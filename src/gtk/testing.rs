@@ -11893,36 +11893,108 @@ mod command_center {
     ///
     /// Three assertions, matching the issue's own three findings exactly:
     ///
-    /// 1. The stale `x=24` assumption for the File menu item lands in
-    ///    blank menu-row padding, left of the real label.
+    /// 1. The stale `x=24` assumption for the File menu item lands left of
+    ///    the real item's hit region — in #720's app-icon slot / blank
+    ///    menu-row padding — so it does not hit-test to File at all.
     /// 2. The stale `x=886/932/978` assumptions for the three caption
-    ///    buttons all miss their real painted centres by a wide margin.
+    ///    buttons come from a "flush right, uniform 46px pitch" model that
+    ///    does not describe the real right-aligned controls bar, and all
+    ///    three land left of their real painted centres.
     /// 3. The stale `x=620` "empty band, must stay HTCAPTION" assumption
     ///    now lands *inside* the Command Center's search box — a real,
     ///    registered `HTCLIENT` widget, not blank drag space.
     ///
-    /// RED-verification: each of the three `assert!`s below was checked by
-    /// hand against this exact frame's real numbers (`File` bounds
-    /// `x=54..82`; caption-button centres `≈893.5/940/989.5`; search box
+    /// RED-verification: each of the three findings below was checked by
+    /// hand against this exact frame's real numbers (`File` item hit region
+    /// `x=46..90`; caption-button centres `≈893.5/940/989.5`; search box
     /// `x=517..797`) before this test was written — every one of the old
     /// smoke-spec assumptions genuinely misses, confirming this is real
     /// staleness and not a tautology that would pass against any layout.
+    /// Each finding also carries a positive control (the *real* coordinate
+    /// resolving to the thing the stale one misses), so none of them can
+    /// pass by the lookup silently resolving to nothing.
+    ///
+    /// Host-font independence (the CI red on the first cut): every number
+    /// this test compares is read back from the frame's own published
+    /// layout, and the only *constants* it asserts against are the four
+    /// stale smoke-spec coordinates themselves. Finding 1 deliberately
+    /// hit-tests the menu-bar layout instead of measuring the File label's
+    /// glyph ink — see the comment at that assertion for why the ink-extent
+    /// form passed locally and failed on CI's font set.
     #[test]
     fn win_gui_smoke_spec_title_band_coordinates_are_stale_1657() {
         let mut h = harness(engine_with_tab_history(), 1024, 768);
         h.driver.render();
 
         // Finding 1: File menu item.
-        let file = h
-            .driver
-            .find_bounds("File")
-            .expect("the File menu label must paint");
+        //
+        // Asserted through `MenuBarLayout::hit_test` -- the *same* call the
+        // running app routes a menu-row click through -- rather than through
+        // the File label's painted glyph ink (`GtkDriver::find_bounds`). The
+        // smoke-spec question is "does a click at x=24 land on the File menu
+        // item?", and the hit region is what answers it; the label's ink is
+        // only a proxy for it. The proxy is also a *fragile* one: the ink's
+        // left edge sits at `app-icon slot + item padding`, the slot width is
+        // derived from the band height, and the band height is derived from
+        // the host's UI font metrics -- so a comparison with a few px of
+        // slack swings with whichever font set the machine happens to have
+        // (this assertion's first cut compared `file.x` against
+        // `24.0 + file.width`, a ~2px margin here, and went red on CI's font
+        // set while staying green locally). The item's hit region clears x=24
+        // by the whole app-icon slot, tens of px, so this form says the same
+        // thing without depending on glyph widths at all.
+        let menu_row = h.menu_row_rect.get();
         assert!(
-            file.x > 24.0 + file.width,
-            "the smoke-spec's stale x=24 assumption must land in blank \
-             padding left of the real File label (got {file:?}) -- if \
-             this ever fires, the layout has moved again and the \
-             smoke-spec coordinates need re-deriving"
+            menu_row.width > 0.0 && menu_row.height > 0.0,
+            "the menu row band must have painted a non-degenerate rect"
+        );
+        // Mirrors `App::render_content`'s own split: GTK's
+        // `titlebar_control_inset()` is the trait default (zero), so the
+        // leading inset is `0.0` and the menu items start after #720's
+        // app-icon slot.
+        let (_app_icon, items_rect) = crate::render::split_menu_row_for_app_icon(menu_row, 0.0);
+        let menu_bar = h.engine.borrow().menu_system.borrow().menu_bar();
+        let file_idx = menu_bar
+            .items
+            .iter()
+            .position(|i| i.label.replace('&', "") == "File")
+            .expect("the menu bar must carry a File item");
+        let mb_layout = {
+            use quadraui::Backend as _;
+            h.driver.backend().menu_bar_layout(items_rect, &menu_bar)
+        };
+        let file = mb_layout
+            .visible_items
+            .iter()
+            .find(|vi| vi.item_idx == file_idx)
+            .expect("the File menu item must be visible in the laid-out bar")
+            .bounds;
+        let band_y = menu_row.y + menu_row.height / 2.0;
+
+        // Positive control: the *real* centre of the File item does resolve
+        // to it, so a failure below is "x=24 is stale", never "this hit-test
+        // never resolves to anything".
+        assert_eq!(
+            mb_layout.hit_test(file.x + file.width / 2.0, band_y),
+            quadraui::MenuBarHit::Item(file_idx),
+            "the File item's own painted centre ({}) must hit-test to File",
+            file.x + file.width / 2.0
+        );
+        assert_ne!(
+            mb_layout.hit_test(24.0, band_y),
+            quadraui::MenuBarHit::Item(file_idx),
+            "the smoke-spec's stale x=24 assumption must NOT hit-test to the \
+             File menu item -- it lands in the app-icon slot / blank padding \
+             left of the real item (which spans {}..{}); if this ever fires, \
+             the layout has moved again and the smoke-spec coordinates need \
+             re-deriving",
+            file.x,
+            file.x + file.width
+        );
+        assert!(
+            24.0 < file.x,
+            "x=24 must fall left of the real File item's leading edge \
+             (got {file:?})"
         );
 
         // Finding 2: the three caption buttons.
@@ -11939,18 +12011,72 @@ mod command_center {
                 .backend()
                 .status_bar_layout(controls_rect, &controls_bar)
         };
-        let button_center_x = |action: &str| -> f32 {
+        let button_rect = |action: &str| -> quadraui::Rect {
             status_layout
                 .hit_regions
                 .iter()
                 .find_map(|(r, hit)| match hit {
-                    quadraui::StatusBarHit::Segment(id) if id.as_str() == action => {
-                        Some(controls_rect.x + r.x + r.width / 2.0)
-                    }
+                    quadraui::StatusBarHit::Segment(id) if id.as_str() == action => Some(
+                        quadraui::Rect::new(controls_rect.x + r.x, r.y, r.width, r.height),
+                    ),
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("{action} must have a registered hit region"))
         };
+        let button_center_x = |action: &str| -> f32 {
+            let r = button_rect(action);
+            r.x + r.width / 2.0
+        };
+
+        // The structural half of this finding, and the one that carries the
+        // weight. The stale triple was derived from a "caption buttons flush
+        // right, uniform 46px pitch" model: close's centre `SPEC_PITCH_PX` in
+        // from the window's right edge, the other two at that same pitch. The
+        // real layout right-aligns the controls `StatusBar` with only
+        // `PIXEL_EDGE_INSET` of trailing slack, so for the spec's model to be
+        // right the close button would have to be
+        // `2 * (SPEC_PITCH_PX - PIXEL_EDGE_INSET)` wide. It is nowhere near
+        // that -- and *that* comparison has a ~30% margin, where comparing the
+        // centres directly turns on ~8px of glyph advance. The per-button
+        // check below keeps the issue's own wording, but this is the claim
+        // that holds whatever font set the host has; tuning the per-button
+        // tolerance against one machine's fonts is exactly how the first cut
+        // of this test passed locally and went red on CI.
+        const SPEC_PITCH_PX: f32 = 46.0;
+        // The band runs to the window's right edge, so this is the `1024` the
+        // smoke spec's own coordinates are expressed against — asserted, not
+        // assumed, because every stale constant here is only meaningful at
+        // that window size.
+        // Tolerance, not `assert_eq!`: the band's right edge is reconstructed
+        // as `x + (1024 - x)` in f32, which only round-trips exactly when `x`
+        // happens to be integral.
+        let window_right = controls_rect.x + controls_rect.width;
+        assert!(
+            (window_right - 1024.0).abs() < 1.0,
+            "the smoke-spec coordinates are derived for a 1024x768 window; \
+             this harness must paint the controls band flush to x=1024 (got \
+             {window_right})"
+        );
+        let spec_implied_button_width =
+            2.0 * (SPEC_PITCH_PX - quadraui::primitives::status_bar::PIXEL_EDGE_INSET);
+        let real_close = button_rect(crate::render::WINDOW_CLOSE_ACTION);
+        assert!(
+            real_close.width < spec_implied_button_width * 0.85,
+            "the smoke-spec's \"caption buttons flush right at {SPEC_PITCH_PX}px \
+             pitch\" model must not describe the real layout: it implies a close \
+             button {spec_implied_button_width}px wide, the real one is \
+             {}px (spanning {}..{} against a window right edge of {window_right})",
+            real_close.width,
+            real_close.x,
+            real_close.x + real_close.width
+        );
+
+        // Per-button detail, matching the issue's own wording ("land in blank
+        // space between them"). The tolerance only has to exclude float
+        // noise and sub-pixel rounding -- how *far* each stale x misses is a
+        // function of the host's glyph advances, so a large threshold here
+        // would be asserting this machine's font set, not the layout. The
+        // claim that cannot drift is the one above.
         for (stale_x, action, name) in [
             (886.0_f32, crate::render::WINDOW_MINIMIZE_ACTION, "minimize"),
             (932.0_f32, crate::render::WINDOW_MAXIMIZE_ACTION, "maximize"),
@@ -11958,10 +12084,19 @@ mod command_center {
         ] {
             let real_x = button_center_x(action);
             assert!(
-                (stale_x - real_x).abs() > 5.0,
+                (stale_x - real_x).abs() > 2.0,
                 "the smoke-spec's stale x={stale_x} assumption for the \
                  {name} button must miss its real painted centre \
                  ({real_x}) by a meaningful margin"
+            );
+            // Direction, not just distance: every stale coordinate sits
+            // *left* of its real centre, because the spec's pitch model
+            // under-measures the buttons' real width. A future layout change
+            // that flipped this would invalidate the spec just as surely.
+            assert!(
+                stale_x < real_x,
+                "the smoke-spec's stale x={stale_x} for the {name} button \
+                 must sit left of its real painted centre ({real_x})"
             );
         }
 
