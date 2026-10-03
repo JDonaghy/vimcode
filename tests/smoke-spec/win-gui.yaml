@@ -677,6 +677,24 @@ steps:
   # `src/win/mod.rs::win_driver_tests::
   # minimap_strip_background_matches_theme_once_a_surface_is_attached_1676`
   # for the Tier-1 coverage this repo *can* add without that primitive.
+  #
+  # vimcode#1696 (editor text not inset by the minimap strip; tab-strip
+  # overflow-action toolbar clipped off the window's right edge) hits the
+  # identical driver-vocabulary wall from a third direction: its own
+  # acceptance bar ("no glyph pixels painted within the minimap strip's
+  # x-range"; "the tab-strip toolbar's right edge is strictly inside the
+  # window") needs exactly the same colour/content-aware pixel primitive
+  # this comment already names as missing, plus a known-long buffer line
+  # to probe against (this spec's seed file is "small", per this file's own
+  # header, not "has a line wide enough to overflow the pane"). See
+  # `docs/PENDING_QUADRAUI_ISSUES.md`'s two matching #1696 entries — both
+  # root-caused to quadraui-side gaps (`Editor`/`EditorPaintOptions` has no
+  # way to reserve trailing content width independently of the scrollbar
+  # anchor; `TabBar::layout`'s right segments have no outer-edge inset,
+  # unlike `StatusBar`'s `PIXEL_EDGE_INSET`) — and `src/render.rs::render::
+  # tests::to_q_editor_does_not_narrow_the_viewport_for_the_minimap_strip_
+  # 1696` for the backend-neutral (runs on any host, no driver needed) test
+  # that pins the first gap numerically.
 
   # quadraui#1232 again — the close button's click is swallowed the same
   # way the menu row's is.
