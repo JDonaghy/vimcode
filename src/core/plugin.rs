@@ -4502,6 +4502,35 @@ impl PluginManager {
                         if let Some(sh) = &m.opts.sign_hl {
                             t.set("sign_hl", sh.clone())?;
                         }
+                        // #1653 review: a mark with virtual text couldn't be
+                        // round-tripped back through `get_mark` at all —
+                        // only hl_group/sign_text/sign_hl came back. Mirror
+                        // `set_mark`'s own `virt_text = {{text, hl_group},
+                        // ...}` shape exactly so a caller can feed this
+                        // table's `virt_text`/`virt_text_pos` straight back
+                        // into another `set_mark` call.
+                        if !m.opts.virt_text.is_empty() {
+                            let chunks = lua.create_table()?;
+                            for (i, c) in m.opts.virt_text.iter().enumerate() {
+                                let chunk = lua.create_table()?;
+                                chunk.set("text", c.text.clone())?;
+                                if let Some(hl) = &c.hl_group {
+                                    chunk.set("hl_group", hl.clone())?;
+                                }
+                                chunks.set(i + 1, chunk)?;
+                            }
+                            t.set("virt_text", chunks)?;
+                        }
+                        if let Some(pos) = m.opts.virt_text_pos {
+                            t.set(
+                                "virt_text_pos",
+                                match pos {
+                                    crate::core::buffer::VirtTextPos::Eol => "eol",
+                                    crate::core::buffer::VirtTextPos::Overlay => "overlay",
+                                    crate::core::buffer::VirtTextPos::Inline => "inline",
+                                },
+                            )?;
+                        }
                         Ok(LuaValue::Table(t))
                     }
                     None => Ok(LuaValue::Nil),
@@ -4519,21 +4548,22 @@ impl PluginManager {
             })?,
         )?;
 
-        // vimcode.decor.clear(ns, buf, start?, end?) — removes every mark in
+        // vimcode.decor.clear(buf, ns, start?, end?) — removes every mark in
         // `ns` (optionally restricted to the 0-indexed, exclusive-`end` row
         // range `[start, end)`) that `buf` is carrying. A plugin names only
         // its own `ns`, so this can't touch another plugin's marks even
-        // though every namespace shares one per-buffer store.
+        // though every namespace shares one per-buffer store. `(buf, ns,
+        // ...)` matches `set_mark`/`get_mark`/`del_mark`'s argument order.
         decor.set(
             "clear",
             lua.create_function(
-                |_, (ns, buf, start, end): (i64, i64, Option<usize>, Option<usize>)| {
+                |_, (buf, ns, start, end): (i64, i64, Option<usize>, Option<usize>)| {
                     let range = match (start, end) {
                         (Some(s), Some(e)) => Some((s, e)),
                         _ => None,
                     };
                     live_engine("vimcode.decor.clear", move |e| {
-                        e.plugin_api_decor_clear(ns, buf, range)
+                        e.plugin_api_decor_clear(buf, ns, range)
                     })
                 },
             )?,

@@ -1457,14 +1457,18 @@ impl Engine {
             .del_mark(buf_id, ns_id, crate::core::buffer::MarkId(id as u64))
     }
 
-    /// `vimcode.decor.clear(ns, buf, start?, end?)` — `start`/`end` are
+    /// `vimcode.decor.clear(buf, ns, start?, end?)` — `start`/`end` are
     /// 0-indexed buffer rows with an exclusive `end`, same convention as
     /// `vimcode.buffer.get_lines`/`set_lines`. `None` clears every mark in
-    /// `ns` regardless of position.
+    /// `ns` regardless of position. `(buf, ns, ...)` matches the argument
+    /// order every other `vimcode.decor.*` mark function uses
+    /// (`set_mark`/`get_mark`/`del_mark`) — an earlier `(ns, buf, ...)` here
+    /// was the one function in the surface that transposed it (#1653
+    /// review).
     pub(crate) fn plugin_api_decor_clear(
         &mut self,
-        ns: i64,
         buf: i64,
+        ns: i64,
         range: Option<(usize, usize)>,
     ) -> bool {
         let Some(buf_id) = self.plugin_api_resolve_buf(buf) else {

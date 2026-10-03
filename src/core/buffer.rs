@@ -282,13 +282,18 @@ pub struct DecorMark {
     pub opts: DecorOpts,
 }
 
-/// A registered `vimcode.decor.set_hl()` highlight group. Colour fields are
-/// the raw `"#rrggbb"`/`"#rrggbbaa"` strings a plugin passed in (or a plain
-/// named token — `render.rs` resolves those too); `None` leaves that
-/// channel untouched (e.g. `fg` set, `bg` absent, inherits the editor
-/// background). `link` names another group whose *resolved* colours/flags
-/// are used instead — at most one hop is honoured (mirrors Neovim: linking
-/// to a group that itself links is not chased further), so it keeps
+/// A registered `vimcode.decor.set_hl()` highlight group. `fg`/`bg` are the
+/// raw `"#rrggbb"`/`"#rrggbbaa"` strings a plugin passed in — `render.rs`'s
+/// `try_from_hex`/`try_from_hex_over` only parse that hex form, so a plain
+/// named colour token (e.g. `"red"`) is not accepted and silently falls
+/// through to the theme default, same as an unregistered group name.
+/// `None` leaves that channel untouched (e.g. `fg` set, `bg` absent,
+/// inherits the editor background). `link` names another group whose
+/// *resolved* colours/flags are used instead when that name is itself a
+/// registered plugin group — at most one hop is honoured (mirrors Neovim:
+/// linking to a group that itself links is not chased further) — or, when
+/// it isn't, a `Theme` role name instead (`render.rs`'s
+/// `resolve_decor_style`, e.g. `link = "Comment"`). Either way it keeps
 /// following theme switches (`ColorScheme`) rather than freezing the
 /// linked-to colour at `set_hl` time.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -301,34 +306,63 @@ pub struct HlGroupDef {
     pub link: Option<String>,
 }
 
-/// Every decoration mark for one buffer, indexed by starting row for
-/// O(visible-range) lookups — [`marks_touching`](Self::marks_touching) never
-/// scans marks anchored off-screen, satisfying #1653's "off-screen lines
-/// must cost nothing per frame" requirement without a per-frame full scan.
+/// Every decoration mark for one buffer, indexed two ways so
+/// [`marks_touching`](Self::marks_touching) costs O(visible range +
+/// overlapping marks) rather than a per-frame scan of everything above the
+/// viewport — satisfying #1653's "off-screen lines must cost nothing per
+/// frame" requirement for real (see that method's doc comment for why a
+/// single start-row index alone can't do this):
+///
+/// - `by_row`, keyed by each mark's *starting* row, answers "marks that
+///   start inside the visible window" via a `BTreeMap::range(start..=end)`
+///   — `O(log n)` to find the window plus `O(k)` for the `k` marks inside
+///   it, regardless of how many thousands of rows of marks sit above it.
+/// - `spanning_by_end`, keyed by each mark's *ending* row but only holding
+///   marks whose range covers more than one row (`end_row > row` — a plain
+///   single-line mark can never start above the window and still reach into
+///   it, so it's redundant to index those twice), answers "a multi-row mark
+///   that started above the window but still reaches into it". Keying on
+///   `end_row` means `range(start_row..)` skips every spanning mark that
+///   already *ended* above the window in the same `O(log n)` step — a mark
+///   that finished scrolling past 10,000 rows ago is never visited either.
 #[derive(Debug, Clone, Default)]
 pub struct BufferDecorations {
     marks: HashMap<MarkId, DecorMark>,
     /// Starting row -> mark ids anchored there. Every entry here names a
     /// live key in `marks`; kept in sync by every mutator below.
     by_row: BTreeMap<usize, Vec<MarkId>>,
+    /// Ending row -> ids of *multi-row* marks (`end_row > row`) ending
+    /// there. A subset of `marks`' keys; see the struct doc comment.
+    spanning_by_end: BTreeMap<usize, Vec<MarkId>>,
 }
 
 impl BufferDecorations {
-    fn index_insert(&mut self, row: usize, id: MarkId) {
+    fn index_insert(&mut self, row: usize, end_row: usize, id: MarkId) {
         self.by_row.entry(row).or_default().push(id);
+        if end_row > row {
+            self.spanning_by_end.entry(end_row).or_default().push(id);
+        }
     }
 
-    fn index_remove(&mut self, row: usize, id: MarkId) {
+    fn index_remove(&mut self, row: usize, end_row: usize, id: MarkId) {
         if let Some(ids) = self.by_row.get_mut(&row) {
             ids.retain(|&m| m != id);
             if ids.is_empty() {
                 self.by_row.remove(&row);
             }
         }
+        if end_row > row {
+            if let Some(ids) = self.spanning_by_end.get_mut(&end_row) {
+                ids.retain(|&m| m != id);
+                if ids.is_empty() {
+                    self.spanning_by_end.remove(&end_row);
+                }
+            }
+        }
     }
 
     pub fn insert(&mut self, mark: DecorMark) {
-        self.index_insert(mark.row, mark.id);
+        self.index_insert(mark.row, mark.end_row, mark.id);
         self.marks.insert(mark.id, mark);
     }
 
@@ -338,22 +372,36 @@ impl BufferDecorations {
 
     pub fn remove(&mut self, id: MarkId) -> Option<DecorMark> {
         let mark = self.marks.remove(&id)?;
-        self.index_remove(mark.row, id);
+        self.index_remove(mark.row, mark.end_row, id);
         Some(mark)
     }
 
     /// Marks whose `[row, end_row]` span touches the visible `[start_row,
     /// end_row]` window — i.e. every mark a renderer needs to paint this
-    /// frame. Only walks `by_row` entries up to `end_row`, so a mark anchored
-    /// past the visible range (however many thousands of lines below) is
-    /// never visited.
+    /// frame.
+    ///
+    /// Two lookups, each skipping straight past marks that can't possibly
+    /// matter rather than visiting and rejecting them one at a time:
+    /// `by_row.range(start_row..=end_row)` for marks starting inside the
+    /// window, plus `spanning_by_end.range(start_row..)` for multi-row marks
+    /// that started above the window but still reach into it (filtered to
+    /// `row < start_row` so a spanning mark that *also* starts inside the
+    /// window isn't double-counted — the first lookup already has it).
+    /// Neither walks a single mark anchored (or, for a spanning mark,
+    /// finished) above `start_row`.
     pub fn marks_touching(&self, start_row: usize, end_row: usize) -> Vec<&DecorMark> {
-        self.by_row
-            .range(..=end_row)
+        let starting_in_window = self
+            .by_row
+            .range(start_row..=end_row)
+            .flat_map(|(_, ids)| ids.iter())
+            .filter_map(|id| self.marks.get(id));
+        let spanning_from_above = self
+            .spanning_by_end
+            .range(start_row..)
             .flat_map(|(_, ids)| ids.iter())
             .filter_map(|id| self.marks.get(id))
-            .filter(|m| m.end_row >= start_row)
-            .collect()
+            .filter(|m| m.row < start_row);
+        starting_in_window.chain(spanning_from_above).collect()
     }
 
     /// Remove every mark in `ns`, optionally restricted to marks whose range
@@ -377,13 +425,13 @@ impl BufferDecorations {
     /// marks follow, see `Engine::shift_marks_for_line_delete`).
     fn relocate(&mut self, mut f: impl FnMut(&DecorMark) -> Option<(usize, usize)>) {
         let mut removals = Vec::new();
-        let mut moves: Vec<(MarkId, usize, usize, usize)> = Vec::new();
+        let mut moves: Vec<(MarkId, usize, usize, usize, usize)> = Vec::new();
         for m in self.marks.values() {
             match f(m) {
                 None => removals.push(m.id),
                 Some((row, end_row)) => {
                     if row != m.row || end_row != m.end_row {
-                        moves.push((m.id, m.row, row, end_row));
+                        moves.push((m.id, m.row, m.end_row, row, end_row));
                     }
                 }
             }
@@ -391,13 +439,13 @@ impl BufferDecorations {
         for id in removals {
             self.remove(id);
         }
-        for (id, old_row, new_row, new_end_row) in moves {
-            self.index_remove(old_row, id);
+        for (id, old_row, old_end_row, new_row, new_end_row) in moves {
+            self.index_remove(old_row, old_end_row, id);
             if let Some(m) = self.marks.get_mut(&id) {
                 m.row = new_row;
                 m.end_row = new_end_row;
             }
-            self.index_insert(new_row, id);
+            self.index_insert(new_row, new_end_row, id);
         }
     }
 
@@ -773,5 +821,87 @@ mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    /// #1653 review: `BufferDecorations::marks_touching` must not walk
+    /// every mark whose starting row sits above the visible window — the
+    /// old `by_row.range(..=end_row)` did exactly that (always starting
+    /// from the very first key), which costs O(marks above the viewport)
+    /// on every single frame for a todo-comments-style plugin that
+    /// scatters single-line marks through a large file. This test can't
+    /// directly assert on "didn't visit N entries" without instrumenting
+    /// the `BTreeMap`, so it instead pins the *correctness* contract the
+    /// new two-index design (`by_row` range-queried from `start_row`,
+    /// `spanning_by_end` catching only genuine multi-row marks) has to
+    /// get right to be safe to query that way at all: a mark entirely
+    /// above the window is excluded, a mark starting inside the window is
+    /// included, a multi-row mark that starts above the window but still
+    /// reaches into it is included, and a multi-row mark that already
+    /// ended above the window is excluded.
+    #[test]
+    fn marks_touching_excludes_marks_outside_the_window() {
+        let mut decs = BufferDecorations::default();
+        let opts = DecorOpts::default();
+
+        let above_single = DecorMark {
+            id: MarkId(1),
+            ns: NamespaceId(0),
+            row: 5,
+            col: 0,
+            end_row: 5,
+            end_col: 0,
+            opts: opts.clone(),
+        };
+        let inside_single = DecorMark {
+            id: MarkId(2),
+            ns: NamespaceId(0),
+            row: 102,
+            col: 0,
+            end_row: 102,
+            end_col: 0,
+            opts: opts.clone(),
+        };
+        let spanning_into_window = DecorMark {
+            id: MarkId(3),
+            ns: NamespaceId(0),
+            row: 0,
+            col: 0,
+            end_row: 150,
+            end_col: 0,
+            opts: opts.clone(),
+        };
+        let spanning_ended_above = DecorMark {
+            id: MarkId(4),
+            ns: NamespaceId(0),
+            row: 0,
+            col: 0,
+            end_row: 10,
+            end_col: 0,
+            opts: opts.clone(),
+        };
+        decs.insert(above_single);
+        decs.insert(inside_single);
+        decs.insert(spanning_into_window);
+        decs.insert(spanning_ended_above);
+
+        let touching: Vec<MarkId> = decs.marks_touching(100, 110).iter().map(|m| m.id).collect();
+        assert!(
+            !touching.contains(&MarkId(1)),
+            "a single-row mark entirely above the window must be excluded"
+        );
+        assert!(
+            touching.contains(&MarkId(2)),
+            "a single-row mark starting inside the window must be included"
+        );
+        assert!(
+            touching.contains(&MarkId(3)),
+            "a multi-row mark that started above the window but still \
+             reaches into it must be included"
+        );
+        assert!(
+            !touching.contains(&MarkId(4)),
+            "a multi-row mark that already ended above the window must be \
+             excluded"
+        );
     }
 }
