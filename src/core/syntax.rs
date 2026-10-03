@@ -805,6 +805,29 @@ impl Syntax {
         self.language
     }
 
+    /// The LSP-style language identifier (e.g. `"rust"`, `"lua"`) this
+    /// `Syntax` was built for — what `vimcode.syntax.node_at`/`query` (#1654
+    /// P6) report back to a plugin as the parsed language's name.
+    pub fn language_id(&self) -> &'static str {
+        self.language.language_id()
+    }
+
+    /// The most recently produced tree-sitter parse tree, if any parse has
+    /// happened yet. Read-only access for the native plugin API (#1654 P6) —
+    /// callers must not hand out anything derived from this tree that
+    /// outlives the current call (no Lua-side tree objects).
+    pub fn tree(&self) -> Option<&Tree> {
+        self.last_tree.as_ref()
+    }
+
+    /// The tree-sitter `Language` this `Syntax` parses with — needed to
+    /// compile an ad hoc plugin-supplied query (#1654 P6's
+    /// `vimcode.syntax.query`), since the built-in `self.query` only ever
+    /// covers the highlight query baked in at construction time.
+    pub fn ts_language(&self) -> Language {
+        self.language.language()
+    }
+
     pub fn parse(&mut self, text: &str) -> Vec<(usize, usize, String)> {
         self.reparse(text);
         self.extract_highlights(text)
@@ -1125,6 +1148,139 @@ pub struct BreadcrumbSymbol {
     pub line: usize,
     /// Start column (0-indexed) of the scope-defining node.
     pub col: usize,
+}
+
+// ─── Native plugin API read surface (#1654 P6) ──────────────────────────────
+//
+// Plain, owned types a `vimcode.syntax.*` call hands back to Lua — never a
+// tree-sitter `Node`/`Tree` itself, which borrows from the parse tree and
+// would have no sound way to "outlive the call" into Lua. `row`/`end_row`
+// are 0-indexed source lines; `col`/`end_col` are 0-indexed **byte** offsets
+// within that line (tree-sitter's native `Point` column unit) — a plugin
+// written against tree-sitter query output already thinks in those units,
+// and converting to/from UTF-8 char or UTF-16 offsets here would make
+// `node_at`/`query` disagree with the query source a plugin pastes in from
+// `nvim-treesitter`-style tooling.
+
+/// A byte-column range in source text, tree-sitter's native unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyntaxRangeInfo {
+    pub start_row: usize,
+    pub start_col: usize,
+    pub end_row: usize,
+    pub end_col: usize,
+}
+
+impl SyntaxRangeInfo {
+    fn from_node(node: &tree_sitter::Node) -> Self {
+        let start = node.start_position();
+        let end = node.end_position();
+        Self {
+            start_row: start.row,
+            start_col: start.column,
+            end_row: end.row,
+            end_col: end.column,
+        }
+    }
+}
+
+/// A node's immediate parent, as reported by `vimcode.syntax.node_at`'s
+/// `parent` field — just the parent's own `kind`/range, not its own parent
+/// (no unbounded ancestor chain; a plugin wanting more walks up itself via
+/// repeated `node_at` calls at the parent's own start position).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxNodeSummary {
+    pub kind: String,
+    pub range: SyntaxRangeInfo,
+}
+
+/// `vimcode.syntax.node_at(buf, row, col)`'s return value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxNodeInfo {
+    pub kind: String,
+    pub range: SyntaxRangeInfo,
+    pub language: String,
+    pub parent: Option<SyntaxNodeSummary>,
+}
+
+/// One capture from `vimcode.syntax.query(buf, query_string, range?)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxCaptureInfo {
+    /// The query's `@capture.name` for this node (without the leading `@`).
+    pub name: String,
+    pub kind: String,
+    pub range: SyntaxRangeInfo,
+}
+
+impl Syntax {
+    /// `vimcode.syntax.node_at(buf, row, col)` (#1654 P6): the smallest
+    /// tree-sitter node spanning `(row, col)`, plus its immediate parent.
+    /// `col` is a 0-indexed byte offset within `row` — see the module note
+    /// above. `Err` (surfaced as a Lua error by the thin wrapper in
+    /// `plugin.rs`) when nothing has been parsed yet, or the position is out
+    /// of range.
+    pub fn node_at(&self, row: usize, col: usize) -> Result<SyntaxNodeInfo, String> {
+        let tree = self
+            .tree()
+            .ok_or("buffer has not been parsed by tree-sitter yet")?;
+        let point = Point::new(row, col);
+        let node = tree
+            .root_node()
+            .descendant_for_point_range(point, point)
+            .ok_or("no syntax node at that position")?;
+        let parent = node.parent().map(|p| SyntaxNodeSummary {
+            kind: p.kind().to_string(),
+            range: SyntaxRangeInfo::from_node(&p),
+        });
+        Ok(SyntaxNodeInfo {
+            kind: node.kind().to_string(),
+            range: SyntaxRangeInfo::from_node(&node),
+            language: self.language_id().to_string(),
+            parent,
+        })
+    }
+
+    /// `vimcode.syntax.query(buf, query_string, range?)` (#1654 P6): compile
+    /// an ad hoc query against this buffer's language and run it over the
+    /// most recent parse tree, optionally restricted to the 0-indexed,
+    /// exclusive `[start_row, end_row)` row range. `text` must be the same
+    /// text the tree was parsed from (the caller — `Engine::plugin_api_
+    /// syntax_query` — re-fetches it from the live buffer each call; there
+    /// is no cached copy on `Syntax` itself).
+    pub fn query_captures(
+        &self,
+        text: &str,
+        query_source: &str,
+        range: Option<(usize, usize)>,
+    ) -> Result<Vec<SyntaxCaptureInfo>, String> {
+        let tree = self
+            .tree()
+            .ok_or("buffer has not been parsed by tree-sitter yet")?;
+        let query = Query::new(&self.ts_language(), query_source)
+            .map_err(|e| format!("invalid query: {e}"))?;
+        let mut cursor = QueryCursor::new();
+        if let Some((start_row, end_row)) = range {
+            // Exclusive `end_row`, matching every other row-range API in
+            // this codebase (e.g. `vimcode.decor.clear`'s `[start, end)`):
+            // `(end_row, 0)` as the upper bound includes every match
+            // starting on a row `< end_row` and excludes row `end_row`
+            // itself.
+            cursor.set_point_range(Point::new(start_row, 0)..Point::new(end_row, 0));
+        }
+        let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+        let mut out = Vec::new();
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let name = query.capture_names()[capture.index as usize].to_string();
+                out.push(SyntaxCaptureInfo {
+                    name,
+                    kind: capture.node.kind().to_string(),
+                    range: SyntaxRangeInfo::from_node(&capture.node),
+                });
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

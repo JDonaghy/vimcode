@@ -4421,6 +4421,11 @@ impl PluginManager {
         // ── vimcode.decor (#1653, Native API P5) ─────────────────────────────
         Self::setup_decor_api(lua, vimcode)?;
 
+        // ── vimcode.syntax / vimcode.undo / vimcode.diagnostics (#1654, P6) ──
+        Self::setup_syntax_api(lua, vimcode)?;
+        Self::setup_undo_api(lua, vimcode)?;
+        Self::setup_diagnostics_api(lua, vimcode)?;
+
         Ok(())
     }
 
@@ -4572,6 +4577,191 @@ impl PluginManager {
         vimcode.set("decor", decor)?;
         Ok(())
     }
+
+    /// Install `vimcode.syntax.*` (#1654, Native API P6): read-only
+    /// tree-sitter access over whatever parse the engine already keeps for
+    /// highlighting (`BufferState::syntax`) — no Lua-side tree object, every
+    /// call returns a plain table. See `Engine::plugin_api_syntax_node_at`/
+    /// `_query` (`engine/plugins.rs`) and `core::syntax::Syntax::node_at`/
+    /// `query_captures` for the underlying logic.
+    fn setup_syntax_api(lua: &Lua, vimcode: &LuaTable) -> LuaResult<()> {
+        let syntax = lua.create_table()?;
+
+        // vimcode.syntax.node_at(buf, row, col) → {type=, range=, language=,
+        // parent=}. `row` is 0-indexed; `col` is a 0-indexed **byte** offset
+        // within that row (tree-sitter's native unit — see `SyntaxRangeInfo`'s
+        // doc comment in `core/syntax.rs`).
+        syntax.set(
+            "node_at",
+            lua.create_function(|lua, (buf, row, col): (i64, usize, usize)| {
+                let node = live_engine("vimcode.syntax.node_at", move |e| {
+                    e.plugin_api_syntax_node_at(buf, row, col)
+                })?
+                .map_err(LuaError::RuntimeError)?;
+                syntax_node_info_to_lua_table(lua, &node)
+            })?,
+        )?;
+
+        // vimcode.syntax.query(buf, query_string, range?) → array of
+        // {name=, type=, range=}. `range`, if given, is
+        // `{start_row, end_row}` (0-indexed, exclusive `end_row`).
+        syntax.set(
+            "query",
+            lua.create_function(
+                |lua, (buf, query_src, range): (i64, String, Option<LuaTable>)| {
+                    let row_range = match &range {
+                        Some(t) => {
+                            let start: usize = t.get(1)?;
+                            let end: usize = t.get(2)?;
+                            Some((start, end))
+                        }
+                        None => None,
+                    };
+                    let (_language, captures) = live_engine("vimcode.syntax.query", move |e| {
+                        e.plugin_api_syntax_query(buf, &query_src, row_range)
+                    })?
+                    .map_err(LuaError::RuntimeError)?;
+                    let out = lua.create_table()?;
+                    for (i, c) in captures.iter().enumerate() {
+                        let row = lua.create_table()?;
+                        row.set("name", c.name.clone())?;
+                        row.set("type", c.kind.clone())?;
+                        row.set("range", syntax_range_to_lua_table(lua, &c.range)?)?;
+                        out.set(i + 1, row)?;
+                    }
+                    Ok(out)
+                },
+            )?,
+        )?;
+
+        vimcode.set("syntax", syntax)?;
+        Ok(())
+    }
+
+    /// Install `vimcode.undo.*` (#1654, Native API P6): read the live undo
+    /// tree and jump straight to a recorded state by `seq`. See
+    /// `Engine::plugin_api_undo_tree`/`_jump` (`engine/plugins.rs`).
+    fn setup_undo_api(lua: &Lua, vimcode: &LuaTable) -> LuaResult<()> {
+        let undo = lua.create_table()?;
+
+        // vimcode.undo.tree(buf) → array of {seq=, parent=, time=, current=},
+        // oldest first.
+        undo.set(
+            "tree",
+            lua.create_function(|lua, buf: Option<i64>| {
+                let buf = buf.unwrap_or(0);
+                let nodes = live_engine("vimcode.undo.tree", move |e| e.plugin_api_undo_tree(buf))?;
+                let out = lua.create_table()?;
+                for (i, n) in nodes.iter().enumerate() {
+                    let row = lua.create_table()?;
+                    row.set("seq", n.seq)?;
+                    row.set("parent", n.parent)?;
+                    let millis = n
+                        .time
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    row.set("time", millis)?;
+                    row.set("current", n.current)?;
+                    out.set(i + 1, row)?;
+                }
+                Ok(out)
+            })?,
+        )?;
+
+        // vimcode.undo.jump(buf, seq) → bool
+        undo.set(
+            "jump",
+            lua.create_function(|_, (buf, seq): (i64, usize)| {
+                live_engine("vimcode.undo.jump", move |e| {
+                    e.plugin_api_undo_jump(buf, seq)
+                })
+            })?,
+        )?;
+
+        vimcode.set("undo", undo)?;
+        Ok(())
+    }
+
+    /// Install `vimcode.diagnostics.get` (#1654, Native API P6). The
+    /// `DiagnosticChanged` event (fired from `Engine::set_diagnostics_for_
+    /// path`, `engine/panels.rs`) uses the existing generic `vimcode.on`
+    /// registration — no separate wiring needed here.
+    fn setup_diagnostics_api(lua: &Lua, vimcode: &LuaTable) -> LuaResult<()> {
+        let diagnostics = lua.create_table()?;
+
+        // vimcode.diagnostics.get(buf?) → array of {range=, severity=,
+        // message=, source=, code=}. `buf` defaults to the active buffer.
+        diagnostics.set(
+            "get",
+            lua.create_function(|lua, buf: Option<i64>| {
+                let diags = live_engine("vimcode.diagnostics.get", move |e| {
+                    e.plugin_api_diagnostics_get(buf)
+                })?;
+                let out = lua.create_table()?;
+                for (i, d) in diags.iter().enumerate() {
+                    let row = lua.create_table()?;
+                    let range = lua.create_table()?;
+                    range.set("start_row", d.range.start.line)?;
+                    range.set("start_col", d.range.start.character)?;
+                    range.set("end_row", d.range.end.line)?;
+                    range.set("end_col", d.range.end.character)?;
+                    row.set("range", range)?;
+                    row.set(
+                        "severity",
+                        match d.severity {
+                            crate::core::lsp::DiagnosticSeverity::Error => "error",
+                            crate::core::lsp::DiagnosticSeverity::Warning => "warning",
+                            crate::core::lsp::DiagnosticSeverity::Information => "information",
+                            crate::core::lsp::DiagnosticSeverity::Hint => "hint",
+                        },
+                    )?;
+                    row.set("message", d.message.clone())?;
+                    row.set("source", d.source.clone())?;
+                    row.set("code", d.code.clone())?;
+                    out.set(i + 1, row)?;
+                }
+                Ok(out)
+            })?,
+        )?;
+
+        vimcode.set("diagnostics", diagnostics)?;
+        Ok(())
+    }
+}
+
+/// Convert a [`crate::core::syntax::SyntaxRangeInfo`] into the
+/// `{start_row=, start_col=, end_row=, end_col=}` table shape shared by
+/// `vimcode.syntax.node_at`/`query`.
+fn syntax_range_to_lua_table<'lua>(
+    lua: &'lua Lua,
+    range: &crate::core::syntax::SyntaxRangeInfo,
+) -> LuaResult<LuaTable<'lua>> {
+    let t = lua.create_table()?;
+    t.set("start_row", range.start_row)?;
+    t.set("start_col", range.start_col)?;
+    t.set("end_row", range.end_row)?;
+    t.set("end_col", range.end_col)?;
+    Ok(t)
+}
+
+/// Convert a [`crate::core::syntax::SyntaxNodeInfo`] into the table
+/// `vimcode.syntax.node_at` returns.
+fn syntax_node_info_to_lua_table<'lua>(
+    lua: &'lua Lua,
+    node: &crate::core::syntax::SyntaxNodeInfo,
+) -> LuaResult<LuaTable<'lua>> {
+    let t = lua.create_table()?;
+    t.set("type", node.kind.clone())?;
+    t.set("range", syntax_range_to_lua_table(lua, &node.range)?)?;
+    t.set("language", node.language.clone())?;
+    if let Some(parent) = &node.parent {
+        let p = lua.create_table()?;
+        p.set("type", parent.kind.clone())?;
+        p.set("range", syntax_range_to_lua_table(lua, &parent.range)?)?;
+        t.set("parent", p)?;
+    }
+    Ok(t)
 }
 
 /// Parse a `vimcode.decor.set_hl` options table into an [`HlGroupDef`].
