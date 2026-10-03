@@ -6563,6 +6563,17 @@ pub fn status_bar_zones_from_layout(layout: &quadraui::StatusBarLayout) -> Statu
 /// backend's own per-window and separated-status paint sites.
 /// `separated`/`global` are `None` whenever that band did not paint this
 /// frame — the empty/absent convention [`ChromeState`] documents.
+///
+/// #1690: the painted *background fill* under a single window's status bar
+/// now extends edge-to-edge under the sidebar/activity bar too (see
+/// `App::paint_editor_windows_rung`'s backdrop fill), but the clickable
+/// band/zones recovered here deliberately stay window-bounded — AppShell's
+/// own activity-bar/sidebar hit-test runs *before* `App::handle` ever sees
+/// the event (quadraui's `ShellAdapter::handle`), so a click over that
+/// visually-capped region never reaches this router at all; widening the
+/// band here without widening *that* hit-test first would just make
+/// `status_bar_zone_hit_test` resolve a position no click can actually
+/// arrive at. See the issue for why this is paint-only.
 pub fn status_bands<'a>(
     windows: &[RenderedWindow],
     lh: f64,
@@ -9778,6 +9789,50 @@ pub fn paint_separated_status_rung(
     let bar = window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:separated"));
     let _ = b.draw_status_bar_interactive(rect, &bar, &quadraui::InteractionState::new());
     b.status_bar_layout(rect, &bar)
+}
+
+/// Paint a plain, content-free fill behind the "real" status bar at
+/// `real_bg` — #1690's edge-to-edge VS Code parity backdrop, shared by
+/// `App::paint_editor_windows_rung`'s single-window case and
+/// `App::compose_bottom_band_rungs`'s `SeparatedStatus` arm.
+///
+/// Deliberately a *separate* paint rather than widening the real bar's own
+/// rect: AppShell's activity-bar/sidebar click hit-test runs before
+/// `App::handle` ever sees the event (quadraui's `ShellAdapter::handle`),
+/// so widening the real bar would move its segments' hit zones into screen
+/// positions a click can never actually reach — see [`status_bands`]'s doc
+/// for the longer version. This backdrop carries no segments of its own
+/// (so it is never stored in a click-hit map and can't be clicked), just
+/// the real bar's own fill colour, painted into `rect` — which callers
+/// widen to the real window/terminal width (`Backend::viewport().width`)
+/// while the real bar underneath stays window/main-content-bounded.
+///
+/// `real_bg` is `None` when the real bar has no segments at all (nothing
+/// to colour-match), in which case this is a no-op — matching
+/// `status_bar.rs::paint`'s own "no segments → `theme.background`" default
+/// would risk painting a visibly different fill than whatever the real bar
+/// ends up using once it *does* have segments.
+pub fn paint_status_backdrop(
+    b: &mut dyn quadraui::Backend,
+    id: &str,
+    rect: quadraui::Rect,
+    real_bg: Option<quadraui::Color>,
+) {
+    let Some(bg) = real_bg else {
+        return;
+    };
+    let backdrop = quadraui::StatusBar {
+        id: quadraui::WidgetId::new(id),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: String::new(),
+            fg: bg,
+            bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: Vec::new(),
+    };
+    let _ = b.draw_status_bar_interactive(rect, &backdrop, &quadraui::InteractionState::new());
 }
 
 /// The unit system one backend composes [`paint_bottom_panel_rung`] in.
@@ -25635,17 +25690,21 @@ pub fn build_window_status_line(
         .and_then(|p| crate::core::lsp::language_id_from_path(p))
         .unwrap_or_default();
 
-    // Derive per-window status bar colors from the editor background.
-    // Active: bg shifted ~10% from editor bg (lighter on dark themes, darker on light).
-    // Inactive: uses theme's status_inactive_bg/fg.
-    let lum = 0.299 * theme.background.r as f64
-        + 0.587 * theme.background.g as f64
-        + 0.114 * theme.background.b as f64;
-    let bar_bg = if lum < 128.0 {
-        theme.background.lighten(0.10)
-    } else {
-        theme.background.darken(0.10)
-    };
+    // #1690: the active window's status bar reads its background from the
+    // theme's own dedicated status-bar key (`theme.status_bg` — the same
+    // field `build_global_status_bar`/the sidebar header/the source-control
+    // header already read) rather than a `lighten`/`darken` offset computed
+    // from the editor background. The offset always *increased* contrast
+    // against a dark background, which is what made the bar read as a
+    // lighter slab instead of a footer (vimcode#1690's Win-GUI report:
+    // `#303030` fill against a `#14161e` editor, both sampled from a real
+    // window) — every color-scheme author already has a considered
+    // `status_bg` value (down to "equal to `background`", VS Code's own
+    // convention under several of its built-in themes) and this is the one
+    // place that value should come from.
+    // Inactive windows keep their own dedicated key (`status_inactive_bg`),
+    // unaffected by this change.
+    let bar_bg = theme.status_bg;
     let bar_fg = theme.foreground;
 
     // Mode text color — use the mode badge color as a subtle text tint
@@ -25746,22 +25805,25 @@ pub fn build_window_status_line(
         // `name…` placeholder when the server isn't reporting progress.
         let lsp_progress = window.and_then(|w| engine.lsp_progress_for_buffer(w.buffer_id));
 
-        // Right side — ordered least-important → most-important (left → right
-        // when right-aligned). Narrow bars drop from the front of this list,
-        // so cursor position (highest priority) stays at the right edge.
-        // See issue #159 for priority rationale.
+        // #1690: segment order now follows VS Code's left/right split
+        // rather than a pure priority ranking. VS Code's status bar puts
+        // the problems counter at the **far left** (with the remote
+        // indicator/workspace trust vimcode has no equivalent of) and, on
+        // the right, `Ln N, Col N` · `Spaces: N` · `UTF-8` · `LF` ·
+        // language · notification bell, in that left-to-right order —
+        // see the issue for the side-by-side pixel sampling this corrects.
+        // `left`/`right` here are still plain vectors read left-to-right
+        // by `StatusBar::layout` (narrow bars drop from the front of
+        // each), so swapping an item's position in the VS Code sequence
+        // also moves where it sits in that drop order — #164 (priority
+        // drop on narrow Win-GUI widths) is the place to revisit that
+        // coupling, not here.
         //
-        // Drop order (least → most important):
-        //   notification · menu toggle · panel toggle · sidebar toggle ·
-        //   problems · utf-8 · line ending · indent · language · LSP ·
-        //   cursor pos
-        //
-        // #1548: the problems counter sits above the encoding/line-ending/
-        // indent trio — diagnostics are more consequential to a narrow bar
-        // dropping segments than "how is this file encoded", but it's still
-        // below the toggles (those are single always-present icon buttons,
-        // not counters) and below language/LSP/cursor (higher-signal, more
-        // frequently glanced at).
+        // vimcode-only segments with no VS Code counterpart (the layout
+        // toggles, LSP status, and the Vim `showcmd` readout) are appended
+        // after the VS Code sequence on their respective side, mirroring
+        // how `NORMAL`/the filename are prepended ahead of it on the left
+        // — VS Code's own segments stay contiguous and in its order.
         let mut right = Vec::new();
 
         // Build each segment optionally; push at the end in priority order.
@@ -25850,8 +25912,14 @@ pub fn build_window_status_line(
             action: Some(StatusAction::TogglePanel),
         };
 
+        // #1690: no trailing space — this is the right-most segment of the
+        // bar by default (showcmd, the only thing ever pushed after it, is
+        // almost always empty/absent), so the same #1541/quadraui#1155
+        // reasoning that keeps `cursor_seg` trailing-space-free applies
+        // here now instead: a backend-added outer-edge inset plus a
+        // hand-rolled trailing space would double up the right margin.
         let sidebar_toggle_seg = StatusSegment {
-            text: format!(" {} ", crate::icons::STATUS_SIDEBAR_TOGGLE.s()),
+            text: format!(" {}", crate::icons::STATUS_SIDEBAR_TOGGLE.s()),
             fg: toggle_fg(engine.session.explorer_visible),
             bg: bar_bg,
             bold: false,
@@ -25864,6 +25932,12 @@ pub fn build_window_status_line(
         // zero is what the previous (non-window) status line did. Two
         // segments sharing one action so a click anywhere in the counter
         // opens the workspace Problems (quickfix) list.
+        //
+        // #1690: pushed onto `left`, not `right` — VS Code puts the
+        // problems counter at the **far left** of the bar (after its own
+        // remote-indicator/workspace-trust segments, which vimcode has no
+        // counterpart for), not mixed into the right-hand encoding/
+        // language/cursor cluster.
         let (diag_errors, diag_warnings) = engine.diagnostic_counts();
         let errors_seg = StatusSegment {
             text: format!(" {} {}", crate::icons::STATUS_ERROR.s(), diag_errors),
@@ -25962,17 +26036,24 @@ pub fn build_window_status_line(
             None
         };
 
-        // 'showcmd' (#1190): the partially-typed Normal-mode command,
-        // shown immediately left of the ruler like Vim's own showcmd area
-        // (`:h 'showcmd'`). Only present in the *active* window's bar — an
+        // 'showcmd' (#1190): the partially-typed Normal-mode command (`:h
+        // 'showcmd'`). Only present in the *active* window's bar — an
         // inactive window's pane never has pending Normal-mode input.
+        //
+        // #1690: no VS Code counterpart, so it is pushed last — the
+        // right-most of vimcode's own appended extras, past VS Code's own
+        // six segments. When present it is therefore the bar's true
+        // right-most segment (ahead of it, `sidebar_toggle_seg` is the
+        // fallback right-most and carries the same no-trailing-space
+        // treatment for the same reason — see its own doc), so no trailing
+        // space here either.
         let showcmd_seg = if engine.settings.showcmd {
             let sc = engine.showcmd_text();
             if sc.is_empty() {
                 None
             } else {
                 Some(StatusSegment {
-                    text: format!(" {sc} "),
+                    text: format!(" {sc}"),
                     fg: bar_fg,
                     bg: bar_bg,
                     bold: false,
@@ -25983,8 +26064,33 @@ pub fn build_window_status_line(
             None
         };
 
-        // Push in priority order: least-important first.
+        // #1690: the problems counter is a *left*-side segment now (VS
+        // Code parity — see the comment above `diag_errors`), pushed right
+        // after the branch so the far-left order reads `NORMAL · filename
+        // [+] [branch] · ⊗ N  ⚠ N`.
+        left.push(errors_seg);
+        left.push(warnings_seg);
+
+        // Right side, in VS Code's own left-to-right order: `Ln N, Col N`
+        // (leftmost of the group) · `Spaces: N` · `UTF-8` · `LF` ·
+        // language · notification bell (rightmost) — see #1690. vimcode's
+        // own extra segments (LSP status, the layout toggles, Vim's
+        // `showcmd`) are appended after the bell, keeping VS Code's six
+        // segments contiguous and in its order rather than interleaved
+        // with vimcode-only affordances.
+        if let Some(s) = cursor_seg {
+            right.push(s);
+        }
+        right.push(indent_seg);
+        right.push(encoding_seg);
+        right.push(line_ending_seg);
+        if let Some(s) = filetype_seg {
+            right.push(s);
+        }
         if let Some(s) = notification_seg {
+            right.push(s);
+        }
+        if let Some(s) = lsp_seg {
             right.push(s);
         }
         if let Some(s) = menu_toggle_seg {
@@ -25992,21 +26098,7 @@ pub fn build_window_status_line(
         }
         right.push(panel_toggle_seg);
         right.push(sidebar_toggle_seg);
-        right.push(errors_seg);
-        right.push(warnings_seg);
-        right.push(encoding_seg);
-        right.push(line_ending_seg);
-        right.push(indent_seg);
-        if let Some(s) = filetype_seg {
-            right.push(s);
-        }
-        if let Some(s) = lsp_seg {
-            right.push(s);
-        }
         if let Some(s) = showcmd_seg {
-            right.push(s);
-        }
-        if let Some(s) = cursor_seg {
             right.push(s);
         }
 
@@ -30608,20 +30700,25 @@ mod tests {
         );
     }
 
-    /// #1541: the ruler segment is the right-most segment of the active
-    /// window's bar, so its own text must not carry a trailing space —
-    /// quadraui#1155 now reserves that outer-edge margin on pixel backends
-    /// (GTK/Win/macOS), and TUI has never had a scrollbar-style gutter to
-    /// hide a trailing blank column in. A stray trailing space here would
-    /// double the gap on the backends that already get one and would be a
-    /// visible dangling blank on TUI, which gets none.
+    /// #1541 established the rule this test now covers for whichever
+    /// segment #1690's reorder made the bar's actual right-most one — the
+    /// ruler (`Ln N, Col N`) moved to the **leftmost** of the right group
+    /// (VS Code parity, see #1690), so `sidebar_toggle_seg` (a vimcode-only
+    /// extra with no VS Code counterpart, appended after VS Code's own six
+    /// segments) is the right-most by default now. Its own text must not
+    /// carry a trailing space — quadraui#1155 reserves that outer-edge
+    /// margin on pixel backends (GTK/Win/macOS), and TUI has never had a
+    /// scrollbar-style gutter to hide a trailing blank column in. A stray
+    /// trailing space here would double the gap on the backends that
+    /// already get one and would be a visible dangling blank on TUI, which
+    /// gets none.
     ///
-    /// RED against the pre-#1541 body (`format!(" Ln {}, Col {} ", ...)`,
-    /// trailing space included): `right_text` ends in `" "`, and this
-    /// assertion fails — confirmed by reverting just this segment's format
-    /// string and re-running.
+    /// RED against the pre-#1690 body for *this* segment (`format!(" {} ",
+    /// ...)`, trailing space included): `last.text` ends in `" "`, and the
+    /// second assertion fails — confirmed by reverting just
+    /// `sidebar_toggle_seg`'s format string and re-running.
     #[test]
-    fn test_window_status_line_ruler_segment_has_no_trailing_space() {
+    fn test_window_status_line_right_most_segment_has_no_trailing_space() {
         use crate::core::engine::Engine;
         let mut engine = Engine::new();
         engine.settings.window_status_line = true;
@@ -30632,15 +30729,28 @@ mod tests {
         let wid = engine.active_window_id();
         let status = build_window_status_line(&engine, &theme, wid, true);
 
+        // The ruler is the *leftmost* of the right group now, not the
+        // right-most — see #1690.
+        assert!(
+            status
+                .right_segments
+                .first()
+                .expect("ruler on: the active window's bar must have a right-most segment")
+                .text
+                .contains("Ln 1"),
+            "expected the ruler to be the leftmost segment of the right \
+             group, got {:?}",
+            status
+                .right_segments
+                .iter()
+                .map(|s| &s.text)
+                .collect::<Vec<_>>()
+        );
+
         let last = status
             .right_segments
             .last()
-            .expect("ruler on: the active window's bar must have a right-most segment");
-        assert!(
-            last.text.contains("Ln 1"),
-            "expected the ruler to be the right-most segment, got '{}'",
-            last.text
-        );
+            .expect("the active window's bar must have a right-most segment");
         assert!(
             !last.text.ends_with(' '),
             "the right-most segment must not carry a trailing space \
@@ -30753,8 +30863,9 @@ mod tests {
         assert!(status.left_segments[0].text.contains("INSERT"));
         // Mode color used as text tint, not background
         assert_eq!(status.left_segments[0].fg, theme.status_mode_insert_bg);
-        // Background is derived from theme.background.lighten(0.10)
-        assert_eq!(status.left_segments[0].bg, theme.background.lighten(0.10));
+        // #1690: background comes straight from the theme's own
+        // `status_bg` key now, not a `background.lighten(0.10)` offset.
+        assert_eq!(status.left_segments[0].bg, theme.status_bg);
     }
 
     #[test]
@@ -31055,8 +31166,10 @@ mod tests {
         let wid = engine.active_window_id();
         let status = build_window_status_line(&engine, &theme, wid, true);
 
+        // #1690: the problems counter moved to `left_segments` (VS Code
+        // parity — far left of the bar, not mixed into the right cluster).
         let diag_segs: Vec<&StatusSegment> = status
-            .right_segments
+            .left_segments
             .iter()
             .filter(|s| s.action == Some(StatusAction::ShowDiagnostics))
             .collect();
@@ -31121,8 +31234,10 @@ mod tests {
         let theme = Theme::onedark();
         let wid = engine.active_window_id();
         let status = build_window_status_line(&engine, &theme, wid, true);
+        // #1690: see the sibling "always shown at zero" test above for why
+        // this reads `left_segments` now.
         let combined: String = status
-            .right_segments
+            .left_segments
             .iter()
             .filter(|s| s.action == Some(StatusAction::ShowDiagnostics))
             .map(|s| s.text.clone())
@@ -31375,9 +31490,12 @@ mod tests {
             .iter()
             .find(|s| s.action == Some(StatusAction::ToggleSidebar))
             .expect("expected sidebar toggle segment");
+        // #1690: no trailing space — see `sidebar_toggle_seg`'s own doc in
+        // `build_window_status_line` (it is the bar's default right-most
+        // segment now that the ruler moved left).
         assert_eq!(
             sidebar_seg.text,
-            format!(" {} ", crate::icons::STATUS_SIDEBAR_TOGGLE.s())
+            format!(" {}", crate::icons::STATUS_SIDEBAR_TOGGLE.s())
         );
 
         let menu_seg = status
@@ -31415,7 +31533,8 @@ mod tests {
             .iter()
             .find(|s| s.action == Some(StatusAction::ToggleSidebar))
             .expect("expected sidebar toggle segment");
-        assert_eq!(sidebar_seg_ascii.text, " [S] ");
+        // #1690: no trailing space — see the nerd-fonts-on assertion above.
+        assert_eq!(sidebar_seg_ascii.text, " [S]");
         let menu_seg_ascii = status_ascii
             .right_segments
             .iter()

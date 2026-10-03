@@ -1579,7 +1579,16 @@ mod tests {
     /// `StatusAction::GoToLine`.
     #[test]
     fn status_bar_segment_click_opens_go_to_line_picker() {
-        let mut h = harness(engine_with_long_buffer(), 1400, 900);
+        // 2200px, not 1400 (#1690): the ruler (`Ln N, Col N`) moved from the
+        // bar's protected right-most slot to the **front** of the
+        // right-side priority-drop order (VS Code parity — it is now the
+        // *leftmost* segment of the right group, matching VS Code's own
+        // layout), so it is now among the first things a narrow bar drops,
+        // not the last. 1400px (this test's original width) no longer
+        // fits it — see `status_bar_1548_polish_paints_and_problems_
+        // counter_click_opens_workspace_quickfix`'s identical 2200px
+        // rationale for the measured drop-off point.
+        let mut h = harness(engine_with_long_buffer(), 2200, 900);
         let win = h.engine.borrow().active_window_id();
         assert!(
             h.engine.borrow().settings.window_status_line,
@@ -1645,7 +1654,11 @@ mod tests {
         engine.settings.status_line_above_terminal = false;
         engine.terminal_open = true;
         engine.session.terminal_panel_rows = 10;
-        let mut h = harness(engine, 1400, 900);
+        // 2200px, not 1400 (#1690) — same priority-drop rationale as
+        // `status_bar_segment_click_opens_go_to_line_picker`'s sibling
+        // comment: the ruler moved to the front of the right-side drop
+        // order, so it no longer survives this bar's original width.
+        let mut h = harness(engine, 2200, 900);
         let win = h.engine.borrow().active_window_id();
 
         assert!(
@@ -1818,6 +1831,134 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1690 acceptance: VS Code parity for the status bar — (1) it is a
+    /// window-width band that caps the activity bar and sidebar instead of
+    /// letting them run past its bottom edge, with a fill colour sourced
+    /// from `theme.status_bg` rather than a computed-lighter-than-
+    /// everything-else offset, and (2) its segments are ordered the way
+    /// VS Code's own bar is: far-left `NORMAL`/filename/problems counter,
+    /// far-right `Ln N, Col N` -> `Spaces: N` -> `UTF-8` -> `LF` ->
+    /// language.
+    ///
+    /// RED against unfixed `develop` (confirmed by reverting this issue's
+    /// `render.rs`/`app.rs` hunks and re-running): the fill sampled at
+    /// `x = 0` on the bar's row was the activity bar's own colour (the
+    /// activity bar/sidebar ran straight through the row instead of being
+    /// capped by it), and `ShowDiagnostics` painted to the *right* of
+    /// `ChangeLanguage` instead of to the left of every right-side
+    /// segment — the exact reversal this issue reports.
+    #[test]
+    fn status_bar_1690_spans_full_window_width_and_orders_segments_vs_code_style() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.lsp_enabled = false;
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        // A real-looking path (no file touched on disk — `file_path` is
+        // only ever read for its extension here, mirroring
+        // `test_window_status_line_problems_counter_reflects_diagnostic_
+        // counts`'s identical no-disk-IO pattern) so the language segment
+        // has something to paint.
+        engine.active_buffer_state_mut().file_path =
+            Some(std::path::PathBuf::from("/tmp/probe_1690.rs"));
+        let text: String = (0..50).map(|i| format!("line {i}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+        engine.lsp_diagnostics.insert(
+            std::path::PathBuf::from("/tmp/probe_1690.rs"),
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange::default(),
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: "probe".to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+        let win = engine.active_window_id();
+        // 1400px, not narrower (same #1548/#1690 rationale elsewhere in
+        // this file): wide enough that every segment this test reads
+        // survives the bar's priority-drop regardless of font metrics.
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        // ---- (1) full-width fill, capping the activity bar/sidebar ----
+        let mode_bounds = h
+            .driver
+            .find_bounds("NORMAL")
+            .expect("the mode badge must paint on the status bar's row");
+        let bar_y = (mode_bounds.y + mode_bounds.height / 2.0) as i32;
+        let (r, g, b) = h.driver.pixel(0, bar_y);
+        let theme = crate::render::Theme::onedark();
+        assert_eq!(
+            (r, g, b),
+            (theme.status_bg.r, theme.status_bg.g, theme.status_bg.b),
+            "the status bar's fill must reach the window's left edge \
+             (x=0) — capping the activity bar and sidebar instead of \
+             letting them run through its row — and come from \
+             theme.status_bg, not whatever colour the activity bar/\
+             sidebar/background paint; sampled {:?} at y={bar_y}",
+            (r, g, b)
+        );
+        // Sanity: this is a real colour switch, not a coincidence — the
+        // activity bar's own fill (`theme.tab_bar_bg` on this backend) is
+        // a distinctly different value.
+        assert_ne!(
+            (r, g, b),
+            (theme.tab_bar_bg.r, theme.tab_bar_bg.g, theme.tab_bar_bg.b),
+            "the x=0 sample must not still be the activity bar's own fill"
+        );
+
+        // ---- (2) segment order: VS Code's left/right split ----
+        // Left group: NORMAL, then the problems counter (ShowDiagnostics)
+        // — both ahead of the right group entirely.
+        let diag_x = h
+            .status_segment_center(win, crate::core::engine::StatusAction::ShowDiagnostics)
+            .expect("the problems counter must paint into status_segment_map")
+            .0;
+        assert!(
+            (mode_bounds.x as f32) < diag_x,
+            "NORMAL ({}) must sit left of the problems counter ({diag_x}) \
+             — both are the bar's far-left group",
+            mode_bounds.x
+        );
+
+        // Right group, left to right: Ln/Col -> Spaces -> UTF-8 -> LF ->
+        // language.
+        let cursor_x = h
+            .status_segment_center(win, crate::core::engine::StatusAction::GoToLine)
+            .expect("the ruler must paint into status_segment_map")
+            .0;
+        let indent_x = h
+            .status_segment_center(win, crate::core::engine::StatusAction::ChangeIndentation)
+            .expect("the indent segment must paint into status_segment_map")
+            .0;
+        let encoding_x = h
+            .status_segment_center(win, crate::core::engine::StatusAction::ChangeEncoding)
+            .expect("the encoding segment must paint into status_segment_map")
+            .0;
+        let eol_x = h
+            .status_segment_center(win, crate::core::engine::StatusAction::ChangeLineEnding)
+            .expect("the line-ending segment must paint into status_segment_map")
+            .0;
+        let lang_x = h
+            .status_segment_center(win, crate::core::engine::StatusAction::ChangeLanguage)
+            .expect("the language segment must paint into status_segment_map")
+            .0;
+
+        assert!(
+            diag_x < cursor_x
+                && cursor_x < indent_x
+                && indent_x < encoding_x
+                && encoding_x < eol_x
+                && eol_x < lang_x,
+            "right-side segments must paint in VS Code's left-to-right \
+             order Ln/Col -> Spaces -> UTF-8 -> LF -> language, got x \
+             positions diag={diag_x} cursor={cursor_x} indent={indent_x} \
+             encoding={encoding_x} eol={eol_x} lang={lang_x}"
+        );
     }
 
     /// Three tabs in the default **single** editor group — the exact shape
@@ -8262,6 +8403,14 @@ second line here
             let mut engine = h.engine.borrow_mut();
             engine.settings.acp_follow_agent = true;
             engine.workspace_root = Some(dir.clone());
+            // Pinned short (#1690): `panel_harness` builds on `Engine::new()`,
+            // which auto-detects this worktree's real (long) git branch
+            // name, and this test's final assertion depends on the
+            // `Ln N` segment surviving the bar's priority-drop — see
+            // `status_bar_1548_polish_paints_and_problems_counter_click_
+            // opens_workspace_quickfix`'s own comment for the established
+            // precedent.
+            engine.git_branch = Some("main".to_string());
             let fixture = concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/fake_acp_agent.sh"
@@ -10768,8 +10917,20 @@ mod chrome_surfaces {
     #[test]
     fn context_menu_key_is_consumed_instead_of_leaking_to_the_editor() {
         let mut engine = small_engine();
+        // Pinned short (#1690, mirrors the established fix in
+        // `status_bar_1548_polish_paints_and_problems_counter_click_opens_
+        // workspace_quickfix`'s own comment): `small_engine()` is built on
+        // `Engine::new()`, which auto-detects this worktree's real (long)
+        // git branch name, and this test's final assertion now depends on
+        // the `Ln N, Col N` segment surviving the bar's priority-drop.
+        engine.git_branch = Some("main".to_string());
         engine.open_editor_context_menu(700, 400);
-        let mut h = harness(engine, 1400, 900);
+        // 2200px, not 1400 (#1690): the ruler moved to the front of the
+        // right-side priority-drop order (VS Code parity — it is now the
+        // *leftmost* segment of the right group, not the protected
+        // right-most one), so it no longer reliably survives this bar's
+        // original width.
+        let mut h = harness(engine, 2200, 900);
         assert!(
             h.driver.screen_contains("Paste"),
             "precondition: the context menu paints its always-enabled Paste item"
@@ -17802,7 +17963,20 @@ mod editor_mouse_rungs {
         // doc comment for why a fixed-visible-sidebar 900px window no
         // longer clears `MINIMAP_MIN_TEXT_COLS`'s suppression threshold now
         // that the real default `settings.font_size` (14pt) reaches paint.
-        let mut h = harness(long_engine(), 1050, 600);
+        //
+        // 1300, not 1050 (#1690): the ruler (`Ln N, Col N`) this test's
+        // final assertion reads moved to the front of the right-side
+        // priority-drop order (VS Code parity — it is now the *leftmost*
+        // segment of the right group), so it is now among the first
+        // things a narrow bar drops, not the last; 1050px no longer
+        // leaves it (and `indent_seg`) room once the default-visible
+        // sidebar/activity-bar chrome is subtracted. This test isn't the
+        // narrow-vs-wide minimap-width comparison (that's the sibling
+        // `minimap_strip_is_narrower_on_a_narrow_pane_than_on_a_wide_one`,
+        // deliberately still at 1050) — it only reads the strip's actual
+        // painted geometry and clicks its vertical middle, so a wider
+        // window changes nothing this test asserts on.
+        let mut h = harness(long_engine(), 1300, 600);
         h.driver.render();
 
         assert!(
