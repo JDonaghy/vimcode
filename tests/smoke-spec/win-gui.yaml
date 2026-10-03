@@ -666,6 +666,17 @@ steps:
   # Track the follow-up primitive as a new claude-coordinator issue; this
   # vimcode PR cannot itself open one (vimcode workers don't file issues in
   # other repos).
+  #
+  # vimcode#1676 ("the minimap strip renders solid white instead of the
+  # active theme") is the same gap this comment already describes, from
+  # the opposite direction: that report needs "did the minimap paint the
+  # *themed background*, not raw white" rather than "did it paint any
+  # non-blank pixels at all" — still an `expect_capture_nonblank`-shaped
+  # (or stricter, colour-comparing) primitive this driver doesn't have.
+  # See `docs/PENDING_QUADRAUI_ISSUES.md`'s matching #1676 entry and
+  # `src/win/mod.rs::win_driver_tests::
+  # minimap_strip_background_matches_theme_once_a_surface_is_attached_1676`
+  # for the Tier-1 coverage this repo *can* add without that primitive.
 
   # quadraui#1232 again — the close button's click is swallowed the same
   # way the menu row's is.
