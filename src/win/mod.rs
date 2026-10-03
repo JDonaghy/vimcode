@@ -1755,7 +1755,17 @@ mod win_driver_tests {
             0.2126 * c.r as f64 + 0.7152 * c.g as f64 + 0.0722 * c.b as f64
         }
         let theme = crate::render::Theme::vscode_dark();
-        let mut brightest = quadraui::Color::rgb(0, 0, 0);
+        // Seeded as `None` rather than with an all-zero black sentinel
+        // colour: `tests/no_hardcoded_colors.rs` (#1575/#1576) exempts only
+        // regions attributed *exactly* `#[cfg(test)]`, and this module is
+        // `#[cfg(all(test, feature = "win"))]`, so even a test-only
+        // sentinel colour literal here reads to that gate as shipped
+        // chrome naming its own colour. The `Option` carries the "no pixel
+        // seen yet" state the sentinel stood in for, naming no colour at
+        // all — strictly better anyway, since a literal black seed would
+        // also silently pass this probe on a theme whose background *is*
+        // black.
+        let mut brightest: Option<quadraui::Color> = None;
         let x0 = rect.x as i32;
         let x1 = (rect.x as f32 + expected_gutter_px).round() as i32;
         let y0 = rect.y as i32;
@@ -1763,11 +1773,16 @@ mod win_driver_tests {
         for x in x0..x1 {
             for y in y0..y1 {
                 let p = h.driver.pixel(x.max(0) as u32, y.max(0) as u32);
-                if luma(p) > luma(brightest) {
-                    brightest = p;
+                if brightest.is_none_or(|b| luma(p) > luma(b)) {
+                    brightest = Some(p);
                 }
             }
         }
+        let brightest = brightest.expect(
+            "the gutter band must span at least one pixel to probe — a \
+             zero-width or zero-height band means the gutter reserved no \
+             space at all, which is vimcode#1691's symptom",
+        );
         assert_ne!(
             (brightest.r, brightest.g, brightest.b),
             (theme.background.r, theme.background.g, theme.background.b),
