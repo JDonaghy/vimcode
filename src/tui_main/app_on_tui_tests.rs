@@ -3953,13 +3953,19 @@ mod tests {
         /// literal `row`/`col` coordinates (not `driver.find`, deliberately
         /// — mirroring the dumb literal-coordinate click the real
         /// `tui-pty` pty driver sends, which has no "find this text and
-        /// click it" primitive) to pin down why, and to confirm the fix:
-        /// `row: 1` always lands on the Explorer root entry, which
-        /// [`build_explorer_rows`] pushes unconditionally with `is_dir:
-        /// true` — a directory regardless of what the launch `cwd` happens
-        /// to contain — so retargeting the spec's right-click there removes
-        /// the coupling instead of special-casing any particular fixture
-        /// layout.
+        /// click it" primitive) to pin down why, and to confirm the
+        /// cwd-independent alternative: `row: 1` always lands on the
+        /// Explorer root entry, which [`build_explorer_rows`] pushes
+        /// unconditionally with `is_dir: true` — a directory regardless of
+        /// what the launch `cwd` happens to contain.
+        ///
+        /// `right-click-explorer-row` itself is left untouched in
+        /// `tests/smoke-spec/tui.yaml` — #3509 treats that file as
+        /// additive-only, so a brittle existing step's coordinate is never
+        /// silently rewritten even to fix a real coupling bug. Instead, a
+        /// new, cwd-independent step
+        /// (`right-click-explorer-root-row-1703`) was added beside it at
+        /// `row: 1`, which this test backs at the unit level.
         ///
         /// Two plain files (not one): with only one file, `row: 3` falls
         /// *below* the single child row into the tree's empty space, which
@@ -4000,9 +4006,11 @@ mod tests {
             let mut h = crate::tui_main::testing::conformance_harness(engine, 100, 30);
             let driver = &mut h.driver;
 
-            // The spec's old coordinate (`row: 3, col: 10`): on this
-            // folderless cwd it lands on the second file's row -- its
-            // context menu correctly has no "New File..."/"New Folder...".
+            // `right-click-explorer-row`'s own coordinate (`row: 3, col:
+            // 10`, left untouched in tests/smoke-spec/tui.yaml per #3509's
+            // additive-only policy): on this folderless cwd it lands on
+            // the second file's row -- its context menu correctly has no
+            // "New File..."/"New Folder...".
             driver.right_click(10.0, 3.0);
             assert!(
                 !driver.screen_has("New File"),
@@ -4013,7 +4021,9 @@ mod tests {
             );
             driver.press_named(quadraui::NamedKey::Escape);
 
-            // The fix: `row: 1` is the Explorer root entry -- always a
+            // The cwd-independent alternative, added to the spec as a new
+            // step (`right-click-explorer-root-row-1703`) rather than a
+            // replacement: `row: 1` is the Explorer root entry -- always a
             // directory by construction, regardless of the cwd's children
             // (or lack of them) -- so its context menu always offers
             // "New File..."/"New Folder...".
