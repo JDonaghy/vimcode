@@ -4216,40 +4216,50 @@ mod tests {
         /// `1 = root entry, 2 = child row` (no toolbar row at all) in
         /// others within the *same* bugbash session, reading the first
         /// difference as the toolbar row being "spurious" — appearing only
-        /// sometimes, as if from a first-frame-only race, and "desyncing"
-        /// the tree from the editor pane.
+        /// sometimes, as if from a first-frame-only race.
         ///
-        /// It is neither. `git log` pins #1693 (the toolbar row) and #1703
-        /// (retargeting the root right-click at the row it introduces) to
-        /// 2026-10-03, a full session before the 2026-10-04 bugbash run
-        /// that filed #1736 — so every run in that session used a binary
-        /// that *already* had the toolbar. The only way the same binary
-        /// produces both row maps is if the two captures were not, in
-        /// fact, the same binary: this repo's `cargo build` writes to a
-        /// `CARGO_TARGET_DIR` shared across every concurrent coordinator
-        /// worktree (see this file's own module doc and
-        /// `docs/QUADRAUI_GUIDE.md`), so a bugbash session running across
-        /// the same window other issues were being built and landed can
-        /// observe the on-disk binary change out from under it mid-session
-        /// — exactly the "correlates with heavier concurrent host load /
-        /// other cargo builds running at the same time" the issue itself
-        /// notes, without drawing the conclusion. 50 consecutive real-pty
-        /// captures of one fixed binary taken by hand while diagnosing
-        /// this (first capture at ~t=0.05s, i.e. before the real first
-        /// frame has even painted, through t well past settle) show the
-        /// toolbar row from the very first non-blank frame onward, byte-
-        /// for-byte identical every time — there is no frame-1-vs-settled
-        /// divergence to catch. This test is the regression guard for that
-        /// finding, the same role
+        /// It is not a race. `git log` pins #1693 (the toolbar row) and
+        /// #1703 (retargeting the root right-click at the row it
+        /// introduces) to 2026-10-03, a full session before the
+        /// 2026-10-04 bugbash run that filed #1736 — so every run in that
+        /// session used a binary that *already* had the toolbar. The only
+        /// way the same binary produces both row maps is if the two
+        /// captures were not, in fact, the same binary: this repo's
+        /// `cargo build` writes to a `CARGO_TARGET_DIR` shared across
+        /// every concurrent coordinator worktree (see this file's own
+        /// module doc and `docs/QUADRAUI_GUIDE.md`), so a bugbash session
+        /// running across the same window other issues were being built
+        /// and landed can observe the on-disk binary change out from
+        /// under it mid-session — exactly the "correlates with heavier
+        /// concurrent host load / other cargo builds running at the same
+        /// time" the issue itself notes, without drawing the conclusion.
+        /// 50 consecutive real-pty captures of one fixed binary taken by
+        /// hand while diagnosing this (first capture at ~t=0.05s, i.e.
+        /// before the real first frame has even painted, through t well
+        /// past settle) show the toolbar row from the very first
+        /// non-blank frame onward, byte-for-byte identical every time —
+        /// there is no frame-1-vs-settled divergence to catch.
+        ///
+        /// This test is **not** the fix for #1736's own "desyncing it
+        /// from the editor pane" complaint — that is a separate question
+        /// (see `explorer_root_row_is_one_below_editor_first_content_row_\
+        /// by_design_1736` just below, and the analysis in
+        /// `tests/smoke-spec/tui.yaml` beside its #1693/#1703 row-map
+        /// comment) and this test asserts nothing about the editor pane
+        /// at all. What it *does* pin down is narrower and already true
+        /// today: the toolbar row's presence and position on the
+        /// Explorer sidebar's very first painted frame (no settle, no
+        /// interaction — `conformance_harness`'s construction performs
+        /// the one and only paint this test ever triggers), so a real
+        /// future regression that only shows up on frame 1 (e.g. a
+        /// toolbar/tree paint ordering bug that races
+        /// `populate_explorer_tree_controller`) fails here instead of
+        /// shipping unnoticed. It is an anti-regression pin for the
+        /// current, intended row map, the same role
         /// `right_click_row_3_on_a_folderless_cwd_hits_a_file_not_a_folder_1703`
         /// plays for its own "investigated, not a defect" bugbash report
-        /// just above: it pins the Explorer sidebar's *very first* painted
-        /// frame (no settle, no interaction — `conformance_harness`'s
-        /// construction performs the one and only paint this test ever
-        /// triggers) to the documented #1693 row map, so a real future
-        /// regression that only shows up on frame 1 (e.g. a toolbar/tree
-        /// paint ordering bug that races `populate_explorer_tree_controller`)
-        /// fails here instead of shipping unnoticed.
+        /// just above — neither test claims to resolve the bugbash
+        /// report's title.
         #[test]
         fn explorer_first_frame_row_map_matches_settled_state_1736() {
             let dir = std::env::temp_dir().join(format!(
@@ -4319,6 +4329,125 @@ mod tests {
                 row3.contains("sample.txt"),
                 "row 3 (first frame) must be the child file row; \
                  screen:\n{screen}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// vimcode#1736's own title is "desyncing it from the editor
+        /// pane" — a claim the test above does not touch, since it only
+        /// looks at the Explorer sidebar in isolation. This test measures
+        /// the actual cross-pane relationship the title complains about:
+        /// the row the editor paints its first line of buffer content on,
+        /// versus the row the Explorer paints its root entry on, on the
+        /// same first frame, at the bugbash evidence's own `100x30` grid
+        /// and default settings (the repro's `settings.json` sets only
+        /// `lsp_enabled`/`use_nerd_fonts`, so `breadcrumbs` is at its
+        /// `default_breadcrumbs() -> true`, `src/core/settings.rs`).
+        ///
+        /// The measured answer, confirmed by a real run of this exact
+        /// test: **they are on the same row — there is no offset at
+        /// all.** Row 0 is the shared tab bar (the editor's single
+        /// `sample.txt ×` tab on the right, the hamburger toggle on the
+        /// left). Row 1 is chrome on *both* sides at once: the Explorer's
+        /// #1693 view-actions toolbar (New File / New Folder / Refresh /
+        /// Collapse All / "...") on the left, and the editor's own
+        /// breadcrumb bar (on by default, `settings.breadcrumbs`) showing
+        /// the open file's path on the right — two independently-added
+        /// features (#1693's toolbar and the pre-existing breadcrumb bar)
+        /// that happen to both occupy exactly one row below the tab bar.
+        /// Row 2 is real content on both sides: the Explorer's root entry
+        /// and the editor's first buffer line, byte-for-byte aligned.
+        ///
+        /// So the issue title's premise — that the toolbar row pushes the
+        /// tree "out of alignment relative to" the editor pane — does not
+        /// hold under default settings: the editor has its own row-1
+        /// chrome (the breadcrumb bar) that keeps row 2 in sync on both
+        /// sides. The bugbash capture that triggered #1736 almost
+        /// certainly compared the Explorer sidebar against itself (an
+        /// earlier capture without the toolbar row vs. a later one with
+        /// it, per the `CARGO_TARGET_DIR`-drift finding in the test
+        /// above) rather than against a simultaneously-captured editor
+        /// pane — there is no evidence in the issue body of an actual
+        /// side-by-side editor-pane row read.
+        ///
+        /// This is therefore the regression guard for the issue title's
+        /// own claim: if a future change removes the breadcrumb bar, the
+        /// toolbar row, or otherwise desyncs the two panes' chrome
+        /// heights, this test goes red and names exactly which row
+        /// diverged. Verified red by hand: temporarily forcing
+        /// `engine.settings.breadcrumbs = false` after construction (so
+        /// the editor loses its row-1 chrome while the Explorer keeps
+        /// its toolbar) moves `editor_row` to 1 while `explorer_root_row`
+        /// stays at 2, failing the `assert_eq!` below exactly as
+        /// expected, before being reverted. See `tests/smoke-spec/tui.yaml`'s
+        /// `right-click-explorer-root-row-1703` comment for the Tier-2
+        /// analogue of the Explorer-only row map, and this PR's own
+        /// description for why #1736 is being closed rather than kept
+        /// open for a product call: the cross-pane desync it reports does
+        /// not reproduce, under the issue's own stated repro settings.
+        #[test]
+        fn explorer_root_row_matches_editor_first_content_row_1736() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1736_cross_pane_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file_path = dir.join("sample.txt");
+            std::fs::write(&file_path, "ZQXW_EDITOR_FIRST_LINE_1736\nsecond line\n").unwrap();
+
+            let mut engine = crate::core::Engine::open(&file_path);
+            engine.settings.use_nerd_fonts = Some(false);
+            engine.cwd = dir.clone();
+            engine.explorer_expanded.insert(dir.clone());
+            engine.explorer_rebuild_rows();
+            engine.session.explorer_visible = true;
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            // Same grid as the bugbash evidence and the test above.
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 100, 30);
+            let driver = &mut h.driver;
+
+            // First painted frame, same as the test above: no settle, no
+            // interaction.
+            let screen = driver.screen();
+            let lines: Vec<&str> = screen.lines().collect();
+
+            let editor_row = lines
+                .iter()
+                .position(|l| l.contains("ZQXW_EDITOR_FIRST_LINE_1736"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "editor must paint the buffer's first line on frame 1; screen:\n{screen}"
+                    )
+                });
+
+            let root_name = dir.file_name().unwrap().to_string_lossy().to_uppercase();
+            let probe: String = root_name.chars().take(12).collect();
+            let explorer_root_row = lines
+                .iter()
+                .position(|l| l.contains(&probe))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Explorer must paint the root entry (prefix {probe:?}) \
+                         on frame 1; screen:\n{screen}"
+                    )
+                });
+
+            assert_eq!(
+                explorer_root_row, editor_row,
+                "the Explorer root entry (row {explorer_root_row}) is expected \
+                 to be on the SAME row as the editor's first content line \
+                 (row {editor_row}) — the Explorer's #1693 toolbar and the \
+                 editor's own breadcrumb bar (`settings.breadcrumbs`, on by \
+                 default) both occupy exactly one row below the shared tab \
+                 bar, keeping the two panes' content rows in sync. If this \
+                 now fails, one pane's chrome height changed without the \
+                 other's; see this test's doc comment before changing the \
+                 asserted relationship. screen:\n{screen}"
             );
 
             let _ = std::fs::remove_dir_all(&dir);
