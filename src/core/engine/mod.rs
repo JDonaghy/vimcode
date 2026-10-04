@@ -2578,6 +2578,9 @@ Page Up / Down      Page up / down
 Ctrl+G              Go to line (prompt)
 Ctrl+P              Fuzzy file finder                     :fuzzy
 Ctrl+Shift+P        Command palette                       :palette
+Alt+Left / Right    Navigate back / forward
+Ctrl+Alt+Left/Right Resize sidebar
+Ctrl+Shift+\\       Jump to matching bracket
 
 ── Selection ───────────────────────────────────────────
 Shift+Arrow         Extend selection by char / line
@@ -2590,13 +2593,14 @@ Ctrl+D              Select word; repeat = add next occurrence
 Ctrl+Shift+L        Select all occurrences (multi-cursor)
 
 ── Multi-Cursor ────────────────────────────────────────
-Alt+Shift+Up/Down   Add cursor above / below
+Ctrl+Alt+Up/Down    Add cursor above / below
 Ctrl+D              Progressive: word → next occurrence
 Ctrl+Shift+L        All occurrences at once
 Escape              Collapse to single cursor
 
 ── Line Operations ─────────────────────────────────────
 Alt+Up / Down       Move line(s) up / down
+Alt+Shift+Up/Down   Duplicate line(s) up / down
 Alt+Z               Toggle word wrap
 
 ── Indentation ─────────────────────────────────────────

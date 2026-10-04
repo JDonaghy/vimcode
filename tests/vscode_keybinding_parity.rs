@@ -140,85 +140,104 @@ struct VscodeBinding {
 /// share one row (`Os::WinLinux`); Mac gets its own row whenever VS Code's
 /// Mac default is not simply "same chord with Cmd for Ctrl".
 static VSCODE_BINDINGS: &[VscodeBinding] = &[
-    // ── Multi-cursor / line duplication (the gated gap) ────────────────
+    // ── Confirmed matches (Linux/Windows) ──────────────────────────────
+    // #1744 fixed the five rows that used to live here as `Status::Missing`
+    // (`insertCursorAbove`/`Below`, `copyLinesUpAction`/`DownAction`,
+    // `navigateBack`/`Forward`, `jumpToBracket`) — see
+    // `gap_ctrl_alt_up_is_move_line_not_insert_cursor_above` and its four
+    // siblings below for the now-`FixLanded`, deleted `KNOWN_GAPS` entries,
+    // and `render::alt_key_router_tests` for the driver-adjacent coverage of
+    // `route_alt_key` itself.
     VscodeBinding {
         command_id: "editor.action.insertCursorAbove",
         os: Os::WinLinux,
         vscode_chord: "Ctrl+Alt+Up",
-        vimcode_key: "(none)",
-        status: Status::Missing,
-        note: "vscode.rs's shared Alt rung (`render::route_alt_key`) has no \
-               `ctrl` parameter at all, so Ctrl+Alt+Up is indistinguishable \
-               from plain Alt+Up and does `vscode_move_line_up` instead. \
-               See KNOWN_GAPS::CTRL_ALT_UP_IS_MOVE_LINE.",
+        vimcode_key: "Alt_Up (ctrl)",
+        status: Status::Matches,
+        note: "`render::route_alt_key` now takes a `ctrl` parameter and \
+               forwards it to `Engine::handle_key` instead of hardcoding \
+               `false`; `handle_vscode_key`'s `\"Alt_Up\" if ctrl` arm (above \
+               the unguarded move-line arm) calls `vscode_add_cursor_above`. \
+               Covered by this file's own \
+               gap_ctrl_alt_up_is_move_line_not_insert_cursor_above (its body \
+               asserts the fix, forcing `KNOWN_GAPS` deletion) and \
+               `render::alt_key_router_tests::\
+               ctrl_alt_up_down_add_a_cursor_distinct_from_plain_alt_up_down`.",
     },
     VscodeBinding {
         command_id: "editor.action.insertCursorBelow",
         os: Os::WinLinux,
         vscode_chord: "Ctrl+Alt+Down",
-        vimcode_key: "(none)",
-        status: Status::Missing,
-        note: "Same gap as insertCursorAbove, mirrored for Down. See \
-               KNOWN_GAPS::CTRL_ALT_DOWN_IS_MOVE_LINE.",
+        vimcode_key: "Alt_Down (ctrl)",
+        status: Status::Matches,
+        note: "Same fix as insertCursorAbove, mirrored for Down.",
     },
     VscodeBinding {
         command_id: "editor.action.copyLinesUpAction",
         os: Os::WinLinux,
         vscode_chord: "Shift+Alt+Up",
         vimcode_key: "Alt_Shift_Up",
-        status: Status::Missing,
-        note: "vimcode binds this exact chord to `vscode_add_cursor_above` \
-               (VS Code's `insertCursorAbove` chord, see above) instead of \
-               duplicating the line. See \
-               KNOWN_GAPS::ALT_SHIFT_UP_IS_ADD_CURSOR.",
+        status: Status::Matches,
+        note: "`Alt_Shift_Up` now dispatches to the new \
+               `Engine::vscode_copy_line_up` (duplicate the line upward) \
+               instead of `vscode_add_cursor_above` — Ctrl+Alt+Up owns that \
+               behaviour now, matching VS Code's real chord for it (see \
+               insertCursorAbove above).",
     },
     VscodeBinding {
         command_id: "editor.action.copyLinesDownAction",
         os: Os::WinLinux,
         vscode_chord: "Shift+Alt+Down",
         vimcode_key: "Alt_Shift_Down",
-        status: Status::Missing,
-        note: "Same swap as copyLinesUpAction, mirrored for Down. Shares \
-               KNOWN_GAPS::ALT_SHIFT_UP_IS_ADD_CURSOR (not separately \
-               gated — Up and Down are the same bug, mirrored).",
+        status: Status::Matches,
+        note: "Same swap as copyLinesUpAction, mirrored for Down \
+               (`Engine::vscode_copy_line_down`).",
     },
-    // ── Navigation (the second gated gap) ──────────────────────────────
     VscodeBinding {
         command_id: "workbench.action.navigateBack",
         os: Os::WinLinux,
         vscode_chord: "Alt+Left",
-        vimcode_key: "(none)",
-        status: Status::Missing,
-        note: "`route_alt_key`'s mode-independent tier claims `AltBase::Left` \
-               unconditionally for sidebar-resize, before the VS Code-mode \
-               tier below it ever runs — so this chord can never reach \
-               `Engine::jump_list_back`, the function Vim mode's Ctrl-O \
-               already calls for the identical feature. See \
-               KNOWN_GAPS::ALT_LEFT_RIGHT_IS_SIDEBAR_RESIZE.",
+        vimcode_key: "Alt_Left",
+        status: Status::Matches,
+        note: "`route_alt_key`'s mode-independent tier no longer claims \
+               `AltBase::Left` unconditionally — it falls through to the \
+               VSCode-mode tier when `engine.is_vscode_mode()`, which now \
+               maps plain Alt+Left to `\"Alt_Left\"` and \
+               `handle_vscode_key` calls `Engine::jump_list_back`, the same \
+               function Vim mode's Ctrl-O already uses. Ctrl+Alt+Left is \
+               VSCode mode's new alternate home for the sidebar-resize this \
+               chord used to always perform (Vim mode keeps plain \
+               Alt+Left/Right for that, unchanged).",
     },
     VscodeBinding {
         command_id: "workbench.action.navigateForward",
         os: Os::WinLinux,
         vscode_chord: "Alt+Right",
-        vimcode_key: "(none)",
-        status: Status::Missing,
+        vimcode_key: "Alt_Right",
+        status: Status::Matches,
         note: "Same as navigateBack, mirrored for `jump_list_forward` / \
-               Ctrl-I. Shares KNOWN_GAPS::ALT_LEFT_RIGHT_IS_SIDEBAR_RESIZE \
-               (not separately gated).",
+               Ctrl-I; Ctrl+Alt+Right is the sidebar-resize alternate home.",
     },
     VscodeBinding {
         command_id: "editor.action.jumpToBracket",
         os: Os::WinLinux,
         vscode_chord: "Ctrl+Shift+\\",
-        vimcode_key: "(none)",
-        status: Status::Missing,
-        note: "No \"\\\\\"/\"backslash\" arm exists anywhere in \
-               `handle_vscode_key`'s ctrl-chord match, despite \
-               `Engine::find_matching_bracket` already existing and already \
-               wired to Vim's `%`. See \
-               KNOWN_GAPS::CTRL_SHIFT_BACKSLASH_JUMP_TO_BRACKET_UNBOUND.",
+        vimcode_key: "Shift_backslash",
+        status: Status::Matches,
+        note: "`render::engine_key_from_ui` now has shift-aware arms for \
+               Ctrl+\\ (the literal shifted glyph `'|'`, and the base key \
+               plus an explicit Shift bit for kitty/CSI-u) producing \
+               `\"Shift_backslash\"`, distinct from plain Ctrl+\\'s \
+               `\"backslash\"` (still bound to `open_editor_group`, Vim \
+               mode's own Ctrl+\\ meaning, unaffected). \
+               `handle_vscode_key`'s new `\"Shift_backslash\" | \"|\"` arm \
+               calls `Engine::move_to_matching_bracket` — the same search \
+               Vim's `%` already uses. A legacy (non-keyboard-enhanced) \
+               terminal still cannot report the Shift bit for this chord at \
+               all (same ANSI-C0 shift-blindness as the Ctrl+K/Ctrl+P family \
+               — see REACHABILITY_TABLE's new row below), so it stays \
+               unreachable there; kitty/CSI-u and GTK can both deliver it.",
     },
-    // ── Confirmed matches (Linux/Windows) ──────────────────────────────
     VscodeBinding {
         command_id: "editor.action.moveLinesUpAction",
         os: Os::WinLinux,
@@ -857,17 +876,39 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
     },
     ReachabilityRow {
         chord: "Ctrl+Alt+Up / Ctrl+Alt+Down (VS Code's real insertCursorAbove/Below)",
+        tui_legacy_xterm: Reach::Yes,
+        tui_kitty_or_csiu: Reach::Yes,
+        conpty_legacy: Reach::Yes,
+        gtk: Reach::Yes,
+        macos_tui: Reach::Yes,
+        macos_gui: Reach::NotApplicable,
+        reason: "#1744: fixed, and was never actually a terminal-encoding \
+                 limitation like the Ctrl+K/Ctrl+P family above — Ctrl+Alt+ \
+                 arrow has a dedicated, unambiguous escape sequence on every \
+                 surface, same as plain Alt+arrow. The old `Reach::No` row \
+                 here recorded a gap in vimcode's own `render::route_alt_key` \
+                 (no `ctrl` parameter at all), not a wire-protocol ambiguity; \
+                 that parameter now exists and forwards `ctrl` through to \
+                 `Engine::handle_vscode_key`, which tells Ctrl+Alt+Up/Down \
+                 apart from plain Alt+Up/Down via its own `if ctrl` guard.",
+    },
+    ReachabilityRow {
+        chord: "Ctrl+\\ (split editor) vs Ctrl+Shift+\\ (jump to matching bracket)",
         tui_legacy_xterm: Reach::No,
-        tui_kitty_or_csiu: Reach::No,
+        tui_kitty_or_csiu: Reach::Yes,
         conpty_legacy: Reach::No,
-        gtk: Reach::No,
+        gtk: Reach::Yes,
         macos_tui: Reach::No,
         macos_gui: Reach::NotApplicable,
-        reason: "Not a terminal-encoding limitation — vimcode's own shared \
-                 Alt rung (`render::route_alt_key`) never receives a `ctrl` \
-                 parameter, so no surface can deliver this chord as \
-                 anything other than plain Alt+Up/Down today. See \
-                 KNOWN_GAPS::CTRL_ALT_UP_IS_MOVE_LINE.",
+        reason: "Same C0-control-code argument as Ctrl+K/Ctrl+Shift+K above: \
+                 Ctrl+\\ is the ANSI C0 byte 0x1C regardless of Shift (the \
+                 physical key's shifted glyph, '|', XORs down to the exact \
+                 same control byte), so a legacy terminal has no way to \
+                 report the Shift bit for this chord at all. kitty/CSI-u \
+                 (explicit Shift modifier alongside the base key) and GTK \
+                 (GDK hands over the literal shifted glyph '|' directly) can \
+                 both report it; `render::engine_key_from_ui` has arms for \
+                 both shapes, producing `\"Shift_backslash\"`.",
     },
     ReachabilityRow {
         chord: "Cmd+<key> (any VS Code Mac-default chord)",
@@ -940,31 +981,29 @@ fn ctrl_shift_k_with_keyboard_enhancement_produces_the_distinct_name() {
     assert!(ctrl);
 }
 
-/// `Ctrl+Alt+Up` has no representation for `route_alt_key`/
-/// `handle_vscode_key` to even receive — demonstrated by using the exact
-/// `Alt_Up` name the Alt rung hands to `handle_vscode_key` (see
-/// `vscode_alt_key_name`, which has no `ctrl`-aware arm) with `ctrl: true`,
-/// and observing it is identical to plain Alt+Up: moves the line, adds no
-/// cursor. This is [`KNOWN_GAPS::CTRL_ALT_UP_IS_MOVE_LINE`]'s own assertion,
-/// phrased as a reachability probe rather than a binding-correctness one.
+/// #1744: `Ctrl+Alt+Up` (`Alt_Up` with `ctrl: true`, the exact name+flag
+/// `route_alt_key` now hands `handle_vscode_key` for that chord — see
+/// `vscode_alt_key_name`'s doc) has a distinct wire representation from plain
+/// Alt+Up after all: `handle_vscode_key`'s `"Alt_Up" if ctrl` arm (checked
+/// before the unguarded move-line arm) routes to `vscode_add_cursor_above`
+/// instead. Before the fix this test's name described reality (`ctrl` was
+/// accepted but ignored, identical outcome to plain Alt+Up); it now pins the
+/// opposite fact, renamed to match.
 #[test]
-fn ctrl_alt_up_has_no_distinct_wire_representation_from_alt_up() {
+fn ctrl_alt_up_has_a_distinct_wire_representation_from_alt_up() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 1, col: 0 };
-    // `ctrl: true` is exactly what a real Ctrl+Alt+Up keypress would carry
-    // if `route_alt_key` forwarded it — which it does not (no such
-    // parameter exists), so this is the most charitable possible input and
-    // it still cannot reach anything but the move-line behaviour.
     e.handle_key("Alt_Up", None, true);
     assert_eq!(
         buf(&e),
-        "bbb\naaa\nccc\n",
-        "moved the line, same as plain Alt+Up"
+        "aaa\nbbb\nccc\n",
+        "Ctrl+Alt+Up must not move any line, unlike plain Alt+Up"
     );
-    assert!(
-        e.view().extra_cursors.is_empty(),
-        "no cursor was added — Ctrl+Alt+Up's real VS Code effect never happened"
+    assert_eq!(
+        e.view().extra_cursors.len(),
+        1,
+        "Ctrl+Alt+Up's real VS Code effect (insertCursorAbove) must happen"
     );
 }
 
@@ -1001,13 +1040,14 @@ enum GapOutcome {
 /// MAY ONLY EVER SHRINK — an entry is deleted in the same change that fixes
 /// the gap it names (see [`gap_gate`]'s `FixLanded` panic, which enforces
 /// that deletion is not optional).
-const KNOWN_GAPS: &[&str] = &[
-    "CTRL_ALT_UP_IS_MOVE_LINE",
-    "CTRL_ALT_DOWN_IS_MOVE_LINE",
-    "ALT_SHIFT_UP_IS_ADD_CURSOR",
-    "ALT_LEFT_RIGHT_IS_SIDEBAR_RESIZE",
-    "CTRL_SHIFT_BACKSLASH_JUMP_TO_BRACKET_UNBOUND",
-];
+///
+/// #1744 fixed every gap this list ever named (`CTRL_ALT_UP_IS_MOVE_LINE`,
+/// `CTRL_ALT_DOWN_IS_MOVE_LINE`, `ALT_SHIFT_UP_IS_ADD_CURSOR`,
+/// `ALT_LEFT_RIGHT_IS_SIDEBAR_RESIZE`,
+/// `CTRL_SHIFT_BACKSLASH_JUMP_TO_BRACKET_UNBOUND`), so it is empty — the
+/// `gap_*` tests below are now plain (ungated) assertions of the fixed
+/// behaviour, same as `src/harness.rs`'s own `KNOWN_BUGS` empty-list state.
+const KNOWN_GAPS: &[&str] = &[];
 
 /// Run `body`, gated on whether `label` is listed in [`KNOWN_GAPS`]. Mirrors
 /// `src/harness.rs::known_bug_gate_outcome` exactly (see that function's doc
@@ -1029,6 +1069,17 @@ fn gap_gate_outcome<F: FnOnce()>(label: &str, body: F) -> GapOutcome {
 /// Pass/fail wrapper: turns `Regression`/`FixLanded` into a test failure
 /// with an actionable message; `Pass`/`ExpectedGap` return normally (an
 /// ordinary passing test, or today's gap, correctly still open).
+///
+/// #1744 fixed every gap `KNOWN_GAPS` ever named, so no `#[test]` in this
+/// file calls this wrapper today (each former `gap_*` test is now a plain,
+/// ungated assertion — see e.g. `ctrl_alt_up_inserts_cursor_above_not_move_line`).
+/// Kept, not deleted: this is this file's whole reason for existing per its
+/// own module doc (deliverable 3, "a bidirectional gate for every binding
+/// `VSCODE_BINDINGS` marks `Missing` or wrong") — a future mismatch gets
+/// pinned by calling this, exactly as `src/harness.rs`'s `known_bug_gate`
+/// stays live infrastructure independent of how many bugs `KNOWN_BUGS`
+/// currently lists.
+#[allow(dead_code)]
 fn gap_gate(label: &'static str, body: impl FnOnce()) {
     match gap_gate_outcome(label, body) {
         GapOutcome::Pass | GapOutcome::ExpectedGap => {}
@@ -1042,6 +1093,24 @@ fn gap_gate(label: &'static str, body: impl FnOnce()) {
              listed in KNOWN_GAPS — the fix landed; delete the KNOWN_GAPS \
              entry and update the matching VSCODE_BINDINGS row to `Matches`"
         ),
+    }
+}
+
+/// Test-only twin of [`gap_gate_outcome`] that takes "is this listed" as an
+/// explicit parameter instead of consulting the real (now-empty)
+/// [`KNOWN_GAPS`] — so the self-test below can exercise all four table rows
+/// without needing a real, permanent entry just to test the mechanism.
+/// Mirrors `src/harness.rs`'s own `known_bug_gate_outcome_for_test` exactly,
+/// for the same reason (`known_bug_gate_outcome`'s contract is "label,
+/// consult the real list"; threading a test-only bool through the real
+/// function would leave a footgun parameter for one test's convenience).
+fn gap_gate_outcome_for_test<F: FnOnce()>(listed: bool, body: F) -> GapOutcome {
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err();
+    match (panicked, listed) {
+        (false, false) => GapOutcome::Pass,
+        (true, true) => GapOutcome::ExpectedGap,
+        (true, false) => GapOutcome::Regression,
+        (false, true) => GapOutcome::FixLanded,
     }
 }
 
@@ -1060,150 +1129,158 @@ fn gap_gate_self_test_both_directions() {
         GapOutcome::Regression
     );
     assert_eq!(
-        gap_gate_outcome("CTRL_ALT_UP_IS_MOVE_LINE", || panic!("still broken")),
+        gap_gate_outcome_for_test(true, || panic!("still broken")),
         GapOutcome::ExpectedGap
     );
     assert_eq!(
-        gap_gate_outcome("CTRL_ALT_UP_IS_MOVE_LINE", || {}),
+        gap_gate_outcome_for_test(true, || {}),
         GapOutcome::FixLanded
     );
 }
 
-/// VS Code's `editor.action.insertCursorAbove` (`Ctrl+Alt+Up`) should add a
-/// cursor one line above, leaving the buffer untouched. `render::
-/// route_alt_key` has no `ctrl` parameter to distinguish Ctrl+Alt+Up from
-/// plain Alt+Up, so today it moves the line instead (verified directly by
-/// [`ctrl_alt_up_has_no_distinct_wire_representation_from_alt_up`] above).
-/// This gate's body asserts the *intended* VS Code outcome, so it is
-/// RED against unfixed `develop` today (confirmed by this exact run) and
-/// turns green (`FixLanded`, forcing this entry's deletion) the moment a fix
-/// lands.
+/// #1744, was `KNOWN_GAPS::CTRL_ALT_UP_IS_MOVE_LINE` (now deleted,
+/// `FixLanded`): VS Code's `editor.action.insertCursorAbove` (`Ctrl+Alt+Up`)
+/// adds a cursor one line above, leaving the buffer untouched.
+/// `render::route_alt_key` now forwards `ctrl` through to
+/// `Engine::handle_vscode_key` instead of hardcoding `false`, and that
+/// function's `"Alt_Up" if ctrl` arm (checked before the unguarded move-line
+/// arm) calls `vscode_add_cursor_above`. **Verified RED against unfixed
+/// `develop`** before this change landed — this test's body is unchanged
+/// from the `gap_gate`-wrapped version that asserted the same outcome and
+/// reported `ExpectedGap` (i.e. panicked) there.
 #[test]
-fn gap_ctrl_alt_up_is_move_line_not_insert_cursor_above() {
-    gap_gate("CTRL_ALT_UP_IS_MOVE_LINE", || {
-        let mut e = engine_with("aaa\nbbb\nccc\n");
-        vscode_mode(&mut e);
-        e.view_mut().cursor = Cursor { line: 1, col: 0 };
-        e.handle_key("Alt_Up", None, true);
-        // Intended VS Code behaviour: the buffer is untouched and a new
-        // cursor appears one line above the original.
-        assert_eq!(
-            buf(&e),
-            "aaa\nbbb\nccc\n",
-            "insertCursorAbove must not move the line"
-        );
-        assert_eq!(
-            e.view().extra_cursors.len(),
-            1,
-            "insertCursorAbove must add exactly one cursor above"
-        );
-    });
+fn ctrl_alt_up_inserts_cursor_above_not_move_line() {
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 1, col: 0 };
+    e.handle_key("Alt_Up", None, true);
+    assert_eq!(
+        buf(&e),
+        "aaa\nbbb\nccc\n",
+        "insertCursorAbove must not move the line"
+    );
+    assert_eq!(
+        e.view().extra_cursors.len(),
+        1,
+        "insertCursorAbove must add exactly one cursor above"
+    );
 }
 
 /// Mirrors the above for `editor.action.insertCursorBelow` (`Ctrl+Alt+Down`).
+/// Was `KNOWN_GAPS::CTRL_ALT_DOWN_IS_MOVE_LINE`.
 #[test]
-fn gap_ctrl_alt_down_is_move_line_not_insert_cursor_below() {
-    gap_gate("CTRL_ALT_DOWN_IS_MOVE_LINE", || {
-        let mut e = engine_with("aaa\nbbb\nccc\n");
-        vscode_mode(&mut e);
-        e.view_mut().cursor = Cursor { line: 0, col: 0 };
-        e.handle_key("Alt_Down", None, true);
-        assert_eq!(
-            buf(&e),
-            "aaa\nbbb\nccc\n",
-            "insertCursorBelow must not move the line"
-        );
-        assert_eq!(
-            e.view().extra_cursors.len(),
-            1,
-            "insertCursorBelow must add exactly one cursor below"
-        );
-    });
+fn ctrl_alt_down_inserts_cursor_below_not_move_line() {
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    e.handle_key("Alt_Down", None, true);
+    assert_eq!(
+        buf(&e),
+        "aaa\nbbb\nccc\n",
+        "insertCursorBelow must not move the line"
+    );
+    assert_eq!(
+        e.view().extra_cursors.len(),
+        1,
+        "insertCursorBelow must add exactly one cursor below"
+    );
 }
 
-/// VS Code's `Shift+Alt+Up` is `editor.action.copyLinesUpAction` (duplicate
-/// line upward); vimcode binds this exact chord to `vscode_add_cursor_above`
-/// instead (the chord VS Code assigns to `insertCursorAbove`, see the gap
-/// above). This gate's body asserts the *intended* VS Code outcome — line
-/// duplicated, no extra cursor — which is RED against unfixed `develop`
-/// (confirmed by this exact run: today's actual outcome is a cursor added
-/// and the buffer untouched, the opposite of what's asserted).
+/// #1744, was `KNOWN_GAPS::ALT_SHIFT_UP_IS_ADD_CURSOR` (now deleted): VS
+/// Code's `Shift+Alt+Up` is `editor.action.copyLinesUpAction` (duplicate line
+/// upward), not add-a-cursor — that chord now belongs to Ctrl+Alt+Up (see
+/// `ctrl_alt_up_inserts_cursor_above_not_move_line` above).
+/// `handle_vscode_key`'s `"Alt_Shift_Up"` arm now calls the new
+/// `Engine::vscode_copy_line_up`. **Verified RED against unfixed `develop`**
+/// before this change landed (this test's body is unchanged from the
+/// `gap_gate`-wrapped version).
 #[test]
-fn gap_alt_shift_up_is_add_cursor_not_copy_line_up() {
-    gap_gate("ALT_SHIFT_UP_IS_ADD_CURSOR", || {
-        let mut e = engine_with("aaa\nbbb\nccc\n");
-        vscode_mode(&mut e);
-        e.view_mut().cursor = Cursor { line: 1, col: 0 };
-        e.handle_key("Alt_Shift_Up", None, false);
-        // Intended VS Code behaviour (`copyLinesUpAction`): "bbb" is
-        // duplicated upward, no extra cursor is created.
-        assert_eq!(
-            buf(&e),
-            "aaa\nbbb\nbbb\nccc\n",
-            "Shift+Alt+Up should duplicate the current line upward"
-        );
-        assert!(
-            e.view().extra_cursors.is_empty(),
-            "copyLinesUpAction does not add a cursor"
-        );
-    });
+fn alt_shift_up_copies_line_up_not_add_cursor() {
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 1, col: 0 };
+    e.handle_key("Alt_Shift_Up", None, false);
+    assert_eq!(
+        buf(&e),
+        "aaa\nbbb\nbbb\nccc\n",
+        "Shift+Alt+Up should duplicate the current line upward"
+    );
+    assert!(
+        e.view().extra_cursors.is_empty(),
+        "copyLinesUpAction does not add a cursor"
+    );
 }
 
+/// Mirrors the above for `editor.action.copyLinesDownAction`
+/// (`Shift+Alt+Down`, `Engine::vscode_copy_line_down`).
+#[test]
+fn alt_shift_down_copies_line_down_not_add_cursor() {
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 1, col: 0 };
+    e.handle_key("Alt_Shift_Down", None, false);
+    assert_eq!(
+        buf(&e),
+        "aaa\nbbb\nbbb\nccc\n",
+        "Shift+Alt+Down should duplicate the current line downward"
+    );
+    assert!(
+        e.view().extra_cursors.is_empty(),
+        "copyLinesDownAction does not add a cursor"
+    );
+}
+
+/// #1744, was `KNOWN_GAPS::ALT_LEFT_RIGHT_IS_SIDEBAR_RESIZE` (now deleted):
 /// VS Code's `Alt+Left`/`Alt+Right` (`workbench.action.navigateBack`/
-/// `navigateForward`) should behave like Vim mode's Ctrl-O/Ctrl-I — jump
-/// back to (and forward from) a recorded jump-list entry — but `Engine::
-/// handle_vscode_key` has no `"Alt_Left"`/`"Alt_Right"` arm at all (confirmed
-/// by reading that match), and `render::route_alt_key`'s mode-independent
-/// tier claims `AltBase::Left`/`Right` unconditionally for sidebar-resize
-/// before the VS Code-mode tier below it would even get a chance to run.
-/// This gate's body seeds a real jump-list entry with the already-public
-/// `Engine::push_jump_location` (the same mechanism Vim mode's motions use)
-/// and asserts Alt+Left returns the cursor to it — the intended behaviour,
-/// RED against unfixed `develop` today because nothing currently consumes
-/// `"Alt_Left"` in VS Code mode.
+/// `navigateForward`) behave like Vim mode's Ctrl-O/Ctrl-I — jump back to (and
+/// forward from) a recorded jump-list entry. `render::route_alt_key`'s
+/// mode-independent tier no longer claims `AltBase::Left`/`Right`
+/// unconditionally for sidebar-resize; in VSCode mode it falls through to the
+/// VSCode-mode tier, which maps the chord to `"Alt_Left"`/`"Alt_Right"` and
+/// `handle_vscode_key` calls `Engine::jump_list_back`/`jump_list_forward`.
+/// Seeds a real jump-list entry with the already-public
+/// `Engine::push_jump_location` (the same mechanism Vim mode's motions use).
+/// **Verified RED against unfixed `develop`** before this change landed
+/// (this test's body is unchanged from the `gap_gate`-wrapped version).
 #[test]
-fn gap_alt_left_right_is_sidebar_resize_not_navigate_back_forward() {
-    gap_gate("ALT_LEFT_RIGHT_IS_SIDEBAR_RESIZE", || {
-        let mut e = engine_with(&"line\n".repeat(10));
-        vscode_mode(&mut e);
-        e.view_mut().cursor = Cursor { line: 0, col: 0 };
-        // Record (0, 0) as a place Ctrl-O/Alt+Left should be able to return
-        // to, then move elsewhere — exactly what a real jump (e.g. VS
-        // Code's "Go to Definition") would have done first.
-        e.push_jump_location();
-        e.view_mut().cursor = Cursor { line: 9, col: 0 };
-        e.handle_key("Alt_Left", None, false);
-        assert_eq!(
-            e.cursor().line,
-            0,
-            "Alt+Left (navigateBack) should return to the jump-list entry, \
-             the same way Ctrl-O already does in Vim mode"
-        );
-    });
+fn alt_left_navigates_back_not_resize_sidebar() {
+    let mut e = engine_with(&"line\n".repeat(10));
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    // Record (0, 0) as a place Ctrl-O/Alt+Left should be able to return
+    // to, then move elsewhere — exactly what a real jump (e.g. VS
+    // Code's "Go to Definition") would have done first.
+    e.push_jump_location();
+    e.view_mut().cursor = Cursor { line: 9, col: 0 };
+    e.handle_key("Alt_Left", None, false);
+    assert_eq!(
+        e.cursor().line,
+        0,
+        "Alt+Left (navigateBack) should return to the jump-list entry, \
+         the same way Ctrl-O already does in Vim mode"
+    );
 }
 
-/// VS Code's `editor.action.jumpToBracket` (`Ctrl+Shift+\`) should move the
-/// cursor onto the matching bracket, exactly like Vim mode's `%` already
-/// does via `Engine::find_matching_bracket` — but `handle_vscode_key` has no
-/// `"\\"`/`"backslash"` arm anywhere in its ctrl-chord match, so the intended
-/// outcome asserted here is RED against unfixed `develop`.
+/// #1744, was `KNOWN_GAPS::CTRL_SHIFT_BACKSLASH_JUMP_TO_BRACKET_UNBOUND` (now
+/// deleted): VS Code's `editor.action.jumpToBracket` (`Ctrl+Shift+\`) moves
+/// the cursor onto the matching bracket, exactly like Vim mode's `%` already
+/// does via `Engine::find_matching_bracket`/`move_to_matching_bracket`.
+/// `render::engine_key_from_ui` now has shift-aware arms producing
+/// `"Shift_backslash"`, and `handle_vscode_key` has a
+/// `"Shift_backslash" | "|"` arm calling `move_to_matching_bracket`.
+/// **Verified RED against unfixed `develop`** before this change landed
+/// (this test's body is unchanged from the `gap_gate`-wrapped version).
 #[test]
-fn gap_ctrl_shift_backslash_jump_to_bracket_is_unbound() {
-    gap_gate("CTRL_SHIFT_BACKSLASH_JUMP_TO_BRACKET_UNBOUND", || {
-        let mut e = engine_with("fn f() { (1 + 2) }\n");
-        vscode_mode(&mut e);
-        // Cursor sits on the opening paren of `(1 + 2)`; its match is the
-        // `)` at char index 15 (single-line buffer, so char index == col).
-        e.view_mut().cursor = Cursor { line: 0, col: 9 };
-        // Neither spelling the shared decoder could plausibly hand this
-        // chord ("backslash" with Shift+Ctrl folded into the uppercase-style
-        // name `engine_key_from_ui` uses elsewhere, or the literal
-        // character) does anything today.
-        e.handle_key("Shift_backslash", None, true);
-        assert_eq!(
-            e.cursor().col,
-            15,
-            "Ctrl+Shift+\\ should jump to the matching ')'"
-        );
-    });
+fn ctrl_shift_backslash_jumps_to_matching_bracket() {
+    let mut e = engine_with("fn f() { (1 + 2) }\n");
+    vscode_mode(&mut e);
+    // Cursor sits on the opening paren of `(1 + 2)`; its match is the
+    // `)` at char index 15 (single-line buffer, so char index == col).
+    e.view_mut().cursor = Cursor { line: 0, col: 9 };
+    e.handle_key("Shift_backslash", None, true);
+    assert_eq!(
+        e.cursor().col,
+        15,
+        "Ctrl+Shift+\\ should jump to the matching ')'"
+    );
 }
