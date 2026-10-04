@@ -482,6 +482,11 @@ rmpv = "1.3"
 # graph) — narrowing here is correct today and free if `arboard` ever
 # narrows its own request first.
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+# #1729: parses `tests/smoke-spec/catalogue.yaml` (the bugbash behaviour
+# catalogue, claude-coordinator#3580) in `tests/smoke_catalogue.rs`'s schema
+# test. Dev-only — nothing vimcode ships reads this file; `coord`'s own
+# bugbash tooling reads it directly as YAML in a separate (Python) process.
+serde_yaml = "0.9"
 
 # #1634: `tests/conpty_idle_flicker.rs` — the raw-output ConPTY idle
 # regression test for the Windows TUI fg-colour flicker. Target-gated (not
