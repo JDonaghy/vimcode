@@ -3954,26 +3954,51 @@ mod tests {
         /// — mirroring the dumb literal-coordinate click the real
         /// `tui-pty` pty driver sends, which has no "find this text and
         /// click it" primitive) to pin down why, and to confirm the
-        /// cwd-independent alternative: `row: 1` always lands on the
-        /// Explorer root entry, which [`build_explorer_rows`] pushes
-        /// unconditionally with `is_dir: true` — a directory regardless of
-        /// what the launch `cwd` happens to contain.
+        /// cwd-independent alternative: the Explorer **root entry row**,
+        /// which [`build_explorer_rows`] pushes unconditionally with
+        /// `is_dir: true` — a directory regardless of what the launch `cwd`
+        /// happens to contain.
         ///
         /// `right-click-explorer-row` itself is left untouched in
         /// `tests/smoke-spec/tui.yaml` — #3509 treats that file as
         /// additive-only, so a brittle existing step's coordinate is never
         /// silently rewritten even to fix a real coupling bug. Instead, a
         /// new, cwd-independent step
-        /// (`right-click-explorer-root-row-1703`) was added beside it at
-        /// `row: 1`, which this test backs at the unit level.
+        /// (`right-click-explorer-root-row-1703`) was added beside it, which
+        /// this test backs at the unit level.
         ///
-        /// Two plain files (not one): with only one file, `row: 3` falls
-        /// *below* the single child row into the tree's empty space, which
-        /// `route_tree_empty_space_context_menu`'s dedicated fallback (#1429)
-        /// resolves to the root folder's own menu — accidentally "passing"
-        /// without ever landing on a file row at all. Two files make `row: 3`
-        /// land squarely on the second file's own row, the same way the
-        /// bugbash's richer real-world `cwd` did.
+        /// # Screen row map (#1693)
+        ///
+        /// The root entry sits at **screen `row: 2`**, not row 1:
+        ///
+        /// | row | content |
+        /// |-----|---------|
+        /// | 0 | sidebar header (`☰ EXPLORER`) |
+        /// | 1 | view-actions toolbar — New File / New Folder / Refresh / Collapse All / `…` (#1693) |
+        /// | 2 | **Explorer root entry** (the workspace folder, always `is_dir`) |
+        /// | 3+ | the root's children |
+        ///
+        /// #1703 was authored before #1693 landed that toolbar row and so
+        /// originally targeted `row: 1`; rebasing onto it moved the root
+        /// entry down by exactly one row, and a `row: 1` right-click now
+        /// lands on the toolbar instead (which opens no context menu at
+        /// all). The offset is a fixed one row — `app.rs` attaches the
+        /// toolbar as an unconditional single-bar
+        /// `SidebarPanelChrome::StatusBars`, for every Explorer render on
+        /// every backend — so it is not a reintroduction of the cwd
+        /// coupling this test exists to remove. The row-2 assertion below
+        /// is guarded by an explicit check that row 2 really is the root
+        /// entry, so the next piece of header chrome fails here loudly
+        /// rather than silently re-aiming the smoke step at the wrong row.
+        ///
+        /// Two plain files (not one): the two files reproduce the "flat, no
+        /// folder" layout of the bugbash run's `cwd`, and keep a child row
+        /// under `row: 3` even if a future chrome row shifts the tree down
+        /// once more — with a single file, such a shift would push `row: 3`
+        /// *below* the only child into the tree's empty space, which
+        /// `route_tree_empty_space_context_menu`'s dedicated fallback
+        /// (#1429) resolves to the root folder's own menu, making the first
+        /// assertion below pass without ever landing on a file row at all.
         ///
         /// [`build_explorer_rows`]: crate::core::engine::explorer_ops::build_explorer_rows
         #[test]
@@ -3986,15 +4011,15 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             // Deliberately two plain files and no subfolder -- the "flat,
-            // no folder" layout the bugbash run's cwd had, just with a
-            // second file so `row: 3` lands on a real row rather than the
-            // empty-space-below-the-tree fallback (see doc above).
+            // no folder" layout the bugbash run's cwd had, with a second
+            // file so `row: 3` keeps landing on a real child row rather
+            // than the empty-space-below-the-tree fallback (see doc above).
             std::fs::write(dir.join("sample.txt"), "hello").unwrap();
             std::fs::write(dir.join("second.txt"), "world").unwrap();
 
             // Each right-click gets its own fresh engine + harness (#1703
             // CI follow-up): the first revision drove both clicks through
-            // one driver with an Escape in between, so the row-1 check
+            // one driver with an Escape in between, so the root-row check
             // inherited whatever dismissing the row-3 menu left behind
             // (menu/hover/focus state). That passed locally but failed in
             // CI's `--no-default-features` lane. Fresh harnesses keep the
@@ -4041,17 +4066,44 @@ mod tests {
 
             // The cwd-independent alternative, added to the spec as a new
             // step (`right-click-explorer-root-row-1703`) rather than a
-            // replacement: `row: 1` is the Explorer root entry -- always a
-            // directory by construction, regardless of the cwd's children
-            // (or lack of them) -- so its context menu always offers
-            // "New File..."/"New Folder...".
+            // replacement: the Explorer root entry -- always a directory by
+            // construction, regardless of the cwd's children (or lack of
+            // them) -- so its context menu always offers "New File..."/
+            // "New Folder...". `row: 2` since #1693's view-actions toolbar
+            // took row 1; see this test's "Screen row map" doc.
             {
                 let mut h = fresh(&dir);
                 let driver = &mut h.driver;
-                driver.right_click(10.0, 1.0);
+
+                // Guard the row map itself, so a future header-chrome row
+                // can't silently re-aim the click (and the smoke step this
+                // backs) at some other row that merely happens to offer
+                // "New File...". The root entry paints the workspace
+                // folder's name, upper-cased and possibly truncated to the
+                // sidebar width, so match on a prefix of it.
+                let root_name = dir.file_name().unwrap().to_string_lossy().to_uppercase();
+                let probe: String = root_name.chars().take(12).collect();
+                let row2 = driver
+                    .screen()
+                    .lines()
+                    .nth(2)
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    row2.contains(&probe),
+                    "row 2 must be the Explorer root entry (expected it to \
+                     show {probe:?}); #1693's view-actions toolbar owns row \
+                     1. If new header chrome shifted the tree again, update \
+                     this test *and* `right-click-explorer-root-row-1703` \
+                     in tests/smoke-spec/tui.yaml together. row 2 was \
+                     {row2:?}; screen:\n{}",
+                    driver.screen()
+                );
+
+                driver.right_click(10.0, 2.0);
                 assert!(
                     driver.screen_has("New File"),
-                    "row 1 is the Explorer root entry and must always be a \
+                    "row 2 is the Explorer root entry and must always open a \
                      directory's context menu, even on a folderless cwd; \
                      screen:\n{}",
                     driver.screen()
