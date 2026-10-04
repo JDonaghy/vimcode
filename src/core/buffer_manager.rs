@@ -2207,6 +2207,37 @@ mod tests {
         assert_matches_full_rescan(&mut state);
     }
 
+    /// #1721 review regression: replacing a CJK character with a sibling
+    /// that shares its leading UTF-8 bytes (`字` = `E5 AD 97`, `存` =
+    /// `E5 AD 98`) through the real buffer-mutation path must not panic.
+    /// `compute_edit`'s byte-level common-prefix/suffix scan used to stop
+    /// mid-codepoint for exactly this pair, producing an `InputEdit` whose
+    /// `start_byte`/`new_end_byte` weren't char boundaries — the very next
+    /// use of them, `update_max_col_incremental`'s `&str` range-indexing,
+    /// panicked with "byte index N is not a char boundary" on every such
+    /// keystroke (an everyday CJK `r`-replace or IME correction, not an
+    /// adversarial case).
+    #[test]
+    fn test_update_syntax_with_limit_cjk_shared_prefix_substitution_no_panic() {
+        use crate::core::syntax::{Syntax, SyntaxLanguage};
+
+        let mut state = BufferState::new(Buffer::new(crate::core::buffer::BufferId(0)));
+        state.syntax = Some(Syntax::new_for_language(SyntaxLanguage::Rust));
+        state.buffer.insert(0, "let x = \"字\";\n");
+        state.update_syntax_with_limit(usize::MAX);
+
+        let text = state.buffer.to_string();
+        let start = text.find('字').unwrap();
+        let end = start + '字'.len_utf8();
+        state.buffer.delete_range(start, end);
+        state.buffer.insert(start, "存");
+        state.update_syntax_with_limit(usize::MAX);
+
+        let text = state.buffer.to_string();
+        let want_max = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert_eq!(state.max_col, want_max);
+    }
+
     /// #1721 oracle, randomised: a long sequence of random inserts/deletes
     /// (multi-byte UTF-8, newlines, random positions) plus simulated
     /// undo/redo, driven through the *real* `update_syntax_with_limit`
@@ -2240,8 +2271,18 @@ mod tests {
         }
 
         fn apply_random_edit(chars: &mut Vec<char>, rng: &mut Lcg) {
+            // '字' (U+5B57, `E5 AD 97`) and '存' (U+5B58, `E5 AD 98`) share
+            // their first two UTF-8 bytes, differing only in the last byte
+            // — this is deliberate (#1721 review): a byte-level
+            // longest-common-prefix/suffix diff between two texts that
+            // differ only by substituting one for the other stops its
+            // scan one byte short of the full character, landing an
+            // `InputEdit` boundary mid-codepoint. Every other char in the
+            // old list had a distinct leading byte from every other,
+            // which made that class of bug invisible to the fuzz corpus.
             const CHOICES: &[char] = &[
-                'a', 'b', 'c', '_', '(', ')', '{', '}', ';', ' ', '\n', '"', 'é', 'λ', '字', '🙂',
+                'a', 'b', 'c', '_', '(', ')', '{', '}', ';', ' ', '\n', '"', 'é', 'λ', '字', '存',
+                '🙂',
             ];
             let len = chars.len();
             let insert = len == 0 || rng.next_usize(100) < 60;

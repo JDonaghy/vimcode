@@ -742,8 +742,13 @@ pub struct Syntax {
 
 /// Running counters for [`Syntax::reparse_incremental`]. See
 /// [`Syntax::stats`].
+///
+/// `pub(crate)`, not `pub` — today this is a test/debugging hook (only
+/// `#[cfg(test)]` code reads [`Syntax::stats`]), not a public API this
+/// crate's consumers depend on, so it shouldn't grow the public surface
+/// until something non-test actually needs it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SyntaxStats {
+pub(crate) struct SyntaxStats {
     /// Parses that had no previous tree/text to diff against (or where the
     /// diff couldn't be reused), so ran a full `parser.parse(text, None)`.
     pub full_parses: usize,
@@ -1040,8 +1045,12 @@ impl Syntax {
     }
 
     /// Running counters of how recent [`reparse_incremental`](Self::reparse_incremental)
-    /// calls were satisfied. See [`SyntaxStats`].
-    pub fn stats(&self) -> SyntaxStats {
+    /// calls were satisfied. See [`SyntaxStats`]. Only consumed by tests
+    /// today (hence `#[cfg(test)]`, not just `pub(crate)` — this would
+    /// otherwise be a `dead_code` warning in a non-test build) — remove the
+    /// gate if a non-test consumer (e.g. a debug overlay) needs it later.
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> SyntaxStats {
         self.stats
     }
 
@@ -1512,9 +1521,42 @@ fn compute_edit(old: &str, new: &str) -> Option<InputEdit> {
         .count()
         .min(max_suffix);
 
-    let start_byte = common_prefix;
-    let old_end_byte = old_b.len() - common_suffix;
-    let new_end_byte = new_b.len() - common_suffix;
+    let mut start_byte = common_prefix;
+    let mut old_end_byte = old_b.len() - common_suffix;
+    let mut new_end_byte = new_b.len() - common_suffix;
+
+    // `common_prefix`/`common_suffix` are a raw byte-level longest-common
+    // prefix/suffix scan with no UTF-8 awareness, so the boundaries they
+    // produce can land in the middle of a multi-byte codepoint whenever
+    // the old and new text share a *partial* encoding of two distinct
+    // characters at the same position — e.g. replacing `字` (U+5B57,
+    // `E5 AD 97`) with `存` (U+5B58, `E5 AD 98`): the two encodings share
+    // their first two bytes, so the prefix scan stops one byte short of
+    // the full character. Every consumer of this `InputEdit` (this
+    // module's own `&str` slicing, plus `update_max_col_incremental` in
+    // `buffer_manager.rs`) indexes `&str` by these offsets, which panics
+    // on a non-char-boundary index. Snap both ends down to the nearest
+    // char boundary before returning — snapping down (rather than up)
+    // only ever *grows* the reported edit to include a few more
+    // byte-identical bytes, which is always safe for tree-sitter's
+    // incremental reparse, just marginally less minimal.
+    //
+    // `start_byte` indexes into the shared prefix, so `old_b` and `new_b`
+    // agree byte-for-byte there — snapping against either is equivalent.
+    while start_byte > 0 && !is_utf8_char_boundary(old_b, start_byte) {
+        start_byte -= 1;
+    }
+    // `old_end_byte`/`new_end_byte` index into the shared *suffix*, which
+    // is also byte-identical between `old_b` and `new_b` (that's what
+    // "common suffix" means) — so decreasing one by `delta` to reach a
+    // char boundary and decreasing the other by the same `delta` keeps
+    // both in sync and lands them on a boundary too.
+    let old_end_before = old_end_byte;
+    while old_end_byte > start_byte && !is_utf8_char_boundary(old_b, old_end_byte) {
+        old_end_byte -= 1;
+    }
+    let delta = old_end_before - old_end_byte;
+    new_end_byte = new_end_byte.saturating_sub(delta).max(start_byte);
 
     Some(InputEdit {
         start_byte,
@@ -1524,6 +1566,14 @@ fn compute_edit(old: &str, new: &str) -> Option<InputEdit> {
         old_end_position: point_for_byte(old, old_end_byte),
         new_end_position: point_for_byte(new, new_end_byte),
     })
+}
+
+/// Whether `bytes[i]` starts a UTF-8 character (or `i` is past the end) —
+/// a local, single-byte check equivalent to `str::is_char_boundary`, usable
+/// on a raw `&[u8]` slice that isn't (yet) known to be a boundary-aligned
+/// `&str`. See [`compute_edit`] for why this matters.
+fn is_utf8_char_boundary(bytes: &[u8], i: usize) -> bool {
+    i >= bytes.len() || (bytes[i] & 0xC0) != 0x80
 }
 
 /// Row/column (tree-sitter's `Point`, byte-based column per its own
@@ -2306,6 +2356,29 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_edit_shared_prefix_byte_cjk_substitution() {
+        // '字' (U+5B57) -> `E5 AD 97`, '存' (U+5B58) -> `E5 AD 98`: they
+        // share their first two bytes, so a raw byte-level common-prefix
+        // scan between the two strings stops 2 bytes into the 3-byte
+        // sequence. Before the char-boundary snap (#1721 review), this
+        // made `start_byte`/`new_end_byte` land mid-codepoint, and any
+        // `&str` slicing on those offsets (e.g.
+        // `update_max_col_incremental`) panicked with "byte index N is
+        // not a char boundary". This must not panic, and the edit must
+        // still round-trip to the correct before/after substrings on
+        // valid char boundaries.
+        let old = "let x = \"字\";";
+        let new = "let x = \"存\";";
+        let edit = compute_edit(old, new).expect("texts differ");
+        assert!(old.is_char_boundary(edit.start_byte));
+        assert!(old.is_char_boundary(edit.old_end_byte));
+        assert!(new.is_char_boundary(edit.start_byte));
+        assert!(new.is_char_boundary(edit.new_end_byte));
+        assert_eq!(&old[edit.start_byte..edit.old_end_byte], "字");
+        assert_eq!(&new[edit.start_byte..edit.new_end_byte], "存");
+    }
+
+    #[test]
     fn test_compute_edit_multibyte_insert() {
         // common prefix/suffix scanning is byte-based; this just confirms
         // the resulting byte range round-trips to the expected substrings
@@ -2342,8 +2415,16 @@ mod tests {
     /// character boundary, including multi-byte UTF-8 (accented Latin,
     /// CJK, emoji) and newlines.
     fn apply_random_edit(chars: &mut Vec<char>, rng: &mut Lcg) {
+        // '字' (U+5B57, `E5 AD 97`) and '存' (U+5B58, `E5 AD 98`) share
+        // their first two UTF-8 bytes, differing only in the last byte —
+        // deliberate (#1721 review): substituting one for the other makes
+        // a byte-level longest-common-prefix/suffix diff stop its scan
+        // one byte short of the full character, landing an `InputEdit`
+        // boundary mid-codepoint. Every other char below has a distinct
+        // leading byte from every other, which made that class of bug
+        // invisible to the fuzz corpus before this pair was added.
         const CHOICES: &[char] = &[
-            'a', 'b', 'c', '_', '(', ')', '{', '}', ';', ' ', '\n', '"', 'é', 'λ', '字', '🙂',
+            'a', 'b', 'c', '_', '(', ')', '{', '}', ';', ' ', '\n', '"', 'é', 'λ', '字', '存', '🙂',
         ];
         let len = chars.len();
         let insert = len == 0 || rng.next_usize(100) < 60;
