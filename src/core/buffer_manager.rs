@@ -1138,6 +1138,19 @@ impl BufferState {
     /// trusts as "the max line wasn't touched" and leaves `max_col`
     /// stuck too high.
     fn update_max_col_incremental(&mut self, text: &str, edit: tree_sitter::InputEdit) {
+        // The `&str` range-indexing below panics on an offset that isn't a
+        // UTF-8 char boundary. `compute_edit` guarantees both offsets are
+        // (by snapping them *outwards* to one — see its comment); state
+        // the dependency here so a future change there surfaces as this
+        // named assertion rather than a bare "byte index N is not a char
+        // boundary" from the middle of a max-col calculation (#1721).
+        debug_assert!(
+            text.is_char_boundary(edit.start_byte) && text.is_char_boundary(edit.new_end_byte),
+            "InputEdit offsets must be char boundaries in the new text: \
+             start_byte={}, new_end_byte={}",
+            edit.start_byte,
+            edit.new_end_byte
+        );
         let line_start = text[..edit.start_byte]
             .rfind('\n')
             .map(|i| i + 1)
@@ -2226,16 +2239,57 @@ mod tests {
         state.buffer.insert(0, "let x = \"字\";\n");
         state.update_syntax_with_limit(usize::MAX);
 
+        // `Buffer::insert`/`delete_range` take *char* indices, so locate
+        // the character by char position (not `str::find`'s byte offset).
         let text = state.buffer.to_string();
-        let start = text.find('字').unwrap();
-        let end = start + '字'.len_utf8();
-        state.buffer.delete_range(start, end);
+        let start = text.chars().position(|c| c == '字').unwrap();
+        state.buffer.delete_range(start, start + 1);
         state.buffer.insert(start, "存");
         state.update_syntax_with_limit(usize::MAX);
 
         let text = state.buffer.to_string();
         let want_max = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
         assert_eq!(state.max_col, want_max);
+    }
+
+    /// #1721 review round 2 regression: the *suffix*-side counterpart of
+    /// the test above. 'җ' (U+0497, `D2 97`) and '字' (U+5B57,
+    /// `E5 AD 97`) share their *trailing* byte and have *different* byte
+    /// lengths, so `compute_edit`'s byte-level common-*suffix* scan stops
+    /// mid-codepoint at a different depth in each text.
+    ///
+    /// The first fix snapped `old_end_byte` inwards against the old text
+    /// and transferred the same numeric delta to `new_end_byte`, which
+    /// left `new_end_byte` on a continuation byte of the new text for the
+    /// `җ` → `字` direction — so `update_max_col_incremental`'s
+    /// `text[edit.new_end_byte..]` panicked with "byte index N is not a
+    /// char boundary", exactly the crash class the round-1 fix was meant
+    /// to close. Both substitution directions are driven here, at the end
+    /// of the buffer (nothing following to force a safe ASCII stop).
+    #[test]
+    fn test_update_syntax_with_limit_cjk_shared_suffix_substitution_no_panic() {
+        use crate::core::syntax::{Syntax, SyntaxLanguage};
+
+        for (first, second) in [('җ', '字'), ('字', 'җ')] {
+            let mut state = BufferState::new(Buffer::new(crate::core::buffer::BufferId(0)));
+            state.syntax = Some(Syntax::new_for_language(SyntaxLanguage::Rust));
+            state.buffer.insert(0, &format!("let x = 1; // {first}"));
+            state.update_syntax_with_limit(usize::MAX);
+
+            // `Buffer::insert`/`delete_range` take *char* indices.
+            let text = state.buffer.to_string();
+            let start = text.chars().position(|c| c == first).unwrap();
+            state.buffer.delete_range(start, start + 1);
+            state.buffer.insert(start, &second.to_string());
+            state.update_syntax_with_limit(usize::MAX);
+
+            let text = state.buffer.to_string();
+            let want_max = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+            assert_eq!(
+                state.max_col, want_max,
+                "{first} -> {second}: max_col diverged from a full rescan"
+            );
+        }
     }
 
     /// #1721 oracle, randomised: a long sequence of random inserts/deletes
@@ -2271,36 +2325,71 @@ mod tests {
         }
 
         fn apply_random_edit(chars: &mut Vec<char>, rng: &mut Lcg) {
-            // '字' (U+5B57, `E5 AD 97`) and '存' (U+5B58, `E5 AD 98`) share
-            // their first two UTF-8 bytes, differing only in the last byte
-            // — this is deliberate (#1721 review): a byte-level
-            // longest-common-prefix/suffix diff between two texts that
-            // differ only by substituting one for the other stops its
-            // scan one byte short of the full character, landing an
-            // `InputEdit` boundary mid-codepoint. Every other char in the
-            // old list had a distinct leading byte from every other,
-            // which made that class of bug invisible to the fuzz corpus.
+            // Two deliberately-colliding pairs (#1721 review), because
+            // every other char in the original list had a distinct
+            // leading *and* trailing byte from every other, which made
+            // both classes of bug invisible to the fuzz corpus:
+            //
+            // * '字' (U+5B57, `E5 AD 97`) / '存' (U+5B58, `E5 AD 98`)
+            //   share their *leading* two bytes, so the common-*prefix*
+            //   scan stops one byte short of the full character.
+            // * 'җ' (U+0497, `D2 97`) / '字' (U+5B57, `E5 AD 97`) share
+            //   their *trailing* byte and differ in byte *length*, so the
+            //   common-*suffix* scan stops mid-codepoint at a different
+            //   depth in each text.
+            //
+            // Either lands an `InputEdit` boundary off a char boundary
+            // unless `compute_edit` snaps it, and the very next use of
+            // those offsets is `update_max_col_incremental`'s `&str`
+            // range-indexing, which panics on a non-boundary index.
             const CHOICES: &[char] = &[
                 'a', 'b', 'c', '_', '(', ')', '{', '}', ';', ' ', '\n', '"', 'é', 'λ', '字', '存',
-                '🙂',
+                'җ', '🙂',
             ];
             let len = chars.len();
-            let insert = len == 0 || rng.next_usize(100) < 60;
-            if insert {
+            // In-place *substitution* (#1721 review round 2) is what makes
+            // the colliding pairs above actually collide: an insert or
+            // delete shifts everything after it, so the byte-level
+            // common-prefix/suffix scan meets its first differing byte on
+            // a character boundary almost every time. Only replacing one
+            // character with another pits two encodings against each
+            // other byte-for-byte.
+            //
+            // And the substitution is *biased* towards the colliding
+            // partner rather than left to chance: hitting a pair randomly
+            // needs the chosen position to already hold one of them and
+            // the random replacement to be its exact partner, a
+            // ~0.1%-per-step coincidence that (measured against the
+            // round-1-broken `compute_edit`) 300 steps did not produce.
+            let partner = |c: char, rng: &mut Lcg| match c {
+                // '字' collides on its leading bytes with '存' and on its
+                // trailing byte with 'җ' — pick either at random.
+                '字' => Some(if rng.next_usize(2) == 0 { '存' } else { 'җ' }),
+                '存' | 'җ' => Some('字'),
+                _ => None,
+            };
+            let roll = rng.next_usize(100);
+            if len > 0 && roll < 25 {
+                let pos = rng.next_usize(len);
+                chars[pos] = partner(chars[pos], rng)
+                    .unwrap_or_else(|| CHOICES[rng.next_usize(CHOICES.len())]);
+            } else if len == 0 || roll < 70 {
                 let pos = rng.next_usize(len + 1);
                 let c = CHOICES[rng.next_usize(CHOICES.len())];
                 chars.insert(pos, c);
             } else {
                 let pos = rng.next_usize(len);
-                let max_del = (len - pos).min(4).max(1);
+                let max_del = (len - pos).clamp(1, 4);
                 let del_len = 1 + rng.next_usize(max_del);
                 let end = (pos + del_len).min(len);
                 chars.drain(pos..end);
             }
         }
 
-        let seed =
-            "fn main() {\n    let x = 1;\n    if x > 0 {\n        println!(\"{}\", x);\n    }\n}\n";
+        // The seed carries the UTF-8-colliding characters from the start
+        // so substitutions can fire in the first few steps rather than
+        // waiting for a random insert to introduce one.
+        let seed = "fn main() {\n    let x = 1;\n    let s = \"字存җ\";\n    if x > 0 {\n        println!(\"{}\", x);\n    }\n}\n";
         let mut chars: Vec<char> = seed.chars().collect();
 
         let mut state = BufferState::new(Buffer::new(crate::core::buffer::BufferId(0)));

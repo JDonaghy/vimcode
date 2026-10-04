@@ -1535,28 +1535,64 @@ fn compute_edit(old: &str, new: &str) -> Option<InputEdit> {
     // the full character. Every consumer of this `InputEdit` (this
     // module's own `&str` slicing, plus `update_max_col_incremental` in
     // `buffer_manager.rs`) indexes `&str` by these offsets, which panics
-    // on a non-char-boundary index. Snap both ends down to the nearest
-    // char boundary before returning — snapping down (rather than up)
-    // only ever *grows* the reported edit to include a few more
-    // byte-identical bytes, which is always safe for tree-sitter's
-    // incremental reparse, just marginally less minimal.
+    // on a non-char-boundary index. So all three offsets get snapped to a
+    // real char boundary before returning.
     //
-    // `start_byte` indexes into the shared prefix, so `old_b` and `new_b`
-    // agree byte-for-byte there — snapping against either is equivalent.
-    while start_byte > 0 && !is_utf8_char_boundary(old_b, start_byte) {
+    // **Snap direction is load-bearing: outwards, never inwards.** Each
+    // offset moves in whichever direction *grows* the reported edit — the
+    // start back towards byte 0, both ends forwards towards the end of
+    // their own text. Growing an edit is always safe (it just asks
+    // tree-sitter to reuse fewer subtrees than it strictly could); but
+    // *shrinking* one is a correctness bug, because the region excluded
+    // from the edit is a region we have told tree-sitter is unchanged
+    // when in fact it may not be. Snapping the ends inwards (the #1721
+    // review's finding) produced a zero-width no-op `InputEdit` for
+    // `old = "字"` (`E5 AD 97`) / `new = "җ"` (`D2 97`) — a complete
+    // character replacement reported to tree-sitter as "nothing changed",
+    // leaving a stale subtree over entirely different text, which is
+    // exactly the garbled-highlighting failure mode incremental parsing
+    // was disabled for before #1721.
+    //
+    // Snapping outwards is also what makes the three offsets *mutually*
+    // consistent without any cross-derivation:
+    //
+    // * `start_byte` starts at `common_prefix`, inside the shared prefix,
+    //   where `old_b` and `new_b` agree byte-for-byte. Walking it
+    //   backwards stays inside that shared region, so the boundary it
+    //   finds is the same boundary in both texts. (It is still checked
+    //   against both, cheaply, rather than resting on that argument.)
+    // * `old_end_byte`/`new_end_byte` both start at the first byte of the
+    //   shared *suffix* in their respective texts, and that suffix is
+    //   byte-identical between them. Walking each forwards therefore
+    //   skips the same number of leading continuation bytes of the same
+    //   identical byte sequence, i.e. both advance by the same amount and
+    //   the bytes beyond them stay equal — the "old and new agree after
+    //   the edit" invariant `InputEdit` means is preserved. Each is
+    //   nonetheless snapped against *its own* text independently, because
+    //   that is the property that actually has to hold for `&str`
+    //   indexing, and because transferring a delta computed in one text
+    //   to the other is precisely the asymmetry that broke here before:
+    //   an *inward* walk leaves the shared suffix almost immediately and
+    //   continues into the genuinely-differing middle region, where a
+    //   delta measured in `old_b` means nothing in `new_b`.
+    while start_byte > 0
+        && (!is_utf8_char_boundary(old_b, start_byte) || !is_utf8_char_boundary(new_b, start_byte))
+    {
         start_byte -= 1;
     }
-    // `old_end_byte`/`new_end_byte` index into the shared *suffix*, which
-    // is also byte-identical between `old_b` and `new_b` (that's what
-    // "common suffix" means) — so decreasing one by `delta` to reach a
-    // char boundary and decreasing the other by the same `delta` keeps
-    // both in sync and lands them on a boundary too.
-    let old_end_before = old_end_byte;
-    while old_end_byte > start_byte && !is_utf8_char_boundary(old_b, old_end_byte) {
-        old_end_byte -= 1;
+    while old_end_byte < old_b.len() && !is_utf8_char_boundary(old_b, old_end_byte) {
+        old_end_byte += 1;
     }
-    let delta = old_end_before - old_end_byte;
-    new_end_byte = new_end_byte.saturating_sub(delta).max(start_byte);
+    while new_end_byte < new_b.len() && !is_utf8_char_boundary(new_b, new_end_byte) {
+        new_end_byte += 1;
+    }
+
+    // Outward snapping only ever moves `start_byte` down and the two ends
+    // up, and `start_byte <= min(old_end_byte, new_end_byte)` held before
+    // it (`common_suffix` is capped at `max_suffix` precisely so the
+    // suffix can't eat back into the prefix), so the `InputEdit`'s own
+    // ordering invariant holds by construction.
+    debug_assert!(start_byte <= old_end_byte && start_byte <= new_end_byte);
 
     Some(InputEdit {
         start_byte,
@@ -2379,6 +2415,99 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_edit_shared_suffix_byte_differing_lengths() {
+        // #1721 review round 2: the *suffix*-side counterpart of the test
+        // above, and the case the first fix got wrong. 'җ' (U+0497) is
+        // `D2 97` (2 bytes) and '字' (U+5B57) is `E5 AD 97` (3 bytes) —
+        // they share their *trailing* byte (`0x97`) and have *different*
+        // byte lengths. Replacing one with the other at the end of the
+        // text (nothing following to force a safe ASCII boundary stop)
+        // makes the byte-level common-*suffix* scan match 1 byte, landing
+        // both end offsets mid-codepoint, each at a different depth into
+        // its own character.
+        //
+        // The first fix walked `old_end_byte` *inwards* to a boundary and
+        // transferred the same numeric delta to `new_end_byte`. That
+        // panicked in one direction (`new_end_byte` left on a
+        // continuation byte of `new`) and silently produced a zero-width
+        // no-op edit in the other (a whole character replaced, reported
+        // to tree-sitter as "nothing changed"). Both directions are
+        // checked here.
+        for (old, new, old_ch, new_ch) in [("җ", "字", 'җ', '字'), ("字", "җ", '字', 'җ')] {
+            let edit = compute_edit(old, new).expect("texts differ");
+            // Every offset is a real char boundary in *both* texts it is
+            // used to index (this is what `&str` range-indexing needs).
+            assert!(
+                old.is_char_boundary(edit.start_byte),
+                "{old:?}->{new:?}: start_byte {} not an old boundary",
+                edit.start_byte
+            );
+            assert!(
+                new.is_char_boundary(edit.start_byte),
+                "{old:?}->{new:?}: start_byte {} not a new boundary",
+                edit.start_byte
+            );
+            assert!(
+                old.is_char_boundary(edit.old_end_byte),
+                "{old:?}->{new:?}: old_end_byte {} not an old boundary",
+                edit.old_end_byte
+            );
+            assert!(
+                new.is_char_boundary(edit.new_end_byte),
+                "{old:?}->{new:?}: new_end_byte {} not a new boundary",
+                edit.new_end_byte
+            );
+            // And the edit actually describes the replacement, rather
+            // than collapsing to a no-op that would leave tree-sitter
+            // reusing a stale subtree over different text.
+            assert_eq!(
+                &old[edit.start_byte..edit.old_end_byte],
+                old_ch.to_string(),
+                "{old:?}->{new:?}: old side of the edit"
+            );
+            assert_eq!(
+                &new[edit.start_byte..edit.new_end_byte],
+                new_ch.to_string(),
+                "{old:?}->{new:?}: new side of the edit"
+            );
+            // The untouched tails must still agree — that is the
+            // invariant `InputEdit` promises tree-sitter.
+            assert_eq!(&old[edit.old_end_byte..], &new[edit.new_end_byte..]);
+        }
+    }
+
+    #[test]
+    fn test_compute_edit_shared_suffix_byte_differing_lengths_mid_text() {
+        // Same `җ`/`字` trailing-byte collision, but embedded in code with
+        // text on both sides, exercising the non-zero `start_byte` /
+        // non-end-of-file path through the same snap.
+        for (old, new) in [
+            (
+                "let a = \"җ\";\nlet b = 1;\n",
+                "let a = \"字\";\nlet b = 1;\n",
+            ),
+            (
+                "let a = \"字\";\nlet b = 1;\n",
+                "let a = \"җ\";\nlet b = 1;\n",
+            ),
+        ] {
+            let edit = compute_edit(old, new).expect("texts differ");
+            assert!(old.is_char_boundary(edit.start_byte));
+            assert!(new.is_char_boundary(edit.start_byte));
+            assert!(old.is_char_boundary(edit.old_end_byte));
+            assert!(new.is_char_boundary(edit.new_end_byte));
+            assert_eq!(&old[..edit.start_byte], &new[..edit.start_byte]);
+            assert_eq!(&old[edit.old_end_byte..], &new[edit.new_end_byte..]);
+            assert_ne!(
+                &old[edit.start_byte..edit.old_end_byte],
+                &new[edit.start_byte..edit.new_end_byte],
+                "a non-empty edit region that is identical on both sides \
+                 means the real change was reported as unchanged"
+            );
+        }
+    }
+
+    #[test]
     fn test_compute_edit_multibyte_insert() {
         // common prefix/suffix scanning is byte-based; this just confirms
         // the resulting byte range round-trips to the expected substrings
@@ -2410,31 +2539,80 @@ mod tests {
         }
     }
 
+    /// If `c` is one of the deliberately UTF-8-colliding fuzz characters,
+    /// the partner it should be substituted for to *force* the collision
+    /// (#1721 review round 2).
+    ///
+    /// Leaving the fuzz to hit these pairs by chance is not coverage:
+    /// hitting one needs the substituted position to already hold one of
+    /// the pair *and* the random replacement to be its exact partner,
+    /// which is a ~0.1%-per-step coincidence — measured, not estimated,
+    /// by re-running both fuzz oracles against the round-1-broken
+    /// `compute_edit` with purely random substitution: 300 and 400 steps
+    /// and neither failed. Biasing the substitution this way makes the
+    /// collision land every time a substitution hits one of these
+    /// characters (a few percent of steps), and both oracles then do fail
+    /// against the broken version.
+    fn colliding_partner(c: char, rng: &mut Lcg) -> Option<char> {
+        match c {
+            // Shares its *leading* two bytes with '存', its *trailing*
+            // byte with 'җ' — pick either collision at random.
+            '字' => Some(if rng.next_usize(2) == 0 { '存' } else { 'җ' }),
+            '存' | 'җ' => Some('字'),
+            _ => None,
+        }
+    }
+
     /// Apply one random insert or (small) delete to `chars` — operating on
     /// `Vec<char>` rather than raw bytes so every edit lands on a valid
     /// character boundary, including multi-byte UTF-8 (accented Latin,
     /// CJK, emoji) and newlines.
     fn apply_random_edit(chars: &mut Vec<char>, rng: &mut Lcg) {
-        // '字' (U+5B57, `E5 AD 97`) and '存' (U+5B58, `E5 AD 98`) share
-        // their first two UTF-8 bytes, differing only in the last byte —
-        // deliberate (#1721 review): substituting one for the other makes
-        // a byte-level longest-common-prefix/suffix diff stop its scan
-        // one byte short of the full character, landing an `InputEdit`
-        // boundary mid-codepoint. Every other char below has a distinct
-        // leading byte from every other, which made that class of bug
-        // invisible to the fuzz corpus before this pair was added.
+        // Two deliberately-colliding pairs (#1721 review), because every
+        // other char below has a distinct leading *and* trailing byte
+        // from every other, which made both classes of bug invisible to
+        // the fuzz corpus before they were added:
+        //
+        // * '字' (U+5B57, `E5 AD 97`) / '存' (U+5B58, `E5 AD 98`) share
+        //   their *leading* two bytes, so substituting one for the other
+        //   makes the common-*prefix* scan stop one byte short of the
+        //   full character.
+        // * 'җ' (U+0497, `D2 97`) / '字' (U+5B57, `E5 AD 97`) share their
+        //   *trailing* byte and have *different* byte lengths, so
+        //   substituting one for the other makes the common-*suffix*
+        //   scan stop mid-codepoint, at a different depth into each
+        //   text's character.
+        //
+        // Either lands an `InputEdit` boundary off a char boundary unless
+        // `compute_edit` snaps it.
         const CHOICES: &[char] = &[
-            'a', 'b', 'c', '_', '(', ')', '{', '}', ';', ' ', '\n', '"', 'é', 'λ', '字', '存', '🙂',
+            'a', 'b', 'c', '_', '(', ')', '{', '}', ';', ' ', '\n', '"', 'é', 'λ', '字', '存', 'җ',
+            '🙂',
         ];
         let len = chars.len();
-        let insert = len == 0 || rng.next_usize(100) < 60;
-        if insert {
+        // Three operations, not two (#1721 review round 2): in-place
+        // *substitution* is the one that makes the colliding pairs above
+        // actually collide. An insert or a delete shifts everything after
+        // it, so the common-prefix/suffix scan meets a differing byte at
+        // a character boundary almost every time; only replacing a
+        // character with a different one of the same-ish position pits
+        // two encodings against each other byte-for-byte. Without this
+        // branch the corpus could contain the colliding characters and
+        // still never produce a mid-codepoint `InputEdit` boundary —
+        // verified, not assumed: with substitution removed, the
+        // round-1-broken `compute_edit` survived all 400 steps.
+        let roll = rng.next_usize(100);
+        if len > 0 && roll < 25 {
+            let pos = rng.next_usize(len);
+            chars[pos] = colliding_partner(chars[pos], rng)
+                .unwrap_or_else(|| CHOICES[rng.next_usize(CHOICES.len())]);
+        } else if len == 0 || roll < 70 {
             let pos = rng.next_usize(len + 1);
             let c = CHOICES[rng.next_usize(CHOICES.len())];
             chars.insert(pos, c);
         } else {
             let pos = rng.next_usize(len);
-            let max_del = (len - pos).min(4).max(1);
+            let max_del = (len - pos).clamp(1, 4);
             let del_len = 1 + rng.next_usize(max_del);
             let end = (pos + del_len).min(len);
             chars.drain(pos..end);
@@ -2456,8 +2634,11 @@ mod tests {
     /// wrong (stale-offset) captures. Restored before committing.
     #[test]
     fn test_incremental_reparse_matches_full_reparse_fuzz() {
-        let seed =
-            "fn main() {\n    let x = 1;\n    if x > 0 {\n        println!(\"{}\", x);\n    }\n}\n";
+        // The seed carries the UTF-8-colliding characters from the start
+        // (#1721 review round 2) so `colliding_partner` substitutions can
+        // fire in the first few steps rather than waiting for a random
+        // insert to introduce one.
+        let seed = "fn main() {\n    let x = 1;\n    let s = \"字存җ\";\n    if x > 0 {\n        println!(\"{}\", x);\n    }\n}\n";
         let mut chars: Vec<char> = seed.chars().collect();
         let mut incremental = Syntax::new_for_language(SyntaxLanguage::Rust);
         incremental.reparse_incremental(&chars.iter().collect::<String>());
@@ -2488,6 +2669,47 @@ mod tests {
             assert_eq!(
                 got, want,
                 "step {step}: incremental highlights diverged from a fresh full parse\ntext:\n{text:?}"
+            );
+        }
+    }
+
+    /// #1721 review round 2, deterministic companion to the fuzz oracle:
+    /// substituting a character for one of a *different byte length* that
+    /// shares its *trailing* UTF-8 byte ('җ' = `D2 97` vs '字' =
+    /// `E5 AD 97`) must still produce highlights identical to a fresh full
+    /// parse, in both directions.
+    ///
+    /// RED-verified against the first fix (which walked `old_end_byte`
+    /// inwards to a boundary and transferred the same delta to
+    /// `new_end_byte`): the `字` → `җ` direction collapsed to a zero-width
+    /// no-op `InputEdit`, so `old_tree.edit()` told tree-sitter nothing
+    /// changed and it reused the stale subtree over different text — this
+    /// assertion caught that divergence. The opposite direction panicked
+    /// outright in `update_max_col_incremental` (covered by
+    /// `buffer_manager.rs`'s companion test).
+    #[test]
+    fn test_incremental_reparse_shared_suffix_byte_substitution_matches_full() {
+        for (first, second) in [
+            ("let a = \"җ\";\n", "let a = \"字\";\n"),
+            ("let a = \"字\";\n", "let a = \"җ\";\n"),
+            // Also at the very end of the text, with nothing following to
+            // force the suffix scan to stop on a safe ASCII byte.
+            ("let a = 1; // җ", "let a = 1; // 字"),
+            ("let a = 1; // 字", "let a = 1; // җ"),
+        ] {
+            let mut incremental = Syntax::new_for_language(SyntaxLanguage::Rust);
+            incremental.reparse_incremental(first);
+            incremental.reparse_incremental(second);
+            let mut got = incremental.extract_highlights(second);
+            got.sort();
+
+            let mut fresh = Syntax::new_for_language(SyntaxLanguage::Rust);
+            let mut want = fresh.parse(second);
+            want.sort();
+
+            assert_eq!(
+                got, want,
+                "{first:?} -> {second:?}: incremental highlights diverged from a full parse"
             );
         }
     }
