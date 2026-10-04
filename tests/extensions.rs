@@ -842,56 +842,90 @@ fn ext_install_unknown_extension_shows_error() {
 }
 
 // ── Terminal-based install ─────────────────────────────────────────────────────
+//
+// #1703 / #1712: these two tests used to drive the `ruby` fixture on the
+// strength of "`ruby-lsp` is unlikely to be on PATH in CI", which made them
+// pass or fail according to what the host machine happened to have installed.
+// *Both* issues hit it independently — #1712 on a macOS box with
+// `brew install ruby-lsp`, #1703 in its own Test stage — which is how two
+// separate fixes for one flake came to be written in parallel. There are
+// *two* independent host dependencies, and the fixtures below remove both:
+//
+//  1. `ext_install_from_registry` only emits a terminal install command when
+//     the manifest's LSP binary cannot be resolved — and resolution
+//     (`lsp_manager::resolve_command`) spans far more than `PATH`: the
+//     vimcode-managed tools dir (#1345), Mason's `bin`, `~/.dotnet/tools`,
+//     `~/.cargo/bin`, `~/.local/bin`, `~/go/bin`, `~/.npm-global/bin` and
+//     the Homebrew prefixes (#917/#1344). Any one of those holding a
+//     `ruby-lsp` turned the assertion below into "got: None". This is the
+//     dependency #1712 diagnosed, and no amount of env scrubbing hides it.
+//  2. `ext_available_manifests()` merges
+//     `~/.config/vimcode/extensions/*/manifest.toml` *over* the registry, so
+//     a developer who has really installed `ruby` gets the published
+//     manifest instead of the fixture — and that one may acquire its LSP
+//     natively (#1345), which deliberately sets no terminal command at all.
+//
+// (2) is also why #1712's narrower fix — reach into `e.ext_registry` and
+// rename the `ruby` entry's `lsp.binary` to a sentinel — could not be the
+// whole answer, and why the two fixes were reconciled in favour of this one
+// rather than merged side by side: the install path resolves its manifest
+// through `ext_available_manifests()`, not through `ext_registry` directly,
+// so a local `ruby` manifest directory shadows the mutation and the test
+// goes red again on exactly the kind of box that reported the flake. A
+// synthetic registry entry closes both holes at once, and `..Default()` on
+// `LspConfig` below carries #1712's `fallback_binaries.clear()` for free —
+// an empty fallback list is the default, so there is no second binary for
+// the resolver to find either.
+//
+// `UNRESOLVABLE_LSP_BINARY` / `TERMINAL_INSTALL_EXT` are names that cannot
+// exist in any probed tool directory or extension directory on any host, so
+// the "LSP binary missing → terminal install" branch is the only branch these
+// tests can take. Note `LspConfig::install` (not `install_linux`) — it is the
+// fallback for every platform, so this stays host-OS-neutral.
 
-/// An LSP binary name no machine can possibly have installed.
-///
-/// The two install tests below need the engine to take the "LSP binary not
-/// found → fall back to the terminal install command" branch. That branch is
-/// chosen by `binary_on_path`, which resolves through
-/// `lsp_manager::resolve_command` — and that probes the Homebrew prefixes,
-/// `~/.local/bin`, `~/.cargo/bin`, `~/go/bin`, … in *addition* to `$PATH`
-/// (#1344), so no amount of env scrubbing can hide a genuinely installed
-/// tool from it. Betting on the fixture's real binary (`ruby-lsp`) being
-/// absent therefore made these tests depend on the machine running the
-/// suite: they went red on a macOS box that happened to have
-/// `brew install ruby-lsp`, for reasons entirely unrelated to the change
-/// under test. Renaming the fixture's LSP binary to this sentinel makes the
-/// branch deterministic; the install command string still mentions
-/// `ruby-lsp`, which is what the assertions actually care about.
-const ABSENT_LSP_BINARY: &str = "vimcode-test-absent-lsp-binary";
+/// An LSP binary name no machine can resolve. See the block comment above.
+const UNRESOLVABLE_LSP_BINARY: &str = "vimcode-test-1703-unresolvable-lsp";
 
-/// Point `ext`'s LSP binary at [`ABSENT_LSP_BINARY`] so an install of it
-/// always falls through to the terminal install command.
-fn force_lsp_binary_absent(e: &mut vimcode_core::Engine, ext: &str) {
-    let registry = e
-        .ext_registry
-        .as_mut()
-        .expect("engine_with_registry should have seeded a registry");
-    let manifest = registry
-        .iter_mut()
-        .find(|m| m.name == ext)
-        .unwrap_or_else(|| panic!("fixture registry should contain '{ext}'"));
-    manifest.lsp.binary = ABSENT_LSP_BINARY.to_string();
-    manifest.lsp.fallback_binaries.clear();
+/// An extension name no on-disk local manifest can shadow. See above.
+const TERMINAL_INSTALL_EXT: &str = "vimcode-test-1703-terminal-install";
+
+/// Engine whose registry holds exactly one extension whose only install
+/// route is a terminal command: an unresolvable LSP binary, a plain
+/// `install` string, no `[lsp.acquire]`, no DAP, no scripts.
+fn engine_with_terminal_install_ext() -> vimcode_core::Engine {
+    use vimcode_core::core::extensions::*;
+    let mut e = engine_with("");
+    e.ext_registry = Some(vec![ExtensionManifest {
+        name: TERMINAL_INSTALL_EXT.to_string(),
+        display_name: "Terminal-install Fixture (#1703)".to_string(),
+        file_extensions: vec![".vimcode1703".to_string()],
+        language_ids: vec!["vimcode1703".to_string()],
+        lsp: LspConfig {
+            binary: UNRESOLVABLE_LSP_BINARY.to_string(),
+            install: format!("gem install {UNRESOLVABLE_LSP_BINARY}"),
+            ..Default::default()
+        },
+        ..Default::default()
+    }]);
+    e
 }
 
 #[test]
 fn ext_install_sets_pending_terminal_command_for_lsp() {
-    let mut e = engine_with_registry("");
-    // Ruby has an LSP install command ("gem install ruby-lsp"); its LSP
-    // binary is renamed to a sentinel so "not installed yet" holds on every
-    // machine (see `force_lsp_binary_absent`).
-    force_lsp_binary_absent(&mut e, "ruby");
-    let action = exec(&mut e, "ExtInstall ruby");
+    let mut e = engine_with_terminal_install_ext();
+    let action = exec(&mut e, &format!("ExtInstall {TERMINAL_INSTALL_EXT}"));
     assert!(
-        e.extension_state.is_installed("ruby"),
-        "ruby should be marked installed"
+        e.extension_state.is_installed(TERMINAL_INSTALL_EXT),
+        "{TERMINAL_INSTALL_EXT} should be marked installed"
     );
     // The action should be RunInTerminal (carries the install command).
+    let cmd = match &action {
+        vimcode_core::EngineAction::RunInTerminal(cmd) => cmd.clone(),
+        other => panic!("should return RunInTerminal action, got: {other:?}"),
+    };
     assert!(
-        matches!(action, vimcode_core::EngineAction::RunInTerminal(_)),
-        "should return RunInTerminal action, got: {:?}",
-        action
+        cmd.contains(UNRESOLVABLE_LSP_BINARY),
+        "terminal command should carry the install string: {cmd}"
     );
     // Clean up
     e.extension_state.installed.clear();
@@ -921,26 +955,19 @@ fn ext_install_no_terminal_command_when_binary_exists() {
 
 #[test]
 fn ext_install_sets_install_context_for_lsp() {
-    let mut e = engine_with_registry("");
-    // Use the ruby extension, with its LSP binary renamed to a sentinel that
-    // can never resolve (see `force_lsp_binary_absent`) so the terminal
-    // install branch is taken regardless of what's installed on this machine.
-    force_lsp_binary_absent(&mut e, "ruby");
-    exec(&mut e, "ExtInstall ruby");
-    // pending_install_context should have been set (consumed by terminal_run_command)
-    // but since we took the terminal command via the action, it's already consumed.
-    // Let's verify via the sidebar path instead.
-    e.extension_state.installed.clear();
-
-    // Test via sidebar: install via 'i' key
+    // The `:ExtInstall` path hands the command back as an `EngineAction`, which
+    // consumes `pending_terminal_command`; the sidebar path cannot return an
+    // action, so it has to leave the command *on the engine* for the backend to
+    // pick up. That is what this test covers — drive the sidebar's `i` key.
+    let mut e = engine_with_terminal_install_ext();
     e.ext_sidebar_has_focus = true;
     e.ext_sidebar_sections_expanded = [true, true];
     let available = e.ext_available_items();
-    let ruby_idx = available
+    let ext_idx = available
         .iter()
-        .position(|m| m.name == "ruby")
-        .expect("ruby should be in available");
-    ext_sidebar_setup(&mut e, 1, ruby_idx);
+        .position(|m| m.name == TERMINAL_INSTALL_EXT)
+        .unwrap_or_else(|| panic!("{TERMINAL_INSTALL_EXT} should be in available"));
+    ext_sidebar_setup(&mut e, 1, ext_idx);
     e.dispatch_ext_sidebar_key_unified("i", None);
 
     // pending_terminal_command should be set (sidebar can't return EngineAction)
@@ -950,8 +977,8 @@ fn ext_install_sets_install_context_for_lsp() {
     );
     let cmd = e.pending_terminal_command.as_ref().unwrap();
     assert!(
-        cmd.contains("ruby-lsp"),
-        "command should mention ruby-lsp: {cmd}"
+        cmd.contains(UNRESOLVABLE_LSP_BINARY),
+        "command should mention {UNRESOLVABLE_LSP_BINARY}: {cmd}"
     );
     // Clean up
     e.extension_state.installed.clear();
