@@ -368,7 +368,15 @@ win = ["quadraui/win"]
 # temporarily adding `"strict-descriptors"` to this dependency's `features`
 # (not committed — quadraui#1251 removes the feature once every consumer
 # has migrated) and confirming `cargo check --all-targets` stays clean.
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "ca7fcc83afad01ec3422f79366566f3a263b22bf", features = ["tui", "terminal"] }
+# #1732 bumps to `1a87c4e` (quadraui `develop` HEAD; no `v0.1.0` tag exists
+# yet, so this is the closest available target) to pick up 39 commits
+# including the Win-GUI caption/drag/theme/quit fixes #1675/#1661/#1667 are
+# waiting on (quadraui#1259, #1260, #1261, #1278) and the Windows-TUI ConPTY
+# blink fix (quadraui#1284), plus the v0.1.0 breaking batch (`817b800`,
+# non_exhaustive descriptors + removed deprecated items), `Backend::
+# measure_text` (quadraui#1132) and the Style-tokens/unit-contract work
+# (quadraui#1133/#1098).
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "1a87c4eb69361c283d239501077c0604bf25083b", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
