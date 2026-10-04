@@ -1,5 +1,19 @@
 use super::*;
 
+// #1730: this file deliberately has — and must never grow — a
+// `cfg(target_os = "macos")` or "is this a Mac terminal" branch. Every
+// binding below is stated purely in terms of `ctrl`/`shift`/the `Alt_*` key
+// names the shared decoder (`render::engine_key_from_ui`) hands it, which is
+// correct for macOS's terminal build too: Cmd is a GUI-only modifier that
+// never reaches a terminal application on any OS, so a macOS TUI's reachable
+// chord alphabet is identical to Linux's. The only surface that will ever
+// need a real Cmd-vs-Ctrl remap is a future macOS *GUI* backend
+// (`src/macos/`, a thin shell with no key-decoding of its own today) — see
+// `tests/vscode_keybinding_parity.rs`'s module doc and `REACHABILITY_TABLE`
+// for the full reasoning and the specific VS Code Mac defaults (Option for
+// word-nav, Cmd for line/doc-nav, Cmd+Option+F for Find & Replace, …) that
+// are *not* a plain substitution of this file's Ctrl chords.
+
 impl Engine {
     /// True when the editor is configured in VSCode editing mode.
     pub fn is_vscode_mode(&self) -> bool {
