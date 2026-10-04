@@ -48,9 +48,14 @@ static ADAPTER_REGISTRY: &[AdapterInfo] = &[
     AdapterInfo {
         name: "delve",
         binary: "dlv",
-        args: &["dap"],
+        // `dlv dap` does NOT speak DAP over stdio — it always starts a TCP
+        // server and prints "DAP server listening at: host:port" to stdout
+        // (verified #1716). We pick the port ourselves (like codelldb) and
+        // pass it via `--listen host:0`; `spawn_tcp` substitutes the real
+        // port before connecting, so we never have to parse adapter stdout.
+        args: &["dap", "--listen", "127.0.0.1:0"],
         languages: &["go"],
-        use_tcp: false,
+        use_tcp: true,
     },
     AdapterInfo {
         name: "js-debug",
@@ -1175,6 +1180,82 @@ mod tests {
             !info.args.contains(&"--listen"),
             "debugpy must not use --listen (TCP mode): {:?}",
             info.args
+        );
+    }
+
+    #[test]
+    fn test_delve_uses_tcp_not_stdio() {
+        // #1716: `dlv dap` always starts a TCP server (it prints "DAP server
+        // listening at: host:port" to stdout) — it never speaks DAP over
+        // stdin/stdout. The registry entry must say so, or `start_adapter`
+        // wires up the wrong transport and debugging silently never starts.
+        let info = DapManager::adapter_by_name("delve").expect("delve registered");
+        assert!(info.use_tcp, "delve must use TCP (use_tcp=true)");
+        assert!(
+            info.args.contains(&"--listen"),
+            "delve args must pass --listen: {:?}",
+            info.args
+        );
+    }
+
+    #[test]
+    fn test_delve_adapter_end_to_end_initialize() {
+        // #1716 black-box regression: launch the real `dlv` binary through
+        // `DapManager::start_adapter` exactly as the engine would for a Go
+        // debug session, and confirm we get a DAP `initialize` response back
+        // over the wire. Before the fix this test hangs/times out forever
+        // because `dlv dap` never answers on stdio (confirmed manually: the
+        // adapter only listens on a TCP socket). Gated on `dlv` being
+        // resolvable so it's a no-op (not a failure) on machines without Go
+        // tooling installed.
+        if resolve_binary("dlv").is_none() {
+            eprintln!("skipping test_delve_adapter_end_to_end_initialize: dlv not found");
+            return;
+        }
+
+        let mut manager = DapManager::new();
+        manager
+            .start_adapter("go", &[])
+            .expect("delve adapter should start");
+
+        let seq = manager
+            .server
+            .as_mut()
+            .expect("server should be running")
+            .initialize("go");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut got_response = false;
+        while std::time::Instant::now() < deadline {
+            let events = manager
+                .server
+                .as_mut()
+                .expect("server should still be running")
+                .poll();
+            for ev in events {
+                if let super::super::dap::DapEvent::RequestComplete {
+                    seq: resp_seq,
+                    command,
+                    success,
+                    ..
+                } = ev
+                {
+                    if resp_seq == seq && command == "initialize" {
+                        assert!(success, "initialize request should succeed");
+                        got_response = true;
+                    }
+                }
+            }
+            if got_response {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        manager.stop();
+        assert!(
+            got_response,
+            "never received an initialize response from delve over TCP"
         );
     }
 
