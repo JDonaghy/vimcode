@@ -83,6 +83,34 @@ steps:
     id: idle-truly-silent
     seconds: 3
 
+  # vimcode#1702 and #1737 each independently caught a one-off real-pty
+  # failure of the 3s check above: a repeating paired SGR-reset +
+  # hide-cursor burst (`\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?25l`), roughly
+  # every ~2s, persisting "10+ seconds straight" in both reports — but
+  # neither could reproduce it again across 8-9 follow-up fresh-HOME
+  # attempts, and a direct code audit both times (`render::
+  # run_shared_tick_chores` and every 2s periodic chore `Engine::poll_idle`
+  # runs) found every one of them already gates its redraw on an actual
+  # before/after difference, matching the #1650 fix neither has regressed
+  # from since. This step cannot force the intermittent failure to
+  # reproduce any more reliably than the two bugbash runs that found it
+  # did, but it widens this control's own window well past the 3s original
+  # (and past the sidebar-open `idle_stability_1650`/#1702 Tier-1 test's
+  # 12s) to the "10-15s" duration #1737's own reproduction steps describe,
+  # so a *persistent* (not one-off) recurrence has a real chance of being
+  # caught here before the next bugbash run finds it on real hardware
+  # again. See `tui_main::app_on_tui_tests::idle_stability_1737` for the
+  # in-process (Tier-1) sibling of this step, including the one concrete,
+  # 100%-reproducible-in-this-PR finding its own investigation turned up:
+  # a single, legitimate extra repaint shortly after first paint from
+  # `Engine::poll_ext_registry` settling the startup extension-registry
+  # fetch — consistent with #1737's own evidence capture's first (lone,
+  # unpaired) logged write, but not with the recurring pairs reported
+  # afterward.
+  - type: expect_silent
+    id: idle-truly-silent-extended-1737
+    seconds: 13
+
   # ─────────────────────────────────────────────────────────────────────
   # vimcode#1731 -- priority-1 vim-mode catalogue journeys (tests/smoke-spec/
   # catalogue.yaml), real-pty-verified (3 consecutive clean `coord`

@@ -7379,6 +7379,109 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // #1737 — idle stability with no sidebar, zero interaction (the literal
+    // bugbash repro, not the #1650/#1702 sidebar-open scenario)
+    // ─────────────────────────────────────────────────────────────────────────
+    /// #1737: a second real-pty bugbash run reported the *exact* #1650/#1702
+    /// byte pattern (paired SGR-reset + hide-cursor bursts roughly every 2s,
+    /// persisting "at least 10 more seconds") — this time caught by
+    /// `tests/smoke-spec/tui.yaml`'s `idle-truly-silent` *control* step,
+    /// which runs with the Explorer/Git sidebar **closed** (the default
+    /// startup state) before any panel click ever happens. That is a
+    /// scenario [`idle_stability_1650`] does not cover (it opens the
+    /// sidebar specifically to exercise #1650's 2s source-control
+    /// auto-refresh), and [`idle_stability_1583`] only observes for ~2.4s
+    /// (8 ticks * 300ms) — far short of the "10+ seconds straight" both
+    /// #1702's and #1737's bugbash reports describe.
+    ///
+    /// Direct investigation for this PR: built this branch's real `vcd`
+    /// binary and drove it under a real OS pty (`pty.fork()`/`os.openpty`,
+    /// not the coord harness) for 8 consecutive 16-second idle
+    /// observations, zero input, default settings, no sidebar. All 8 were
+    /// silent after startup settled, except for exactly one spurious
+    /// repaint ~250ms after the first frame in every run — traced (temporary
+    /// `std::env::var_os`-gated instrumentation in `Engine::poll_idle` and
+    /// `render::run_shared_tick_chores`, removed before this commit) to
+    /// `Engine::poll_ext_registry` consuming the startup extension-registry
+    /// fetch's result on the first `poll_idle` tick after the first paint.
+    /// That is a real, single state change (the registry genuinely arrived)
+    /// correctly producing exactly one redraw — not a bug — but it does
+    /// explain the *shape* of #1737's own evidence capture: its first
+    /// logged write (`t=4.496s`, alone, no partner) is a lone burst,
+    /// consistent with this mechanism. The *recurring* pairs reported
+    /// afterward were never reproduced in any of those 8 runs, matching
+    /// #1702's own "9+ follow-up attempts ... failed to reproduce"
+    /// conclusion for the sidebar-open sibling.
+    ///
+    /// No production code change (same verdict #1702 reached for the
+    /// sidebar-open case): every 2-second periodic chore
+    /// `render::run_shared_tick_chores`/`Engine::poll_idle` runs
+    /// (`check_file_changes`, `tick_git_branch`, the source-control
+    /// auto-refresh gate) gates its redraw on an actual before/after
+    /// difference, confirmed by direct re-read for this PR. This test
+    /// widens coverage of the *no-sidebar* idle scenario #1737's own
+    /// reproduction steps describe to the same ~12s/40-tick duration #1702
+    /// already applied to the sidebar-open sibling
+    /// ([`idle_stability_1650`]), so a future regression in either scenario
+    /// has a comparable chance of being caught here before it ever reaches
+    /// a real-pty bugbash again.
+    mod idle_stability_1737 {
+        use super::*;
+        use quadraui::Reaction;
+
+        #[test]
+        fn idle_ticks_with_no_sidebar_and_zero_interaction_do_not_repaint() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+            engine.settings.lsp_enabled = false;
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            // Settle past the startup paint (and the one legitimate
+            // extension-registry-fetch redraw documented above) before
+            // asserting stability — same contract every sibling in this
+            // family uses.
+            for _ in 0..3 {
+                driver.tick();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let screen0 = driver.screen();
+            assert!(
+                screen0.contains("alpha"),
+                "precondition: the buffer text must actually be painted; screen:\n{screen0}"
+            );
+
+            // #1702/#1737 both report the recurring pattern persisting "10+
+            // seconds straight" — 40 ticks * 300ms ≈ 12s, matching
+            // idle_stability_1650's own widened window, covers six full 2s
+            // cycles of every periodic chore in `Engine::poll_idle`.
+            let mut failures: Vec<String> = Vec::new();
+            for n in 0..40 {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let reaction = driver.tick();
+                let screen_n = driver.screen();
+                if reaction != Reaction::Continue {
+                    failures.push(format!(
+                        "tick {n}: an idle tick with no sidebar and zero \
+                         interaction must not force a repaint (#1737) — \
+                         got {reaction:?}"
+                    ));
+                }
+                if screen_n != screen0 {
+                    failures.push(format!(
+                        "tick {n}: rendered text must not change with no input"
+                    ));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "idle-stability violated:\n{}",
+                failures.join("\n")
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // #1722 — a `MouseMoved` that changes no hover target must not repaint
     // ─────────────────────────────────────────────────────────────────────────
     /// #1722's second acceptance bullet: "a `MouseMoved` that doesn't change
