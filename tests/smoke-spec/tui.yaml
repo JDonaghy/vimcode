@@ -167,9 +167,26 @@ steps:
   # `expect_menu_latency`); `expect_within`'s own `ms` budget stands in as
   # the latency bound here — a menu that needs the full budget to appear is
   # exactly as much a regression as one that never appears at all.
+  #
+  # `row: 1` (not `row: 3`, this step's original coordinate) — vimcode#1703:
+  # a bugbash run's `cwd` held plain files but no subfolder, and `row: 3`
+  # landed on one of those files, whose context menu correctly omits
+  # "New File..."/"New Folder..." (folder-only actions). That was this
+  # spec's own `cwd`-layout coupling, not an app defect: the tree's row 0
+  # (`row: 1` on this grid, directly below the title/tab-bar row) is always
+  # the Explorer's *root* entry — `build_explorer_rows`
+  # (`src/core/engine/explorer_ops.rs`) pushes it unconditionally with
+  # `is_dir: true`, before listing any children — so it is a directory
+  # regardless of what the launch `cwd` happens to contain, with no
+  # dependence on a specific fixture layout the way any child row is.
+  # Confirmed by `src/tui_main/app_on_tui_tests.rs`'s
+  # `right_click_row_3_on_a_folderless_cwd_hits_a_file_not_a_folder_1703`
+  # (same `cols: 100` x `rows: 30` grid, same literal row/col click): `row:
+  # 3` on a folderless `cwd` hits a file row (no "New File..."), `row: 1`
+  # always hits the root folder row (always "New File...").
   - type: click
     id: right-click-explorer-row
-    row: 3
+    row: 1
     col: 10
     button: right
   - type: expect_within
