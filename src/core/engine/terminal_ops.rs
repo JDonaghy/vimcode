@@ -1563,15 +1563,28 @@ pub(crate) fn install_script_path(install_key: &str, is_powershell: bool) -> Pat
 /// `sh '<path>'` for POSIX; `& '<path>'` for PowerShell — both quoted via
 /// [`quote_shell_arg`] since a temp-dir path can itself contain spaces or
 /// other shell metacharacters on some systems.
+///
+/// **Ends with its own `; exit` / `; Exit`**, and must keep doing so: the
+/// wrapper's trailing `exit` (step 5 of [`build_terminal_install_wrapper`])
+/// was written to exit the *pane's interactive shell*, which is what makes
+/// `TerminalSession::is_exited()` fire so `poll_terminal` removes the
+/// pane's `TerminalSlot` once the user presses Enter at "Press Enter to
+/// close…". Now that the wrapper runs as a child `sh`/`&` invocation rather
+/// than being typed into that shell directly, its `exit` only ends the
+/// child — so the launcher line has to carry the interactive shell's own
+/// exit itself, or the pane would return to its PS1 prompt and stay open
+/// (and unremovable) forever. The install's *result* no longer depends on
+/// this (#1396 finalizes off the exit-code scratch file), only the pane's
+/// lifecycle does.
 pub(crate) fn build_terminal_install_launch_line(
     script_path: &Path,
     is_powershell: bool,
 ) -> String {
     let quoted = quote_shell_arg(&script_path.display().to_string(), is_powershell);
     if is_powershell {
-        format!("& {quoted}\n")
+        format!("& {quoted}; Exit\n")
     } else {
-        format!("sh {quoted}\n")
+        format!("sh {quoted}; exit\n")
     }
 }
 
@@ -2104,6 +2117,38 @@ mod tests {
         assert!(
             script.contains("Read-Host; Exit\n"),
             "PowerShell wrapper must end with `Read-Host; Exit\\n` so the shell exits; got:\n{script}"
+        );
+    }
+
+    /// #1712 kept the two tests above honest: the wrapper's own trailing
+    /// `exit` now runs in a *child* `sh`/`&` invocation, so it no longer
+    /// ends the pane's interactive shell — the launcher line typed into
+    /// that shell has to carry the exit itself, or `TerminalSession::
+    /// is_exited()` never fires and `poll_terminal` never removes the
+    /// pane's `TerminalSlot` (the pane just returns to its PS1 prompt and
+    /// can't be closed). Dropping the `; exit` / `; Exit` suffix from
+    /// `build_terminal_install_launch_line` makes this test fail while
+    /// `posix_wrapper_ends_with_exit` above keeps passing, which is exactly
+    /// the gap it covers.
+    #[test]
+    fn install_launch_line_exits_the_pane_shell_after_the_script_returns() {
+        let posix = build_terminal_install_launch_line(
+            &PathBuf::from("/tmp/vimcode-install-test.sh"),
+            false,
+        );
+        assert_eq!(
+            posix, "sh '/tmp/vimcode-install-test.sh'; exit\n",
+            "POSIX launcher must run the script and then exit the pane's \
+             own interactive shell"
+        );
+        let ps = build_terminal_install_launch_line(
+            &PathBuf::from("C:\\Temp\\vimcode-install-test.ps1"),
+            true,
+        );
+        assert_eq!(
+            ps, "& \"C:\\Temp\\vimcode-install-test.ps1\"; Exit\n",
+            "PowerShell launcher must run the script and then exit the \
+             pane's own shell"
         );
     }
 
