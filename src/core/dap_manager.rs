@@ -792,6 +792,18 @@ impl DapManager {
     /// then falls back to the built-in `ADAPTER_REGISTRY`.
     /// `name_or_lang` may be an adapter name (e.g. `"codelldb"`) or a language
     /// identifier (e.g. `"rust"`).
+    ///
+    /// #1716 cross-repo note: the manifest branch below takes priority over
+    /// `ADAPTER_REGISTRY` whenever `ext_manifests` has a non-empty-binary
+    /// entry for this language — and callers pass `ext_available_manifests()`
+    /// (every manifest in the cached registry), not just installed ones. So
+    /// fixing `ADAPTER_REGISTRY`'s `delve` entry here only helps users whose
+    /// cached registry has no `go` entry at all. As of this writing,
+    /// `vimcode-ext`'s live `registry.json` still ships `go.dap.transport =
+    /// "stdio"` / `args = ["dap"]` for delve, which is the same bug this
+    /// module's registry just fixed — so most real users still hit it via
+    /// the manifest branch until that registry is updated to match (tracked
+    /// as a cross-repo follow-up on #1716).
     pub fn start_adapter(
         &mut self,
         name_or_lang: &str,
