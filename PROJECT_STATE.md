@@ -1,5 +1,57 @@
 # VimCode Project State
 
+**Last updated:** October 3, 2026 (#1719, partial — detect extension
+prerequisites before install, for LSP and DAP). Fixes the half of #1719
+that lives in this repo without touching the registry (vimcode-ext):
+
+- `src/core/engine/lsp_ops.rs`'s `ext_install_from_registry_with_runtime_
+  check` now checks `manifest.lsp.dependencies` **before** dispatching the
+  legacy terminal-install command (previously only checked at LSP
+  server-start time, well after the install pane had already failed with
+  a bare `command not found: npm`), and likewise for the new
+  `manifest.dap.dependencies` (`DapConfig`, `src/core/extensions.rs` — did
+  not exist before this issue) before the DAP leg's install.
+- `src/core/dap_manager.rs`'s new `adapter_dependencies(adapter, platform)`
+  declares the built-in codelldb/debugpy/delve/netcoredbg installers' own
+  prerequisites (curl+unzip, python3, go, curl+tar respectively — fewer on
+  Windows, which uses PowerShell's built-in `Expand-Archive` instead of
+  `unzip`/`tar`) — these ship inside vimcode itself, so nothing in the
+  registry could ever have declared them. Checked only when the manifest
+  doesn't override the install command itself (a manifest-declared
+  `dap.dependencies` always wins over the built-in guess).
+- `PREREQ_INSTALLS` (`src/core/extensions.rs`) gained `brew` (the Homebrew
+  installer one-liner — several registry manifests' `install_macos` shells
+  to `brew install …` with nothing declaring Homebrew itself), `java`
+  (JDK), `curl`, `unzip`, `tar`. `go`'s Linux hint changed from `sudo apt
+  install golang-go` (Ubuntu 24.04 ships 1.22, too old for `gopls@latest`,
+  and pins `GOTOOLCHAIN=local`) to `sudo snap install go --classic`.
+- New headless CLI entry point: `vimcode --ext-install <name> [--json]`
+  (`src/main.rs`) — runs the same prerequisite check with no GUI/TUI
+  backend, reports a JSON or plain-text verdict, exits non-zero and
+  dispatches **no** install when a prerequisite is missing. Exists so an
+  external driver (vimcode-ext#17's CI matrix) can exercise vimcode's real
+  detect/instruct logic instead of re-implementing it.
+- Tests: `every_prereq_install_entry_is_runnable_on_every_platform` +
+  `prereq_install_cmd_covers_the_1719_additions` (`extensions.rs`),
+  `adapter_dependencies_*` (`dap_manager.rs`), five new engine-level tests
+  in `lsp_ops.rs` (`lsp_legacy_install_blocked_when_declared_dependency_
+  missing` and four DAP siblings), `ext_install_flag_and_value_parse_and_
+  json_is_recognised` + `ext_install_value_is_not_mistaken_for_the_file_
+  path` (`main.rs`), and the black-box `tests/ext_install_cli.rs` (spawns
+  the real compiled binary with a throwaway `$HOME`/local extension
+  manifest and a `PATH` that can't resolve `npm`). All RED-verified against
+  the pre-fix code.
+
+**Not done (see `docs/PENDING_VIMCODE_ISSUES.md`'s "#1719 remainder"
+entry for the full writeup):** no minimum-version checking (a *present but
+too old* `go`/etc. still passes detection); the headless entry point
+checks prerequisites and runs the install but does not yet speak LSP/DAP
+`initialize` to confirm "working" (contract item 3) — left to
+vimcode-ext#17's own matrix, which has the per-language client fixtures
+for it. The npm-global-prefix and dotnet/csharp-ls version-pin issues the
+GitHub issue also names are explicitly vimcode-ext's own fixes (#14/#15),
+not this repo's.
+
 **Last updated:** September 24, 2026 (#523, Track A Phase 0b — wire Board
 actions to provider-declared commands, on top of #521/#522's generic Board
 host and #524's document buffers). Makes the board actionable: right-click

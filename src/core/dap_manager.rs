@@ -178,6 +178,56 @@ pub fn resolve_binary(name: &str) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Built-in adapter install prerequisites (#1719)
+// ---------------------------------------------------------------------------
+
+/// System binaries the **built-in** install branch of `install_cmd_for_
+/// adapter` shells out to, for a given adapter and target platform.
+///
+/// These are independent of any extension manifest's `dap.dependencies`
+/// (new in #1719, for registry-declared adapters) — codelldb, debugpy,
+/// delve, and netcoredbg ship their installers *inside vimcode itself*
+/// (the `match adapter_name` arm below), so nothing in the registry ever
+/// gets a chance to declare their prerequisites. Before #1719 none of this
+/// was checked anywhere: a DAP install just failed inside the terminal pane
+/// with an opaque "command not found" for `go`/`python3`/`curl`/`unzip`.
+/// `Engine::ext_install_from_registry_with_runtime_check` calls this
+/// *before* building the install command, same treatment `LspConfig::
+/// dependencies` already got for LSP servers.
+pub fn adapter_dependencies(adapter_name: &str, platform: Platform) -> &'static [&'static str] {
+    match adapter_name {
+        // `codelldb_install_cmd_for` (Unix): `curl` downloads the VSIX,
+        // `unzip` unpacks it. `codelldb_install_cmd_windows`: `curl.exe`
+        // plus PowerShell's built-in `Expand-Archive` — no external unzip.
+        "codelldb" => {
+            if matches!(platform, Platform::Windows) {
+                &["curl"]
+            } else {
+                &["curl", "unzip"]
+            }
+        }
+        // `install_cmd_for_adapter`'s "debugpy" arm runs
+        // `{python3} -m venv ... && pip install debugpy` against whatever
+        // `find_python_binary()` resolved, falling back to the bare name
+        // `python3` when nothing resolved yet — so `python3` itself must
+        // be present for that fallback to have any chance of working.
+        "debugpy" => &["python3"],
+        // `go install github.com/go-delve/delve/cmd/dlv@latest`.
+        "delve" => &["go"],
+        // `netcoredbg_install_cmd_unix_for`: `curl` + `tar -xzf`.
+        // `netcoredbg_install_cmd_windows`: `curl.exe` + `Expand-Archive`.
+        "netcoredbg" => {
+            if matches!(platform, Platform::Windows) {
+                &["curl"]
+            } else {
+                &["curl", "tar"]
+            }
+        }
+        _ => &[],
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Install commands
 // ---------------------------------------------------------------------------
 
@@ -1039,6 +1089,59 @@ impl Default for DapManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #1719: built-in adapter install prerequisites ──────────────────
+
+    #[test]
+    fn adapter_dependencies_codelldb_needs_curl_and_unzip_on_unix() {
+        let deps = adapter_dependencies("codelldb", Platform::Linux);
+        assert_eq!(deps, &["curl", "unzip"]);
+        let deps = adapter_dependencies("codelldb", Platform::MacOS);
+        assert_eq!(deps, &["curl", "unzip"]);
+    }
+
+    #[test]
+    fn adapter_dependencies_codelldb_needs_only_curl_on_windows() {
+        // `Expand-Archive` is a built-in PowerShell cmdlet — no external
+        // `unzip` is ever invoked on Windows (`codelldb_install_cmd_windows`).
+        assert_eq!(
+            adapter_dependencies("codelldb", Platform::Windows),
+            &["curl"]
+        );
+    }
+
+    #[test]
+    fn adapter_dependencies_netcoredbg_needs_curl_and_tar_on_unix() {
+        let deps = adapter_dependencies("netcoredbg", Platform::Linux);
+        assert_eq!(deps, &["curl", "tar"]);
+    }
+
+    #[test]
+    fn adapter_dependencies_netcoredbg_needs_only_curl_on_windows() {
+        assert_eq!(
+            adapter_dependencies("netcoredbg", Platform::Windows),
+            &["curl"]
+        );
+    }
+
+    #[test]
+    fn adapter_dependencies_debugpy_needs_python3() {
+        assert_eq!(
+            adapter_dependencies("debugpy", Platform::Linux),
+            &["python3"]
+        );
+    }
+
+    #[test]
+    fn adapter_dependencies_delve_needs_go() {
+        assert_eq!(adapter_dependencies("delve", Platform::Linux), &["go"]);
+    }
+
+    #[test]
+    fn adapter_dependencies_unknown_adapter_has_none() {
+        assert!(adapter_dependencies("js-debug", Platform::Linux).is_empty());
+        assert!(adapter_dependencies("totally-unknown", Platform::Linux).is_empty());
+    }
 
     #[test]
     fn test_dap_adapter_registry_rust() {
