@@ -1163,6 +1163,15 @@ pub struct Settings {
     /// settings state (derived, rebuildable from `iskeyword` alone), so it's
     /// excluded from (de)serialization — the `Default impl` just sets it to
     /// an empty `RefCell`, rebuilt lazily on first use.
+    ///
+    /// `RefCell`, not e.g. an `AtomicUsize`-backed scheme, because
+    /// `Settings` is accessed from a single thread everywhere today — it's
+    /// never wrapped in `Arc`/`Mutex` and shared across threads elsewhere in
+    /// this codebase. `RefCell<T>` is `!Sync`, so the moment something
+    /// *does* start sharing a `Settings` across threads, this field is the
+    /// first thing that will fail to compile — a deliberate tripwire, not
+    /// an oversight, but recorded here so that failure reads as "this field
+    /// needs a thread-safe cache", not as a mystery.
     #[serde(skip)]
     iskeyword_cache: RefCell<Option<(String, IskeywordParsed)>>,
 }
