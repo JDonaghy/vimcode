@@ -8515,8 +8515,18 @@ pub fn route_gutter_hover(
 /// hover card itself" — dismissing while the pointer is on the card is what
 /// makes a hover card impossible to read.
 ///
-/// Returns `true` when the pointer was inside the sidebar body (so the caller
-/// can skip its editor-hover rungs).
+/// Returns `true` when this call actually changed something this function
+/// paints synchronously — today that's only `engine.sc_button_hovered` (the
+/// SC toolbar hover highlight), since every other mutation here
+/// (`panel_hover_mouse_move`/`dismiss_panel_hover`) only arms a dwell/dismiss
+/// *timer*; the popup itself (`engine.panel_hover`, what paint actually
+/// reads) only flips later, from the tick loop's own `poll_panel_hover`,
+/// which already reports its own redraw need independently. Do **not** read
+/// this as "pointer is inside the sidebar body" — #1722 review: it used to
+/// return `geometry.contains_x(x)` regardless of whether any hover state
+/// changed, so every `MouseMoved` whose X falls in the sidebar column (most
+/// of the left strip whenever the sidebar is open) forced a full repaint,
+/// even two consecutive moves to the same pixel.
 pub fn route_sidebar_hover(
     engine: &mut Engine,
     owner: &SidebarOwner,
@@ -8527,6 +8537,7 @@ pub fn route_sidebar_hover(
     mouse_on_popup: bool,
 ) -> bool {
     let inside = sidebar_visible && geometry.contains_x(x);
+    let sc_button_hovered_before = engine.sc_button_hovered;
     match owner {
         SidebarOwner::Git if inside => {
             // Route via the cached `SidebarPanelLayout` (#509) — no per-frame
@@ -8597,7 +8608,7 @@ pub fn route_sidebar_hover(
             }
         }
     }
-    inside
+    engine.sc_button_hovered != sc_button_hovered_before
 }
 
 // ─── Sidebar panel body dispatch (#754) ───────────────────────────────────────
