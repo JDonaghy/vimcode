@@ -443,7 +443,8 @@ mod tests {
         #[test]
         fn driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1053_activity_bar_all_targets_{:?}",
+                "vimcode_test_1053_activity_bar_all_targets_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -792,8 +793,11 @@ mod tests {
         /// just its header) must reach the screen via `App::render_content`.
         #[test]
         fn render_content_paints_explorer_sidebar_content_via_shell_app() {
-            let dir =
-                std::env::temp_dir().join(format!("vc1425expl_{:?}", std::thread::current().id()));
+            let dir = std::env::temp_dir().join(format!(
+                "vc1425expl_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("mk1425.txt"), b"").unwrap();
@@ -840,8 +844,11 @@ mod tests {
         /// `sidebar_sel_bg_inactive`'s own doc names.
         #[test]
         fn explorer_unfocused_selected_row_paints_sidebar_sel_bg_inactive_via_shell_app() {
-            let dir = std::env::temp_dir()
-                .join(format!("vc1574explinact_{:?}", std::thread::current().id()));
+            let dir = std::env::temp_dir().join(format!(
+                "vc1574explinact_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let marker = dir.join("zz1574.txt");
@@ -1025,8 +1032,11 @@ mod tests {
         /// below fails.
         #[test]
         fn render_content_shows_dotfiles_but_hides_git_by_default_via_shell_app() {
-            let dir =
-                std::env::temp_dir().join(format!("vc1545dot_{:?}", std::thread::current().id()));
+            let dir = std::env::temp_dir().join(format!(
+                "vc1545dot_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(".dotmk1545"), b"").unwrap();
@@ -1160,7 +1170,8 @@ mod tests {
         #[test]
         fn source_control_panel_paints_header() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1425_sc_panel_{:?}",
+                "vimcode_test_1425_sc_panel_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -1484,7 +1495,8 @@ mod tests {
         /// engine plus the temp dir so the test can remove it.
         fn engine_with_focused_explorer(tag: &str) -> (crate::core::Engine, std::path::PathBuf) {
             let dir = std::env::temp_dir().join(format!(
-                "vc1430focus_{tag}_{:?}",
+                "vc1430focus_{tag}_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -2013,7 +2025,8 @@ mod tests {
         /// instead).
         fn engine_with_two_file_tabs_and_switcher_open() -> crate::core::Engine {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1431_tab_switcher_{:?}",
+                "vimcode_test_1431_tab_switcher_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -2248,7 +2261,8 @@ mod tests {
         #[test]
         fn folder_picker_paints_and_filters_via_shell_app() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1431_folder_picker_{:?}",
+                "vimcode_test_1431_folder_picker_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -2317,8 +2331,11 @@ mod tests {
         /// first line.
         #[test]
         fn quick_open_hides_git_internals_but_shows_dotfiles_via_shell_app() {
-            let dir =
-                std::env::temp_dir().join(format!("vc1545qo_{:?}", std::thread::current().id()));
+            let dir = std::env::temp_dir().join(format!(
+                "vc1545qo_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join(".git")).unwrap();
             std::fs::write(dir.join(".git").join("HEAD1545"), b"ref: refs/heads/main\n").unwrap();
@@ -2430,7 +2447,8 @@ mod tests {
         #[test]
         fn two_tabs_paint_both_labels() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1425_two_tabs_{:?}",
+                "vimcode_test_1425_two_tabs_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -2500,7 +2518,8 @@ mod tests {
         #[test]
         fn stacked_groups_bottom_tab_row_shows_its_label_1586() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1586_stacked_tabs_{:?}",
+                "vimcode_test_1586_stacked_tabs_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -2655,7 +2674,8 @@ mod tests {
         #[test]
         fn tui_tab_drag_past_a_neighbour_reorders_the_painted_tab_bar() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1431_tui_tab_drag_{:?}",
+                "vimcode_test_1431_tui_tab_drag_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -5177,7 +5197,8 @@ mod tests {
         fn exactly_full_wrapped_line_paints_no_trailing_blank_row() {
             let _settings_guard = crate::core::settings::TestSettingsPathGuard::install(
                 std::env::temp_dir().join(format!(
-                    "vimcode_test_1496_no_settings_{:?}.json",
+                    "vimcode_test_1496_no_settings_{}_{:?}.json",
+                    std::process::id(),
                     std::thread::current().id()
                 )),
             );
@@ -5261,7 +5282,8 @@ mod tests {
             // Point it at a path that doesn't exist instead.
             let _settings_guard = crate::core::settings::TestSettingsPathGuard::install(
                 std::env::temp_dir().join(format!(
-                    "vimcode_test_1496_no_settings_{:?}.json",
+                    "vimcode_test_1496_no_settings_{}_{:?}.json",
+                    std::process::id(),
                     std::thread::current().id()
                 )),
             );
@@ -6753,7 +6775,8 @@ mod tests {
         #[test]
         fn opening_utf16le_bom_file_shows_decoded_content_via_shell_app() {
             let path = std::env::temp_dir().join(format!(
-                "vimcode_test_1560_utf16le_{:?}.txt",
+                "vimcode_test_1560_utf16le_{}_{:?}.txt",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let mut bytes: Vec<u8> = vec![0xFF, 0xFE]; // UTF-16LE BOM
@@ -6784,7 +6807,8 @@ mod tests {
         #[test]
         fn opening_utf8_bom_file_shows_decoded_content_via_shell_app() {
             let path = std::env::temp_dir().join(format!(
-                "vimcode_test_1560_utf8bom_{:?}.txt",
+                "vimcode_test_1560_utf8bom_{}_{:?}.txt",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF]; // UTF-8 BOM
@@ -6884,7 +6908,8 @@ mod tests {
             let paint = crate::test_paint::PaintGuard::acquire();
             let cwd = crate::test_cwd::CwdReadGuard::acquire();
             let home = std::env::temp_dir().join(format!(
-                "vimcode_test_1583_home_{:?}",
+                "vimcode_test_1583_home_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&home);
@@ -6892,7 +6917,8 @@ mod tests {
             let home_guard = crate::core::paths::set_test_home(&home);
 
             let path = std::env::temp_dir().join(format!(
-                "vimcode_test_1583_{:?}.rs",
+                "vimcode_test_1583_{}_{:?}.rs",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let mut text = String::new();
@@ -8810,7 +8836,8 @@ mod tests {
         #[test]
         fn badge_mode_suppresses_auto_open_and_shows_edited_summary_via_shell_app() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1515_tui_badge_{:?}",
+                "vimcode_test_1515_tui_badge_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -8883,7 +8910,8 @@ mod tests {
         #[test]
         fn badge_mode_paints_gutter_markers_on_agent_changed_lines_via_shell_app() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1515_tui_gutter_{:?}",
+                "vimcode_test_1515_tui_gutter_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -8933,7 +8961,8 @@ mod tests {
         #[test]
         fn off_mode_paints_no_gutter_markers_via_shell_app() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1515_tui_off_gutter_{:?}",
+                "vimcode_test_1515_tui_off_gutter_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -9015,7 +9044,8 @@ mod tests {
         #[test]
         fn virtual_action_row_paints_in_the_normal_buffer_view_via_shell_app() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1517_tui_row_{:?}",
+                "vimcode_test_1517_tui_row_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -9060,7 +9090,8 @@ mod tests {
         #[test]
         fn leader_ar_reverts_the_hunk_under_the_cursor_via_shell_app() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1517_tui_ar_{:?}",
+                "vimcode_test_1517_tui_ar_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -9109,7 +9140,8 @@ mod tests {
         #[test]
         fn leader_ak_keeps_the_hunk_under_the_cursor_via_shell_app() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1517_tui_ak_{:?}",
+                "vimcode_test_1517_tui_ak_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -9158,7 +9190,8 @@ mod tests {
         #[test]
         fn editing_a_hunk_before_keep_labels_it_edited_and_keeps_the_edit_via_shell_app() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1517_tui_edit_{:?}",
+                "vimcode_test_1517_tui_edit_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -9250,7 +9283,8 @@ mod tests {
         #[test]
         fn jump_next_hunk_prefers_the_outstanding_review_hunk_over_raw_git_diff_via_shell_app() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1517_tui_git_precedence_{:?}",
+                "vimcode_test_1517_tui_git_precedence_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
@@ -9366,7 +9400,8 @@ mod tests {
         #[test]
         fn keep_one_hunk_reject_the_other_via_shell_app() {
             let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1516_tui_hunks_{:?}",
+                "vimcode_test_1516_tui_hunks_{}_{:?}",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);

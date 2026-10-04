@@ -937,7 +937,8 @@ mod tests {
     #[test]
     fn tab_drag_past_a_neighbour_reorders_the_painted_tab_bar() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_753_gtk_tab_drag_{:?}",
+            "vimcode_test_753_gtk_tab_drag_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1043,7 +1044,8 @@ mod tests {
     #[test]
     fn tab_drag_into_another_group_merges_and_collapses_the_source_on_gtk() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1370_gtk_merge_{:?}",
+            "vimcode_test_1370_gtk_merge_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1139,7 +1141,8 @@ mod tests {
     #[test]
     fn tab_drag_to_the_left_edge_splits_into_a_new_group_on_gtk() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1370_gtk_split_{:?}",
+            "vimcode_test_1370_gtk_split_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2600,7 +2603,8 @@ mod tests {
         tag: &str,
     ) -> (Engine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_992_gtk_explorer_{tag}_{:?}",
+            "vimcode_test_992_gtk_explorer_{tag}_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2705,7 +2709,8 @@ mod tests {
     #[test]
     fn explorer_tree_shows_dotfiles_but_hides_git_by_default_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1545_gtk_explorer_{:?}",
+            "vimcode_test_1545_gtk_explorer_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2767,7 +2772,8 @@ mod tests {
         crate::icons::set_nerd_fonts(true);
 
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1381_gtk_explorer_icon_color_{:?}",
+            "vimcode_test_1381_gtk_explorer_icon_color_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2854,7 +2860,8 @@ mod tests {
         kind: crate::core::git::StatusKind,
     ) -> (Engine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "vc1051_gtk_explorer_{tag}_{:?}",
+            "vc1051_gtk_explorer_{tag}_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5974,7 +5981,8 @@ mod sidebar_panel_clicks {
     #[test]
     fn clicking_explorer_collapse_all_collapses_nested_directories_but_keeps_the_root_open() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1693_collapse_all_{:?}",
+            "vimcode_test_1693_collapse_all_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -8317,7 +8325,8 @@ second line here
     #[test]
     fn change_review_close_restores_chrome_clicks_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_955_gtk_review_modal_pop_{:?}",
+            "vimcode_test_955_gtk_review_modal_pop_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -16905,7 +16914,8 @@ mod editor_band_order {
     #[test]
     fn live_tab_drag_composes_the_ghost_rung_inside_the_band_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_764_gtk_tab_drag_{:?}",
+            "vimcode_test_764_gtk_tab_drag_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -17474,7 +17484,8 @@ mod modal_rung {
     #[test]
     fn quick_open_hides_git_internals_but_shows_dotfiles_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1545_gtk_picker_{:?}",
+            "vimcode_test_1545_gtk_picker_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -20574,7 +20585,8 @@ mod conformance_proof_slice {
 
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_928_gtk_conformance_{tag}_{:?}",
+            "vimcode_test_928_gtk_conformance_{tag}_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -21997,7 +22009,8 @@ mod issue_1460_acp_turn_review_and_checkpoints {
     #[test]
     fn acp_turn_review_lists_all_three_files_and_revert_restores_one_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1460_gtk_turn_review_{:?}",
+            "vimcode_test_1460_gtk_turn_review_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22087,7 +22100,8 @@ mod issue_1460_acp_turn_review_and_checkpoints {
     #[test]
     fn acp_restore_checkpoint_keeps_a_user_edit_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1460_gtk_restore_{:?}",
+            "vimcode_test_1460_gtk_restore_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22208,7 +22222,8 @@ mod issue_1460_acp_turn_review_and_checkpoints {
         /// reachable from the steps below).
         fn open_comment_heavy_buffer() -> (std::path::PathBuf, Engine) {
             let path = std::env::temp_dir().join(format!(
-                "vimcode_test_1583_gtk_{:?}.rs",
+                "vimcode_test_1583_gtk_{}_{:?}.rs",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let mut text = String::new();
@@ -22371,7 +22386,8 @@ mod issue_1515_acp_review_badge {
     #[test]
     fn badge_mode_suppresses_auto_open_and_shows_edited_summary_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1515_gtk_badge_{:?}",
+            "vimcode_test_1515_gtk_badge_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22445,7 +22461,8 @@ mod issue_1515_acp_review_badge {
     #[test]
     fn badge_mode_paints_gutter_markers_on_agent_changed_lines_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1515_gtk_gutter_{:?}",
+            "vimcode_test_1515_gtk_gutter_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22492,7 +22509,8 @@ mod issue_1515_acp_review_badge {
     #[test]
     fn off_mode_paints_no_gutter_markers_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1515_gtk_off_gutter_{:?}",
+            "vimcode_test_1515_gtk_off_gutter_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22570,7 +22588,8 @@ mod issue_1517_acp_inline_review {
     #[test]
     fn virtual_action_row_paints_in_the_normal_buffer_view_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1517_gtk_row_{:?}",
+            "vimcode_test_1517_gtk_row_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22614,7 +22633,8 @@ mod issue_1517_acp_inline_review {
     #[test]
     fn leader_ar_reverts_the_hunk_under_the_cursor_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1517_gtk_ar_{:?}",
+            "vimcode_test_1517_gtk_ar_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22663,7 +22683,8 @@ mod issue_1517_acp_inline_review {
     #[test]
     fn leader_ak_keeps_the_hunk_under_the_cursor_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1517_gtk_ak_{:?}",
+            "vimcode_test_1517_gtk_ak_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22712,7 +22733,8 @@ mod issue_1517_acp_inline_review {
     #[test]
     fn editing_a_hunk_before_keep_labels_it_edited_and_keeps_the_edit_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1517_gtk_edit_{:?}",
+            "vimcode_test_1517_gtk_edit_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22796,7 +22818,8 @@ mod issue_1517_acp_inline_review {
     #[test]
     fn jump_next_hunk_prefers_the_outstanding_review_hunk_over_raw_git_diff_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1517_gtk_git_precedence_{:?}",
+            "vimcode_test_1517_gtk_git_precedence_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22893,7 +22916,8 @@ mod issue_1516_hunk_level_review {
     #[test]
     fn keep_one_hunk_reject_the_other_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1516_gtk_hunks_{:?}",
+            "vimcode_test_1516_gtk_hunks_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
