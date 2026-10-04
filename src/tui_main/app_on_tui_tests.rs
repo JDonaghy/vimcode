@@ -192,6 +192,23 @@ mod tests {
         h
     }
 
+    /// Dispatch a plain hover `MouseMoved` — no button held. `TuiDriver::
+    /// mouse_move` itself always sends the left button *held* (it exists to
+    /// drive drag-selection scenarios, per its own doc), so a genuine no-op
+    /// hover move has to be built and sent directly through `driver.dispatch`
+    /// instead. Shared by both #1722 regression tests below (the no-sidebar
+    /// editor case and the sidebar-open case).
+    fn hover_move(
+        driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        x: f32,
+        y: f32,
+    ) -> quadraui::Reaction {
+        driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(x, y),
+            buttons: quadraui::ButtonMask::default(),
+        })
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Key dispatch
     // ─────────────────────────────────────────────────────────────────────────
@@ -1354,6 +1371,66 @@ mod tests {
             engine2.sc_help_open = true;
             let h2 = crate::tui_main::testing::conformance_harness(engine2, 10, 3);
             let _ = h2.driver.screen();
+        }
+
+        /// #1722 review (blocking finding): `render::route_sidebar_hover`
+        /// used to return `geometry.contains_x(x)` — "is the pointer's X
+        /// inside the sidebar column" — regardless of whether any hover
+        /// target actually changed. `contains_x` only checks the X range,
+        /// not Y, so that was `true` for nearly every pixel in the sidebar
+        /// whenever it's open (the default startup state with a panel
+        /// showing), and `App`'s `MouseMoved` arm forced a full repaint on
+        /// every such move — even two consecutive moves to the exact same
+        /// pixel. Fixed by returning whether `engine.sc_button_hovered` —
+        /// the one thing this function paints synchronously, everything
+        /// else it touches (`panel_hover_mouse_move`/`dismiss_panel_hover`)
+        /// only arms a dwell/dismiss timer the tick loop's own
+        /// `poll_panel_hover` resolves and reports separately — actually
+        /// changed, mirroring the before/after comparison
+        /// `route_gutter_hover`'s own caller already used.
+        ///
+        /// Drives the actual bug a prior revision of this PR missed: a
+        /// Source Control sidebar open (not the no-sidebar fixture
+        /// [`super::mouse_moved_to_the_same_plain_editor_cell_does_not_repaint`]
+        /// uses, which structurally never reaches `route_sidebar_hover` at
+        /// all since `ctx.layout.sidebar_content_bounds` is `None`),
+        /// hovering the same row twice.
+        ///
+        /// **Verified RED**: with `route_sidebar_hover` reverted to
+        /// returning `inside` unconditionally (this PR's pre-fix state),
+        /// this test's second `hover_move` returns `Reaction::Redraw`, not
+        /// `Continue`.
+        #[test]
+        fn mouse_moved_to_the_same_sidebar_row_does_not_repaint() {
+            let mut h = harness(sc_engine("hover_1722"));
+            let driver = &mut h.driver;
+            driver.render();
+
+            let (x, y) = driver
+                .find("SOURCE CONTROL")
+                .expect("the SC panel header must be painted");
+
+            // First move establishes whatever hover state a move to this
+            // sidebar row implies, then settle before taking the comparison
+            // snapshot.
+            hover_move(driver, x, y);
+            let screen0 = driver.screen();
+
+            // Second move to the exact same cell: nothing about the pointer
+            // target changed, so no hover state can have changed either.
+            let reaction = hover_move(driver, x, y);
+            assert_eq!(
+                reaction,
+                quadraui::Reaction::Continue,
+                "a MouseMoved to the same sidebar row as the previous one, \
+                 with the sidebar open and touching no hover target, must \
+                 not force a repaint (#1722 review)"
+            );
+            assert_eq!(
+                driver.screen(),
+                screen0,
+                "rendered text must not change from a no-op sidebar hover move"
+            );
         }
 
         /// A second click on the already-active Search icon must toggle the
@@ -7198,14 +7275,20 @@ mod tests {
     /// #1722's second acceptance bullet: "a `MouseMoved` that doesn't change
     /// any hover target must return `Continue`." Audited
     /// `App::handle_dispatch`'s `MouseMoved` arm (`src/app.rs`) for this
-    /// issue: the sidebar-hover and gutter-hover rungs it calls
-    /// (`render::route_sidebar_hover`/`render::route_gutter_hover`) already
-    /// gate `draw_needed` on an actual before/after difference, and the
-    /// window-edge resize-cursor hint and `mouse_pos_cell` bookkeeping
-    /// above them never touch `draw_needed` at all — found no bug on this
-    /// half, unlike the tab-width chore above. This test pins that down as
-    /// a black-box regression guard rather than leaving the audit as only
-    /// a sentence in a PR description.
+    /// issue: `render::route_gutter_hover`'s caller already gates
+    /// `draw_needed` on an actual before/after difference
+    /// (`engine.gutter_hover_window != was`), and the window-edge
+    /// resize-cursor hint and `mouse_pos_cell` bookkeeping above it never
+    /// touch `draw_needed` at all.
+    ///
+    /// This fixture has no sidebar (`harness_no_sidebar`), so it structurally
+    /// never reaches `render::route_sidebar_hover` at all — that rung's own
+    /// coverage, including the bug a prior revision of this PR incorrectly
+    /// claimed didn't exist, is
+    /// [`sidebar_panels::mouse_moved_to_the_same_sidebar_row_does_not_repaint`].
+    /// This test pins down the plain-editor half as a black-box regression
+    /// guard rather than leaving the audit as only a sentence in a PR
+    /// description.
     #[test]
     fn mouse_moved_to_the_same_plain_editor_cell_does_not_repaint() {
         let mut engine = plain_engine();
@@ -7216,18 +7299,6 @@ mod tests {
         let (x, y) = driver
             .find("hello world")
             .expect("buffer text must be painted");
-
-        // A plain hover move: no button held. `TuiDriver::mouse_move`
-        // itself always sends the left button *held* (it exists to drive
-        // drag-selection scenarios, per its own doc), so a genuine no-op
-        // hover move has to be built and sent directly through
-        // `driver.dispatch` instead.
-        let hover_move = |driver: &mut quadraui::tui::testing::TuiDriver<_>, x: f32, y: f32| {
-            driver.dispatch(quadraui::UiEvent::MouseMoved {
-                position: quadraui::Point::new(x, y),
-                buttons: quadraui::ButtonMask::default(),
-            })
-        };
 
         // First move establishes whatever hover state a move to this cell
         // implies (there is none here — no gutter fold marker, no sidebar
