@@ -3082,6 +3082,21 @@ pub fn apply_picker_row_click(engine: &mut Engine, idx: usize) {
 // the symbolic name. GTK has no such ambiguity (GDK always hands over the
 // real keysym for the physical key pressed), so it always passes `true`,
 // which simply disables those terminal-only fallback arms.
+//
+// #1744: `App::handle_dispatch` (the *one* shared dispatcher both GTK and
+// TUI run through, not a GTK-only thing despite the paragraph above calling
+// it "GTK's own decode") only calls this function from its `Key::Named`
+// arm — its `Key::Char` arm has its own, independent one-line decode
+// (`c.to_string()`), matching the "GTK never needs this function's
+// `Key::Char` ambiguity-resolution" reasoning above for GTK, but also
+// (accidentally) true for TUI since the #1422/#1499 unification. This
+// function's own `Key::Char` arm therefore has no production caller at
+// all — every one of its branches, old and new, is exercised only by this
+// file's own unit tests below, not by a real keypress on either backend.
+// `App::handle_dispatch`'s `Key::Char` arm carries the one special case
+// that chord actually needs (Ctrl+Shift+\'s `"Shift_backslash"`, mirrored
+// from this function's own arms for the same chord) directly, rather than
+// calling into this function — see that match's own comment.
 pub fn engine_key_from_ui(
     key: &quadraui::Key,
     modifiers: quadraui::Modifiers,
@@ -3103,17 +3118,35 @@ pub fn engine_key_from_ui(
                 let name = if lower == ' ' {
                     "space".to_string()
                 } else if lower == '|' {
-                    // Ctrl+Shift+\: GTK (and a kitty/CSI-u terminal without
-                    // keyboard-enhanced *character* resolution) deliver the
-                    // already-shifted glyph directly — same pattern as the
-                    // bracket pairs' literal '}'/'{' arms below. #1744:
-                    // VS Code's `editor.action.jumpToBracket`.
+                    // Ctrl+Shift+\: the literal already-shifted glyph —
+                    // same pattern as the bracket pairs' literal '}'/'{'
+                    // arms below. #1744: VS Code's
+                    // `editor.action.jumpToBracket`.
+                    //
+                    // This whole `Key::Char` arm has no production caller
+                    // (see this function's own module doc: the only live
+                    // call site, `App::handle_dispatch`, only reaches
+                    // `engine_key_from_ui` from the `Key::Named` arm), so
+                    // renaming `'|'` to `"Shift_backslash"` here is not
+                    // what makes this shape reachable in production —
+                    // `App::handle_dispatch`'s own `Key::Char` arm forwards
+                    // the raw `"|".to_string()` unchanged, and
+                    // `Engine::handle_vscode_key`'s `"Shift_backslash" |
+                    // "|"` arm already accepts that literal spelling
+                    // directly. Kept here anyway so this function's test
+                    // coverage for every other Ctrl+symbol spelling
+                    // continues to exercise one real decode table rather
+                    // than a partial, stale copy of it.
                     "Shift_backslash".to_string()
                 } else if lower == '\\' && shift {
                     // Ctrl+Shift+\ via an explicit Shift modifier bit
                     // (kitty/CSI-u reporting the base key plus SHIFT rather
                     // than the shifted glyph) — same pattern as the bracket
-                    // pairs' `&& shift` arms below. #1744.
+                    // pairs' `&& shift` arms below. #1744. See the sibling
+                    // arm above: also dead in production, mirrored by
+                    // `App::handle_dispatch`'s own `Key::Char('\\') if
+                    // modifiers.ctrl && modifiers.shift` arm, which is what
+                    // actually makes this chord reachable.
                     "Shift_backslash".to_string()
                 } else if lower == '\\' || (!keyboard_enhanced && lower == '4') {
                     // Ctrl+\ sends byte 0x1C; without keyboard enhancement crossterm decodes
@@ -4236,8 +4269,9 @@ fn alt_chord_base(key_name: &str, unicode: Option<char>) -> Option<AltBase> {
 /// (`Engine::jump_list_back`/`jump_list_forward`, the same mechanism Vim
 /// mode's Ctrl-O/Ctrl-I already use), not sidebar resize — see
 /// [`route_alt_key`]'s mode-independent tier, which now only claims
-/// `Left`/`Right` for resize outside VSCode mode (or with `ctrl` held, VSCode
-/// mode's own alternate home for the same resize).
+/// `Left`/`Right` for resize outside VSCode mode (or with both `ctrl` *and*
+/// `shift` held, VSCode mode's own alternate home for the same resize — see
+/// that tier's own doc for why plain `ctrl` alone was the wrong choice).
 fn vscode_alt_key_name(base: AltBase, shift: bool) -> Option<&'static str> {
     Some(match (base, shift) {
         (AltBase::Up, true) => "Alt_Shift_Up",
@@ -4267,9 +4301,26 @@ fn vscode_alt_key_name(base: AltBase, shift: bool) -> Option<&'static str> {
 /// `insertCursorBelow` (forwarded to `Engine::handle_vscode_key` as `Alt_Up`/
 /// `Alt_Down` with `ctrl` now passed through instead of hardcoded `false`,
 /// letting that function's own `if ctrl` guard tell it apart from plain
-/// Alt+Up/Down's move-line); and Ctrl+Alt+Left/Right is VSCode mode's
+/// Alt+Up/Down's move-line); and Ctrl+Shift+Alt+Left/Right is VSCode mode's
 /// alternate home for sidebar resize, now that plain Alt+Left/Right means
 /// navigate back/forward in that mode (see [`vscode_alt_key_name`]'s doc).
+///
+/// That alternate home is Ctrl+**Shift**+Alt+Left/Right, not plain
+/// Ctrl+Alt+Left/Right: the latter is already the shipped default binding
+/// for `panel_keys.nav_back`/`nav_forward`
+/// (`Settings::PanelKeys::nav_back`/`nav_forward`, `"<C-A-Left>"`/
+/// `"<C-A-Right>"`), registered as a `AcceleratorScope::Global` accelerator
+/// by [`register_panel_accelerators`] below. quadraui's accelerator tier
+/// sits *above* this rung and **replaces** a matched key event with the
+/// fired accelerator rather than letting it fall through
+/// (`accelerator_match_replaces_keypressed_with_accelerator`, quadraui's own
+/// `tui/backend.rs`), so a plain Ctrl+Alt+Left/Right arm here would never
+/// actually run in the live app — it would be silently shadowed by tab
+/// history nav on every real keypress, reachable only when a test calls
+/// this function directly below the accelerator tier. Ctrl+Shift+Alt is
+/// free on both backends and is not itself a VS Code default binding either
+/// (unlike Ctrl+Alt+Left/Right, which upstream binds to
+/// `workbench.action.moveEditorToPreviousGroup`/`NextGroup`).
 pub fn route_alt_key(
     engine: &mut Engine,
     key_name: &str,
@@ -4293,16 +4344,24 @@ pub fn route_alt_key(
     // working exactly as it did, and gives GTK (which never had the chord at
     // all) the same tolerance.
     match base {
-        // #1744: in VSCode mode, Ctrl+Alt+Left/Right is sidebar resize's
-        // alternate home — plain Alt+Left/Right now means navigate
+        // #1744: in VSCode mode, Ctrl+Shift+Alt+Left/Right is sidebar
+        // resize's alternate home — plain Alt+Left/Right now means navigate
         // back/forward in that mode (the arm below, via
-        // `vscode_alt_key_name`). Outside VSCode mode `ctrl` is ignored, same
-        // as every other mode-independent arm here, so Vim mode keeps
-        // resizing on plain Alt+Left/Right exactly as before.
-        AltBase::Left if ctrl && engine.is_vscode_mode() => {
+        // `vscode_alt_key_name`), and plain Ctrl+Alt+Left/Right is already
+        // claimed, above this rung, by the `panel_keys.nav_back`/
+        // `nav_forward` global accelerator — see this function's own doc
+        // for why `ctrl` alone is not a usable alternate home. Outside
+        // VSCode mode `ctrl`/`shift` are ignored, same as every other
+        // mode-independent arm here, so Vim mode keeps resizing on plain
+        // Alt+Left/Right (with or without Shift, as before #1744) exactly
+        // as before — Shift+Alt+Left/Right's own VSCode-mode fate (nothing:
+        // deliberately left unbound, since Ctrl+Shift+Alt is the chord that
+        // now owns this) is documented on the arm below that doesn't match
+        // it.
+        AltBase::Left if ctrl && shift && engine.is_vscode_mode() => {
             return AltKeyOutcome::ResizeSidebar(-1);
         }
-        AltBase::Right if ctrl && engine.is_vscode_mode() => {
+        AltBase::Right if ctrl && shift && engine.is_vscode_mode() => {
             return AltKeyOutcome::ResizeSidebar(1);
         }
         AltBase::Left if !engine.is_vscode_mode() => return AltKeyOutcome::ResizeSidebar(-1),
@@ -37747,8 +37806,10 @@ mod alt_key_router_tests {
     //! is precisely how the old duplicated blocks were able to drift without
     //! anyone noticing. These tests feed both spellings of one chord into
     //! [`route_alt_key`] and assert the two resolve identically; the
-    //! rendered-output halves live in `src/tui_main/shell_app.rs`
-    //! (`alt_*_via_shell_app`) and `src/gtk/testing.rs` (`alt_*_on_gtk`).
+    //! rendered-output halves live in `src/tui_main/app_on_tui_tests.rs`
+    //! (`alt_*_via_shell_app`, plus #1744's `mod vscode_mode_alt_rung_1744`)
+    //! and `src/gtk/testing.rs` (`alt_*_on_gtk`, plus #1744's
+    //! `mod alt_rung_1744`).
     use super::*;
     use crate::core::Mode;
 
@@ -37820,10 +37881,10 @@ mod alt_key_router_tests {
         shift: false,
         ctrl: true,
     };
-    const CTRL_ALT_RIGHT: Chord = Chord {
+    const CTRL_SHIFT_ALT_RIGHT: Chord = Chord {
         tui: ("Right", None),
         gtk: ("Right", None),
-        shift: false,
+        shift: true,
         ctrl: true,
     };
 
@@ -37977,9 +38038,13 @@ mod alt_key_router_tests {
     /// store the sidebar width in different places — the *clamp* is shared).
     /// #1744: in VSCode mode the plain chord means navigate back/forward
     /// instead (see [`vscode_mode_alt_left_right_navigate_instead_of_resize`]
-    /// below), so Ctrl+Alt+Right is VSCode mode's alternate resize home.
+    /// below), so Ctrl+**Shift**+Alt+Right is VSCode mode's alternate resize
+    /// home — plain Ctrl+Alt+Right is already the shipped
+    /// `panel_keys.nav_forward` accelerator, which the accelerator tier
+    /// claims *above* this rung in the live app (see [`route_alt_key`]'s own
+    /// doc), so it cannot be the alternate home.
     #[test]
-    fn alt_arrows_resize_in_vim_mode_and_vscode_mode_ctrl_alt() {
+    fn alt_arrows_resize_in_vim_mode_and_vscode_mode_ctrl_shift_alt() {
         let (outcome, ..) = resolves_identically(&ALT_RIGHT, false);
         assert_eq!(
             outcome,
@@ -37987,12 +38052,33 @@ mod alt_key_router_tests {
             "Vim-mode Alt+Right must widen the sidebar"
         );
 
-        let (outcome, ..) = resolves_identically(&CTRL_ALT_RIGHT, true);
+        let (outcome, ..) = resolves_identically(&CTRL_SHIFT_ALT_RIGHT, true);
         assert_eq!(
             outcome,
             AltKeyOutcome::ResizeSidebar(1),
-            "VSCode-mode Ctrl+Alt+Right must widen the sidebar, now that \
-             plain Alt+Right means navigate-forward in that mode"
+            "VSCode-mode Ctrl+Shift+Alt+Right must widen the sidebar, now \
+             that plain Alt+Right means navigate-forward in that mode and \
+             plain Ctrl+Alt+Right is the shipped tab-history accelerator"
+        );
+
+        // Ctrl+Alt+Right alone (no Shift) must NOT resize in VSCode mode —
+        // the resize arms above require both `ctrl` and `shift`, so this
+        // falls through to the same `vscode_alt_key_name` lookup plain
+        // Alt+Right uses (navigate-forward; `ctrl` is not part of that
+        // lookup's key, only its *shift* half is). This function is never
+        // actually called with this exact shape in the live app — the
+        // accelerator tier above it claims plain Ctrl+Alt+Right first (see
+        // this function's own doc) — but pinning what it *would* do keeps
+        // the resize arms' `ctrl && shift` guard from silently degrading to
+        // `ctrl` alone again.
+        let mut e = engine();
+        e.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        e.mode = Mode::Insert;
+        assert_eq!(
+            route_alt_key(&mut e, "Right", None, false, true, true),
+            AltKeyOutcome::Handled,
+            "plain Ctrl+Alt+Right (no Shift) must not resize — it falls to \
+             the navigate-forward arm instead, same as plain Alt+Right"
         );
 
         assert_eq!(alt_resized_sidebar_width(30, 1), 31);
@@ -38041,7 +38127,19 @@ mod alt_key_router_tests {
 
         e.view_mut().cursor.line = 2;
         let outcome = route_alt_key(&mut e, "Right", None, false, false, true);
-        assert_eq!(outcome, AltKeyOutcome::Handled);
+        assert_eq!(
+            outcome,
+            AltKeyOutcome::Handled,
+            "VSCode-mode Alt+Right must be handled here, not handed back as \
+             ResizeSidebar"
+        );
+        assert_eq!(
+            e.view().cursor.line,
+            2,
+            "Alt+Right (navigateForward) must move forward in the jump \
+             list, back to the line Alt+Left just left — not leave the \
+             cursor on line 0 where Alt+Left's own assertion above left it"
+        );
 
         // Sanity: the same chords still resize in Vim mode.
         let (outcome, ..) = resolves_identically(&ALT_LEFT, false);

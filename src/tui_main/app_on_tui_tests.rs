@@ -1729,6 +1729,285 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // #1744 fix-iteration driver-tier coverage
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Driver-tier black-box coverage for the five VS Code-mode chords
+    /// `route_alt_key`/`handle_vscode_key` were fixed to decode correctly
+    /// (#1730's `KNOWN_GAPS`, closed by #1744). Unlike every other module in
+    /// this file, these are not part of the #1425 App-vs-shipped-TUI gap
+    /// inventory (there is no shipped-TUI `shell_app.rs` counterpart to
+    /// compare against for brand-new #1744 bindings), so they are plain
+    /// `#[test]`s, not wrapped in `known_bug_gate`. The GTK mirror of each
+    /// test lives in `src/gtk/testing.rs`'s `mod alt_rung_1744`.
+    ///
+    /// Each test dispatches a real `UiEvent::KeyPressed` through the
+    /// production `App::handle_dispatch` → `route_alt_key`/
+    /// `Engine::handle_key` path (not a direct `route_alt_key`/`handle_key`
+    /// call, unlike `render::alt_key_router_tests` and
+    /// `tests/vscode_keybinding_parity.rs`) and asserts on `driver.screen()`
+    /// — unlike GTK, TUI's driver has a real character grid, so these can
+    /// (and do) assert on the duplicated/typed editor buffer text directly,
+    /// not just a status-bar proxy for it.
+    mod vscode_mode_alt_rung_1744 {
+        use super::*;
+
+        fn vscode_engine(buffer: &str) -> crate::core::Engine {
+            let mut engine = plain_engine();
+            engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+            engine.mode = crate::core::Mode::Insert;
+            engine.buffer_mut().insert(0, buffer);
+            engine.view_mut().cursor = crate::core::Cursor { line: 0, col: 0 };
+            engine
+        }
+
+        fn press(
+            driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            key: quadraui::Key,
+            modifiers: quadraui::Modifiers,
+        ) {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key,
+                modifiers,
+                repeat: false,
+            });
+        }
+
+        /// Ctrl+Alt+Down is VS Code's real `insertCursorBelow` — typing
+        /// after it must insert on *two* lines, not just move the line
+        /// down. Painted editor text is the strongest possible proof here:
+        /// a real second cursor, not a state flag.
+        ///
+        /// **Verified RED against unfixed `develop`:** before #1744,
+        /// `route_alt_key` had no `ctrl` parameter, so Ctrl+Alt+Down decoded
+        /// identically to plain Alt+Down (move-line) — the screen would
+        /// show `"Xbbb"`/`"aaa"` (swapped, single cursor), never `"Xaaa"`
+        /// *and* `"Xbbb"` together.
+        #[test]
+        fn ctrl_alt_down_adds_a_cursor_below_in_vscode_mode_via_shell_app() {
+            let engine = vscode_engine("aaa\nbbb\n");
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            press(
+                driver,
+                quadraui::Key::Named(quadraui::NamedKey::Down),
+                quadraui::Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Default::default()
+                },
+            );
+            press(
+                driver,
+                quadraui::Key::Char('X'),
+                quadraui::Modifiers::default(),
+            );
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("Xaaa") && screen.contains("Xbbb"),
+                "Ctrl+Alt+Down (insertCursorBelow) must add a second \
+                 cursor, so typing 'X' inserts on both lines; screen:\n{screen}"
+            );
+        }
+
+        /// Shift+Alt+Down is VS Code's real `copyLinesDownAction` — it must
+        /// duplicate the line (the marker appears twice), not add a cursor
+        /// (which would leave it appearing once, with typed text doubling
+        /// up instead — a different, distinguishable failure mode this test
+        /// doesn't need to also check).
+        ///
+        /// **Verified RED against unfixed `develop`:** before #1744,
+        /// `handle_vscode_key`'s `"Alt_Shift_Down"` arm called
+        /// `vscode_add_cursor_below` instead of `vscode_copy_line_down`, so
+        /// the marker paints exactly once.
+        #[test]
+        fn shift_alt_down_duplicates_the_line_in_vscode_mode_via_shell_app() {
+            let engine = vscode_engine("ZQXW1744A\nZQXW1744B\n");
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            press(
+                driver,
+                quadraui::Key::Named(quadraui::NamedKey::Down),
+                quadraui::Modifiers {
+                    alt: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            );
+
+            let screen = driver.screen();
+            assert_eq!(
+                screen.matches("ZQXW1744A").count(),
+                2,
+                "Shift+Alt+Down (copyLinesDownAction) must duplicate the \
+                 line, not add a cursor; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("ZQXW1744B"),
+                "the second line must be untouched; screen:\n{screen}"
+            );
+        }
+
+        /// Plain Alt+Left is VS Code's `navigateBack` — it must return the
+        /// cursor to the last jump-list entry, not resize the sidebar (the
+        /// mode-independent meaning this chord used to have unconditionally).
+        ///
+        /// **Verified RED against unfixed `develop`:** before #1744, the
+        /// mode-independent tier's unconditional `AltBase::Left =>
+        /// ResizeSidebar(-1)` ran before the VSCode-mode tier ever saw the
+        /// chord, so the painted cursor position never changes.
+        #[test]
+        fn alt_left_navigates_the_jump_list_in_vscode_mode_via_shell_app() {
+            let mut engine = vscode_engine(&"line\n".repeat(10));
+            engine.push_jump_location();
+            engine.view_mut().cursor = crate::core::Cursor { line: 9, col: 0 };
+            // 200, not this module's usual 80: at 80 columns the status
+            // bar's own priority-drop sheds the "Ln N, Col N" segment
+            // before the rightmost encoding/line-ending/toggle segments —
+            // same mechanism `status_bar_segment_click_opens_go_to_line_
+            // picker`'s GTK sibling documents needing *more* width for, not
+            // less. `harness_no_sidebar` also frees up columns, since
+            // `plain_engine`'s sidebar is visible by default.
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 200, 24);
+            collapse_sidebar(&mut h.driver);
+            let driver = &mut h.driver;
+
+            assert!(
+                driver.screen().contains("Ln 10, Col 1"),
+                "precondition: painted cursor must start on line 10; \
+                 screen:\n{}",
+                driver.screen()
+            );
+
+            press(
+                driver,
+                quadraui::Key::Named(quadraui::NamedKey::Left),
+                quadraui::Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+            );
+
+            assert!(
+                driver.screen().contains("Ln 1, Col 1"),
+                "Alt+Left (navigateBack) must return the painted cursor to \
+                 the jump-list entry at line 1, not resize the sidebar; \
+                 screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// VSCode mode's own alternate home for keyboard sidebar resize is
+        /// Ctrl+**Shift**+Alt+Right — not plain Ctrl+Alt+Right, which is
+        /// already the shipped `panel_keys.nav_forward` global accelerator
+        /// and would never reach `route_alt_key` at all in the live app
+        /// (see that function's own doc). Mirrors
+        /// `alt_right_widens_the_painted_sidebar_via_shell_app` above, in
+        /// VSCode mode with the alternate chord. Runs at `(120, 24)` for the
+        /// same reason that test does.
+        ///
+        /// **Verified RED against unfixed `develop`:** before this fix
+        /// iteration, this rung's alternate-resize arms matched on `ctrl`
+        /// alone (plain Ctrl+Alt+Right) — a chord the live accelerator tier
+        /// claims first and this rung never actually sees — so dispatching
+        /// Ctrl+Shift+Alt+Right found no matching arm and fell through to
+        /// `vscode_alt_key_name`'s plain-`Alt_Right` lookup (navigate-
+        /// forward) instead of widening the sidebar.
+        #[test]
+        fn ctrl_shift_alt_right_resizes_the_sidebar_in_vscode_mode_via_shell_app() {
+            let mut engine = vscode_engine("");
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            engine.session.explorer_visible = true;
+            engine.buffer_mut().insert(0, "ZQXW1744R");
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 120, 24);
+            let driver = &mut h.driver;
+
+            let before = driver
+                .find_bounds("ZQXW1744R")
+                .expect("the editor marker must paint before the resize");
+
+            press(
+                driver,
+                quadraui::Key::Named(quadraui::NamedKey::Right),
+                quadraui::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    alt: true,
+                    ..Default::default()
+                },
+            );
+
+            let after = driver
+                .find_bounds("ZQXW1744R")
+                .expect("the editor marker must still paint after the resize");
+            assert_eq!(
+                after.x,
+                before.x + 1.0,
+                "Ctrl+Shift+Alt+Right must widen the painted sidebar by one \
+                 column in VSCode mode; screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// Ctrl+Shift+\ is VS Code's real `editor.action.jumpToBracket` —
+        /// it must move the cursor onto the matching bracket. Covers both
+        /// input shapes `App::handle_dispatch`'s `Key::Char` arm resolves to
+        /// `"Shift_backslash"`/`"|"`: the literal already-shifted glyph
+        /// `'|'`, and the base key `'\\'` plus an explicit Shift bit (the
+        /// kitty/CSI-u shape the #1744 fix-iteration review found
+        /// unreachable in production — see `render::engine_key_from_ui`'s
+        /// module doc and `App::handle_dispatch`'s own
+        /// `Key::Char('\\') if modifiers.ctrl && modifiers.shift` arm).
+        #[test]
+        fn ctrl_shift_backslash_jumps_to_the_matching_bracket_in_vscode_mode_via_shell_app() {
+            for (key, label) in [
+                (quadraui::Key::Char('|'), "literal '|' glyph"),
+                (
+                    quadraui::Key::Char('\\'),
+                    "base '\\' + explicit Shift bit (kitty/CSI-u)",
+                ),
+            ] {
+                let engine = vscode_engine("(abc)\n");
+                // 200-column, sidebar-collapsed harness: see the comment on
+                // `alt_left_navigates_the_jump_list_in_vscode_mode_via_shell_app`
+                // above for why this module's usual 80-column default drops
+                // the "Ln N, Col N" segment entirely.
+                let mut h = crate::tui_main::testing::conformance_harness(engine, 200, 24);
+                collapse_sidebar(&mut h.driver);
+                let driver = &mut h.driver;
+
+                assert!(
+                    driver.screen().contains("Ln 1, Col 1"),
+                    "[{label}] precondition: painted cursor must start on \
+                     the opening '('; screen:\n{}",
+                    driver.screen()
+                );
+
+                press(
+                    driver,
+                    key,
+                    quadraui::Modifiers {
+                        ctrl: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                );
+
+                assert!(
+                    driver.screen().contains("Ln 1, Col 5"),
+                    "[{label}] Ctrl+Shift+\\ must move the painted cursor \
+                     onto the matching ')' (col 5); screen:\n{}",
+                    driver.screen()
+                );
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Popups
     // ─────────────────────────────────────────────────────────────────────────
     mod popups {

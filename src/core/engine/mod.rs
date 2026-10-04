@@ -2579,7 +2579,7 @@ Ctrl+G              Go to line (prompt)
 Ctrl+P              Fuzzy file finder                     :fuzzy
 Ctrl+Shift+P        Command palette                       :palette
 Alt+Left / Right    Navigate back / forward
-Ctrl+Alt+Left/Right Resize sidebar
+Ctrl+Shift+Alt+L/R  Resize sidebar
 Ctrl+Shift+\\       Jump to matching bracket
 
 ── Selection ───────────────────────────────────────────

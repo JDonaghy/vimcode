@@ -146,8 +146,11 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
     // `navigateBack`/`Forward`, `jumpToBracket`) — see
     // `gap_ctrl_alt_up_is_move_line_not_insert_cursor_above` and its four
     // siblings below for the now-`FixLanded`, deleted `KNOWN_GAPS` entries,
-    // and `render::alt_key_router_tests` for the driver-adjacent coverage of
-    // `route_alt_key` itself.
+    // `render::alt_key_router_tests` for `route_alt_key`'s own
+    // spelling-identity unit coverage, and — the actual black-box proof for
+    // all five chords, per CLAUDE.md's rendered-output rule —
+    // `src/gtk/testing.rs`'s `mod alt_rung_1744` and
+    // `src/tui_main/app_on_tui_tests.rs`'s `mod vscode_mode_alt_rung_1744`.
     VscodeBinding {
         command_id: "editor.action.insertCursorAbove",
         os: Os::WinLinux,
@@ -204,10 +207,16 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
                VSCode-mode tier when `engine.is_vscode_mode()`, which now \
                maps plain Alt+Left to `\"Alt_Left\"` and \
                `handle_vscode_key` calls `Engine::jump_list_back`, the same \
-               function Vim mode's Ctrl-O already uses. Ctrl+Alt+Left is \
-               VSCode mode's new alternate home for the sidebar-resize this \
-               chord used to always perform (Vim mode keeps plain \
-               Alt+Left/Right for that, unchanged).",
+               function Vim mode's Ctrl-O already uses. Ctrl+**Shift**+Alt+\
+               Left is VSCode mode's new alternate home for the \
+               sidebar-resize this chord used to always perform (Vim mode \
+               keeps plain Alt+Left/Right for that, unchanged) — plain \
+               Ctrl+Alt+Left could not be that home: it is already the \
+               shipped `panel_keys.nav_back` global accelerator \
+               (`Settings::PanelKeys`, `\"<C-A-Left>\"`), claimed by \
+               quadraui's accelerator tier *above* `route_alt_key`, which \
+               replaces the matched key event rather than letting it fall \
+               through (see `route_alt_key`'s own doc).",
     },
     VscodeBinding {
         command_id: "workbench.action.navigateForward",
@@ -216,7 +225,9 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
         vimcode_key: "Alt_Right",
         status: Status::Matches,
         note: "Same as navigateBack, mirrored for `jump_list_forward` / \
-               Ctrl-I; Ctrl+Alt+Right is the sidebar-resize alternate home.",
+               Ctrl-I; Ctrl+Shift+Alt+Right is the sidebar-resize alternate \
+               home, for the same `panel_keys.nav_forward` \
+               (`\"<C-A-Right>\"`) reason plain Ctrl+Alt+Right couldn't be.",
     },
     VscodeBinding {
         command_id: "editor.action.jumpToBracket",
@@ -224,18 +235,23 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
         vscode_chord: "Ctrl+Shift+\\",
         vimcode_key: "Shift_backslash",
         status: Status::Matches,
-        note: "`render::engine_key_from_ui` now has shift-aware arms for \
-               Ctrl+\\ (the literal shifted glyph `'|'`, and the base key \
-               plus an explicit Shift bit for kitty/CSI-u) producing \
-               `\"Shift_backslash\"`, distinct from plain Ctrl+\\'s \
-               `\"backslash\"` (still bound to `open_editor_group`, Vim \
-               mode's own Ctrl+\\ meaning, unaffected). \
-               `handle_vscode_key`'s new `\"Shift_backslash\" | \"|\"` arm \
-               calls `Engine::move_to_matching_bracket` — the same search \
-               Vim's `%` already uses. A legacy (non-keyboard-enhanced) \
-               terminal still cannot report the Shift bit for this chord at \
-               all (same ANSI-C0 shift-blindness as the Ctrl+K/Ctrl+P family \
-               — see REACHABILITY_TABLE's new row below), so it stays \
+        note: "`App::handle_dispatch`'s `Key::Char` arm — the real \
+               production decode both backends share, NOT \
+               `render::engine_key_from_ui` (see that function's own module \
+               doc: its `Key::Char` arm has no production caller) — now has \
+               a shift-aware special case for Ctrl+\\: the literal shifted \
+               glyph `'|'` already passed straight through unchanged, and a \
+               new one-line arm resolves the base key plus an explicit \
+               Shift bit (kitty/CSI-u) to `\"Shift_backslash\"` too, \
+               distinct from plain Ctrl+\\'s `\"backslash\"`/`\"\\\\\"` \
+               (still bound to `open_editor_group`, Vim mode's own Ctrl+\\ \
+               meaning, unaffected). `handle_vscode_key`'s new \
+               `\"Shift_backslash\" | \"|\"` arm calls \
+               `Engine::move_to_matching_bracket` — the same search Vim's \
+               `%` already uses. A legacy (non-keyboard-enhanced) terminal \
+               still cannot report the Shift bit for this chord at all \
+               (same ANSI-C0 shift-blindness as the Ctrl+K/Ctrl+P family — \
+               see REACHABILITY_TABLE's new row below), so it stays \
                unreachable there; kitty/CSI-u and GTK can both deliver it.",
     },
     VscodeBinding {
@@ -907,8 +923,15 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  report the Shift bit for this chord at all. kitty/CSI-u \
                  (explicit Shift modifier alongside the base key) and GTK \
                  (GDK hands over the literal shifted glyph '|' directly) can \
-                 both report it; `render::engine_key_from_ui` has arms for \
-                 both shapes, producing `\"Shift_backslash\"`.",
+                 both report it. NOT via `render::engine_key_from_ui` — that \
+                 function's `Key::Char` arm has no production caller on \
+                 either backend (see its own module doc); the real \
+                 production path is `App::handle_dispatch`'s `Key::Char` \
+                 arm, which forwards the literal '|' glyph unchanged (already \
+                 matched by `handle_vscode_key`'s `\"Shift_backslash\" | \
+                 \"|\"` arm) and has its own one-line special case for the \
+                 explicit-Shift-bit shape, producing `\"Shift_backslash\"` \
+                 directly.",
     },
     ReachabilityRow {
         chord: "Cmd+<key> (any VS Code Mac-default chord)",
@@ -1212,7 +1235,17 @@ fn alt_shift_up_copies_line_up_not_add_cursor() {
 }
 
 /// Mirrors the above for `editor.action.copyLinesDownAction`
-/// (`Shift+Alt+Down`, `Engine::vscode_copy_line_down`).
+/// (`Shift+Alt+Down`, `Engine::vscode_copy_line_down`). Not itself a
+/// `KNOWN_GAPS` conversion — the issue's gap list named only one label,
+/// `ALT_SHIFT_UP_IS_ADD_CURSOR`, for the Up/Down pair — but the root cause
+/// was identical in both directions: `"Alt_Shift_Down"` used to reach
+/// `vscode_add_cursor_below` the same way `"Alt_Shift_Up"` reached
+/// `vscode_add_cursor_above`. **Verified RED against unfixed `develop`**:
+/// reverting `handle_vscode_key`'s `"Alt_Shift_Down" =>
+/// self.vscode_copy_line_down(&mut changed)` arm to call
+/// `vscode_add_cursor_below()` instead reproduces both assertion failures
+/// here (the buffer stays `"aaa\nbbb\nccc\n"` and `extra_cursors` gains an
+/// entry).
 #[test]
 fn alt_shift_down_copies_line_down_not_add_cursor() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
@@ -1265,9 +1298,14 @@ fn alt_left_navigates_back_not_resize_sidebar() {
 /// deleted): VS Code's `editor.action.jumpToBracket` (`Ctrl+Shift+\`) moves
 /// the cursor onto the matching bracket, exactly like Vim mode's `%` already
 /// does via `Engine::find_matching_bracket`/`move_to_matching_bracket`.
-/// `render::engine_key_from_ui` now has shift-aware arms producing
-/// `"Shift_backslash"`, and `handle_vscode_key` has a
-/// `"Shift_backslash" | "|"` arm calling `move_to_matching_bracket`.
+/// `App::handle_dispatch`'s `Key::Char` arm (`src/app.rs`) now has a special
+/// case producing `"Shift_backslash"` for the one input shape that needs
+/// it, and `handle_vscode_key` has a `"Shift_backslash" | "|"` arm calling
+/// `move_to_matching_bracket`. This test, like its four siblings above,
+/// drives the engine with an already-decoded key name; the driver-tier
+/// proof that a real Ctrl+Shift+\ keypress decodes to that name on both
+/// backends is `src/gtk/testing.rs`'s `mod alt_rung_1744` and
+/// `src/tui_main/app_on_tui_tests.rs`'s `mod vscode_mode_alt_rung_1744`.
 /// **Verified RED against unfixed `develop`** before this change landed
 /// (this test's body is unchanged from the `gap_gate`-wrapped version).
 #[test]
