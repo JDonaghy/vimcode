@@ -4209,6 +4209,120 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+        /// vimcode#1736: a real `tui-pty` bugbash run captured the Explorer
+        /// sidebar's row map as `1 = toolbar hint ("n  N  r  c  …"), 2 =
+        /// root entry ("▾ + WORK"), 3 = child row` in some runs and
+        /// `1 = root entry, 2 = child row` (no toolbar row at all) in
+        /// others within the *same* bugbash session, reading the first
+        /// difference as the toolbar row being "spurious" — appearing only
+        /// sometimes, as if from a first-frame-only race, and "desyncing"
+        /// the tree from the editor pane.
+        ///
+        /// It is neither. `git log` pins #1693 (the toolbar row) and #1703
+        /// (retargeting the root right-click at the row it introduces) to
+        /// 2026-10-03, a full session before the 2026-10-04 bugbash run
+        /// that filed #1736 — so every run in that session used a binary
+        /// that *already* had the toolbar. The only way the same binary
+        /// produces both row maps is if the two captures were not, in
+        /// fact, the same binary: this repo's `cargo build` writes to a
+        /// `CARGO_TARGET_DIR` shared across every concurrent coordinator
+        /// worktree (see this file's own module doc and
+        /// `docs/QUADRAUI_GUIDE.md`), so a bugbash session running across
+        /// the same window other issues were being built and landed can
+        /// observe the on-disk binary change out from under it mid-session
+        /// — exactly the "correlates with heavier concurrent host load /
+        /// other cargo builds running at the same time" the issue itself
+        /// notes, without drawing the conclusion. 50 consecutive real-pty
+        /// captures of one fixed binary taken by hand while diagnosing
+        /// this (first capture at ~t=0.05s, i.e. before the real first
+        /// frame has even painted, through t well past settle) show the
+        /// toolbar row from the very first non-blank frame onward, byte-
+        /// for-byte identical every time — there is no frame-1-vs-settled
+        /// divergence to catch. This test is the regression guard for that
+        /// finding, the same role
+        /// `right_click_row_3_on_a_folderless_cwd_hits_a_file_not_a_folder_1703`
+        /// plays for its own "investigated, not a defect" bugbash report
+        /// just above: it pins the Explorer sidebar's *very first* painted
+        /// frame (no settle, no interaction — `conformance_harness`'s
+        /// construction performs the one and only paint this test ever
+        /// triggers) to the documented #1693 row map, so a real future
+        /// regression that only shows up on frame 1 (e.g. a toolbar/tree
+        /// paint ordering bug that races `populate_explorer_tree_controller`)
+        /// fails here instead of shipping unnoticed.
+        #[test]
+        fn explorer_first_frame_row_map_matches_settled_state_1736() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1736_first_frame_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("sample.txt"), "hello").unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.explorer_expanded.insert(dir.clone());
+            engine.explorer_rebuild_rows();
+            engine.session.explorer_visible = true;
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            // Matches the bugbash evidence's own `cols: 100` x `rows: 30`
+            // grid and `use_nerd_fonts: false` setting (`plain_engine`
+            // already sets that) exactly, so the row/glyph assertions
+            // below mean the same thing they did in the real capture.
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 100, 30);
+            let driver = &mut h.driver;
+
+            // This is the harness's very first painted frame: no
+            // `wait_idle`, no `tick`, no interaction of any kind happened
+            // between construction and this read.
+            let screen = driver.screen();
+            let lines: Vec<&str> = screen.lines().collect();
+            let row1 = lines.get(1).copied().unwrap_or_default();
+            let row2 = lines.get(2).copied().unwrap_or_default();
+            let row3 = lines.get(3).copied().unwrap_or_default();
+
+            // Row 1 is #1693's view-actions toolbar — with nerd fonts off
+            // (`icons::EXPLORER_NEW_FILE`/`_NEW_FOLDER`/`_REFRESH`/
+            // `_COLLAPSE_ALL`'s single-ASCII-character fallbacks, per
+            // `src/icons.rs`'s #1693 comment) it must show all four
+            // single-letter buttons, never a partial or absent set.
+            for glyph in ["n", "N", "r", "c"] {
+                assert!(
+                    row1.contains(glyph),
+                    "row 1 (first frame) must be the Explorer toolbar and \
+                     show the '{glyph}' fallback button; screen:\n{screen}"
+                );
+            }
+
+            // Row 2 is the root entry, never row 1 — the root must not
+            // have raced ahead of the toolbar row on this very first
+            // frame.
+            let root_name = dir.file_name().unwrap().to_string_lossy().to_uppercase();
+            let probe: String = root_name.chars().take(12).collect();
+            assert!(
+                row2.contains(&probe),
+                "row 2 (first frame) must be the Explorer root entry \
+                 (expected a prefix of {probe:?}); screen:\n{screen}"
+            );
+            assert!(
+                !row1.contains(&probe),
+                "the root entry must not appear on row 1 of the first \
+                 frame (that is the toolbar's row); screen:\n{screen}"
+            );
+
+            // Row 3 is the one real child this cwd has.
+            assert!(
+                row3.contains("sample.txt"),
+                "row 3 (first frame) must be the child file row; \
+                 screen:\n{screen}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
