@@ -71,6 +71,8 @@ use std::rc::Rc;
 
 use quadraui::testing::{ConformanceDriver, DriverInput};
 
+use crate::harness::DriverRepaint;
+
 use crate::core::plugin::{ExtPanelBadge, ExtPanelItem, PanelRegistration};
 use crate::core::Engine;
 
@@ -691,16 +693,24 @@ pub fn reveal_selects_the_revealed_row<D: ConformanceDriver>(
 /// directly — the same "no wall clock on `ConformanceDriver`" constraint
 /// [`PluginPanelFixture::hover`] documents, applied without pre-seeding the
 /// *routed* row, so the row the dwell fires on is still whatever the real
-/// dispatch resolved. A second identical `MouseMoved` repaints — every
-/// `MouseMoved` inside the sidebar body sets `draw_needed` regardless of
-/// which row it lands on — so the assertions below read the frame that
-/// `poll_panel_hover` actually populated.
+/// dispatch resolved. The popup is then painted by an explicit
+/// [`DriverRepaint::repaint`] — the harness stand-in for the runner's "the
+/// idle tick reported a redraw, so paint", and exactly what the real app
+/// does once `Engine::poll_idle` (which calls `poll_panel_hover`) returns
+/// `true`. Until #1722 this scenario instead got its frame from a second
+/// identical `MouseMoved`, which repainted only because *every* move inside
+/// the sidebar's X range forced a redraw whether or not a hover target
+/// changed; that spurious repaint was the bug #1722 fixed, so leaning on it
+/// here would have made this scenario a test that only passes against the
+/// bug.
 ///
 /// Asserts only painted text (`screen_has`), never `engine.panel_hover`
 /// itself — the CLAUDE.md "rendered output, not state" rule (#587/#592):
 /// `panel_hover_dwell`/`poll_panel_hover`'s return value are read only to
 /// drive the popup into existence without a real sleep, not as the proof.
-pub fn hover_resolves_to_the_row_under_the_pointer<D: ConformanceDriver + DriverInput>(
+pub fn hover_resolves_to_the_row_under_the_pointer<
+    D: ConformanceDriver + DriverInput + DriverRepaint,
+>(
     driver: &mut D,
     engine: &Rc<RefCell<Engine>>,
     target: &str,
@@ -723,14 +733,13 @@ pub fn hover_resolves_to_the_row_under_the_pointer<D: ConformanceDriver + Driver
     }
 
     let centre = painted_bounds(driver, target);
-    let move_to_target = || quadraui::UiEvent::MouseMoved {
+    driver.dispatch(quadraui::UiEvent::MouseMoved {
         position: quadraui::Point::new(
             centre.x + centre.width / 2.0,
             centre.y + centre.height / 2.0,
         ),
         buttons: quadraui::ButtonMask::default(),
-    };
-    driver.dispatch(move_to_target());
+    });
 
     assert!(
         engine.borrow().panel_hover_dwell.is_some(),
@@ -762,7 +771,10 @@ pub fn hover_resolves_to_the_row_under_the_pointer<D: ConformanceDriver + Driver
         centre.y
     );
 
-    driver.dispatch(move_to_target());
+    // The frame the runner would paint on the back of that `poll_idle`
+    // redraw. Not a second `MouseMoved`: a hover move that changes no
+    // hover target must *not* repaint (#1722).
+    driver.repaint();
 
     assert!(
         driver.screen_has(target_md),

@@ -198,6 +198,51 @@ pub fn screen_row_has<D: ConformanceDriver>(driver: &D, needle: &str) -> bool {
     })
 }
 
+/// Paint one frame *without* dispatching an input event — the harness
+/// stand-in for the runner's "the idle tick reported a redraw, so paint".
+///
+/// Every `ConformanceDriver` in quadraui repaints only when the app's own
+/// dispatch returns [`quadraui::Reaction::Redraw`], and none of them expose
+/// a tick on the shared trait (`TuiDriver::tick` exists; `GtkDriver` /
+/// `MacDriver` have no equivalent). So a backend-neutral scenario that
+/// advances *time-driven* engine state by hand — calling
+/// `Engine::poll_panel_hover` instead of sleeping out a real hover dwell —
+/// has no way to get that state onto the screen.
+///
+/// Before #1722 such scenarios got their frame by accident: a `MouseMoved`
+/// anywhere in the sidebar's X range forced a repaint whether or not any
+/// hover target changed (see [`crate::render::route_sidebar_hover`]'s own
+/// doc). That spurious repaint *was* the bug #1722 fixed, so the scenarios
+/// now ask for the frame explicitly, which is also what the real runner
+/// does — `Engine::poll_idle` returns `true` and the runner paints.
+///
+/// Implemented here rather than upstream because the trait is local; each
+/// driver already has a public, inherent `render()`.
+pub trait DriverRepaint {
+    /// Re-render the current app state into this driver's frame buffer.
+    fn repaint(&mut self);
+}
+
+impl<A: quadraui::AppLogic> DriverRepaint for quadraui::tui::testing::TuiDriver<A> {
+    fn repaint(&mut self) {
+        self.render();
+    }
+}
+
+#[cfg(feature = "gui")]
+impl<A: quadraui::AppLogic> DriverRepaint for quadraui::gtk::testing::GtkDriver<A> {
+    fn repaint(&mut self) {
+        self.render();
+    }
+}
+
+#[cfg(all(feature = "macos", target_os = "macos"))]
+impl<A: quadraui::AppLogic> DriverRepaint for quadraui::macos::testing::MacDriver<A> {
+    fn repaint(&mut self) {
+        self.render();
+    }
+}
+
 /// A backend-neutral [`ConformanceDriver`] plus the `Rc` handle to the
 /// [`Engine`] it drives, and the two process-wide guards every headless
 /// paint-time harness in this repo needs (mirrors
