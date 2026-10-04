@@ -41,6 +41,18 @@ that lives in this repo without touching the registry (vimcode-ext):
   the real compiled binary with a throwaway `$HOME`/local extension
   manifest and a `PATH` that can't resolve `npm`). All RED-verified against
   the pre-fix code.
+- **Review fix (2026-10-03):** the engine-internal-state tests above were
+  flagged as necessary-but-not-sufficient per CLAUDE.md's black-box
+  coverage rule (the same gap #1346's review caught for the closely
+  analogous "missing runtime" fallback in this same function). Added
+  driver-tier coverage for both backends, asserting on rendered output
+  instead of engine state: `tui_main::app_on_tui_tests::tests::issue_1719_
+  prerequisite_detect_before_install` (`TuiDriver`, two tests — the LSP
+  legacy leg and the built-in delve DAP leg) and its GTK twin
+  `gtk::testing::issue_1719_missing_prereq_blocks_install` (`GtkDriver`,
+  same two scenarios). Both RED-verified against a reintroduced regression
+  (`if true || missing.is_empty()` in `lsp_ops.rs`'s legacy-install
+  branch) before being restored to pass against the real fix.
 
 **Not done (see `docs/PENDING_VIMCODE_ISSUES.md`'s "#1719 remainder"
 entry for the full writeup):** no minimum-version checking (a *present but
