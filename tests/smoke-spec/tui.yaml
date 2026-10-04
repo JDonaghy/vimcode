@@ -140,6 +140,31 @@ steps:
     text: "n  N  r  c  …"
     ms: 5000
 
+  # vimcode#1741 — this control failed ~100% of real-pty runs (2168-2377
+  # bytes received during the supposed-silent 3s window below) because it
+  # started measuring immediately after `first-frame-painted`/the #1736
+  # toolbar check above, with no settle margin for `Engine::ext_refresh`'s
+  # background extension-registry network fetch to actually land. That
+  # fetch is spawned unconditionally at real `vcd` startup (never by the
+  # deterministic Tier-1 harness entry points, which is why no in-process
+  # test saw this) and its completion repaint — the same one
+  # `tui_main::app_on_tui_tests::idle_stability_1737`'s module doc traces to
+  # `Engine::poll_ext_registry` consuming the fetch result on the first
+  # `poll_idle` tick after first paint, visible later as the "Extension
+  # registry updated (N extensions)" status message — can land anywhere in
+  # the first few seconds after first paint, not necessarily before this
+  # step would otherwise start. A probe spec (launch -> expect_within
+  # NORMAL -> `wait_idle` 2000ms/30000ms budget -> `expect_silent` 3s)
+  # passed cleanly, isolating the cause to missing settle time here, not to
+  # ongoing churn — i.e. still the #1634 control it always was, just
+  # started too early. This `wait_idle` gives the fetch's one legitimate
+  # repaint room to happen *before* the silence window opens, rather than
+  # inside it.
+  - type: wait_idle
+    id: settle-ext-registry-fetch-1741
+    ms: 2000
+    timeout_ms: 30000
+
   # vimcode#1634 was specifically a Windows-Terminal *rendering* bug — a real
   # ~1Hz foreground flicker with a genuinely silent underlying byte stream
   # (confirmed in `tests/conpty_idle_flicker.rs`'s own module doc: the bug
