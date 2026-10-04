@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1153,6 +1154,17 @@ pub struct Settings {
     /// percentage of the window height" is not modeled.
     #[serde(default = "default_scrolljump")]
     pub scrolljump: usize,
+
+    /// Lazily-parsed form of `iskeyword`, keyed by the spec string it was
+    /// parsed from. `is_keyword_char` is called in tight loops — the
+    /// nearby-buffer word scan behind completion (#1721) calls it once per
+    /// character scanned, which re-parsed and re-allocated the
+    /// comma-separated `iskeyword` spec on every single call. Not real
+    /// settings state (derived, rebuildable from `iskeyword` alone), so it's
+    /// excluded from (de)serialization — the `Default impl` just sets it to
+    /// an empty `RefCell`, rebuilt lazily on first use.
+    #[serde(skip)]
+    iskeyword_cache: RefCell<Option<(String, IskeywordParsed)>>,
 }
 
 /// Mode-derived default for `ctrl_f_action` — see the field doc comment on
@@ -1944,6 +1956,7 @@ impl Default for Settings {
             laststatus: default_laststatus(),
             sidescrolloff: 0,
             scrolljump: default_scrolljump(),
+            iskeyword_cache: RefCell::new(None),
         }
     }
 }
@@ -2006,6 +2019,16 @@ enum IskeywordItem {
 struct IskeywordEntry {
     item: IskeywordItem,
     include: bool,
+}
+
+/// Cached outcome of parsing `iskeyword` — either the entry list, or a
+/// marker that the spec was unparsable (so `is_keyword_char` can fall back
+/// to the ASCII+Unicode-alphanumeric default without re-attempting the
+/// parse on every call). See [`Settings::iskeyword_cache`].
+#[derive(Debug, Clone)]
+enum IskeywordParsed {
+    Entries(Vec<IskeywordEntry>),
+    Invalid,
 }
 
 /// Parse one comma-separated token (after an optional leading `^`, already
@@ -2585,22 +2608,32 @@ impl Settings {
     }
 
     /// Is `c` a "word" character per `'iskeyword'` (#1191)? Drives
-    /// `w`/`b`/`e`/`ge`, `*`/`#`/`g*`/`g#`, and the `iw`/`aw` text objects.
-    ///
-    /// Reparses `self.iskeyword` on every call rather than caching a parsed
-    /// form — deliberately: the spec is short (a handful of comma-separated
-    /// items) and per-call cost is dominated by matching against those few
-    /// items, not by string splitting, so a cache would trade a real
-    /// invalidation-correctness risk (stale entries after `:set
-    /// iskeyword+=...`) for a speedup on a path that isn't hot (word
-    /// motions touch tens of characters, not the whole buffer, per
-    /// keystroke). Falls back to the old ASCII+Unicode-alphanumeric default
-    /// if the stored spec is somehow unparsable (defensive only —
-    /// `set_value_option` validates on write).
+    /// `w`/`b`/`e`/`ge`, `*`/`#`/`g*`/`g#`, and the `iw`/`aw` text objects —
+    /// and, less obviously, the nearby-buffer word scan behind completion
+    /// (`Engine::word_completions_nearby`), which calls this once per
+    /// character scanned and is itself called on every insert-mode
+    /// keystroke. That path turned "re-parse the spec per call" from a
+    /// cold corner into ~3-4% of per-keystroke CPU on a large file
+    /// (#1721) — `self.iskeyword_cache` now parses the spec once and
+    /// reuses the result until the spec string itself changes (`:set
+    /// iskeyword+=...` etc.), invalidated by simple string comparison so
+    /// there's no separate "dirty" bit to forget to set. Falls back to the
+    /// old ASCII+Unicode-alphanumeric default if the stored spec is
+    /// somehow unparsable (defensive only — `set_value_option` validates
+    /// on write).
     pub(crate) fn is_keyword_char(&self, c: char) -> bool {
-        match parse_iskeyword(&self.iskeyword) {
-            Ok(entries) => iskeyword_matches(&entries, c),
-            Err(_) => c.is_alphanumeric() || c == '_',
+        let mut cache = self.iskeyword_cache.borrow_mut();
+        let stale = !matches!(cache.as_ref(), Some((spec, _)) if spec == &self.iskeyword);
+        if stale {
+            let parsed = match parse_iskeyword(&self.iskeyword) {
+                Ok(entries) => IskeywordParsed::Entries(entries),
+                Err(_) => IskeywordParsed::Invalid,
+            };
+            *cache = Some((self.iskeyword.clone(), parsed));
+        }
+        match &cache.as_ref().expect("just populated above").1 {
+            IskeywordParsed::Entries(entries) => iskeyword_matches(entries, c),
+            IskeywordParsed::Invalid => c.is_alphanumeric() || c == '_',
         }
     }
 

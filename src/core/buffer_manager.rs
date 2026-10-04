@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use super::buffer::{read_file_to_string, Buffer, BufferId};
 use super::cursor::Cursor;
-use super::syntax::Syntax;
+use super::syntax::{Syntax, SyntaxReparseOutcome};
 
 /// Binds a scratch buffer to a provider document (#524): the id (if the
 /// document already exists on the provider — `None` for the new-document
@@ -658,6 +658,11 @@ pub struct BufferState {
     /// Cached maximum line length (in chars) across the whole buffer.
     /// Recomputed in `update_syntax` so renders don't need to scan every line.
     pub max_col: usize,
+    /// Row index of the line that produced `max_col`. Internal
+    /// bookkeeping for `update_max_col_incremental` (#1721) — lets a
+    /// keystroke-sized edit tell whether it could have invalidated the
+    /// cached max without rescanning every other line.
+    max_col_line: usize,
     /// Whether this buffer is read-only (e.g. markdown preview).
     pub read_only: bool,
     /// Pre-rendered markdown content (set for markdown preview buffers).
@@ -735,6 +740,102 @@ impl std::fmt::Debug for BufferState {
     }
 }
 
+/// Does a highlight span `[start, end)` overlap `[rehighlight_start,
+/// rehighlight_end)`? Used symmetrically in [`BufferState::patch_highlights`]
+/// to decide both what to drop from the cached set and what to keep from
+/// the fresh re-extraction.
+///
+/// A zero-width span (`start == end`) gets inclusive-both-ends treatment
+/// instead of the normal half-open overlap test: zero-width captures are
+/// tree-sitter error-recovery "MISSING" node markers (common on text
+/// that's momentarily invalid mid-edit, e.g. an unclosed `(`), and
+/// tree-sitter's own `set_byte_range` already excludes one sitting exactly
+/// at the half-open range's exclusive end — confirmed by direct
+/// experiment. Mirroring that exclusion here instead of correcting for it
+/// would silently drop a real capture the moment it landed on a boundary.
+fn overlaps_rehighlight(
+    start: usize,
+    end: usize,
+    rehighlight_start: usize,
+    rehighlight_end: usize,
+) -> bool {
+    if start == end {
+        start >= rehighlight_start && start <= rehighlight_end
+    } else {
+        start < rehighlight_end && end > rehighlight_start
+    }
+}
+
+/// Widen `[start, end)` (new-text coordinates) to swallow any entry in
+/// `highlights` (sorted by start byte, old-text coordinates) that touches
+/// it exactly — `*e == start` on the left, or `*s == end` (converted to
+/// old-text coordinates first) on the right — repeating until a pass
+/// makes no further change (a touched entry's own far boundary can in
+/// turn touch another entry).
+///
+/// Needed because `Syntax::reparse_incremental`'s `changed_ranges`-
+/// derived window can under-report when an edit lands exactly on an old
+/// node's boundary: observed in practice, an insertion immediately after
+/// an identifier extended that identifier in the new tree (a `property`
+/// capture growing from `(38, 39)` to `(38, 41)`), with `changed_ranges`
+/// reporting nothing before the insertion point — tree-sitter's own
+/// boundary-adjustment heuristic guessed the inserted text was outside
+/// the node, and nothing corrected that guess before the comparison.
+///
+/// A free function taking `highlights: &[...]` rather than a
+/// `BufferState` method taking `&self`: its caller
+/// (`update_syntax_with_limit`) already holds `self.syntax` borrowed
+/// mutably across the whole match arm, and a `&self` method call would
+/// borrow all of `self`, conflicting with that — a plain
+/// `&self.highlights` field borrow at the call site doesn't. Binary
+/// search instead of a linear scan for the same reason this whole module
+/// exists: `highlights` holds every highlight in the file (not just the
+/// viewport), and this runs on every keystroke, so an O(file) scan here
+/// would silently reintroduce the per-keystroke cost being removed.
+fn widen_rehighlight_to_touching_entries(
+    highlights: &[(usize, usize, String)],
+    edit: tree_sitter::InputEdit,
+    mut start: usize,
+    mut end: usize,
+) -> (usize, usize) {
+    let delta = edit.new_end_byte as i64 - edit.old_end_byte as i64;
+    loop {
+        let mut changed = false;
+
+        // `start` is always within the shared "before the edit"
+        // coordinate space (nothing before `edit.start_byte` ever
+        // changes, and `start` never exceeds that), so it compares
+        // directly against cached (old-coordinate) entries. Sorted by
+        // start byte, so only the entry immediately before the first one
+        // with `start_byte >= start` can touch it from the left.
+        let idx = highlights.partition_point(|h| h.0 < start);
+        if idx > 0 {
+            let (s, e, _) = &highlights[idx - 1];
+            if *e == start && *s < start {
+                start = *s;
+                changed = true;
+            }
+        }
+
+        // `end` is a new-text coordinate; convert to the equivalent
+        // old-text coordinate before comparing against cached entries,
+        // then convert any found extension back.
+        let end_in_old = (end as i64 - delta).max(0) as usize;
+        let idx = highlights.partition_point(|h| h.0 < end_in_old);
+        if let Some((s, e, _)) = highlights.get(idx) {
+            if *s == end_in_old && *e > end_in_old {
+                end = (*e as i64 + delta).max(0) as usize;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+    (start, end)
+}
+
 impl BufferState {
     pub fn new(buffer: Buffer) -> Self {
         let mut state = Self {
@@ -756,6 +857,7 @@ impl BufferState {
             diff_hunks: Vec::new(),
             lsp_language_id: None,
             max_col: 0,
+            max_col_line: 0,
             read_only: false,
             md_rendered: None,
             semantic_tokens: Vec::new(),
@@ -805,6 +907,7 @@ impl BufferState {
             diff_hunks: Vec::new(),
             lsp_language_id,
             max_col: 0,
+            max_col_line: 0,
             read_only: false,
             md_rendered: None,
             semantic_tokens: Vec::new(),
@@ -844,22 +947,270 @@ impl BufferState {
     ///
     /// Exists separately from `update_syntax` so tests can exercise the gate
     /// without racing on the process-wide [`SYNTAX_MAX_LINES`] atomic.
+    ///
+    /// Called on every keystroke (#1721), so the three expensive parts are
+    /// all either incremental or skipped when nothing changed:
+    /// `Syntax::reparse_incremental` reuses the previous parse tree instead
+    /// of a full reparse, `patch_highlights` re-extracts highlights only
+    /// for the byte range that actually changed instead of the whole file,
+    /// and `max_col` is updated from just the touched lines unless that
+    /// can't prove the global max (in which case it falls back to a full
+    /// rescan, same as before).
     pub fn update_syntax_with_limit(&mut self, max_lines: usize) {
         let text = self.buffer.to_string();
         let over_limit = self.buffer.content.len_lines() > max_lines;
-        self.highlights = if over_limit {
-            Vec::new()
-        } else if let Some(ref mut syn) = self.syntax {
-            let mut hl = syn.parse(&text);
-            // Ensure sorted by start_byte — the render pipeline uses binary
-            // search (partition_point) to narrow highlights to the viewport.
-            hl.sort_by_key(|h| h.0);
-            hl
-        } else {
-            Vec::new()
+        if over_limit {
+            self.highlights = Vec::new();
+            self.rescan_max_col(&text);
+            return;
+        }
+        let Some(syn) = self.syntax.as_mut() else {
+            self.highlights = Vec::new();
+            self.rescan_max_col(&text);
+            return;
         };
-        // Cache max line length while we have the text; avoids O(N) scan every render.
-        self.max_col = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        match syn.reparse_incremental(&text) {
+            SyntaxReparseOutcome::Unchanged => {
+                // Text didn't change since the last call (common — many
+                // call sites call `update_syntax` defensively) — nothing to
+                // re-extract or rescan.
+            }
+            SyntaxReparseOutcome::Full => {
+                let mut hl = syn.extract_highlights(&text);
+                // Ensure sorted by start_byte — the render pipeline uses
+                // binary search (partition_point) to narrow highlights to
+                // the viewport.
+                hl.sort_by_key(|h| h.0);
+                self.highlights = hl;
+                self.rescan_max_col(&text);
+            }
+            SyntaxReparseOutcome::Incremental {
+                edit,
+                rehighlight_start,
+                rehighlight_end,
+            } => {
+                // `changed_ranges` can under-report when an edit lands
+                // exactly on an old node's boundary (observed in
+                // practice: inserting text immediately after an
+                // identifier extended that identifier in the new tree,
+                // with `changed_ranges` reporting nothing before the
+                // insertion point) — widen to swallow any cached entry
+                // that touches the window exactly before trusting it.
+                let (rehighlight_start, rehighlight_end) = widen_rehighlight_to_touching_entries(
+                    &self.highlights,
+                    edit,
+                    rehighlight_start,
+                    rehighlight_end,
+                );
+                // Pad the queried range by 1 byte on each side: tree-
+                // sitter's `set_byte_range` excludes a *zero-width*
+                // capture (an error-recovery "MISSING" node, common on
+                // text that's momentarily invalid mid-edit) sitting
+                // exactly at the exclusive end boundary — confirmed by
+                // direct experiment, not just inference — and by
+                // symmetry potentially the start boundary too. Deliberately
+                // *not* clamped to `text.len()` on the high side: a
+                // zero-width node can sit exactly at EOF (an unclosed
+                // `{`/`(` while typing is common, and tree-sitter inserts
+                // its MISSING-token marker right at the end of the file),
+                // and querying `set_byte_range(_, text.len())` alone still
+                // excludes it by that same exclusive-boundary rule — only
+                // `text.len() + 1` reaches it. Confirmed safe to query one
+                // byte past the real length (no panic, no out-of-bounds
+                // read — `set_byte_range` only stores the bound for
+                // filtering, text access stays governed by the actual
+                // nodes). `patch_highlights` re-applies the *unpadded*
+                // bounds itself (via `overlaps_rehighlight`) so a padding-
+                // only capture that isn't actually a boundary marker
+                // doesn't get kept twice.
+                let fetch_start = rehighlight_start.saturating_sub(1);
+                let fetch_end = rehighlight_end + 1;
+                let fresh = syn.extract_highlights_range(&text, fetch_start, fetch_end);
+                self.patch_highlights(edit, rehighlight_start, rehighlight_end, fresh);
+                self.update_max_col_incremental(&text, edit);
+            }
+        }
+    }
+
+    /// Splice freshly-extracted highlights for `[rehighlight_start,
+    /// rehighlight_end)` (new-text byte offsets) into the existing cached
+    /// `self.highlights`, instead of re-extracting the whole file (#1721).
+    ///
+    /// Cached entries are bare byte-range tuples in *old*-text
+    /// coordinates, so they're first partitioned in that coordinate
+    /// space: entries entirely before `edit.start_byte` are untouched
+    /// (old and new text are identical up to there), entries entirely at
+    /// or after `edit.old_end_byte` are shifted to new-text coordinates
+    /// by the edit's length delta (`InputEdit::edit_range`-equivalent,
+    /// done by hand since highlights aren't `tree_sitter::Range`s), and
+    /// everything else — inside the edit's old span — is dropped outright
+    /// as stale. *Only after* that remapping are the survivors (now in
+    /// new-text coordinates) compared against `[rehighlight_start,
+    /// rehighlight_end)` (also new-text coordinates, can be wider than
+    /// the edit itself — `changed_ranges` may extend past it) and
+    /// anything overlapping is dropped too, to be replaced by `fresh`.
+    /// Comparing old-coordinate entries directly against
+    /// `rehighlight_start`/`rehighlight_end` without this first pass is
+    /// wrong whenever the edit changes length (`old_end_byte !=
+    /// new_end_byte`) — the two coordinate spaces disagree past the edit
+    /// point, and a stale in-old-span entry can slip through if it
+    /// happens to land outside the new-coordinate window by sheer
+    /// numeric coincidence.
+    ///
+    /// `fresh` itself is filtered to captures that actually overlap the
+    /// span: tree-sitter's `set_byte_range` restricts which *nodes* get
+    /// traversed by overlap with the queried range, not which individual
+    /// capture spans are reported — a capture on a small sibling of a node
+    /// that merely encloses the range can "leak" through attached to the
+    /// same match, with a span nowhere near the range (observed in
+    /// practice: a `let` binding's identifier captured as `@function`
+    /// leaking in from several bytes before the query's start). Such a
+    /// leaked capture duplicates content already present in the kept set,
+    /// so it's dropped here rather than trusted to widen the patched
+    /// region.
+    fn patch_highlights(
+        &mut self,
+        edit: tree_sitter::InputEdit,
+        rehighlight_start: usize,
+        rehighlight_end: usize,
+        fresh: Vec<(usize, usize, String)>,
+    ) {
+        let delta = edit.new_end_byte as i64 - edit.old_end_byte as i64;
+        let mut kept: Vec<(usize, usize, String)> = self
+            .highlights
+            .drain(..)
+            .filter_map(|(start, end, name)| {
+                if end <= edit.start_byte {
+                    // Entirely before the edit (old-text coordinates) —
+                    // old and new text are identical up to `start_byte`,
+                    // so these byte offsets are unaffected.
+                    Some((start, end, name))
+                } else if start >= edit.old_end_byte {
+                    // Entirely at or after the edit (old-text
+                    // coordinates) — shift to new-text coordinates by
+                    // the length delta.
+                    let new_start = (start as i64 + delta).max(0) as usize;
+                    let new_end = (end as i64 + delta).max(0) as usize;
+                    Some((new_start, new_end, name))
+                } else {
+                    // Overlaps the edit's old span — stale, dropped.
+                    None
+                }
+            })
+            // Survivors are now in new-text coordinates (or coordinates
+            // valid in both spaces, for the before-edit case). Drop any
+            // that additionally fall inside the wider rehighlight window.
+            .filter(|(start, end, _)| {
+                !overlaps_rehighlight(*start, *end, rehighlight_start, rehighlight_end)
+            })
+            .collect();
+
+        kept.extend(fresh.into_iter().filter(|(start, end, _)| {
+            overlaps_rehighlight(*start, *end, rehighlight_start, rehighlight_end)
+        }));
+        kept.sort_by_key(|h| h.0);
+        self.highlights = kept;
+    }
+
+    /// Update `self.max_col` from just the lines the edit touched, instead
+    /// of rescanning every line (#1721).
+    ///
+    /// Safe without reading any line outside the touched span because
+    /// `self.max_col_line` remembers *which* line last produced the cached
+    /// max: if the edit didn't touch that line, every line outside the
+    /// touched span is provably unchanged, so the old max still holds
+    /// unless the touched span now exceeds it. The only case this can't
+    /// resolve locally is the edit touching `max_col_line` itself without
+    /// growing past the old max — that line may have shrunk, and nothing
+    /// here tracks the length of every other line to know what the new
+    /// true max is, so it falls back to a full rescan (same cost as
+    /// before #1721, just no longer paid on every keystroke).
+    ///
+    /// `max_col_line` is a row index, and rows are old/new-text-coordinate
+    /// sensitive exactly like highlight byte offsets are: an edit that
+    /// adds or removes a line *anywhere before* `max_col_line` shifts
+    /// every row number after it, the same way an edit shifts byte
+    /// offsets after it in `patch_highlights`. Forgetting to shift it
+    /// (confirmed by the randomised oracle test below, not just
+    /// inference) leaves `max_col_line` pointing at the wrong row —
+    /// harmless until some *other*, later edit shrinks whatever line now
+    /// actually occupies that row, which this function then wrongly
+    /// trusts as "the max line wasn't touched" and leaves `max_col`
+    /// stuck too high.
+    fn update_max_col_incremental(&mut self, text: &str, edit: tree_sitter::InputEdit) {
+        let line_start = text[..edit.start_byte]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let line_end = text[edit.new_end_byte..]
+            .find('\n')
+            .map(|i| edit.new_end_byte + i)
+            .unwrap_or(text.len());
+
+        let mut touched_max = 0usize;
+        let mut touched_max_row_offset = 0usize;
+        for (i, line) in text[line_start..line_end].split('\n').enumerate() {
+            let len = line.chars().count();
+            if len > touched_max {
+                touched_max = len;
+                touched_max_row_offset = i;
+            }
+        }
+        let touched_start_row = edit.start_position.row;
+        let touched_old_end_row = edit.old_end_position.row;
+        let touched_new_end_row = edit.new_end_position.row;
+        let row_delta = touched_new_end_row as i64 - touched_old_end_row as i64;
+        let touched_max_line = touched_start_row + touched_max_row_offset;
+
+        if touched_max > self.max_col {
+            // Unambiguous new global max.
+            self.max_col = touched_max;
+            self.max_col_line = touched_max_line;
+            return;
+        }
+        if self.max_col_line < touched_start_row {
+            // Entirely before the edit (shared old/new row numbering) —
+            // untouched, still valid.
+            return;
+        }
+        if self.max_col_line > touched_old_end_row {
+            // Entirely after the edit, in *old*-text row numbering — the
+            // line itself is untouched content, but its row number shifts
+            // by however many lines this edit added or removed.
+            self.max_col_line = (self.max_col_line as i64 + row_delta).max(0) as usize;
+            return;
+        }
+        // Inside the touched span (old-text row numbering).
+        if touched_max == self.max_col {
+            // The tracked max line was touched, but a line within the
+            // touched span still ties the old max — re-anchor to it (any
+            // line of that length re-establishes the invariant; it need
+            // not be the exact original line).
+            self.max_col_line = touched_max_line;
+            return;
+        }
+        // The tracked max line was touched and nothing touched reaches
+        // the old max anymore — it may have shrunk, and nothing here
+        // tracks every other line's length to know the new true max.
+        self.rescan_max_col(text);
+    }
+
+    /// Full O(file) scan for the longest line, and which line it is —
+    /// the fallback `update_max_col_incremental` uses when it can't prove
+    /// the cached max is still correct, and what every other code path
+    /// (no syntax, over the highlight size limit, full reparse) uses.
+    fn rescan_max_col(&mut self, text: &str) {
+        let mut max_col = 0usize;
+        let mut max_row = 0usize;
+        for (row, line) in text.lines().enumerate() {
+            let len = line.chars().count();
+            if len > max_col {
+                max_col = len;
+                max_row = row;
+            }
+        }
+        self.max_col = max_col;
+        self.max_col_line = max_row;
     }
 
     /// Analyze the buffer's existing indentation to detect the indent width.
@@ -1774,6 +2125,186 @@ mod tests {
             !big.highlights.is_empty(),
             "buffer should get highlights after raising the limit"
         );
+    }
+
+    /// #1721 integration test: `update_syntax_with_limit`'s incremental
+    /// path (`patch_highlights` + `update_max_col_incremental`) must agree
+    /// with a from-scratch full parse / full line-length rescan after
+    /// every edit — not just on average, exactly. The sequence below
+    /// deliberately drives every branch `update_max_col_incremental` has:
+    /// a touched line growing past the cached max (fast path, no touched
+    /// line relationship to the old max), an edit to an unrelated line
+    /// (fast path, cached max untouched), the max-holding line shrinking
+    /// back down (forces the full-rescan fallback), and a brand new line
+    /// elsewhere becoming the max.
+    #[test]
+    fn test_update_syntax_with_limit_incremental_matches_full_rescan() {
+        use crate::core::syntax::{Syntax, SyntaxLanguage};
+
+        fn assert_matches_full_rescan(state: &mut BufferState) {
+            let text = state.buffer.to_string();
+
+            let mut fresh = Syntax::new_for_language(SyntaxLanguage::Rust);
+            let mut want = fresh.parse(&text);
+            want.sort_by_key(|h| h.0);
+            let mut got = state.highlights.clone();
+            got.sort_by_key(|h| h.0);
+            assert_eq!(got, want, "highlights diverged from a full rescan:\n{text}");
+
+            let want_max = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+            assert_eq!(
+                state.max_col, want_max,
+                "max_col diverged from a full rescan:\n{text}"
+            );
+        }
+
+        let mut state = BufferState::new(Buffer::new(crate::core::buffer::BufferId(0)));
+        state.syntax = Some(Syntax::new_for_language(SyntaxLanguage::Rust));
+        state.buffer.insert(
+            0,
+            "fn main() {\n    let x = 1;\n    println!(\"{}\", x);\n}\n",
+        );
+        state.update_syntax_with_limit(usize::MAX);
+        assert_matches_full_rescan(&mut state);
+
+        // 1. Lengthen the `let x` line until it becomes the longest line
+        //    in the file.
+        let pos = state.buffer.to_string().find("let ").unwrap() + "let ".len();
+        state
+            .buffer
+            .insert(pos, "really_long_identifier_name_0123456789_");
+        state.update_syntax_with_limit(usize::MAX);
+        assert_matches_full_rescan(&mut state);
+
+        // 2. Edit an unrelated (non-max) line — must not disturb the
+        //    cached max, and the touched span's highlights must still
+        //    match a full parse.
+        let pos = state.buffer.to_string().find("println!").unwrap();
+        state.buffer.insert(pos, "/* note */ ");
+        state.update_syntax_with_limit(usize::MAX);
+        assert_matches_full_rescan(&mut state);
+
+        // 3. Shrink the line that currently holds the max back down —
+        //    forces the full-rescan fallback, since the touched line
+        //    *was* the max and no longer grows past it.
+        let text = state.buffer.to_string();
+        let start = text
+            .find("really_long_identifier_name_0123456789_")
+            .unwrap();
+        let end = start + "really_long_identifier_name_0123456789_".len();
+        state.buffer.delete_range(start, end);
+        state.update_syntax_with_limit(usize::MAX);
+        assert_matches_full_rescan(&mut state);
+
+        // 4. A brand new, much longer line elsewhere becomes the new
+        //    global max.
+        let pos = state.buffer.to_string().find("fn main").unwrap();
+        state.buffer.insert(
+            pos,
+            "// a very very very very very very very very very long comment line\n",
+        );
+        state.update_syntax_with_limit(usize::MAX);
+        assert_matches_full_rescan(&mut state);
+    }
+
+    /// #1721 oracle, randomised: a long sequence of random inserts/deletes
+    /// (multi-byte UTF-8, newlines, random positions) plus simulated
+    /// undo/redo, driven through the *real* `update_syntax_with_limit`
+    /// path (not `Syntax` directly — this is what caught a real bug the
+    /// hand-written scenario above didn't: `extract_highlights_range`
+    /// can return a capture whose own span lies outside the queried byte
+    /// range, entirely because an enclosing node happened to overlap it;
+    /// trusting that capture to widen the "drop zone" discarded unrelated,
+    /// still-valid cached highlights). After every step, `highlights` and
+    /// `max_col` must match a from-scratch full parse / full rescan.
+    #[test]
+    fn test_update_syntax_with_limit_fuzz_matches_full_rescan() {
+        use crate::core::syntax::{Syntax, SyntaxLanguage};
+
+        struct Lcg(u64);
+        impl Lcg {
+            fn next_u64(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                self.0
+            }
+            fn next_usize(&mut self, bound: usize) -> usize {
+                if bound == 0 {
+                    0
+                } else {
+                    (self.next_u64() % bound as u64) as usize
+                }
+            }
+        }
+
+        fn apply_random_edit(chars: &mut Vec<char>, rng: &mut Lcg) {
+            const CHOICES: &[char] = &[
+                'a', 'b', 'c', '_', '(', ')', '{', '}', ';', ' ', '\n', '"', 'é', 'λ', '字', '🙂',
+            ];
+            let len = chars.len();
+            let insert = len == 0 || rng.next_usize(100) < 60;
+            if insert {
+                let pos = rng.next_usize(len + 1);
+                let c = CHOICES[rng.next_usize(CHOICES.len())];
+                chars.insert(pos, c);
+            } else {
+                let pos = rng.next_usize(len);
+                let max_del = (len - pos).min(4).max(1);
+                let del_len = 1 + rng.next_usize(max_del);
+                let end = (pos + del_len).min(len);
+                chars.drain(pos..end);
+            }
+        }
+
+        let seed =
+            "fn main() {\n    let x = 1;\n    if x > 0 {\n        println!(\"{}\", x);\n    }\n}\n";
+        let mut chars: Vec<char> = seed.chars().collect();
+
+        let mut state = BufferState::new(Buffer::new(crate::core::buffer::BufferId(0)));
+        state.syntax = Some(Syntax::new_for_language(SyntaxLanguage::Rust));
+        state.buffer.insert(0, &chars.iter().collect::<String>());
+        state.update_syntax_with_limit(usize::MAX);
+
+        let mut history: Vec<Vec<char>> = vec![chars.clone()];
+        let mut rng = Lcg(0x5EED_1234_ABCD_9876);
+
+        for step in 0..300 {
+            if step % 13 == 12 && history.len() > 1 {
+                let back = 1 + rng.next_usize(history.len() - 1);
+                chars = history[history.len() - 1 - back].clone();
+            } else {
+                apply_random_edit(&mut chars, &mut rng);
+            }
+            history.push(chars.clone());
+            let new_text: String = chars.iter().collect();
+
+            let old_len = state.buffer.content.len_chars();
+            state.buffer.delete_range(0, old_len);
+            state.buffer.insert(0, &new_text);
+            state.update_syntax_with_limit(usize::MAX);
+
+            let mut fresh = Syntax::new_for_language(SyntaxLanguage::Rust);
+            let mut want = fresh.parse(&new_text);
+            want.sort_by_key(|h| h.0);
+            let mut got = state.highlights.clone();
+            got.sort_by_key(|h| h.0);
+            assert_eq!(
+                got, want,
+                "step {step}: highlights diverged from a full rescan\ntext:\n{new_text:?}"
+            );
+
+            let want_max = new_text
+                .lines()
+                .map(|l| l.chars().count())
+                .max()
+                .unwrap_or(0);
+            assert_eq!(
+                state.max_col, want_max,
+                "step {step}: max_col diverged from a full rescan\ntext:\n{new_text:?}"
+            );
+        }
     }
 
     // Note: the atomic-sync path (`set_syntax_max_lines` → `update_syntax`

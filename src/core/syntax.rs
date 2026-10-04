@@ -1,5 +1,5 @@
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Language, Parser, Point, Query, QueryCursor, Tree};
+use tree_sitter::{InputEdit, Language, Parser, Point, Query, QueryCursor, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxLanguage {
@@ -718,12 +718,69 @@ pub struct Syntax {
     query: Query,
     #[allow(dead_code)] // Used in tests
     language: SyntaxLanguage,
-    /// Most recently produced parse tree. Passed back to the parser on the next
-    /// call to `parse()` so tree-sitter can skip re-parsing unchanged subtrees
-    /// (incremental parsing). The tree is not explicitly edited with `InputEdit`
-    /// before re-use — tree-sitter still benefits from unchanged subtree reuse
-    /// as a best-effort optimisation.
+    /// Most recently produced parse tree. On the next call to
+    /// [`Syntax::reparse_incremental`], this tree is diffed against the
+    /// incoming text (see [`compute_edit`]), `tree.edit()`-ed with the
+    /// resulting [`InputEdit`], and passed back into `parser.parse()` as the
+    /// reuse baseline — real tree-sitter incremental parsing (#1721), not
+    /// just best-effort subtree reuse. Edits are reconstructed by diffing
+    /// text rather than threaded through from the buffer's mutation call
+    /// sites, so this stays correct regardless of which of the many insert/
+    /// delete/undo/redo/paste/macro paths produced the new text.
     last_tree: Option<Tree>,
+    /// Full text of the most recently produced `last_tree`, kept so the
+    /// next call can reconstruct an [`InputEdit`] by diffing against it.
+    /// `None` before the first parse.
+    last_text: Option<String>,
+    /// Running counters of how [`Syntax::reparse_incremental`] was
+    /// satisfied — read by tests to prove a keystroke-sized edit on a large
+    /// buffer doesn't trigger a full O(file) reparse after the first one
+    /// (#1721's "no full-file work per keystroke" acceptance bar), and
+    /// available generally as instrumentation.
+    stats: SyntaxStats,
+}
+
+/// Running counters for [`Syntax::reparse_incremental`]. See
+/// [`Syntax::stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyntaxStats {
+    /// Parses that had no previous tree/text to diff against (or where the
+    /// diff couldn't be reused), so ran a full `parser.parse(text, None)`.
+    pub full_parses: usize,
+    /// Parses that reused the previous tree via `tree.edit()` +
+    /// `parser.parse(text, Some(&old_tree))`.
+    pub incremental_parses: usize,
+    /// Calls where the text was byte-for-byte identical to the last call —
+    /// no parse ran at all.
+    pub unchanged_parses: usize,
+}
+
+/// What [`Syntax::reparse_incremental`] had to do, and — for the
+/// incremental case — which byte range of the *new* text needs its
+/// highlights re-extracted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyntaxReparseOutcome {
+    /// `text` was byte-for-byte identical to the last call. No parse ran;
+    /// cached highlights are still valid as-is.
+    Unchanged,
+    /// No previous tree to diff against (first parse for this `Syntax`, or
+    /// the previous tree was unexpectedly missing) — a full
+    /// `parser.parse(text, None)` ran. Callers must re-extract highlights
+    /// for the whole file.
+    Full,
+    /// `tree.edit()` + an incremental `parser.parse(text, Some(&old_tree))`
+    /// ran. `rehighlight_start..rehighlight_end` (byte offsets into the
+    /// *new* text) covers the edit itself plus everything tree-sitter's
+    /// `Tree::changed_ranges` reports as structurally different —
+    /// re-extracting highlights over just that span and splicing the
+    /// result into a byte-shifted cached set (see
+    /// `BufferState::patch_highlights`) is equivalent to, but far cheaper
+    /// than, re-extracting over the whole file.
+    Incremental {
+        edit: InputEdit,
+        rehighlight_start: usize,
+        rehighlight_end: usize,
+    },
 }
 
 impl Syntax {
@@ -759,6 +816,8 @@ impl Syntax {
             query,
             language,
             last_tree: None,
+            last_text: None,
+            stats: SyntaxStats::default(),
         }
     }
 
@@ -833,20 +892,157 @@ impl Syntax {
         self.extract_highlights(text)
     }
 
-    /// Incrementally re-parse the text without extracting highlights.
-    /// This is fast (tree-sitter reuses unchanged subtrees) and should be
-    /// called on every keystroke. Highlight extraction can be deferred.
+    /// Re-parse the text without extracting highlights, reusing the
+    /// previous tree via [`reparse_incremental`](Self::reparse_incremental)
+    /// when possible. This is the method `parse()` uses; prefer
+    /// `reparse_incremental` directly when you need to know *what* changed
+    /// (e.g. to patch a cached highlight set instead of re-extracting from
+    /// scratch).
     pub fn reparse(&mut self, text: &str) {
-        // Always do a full parse (no old_tree).  Passing the old tree for
-        // incremental parsing requires calling tree.edit() with precise byte
-        // offset deltas BEFORE reparsing.  Without tree.edit(), tree-sitter
-        // assumes the text is unchanged and reuses stale nodes, producing
-        // highlights with wrong byte offsets (garbled partial-word coloring).
+        self.reparse_incremental(text);
+    }
+
+    /// Re-parse `text`, reusing the previous tree whenever possible.
+    ///
+    /// There is no explicit edit event threaded in from the buffer's
+    /// mutation call sites, so the [`InputEdit`] tree-sitter needs is
+    /// reconstructed by diffing the previous full text against the new one
+    /// (longest common prefix/suffix — see [`compute_edit`]). That keeps
+    /// this correct no matter which of vimcode's many edit paths (typing,
+    /// delete, replace, undo/redo, paste, multi-cursor, macros) produced
+    /// the new text, at the cost of an O(file) byte comparison — orders of
+    /// magnitude cheaper than the O(file) tree-sitter parse + highlight
+    /// query it replaces (#1721).
+    ///
+    /// Falls back to a full `parser.parse(text, None)` when there's no
+    /// previous tree/text to diff against (first parse for this `Syntax`).
+    pub fn reparse_incremental(&mut self, text: &str) -> SyntaxReparseOutcome {
+        let Some(old_text) = self.last_text.as_deref() else {
+            self.full_reparse(text);
+            return SyntaxReparseOutcome::Full;
+        };
+        let Some(edit) = compute_edit(old_text, text) else {
+            self.stats.unchanged_parses += 1;
+            return SyntaxReparseOutcome::Unchanged;
+        };
+        let Some(mut old_tree) = self.last_tree.clone() else {
+            self.full_reparse(text);
+            return SyntaxReparseOutcome::Full;
+        };
+        old_tree.edit(&edit);
+        let new_tree = self
+            .parser
+            .parse(text, Some(&old_tree))
+            .expect("tree-sitter parse failed");
+
+        let mut rehighlight_start = edit.start_byte;
+        let mut rehighlight_end = edit.new_end_byte;
+        for r in old_tree.changed_ranges(&new_tree) {
+            rehighlight_start = rehighlight_start.min(r.start_byte);
+            rehighlight_end = rehighlight_end.max(r.end_byte);
+        }
+        rehighlight_start = rehighlight_start.min(text.len());
+        rehighlight_end = rehighlight_end.clamp(rehighlight_start, text.len());
+
+        // `changed_ranges` alone is not a reliable bound to patch a cached
+        // highlight set against — confirmed by direct experiment (not
+        // just inference), in two different ways:
+        //
+        // 1. Around a parse ERROR: a capture whose span visibly grew (a
+        //    `property` identifier extended by an insertion landing
+        //    exactly on its old boundary) produced an *empty*
+        //    `changed_ranges()` when the surrounding construct had a
+        //    syntax error — as code typically does mid-edit (e.g. a
+        //    momentarily-unclosed bracket).
+        // 2. Even on well-formed code: removing a statement separator
+        //    (`;`) that let two previously-separate tokens merge into one
+        //    (`pri` + `ntln!(...)` → `println!(...)`) also produced an
+        //    empty `changed_ranges()`.
+        //
+        // In both cases the incrementally-parsed tree itself was still
+        // byte-for-byte correct (confirmed against a fresh full parse) —
+        // this is a `changed_ranges` reporting gap for boundary-adjacent
+        // merges, not a parsing bug — but a caller patching a cached
+        // highlight set from `changed_ranges` alone would miss the
+        // boundary move either way.
+        //
+        // Rather than chase further leaf-level special cases, widen to a
+        // structurally safe boundary instead: the *top-level construct*
+        // (the direct child of the tree root) containing the edit. A
+        // boundary-adjacent merge can only ever pull in content from
+        // within that same construct — pulling a sibling top-level item's
+        // content across its own boundary would itself be a top-level
+        // restructuring, which isn't what either confirmed gap above
+        // was (both stayed within one statement). This is far coarser
+        // than the true minimal "safe" range, but it's a boundary that's
+        // cheap to prove safe, and still a large improvement over the
+        // whole file on anything but a single giant top-level item.
+        if let Some(mut node) = new_tree
+            .root_node()
+            .descendant_for_byte_range(rehighlight_start, rehighlight_end)
+        {
+            while let Some(parent) = node.parent() {
+                if parent.parent().is_none() {
+                    break; // `parent` is the root; `node` is the top-level item.
+                }
+                node = parent;
+            }
+            rehighlight_start = rehighlight_start.min(node.start_byte());
+            rehighlight_end = rehighlight_end.max(node.end_byte());
+        } else {
+            // No enclosing node found at all (shouldn't normally happen) —
+            // fall back to the whole file rather than trust a narrow,
+            // unvalidated window.
+            rehighlight_start = 0;
+            rehighlight_end = text.len();
+        }
+
+        // Belt and suspenders: even "top-level item" isn't a safe boundary
+        // once error recovery is involved — confirmed by direct
+        // experiment, a heavily-malformed buffer (missing parens on a
+        // function signature, among other damage) fragmented what should
+        // be one function body into several adjacent top-level items, and
+        // an edit went on to *merge two of those fragments* across what
+        // the top-level climb above treated as a hard boundary. There is
+        // no bounded-size window that's provably safe once the parse
+        // state contains an error anywhere — error recovery can
+        // desync arbitrarily far from the actual edit point — so treat
+        // any error in the whole tree (a cheap, cached O(1) check, not a
+        // traversal) as a signal to just re-highlight everything. This
+        // only costs anything while the buffer has a syntax error
+        // *anywhere* (not even necessarily near the cursor); well-formed
+        // code — the common case, and what #1721's "no full reparse/
+        // extraction per keystroke" target is measured against — is
+        // unaffected.
+        if new_tree.root_node().has_error() {
+            rehighlight_start = 0;
+            rehighlight_end = text.len();
+        }
+
+        self.last_tree = Some(new_tree);
+        self.last_text = Some(text.to_string());
+        self.stats.incremental_parses += 1;
+        SyntaxReparseOutcome::Incremental {
+            edit,
+            rehighlight_start,
+            rehighlight_end,
+        }
+    }
+
+    fn full_reparse(&mut self, text: &str) {
         let tree = self
             .parser
             .parse(text, None)
             .expect("tree-sitter parse failed");
         self.last_tree = Some(tree);
+        self.last_text = Some(text.to_string());
+        self.stats.full_parses += 1;
+    }
+
+    /// Running counters of how recent [`reparse_incremental`](Self::reparse_incremental)
+    /// calls were satisfied. See [`SyntaxStats`].
+    pub fn stats(&self) -> SyntaxStats {
+        self.stats
     }
 
     /// Extract highlights from the most recent parse tree.
@@ -1281,6 +1477,66 @@ impl Syntax {
         }
         Ok(out)
     }
+}
+
+/// Compute the single [`InputEdit`] describing how `old` text became `new`
+/// text, via longest common prefix/suffix — the technique editors without
+/// an exact edit-event log use to recover an edit descriptor tree-sitter
+/// can incrementally reparse against (#1721). When several disjoint edits
+/// (e.g. multi-cursor inserts) happened between calls, this collapses them
+/// into one bounding region spanning the first to the last difference —
+/// still a *correct* edit descriptor (it accurately describes what the old
+/// and new text are either side of, and inside, that region), just one
+/// tree-sitter can reuse fewer subtrees within. Returns `None` if the two
+/// texts are identical.
+fn compute_edit(old: &str, new: &str) -> Option<InputEdit> {
+    if old == new {
+        return None;
+    }
+    let old_b = old.as_bytes();
+    let new_b = new.as_bytes();
+
+    let common_prefix = old_b
+        .iter()
+        .zip(new_b.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // Suffix match must not eat back into the already-matched prefix.
+    let max_suffix = old_b.len().min(new_b.len()) - common_prefix;
+    let common_suffix = old_b[common_prefix..]
+        .iter()
+        .rev()
+        .zip(new_b[common_prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(max_suffix);
+
+    let start_byte = common_prefix;
+    let old_end_byte = old_b.len() - common_suffix;
+    let new_end_byte = new_b.len() - common_suffix;
+
+    Some(InputEdit {
+        start_byte,
+        old_end_byte,
+        new_end_byte,
+        start_position: point_for_byte(old, start_byte),
+        old_end_position: point_for_byte(old, old_end_byte),
+        new_end_position: point_for_byte(new, new_end_byte),
+    })
+}
+
+/// Row/column (tree-sitter's `Point`, byte-based column per its own
+/// convention) of `byte_offset` within `text`. Used to build the
+/// [`InputEdit`] positions [`compute_edit`] needs alongside byte offsets.
+fn point_for_byte(text: &str, byte_offset: usize) -> Point {
+    let bytes = &text.as_bytes()[..byte_offset];
+    let row = bytes.iter().filter(|&&b| b == b'\n').count();
+    let column = match bytes.iter().rposition(|&b| b == b'\n') {
+        Some(newline_idx) => byte_offset - newline_idx - 1,
+        None => byte_offset,
+    };
+    Point::new(row, column)
 }
 
 #[cfg(test)]
@@ -2006,5 +2262,190 @@ mod tests {
             highlights.iter().map(|(_, _, k)| k.as_str()).collect();
         assert!(kinds.contains("comment"));
         assert!(!kinds.contains("keyword"));
+    }
+
+    // ── #1721: real incremental parsing ─────────────────────────────────
+
+    #[test]
+    fn test_compute_edit_none_when_unchanged() {
+        assert_eq!(compute_edit("same text", "same text"), None);
+    }
+
+    #[test]
+    fn test_compute_edit_pure_insert() {
+        let old = "fn main() {}";
+        let new = "fn main() { x }";
+        let edit = compute_edit(old, new).expect("texts differ");
+        assert_eq!(edit.start_byte, 11);
+        assert_eq!(edit.old_end_byte, 11);
+        assert_eq!(edit.new_end_byte, 14);
+        assert_eq!(&new[edit.start_byte..edit.new_end_byte], " x ");
+    }
+
+    #[test]
+    fn test_compute_edit_pure_delete() {
+        let old = "fn main() { x }";
+        let new = "fn main() {}";
+        let edit = compute_edit(old, new).expect("texts differ");
+        assert_eq!(edit.start_byte, 11);
+        assert_eq!(edit.old_end_byte, 14);
+        assert_eq!(edit.new_end_byte, 11);
+        assert_eq!(&old[edit.start_byte..edit.old_end_byte], " x ");
+    }
+
+    #[test]
+    fn test_compute_edit_replace_with_newline() {
+        let old = "line one\nline two\nline three";
+        let new = "line one\nline TWO\nline three";
+        let edit = compute_edit(old, new).expect("texts differ");
+        assert_eq!(&old[edit.start_byte..edit.old_end_byte], "two");
+        assert_eq!(&new[edit.start_byte..edit.new_end_byte], "TWO");
+        // The replaced text is on row 1 (0-indexed), after "line one\nline ".
+        assert_eq!(edit.start_position.row, 1);
+        assert_eq!(edit.start_position.column, "line ".len());
+    }
+
+    #[test]
+    fn test_compute_edit_multibyte_insert() {
+        // common prefix/suffix scanning is byte-based; this just confirms
+        // the resulting byte range round-trips to the expected substrings
+        // even when the inserted text is multi-byte UTF-8.
+        let old = "let s = \"\";";
+        let new = "let s = \"héllo 字 🙂\";";
+        let edit = compute_edit(old, new).expect("texts differ");
+        assert_eq!(&new[edit.start_byte..edit.new_end_byte], "héllo 字 🙂");
+        assert_eq!(edit.old_end_byte - edit.start_byte, 0);
+    }
+
+    /// A deterministic PCG/LCG-style PRNG — no `rand` dependency, same
+    /// technique as `engine::acp_ops::oversize_rgba_image`'s fuzz fixture.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+        fn next_usize(&mut self, bound: usize) -> usize {
+            if bound == 0 {
+                0
+            } else {
+                (self.next_u64() % bound as u64) as usize
+            }
+        }
+    }
+
+    /// Apply one random insert or (small) delete to `chars` — operating on
+    /// `Vec<char>` rather than raw bytes so every edit lands on a valid
+    /// character boundary, including multi-byte UTF-8 (accented Latin,
+    /// CJK, emoji) and newlines.
+    fn apply_random_edit(chars: &mut Vec<char>, rng: &mut Lcg) {
+        const CHOICES: &[char] = &[
+            'a', 'b', 'c', '_', '(', ')', '{', '}', ';', ' ', '\n', '"', 'é', 'λ', '字', '🙂',
+        ];
+        let len = chars.len();
+        let insert = len == 0 || rng.next_usize(100) < 60;
+        if insert {
+            let pos = rng.next_usize(len + 1);
+            let c = CHOICES[rng.next_usize(CHOICES.len())];
+            chars.insert(pos, c);
+        } else {
+            let pos = rng.next_usize(len);
+            let max_del = (len - pos).min(4).max(1);
+            let del_len = 1 + rng.next_usize(max_del);
+            let end = (pos + del_len).min(len);
+            chars.drain(pos..end);
+        }
+    }
+
+    /// Correctness oracle (#1721): a long randomised sequence of inserts
+    /// and deletes (multi-byte UTF-8, newlines, random positions) plus
+    /// simulated undo/redo (jumping back to an earlier snapshot — from
+    /// `Syntax`'s point of view that's just another arbitrary text
+    /// transition, the same as any other edit path). After every step,
+    /// the incrementally-reparsed tree's highlights must *exactly* match
+    /// a fresh full `parse(text, None)` of the same text.
+    ///
+    /// RED-verified: commenting out the `old_tree.edit(&edit);` line in
+    /// `reparse_incremental` (reproducing the exact bug this fix replaces
+    /// — passing an old tree to `parser.parse` without editing it first)
+    /// makes this fail within the first handful of steps, with visibly
+    /// wrong (stale-offset) captures. Restored before committing.
+    #[test]
+    fn test_incremental_reparse_matches_full_reparse_fuzz() {
+        let seed =
+            "fn main() {\n    let x = 1;\n    if x > 0 {\n        println!(\"{}\", x);\n    }\n}\n";
+        let mut chars: Vec<char> = seed.chars().collect();
+        let mut incremental = Syntax::new_for_language(SyntaxLanguage::Rust);
+        incremental.reparse_incremental(&chars.iter().collect::<String>());
+
+        let mut history: Vec<Vec<char>> = vec![chars.clone()];
+        let mut rng = Lcg(0xC0FF_EE11_2233_4455);
+
+        for step in 0..400 {
+            if step % 17 == 16 && history.len() > 1 {
+                // Simulated undo/redo: jump to an earlier snapshot instead
+                // of applying a fresh edit.
+                let back = 1 + rng.next_usize(history.len() - 1);
+                chars = history[history.len() - 1 - back].clone();
+            } else {
+                apply_random_edit(&mut chars, &mut rng);
+            }
+            history.push(chars.clone());
+
+            let text: String = chars.iter().collect();
+            incremental.reparse_incremental(&text);
+            let mut got = incremental.extract_highlights(&text);
+            got.sort();
+
+            let mut fresh = Syntax::new_for_language(SyntaxLanguage::Rust);
+            let mut want = fresh.parse(&text);
+            want.sort();
+
+            assert_eq!(
+                got, want,
+                "step {step}: incremental highlights diverged from a fresh full parse\ntext:\n{text:?}"
+            );
+        }
+    }
+
+    /// No full-file work per keystroke (#1721's acceptance bar): after the
+    /// unavoidable first full parse, typing into a large buffer must not
+    /// trigger any further full reparses — every subsequent keystroke
+    /// should reuse the previous tree via `tree.edit()` + incremental
+    /// `parser.parse(text, Some(&old_tree))`.
+    #[test]
+    fn test_reparse_incremental_no_full_parse_after_first_keystroke() {
+        let mut text = "fn main() {\n".to_string();
+        for i in 0..2000 {
+            text.push_str(&format!("    let v{i} = {i};\n"));
+        }
+        text.push_str("}\n");
+
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Rust);
+        syntax.reparse_incremental(&text);
+        assert_eq!(syntax.stats().full_parses, 1);
+
+        let insert_at = text.find("let v1000").expect("fixture line present");
+        let mut cur = text.clone();
+        for (i, ch) in "let_me_type_this_identifier".chars().enumerate() {
+            cur.insert(insert_at + i, ch);
+            syntax.reparse_incremental(&cur);
+        }
+
+        let stats = syntax.stats();
+        assert_eq!(
+            stats.full_parses,
+            1,
+            "typing after the first parse triggered {} additional full reparse(s) — \
+             every keystroke should reuse the previous tree (#1721)",
+            stats.full_parses - 1
+        );
+        assert!(
+            stats.incremental_parses > 0,
+            "expected at least one incremental parse to have run"
+        );
     }
 }
