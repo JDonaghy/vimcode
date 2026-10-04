@@ -562,6 +562,75 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// vimcode#1740 — `tests/smoke-spec/tui.yaml`'s own header comment
+        /// claimed the real-terminal activity-bar row order is
+        /// Explorer/Search/Debug/Source-Control/Extensions/AI/Board, and its
+        /// `click-source-control-icon` step (`row: 4`) was authored against
+        /// that claim. The *actual* order —
+        /// `sidebar::FIXED_ACTIVITY_PANEL_IDS`, which
+        /// `render::build_activity_bar`'s own `debug_assert_eq!` forbids
+        /// drifting from — is Explorer/Search/Source-Control/Debug/
+        /// Extensions/AI/Board (#1698 put Git before Debug, to match VS
+        /// Code's own ordering). So row 4 is Debug, not Source Control, and
+        /// the sealed Tier-2 spec's row-4 click opened the wrong panel on
+        /// every real run.
+        ///
+        /// This pins the exact row→panel mapping at the Tier-1 level, using
+        /// the *same addressing scheme* the Tier-2 pty spec's `click` steps
+        /// use — plain cell-unit `(col, row)` coordinates, row 0 reserved
+        /// for the hamburger toggle, rows 1..=7 the fixed panels in order —
+        /// rather than this file's usual `driver.inventory()`/`driver.find`
+        /// zone lookup, precisely so a future row/order mismatch between
+        /// this mapping and the real one fails here, in-process, instead of
+        /// only in a 20s real-pty run. `quadraui::tui::testing::TuiDriver::
+        /// click`'s own doc confirms `(x, y)` are "cell units for TUI", so
+        /// `(1.5, row + 0.5)` below lands in the middle of the icon cell at
+        /// that row exactly like a real `ESC [ < 0 ; 2 ; row+1 M` SGR click
+        /// at 1-indexed terminal column 2 would (`ICON_COLUMN = 1`,
+        /// 0-indexed, per `tests/conpty_activity_bar_click.rs`'s own doc).
+        ///
+        /// RED-verified by hand: swapping this list's row-3/row-4 entries
+        /// (i.e. encoding the spec's own wrong claim — Debug at row 3,
+        /// Source Control at row 4) fails both assertions, each reporting
+        /// the *other* panel's marker on screen instead of the expected
+        /// one — confirming this test actually distinguishes the two
+        /// orderings rather than vacuously passing either way.
+        #[test]
+        fn activity_bar_row_click_order_matches_fixed_activity_panel_ids() {
+            let mut h = harness(plain_engine());
+            let driver = &mut h.driver;
+            // Six back-to-back clicks with no simulated time between them
+            // would otherwise fold pairwise into `DoubleClick`s (#1432,
+            // same reasoning as this module's own `collapse_sidebar` doc).
+            driver.set_double_click_folding(false);
+
+            // (row, expected sidebar-header marker, label) — row 0 is the
+            // hamburger; rows 1..=7 are `FIXED_ACTIVITY_PANEL_IDS` in
+            // order, per `sidebar.rs`'s own "Index mapping: 0 = hamburger,
+            // 1..=7 = FIXED_ACTIVITY_PANEL_IDS" doc.
+            let expectations: [(f32, &str, &str); 7] = [
+                (1.0, "EXPLORER", "Explorer"),
+                (2.0, "SEARCH", "Search"),
+                (3.0, "SOURCE CONTROL", "Source Control (Git)"),
+                (4.0, "RUN AND DEBUG", "Run and Debug"),
+                (5.0, "EXTENSIONS", "Extensions"),
+                (6.0, "AI", "AI Assistant"),
+                (7.0, "BOARD", "Board"),
+            ];
+
+            for (row, marker, label) in expectations {
+                driver.click(1.5, row + 0.5);
+                let screen = driver.screen();
+                assert!(
+                    screen.contains(marker),
+                    "row {row} (col 1) — the exact (row, col) addressing \
+                     tests/smoke-spec/tui.yaml's own `click` steps use — \
+                     must open {label} (marker {marker:?} missing); \
+                     screen:\n{screen}"
+                );
+            }
+        }
+
         /// Mirrors `shell_app.rs`'s test of the same name (#694): a
         /// hamburger click with the sidebar closed beforehand must not
         /// panic through the real dispatch pipeline, and must reveal the

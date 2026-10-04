@@ -31,9 +31,20 @@
 # leftmost column (`x = 0` accent, `x = 1` icon glyph — exactly
 # `tests/conpty_activity_bar_click.rs`'s own `ICON_COLUMN = 1`), and with no
 # title/tab-bar row inserted above it, row 0 is the hamburger menu toggle,
-# rows 1-7 are Explorer/Search/Debug/Source Control(Git)/Extensions/AI
-# Assistant/Board in that fixed order (`src/render.rs`'s `fixed` array,
-# `build_activity_bar`), and the last row (here, row 29) is Settings.
+# rows 1-7 are Explorer/Search/Source Control(Git)/Debug/Extensions/AI
+# Assistant/Board in that fixed order (`src/core/engine/sidebar.rs`'s
+# `FIXED_ACTIVITY_PANEL_IDS` — Git before Debug, per #1698's VS-Code-order
+# swap; `src/render.rs`'s `build_activity_bar` `fixed` array has a
+# `debug_assert_eq!` forbidding it from drifting out of sync with that
+# constant), and the last row (here, row 29) is Settings.
+#
+# #1740: this comment and the `click-source-control-icon` step below used to
+# claim the opposite order (Debug before Source Control), which made that
+# step's row-4 click actually land on Debug and time out waiting for
+# "SOURCE CONTROL". Fixed by moving that click to row 3 — see
+# `src/tui_main/app_on_tui_tests.rs`'s
+# `activity_bar_row_click_order_matches_fixed_activity_panel_ids` for the
+# Tier-1 conformance test that now pins this exact row→panel mapping.
 name: vimcode-tui-pty
 cols: 100
 rows: 30
@@ -1662,9 +1673,12 @@ steps:
     ms: 500
     timeout_ms: 5000
 
+  # #1740: row 3, not row 4 — Source Control (Git) sits third in the fixed
+  # activity-bar order (Explorer, Search, Source Control, Debug, ...), one
+  # row above Debug. Row 4 is exercised separately below.
   - type: click
     id: click-source-control-icon
-    row: 4
+    row: 3
     col: 1
   - type: expect_within
     id: activity-bar-source-control-switches-panel-1636
@@ -1672,6 +1686,23 @@ steps:
     ms: 5000
   - type: wait_idle
     id: settle-after-source-control-click
+    ms: 500
+    timeout_ms: 5000
+
+  # #1740: row 4, the row this spec used to (wrongly) use for Source
+  # Control, actually opens Debug — exercised here explicitly so the
+  # row-3/row-4 boundary this bug lived on is covered both ways, not just
+  # fixed one-sided.
+  - type: click
+    id: click-debug-icon-1740
+    row: 4
+    col: 1
+  - type: expect_within
+    id: activity-bar-debug-switches-panel-1740
+    text: "RUN AND DEBUG"
+    ms: 5000
+  - type: wait_idle
+    id: settle-after-debug-click-1740
     ms: 500
     timeout_ms: 5000
 
