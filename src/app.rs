@@ -11181,4 +11181,79 @@ mod portable_entry_point_tests {
              the saved session says maximized: true"
         );
     }
+
+    /// #1722: a tab-bar width correction that doesn't move the active
+    /// tab's resolved scroll offset must not schedule a redraw — the
+    /// shared-code half of "spurious full repaints: idle tick returns
+    /// Redraw ~4×/s with several tabs open". Backend-neutral (`TuiBackend`,
+    /// no `gui` feature needed — unlike
+    /// `handle_poll_tick_scrolls_the_active_tab_back_into_view_on_gtk`
+    /// above) because the bug lives in
+    /// `render::run_shared_tick_chores`/`Engine::post_draw_apply_widths`,
+    /// code both backends share equally; this additionally proves the fix
+    /// reaches the real tick path a runner drives (`App::handle_poll_tick`
+    /// → `run_shared_tick_chores` → `self.draw_needed`), the exact signal
+    /// `tick_dispatch` turns into `Reaction::Redraw`/`Continue` — the same
+    /// observable `app_on_tui_tests`'s `idle_stability_1583`/`_1650` assert
+    /// on via `driver.tick()`.
+    ///
+    /// Stands in for a real paint by pushing straight into
+    /// `App::tab_visible_counts`, the same technique
+    /// `handle_poll_tick_scrolls_the_active_tab_back_into_view_on_gtk`
+    /// above uses and documents the rationale for (no headless way to pump
+    /// a real paint here yet) — on a pixel-measuring backend (GTK/Win-GUI/
+    /// macOS) the measured width genuinely can wobble by a sub-pixel-
+    /// rounding unit between otherwise-identical frames; this test
+    /// reproduces that shape directly rather than depending on real GTK
+    /// float jitter happening to land on a test machine.
+    ///
+    /// RED-verified: reverting `Engine::post_draw_apply_widths` to its
+    /// pre-#1722 `width_bookkeeping_changed || scroll_changed` contract
+    /// makes this fail — the second tick below (a one-column width wobble
+    /// with no effect on the resolved scroll offset) sets `draw_needed`
+    /// instead of leaving it clear. Confirmed by hand before committing.
+    #[test]
+    fn handle_poll_tick_does_not_redraw_on_a_cosmetic_tab_width_wobble() {
+        let engine = Rc::new(RefCell::new(Engine::new()));
+        // Three tabs, active = last (idx 2); each "[No Name]" tab is 16
+        // display columns wide (see `Engine::tab_display_width`).
+        engine.borrow_mut().new_tab(None);
+        engine.borrow_mut().new_tab(None);
+        let group_id = engine.borrow().active_group;
+
+        let mut app = App::new_headless_with_backend(
+            Rc::clone(&engine),
+            Rc::new(RefCell::new(
+                Box::new(quadraui::tui::TuiBackend::new()) as Box<dyn quadraui::Backend>
+            )),
+            render::UnitProfile::cell(),
+        );
+        let mut backend: Box<dyn quadraui::Backend> = Box::new(quadraui::tui::TuiBackend::new());
+
+        // First tick: bar only wide enough for one tab (16 <= 30 < 32) —
+        // a real correction, since the active tab (idx 2) wasn't visible
+        // at the engine's default offset.
+        app.tab_visible_counts.borrow_mut().push((group_id, 30));
+        app.handle_poll_tick(&mut *backend);
+        assert!(
+            app.draw_needed.get(),
+            "test setup: narrowing the bar enough to hide the active tab \
+             must schedule a redraw"
+        );
+        app.draw_needed.set(false);
+
+        // Second tick: one column narrower, still only enough for exactly
+        // one tab — the resolved scroll offset is identical, so nothing
+        // painted this frame would differ from what's already on screen.
+        app.tab_visible_counts.borrow_mut().push((group_id, 29));
+        app.handle_poll_tick(&mut *backend);
+        assert!(
+            !app.draw_needed.get(),
+            "a one-column tab-bar width wobble with no effect on which tab \
+             is scrolled into view must not schedule a redraw (#1722) — on \
+             a pixel-measuring backend (GTK/Win-GUI/macOS) this is exactly \
+             the kind of sub-pixel-rounding noise that forced a redraw \
+             every ~250ms idle tick with several tabs open"
+        );
+    }
 }

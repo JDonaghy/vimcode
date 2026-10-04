@@ -7103,6 +7103,154 @@ mod tests {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // #1722 — idle stability with several tabs open
+    // ─────────────────────────────────────────────────────────────────────────
+    /// #1722's own acceptance bar: "a headless `App` with multiple tabs
+    /// open and no input must return `Reaction::Continue` from repeated
+    /// `tick()` calls once settled." Sibling of
+    /// [`idle_stability_1583`]/[`idle_stability_1650`] — same shape
+    /// (settle, snapshot, tick-and-compare in a loop), this time with six
+    /// tabs open on the unsplit tab bar rather than one, since the report's
+    /// own measurements tie the churn to "right after a click that likely
+    /// opened a second tab".
+    ///
+    /// This module's own confirmed culprit — `Engine::post_draw_apply_
+    /// widths` forcing a redraw on a cosmetic-only tab-bar width change —
+    /// is a pixel-measurement artifact of the backends that actually
+    /// measure tab-bar width in sub-pixel units (GTK/Win-GUI/macOS);
+    /// `TuiBackend`'s char-cell widths are exact integers that never wobble
+    /// between two identical paints, so this test does not, and cannot,
+    /// reproduce that specific failure the way `crate::app::
+    /// portable_entry_point_tests::handle_poll_tick_does_not_redraw_on_a_
+    /// cosmetic_tab_width_wobble` (`src/app.rs`) does by injecting the
+    /// wobble directly. It stays here anyway, green on both the buggy and
+    /// fixed code, as the acceptance bar's own literal black-box
+    /// reproduction and as a regression guard against any *other*
+    /// multi-tab idle-redraw source a future change might introduce.
+    mod idle_stability_1722 {
+        use super::*;
+        use quadraui::Reaction;
+
+        #[test]
+        fn idle_ticks_with_six_tabs_open_do_not_repaint() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1722_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut engine = plain_engine();
+            for i in 0..6 {
+                let p = dir.join(format!("tab_number_{i}.txt"));
+                std::fs::write(&p, "hello\n").unwrap();
+                engine.new_tab(Some(&p));
+            }
+            engine.settings.lsp_enabled = false;
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            // Settle past the startup paint before asserting stability —
+            // same contract [`idle_stability_1583`]/[`idle_stability_1650`]
+            // use.
+            for _ in 0..3 {
+                driver.tick();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let screen0 = driver.screen();
+            assert!(
+                screen0.contains("tab_number_5.txt"),
+                "precondition: the sixth tab must actually be painted, or \
+                 this test silently degrades into a one-tab rerun of \
+                 idle_stability_1583; screen:\n{screen0}"
+            );
+
+            let mut failures: Vec<String> = Vec::new();
+            for n in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let reaction = driver.tick();
+                let screen_n = driver.screen();
+                if reaction != Reaction::Continue {
+                    failures.push(format!(
+                        "tick {n}: an idle tick must not force a repaint \
+                         with six tabs open and nothing changed (#1722) — \
+                         got {reaction:?}"
+                    ));
+                }
+                if screen_n != screen0 {
+                    failures.push(format!(
+                        "tick {n}: rendered text must not change with no input"
+                    ));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "idle-stability violated:\n{}",
+                failures.join("\n")
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #1722 — a `MouseMoved` that changes no hover target must not repaint
+    // ─────────────────────────────────────────────────────────────────────────
+    /// #1722's second acceptance bullet: "a `MouseMoved` that doesn't change
+    /// any hover target must return `Continue`." Audited
+    /// `App::handle_dispatch`'s `MouseMoved` arm (`src/app.rs`) for this
+    /// issue: the sidebar-hover and gutter-hover rungs it calls
+    /// (`render::route_sidebar_hover`/`render::route_gutter_hover`) already
+    /// gate `draw_needed` on an actual before/after difference, and the
+    /// window-edge resize-cursor hint and `mouse_pos_cell` bookkeeping
+    /// above them never touch `draw_needed` at all — found no bug on this
+    /// half, unlike the tab-width chore above. This test pins that down as
+    /// a black-box regression guard rather than leaving the audit as only
+    /// a sentence in a PR description.
+    #[test]
+    fn mouse_moved_to_the_same_plain_editor_cell_does_not_repaint() {
+        let mut engine = plain_engine();
+        engine.buffer_mut().insert(0, "hello world\n");
+        let mut h = harness_no_sidebar(engine);
+        let driver = &mut h.driver;
+
+        let (x, y) = driver
+            .find("hello world")
+            .expect("buffer text must be painted");
+
+        // A plain hover move: no button held. `TuiDriver::mouse_move`
+        // itself always sends the left button *held* (it exists to drive
+        // drag-selection scenarios, per its own doc), so a genuine no-op
+        // hover move has to be built and sent directly through
+        // `driver.dispatch` instead.
+        let hover_move = |driver: &mut quadraui::tui::testing::TuiDriver<_>, x: f32, y: f32| {
+            driver.dispatch(quadraui::UiEvent::MouseMoved {
+                position: quadraui::Point::new(x, y),
+                buttons: quadraui::ButtonMask::default(),
+            })
+        };
+
+        // First move establishes whatever hover state a move to this cell
+        // implies (there is none here — no gutter fold marker, no sidebar
+        // popup — but settle it before taking the comparison snapshot).
+        hover_move(driver, x, y);
+        let screen0 = driver.screen();
+
+        // Second move to the exact same cell: nothing about the pointer
+        // target changed, so no hover state can have changed either.
+        let reaction = hover_move(driver, x, y);
+        assert_eq!(
+            reaction,
+            quadraui::Reaction::Continue,
+            "a MouseMoved that lands on the same cell as the previous one, \
+             touching no hover target, must not force a repaint (#1722)"
+        );
+        assert_eq!(
+            driver.screen(),
+            screen0,
+            "rendered text must not change from a no-op mouse move"
+        );
+    }
+
     /// #1397/#1577: the recommended-extension install offer, TUI half of
     /// the black-box coverage — GTK's twin is
     /// `crate::gtk::testing::issue_1577_ext_install_offer_toast`, which its

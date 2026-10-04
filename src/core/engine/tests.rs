@@ -21940,15 +21940,23 @@ fn test_tab_scroll_offset_accounts_for_wide_display_name() {
 
 #[test]
 fn test_post_draw_apply_widths_reports_changes() {
+    // #1722: a lone tab fits at any sane width, so none of the three calls
+    // below ever has anything to correct — `tab_scroll_offset` is `0` before
+    // and after every one of them. The pre-#1722 contract reported "changed"
+    // on the *first* call purely because `tab_bar_width` starts at
+    // `usize::MAX` and any real width differs from that sentinel, and again
+    // on the *third* call purely because 60 != 80 — in both cases forcing a
+    // redraw that would have painted pixel-for-pixel the same frame. See
+    // `Engine::post_draw_apply_widths`'s own doc for why only a
+    // `tab_scroll_offset` change is a real signal.
     let mut engine = Engine::new();
     let group_id = engine.active_group;
 
-    // First call with a fresh width must report change (tab_bar_width
-    // defaults to usize::MAX, so any reported value differs).
     let changed = engine.post_draw_apply_widths(&[(group_id, 80)]);
     assert!(
-        changed,
-        "first apply with new width should report change so backend redraws"
+        !changed,
+        "a single tab always fits — the first apply has nothing to correct \
+         and must not force a redraw (#1722)"
     );
 
     // Second call with the same width is idempotent — must report no change
@@ -21959,9 +21967,67 @@ fn test_post_draw_apply_widths_reports_changes() {
         "no-op apply must report no change to avoid redraw loops"
     );
 
-    // Different width reports change.
+    // A different raw width that still leaves the lone tab fully visible
+    // (no scroll-offset change) must likewise report no change — this is
+    // exactly the #1722 bug: on a pixel-measuring backend this width can
+    // wobble by a sub-pixel-rounding unit every frame with nothing painted
+    // differently, and the old contract turned every such wobble into a
+    // forced repaint.
     let changed = engine.post_draw_apply_widths(&[(group_id, 60)]);
-    assert!(changed, "width change must be reported");
+    assert!(
+        !changed,
+        "a width change with no visible effect must not be reported (#1722)"
+    );
+}
+
+/// #1722: the scroll-affecting sibling of
+/// [`test_post_draw_apply_widths_reports_changes`] — confirms a tiny,
+/// cosmetic-only width change (one that doesn't cross any tab-fit boundary)
+/// reports no change even with *several* tabs open and the bar already
+/// scrolled, which is the exact "idle tick returns `Redraw` continuously
+/// with several tabs open" shape the issue reported. A width change that
+/// *does* cross a fit boundary (covered by
+/// `test_post_draw_apply_widths_detects_scroll_change` below) must still be
+/// reported.
+#[test]
+fn test_post_draw_apply_widths_ignores_cosmetic_width_wobble_with_several_tabs() {
+    let mut engine = Engine::new();
+    let group_id = engine.active_group;
+    // Three tabs total (one default + two new), each "[No Name]" tab is 16
+    // display columns wide (see `tab_display_width`), active = last (idx 2).
+    engine.new_tab(None);
+    engine.new_tab(None);
+    assert_eq!(engine.active_group().active_tab, 2);
+
+    // Bar only wide enough for one tab (16 <= 30 < 32) — forces a real
+    // scroll correction so the active tab (idx 2) is actually visible.
+    let changed = engine.post_draw_apply_widths(&[(group_id, 30)]);
+    assert!(
+        changed,
+        "test setup: narrowing the bar enough to hide the active tab must \
+         report a real scroll correction"
+    );
+    assert_eq!(
+        engine.active_group().tab_scroll_offset,
+        2,
+        "test setup: only the active tab should be visible at this width"
+    );
+
+    // One column narrower — still enough for exactly one tab, so the
+    // resolved scroll offset is identical. This is the cosmetic wobble: the
+    // raw width value differs (30 -> 29) but nothing about what's painted
+    // does.
+    let changed = engine.post_draw_apply_widths(&[(group_id, 29)]);
+    assert!(
+        !changed,
+        "a one-column width wobble that doesn't change which tab is \
+         scrolled into view must not force a redraw (#1722)"
+    );
+    assert_eq!(
+        engine.active_group().tab_scroll_offset,
+        2,
+        "scroll offset must be unaffected by the cosmetic wobble"
+    );
 }
 
 #[test]
