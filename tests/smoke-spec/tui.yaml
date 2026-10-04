@@ -205,17 +205,30 @@ steps:
   # `right_click_row_3_on_a_folderless_cwd_hits_a_file_not_a_folder_1703`
   # reproduces and confirms this at the unit level.
   #
-  # `row: 1, col: 10` is cwd-layout-independent: `build_explorer_rows`
+  # `row: 2, col: 10` is cwd-layout-independent: `build_explorer_rows`
   # (`src/core/engine/explorer_ops.rs`) pushes the Explorer's root entry
   # unconditionally with `is_dir: true`, before listing any children, so
-  # row 1 (the row directly below the activity bar's Explorer icon row in
-  # this grid) is always a directory regardless of what the launch `cwd`
-  # happens to contain. This step is therefore a reliable Tier-2 oracle for
-  # #1635 ("slow right-click context menus") that cannot flake the way
-  # `right-click-explorer-row` can on an unexpected `cwd` layout.
+  # the root entry's row is always a directory regardless of what the
+  # launch `cwd` happens to contain. This step is therefore a reliable
+  # Tier-2 oracle for #1635 ("slow right-click context menus") that cannot
+  # flake the way `right-click-explorer-row` can on an unexpected `cwd`
+  # layout.
+  #
+  # Why row 2 and not row 1 (#1693): the Explorer panel's rows in this grid
+  # are 0 = sidebar header ("EXPLORER"), 1 = the view-actions toolbar
+  # (New File / New Folder / Refresh / Collapse All / "...") that #1693
+  # added above the tree, 2 = the root entry, 3+ = its children. #1703 was
+  # authored before #1693 landed and originally aimed at row 1; a row-1
+  # right-click now hits the toolbar, which opens no context menu at all.
+  # The toolbar is an unconditional single-row
+  # `SidebarPanelChrome::StatusBars` (`src/app.rs`), so this is a fixed
+  # one-row offset, not a return of the `cwd` coupling above. The unit
+  # test named below asserts row 2 really is the root entry, so further
+  # header chrome breaks that test rather than silently re-aiming this
+  # step; keep the two in sync.
   - type: click
     id: right-click-explorer-root-row-1703
-    row: 1
+    row: 2
     col: 10
     button: right
   - type: expect_within
