@@ -3941,6 +3941,91 @@ mod tests {
                 driver.screen()
             );
         }
+
+        /// vimcode#1703: `tests/smoke-spec/tui.yaml`'s `right-click-
+        /// explorer-row` step hardcoded `row: 3, col: 10` and failed a
+        /// bugbash run whose launch `cwd` held plain files but no
+        /// subfolder — `row 3` landed on one of those files, whose context
+        /// menu correctly omits "New File.../New Folder..." (those only
+        /// make sense for a directory). That was a spec/cwd-layout
+        /// coupling bug, not an app defect: this reproduces the exact
+        /// scenario at the spec's own `cols: 100` x `rows: 30` grid and
+        /// literal `row`/`col` coordinates (not `driver.find`, deliberately
+        /// — mirroring the dumb literal-coordinate click the real
+        /// `tui-pty` pty driver sends, which has no "find this text and
+        /// click it" primitive) to pin down why, and to confirm the fix:
+        /// `row: 1` always lands on the Explorer root entry, which
+        /// [`build_explorer_rows`] pushes unconditionally with `is_dir:
+        /// true` — a directory regardless of what the launch `cwd` happens
+        /// to contain — so retargeting the spec's right-click there removes
+        /// the coupling instead of special-casing any particular fixture
+        /// layout.
+        ///
+        /// Two plain files (not one): with only one file, `row: 3` falls
+        /// *below* the single child row into the tree's empty space, which
+        /// `route_tree_empty_space_context_menu`'s dedicated fallback (#1429)
+        /// resolves to the root folder's own menu — accidentally "passing"
+        /// without ever landing on a file row at all. Two files make `row: 3`
+        /// land squarely on the second file's own row, the same way the
+        /// bugbash's richer real-world `cwd` did.
+        ///
+        /// [`build_explorer_rows`]: crate::core::engine::explorer_ops::build_explorer_rows
+        #[test]
+        fn right_click_row_3_on_a_folderless_cwd_hits_a_file_not_a_folder_1703() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1703_rc_row3_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            // Deliberately two plain files and no subfolder -- the "flat,
+            // no folder" layout the bugbash run's cwd had, just with a
+            // second file so `row: 3` lands on a real row rather than the
+            // empty-space-below-the-tree fallback (see doc above).
+            std::fs::write(dir.join("sample.txt"), "hello").unwrap();
+            std::fs::write(dir.join("second.txt"), "world").unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.explorer_expanded.insert(dir);
+            engine.explorer_rebuild_rows();
+            engine.session.explorer_visible = true;
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            // Matches `tests/smoke-spec/tui.yaml`'s own `cols: 100` x
+            // `rows: 30` grid exactly, so the row numbers below mean the
+            // same thing they do in the real spec.
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 100, 30);
+            let driver = &mut h.driver;
+
+            // The spec's old coordinate (`row: 3, col: 10`): on this
+            // folderless cwd it lands on the second file's row -- its
+            // context menu correctly has no "New File..."/"New Folder...".
+            driver.right_click(10.0, 3.0);
+            assert!(
+                !driver.screen_has("New File"),
+                "row 3 on a folderless cwd is a plain file's row; its \
+                 context menu must not offer folder-only actions; \
+                 screen:\n{}",
+                driver.screen()
+            );
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            // The fix: `row: 1` is the Explorer root entry -- always a
+            // directory by construction, regardless of the cwd's children
+            // (or lack of them) -- so its context menu always offers
+            // "New File..."/"New Folder...".
+            driver.right_click(10.0, 1.0);
+            assert!(
+                driver.screen_has("New File"),
+                "row 1 is the Explorer root entry and must always be a \
+                 directory's context menu, even on a folderless cwd; \
+                 screen:\n{}",
+                driver.screen()
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
