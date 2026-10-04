@@ -756,6 +756,36 @@ steps:
     id: 'vim-yy-and-p-yank-and-paste-line-content-settle'
     ms: 350
     timeout_ms: 4000
+  # vim-yy-and-p-yank-and-paste-line: the content check above ('alef') also
+  # passes if 'p' pasted nothing at all, since the original line 1 ('alef')
+  # is still on screen regardless. Deleting line 1 and confirming 'alef'
+  # still appears proves the text on line 3 is a real pasted copy, not just
+  # the untouched original -- if 'p' had been a no-op, this 'dd' would
+  # remove the buffer's only 'alef' and the check below would fail.
+  - type: key
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-gg1'
+    key: 'g'
+  - type: key
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-d1'
+    key: 'd'
+  - type: key
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-d2'
+    key: 'd'
+  - type: wait_idle
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-settle'
+    ms: 350
+    timeout_ms: 4000
+  - type: expect_within
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-copy-survives'
+    text: 'alef'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-copy-survives-settle'
+    ms: 350
+    timeout_ms: 4000
   # vim-cc-changes-line setup
   - type: key
     id: 'rebuild7-clear-colon'
@@ -777,6 +807,14 @@ steps:
     id: 'rebuild7-mode0'
     key: 'i'
   - type: key
+    key: ' '
+  - type: key
+    key: ' '
+  - type: key
+    key: ' '
+  - type: key
+    key: ' '
+  - type: key
     key: 'f'
   - type: key
     key: 'o'
@@ -785,9 +823,12 @@ steps:
   - type: key
     id: 'rebuild7-esc0'
     key: 'esc'
+  # Fixture carries a 4-space leading indent (catalogue: '    foo') so the
+  # 'cc' step below can prove indent preservation, not just content
+  # replacement -- see vim-cc-changes-line-text.
   - type: expect_within
     id: 'rebuild7-line0-landed'
-    text: 'foo'
+    text: '    foo'
     ms: 5000
   - type: expect_within
     id: 'rebuild7-line0-normal'
@@ -818,10 +859,13 @@ steps:
   - type: key
     id: 'vim-cc-esc'
     key: 'esc'
-  # vim-cc-changes-line: 'cc' replaces the line's content with the typed text
+  # vim-cc-changes-line: 'cc' replaces the line's content with the typed text,
+  # preserving the original line's leading indent ('    foo' -> '    bar') --
+  # a bare 'bar' substring check would also pass if indent were dropped, so
+  # this asserts the indented form specifically.
   - type: expect_within
     id: 'vim-cc-changes-line-text'
-    text: 'bar'
+    text: '    bar'
     ms: 5000
   - type: wait_idle
     id: 'vim-cc-changes-line-text-settle'
@@ -1179,6 +1223,9 @@ steps:
     id: 'vim-visual-l3'
     key: 'l'
   - type: key
+    id: 'vim-visual-l4'
+    key: 'l'
+  - type: key
     id: 'vim-visual-d'
     key: 'd'
   # vim-visual-v-selects-and-d-deletes: 'v'+motion+'d' deletes 'hello', leaving ' world'
@@ -1197,6 +1244,22 @@ steps:
     ms: 5000
   - type: wait_idle
     id: 'vim-visual-v-selects-and-d-deletes-mode-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-visual-v-selects-and-d-deletes: the substring check above (text ' world')
+  # also passes if only 4 chars ('hell') were deleted (leaving 'o world', which
+  # contains ' world' starting at index 1) -- a length check via '$' distinguishes
+  # the two outcomes. ' world' is 6 chars, so '$' (last char, 1-indexed) lands on
+  # Col 6; the under-selecting bug's 'o world' is 7 chars and would land on Col 7.
+  - type: key
+    id: 'vim-visual-v-selects-and-d-deletes-dollar'
+    key: '$'
+  - type: expect_within
+    id: 'vim-visual-v-selects-and-d-deletes-length'
+    text: 'Ln 1, Col 6'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-visual-v-selects-and-d-deletes-length-settle'
     ms: 350
     timeout_ms: 4000
   # vim-ex-substitute-current-line setup
