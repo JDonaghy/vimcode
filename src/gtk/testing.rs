@@ -21463,6 +21463,105 @@ mod acquire_status_paint_1345 {
     }
 }
 
+/// #1719 review: GTK twin of `tui_main::app_on_tui_tests::tests::
+/// issue_1719_prerequisite_detect_before_install` — the multi-backend rule
+/// asks for both backends' black-box coverage, not just TUI's, for a
+/// change that repaints `engine.message` (rendered by both). Same
+/// `pub(crate) Engine::ext_install_from_registry_with_runtime_check` seam,
+/// stubbed `runtime_present`, asserting on `driver.screen_contains`
+/// instead of engine-internal state — see that module's own doc for why.
+#[cfg(test)]
+mod issue_1719_missing_prereq_blocks_install {
+    use super::*;
+
+    /// #1719 acceptance: a manifest's legacy `[lsp]` `install_*` string,
+    /// gated by the new `lsp.dependencies` field, must paint the
+    /// actionable "requires npm — ..." status line instead of silently
+    /// queuing a doomed terminal command — the GTK twin of
+    /// `lsp_legacy_install_blocked_when_dependency_missing_paints_status`.
+    #[test]
+    fn lsp_legacy_install_blocked_when_dependency_missing_paints_status_via_gtk() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+
+        let mut engine = Engine::new();
+        let ext_name = "vc-gtk-1719-lsp-missing-dep";
+        engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 gtk lsp dep".to_string(),
+            language_ids: vec!["vc-gtk-1719-lsp-lang".to_string()],
+            lsp: LspConfig {
+                binary: "vc-gtk-1719-lsp-bin".to_string(),
+                install_linux: "npm install -g vc-gtk-1719-lsp-bin".to_string(),
+                install_macos: "npm install -g vc-gtk-1719-lsp-bin".to_string(),
+                install_windows: "npm install -g vc-gtk-1719-lsp-bin".to_string(),
+                dependencies: vec!["npm".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        let mut h = harness(engine, 1000, 640);
+        h.engine
+            .borrow_mut()
+            .ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("requires npm"),
+            "a missing declared LSP dependency must paint a visible \
+             'requires npm' instruction on GTK too; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.engine.borrow().pending_terminal_command.is_none(),
+            "a missing declared dependency must never dispatch an install"
+        );
+    }
+
+    /// #1719 acceptance: the built-in `delve` DAP adapter's hardcoded `go
+    /// install ...` installer, gated by the new `dap_manager::
+    /// adapter_dependencies` merge, must also paint a "requires go" status
+    /// line rather than queuing the install — the GTK twin of
+    /// `dap_builtin_delve_install_blocked_when_go_missing_paints_status`.
+    #[test]
+    fn dap_builtin_delve_install_blocked_when_go_missing_paints_status_via_gtk() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest};
+
+        let mut engine = Engine::new();
+        let ext_name = "vc-gtk-1719-delve-missing-go";
+        engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 gtk delve dep".to_string(),
+            dap: DapConfig {
+                adapter: "delve".to_string(),
+                // Deliberately not the literal `dlv` binary name — see
+                // `lsp_ops::tests::dap_builtin_delve_install_blocked_when_
+                // go_missing`'s comment for why.
+                binary: "vc-gtk-1719-nonexistent-dlv".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        let mut h = harness(engine, 1000, 640);
+        h.engine
+            .borrow_mut()
+            .ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("requires go"),
+            "delve's missing `go` prerequisite must paint a visible \
+             'requires go' instruction on GTK too; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.engine.borrow().pending_terminal_command.is_none(),
+            "delve's install must never run without `go` present"
+        );
+    }
+}
+
 /// #1397/#1577: the recommended-extension install offer, rebuilt on
 /// quadraui#1185's multi-action toast — a non-modal notification with real
 /// "Install"/"Don't ask again" buttons (not printed-as-body-text shortcuts)

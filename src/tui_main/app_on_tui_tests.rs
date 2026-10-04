@@ -7639,6 +7639,144 @@ mod tests {
         }
     }
 
+    /// #1719 review: driver-tier black-box coverage for the "declared
+    /// (or built-in) prerequisite is missing → block the install and paint
+    /// an instruction instead" behaviour. `core::engine::lsp_ops::tests`
+    /// already covers the same seam at the engine-internal-state level
+    /// (`e.message.contains("npm")`, `e.pending_terminal_command.is_none()`
+    /// for the LSP legacy-install leg, the manifest-declared DAP leg, and
+    /// the built-in-adapter DAP leg); this module closes the gap the
+    /// review flagged — the same gap #1346's review flagged for the
+    /// sibling "missing runtime" fallback above — by asserting on
+    /// `driver.screen()` instead, through the same `pub(crate) Engine::
+    /// ext_install_from_registry_with_runtime_check` seam (stubbed
+    /// `runtime_present`, deterministic regardless of what's actually on
+    /// the machine running the suite).
+    mod issue_1719_prerequisite_detect_before_install {
+        use super::*;
+
+        /// [`harness_no_sidebar`], but considerably wider than the default
+        /// 80 columns. `missing_dependency_message`'s "requires X — X:
+        /// <install hint>" status line is longer than the #1346 sibling
+        /// module's "needs X — <hint>" one (it also prefixes the
+        /// extension's display name), long enough to get truncated before
+        /// "requires npm"/"requires go" ever reaches the screen at the
+        /// narrow default — confirmed by hand while writing this test.
+        fn wide_harness_no_sidebar(
+            engine: crate::core::Engine,
+        ) -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 24);
+            collapse_sidebar(&mut h.driver);
+            h
+        }
+
+        /// #1719 acceptance: a manifest's legacy `[lsp]` `install_*`
+        /// string, gated by the new `lsp.dependencies` field, must paint
+        /// the actionable "requires npm — ..." status line instead of
+        /// silently queuing a doomed terminal command — the mirror-image
+        /// LSP leg of `lsp_ops::tests::
+        /// lsp_legacy_install_blocked_when_declared_dependency_missing`,
+        /// now asserting on rendered output rather than engine state.
+        ///
+        /// Verified RED against a reintroduced regression (commenting out
+        /// the `missing.is_empty()` gate in `lsp_ops.rs`'s legacy-install
+        /// branch so it falls straight to the `else` with no dependency
+        /// check): the screen painted "LSP: installing" instead of
+        /// "requires npm", confirming this test catches a real
+        /// behavioural break and not just a visibility change.
+        #[test]
+        fn lsp_legacy_install_blocked_when_dependency_missing_paints_status() {
+            use crate::core::extensions::{ExtensionManifest, LspConfig};
+
+            let mut engine = crate::core::Engine::new_for_test();
+            let ext_name = "vc-tui-1719-lsp-missing-dep";
+            engine.ext_registry = Some(vec![ExtensionManifest {
+                name: ext_name.to_string(),
+                display_name: "1719 TUI LSP missing-dep test".to_string(),
+                language_ids: vec!["vc-tui-1719-lsp-lang".to_string()],
+                lsp: LspConfig {
+                    binary: "vc-tui-1719-lsp-bin".to_string(),
+                    install_linux: "npm install -g vc-tui-1719-lsp-bin".to_string(),
+                    install_macos: "npm install -g vc-tui-1719-lsp-bin".to_string(),
+                    install_windows: "npm install -g vc-tui-1719-lsp-bin".to_string(),
+                    dependencies: vec!["npm".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }]);
+
+            let mut h = wide_harness_no_sidebar(engine);
+            h.engine
+                .borrow_mut()
+                .ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("requires npm"),
+                "a missing declared LSP dependency must paint a visible \
+                 'requires npm' instruction instead of dispatching a doomed \
+                 install; painted: {:?}",
+                h.driver.screen()
+            );
+            assert!(
+                h.engine.borrow().pending_terminal_command.is_none(),
+                "a missing declared dependency must never dispatch an install"
+            );
+        }
+
+        /// #1719 acceptance: the built-in `delve` DAP adapter's hardcoded
+        /// `go install ...` installer, gated by the new `dap_manager::
+        /// adapter_dependencies` merge, must also paint a "requires go"
+        /// status line rather than queuing the install — the mirror-image
+        /// DAP leg of `lsp_ops::tests::
+        /// dap_builtin_delve_install_blocked_when_go_missing`.
+        ///
+        /// Verified RED the same way as the sibling test above: removing
+        /// the `dap_manager::adapter_dependencies` merge in `lsp_ops.rs`'s
+        /// built-in DAP branch lets the install command through, and the
+        /// screen paints "DAP: installing" instead of "requires go".
+        #[test]
+        fn dap_builtin_delve_install_blocked_when_go_missing_paints_status() {
+            use crate::core::extensions::{DapConfig, ExtensionManifest};
+
+            let mut engine = crate::core::Engine::new_for_test();
+            let ext_name = "vc-tui-1719-delve-missing-go";
+            engine.ext_registry = Some(vec![ExtensionManifest {
+                name: ext_name.to_string(),
+                display_name: "1719 TUI delve missing-go test".to_string(),
+                dap: DapConfig {
+                    adapter: "delve".to_string(),
+                    // Deliberately not the literal `dlv` binary name — see
+                    // `lsp_ops::tests::dap_builtin_delve_install_blocked_
+                    // when_go_missing`'s comment for why.
+                    binary: "vc-tui-1719-nonexistent-dlv".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }]);
+
+            let mut h = wide_harness_no_sidebar(engine);
+            h.engine
+                .borrow_mut()
+                .ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("requires go"),
+                "delve's missing `go` prerequisite must paint a visible \
+                 'requires go' instruction instead of dispatching the \
+                 doomed `go install` command; painted: {:?}",
+                h.driver.screen()
+            );
+            assert!(
+                h.engine.borrow().pending_terminal_command.is_none(),
+                "delve's install must never run without `go` present"
+            );
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // #1507: AI panel persistent send/stop/leave hint + `<leader>ai` focus
     // toggle
