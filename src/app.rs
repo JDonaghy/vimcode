@@ -8601,6 +8601,26 @@ impl App {
                     repeat,
                 };
                 let (key_name, unicode) = match key {
+                    // #1744: Ctrl+Shift+\ (VS Code's `editor.action.
+                    // jumpToBracket`) needs to decode distinctly from plain
+                    // Ctrl+\ (`open_editor_group`/split-editor). Most
+                    // surfaces (GDK, and a kitty/CSI-u terminal with
+                    // character-resolution keyboard enhancement) already
+                    // deliver the resolved glyph `'|'` here, which matches
+                    // `Engine::handle_vscode_key`'s own `"Shift_backslash" |
+                    // "|"` arm unchanged below — no special case needed for
+                    // that shape. A kitty/CSI-u terminal reporting the base
+                    // key `'\\'` plus an explicit Shift *bit* instead (rather
+                    // than the shifted glyph) needs this one extra arm to
+                    // reach the same arm — `render::engine_key_from_ui` has
+                    // the mirror logic for this chord too, but is never
+                    // called from this `Key::Char` match (see that
+                    // function's own module doc on why GTK/TUI's `Key::Char`
+                    // decode stays independent of it), so it alone cannot
+                    // make this shape reachable.
+                    Key::Char('\\') if modifiers.ctrl && modifiers.shift => {
+                        ("Shift_backslash".to_string(), Some('\\'))
+                    }
                     Key::Char(c) => (c.to_string(), Some(c)),
                     Key::Named(_) => {
                         // #826: `Escape`/`Enter`->`Return`/`Backspace`->

@@ -460,7 +460,10 @@ journeys:
   reference_detail: 'README ''Line Operations'': Alt+Shift+Up duplicates the line/selection, inserting
     the copy above'
   steps: Buffer 'aaa\nbbb', cursor on 'bbb'; press Alt+Shift+Up
-  expected: Buffer becomes 'aaa\nbbb\nbbb'; cursor stays on the original (now second) 'bbb'
+  expected: Buffer becomes 'aaa\nbbb\nbbb'; cursor stays at the same line *index* (line 1), which the
+    new, upper copy now occupies — real VS Code's copyLinesUpAction moves the cursor with the
+    duplicate it just created, not with the original text, matching copyLinesDownAction's own
+    "cursor follows the new copy" symmetry below rather than being its mirror opposite
   priority: 2
 - id: vscode-alt-shift-down-duplicates-line-down
   area: vscode-mode

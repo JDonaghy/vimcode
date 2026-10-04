@@ -74,6 +74,11 @@ fn test_vscode_move_line_up_with_selection() {
 // `copyLinesDownAction` (duplicate the line) — it used to be misbound to
 // add-a-cursor, which is Ctrl+Alt+Up/Down's real chord (`insertCursorAbove`/
 // `insertCursorBelow`, see the "Multi-cursor" section below).
+//
+// Verified RED against unfixed `develop` for both tests below: reverting
+// `handle_vscode_key`'s `"Alt_Shift_Up"`/`"Alt_Shift_Down"` arms to call
+// `vscode_add_cursor_above`/`_below` instead reproduces both assertion
+// failures (buffer unchanged, `extra_cursors` gains an entry).
 
 #[test]
 fn test_vscode_alt_shift_down_duplicates_line_down() {
@@ -178,6 +183,13 @@ fn test_vscode_select_line_extends() {
 // exact spelling `render::route_alt_key` now forwards) is VS Code's real
 // `insertCursorAbove`/`insertCursorBelow`. Plain Alt+Up/Down (no ctrl) still
 // moves the line (see Phase 1 above); Alt+Shift+Up/Down duplicates it.
+//
+// Verified RED against unfixed `develop` for the three tests below:
+// `handle_vscode_key` used to have no `"Alt_Up"/"Alt_Down" if ctrl` arm at
+// all (and `route_alt_key` had no `ctrl` parameter to forward one with), so
+// Ctrl+Alt+Up/Down ran the move-line arm instead — these assertions'
+// `extra_cursors` checks fail and the buffer-unchanged checks fail against
+// that code.
 
 #[test]
 fn test_vscode_ctrl_alt_down_adds_cursor_below() {

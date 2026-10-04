@@ -678,9 +678,15 @@ impl Engine {
         self.insert_with_undo(insert_pos, &text);
         self.finish_undo_group();
         let shift = end_line - start_line + 1;
-        self.view_mut().cursor.line += shift;
+        // `.min(max_line)` mirrors `vscode_move_line_down`'s own clamp —
+        // the insert above always adds exactly `shift` lines today, so this
+        // is a no-op in practice, but leaving the addition unclamped (as a
+        // prior version of this function did) would panic the moment that
+        // invariant ever changes, where its sibling would just saturate.
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        self.view_mut().cursor.line = (self.view().cursor.line + shift).min(max_line);
         if let Some(ref mut anc) = self.visual_anchor {
-            anc.line += shift;
+            anc.line = (anc.line + shift).min(max_line);
         }
         *changed = true;
     }
@@ -1390,8 +1396,12 @@ impl Engine {
                 // #1744: Ctrl+Shift+\ → jump to matching bracket (VS Code's
                 // `editor.action.jumpToBracket`), the same underlying search
                 // Vim mode's `%` already uses. `"|"` is the literal shifted
-                // glyph some backends deliver instead of an explicit Shift
-                // bit — see `render::engine_key_from_ui`'s matching arms.
+                // glyph most surfaces deliver instead of an explicit Shift
+                // bit — `App::handle_dispatch`'s `Key::Char` arm
+                // (`src/app.rs`) forwards it unchanged via `c.to_string()`;
+                // `"Shift_backslash"` is that same match's own special case
+                // for the one shape ('\\' + an explicit Shift bit) that
+                // isn't already a distinct glyph.
                 "Shift_backslash" | "|" => {
                     self.move_to_matching_bracket();
                 }
