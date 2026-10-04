@@ -30642,6 +30642,63 @@ mod tests {
         assert_eq!(bar.active_accent, Some(expected));
     }
 
+    /// #1688: the *descriptor* boundary for the editor tab-bar accent line.
+    /// `build_screen_layout`'s per-group loop sets `accent = Some(theme.
+    /// tab_active_accent)` only for `gid == engine.active_group`, so this
+    /// pins that the `quadraui::TabBar` handed to every backend already
+    /// carries the right `active_accent` for both the active and inactive
+    /// group of a split — before any backend rasteriser gets a chance to
+    /// drop it. #1688 found Win-GUI painting zero accent pixels anywhere in
+    /// the tab strip; this test rules out "the descriptor itself is wrong"
+    /// as the cause, narrowing the bug to the Win-GUI rasteriser (tracked
+    /// upstream, see `docs/PENDING_QUADRAUI_ISSUES.md`'s "Seven Win-GUI
+    /// rasterisers" entry / quadraui#1261) rather than anything in this
+    /// file.
+    #[test]
+    fn build_screen_layout_sets_tab_bar_active_accent_only_on_active_group() {
+        use crate::core::engine::Engine;
+        use crate::core::window::WindowRect;
+
+        let line_height = 20.0;
+        let char_width = 8.0;
+        let theme = Theme::vscode_dark();
+
+        let mut engine = Engine::new();
+        engine.execute_command("EditorGroupSplit");
+        assert_eq!(engine.group_layout.leaf_count(), 2);
+        let content_bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+        let (rects, _) = engine.calculate_group_window_rects(content_bounds, 32.0);
+        let screen = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            gtk_minimap_sizing(),
+        );
+        assert_eq!(screen.group_tab_bars.len(), 2);
+
+        let expected = Some(theme.tab_active_accent);
+        let mut saw_active_some = false;
+        for gtb in &screen.group_tab_bars {
+            if gtb.group_id == engine.active_group {
+                assert_eq!(
+                    gtb.bar.active_accent, expected,
+                    "the active group's tab bar must carry `theme.tab_active_accent`"
+                );
+                saw_active_some = true;
+            } else {
+                assert_eq!(
+                    gtb.bar.active_accent, None,
+                    "an inactive group's tab bar must carry no accent"
+                );
+            }
+        }
+        assert!(saw_active_some, "exactly one group must be active");
+    }
+
     /// #1127: `themes_dir()` must derive from the cross-platform
     /// `core::paths::vimcode_config_dir()` (which handles `APPDATA` on
     /// Windows), not read `$HOME` directly — reading `$HOME` raw would put
