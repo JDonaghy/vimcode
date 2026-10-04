@@ -2874,6 +2874,7 @@ impl App {
             &key_name,
             unicode,
             shift,
+            ctrl,
             alt,
         );
         match alt_outcome {

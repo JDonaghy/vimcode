@@ -70,35 +70,29 @@ fn test_vscode_move_line_up_with_selection() {
     assert_eq!(buf(&e), "bbb\nccc\naaa\nddd\n");
 }
 
+// #1744: Shift+Alt+Up/Down is VS Code's `copyLinesUpAction`/
+// `copyLinesDownAction` (duplicate the line) — it used to be misbound to
+// add-a-cursor, which is Ctrl+Alt+Up/Down's real chord (`insertCursorAbove`/
+// `insertCursorBelow`, see the "Multi-cursor" section below).
+
 #[test]
-fn test_vscode_alt_shift_down_adds_cursor_below() {
+fn test_vscode_alt_shift_down_duplicates_line_down() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 0, col: 1 };
     e.handle_key("Alt_Shift_Down", None, false);
-    assert_eq!(e.view().extra_cursors.len(), 1);
-    assert_eq!(e.view().extra_cursors[0], Cursor { line: 1, col: 1 });
+    assert_eq!(buf(&e), "aaa\naaa\nbbb\nccc\n");
+    assert!(e.view().extra_cursors.is_empty());
 }
 
 #[test]
-fn test_vscode_alt_shift_up_adds_cursor_above() {
+fn test_vscode_alt_shift_up_duplicates_line_up() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 2, col: 0 };
     e.handle_key("Alt_Shift_Up", None, false);
-    assert_eq!(e.view().extra_cursors.len(), 1);
-    assert_eq!(e.view().extra_cursors[0], Cursor { line: 1, col: 0 });
-}
-
-#[test]
-fn test_vscode_alt_shift_down_multiple() {
-    let mut e = engine_with("aaa\nbbb\nccc\nddd\n");
-    vscode_mode(&mut e);
-    e.view_mut().cursor = Cursor { line: 0, col: 0 };
-    e.handle_key("Alt_Shift_Down", None, false);
-    e.handle_key("Alt_Shift_Down", None, false);
-    // Should have 2 extra cursors (lines 1 and 2)
-    assert_eq!(e.view().extra_cursors.len(), 2);
+    assert_eq!(buf(&e), "aaa\nbbb\nccc\nccc\n");
+    assert!(e.view().extra_cursors.is_empty());
 }
 
 #[test]
@@ -179,6 +173,52 @@ fn test_vscode_select_line_extends() {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Phase 2: Multi-Cursor + Indentation
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// #1744: Ctrl+Alt+Up/Down (`"Alt_Up"`/`"Alt_Down"` with `ctrl: true` — the
+// exact spelling `render::route_alt_key` now forwards) is VS Code's real
+// `insertCursorAbove`/`insertCursorBelow`. Plain Alt+Up/Down (no ctrl) still
+// moves the line (see Phase 1 above); Alt+Shift+Up/Down duplicates it.
+
+#[test]
+fn test_vscode_ctrl_alt_down_adds_cursor_below() {
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 1 };
+    e.handle_key("Alt_Down", None, true);
+    assert_eq!(e.view().extra_cursors.len(), 1);
+    assert_eq!(e.view().extra_cursors[0], Cursor { line: 1, col: 1 });
+    assert_eq!(
+        buf(&e),
+        "aaa\nbbb\nccc\n",
+        "insertCursorBelow must not move any line"
+    );
+}
+
+#[test]
+fn test_vscode_ctrl_alt_up_adds_cursor_above() {
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 2, col: 0 };
+    e.handle_key("Alt_Up", None, true);
+    assert_eq!(e.view().extra_cursors.len(), 1);
+    assert_eq!(e.view().extra_cursors[0], Cursor { line: 1, col: 0 });
+    assert_eq!(
+        buf(&e),
+        "aaa\nbbb\nccc\n",
+        "insertCursorAbove must not move any line"
+    );
+}
+
+#[test]
+fn test_vscode_ctrl_alt_down_multiple() {
+    let mut e = engine_with("aaa\nbbb\nccc\nddd\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    e.handle_key("Alt_Down", None, true);
+    e.handle_key("Alt_Down", None, true);
+    // Should have 2 extra cursors (lines 1 and 2)
+    assert_eq!(e.view().extra_cursors.len(), 2);
+}
 
 #[test]
 fn test_vscode_ctrl_d_selects_word() {
@@ -469,11 +509,11 @@ fn test_vscode_move_line_preserves_content() {
 }
 
 #[test]
-fn test_vscode_alt_shift_preserves_cursor_col() {
+fn test_vscode_ctrl_alt_down_preserves_cursor_col() {
     let mut e = engine_with("hello world\nsecond\n");
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 0, col: 5 };
-    e.handle_key("Alt_Shift_Down", None, false);
+    e.handle_key("Alt_Down", None, true);
     // Primary cursor stays at col 5, extra cursor added at (1, 5)
     assert_eq!(e.cursor().col, 5);
     assert_eq!(e.view().extra_cursors[0].col, 5);
@@ -634,8 +674,8 @@ fn test_vscode_multi_cursor_type_char() {
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 0, col: 0 };
     // Add cursors on lines 1 and 2
-    e.handle_key("Alt_Shift_Down", None, false);
-    e.handle_key("Alt_Shift_Down", None, false);
+    e.handle_key("Alt_Down", None, true);
+    e.handle_key("Alt_Down", None, true);
     assert_eq!(e.view().extra_cursors.len(), 2);
     // Type 'X' — should insert at all 3 cursor positions
     e.handle_key("X", Some('X'), false);
@@ -650,8 +690,8 @@ fn test_vscode_multi_cursor_backspace() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 0, col: 1 };
-    e.handle_key("Alt_Shift_Down", None, false);
-    e.handle_key("Alt_Shift_Down", None, false);
+    e.handle_key("Alt_Down", None, true);
+    e.handle_key("Alt_Down", None, true);
     // Backspace — should delete first char on all 3 lines
     e.handle_key("BackSpace", None, false);
     let lines = get_lines(&e);
@@ -704,7 +744,7 @@ fn test_vscode_multi_cursor_escape_clears() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 0, col: 0 };
-    e.handle_key("Alt_Shift_Down", None, false);
+    e.handle_key("Alt_Down", None, true);
     assert_eq!(e.view().extra_cursors.len(), 1);
     e.handle_key("Escape", None, false);
     assert_eq!(e.view().extra_cursors.len(), 0);

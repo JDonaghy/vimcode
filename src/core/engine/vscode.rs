@@ -610,6 +610,81 @@ impl Engine {
         *changed = true;
     }
 
+    /// Shift+Alt+Up: duplicate the current line (or selected lines) directly
+    /// above themselves — VS Code's `editor.action.copyLinesUpAction`. The
+    /// cursor (and visual anchor) are left at the same line index, which the
+    /// new, upper copy now occupies (the original content shifts down by the
+    /// number of duplicated lines) — matching VS Code's own "the duplicate
+    /// becomes the thing you're editing" feel, and letting repeated presses
+    /// keep stacking copies upward. #1744: this chord used to be misbound to
+    /// `vscode_add_cursor_above` (now Ctrl+Alt+Up's `insertCursorAbove`).
+    fn vscode_copy_line_up(&mut self, changed: &mut bool) {
+        let (start_line, end_line) = self.vscode_affected_lines();
+        self.start_undo_group();
+        let start = self.buffer().line_to_char(start_line);
+        let num_lines = self.buffer().len_lines();
+        let end = if end_line + 1 < num_lines {
+            self.buffer().line_to_char(end_line + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+        let mut text: String = self.buffer().content.slice(start..end).chars().collect();
+        if !text.ends_with('\n') {
+            // Only the last line of the buffer can lack a trailing newline;
+            // the duplicate still needs one to separate it from the
+            // (shifted-down) original.
+            text.push('\n');
+        }
+        self.insert_with_undo(start, &text);
+        self.finish_undo_group();
+        *changed = true;
+    }
+
+    /// Shift+Alt+Down: duplicate the current line (or selected lines)
+    /// directly below themselves — VS Code's
+    /// `editor.action.copyLinesDownAction`. The cursor (and visual anchor)
+    /// move down by the number of duplicated lines, onto the new copy,
+    /// mirroring [`Engine::vscode_copy_line_up`]'s "follow the duplicate"
+    /// behaviour.
+    fn vscode_copy_line_down(&mut self, changed: &mut bool) {
+        let (start_line, end_line) = self.vscode_affected_lines();
+        self.start_undo_group();
+        let start = self.buffer().line_to_char(start_line);
+        let num_lines = self.buffer().len_lines();
+        let end = if end_line + 1 < num_lines {
+            self.buffer().line_to_char(end_line + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+        let mut text: String = self.buffer().content.slice(start..end).chars().collect();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let insert_pos = if end_line + 1 < num_lines {
+            end
+        } else {
+            // Last line with no trailing newline: insert a separator first,
+            // mirroring `vscode_move_line_up`'s own end-of-buffer fixup, so
+            // the duplicate doesn't run on into the original line's text.
+            let pos = self.buffer().len_chars();
+            if pos > 0 {
+                let last_ch: char = self.buffer().content.char(pos - 1);
+                if last_ch != '\n' {
+                    self.insert_with_undo(pos, "\n");
+                }
+            }
+            self.buffer().len_chars()
+        };
+        self.insert_with_undo(insert_pos, &text);
+        self.finish_undo_group();
+        let shift = end_line - start_line + 1;
+        self.view_mut().cursor.line += shift;
+        if let Some(ref mut anc) = self.visual_anchor {
+            anc.line += shift;
+        }
+        *changed = true;
+    }
+
     /// Ctrl+Shift+K: delete current line.
     fn vscode_delete_line(&mut self, changed: &mut bool) {
         let num_lines = self.buffer().len_lines();
@@ -1091,10 +1166,28 @@ impl Engine {
         // ── Alt-encoded keys (sent from backends when in VSCode mode) ────
         if key_name.starts_with("Alt_") {
             match key_name {
+                // #1744: `ctrl` now flows through from `render::route_alt_key`
+                // instead of being hardcoded `false`, so Ctrl+Alt+Up/Down —
+                // VS Code's real `insertCursorAbove`/`insertCursorBelow` —
+                // can finally be told apart from plain Alt+Up/Down's
+                // move-line. These guarded arms must stay above the
+                // unguarded ones below, or the `ctrl` distinction is lost.
+                "Alt_Up" if ctrl => self.vscode_add_cursor_above(),
+                "Alt_Down" if ctrl => self.vscode_add_cursor_below(),
                 "Alt_Up" => self.vscode_move_line_up(&mut changed),
                 "Alt_Down" => self.vscode_move_line_down(&mut changed),
-                "Alt_Shift_Up" => self.vscode_add_cursor_above(),
-                "Alt_Shift_Down" => self.vscode_add_cursor_below(),
+                // #1744: Shift+Alt+Up/Down is VS Code's `copyLinesUpAction`/
+                // `copyLinesDownAction` (duplicate the line), not add-cursor
+                // — that chord used to be misbound here to
+                // `vscode_add_cursor_above`/`_below`, the behaviour
+                // Ctrl+Alt+Up/Down now owns above.
+                "Alt_Shift_Up" => self.vscode_copy_line_up(&mut changed),
+                "Alt_Shift_Down" => self.vscode_copy_line_down(&mut changed),
+                // #1744: VS Code's `workbench.action.navigateBack`/
+                // `navigateForward`, the same jump-list mechanism Vim mode's
+                // Ctrl-O/Ctrl-I already use.
+                "Alt_Left" => self.jump_list_back(),
+                "Alt_Right" => self.jump_list_forward(),
                 "Alt_z" => {
                     self.settings.wrap = !self.settings.wrap;
                     self.message = format!(
@@ -1293,6 +1386,14 @@ impl Engine {
                 // presses unfold nested folds)
                 "Shift_bracketright" => {
                     self.cmd_fold_open_progressive();
+                }
+                // #1744: Ctrl+Shift+\ → jump to matching bracket (VS Code's
+                // `editor.action.jumpToBracket`), the same underlying search
+                // Vim mode's `%` already uses. `"|"` is the literal shifted
+                // glyph some backends deliver instead of an explicit Shift
+                // bit — see `render::engine_key_from_ui`'s matching arms.
+                "Shift_backslash" | "|" => {
+                    self.move_to_matching_bracket();
                 }
                 _ => {}
             }
