@@ -187,7 +187,13 @@ pub fn resolve_binary(name: &str) -> Option<PathBuf> {
 /// built-in install logic.  Returns `None` for adapters that require manual
 /// installation.
 ///
-/// On Unix the command is run via `sh -c`; on Windows via `cmd /C`.
+/// Run inside a visible terminal pane (`terminal_run_command`): `sh` on Unix,
+/// and on Windows `powershell.exe` (Windows PowerShell 5.1, the pane's
+/// `default_shell()` — **not** `cmd /C`, despite what this comment used to
+/// say). #1715: every string this function can return must therefore be
+/// valid PowerShell 5.1 on Windows, not `cmd.exe` batch syntax — no `&&`
+/// statement separators (a PS5.1 parse error) and no `%VAR%` expansions
+/// (PowerShell never substitutes these; use `$env:VAR`).
 pub fn install_cmd_for_adapter(
     adapter_name: &str,
     ext_manifests: &[extensions::ExtensionManifest],
@@ -223,8 +229,13 @@ pub fn install_cmd_for_adapter(
             let venv_python = format!("{venv}\\Scripts\\python");
             #[cfg(not(target_os = "windows"))]
             let venv_python = format!("{venv}/bin/python");
+            // `;` not `&&` (#1715): PowerShell 5.1 — the Windows install
+            // pane's shell — has no `&&` statement separator at all, and
+            // `;` already works on both it and POSIX `sh` (same convention
+            // `lsp_ops.rs` uses when it joins several adapters' install
+            // commands together).
             Some(format!(
-                "{system_python} -m venv {venv} && {venv_python} -m pip install debugpy"
+                "{system_python} -m venv {venv} ; {venv_python} -m pip install debugpy"
             ))
         }
         "delve" => Some("go install github.com/go-delve/delve/cmd/dlv@latest".to_string()),
@@ -243,16 +254,38 @@ pub fn install_cmd_for_adapter(
 
 #[cfg(target_os = "windows")]
 fn codelldb_install_cmd() -> String {
-    // cmd /C runs this; inner PowerShell uses single-quoted strings to avoid cmd
-    // escaping issues.  codelldb only ships x64 for Windows currently.
+    codelldb_install_cmd_windows()
+}
+
+/// Windows codelldb install command, as plain PowerShell 5.1 (#1715).
+///
+/// `default_shell()` on Windows is `powershell.exe` — Windows PowerShell
+/// 5.1, never `cmd.exe` — and `terminal_run_command` embeds this string
+/// verbatim into a `.ps1` file that shell runs directly (`terminal_ops::
+/// build_terminal_install_wrapper`). There is no `cmd /C` anywhere in that
+/// path, so this must be valid PowerShell 5.1 on its own, not a `cmd.exe`
+/// one-liner with a nested `powershell -Command` escape hatch (the
+/// previous shape of this function): PowerShell 5.1 has no `&&` statement
+/// separator at all ("The token '&&' is not a valid statement separator in
+/// this version") — statements are joined with `;` instead, same
+/// convention `lsp_ops.rs` already uses — and `%TEMP%` is a `cmd.exe`-only
+/// expansion that PowerShell never substitutes, so every reference uses
+/// `$env:TEMP` instead. codelldb only ships x64 for Windows currently.
+///
+/// Deliberately **not** `#[cfg(windows)]`: it's a pure string builder, so
+/// keeping it compiled on every target lets the Linux test suite — the one
+/// CI actually runs on every PR, per `build-windows-tui`'s own comment
+/// about never running `cargo test` on Windows — assert on its exact
+/// contents. Only the real dispatch to it, `codelldb_install_cmd()` above,
+/// is Windows-only.
+fn codelldb_install_cmd_windows() -> String {
     concat!(
         "curl.exe -fSL https://github.com/vadimcn/codelldb/releases/latest/download/",
-        "codelldb-win32-x64.vsix -o %TEMP%\\vimcode-codelldb.vsix",
-        " && powershell -NoProfile -Command \"",
-        "Expand-Archive $env:TEMP\\vimcode-codelldb.vsix $env:TEMP\\vimcode-codelldb -Force;",
-        "$d=$env:USERPROFILE+'\\.local\\bin';",
-        "New-Item -ItemType Directory -Force $d|Out-Null;",
-        "Copy-Item $env:TEMP\\vimcode-codelldb\\extension\\adapter\\codelldb.exe $d\"",
+        "codelldb-win32-x64.vsix -o $env:TEMP\\vimcode-codelldb.vsix; ",
+        "Expand-Archive $env:TEMP\\vimcode-codelldb.vsix $env:TEMP\\vimcode-codelldb -Force; ",
+        "$d = $env:USERPROFILE + '\\.local\\bin'; ",
+        "New-Item -ItemType Directory -Force $d | Out-Null; ",
+        "Copy-Item $env:TEMP\\vimcode-codelldb\\extension\\adapter\\codelldb.exe $d",
     )
     .to_string()
 }
@@ -316,7 +349,46 @@ fn codelldb_install_cmd_for(platform: Platform, arch: Arch) -> String {
     )
 }
 
+#[cfg(target_os = "windows")]
 fn netcoredbg_install_cmd() -> String {
+    netcoredbg_install_cmd_windows()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn netcoredbg_install_cmd() -> String {
+    netcoredbg_install_cmd_unix()
+}
+
+/// Windows netcoredbg install command, as plain PowerShell 5.1 (#1715). No
+/// Windows branch existed before this — the install pane just ran the Unix
+/// `curl … && tar … && cp …` chain verbatim as PowerShell, which fails at
+/// parse time on the first `&&` — so C# debugging could never be installed
+/// on Windows at all. See `codelldb_install_cmd_windows`'s doc comment for
+/// why plain PowerShell (`;`, `$env:TEMP`) rather than `cmd.exe` syntax.
+/// netcoredbg's Windows release asset is `netcoredbg-win64.zip`
+/// (https://github.com/Samsung/netcoredbg/releases), which — like the
+/// Linux/macOS tarballs below — unpacks to a `netcoredbg/` subdirectory
+/// containing the binary, here `netcoredbg.exe`.
+///
+/// Deliberately **not** `#[cfg(windows)]`, same testability rationale as
+/// `codelldb_install_cmd_windows`.
+fn netcoredbg_install_cmd_windows() -> String {
+    concat!(
+        "curl.exe -fSL https://github.com/Samsung/netcoredbg/releases/latest/download/",
+        "netcoredbg-win64.zip -o $env:TEMP\\vimcode-netcoredbg.zip; ",
+        "Expand-Archive $env:TEMP\\vimcode-netcoredbg.zip $env:TEMP\\vimcode-netcoredbg -Force; ",
+        "$d = $env:USERPROFILE + '\\.local\\bin'; ",
+        "New-Item -ItemType Directory -Force $d | Out-Null; ",
+        "Copy-Item $env:TEMP\\vimcode-netcoredbg\\netcoredbg\\netcoredbg.exe $d",
+    )
+    .to_string()
+}
+
+/// Unix (Linux/macOS) netcoredbg install command — unchanged by #1715,
+/// just renamed so `netcoredbg_install_cmd()` can dispatch between this and
+/// the new `netcoredbg_install_cmd_windows()` above.
+#[cfg(not(target_os = "windows"))]
+fn netcoredbg_install_cmd_unix() -> String {
     // netcoredbg releases: https://github.com/Samsung/netcoredbg/releases
     let arch = if std::env::consts::ARCH == "aarch64" {
         "arm64"
@@ -986,6 +1058,97 @@ mod tests {
     fn test_dap_resolve_binary_not_found() {
         let result = resolve_binary("__vimcode_nonexistent_dap_binary_xyzzy__");
         assert!(result.is_none(), "nonexistent binary should return None");
+    }
+
+    /// #1715: fail-closed check that a string the Windows install pane will
+    /// type into `powershell.exe` (Windows PowerShell 5.1, never `cmd.exe`
+    /// — `default_shell()`/`terminal_run_command`) can't possibly hit the
+    /// two concrete failures the bugbash found:
+    /// - `&&` — not a valid PowerShell 5.1 statement separator at all (a
+    ///   parse-time error, "The token '&&' is not a valid statement
+    ///   separator in this version"), unlike POSIX `sh` where it's fine.
+    /// - `%SOMETHING%` — a `cmd.exe`-only expansion; PowerShell never
+    ///   substitutes it, so a literal `%TEMP%\foo` reaches `curl.exe` as
+    ///   that exact literal path string instead of a real temp directory.
+    ///
+    /// This is the acceptance bar's "at minimum" fallback (a real PS5.1
+    /// parser only exists on a Windows host, and `cargo test` never runs
+    /// there in CI — see `build-windows-tui`'s own header comment) rather
+    /// than a full grammar check, but it is exactly the string-shaped bug
+    /// both `codelldb_install_cmd_windows` and (before this fix)
+    /// `netcoredbg_install_cmd`'s missing Windows branch shipped.
+    fn assert_powershell5_safe(label: &str, cmd: &str) {
+        assert!(
+            !cmd.contains("&&"),
+            "{label}: PowerShell 5.1 has no `&&` statement separator — use `;`: {cmd}"
+        );
+        // A crude `%VAR%` detector: cmd.exe-style expansions are a `%`,
+        // some non-`%` text, then another `%` — reject that shape rather
+        // than literal bare `%` (e.g. a URL-encoded byte) to avoid false
+        // positives.
+        let mut rest = cmd;
+        while let Some(open) = rest.find('%') {
+            let after_open = &rest[open + 1..];
+            if let Some(close) = after_open.find('%') {
+                let candidate = &after_open[..close];
+                assert!(
+                    candidate.is_empty() || candidate.contains(char::is_whitespace),
+                    "{label}: looks like a cmd.exe `%VAR%` expansion \
+                     (PowerShell never substitutes these — use $env:VAR \
+                     instead): %{candidate}% in {cmd}"
+                );
+                rest = &after_open[close + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn test_codelldb_install_cmd_windows_is_powershell5_safe() {
+        assert_powershell5_safe("codelldb", &codelldb_install_cmd_windows());
+    }
+
+    #[test]
+    fn test_netcoredbg_install_cmd_windows_is_powershell5_safe() {
+        assert_powershell5_safe("netcoredbg", &netcoredbg_install_cmd_windows());
+    }
+
+    #[test]
+    fn test_debugpy_install_cmd_is_powershell5_safe() {
+        // Unlike the codelldb/netcoredbg builders above, debugpy's install
+        // command doesn't have a separately callable Windows-only builder
+        // (its Windows-vs-Unix difference is just the venv `python` path,
+        // behind a `#[cfg(target_os = "windows")]` on one `let` binding) —
+        // but the `&&` joiner this test guards against was never behind
+        // that cfg at all, so it's reachable here on every platform.
+        let cmd = install_cmd_for_adapter("debugpy", &[]).expect("debugpy should have install cmd");
+        assert_powershell5_safe("debugpy", &cmd);
+    }
+
+    /// #1715: every string the *Windows* install pane can actually type
+    /// into `powershell.exe` for a built-in adapter must be PowerShell-5.1
+    /// safe — not just the ones the bugbash happened to hit — so a future
+    /// adapter addition can't reintroduce the same bug silently. Checks the
+    /// Windows-specific builders directly (`codelldb_install_cmd_windows`,
+    /// `netcoredbg_install_cmd_windows`) rather than going through
+    /// `install_cmd_for_adapter`/`codelldb_install_cmd`/
+    /// `netcoredbg_install_cmd`, since *those* dispatch on the host OS at
+    /// compile time and would hand back the Unix variant's command (which
+    /// legitimately uses `&&` — it runs under `sh`, not PowerShell) on a
+    /// non-Windows test run. `delve`'s single `go install …` line and
+    /// `debugpy`'s command (fixed above to use `;` unconditionally, not
+    /// just on Windows) have no OS-conditional builder to call separately,
+    /// so they're covered through `install_cmd_for_adapter` directly.
+    #[test]
+    fn test_all_builtin_windows_dap_install_cmds_are_powershell5_safe() {
+        assert_powershell5_safe("codelldb (windows)", &codelldb_install_cmd_windows());
+        assert_powershell5_safe("netcoredbg (windows)", &netcoredbg_install_cmd_windows());
+        for adapter in ["delve", "debugpy"] {
+            let cmd = install_cmd_for_adapter(adapter, &[])
+                .unwrap_or_else(|| panic!("{adapter} should have a built-in install command"));
+            assert_powershell5_safe(adapter, &cmd);
+        }
     }
 
     #[test]
