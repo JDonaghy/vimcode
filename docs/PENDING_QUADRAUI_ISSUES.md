@@ -1477,6 +1477,102 @@ vimcode-side fix available; `WinBackend` is a 1-line quadraui re-export
 (`src/win/backend.rs`) and every file named above lives in quadraui, not
 in this repo.
 
+**Addendum (vimcode#1688):** this same entry — specifically its
+`win::tab_bar::paint_tab_bar_icons_from_layout` (`tab_bar.rs:285`) bullet —
+also accounts for vimcode#1688's "all three tabs look identical" background
+half (`tab_active_bg == tab_bar_bg` because the rasteriser builds a fresh
+`Theme::default()` instead of reading `self.current_theme`). That report's
+*accent-line* half is a separate, additional gap in the very same
+rasteriser — see the new entry immediately below — not covered by this
+one. #1688 blocks on both this entry and that one.
+
+---
+
+## Win-GUI tab-bar rasteriser paints zero accent-line pixels even though the descriptor it's given already carries `Some(active_accent)` (blocks vimcode#1688's accent-line half)
+
+**Title:** `win::tab_bar::paint_tab_bar_icons_from_layout` never reaches (or
+never honours) its own `if let Some(accent) = bar.active_accent` branch —
+vimcode's descriptor boundary is confirmed correct by a new regression
+test, so the gap is entirely inside this rasteriser, not upstream of it.
+
+**Body:**
+
+vimcode#1688 reports a Win-GUI tab strip where a pixel scan of the whole
+band the accent line should occupy (`x = 500..960`, `y = 44..50`) returns
+one single, uniform colour everywhere — not a dimmed accent, no accent
+pixel at all, for any of the three open tabs including the one that is
+actually active.
+
+The sibling entry directly above this one (quadraui#1261, the "Seven
+Win-GUI rasterisers still paint a hardcoded `Theme::default()`" issue)
+already names this exact rasteriser and already explains the *background*
+half of #1688's symptom (`tab_active_bg == tab_bar_bg`, both landing on
+quadraui's own dark default). It does **not** explain the missing accent
+line: per `tab_bar.rs:308` (cited in #1688 directly), the accent paints from
+the **descriptor** — `if let Some(accent) = bar.active_accent` — not from
+`self.current_theme`/`Theme::default()` at all, so fixing #1261 alone would
+leave the accent line still unpainted.
+
+This vimcode PR added `render::tests::
+build_screen_layout_sets_tab_bar_active_accent_only_on_active_group`
+(`src/render.rs`) to settle which side of the descriptor boundary the bug
+is on. It builds a real two-group split via `Engine::execute_command
+("EditorGroupSplit")`, calls the same `build_screen_layout` every backend
+calls, and asserts `GroupTabBar::bar.active_accent ==
+Some(theme.tab_active_accent)` for the active group's bar and `None` for
+the inactive group's — mirroring `build_activity_bar_active_accent_uses_
+activity_active_accent_not_cursor`'s existing pattern for the sibling
+activity-bar accent. Verified RED first (temporarily forcing the `is_active`
+branch in `build_screen_layout` to `if false` reproduces `left: None, right:
+Some(...)` against the fixed code, confirming the test can fail), then
+green against the real code. So: **the `quadraui::TabBar` descriptor
+vimcode hands every backend already carries the right `active_accent` for
+the active group.** `src/render.rs`'s `is_active = gid == engine.
+active_group` check and the `let accent = if is_active { Some(theme.
+tab_active_accent) } else { None };` line it feeds are both already correct
+and unchanged by this PR.
+
+That rules out "vimcode is passing `active_accent: None`" (the first branch
+#1688's own **Ask** named) and narrows it to the second: **the Win
+rasteriser is not reaching, or not honouring, its own `if let Some(accent)
+= bar.active_accent` branch** at `tab_bar.rs:308`. This repo has no
+Windows host to single-step that branch on, and per `src/win/mod.rs`'s
+`#1558` doc section, dell64 (this fleet's only real Windows host) has
+repeatedly been unable to capture Win-GUI client-area pixel content this
+session cycle (locked-session Direct2D/GDI suspension, see the `native_menu`
+entry above) — so confirming *why* the branch doesn't paint (never
+reached, reached but drawing with a transparent/zero-alpha colour, drawing
+into the wrong rect, or something else) needs either a live, unlocked
+Windows session or new `WinDriver` pixel-probe infrastructure, neither
+available from this worktree.
+
+**Ask:** on real Windows hardware (or via a new `WinDriver`/
+`ConformanceHarness` pixel probe once device-loss/locked-session capture is
+unblocked), step through `paint_tab_bar_icons_from_layout`'s accent branch
+with a `TabBar { active_accent: Some(_), .. }` descriptor and determine why
+no accent pixel reaches the screen — most likely candidates, in rough order
+of plausibility given the symptom (uniform colour across the *entire* band,
+not merely dim): the branch draws into a rect that's already fully
+overpainted by a later call in the same frame (z-order bug), the accent
+colour it draws with happens to resolve to the same value as the
+surrounding fill (a theme-wiring bug *inside* this branch, distinct from
+#1261's `Theme::default()` bug since this branch reads the descriptor, not
+`self.current_theme`), or the branch is skipped entirely due to a stale/
+default `TabBar` being reconstructed somewhere between `WinBackend::
+draw_tab_bar_icons`'s entry and this call (an adapter bug, not a descriptor
+bug, since vimcode's own descriptor is now proven correct above). Add a
+`win::backend` unit test once the real cause is found, mirroring this PR's
+`build_screen_layout_sets_tab_bar_active_accent_only_on_active_group`
+shape but pixel-probing the Win-GUI rasteriser's own output.
+
+**Blocks:** `JDonaghy/vimcode#1688`'s accent-line half. Leave that issue
+open behind this entry and the `Theme::default()` entry above (quadraui#1261)
+per `GOALS.md`'s milestone-discipline rule — there is no per-backend
+vimcode-side fix available; the descriptor vimcode hands every backend is
+confirmed correct by the regression test this PR ships, and
+`WinBackend::draw_tab_bar_icons` is a thin quadraui re-export
+(`src/win/backend.rs`), not a `src/win/` decision point.
+
 ---
 
 ## `WinDriver` has no `.tick()` (unlike `TuiDriver`/`MacDriver`), and its own `attach_headless` never sets `WinBackend::hwnd` — `tick`/`request_frame_in` scheduling bugs on Win-GUI can't be driver-tested even on real Windows (found fixing vimcode#1668)
