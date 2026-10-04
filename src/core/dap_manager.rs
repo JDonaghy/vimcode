@@ -1031,6 +1031,50 @@ mod tests {
         );
     }
 
+    /// #1712: the real rust/cpp combined install (`rustup component add
+    /// rust-analyzer ; <codelldb install command>`) is itself longer than
+    /// macOS's 1024-byte tty canon cap, for every `(Platform, Arch)`
+    /// combination codelldb builds a non-Windows command for. Confirms the
+    /// actual bytes `terminal_run_command` now types into the PTY —
+    /// `terminal_ops::build_terminal_install_launch_line`, not this
+    /// module's own command string — stay under that cap regardless, since
+    /// the fix for #1712 moved the command itself into a temp script file.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn rust_cpp_codelldb_install_launch_line_under_canon_cap_every_platform_arch() {
+        use crate::core::engine::terminal_ops::{
+            build_terminal_install_launch_line, install_script_path,
+        };
+
+        const MACOS_MAX_CANON: usize = 1024;
+        for platform in Platform::ALL {
+            for arch in Arch::ALL {
+                let codelldb_cmd = codelldb_install_cmd_for(platform, arch);
+                let combined = format!("rustup component add rust-analyzer ; {codelldb_cmd}");
+                assert!(
+                    combined.len() > MACOS_MAX_CANON,
+                    "fixture should reproduce a combined install command \
+                     longer than the macOS canon cap (platform={platform:?}, \
+                     arch={arch:?}), otherwise it isn't exercising the bug: \
+                     {} bytes",
+                    combined.len()
+                );
+                for is_powershell in [false, true] {
+                    let script_path = install_script_path("dap:codelldb", is_powershell);
+                    let launch_line =
+                        build_terminal_install_launch_line(&script_path, is_powershell);
+                    assert!(
+                        launch_line.len() < MACOS_MAX_CANON,
+                        "platform={platform:?} arch={arch:?} is_powershell={is_powershell}: \
+                         PTY-typed launch line is {} bytes, must stay under the \
+                         {MACOS_MAX_CANON}-byte macOS tty canon cap; got:\n{launch_line}",
+                        launch_line.len()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_install_cmd_debugpy() {
         let cmd = install_cmd_for_adapter("debugpy", &[]);
