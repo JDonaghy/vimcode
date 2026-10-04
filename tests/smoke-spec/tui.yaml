@@ -1731,3 +1731,22 @@ steps:
     id: dismiss-context-menu-root-row-1703
     key: esc
 
+  # vimcode#1736 ("Explorer sidebar ... desyncing it from the editor
+  # pane") — a bugbash report that the Explorer tree's content row (row
+  # 2 above) sits one row below the editor pane's own first content
+  # line, out of alignment. It does not: under this spec's own default
+  # settings (`breadcrumbs` defaults to `true`, `src/core/settings.rs`'s
+  # `default_breadcrumbs`, and the repro's settings.json here only
+  # overrides `lsp_enabled`/`use_nerd_fonts`), the editor paints its own
+  # breadcrumb bar on row 1 — the same row the Explorer's #1693 toolbar
+  # occupies — so both panes' real content lands on row 2, aligned. The
+  # unit-level proof (including a hand-verified RED when breadcrumbs are
+  # forced off) is
+  # `explorer_root_row_matches_editor_first_content_row_1736`
+  # (`src/tui_main/app_on_tui_tests.rs`); no Tier-2 step is added here
+  # beyond this note because that unit test already pins the exact
+  # row relationship and is far cheaper to run than a pty capture. If a
+  # future change to either pane's chrome (removing the breadcrumb bar,
+  # moving the toolbar, adding a second toolbar row, etc.) breaks that
+  # test, revisit this comment before re-authoring a Tier-2 step.
+
