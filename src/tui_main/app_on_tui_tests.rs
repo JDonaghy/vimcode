@@ -3992,34 +3992,52 @@ mod tests {
             std::fs::write(dir.join("sample.txt"), "hello").unwrap();
             std::fs::write(dir.join("second.txt"), "world").unwrap();
 
-            let mut engine = plain_engine();
-            engine.cwd = dir.clone();
-            engine.explorer_expanded.insert(dir);
-            engine.explorer_rebuild_rows();
-            engine.session.explorer_visible = true;
-            engine.app_shell.show_panel(&quadraui::WidgetId::new(
-                crate::core::engine::sidebar::PANEL_EXPLORER,
-            ));
-            // Matches `tests/smoke-spec/tui.yaml`'s own `cols: 100` x
-            // `rows: 30` grid exactly, so the row numbers below mean the
-            // same thing they do in the real spec.
-            let mut h = crate::tui_main::testing::conformance_harness(engine, 100, 30);
-            let driver = &mut h.driver;
+            // Each right-click gets its own fresh engine + harness (#1703
+            // CI follow-up): the first revision drove both clicks through
+            // one driver with an Escape in between, so the row-1 check
+            // inherited whatever dismissing the row-3 menu left behind
+            // (menu/hover/focus state). That passed locally but failed in
+            // CI's `--no-default-features` lane. Fresh harnesses keep the
+            // two checks independent, so neither depends on the other's
+            // teardown.
+            let fresh = |dir: &std::path::Path| {
+                let mut engine = plain_engine();
+                engine.cwd = dir.to_path_buf();
+                engine.explorer_expanded.insert(dir.to_path_buf());
+                engine.explorer_rebuild_rows();
+                engine.session.explorer_visible = true;
+                engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                    crate::core::engine::sidebar::PANEL_EXPLORER,
+                ));
+                // Matches `tests/smoke-spec/tui.yaml`'s own `cols: 100` x
+                // `rows: 30` grid exactly, so the row numbers below mean
+                // the same thing they do in the real spec.
+                crate::tui_main::testing::conformance_harness(engine, 100, 30)
+            };
 
             // `right-click-explorer-row`'s own coordinate (`row: 3, col:
             // 10`, left untouched in tests/smoke-spec/tui.yaml per #3509's
             // additive-only policy): on this folderless cwd it lands on
             // the second file's row -- its context menu correctly has no
             // "New File..."/"New Folder...".
-            driver.right_click(10.0, 3.0);
-            assert!(
-                !driver.screen_has("New File"),
-                "row 3 on a folderless cwd is a plain file's row; its \
-                 context menu must not offer folder-only actions; \
-                 screen:\n{}",
-                driver.screen()
-            );
-            driver.press_named(quadraui::NamedKey::Escape);
+            {
+                let mut h = fresh(&dir);
+                let driver = &mut h.driver;
+                driver.right_click(10.0, 3.0);
+                assert!(
+                    driver.screen_has("Copy Path"),
+                    "row 3 must land on a real explorer row and open its \
+                     context menu; screen:\n{}",
+                    driver.screen()
+                );
+                assert!(
+                    !driver.screen_has("New File"),
+                    "row 3 on a folderless cwd is a plain file's row; its \
+                     context menu must not offer folder-only actions; \
+                     screen:\n{}",
+                    driver.screen()
+                );
+            }
 
             // The cwd-independent alternative, added to the spec as a new
             // step (`right-click-explorer-root-row-1703`) rather than a
@@ -4027,14 +4045,20 @@ mod tests {
             // directory by construction, regardless of the cwd's children
             // (or lack of them) -- so its context menu always offers
             // "New File..."/"New Folder...".
-            driver.right_click(10.0, 1.0);
-            assert!(
-                driver.screen_has("New File"),
-                "row 1 is the Explorer root entry and must always be a \
-                 directory's context menu, even on a folderless cwd; \
-                 screen:\n{}",
-                driver.screen()
-            );
+            {
+                let mut h = fresh(&dir);
+                let driver = &mut h.driver;
+                driver.right_click(10.0, 1.0);
+                assert!(
+                    driver.screen_has("New File"),
+                    "row 1 is the Explorer root entry and must always be a \
+                     directory's context menu, even on a folderless cwd; \
+                     screen:\n{}",
+                    driver.screen()
+                );
+            }
+
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
