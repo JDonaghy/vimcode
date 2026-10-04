@@ -127,6 +127,15 @@ struct Args {
     tui: bool,
     /// `--debug <logfile>`: write a debug log to this path.
     debug_log: Option<String>,
+    /// `--ext-install <name>`: headless prerequisite check (and, when every
+    /// prerequisite is present, install) for one extension — #1719's "an
+    /// external driver (vimcode-ext#17's CI matrix) can exercise vimcode's
+    /// real prerequisite-selection logic without reimplementing it" entry
+    /// point. Never touches a GUI/TUI backend.
+    ext_install: Option<String>,
+    /// `--json`: with `--ext-install`, print the result as one JSON object
+    /// instead of plain text.
+    json: bool,
     /// First positional argument: the file to open.
     file_path: Option<PathBuf>,
 }
@@ -142,10 +151,20 @@ impl Args {
         let debug_flag = argv.iter().position(|a| a == "--debug");
         let debug_log = debug_flag.and_then(|i| argv.get(i + 1)).cloned();
 
-        // First positional argument (not starting with '-', not a --debug value)
+        // --ext-install <name>: headless prerequisite check / install (#1719)
+        let ext_install_flag = argv.iter().position(|a| a == "--ext-install");
+        let ext_install = ext_install_flag.and_then(|i| argv.get(i + 1)).cloned();
+        let json = argv.iter().any(|a| a == "--json");
+
+        // First positional argument (not starting with '-', not a --debug
+        // or --ext-install value)
         let skip_args: std::collections::HashSet<usize> = {
             let mut s = std::collections::HashSet::new();
             if let Some(i) = debug_flag {
+                s.insert(i);
+                s.insert(i + 1);
+            }
+            if let Some(i) = ext_install_flag {
                 s.insert(i);
                 s.insert(i + 1);
             }
@@ -163,6 +182,8 @@ impl Args {
             version,
             tui,
             debug_log,
+            ext_install,
+            json,
             file_path,
         }
     }
@@ -182,7 +203,10 @@ fn usage_text() -> String {
          \x20\x20-h, --help          Print this help message and exit\n\
          \x20\x20-V, --version       Print the version and exit\n\
          \x20\x20-t, --tui           Force the terminal UI (no GTK4 required)\n\
-         \x20\x20    --debug <FILE>  Write a debug log to FILE\n\n\
+         \x20\x20    --debug <FILE>  Write a debug log to FILE\n\
+         \x20\x20    --ext-install <NAME>  Headless prerequisite check (and install) \
+for one extension, no GUI/TUI\n\
+         \x20\x20    --json          With --ext-install, print the result as JSON\n\n\
          Arguments:\n\
          \x20\x20[FILE]              File to open on startup\n",
         env!("CARGO_PKG_VERSION"),
@@ -261,6 +285,181 @@ fn launch_gui(args: Args) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Headless `--ext-install <name>` entry point (#1719).
+///
+/// Runs the same prerequisite check `Engine::ext_install_from_registry_
+/// with_runtime_check` runs before dispatching an install, with no GUI/TUI
+/// backend involved — the point is that an external driver (vimcode-ext#17's
+/// cross-platform CI matrix) can exercise vimcode's *real* detect/instruct
+/// logic end to end instead of re-implementing it and drifting, which is
+/// exactly what happened three times over in the bugbash this issue
+/// describes. Prints a JSON (`--json`) or plain-text verdict and exits
+/// non-zero the moment a prerequisite is missing, **without** dispatching
+/// the doomed install — contract item 1 ("detect before install").
+///
+/// Scope, documented rather than silently partial: once every declared
+/// prerequisite is present, this runs the resolved install command
+/// synchronously (there is no terminal pane to hand it to in headless mode)
+/// and reports its exit status. It does not yet speak LSP/DAP `initialize`
+/// against the freshly installed server/adapter to confirm "working" per
+/// the issue's contract item 3 — that verification is left to vimcode-ext#17's
+/// own matrix, which has the per-language client fixtures to drive it; this
+/// entry point's job is just to stop re-implementation of the *selection and
+/// detection* half.
+fn run_ext_install(name: &str, json: bool) -> ExitCode {
+    let engine = vimcode_core::core::engine::Engine::new();
+    let Some(manifest) = engine
+        .ext_available_manifests()
+        .into_iter()
+        .find(|m| m.name.eq_ignore_ascii_case(name))
+    else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"extension": name, "status": "unknown_extension"})
+            );
+        } else {
+            eprintln!("vimcode: unknown extension '{name}'");
+        }
+        return ExitCode::FAILURE;
+    };
+
+    let present = |dep: &str| vimcode_core::core::lsp_manager::resolve_command(dep).is_some();
+
+    // Same gating `Engine::ext_install_from_registry_with_runtime_check`
+    // applies before checking `lsp.dependencies`/`dap.dependencies`: native
+    // `[lsp.acquire]`/`[dap.acquire]` tables have their own runtime check
+    // (#1346, `resolve_acquire_action`) and are not this function's concern,
+    // and there is nothing to check if no install command exists at all.
+    let mut missing: Vec<String> = Vec::new();
+    if !manifest.lsp.binary.is_empty()
+        && manifest.lsp.acquire.is_none()
+        && !manifest.lsp.install_cmd_for_platform().is_empty()
+    {
+        for dep in &manifest.lsp.dependencies {
+            if !present(dep) && !missing.contains(dep) {
+                missing.push(dep.clone());
+            }
+        }
+    }
+    if !manifest.dap.adapter.is_empty() && manifest.dap.acquire.is_none() {
+        for dep in &manifest.dap.dependencies {
+            if !present(dep) && !missing.contains(dep) {
+                missing.push(dep.clone());
+            }
+        }
+        if manifest.dap.install_cmd_for_platform().is_empty() {
+            for dep in vimcode_core::core::dap_manager::adapter_dependencies(
+                &manifest.dap.adapter,
+                vimcode_core::core::extensions::Platform::host(),
+            ) {
+                if !present(dep) && !missing.iter().any(|m| m == dep) {
+                    missing.push(dep.to_string());
+                }
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        let instructions: std::collections::BTreeMap<String, String> = missing
+            .iter()
+            .map(|dep| {
+                let hint = vimcode_core::core::extensions::prereq_install_cmd(dep)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("install {dep} and try again"));
+                (dep.clone(), hint)
+            })
+            .collect();
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "extension": name,
+                    "status": "missing_prerequisite",
+                    "missing": missing,
+                    "instructions": instructions,
+                })
+            );
+        } else {
+            eprintln!("vimcode: '{name}' requires {} —", missing.join(", "));
+            for (dep, hint) in &instructions {
+                eprintln!("  {dep}: {hint}");
+            }
+        }
+        return ExitCode::FAILURE;
+    }
+
+    // Every declared prerequisite is present — run the resolved install
+    // command(s) for real and report the exit status.
+    let mut commands: Vec<String> = Vec::new();
+    if !manifest.lsp.binary.is_empty() && manifest.lsp.acquire.is_none() {
+        let cmd = manifest.lsp.install_cmd_for_platform();
+        if !cmd.is_empty() {
+            commands.push(cmd.to_string());
+        }
+    }
+    if !manifest.dap.adapter.is_empty() && manifest.dap.acquire.is_none() {
+        if let Some(cmd) = vimcode_core::core::dap_manager::install_cmd_for_adapter(
+            &manifest.dap.adapter,
+            std::slice::from_ref(&manifest),
+        ) {
+            commands.push(cmd);
+        }
+    }
+
+    let mut exit_status: i32 = 0;
+    for cmd in &commands {
+        exit_status = run_shell_command(cmd);
+        if exit_status != 0 {
+            break;
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "extension": name,
+                "status": "installed",
+                "install_exit_status": exit_status,
+            })
+        );
+    } else {
+        println!("vimcode: '{name}' installed (exit status {exit_status})");
+    }
+
+    if exit_status == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Run a shell command synchronously and return its exit code (or `1` if it
+/// could not be spawned / had no exit code). The shell choice mirrors the
+/// install pane's: `sh` on Unix, Windows PowerShell on Windows (#1715 — no
+/// `cmd.exe`, so every `PREREQ_INSTALLS`/manifest install string already has
+/// to be valid in one of these two).
+#[cfg(not(target_os = "windows"))]
+fn run_shell_command(cmd: &str) -> i32 {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .status()
+        .map(|s| s.code().unwrap_or(1))
+        .unwrap_or(1)
+}
+
+#[cfg(target_os = "windows")]
+fn run_shell_command(cmd: &str) -> i32 {
+    std::process::Command::new("powershell.exe")
+        .arg("-Command")
+        .arg(cmd)
+        .status()
+        .map(|s| s.code().unwrap_or(1))
+        .unwrap_or(1)
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     let args = Args::parse(&argv);
@@ -273,6 +472,10 @@ fn main() -> ExitCode {
     if args.version {
         println!("{}", version_banner(COMPILED_GUI_BACKEND));
         return ExitCode::SUCCESS;
+    }
+
+    if let Some(name) = &args.ext_install {
+        return run_ext_install(name, args.json);
     }
 
     if args.tui {
@@ -341,6 +544,25 @@ mod arg_parsing_tests {
         let a = Args::parse(&argv(&["--debug"]));
         assert_eq!(a.debug_log, None);
         assert_eq!(a.file_path, None);
+    }
+
+    /// #1719: `--ext-install <name>` takes its value, same as `--debug`
+    /// does, and `--json` is recognised as a separate bare flag.
+    #[test]
+    fn ext_install_flag_and_value_parse_and_json_is_recognised() {
+        let a = Args::parse(&argv(&["--ext-install", "yaml", "--json"]));
+        assert_eq!(a.ext_install.as_deref(), Some("yaml"));
+        assert!(a.json);
+        assert_eq!(a.file_path, None);
+    }
+
+    /// `--ext-install`'s value must not be mistaken for the file to open,
+    /// mirroring `debug_value_is_not_mistaken_for_the_file_path` above.
+    #[test]
+    fn ext_install_value_is_not_mistaken_for_the_file_path() {
+        let a = Args::parse(&argv(&["--ext-install", "yaml", "notes.txt"]));
+        assert_eq!(a.ext_install.as_deref(), Some("yaml"));
+        assert_eq!(a.file_path, Some(PathBuf::from("notes.txt")));
     }
 }
 
@@ -425,7 +647,17 @@ mod gui_backend_tests {
         let text = usage_text();
         assert!(text.starts_with(&format!("VimCode {}", env!("CARGO_PKG_VERSION"))));
         assert!(text.contains("Usage: vimcode"));
-        for flag in ["--help", "-h", "--version", "-V", "--tui", "-t", "--debug"] {
+        for flag in [
+            "--help",
+            "-h",
+            "--version",
+            "-V",
+            "--tui",
+            "-t",
+            "--debug",
+            "--ext-install",
+            "--json",
+        ] {
             assert!(text.contains(flag), "usage text missing {flag:?}: {text}");
         }
     }

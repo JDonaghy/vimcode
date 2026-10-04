@@ -464,18 +464,40 @@ impl Engine {
                     }
                 }
             } else if !manifest.lsp.install_cmd_for_platform().is_empty() {
-                let lsp_key = format!("ext:{ext_name}:lsp");
-                self.lsp_installing.insert(lsp_key.clone());
-                install_commands.push(manifest.lsp.install_cmd_for_platform().to_string());
-                self.pending_install_context = Some(InstallContext {
-                    ext_name: ext_name.clone(),
-                    install_key: lsp_key,
-                });
-                self.notify(
-                    NotificationKind::LspInstall,
-                    &format!("Installing {}…", manifest.lsp.binary),
-                );
-                status_parts.push(format!("LSP: installing {}…", manifest.lsp.binary));
+                // #1719: this is the legacy terminal-install leg — unlike
+                // the `[lsp.acquire]` branch above, nothing here checked
+                // `manifest.lsp.dependencies` before now. Detection only
+                // ran at server-start time (`resolve_and_start_server`),
+                // well after the install pane had already failed with a
+                // bare "command not found: npm". Check first; show the
+                // same actionable hint `missing_dependency_message`
+                // already builds for the server-start case, and never
+                // dispatch a doomed command.
+                let missing: Vec<&str> = manifest
+                    .lsp
+                    .dependencies
+                    .iter()
+                    .filter(|dep| !runtime_present(dep))
+                    .map(|s| s.as_str())
+                    .collect();
+                if missing.is_empty() {
+                    let lsp_key = format!("ext:{ext_name}:lsp");
+                    self.lsp_installing.insert(lsp_key.clone());
+                    install_commands.push(manifest.lsp.install_cmd_for_platform().to_string());
+                    self.pending_install_context = Some(InstallContext {
+                        ext_name: ext_name.clone(),
+                        install_key: lsp_key,
+                    });
+                    self.notify(
+                        NotificationKind::LspInstall,
+                        &format!("Installing {}…", manifest.lsp.binary),
+                    );
+                    status_parts.push(format!("LSP: installing {}…", manifest.lsp.binary));
+                } else {
+                    status_parts.push(crate::core::lsp_manager::missing_dependency_message(
+                        &manifest, &missing,
+                    ));
+                }
             }
         }
 
@@ -534,28 +556,63 @@ impl Engine {
                     }
                 }
             } else {
-                let adapter_install = crate::core::dap_manager::install_cmd_for_adapter(
-                    manifest.dap.adapter.as_str(),
-                    &available_manifests,
-                );
-                if let Some(cmd_str) = adapter_install {
-                    let dap_key = format!("dap:{}", manifest.dap.adapter);
-                    self.lsp_installing.insert(dap_key.clone());
-                    install_commands.push(cmd_str);
-                    // Only set install context if LSP didn't already set it.
-                    if self.pending_install_context.is_none() {
-                        self.pending_install_context = Some(InstallContext {
-                            ext_name: ext_name.clone(),
-                            install_key: dap_key,
-                        });
+                // #1719: merge manifest-declared `dap.dependencies` with
+                // the built-in adapters' hardcoded prerequisites
+                // (`dap_manager::adapter_dependencies` — delve needs `go`,
+                // debugpy needs `python3`, codelldb/netcoredbg need
+                // `curl`+`unzip`/`tar`) *before* building the install
+                // command, same treatment the LSP leg above just got.
+                // The built-in list only applies when this manifest itself
+                // has no `install_*` override — if it does, `install_cmd_
+                // for_adapter` will use that command instead, which may
+                // have entirely different prerequisites.
+                let mut missing: Vec<String> = manifest
+                    .dap
+                    .dependencies
+                    .iter()
+                    .filter(|dep| !runtime_present(dep))
+                    .cloned()
+                    .collect();
+                if manifest.dap.install_cmd_for_platform().is_empty() {
+                    for dep in crate::core::dap_manager::adapter_dependencies(
+                        &manifest.dap.adapter,
+                        extensions::Platform::host(),
+                    ) {
+                        if !runtime_present(dep) && !missing.iter().any(|m| m == dep) {
+                            missing.push(dep.to_string());
+                        }
                     }
-                    status_parts.push(format!("DAP: installing {}…", manifest.dap.adapter));
-                } else if !dap_binary.is_empty() {
-                    // Nothing knows how to install this adapter — fall back
-                    // to telling the user.
-                    status_parts.push(format!(
-                        "DAP: {dap_binary} needs manual install (no automated installer)"
+                }
+                if !missing.is_empty() {
+                    let missing_refs: Vec<&str> = missing.iter().map(String::as_str).collect();
+                    status_parts.push(crate::core::lsp_manager::missing_dependency_message(
+                        &manifest,
+                        &missing_refs,
                     ));
+                } else {
+                    let adapter_install = crate::core::dap_manager::install_cmd_for_adapter(
+                        manifest.dap.adapter.as_str(),
+                        &available_manifests,
+                    );
+                    if let Some(cmd_str) = adapter_install {
+                        let dap_key = format!("dap:{}", manifest.dap.adapter);
+                        self.lsp_installing.insert(dap_key.clone());
+                        install_commands.push(cmd_str);
+                        // Only set install context if LSP didn't already set it.
+                        if self.pending_install_context.is_none() {
+                            self.pending_install_context = Some(InstallContext {
+                                ext_name: ext_name.clone(),
+                                install_key: dap_key,
+                            });
+                        }
+                        status_parts.push(format!("DAP: installing {}…", manifest.dap.adapter));
+                    } else if !dap_binary.is_empty() {
+                        // Nothing knows how to install this adapter — fall back
+                        // to telling the user.
+                        status_parts.push(format!(
+                            "DAP: {dap_binary} needs manual install (no automated installer)"
+                        ));
+                    }
                 }
             }
         }
@@ -1820,5 +1877,233 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── #1719: detect missing prerequisites before dispatching an install ──
+
+    /// #1719 acceptance criterion: an extension whose `lsp.dependencies`
+    /// names a binary that isn't on PATH must never reach the terminal
+    /// pane at all — the pre-#1719 behaviour let the legacy `install_*`
+    /// string through unconditionally, so the failure only ever showed up
+    /// as `command not found: npm` *inside* the pane the install already
+    /// started. `missing_dependency_message`'s actionable hint must appear
+    /// in the status line instead, and no terminal command may be queued.
+    ///
+    /// Verified RED against the pre-#1719 code (the `else if !manifest.
+    /// lsp.install_cmd_for_platform().is_empty()` branch with no `missing`
+    /// check in front of it): `pending_terminal_command` becomes `Some`
+    /// and `e.message` never mentions `npm`.
+    #[test]
+    fn lsp_legacy_install_blocked_when_declared_dependency_missing() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1719-lsp-missing-dep";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 LSP missing-dep test".to_string(),
+            language_ids: vec!["vc-unit-1719-lsp-lang".to_string()],
+            lsp: LspConfig {
+                binary: "vc-unit-1719-lsp-bin".to_string(),
+                install_linux: "npm install -g vc-unit-1719-lsp-bin".to_string(),
+                install_macos: "npm install -g vc-unit-1719-lsp-bin".to_string(),
+                install_windows: "npm install -g vc-unit-1719-lsp-bin".to_string(),
+                dependencies: vec!["npm".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        e.ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+
+        assert!(
+            e.pending_terminal_command.is_none(),
+            "a missing declared dependency must never dispatch an install; got: {:?}",
+            e.pending_terminal_command
+        );
+        assert!(
+            e.message.contains("npm"),
+            "status line must name the missing dependency; got: {}",
+            e.message
+        );
+    }
+
+    /// Same contract as above, but for the DAP leg's *manifest-declared*
+    /// `install_*` command, using the new `dap.dependencies` field (#1719 —
+    /// this field didn't exist before this issue).
+    #[test]
+    fn dap_manifest_install_blocked_when_declared_dependency_missing() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest};
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1719-dap-missing-dep";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 DAP missing-dep test".to_string(),
+            dap: DapConfig {
+                adapter: "vc-unit-1719-dap-adapter".to_string(),
+                binary: "vc-unit-1719-dap-bin".to_string(),
+                install_linux: "gem install vc-unit-1719-dap-bin".to_string(),
+                install_macos: "gem install vc-unit-1719-dap-bin".to_string(),
+                install_windows: "gem install vc-unit-1719-dap-bin".to_string(),
+                dependencies: vec!["gem".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        e.ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+
+        assert!(
+            e.pending_terminal_command.is_none(),
+            "a missing declared DAP dependency must never dispatch an install; got: {:?}",
+            e.pending_terminal_command
+        );
+        assert!(
+            e.message.contains("gem"),
+            "status line must name the missing DAP dependency; got: {}",
+            e.message
+        );
+    }
+
+    /// #1719: the built-in `delve` adapter's installer runs `go install
+    /// github.com/go-delve/delve/cmd/dlv@latest` — nothing declared `go` as
+    /// a prerequisite anywhere before this issue (`dap.dependencies` did
+    /// not even exist), so a machine without `go` saw an opaque `command
+    /// not found: go` inside the install pane rather than an upfront
+    /// message. This drives the real merge of `dap_manager::adapter_
+    /// dependencies` into `ext_install_from_registry_with_runtime_check`'s
+    /// built-in-installer branch, not just the pure function on its own.
+    ///
+    /// Verified RED against the pre-#1719 code (the built-in branch calling
+    /// `install_cmd_for_adapter` unconditionally): `pending_terminal_
+    /// command` ends up `Some("... go install ...")` and `e.message` never
+    /// mentions `go` as a missing prerequisite.
+    #[test]
+    fn dap_builtin_delve_install_blocked_when_go_missing() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest};
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1719-delve-missing-go";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 delve missing-go test".to_string(),
+            dap: DapConfig {
+                adapter: "delve".to_string(),
+                // Deliberately not the literal `dlv` binary name — a dev
+                // machine that has ever run `go install .../dlv` has it
+                // sitting in `~/go/bin`, which `resolve_command` probes
+                // regardless of PATH, short-circuiting the "already
+                // resolvable" check before this test's prerequisite check
+                // ever runs. See the sibling codelldb test's comment.
+                binary: "vc-unit-1719-nonexistent-dlv".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        // Neither the adapter binary nor `go` is on PATH — the runtime
+        // predicate below always returns false, so this is deterministic
+        // regardless of what's on the machine running the suite.
+        e.ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+
+        assert!(
+            e.pending_terminal_command.is_none(),
+            "delve's install must never run without `go` present; got: {:?}",
+            e.pending_terminal_command
+        );
+        assert!(
+            e.message.contains("go"),
+            "status line must name `go` as the missing prerequisite; got: {}",
+            e.message
+        );
+    }
+
+    /// #1719: the built-in `codelldb` adapter's Unix installer needs
+    /// `curl` and `unzip`; pin that both are checked (not just the first
+    /// one found).
+    #[test]
+    fn dap_builtin_codelldb_install_blocked_when_curl_and_unzip_missing() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest};
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1719-codelldb-missing-tools";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 codelldb missing-tools test".to_string(),
+            dap: DapConfig {
+                adapter: "codelldb".to_string(),
+                // Deliberately not the literal `codelldb` binary name —
+                // this dev machine (and maybe the CI runner) may have a
+                // real one on PATH already, which would short-circuit
+                // `ext_install_from_registry_with_runtime_check`'s
+                // "already resolvable" check before the prerequisite
+                // check this test targets ever runs.
+                binary: "vc-unit-1719-nonexistent-codelldb".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        e.ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+
+        assert!(
+            e.pending_terminal_command.is_none(),
+            "codelldb's install must never run without curl/unzip present; got: {:?}",
+            e.pending_terminal_command
+        );
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(
+                e.message.contains("curl") && e.message.contains("unzip"),
+                "status line must name both missing prerequisites; got: {}",
+                e.message
+            );
+        }
+    }
+
+    /// A manifest that already declares its *own* `install_*` for a
+    /// built-in adapter name (`codelldb`) must be checked against its own
+    /// `dap.dependencies`, not the built-in curl/unzip list — the built-in
+    /// list only applies when nothing overrides the install command.
+    #[test]
+    fn dap_manifest_override_of_builtin_adapter_uses_its_own_dependencies() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest};
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1719-codelldb-override";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 codelldb override test".to_string(),
+            dap: DapConfig {
+                adapter: "codelldb".to_string(),
+                // See the sibling test above for why this isn't the
+                // literal `codelldb` binary name.
+                binary: "vc-unit-1719-nonexistent-codelldb".to_string(),
+                install_linux: "pip install codelldb-shim".to_string(),
+                install_macos: "pip install codelldb-shim".to_string(),
+                install_windows: "pip install codelldb-shim".to_string(),
+                dependencies: vec!["pip".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        // `pip` is declared missing; `curl`/`unzip` (the built-in codelldb
+        // prerequisites) are irrelevant here since this manifest overrides
+        // the install command entirely.
+        e.ext_install_from_registry_with_runtime_check(ext_name, |dep| dep != "pip");
+
+        assert!(
+            e.pending_terminal_command.is_none(),
+            "the overriding manifest's own missing dependency must still block install; got: {:?}",
+            e.pending_terminal_command
+        );
+        assert!(
+            e.message.contains("pip"),
+            "status line must name the manifest's own declared dependency, not the \
+             built-in codelldb list; got: {}",
+            e.message
+        );
     }
 }

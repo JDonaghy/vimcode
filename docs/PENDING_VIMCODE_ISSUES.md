@@ -76,3 +76,61 @@ item 2 (this entry) and ask item 4 (indent guides, drafted in
 `docs/PENDING_QUADRAUI_ISSUES.md`) are not.
 
 ---
+
+## #1719 remainder — no minimum-version checking, and the headless `--ext-install` entry point doesn't speak `initialize` yet
+
+**Title:** `#1719`'s "detect before install" half landed (LSP/DAP
+dependency checks run before any install is dispatched, `dap.dependencies`
+exists, the built-in codelldb/debugpy/delve/netcoredbg adapters declare
+their own curl/unzip/tar/python3/go prerequisites, and `vimcode --ext-install
+<name> --json` reports a missing-prerequisite verdict headlessly without
+running a doomed install — all RED-verified against unfixed code). Two
+pieces of the issue's own "Fix" list are explicitly **not** done:
+
+1. **No minimum-version checking.** `dependencies`/`adapter_dependencies`
+   are presence-only (`resolve_command(dep).is_some()`) — a *present but
+   too old* `go` (the issue's own example: Ubuntu 24.04's `golang-go` is
+   1.22, `gopls@latest` wants materially newer) still passes detection and
+   fails later with the tool's own error, exactly as the issue describes.
+   The `go` hint itself was changed to `snap install go --classic`
+   (tracks current stable, sidesteps `GOTOOLCHAIN=local` from a distro
+   package) as a mitigation, but that's an install-string fix, not a
+   version *check*. Adding real version checking needs a manifest schema
+   decision (a `min_versions` table, or `dependencies = ["go>=1.21"]`
+   inline syntax) plus a per-tool "how do I ask this binary its version"
+   probe (`go version`, `dotnet --version`, etc. all format differently) —
+   scoped as its own issue rather than guessed at here.
+2. **The headless entry point doesn't verify `initialize`.** `--ext-install`
+   checks prerequisites, reports the instruction, and — once every
+   prerequisite is present — runs the resolved install command and reports
+   its exit status. It does not then speak LSP/DAP `initialize` against the
+   freshly installed server/adapter to confirm "working" (the issue's
+   contract item 3). `vimcode-ext#17`'s own CI matrix has the per-language
+   client fixtures to drive that handshake and was always going to need
+   them regardless of what this entry point does; wiring a generic
+   initialize-probe into `vimcode --ext-install` itself (rather than
+   leaving it to the external matrix) is additional scope worth deciding
+   deliberately, not bundling into this fix silently.
+
+**Ask:** File both as their own issues (or one combined "harden #1719"
+follow-up) once `#1719` itself is reviewed, so the two known gaps don't
+quietly become "the bug was fixed" in release notes — see CLAUDE.md's
+"Never describe a `KNOWN_BUGS`-gated issue as fixed" rule, which applies in
+spirit here even though this isn't a `KNOWN_BUGS` entry: the PR landing
+this says `ISSUE_RESOLUTION: partial` for exactly this reason.
+
+**Test:** `every_prereq_install_entry_is_runnable_on_every_platform` and
+`prereq_install_cmd_covers_the_1719_additions` (`src/core/extensions.rs`),
+`adapter_dependencies_*` (`src/core/dap_manager.rs`),
+`lsp_legacy_install_blocked_when_declared_dependency_missing` /
+`dap_manifest_install_blocked_when_declared_dependency_missing` /
+`dap_builtin_delve_install_blocked_when_go_missing` /
+`dap_builtin_codelldb_install_blocked_when_curl_and_unzip_missing` /
+`dap_manifest_override_of_builtin_adapter_uses_its_own_dependencies`
+(`src/core/engine/lsp_ops.rs`), `ext_install_flag_and_value_parse_and_json_
+is_recognised` (`src/main.rs`), and the black-box
+`ext_install_reports_missing_npm_and_runs_no_install_without_prerequisite`
+(`tests/ext_install_cli.rs`, spawns the real binary) all landed with this
+entry and were RED-verified against the pre-fix code.
+
+---

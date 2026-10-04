@@ -558,6 +558,18 @@ pub struct DapConfig {
     /// Arguments passed to the DAP binary.
     #[serde(default)]
     pub args: Vec<String>,
+    /// System binaries that must be on PATH for the DAP adapter's **install
+    /// step** to work (#1719) — the `DapConfig` analogue of `LspConfig::
+    /// dependencies`. E.g. a manifest-declared adapter whose `install_*`
+    /// shells out to a package manager names it here. Checked by
+    /// `Engine::ext_install_from_registry_with_runtime_check` *before* the
+    /// install command is dispatched to the terminal pane — distinct from
+    /// the built-in adapters' (codelldb/debugpy/delve/netcoredbg) own
+    /// prerequisites, which are hardcoded in `dap_manager::
+    /// adapter_dependencies` since those installers ship with vimcode, not
+    /// the registry.
+    #[serde(default)]
+    pub dependencies: Vec<String>,
     /// Native tool acquisition (#1345) — see `LspConfig::acquire`'s doc.
     #[serde(default)]
     pub acquire: Option<crate::core::tool_acquire::AcquireConfig>,
@@ -639,10 +651,17 @@ const PREREQ_INSTALLS: &[(&str, PrereqInstall)] = &[
             windows: "winget install Microsoft.DotNet.SDK.8",
         },
     ),
+    // #1719 bugbash (vimcode-ext#17): Ubuntu 24.04's `golang-go` apt package
+    // is Go 1.22, but `gopls@latest` (and anything else resolved with
+    // `@latest`) wants a materially newer `go` — and Debian's packaged Go
+    // pins `GOTOOLCHAIN=local`, so it can't just self-upgrade the way a
+    // stock `go` toolchain would. `snap install go --classic` tracks the
+    // current stable release instead of whatever a distro happened to
+    // package, so the retry after this hint actually succeeds.
     (
         "go",
         PrereqInstall {
-            linux: "sudo apt install golang-go",
+            linux: "sudo snap install go --classic",
             macos: "brew install go",
             windows: "winget install GoLang.Go",
         },
@@ -681,6 +700,72 @@ const PREREQ_INSTALLS: &[(&str, PrereqInstall)] = &[
             linux: "sudo apt install python3 python3-venv python3-pip",
             macos: "brew install python3",
             windows: "winget install Python.Python.3",
+        },
+    ),
+    // #1719: several registry manifests' `install_macos` shells straight
+    // to `brew install …` (cpp, java, lua, markdown, latex, ruby,
+    // terraform) with nothing declaring Homebrew itself as a prerequisite
+    // — a Mac without it got no instruction, just `brew: command not
+    // found` inside the install pane. Homebrew's own installer is the one
+    // true "how do I get brew" command; it also supports Linux
+    // ("Homebrew on Linux"), so the same one-liner covers that platform
+    // too. Windows has no Homebrew port; the realistic path there is WSL,
+    // so the hint installs WSL and then runs the same installer inside it
+    // rather than a placeholder.
+    (
+        "brew",
+        PrereqInstall {
+            linux: "NONINTERACTIVE=1 /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"",
+            macos: "NONINTERACTIVE=1 /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"",
+            windows: "wsl --install ; wsl bash -c 'NONINTERACTIVE=1 /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"'",
+        },
+    ),
+    // #1719: the `java` extension's install needs a JDK on PATH; nothing
+    // in the shared table named it before.
+    (
+        "java",
+        PrereqInstall {
+            linux: "sudo apt install openjdk-17-jdk",
+            macos: "brew install openjdk@17",
+            windows: "winget install EclipseAdoptium.Temurin.17.JDK",
+        },
+    ),
+    // #1719: curl/unzip/tar back the built-in codelldb/netcoredbg DAP
+    // installers (`dap_manager::codelldb_install_cmd_for`/
+    // `netcoredbg_install_cmd_unix_for`) — see
+    // `dap_manager::adapter_dependencies`, which is what actually checks
+    // these before dispatch. macOS and most Linux distros ship `curl`/
+    // `tar` already, but a minimal/container image may not, so a real
+    // install command still belongs here rather than skipping the entry.
+    (
+        "curl",
+        PrereqInstall {
+            linux: "sudo apt install curl",
+            macos: "brew install curl",
+            windows: "winget install cURL.cURL",
+        },
+    ),
+    (
+        "unzip",
+        PrereqInstall {
+            linux: "sudo apt install unzip",
+            macos: "brew install unzip",
+            // codelldb's Windows install uses PowerShell's built-in
+            // `Expand-Archive` (`dap_manager::codelldb_install_cmd_windows`)
+            // — `unzip` itself is never invoked on Windows, so `adapter_
+            // dependencies` never asks for it there. Kept as a real,
+            // accurate (not placeholder) runnable command regardless.
+            windows: "echo 'unzip is not required on Windows -- Expand-Archive is built into PowerShell'",
+        },
+    ),
+    (
+        "tar",
+        PrereqInstall {
+            linux: "sudo apt install tar",
+            macos: "brew install gnu-tar",
+            // Same reasoning as `unzip` above: netcoredbg's Windows install
+            // uses `Expand-Archive`, never `tar.exe`.
+            windows: "echo 'tar is not required on Windows -- Expand-Archive is built into PowerShell'",
         },
     ),
 ];
@@ -1304,6 +1389,49 @@ package = "csharprepl"
     #[test]
     fn prereq_install_cmd_covers_python3_for_pip_kind() {
         assert!(prereq_install_cmd("python3").is_some());
+    }
+
+    /// #1719 acceptance criterion: every `PREREQ_INSTALLS` entry, on every
+    /// platform, resolves to a single runnable command string — never
+    /// empty and never a placeholder (`TODO`, `<...>`, `xxx`) that would
+    /// just move the "command not found" failure from the install pane to
+    /// the retry the hint told the user to run.
+    #[test]
+    fn every_prereq_install_entry_is_runnable_on_every_platform() {
+        for (name, table) in PREREQ_INSTALLS {
+            for (platform, cmd) in [
+                (Platform::Linux, table.linux),
+                (Platform::MacOS, table.macos),
+                (Platform::Windows, table.windows),
+            ] {
+                assert!(
+                    !cmd.trim().is_empty(),
+                    "{name} on {platform} has an empty install hint"
+                );
+                for placeholder in ["TODO", "<", ">", "xxx", "PLACEHOLDER"] {
+                    assert!(
+                        !cmd.contains(placeholder),
+                        "{name} on {platform} looks like a placeholder, not a \
+                         runnable command: {cmd:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #1719: `brew`, `java`, `curl`, `unzip`, `tar` are the new entries
+    /// this issue adds to the shared hint table (Homebrew itself, a JDK,
+    /// and the archive tools the built-in codelldb/netcoredbg DAP
+    /// installers shell out to) — pinned individually so a future refactor
+    /// of the table can't silently drop one of them.
+    #[test]
+    fn prereq_install_cmd_covers_the_1719_additions() {
+        for dep in ["brew", "java", "curl", "unzip", "tar"] {
+            assert!(
+                prereq_install_cmd(dep).is_some(),
+                "{dep} should have a built-in install hint"
+            );
+        }
     }
 
     #[test]
