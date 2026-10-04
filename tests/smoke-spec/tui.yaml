@@ -69,6 +69,58 @@ steps:
     text: "NORMAL"
     ms: 20000
 
+  # vimcode#1736 — a bugbash report that row 1 of the Explorer sidebar
+  # shows "a spurious 'n  N  r  c  …' hint row ... where `▾ + WORK`
+  # belongs", pushing the tree down one row. **#1736 is still open and
+  # this step is not its fix** (see `src/tui_main/app_on_tui_tests.rs`'s
+  # two `*_1736` tests for the full investigation, and for what is still
+  # undecided and needs a human product call). What this step pins, at
+  # the pty layer and under the report's own conditions — fresh HOME,
+  # first settled frame, zero keys or clicks sent, which is why it sits
+  # here above every `click`/`key` step rather than at the end of the
+  # file — is the one part the investigation did settle: `n  N  r  c  …`
+  # is neither corruption nor a race. It is #1693's view-actions toolbar
+  # rendering its documented nerd-fonts-off ASCII fallbacks
+  # (`icons::EXPLORER_NEW_FILE` `n` / `_NEW_FOLDER` `N` / `_REFRESH` `r`
+  # / `_COLLAPSE_ALL` `c` / `_OVERFLOW` `…`), on row 1, which is exactly
+  # where the `right-click-explorer-root-row-1703` comment below already
+  # documents it belongs.
+  #
+  # `region:` confines the assertion to the sidebar band (cols 3..22 —
+  # the activity bar owns cols 0..2, `x = 0` accent / `x = 1` icon / `x
+  # = 2` the `│` divider, and the editor band's content starts at col
+  # 25), so it cannot be accidentally satisfied by editor content. It is
+  # launch-independent: neither the sidebar's default width nor the
+  # toolbar's 3-cell-per-button `" {} "` segments depend on the launch
+  # `cwd`/file the way `right-click-explorer-row` below does. Column
+  # band and glyph columns (`n` at 9, `N` 12, `r` 15, `c` 18, `…` 21)
+  # confirmed by a real `coord.tui_pty_driver` run of this exact file
+  # against a real Linux pty at this grid. Falsifiability confirmed the
+  # same way: re-running this step with `region.row: 2` fails, so it
+  # really is pinned to row 1 and would catch the one-row push-down the
+  # report describes. `expect_within` rather than `expect_screen` for
+  # the same reason every other check in this file uses it — see the
+  # `first-frame-painted` comment above.
+  #
+  # Only the Explorer half of #1736 is checkable at this tier. The
+  # report's other half (the tree being "out of alignment relative to"
+  # the editor pane) needs the editor's own row-1/row-2 content, and
+  # there is no launch-independent anchor for it here: the breadcrumb
+  # bar renders the launch file's own basename, the editor body renders
+  # that file's own text, line numbers are off in the default config,
+  # and the default theme paints the breadcrumb bar's background
+  # identically to the editor's (`bg == '000000'` for both, probed over
+  # a real pty). That half is covered at Tier-1 by
+  # `explorer_root_row_matches_editor_first_content_row_1736`, where the
+  # harness owns the file content. Do not "upgrade" it to a step here by
+  # hardcoding `sample.txt`/its text — this file's header deliberately
+  # describes the launch command as an example, not a contract.
+  - type: expect_within
+    id: explorer-toolbar-owns-row-1-1736
+    region: {row: 1, col: 3, height: 1, width: 20}
+    text: "n  N  r  c  …"
+    ms: 5000
+
   # vimcode#1634 was specifically a Windows-Terminal *rendering* bug — a real
   # ~1Hz foreground flicker with a genuinely silent underlying byte stream
   # (confirmed in `tests/conpty_idle_flicker.rs`'s own module doc: the bug
@@ -1730,23 +1782,4 @@ steps:
   - type: key
     id: dismiss-context-menu-root-row-1703
     key: esc
-
-  # vimcode#1736 ("Explorer sidebar ... desyncing it from the editor
-  # pane") — a bugbash report that the Explorer tree's content row (row
-  # 2 above) sits one row below the editor pane's own first content
-  # line, out of alignment. It does not: under this spec's own default
-  # settings (`breadcrumbs` defaults to `true`, `src/core/settings.rs`'s
-  # `default_breadcrumbs`, and the repro's settings.json here only
-  # overrides `lsp_enabled`/`use_nerd_fonts`), the editor paints its own
-  # breadcrumb bar on row 1 — the same row the Explorer's #1693 toolbar
-  # occupies — so both panes' real content lands on row 2, aligned. The
-  # unit-level proof (including a hand-verified RED when breadcrumbs are
-  # forced off) is
-  # `explorer_root_row_matches_editor_first_content_row_1736`
-  # (`src/tui_main/app_on_tui_tests.rs`); no Tier-2 step is added here
-  # beyond this note because that unit test already pins the exact
-  # row relationship and is far cheaper to run than a pty capture. If a
-  # future change to either pane's chrome (removing the breadcrumb bar,
-  # moving the toolbar, adding a second toolbar row, etc.) breaks that
-  # test, revisit this comment before re-authoring a Tier-2 step.
 

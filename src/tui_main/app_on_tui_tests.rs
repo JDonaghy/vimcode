@@ -4242,10 +4242,11 @@ mod tests {
         ///
         /// This test is **not** the fix for #1736's own "desyncing it
         /// from the editor pane" complaint — that is a separate question
-        /// (see `explorer_root_row_is_one_below_editor_first_content_row_\
-        /// by_design_1736` just below, and the analysis in
-        /// `tests/smoke-spec/tui.yaml` beside its #1693/#1703 row-map
-        /// comment) and this test asserts nothing about the editor pane
+        /// (see `explorer_root_row_matches_editor_first_content_row_1736`
+        /// just below, which measures it, and the `#1736` comment in
+        /// `tests/smoke-spec/tui.yaml` above its
+        /// `explorer-toolbar-owns-row-1-1736` step) and this test asserts
+        /// nothing about the editor pane
         /// at all. What it *does* pin down is narrower and already true
         /// today: the toolbar row's presence and position on the
         /// Explorer sidebar's very first painted frame (no settle, no
@@ -4371,21 +4372,63 @@ mod tests {
         /// pane — there is no evidence in the issue body of an actual
         /// side-by-side editor-pane row read.
         ///
-        /// This is therefore the regression guard for the issue title's
-        /// own claim: if a future change removes the breadcrumb bar, the
-        /// toolbar row, or otherwise desyncs the two panes' chrome
-        /// heights, this test goes red and names exactly which row
-        /// diverged. Verified red by hand: temporarily forcing
-        /// `engine.settings.breadcrumbs = false` after construction (so
-        /// the editor loses its row-1 chrome while the Explorer keeps
-        /// its toolbar) moves `editor_row` to 1 while `explorer_root_row`
-        /// stays at 2, failing the `assert_eq!` below exactly as
-        /// expected, before being reverted. See `tests/smoke-spec/tui.yaml`'s
-        /// `right-click-explorer-root-row-1703` comment for the Tier-2
-        /// analogue of the Explorer-only row map, and this PR's own
-        /// description for why #1736 is being closed rather than kept
-        /// open for a product call: the cross-pane desync it reports does
-        /// not reproduce, under the issue's own stated repro settings.
+        /// # What this test is, and what it deliberately is not
+        ///
+        /// It is an **anti-regression pin for the cross-pane row
+        /// relationship as it ships today**: if a future change removes
+        /// the breadcrumb bar, removes or moves the toolbar row, or
+        /// otherwise desyncs the two panes' chrome heights, this test
+        /// goes red and names exactly which row diverged.
+        ///
+        /// It is **not** a RED-then-GREEN regression guard, and it does
+        /// not satisfy #1736's own acceptance line ("must add a ...
+        /// scenario or step that fails first, covering this exact
+        /// behaviour"). Being straight about why, because it matters for
+        /// how #1736 should be dispositioned: *there is no revision of
+        /// this codebase against which this test is red.* The reported
+        /// cross-pane desync does not reproduce here at all, so there is
+        /// no bug fix to remove and re-observe. The assertion can be
+        /// *made* to fail — temporarily forcing
+        /// `engine.settings.breadcrumbs = false` after construction
+        /// strips the editor's row-1 chrome while the Explorer keeps its
+        /// toolbar, moving `editor_row` to 1 while `explorer_root_row`
+        /// stays at 2, which was run by hand and fails the `assert_eq!`
+        /// below exactly as expected — but that is a *falsifiability
+        /// demonstration* (proof this assertion is not vacuous), not a
+        /// reproduction of what #1736 reports. Breaking an unrelated
+        /// setting to manufacture a red run would not be a
+        /// "fails-first" guard and is not claimed as one.
+        ///
+        /// # Therefore: #1736 stays open
+        ///
+        /// What this test and the one above establish is bounded: the
+        /// toolbar row is intended and stable (not a race, not
+        /// corruption), and under the issue's own stated repro settings
+        /// the two panes' content rows measure as *aligned*, not offset.
+        /// What they cannot establish is the product question underneath
+        /// the report — whether the Explorer having a chrome row at all,
+        /// and the row map users actually see across the settings
+        /// combinations where the editor has no breadcrumb bar (anyone
+        /// who has turned `breadcrumbs` off has a genuine one-row
+        /// offset between the panes), is the UX this project wants.
+        /// That is a call for whoever owns the product decision, and
+        /// deliberately is not made here: nothing in this file, and
+        /// nothing in the change that added it, re-scopes #1736, marks
+        /// it "working as intended", or should be read as closing it.
+        /// The change these tests ship with makes **no production-code
+        /// change** and so cannot have fixed anything; #1736 stays open
+        /// for that decision.
+        ///
+        /// Tier-2 analogues, both in `tests/smoke-spec/tui.yaml`:
+        /// `explorer-toolbar-owns-row-1-1736` (added alongside this
+        /// test — pins, on a real pty under the report's own
+        /// zero-interaction first-frame conditions, that row 1 of the
+        /// sidebar band really is the `n  N  r  c  …` toolbar) and
+        /// `right-click-explorer-root-row-1703` (the Explorer-only row
+        /// map). The cross-pane half stays here rather than there
+        /// because it needs control of the opened file's content, which
+        /// the pty tier does not have — see that file's own #1736
+        /// comment.
         #[test]
         fn explorer_root_row_matches_editor_first_content_row_1736() {
             let dir = std::env::temp_dir().join(format!(
