@@ -2738,8 +2738,8 @@ impl Engine {
 
     /// Apply per-group tab bar widths (in char-cells) measured by the most
     /// recent draw, then re-check that every group's active tab is on-screen.
-    /// Returns `true` iff any width or any `tab_scroll_offset` actually
-    /// changed — when true, the calling backend should trigger one more
+    /// Returns `true` iff any group's `tab_scroll_offset` actually changed as
+    /// a result — when true, the calling backend should trigger one more
     /// draw cycle so the corrected scroll offset reaches the screen.
     ///
     /// **This is the single contract every UI backend must call after each
@@ -2764,17 +2764,30 @@ impl Engine {
     ///   returns true, `self.draw_needed.set(true)` schedules the next
     ///   `tick_dispatch` to return `Reaction::Redraw`.
     ///
-    /// The width/scroll change-tracking lets backends avoid an unconditional
-    /// extra paint per frame; the feedback loop converges in ≤2 frames
-    /// because the second draw measures the same width and reports no change.
+    /// #1722: the return value used to be `width_bookkeeping_changed ||
+    /// scroll_changed` — i.e. it also forced a redraw whenever the raw
+    /// `tab_bar_width` value this call just stored differed from what was
+    /// stored before, even if that difference never moved
+    /// `tab_scroll_offset` (same tabs visible, same offset, same pixels on
+    /// screen either way). That raw value is *itself* derived from the
+    /// paint that already happened this frame, so a bare change in it has
+    /// nothing left to correct — unlike a `tab_scroll_offset` correction,
+    /// which does change what the next paint draws. On a pixel-measuring
+    /// backend (GTK/Win-GUI/macOS) the per-frame width can wobble by a
+    /// sub-pixel-rounding unit with several tabs open — each wobble is a
+    /// legitimate "the width changed" but a no-op "did anything paint
+    /// differently", and the old contract turned every one of those into
+    /// a forced repaint, which re-measured a slightly different width and
+    /// forced another, indefinitely. Basing the signal purely on
+    /// `tab_scroll_offset` (the one piece of state a width correction can
+    /// actually move) keeps the real "active tab was scrolled out of view"
+    /// case working (covered by
+    /// `test_post_draw_apply_widths_detects_scroll_change`, `tests.rs`) while
+    /// making the cosmetic-only case report no change
+    /// (`test_post_draw_apply_widths_reports_changes`, same file).
     pub fn post_draw_apply_widths(&mut self, widths: &[(GroupId, usize)]) -> bool {
-        let mut changed = false;
         for &(gid, width) in widths {
-            let before = self.editor_groups.get(&gid).map(|g| g.tab_bar_width);
             self.set_tab_visible_count(gid, width);
-            if before != self.editor_groups.get(&gid).map(|g| g.tab_bar_width) {
-                changed = true;
-            }
         }
         let scrolls_before: std::collections::HashMap<GroupId, usize> = self
             .editor_groups
@@ -2782,11 +2795,9 @@ impl Engine {
             .map(|(&gid, g)| (gid, g.tab_scroll_offset))
             .collect();
         self.ensure_all_groups_tabs_visible();
-        let scroll_changed = self
-            .editor_groups
+        self.editor_groups
             .iter()
-            .any(|(gid, g)| scrolls_before.get(gid) != Some(&g.tab_scroll_offset));
-        changed || scroll_changed
+            .any(|(gid, g)| scrolls_before.get(gid) != Some(&g.tab_scroll_offset))
     }
 
     // =======================================================================
