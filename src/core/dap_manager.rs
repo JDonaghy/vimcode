@@ -384,21 +384,48 @@ fn netcoredbg_install_cmd_windows() -> String {
     .to_string()
 }
 
-/// Unix (Linux/macOS) netcoredbg install command — unchanged by #1715,
-/// just renamed so `netcoredbg_install_cmd()` can dispatch between this and
-/// the new `netcoredbg_install_cmd_windows()` above.
+/// Unix (Linux/macOS) netcoredbg install command.
+///
+/// #1717: this used to `cp` only the `netcoredbg` binary out of the
+/// unpacked tarball, leaving `libdbgshim.so` and the managed `*.dll`
+/// support files behind. netcoredbg resolves `libdbgshim.so` relative to
+/// its own executable's directory, so a binary-only copy dies immediately
+/// with `dlopen() error: …/libdbgshim.so: cannot open shared object file`
+/// the moment it's launched. Fixed by copying the **whole** unpacked
+/// `netcoredbg/` directory (`cp -r … /.`) into `~/.local/bin`, so every
+/// support file the binary needs lands right next to it — `resolve_binary`
+/// (via `extra_tool_dirs`) already probes `~/.local/bin`, so no change is
+/// needed on the resolution side, only on what install actually places
+/// there.
 #[cfg(not(target_os = "windows"))]
 fn netcoredbg_install_cmd_unix() -> String {
+    netcoredbg_install_cmd_unix_for(Platform::host(), Arch::host())
+}
+
+/// Build the Unix netcoredbg install command for an explicit
+/// platform/arch rather than always resolving against the host (#1395-style
+/// testable seam, matching `codelldb_install_cmd_for` above).
+#[cfg(not(target_os = "windows"))]
+fn netcoredbg_install_cmd_unix_for(platform: Platform, arch: Arch) -> String {
     // netcoredbg releases: https://github.com/Samsung/netcoredbg/releases
-    let arch = if std::env::consts::ARCH == "aarch64" {
-        "arm64"
-    } else {
-        "amd64"
-    };
-    let os = if std::env::consts::OS == "macos" {
+    //
+    // #1717: Samsung publishes `netcoredbg-osx-amd64.tar.gz` and
+    // `netcoredbg-linux-{amd64,arm64}.tar.gz` — there is NO
+    // `netcoredbg-osx-arm64.tar.gz`. Asking for it 404s outright on Apple
+    // Silicon. Until/unless Samsung ships a native arm64 macOS build, fall
+    // back to the amd64 build, which runs fine under Rosetta 2.
+    let os = if platform == Platform::MacOS {
         "osx"
     } else {
         "linux"
+    };
+    let arch = if platform == Platform::MacOS {
+        "amd64"
+    } else {
+        match arch {
+            Arch::Arm64 => "arm64",
+            Arch::Amd64 => "amd64",
+        }
     };
     format!(
         "curl -fSL 'https://github.com/Samsung/netcoredbg/releases/latest/download/\
@@ -406,7 +433,7 @@ fn netcoredbg_install_cmd_unix() -> String {
          mkdir -p /tmp/vimcode-netcoredbg && \
          tar -xzf /tmp/vimcode-netcoredbg.tar.gz -C /tmp/vimcode-netcoredbg && \
          mkdir -p \"$HOME/.local/bin\" && \
-         cp /tmp/vimcode-netcoredbg/netcoredbg/netcoredbg \"$HOME/.local/bin/netcoredbg\" && \
+         cp -r /tmp/vimcode-netcoredbg/netcoredbg/. \"$HOME/.local/bin/\" && \
          chmod +x \"$HOME/.local/bin/netcoredbg\""
     )
 }
@@ -1208,6 +1235,74 @@ mod tests {
         assert!(
             cmd.contains("codelldb-linux-x64.vsix"),
             "linux/amd64 install cmd should reference the linux-x64 asset: {cmd}"
+        );
+    }
+
+    /// #1717 bug 1: unpacking only the binary left `libdbgshim.so` (and the
+    /// managed `*.dll` support files) behind, so the installed netcoredbg
+    /// died at launch with `dlopen() error: …/libdbgshim.so: cannot open
+    /// shared object file`. The fix must copy the *whole* unpacked
+    /// `netcoredbg/` directory into `~/.local/bin`, not just the binary —
+    /// confirm the install command actually says so (`cp -r … netcoredbg/.`),
+    /// and that it no longer contains the old binary-only `cp` of just the
+    /// `netcoredbg` file. This test was observed RED against unfixed
+    /// `develop`, which only emitted
+    /// `cp .../netcoredbg/netcoredbg "$HOME/.local/bin/netcoredbg"`.
+    #[test]
+    fn test_netcoredbg_install_cmd_copies_whole_directory() {
+        let cmd = netcoredbg_install_cmd_unix_for(Platform::Linux, Arch::Amd64);
+        assert!(
+            cmd.contains("cp -r /tmp/vimcode-netcoredbg/netcoredbg/. \"$HOME/.local/bin/\""),
+            "install cmd must recursively copy the whole unpacked netcoredbg/ \
+             directory (binary + libdbgshim.so + managed dlls) into \
+             ~/.local/bin, not just the netcoredbg binary: {cmd}"
+        );
+        assert!(
+            !cmd.contains("cp /tmp/vimcode-netcoredbg/netcoredbg/netcoredbg "),
+            "install cmd must not go back to copying only the netcoredbg \
+             binary (the #1717 bug): {cmd}"
+        );
+    }
+
+    /// #1717 bug 2: Samsung does not publish `netcoredbg-osx-arm64.tar.gz`
+    /// — only `netcoredbg-osx-amd64.tar.gz` — so asking for the arm64 asset
+    /// 404s outright on Apple Silicon. Apple Silicon must fall back to the
+    /// amd64 build (it runs fine under Rosetta 2) instead of 404ing.
+    #[test]
+    fn test_netcoredbg_install_cmd_macos_arm64_falls_back_to_amd64() {
+        let cmd = netcoredbg_install_cmd_unix_for(Platform::MacOS, Arch::Arm64);
+        assert!(
+            cmd.contains("netcoredbg-osx-amd64.tar.gz"),
+            "macOS arm64 install cmd must fall back to the osx-amd64 asset \
+             (no native osx-arm64 build is published): {cmd}"
+        );
+        assert!(
+            !cmd.contains("osx-arm64"),
+            "macOS arm64 install cmd must never reference the \
+             nonexistent osx-arm64 asset: {cmd}"
+        );
+    }
+
+    /// Companion to the arm64 fallback test above: macOS/amd64 and Linux
+    /// (either arch) must keep resolving to their own real assets.
+    #[test]
+    fn test_netcoredbg_install_cmd_macos_amd64_and_linux_unchanged() {
+        let macos_amd64 = netcoredbg_install_cmd_unix_for(Platform::MacOS, Arch::Amd64);
+        assert!(
+            macos_amd64.contains("netcoredbg-osx-amd64.tar.gz"),
+            "{macos_amd64}"
+        );
+
+        let linux_amd64 = netcoredbg_install_cmd_unix_for(Platform::Linux, Arch::Amd64);
+        assert!(
+            linux_amd64.contains("netcoredbg-linux-amd64.tar.gz"),
+            "{linux_amd64}"
+        );
+
+        let linux_arm64 = netcoredbg_install_cmd_unix_for(Platform::Linux, Arch::Arm64);
+        assert!(
+            linux_arm64.contains("netcoredbg-linux-arm64.tar.gz"),
+            "{linux_arm64}"
         );
     }
 
