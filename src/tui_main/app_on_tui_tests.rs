@@ -3186,6 +3186,118 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // #1712: an extension install whose command line is longer than the tty's
+    // canonical-mode input cap never ran at all
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Driver-tier, black-box coverage for #1712. `Engine::terminal_run_command`
+    /// used to *type* the whole install wrapper — which starts with the install
+    /// command verbatim — into the pane's PTY as a single line. A tty's
+    /// canonical-mode line discipline caps one input line at 1024 bytes on
+    /// macOS (`MAX_CANON`; 4096 on Linux) and silently discards everything past
+    /// it, trailing newline included, so the shell never saw a complete line:
+    /// the real `rust`/`cpp` installs (`rustup component add rust-analyzer ;
+    /// <codelldb install command>`, ~1.3 KB) left the pane parked at a
+    /// half-typed prompt forever and the "Installing…" spinner never resolved.
+    ///
+    /// Asserted on **painted pane content** (`driver.screen()`), not on engine
+    /// state: the bug was never visible in state — the pane, its slot and its
+    /// install context were all created correctly, and the PTY write "succeeded"
+    /// — only the child's absent output showed it.
+    ///
+    /// RED against unfixed `develop`: with the fix reverted (type `wrapped`
+    /// instead of the temp-script launcher line) the marker never appears and
+    /// this test fails on its timeout, on Linux as well as macOS, since the
+    /// padding below overshoots both platforms' caps. Verified by reverting
+    /// `terminal_run_command`'s injection back to `wrapped` and re-running.
+    #[cfg(unix)]
+    mod terminal_install_long_command_1712 {
+        use super::*;
+
+        /// Printed by the install command's *last* statement — i.e. from
+        /// bytes that sit well past every platform's canon cap, so neither
+        /// the tty's echo of a truncated typed line nor a partially-executed
+        /// command can produce it. It appears on screen only if the shell
+        /// genuinely ran the whole command.
+        const MARKER: &str = "ZQXW1712INSTALLRAN";
+
+        #[test]
+        fn install_command_over_the_tty_canon_cap_still_runs_and_paints_its_output() {
+            // `:` is the POSIX no-op builtin — it accepts (and discards) the
+            // padding argument without printing 8 KB into the pane, while
+            // still making the command line itself far longer than the 1024
+            // byte macOS cap and the 4096 byte Linux one.
+            let padding = "p".repeat(8000);
+            let command = format!(": '{padding}' ; printf '%s\\n' '{MARKER}'");
+            assert!(
+                command.len() > 4096,
+                "fixture must exceed the most generous platform's canon cap, \
+                 otherwise it isn't exercising the bug: {} bytes",
+                command.len()
+            );
+
+            let mut engine = plain_engine();
+            // The exact call `render::handle_engine_action` makes for
+            // `EngineAction::RunInTerminal` — the install path every backend
+            // funnels through (`tests/extensions.rs` covers the
+            // `:ExtInstall` → `RunInTerminal` leg that reaches it).
+            engine.terminal_run_command(&command, 80, 10);
+            let mut h = harness_no_sidebar(engine);
+
+            // Drain the PTY and repaint until the child's output shows up.
+            // Up to ~6s of wall clock: generous for a `printf`, but a cold
+            // shell spawn on a loaded CI box is not instant.
+            let mut painted = false;
+            for _ in 0..600 {
+                h.engine.borrow_mut().poll_terminal();
+                h.driver.render();
+                if h.driver.screen_contains(MARKER) {
+                    painted = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                painted,
+                "an install command longer than the tty canon cap must still \
+                 run and paint its output in the terminal pane (#1712); the \
+                 pane never printed {MARKER}, i.e. the command was truncated \
+                 before the shell could execute it. screen:\n{}",
+                h.driver.screen()
+            );
+
+            // …and the pane must still close when the user answers the
+            // wrapper's "Press Enter to close…" prompt. Routing the wrapper
+            // through a child `sh` moved its trailing `exit` out of the
+            // pane's own interactive shell, so without the launcher line's
+            // `; exit` the shell returns to its PS1 prompt,
+            // `TerminalSession::is_exited()` never fires and
+            // `poll_terminal` never removes the `TerminalSlot` — a pane
+            // nothing can close. Asserted as painted *absence*: once the
+            // slot is gone the pane stops painting, so its output
+            // disappears from the screen.
+            h.engine.borrow_mut().terminal_write(b"\n");
+            let mut closed = false;
+            for _ in 0..600 {
+                h.engine.borrow_mut().poll_terminal();
+                h.driver.render();
+                if !h.driver.screen_contains(MARKER) {
+                    closed = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                closed,
+                "pressing Enter at the install wrapper's \"Press Enter to \
+                 close…\" prompt must exit the pane's shell so the pane \
+                 stops painting (#1712); it is still showing {MARKER}. \
+                 screen:\n{}",
+                h.driver.screen()
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // #1668: Win-GUI's embedded terminal panel renders completely blank
     // ─────────────────────────────────────────────────────────────────────────
     /// Driver-tier, black-box coverage for #1668's review request: the

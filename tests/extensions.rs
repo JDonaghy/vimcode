@@ -843,11 +843,45 @@ fn ext_install_unknown_extension_shows_error() {
 
 // ── Terminal-based install ─────────────────────────────────────────────────────
 
+/// An LSP binary name no machine can possibly have installed.
+///
+/// The two install tests below need the engine to take the "LSP binary not
+/// found → fall back to the terminal install command" branch. That branch is
+/// chosen by `binary_on_path`, which resolves through
+/// `lsp_manager::resolve_command` — and that probes the Homebrew prefixes,
+/// `~/.local/bin`, `~/.cargo/bin`, `~/go/bin`, … in *addition* to `$PATH`
+/// (#1344), so no amount of env scrubbing can hide a genuinely installed
+/// tool from it. Betting on the fixture's real binary (`ruby-lsp`) being
+/// absent therefore made these tests depend on the machine running the
+/// suite: they went red on a macOS box that happened to have
+/// `brew install ruby-lsp`, for reasons entirely unrelated to the change
+/// under test. Renaming the fixture's LSP binary to this sentinel makes the
+/// branch deterministic; the install command string still mentions
+/// `ruby-lsp`, which is what the assertions actually care about.
+const ABSENT_LSP_BINARY: &str = "vimcode-test-absent-lsp-binary";
+
+/// Point `ext`'s LSP binary at [`ABSENT_LSP_BINARY`] so an install of it
+/// always falls through to the terminal install command.
+fn force_lsp_binary_absent(e: &mut vimcode_core::Engine, ext: &str) {
+    let registry = e
+        .ext_registry
+        .as_mut()
+        .expect("engine_with_registry should have seeded a registry");
+    let manifest = registry
+        .iter_mut()
+        .find(|m| m.name == ext)
+        .unwrap_or_else(|| panic!("fixture registry should contain '{ext}'"));
+    manifest.lsp.binary = ABSENT_LSP_BINARY.to_string();
+    manifest.lsp.fallback_binaries.clear();
+}
+
 #[test]
 fn ext_install_sets_pending_terminal_command_for_lsp() {
     let mut e = engine_with_registry("");
-    // Ruby has an LSP install command ("gem install ruby-lsp") and ruby-lsp
-    // binary is unlikely to be on PATH in CI.
+    // Ruby has an LSP install command ("gem install ruby-lsp"); its LSP
+    // binary is renamed to a sentinel so "not installed yet" holds on every
+    // machine (see `force_lsp_binary_absent`).
+    force_lsp_binary_absent(&mut e, "ruby");
     let action = exec(&mut e, "ExtInstall ruby");
     assert!(
         e.extension_state.is_installed("ruby"),
@@ -888,7 +922,10 @@ fn ext_install_no_terminal_command_when_binary_exists() {
 #[test]
 fn ext_install_sets_install_context_for_lsp() {
     let mut e = engine_with_registry("");
-    // Use ruby extension whose LSP binary (ruby-lsp) is not on PATH.
+    // Use the ruby extension, with its LSP binary renamed to a sentinel that
+    // can never resolve (see `force_lsp_binary_absent`) so the terminal
+    // install branch is taken regardless of what's installed on this machine.
+    force_lsp_binary_absent(&mut e, "ruby");
     exec(&mut e, "ExtInstall ruby");
     // pending_install_context should have been set (consumed by terminal_run_command)
     // but since we took the terminal command via the action, it's already consumed.
