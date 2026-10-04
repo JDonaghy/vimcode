@@ -589,12 +589,15 @@ mod tests {
         /// at 1-indexed terminal column 2 would (`ICON_COLUMN = 1`,
         /// 0-indexed, per `tests/conpty_activity_bar_click.rs`'s own doc).
         ///
-        /// RED-verified by hand: swapping this list's row-3/row-4 entries
-        /// (i.e. encoding the spec's own wrong claim — Debug at row 3,
-        /// Source Control at row 4) fails both assertions, each reporting
-        /// the *other* panel's marker on screen instead of the expected
-        /// one — confirming this test actually distinguishes the two
-        /// orderings rather than vacuously passing either way.
+        /// RED-verified by hand, twice (second time on the fix-1 pass):
+        /// swapping this list's row-3/row-4 entries — i.e. encoding the
+        /// spec's own wrong claim, Debug at row 3 and Source Control at
+        /// row 4 — makes the run report
+        /// `row 3 (col 1) ... must open Run and Debug (marker "RUN AND
+        /// DEBUG" missing)` and fail, because row 3 really paints
+        /// `SOURCE CONTROL`. Restoring the entries turns it green again.
+        /// So the test distinguishes the two orderings instead of
+        /// vacuously passing either way (the #553 trap).
         #[test]
         fn activity_bar_row_click_order_matches_fixed_activity_panel_ids() {
             let mut h = harness(plain_engine());
