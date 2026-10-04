@@ -6185,12 +6185,26 @@ mod issue_1427_menu_bar_reveal_shared {
     /// Alt+F must reveal the (hidden by default) menu bar *and* hand the
     /// same keystroke to the `MenuSystem` intercept, which activates the
     /// File menu — both of which redraw, and the reveal reserves one more
-    /// row above the editor content, shifting a marker at buffer offset 0
-    /// down by exactly one line.
+    /// row above the editor content, shifting a marker down by exactly
+    /// one line.
+    ///
+    /// #1732: the File dropdown's width used to be a flat `20.0 * lh`
+    /// guess; quadraui#1132 (`dropdown_width`, measured from the real
+    /// item labels via `Backend::measure_text`) widened it to fit its
+    /// longest item ("Open Workspace From File…"), which now bleeds past
+    /// the Explorer sidebar's own width into the editor's first ~10
+    /// columns. A marker at buffer offset 0 would sit inside that
+    /// dropdown's footprint and get column-clipped instead of testing the
+    /// row shift this scenario is actually about, so the marker lives 15
+    /// blank lines down — below the File dropdown's current 14-row
+    /// height (1 header + 12 items/separators + 1 border), comfortably
+    /// inside this 24-row viewport either side of the Alt-reveal.
     #[test]
     fn alt_letter_reveals_menu_bar_via_app_on_tui() {
         let mut engine = engine_with_sidebar_open();
-        engine.buffer_mut().insert(0, "ZQXW_ALT_MARKER");
+        engine
+            .buffer_mut()
+            .insert(0, &format!("{}ZQXW_ALT_MARKER", "\n".repeat(15)));
         let mut h = crate::tui_main::testing::conformance_harness(engine, 80, 24);
 
         let before = h.driver.screen();
