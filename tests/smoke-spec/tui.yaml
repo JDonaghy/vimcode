@@ -83,6 +83,1407 @@ steps:
     id: idle-truly-silent
     seconds: 3
 
+  # ─────────────────────────────────────────────────────────────────────
+  # vimcode#1731 -- priority-1 vim-mode catalogue journeys (tests/smoke-spec/
+  # catalogue.yaml), real-pty-verified (3 consecutive clean `coord`
+  # tui-pty-driver runs against this exact build/spec, HOME-isolated with
+  # `use_nerd_fonts`/`lsp_enabled` off, same precondition as this file's own
+  # header). Each journey below clears the buffer (':%d') and types its own
+  # known fixture text via `i`/`o` rather than relying on the fixture
+  # `sample.txt` (alpha/beta/gamma has no spaces, so word-motion/operator
+  # journeys need real multi-word content) -- this also makes every journey
+  # independent of the activity-bar/context-menu steps above, so neither
+  # section can break the other under the additive-only rule (#3509).
+  #
+  # Two real-build findings from authoring this batch, not fixed here
+  # (filed as their own finding in the PR, not papered over by a weaker
+  # assertion that happens to still pass):
+  #   - 'gg'/'G' move the cursor's LINE correctly but do not reset its
+  #     COLUMN to the line's first non-blank the way real Neovim does --
+  #     confirmed directly (move to column 9 via 'w' 'w', then 'gg': lands
+  #     at column 11, the line's length, not column 1). The checks below
+  #     therefore only assert the line half of each gg/G journey's expected
+  #     outcome, not the column half.
+  #   - A single key sent in the same instant a multi-key motion
+  #     immediately follows a just-passed `expect_within` can still land
+  #     before the app's input queue is truly ready for it (silently
+  #     typed as a literal character instead of executing as a motion/
+  #     command) -- every mode transition and multi-key motion below is
+  #     followed by a short `wait_idle` margin for exactly this reason.
+
+  # Settle past the startup transient (extension-registry refresh,
+  # initial layout) before the first real buffer interaction below.
+  - type: key
+    id: 'vim-batch-settle-esc'
+    key: 'esc'
+  - type: wait_idle
+    id: 'vim-batch-settle-wait'
+    ms: 500
+    timeout_ms: 15000
+  # vim-gg-and-g-goto-buffer-ends setup
+  - type: key
+    id: 'rebuild1-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild1-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild1-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild1-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild1-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild1-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'z'
+  - type: key
+    id: 'rebuild1-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild1-line0-landed'
+    text: 'foo bar baz'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild1-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  - type: key
+    id: 'rebuild1-mode1'
+    key: 'o'
+  - type: key
+    key: 'q'
+  - type: key
+    key: 'u'
+  - type: key
+    key: 'x'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'q'
+  - type: key
+    key: 'u'
+  - type: key
+    key: 'u'
+  - type: key
+    key: 'x'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild1-esc1'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild1-line1-landed'
+    text: 'qux quux foo'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild1-line1-normal'
+    text: 'NORMAL'
+    ms: 3000
+  - type: key
+    id: 'rebuild1-mode2'
+    key: 'o'
+  - type: key
+    key: 's'
+  - type: key
+    key: 'h'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'r'
+  - type: key
+    key: 't'
+  - type: key
+    id: 'rebuild1-esc2'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild1-line2-landed'
+    text: 'short'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild1-line2-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild1-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild1-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-gg-1-key'
+    key: 'g'
+  - type: key
+    id: 'vim-gg-1-key2'
+    key: 'g'
+  # vim-gg-and-g-goto-buffer-ends: 'gg' from the last line reaches line 1
+  - type: expect_within
+    id: 'vim-gg-and-g-goto-buffer-ends-top'
+    text: 'Ln 1'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-gg-and-g-goto-buffer-ends-top-settle'
+    ms: 350
+    timeout_ms: 4000
+  - type: key
+    id: 'vim-G-key'
+    key: 'G'
+  # vim-gg-and-g-goto-buffer-ends: 'G' reaches the last line (3)
+  - type: expect_within
+    id: 'vim-gg-and-g-goto-buffer-ends-bottom'
+    text: 'Ln 3'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-gg-and-g-goto-buffer-ends-bottom-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-0-and-dollar-line-boundaries setup
+  - type: key
+    id: 'rebuild2-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild2-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild2-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild2-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild2-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild2-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'z'
+  - type: key
+    id: 'rebuild2-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild2-line0-landed'
+    text: 'foo bar baz'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild2-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild2-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild2-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-boundaries-l1'
+    key: 'l'
+  - type: key
+    id: 'vim-boundaries-l2'
+    key: 'l'
+  - type: key
+    id: 'vim-boundaries-dollar'
+    key: '$'
+  # vim-0-and-dollar-line-boundaries: '$' reaches the last column (11)
+  - type: expect_within
+    id: 'vim-0-and-dollar-line-boundaries-end'
+    text: 'Ln 1, Col 11'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-0-and-dollar-line-boundaries-end-settle'
+    ms: 350
+    timeout_ms: 4000
+  - type: key
+    id: 'vim-boundaries-zero'
+    key: '0'
+  # vim-0-and-dollar-line-boundaries: '0' returns to column 1
+  - type: expect_within
+    id: 'vim-0-and-dollar-line-boundaries-start'
+    text: 'Ln 1, Col 1'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-0-and-dollar-line-boundaries-start-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-w-moves-word-forward setup
+  - type: key
+    id: 'rebuild3-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild3-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild3-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild3-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild3-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild3-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'z'
+  - type: key
+    id: 'rebuild3-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild3-line0-landed'
+    text: 'foo bar baz'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild3-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild3-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild3-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-w-zero'
+    key: '0'
+  - type: key
+    id: 'vim-w-key'
+    key: 'w'
+  # vim-w-moves-word-forward: 'w' from column 1 lands on 'bar' (column 5)
+  - type: expect_within
+    id: 'vim-w-moves-word-forward-check'
+    text: 'Ln 1, Col 5'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-w-moves-word-forward-check-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-dw-deletes-word setup
+  - type: key
+    id: 'rebuild4-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild4-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild4-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild4-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild4-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild4-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'z'
+  - type: key
+    id: 'rebuild4-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild4-line0-landed'
+    text: 'foo bar baz'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild4-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild4-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild4-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-dw-zero'
+    key: '0'
+  - type: key
+    id: 'vim-dw-w1'
+    key: 'w'
+  - type: key
+    id: 'vim-dw-d'
+    key: 'd'
+  - type: key
+    id: 'vim-dw-w2'
+    key: 'w'
+  # vim-dw-deletes-word: 'dw' on 'bar ' leaves 'foo baz'
+  - type: expect_within
+    id: 'vim-dw-deletes-word-check'
+    text: 'foo baz'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-dw-deletes-word-check-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-dd-deletes-line setup
+  - type: key
+    id: 'rebuild5-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild5-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild5-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild5-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild5-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild5-mode0'
+    key: 'i'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'n'
+  - type: key
+    key: 'e'
+  - type: key
+    id: 'rebuild5-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild5-line0-landed'
+    text: 'one'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild5-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  - type: key
+    id: 'rebuild5-mode1'
+    key: 'o'
+  - type: key
+    key: 't'
+  - type: key
+    key: 'w'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild5-esc1'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild5-line1-landed'
+    text: 'two'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild5-line1-normal'
+    text: 'NORMAL'
+    ms: 3000
+  - type: key
+    id: 'rebuild5-mode2'
+    key: 'o'
+  - type: key
+    key: 't'
+  - type: key
+    key: 'h'
+  - type: key
+    key: 'r'
+  - type: key
+    key: 'e'
+  - type: key
+    key: 'e'
+  - type: key
+    id: 'rebuild5-esc2'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild5-line2-landed'
+    text: 'three'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild5-line2-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild5-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild5-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-dd-zero'
+    key: '0'
+  - type: key
+    id: 'vim-dd-d1'
+    key: 'd'
+  - type: key
+    id: 'vim-dd-d2'
+    key: 'd'
+  # vim-dd-deletes-line: 'dd' on line 1 ('one') leaves 'two' as the new line 1
+  - type: expect_within
+    id: 'vim-dd-deletes-line-content'
+    text: 'two'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-dd-deletes-line-content-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-dd-deletes-line: cursor lands on the new line 1 at column 1
+  - type: expect_within
+    id: 'vim-dd-deletes-line-cursor'
+    text: 'Ln 1, Col 1'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-dd-deletes-line-cursor-settle'
+    ms: 350
+    timeout_ms: 4000
+  - type: key
+    id: 'vim-dd-verify-G'
+    key: 'G'
+  # vim-dd-deletes-line: only 2 lines remain ('dd' really removed one, not just blanked it)
+  - type: expect_within
+    id: 'vim-dd-deletes-line-linecount'
+    text: 'Ln 2, Col 1'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-dd-deletes-line-linecount-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-yy-and-p-yank-and-paste-line setup
+  - type: key
+    id: 'rebuild6-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild6-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild6-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild6-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild6-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild6-mode0'
+    key: 'i'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'l'
+  - type: key
+    key: 'e'
+  - type: key
+    key: 'f'
+  - type: key
+    id: 'rebuild6-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild6-line0-landed'
+    text: 'alef'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild6-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  - type: key
+    id: 'rebuild6-mode1'
+    key: 'o'
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'e'
+  - type: key
+    key: 't'
+  - type: key
+    id: 'rebuild6-esc1'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild6-line1-landed'
+    text: 'bet'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild6-line1-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild6-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild6-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-yy-y1'
+    key: 'y'
+  - type: key
+    id: 'vim-yy-y2'
+    key: 'y'
+  - type: key
+    id: 'vim-yy-j'
+    key: 'j'
+  - type: key
+    id: 'vim-yy-p'
+    key: 'p'
+  # vim-yy-and-p-yank-and-paste-line: 'p' pastes the yanked line below, cursor on the new line 3
+  - type: expect_within
+    id: 'vim-yy-and-p-yank-and-paste-line-cursor'
+    text: 'Ln 3, Col 1'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-yy-and-p-yank-and-paste-line-cursor-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-yy-and-p-yank-and-paste-line: the pasted line 3 is a copy of the yanked 'alef'
+  - type: expect_within
+    id: 'vim-yy-and-p-yank-and-paste-line-content'
+    text: 'alef'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-yy-and-p-yank-and-paste-line-content-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-cc-changes-line setup
+  - type: key
+    id: 'rebuild7-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild7-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild7-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild7-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild7-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild7-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild7-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild7-line0-landed'
+    text: 'foo'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild7-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild7-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild7-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-cc-c1'
+    key: 'c'
+  - type: key
+    id: 'vim-cc-c2'
+    key: 'c'
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    id: 'vim-cc-esc'
+    key: 'esc'
+  # vim-cc-changes-line: 'cc' replaces the line's content with the typed text
+  - type: expect_within
+    id: 'vim-cc-changes-line-text'
+    text: 'bar'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-cc-changes-line-text-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-cc-changes-line: Escape after 'cc' leaves Normal mode, not stuck in Insert
+  - type: expect_within
+    id: 'vim-cc-changes-line-mode'
+    text: 'NORMAL'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-cc-changes-line-mode-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-ciw-changes-inner-word setup
+  - type: key
+    id: 'rebuild8-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild8-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild8-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild8-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild8-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild8-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'z'
+  - type: key
+    id: 'rebuild8-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild8-line0-landed'
+    text: 'foo bar baz'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild8-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild8-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild8-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-ciw-0'
+    key: '0'
+  - type: key
+    id: 'vim-ciw-w'
+    key: 'w'
+  - type: key
+    id: 'vim-ciw-c'
+    key: 'c'
+  - type: key
+    id: 'vim-ciw-i'
+    key: 'i'
+  - type: key
+    id: 'vim-ciw-w2'
+    key: 'w'
+  - type: key
+    key: 'q'
+  - type: key
+    key: 'u'
+  - type: key
+    key: 'x'
+  - type: key
+    id: 'vim-ciw-esc'
+    key: 'esc'
+  # vim-ciw-changes-inner-word: 'ciw' on 'bar' replaces just that word
+  - type: expect_within
+    id: 'vim-ciw-changes-inner-word-text'
+    text: 'foo qux baz'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-ciw-changes-inner-word-text-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-dot-repeats-last-change setup
+  - type: key
+    id: 'rebuild9-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild9-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild9-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild9-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild9-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild9-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild9-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild9-line0-landed'
+    text: 'foo foo foo'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild9-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild9-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild9-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-dot-0'
+    key: '0'
+  - type: key
+    id: 'vim-dot-x'
+    key: 'x'
+  - type: key
+    id: 'vim-dot-w1'
+    key: 'w'
+  - type: key
+    id: 'vim-dot-w2'
+    key: 'w'
+  - type: key
+    id: 'vim-dot-dot'
+    key: '.'
+  # vim-dot-repeats-last-change: '.' repeats the 'x' deletion on the 3rd 'foo'
+  - type: expect_within
+    id: 'vim-dot-repeats-last-change-text'
+    text: 'oo foo oo'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-dot-repeats-last-change-text-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-undo-and-redo setup
+  - type: key
+    id: 'rebuild10-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild10-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild10-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild10-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild10-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild10-mode0'
+    key: 'i'
+  - type: key
+    key: 'h'
+  - type: key
+    key: 'e'
+  - type: key
+    key: 'l'
+  - type: key
+    key: 'l'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild10-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild10-line0-landed'
+    text: 'hello'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild10-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild10-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild10-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-undo-d1'
+    key: 'd'
+  - type: key
+    id: 'vim-undo-d2'
+    key: 'd'
+  - type: key
+    id: 'vim-undo-u1'
+    key: 'u'
+  # vim-undo-and-redo: 'u' restores the line 'dd' deleted
+  - type: expect_within
+    id: 'vim-undo-and-redo-after-undo'
+    text: 'hello'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-undo-and-redo-after-undo-settle'
+    ms: 350
+    timeout_ms: 4000
+  - type: key
+    id: 'vim-undo-redo'
+    key: 'ctrl+r'
+  # vim-undo-and-redo: Ctrl-R re-deletes it, leaving an empty buffer at Ln 1
+  - type: expect_within
+    id: 'vim-undo-and-redo-after-redo'
+    text: 'Ln 1, Col 1'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-undo-and-redo-after-redo-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-visual-v-selects-and-d-deletes setup
+  - type: key
+    id: 'rebuild11-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild11-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild11-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild11-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild11-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild11-mode0'
+    key: 'i'
+  - type: key
+    key: 'h'
+  - type: key
+    key: 'e'
+  - type: key
+    key: 'l'
+  - type: key
+    key: 'l'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'w'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'r'
+  - type: key
+    key: 'l'
+  - type: key
+    key: 'd'
+  - type: key
+    id: 'rebuild11-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild11-line0-landed'
+    text: 'hello world'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild11-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild11-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild11-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-visual-0'
+    key: '0'
+  - type: key
+    id: 'vim-visual-v'
+    key: 'v'
+  - type: key
+    id: 'vim-visual-l1'
+    key: 'l'
+  - type: key
+    id: 'vim-visual-l2'
+    key: 'l'
+  - type: key
+    id: 'vim-visual-l3'
+    key: 'l'
+  - type: key
+    id: 'vim-visual-d'
+    key: 'd'
+  # vim-visual-v-selects-and-d-deletes: 'v'+motion+'d' deletes 'hello', leaving ' world'
+  - type: expect_within
+    id: 'vim-visual-v-selects-and-d-deletes-text'
+    text: ' world'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-visual-v-selects-and-d-deletes-text-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-visual-v-selects-and-d-deletes: deleting the selection returns to Normal mode
+  - type: expect_within
+    id: 'vim-visual-v-selects-and-d-deletes-mode'
+    text: 'NORMAL'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-visual-v-selects-and-d-deletes-mode-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-ex-substitute-current-line setup
+  - type: key
+    id: 'rebuild12-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild12-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild12-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild12-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild12-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild12-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild12-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild12-line0-landed'
+    text: 'foo foo foo'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild12-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild12-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild12-rewind-gg2'
+    key: 'g'
+  - type: key
+    key: ':'
+  - type: key
+    key: 's'
+  - type: key
+    key: '/'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: '/'
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: '/'
+  - type: key
+    id: 'vim-exsub-enter'
+    key: 'enter'
+  # vim-ex-substitute-current-line: ':s/foo/bar/' replaces only the first occurrence
+  - type: expect_within
+    id: 'vim-ex-substitute-current-line-check'
+    text: 'bar foo foo'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-ex-substitute-current-line-check-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-ex-substitute-global-flag setup
+  - type: key
+    id: 'rebuild13-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild13-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild13-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild13-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild13-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild13-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild13-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild13-line0-landed'
+    text: 'foo foo foo'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild13-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild13-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild13-rewind-gg2'
+    key: 'g'
+  - type: key
+    key: ':'
+  - type: key
+    key: 's'
+  - type: key
+    key: '/'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: '/'
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: '/'
+  - type: key
+    key: 'g'
+  - type: key
+    id: 'vim-exsubg-enter'
+    key: 'enter'
+  # vim-ex-substitute-global-flag: the 'g' flag replaces every occurrence on the line
+  - type: expect_within
+    id: 'vim-ex-substitute-global-flag-check'
+    text: 'bar bar bar'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-ex-substitute-global-flag-check-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-insert-i-a-o-variants setup
+  - type: key
+    id: 'rebuild14-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild14-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild14-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild14-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild14-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild14-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild14-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild14-line0-landed'
+    text: 'foo'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild14-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild14-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild14-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-insert-0'
+    key: '0'
+  - type: key
+    id: 'vim-insert-a'
+    key: 'a'
+  - type: key
+    key: 'X'
+  - type: key
+    id: 'vim-insert-esc2'
+    key: 'esc'
+  # vim-insert-i-a-o-variants: 'a' appends after the cursor ('foo' -> 'fXoo')
+  - type: expect_within
+    id: 'vim-insert-i-a-o-variants-fXoo'
+    text: 'fXoo'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-insert-i-a-o-variants-fXoo-settle'
+    ms: 350
+    timeout_ms: 4000
+  - type: key
+    id: 'vim-insert-o2'
+    key: 'o'
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    id: 'vim-insert-esc3'
+    key: 'esc'
+  # vim-insert-i-a-o-variants: 'o' opens a new line below with the typed text
+  - type: expect_within
+    id: 'vim-insert-i-a-o-variants-bar-line'
+    text: 'bar'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-insert-i-a-o-variants-bar-line-settle'
+    ms: 350
+    timeout_ms: 4000
+
   # vimcode#1636 ("clicking activity-bar icons does nothing") — real SGR
   # mouse clicks at the icon column, exactly
   # `tests/conpty_activity_bar_click.rs`'s own `send_sgr_click`, confirmed on
