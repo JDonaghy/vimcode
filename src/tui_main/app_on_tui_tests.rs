@@ -8047,6 +8047,148 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // #1741 — a silence check must settle past the ext-registry fetch's one
+    // legitimate post-first-paint repaint before it means anything
+    // ─────────────────────────────────────────────────────────────────────────
+    /// vimcode#1741: `tests/smoke-spec/tui.yaml`'s Tier-2 `idle-truly-silent`
+    /// control failed on 3 consecutive real-pty runs (2168-2377 bytes
+    /// received during the supposedly-silent 3s window) because it started
+    /// measuring immediately after the first real frame painted, with no
+    /// settle margin for `Engine::ext_refresh`'s background
+    /// extension-registry fetch — spawned unconditionally at real `vcd`
+    /// startup, never by the deterministic test entry points (see
+    /// [`idle_stability_1737`]'s module doc for the identical mechanism,
+    /// traced there to `Engine::poll_ext_registry` consuming the fetch
+    /// result on the first `poll_idle` tick after first paint) — to land
+    /// and produce its one legitimate repaint. This PR's fix was to the
+    /// Tier-2 YAML itself: a `wait_idle` settle step
+    /// (`settle-ext-registry-fetch-1741`) between first-paint and the
+    /// silence check.
+    ///
+    /// This is the in-process (Tier-1), fully hermetic counterpart the
+    /// issue's acceptance bar asks for: no real network call (the
+    /// background channel here is armed by hand, exactly mirroring
+    /// `ext_refresh`'s own `ext_registry_rx`/`ext_registry_fetching`
+    /// plumbing, with the thread body swapped for a short, known sleep
+    /// instead of a real HTTP fetch — `Engine::poll_ext_registry`, the
+    /// unmodified production polling code, cannot tell the difference), but
+    /// the exact race is reproduced on demand rather than depending on real
+    /// network timing. Demonstrates both halves of #1741's finding
+    /// directly: a silence check that starts with *zero* settle margin
+    /// after first paint observes the fetch's repaint (mirrors the real-pty
+    /// failure — this is the half that must be RED before any fix and is
+    /// what makes this a regression guard, not just a demonstration), and a
+    /// check that first settles past the fetch's delay does not (mirrors
+    /// this PR's `wait_idle` fix).
+    mod idle_silence_settle_1741 {
+        use super::*;
+        use quadraui::Reaction;
+
+        /// How long the simulated background fetch takes to resolve after
+        /// being armed — long enough that a zero-settle poll immediately
+        /// after first paint reliably has not consumed it yet (so the
+        /// "fetch still in flight, about to repaint" window this test
+        /// exercises is real, not a race it happens to win), short enough
+        /// to keep the test fast.
+        const SIMULATED_FETCH_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
+
+        /// Arms a hermetic stand-in for `Engine::ext_refresh`'s background
+        /// registry fetch: spawns a thread that sleeps
+        /// [`SIMULATED_FETCH_DELAY`] then sends an empty, successful
+        /// result through the exact same channel plumbing `ext_refresh`
+        /// itself sets up (`ext_registry_rx`/`ext_registry_fetching`), so
+        /// `Engine::poll_ext_registry` — the real, unmodified production
+        /// code — consumes it exactly as it would a real fetch that
+        /// happened to resolve this fast. No real network I/O, so this
+        /// test is hermetic and deterministic regardless of network
+        /// availability in CI.
+        fn arm_simulated_registry_fetch(engine: &mut crate::core::Engine) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                std::thread::sleep(SIMULATED_FETCH_DELAY);
+                let _ = tx.send(Some(Vec::new()));
+            });
+            engine.ext_registry_rx = Some(rx);
+            engine.ext_registry_fetching = true;
+        }
+
+        #[test]
+        fn zero_settle_after_first_paint_sees_the_fetch_repaint_but_a_settled_check_does_not() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+            engine.settings.lsp_enabled = false;
+            let mut h = harness_no_sidebar(engine);
+
+            // First real frame, then arm the simulated fetch — mirrors the
+            // real startup order #1741 traces: `ext_refresh()` is already
+            // in flight by the time the first frame paints.
+            h.driver.tick();
+            assert!(
+                h.driver.screen_has("alpha"),
+                "precondition: the buffer text must actually be painted"
+            );
+            arm_simulated_registry_fetch(&mut h.engine.borrow_mut());
+            let screen0 = h.driver.screen();
+
+            // RED half (mirrors #1741's real-pty failure): poll for
+            // "silence" starting immediately, with zero settle margin. The
+            // fetch resolves partway through and `Engine::poll_ext_registry`
+            // reports a real change, so this must observe a forced repaint
+            // (`Reaction` other than `Continue`, or a changed screen) well
+            // before this loop's own budget — several multiples of
+            // `SIMULATED_FETCH_DELAY` — runs out.
+            let mut saw_repaint = false;
+            let start = std::time::Instant::now();
+            while start.elapsed() < SIMULATED_FETCH_DELAY * 3 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let reaction = h.driver.tick();
+                if reaction != Reaction::Continue || h.driver.screen() != screen0 {
+                    saw_repaint = true;
+                    break;
+                }
+            }
+            assert!(
+                saw_repaint,
+                "a silence check with zero settle margin after first paint \
+                 must observe the extension-registry fetch's one legitimate \
+                 repaint (#1741) — none was observed within the budget; \
+                 either the simulated fetch never resolved or this test's \
+                 own timing assumption is stale"
+            );
+
+            // GREEN half (mirrors this PR's `wait_idle` fix): settle past
+            // the fetch's delay first, *then* measure for silence — exactly
+            // what the Tier-2 `settle-ext-registry-fetch-1741` step does
+            // before `idle-truly-silent` in `tests/smoke-spec/tui.yaml`.
+            std::thread::sleep(SIMULATED_FETCH_DELAY * 2);
+            let _ = h.driver.tick(); // drain the now-resolved fetch's own repaint
+            let screen1 = h.driver.screen();
+            let mut failures: Vec<String> = Vec::new();
+            for n in 0..10 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let reaction = h.driver.tick();
+                if reaction != Reaction::Continue {
+                    failures.push(format!(
+                        "tick {n}: unexpected repaint after settling past \
+                         the fetch — got {reaction:?}"
+                    ));
+                }
+                if h.driver.screen() != screen1 {
+                    failures.push(format!(
+                        "tick {n}: rendered text changed after settling past the fetch"
+                    ));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "idle-silence should hold once settled past the fetch's \
+                 own one-time repaint:\n{}",
+                failures.join("\n")
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // #1722 — a `MouseMoved` that changes no hover target must not repaint
     // ─────────────────────────────────────────────────────────────────────────
     /// #1722's second acceptance bullet: "a `MouseMoved` that doesn't change
