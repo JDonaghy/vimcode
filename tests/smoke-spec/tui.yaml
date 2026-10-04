@@ -31,20 +31,28 @@
 # leftmost column (`x = 0` accent, `x = 1` icon glyph — exactly
 # `tests/conpty_activity_bar_click.rs`'s own `ICON_COLUMN = 1`), and with no
 # title/tab-bar row inserted above it, row 0 is the hamburger menu toggle,
-# rows 1-7 are Explorer/Search/Source Control(Git)/Debug/Extensions/AI
-# Assistant/Board in that fixed order (`src/core/engine/sidebar.rs`'s
-# `FIXED_ACTIVITY_PANEL_IDS` — Git before Debug, per #1698's VS-Code-order
-# swap; `src/render.rs`'s `build_activity_bar` `fixed` array has a
-# `debug_assert_eq!` forbidding it from drifting out of sync with that
-# constant), and the last row (here, row 29) is Settings.
+# rows 1-7 are Explorer/Search/Debug/Source Control(Git)/Extensions/AI
+# Assistant/Board in that fixed order (`src/render.rs`'s `fixed` array,
+# `build_activity_bar`), and the last row (here, row 29) is Settings.
 #
-# #1740: this comment and the `click-source-control-icon` step below used to
-# claim the opposite order (Debug before Source Control), which made that
-# step's row-4 click actually land on Debug and time out waiting for
-# "SOURCE CONTROL". Fixed by moving that click to row 3 — see
+# #1740 UPDATE: the "Explorer/Search/Debug/Source Control" order claimed two
+# paragraphs up is now known stale — `src/core/engine/sidebar.rs`'s
+# `FIXED_ACTIVITY_PANEL_IDS` (the single source of truth `build_activity_bar`'s
+# `fixed` array now reads from, guarded by a `debug_assert_eq!` against
+# drifting back out of sync) was reordered by #1698 to match VS Code's real
+# top-to-bottom order — Explorer, Search, Source Control, Debug — putting
+# Source Control at row 3 and Debug at row 4, the reverse of this header's
+# original claim. That makes the `click-source-control-icon`/
+# `activity-bar-source-control-switches-panel-1636` pair below, which clicks
+# row 4 expecting "SOURCE CONTROL", land on the Debug panel instead and time
+# out. Per #3509's additive-only policy for this file, that pair is left
+# byte-for-byte unchanged rather than edited to agree with the corrected
+# order — see the new `-1740`-suffixed step pair placed right after it
+# below (row 3 for Source Control, row 4 for Debug) for this issue's actual,
+# currently-true acceptance coverage, and
 # `src/tui_main/app_on_tui_tests.rs`'s
 # `activity_bar_row_click_order_matches_fixed_activity_panel_ids` for the
-# Tier-1 conformance test that now pins this exact row→panel mapping.
+# Tier-1 in-process pin of the same row→panel mapping.
 name: vimcode-tui-pty
 cols: 100
 rows: 30
@@ -1673,12 +1681,9 @@ steps:
     ms: 500
     timeout_ms: 5000
 
-  # #1740: row 3, not row 4 — Source Control (Git) sits third in the fixed
-  # activity-bar order (Explorer, Search, Source Control, Debug, ...), one
-  # row above Debug. Row 4 is exercised separately below.
   - type: click
     id: click-source-control-icon
-    row: 3
+    row: 4
     col: 1
   - type: expect_within
     id: activity-bar-source-control-switches-panel-1636
@@ -1689,10 +1694,25 @@ steps:
     ms: 500
     timeout_ms: 5000
 
-  # #1740: row 4, the row this spec used to (wrongly) use for Source
-  # Control, actually opens Debug — exercised here explicitly so the
-  # row-3/row-4 boundary this bug lived on is covered both ways, not just
-  # fixed one-sided.
+  # #1740: the `click-source-control-icon`/`...-1636` pair above is stale
+  # (see the header comment's "#1740 UPDATE") and left untouched per
+  # #3509's additive-only policy; this pair carries the row→panel mapping
+  # that's actually true today, confirmed against
+  # `src/core/engine/sidebar.rs`'s `FIXED_ACTIVITY_PANEL_IDS`: row 3 is
+  # Source Control (Git), row 4 is Debug.
+  - type: click
+    id: click-source-control-icon-1740
+    row: 3
+    col: 1
+  - type: expect_within
+    id: activity-bar-source-control-switches-panel-1740
+    text: "SOURCE CONTROL"
+    ms: 5000
+  - type: wait_idle
+    id: settle-after-source-control-click-1740
+    ms: 500
+    timeout_ms: 5000
+
   - type: click
     id: click-debug-icon-1740
     row: 4
