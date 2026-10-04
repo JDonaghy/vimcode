@@ -30500,7 +30500,7 @@ mod tests {
 
     #[test]
     fn test_from_vscode_json() {
-        let dir = std::env::temp_dir().join("vimcode_test_theme");
+        let dir = crate::harness::scratch_dir("vimcode_test_theme");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test-theme.json");
         std::fs::write(
@@ -30554,7 +30554,7 @@ mod tests {
     /// independent colours, not one derived from the other.
     #[test]
     fn from_vscode_json_prefers_explicit_active_border_over_foreground() {
-        let dir = std::env::temp_dir().join("vimcode_test_1547_active_border");
+        let dir = crate::harness::scratch_dir("vimcode_test_1547_active_border");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test-theme.json");
         std::fs::write(
@@ -30589,7 +30589,7 @@ mod tests {
     /// whatever built-in default `Theme::onedark()` seeded it with.
     #[test]
     fn from_vscode_json_falls_back_to_foreground_when_active_border_absent() {
-        let dir = std::env::temp_dir().join("vimcode_test_1547_active_border_fallback");
+        let dir = crate::harness::scratch_dir("vimcode_test_1547_active_border_fallback");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test-theme.json");
         std::fs::write(
@@ -30743,7 +30743,7 @@ mod tests {
         use crate::core::engine::{Engine, OpenMode};
         use crate::core::window::SplitDirection;
 
-        let dir = std::env::temp_dir().join("vimcode_render_diff_groups");
+        let dir = crate::harness::scratch_dir("vimcode_render_diff_groups");
         std::fs::create_dir_all(&dir).unwrap();
         let f1 = dir.join("a.txt");
         let f2 = dir.join("b.txt");
@@ -35045,7 +35045,7 @@ mod tests {
     #[test]
     fn test_open_file_preview_does_not_replace_permanent() {
         let mut e = test_engine("first file\n");
-        let dir = std::env::temp_dir().join("vimcode_test_preview");
+        let dir = crate::harness::scratch_dir("vimcode_test_preview");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         let f2 = dir.join("b.txt");
@@ -35086,7 +35086,7 @@ mod tests {
     #[test]
     fn test_open_file_in_tab_creates_new_tab() {
         let mut e = test_engine("scratch\n");
-        let dir = std::env::temp_dir().join("vimcode_test_tab");
+        let dir = crate::harness::scratch_dir("vimcode_test_tab");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         let f2 = dir.join("b.txt");
@@ -35143,7 +35143,7 @@ mod tests {
     #[test]
     fn test_behavior_tab_click_switches_tab() {
         let mut e = test_engine("first\n");
-        let dir = std::env::temp_dir().join("vimcode_test_tab_click");
+        let dir = crate::harness::scratch_dir("vimcode_test_tab_click");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         let f2 = dir.join("b.txt");
@@ -35171,7 +35171,7 @@ mod tests {
     #[test]
     fn test_behavior_tab_close_removes_tab() {
         let mut e = test_engine("scratch\n");
-        let dir = std::env::temp_dir().join("vimcode_test_tab_close");
+        let dir = crate::harness::scratch_dir("vimcode_test_tab_close");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         std::fs::write(&f1, "file A\n").unwrap();
@@ -35196,7 +35196,7 @@ mod tests {
     #[test]
     fn test_behavior_dirty_check_before_tab_close() {
         let mut e = test_engine("");
-        let dir = std::env::temp_dir().join("vimcode_test_dirty_close");
+        let dir = crate::harness::scratch_dir("vimcode_test_dirty_close");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         std::fs::write(&f1, "original\n").unwrap();
@@ -35263,7 +35263,7 @@ mod tests {
     #[test]
     fn test_behavior_explorer_context_menu() {
         let mut e = test_engine("");
-        let dir = std::env::temp_dir().join("vimcode_test_ctx_explorer");
+        let dir = crate::harness::scratch_dir("vimcode_test_ctx_explorer");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("test.txt");
         std::fs::write(&f1, "content\n").unwrap();
@@ -35487,7 +35487,7 @@ mod tests {
     #[test]
     fn test_behavior_tab_drag_drop_creates_split() {
         let mut e = test_engine("scratch\n");
-        let dir = std::env::temp_dir().join("vimcode_test_drag_drop");
+        let dir = crate::harness::scratch_dir("vimcode_test_drag_drop");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         std::fs::write(&f1, "file A\n").unwrap();
@@ -35517,7 +35517,7 @@ mod tests {
     #[test]
     fn test_behavior_goto_tab_promotes_preview() {
         let mut e = test_engine("scratch\n");
-        let dir = std::env::temp_dir().join("vimcode_test_promote");
+        let dir = crate::harness::scratch_dir("vimcode_test_promote");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         std::fs::write(&f1, "file A\n").unwrap();
@@ -35579,7 +35579,7 @@ mod tests {
     #[test]
     fn test_behavior_preview_reuse_then_permanent() {
         let mut e = test_engine("scratch\n");
-        let dir = std::env::temp_dir().join("vimcode_test_preview_reuse");
+        let dir = crate::harness::scratch_dir("vimcode_test_preview_reuse");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         let f2 = dir.join("b.txt");

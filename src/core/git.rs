@@ -1473,7 +1473,7 @@ mod tests {
     #[test]
     fn test_show_file_at_ref_returns_head_content() {
         use std::process::Command;
-        let dir = std::env::temp_dir().join("vimcode_show_ref_head");
+        let dir = crate::harness::scratch_dir("vimcode_show_ref_head");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         git_command()
@@ -1514,7 +1514,7 @@ mod tests {
     #[test]
     fn test_show_file_at_ref_nonexistent() {
         use std::process::Command;
-        let dir = std::env::temp_dir().join("vimcode_show_ref_nofile");
+        let dir = crate::harness::scratch_dir("vimcode_show_ref_nofile");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         git_command()
@@ -1546,7 +1546,7 @@ mod tests {
     #[test]
     fn test_checkout_branch_and_create_branch() {
         use std::process::Command;
-        let dir = std::env::temp_dir().join("vimcode_branch_ops");
+        let dir = crate::harness::scratch_dir("vimcode_branch_ops");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         git_command()
@@ -1598,7 +1598,7 @@ mod tests {
 
     #[test]
     fn test_changed_files_between_lists_files_changed_on_head_since_base() {
-        let dir = std::env::temp_dir().join("vimcode_changed_files_between");
+        let dir = crate::harness::scratch_dir("vimcode_changed_files_between");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         git_command()
@@ -1669,7 +1669,7 @@ mod tests {
 
     #[test]
     fn test_changed_files_between_unknown_ref_is_none_not_an_empty_diff() {
-        let dir = std::env::temp_dir().join("vimcode_changed_files_between_bad_ref");
+        let dir = crate::harness::scratch_dir("vimcode_changed_files_between_bad_ref");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         git_command()
@@ -1690,7 +1690,7 @@ mod tests {
     /// it ever reaches git's argv.
     #[test]
     fn test_changed_files_between_rejects_flag_like_revisions() {
-        let dir = std::env::temp_dir().join("vimcode_changed_files_between_flag_smuggle");
+        let dir = crate::harness::scratch_dir("vimcode_changed_files_between_flag_smuggle");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         git_command()
