@@ -6246,12 +6246,61 @@ mod tests {
         /// RED verified: with the `acp_permission_default` gate in
         /// `Engine::acp_handle_permission_request` deleted (falling
         /// straight through to `show_dialog`/parking, the pre-#1518
-        /// behaviour), the loop below observes "Tool kind: edit" paint and
-        /// fails immediately instead of waiting out the full 5s with it
+        /// behaviour), the wait loops below observe "Tool kind: edit" paint
+        /// and fail immediately instead of running the turn out with it
         /// absent.
+        ///
+        /// #1732, two full-suite-only flake sources, both fixed here (the
+        /// test failed once under the whole lib lane and passed every time
+        /// in isolation, including under 2x-core CPU saturation):
+        ///
+        /// 1. `App::handle_poll_tick` runs `settings_file_changed` ->
+        ///    `Engine::check_settings_reload` on *every* `driver.tick()`,
+        ///    and that reload replaces `engine.settings` wholesale. The
+        ///    one-shot `check_settings_reload()` below only consumes the
+        ///    *first* mtime change; anything that moved this machine's real
+        ///    `~/.config/vimcode/settings.json` mtime later in the run would
+        ///    reload it mid-turn and reset `acp_permission_default` to `Ask`
+        ///    — so `Engine::acp_handle_permission_request` (which reads
+        ///    `self.settings.acp_permission_default` live, at request time)
+        ///    would open the dialog and "Tool kind: edit" would paint. The
+        ///    `TestSettingsPathGuard` below points `settings_file_path()` at
+        ///    a per-process path that cannot exist, so the per-tick poll
+        ///    takes its `mtime.is_none()` early return forever and nothing
+        ///    outside this test can rewrite the settings it just injected.
+        ///    (Same reasoning as `word_wrap`'s own
+        ///    `TestSettingsPathGuard` use.)
+        /// 2. The completion wait was 5s for a *whole* real subprocess
+        ///    round trip — `sh` fork/exec, `initialize`, `session/new`,
+        ///    `session/prompt`, `session/request_permission`, the
+        ///    auto-answer, then `end_turn`. That is the longest-latency
+        ///    wait of any ACP test in this module, and 5s of it is a budget,
+        ///    not a behavioural assertion: the loops exit the instant the
+        ///    condition flips, so a wider deadline costs a green run
+        ///    nothing and only stops a loaded machine from being reported as
+        ///    a regression.
+        ///
+        /// The wait is also split in two so it cannot pass *vacuously*. The
+        /// old single `while ai_streaming` loop would fall straight through
+        /// if the turn had not started yet, and its `!ai_streaming`
+        /// assertion would then hold for the wrong reason. Phase 1 waits for
+        /// the agent's own streamed `Hello_Perm1518` greeting to paint
+        /// (the fixture emits it *before* it issues the permission request),
+        /// proving the session really is mid-turn; only then does phase 2
+        /// wait for the turn to settle, which the fixture only ever does
+        /// after it has read a reply to that request. Both loops assert the
+        /// dialog is absent on every frame.
         #[cfg(unix)]
         #[test]
         fn acp_permission_default_allow_all_skips_the_dialog_via_shell_app() {
+            let _settings_guard = crate::core::settings::TestSettingsPathGuard::install(
+                std::env::temp_dir().join(format!(
+                    "vimcode_test_1732_no_settings_{}_{:?}.json",
+                    std::process::id(),
+                    std::thread::current().id()
+                )),
+            );
+
             let mut engine = plain_engine();
             engine.check_settings_reload();
             engine.app_shell.show_panel(&quadraui::WidgetId::new(
@@ -6266,7 +6315,12 @@ mod tests {
                 name: "alpha".to_string(),
                 command: format!("sh \"{fixture}\""),
                 cwd: String::new(),
-                env: vec!["ACP_FAKE_REQUEST_PERMISSION_DIFF=1".to_string()],
+                env: vec![
+                    "ACP_FAKE_REQUEST_PERMISSION_DIFF=1".to_string(),
+                    // One unbroken token, so phase 1's wait cannot match a
+                    // bare "Hello" painted by anything else.
+                    "ACP_FAKE_AGENT_LABEL=Perm1518".to_string(),
+                ],
                 mcp_servers: Vec::new(),
             }];
             engine.settings.acp_active_agent = "alpha".to_string();
@@ -6283,8 +6337,35 @@ mod tests {
             }
             driver.press_named(quadraui::NamedKey::Enter);
 
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while h.engine.borrow().acp().ai_streaming && Instant::now() < deadline {
+            // Phase 1: the turn is genuinely under way — the agent's own
+            // streamed greeting has painted, which the fixture emits on the
+            // way to issuing `session/request_permission`.
+            let greeting_deadline = Instant::now() + Duration::from_secs(30);
+            let mut screen = driver.screen();
+            while !screen.contains("Hello_Perm1518") && Instant::now() < greeting_deadline {
+                driver.tick();
+                screen = driver.screen();
+                assert!(
+                    !screen.contains("Tool kind:"),
+                    "allow_all must never paint the permission dialog; \
+                     screen:\n{screen}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                screen.contains("Hello_Perm1518"),
+                "the session must start and stream the agent's reply within \
+                 30s, or the dialog-absence assertions below prove nothing; \
+                 screen:\n{screen}"
+            );
+
+            // Phase 2: and it settles on its own, without a human ever being
+            // asked — the fixture only answers `session/prompt` with
+            // `end_turn` after it has read a reply to its permission
+            // request, so `ai_streaming` going false *is* the auto-answer
+            // having reached the wire.
+            let settle_deadline = Instant::now() + Duration::from_secs(30);
+            while h.engine.borrow().acp().ai_streaming && Instant::now() < settle_deadline {
                 driver.tick();
                 let screen = driver.screen();
                 assert!(
@@ -6297,8 +6378,10 @@ mod tests {
             assert!(
                 !h.engine.borrow().acp().ai_streaming,
                 "the auto-approved request must let the turn resume to \
-                 completion within 5s, not hang waiting for a human who is \
-                 never asked"
+                 completion within 30s, not hang waiting for a human who is \
+                 never asked (acp_permission_default is {:?} at this point — \
+                 if it is not AllowAll, a settings reload stomped it)",
+                h.engine.borrow().settings.acp_permission_default
             );
             let screen = driver.screen();
             assert!(
