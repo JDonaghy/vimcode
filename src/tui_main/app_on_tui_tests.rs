@@ -322,6 +322,68 @@ mod tests {
             );
         }
 
+        /// #1779 (bugbash:tui-pty:linux): pressing `o` on a buffer whose
+        /// last line becomes the buffer's new last line must still paint
+        /// *every* line of the result, each in its own row, in order — the
+        /// original bug report's single-line repro ('foo' + `o` + 'bar' +
+        /// Escape). The buffer/file content was always correct (`:w` wrote
+        /// `foo\nbar\n`); only the TUI *paint* dropped the first line and
+        /// shifted the new last line up one row, leaving a blank row below
+        /// it. Drives the real `App` + `TuiBackend` key pipeline (not a
+        /// bare `Engine::handle_key` + content-string assertion — the bug
+        /// is specifically in what gets painted, not in the buffer).
+        ///
+        /// **Confirmed NOT RED** against unfixed `develop` — `TuiDriver`
+        /// dispatches and renders each key synchronously with no gap, so
+        /// it never reproduces this bug (see the `vt_driver` twin below
+        /// for the full explanation and the real, RED-verified repro).
+        /// Kept as a passing regression test anyway: it drives the same
+        /// production render path the real repro does, just missing the
+        /// one ingredient (an idle tick between keystrokes) that exposes
+        /// the bug — a future regression here would still be real.
+        #[test]
+        fn opening_a_line_below_the_last_line_paints_every_line_in_order_1779() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQXW_FOO\n");
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                driver.screen_has("ZQXW_FOO"),
+                "precondition: the single existing line must be painted"
+            );
+
+            driver.type_char('o');
+            for c in "ZQXW_BAR".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            let screen = driver.screen();
+            let foo_pos = driver.find("ZQXW_FOO");
+            let bar_pos = driver.find("ZQXW_BAR");
+            assert!(
+                foo_pos.is_some() && bar_pos.is_some(),
+                "both the original first line and the line opened below it \
+                 must still be painted somewhere on screen; screen:\n{screen}"
+            );
+            let (_, foo_y) = foo_pos.unwrap();
+            let (_, bar_y) = bar_pos.unwrap();
+            assert!(
+                bar_y > foo_y,
+                "the line opened with 'o' must paint strictly below the \
+                 original first line, not replace it; foo_y={foo_y} \
+                 bar_y={bar_y} screen:\n{screen}"
+            );
+            assert_eq!(
+                bar_y,
+                foo_y + 1.0,
+                "the new line must paint immediately below the first line \
+                 with no blank row between them; foo_y={foo_y} bar_y={bar_y} \
+                 screen:\n{screen}"
+            );
+        }
+
         /// #1763 (bugbash:tui-pty:macos): a real-pty run of
         /// `tests/smoke-spec/tui.yaml`'s `vim-dw-deletes-word` journey
         /// caught the menu bar's "Go" dropdown (mnemonic `'g'`,
@@ -5906,6 +5968,74 @@ mod tests {
                 "Ctrl+L must call Backend::request_full_repaint and force \
                  the stale glyph to clear — screen:\n{}",
                 driver.screen()
+            );
+        }
+
+        /// #1779 (bugbash:tui-pty:linux): companion to
+        /// `opening_a_line_below_the_last_line_paints_every_line_in_order_
+        /// 1779` above, using `vt_driver` (a real `CrosstermBackend` whose
+        /// writes are parsed by a real `vt100::Parser`) instead of plain
+        /// `TuiDriver`/`TestBackend`, in case the bug were in what ANSI
+        /// bytes ratatui's incremental diff emits rather than in its own
+        /// in-memory `Buffer` (the `request_full_repaint`-shaped gap
+        /// `ctrl_l_repaints_a_stale_cell_...` above exists to catch for a
+        /// different trigger).
+        ///
+        /// **Confirmed NOT RED** against unfixed `develop`, same as the
+        /// `TestBackend` twin above — both stayed green driving this exact
+        /// key sequence. The real repro needs an actual OS pty: between
+        /// this and the `TestBackend` twin, `App::handle_key_press`
+        /// dispatches and renders each key synchronously with no gap, but
+        /// the real `quadraui::tui::run::Runner` only renders at the top
+        /// of its *next* event-loop pass and runs `App::tick` — which is
+        /// what caches `RenderedWindow`-derived viewport geometry back
+        /// onto the engine — after every batch, including idle ones. The
+        /// real repro is `tests/pty_open_line_below_paints_all_lines.rs`,
+        /// which drives a real `vcd` under a real Unix pty and *was*
+        /// RED-verified there before the `src/render.rs`
+        /// `visible_line_capacity` fix landed in this same commit. Kept
+        /// here anyway as permanent evidence that this exact bug sits
+        /// outside both in-process drivers' reach — the next person
+        /// chasing a similar "only reproduces over a real pty" report can
+        /// rule this pair out in one grep instead of re-deriving it.
+        #[test]
+        fn opening_a_line_below_the_last_line_paints_every_line_in_order_via_vt_driver_1779() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQXW_FOO\n");
+            let mut driver = vt_driver(engine);
+
+            assert!(
+                driver.screen_contains("ZQXW_FOO"),
+                "precondition: the single existing line must be painted; \
+                 screen:\n{}",
+                driver.screen()
+            );
+
+            driver.type_char('o');
+            for c in "ZQXW_BAR".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Escape);
+            driver.render();
+
+            let screen = driver.screen();
+            let foo_pos = driver.find("ZQXW_FOO");
+            let bar_pos = driver.find("ZQXW_BAR");
+            assert!(
+                foo_pos.is_some() && bar_pos.is_some(),
+                "both the original first line and the line opened below it \
+                 with 'o' must be painted on the real terminal grid, not \
+                 just in ratatui's own diff buffer; screen:\n{screen}"
+            );
+            let (_, foo_y) = foo_pos.unwrap();
+            let (_, bar_y) = bar_pos.unwrap();
+            assert_eq!(
+                bar_y,
+                foo_y + 1.0,
+                "the new line must paint immediately below the first line, \
+                 on the actual vt100-observed terminal grid, with no blank \
+                 row between them and no row vanishing; foo_y={foo_y} \
+                 bar_y={bar_y} screen:\n{screen}"
             );
         }
 
