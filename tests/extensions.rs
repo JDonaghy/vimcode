@@ -1728,9 +1728,40 @@ fn ext_delete_last_installed_expands_available_if_collapsed() {
 // state queries
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// On-disk home for a plugin fixture named `plugin_name`, unique to *this
+/// test process*.
+///
+/// `std::env::temp_dir()` is shared by every process the user runs, so a path
+/// keyed only on `plugin_name` is the *same* directory in two concurrent test
+/// runs — two coord worktrees on one machine, or a `--test extensions` run
+/// alongside a full `cargo test`. Every fixture helper below starts with
+/// `remove_dir_all` and then writes the Lua source, so concurrent runs
+/// clobber each other three ways, all of which surface as an assertion
+/// failure that looks unrelated to the shared directory:
+///
+/// * `fs::write` into a directory another run just deleted fails outright
+///   (`EINVAL`), panicking in the helper itself;
+/// * the last writer wins, so a run can load *another* run's Lua — fatal when
+///   the source is interpolated per-run, e.g. the `http_*` fixtures embed
+///   their own ephemeral `base_url`, so the losers all aim at one run's
+///   single-connection fixture server and their callbacks never fire;
+/// * `load_plugins_dir` can observe the directory mid-recreate and load zero
+///   plugins, after which every `vimcode.command` the test registered is
+///   simply absent.
+///
+/// Appending the pid gives each run its own fixtures. The pid is stable for
+/// the life of the process, so helpers that need to re-derive the same path
+/// later (a simulated plugin reload) still agree with the original.
+fn plugin_fixture_dir(plugin_name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "vc_plugin_api_{plugin_name}_{}",
+        std::process::id()
+    ))
+}
+
 /// Helper: create an engine with a PluginManager loaded from a temp dir.
 fn engine_with_plugin(text: &str, plugin_name: &str, lua_code: &str) -> vimcode_core::Engine {
-    let dir = std::env::temp_dir().join(format!("vc_plugin_api_{}", plugin_name));
+    let dir = plugin_fixture_dir(plugin_name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(format!("{plugin_name}.lua")), lua_code).unwrap();
@@ -2128,7 +2159,7 @@ fn plugin_buf_write_event_fires_on_save() {
 fn plugin_vim_enter_fires_on_init() {
     // VimEnter fires when init_plugins is called.
     // We test it by creating a plugin manager manually with a VimEnter hook.
-    let dir = std::env::temp_dir().join("vc_plugin_api_vimenter");
+    let dir = plugin_fixture_dir("vimenter");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -4822,7 +4853,7 @@ fn immediate_window_cursor_is_one_indexed_and_clamped() {
 /// Lua error rather than silently doing nothing (or worse).
 #[test]
 fn immediate_api_outside_a_callback_is_a_clear_lua_error() {
-    let dir = std::env::temp_dir().join("vc_plugin_api_live_no_engine");
+    let dir = plugin_fixture_dir("live_no_engine");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -4998,7 +5029,13 @@ fn buf_leave_fires_with_old_buffer_handle_on_window_set_buf() {
 
 #[test]
 fn buf_write_pre_fires_before_the_file_is_actually_written() {
-    let tmp = std::env::temp_dir().join("vc_plugin_bufwritepre_test.txt");
+    // Per-pid, for the same reason `plugin_fixture_dir` is: a concurrent test
+    // run sharing this path would have already replaced "old\n" with "new\n"
+    // before `BufWritePre` reads it.
+    let tmp = std::env::temp_dir().join(format!(
+        "vc_plugin_bufwritepre_test_{}.txt",
+        std::process::id()
+    ));
     std::fs::write(&tmp, "old\n").ok();
 
     let mut e = engine_with_plugin(
@@ -5941,7 +5978,7 @@ fn plugin_manager_with(
     plugin_name: &str,
     lua_code: &str,
 ) -> vimcode_core::core::plugin::PluginManager {
-    let dir = std::env::temp_dir().join(format!("vc_plugin_api_{plugin_name}"));
+    let dir = plugin_fixture_dir(plugin_name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(format!("{plugin_name}.lua")), lua_code).unwrap();
@@ -7119,7 +7156,7 @@ fn storage_persists_across_plugin_reload() {
     // Simulate a plugin reload: a fresh `PluginManager`, loaded from the
     // exact same plugin file `engine_with_plugin` wrote, installed in place
     // of the old one — same shape as #1624's `manager_swap_...` tests.
-    let dir = std::env::temp_dir().join("vc_plugin_api_storage_persist_1632");
+    let dir = plugin_fixture_dir("storage_persist_1632");
     let mut mgr2 = vimcode_core::core::plugin::PluginManager::new().expect("PluginManager::new");
     mgr2.load_plugins_dir(&dir, &[]);
     e.set_plugin_manager(mgr2);
