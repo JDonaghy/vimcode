@@ -8450,7 +8450,42 @@ impl App {
                     self.draw_needed.set(true);
                     return quadraui::Reaction::Redraw;
                 }
-                quadraui::MenuEvent::Ignored => {}
+                // #1763: a dropdown that was genuinely open (`menu_open`,
+                // not just the bar revealed) and a `KeyPressed` it doesn't
+                // recognise (anything but Escape/arrows/Enter/a matching
+                // Alt+<letter>, all handled above) falls all the way
+                // through to `Ignored` — `quadraui::MenuSystem::handle` has
+                // no type-ahead/dismiss-on-any-key behaviour of its own
+                // (`quadraui/src/compose/menu_system.rs`'s own `handle`:
+                // the match's final arm is a bare `_ => MenuEvent::Ignored`
+                // for exactly this case). Left alone, the dropdown stays
+                // `is_open()` and keeps painting every subsequent frame
+                // (`render_content`'s unconditional `menu_system.render()`
+                // call) while this same event keeps flowing to the Vim/
+                // editor dispatch below and is applied there as normal —
+                // so a key sequence that happens to open a menu (Alt+<its
+                // mnemonic>, or — per #1763's own bugbash repro — a
+                // terminal that collapses a fast Escape-then-letter into
+                // an Alt+letter chord) leaves every following keystroke
+                // editing the buffer correctly *underneath* a dropdown
+                // that visually never goes away, exactly the "unexpected
+                // 'Go' menu dropdown" symptom. Closing here mirrors
+                // `handle_escape`'s own whole-menu close (same `close()`
+                // call) for the one case that handler can't reach: the
+                // key wasn't Escape, so `MenuSystem::handle` never ran
+                // that arm itself. Deliberately does not also return
+                // early or touch `engine.menu_bar_visible` — the event
+                // must still fall through to the rest of this dispatch
+                // (unchanged), and a plain Escape close already leaves the
+                // toggleable bar row itself visible too (checked manually
+                // while diagnosing this), so an unrecognised key closing
+                // only the dropdown is the narrower, consistent fix.
+                quadraui::MenuEvent::Ignored => {
+                    if menu_open && matches!(event, quadraui::UiEvent::KeyPressed { .. }) {
+                        menu_system.borrow_mut().close(backend);
+                        self.draw_needed.set(true);
+                    }
+                }
             }
         }
 
