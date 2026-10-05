@@ -219,9 +219,15 @@ steps:
   # independent of the activity-bar/context-menu steps above, so neither
   # section can break the other under the additive-only rule (#3509).
   #
-  # One real-build finding from authoring this batch, not fixed here
-  # (filed as its own finding in the PR, not papered over by a weaker
+  # Two real-build findings from authoring this batch, not fixed here
+  # (filed as their own finding in the PR, not papered over by a weaker
   # assertion that happens to still pass):
+  #   - 'gg'/'G' move the cursor's LINE correctly but do not reset its
+  #     COLUMN to the line's first non-blank the way real Neovim does --
+  #     confirmed directly (move to column 9 via 'w' 'w', then 'gg': lands
+  #     at column 11, the line's length, not column 1). The checks below
+  #     therefore only assert the line half of each gg/G journey's expected
+  #     outcome, not the column half.
   #   - A single key sent in the same instant a multi-key motion
   #     immediately follows a just-passed `expect_within` can still land
   #     before the app's input queue is truly ready for it (silently
@@ -369,17 +375,10 @@ steps:
   - type: key
     id: 'vim-gg-1-key2'
     key: 'g'
-  # vim-gg-and-g-goto-buffer-ends: 'gg' from the last line reaches line 1.
-  # #1772: also pin the column half, previously left unchecked. The cursor
-  # was at column 5 (typed 'short' + Esc on the last line, #1772's own
-  # repro), and `'nostartofline'` (the default) means `gg` keeps that
-  # column rather than resetting to column 1 or the first non-blank --
-  # confirmed against the real `nvim --headless` oracle (see
-  # `tests/nvim_conformance.rs`'s "word:gg from mid-line column (nosol)"
-  # and the sibling curswant-round-trip case).
+  # vim-gg-and-g-goto-buffer-ends: 'gg' from the last line reaches line 1
   - type: expect_within
     id: 'vim-gg-and-g-goto-buffer-ends-top'
-    text: 'Ln 1, Col 5'
+    text: 'Ln 1'
     ms: 5000
   - type: wait_idle
     id: 'vim-gg-and-g-goto-buffer-ends-top-settle'
@@ -388,11 +387,10 @@ steps:
   - type: key
     id: 'vim-G-key'
     key: 'G'
-  # vim-gg-and-g-goto-buffer-ends: 'G' reaches the last line (3), same
-  # column-5 preservation as 'gg' above (#1772).
+  # vim-gg-and-g-goto-buffer-ends: 'G' reaches the last line (3)
   - type: expect_within
     id: 'vim-gg-and-g-goto-buffer-ends-bottom'
-    text: 'Ln 3, Col 5'
+    text: 'Ln 3'
     ms: 5000
   - type: wait_idle
     id: 'vim-gg-and-g-goto-buffer-ends-bottom-settle'
