@@ -8176,6 +8176,149 @@ impl App {
     }
 }
 
+/// #1745: on the native macOS GUI, a real Cmd keypress reaches this crate as
+/// `quadraui::Modifiers::cmd`, a bit `engine_key_from_ui`/`handle_key_press`/
+/// every other `modifiers.ctrl` check in this file has never read — see
+/// `tests/vscode_keybinding_parity.rs`'s corrected `macos_gui` column. So
+/// before this fix Cmd+C/V/X/Z/S/P/… didn't merely *diverge* from VS Code's
+/// Mac defaults, they did **nothing at all**: `ctrl` stayed `false` and the
+/// plain, unmodified character fell through to whatever Insert-mode typing
+/// does with it.
+///
+/// Folds `cmd` into `ctrl` for a `KeyPressed` event, but only when the live
+/// backend's own [`quadraui::PlatformServices::platform_name`] — a runtime
+/// capability query, not a `cfg!(target_os = "macos")` guess — reports
+/// `"macos"`. That is true only for `quadraui::macos::MacBackend`: GTK's own
+/// Cmd-reporting convention (Super/Meta -> `cmd`, quadraui's
+/// `gtk/events.rs`) is left completely alone, so a GNOME user's Super key
+/// does not suddenly start acting like Ctrl. This is the one shared
+/// dispatcher both GTK and the macOS GUI already run through (`App::handle`
+/// -> `handle_dispatch`), so the fix lives here once rather than in any
+/// backend-specific file — see this file's own module doc and CLAUDE.md's
+/// Platform-Neutrality Rule.
+///
+/// Mouse events are deliberately left untouched: the issue this fixes
+/// (#1745) is scoped to VS Code mode's keyboard chords, and folding `cmd`
+/// into the `MouseButton::Left if modifiers.ctrl` go-to-definition chord
+/// would be a second, separate behaviour change with no test coverage here.
+///
+/// ## Arrow keys are handled separately, and only in VS Code mode
+///
+/// VS Code's real Mac defaults do **not** treat Cmd+Arrow as a plain
+/// Ctrl-to-Cmd substitution the way every letter/symbol chord above does:
+/// Option (`alt`) is the word-wise-navigation modifier on Mac
+/// (`cursorWordLeft`/`cursorWordRight`, vimcode's existing Ctrl+Left/Right),
+/// while Cmd+Left/Right is line start/end (`cursorHome`/`cursorEnd`, plain
+/// `Home`/`End`) and Cmd+Up/Down is document start/end
+/// (`cursorTop`/`cursorBottom`, Ctrl+Home/Ctrl+End) — see
+/// tests/vscode_keybinding_parity.rs's `cursorWordEndRight / cursorWordLeft` and
+/// `cursorTop / cursorBottom` rows. A blanket `cmd -> ctrl` fold would make
+/// Cmd+Right *word-move* (vimcode's Ctrl+Right), which is not what either
+/// VS Code or this fix wants, so arrows are excluded from the fold above
+/// and translated here instead — a key-identity translation (not just a
+/// modifier fold), gated on VS Code mode specifically because that's this
+/// issue's scope and `route_alt_key`'s own Alt+Left/Right handling (VS
+/// Code's Win/Linux `navigateBack`/`navigateForward` default) is itself
+/// VS-Code-mode-gated.
+///
+/// `alt` is cleared on the Option+Left/Right arm so `route_alt_key` (called
+/// later in `handle_dispatch`, unconditionally whenever `alt` is set) sees
+/// `alt == false` and takes its own `Fallthrough` path instead of also
+/// claiming the chord as `navigateBack`/`navigateForward` — Mac's own
+/// default for that command is Ctrl+-/Ctrl+Shift+- instead (tracked as a
+/// still-open gap; see `tests/vscode_keybinding_parity.rs`'s `KNOWN_GAPS`).
+fn normalize_mac_cmd_as_ctrl(
+    event: quadraui::UiEvent,
+    backend: &dyn quadraui::Backend,
+    vscode_mode: bool,
+) -> quadraui::UiEvent {
+    use quadraui::{Key, Modifiers, NamedKey, UiEvent};
+    if backend.services().platform_name() != "macos" {
+        return event;
+    }
+    match event {
+        // Option+Left/Right (no Cmd, no physical Ctrl already held): word
+        // move, matching vimcode's existing Ctrl+Left/Right.
+        UiEvent::KeyPressed {
+            key: key @ (Key::Named(NamedKey::Left) | Key::Named(NamedKey::Right)),
+            modifiers,
+            repeat,
+        } if vscode_mode && modifiers.alt && !modifiers.cmd && !modifiers.ctrl => {
+            UiEvent::KeyPressed {
+                key,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    alt: false,
+                    ..modifiers
+                },
+                repeat,
+            }
+        }
+        // Cmd+Left/Right (no Option): line start/end.
+        UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::Left),
+            modifiers,
+            repeat,
+        } if vscode_mode && modifiers.cmd && !modifiers.alt => UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::Home),
+            modifiers,
+            repeat,
+        },
+        UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::Right),
+            modifiers,
+            repeat,
+        } if vscode_mode && modifiers.cmd && !modifiers.alt => UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::End),
+            modifiers,
+            repeat,
+        },
+        // Cmd+Up/Down (no Option): document start/end — `Home`/`End` with
+        // an extra `ctrl` bit, the same shape `engine_key_from_ui`'s
+        // `NamedKey::Home`/`End` arms already use for Ctrl+Home/Ctrl+End.
+        UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::Up),
+            modifiers,
+            repeat,
+        } if vscode_mode && modifiers.cmd && !modifiers.alt => UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::Home),
+            modifiers: Modifiers {
+                ctrl: true,
+                ..modifiers
+            },
+            repeat,
+        },
+        UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::Down),
+            modifiers,
+            repeat,
+        } if vscode_mode && modifiers.cmd && !modifiers.alt => UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::End),
+            modifiers: Modifiers {
+                ctrl: true,
+                ..modifiers
+            },
+            repeat,
+        },
+        // Every other chord: fold `cmd` into `ctrl` unchanged (the plain
+        // Ctrl-to-Cmd substitution that covers every letter/symbol VS Code
+        // Mac default this file's own doc enumerates).
+        UiEvent::KeyPressed {
+            key,
+            mut modifiers,
+            repeat,
+        } if modifiers.cmd => {
+            modifiers.ctrl = true;
+            UiEvent::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+            }
+        }
+        other => other,
+    }
+}
+
 impl App {
     /// The actual body of `ShellApp::handle`, moved to an inherent
     /// method (#813) so the trait impl can wrap it with a single
@@ -8189,6 +8332,10 @@ impl App {
         ctx: &quadraui::ShellContext<'_>,
     ) -> quadraui::Reaction {
         use quadraui::{Key, MouseButton, UiEvent};
+        // #1745: must run before anything else reads `event`'s modifiers —
+        // see `normalize_mac_cmd_as_ctrl`'s own doc.
+        let vscode_mode = self.engine.borrow().is_vscode_mode();
+        let event = normalize_mac_cmd_as_ctrl(event, backend, vscode_mode);
 
         // ── #1427: shared menu-bar reveal/hide routing ───────────────────────
         // The #318 Alt+<letter> shim (only fires while the bar is hidden —

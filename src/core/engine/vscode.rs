@@ -6,13 +6,22 @@ use super::*;
 // names the shared decoder (`render::engine_key_from_ui`) hands it, which is
 // correct for macOS's terminal build too: Cmd is a GUI-only modifier that
 // never reaches a terminal application on any OS, so a macOS TUI's reachable
-// chord alphabet is identical to Linux's. The only surface that will ever
-// need a real Cmd-vs-Ctrl remap is a future macOS *GUI* backend
-// (`src/macos/`, a thin shell with no key-decoding of its own today) — see
-// `tests/vscode_keybinding_parity.rs`'s module doc and `REACHABILITY_TABLE`
-// for the full reasoning and the specific VS Code Mac defaults (Option for
-// word-nav, Cmd for line/doc-nav, Cmd+Option+F for Find & Replace, …) that
-// are *not* a plain substitution of this file's Ctrl chords.
+// chord alphabet is identical to Linux's.
+//
+// #1745: the macOS *GUI* backend (`src/macos/`) does exist in this repo
+// (#1730's module doc wrongly assumed otherwise) and does need a real
+// Cmd-vs-Ctrl remap — but that remap still does not belong in this file.
+// `App::normalize_mac_cmd_as_ctrl` (`src/app.rs`), called once at the top of
+// the one shared `App::handle_dispatch` both GTK and the macOS GUI run
+// through, folds `Modifiers::cmd` into `ctrl` for plain substitution chords
+// and translates the handful of VS Code Mac defaults that are *not* a plain
+// substitution (Option for word-nav, Cmd for line/doc-nav) into the exact
+// `Key`/`Modifiers` shape this file already understands, before this file
+// ever sees the event — so `vscode.rs` keeps speaking only `ctrl`/`shift`/
+// `Alt_*`, unchanged. `Cmd+Option+F` for Find & Replace is not yet among
+// them: see `tests/vscode_keybinding_parity.rs`'s `REACHABILITY_TABLE` and
+// `docs/PENDING_QUADRAUI_ISSUES.md` for why that one is blocked upstream in
+// quadraui, not a vimcode-side gap.
 
 impl Engine {
     /// True when the editor is configured in VSCode editing mode.
