@@ -339,6 +339,14 @@ impl Engine {
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
             self.shift_decor_across_undo_nav(&old_text);
+            // #1787: an undo swaps in an entire prior buffer snapshot, so any
+            // open completion popup's `completion_candidates` (computed from
+            // the pre-undo text, e.g. the whole word the user was mid-typing)
+            // is now stale — nothing else re-triggers completion on an undo,
+            // so without this the popup rides along showing text that no
+            // longer exists in the buffer until the next keystroke happens
+            // to dismiss or refresh it.
+            self.dismiss_completion();
             true
         } else {
             self.message = "Already at oldest change".to_string();
@@ -358,6 +366,10 @@ impl Engine {
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
             self.shift_decor_across_undo_nav(&old_text);
+            // #1787: see the matching comment in `undo` above — a redo swaps
+            // in a different buffer snapshot too, so the same staleness
+            // applies.
+            self.dismiss_completion();
             true
         } else {
             self.message = "Already at newest change".to_string();
