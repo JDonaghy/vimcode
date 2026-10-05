@@ -18,12 +18,12 @@
 //! only observe whether `crossterm` itself was patched, which it was not.
 //!
 //! This file is the test that actually exercises the shipped fix: a real
-//! `vcd` binary, under a real Unix pty (mirrors `tests/
-//! pty_settings_header_delay.rs`'s `spawn_under_pty` shape), whose pty
-//! *master* is closed out from under it — exactly `TuiBackend::
-//! wait_events`'s own documented trigger condition — while this test
-//! watches, from the outside, whether the process exits on its own in
-//! bounded time without pegging a CPU core while it does.
+//! `vcd` binary, under a real Unix pty (mirrors the `spawn_under_pty` shape
+//! in `tests/pty_settings_header_delay.rs`), whose pty *master* is closed
+//! out from under it — exactly the documented trigger condition of
+//! `TuiBackend::wait_events` — while this test watches, from the outside,
+//! whether the process exits on its own in bounded time without pegging a
+//! CPU core while it does.
 //!
 //! # Every dup of the master fd must close, not just one handle
 //!
@@ -34,8 +34,8 @@
 //! slave never sees a hangup — until *every* dup'd fd referencing it is
 //! closed, not just the original `MasterPty` handle. An earlier version of
 //! this test spawned a background thread holding a long-lived clone of the
-//! reader to capture `vcd`'s startup output (mirroring `tests/
-//! pty_settings_header_delay.rs`'s shape, which never needs to fully close
+//! reader to capture `vcd`'s startup output (mirroring the shape in
+//! `tests/pty_settings_header_delay.rs`, which never needs to fully close
 //! its master), then dropped only the original `master` object — leaving
 //! that thread's cloned reader fd (and the writer clone it also held)
 //! open, so the master was never actually fully closed and `vcd` correctly
@@ -56,8 +56,8 @@
 //! periodic-recheck guard). **Measured on macOS** (`sample(1)`, 1ms
 //! interval, 2s window, on the real `vcd` process mid-run, against that
 //! pin): the main thread was parked inside `TuiBackend::wait_events` →
-//! `ratatui::crossterm::event::poll` → `UnixInternalEventSource::
-//! try_read`, issuing a bare `read()` syscall ~1390 times in that window
+//! `ratatui::crossterm::event::poll` → `UnixInternalEventSource::try_read`,
+//! issuing a bare `read()` syscall ~1390 times in that window
 //! with **no** `stdin_hung_up` frame anywhere on the stack — i.e. the
 //! guard was checked, came back `false`, and crossterm was entered,
 //! exactly as designed, right before the hangup landed; once inside, that
@@ -84,16 +84,17 @@
 //! but `POLLHUP`-on-a-pty-slave is exactly the bit a Linux run alone
 //! doesn't confirm, so treat macOS as structurally-argued, not measured).
 //! Per this repo's Platform-Neutrality Rule, that fix correctly landed in
-//! quadraui, not as a vimcode-side workaround — vimcode's only change here is
-//! consuming the new pin and un-ignoring this test. See
+//! quadraui, not as a vimcode-side workaround — vimcode's only change
+//! here is consuming the new pin and un-ignoring this test. See
 //! `docs/PENDING_QUADRAUI_ISSUES.md`'s "crossterm 0.29.0 ... busy-spins"
 //! entry (its "#1775 update" section) for the full writeup. Note that
-//! un-ignoring this test does **not** imply `crossterm_dead_pty_busy_loop.
-//! rs` should also be un-ignored — that file drives raw `crossterm::
-//! event::poll` directly, bypassing `TuiBackend` entirely, so it cannot
-//! observe this fix and stays `#[ignore]`d pending an upstream `crossterm`
-//! fix (see that file's own module doc, and the PENDING entry's "Note on
-//! the two `#[ignore]`d vimcode tests" paragraph).
+//! un-ignoring this test does **not** imply that
+//! `crossterm_dead_pty_busy_loop.rs` should also be un-ignored — that
+//! file drives raw `crossterm::event::poll` directly, bypassing
+//! `TuiBackend` entirely, so it cannot observe this fix and stays
+//! `#[ignore]`d pending an upstream `crossterm` fix (see that file's own
+//! module doc, and the PENDING entry's "Note on the two `#[ignore]`d
+//! vimcode tests" paragraph).
 #![cfg(unix)]
 
 use std::io::{ErrorKind, Read, Write};
