@@ -8347,6 +8347,141 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // #1761 — the startup extension-registry refresh must never surface a
+    // status message or force a repaint at all, no matter how long its
+    // background fetch takes
+    // ─────────────────────────────────────────────────────────────────────────
+    /// vimcode#1761: #1741 treated the startup registry fetch's post-first-
+    /// paint repaint as a single, legitimate, unavoidable event and widened
+    /// the Tier-2 YAML's settle margin to absorb it. A real-pty bugbash run
+    /// later caught the same mechanism still breaking the
+    /// `idle-no-repaint-bytes-when-idle` journey's "perfectly silent once
+    /// idle" contract on a fresh `$HOME` (no `registry_cache.json`): the
+    /// "Extension registry updated (N extensions)" status message landed
+    /// well outside any settle window `registry::fetch_registry`'s own
+    /// `curl --max-time 15` allows, because the fetch's completion time is
+    /// bounded only by that 15s ceiling — not by anything a fixed settle
+    /// margin can assume. A settle-margin workaround cannot fix an
+    /// unbounded delay; this PR removes the message (and the repaint it
+    /// forces) entirely from the *automatic* startup refresh, via
+    /// `Engine::ext_refresh_quiet` (`src/core/engine/lsp_ops.rs`) — see
+    /// that method's doc for why an explicit, user-requested refresh
+    /// (`Engine::ext_refresh`, unchanged) keeps its message.
+    ///
+    /// Unlike [`idle_silence_settle_1741`], this calls the real,
+    /// unmodified `Engine::ext_refresh_quiet` production entry point
+    /// (not a hand-rolled channel) — with `extension_registries` cleared
+    /// first so the background thread's one real-filesystem/network-
+    /// shaped step, `registry::fetch_registry`, has no URL to call and
+    /// resolves near-instantly with an empty, successful registry. That
+    /// keeps the test hermetic and fast while still exercising
+    /// `poll_ext_registry`'s real message-suppression branch end to end.
+    ///
+    /// RED against pre-#1761 `develop`: `Engine::ext_refresh_quiet` does
+    /// not exist there, and the only public entry point
+    /// (`Engine::ext_refresh`) always sets `self.message` on its "fetch
+    /// succeeded" branch regardless of who called it — so this test, run
+    /// against that code with `ext_refresh_quiet` calls replaced by
+    /// `ext_refresh`, observes the banned text and a forced repaint,
+    /// exactly like the real-pty bugbash did.
+    mod quiet_startup_registry_refresh_1761 {
+        use super::*;
+        use quadraui::Reaction;
+
+        #[test]
+        fn startup_registry_refresh_never_shows_a_message_or_forces_a_repaint() {
+            // Hermetic: `Engine::ext_refresh_quiet`'s real production code
+            // calls `registry::save_cache` on a successful fetch, which
+            // must not touch the real `~/.config/vimcode/` on whatever
+            // machine runs this suite (mirrors the #1741 review fix).
+            let home = std::env::temp_dir().join(format!(
+                "vimcode_test_1761_home_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            std::fs::create_dir_all(&home).unwrap();
+            let _home_guard = crate::core::paths::set_test_home(&home);
+
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+            engine.settings.lsp_enabled = false;
+            let mut h = harness_no_sidebar(engine);
+
+            // First real frame, same as every sibling in this family.
+            h.driver.tick();
+            assert!(
+                h.driver.screen_has("alpha"),
+                "precondition: the buffer text must actually be painted"
+            );
+            let screen0 = h.driver.screen();
+
+            // Arm the real startup entry point — no URLs configured, so
+            // the background thread's `fetch_registry` loop has nothing to
+            // call and the channel send happens almost immediately, but
+            // still asynchronously through the exact same
+            // `ext_registry_rx`/`poll_ext_registry` plumbing a real,
+            // slow (`curl --max-time 15`) fetch would use.
+            {
+                let mut engine = h.engine.borrow_mut();
+                engine.settings.extension_registries = Vec::new();
+                engine.ext_refresh_quiet();
+            }
+
+            // Poll for up to 2s — generous relative to the near-instant
+            // empty-registry fetch this test arms, nowhere near wide
+            // enough to mask a real #1761 regression (which would show
+            // the banned message on the very first tick that drains the
+            // channel, long before any 15s-scale delay could matter).
+            let mut failures: Vec<String> = Vec::new();
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let reaction = h.driver.tick();
+                if h.driver.screen_has("Extension registry updated") {
+                    failures.push(
+                        "the automatic startup registry refresh must never \
+                         surface a status message (#1761) — found \
+                         'Extension registry updated' on screen"
+                            .to_string(),
+                    );
+                    break;
+                }
+                if reaction != Reaction::Continue {
+                    failures.push(format!(
+                        "the automatic startup registry refresh must not \
+                         force a repaint (#1761) — got {reaction:?}"
+                    ));
+                }
+                if h.driver.screen() != screen0 {
+                    failures.push(
+                        "rendered text changed as a result of the \
+                         automatic startup registry refresh (#1761)"
+                            .to_string(),
+                    );
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "idle-silence violated by the startup registry refresh:\n{}",
+                failures.join("\n")
+            );
+
+            // Precondition check, after the loop above: the fetch must
+            // actually have completed (not just never started), or the
+            // silence observed above would be vacuous.
+            assert_eq!(
+                h.engine.borrow().ext_registry.as_ref().map(|v| v.len()),
+                Some(0),
+                "precondition: the quiet startup fetch must have resolved \
+                 (ext_registry populated with the empty registry) within \
+                 the 2s budget — either it never completed or this test's \
+                 own timing assumption is stale"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // #1722 — a `MouseMoved` that changes no hover target must not repaint
     // ─────────────────────────────────────────────────────────────────────────
     /// #1722's second acceptance bullet: "a `MouseMoved` that doesn't change
