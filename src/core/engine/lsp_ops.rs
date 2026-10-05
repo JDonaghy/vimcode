@@ -353,7 +353,14 @@ impl Engine {
                     let count = entries.len();
                     registry::save_cache(&entries);
                     self.ext_registry = Some(entries);
-                    // Re-filter stored diagnostics with updated ignore_error_sources.
+                    // Re-filter stored diagnostics with updated
+                    // ignore_error_sources. Note this can change painted
+                    // output (gutter signs / Problems panel / status counts)
+                    // even on a quiet fetch, and the redraw verdict below
+                    // deliberately does not cover it: it only matters when a
+                    // registry entry's `ignore_error_sources` changed *and*
+                    // diagnostics were already on screen, and it self-heals on
+                    // the next repaint (#1761 review).
                     self.refilter_diagnostics();
                     if !quiet {
                         self.message = format!("Extension registry updated ({count} extensions)");
@@ -368,25 +375,13 @@ impl Engine {
                     }
                 }
             }
-            // #1761: on the common quiet (startup) path there is no message
-            // and `ext_registry`'s own data is only read when the
-            // Extensions panel is open (closed by default), so reporting
-            // "no redraw needed" here, instead of unconditional `true`, is
-            // what actually keeps the terminal silent on a cold launch —
-            // the caller's diff-based renderer would emit zero bytes for an
-            // unchanged frame either way, but skipping the redraw avoids
-            // even computing one. That's not quite "never changes anything
-            // painted" though: if the panel is open while the fetch lands
-            // (e.g. opened during the fetch window, see `sidebar.rs`'s
-            // `PANEL_EXTENSIONS` open handler, which deliberately does not
-            // re-arm when a fetch is already in flight), the panel's list
-            // needs the redraw this fetch just produced — hence the
-            // `active_panel_is` check below. `refilter_diagnostics` just
-            // above is a second, narrower exception (gutter signs / Problems
-            // panel can change if a registry entry's `ignore_error_sources`
-            // changed) that this return value does not cover; it is
-            // self-healing on the next unrelated repaint, so it's left as
-            // documented behaviour rather than folded into the check.
+            // #1761: a quiet (startup) fetch reports "no redraw needed" so a
+            // cold launch stays silent; see `Engine::ext_registry_quiet`'s doc
+            // for why. The panel check is the one case where a quiet fetch
+            // *is* visible: `sidebar.rs`'s `PANEL_EXTENSIONS` open handler
+            // deliberately does not re-arm while a fetch is in flight, so a
+            // panel opened during the fetch window relies on this completion
+            // for its first painted list.
             !quiet || self.active_panel_is(PANEL_EXTENSIONS)
         } else {
             false
@@ -2236,6 +2231,26 @@ mod tests {
     /// list needs the fetch result just populated), even though the common
     /// quiet/closed-panel startup case must not.
     fn poll_with(quiet: bool, panel_open: bool) -> bool {
+        // `poll_ext_registry`'s success branch calls `registry::save_cache`
+        // unconditionally, which resolves through
+        // `paths::vimcode_config_dir()`. Without a `TestHomeGuard` held
+        // across that call, this test would write `[]` over the *real*
+        // `~/.config/vimcode/registry_cache.json` on whatever machine runs
+        // the suite — and a truncated cache is sticky, because `load_cache`
+        // then returns `Some([])`, which makes `sidebar.rs`'s
+        // `ext_registry.is_none()` guard false and leaves the developer's
+        // Extensions panel painting empty until they refresh by hand.
+        // Thread-local override, not `set_var("HOME", …)` — see
+        // `core::paths::TEST_HOME_OVERRIDE` (#1741 review, #1761 review).
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_1761_poll_home_q{quiet}_p{panel_open}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let home_guard = crate::core::paths::set_test_home(&home);
+
         let mut e = Engine::new_for_test();
         if panel_open {
             e.app_shell
@@ -2253,7 +2268,19 @@ mod tests {
         e.ext_registry_rx = Some(rx);
         e.ext_registry_fetching = true;
         e.ext_registry_quiet = quiet;
-        e.poll_ext_registry()
+        // Bind, don't tail-return: the guard must still be alive while
+        // `poll_ext_registry` runs `save_cache` (a tail expression would
+        // also be fine today, but binding makes the ordering explicit and
+        // lets the cache assertion below run under the override).
+        let redraw = e.poll_ext_registry();
+        assert!(
+            home.join(".config/vimcode/registry_cache.json").exists(),
+            "the fetch's cache write must land under the test home override, \
+             not the real ~/.config/vimcode (#1761 review)"
+        );
+        drop(home_guard);
+        let _ = std::fs::remove_dir_all(&home);
+        redraw
     }
 
     #[test]
