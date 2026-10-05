@@ -291,6 +291,81 @@ mod tests {
             );
         }
 
+        /// #1763 (bugbash:tui-pty:macos): a real-pty run of
+        /// `tests/smoke-spec/tui.yaml`'s `vim-dw-deletes-word` journey
+        /// caught the menu bar's "Go" dropdown (mnemonic `'g'`,
+        /// `MENU_STRUCTURE`'s `("Go", 'g', ...)` in `render.rs`) appearing
+        /// mid-sequence over a plain `dw` and never going away — the
+        /// screen showed the boxed "Go to File / Go to Line / Go to
+        /// De[finition]" dropdown instead of the edited `foo baz` buffer
+        /// text the YAML step asserts on.
+        ///
+        /// `TuiDriver::type_char`'s synthetic `KeyPressed` never carries
+        /// `alt: true` (confirmed while diagnosing this: a bare `type_char
+        /// ('g')` twice, mirroring the YAML's `gg` rewind-to-top motion,
+        /// never opens the menu at all), so whatever turns the real pty's
+        /// plain `'g'` keystroke into an `Alt+g` chord is a raw-terminal-
+        /// decode question `TuiDriver` structurally cannot reach (same
+        /// quadraui#302-shaped blind spot the raw-mode/SGR-mouse smoke
+        /// tests already carve out) — not reproduced here, and not this
+        /// test's job.
+        ///
+        /// What *is* reachable, real production code, and the actual
+        /// fixable defect: once something does open the dropdown (`Alt+g`
+        /// dispatched directly below, standing in for whatever the pty
+        /// sends), `quadraui::MenuSystem::handle` has no type-ahead/
+        /// dismiss-on-any-key behaviour — an unrecognised `KeyPressed`
+        /// (plain `'0'`/`'w'`/`'d'`/`'w'`, none of them Escape/an arrow/
+        /// Enter/a matching Alt+<letter>) falls through to
+        /// `MenuEvent::Ignored`, and pre-fix `App::handle_dispatch` left
+        /// the dropdown `is_open()` — and therefore still painted every
+        /// frame — while that same keystroke kept flowing to the Vim
+        /// engine underneath and was applied there, so the buffer
+        /// genuinely becomes `foo baz` while the screen keeps showing the
+        /// stale "Go" dropdown on top of it: exactly this issue's
+        /// symptom. RED-verified against pre-fix `App::handle_dispatch`
+        /// (reverting the new `MenuEvent::Ignored` arm back to `{}`
+        /// reproduces `driver.screen_has("Go to File")` staying `true`
+        /// through every one of the four follow-up keystrokes).
+        #[test]
+        fn alt_g_dropdown_does_not_survive_a_vim_dw_1763() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "foo bar baz\n");
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('g'),
+                modifiers: quadraui::Modifiers {
+                    alt: true,
+                    ..quadraui::Modifiers::default()
+                },
+                repeat: false,
+            });
+            assert!(
+                driver.screen_has("Go to File"),
+                "precondition: Alt+g must open the \"Go\" dropdown; screen:\n{}",
+                driver.screen()
+            );
+            // `0 w d w`: move to "bar", then `dw` deletes it — the exact
+            // `vim-dw-deletes-word` keystrokes from `tui.yaml`.
+            driver.type_char('0');
+            driver.type_char('w');
+            driver.type_char('d');
+            driver.type_char('w');
+            assert!(
+                !driver.screen_has("Go to File"),
+                "the stale \"Go\" dropdown must not survive a key it doesn't \
+                 recognise; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_has("foo baz"),
+                "the `dw` motion must still reach the editor underneath (not \
+                 get swallowed by the dropdown); screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// `u` after `dd` must restore the deleted line — the undo stack, same
         /// key pipeline as [`dd_deletes_the_current_line`].
         #[test]
