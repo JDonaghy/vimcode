@@ -7638,18 +7638,26 @@ impl Engine {
     }
 
     /// Land the cursor on `line` for `G`/`gg`/`H`/`M`/`L` — Vim's
-    /// `'startofline'` option names all five. `curswant` is already `None`
-    /// here (these keys aren't in `update_curswant_for_key`'s preserved
-    /// list), so unlike the `<C-d>`-family helper
-    /// (`land_vertical_scroll_cursor`) there is no remembered column to fall
-    /// back on when the option is off — the baseline behavior is simply
-    /// "leave the actual column alone, clamped to the new line".
+    /// `'startofline'` option names all five, and (#1772) they are
+    /// `curswant`-preserving exactly like the `<C-d>` family when the
+    /// option is off: `update_curswant_for_key` keeps `self.curswant` alive
+    /// across these keys (and across `gg`'s own two-keystroke sequence), so
+    /// bouncing through a short line and back to a long one restores the
+    /// original desired column instead of staying wherever the short line
+    /// clamped it to — confirmed against the real `nvim --headless` oracle
+    /// (`"word:gg after G loses curswant through a short line (nosol)"` in
+    /// `tests/nvim_conformance.rs`). This mirrors
+    /// `land_vertical_scroll_cursor` exactly; the only difference is the
+    /// `'startofline'`-on column (first non-blank) also becomes the new
+    /// `curswant`, same as that helper does.
     pub(crate) fn land_line_jump_cursor(&mut self, line: usize) {
         if self.settings.startofline {
             self.move_cursor_to_first_non_blank(line);
+            self.curswant = Some(self.view().cursor.col);
         } else {
+            let want = self.curswant();
             self.view_mut().cursor.line = line;
-            self.clamp_cursor_col();
+            self.apply_curswant(want);
         }
     }
 }

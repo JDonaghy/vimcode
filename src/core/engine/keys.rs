@@ -20,14 +20,22 @@ impl Engine {
     ///    documents these as curswant-preserving alongside `j`/`k`, and
     ///    `scroll_and_move_by`/`page_down`/`page_up` read/reapply `curswant`
     ///    just like a plain vertical motion does.
+    ///  - `G` / `H` / `M` / `L` — the other single-key `'startofline'`
+    ///    commands (#1772).
+    ///  - the bare, not-yet-resolved `g` keystroke that *starts* a `g`-
+    ///    sequence, and `gg`'s own second keystroke — `gg` is the fifth
+    ///    `'startofline'` command (#1772). This is safe even though most
+    ///    `g`-sequences (`ge`, `g_`, `gJ`, `gv`, …) don't want `curswant`
+    ///    preserved at all: the first `g` keystroke is a pure "arm
+    ///    `pending_key`" no-op that never moves the cursor, so preserving
+    ///    across it changes nothing by itself — and every *other* second
+    ///    keystroke besides `g` still falls through to the unconditional
+    ///    reset below (`pending_key.is_some()` is true for it, and the
+    ///    `gg`-specific escape above only matches `unicode == Some('g')`).
     ///
     /// Reset to `None` for everything else, including `$` (its own handler
     /// sets `Some(CURSWANT_EOL)` immediately afterward, so the reset here
-    /// just guarantees a clean slate for keys that don't) and `g` — even
-    /// when `g` is about to resolve to `gj`/`gk`: those dispatch to
-    /// `move_visual_down`/`move_visual_up` (`src/core/engine/search.rs`),
-    /// which never read or write `curswant`, so there is no downstream
-    /// motion for a preserved value to feed.
+    /// just guarantees a clean slate for keys that don't).
     fn update_curswant_for_key(&mut self, unicode: Option<char>, ctrl: bool) {
         if !matches!(
             self.mode,
@@ -35,6 +43,18 @@ impl Engine {
         ) {
             self.latch_visual_block_want();
             self.curswant = None;
+            return;
+        }
+        // #1772: `gg`'s second keystroke must escape the generic
+        // "any pending multi-key sequence resets curswant" rule below —
+        // `gg` is one of Vim's documented `'startofline'` commands
+        // (alongside `G`/`H`/`M`/`L`/the `<C-d>` family), so with the
+        // default `'nostartofline'` it has to honor the *remembered*
+        // column exactly like `j`/`k`, not whatever the first `g`
+        // keystroke's dispatch already clamped the actual column to.
+        // Every other two-key `g`-sequence (`ge`, `g_`, `gJ`, …) still
+        // falls through to the reset below, unaffected.
+        if self.pending_key == Some('g') && unicode == Some('g') && !ctrl {
             return;
         }
         if self.pending_operator.is_some()
@@ -51,7 +71,11 @@ impl Engine {
                 if matches!(ch, 'd' | 'u' | 'f' | 'b' | 'e' | 'y') {
                     return;
                 }
-            } else if matches!(ch, 'j' | 'k') {
+            } else if matches!(ch, 'j' | 'k' | 'G' | 'H' | 'M' | 'L' | 'g') {
+                // #1772: `G`/`H`/`M`/`L` are the other single-key
+                // `'startofline'` commands, and `g` here is the bare
+                // first keystroke arming `pending_key` for a `g`-sequence
+                // (including `gg` itself) — see the doc comment above.
                 return;
             } else if ch.is_ascii_digit() && (ch != '0' || self.count.is_some()) {
                 return; // count digit in progress; cursor hasn't moved
@@ -2304,18 +2328,19 @@ impl Engine {
                         } else {
                             0
                         };
-                        // `gg`, like `G`/`H`/`M`/`L`, doesn't use `curswant` at
-                        // all — there's no remembered column to fall back on
-                        // (see `land_line_jump_cursor`'s own doc comment).
-                        // `'startofline'` (`Settings::startofline`, #876) is
-                        // OFF by default (Neovim's default; Vim's is ON), so
-                        // out of the box `gg` never jumps to column
-                        // 0/first-non-blank; it keeps the column the cursor
-                        // already had, clamped to the target line's length
-                        // (verified against `nvim --headless`, the conformance
-                        // oracle this repo's tests run against; see #806 review —
-                        // a real `vim` binary's `col('.')` after `gg` is not a
-                        // substitute for the actual nvim oracle used by
+                        // `gg`, like `G`/`H`/`M`/`L`, is `curswant`-preserving
+                        // (see `land_line_jump_cursor`'s own doc comment,
+                        // #1772). `'startofline'` (`Settings::startofline`,
+                        // #876) is OFF by default (Neovim's default; Vim's is
+                        // ON), so out of the box `gg` never jumps to column
+                        // 0/first-non-blank; it keeps the remembered desired
+                        // column (clamped to the target line's length), and
+                        // that column survives even an intervening jump
+                        // through a shorter line (verified against `nvim
+                        // --headless`, the conformance oracle this repo's
+                        // tests run against; see #806 review — a real `vim`
+                        // binary's `col('.')` after `gg` is not a substitute
+                        // for the actual nvim oracle used by
                         // `tests/nvim_conformance.rs`).
                         self.land_line_jump_cursor(target_line);
                     }
