@@ -2487,6 +2487,49 @@ mod tests {
                 );
             }
         }
+
+        /// #1773 — smoke-spec `modeswitch-alt-m-from-normal`: switching from
+        /// Vim Normal mode to VSCode mode via Alt-M must paint the status
+        /// bar hint exactly as README/the catalogue document it —
+        /// `EDIT  F1:palette  Alt-M:vim` — not `EDIT  F1:cmd  Alt-M:vim`.
+        /// `F1` does open the Command Palette either way, so this is purely
+        /// a label-text mismatch, not a functional gap; the painted text is
+        /// still the contract here, since it's what a user actually reads.
+        ///
+        /// **Verified RED against unfixed `develop`:** before this fix,
+        /// `Engine::mode_str`'s VSCode-mode arm returned the literal string
+        /// `"EDIT  F1:cmd  Alt-M:vim"`, so `screen.contains("F1:palette")`
+        /// failed (the screen had `F1:cmd` instead).
+        #[test]
+        fn alt_m_from_normal_shows_the_documented_f1_palette_hint_via_shell_app() {
+            let engine = plain_engine();
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                driver.screen_has("NORMAL"),
+                "precondition: a fresh engine starts in Vim Normal mode; \
+                 screen:\n{}",
+                driver.screen()
+            );
+
+            press(
+                driver,
+                quadraui::Key::Char('m'),
+                quadraui::Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+            );
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("EDIT  F1:palette  Alt-M:vim"),
+                "Alt-M from Vim Normal mode must switch to VSCode mode and \
+                 paint the documented status bar hint \
+                 'EDIT  F1:palette  Alt-M:vim'; screen:\n{screen}"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3742,7 +3785,7 @@ mod tests {
         /// #1760: the `Ln N, Col N` ruler must survive on the window
         /// status bar even once other optional left-side segments — a
         /// dirty-file marker (`[+]`), a git branch, and VS Code mode's
-        /// long `EDIT  F1:cmd  Alt-M:vim` hint — are all competing for the
+        /// long `EDIT  F1:palette  Alt-M:vim` hint — are all competing for the
         /// same 80-column width budget. Before this fix,
         /// `build_window_status_line` pushed `cursor_seg` *first* into
         /// `right`, which is the segment quadraui's `StatusBar::layout`
@@ -3776,7 +3819,7 @@ mod tests {
                 "fixture sanity: the git branch segment must paint; screen:\n{screen}"
             );
             assert!(
-                screen.contains("F1:cmd"),
+                screen.contains("F1:palette"),
                 "fixture sanity: VS Code mode's EDIT hint must paint; screen:\n{screen}"
             );
             assert!(

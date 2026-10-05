@@ -35,7 +35,7 @@ impl Engine {
             return match self.mode {
                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock => "SELECT",
                 Mode::Command => "COMMAND",
-                _ => "EDIT  F1:cmd  Alt-M:vim",
+                _ => "EDIT  F1:palette  Alt-M:vim",
             };
         }
         match self.mode {
