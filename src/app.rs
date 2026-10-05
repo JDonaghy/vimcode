@@ -8469,19 +8469,61 @@ impl App {
                 // an Alt+letter chord) leaves every following keystroke
                 // editing the buffer correctly *underneath* a dropdown
                 // that visually never goes away, exactly the "unexpected
-                // 'Go' menu dropdown" symptom. Closing here mirrors
-                // `handle_escape`'s own whole-menu close (same `close()`
-                // call) for the one case that handler can't reach: the
-                // key wasn't Escape, so `MenuSystem::handle` never ran
-                // that arm itself. Deliberately does not also return
-                // early or touch `engine.menu_bar_visible` — the event
-                // must still fall through to the rest of this dispatch
-                // (unchanged), and a plain Escape close already leaves the
-                // toggleable bar row itself visible too (checked manually
-                // while diagnosing this), so an unrecognised key closing
-                // only the dropdown is the narrower, consistent fix.
+                // 'Go' menu dropdown" symptom. Closing here mirrors the
+                // private `handle_escape`'s own whole-menu close inside
+                // `MenuSystem::handle` (same `close()` call) for the one
+                // case that handler can't reach: the key wasn't Escape, so
+                // `MenuSystem::handle` never ran that arm itself.
+                //
+                // This lives in *shared* `handle_dispatch`, not TUI-side
+                // wiring, so the same dismiss-on-unrecognised-key behaviour
+                // lands on GTK and macOS too, where `menu_bar_visible` is
+                // always `true` and `menu_open` is reachable by a plain
+                // mouse click on a bar label — see GTK's
+                // `unrecognised_key_closes_a_stale_open_dropdown_on_gtk_1763`
+                // (`src/gtk/testing.rs`) for that side's coverage.
+                //
+                // Deliberately does not also return early or consume the
+                // key (no `engine.menu_bar_visible` touch, no early
+                // return) — the event must still fall through to the rest
+                // of this dispatch unchanged. That is a conscious choice,
+                // not an oversight: a dropdown open from a genuine user
+                // click, dismissed by a stray letter, now also lets that
+                // letter reach and mutate the buffer underneath (a
+                // pre-existing leak this does not introduce — the key
+                // already flowed through before this arm existed, just
+                // with a stale dropdown left on top of it). Swallowing the
+                // key instead would avoid that, but would also silently
+                // eat whatever the user actually meant to type, which is
+                // the worse failure mode of the two. A plain Escape close
+                // already leaves the toggleable bar row itself visible too
+                // (TUI: `escape_closes_the_dropdown_but_leaves_the_
+                // toggleable_bar_row_visible_1763` below), so an
+                // unrecognised key closing only the dropdown — and letting
+                // the key fall through — is the narrower, consistent fix.
+                //
+                // NOT fixed here, and still open: #1763's own repro traces
+                // the spurious dropdown open back to a real macOS pty
+                // apparently collapsing a fast keystroke into an `Alt+g`
+                // chord — `TuiDriver` can't carry that modifier
+                // synthetically (see `alt_g_dropdown_does_not_survive_a_
+                // vim_dw_1763`'s own doc), so the mis-decode itself is
+                // neither reproduced nor fixed by this arm, and the
+                // mis-decoded keystroke is still swallowed by whichever
+                // `handle_alt_char`/menu-open arm actually consumes it
+                // upstream of this one. A follow-up issue for that
+                // raw-terminal-decode question (vimcode or quadraui) still
+                // needs to be filed — track it from there, not from this
+                // comment, once it exists.
+                //
+                // A generic "dismiss an open menu on any unrecognised key"
+                // is also arguably `quadraui::MenuSystem::handle`'s own
+                // policy to own (every quadraui consumer would want it,
+                // not just vimcode) rather than a vimcode-side patch — a
+                // quadraui issue for type-ahead/dismiss-on-any-key would
+                // let this arm be deleted later; also not yet filed.
                 quadraui::MenuEvent::Ignored => {
-                    if menu_open && matches!(event, quadraui::UiEvent::KeyPressed { .. }) {
+                    if menu_open && matches!(event, UiEvent::KeyPressed { .. }) {
                         menu_system.borrow_mut().close(backend);
                         self.draw_needed.set(true);
                     }

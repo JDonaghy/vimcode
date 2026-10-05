@@ -21,6 +21,14 @@ mod tests {
     //! seams. Nothing in `src/app.rs`, `src/render.rs`, or `src/tui_main/`
     //! (outside this file and the one `mod` declaration in `mod.rs`) changes.
     //!
+    //! **Exception:** #1763's two tests below (`alt_g_dropdown_does_not_
+    //! survive_a_vim_dw_1763` and `escape_closes_the_dropdown_but_leaves_
+    //! the_toggleable_bar_row_visible_1763`) exist specifically to cover a
+    //! genuine new `src/app.rs` change (the `MenuEvent::Ignored` arm in
+    //! `handle_dispatch`) — the invariant above does not hold for that one
+    //! commit. Everything else in this file still only drives
+    //! already-shipped code.
+    //!
     //! # Reading a failure here
     //!
     //! A test that panics *unwrapped* is a regression — it must not happen on
@@ -362,6 +370,45 @@ mod tests {
                 driver.screen_has("foo baz"),
                 "the `dw` motion must still reach the editor underneath (not \
                  get swallowed by the dropdown); screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// #1763 (review round 1, nit): backs up the `MenuEvent::Ignored`
+        /// arm's own comment claim that a plain Escape close ("`handle_
+        /// escape`'s own whole-menu close") leaves the toggleable menu
+        /// bar's row itself on screen — only the dropdown's items go
+        /// away. Previously "checked manually while diagnosing this" with
+        /// no test behind it; this makes that invariant durable.
+        #[test]
+        fn escape_closes_the_dropdown_but_leaves_the_toggleable_bar_row_visible_1763() {
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('g'),
+                modifiers: quadraui::Modifiers {
+                    alt: true,
+                    ..quadraui::Modifiers::default()
+                },
+                repeat: false,
+            });
+            assert!(
+                driver.screen_has("Go to File"),
+                "precondition: Alt+g must open the \"Go\" dropdown; screen:\n{}",
+                driver.screen()
+            );
+
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            assert!(
+                !driver.screen_has("Go to File"),
+                "Escape must close the open dropdown; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_has("Go"),
+                "Escape closing the dropdown must leave the toggleable bar \
+                 row itself (the \"Go\" label) on screen; screen:\n{}",
                 driver.screen()
             );
         }
