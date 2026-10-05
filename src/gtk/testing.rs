@@ -19680,6 +19680,95 @@ mod alt_rung {
                 );
             }
         }
+
+        fn plain_engine() -> Engine {
+            let mut engine = Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            engine
+        }
+
+        /// GTK mirror of `app_on_tui_tests.rs`'s
+        /// `alt_m_round_trip_hides_the_menu_bar_row_again_via_shell_app_1780`
+        /// — but pinning the *opposite* outcome. On GTK the drawn menu row
+        /// doubles as the client-side titlebar and `setup()` pins
+        /// `menu_bar_visible = true` for the engine's whole lifetime
+        /// (`menu_bar_toggleable` stays `false` — see the module doc on
+        /// `overlay_band_holds_only_the_title_bar_when_no_overlay_is_open_via_gtk_driver`).
+        /// `Engine::toggle_editor_mode`'s VSCode -> Vim arm is now gated on
+        /// `menu_bar_toggleable` (#1780 review) specifically so this round
+        /// trip leaves the titlebar/menu row alone on GTK, rather than
+        /// clearing `menu_bar_visible` and stranding GTK with a
+        /// reserved-but-blank titlebar strip with no in-app way back.
+        ///
+        /// **Verified RED against the naive #1780 fix (unconditional
+        /// `self.menu_bar_visible = false` in the Vim-mode arm, no
+        /// `menu_bar_toggleable` gate):** the second Alt-M would have
+        /// cleared `menu_bar_visible` on GTK too, so `screen_contains("File")`
+        /// below would fail.
+        #[test]
+        fn alt_m_round_trip_leaves_the_pinned_menu_bar_row_alone_on_gtk() {
+            let engine = plain_engine();
+            let mut h = harness(engine, 1400, 900);
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("File"),
+                "precondition: GTK's titlebar-doubling menu row is pinned \
+                 visible from `setup()`; painted: {:?}",
+                h.driver.painted_texts()
+            );
+            let row_before = h.menu_row_rect.get();
+            assert!(
+                row_before.height > 0.0,
+                "precondition: the menu row must have real painted height \
+                 before any Alt-M; rect: {row_before:?}"
+            );
+
+            let alt_m = Modifiers {
+                alt: true,
+                ..Default::default()
+            };
+
+            // First Alt-M: Vim -> VSCode.
+            press(&mut h.driver, Key::Char('m'), alt_m);
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("EDIT"),
+                "first Alt-M must switch to VSCode mode; painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                h.driver.screen_contains("File"),
+                "menu row must still paint in VSCode mode on GTK; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            // Second Alt-M: VSCode -> Vim. Status flips back, but — unlike
+            // TUI — the pinned titlebar/menu row must NOT disappear.
+            press(&mut h.driver, Key::Char('m'), alt_m);
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("NORMAL"),
+                "second Alt-M must switch back to Vim Normal mode; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                h.driver.screen_contains("File"),
+                "second Alt-M (VSCode -> Vim) must leave GTK's pinned \
+                 titlebar/menu row painted — clearing it would strand GTK \
+                 with a reserved-but-blank titlebar strip; painted: {:?}",
+                h.driver.painted_texts()
+            );
+            let row_after = h.menu_row_rect.get();
+            assert_eq!(
+                (row_after.y, row_after.height),
+                (row_before.y, row_before.height),
+                "the menu row's painted geometry must be unchanged by the \
+                 Alt-M round trip on GTK: before {row_before:?}, after \
+                 {row_after:?}"
+            );
+        }
     }
 
     /// #1745 review: the only thing standing between GTK and the whole

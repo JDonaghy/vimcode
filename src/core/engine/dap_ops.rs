@@ -1444,12 +1444,24 @@ impl Engine {
         } else {
             self.mode = Mode::Normal;
             // #1780: VSCode mode's own entry above unconditionally reveals
-            // the menu-bar row (`menu_bar_visible = true`); without the
+            // the menu-bar row (`menu_bar_visible = true`); without a
             // mirror-image clear here, toggling straight back to Vim mode
             // left that row permanently on screen (shifting the activity
             // bar/sidebar/editor content down by one row forever), since
             // nothing else in the Vim-mode arm ever flips it back off.
-            self.menu_bar_visible = false;
+            //
+            // Gated on `menu_bar_toggleable` (true only on backends with a
+            // runner-drawn, hideable menu bar — i.e. TUI): on a
+            // `window_chrome` backend (GTK, future Win-GUI) the drawn menu
+            // bar doubles as the client-side titlebar and is pinned visible
+            // once at `App::setup` (`menu_bar_toggleable` stays `false`
+            // there). Clearing `menu_bar_visible` unconditionally would
+            // leave those backends with a reserved-but-blank titlebar strip
+            // after a VSCode->Vim round trip, with no in-app way back short
+            // of `:set menu` (see review discussion on #1780).
+            if self.menu_bar_toggleable {
+                self.menu_bar_visible = false;
+            }
         }
         let _ = self.settings.save();
     }

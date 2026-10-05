@@ -2530,6 +2530,32 @@ mod tests {
                  'EDIT  F1:palette  Alt-M:vim'; screen:\n{screen}"
             );
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #1780 fix-iteration driver-tier coverage
+    // ─────────────────────────────────────────────────────────────────────────
+    /// A #1780 mode-toggle regression test does not belong inside
+    /// `vscode_mode_alt_rung_1744` — that module is scoped to the five
+    /// brand-new VS Code-mode chords #1744 fixed, not mode-toggle chrome —
+    /// so it gets its own sibling module instead (#1780 review). The GTK
+    /// mirror lives in `src/gtk/testing.rs`'s `mod alt_rung_1744` (appended
+    /// there rather than split into its own module, matching that file's
+    /// existing layout).
+    mod modeswitch_1780 {
+        use super::*;
+
+        fn press(
+            driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            key: quadraui::Key,
+            modifiers: quadraui::Modifiers,
+        ) {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key,
+                modifiers,
+                repeat: false,
+            });
+        }
 
         /// #1780 — bugbash catalogue scenario `modeswitch-alt-m-back-to-vim`:
         /// a second Alt-M (VSCode → Vim) must remove the menu-bar row the
@@ -2540,17 +2566,32 @@ mod tests {
         /// row — and the one-row downward shift of the activity bar/sidebar/
         /// editor content it causes — was permanent after the first toggle.
         /// "File" is the menu row's own always-first label (same signal
-        /// `colon_opens_the_command_line_after_an_alt_chord_swallows_
-        /// escape_1764` and `hamburger_relocated_click_after_reveal_hides_
-        /// menu_bar_via_app_on_tui` both key off of).
+        /// `colon_opens_the_command_line_after_an_alt_chord_swallows_escape_1764`
+        /// and `hamburger_relocated_click_after_reveal_hides_menu_bar_via_app_on_tui`
+        /// both key off of). The issue's own
+        /// evidence is a *geometry* shift ("all other rows have shifted
+        /// down by one"), not just a label disappearing, so this also pins
+        /// the editor buffer's own painted row back to its pre-toggle `y`
+        /// — a half-fix that stopped painting "File" but left the row
+        /// reserved would still move the buffer content down and fail
+        /// this. Tracked via a unique marker inserted into the buffer
+        /// rather than a sidebar label: VSCode mode collapses the
+        /// default-active hamburger panel's body entirely (no header, no
+        /// tree), and switching to Explorer to get a stable sidebar label
+        /// would steal keyboard focus from the editor and swallow the
+        /// Alt-M below before it ever reaches `route_alt_key`.
         ///
         /// **Verified RED against unfixed `develop`:** before this fix,
         /// `toggle_editor_mode`'s Vim-mode arm never touched
         /// `menu_bar_visible`, so after the second Alt-M below the screen
-        /// still painted "File" and this test's final assertion failed.
+        /// still painted "File" and the marker stayed shifted down by one
+        /// row — both final assertions failed.
         #[test]
         fn alt_m_round_trip_hides_the_menu_bar_row_again_via_shell_app_1780() {
-            let engine = plain_engine();
+            let mut engine = plain_engine();
+            // Unique marker — see this fn's doc comment for why the editor
+            // buffer, not a sidebar label, is what this test tracks.
+            engine.buffer_mut().insert(0, "ZQXW1780MARKER\n");
             let mut h = harness(engine);
             let driver = &mut h.driver;
 
@@ -2560,6 +2601,10 @@ mod tests {
                  row; screen:\n{}",
                 driver.screen()
             );
+            let marker_y_before = driver
+                .find_bounds("ZQXW1780MARKER")
+                .expect("precondition: the editor buffer must paint before any Alt-M")
+                .y;
 
             let alt_m = quadraui::Modifiers {
                 alt: true,
@@ -2569,7 +2614,7 @@ mod tests {
             // First Alt-M: Vim -> VSCode. The menu-bar row must appear.
             press(driver, quadraui::Key::Char('m'), alt_m);
             assert!(
-                driver.screen_has("EDIT"),
+                driver.screen_contains("EDIT"),
                 "first Alt-M must switch to VSCode mode; screen:\n{}",
                 driver.screen()
             );
@@ -2578,6 +2623,16 @@ mod tests {
                 "first Alt-M (Vim -> VSCode) must reveal the menu-bar row; \
                  screen:\n{}",
                 driver.screen()
+            );
+            let marker_y_with_menu_bar = driver
+                .find_bounds("ZQXW1780MARKER")
+                .expect("the editor buffer must still paint with the menu bar shown")
+                .y;
+            assert!(
+                marker_y_with_menu_bar > marker_y_before,
+                "revealing the menu-bar row must push the editor content \
+                 down; before {marker_y_before}, with menu bar \
+                 {marker_y_with_menu_bar}"
             );
 
             // Second Alt-M: VSCode -> Vim. The status bar flips back...
@@ -2595,6 +2650,16 @@ mod tests {
                 !screen.contains("File"),
                 "second Alt-M (VSCode -> Vim) must remove the menu-bar row \
                  the first toggle added; screen:\n{screen}"
+            );
+            let marker_y_after = driver
+                .find_bounds("ZQXW1780MARKER")
+                .expect("the editor buffer must still paint after the round trip")
+                .y;
+            assert_eq!(
+                marker_y_after, marker_y_before,
+                "the editor content (and everything below the menu row) \
+                 must return to its pre-toggle row, not stay shifted down \
+                 by the menu-bar row's height; screen:\n{screen}"
             );
         }
     }
