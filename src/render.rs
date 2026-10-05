@@ -13016,7 +13016,11 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
         &[
             MenuItemData {
                 label: "New Tab",
-                shortcut: "Ctrl+T",
+                // #1789: see `core::engine::mod::PALETTE_COMMANDS`'s
+                // "File: New Tab" entry — this used to mirror its stale
+                // "Ctrl+T" claim, but that chord is live-bound to the
+                // integrated terminal toggle, not `tabnew`.
+                shortcut: "",
                 vscode_shortcut: "",
                 action: "tabnew",
                 enabled: true,

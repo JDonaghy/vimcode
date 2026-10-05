@@ -100,9 +100,14 @@ steps:
   # underlying byte stream is silent — this step is the one tier that can
   # actually see Windows Terminal's own repaint behaviour, independent of
   # what bytes `vcd.exe` sent it). "a horizontally stacked tab group open" —
-  # `Ctrl+T` opens vimcode's own second editor tab (`MENU_STRUCTURE`'s "New
-  # Tab", shortcut `Ctrl+T`), landing two tabs side by side in vimcode's own
-  # tab bar.
+  # vimcode#1789 corrected this step's own premise: `Ctrl+T` does NOT open
+  # a second editor tab (the Command Palette's "File: New Tab" row used to
+  # claim it did, but that was the bug — see `PALETTE_COMMANDS`'s own entry
+  # and `tests/smoke-spec/catalogue.yaml`'s nearby journeys). The live
+  # binding is `panel_keys.open_terminal` — it opens/focuses vimcode's
+  # integrated terminal panel instead, which is still "more going on than
+  # one blank tab" for this idle-flicker precondition's purposes, just not
+  # a second entry in vimcode's own tab bar.
   - type: key
     id: open-second-tab
     key: "ctrl+t"

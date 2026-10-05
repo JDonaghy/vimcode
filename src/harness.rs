@@ -6427,3 +6427,73 @@ mod issue_1427_menu_bar_reveal_shared {
         );
     }
 }
+
+// #1789: bugbash finding — the Command Palette's "File: New Tab" row
+// advertises `Ctrl+T` as its shortcut hint, but the chord's real, live
+// binding is `panel_keys.open_terminal` (README § "Integrated Terminal":
+// "`Ctrl-T` (Normal mode) — toggle the integrated terminal panel";
+// `PanelKeys::open_terminal`'s own `#[serde(default = "pk_open_terminal")]`
+// → `"<C-t>"`, registered globally by `render::register_panel_accelerators`
+// regardless of Vim/VSCode mode). Pressing Ctrl+T opens/focuses the
+// terminal panel, never creates a second tab — exactly the mismatch
+// vimcode#1789 reports, reproduced here as a cross-backend conformance
+// scenario rather than fixed by changing the live keybinding: the terminal
+// toggle is the one README documents as intentional, so the bug is the
+// palette's own stale label, not the chord's behaviour. (The chord's own
+// live behaviour already has coverage elsewhere — e.g.
+// `menu_terminal_activation_opens_terminal_pane` below — this scenario
+// only needs to pin the label.)
+#[cfg(test)]
+mod issue_1789_command_palette_new_tab_shortcut_lies {
+    use super::*;
+
+    fn engine_vscode_fixture() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine
+    }
+
+    /// The Command Palette's own displayed shortcut hint for "File: New
+    /// Tab" must not claim `Ctrl+T` — that chord is live-bound to the
+    /// integrated terminal toggle (`panel_keys.open_terminal`), never to
+    /// `tabnew`.
+    ///
+    /// RED against unfixed `develop`: `PALETTE_COMMANDS`'s `"File: New
+    /// Tab"` entry hard-codes `shortcut: "Ctrl+T"` with an empty
+    /// `vscode_shortcut` (falls back to `shortcut`), so the palette row
+    /// paints "Ctrl+T" right next to "File: New Tab" in every mode.
+    crate::backend_conformance! {
+        label: command_palette_new_tab_shortcut_matches_live_binding,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_vscode_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            // Opened via F1 (`PALETTE_COMMANDS`'s own "View: Command
+            // Palette" entry, `vscode_shortcut: "F1"`, handled directly in
+            // both modes by `Engine::handle_key`/`vscode.rs`) rather than
+            // `:CommandPalette` — VSCode mode has no Normal-mode ':'
+            // gesture, so typing ':' there inserts a literal colon into
+            // the buffer instead of opening the command line.
+            driver.press_named(NamedKey::F(1));
+            driver.type_text("New Tab");
+            // "File:" alone, not the full "File: New Tab" phrase — TUI
+            // paints each word of a palette row as its own text run with
+            // no joining space (`command_palette_filters_and_escape_
+            // dismisses`'s own doc spells this out), so a needle spanning
+            // the "New"/"Tab" word boundary never matches there even
+            // though the phrase is plainly on screen.
+            assert!(
+                screen_row_has(driver, "File:"),
+                "typing 'New Tab' must keep the 'File: New Tab' entry visible"
+            );
+            assert!(
+                !screen_row_has(driver, "Ctrl+T"),
+                "#1789: the palette must not advertise Ctrl+T as 'File: \
+                 New Tab's shortcut — that chord is live-bound to the \
+                 integrated terminal toggle (panel_keys.open_terminal), \
+                 never to tabnew"
+            );
+        },
+    }
+}
