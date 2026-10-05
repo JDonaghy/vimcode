@@ -763,10 +763,14 @@ fn test_vscode_select_all_after_multicursor_edit_then_type_replaces_buffer() {
     e.view_mut().cursor = Cursor { line: 0, col: 0 };
     e.handle_key("d", Some('d'), true); // select first "foo"
     e.handle_key("d", Some('d'), true); // add cursor at second "foo"
+
+    // Precondition: Ctrl+D Ctrl+D added exactly one extra cursor.
     assert_eq!(e.view().extra_cursors.len(), 1);
     e.handle_key("X", Some('X'), false);
     assert_eq!(buf(&e), "X bar X");
-    // Two cursors remain after the multi-cursor edit.
+    // Load-bearing: the extra cursor survives the multi-cursor edit itself
+    // (this is the bug's actual precondition — Ctrl+A only crashes if a
+    // stale extra cursor is still here afterwards).
     assert_eq!(e.view().extra_cursors.len(), 1);
     // Ctrl+A: select all. This used to leave the stale extra cursor in
     // place, which crashed the very next keystroke.

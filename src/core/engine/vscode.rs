@@ -336,12 +336,15 @@ impl Engine {
     ///
     /// #1785: select-all collapses to a single whole-buffer selection, so any
     /// multi-cursor state left over from a prior Ctrl+D/Ctrl+Shift+L edit must
-    /// be cleared here. Otherwise the next typed character hits the
-    /// multi-cursor-with-selection branch below, which assumes every extra
-    /// cursor carries its own matched-length selection from Ctrl+D — but
-    /// after Ctrl+A the "selection" is the whole document, so that branch
-    /// computes a garbage (underflowed) char index per stale extra cursor and
-    /// `delete_with_undo` panics deep inside ropey on an out-of-bounds range.
+    /// be cleared here. Otherwise the next typed character hits the inline
+    /// multi-cursor-with-selection branch in `handle_vscode_key`'s `unicode`
+    /// (catch-all `_`) arm — the sibling of the dedicated
+    /// `vscode_mc_delete_selections` method, same underflow shape, different
+    /// call site — which assumes every extra cursor carries its own
+    /// matched-length selection from Ctrl+D. After Ctrl+A the "selection" is
+    /// the whole document instead, so that branch computes a garbage
+    /// (underflowed) char index per stale extra cursor and `delete_with_undo`
+    /// panics deep inside ropey on an out-of-bounds range.
     fn vscode_select_all(&mut self) {
         self.view_mut().extra_cursors.clear();
         self.visual_anchor = Some(Cursor { line: 0, col: 0 });
