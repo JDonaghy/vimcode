@@ -2856,6 +2856,135 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // #1787 fix-iteration driver-tier coverage
+    // ─────────────────────────────────────────────────────────────────────────
+    /// #1787 — bugbash catalogue scenario `modeswitch-alt-m-from-insert`
+    /// (variant: undo first): in VSCode mode, typing a character opens an
+    /// auto-trigger completion popup (`Engine::trigger_completion`, called
+    /// unconditionally after every plain-char insert —
+    /// `src/core/engine/vscode.rs`). Ctrl+Z then undoes that insert
+    /// (`"z" => { self.vscode_clear_selection(); self.undo(); ... }`, same
+    /// file) but `Engine::undo` (`src/core/engine/buffers.rs`) never calls
+    /// `dismiss_completion()`, so the popup survives with its *pre-undo*
+    /// candidate text still cached (`completion_candidates` is only ever
+    /// narrowed/replaced by a fresh `trigger_completion` call, which undo
+    /// never makes). Alt-M (`Engine::toggle_editor_mode`,
+    /// `src/core/engine/dap_ops.rs`) doesn't call `dismiss_completion`
+    /// either, so the stale popup rides along into Vim mode and paints over
+    /// whatever chrome happens to occupy that screen region — the sidebar,
+    /// per the issue's own report. It only ever clears on the *next*
+    /// keypress, because `src/core/engine/keys.rs`'s own "Safety: dismiss
+    /// completion popup if it's visible outside Insert mode" rung only runs
+    /// at the top of the *next* non-Insert, non-VSCode key dispatch — it
+    /// cannot run retroactively the instant the mode itself flips.
+    ///
+    /// This test drives the issue's exact repro
+    /// (type → Ctrl+Z → Alt-M) with the Explorer sidebar painted (the real
+    /// `App`'s shadow `engine.app_shell` defaults to Explorer-active, same
+    /// precondition `driver_click_on_every_activity_bar_icon_opens_its_
+    /// panel_via_shell_app` above relies on) and asserts the *painted*
+    /// screen no longer shows the stale pre-undo candidate text — not that
+    /// some `completion_idx`/`completion_candidates` field was cleared,
+    /// which could be true while a stale glyph still sits on the grid from
+    /// an earlier paint.
+    ///
+    /// **Verified RED against unfixed `develop`:** before this fix, neither
+    /// `Engine::undo` nor `Engine::toggle_editor_mode` dismissed the
+    /// completion popup, so `completion_candidates` still held `"sXmoke"`
+    /// (the whole word under the cursor, found by `word_completions_
+    /// nearby`'s own `word != prefix` buffer self-match) straight through
+    /// both the undo and the Alt-M below; `screen.contains("sXmoke")` was
+    /// true and this test's final assertion failed.
+    #[test]
+    fn stale_pre_undo_completion_popup_is_dismissed_by_undo_1787() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1787_stale_pre_undo_completion_popup_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker_file = dir.join("zqxw1787.txt");
+        std::fs::write(&marker_file, "marker").unwrap();
+
+        let mut engine = plain_engine();
+        engine.cwd = dir.clone();
+        engine.explorer_reveal_path(&marker_file);
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.mode = crate::core::Mode::Insert;
+        engine.buffer_mut().insert(0, "smoke");
+        engine.view_mut().cursor = crate::core::Cursor { line: 0, col: 1 };
+        let mut h = harness(engine);
+        let driver = &mut h.driver;
+
+        assert!(
+            driver.screen_has("zqxw1787.txt"),
+            "precondition: Explorer must be the painted sidebar before any \
+             of this test's keys; screen:\n{}",
+            driver.screen()
+        );
+
+        let press = |driver: &mut quadraui::tui::testing::TuiDriver<_>,
+                     key: quadraui::Key,
+                     modifiers: quadraui::Modifiers| {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key,
+                modifiers,
+                repeat: false,
+            });
+        };
+
+        // Type 'X' mid-word: "smoke" -> "sXmoke". VSCode mode auto-triggers
+        // completion after every plain-char insert.
+        press(
+            driver,
+            quadraui::Key::Char('X'),
+            quadraui::Modifiers::default(),
+        );
+        assert!(
+            driver.screen_has("sXmoke"),
+            "precondition: typing 'X' must open the auto-trigger completion \
+             popup showing the whole word under the cursor as a candidate; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        // Ctrl+Z: undo the insert. The buffer reverts to "smoke"...
+        press(
+            driver,
+            quadraui::Key::Char('z'),
+            quadraui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+
+        // ...then Alt-M: switch VSCode -> Vim mode.
+        press(
+            driver,
+            quadraui::Key::Char('m'),
+            quadraui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        );
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("NORMAL"),
+            "Alt-M must switch back to Vim Normal mode; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("sXmoke"),
+            "the completion popup's stale pre-undo candidate text must not \
+             survive an undo + Alt-M mode switch, overlapping the Explorer \
+             sidebar until the next cursor-movement keypress; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Popups
     // ─────────────────────────────────────────────────────────────────────────
     mod popups {
