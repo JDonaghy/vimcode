@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use super::dap::DapServer;
 use super::extensions;
 use super::extensions::Platform;
+#[cfg(not(target_os = "windows"))]
 use super::tool_acquire::Arch;
 
 // ---------------------------------------------------------------------------
