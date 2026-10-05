@@ -4177,6 +4177,19 @@ pub fn route_terminal_resize(engine: &mut Engine, panel_cols: u16, rows: u16) {
 // visible and TUI's is visible in VSCode mode, so the reachable case is TUI in
 // Vim mode. Converging the rung does not change that ordering — it is the same
 // on both backends, which is the point.
+//
+// #1764 (non-blocking review note) narrows this slightly on the *toggleable*
+// (TUI) profile only: `alt_mnemonic_open_allowed` now refuses a fresh menu
+// open while mid-text-entry (Insert/Replace) or mid-command-line
+// (Command/Search), so on TUI a Shift+Alt+F pressed in one of those modes no
+// longer gets swallowed by the menu tier — it reaches this arm and runs
+// `lsp_format_current()` instead. GTK (never toggleable) is unaffected: its
+// menu tier still claims the chord first in every mode, exactly as before.
+// Plausibly an improvement (formatting while typing is a reasonable thing to
+// want), but it is a real, if narrow, ordering change worth knowing about
+// when reading the "reachable case is TUI in Vim mode" sentence above — that
+// sentence is now true only for the menu-open half of the story, not for
+// where this specific chord ends up executing on every TUI mode.
 
 /// Lower bound Alt+Left clamps the sidebar width to, in `AppShell` width units
 /// (columns on TUI, line-heights on GTK — see
@@ -4218,26 +4231,45 @@ pub fn alt_resized_sidebar_width(current: u16, delta: i32) -> u16 {
 /// that is the standard xterm 8-bit-meta encoding for Alt and a raw
 /// terminal reader cannot always tell the two apart from bytes alone.
 ///
-/// Letting that chord open a dropdown while the engine is mid-text-entry
-/// (`Insert`/`Replace`) or mid-command-line (`Command`/`Search`) is strictly
-/// worse than not: it swallows the keystroke that — if this really was a
-/// collapsed Escape — was supposed to return to `Normal` mode, and does so
-/// silently, with no error and no visible cue beyond the dropdown itself.
-/// Every subsequent keystroke then falls through as literal Insert-mode
-/// text (or Command-line text), which is exactly #1764's reported
+/// That ambiguity is **terminal-only**: it exists because a pty delivers Alt
+/// as a byte-level encoding a raw reader has to *infer* rather than a
+/// discrete, unambiguous modifier bit. `menu_bar_toggleable` (true only on
+/// the `cell`/TUI profile — `App::setup`'s own doc) is this crate's existing,
+/// non-`cfg` discriminator for exactly that backend shape (see e.g.
+/// `App::handle_dispatch`'s `menu_bar_intercept_rect` call and
+/// `render::menu_bar_intercept_rect`'s own doc). On every other backend
+/// (GTK/macOS/Win — always `false` here) a `Modifiers { alt: true }`
+/// `KeyPressed` is a real, unambiguous keystroke from a real keyboard; there
+/// is no pty to fuse anything, so the standard Alt+<mnemonic> menu gesture
+/// stays allowed in every mode there, matching pre-#1764 behaviour exactly.
+///
+/// On the toggleable (TUI) profile, letting the fused chord open a dropdown
+/// while the engine is mid-text-entry (`Insert`/`Replace`) or
+/// mid-command-line (`Command`/`Search`) is strictly worse than not: it
+/// swallows the keystroke that — if this really was a collapsed Escape —
+/// was supposed to return to `Normal` mode, and does so silently, with no
+/// error and no visible cue beyond the dropdown itself. Every subsequent
+/// keystroke then falls through as literal Insert-mode text (or
+/// Command-line text), which is exactly #1764's reported
 /// `foo bar bazg0wdw:%d`-shaped corruption. `Normal` and the `Visual*`
-/// family are where a menu action is conventionally meaningful (and where
-/// an unclaimed bare key is a harmless pending-key latch, not literal
-/// insertion), so only those allow the open.
+/// family are where a menu action is conventionally meaningful there (and
+/// where an unclaimed bare key is a harmless pending-key latch, not literal
+/// insertion), so only those allow the open on that profile.
 ///
 /// The other half of this fix is `crate::app::App::handle_key_press`'s own
 /// `AltKeyOutcome::Fallthrough` arm: once this function has kept the menu
-/// from stealing the chord, that arm treats an unclaimed Alt chord as an
-/// implicit Escape instead of letting `Engine::handle_key` see it as the
-/// bare, unmodified key (which has no `alt` parameter to even know the
-/// difference).
-pub fn alt_mnemonic_open_allowed(mode: crate::core::Mode) -> bool {
+/// from stealing the chord, that arm treats an unclaimed *printable-char*
+/// Alt chord (see `alt_chord_is_printable_char`) as an implicit Escape
+/// instead of letting `Engine::handle_key` see it as the bare, unmodified
+/// key (which has no `alt` parameter to even know the difference). That
+/// substitution is not itself gated on `menu_bar_toggleable` — see its own
+/// call site for why a bare-letter fallthrough is equally wrong to redeliver
+/// on every backend, pty or not.
+pub fn alt_mnemonic_open_allowed(mode: crate::core::Mode, menu_bar_toggleable: bool) -> bool {
     use crate::core::Mode;
+    if !menu_bar_toggleable {
+        return true;
+    }
     matches!(
         mode,
         Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
@@ -4294,6 +4326,26 @@ fn alt_chord_base(key_name: &str, unicode: Option<char>) -> Option<AltBase> {
     unicode.or(from_name).map(AltBase::Char)
 }
 
+/// #1764: whether an unclaimed Alt chord's base key is a printable
+/// character (letter/digit/punctuation) rather than a named key
+/// (`Enter`/`BackSpace`/`Up`/`Down`/`Home`/`Delete`/`Page_Up`/…). Only the
+/// printable-char shape is what a real pty's Escape-then-letter fusion (the
+/// #1763/#1764 mechanism — the standard xterm 8-bit-meta encoding collapsing
+/// a fast `Escape` + letter into one `Alt+<letter>` byte sequence) can
+/// produce; a named key can never be the second half of that fusion.
+///
+/// Exposed for `App::handle_key_press`'s `AltKeyOutcome::Fallthrough` arm,
+/// which must not treat *every* unclaimed Alt chord as an implicit Escape —
+/// doing so swallowed pre-existing, meaningful bare-key fallthroughs for
+/// named keys (`Alt+Enter`/`Alt+BackSpace` inserting/deleting in Insert
+/// mode, `Alt+Up`/`Alt+Down` moving the cursor in Vim mode outside VSCode
+/// mode, `Alt+]`/`Alt+[` falling through outside Insert mode per
+/// [`route_alt_key`]'s own comment on that arm) that have nothing to do with
+/// the pty-fusion bug this function exists to let that arm recognise.
+pub(crate) fn alt_chord_is_printable_char(key_name: &str, unicode: Option<char>) -> bool {
+    matches!(alt_chord_base(key_name, unicode), Some(AltBase::Char(_)))
+}
+
 /// The single statement of what **VSCode mode** means for an Alt chord: the
 /// `Alt_*` key name `Engine::handle_vscode_key` decodes, or `None` when the
 /// chord is not a VS Code editor command.
@@ -4328,8 +4380,16 @@ fn vscode_alt_key_name(base: AltBase, shift: bool) -> Option<&'static str> {
 ///
 /// Call it with the backend's own key spelling (see [`alt_chord_base`]) once
 /// the menu tier above has declined the event. Returns [`AltKeyOutcome`];
-/// `Fallthrough` means nothing here claimed the chord and the caller must keep
-/// dispatching.
+/// `Fallthrough` means nothing here claimed the chord. Through #1763, the
+/// caller always kept dispatching it as if `alt` had never been set — #1764
+/// changed that for a chord whose base is a printable character (see
+/// [`alt_chord_is_printable_char`]): `App::handle_key_press`'s
+/// `Fallthrough` arm now treats *that* shape as an implicit Escape instead
+/// of redelivering the bare key, so this rung is no longer a pure filter for
+/// printable-char chords — only for the named-key chords (`Enter`,
+/// `BackSpace`, `Home`/`End`/`Delete`/`Page_Up`/`Page_Down`, and `Left`/
+/// `Right`/`Up`/`Down` outside the arms above) that still fall all the way
+/// through exactly as before.
 ///
 /// `alt == false` is an immediate `Fallthrough`, so a caller may invoke this
 /// unconditionally rather than wrapping it in its own modifier test.
@@ -5906,7 +5966,12 @@ pub fn disarm_hamburger_stale_click_guard(engine: &mut Engine) {
 ///    `engine.menu_bar_visible = true` and lets the event keep flowing: the
 ///    caller's own `MenuSystem` intercept, called immediately after this
 ///    returns `None`, is what actually opens the menu using the
-///    just-flipped flag.
+///    just-flipped flag. #1764: gated on the same
+///    [`alt_mnemonic_open_allowed`] predicate the caller's intercept uses,
+///    so the reveal and the open stay in lock-step — a mode this predicate
+///    refuses (mid-text-entry on the toggleable profile) never reveals the
+///    bar in the first place, rather than revealing it and then having the
+///    caller refuse to open anything into it.
 /// 2. **Stale hamburger-corner click** — revealing the bar shifts the whole
 ///    activity bar (hamburger included) down one row; a second click at the
 ///    *exact screen position* that revealed it (muscle memory) lands one row
@@ -5938,7 +6003,16 @@ pub fn route_menu_bar_reveal(
 ) -> Option<quadraui::Reaction> {
     if !engine.menu_bar_visible {
         if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
-            if modifiers.alt {
+            // #1764 (review finding, round 1): this shim and the caller's
+            // own `MenuSystem` intercept are two halves of one action (see
+            // this function's own doc, point 1) — gating only the intercept
+            // and not this reveal left the bar *half*-opened: a fused pty
+            // chord flipped `menu_bar_visible` true here, the caller then
+            // refused to open the dropdown, and the bar row stayed revealed
+            // with nothing in it, consuming a terminal row and shifting the
+            // whole layout for the rest of the session. Same predicate as
+            // the caller's gate, so the two halves agree in every mode.
+            if modifiers.alt && alt_mnemonic_open_allowed(engine.mode, engine.menu_bar_toggleable) {
                 if let quadraui::Key::Char(c) = key {
                     let bar = engine.menu_system.borrow().menu_bar();
                     if bar.find_alt_target(*c).is_some() {
@@ -38205,8 +38279,16 @@ mod alt_key_router_tests {
         assert_eq!(outcome, AltKeyOutcome::ResizeSidebar(-1));
     }
 
-    /// A chord with no arm must fall through untouched — the rung is a filter,
-    /// not a sink. `Alt+q` is deliberately not bound to anything.
+    /// A chord with no arm must fall through untouched — this rung itself
+    /// never sinks it. `Alt+q` is deliberately not bound to anything.
+    ///
+    /// #1764: this rung's own `Fallthrough` return is no longer the end of
+    /// the story for a printable-char base like `'q'` — the caller
+    /// (`App::handle_key_press`'s `Fallthrough` arm) now substitutes an
+    /// implicit Escape for it instead of redelivering the bare key. That
+    /// substitution lives in `app.rs`, one layer above what this function
+    /// and this test can see; what this test still pins is this rung's own
+    /// contract, that it does not claim the chord itself.
     #[test]
     fn an_unclaimed_alt_chord_falls_through_on_both_spellings() {
         let unbound = Chord {
@@ -38237,6 +38319,39 @@ mod alt_key_router_tests {
             e.buffer().to_string().starts_with("alpha\n"),
             "a plain Down must not have been decoded as `Alt_Down`"
         );
+    }
+
+    /// #1764 (review nit, round 1): every other predicate on this rung has
+    /// its own exhaustive-over-`Mode` unit test here; `alt_mnemonic_open_
+    /// allowed` had none. Pins both halves of its contract: on the
+    /// toggleable (TUI) profile only Normal/Visual* allow a fresh open, and
+    /// on every other (GTK/macOS/Win) profile every mode allows it — there
+    /// is no pty-fusion ambiguity to defend against there.
+    #[test]
+    fn alt_mnemonic_open_allowed_is_normal_and_visual_only_on_the_toggleable_profile() {
+        let toggleable_allowed = [
+            Mode::Normal,
+            Mode::Visual,
+            Mode::VisualLine,
+            Mode::VisualBlock,
+        ];
+        let toggleable_blocked = [Mode::Insert, Mode::Replace, Mode::Command, Mode::Search];
+        for mode in toggleable_allowed {
+            assert!(
+                alt_mnemonic_open_allowed(mode, true),
+                "{mode:?} must allow a fresh mnemonic open on the toggleable profile"
+            );
+            // Every mode is allowed on a non-toggleable (GTK/macOS/Win)
+            // profile — there is no pty to fuse an Escape into the chord.
+            assert!(alt_mnemonic_open_allowed(mode, false));
+        }
+        for mode in toggleable_blocked {
+            assert!(
+                !alt_mnemonic_open_allowed(mode, true),
+                "{mode:?} must block a fresh mnemonic open on the toggleable profile"
+            );
+            assert!(alt_mnemonic_open_allowed(mode, false));
+        }
     }
 }
 

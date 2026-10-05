@@ -15290,28 +15290,34 @@ mod app_icon {
         );
     }
 
-    /// #1764 (follow-up to #1763): the same shared `App::handle_dispatch`
-    /// fix `unrecognised_key_closes_a_stale_open_dropdown_on_gtk_1763` just
-    /// above covers also has to stop a dropdown from *opening* in the first
-    /// place when the engine is mid-text-entry — see `render::alt_mnemonic_
-    /// open_allowed`'s own doc for why. #1763's own bugbash finding traced
-    /// a real pty collapsing a fast Escape-then-letter into one `Alt+g`
-    /// chord; letting that chord open the "Go" dropdown swallows the Escape
-    /// it stood in for and leaves Insert mode stuck for every following
-    /// keystroke — #1764's reported `foo bar bazg0wdw:%d` corruption.
+    /// #1764 (follow-up to #1763, revised in review round 1): the fix for
+    /// #1763/#1764's pty-fusion bug (a real macOS pty can collapse a fast
+    /// Escape-then-letter into one `Alt+<letter>` chord — see
+    /// `render::alt_mnemonic_open_allowed`'s own doc) is gated on
+    /// `engine.menu_bar_toggleable`, the existing discriminator for "this is
+    /// the raw-terminal profile a pty can even fuse bytes for"
+    /// (`App::setup`'s own doc — only ever `true` on the `cell`/TUI
+    /// profile). GTK's menu bar is always visible and a `Modifiers { alt:
+    /// true }` `KeyPressed` there is a real, unambiguous keystroke from a
+    /// real keyboard — there is no pty to fuse anything — so the standard
+    /// Alt+<mnemonic> menu gesture must keep working in every mode on GTK,
+    /// including mid-text-entry, exactly as it did before #1764.
     ///
-    /// GTK can't reproduce the pty collapse itself, but it *can* dispatch a
-    /// real `Alt+g` chord directly (`alt_press`, unlike `TuiDriver::
-    /// type_char`, which never carries `alt: true`) while genuinely in
-    /// Insert mode, exercising the identical shared code this issue's TUI
-    /// regression test (`app_on_tui_tests.rs`'s `colon_opens_the_command_
-    /// line_after_an_alt_chord_swallows_escape_1764`) does.
+    /// An earlier version of this test (round 1 of this issue) asserted the
+    /// opposite — that Alt+g must *not* open the dropdown and must instead
+    /// be swallowed as an implicit Escape — which was itself the regression
+    /// a review caught: it cemented the loss of ordinary mnemonic menu
+    /// access on a backend where the ambiguity #1764 exists for cannot
+    /// occur. This version pins the restored, correct behaviour instead.
     ///
-    /// **Verified RED against unfixed `develop`:** before this fix, "Go to
-    /// File" painted and the status bar stayed on `INSERT` after the
-    /// Alt+g chord.
+    /// **Verified RED against the round-1 fix (`menu_bar_toggleable` not yet
+    /// threaded through `alt_mnemonic_open_allowed`):** before this round,
+    /// `alt_mnemonic_open_allowed` ignored the backend shape entirely, so
+    /// GTK's Alt+g in Insert mode was blocked exactly like TUI's — "Go to
+    /// File" never painted and the status bar stayed on `INSERT` — failing
+    /// the assertions below.
     #[test]
-    fn alt_mnemonic_does_not_steal_the_menu_from_insert_mode_on_gtk_1764() {
+    fn alt_mnemonic_still_opens_the_menu_from_insert_mode_on_gtk_1764() {
         let mut engine = Engine::new_for_test();
         engine.buffer_mut().insert(0, "foo bar baz\n");
         engine.handle_key("i", Some('i'), false);
@@ -15324,6 +15330,9 @@ mod app_icon {
             h.driver.painted_texts()
         );
 
+        // Hand-rolled rather than the `alt_rung`/`alt_rung_1744` modules' own
+        // private `alt_press` helper (out of scope here — this test lives in
+        // the outer `mod tests`, not either of those nested modules).
         h.driver.dispatch(quadraui::UiEvent::KeyPressed {
             key: quadraui::Key::Char('g'),
             modifiers: quadraui::Modifiers {
@@ -15335,16 +15344,11 @@ mod app_icon {
         h.driver.render();
 
         assert!(
-            !h.driver.screen_contains("Go to File"),
-            "Alt+g must not open the \"Go\" dropdown while the engine is \
-             mid-text-entry; painted texts were {:?}",
-            h.driver.painted_texts()
-        );
-        assert!(
-            h.driver.screen_contains("NORMAL"),
-            "the unclaimed Alt+g chord must be treated as the Escape it \
-             may stand in for, returning to Normal mode instead of \
-             leaving Insert mode stuck; painted texts were {:?}",
+            h.driver.screen_contains("Go to File"),
+            "Alt+g must still open the \"Go\" dropdown from Insert mode on \
+             GTK — there is no pty to fuse an Escape into this chord on \
+             this backend, so the #1764 workaround must not apply here; \
+             painted texts were {:?}",
             h.driver.painted_texts()
         );
     }
