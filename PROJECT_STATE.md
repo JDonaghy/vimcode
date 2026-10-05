@@ -1,5 +1,50 @@
 # VimCode Project State
 
+**Last updated:** October 4, 2026 (#1761 — the automatic startup
+extension-registry refresh no longer breaks the idle-silence guarantee):
+
+- Root cause: `Engine::startup_inner`'s unconditional, ambient
+  `ext_refresh()` call at launch always surfaced a
+  `"Extension registry updated (N extensions)"` status message (and the
+  repaint that comes with it) whenever its background fetch completed —
+  and that completion time is bounded only by `registry::fetch_registry`'s
+  `curl --max-time 15`, i.e. anywhere from under a second to ~15s after
+  the first frame paints, entirely outside the user's control. #1702/
+  #1737/#1741 had already traced this exact mechanism and worked around
+  it with a wider Tier-2 YAML settle margin (`tests/smoke-spec/tui.yaml`'s
+  `settle-ext-registry-fetch-1741`), but a real-pty bugbash run still
+  caught it: a fixed settle margin cannot bound an unbounded network
+  delay.
+- Fix (`src/core/engine/lsp_ops.rs`): split `ext_refresh` into a shared
+  `ext_refresh_inner(quiet: bool)`, with the public `ext_refresh()` (every
+  explicit, user-initiated call site — Extensions panel open/refresh,
+  `:ExtRefresh`) keeping its status message, and a new `pub(crate)
+  ext_refresh_quiet()` — used only by `Engine::startup_inner`'s automatic
+  call — that never touches `self.message` on either the success or
+  failure branch, and reports "no redraw needed" to `poll_idle`. New
+  `Engine::ext_registry_quiet` field (`src/core/engine/mod.rs`) threads the
+  quiet/non-quiet flag through the async fetch's `mpsc` channel round
+  trip.
+- Test: `tui_main::app_on_tui_tests::tests::quiet_startup_registry_
+  refresh_1761` (`src/tui_main/app_on_tui_tests.rs`) — Tier-1, drives the
+  real `Engine::ext_refresh_quiet()` production entry point (not a
+  hand-rolled channel) through a `TuiDriver`, asserts the status message
+  never paints and no repaint fires across a 2s poll window, and confirms
+  the fetch genuinely completed (not vacuously silent because it never
+  ran). RED-verified against pre-fix behavior (manually reverting
+  `ext_refresh_quiet` to the old unconditional-message path reproduces
+  the exact failure the bugbash found).
+- Manually reproduced the pre-fix bug directly against the real compiled
+  `vcd` binary under a `tmux` pty with a fresh `$HOME` (no
+  `registry_cache.json`) before writing the fix, to ground-truth the
+  mechanism rather than relying on the existing (already deeply-explored)
+  theories in #1702/#1737/#1741's own comments.
+- Not touched: `tests/smoke-spec/tui.yaml`'s existing `wait_idle`/
+  `expect_silent` settle margins from #1741/#1737 — they're now
+  redundant insurance (the message they were waiting out no longer
+  fires) rather than wrong, and removing them wasn't necessary to satisfy
+  this issue's acceptance bar (a new Tier-1 regression test).
+
 **Last updated:** October 4, 2026 (#1760 — status bar drops the Ln/Col
 cursor-position segment once other optional segments compete for width).
 Root cause: `build_window_status_line` (`src/render.rs`, shared by both

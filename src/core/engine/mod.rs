@@ -4338,6 +4338,24 @@ pub struct Engine {
     /// Channel for receiving the registry fetch result from the background thread.
     pub ext_registry_rx:
         Option<std::sync::mpsc::Receiver<Option<Vec<extensions::ExtensionManifest>>>>,
+    /// True when the in-flight fetch armed by [`Self::ext_registry_rx`] was
+    /// started by [`Self::ext_refresh_quiet`] (startup's automatic, no
+    /// user-visible-change refresh) rather than [`Self::ext_refresh`] (an
+    /// explicit, user-initiated one — opening the Extensions panel, the
+    /// panel's own refresh key, or `:ExtRefresh`). `poll_ext_registry`
+    /// consults this to decide whether to surface a status message (#1761:
+    /// the startup fetch is unconditional, backgrounded, and its own
+    /// completion time is bounded only by `registry::fetch_registry`'s
+    /// `curl --max-time 15` — i.e. it can land anywhere from under a second
+    /// to ~15s after the first frame paints, entirely outside the user's
+    /// control. Surfacing a status message for it, however briefly,
+    /// breaks the "perfectly silent once idle" contract the
+    /// `idle-no-repaint-bytes-when-idle` journey promises, for however long
+    /// the fetch happens to take on the machine it runs on. An explicit,
+    /// user-requested refresh is the opposite case: the user just took an
+    /// action and is watching for its result, so staying silent there would
+    /// be the bug.
+    pub(crate) ext_registry_quiet: bool,
 
     // --- Native tool acquisition (#1345) ---
     /// In-flight background acquisitions (`tool_acquire::acquire_and_install`),
@@ -5481,6 +5499,7 @@ impl Engine {
             ext_registry: registry::load_cache(),
             ext_registry_fetching: false,
             ext_registry_rx: None,
+            ext_registry_quiet: false,
             tool_acquire_tasks: HashMap::new(),
             tool_acquire_groups: HashMap::new(),
             ext_sidebar_system: {
@@ -5727,8 +5746,8 @@ impl Engine {
     /// `startup` performs — `plugin_init()` (loads and **executes** every
     /// `.lua` script in the developer's real
     /// `~/.config/vimcode/{plugins,extensions}/`, then fires `VimEnter`) and
-    /// `ext_refresh()` (spawns a thread that fetches the remote extension
-    /// registry over the network). Both make driver-tier tests depend on the
+    /// `ext_refresh_quiet()` (spawns a thread that fetches the remote
+    /// extension registry over the network). Both make driver-tier tests depend on the
     /// machine they run on: a user plugin that hooks `ModeChanged` /
     /// `InsertEnter` / `cursor_move` can call `vimcode.buf.set_cursor` or
     /// `set_lines` *synchronously inside a keystroke*, so an installed
@@ -5757,7 +5776,7 @@ impl Engine {
     ) {
         if load_ambient_state {
             self.plugin_init();
-            self.ext_refresh();
+            self.ext_refresh_quiet();
         }
         if let Some(path) = file_path {
             if path.is_dir() {

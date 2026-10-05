@@ -259,8 +259,39 @@ impl Engine {
     }
 
     /// Spawn a background thread to fetch all configured extension registries.
-    /// Result arrives via `ext_registry_rx`.
+    /// Result arrives via `ext_registry_rx`. Explicit/user-initiated refresh
+    /// (Extensions panel open, its refresh key, `:ExtRefresh`) — surfaces a
+    /// status message when it completes. Startup's own automatic refresh
+    /// uses [`Self::ext_refresh_quiet`] instead; see that method's doc and
+    /// `ext_registry_quiet`'s doc for why the two must not share a message
+    /// policy (#1761).
     pub fn ext_refresh(&mut self) {
+        self.ext_refresh_inner(false);
+    }
+
+    /// The automatic refresh [`Engine::startup_inner`] fires unconditionally
+    /// on every launch, before anything the user did. Identical to
+    /// [`Self::ext_refresh`] except the eventual completion — consumed by
+    /// [`Self::poll_ext_registry`] — never touches `self.message` (#1761).
+    ///
+    /// That matters because this fetch's completion time is bounded only by
+    /// `registry::fetch_registry`'s `curl --max-time 15` — anywhere from
+    /// under a second (warm DNS/fast network) to ~15s (slow network, no
+    /// cached registry to fall back to while it runs), entirely outside the
+    /// user's control and uncorrelated with anything they did. A status
+    /// message for it — even a successful, correct one — is still
+    /// unsolicited output that can land several seconds after the first
+    /// frame painted, breaking the `idle-no-repaint-bytes-when-idle`
+    /// journey's contract that the terminal goes perfectly silent once
+    /// idle. An explicit, user-requested refresh keeps its message: the
+    /// user just took an action and is watching for its result, so staying
+    /// silent *there* would be the bug.
+    pub(crate) fn ext_refresh_quiet(&mut self) {
+        self.ext_refresh_inner(true);
+    }
+
+    /// Shared body of [`Self::ext_refresh`] / [`Self::ext_refresh_quiet`].
+    fn ext_refresh_inner(&mut self, quiet: bool) {
         if self.ext_registry_fetching {
             return; // already in progress
         }
@@ -290,6 +321,7 @@ impl Engine {
         });
         self.ext_registry_rx = Some(rx);
         self.ext_registry_fetching = true;
+        self.ext_registry_quiet = quiet;
     }
 
     /// Non-blocking check for a completed registry fetch.
@@ -303,6 +335,8 @@ impl Engine {
         if let Some(maybe_reg) = result {
             self.ext_registry_fetching = false;
             self.ext_registry_rx = None;
+            let quiet = self.ext_registry_quiet;
+            self.ext_registry_quiet = false;
             match maybe_reg {
                 Some(entries) => {
                     let count = entries.len();
@@ -310,18 +344,28 @@ impl Engine {
                     self.ext_registry = Some(entries);
                     // Re-filter stored diagnostics with updated ignore_error_sources.
                     self.refilter_diagnostics();
-                    self.message = format!("Extension registry updated ({count} extensions)");
+                    if !quiet {
+                        self.message = format!("Extension registry updated ({count} extensions)");
+                    }
                 }
                 None => {
                     if self.ext_registry.is_some() {
                         // Cache from a previous fetch is still available —
                         // silently keep it rather than alarming the user.
-                    } else {
+                    } else if !quiet {
                         self.message = "Registry fetch failed — try again later".to_string();
                     }
                 }
             }
-            true
+            // #1761: the quiet (startup) fetch never changes anything the
+            // screen paints — no message, and `ext_registry`'s own data is
+            // only read when the Extensions panel is open (closed by
+            // default). Reporting "no redraw needed" here, instead of
+            // unconditional `true`, is what actually keeps the terminal
+            // silent — the caller's diff-based renderer would emit zero
+            // bytes for an unchanged frame either way, but skipping the
+            // redraw avoids even computing one.
+            !quiet
         } else {
             false
         }
