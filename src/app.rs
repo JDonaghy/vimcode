@@ -8302,12 +8302,19 @@ fn normalize_mac_cmd_as_ctrl(
         },
         // Every other chord: fold `cmd` into `ctrl` unchanged (the plain
         // Ctrl-to-Cmd substitution that covers every letter/symbol VS Code
-        // Mac default this file's own doc enumerates).
+        // Mac default this file's own doc enumerates). Gated on
+        // `vscode_mode`, same as the arrow arms above — this issue is
+        // scoped to VS Code mode on the macOS GUI (#1745), and without the
+        // gate it would also change default Vim-mode behaviour on Mac:
+        // Cmd+W would enter vim's window-command prefix, Cmd+V would enter
+        // visual-block, Cmd+D would scroll a half page, etc. Vim mode's own
+        // Mac Cmd semantics (if any are ever wanted) are a separate,
+        // untested design decision and not part of this fix.
         UiEvent::KeyPressed {
             key,
             mut modifiers,
             repeat,
-        } if modifiers.cmd => {
+        } if vscode_mode && modifiers.cmd => {
             modifiers.ctrl = true;
             UiEvent::KeyPressed {
                 key,
@@ -8333,8 +8340,22 @@ impl App {
     ) -> quadraui::Reaction {
         use quadraui::{Key, MouseButton, UiEvent};
         // #1745: must run before anything else reads `event`'s modifiers —
-        // see `normalize_mac_cmd_as_ctrl`'s own doc.
-        let vscode_mode = self.engine.borrow().is_vscode_mode();
+        // see `normalize_mac_cmd_as_ctrl`'s own doc. The `matches!` guard
+        // is a cheap hardening (#1745 review), not a behaviour change:
+        // `normalize_mac_cmd_as_ctrl`'s own `match` only has arms for
+        // `UiEvent::KeyPressed`, falling through every other variant via
+        // `other => other` regardless of `vscode_mode`'s value — so
+        // skipping the borrow entirely for a non-`KeyPressed` event (mouse
+        // moves/window events, the overwhelming majority of dispatches)
+        // changes nothing it would have computed. Without the guard this
+        // was an *unconditional* immutable borrow at the top of the one
+        // shared dispatcher, on every event; `dispatch_engine_action`
+        // holds a `borrow_mut()` across the whole `apply_engine_action`
+        // call, and quadraui's macOS dialogs drive nested modal loops, so
+        // any nested re-entry into `handle` that previously passed through
+        // a non-engine-borrowing arm would have panicked on this borrow.
+        let vscode_mode =
+            matches!(event, UiEvent::KeyPressed { .. }) && self.engine.borrow().is_vscode_mode();
         let event = normalize_mac_cmd_as_ctrl(event, backend, vscode_mode);
 
         // ── #1427: shared menu-bar reveal/hide routing ───────────────────────

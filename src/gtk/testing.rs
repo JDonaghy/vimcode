@@ -19480,6 +19480,60 @@ mod alt_rung {
             }
         }
     }
+
+    /// #1745 review: the only thing standing between GTK and the whole
+    /// Cmd-to-Ctrl fold is `normalize_mac_cmd_as_ctrl`'s own
+    /// `backend.services().platform_name() != "macos"` early return — pin
+    /// that directly, on the live GTK backend, rather than trusting the
+    /// module doc's "GTK's own Cmd-reporting convention (Super/Meta ->
+    /// `cmd`) is untouched" claim by inspection alone.
+    ///
+    /// `quadraui::Modifiers::cmd` is what GTK reports for a held Super/Meta
+    /// key (same field #1745 reads on macOS for a held Cmd key — see
+    /// `normalize_mac_cmd_as_ctrl`'s own doc in `src/app.rs`), so this
+    /// drives the exact same `UiEvent::KeyPressed { Key::Char('/'), cmd:
+    /// true, .. }` `src/macos/mod.rs`'s `cmd_slash_toggles_line_comment`
+    /// drives, through this crate's `App::handle_dispatch`, and expects the
+    /// *opposite* painted outcome: a literal `/` character inserted, not a
+    /// toggled line comment — because on GTK this is Super+/, not a VS Code
+    /// Ctrl+/ substitute, and nothing about this issue should change that.
+    ///
+    /// RED would look like: if the early return above were gated wrong (or
+    /// missing), this `/` would instead comment the line, exactly as
+    /// `cmd_slash_toggles_line_comment` asserts on macOS.
+    #[test]
+    fn cmd_slash_is_not_folded_to_ctrl_slash_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.mode = crate::core::Mode::Insert;
+        engine.buffer_mut().insert(0, "print(1)\n");
+        engine.view_mut().cursor = crate::core::Cursor { line: 0, col: 0 };
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        h.driver.dispatch(UiEvent::KeyPressed {
+            key: Key::Char('/'),
+            modifiers: Modifiers {
+                cmd: true,
+                ..Default::default()
+            },
+            repeat: false,
+        });
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("/print(1)"),
+            "Cmd(Super)+/ must be a plain '/' keystroke on GTK, not VS \
+             Code's Mac `commentLine` substitute — painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("# print(1)"),
+            "Cmd(Super)+/ must not toggle the line comment on GTK; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
 }
 
 #[cfg(test)]
