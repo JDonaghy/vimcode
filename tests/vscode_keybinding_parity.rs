@@ -636,6 +636,777 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
                quadraui-blocked, since `-` is an ordinary `Key::Char` no \
                different from the other symbol chords this issue fixed.",
     },
+
+    // ═════════════════════════════════════════════════════════════════════
+    // #1746: expand the table to VS Code's full default editor/workbench
+    // set. Every row below is cross-referenced directly against
+    // `src/core/engine/vscode.rs`'s own match arms (grepped, not recalled
+    // from memory) — see this file's own closing report (in the PR/commit
+    // body, not duplicated here) for the handful of real mismatches these
+    // rows turned up, each gated in KNOWN_GAPS below.
+    // ═════════════════════════════════════════════════════════════════════
+
+    // ── Clipboard / undo / select-all (Win/Linux) ──────────────────────────
+    VscodeBinding {
+        command_id: "editor.action.clipboardCopyAction",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+C",
+        vimcode_key: "c (ctrl)",
+        status: Status::Matches,
+        note: "`handle_vscode_key`'s ctrl `\"c\"` arm calls `vscode_copy`. \
+               Covered by this file's own \
+               test_vscode_ctrl_c_copy_no_selection_copies_current_line.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.clipboardCutAction",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+X",
+        vimcode_key: "x (ctrl)",
+        status: Status::Matches,
+        note: "`\"x\"` arm calls `vscode_cut`. Covered by this file's own \
+               test_vscode_ctrl_x_cut_no_selection_cuts_current_line.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.clipboardPasteAction",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+V",
+        vimcode_key: "v (ctrl)",
+        status: Status::Matches,
+        note: "`\"v\"` arm calls `vscode_paste`. Covered by this file's own \
+               test_vscode_ctrl_v_pastes_copied_text.",
+    },
+    VscodeBinding {
+        command_id: "undo",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+Z",
+        vimcode_key: "z (ctrl)",
+        status: Status::Matches,
+        note: "`\"z\"` arm calls `Engine::undo`. Covered by \
+               tests/vscode_mode.rs::test_vscode_undo_redo_still_works.",
+    },
+    VscodeBinding {
+        command_id: "redo",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+Y",
+        vimcode_key: "y (ctrl)",
+        status: Status::Matches,
+        note: "`\"y\"` arm calls `Engine::redo`. Covered by \
+               tests/vscode_mode.rs::test_vscode_undo_redo_still_works. \
+               (VS Code's own Mac default for redo is Cmd+Shift+Z, NOT \
+               Cmd+Y — see KNOWN_GAPS::CMD_SHIFT_Z_REDO_UNREACHABLE_ON_MAC \
+               below for why the generic Cmd-to-Ctrl fold does not cover \
+               this one.)",
+    },
+    VscodeBinding {
+        command_id: "editor.action.selectAll",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+A",
+        vimcode_key: "a (ctrl)",
+        status: Status::Matches,
+        note: "`\"a\"` arm calls `vscode_select_all`. Covered by this \
+               file's own test_vscode_ctrl_a_select_all.",
+    },
+
+    // ── Word / document cursor movement + selection (Win/Linux) ────────────
+    VscodeBinding {
+        command_id: "cursorWordRight",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+Right",
+        vimcode_key: "Right (ctrl)",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_ctrl_right_moves_word_forward_and_clears_selection.",
+    },
+    VscodeBinding {
+        command_id: "cursorWordLeft",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+Left",
+        vimcode_key: "Left (ctrl)",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_ctrl_left_moves_word_backward.",
+    },
+    VscodeBinding {
+        command_id: "cursorTop",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+Home",
+        vimcode_key: "Home (ctrl)",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_ctrl_home_moves_to_document_start.",
+    },
+    VscodeBinding {
+        command_id: "cursorBottom",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+End",
+        vimcode_key: "End (ctrl)",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_ctrl_end_moves_to_document_end.",
+    },
+    VscodeBinding {
+        command_id: "cursorWordRightSelect",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+Shift+Right",
+        vimcode_key: "Shift_Right (ctrl)",
+        status: Status::Matches,
+        note: "Not in the Ctrl+K/P shift-blind family above: Ctrl+Shift+ \
+               Arrow carries an explicit CSI modifier parameter even on a \
+               legacy terminal (arrow keys are never ANSI C0 codes), so \
+               this is reachable everywhere Ctrl+Arrow is. Covered by this \
+               file's own \
+               test_vscode_ctrl_shift_right_extends_selection_by_word.",
+    },
+    VscodeBinding {
+        command_id: "cursorWordLeftSelect",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+Shift+Left",
+        vimcode_key: "Shift_Left (ctrl)",
+        status: Status::Matches,
+        note: "Same CSI-param reachability as cursorWordRightSelect. \
+               Covered by this file's own \
+               test_vscode_ctrl_shift_left_extends_selection_by_word.",
+    },
+    VscodeBinding {
+        command_id: "cursorTopSelect",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+Shift+Home",
+        vimcode_key: "Shift_Home (ctrl)",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_ctrl_shift_home_extends_selection_to_doc_start.",
+    },
+    VscodeBinding {
+        command_id: "cursorBottomSelect",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+Shift+End",
+        vimcode_key: "Shift_End (ctrl)",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_ctrl_shift_end_extends_selection_to_doc_end.",
+    },
+    VscodeBinding {
+        command_id: "deleteWordRight",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+Delete",
+        vimcode_key: "Delete (ctrl)",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_ctrl_delete_deletes_word_forward.",
+    },
+    VscodeBinding {
+        command_id: "deleteWordLeft",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+BackSpace",
+        vimcode_key: "BackSpace (ctrl)",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_ctrl_backspace_deletes_word_backward. VS Code's \
+               own Mac default for this command is Option+Backspace, NOT \
+               a Cmd substitution — see \
+               KNOWN_GAPS::OPTION_BACKSPACE_DELETE_WORD_LEFT_UNBOUND_ON_MAC \
+               below.",
+    },
+
+    // ── Plain (unmodified) cursor movement + Shift-extend (Win/Linux/Mac,
+    //    identical — no modifier divergence) ───────────────────────────────
+    VscodeBinding {
+        command_id: "cursorRight",
+        os: Os::WinLinux,
+        vscode_chord: "Right",
+        vimcode_key: "Right",
+        status: Status::Matches,
+        note: "The non-ctrl, non-shift arm of `handle_vscode_key`'s plain \
+               match: `vscode_clear_selection()` then `move_right_insert()`. \
+               New test: test_vscode_plain_right_clears_selection_and_moves.",
+    },
+    VscodeBinding {
+        command_id: "cursorLeft",
+        os: Os::WinLinux,
+        vscode_chord: "Left",
+        vimcode_key: "Left",
+        status: Status::Matches,
+        note: "Same plain arm, `move_left()`. New test: \
+               test_vscode_plain_left_moves_cursor_left.",
+    },
+    VscodeBinding {
+        command_id: "cursorUp",
+        os: Os::WinLinux,
+        vscode_chord: "Up",
+        vimcode_key: "Up",
+        status: Status::Matches,
+        note: "Same plain arm, `vscode_do_move(\"Up\")`. New test: \
+               test_vscode_plain_up_moves_cursor_up.",
+    },
+    VscodeBinding {
+        command_id: "cursorDown",
+        os: Os::WinLinux,
+        vscode_chord: "Down",
+        vimcode_key: "Down",
+        status: Status::Matches,
+        note: "Same plain arm, `vscode_do_move(\"Down\")`. New test: \
+               test_vscode_plain_down_moves_cursor_down.",
+    },
+    VscodeBinding {
+        command_id: "cursorHome",
+        os: Os::WinLinux,
+        vscode_chord: "Home",
+        vimcode_key: "Home",
+        status: Status::Matches,
+        note: "`vscode_smart_home` toggles between first-non-whitespace and \
+               column 0, matching VS Code's own `cursorHome` smart-home \
+               behaviour exactly. New test: \
+               test_vscode_plain_home_smart_toggle.",
+    },
+    VscodeBinding {
+        command_id: "cursorEnd",
+        os: Os::WinLinux,
+        vscode_chord: "End",
+        vimcode_key: "End",
+        status: Status::Matches,
+        note: "Same plain arm, moves to `get_line_len_for_insert`. New \
+               test: test_vscode_plain_end_moves_to_line_end.",
+    },
+    VscodeBinding {
+        command_id: "cursorPageUp",
+        os: Os::WinLinux,
+        vscode_chord: "Page_Up",
+        vimcode_key: "Page_Up",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_page_up_moves_cursor_up_a_viewport.",
+    },
+    VscodeBinding {
+        command_id: "cursorPageDown",
+        os: Os::WinLinux,
+        vscode_chord: "Page_Down",
+        vimcode_key: "Page_Down",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_page_down_moves_cursor_down_a_viewport. VS \
+               Code's `cursorPageUpSelect`/`cursorPageDownSelect` \
+               (Shift+Page_Up/Down) are a separate, real gap — see \
+               KNOWN_GAPS::SHIFT_PAGEUP_PAGEDOWN_SHIFT_BIT_DROPPED_BY_\
+               DECODER below.",
+    },
+    VscodeBinding {
+        command_id: "cursorRightSelect",
+        os: Os::WinLinux,
+        vscode_chord: "Shift+Right",
+        vimcode_key: "Shift_Right",
+        status: Status::Matches,
+        note: "`key_name.starts_with(\"Shift_\")` arm, no ctrl: \
+               `vscode_extend_selection(\"Right\")`. Covered by this \
+               file's own \
+               test_vscode_shift_right_extends_selection_without_ctrl.",
+    },
+    VscodeBinding {
+        command_id: "cursorLeftSelect",
+        os: Os::WinLinux,
+        vscode_chord: "Shift+Left",
+        vimcode_key: "Shift_Left",
+        status: Status::Matches,
+        note: "Same Shift_ arm, `vscode_extend_selection(\"Left\")`. New \
+               test: test_vscode_shift_left_extends_selection_without_ctrl.",
+    },
+    VscodeBinding {
+        command_id: "cursorUpSelect",
+        os: Os::WinLinux,
+        vscode_chord: "Shift+Up",
+        vimcode_key: "Shift_Up",
+        status: Status::Matches,
+        note: "Same Shift_ arm, `vscode_extend_selection(\"Up\")`. New \
+               test: test_vscode_shift_up_extends_selection_without_ctrl.",
+    },
+    VscodeBinding {
+        command_id: "cursorDownSelect",
+        os: Os::WinLinux,
+        vscode_chord: "Shift+Down",
+        vimcode_key: "Shift_Down",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_shift_down_extends_selection_without_ctrl.",
+    },
+    VscodeBinding {
+        command_id: "cursorHomeSelect",
+        os: Os::WinLinux,
+        vscode_chord: "Shift+Home",
+        vimcode_key: "Shift_Home",
+        status: Status::Matches,
+        note: "Same Shift_ arm, `vscode_extend_selection(\"SmartHome\")`. \
+               New test: \
+               test_vscode_shift_home_extends_selection_without_ctrl.",
+    },
+    VscodeBinding {
+        command_id: "cursorEndSelect",
+        os: Os::WinLinux,
+        vscode_chord: "Shift+End",
+        vimcode_key: "Shift_End",
+        status: Status::Matches,
+        note: "Same Shift_ arm, `vscode_extend_selection(\"LineEnd\")`. New \
+               test: test_vscode_shift_end_extends_selection_without_ctrl.",
+    },
+
+    // ── Editing / palette / panels (Win/Linux) ─────────────────────────────
+    VscodeBinding {
+        command_id: "workbench.action.quit",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+Q",
+        vimcode_key: "q (ctrl)",
+        status: Status::Matches,
+        note: "VS Code's own Linux default (Windows has no default binding \
+               for this chord — Alt+F4 is the OS convention there instead, \
+               so vimcode binding Ctrl+Q on Windows too is a harmless \
+               superset, not a mismatch). Covered by this file's own \
+               test_vscode_ctrl_q_quits_when_no_unsaved_changes.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.commentLine",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+/",
+        vimcode_key: "slash (ctrl)",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_ctrl_slash_toggles_line_comment.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.expandLineSelection",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+L",
+        vimcode_key: "l (ctrl)",
+        status: Status::Matches,
+        note: "`\"l\"` arm calls `vscode_select_line`, which expands \
+               further on repeated presses exactly like VS Code's \
+               `expandLineSelection`. Covered by \
+               tests/vscode_mode.rs::test_vscode_select_line and \
+               test_vscode_select_line_extends.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.gotoLine",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+G",
+        vimcode_key: "g (ctrl)",
+        status: Status::Matches,
+        note: "Covered by tests/vscode_mode.rs::test_vscode_ctrl_g_goto_line \
+               (same binding as the Os::Mac row above — VS Code uses this \
+               chord unchanged on every OS).",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.toggleSidebarVisibility",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+B",
+        vimcode_key: "b (ctrl, via panel_keys accelerator)",
+        status: Status::Matches,
+        note: "On Linux/GTK and TUI the real toggle happens via the \
+               `panel_keys.toggle_sidebar` accelerator (default `\"<C-b>\"`, \
+               `DeferredAction::ToggleSidebar`), matched *before* the \
+               keypress reaches `handle_vscode_key`'s own `\"b\"` arm — see \
+               the `Cmd+B` row above for the full dispatch-ordering \
+               writeup. The end result is still correct on this platform \
+               (unlike macOS GUI's Cmd+B): a physical Ctrl+B really does \
+               toggle the sidebar. Covered by \
+               tests/vscode_mode.rs::test_vscode_ctrl_b_toggle_sidebar \
+               (engine-level: asserts `handle_vscode_key`'s own \
+               `EngineAction::ToggleSidebar` return, not the accelerator \
+               path, which this separate integration-test crate cannot \
+               reach — see the `Cmd+B` row's note on why that distinction \
+               matters).",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.togglePanel",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+J",
+        vimcode_key: "j (ctrl)",
+        status: Status::Matches,
+        note: "`\"j\"` arm calls `Engine::toggle_terminal()` directly (no \
+               accelerator indirection, unlike toggleSidebarVisibility \
+               above). Covered by \
+               tests/vscode_mode.rs::test_vscode_ctrl_j_toggle_terminal.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.terminal.toggleTerminal",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+`",
+        vimcode_key: "grave (ctrl)",
+        status: Status::Matches,
+        note: "Covered by \
+               tests/vscode_mode.rs::test_vscode_ctrl_backtick_toggle_terminal \
+               (same chord as the Os::Mac row above — no OS divergence \
+               for this one).",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.openSettings",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+,",
+        vimcode_key: "comma (ctrl)",
+        status: Status::Matches,
+        note: "Covered by \
+               tests/vscode_mode.rs::test_vscode_ctrl_comma_settings.",
+    },
+    VscodeBinding {
+        command_id: "editor.toggleWordWrap",
+        os: Os::WinLinux,
+        vscode_chord: "Alt+Z",
+        vimcode_key: "Alt_z",
+        status: Status::Matches,
+        note: "Covered by tests/vscode_mode.rs::test_vscode_alt_z_toggle_wrap.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.showCommands",
+        os: Os::WinLinux,
+        vscode_chord: "F1",
+        vimcode_key: "F1",
+        status: Status::Matches,
+        note: "F1 is VS Code's own built-in alternative to Ctrl+Shift+P — \
+               see REACHABILITY_TABLE's `Ctrl+K vs Ctrl+Shift+K`-family \
+               rows for why that matters on a legacy terminal. Covered by \
+               this file's own test_vscode_f1_opens_command_palette.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.toggleMenuBar",
+        os: Os::WinLinux,
+        vscode_chord: "F10",
+        vimcode_key: "F10",
+        status: Status::Matches,
+        note: "Covered by this file's own test_vscode_f10_toggles_menu_bar.",
+    },
+    VscodeBinding {
+        command_id: "deleteLeft",
+        os: Os::WinLinux,
+        vscode_chord: "BackSpace",
+        vimcode_key: "BackSpace",
+        status: Status::Matches,
+        note: "The plain (non-ctrl) `\"BackSpace\"` arm. New test: \
+               test_vscode_plain_backspace_deletes_char_before_cursor.",
+    },
+    VscodeBinding {
+        command_id: "deleteRight",
+        os: Os::WinLinux,
+        vscode_chord: "Delete",
+        vimcode_key: "Delete",
+        status: Status::Matches,
+        note: "Covered by this file's own \
+               test_vscode_plain_delete_removes_char_under_cursor.",
+    },
+    VscodeBinding {
+        command_id: "type (newline)",
+        os: Os::WinLinux,
+        vscode_chord: "Enter",
+        vimcode_key: "Return",
+        status: Status::Matches,
+        note: "Covered by this file's own test_vscode_plain_return_inserts_newline.",
+    },
+    VscodeBinding {
+        command_id: "tab",
+        os: Os::WinLinux,
+        vscode_chord: "Tab",
+        vimcode_key: "Tab",
+        status: Status::Matches,
+        note: "Covered by this file's own test_vscode_plain_tab_inserts_indent.",
+    },
+    VscodeBinding {
+        command_id: "outdent",
+        os: Os::WinLinux,
+        vscode_chord: "Shift+Tab",
+        vimcode_key: "ISO_Left_Tab",
+        status: Status::Matches,
+        note: "Covered by tests/vscode_mode.rs::test_vscode_shift_tab_outdent.",
+    },
+    VscodeBinding {
+        command_id: "hideSuggestWidget",
+        os: Os::WinLinux,
+        vscode_chord: "Escape",
+        vimcode_key: "Escape",
+        status: Status::Matches,
+        note: "`\"Escape\"` arm's completion-popup-first priority. Covered \
+               by tests/vscode_mode.rs::test_vscode_escape_dismisses_completion.",
+    },
+    VscodeBinding {
+        command_id: "removeSecondaryCursors",
+        os: Os::WinLinux,
+        vscode_chord: "Escape",
+        vimcode_key: "Escape",
+        status: Status::Matches,
+        note: "Same `\"Escape\"` arm, next priority tier (clears \
+               `extra_cursors` when no completion popup is open). Covered \
+               by tests/vscode_mode.rs::test_vscode_escape_clears_extra_cursors.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.formatDocument",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+K Ctrl+F",
+        vimcode_key: "k (ctrl) then f (ctrl)",
+        status: Status::Matches,
+        note: "`vscode_ctrl_k_dispatch`'s `\"f\"` arm calls \
+               `lsp_format_current`. Covered by \
+               tests/vscode_mode.rs::test_vscode_ctrl_k_ctrl_f_format.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.closeAllEditors",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+K Ctrl+W",
+        vimcode_key: "k (ctrl) then w (ctrl)",
+        status: Status::Matches,
+        note: "`vscode_ctrl_k_dispatch`'s `\"w\"` arm closes every tab in \
+               the active group. New test: \
+               test_vscode_ctrl_k_ctrl_w_closes_all_editors_in_group.",
+    },
+
+    // ── Mac: more plain Ctrl-to-Cmd substitutions, same \
+    //    `normalize_mac_cmd_as_ctrl` generic fold arm as toggleSidebar\
+    //    Visibility/togglePanel/openSettings/commentLine/clipboardCutAction \
+    //    above — not independently re-tested at the engine level, since \
+    //    the fold delivers the exact same (key_name, ctrl=true) shape the \
+    //    Win/Linux rows above already exercise; see `normalize_mac_cmd_\
+    //    as_ctrl`'s own doc for the `MacDriver` reachability proof. ───────
+    VscodeBinding {
+        command_id: "editor.action.clipboardCopyAction",
+        os: Os::Mac,
+        vscode_chord: "Cmd+C",
+        vimcode_key: "c (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same \"c\" arm as the \
+               Win/Linux row above.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.clipboardPasteAction",
+        os: Os::Mac,
+        vscode_chord: "Cmd+V",
+        vimcode_key: "v (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same \"v\" arm as the \
+               Win/Linux row above.",
+    },
+    VscodeBinding {
+        command_id: "undo",
+        os: Os::Mac,
+        vscode_chord: "Cmd+Z",
+        vimcode_key: "z (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same \"z\" arm as the \
+               Win/Linux row above.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.selectAll",
+        os: Os::Mac,
+        vscode_chord: "Cmd+A",
+        vimcode_key: "a (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same \"a\" arm as the \
+               Win/Linux row above.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.deleteLines",
+        os: Os::Mac,
+        vscode_chord: "Cmd+Shift+K",
+        vimcode_key: "K (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same \"K\" arm as the \
+               Win/Linux deleteLines row above. Unlike toggleSidebar\
+               Visibility's Cmd+B, this one's real implementation sits \
+               inside `handle_vscode_key` itself, not a separate \
+               `panel_keys` accelerator, so the fold's ordering problem \
+               does not apply here.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.insertLineAfter",
+        os: Os::Mac,
+        vscode_chord: "Cmd+Enter",
+        vimcode_key: "Return (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same ctrl-Return arm \
+               as the Win/Linux insertLineAfter row above.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.insertLineBefore",
+        os: Os::Mac,
+        vscode_chord: "Cmd+Shift+Enter",
+        vimcode_key: "Shift_Return (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same ctrl-Shift_Return \
+               arm as the Win/Linux insertLineBefore row above.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.addSelectionToNextFindMatch",
+        os: Os::Mac,
+        vscode_chord: "Cmd+D",
+        vimcode_key: "d (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same \"d\" arm as the \
+               Win/Linux addSelectionToNextFindMatch row above.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.expandLineSelection",
+        os: Os::Mac,
+        vscode_chord: "Cmd+L",
+        vimcode_key: "l (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same \"l\" arm as the \
+               Win/Linux expandLineSelection row above.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.indentLines",
+        os: Os::Mac,
+        vscode_chord: "Cmd+]",
+        vimcode_key: "bracketright (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same \"]\" arm as the \
+               Win/Linux indentLines row above.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.outdentLines",
+        os: Os::Mac,
+        vscode_chord: "Cmd+[",
+        vimcode_key: "bracketleft (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same \"[\" arm as the \
+               Win/Linux outdentLines row above.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.quickOpen",
+        os: Os::Mac,
+        vscode_chord: "Cmd+P",
+        vimcode_key: "p (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same \"p\" arm as the \
+               Win/Linux quickOpen row above.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.showCommands",
+        os: Os::Mac,
+        vscode_chord: "Cmd+Shift+P",
+        vimcode_key: "P (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same \"P\" arm as the \
+               Win/Linux showCommands row above.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.selectHighlights",
+        os: Os::Mac,
+        vscode_chord: "Cmd+Shift+L",
+        vimcode_key: "L (Ctrl or Cmd)",
+        status: Status::Matches,
+        note: "Generic Cmd-to-Ctrl fold, reaches the same \"L\" arm as the \
+               Win/Linux selectHighlights row above.",
+    },
+
+    // ── Mac: real gaps turned up by this pass (#1746) ──────────────────────
+    VscodeBinding {
+        command_id: "redo",
+        os: Os::Mac,
+        vscode_chord: "Cmd+Shift+Z",
+        vimcode_key: "(no \"Z\" ctrl arm at all)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CMD_SHIFT_Z_REDO_UNREACHABLE_ON_MAC. VS Code's \
+               real Mac default for redo is Cmd+Shift+Z — NOT Cmd+Y, which \
+               is what the generic Cmd-to-Ctrl fold would produce if redo's \
+               Mac chord were a plain substitution of vimcode's Ctrl+Y. \
+               `handle_vscode_key`'s ctrl match has a lowercase `\"y\"` arm \
+               for redo but no `\"Z\"` (uppercase, i.e. Ctrl+Shift+Z) arm \
+               at all — confirmed by reading the match directly — so \
+               neither Linux/Windows' own Ctrl+Shift+Z nor the Mac GUI's \
+               folded equivalent does anything today.",
+    },
+    VscodeBinding {
+        command_id: "deleteWordLeft",
+        os: Os::Mac,
+        vscode_chord: "Option+BackSpace",
+        vimcode_key: "(no \"Alt_BackSpace\" arm at all)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::OPTION_BACKSPACE_DELETE_WORD_LEFT_UNBOUND_ON_MAC. \
+               VS Code's Mac default for deleteWordLeft is Option+Backspace \
+               (Linux/Windows' is Ctrl+Backspace, already `Matches` above) \
+               — NOT a Cmd substitution, so `normalize_mac_cmd_as_ctrl`'s \
+               fold (gated on `modifiers.cmd`) never even sees it. \
+               `render::alt_chord_base` (`src/render.rs`) only recognises \
+               `Left`/`Right`/`Up`/`Down` and single-character keys as an \
+               Alt-chord base — `NamedKey::Backspace`'s multi-character \
+               name (`\"BackSpace\"`) falls through that filter entirely, \
+               so `route_alt_key` returns `Fallthrough` for Alt+Backspace \
+               and the chord never reaches `vscode_alt_key_name` at all; \
+               even if it did, `handle_vscode_key`'s `Alt_` match has no \
+               `\"Alt_BackSpace\"` arm either. Confirmed directly from both \
+               functions, not guessed.",
+    },
+    VscodeBinding {
+        command_id: "deleteWordRight",
+        os: Os::Mac,
+        vscode_chord: "Option+Delete",
+        vimcode_key: "(no \"Alt_Delete\" arm at all)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::OPTION_DELETE_WORD_RIGHT_UNBOUND_ON_MAC. Mirrors \
+               deleteWordLeft above for Delete — same `alt_chord_base` \
+               multi-character-name gap, same missing `handle_vscode_key` \
+               arm.",
+    },
+
+    // ── Real mismatches (not just unbound) found while expanding this \
+    //    table — Ctrl+K's two "add"/"remove" comment sub-chords both call \
+    //    the *same* toggle function, so each one does the wrong thing \
+    //    whenever the line is already in the opposite state. One-line-fix \
+    //    candidates (give `vscode_ctrl_k_dispatch`'s "c"/"u" arms their own \
+    //    add-only/remove-only comment helpers instead of sharing \
+    //    `toggle_comment`), filed as a follow-up rather than fixed here \
+    //    per this issue's own scope note. ───────────────────────────────────
+    VscodeBinding {
+        command_id: "editor.action.addCommentLine",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+K Ctrl+C",
+        vimcode_key: "k (ctrl) then c (ctrl)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_K_CTRL_C_TOGGLES_INSTEAD_OF_ADD_ONLY. \
+               `vscode_ctrl_k_dispatch`'s `\"c\"` arm calls \
+               `Engine::toggle_comment` — the exact same call its `\"u\"` \
+               arm makes for removeCommentLine below. VS Code's \
+               `addCommentLine` is idempotent (a no-op on an \
+               already-commented line); vimcode's Ctrl+K Ctrl+C instead \
+               *uncomments* an already-commented line, because it toggles \
+               rather than only adding.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.removeCommentLine",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+K Ctrl+U",
+        vimcode_key: "k (ctrl) then u (ctrl)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_K_CTRL_U_TOGGLES_INSTEAD_OF_REMOVE_ONLY. \
+               Mirrors addCommentLine above: `vscode_ctrl_k_dispatch`'s \
+               `\"u\"` arm also calls `Engine::toggle_comment`, so VS \
+               Code's `removeCommentLine` (a no-op on an uncommented line) \
+               instead *adds* a comment to an uncommented line.",
+    },
+
+    // ── Decoder bug (not platform-specific — affects every backend
+    //    identically, so it does not belong in REACHABILITY_TABLE's
+    //    per-surface framing) found while checking Shift+Page_Up/Down ──────
+    VscodeBinding {
+        command_id: "cursorPageUpSelect",
+        os: Os::WinLinux,
+        vscode_chord: "Shift+Page_Up",
+        vimcode_key: "(decodes identically to plain Page_Up, shift bit lost)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::SHIFT_PAGEUP_PAGEDOWN_SHIFT_BIT_DROPPED_BY_\
+               DECODER. `render::engine_key_from_ui`'s `NamedKey::PageUp` \
+               arm is `Some((\"Page_Up\".to_string(), None, false))` \
+               unconditionally — unlike its `Home`/`End` siblings a few \
+               lines above, which emit a distinct `\"Shift_Home\"`/ \
+               `\"Shift_End\"` name when `shift` is set, `PageUp` never \
+               even inspects `shift`. So a real Shift+Page Up keypress on \
+               any backend decodes exactly like plain Page Up, and \
+               `handle_vscode_key` (which has no `\"Shift_Page_Up\"` arm \
+               either) has no way to ever learn Shift was held.",
+    },
+    VscodeBinding {
+        command_id: "cursorPageDownSelect",
+        os: Os::WinLinux,
+        vscode_chord: "Shift+Page_Down",
+        vimcode_key: "(decodes identically to plain Page_Down, shift bit lost)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::SHIFT_PAGEUP_PAGEDOWN_SHIFT_BIT_DROPPED_BY_\
+               DECODER. Mirrors cursorPageUpSelect above — \
+               `NamedKey::PageDown`'s arm has the identical unconditional- \
+               `false` shape.",
+    },
 ];
 
 /// The table above must stay internally consistent: every `Missing` row
@@ -948,6 +1719,155 @@ fn test_vscode_plain_delete_removes_char_under_cursor() {
     assert_eq!(buf(&e), "ello\n");
 }
 
+// ─── #1746: new engine-level coverage for the rows added to expand the
+// table to 100+ (plain arrow/Home/End movement, plain Shift-extend, Ctrl+K
+// Ctrl+W) ────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_vscode_plain_right_clears_selection_and_moves() {
+    let mut e = engine_with("hello\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    e.visual_anchor = Some(Cursor { line: 0, col: 0 });
+    e.mode = Mode::Visual;
+    e.handle_key("Right", None, false);
+    assert!(
+        e.visual_anchor.is_none(),
+        "plain Right must clear any active selection"
+    );
+    assert_eq!(e.cursor().col, 1);
+}
+
+#[test]
+fn test_vscode_plain_left_moves_cursor_left() {
+    let mut e = engine_with("hello\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 3 };
+    e.handle_key("Left", None, false);
+    assert_eq!(e.cursor().col, 2);
+}
+
+#[test]
+fn test_vscode_plain_up_moves_cursor_up() {
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 2, col: 0 };
+    e.handle_key("Up", None, false);
+    assert_eq!(e.cursor().line, 1);
+}
+
+#[test]
+fn test_vscode_plain_down_moves_cursor_down() {
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    e.handle_key("Down", None, false);
+    assert_eq!(e.cursor().line, 1);
+}
+
+#[test]
+fn test_vscode_plain_home_smart_toggle() {
+    let mut e = engine_with("    hello\n");
+    vscode_mode(&mut e);
+    // Cursor past the indent: first Home press goes to the first
+    // non-whitespace column (VS Code's "smart home").
+    e.view_mut().cursor = Cursor { line: 0, col: 7 };
+    e.handle_key("Home", None, false);
+    assert_eq!(
+        e.cursor().col,
+        4,
+        "first Home press should go to indent end"
+    );
+    // Pressing Home again from the indent-end column goes to column 0.
+    e.handle_key("Home", None, false);
+    assert_eq!(e.cursor().col, 0, "second Home press should go to column 0");
+}
+
+#[test]
+fn test_vscode_plain_end_moves_to_line_end() {
+    let mut e = engine_with("hello\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    e.handle_key("End", None, false);
+    assert_eq!(e.cursor().col, 5);
+}
+
+#[test]
+fn test_vscode_plain_backspace_deletes_char_before_cursor() {
+    let mut e = engine_with("hello\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 5 };
+    e.handle_key("BackSpace", None, false);
+    assert_eq!(buf(&e), "hell\n");
+}
+
+#[test]
+fn test_vscode_shift_left_extends_selection_without_ctrl() {
+    let mut e = engine_with("hello\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 3 };
+    e.handle_key("Shift_Left", None, false);
+    assert!(e.visual_anchor.is_some());
+    assert_eq!(e.cursor().col, 2);
+}
+
+#[test]
+fn test_vscode_shift_up_extends_selection_without_ctrl() {
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 2, col: 0 };
+    e.handle_key("Shift_Up", None, false);
+    assert!(e.visual_anchor.is_some());
+    assert_eq!(e.cursor().line, 1);
+}
+
+#[test]
+fn test_vscode_shift_home_extends_selection_without_ctrl() {
+    let mut e = engine_with("    hello\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 7 };
+    e.handle_key("Shift_Home", None, false);
+    assert!(e.visual_anchor.is_some());
+    assert_eq!(
+        e.cursor().col,
+        4,
+        "Shift+Home uses the same smart-home target"
+    );
+}
+
+#[test]
+fn test_vscode_shift_end_extends_selection_without_ctrl() {
+    let mut e = engine_with("hello\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    e.handle_key("Shift_End", None, false);
+    assert!(e.visual_anchor.is_some());
+    assert_eq!(e.cursor().col, 5);
+}
+
+#[test]
+fn test_vscode_ctrl_k_ctrl_w_closes_all_editors_in_group() {
+    let mut e = engine_with("aaa\n");
+    vscode_mode(&mut e);
+    e.new_tab(None);
+    e.new_tab(None);
+    let group = e.active_group;
+    assert_eq!(
+        e.editor_groups.get(&group).map(|g| g.tabs.len()),
+        Some(3),
+        "test setup should have 3 tabs open"
+    );
+    e.handle_key("k", Some('k'), true);
+    assert!(e.vscode_pending_ctrl_k);
+    e.handle_key("w", Some('w'), true);
+    assert!(!e.vscode_pending_ctrl_k);
+    assert_eq!(
+        e.editor_groups.get(&group).map(|g| g.tabs.len()),
+        Some(1),
+        "Ctrl+K Ctrl+W should close every tab but the last"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 2. Reachability matrix — does real input ever produce the key the table
 //    above says `handle_vscode_key` wants?
@@ -980,6 +1900,17 @@ struct ReachabilityRow {
     macos_tui: Reach,
     macos_gui: Reach,
     reason: &'static str,
+    /// #1746 (deliverable 2): what a TUI user on `tui_legacy_xterm` or
+    /// `conpty_legacy` should press instead, when the chord's `Reach` on
+    /// either of those is `No`. VS Code's own alternative binding where one
+    /// exists (e.g. F1 for the command palette); otherwise a proposed
+    /// fallback (the command palette by name is always available since F1
+    /// is reachable on every surface — see its own row below). `"n/a"` for
+    /// rows that are already `Yes` on both legacy surfaces, or whose `No`
+    /// cells are `macos_tui`/`macos_gui` only (no terminal fallback is
+    /// meaningful for a GUI-only modifier — see the macOS-terminal decision
+    /// in this file's module doc).
+    fallback: &'static str,
 }
 
 /// The reachability matrix (deliverable 2). Driver-tier tests for the rows
@@ -1012,6 +1943,10 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  GUI — confirmed directly from `macos/events.rs`: Shift is \
                  its own flag bit, independent of Ctrl, same as GDK) \
                  carries that bit.",
+        fallback: "#1746: VS Code ships no non-Shift alternative for \
+                   deleteLines. Propose: F1 (always reachable — see that \
+                   row below) opens the command palette; run \"Delete \
+                   Line\" by name instead of the chord.",
     },
     ReachabilityRow {
         chord: "Ctrl+P (quick open) vs Ctrl+Shift+P (command palette)",
@@ -1023,6 +1958,11 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
         macos_gui: Reach::Yes,
         reason: "Same C0-control-code argument as Ctrl+K/Ctrl+Shift+K, \
                  substituting 'p' for 'k'.",
+        fallback: "#1746: VS Code's own built-in alternative — F1 opens the \
+                   command palette directly (`workbench.action.\
+                   showCommands`'s own row below), so a legacy-terminal \
+                   user reaches the exact same place Ctrl+Shift+P would \
+                   have via a chord that *is* reachable there.",
     },
     ReachabilityRow {
         chord: "Ctrl+[ / Ctrl+Shift+[ (outdent vs fold)",
@@ -1039,6 +1979,7 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  `Shift_bracketleft` — see that function's `lower == '3'` \
                  arm. Listed here precisely to document that this pair is \
                  *not* in the same unresolved state as Ctrl+K/Ctrl+P above.",
+        fallback: "n/a — already `Reach::Yes` everywhere, no fallback needed.",
     },
     ReachabilityRow {
         chord: "Alt+Up / Alt+Down (move line)",
@@ -1053,6 +1994,7 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  which includes every surface vimcode ships today (macOS \
                  Option key behaves as Alt in a terminal, and as `alt` in \
                  `quadraui::Modifiers` on the macOS GUI).",
+        fallback: "n/a — already `Reach::Yes` everywhere, no fallback needed.",
     },
     ReachabilityRow {
         chord: "Ctrl+Alt+Up / Ctrl+Alt+Down (VS Code's real insertCursorAbove/Below)",
@@ -1075,6 +2017,7 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  key is `modifiers.ctrl`, distinct from `modifiers.cmd` \
                  (quadraui's `macos/events.rs`), so Ctrl+Alt+Up/Down never \
                  even touches #1745's Cmd-fold.",
+        fallback: "n/a — already `Reach::Yes` everywhere, no fallback needed.",
     },
     ReachabilityRow {
         chord: "Ctrl+\\ (split editor) vs Ctrl+Shift+\\ (jump to matching bracket)",
@@ -1102,6 +2045,34 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  and has its own one-line special case for the \
                  explicit-Shift-bit shape, producing `\"Shift_backslash\"` \
                  directly.",
+        fallback: "#1746: VS Code ships no alternative binding for \
+                   jumpToBracket. Propose: F1 opens the command palette; \
+                   run \"Go to Bracket\" by name instead of the chord.",
+    },
+    ReachabilityRow {
+        chord: "Ctrl+Shift+L (select all occurrences) vs Ctrl+L (expand line \
+                 selection, chord prefix for the former)",
+        tui_legacy_xterm: Reach::No,
+        tui_kitty_or_csiu: Reach::Yes,
+        conpty_legacy: Reach::No,
+        gtk: Reach::Yes,
+        macos_tui: Reach::No,
+        macos_gui: Reach::Yes,
+        reason: "#1746: the same C0-control-code argument as Ctrl+K/Ctrl+ \
+                 Shift+K above, substituting 'l' for 'k' — a legacy \
+                 terminal's Ctrl+L and Ctrl+Shift+L both decode to the \
+                 same shift-blind `Char('l')+CONTROL`, so \
+                 `editor.action.selectHighlights` is unreachable there \
+                 while plain Ctrl+L (`expandLineSelection`) still works. \
+                 This row was missing from the table before #1746 even \
+                 though the underlying ambiguity is identical to the \
+                 already-documented K/P/\\ rows — added while auditing \
+                 every Ctrl+Shift+<letter> binding in VSCODE_BINDINGS for \
+                 this issue's own deliverable 2.",
+        fallback: "#1746: VS Code ships no non-Shift alternative for \
+                   selectHighlights. Propose: F1 opens the command \
+                   palette; run \"Select All Occurrences of Find Match\" \
+                   by name instead of the chord.",
     },
     ReachabilityRow {
         chord: "Cmd+<key> (any VS Code Mac-default chord)",
@@ -1126,6 +2097,11 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  the event. See this table's own three Option/Cmd-arrow \
                  rows below for the handful of Mac defaults that are *not* \
                  a plain Ctrl-to-Cmd substitution.",
+        fallback: "n/a — GUI-only chord; macOS TUI has no Cmd modifier to \
+                   receive at all, so there is no terminal fallback \
+                   distinct from the Linux/Windows TUI default (same \
+                   chord, Ctrl instead of Cmd — this file's own \
+                   macOS-terminal decision in the module doc).",
     },
     ReachabilityRow {
         chord: "Option+Left/Right (word-nav) vs Cmd+Left/Right (line start/end) vs Cmd+Up/Down (doc start/end)",
@@ -1146,6 +2122,10 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  `src/macos/mod.rs`'s `option_right_moves_word_forward_not_\
                  navigate_forward`, `cmd_right_moves_to_line_end_not_one_\
                  column`, and `cmd_down_moves_to_document_end_not_one_line`.",
+        fallback: "n/a — same GUI-only-modifier reasoning as the generic \
+                   Cmd+<key> row above; macOS TUI already has the \
+                   Linux/Windows Ctrl+Left/Right word-nav binding as its \
+                   own default, which is the fallback.",
     },
     ReachabilityRow {
         chord: "Cmd+Option+F (Find & Replace)",
@@ -1163,6 +2143,9 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  on a US keyboard) rather than the base letter — confirmed \
                  by reading that function directly. See \
                  docs/PENDING_QUADRAUI_ISSUES.md.",
+        fallback: "n/a — GUI-only chord, same as the generic Cmd+<key> \
+                   row; Ctrl+H (Linux/Windows' default) already works on \
+                   the macOS TUI as the fallback.",
     },
     ReachabilityRow {
         chord: "Cmd+<key> for a panel_keys-accelerator-only chord (toggle_sidebar, \
@@ -1199,6 +2182,10 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  `src/macos/mod.rs`'s \
                  `cmd_b_does_not_toggle_sidebar_dead_panel_accelerator` for \
                  the concrete, driver-proven instance.",
+        fallback: "n/a — GUI-only chord; the Ctrl-literal accelerator \
+                   (e.g. `<C-b>`) already works unmodified on macOS TUI, \
+                   same as every other platform, since it was never \
+                   routed through the Cmd fold in the first place.",
     },
 ];
 
@@ -1341,6 +2328,18 @@ const KNOWN_GAPS: &[&str] = &[
     "CMD_OPTION_F_FIND_REPLACE_UNREACHABLE",
     "CTRL_MINUS_NAVIGATE_BACK_FORWARD_ON_MAC_UNVERIFIED",
     "PANEL_ACCELERATOR_CMD_CHORDS_DEAD_ON_MACOS_GUI",
+    // #1746, added while expanding VSCODE_BINDINGS past 100 rows — see each
+    // label's own VSCODE_BINDINGS row for the full writeup and its gate
+    // test below for the RED proof. Verified RED against unfixed `develop`
+    // by temporarily removing these six labels and re-running this suite:
+    // all six gate tests failed with `Regression` (the exact panics this
+    // issue's new code is supposed to pin), confirming each one can fail.
+    "CMD_SHIFT_Z_REDO_UNREACHABLE_ON_MAC",
+    "OPTION_BACKSPACE_DELETE_WORD_LEFT_UNBOUND_ON_MAC",
+    "OPTION_DELETE_WORD_RIGHT_UNBOUND_ON_MAC",
+    "CTRL_K_CTRL_C_TOGGLES_INSTEAD_OF_ADD_ONLY",
+    "CTRL_K_CTRL_U_TOGGLES_INSTEAD_OF_REMOVE_ONLY",
+    "SHIFT_PAGEUP_PAGEDOWN_SHIFT_BIT_DROPPED_BY_DECODER",
 ];
 
 /// Run `body`, gated on whether `label` is listed in [`KNOWN_GAPS`]. Mirrors
@@ -1678,6 +2677,163 @@ fn gap_ctrl_minus_navigates_back_on_mac() {
             0,
             "Ctrl+- (navigateBack) should return to the jump-list entry, \
              the same way Alt+Left already does on Win/Linux"
+        );
+    });
+}
+
+// ─── #1746: new gates, found while expanding VSCODE_BINDINGS to 100+ rows ──
+
+/// `KNOWN_GAPS::CMD_SHIFT_Z_REDO_UNREACHABLE_ON_MAC`. See this gap's
+/// `VSCODE_BINDINGS` row (`redo`, `Os::Mac`) for the full writeup: VS
+/// Code's real Mac default for redo is Cmd+Shift+Z, which folds to Ctrl+
+/// Shift+Z (key name `"Z"`) — `handle_vscode_key`'s ctrl match has no `"Z"`
+/// arm, only lowercase `"y"`. Drives a real undo/redo roundtrip: types a
+/// character, undoes it with Ctrl+Z (already `Matches`), then presses `"Z"`
+/// (Ctrl+Shift+Z's engine-level shape) expecting the character back.
+#[test]
+fn gap_cmd_shift_z_redos_on_mac() {
+    gap_gate("CMD_SHIFT_Z_REDO_UNREACHABLE_ON_MAC", || {
+        let mut e = engine_with("hello\n");
+        vscode_mode(&mut e);
+        e.view_mut().cursor = Cursor { line: 0, col: 5 };
+        e.handle_key("!", Some('!'), false);
+        assert_eq!(buf(&e), "hello!\n", "test setup: typed one character");
+        e.handle_key("z", Some('z'), true);
+        assert_eq!(buf(&e), "hello\n", "test setup: Ctrl+Z undid the type");
+        e.handle_key("Z", Some('Z'), true);
+        assert_eq!(
+            buf(&e),
+            "hello!\n",
+            "Ctrl+Shift+Z (VS Code Mac's real redo chord) should redo"
+        );
+    });
+}
+
+/// `KNOWN_GAPS::OPTION_BACKSPACE_DELETE_WORD_LEFT_UNBOUND_ON_MAC`. See this
+/// gap's `VSCODE_BINDINGS` row (`deleteWordLeft`, `Os::Mac`) for the full
+/// writeup: `render::alt_chord_base` has no case for `NamedKey::Backspace`'s
+/// multi-character name, so `route_alt_key` falls through and
+/// `handle_vscode_key`'s `Alt_` match (which has no `"Alt_BackSpace"` arm
+/// either) never gets a chance either way. Drives the hypothetical correct
+/// key name directly — confirming it is unhandled regardless of which of
+/// the two functions would need the fix.
+#[test]
+fn gap_option_backspace_deletes_word_left_on_mac() {
+    gap_gate("OPTION_BACKSPACE_DELETE_WORD_LEFT_UNBOUND_ON_MAC", || {
+        let mut e = engine_with("hello world\n");
+        vscode_mode(&mut e);
+        e.view_mut().cursor = Cursor { line: 0, col: 11 };
+        e.handle_key("Alt_BackSpace", None, false);
+        assert_eq!(
+            buf(&e),
+            "hello \n",
+            "Option+Backspace (VS Code Mac's deleteWordLeft) should delete \
+             the word before the cursor, the same as Ctrl+Backspace does \
+             on Linux/Windows"
+        );
+    });
+}
+
+/// `KNOWN_GAPS::OPTION_DELETE_WORD_RIGHT_UNBOUND_ON_MAC`. Mirrors
+/// `gap_option_backspace_deletes_word_left_on_mac` above, for Delete.
+#[test]
+fn gap_option_delete_deletes_word_right_on_mac() {
+    gap_gate("OPTION_DELETE_WORD_RIGHT_UNBOUND_ON_MAC", || {
+        let mut e = engine_with("hello world\n");
+        vscode_mode(&mut e);
+        e.view_mut().cursor = Cursor { line: 0, col: 0 };
+        e.handle_key("Alt_Delete", None, false);
+        assert_eq!(
+            buf(&e),
+            " world\n",
+            "Option+Delete (VS Code Mac's deleteWordRight) should delete \
+             the word after the cursor, the same as Ctrl+Delete does on \
+             Linux/Windows"
+        );
+    });
+}
+
+/// `KNOWN_GAPS::CTRL_K_CTRL_C_TOGGLES_INSTEAD_OF_ADD_ONLY`. See this gap's
+/// `VSCODE_BINDINGS` row (`editor.action.addCommentLine`) for the full
+/// writeup: `vscode_ctrl_k_dispatch`'s `"c"` arm calls the same
+/// `toggle_comment` its `"u"` arm uses, so pressing Ctrl+K Ctrl+C on an
+/// already-commented line uncomments it instead of being a no-op.
+#[test]
+fn gap_ctrl_k_ctrl_c_only_adds_never_removes() {
+    gap_gate("CTRL_K_CTRL_C_TOGGLES_INSTEAD_OF_ADD_ONLY", || {
+        let mut e = engine_with("# print(1)\n");
+        vscode_mode(&mut e);
+        e.view_mut().cursor = Cursor { line: 0, col: 0 };
+        e.handle_key("k", Some('k'), true);
+        assert!(
+            e.vscode_pending_ctrl_k,
+            "test setup: Ctrl+K armed the chord"
+        );
+        e.handle_key("c", Some('c'), true);
+        assert!(
+            buf(&e).contains('#'),
+            "addCommentLine must be idempotent — it must not remove an \
+             existing comment marker: {:?}",
+            buf(&e)
+        );
+    });
+}
+
+/// `KNOWN_GAPS::CTRL_K_CTRL_U_TOGGLES_INSTEAD_OF_REMOVE_ONLY`. Mirrors
+/// `gap_ctrl_k_ctrl_c_only_adds_never_removes` above, for removeCommentLine
+/// on an uncommented line.
+#[test]
+fn gap_ctrl_k_ctrl_u_only_removes_never_adds() {
+    gap_gate("CTRL_K_CTRL_U_TOGGLES_INSTEAD_OF_REMOVE_ONLY", || {
+        let mut e = engine_with("print(1)\n");
+        vscode_mode(&mut e);
+        e.view_mut().cursor = Cursor { line: 0, col: 0 };
+        e.handle_key("k", Some('k'), true);
+        assert!(
+            e.vscode_pending_ctrl_k,
+            "test setup: Ctrl+K armed the chord"
+        );
+        e.handle_key("u", Some('u'), true);
+        assert!(
+            !buf(&e).contains('#'),
+            "removeCommentLine must be idempotent — it must not add a \
+             comment marker to an already-uncommented line: {:?}",
+            buf(&e)
+        );
+    });
+}
+
+/// `KNOWN_GAPS::SHIFT_PAGEUP_PAGEDOWN_SHIFT_BIT_DROPPED_BY_DECODER`. See
+/// this gap's two `VSCODE_BINDINGS` rows (`cursorPageUpSelect`/
+/// `cursorPageDownSelect`) for the full writeup: unlike its `Home`/`End`
+/// siblings, `engine_key_from_ui`'s `NamedKey::PageUp`/`PageDown` arms never
+/// look at `shift` at all. Driver-tier (not engine-level), same idiom as
+/// the Ctrl+K/Ctrl+Shift+K pair's own driver-tier tests above — this is a
+/// decoder bug, not an input-triple the engine could ever usefully receive
+/// today (there is no `"Shift_Page_Up"` arm in `handle_vscode_key` either,
+/// since nothing can produce that name yet).
+#[test]
+fn gap_shift_pageup_pagedown_shift_bit_dropped_by_decoder() {
+    gap_gate("SHIFT_PAGEUP_PAGEDOWN_SHIFT_BIT_DROPPED_BY_DECODER", || {
+        use quadraui::{Key, Modifiers, NamedKey};
+        let shift_mods = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let (up_name, _, _) =
+            engine_key_from_ui(&Key::Named(NamedKey::PageUp), shift_mods, false).unwrap();
+        assert_eq!(
+            up_name, "Shift_Page_Up",
+            "Shift+Page Up must decode distinctly from plain Page Up, the \
+             same way Shift+Home already decodes to \"Shift_Home\" — \
+             instead it collapses to {up_name:?}"
+        );
+        let (down_name, _, _) =
+            engine_key_from_ui(&Key::Named(NamedKey::PageDown), shift_mods, false).unwrap();
+        assert_eq!(
+            down_name, "Shift_Page_Down",
+            "Shift+Page Down must decode distinctly from plain Page Down — \
+             instead it collapses to {down_name:?}"
         );
     });
 }
