@@ -1072,7 +1072,29 @@ pub struct RenderedWindow {
     /// truncate before using it.
     pub rect: WindowRect,
     /// Visible lines, one per row.
+    ///
+    /// **Not** the window's row *capacity* — `build_rendered_window`'s
+    /// fill loop stops the moment it runs out of buffer content
+    /// (`line_idx < total_lines`), so on a buffer shorter than the
+    /// viewport this is shorter than the number of rows the window
+    /// actually has room to paint. Use [`Self::visible_line_capacity`]
+    /// for "how many rows could this window show" — e.g. feeding
+    /// `Engine::set_viewport_for_window` (#1779: using `lines.len()`
+    /// there pinned a 1-line buffer's `view.viewport_lines` to `1`, so
+    /// the very next `ensure_cursor_visible` — on the keystroke that grew
+    /// the buffer to 2 lines — believed the viewport could show only one
+    /// line and scrolled line 0 out of view to keep the cursor's new
+    /// line "visible").
     pub lines: Vec<RenderedLine>,
+    /// This window's row *capacity* at the geometry `rect`/`line_height`
+    /// this frame painted with — `(rect.height / line_height).floor()`,
+    /// minus one for the per-window status row when that's shown (exactly
+    /// the `visible_lines` local `build_screen_layout`'s window loop
+    /// computes and feeds into `build_rendered_window`). Unlike
+    /// [`Self::lines`]`.len()`, this does **not** shrink just because the
+    /// buffer itself is shorter than the viewport — see that field's doc
+    /// for the #1779 bug this distinction exists to keep fixed.
+    pub visible_line_capacity: usize,
     /// Cursor position + shape, or `None` if the cursor is scrolled off-screen.
     pub cursor: Option<(CursorPos, CursorShape)>,
     /// Secondary cursor positions (multi-cursor Alt-D). Rendered as dimmed blocks.
@@ -6375,11 +6397,27 @@ pub(crate) fn run_shared_tick_chores(
     // Exact per-window viewport dimensions from the last paint, so
     // `ensure_cursor_visible` uses real geometry rather than a whole-screen
     // approximation that can't see splits.
+    //
+    // `rw.visible_line_capacity`, not `rw.lines.len()` (#1779): the latter
+    // is how many rows the *buffer* had content for last frame, which on a
+    // buffer shorter than the window is less than the window's actual row
+    // capacity — `RenderedWindow::lines`'s own doc has the full case this
+    // under-counted. Feeding that short count into `view.viewport_lines`
+    // pinned a freshly-opened one-line buffer's viewport to "1 row tall";
+    // the very next edit that grew the buffer (`o<text><Esc>`) then ran
+    // `ensure_cursor_visible` against that stale 1-row belief and scrolled
+    // line 0 out of view to keep the cursor's new line "on screen" —
+    // reproduced on a real pty (`tests/
+    // pty_open_line_below_paints_all_lines.rs`) between the idle tick that
+    // cached the 1-row figure and the keystroke that acted on it; neither
+    // in-process driver (`TuiDriver`/`TuiVtDriver`) ever runs a tick
+    // between dispatching a key and rendering its result, so this never
+    // showed up there.
     if let Some(layout) = app.cached_screen_layout.borrow().as_ref() {
         for rw in &layout.windows {
             engine.set_viewport_for_window(
                 rw.window_id,
-                rw.lines.len().max(1),
+                rw.visible_line_capacity.max(1),
                 rw.text_viewport_cols.max(1),
             );
         }
@@ -23546,6 +23584,7 @@ fn build_rendered_window(
         window_id: id,
         rect: *rect,
         lines: vec![],
+        visible_line_capacity: visible_lines.max(1),
         cursor: None,
         extra_cursors: vec![],
         selection: None,
@@ -24943,6 +24982,7 @@ fn build_rendered_window(
         window_id,
         rect: *rect,
         lines,
+        visible_line_capacity: visible_lines.max(1),
         cursor,
         extra_cursors,
         selection,
@@ -31121,6 +31161,65 @@ mod tests {
         assert_eq!(first_line.spell_errors[0].end_col, 8);
     }
 
+    // ── RenderedWindow::visible_line_capacity (#1779) ────────────────────────
+
+    /// A one-line buffer in a 24-row window must report a row *capacity*
+    /// of 24 even though only 1 row of actual content was painted —
+    /// `run_shared_tick_chores` (`src/render.rs`) feeds this straight into
+    /// `Engine::set_viewport_for_window`, and `ensure_cursor_visible` (run
+    /// on every keystroke, including the one that grows this buffer to 2
+    /// lines) trusts that number to decide whether the viewport is tall
+    /// enough to show the cursor's line without scrolling.
+    ///
+    /// RED against the pre-fix shape (`visible_line_capacity` not a field;
+    /// callers read `lines.len()` instead): `lines.len()` here is `1`, not
+    /// `24` — exactly the stale-viewport value that made `ensure_cursor_
+    /// visible` believe a 24-row window could show only one line, and
+    /// scroll line 0 out of view the moment `o<text><Esc>` grew the buffer
+    /// to two lines (`tests/pty_open_line_below_paints_all_lines.rs` pins
+    /// the full end-to-end symptom on a real pty, where the idle tick that
+    /// caches this value actually runs between keystrokes).
+    #[test]
+    fn visible_line_capacity_is_the_window_row_capacity_not_the_painted_line_count() {
+        use crate::core::Engine;
+
+        let mut engine = Engine::new();
+        // No per-window status row, so the window's whole 24-row rect is
+        // text rows — keeps the expected capacity a round number instead
+        // of also pinning `window_status_row_reserved`'s own default.
+        engine.settings.window_status_line = false;
+        engine.buffer_mut().insert(0, "ZQXW_ONELINE\n");
+
+        let rects = vec![(
+            engine.active_window_id(),
+            WindowRect::new(0.0, 0.0, 80.0, 24.0),
+        )];
+        let theme = Theme::onedark();
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        );
+
+        let window = &layout.windows[0];
+        assert_eq!(
+            window.lines.len(),
+            1,
+            "precondition: a 1-line buffer only paints 1 line of content"
+        );
+        assert_eq!(
+            window.visible_line_capacity, 24,
+            "the window's row capacity must reflect its actual 24-row \
+             rect, not how many lines the buffer currently has content \
+             for"
+        );
+    }
+
     // ── status_bar_zone_hit_test (#672) ──────────────────────────────────────
 
     #[test]
@@ -33267,6 +33366,7 @@ mod tests {
             window_id: WindowId(0),
             rect,
             lines: vec![],
+            visible_line_capacity: 1,
             cursor: None,
             extra_cursors: vec![],
             selection: None,

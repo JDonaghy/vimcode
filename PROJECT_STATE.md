@@ -1,5 +1,30 @@
 # VimCode Project State
 
+**Last updated:** October 5, 2026 (#1779 — TUI "line 1 vanishes" on `o` /
+yy+j+p when the edit grows the buffer's last line). **Fixed.** Root cause:
+`src/render.rs`'s `run_shared_tick_chores` fed `Engine::set_viewport_
+for_window` the *previous frame's painted line count*
+(`RenderedWindow.lines.len()`), not the window's actual row *capacity* —
+on a buffer shorter than the viewport (e.g. a freshly opened 1-line file),
+those two differ, so `view.viewport_lines` got pinned to the buffer's
+current length. The real TUI runner calls that tick between every input
+batch (including idle ones), so by the time the next keystroke grew the
+buffer, `Engine::ensure_cursor_visible` believed the viewport was exactly
+as tall as the old content and scrolled line 0 out of view to keep the
+cursor's new line "on screen". Neither in-process driver
+(`quadraui::tui::testing::TuiDriver` nor `tui::vt_testing::TuiVtDriver`)
+ever interleaves a tick between dispatching a key and rendering it, so
+this never reproduced there — confirmed RED only on a real Unix pty
+(`tests/pty_open_line_below_paints_all_lines.rs`, new). Fix: added
+`RenderedWindow::visible_line_capacity` (the window's real row count from
+`rect`/`line_height`, independent of how much buffer content exists) and
+pointed `run_shared_tick_chores` at it instead of `lines.len()`. Coverage:
+the new real-pty test (RED-verified pre-fix, GREEN post-fix), a
+`src/render.rs` unit test pinning the new field's value against
+`lines.len()` on a short buffer, and two in-process `TuiDriver`/
+`TuiVtDriver` regression tests kept as permanent negative evidence that
+this exact bug sits outside both harnesses' reach.
+
 **Last updated:** October 5, 2026 (#1762 fix iteration 1 — activity bar got
 stuck on "Run and Debug" after visiting Extensions, and a misrouted
 right-click launched a failing debug session). **Status: partial — see
