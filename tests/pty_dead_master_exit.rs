@@ -52,8 +52,8 @@
 //! call site for why a controlling terminal makes this test pass for the
 //! wrong reason (a real `SIGHUP`, not the guard, kills `vcd`). Without
 //! that backstop, this test deterministically reproduces #1735 against
-//! the #1765 pin: `sample`-ing the real `vcd` process mid-run (macOS
-//! `sample(1)`, 1ms interval, 2s window) shows the main thread parked
+//! the #1765 pin. **Measured on macOS** (`sample(1)`, 1ms interval, 2s
+//! window, on the real `vcd` process mid-run): the main thread is parked
 //! inside `TuiBackend::wait_events` → `ratatui::crossterm::event::poll` →
 //! `UnixInternalEventSource::try_read`, issuing a bare `read()` syscall
 //! ~1390 times in that window with **no** `stdin_hung_up` frame anywhere
@@ -62,9 +62,11 @@
 //! landed.
 //!
 //! Reading `quadraui::tui::backend::TuiBackend::wait_events`'s own source
-//! (the `8425673` pin) explains why that's not a narrow, unlucky race but
-//! close to a *guaranteed* one for this trigger shape: while idle, the
-//! loop re-checks `stdin_hung_up()` only in the brief gap *between* two
+//! (the `8425673` pin — this part is plain, OS-agnostic Rust, read once
+//! and applicable identically to any Unix target, not a macOS-specific
+//! observation) explains why that's not a narrow, unlucky race but close
+//! to a *guaranteed* one for this trigger shape: while idle, the loop
+//! re-checks `stdin_hung_up()` only in the brief gap *between* two
 //! consecutive `ratatui::crossterm::event::poll(STDIN_HANGUP_POLL_SLICE)`
 //! calls (20ms each), immediately starting the next slice if nothing was
 //! found. `vcd` idling with no input is therefore inside one of those
@@ -78,7 +80,14 @@
 //! either. This matches the b145a55 commit's own review note ("Slicing
 //! narrows, but does not eliminate, that race... a full fix would mean
 //! reimplementing crossterm's own reader") — just quantifies how little
-//! the narrowing actually buys for this exact trigger.
+//! the narrowing actually buys for this exact trigger. The ~1390-reads/2s
+//! figure and the 5/5-runs count are macOS-only measurements; the
+//! structural argument (the source reading above) is platform-neutral and
+//! predicts the same outcome on Linux, but that has not been
+//! independently measured on Linux as of this writing — Linux's own
+//! `stdin_hung_up()` path differs (see `backend.rs:1490-1509`'s doc on
+//! `tty_vhangup()`/`isatty`-returns-`EIO`), so the exact timing could in
+//! principle differ even if the race's existence does not.
 //!
 //! Per this repo's Platform-Neutrality Rule, the fix for *that* gap
 //! belongs in quadraui (e.g. actually reimplementing the read loop, or
@@ -87,10 +96,17 @@
 //! workaround — so, mirroring `crossterm_dead_pty_busy_loop.rs`'s own
 //! precedent, this test stays `#[ignore]`d with this analysis rather than
 //! either being weakened to stop asserting the exit, or left to red-wall
-//! `cargo test` until that lands. Run explicitly with `cargo test --test
-//! pty_dead_master_exit -- --ignored` to see it fail today. Un-ignore
-//! once a quadraui fix closes (or substantially narrows, in a way
-//! verified against this exact non-ctty trigger shape) this race.
+//! `cargo test` until that lands. See `docs/PENDING_QUADRAUI_ISSUES.md`'s
+//! "crossterm 0.29.0 ... busy-spins" entry (its "#1765 update" section)
+//! for the drafted quadraui issue this gap is tracked against. Run
+//! explicitly with `cargo test --test pty_dead_master_exit -- --ignored`
+//! to see it fail today. Un-ignore once a quadraui fix closes (or
+//! substantially narrows, in a way verified against this exact non-ctty
+//! trigger shape) this race — note that un-ignoring this test does
+//! **not** imply `crossterm_dead_pty_busy_loop.rs` should also be
+//! un-ignored, or vice versa; they have different un-ignore conditions
+//! (see that file's own module doc, and the PENDING entry's "Note on the
+//! two `#[ignore]`d vimcode tests" paragraph).
 #![cfg(unix)]
 
 use std::io::{ErrorKind, Read, Write};
@@ -124,6 +140,15 @@ const EXIT_BUDGET: Duration = Duration::from_secs(5);
 /// to 100% of one core for the entire window. `EXIT_BUDGET` is 5s; 1s of
 /// consumed CPU time during that window is already a generous bar — a
 /// reproduction of the bug would consume close to the full 5s.
+///
+/// Note on measurement floor: the BSD `ps` macOS ships reports `time=` with
+/// fractional seconds (`[[dd-]hh:]mm:ss.ff`), but Linux's `procps` `ps`
+/// reports whole seconds only (`[DD-]HH:MM:SS`, no `.ff` field at all) —
+/// `parse_ps_time` handles both, but on Linux this bar is effectively "a
+/// full second of CPU was observed," not "1.0s precisely." That's still
+/// well below what a 100%-of-a-core spin would produce over `EXIT_BUDGET`,
+/// so it doesn't change what this test catches, but don't tighten this
+/// constant below 1.0 expecting sub-second precision on Linux.
 const MAX_CPU_SECONDS_WHILE_WAITING: f64 = 1.0;
 
 /// Non-blocking read polling interval while waiting for `vcd`'s startup
@@ -237,9 +262,16 @@ fn wait_for_screen_contains(
     let mut buf = [0u8; 4096];
     let start = Instant::now();
     loop {
-        pump_once(reader, writer, parser, &mut buf);
+        let still_open = pump_once(reader, writer, parser, &mut buf);
         if screen_text(parser).contains(needle) {
             return Some(start.elapsed());
+        }
+        if !still_open {
+            // EOF before startup ever finished — not expected on this
+            // code path (this is only called before the test closes the
+            // master itself), so fail fast rather than spinning the
+            // retry loop for the full `timeout`.
+            return None;
         }
         if start.elapsed() >= timeout {
             return None;
@@ -296,9 +328,11 @@ fn parse_ps_time(text: &str) -> Option<f64> {
             — see this file's module doc, '#[ignore]d too' section, for \
             the full stack-sample-based analysis of why the guard's \
             narrow inter-slice checking window doesn't help this trigger \
-            shape in practice. Run explicitly with `cargo test --test \
+            shape in practice, and `docs/PENDING_QUADRAUI_ISSUES.md`'s \
+            'crossterm 0.29.0 ... busy-spins' entry for the drafted \
+            quadraui issue. Run explicitly with `cargo test --test \
             pty_dead_master_exit -- --ignored` to see it fail today."]
-fn vcd_exits_promptly_once_its_pty_master_closes() {
+fn vcd_should_exit_promptly_once_its_pty_master_closes() {
     let home = isolated_home();
     let main_rs = home.join("main.rs");
     std::fs::write(&main_rs, "fn main() {}\n").expect("write main.rs");
@@ -374,8 +408,15 @@ fn vcd_exits_promptly_once_its_pty_master_closes() {
 
     // Baseline CPU time right before the hangup, so the assertion below
     // measures only what vcd spends *after* its pty dies, not whatever
-    // startup/paint work it already did.
-    let cpu_before = ps_cpu_time_secs(pid).unwrap_or(0.0);
+    // startup/paint work it already did. `None` (the baseline `ps` call
+    // itself failed — e.g. a transient `ps` spawn hiccup) is kept distinct
+    // from `Some(0.0)` rather than silently defaulted to zero: a silent
+    // zero-fallback would turn a missing baseline into "measure vcd's
+    // *total* CPU including all of its startup/tree-sitter work," which
+    // could fail the CPU assertion below for a reason that has nothing to
+    // do with #1735. If the baseline is missing, the CPU assertion is
+    // skipped below rather than measuring the wrong thing.
+    let cpu_before = ps_cpu_time_secs(pid);
 
     // The bugbash's own trigger: the driving terminal/process goes away.
     // Every dup'd fd referencing the master (the original handle, the
@@ -386,16 +427,27 @@ fn vcd_exits_promptly_once_its_pty_master_closes() {
     drop(writer);
     drop(master);
 
+    // One unconditional sample taken right after the close, before the
+    // first `try_wait` check below, so a build that exits on its very next
+    // scheduler tick (the success path this test exists to protect) still
+    // has at least one post-close CPU sample to report — otherwise
+    // `peak_cpu_during_wait` could stay at its initial 0.0 the whole time
+    // and the CPU assertion below would pass vacuously, never having
+    // actually measured anything.
+    let mut peak_cpu_during_wait = match (cpu_before, ps_cpu_time_secs(pid)) {
+        (Some(before), Some(now)) => (now - before).max(0.0),
+        _ => 0.0,
+    };
+
     let wait_start = Instant::now();
     let mut exited = false;
-    let mut peak_cpu_during_wait = 0.0_f64;
     loop {
         if let Ok(Some(_status)) = child.try_wait() {
             exited = true;
             break;
         }
-        if let Some(cpu_now) = ps_cpu_time_secs(pid) {
-            let consumed = (cpu_now - cpu_before).max(0.0);
+        if let (Some(before), Some(cpu_now)) = (cpu_before, ps_cpu_time_secs(pid)) {
+            let consumed = (cpu_now - before).max(0.0);
             if consumed > peak_cpu_during_wait {
                 peak_cpu_during_wait = consumed;
             }
@@ -414,6 +466,15 @@ fn vcd_exits_promptly_once_its_pty_master_closes() {
     }
     let _ = child.wait();
 
+    if cpu_before.is_none() {
+        eprintln!(
+            "WARNING: the baseline `ps` sample failed (see ps_cpu_time_secs), \
+             so the CPU-time assertion below is being skipped entirely rather \
+             than measuring against a wrong (zero) baseline. Only the exit-\
+             time assertion ran."
+        );
+    }
+
     assert!(
         exited,
         "#1735: vcd did not exit on its own within {EXIT_BUDGET:?} of its \
@@ -423,7 +484,7 @@ fn vcd_exits_promptly_once_its_pty_master_closes() {
          hangup and exits within roughly one idle-poll tick."
     );
     assert!(
-        peak_cpu_during_wait < MAX_CPU_SECONDS_WHILE_WAITING,
+        cpu_before.is_none() || peak_cpu_during_wait < MAX_CPU_SECONDS_WHILE_WAITING,
         "#1735: vcd exited after its pty master closed ({wait_elapsed:?}), \
          but consumed {peak_cpu_during_wait:.2}s of CPU time while doing \
          so — over the {MAX_CPU_SECONDS_WHILE_WAITING}s bar, which is \

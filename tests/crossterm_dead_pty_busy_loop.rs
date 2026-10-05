@@ -128,10 +128,16 @@
 //! `crossterm` 0.29.0 itself is unpatched by #1765 — only vimcode's
 //! transitive quadraui pin moved, not crossterm's own pinned version —
 //! so this direct repro remains exactly as RED as it was before. See
-//! `tests/pty_dead_master_exit.rs`, added by #1765, for the test that
-//! actually exercises quadraui#1295's guard end-to-end through a real
-//! `vcd` process — and for why *that* test is **also** still `#[ignore]`d
-//! despite exercising the real fix.
+//! `tests/pty_dead_master_exit.rs::vcd_should_exit_promptly_once_its_pty_master_closes`,
+//! added by #1765, for the test that actually exercises quadraui#1295's
+//! guard end-to-end through a real `vcd` process — and for why *that*
+//! test is **also** still `#[ignore]`d despite exercising the real fix
+//! (short version: the guard's inter-slice check window is too narrow to
+//! help in practice; see that file's own module doc for the full
+//! analysis). Both tests, and the drafted follow-up quadraui issue that
+//! covers the remaining gap, are tracked in
+//! `docs/PENDING_QUADRAUI_ISSUES.md`'s "crossterm 0.29.0 ... busy-spins"
+//! entry — see its "#1765 update" section for what changed.
 #![cfg(target_os = "linux")]
 
 use std::ffi::CStr;
@@ -271,7 +277,9 @@ fn redirect_stdin_to(fd: RawFd) {
             a bare Ok(0) read), not a vimcode-side regression, and not \
             something quadraui#1295's TuiBackend-level guard can fix for a \
             test that bypasses TuiBackend entirely (see this file's module \
-            doc, '#1765 update'). Run explicitly with `cargo test --release \
+            doc, '#1765 update', and `docs/PENDING_QUADRAUI_ISSUES.md`'s \
+            'crossterm 0.29.0 ... busy-spins' entry for the drafted \
+            quadraui issue). Run explicitly with `cargo test --release \
             --test crossterm_dead_pty_busy_loop -- --ignored` to see it \
             fail today. Un-ignore once crossterm itself ships a fix this \
             crate's pin can pick up."]
