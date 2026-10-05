@@ -2890,27 +2890,67 @@ impl App {
                 return;
             }
             render::AltKeyOutcome::Fallthrough => {
-                // #1764: an Alt-modified key that no rung above claimed
-                // must not reach `Engine::handle_key` as if the modifier
-                // never existed — that function takes no `alt` parameter
-                // at all, so the fallthrough below would redeliver it as
-                // the *bare* key, which in Insert/Replace mode means
-                // inserting the character literally. Treating it as an
-                // implicit Escape instead (and discarding the letter) is
-                // the better of the two unverifiable guesses: Vim mode has
-                // no `<M-x>` mappings for the letter to mean anything else,
-                // while a real pty collapsing a fast Escape-then-letter
+                // #1764: an Alt-modified *printable-character* key that no
+                // rung above claimed must not reach `Engine::handle_key` as
+                // if the modifier never existed — that function takes no
+                // `alt` parameter at all, so the fallthrough below would
+                // redeliver it as the *bare* key, which in Insert/Replace
+                // mode means inserting the character literally. Treating it
+                // as an implicit Escape instead (and discarding the letter)
+                // is the better of the two unverifiable guesses: Vim mode
+                // has no `<M-x>` mappings for a letter to mean anything
+                // else, while a real pty collapsing a fast Escape-then-letter
                 // into this exact chord is the documented #1763/#1764
                 // mechanism — see `render::alt_mnemonic_open_allowed`'s own
                 // doc for the matching other half of this fix (keeping the
                 // menu bar from stealing the chord first). Escape is a
-                // harmless, idempotent no-op in `Normal` mode, so this is
-                // safe to apply unconditionally rather than only in the
-                // modes actually at risk.
-                if alt {
+                // harmless no-op in `Normal` mode (though *not* in the
+                // `Visual*` family, which `alt_mnemonic_open_allowed` also
+                // admits and where Escape exits Visual mode — still the
+                // right substitution there, since the alternative is
+                // literal-text corruption, not a no-op either way), so this
+                // is safe to apply across every mode this rung can see.
+                //
+                // Gated on `render::alt_chord_is_printable_char` (review
+                // finding, #1764 round 1), not on `alt` alone: a real pty's
+                // Escape-then-letter fusion only ever produces a
+                // printable-char chord (`alt_chord_is_printable_char`'s own
+                // doc), so narrowing to that shape keeps the #1764 fix while
+                // restoring every named-key Alt fallthrough that predates it
+                // — `Alt+Enter`/`Alt+BackSpace` in Insert mode,
+                // `Alt+Up`/`Alt+Down` moving the cursor in Vim mode outside
+                // VSCode mode, and `Alt+]`/`Alt+[`/`Home`/`End`/`Delete`/
+                // `Page_Up`/`Page_Down` falling through exactly as
+                // `route_alt_key`'s own arms document.
+                //
+                // Not gated on `menu_bar_toggleable` the way
+                // `alt_mnemonic_open_allowed` is: on macOS GUI, `Option+
+                // <letter>` is the system dead-key/special-character
+                // modifier, so a printable-char Alt chord can arrive there
+                // too without any pty involved. Pre-#1764 an `Option+e` in
+                // Insert mode inserted `e` literally (already the wrong
+                // character for that key combo); post-#1764 it exits Insert
+                // mode instead, which is a more surprising failure in
+                // isolation — but this crate has no `alt`-aware dead-key
+                // decoding on any backend today, so "literal wrong
+                // character" was never the correct behaviour to preserve
+                // either. Left as a known, narrow trade-off (quadraui's
+                // macOS backend's dead-key handling, if it grows one, is the
+                // real fix) rather than threading a third backend-shaped
+                // condition through this already-shared rung.
+                if alt && render::alt_chord_is_printable_char(&key_name, unicode) {
                     let action = self.engine.borrow_mut().handle_key("Escape", None, false);
                     self.dispatch_engine_action(action, false);
                     self.draw_needed.set(true);
+                    // No `run_post_key_epilogue(ctx)` call, matching every
+                    // sibling early-return rung above (`ModalKeyRoute::Engine`
+                    // included, which also dispatches an engine action and
+                    // returns without it) — review finding confirmed: the
+                    // epilogue's only work (sidebar autohide/focus,
+                    // explorer-after-move refresh, quickfix scroll clamp) is
+                    // driven by state a plain Insert→Normal Escape never
+                    // touches, so skipping it here changes nothing it would
+                    // have done.
                     return;
                 }
             }
@@ -8457,7 +8497,7 @@ impl App {
                 event,
                 UiEvent::KeyPressed { modifiers, .. } if modifiers.alt
             )
-            && !render::alt_mnemonic_open_allowed(self.engine.borrow().mode);
+            && !render::alt_mnemonic_open_allowed(self.engine.borrow().mode, menu_bar_toggleable);
         if !alt_mnemonic_open_blocked && (menu_open || (menu_bar_visible && !change_review_open)) {
             // `menu_items_rect`, not `menu_row_rect` (#720): the app icon
             // occupies a leading slot, so the items the last frame *painted*

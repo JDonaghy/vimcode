@@ -25,9 +25,15 @@ mod tests {
     //! survive_a_vim_dw_1763` and `escape_closes_the_dropdown_but_leaves_
     //! the_toggleable_bar_row_visible_1763`) exist specifically to cover a
     //! genuine new `src/app.rs` change (the `MenuEvent::Ignored` arm in
-    //! `handle_dispatch`) — the invariant above does not hold for that one
-    //! commit. Everything else in this file still only drives
-    //! already-shipped code.
+    //! `handle_dispatch`) — the invariant above does not hold for those two
+    //! commits. #1764's one test below
+    //! (`colon_opens_the_command_line_after_an_alt_chord_swallows_
+    //! escape_1764`) is the same kind of exception, covering brand-new
+    //! `src/app.rs` (the `AltKeyOutcome::Fallthrough` arm's implicit-Escape
+    //! substitution and the menu-bar-intercept's `alt_mnemonic_open_blocked`
+    //! gate) and `src/render.rs` (`alt_mnemonic_open_allowed`,
+    //! `alt_chord_is_printable_char`) production code. Everything else in
+    //! this file still only drives already-shipped code.
     //!
     //! # Reading a failure here
     //!
@@ -431,6 +437,25 @@ mod tests {
                 !driver.screen_has("Go to File"),
                 "the Alt+g chord must not open the \"Go\" dropdown while \
                  the engine is mid-text-entry; screen:\n{}",
+                driver.screen()
+            );
+            // #1764 (review finding, round 1): the menu *row* itself must
+            // stay hidden, not just the dropdown's items — `route_menu_bar_
+            // reveal`'s own Alt+<letter> shim (which flips
+            // `engine.menu_bar_visible`, a separate half of this action from
+            // the dropdown-open gate just above) must be gated the same way,
+            // or the fused chord leaves a permanently-revealed, empty bar
+            // row consuming a terminal row with nothing in it. "File" is the
+            // menu row's own always-first label (see `hamburger_relocated_
+            // click_after_reveal_hides_menu_bar_via_app_on_tui`'s identical
+            // precondition check), so its absence here pins the row itself,
+            // not just this one dropdown's contents.
+            assert!(
+                !driver.screen_contains("File"),
+                "the Alt+g chord must not reveal the menu-bar row at all \
+                 while the engine is mid-text-entry — a revealed-but-empty \
+                 row is the same stray-artifact family as #1763's stuck \
+                 dropdown; screen:\n{}",
                 driver.screen()
             );
             assert!(
