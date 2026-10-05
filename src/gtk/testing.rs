@@ -15164,6 +15164,66 @@ mod app_icon {
         );
     }
 
+    /// #1763 (review round 1): the fix lives in **shared**
+    /// `App::handle_dispatch` (the `MenuEvent::Ignored` arm just above the
+    /// Command Center block), not TUI-side wiring, so a GTK user gets the
+    /// identical dismiss-on-unrecognised-key behaviour. On GTK/macOS
+    /// `menu_bar_visible` is always `true` (`ShellApp::setup`'s three-way
+    /// branch) and a dropdown opens from a plain click on a bar label — no
+    /// Alt-chord stand-in needed the way the TUI regression test
+    /// (`app_on_tui_tests.rs`'s `alt_g_dropdown_does_not_survive_a_vim_
+    /// dw_1763`) requires, since `TuiDriver::type_char` can't carry `alt:
+    /// true`. This exercises the real GTK trigger end to end: click
+    /// "File" to open the dropdown (same gesture
+    /// `clicking_file_after_the_app_icon_still_opens_the_file_menu` above
+    /// proves opens it), then send one plain, unrecognised `KeyPressed`
+    /// (`'q'` — not Escape/an arrow/Enter/a matching Alt+<letter>, so it
+    /// falls through `MenuSystem::handle` to `MenuEvent::Ignored` exactly
+    /// like the TUI scenario's stray `0`/`w`/`d`/`w`), and asserts the
+    /// dropdown's "New Tab" entry stops painting.
+    ///
+    /// RED-verified the same way the TUI test was: reverting the
+    /// `MenuEvent::Ignored` arm to `{}` leaves "New Tab" painted after the
+    /// `'9'` keystroke on this exact path.
+    #[test]
+    fn unrecognised_key_closes_a_stale_open_dropdown_on_gtk_1763() {
+        let mut h = harness(Engine::new_for_test(), 1200, 800);
+        h.driver.render();
+
+        let file = h
+            .driver
+            .find_bounds("File")
+            .expect("the File menu-bar header must paint");
+        h.driver
+            .click(file.x + file.width / 2.0, file.y + file.height / 2.0);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("New Tab"),
+            "precondition: clicking File must open its dropdown; painted \
+             texts were {:?}",
+            h.driver.painted_texts()
+        );
+
+        // A plain, unrecognised key — not Escape/an arrow/Enter/a matching
+        // Alt+<letter> mnemonic — must fall through `MenuSystem::handle` to
+        // `MenuEvent::Ignored` and, via the shared `App::handle_dispatch`
+        // fix, close the stale dropdown. `'9'` (a digit — just starts a
+        // harmless, inert Vim count-prefix accumulation underneath, unlike
+        // a letter such as `'q'` which would start macro recording) is
+        // chosen so the keystroke that falls through to the editor can't
+        // produce any visible side effect that would confuse the
+        // assertion below.
+        h.driver.type_char('9');
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("New Tab"),
+            "the stale File dropdown must not survive a key it doesn't \
+             recognise on GTK, same as on TUI; painted texts were {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     /// vimcode#1673 (bugbash finding): a real Win-GUI click at x=24, y=16
     /// — the title band's historical menu-row-item coordinate, the exact
     /// stale value `tests/smoke-spec/win-gui.yaml`'s original
