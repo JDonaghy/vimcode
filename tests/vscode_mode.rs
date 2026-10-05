@@ -752,6 +752,33 @@ fn test_vscode_ctrl_d_then_backspace_deletes_all() {
 }
 
 #[test]
+fn test_vscode_select_all_after_multicursor_edit_then_type_replaces_buffer() {
+    // #1785: regression for a crash where typing after Ctrl+A, following a
+    // multi-cursor Ctrl+D edit, panicked inside ropey instead of replacing
+    // the whole buffer. Exact repro from the bug report: "foo bar foo",
+    // cursor at start, Ctrl+D Ctrl+D (selects both "foo"s), type "X" (->
+    // "X bar X", two cursors remain), Ctrl+A (select all), type "Y".
+    let mut e = engine_with("foo bar foo");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    e.handle_key("d", Some('d'), true); // select first "foo"
+    e.handle_key("d", Some('d'), true); // add cursor at second "foo"
+    assert_eq!(e.view().extra_cursors.len(), 1);
+    e.handle_key("X", Some('X'), false);
+    assert_eq!(buf(&e), "X bar X");
+    // Two cursors remain after the multi-cursor edit.
+    assert_eq!(e.view().extra_cursors.len(), 1);
+    // Ctrl+A: select all. This used to leave the stale extra cursor in
+    // place, which crashed the very next keystroke.
+    e.handle_key("a", Some('a'), true);
+    // Typing now must not panic, and must replace the *entire* buffer
+    // (rendered content), same as the single-cursor case.
+    e.handle_key("Y", Some('Y'), false);
+    assert_eq!(buf(&e), "Y");
+    assert!(e.view().extra_cursors.is_empty());
+}
+
+#[test]
 fn test_vscode_multi_cursor_escape_clears() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
     vscode_mode(&mut e);
