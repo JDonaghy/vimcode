@@ -63,6 +63,20 @@ extension-registry refresh no longer breaks the idle-silence guarantee):
   drives the real public `Engine::startup()` entry point (not just
   `ext_refresh_quiet()` directly) so a regression at `startup_inner`'s own
   call site is caught black-box too — RED-verified the same way.
+- Review round 2: the four new unit tests drive the real
+  `poll_ext_registry()`, whose success branch calls `registry::save_cache`
+  unconditionally, so their shared `poll_with` helper now holds a
+  `core::paths::TestHomeGuard` across that call (and asserts the cache
+  landed under the temp home). Without it `cargo test` truncated the
+  developer's real `~/.config/vimcode/registry_cache.json` to `[]`, which
+  is sticky: `load_cache()` then returns `Some([])`, defeating
+  `sidebar.rs`'s `ext_registry.is_none()` guard so the Extensions panel
+  paints empty until a manual refresh. Same convention as
+  `lsp_ops.rs`'s existing guard use and the #1741 review fix.
+  The dedupe fix also gained a driver-tier guard that asserts on *painted*
+  output rather than the `ext_registry_quiet` flag:
+  `tui_main::app_on_tui_tests::tests::quiet_startup_registry_refresh_1761::explicit_refresh_during_the_quiet_startup_fetch_still_paints_its_message`
+  (RED-verified: fails with the dedupe upgrade reverted).
 
 **Last updated:** October 4, 2026 (#1760 — status bar drops the Ln/Col
 cursor-position segment once other optional segments compete for width).

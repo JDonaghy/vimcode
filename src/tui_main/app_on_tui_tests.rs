@@ -8419,7 +8419,9 @@ mod tests {
             h: &mut crate::harness::ConformanceHarness<quadraui::tui::testing::TuiDriver<L>>,
             screen0: &str,
         ) {
-            let mut failures: Vec<String> = Vec::new();
+            // At most one violation is ever recorded — each arm below breaks
+            // out of the loop — so this is an `Option`, not a `Vec`.
+            let mut failure: Option<&str> = None;
             let start = std::time::Instant::now();
             let mut resolved_at: Option<std::time::Instant> = None;
             let confirmation_margin = std::time::Duration::from_millis(200);
@@ -8427,19 +8429,17 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 h.driver.tick();
                 if h.driver.screen_has("Extension registry updated") {
-                    failures.push(
+                    failure = Some(
                         "the automatic startup registry refresh must never \
                          surface a status message (#1761) — found \
-                         'Extension registry updated' on screen"
-                            .to_string(),
+                         'Extension registry updated' on screen",
                     );
                     break;
                 }
                 if h.driver.screen() != screen0 {
-                    failures.push(
+                    failure = Some(
                         "rendered text changed as a result of the \
-                         automatic startup registry refresh (#1761)"
-                            .to_string(),
+                         automatic startup registry refresh (#1761)",
                     );
                     break;
                 }
@@ -8453,9 +8453,9 @@ mod tests {
                 }
             }
             assert!(
-                failures.is_empty(),
-                "idle-silence violated by the startup registry refresh:\n{}",
-                failures.join("\n")
+                failure.is_none(),
+                "idle-silence violated by the startup registry refresh: {}",
+                failure.unwrap_or_default()
             );
         }
 
@@ -8551,6 +8551,82 @@ mod tests {
                  (ext_registry populated with the empty registry) within \
                  the 2s budget — either it never completed or this test's \
                  own timing assumption is stale"
+            );
+        }
+
+        /// The complement of the two tests above, and the driver-tier guard
+        /// for the #1761 *review*'s dedupe finding: an explicit,
+        /// user-requested refresh issued **while the quiet startup fetch is
+        /// still in flight** dedupes against it, and must still surface its
+        /// status message when that fetch lands. Before the
+        /// `if !quiet { self.ext_registry_quiet = false; }` upgrade in
+        /// `ext_refresh_inner`'s early return, the explicit refresh silently
+        /// inherited startup's silence policy and the user got no feedback
+        /// at all.
+        ///
+        /// Asserts on *painted* output rather than the `ext_registry_quiet`
+        /// flag (CLAUDE.md: "assert on rendered output — never on state being
+        /// populated"); `engine::lsp_ops`'s
+        /// `explicit_refresh_upgrades_an_in_flight_quiet_fetch` covers the
+        /// flag itself. This calls the same `ext_refresh()` the Extensions
+        /// sidebar's `r` key handler calls (`core/engine/ext_panel.rs`),
+        /// skipping only the keybinding table lookup.
+        #[test]
+        fn explicit_refresh_during_the_quiet_startup_fetch_still_paints_its_message() {
+            let _home_guard = fresh_test_home("explicit_during_quiet");
+
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+            engine.settings.lsp_enabled = false;
+            let mut h = harness_no_sidebar(engine);
+
+            h.driver.tick();
+            assert!(
+                h.driver.screen_has("alpha"),
+                "precondition: the buffer text must actually be painted"
+            );
+
+            {
+                let mut engine = h.engine.borrow_mut();
+                engine.settings.extension_registries = Vec::new();
+                // Arm startup's quiet fetch, then issue the explicit refresh
+                // *without* an intervening tick, so `poll_ext_registry` has
+                // not yet drained the channel and `ext_registry_fetching` is
+                // still true — i.e. we are genuinely on the dedupe path.
+                engine.ext_refresh_quiet();
+                assert!(
+                    engine.ext_registry_fetching,
+                    "precondition: the quiet fetch must still be in flight, \
+                     otherwise the explicit refresh below would spawn its own \
+                     fetch and this test would not exercise the dedupe path"
+                );
+                engine.ext_refresh();
+            }
+
+            // Pump until the deduped fetch lands and paints its message.
+            let start = std::time::Instant::now();
+            let mut painted = false;
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                h.driver.tick();
+                if h.driver.screen_has("Extension registry updated") {
+                    painted = true;
+                    break;
+                }
+            }
+
+            assert_eq!(
+                h.engine.borrow().ext_registry.as_ref().map(|v| v.len()),
+                Some(0),
+                "precondition: the deduped fetch must have resolved within \
+                 the 2s budget, or the silence below would be vacuous"
+            );
+            assert!(
+                painted,
+                "an explicit refresh that deduped against the in-flight quiet \
+                 startup fetch must still paint its status message when the \
+                 fetch lands (#1761 review) — screen:\n{}",
+                h.driver.screen()
             );
         }
     }
