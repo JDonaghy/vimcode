@@ -13,8 +13,8 @@
 //!    for the surface `src/core/engine/vscode.rs` actually implements, each
 //!    row marked `Matches` / `Missing` against what vimcode does (`MacDiverges`
 //!    was a third status #1730 introduced and #1745 deleted — see the
-//!    correction below). Every `Matches` row that the existing 62 tests don't already
-//!    exercise gets a new engine-level test here (same style as
+//!    correction below). Every `Matches` row that the existing 62 tests
+//!    don't already exercise gets a new engine-level test here (same style as
 //!    `tests/vscode_mode.rs`'s own `vk`/`handle_key` idiom — this is
 //!    deliberately *not* a driver-tier test: the gap this table closes is
 //!    "is every implemented binding asserted", not "does a real keypress
@@ -52,7 +52,7 @@
 //! not Ctrl, for every one of the chords below.
 //!
 //! #1745 did the actual reachability work this correction implies:
-//! `App::normalize_mac_cmd_as_ctrl` (`src/app.rs`, called once at the top of
+//! `normalize_mac_cmd_as_ctrl` (`src/app.rs`, called once at the top of
 //! the one shared `App::handle_dispatch`) folds `quadraui::Modifiers::cmd`
 //! into `ctrl` for plain Ctrl-to-Cmd substitution chords, and translates the
 //! handful of VS Code Mac defaults that are *not* a plain substitution
@@ -64,9 +64,16 @@
 //! is untouched. See that function's own doc for the full reasoning, and
 //! `src/macos/mod.rs`'s `vscode_mode_mac_cmd_1745` module for the `MacDriver`
 //! black-box proofs. Every row below marked `Matches` for `Os::Mac` is backed
-//! by one of those tests or by this file's own `KNOWN_GAPS` gate; the one
-//! real gap that remains (`Cmd+Option+F` for Find & Replace) is blocked
-//! upstream in quadraui — see `docs/PENDING_QUADRAUI_ISSUES.md`.
+//! by one of those tests or by this file's own `KNOWN_GAPS` gate; three real
+//! gaps remain: `Cmd+Option+F` for Find & Replace is blocked upstream in
+//! quadraui (see `docs/PENDING_QUADRAUI_ISSUES.md`), Ctrl+-/Ctrl+Shift+- for
+//! navigate back/forward needs its own vimcode-side follow-up issue, and
+//! `Cmd+B` (and every other chord whose only real implementation is a
+//! `panel_keys` accelerator — see the `toggleSidebarVisibility` row and
+//! `REACHABILITY_TABLE`'s matching row below) is dead on the macOS GUI
+//! because the Cmd-to-Ctrl fold runs *after* quadraui's own accelerator
+//! matching, so it can never retroactively make a Cmd keypress match a
+//! Ctrl-literal accelerator binding.
 //!
 //! ## The macOS-terminal question (deliverable 3)
 //!
@@ -86,6 +93,26 @@
 //! the native macOS **GUI** backend (`src/macos/`) — see the correction
 //! above and [`REACHABILITY_TABLE`]'s `macos_gui` column for what that
 //! backend needs (and, as of #1745, does) differently from the terminal.
+//!
+//! ## Native menu bar vs editor bindings: no double-fire (issue acceptance
+//! ## condition)
+//!
+//! The issue's own acceptance condition requires that macOS menu-bar
+//! shortcuts not double-fire with editor bindings (e.g. Cmd+C handled by
+//! both the native menu and the engine). Confirmed safe by reading the
+//! code directly: `render.rs`'s menu-item builder constructs each native
+//! menu entry's `key_equivalent` as `quadraui::KeyBinding::Literal("Ctrl+\
+//! ...")` — **Ctrl**, not Cmd — and quadraui's own `macos/\
+//! menu_bar_install.rs::parsed_to_ns` maps `ctrl` to
+//! `NSEventModifierFlags::Control`, so the native `NSMenu`'s key
+//! equivalents are Ctrl-based and structurally cannot intercept a Cmd
+//! chord. The consequence worth flagging explicitly: the native macOS menu
+//! bar still *advertises* Ctrl+S/Ctrl+Z/Ctrl+C in its menus, while the
+//! chords that actually work in the editor on macOS, as of #1745, are the
+//! Cmd equivalents — a cosmetic (tooltip-only) mismatch, not a functional
+//! one, and out of this issue's scope to fix (it would need the menu
+//! builder itself to know it's rendering for a Cmd-translating backend,
+//! which is a `render.rs` change with its own review, not folded in here).
 //!
 //! ## Why these specific gated gaps and not others
 //!
@@ -138,7 +165,7 @@ enum Status {
     /// used to carry a (now-deleted) `MacDiverges` status because the Mac
     /// chord was not a plain Ctrl-to-Cmd substitution on the *terminal*
     /// build is `Matches` now that the macOS *GUI* backend exists to
-    /// translate it (`App::normalize_mac_cmd_as_ctrl`, `src/app.rs`) —
+    /// translate it (`normalize_mac_cmd_as_ctrl`, `src/app.rs`) —
     /// Cmd is a GUI-only modifier, so the terminal-build reasoning in the
     /// module doc's macOS-terminal decision is unaffected.
     Matches,
@@ -416,7 +443,7 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
         note: "Covered by tests/vscode_mode.rs::test_vscode_ctrl_shift_p_command_palette.",
     },
     // ── Fixed by #1745: plain Ctrl-to-Cmd substitutions on the macOS GUI ──
-    // `App::normalize_mac_cmd_as_ctrl` (`src/app.rs`) folds `Modifiers::cmd`
+    // `normalize_mac_cmd_as_ctrl` (`src/app.rs`) folds `Modifiers::cmd`
     // into `ctrl` whenever the live backend reports `platform_name() ==
     // "macos"`, so every row below now matches on that backend too. On
     // macOS *TUI* these stay Ctrl-only per this issue's own decision (Cmd
@@ -426,20 +453,50 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
         os: Os::Mac,
         vscode_chord: "Cmd+B",
         vimcode_key: "b (Ctrl or Cmd)",
-        status: Status::Matches,
-        note: "#1745: reaches `Engine::handle_vscode_key`'s \"b\" arm \
-               (`EngineAction::ToggleSidebar`) on the macOS GUI the same as \
-               Ctrl+B elsewhere. Not independently driver-tested: the \
-               keyboard-triggered `EngineAction::ToggleSidebar` path does \
-               not actually flip paint-visible sidebar state on *any* \
-               backend today (`render::apply_engine_action`'s arm is a bare \
-               redraw trigger — the real toggle only happens via the \
-               `panel_keys` accelerator/`DeferredAction::ToggleSidebar` \
-               path) — a pre-existing, cross-backend gap unrelated to Cmd \
-               decoding, out of this issue's scope; see this PR's closing \
-               notes for the follow-up. `cmd_f_opens_find` (`src/macos/\
-               mod.rs`) proves the same `ctrl`-fold mechanism on a chord \
-               that *does* act purely within `Engine`.",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::PANEL_ACCELERATOR_CMD_CHORDS_DEAD_ON_MACOS_GUI. \
+               `normalize_mac_cmd_as_ctrl`'s fold does reach `Engine::\
+               handle_vscode_key`'s \"b\" arm (`EngineAction::ToggleSidebar`) \
+               on the macOS GUI the same as Ctrl+B elsewhere — but that is \
+               not the chord that actually works. `render::\
+               apply_engine_action`'s `ToggleSidebar` arm is a bare \
+               `app.draw_needed.set(true)`; the real toggle \
+               (`Engine::toggle_sidebar`) only ever runs via the *separate* \
+               `panel_keys` accelerator (`DeferredAction::ToggleSidebar`), \
+               registered as `quadraui::KeyBinding::Literal(pk.\
+               toggle_sidebar)` (default `\"<C-b>\"`). quadraui's own \
+               `macos_universal_binding_modifiers` (`macos/backend.rs`) \
+               deliberately leaves `Literal` bindings untouched for Mac's \
+               own Cmd convention, so that accelerator matches a physical \
+               Ctrl+B and never a Cmd+B — and quadraui's shared \
+               `runtime::preprocess_event` runs that accelerator match \
+               *before* an unmatched keypress ever reaches \
+               `App::handle_dispatch`, where this issue's Cmd-fold lives. \
+               So on Linux/GTK the chord VS Code documents (Ctrl+B) really \
+               does toggle the sidebar (via the accelerator, not the \
+               engine-key path above); on the macOS GUI the chord VS Code \
+               documents (Cmd+B) does not toggle anything, because the fold \
+               runs too late to ever reach that Ctrl-literal accelerator. \
+               `cmd_b_does_not_toggle_sidebar_dead_panel_accelerator` \
+               (`src/macos/mod.rs`) is the RED proof, driven through the \
+               real production dispatch path (not `Engine::handle_key` \
+               alone, which can't see this — the defect is in \
+               `render::apply_engine_action`, `pub(crate)` and only \
+               reachable from inside the `vimcode_core` crate, not this \
+               separate integration-test crate); its sibling \
+               `ctrl_b_toggle_sidebar_proves_sidebar_visible_is_a_real_\
+               paint_oracle` confirms the working Ctrl+B path on the same \
+               fixture, ruling out a broken test rather than a real gap. \
+               This is the general shape for every chord whose only real \
+               implementation is a `panel_keys` accelerator \
+               (`toggle_sidebar`, `focus_explorer`, `focus_search`, \
+               `terminal_toggle_max`, `focus_notifications`) — see \
+               `REACHABILITY_TABLE`'s matching row below. Needs its own \
+               follow-up vimcode issue (not quadraui-blocked: the fix is a \
+               vimcode-side dispatch-ordering change, e.g. having \
+               `apply_engine_action`'s `ToggleSidebar` arm call \
+               `Engine::toggle_sidebar` directly instead of relying on the \
+               accelerator).",
     },
     VscodeBinding {
         command_id: "workbench.action.togglePanel",
@@ -524,7 +581,7 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
                navigation is Option+arrow, while Cmd+arrow is \
                cursorHome/cursorEnd (line start/end); the two modifiers \
                swap roles relative to Linux/Windows' Ctrl=word, \
-               Home/End=line split. `App::normalize_mac_cmd_as_ctrl` \
+               Home/End=line split. `normalize_mac_cmd_as_ctrl` \
                translates `Key::Named(Left|Right)` with `alt && !cmd` into \
                the same `ctrl == true` shape Linux/Windows' Ctrl+Left/Right \
                already produces (and clears `alt` so `route_alt_key` does \
@@ -545,7 +602,7 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
                vimcode has no Ctrl+Up/Down binding on Linux/Windows (`Engine::\
                handle_vscode_key`'s ctrl match has no \"Up\"/\"Down\" arm) \
                but does have Ctrl+Home/Ctrl+End (document start/end) — \
-               `App::normalize_mac_cmd_as_ctrl` translates `Key::Named(Up|\
+               `normalize_mac_cmd_as_ctrl` translates `Key::Named(Up|\
                Down)` with `cmd && !alt` into `Key::Named(Home|End)` with \
                `ctrl == true`, reusing that existing binding rather than \
                inventing a new one. `MacDriver`-proven: `src/macos/mod.rs`'s \
@@ -562,7 +619,7 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
         note: "Per this issue's own brief, VS Code's real Mac default for \
                navigateBack/navigateForward is Ctrl+-/Ctrl+Shift+- — NOT \
                plain Alt+Left/Right (that is Win/Linux's default, already \
-               `Matches` above, and #1745's `App::normalize_mac_cmd_as_ctrl` \
+               `Matches` above, and #1745's `normalize_mac_cmd_as_ctrl` \
                deliberately reroutes Mac's plain Option+Left/Right to \
                word-move instead, clearing `alt` so `route_alt_key` cannot \
                also claim it as navigate-back/forward on this backend — see \
@@ -1064,7 +1121,7 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  distinct bit a live `MacBackend` reports on every Cmd \
                  keypress (`src/macos/` is a thin wrapper around it, no \
                  key-decoding of its own, per its own module doc) — and \
-                 `App::normalize_mac_cmd_as_ctrl` (`src/app.rs`) now reads \
+                 `normalize_mac_cmd_as_ctrl` (`src/app.rs`) now reads \
                  it and folds it into `ctrl` before `vscode.rs` ever sees \
                  the event. See this table's own three Option/Cmd-arrow \
                  rows below for the handful of Mac defaults that are *not* \
@@ -1084,7 +1141,7 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  here since vimcode's TUI binding for word-nav is \
                  Ctrl+Left/Right, not Option+Left/Right — VS Code's own \
                  terminal-hosted editor falls back the same way). On the \
-                 macOS GUI, reachable via `App::normalize_mac_cmd_as_ctrl`'s \
+                 macOS GUI, reachable via `normalize_mac_cmd_as_ctrl`'s \
                  three arrow-translation arms — `MacDriver`-proven by \
                  `src/macos/mod.rs`'s `option_right_moves_word_forward_not_\
                  navigate_forward`, `cmd_right_moves_to_line_end_not_one_\
@@ -1106,6 +1163,42 @@ static REACHABILITY_TABLE: &[ReachabilityRow] = &[
                  on a US keyboard) rather than the base letter — confirmed \
                  by reading that function directly. See \
                  docs/PENDING_QUADRAUI_ISSUES.md.",
+    },
+    ReachabilityRow {
+        chord: "Cmd+<key> for a panel_keys-accelerator-only chord (toggle_sidebar, \
+                 focus_explorer, focus_search, terminal_toggle_max, \
+                 focus_notifications)",
+        tui_legacy_xterm: Reach::NotApplicable,
+        tui_kitty_or_csiu: Reach::NotApplicable,
+        conpty_legacy: Reach::NotApplicable,
+        gtk: Reach::NotApplicable,
+        macos_tui: Reach::No,
+        macos_gui: Reach::No,
+        reason: "KNOWN_GAPS::PANEL_ACCELERATOR_CMD_CHORDS_DEAD_ON_MACOS_GUI. \
+                 The general form of the `toggleSidebarVisibility` \
+                 (`Cmd+B`) row above: these five actions' only real \
+                 implementation is a `panel_keys` accelerator — registered \
+                 as `quadraui::KeyBinding::Literal(...)`, matched by \
+                 quadraui's shared `runtime::preprocess_event` *before* an \
+                 unmatched keypress ever reaches `App::handle_dispatch` \
+                 (where #1745's Cmd-to-Ctrl fold lives). quadraui's own \
+                 `macos_universal_binding_modifiers` deliberately leaves \
+                 `Literal` bindings untouched for Mac's own Cmd convention, \
+                 so the accelerator only ever matches the physical Ctrl \
+                 chord — by the time the fold could turn a Cmd keypress \
+                 into something that looks like Ctrl, the accelerator- \
+                 matching step has already run and missed it. Unlike the \
+                 `Cmd+<key> (any VS Code Mac-default chord)` row above, \
+                 this is `No`, not `Yes`: that row covers chords whose real \
+                 implementation is reached by `Engine::handle_vscode_key` \
+                 itself (where the fold's `ctrl`-true event does land); \
+                 this row covers the handful whose real implementation \
+                 sits one layer further out, in the accelerator the fold \
+                 never gets a chance to retroactively satisfy. See \
+                 `toggleSidebarVisibility`'s `VSCODE_BINDINGS` row and \
+                 `src/macos/mod.rs`'s \
+                 `cmd_b_does_not_toggle_sidebar_dead_panel_accelerator` for \
+                 the concrete, driver-proven instance.",
     },
 ];
 
@@ -1227,12 +1320,27 @@ enum GapOutcome {
 /// `CTRL_SHIFT_BACKSLASH_JUMP_TO_BRACKET_UNBOUND`); the `gap_*` tests for
 /// those five are now plain (ungated) assertions of the fixed behaviour,
 /// same as `src/harness.rs`'s own `KNOWN_BUGS` empty-list state. #1745 adds
-/// two new entries, both still open — see the matching `VSCODE_BINDINGS`
-/// rows (`editor.action.startFindReplaceAction` and
-/// `workbench.action.navigateBack / navigateForward`) for the full writeup.
+/// three new entries, all still open — see the matching `VSCODE_BINDINGS`
+/// rows (`editor.action.startFindReplaceAction`,
+/// `workbench.action.navigateBack / navigateForward`, and
+/// `workbench.action.toggleSidebarVisibility`) for the full writeup.
+///
+/// `PANEL_ACCELERATOR_CMD_CHORDS_DEAD_ON_MACOS_GUI` is the one entry here
+/// with no [`gap_gate`] call of its own: the defect it names
+/// (`render::apply_engine_action`'s `ToggleSidebar` arm never calling
+/// `Engine::toggle_sidebar`) is only reachable through the real production
+/// dispatch path, which is `pub(crate)` to `vimcode_core` and therefore
+/// invisible from this separate integration-test crate — see
+/// `src/macos/mod.rs`'s `cmd_b_does_not_toggle_sidebar_dead_panel_
+/// accelerator` for that entry's actual RED proof and the deletion
+/// instructions that live there instead. The structural self-check
+/// (`vscode_bindings_table_rows_are_well_formed`) still requires this
+/// label's `VSCODE_BINDINGS` row to name it, so a future edit that adds a
+/// `Missing` row without wiring up *some* gate still fails loudly.
 const KNOWN_GAPS: &[&str] = &[
     "CMD_OPTION_F_FIND_REPLACE_UNREACHABLE",
     "CTRL_MINUS_NAVIGATE_BACK_FORWARD_ON_MAC_UNVERIFIED",
+    "PANEL_ACCELERATOR_CMD_CHORDS_DEAD_ON_MACOS_GUI",
 ];
 
 /// Run `body`, gated on whether `label` is listed in [`KNOWN_GAPS`]. Mirrors
@@ -1504,13 +1612,29 @@ fn ctrl_shift_backslash_jumps_to_matching_bracket() {
 /// Body asserts the *correct* (still unimplemented) outcome, so it panics
 /// today — `gap_gate` reports `ExpectedGap` for a listed label, which is
 /// this test's normal, passing result until the gap closes.
+///
+/// #1745 review: this body drives `'\u{192}'` — the exact glyph that will
+/// **stop** arriving once the quadraui fix lands (the fix is quadraui
+/// resolving Option+F to the base letter `'f'` instead). That means this
+/// test can only ever report `ExpectedGap` (today) or `Regression`
+/// (post-fix, since `'\u{192}'` would then reach the engine as an ordinary,
+/// un-bound character and the assertions below would still fail, just for
+/// an unrelated reason) — it can never report `FixLanded`, so it cannot
+/// force `KNOWN_GAPS::CMD_OPTION_F_FIND_REPLACE_UNREACHABLE`'s deletion the
+/// way `gap_gate`'s contract expects (same class of mistake as the
+/// now-fixed `gap_ctrl_minus_navigates_back_on_mac`, which drove a key name
+/// the real decoder never produces). When the quadraui fix lands, update
+/// this body to drive `'f'` instead before deleting the `KNOWN_GAPS` entry.
 #[test]
 fn gap_cmd_option_f_find_replace_unreachable() {
     gap_gate("CMD_OPTION_F_FIND_REPLACE_UNREACHABLE", || {
         let mut e = engine_with("hello\n");
         vscode_mode(&mut e);
-        // The literal glyph a real Mac keyboard's Option+F produces
-        // (`characters()`, not `charactersIgnoringModifiers()`).
+        // The literal glyph a real Mac keyboard's Option+F produces today
+        // (`characters()`, not `charactersIgnoringModifiers()`) — see this
+        // test's own doc above for why this must change to `'f'` once the
+        // upstream quadraui fix lands, in the same change that deletes the
+        // `KNOWN_GAPS` entry.
         e.handle_key("\u{192}", Some('\u{192}'), true);
         assert!(
             e.find_replace_open,
@@ -1548,7 +1672,7 @@ fn gap_ctrl_minus_navigates_back_on_mac() {
         e.view_mut().cursor = Cursor { line: 0, col: 0 };
         e.push_jump_location();
         e.view_mut().cursor = Cursor { line: 9, col: 0 };
-        e.handle_key("minus", Some('-'), true);
+        e.handle_key("-", Some('-'), true);
         assert_eq!(
             e.cursor().line,
             0,

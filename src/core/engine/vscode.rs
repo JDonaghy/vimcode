@@ -11,7 +11,7 @@ use super::*;
 // #1745: the macOS *GUI* backend (`src/macos/`) does exist in this repo
 // (#1730's module doc wrongly assumed otherwise) and does need a real
 // Cmd-vs-Ctrl remap — but that remap still does not belong in this file.
-// `App::normalize_mac_cmd_as_ctrl` (`src/app.rs`), called once at the top of
+// `normalize_mac_cmd_as_ctrl` (`src/app.rs`), called once at the top of
 // the one shared `App::handle_dispatch` both GTK and the macOS GUI run
 // through, folds `Modifiers::cmd` into `ctrl` for plain substitution chords
 // and translates the handful of VS Code Mac defaults that are *not* a plain
