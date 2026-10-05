@@ -44,69 +44,50 @@
 //! own locals) specifically so that a single explicit `drop` of the
 //! reader, writer, and master together is a real, complete close.
 //!
-//! # `#[ignore]`d too — RED-confirmed (5/5 runs) even with quadraui#1295's
-//! guard in place
+//! # Un-`#[ignore]`d by #1775 — RED-confirmed (5/5 runs) against the
+//! #1765 pin, GREEN against quadraui#1301
 //!
 //! This test deliberately is **not** a controlling-terminal pty
 //! (`CommandBuilder::set_controlling_tty(false)`) — see the comment at its
 //! call site for why a controlling terminal makes this test pass for the
-//! wrong reason (a real `SIGHUP`, not the guard, kills `vcd`). Without
-//! that backstop, this test deterministically reproduces #1735 against
-//! the #1765 pin. **Measured on macOS** (`sample(1)`, 1ms interval, 2s
-//! window, on the real `vcd` process mid-run): the main thread is parked
-//! inside `TuiBackend::wait_events` → `ratatui::crossterm::event::poll` →
-//! `UnixInternalEventSource::try_read`, issuing a bare `read()` syscall
-//! ~1390 times in that window with **no** `stdin_hung_up` frame anywhere
-//! on the stack — i.e. the guard was checked, came back `false`, and
-//! crossterm was entered, exactly as designed, right before the hangup
-//! landed.
+//! wrong reason (a real `SIGHUP`, not the fix, kills `vcd`). Without that
+//! backstop, this test deterministically reproduced #1735 against the
+//! #1765 pin (quadraui `8425673`, carrying only quadraui#1295's
+//! periodic-recheck guard). **Measured on macOS** (`sample(1)`, 1ms
+//! interval, 2s window, on the real `vcd` process mid-run, against that
+//! pin): the main thread was parked inside `TuiBackend::wait_events` →
+//! `ratatui::crossterm::event::poll` → `UnixInternalEventSource::
+//! try_read`, issuing a bare `read()` syscall ~1390 times in that window
+//! with **no** `stdin_hung_up` frame anywhere on the stack — i.e. the
+//! guard was checked, came back `false`, and crossterm was entered,
+//! exactly as designed, right before the hangup landed; once inside, that
+//! specific delegated call never returned, so the guard never got another
+//! chance to run either (`quadraui#1295`'s own b145a55 commit message
+//! said as much: "Slicing narrows, but does not eliminate, that race").
 //!
-//! Reading `quadraui::tui::backend::TuiBackend::wait_events`'s own source
-//! (the `8425673` pin — this part is plain, OS-agnostic Rust, read once
-//! and applicable identically to any Unix target, not a macOS-specific
-//! observation) explains why that's not a narrow, unlucky race but close
-//! to a *guaranteed* one for this trigger shape: while idle, the loop
-//! re-checks `stdin_hung_up()` only in the brief gap *between* two
-//! consecutive `ratatui::crossterm::event::poll(STDIN_HANGUP_POLL_SLICE)`
-//! calls (20ms each), immediately starting the next slice if nothing was
-//! found. `vcd` idling with no input is therefore inside one of those
-//! 20ms calls essentially 100% of the time, with the inter-call gap
-//! where the guard actually runs measured in microseconds. An external,
-//! asynchronous master-close (this test; a real terminal disconnect in
-//! production) lands during an in-flight call on close to every
-//! occurrence, not occasionally — and once mio reports a hung-up fd as
-//! "ready" and `try_read` takes its first `Ok(0)` read, that specific
-//! call can never return, so the guard never gets another chance to run
-//! either. This matches the b145a55 commit's own review note ("Slicing
-//! narrows, but does not eliminate, that race... a full fix would mean
-//! reimplementing crossterm's own reader") — just quantifies how little
-//! the narrowing actually buys for this exact trigger. The ~1390-reads/2s
-//! figure and the 5/5-runs count are macOS-only measurements; the
-//! structural argument (the source reading above) is platform-neutral and
-//! predicts the same outcome on Linux, but that has not been
-//! independently measured on Linux as of this writing — Linux's own
-//! `stdin_hung_up()` path differs (see `backend.rs:1490-1509`'s doc on
-//! `tty_vhangup()`/`isatty`-returns-`EIO`), so the exact timing could in
-//! principle differ even if the race's existence does not.
-//!
-//! Per this repo's Platform-Neutrality Rule, the fix for *that* gap
-//! belongs in quadraui (e.g. actually reimplementing the read loop, or
-//! an `epoll`/`kqueue`-level rearm that re-entering `wait_events` can
-//! observe before calling crossterm at all), not as a vimcode-side
-//! workaround — so, mirroring `crossterm_dead_pty_busy_loop.rs`'s own
-//! precedent, this test stays `#[ignore]`d with this analysis rather than
-//! either being weakened to stop asserting the exit, or left to red-wall
-//! `cargo test` until that lands. See `docs/PENDING_QUADRAUI_ISSUES.md`'s
-//! "crossterm 0.29.0 ... busy-spins" entry (its "#1765 update" section)
-//! for the drafted quadraui issue this gap is tracked against. Run
-//! explicitly with `cargo test --test pty_dead_master_exit -- --ignored`
-//! to see it fail today. Un-ignore once a quadraui fix closes (or
-//! substantially narrows, in a way verified against this exact non-ctty
-//! trigger shape) this race — note that un-ignoring this test does
-//! **not** imply `crossterm_dead_pty_busy_loop.rs` should also be
-//! un-ignored, or vice versa; they have different un-ignore conditions
-//! (see that file's own module doc, and the PENDING entry's "Note on the
-//! two `#[ignore]`d vimcode tests" paragraph).
+//! #1775 bumps the pin to quadraui `a536053`, which carries quadraui#1301
+//! (`4fda8f7`, `a536053`) — the structural fix that b145a55 said would be
+//! needed: `TuiBackend::wait_events`/`poll_events` no longer delegate a
+//! blocking wait straight into crossterm's broken reader at all. They now
+//! call quadraui's own `poll(2)`-based `wait_for_stdin_ready` first,
+//! blocking *there* for the caller's real timeout, and only ever hand
+//! crossterm a guaranteed non-blocking `Duration::ZERO` call once
+//! readiness with no hangup bit is already confirmed. `poll(2)` reports
+//! `POLLHUP` the instant a hangup happens — including mid-wait, not only
+//! between slices — so the hangup itself is now the wakeup instead of
+//! something a periodic re-check has to race a call that never returns.
+//! This test is GREEN against that pin (confirmed on Linux). Per this
+//! repo's Platform-Neutrality Rule, that fix correctly landed in quadraui,
+//! not as a vimcode-side workaround — vimcode's only change here is
+//! consuming the new pin and un-ignoring this test. See
+//! `docs/PENDING_QUADRAUI_ISSUES.md`'s "crossterm 0.29.0 ... busy-spins"
+//! entry (its "#1775 update" section) for the full writeup. Note that
+//! un-ignoring this test does **not** imply `crossterm_dead_pty_busy_loop.
+//! rs` should also be un-ignored — that file drives raw `crossterm::
+//! event::poll` directly, bypassing `TuiBackend` entirely, so it cannot
+//! observe this fix and stays `#[ignore]`d pending an upstream `crossterm`
+//! fix (see that file's own module doc, and the PENDING entry's "Note on
+//! the two `#[ignore]`d vimcode tests" paragraph).
 #![cfg(unix)]
 
 use std::io::{ErrorKind, Read, Write};
@@ -323,15 +304,6 @@ fn parse_ps_time(text: &str) -> Option<f64> {
 }
 
 #[test]
-#[ignore = "#1735/#1765: RED-confirmed (5/5 local runs on macOS) even \
-            against the pin that includes quadraui#1295's dead-pty guard \
-            — see this file's module doc, '#[ignore]d too' section, for \
-            the full stack-sample-based analysis of why the guard's \
-            narrow inter-slice checking window doesn't help this trigger \
-            shape in practice, and `docs/PENDING_QUADRAUI_ISSUES.md`'s \
-            'crossterm 0.29.0 ... busy-spins' entry for the drafted \
-            quadraui issue. Run explicitly with `cargo test --test \
-            pty_dead_master_exit -- --ignored` to see it fail today."]
 fn vcd_should_exit_promptly_once_its_pty_master_closes() {
     let home = isolated_home();
     let main_rs = home.join("main.rs");

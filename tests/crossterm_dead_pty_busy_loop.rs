@@ -129,15 +129,24 @@
 //! transitive quadraui pin moved, not crossterm's own pinned version —
 //! so this direct repro remains exactly as RED as it was before. See
 //! `tests/pty_dead_master_exit.rs::vcd_should_exit_promptly_once_its_pty_master_closes`,
-//! added by #1765, for the test that actually exercises quadraui#1295's
-//! guard end-to-end through a real `vcd` process — and for why *that*
-//! test is **also** still `#[ignore]`d despite exercising the real fix
-//! (short version: the guard's inter-slice check window is too narrow to
-//! help in practice; see that file's own module doc for the full
-//! analysis). Both tests, and the drafted follow-up quadraui issue that
-//! covers the remaining gap, are tracked in
-//! `docs/PENDING_QUADRAUI_ISSUES.md`'s "crossterm 0.29.0 ... busy-spins"
-//! entry — see its "#1765 update" section for what changed.
+//! added by #1765, for the test that actually exercises the quadraui-side
+//! guard end-to-end through a real `vcd` process.
+//!
+//! **#1775 update: that other test is now GREEN; this one is not, and
+//! stays `#[ignore]`d.** #1775 bumped the pin to quadraui `a536053`,
+//! which carries quadraui#1301 — a real structural fix (not just a
+//! narrower periodic re-check) that stops `TuiBackend::wait_events` from
+//! ever delegating a blocking wait straight into crossterm's broken
+//! reader. `pty_dead_master_exit.rs` is un-`#[ignore]`d and passing as of
+//! #1775 because it drives a real `vcd` through `TuiBackend`, so it can
+//! observe that fix. This file still cannot: it calls `ratatui::crossterm
+//! ::event::poll` directly, bypassing `TuiBackend` (and therefore
+//! quadraui#1301's fix) entirely by construction, so it still only
+//! observes whether `crossterm` 0.29.0 itself was patched — it was not.
+//! Both tests, and the drafted follow-up quadraui-vs-crossterm-upstream
+//! split, are tracked in `docs/PENDING_QUADRAUI_ISSUES.md`'s "crossterm
+//! 0.29.0 ... busy-spins" entry — see its "#1775 update" section for what
+//! changed.
 #![cfg(target_os = "linux")]
 
 use std::ffi::CStr;

@@ -385,15 +385,31 @@ win = ["quadraui/win"]
 # but did not change vimcode behaviour — confirmed by a clean build on all
 # three feature sets, no call-site changes needed).
 #
-# quadraui#1295 (`3ebead9`, `b145a55`, `26ed611`) narrows but does not
+# quadraui#1295 (`3ebead9`, `b145a55`, `26ed611`) narrowed but did not
 # close vimcode#1735 (dead-pty busy-spin) for a headless, non-ctty `vcd` —
-# see `tests/pty_dead_master_exit.rs`'s module doc for the full
-# inter-slice-window analysis and `docs/PENDING_QUADRAUI_ISSUES.md`'s
-# "crossterm 0.29.0 ... busy-spins" entry for the drafted follow-up
-# quadraui ask (reimplement the read loop, or an epoll/kqueue rearm
-# observable before `wait_events` ever calls into crossterm). vimcode#1735
-# stays open pending that fix.
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "84256731fa75705fe9cff6b5b0fa9de66f93bcd3", features = ["tui", "terminal"] }
+# see `tests/pty_dead_master_exit.rs`'s module doc for the inter-slice-
+# window analysis that motivated the real fix below.
+#
+# #1775 bumps to `a536053` (quadraui `develop` HEAD, 8 commits ahead of
+# `8425673`) for quadraui#1301 (`4fda8f7`, `a536053`) — the actual fix for
+# the dead-pty busy-spin: `TuiBackend::wait_events` no longer delegates a
+# blocking wait straight to crossterm's broken `UnixInternalEventSource::
+# try_read`. It now calls this crate's own `poll(2)`-based
+# `wait_for_stdin_ready` first, for the caller's real timeout, and only
+# ever hands crossterm a guaranteed non-blocking `Duration::ZERO` call
+# once readiness with no hangup bit is already confirmed — so a hangup
+# arriving *during* what used to be the delegated blocking call is now
+# the wakeup itself (`POLLHUP`), not something a periodic re-check has to
+# race a call that never returns. This is what finally fixes vimcode#1735
+# — see `tests/pty_dead_master_exit.rs`, now un-`#[ignore]`d.
+#
+# Also carries quadraui#1099 (`c851834`, `44c95f6` — reshapes `Frame`
+# into an owned type, closes the 14-primitive `Surface` gap, makes
+# `FrameHitMap` serializable; adopted as-is, no vimcode call-site changes
+# needed beyond what the compiler required) and quadraui#1103 (`b6fd556`,
+# `b5bf8ad` — optional flex/grid layout over Taffy, feature-gated
+# upstream and not enabled here).
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "a5360532e297deecece65103df8ce61f53230bda", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
