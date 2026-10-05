@@ -756,6 +756,111 @@ mod tests {
             }
         }
 
+        /// #1762 (bugbash:tui-pty:macos) — "Activity bar gets stuck on 'Run
+        /// and Debug' after visiting Extensions, and a misrouted right-click
+        /// launches a failing debug session".
+        ///
+        /// Root cause, traced to the pinned quadraui rev
+        /// (`quadraui::dispatch::DoubleClickDetector`,
+        /// `DOUBLE_CLICK_RADIUS = 1.5` TUI cells / `DOUBLE_CLICK_MS = 400`):
+        /// adjacent activity-bar rows are exactly `1.0` cell apart, inside
+        /// that 1.5-cell radius, so two genuinely distinct real clicks on
+        /// *adjacent* icons (Source Control row 3 then Debug row 4, Debug
+        /// row 4 then Extensions row 5, …) landing within 400ms of each
+        /// other fold into one synthesized `UiEvent::DoubleClick` —
+        /// `quadraui::compose::app_shell::AppShell::handle` only matches a
+        /// plain `MouseDown` for activity-bar hit-testing, so that
+        /// `DoubleClick` resolves as `AppShellEvent::Ignored` and the second
+        /// click is silently dropped. The sidebar then stays on whatever
+        /// panel was already active (reliably Debug/"RUN AND DEBUG" in this
+        /// exact sequence), and a later click/right-click meant for a
+        /// different panel lands on that stale panel's own content instead
+        /// — the bugbash's "misrouted right-click launches a failing debug
+        /// session" half of this report.
+        ///
+        /// This replays `tests/smoke-spec/tui.yaml`'s own activity-bar
+        /// section byte-for-byte (same six real clicks, same rows, in order,
+        /// with the file's own `click-source-control-icon`/`...-1636` stale
+        /// step — row 4, which is actually Debug since #1698's reorder —
+        /// left in per that file's #3509 additive-only policy and #1740's
+        /// own header note), with **no simulated time between clicks**: the
+        /// worst case for the 400ms fold window, and a realistic one too —
+        /// `tests/smoke-spec/tui.yaml`'s own `wait_idle` pacing between
+        /// clicks is satisfied the instant the terminal has already settled
+        /// (confirmed directly by this same file's `#1741`-era header
+        /// comment on `wait_idle`'s "trivially satisfies […] from the
+        /// instant it launches" semantics), so it guarantees no minimum
+        /// real-time gap either.
+        ///
+        /// RED-verified by hand against this exact fix reverted (the
+        /// `App::handle_dispatch` "#1762" rung in `src/app.rs` deleted): the
+        /// `after_source_control_1740`/`after_debug_1740`/
+        /// `after_extensions`/`after_explorer_again` assertions below all
+        /// fail, every one finding "RUN AND DEBUG" where its own marker was
+        /// expected — the exact symptom the bugbash report names.
+        #[test]
+        fn activity_bar_adjacent_clicks_are_not_dropped_by_double_click_fold_1762() {
+            let mut h = harness(plain_engine());
+            let driver = &mut h.driver;
+            // Double-click folding left at its production DEFAULT (on) --
+            // this scenario exists specifically to prove a real click
+            // sequence survives it, unlike every other test in this module
+            // that calls `set_double_click_folding(false)` to sidestep it.
+
+            driver.click(1.5, 1.5); // row 1: Explorer
+            assert!(
+                driver.screen().contains("EXPLORER"),
+                "precondition: clicking Explorer must open it; screen:\n{}",
+                driver.screen()
+            );
+
+            driver.click(1.5, 4.5); // row 4: tui.yaml's stale "-1636" step (actually Debug)
+            assert!(
+                driver.screen().contains("RUN AND DEBUG"),
+                "precondition: row 4 opens Debug (FIXED_ACTIVITY_PANEL_IDS, \
+                 #1698/#1740); screen:\n{}",
+                driver.screen()
+            );
+
+            driver.click(1.5, 3.5); // row 3: tui.yaml's corrected "-1740" Source Control step
+            assert!(
+                driver.screen().contains("SOURCE CONTROL"),
+                "clicking Source Control right after Debug (adjacent rows, \
+                 zero delay) must switch to it, not get folded into a \
+                 dropped DoubleClick; screen:\n{}",
+                driver.screen()
+            );
+
+            driver.click(1.5, 4.5); // row 4: tui.yaml's corrected "-1740" Debug step
+            assert!(
+                driver.screen().contains("RUN AND DEBUG"),
+                "clicking Debug right after Source Control (adjacent rows, \
+                 zero delay) must switch to it, not get folded into a \
+                 dropped DoubleClick; screen:\n{}",
+                driver.screen()
+            );
+
+            driver.click(1.5, 5.5); // row 5: Extensions
+            assert!(
+                driver.screen().contains("EXTENSIONS"),
+                "clicking Extensions right after Debug (adjacent rows, zero \
+                 delay) must switch to it -- this is the bugbash's own \
+                 'activity-bar-extensions-switches-panel-1636' failure, \
+                 which found \"RUN AND DEBUG\" instead; screen:\n{}",
+                driver.screen()
+            );
+
+            driver.click(1.5, 1.5); // row 1: Explorer again
+            assert!(
+                driver.screen().contains("EXPLORER"),
+                "re-clicking Explorer must switch back to it -- this is the \
+                 bugbash's own 'activity-bar-explorer-reselect-1636' \
+                 failure, which found \"RUN AND DEBUG\" instead; \
+                 screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// Mirrors `shell_app.rs`'s test of the same name (#694): a
         /// hamburger click with the sidebar closed beforehand must not
         /// panic through the real dispatch pipeline, and must reveal the
