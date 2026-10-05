@@ -8823,46 +8823,83 @@ impl App {
         // a plain `UiEvent::MouseDown` for activity-bar hit-testing — every
         // other event variant, `DoubleClick` included, falls through its own
         // `_ => AppShellEvent::Ignored` arm. `quadraui::dispatch::
-        // DoubleClickDetector` (the backend-agnostic fold both `TuiBackend`
-        // and `MacBackend` run every `MouseDown` through) folds a press into
-        // a `DoubleClick` whenever it lands within `DOUBLE_CLICK_RADIUS`
-        // (1.5 *cells*, TUI's own grid unit) of the previous press within
-        // `DOUBLE_CLICK_MS` (400ms) — a radius wider than one activity-bar
-        // row (adjacent icons are exactly 1.0 cell apart), so two genuinely
-        // distinct, fast real clicks on *adjacent* icons (Source Control
-        // then Debug, Debug then Extensions, …) fold into a `DoubleClick`
-        // the activity bar has no handler for. The second click is then
-        // silently dropped — the sidebar stays on whatever panel was
-        // already active, and a later click/right-click meant for a
-        // different panel (e.g. the Explorer tree) lands on that stale
-        // panel's own content instead. This is the mechanism behind
-        // vimcode#1762's bugbash report (Explorer -> Source Control ->
-        // Extensions -> Explorer getting stuck on "RUN AND DEBUG", then a
-        // right-click meant for the Explorer tree landing on the still-open
-        // Debug panel's own controls and launching a real DAP session).
+        // DoubleClickDetector` folds a press into a `DoubleClick` whenever
+        // it lands within its radius of the previous press within
+        // `DOUBLE_CLICK_MS` (400ms). Only `TuiBackend` runs the *default*
+        // 1.5-*cell* radius (TUI's own character-grid unit, where adjacent
+        // activity-bar rows are exactly 1.0 cell apart); `MacBackend` uses
+        // `DoubleClickDetector::with_radius(MAC_DOUBLE_CLICK_RADIUS)` = 4.0
+        // *points*, explicitly because the cell-tuned 1.5 is meaningless in
+        // AppKit's point-precision coordinates, and GTK/Windows use their
+        // own 4.0px radius — so adjacent-row folding is a TUI-only failure
+        // mode. On TUI, two genuinely distinct, fast real clicks on
+        // *adjacent* icons (Source Control then Debug, Debug then
+        // Extensions, …) land within that 1.5-cell radius and fold into one
+        // `DoubleClick`, which the activity bar has no handler for — the
+        // second click is silently dropped and the sidebar stays on
+        // whatever panel was already active.
+        //
+        // This is a real, previously-unknown latent bug in its own right,
+        // confirmed by `activity_bar_adjacent_clicks_are_not_dropped_by_double_click_fold_1762`
+        // in `src/tui_main/app_on_tui_tests.rs`. It is NOT a confirmed
+        // explanation for vimcode#1762's reported "Explorer -> Source
+        // Control -> Extensions -> Explorer" symptom: the final Explorer
+        // re-click sits 4.0 cells from the row it follows, far outside the
+        // 1.5-cell radius, so that specific re-click cannot be dropped by
+        // this fold under any timing — see that test's doc comment and
+        // `PROJECT_STATE.md` for the full accounting of what this fix does
+        // and does not demonstrate about #1762's exact reported run.
         //
         // The real fix belongs in quadraui (`AppShell::handle` growing a
         // `DoubleClick` arm identical to its `MouseDown` one for the
         // activity-bar band — a double-click on an activity-bar icon has no
         // distinct meaning from a single click there, for every consumer,
-        // not just vimcode) — a quadraui issue describing this gap should be
-        // filed per CLAUDE.md's Platform-Neutrality Rule, and is not yet
-        // filed/landed as of this commit. Until it is, re-synthesize the
-        // dropped click as the plain `MouseDown` it
-        // was always meant to be and feed it back through the shell's own
-        // *public* `handle()` — the exact dispatch a real single click takes
-        // — rather than hand-rolling an activity-bar hit-test here. That
-        // keeps this "thin event-to-engine wiring" against the existing
-        // public API, shared once in `App` (not `src/gtk/`/`src/tui_main/`),
-        // so both backends pick up the fix from one place — the same
-        // pattern `render::consume_hamburger_stale_click_guard`/
+        // not just vimcode). That gap is drafted in
+        // `docs/PENDING_QUADRAUI_ISSUES.md` for the coordinator to file
+        // verbatim (not yet filed/landed as of this commit, per CLAUDE.md's
+        // Platform-Neutrality Rule). Until it lands, re-synthesize the
+        // dropped click as the plain `MouseDown` it was always meant to be
+        // and feed it back through the shell's own *public* `handle()` —
+        // the exact dispatch a real single click takes — rather than
+        // hand-rolling an activity-bar hit-test here. That keeps this "thin
+        // event-to-engine wiring" against the existing public API, shared
+        // once in `App` (not `src/gtk/`/`src/tui_main/`), so both backends
+        // pick up the fix from one place — the same pattern
+        // `render::consume_hamburger_stale_click_guard`/
         // `render::sync_runner_sidebar_visibility` already use for other
         // quadraui-shaped gaps in this exact file.
+        //
+        // The synthetic is hard-coded to `MouseButton::Left` because
+        // `UiEvent::DoubleClick` carries no button — `DoubleClickDetector`
+        // folds same-button pairs of any button, so a fast double-*right*-
+        // click on the activity bar is replayed as a left click. Harmless
+        // in practice (it only switches panels, same as a left click
+        // would), but worth flagging since it's not quite faithful replay.
+        //
+        // Note this also changes behaviour on every backend, not just TUI:
+        // a genuine fast double-click on an activity-bar icon that is
+        // *already active* used to be swallowed as `Ignored` (the first
+        // click already toggled the sidebar hidden); it is now replayed as
+        // a second plain `MouseDown`, which `AppShell::handle_activity_click`
+        // treats as a toggle and re-shows the sidebar. That is arguably
+        // more VS-Code-like (a double-click has no special meaning on this
+        // chrome), but it is a user-visible semantic change with its own
+        // GTK-side coverage below (`src/gtk/testing.rs`'s
+        // `activity_bar_double_click_on_active_icon_reopens_sidebar_via_gtk_driver`).
         if let UiEvent::DoubleClick { position, .. } = &event {
             let position = *position;
-            if ctx.layout.activity_bar_bounds.contains(position) {
-                let viewport = backend.viewport();
-                let area = quadraui::Rect::new(0.0, 0.0, viewport.width, viewport.height);
+            let viewport = backend.viewport();
+            let area = quadraui::Rect::new(0.0, 0.0, viewport.width, viewport.height);
+            // Recompute the layout fresh (not `ctx.layout`, the cached
+            // per-frame copy) so this gate agrees with the hit-test
+            // `handle()` performs two lines down, matching
+            // `render::route_menu_bar_reveal`'s own
+            // `ctx.shell().layout(area, backend.line_height())` pattern for
+            // the same "gate must match the hit-test" reason: both run
+            // inside `handle_dispatch`, which can have already mutated
+            // shell chrome earlier in this same dispatch.
+            let layout = ctx.shell().layout(area, backend.line_height());
+            if layout.activity_bar_bounds.contains(position) {
                 let synthetic = UiEvent::MouseDown {
                     widget: None,
                     button: MouseButton::Left,
@@ -8873,13 +8910,18 @@ impl App {
                 if !matches!(shell_ev, quadraui::AppShellEvent::Ignored) {
                     quadraui::ShellApp::on_shell_event_ctx(self, &shell_ev, ctx);
                     self.draw_needed.set(true);
+                    return if self.draw_needed.get() {
+                        self.draw_needed.set(false);
+                        quadraui::Reaction::Redraw
+                    } else {
+                        quadraui::Reaction::Continue
+                    };
                 }
-                return if self.draw_needed.get() {
-                    self.draw_needed.set(false);
-                    quadraui::Reaction::Redraw
-                } else {
-                    quadraui::Reaction::Continue
-                };
+                // `shell_ev` was `Ignored` (e.g. the double-click landed in
+                // the activity bar's bounds but hit no zone) — fall through
+                // to the rest of the dispatch pipeline instead of
+                // unconditionally consuming it, same as every other arm in
+                // this function.
             }
         }
 

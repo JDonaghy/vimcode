@@ -14,12 +14,20 @@ mod tests {
     //! new, descriptive name where `App`'s own construction/fields differ
     //! enough that a faithful port needed a different shape.
     //!
-    //! # No production code here
+    //! # No production code here (one dated exception: #1762)
     //!
     //! Every test below drives already-shipped code through the existing
     //! [`crate::tui_main::testing::conformance_harness`] / [`crate::harness`]
     //! seams. Nothing in `src/app.rs`, `src/render.rs`, or `src/tui_main/`
-    //! (outside this file and the one `mod` declaration in `mod.rs`) changes.
+    //! (outside this file and the one `mod` declaration in `mod.rs`) changes
+    //! — except `activity_bar_adjacent_clicks_are_not_dropped_by_double_click_fold_1762`
+    //! below, which pins a fix landing in `src/app.rs` (`App::handle_dispatch`'s
+    //! "#1762" rung) rather than driving already-shipped code: the bug it
+    //! covers only reproduces through the real `App::handle_dispatch`
+    //! pipeline this module's harness already exercises, so this was the
+    //! natural home for it rather than opening a one-off file. If a second
+    //! exception shows up, promote this to a per-test note instead of
+    //! stretching this header further.
     //!
     //! **Exception:** #1763's two tests below (`alt_g_dropdown_does_not_
     //! survive_a_vim_dw_1763` and `escape_closes_the_dropdown_but_leaves_
@@ -166,12 +174,21 @@ mod tests {
         // `driver.click()` calls with no simulated time between them fold
         // into a single `UiEvent::DoubleClick` (same reasoning
         // `shell_app.rs`'s own `hamburger_relocated_click_after_reveal_
-        // hides_menu_bar` documents), which would only ever activate
-        // Explorer once, never reach the toggle-closed branch. Needs the
-        // concrete `TuiDriver` type (not the generic `ConformanceDriver`/
-        // `DriverInput` bound this helper used before #1427), since
-        // `set_double_click_folding` is TUI-only — fine here, this whole
-        // module is TUI-only by construction (see its own doc).
+        // hides_menu_bar` documents). Before #1762's `App::handle_dispatch`
+        // rung, that fold would only ever have activated Explorer once and
+        // never reached the toggle-closed branch; the rung now rescues it
+        // by replaying the fold as a second plain `MouseDown`, so folding
+        // is no longer strictly load-bearing here — left disabled anyway,
+        // since this helper's job is a deterministic two-click sequence,
+        // not a fold-rescue scenario (that's
+        // `activity_bar_adjacent_clicks_are_not_dropped_by_double_click_fold_1762`'s
+        // job, and the GTK-side
+        // `activity_bar_double_click_on_active_icon_reopens_sidebar_via_gtk_driver`'s).
+        // Needs the concrete `TuiDriver` type (not the generic
+        // `ConformanceDriver`/`DriverInput` bound this helper used before
+        // #1427), since `set_double_click_folding` is TUI-only — fine
+        // here, this whole module is TUI-only by construction (see its own
+        // doc).
         driver.set_double_click_folding(false);
         let explorer_bounds = |driver: &mut quadraui::tui::testing::TuiDriver<_>| {
             driver
@@ -587,12 +604,18 @@ mod tests {
             // directly: the Search→Source-Control click pair stayed plain
             // `MouseDown`s, but the very next click (Source Control→
             // Extensions, on the activity bar's fixed-width column, one row
-            // apart) arrived as `DoubleClick`, and a double-click on a plain
-            // activity-bar icon zone has no "activate panel" handler — it
-            // silently did nothing, exactly the "click lands, panel doesn't
-            // switch" symptom this scenario used to gate as a "product"
-            // dispatch gap. Same root cause and same fix as this module's
-            // own `collapse_sidebar` doc (#1427/#1432).
+            // apart) arrived as `DoubleClick`. At the time this was written,
+            // a double-click on a plain activity-bar icon zone had no
+            // "activate panel" handler and silently did nothing; #1762's
+            // `App::handle_dispatch` rung now rescues that case by
+            // replaying it as a plain `MouseDown` (see
+            // `activity_bar_adjacent_clicks_are_not_dropped_by_double_click_fold_1762`
+            // below), so folding is no longer load-bearing for *this*
+            // scenario either way — left disabled regardless, since this
+            // test's own point is the Explorer-reveal precondition below,
+            // not activity-bar fold behaviour, and disabling it keeps the
+            // six clicks independently deterministic. Same root cause as
+            // this module's own `collapse_sidebar` doc (#1427/#1432).
             driver.set_double_click_folding(false);
 
             // Unlike the mirrored `shell_app.rs` test, `App`'s shadow
@@ -727,6 +750,11 @@ mod tests {
             // Six back-to-back clicks with no simulated time between them
             // would otherwise fold pairwise into `DoubleClick`s (#1432,
             // same reasoning as this module's own `collapse_sidebar` doc).
+            // #1762's `App::handle_dispatch` rung now rescues most of those
+            // folds (replaying them as the plain `MouseDown` they were
+            // meant to be), but this test's own point is the row→panel
+            // mapping, not fold behaviour, so folding stays disabled here
+            // for determinism regardless.
             driver.set_double_click_folding(false);
 
             // (row, expected sidebar-header marker, label) — row 0 is the
@@ -760,7 +788,8 @@ mod tests {
         /// and Debug' after visiting Extensions, and a misrouted right-click
         /// launches a failing debug session".
         ///
-        /// Root cause, traced to the pinned quadraui rev
+        /// **What this test proves, precisely:** a real, previously-unknown
+        /// latent bug in the pinned quadraui rev
         /// (`quadraui::dispatch::DoubleClickDetector`,
         /// `DOUBLE_CLICK_RADIUS = 1.5` TUI cells / `DOUBLE_CLICK_MS = 400`):
         /// adjacent activity-bar rows are exactly `1.0` cell apart, inside
@@ -772,32 +801,53 @@ mod tests {
         /// plain `MouseDown` for activity-bar hit-testing, so that
         /// `DoubleClick` resolves as `AppShellEvent::Ignored` and the second
         /// click is silently dropped. The sidebar then stays on whatever
-        /// panel was already active (reliably Debug/"RUN AND DEBUG" in this
-        /// exact sequence), and a later click/right-click meant for a
-        /// different panel lands on that stale panel's own content instead
-        /// — the bugbash's "misrouted right-click launches a failing debug
-        /// session" half of this report.
+        /// panel was already active until the *next* real click — this
+        /// test fixes that.
+        ///
+        /// **What this test does NOT prove: that this is the mechanism
+        /// behind #1762's reported run.** The fold needs two clicks within
+        /// 1.5 cells of each other; the issue's own repro
+        /// (`tests/smoke-spec/tui.yaml`'s activity-bar section) pairs every
+        /// click with an `expect_within` (confirming the *previous* click's
+        /// effect actually painted) followed by a 500ms `wait_idle` —
+        /// comfortably over the 400ms fold window — before the *next*
+        /// click fires, so the reported lane should not hit this fold under
+        /// normal timing; no measurement contradicting that pacing is
+        /// offered here. Separately, the issue's own
+        /// "activity-bar-explorer-reselect-1636" step clicks row 5
+        /// (Extensions) then row 1 (Explorer) — a 4.0-cell gap, far outside
+        /// the 1.5-cell radius, and `DoubleClickDetector::process` resets
+        /// its own `last_click_time` to `None` the instant it folds a pair,
+        /// so the click immediately after any fold is never itself
+        /// eligible to be folded. No timing makes that specific re-click
+        /// droppable by this mechanism, so it plausibly still reproduces
+        /// after this fix; something else in the dispatch path is the more
+        /// likely cause of that exact step's "RUN AND DEBUG" finding, and
+        /// is not identified here. This fix stands on its own as a genuine
+        /// adjacency-fold bug fix, not as a demonstrated resolution of
+        /// #1762's exact reported run.
         ///
         /// This replays `tests/smoke-spec/tui.yaml`'s own activity-bar
         /// section byte-for-byte (same six real clicks, same rows, in order,
         /// with the file's own `click-source-control-icon`/`...-1636` stale
         /// step — row 4, which is actually Debug since #1698's reorder —
         /// left in per that file's #3509 additive-only policy and #1740's
-        /// own header note), with **no simulated time between clicks**: the
-        /// worst case for the 400ms fold window, and a realistic one too —
-        /// `tests/smoke-spec/tui.yaml`'s own `wait_idle` pacing between
-        /// clicks is satisfied the instant the terminal has already settled
-        /// (confirmed directly by this same file's `#1741`-era header
-        /// comment on `wait_idle`'s "trivially satisfies […] from the
-        /// instant it launches" semantics), so it guarantees no minimum
-        /// real-time gap either.
+        /// own header note), but with **no simulated time between clicks**
+        /// — the worst case for the 400ms fold window, deliberately more
+        /// aggressive than the spec's own paced timing (see above), so this
+        /// test is evidence for the adjacency-fold bug in isolation, not a
+        /// byte-for-byte timing replay of the spec.
         ///
-        /// RED-verified by hand against this exact fix reverted (the
-        /// `App::handle_dispatch` "#1762" rung in `src/app.rs` deleted): the
-        /// `after_source_control_1740`/`after_debug_1740`/
-        /// `after_extensions`/`after_explorer_again` assertions below all
-        /// fail, every one finding "RUN AND DEBUG" where its own marker was
-        /// expected — the exact symptom the bugbash report names.
+        /// **RED-verified by hand** against this exact fix reverted (the
+        /// `App::handle_dispatch` "#1762" rung in `src/app.rs` deleted):
+        /// only the *first* assertion below that exercises the fold —
+        /// "clicking Source Control right after Debug" — is ever observed
+        /// to fail, because `assert!` panics and stops the test there; it
+        /// fails finding "RUN AND DEBUG" (the stale Debug panel) where
+        /// "SOURCE CONTROL" was expected, confirming the click was dropped.
+        /// The later assertions (`Debug`/`Extensions`/`Explorer`-reselect)
+        /// are never reached in that run and this test makes no claim
+        /// about what they would have found.
         #[test]
         fn activity_bar_adjacent_clicks_are_not_dropped_by_double_click_fold_1762() {
             let mut h = harness(plain_engine());

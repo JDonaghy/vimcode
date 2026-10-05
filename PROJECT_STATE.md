@@ -1,10 +1,15 @@
 # VimCode Project State
 
-**Last updated:** October 5, 2026 (#1762 — activity bar got stuck on "Run
-and Debug" after visiting Extensions, and a misrouted right-click launched
-a failing debug session):
+**Last updated:** October 5, 2026 (#1762 fix iteration 1 — activity bar got
+stuck on "Run and Debug" after visiting Extensions, and a misrouted
+right-click launched a failing debug session). **Status: partial — see
+below.** This entry was corrected in fix iteration 1 after review found two
+of its original factual claims contradicted by the code/spec they cited;
+read the "What is NOT demonstrated" bullet before treating this as closing
+#1762.
 
-- Root cause, traced to the pinned quadraui rev
+- Confirmed real bug (independent of whether it explains #1762's reported
+  run): traced to the pinned quadraui rev
   (`quadraui::dispatch::DoubleClickDetector`): `DOUBLE_CLICK_RADIUS` is 1.5
   TUI cells and the activity bar's icon rows are exactly 1.0 cell apart, so
   two genuinely distinct real clicks on *adjacent* activity-bar icons
@@ -14,40 +19,66 @@ a failing debug session):
   only has a hit-test arm for a plain `MouseDown` — every other event,
   `DoubleClick` included, falls through its own `_ => Ignored` arm — so the
   second click was silently dropped and the sidebar stayed on whatever
-  panel was already active (reliably Debug/"RUN AND DEBUG" in the
-  bugbash's exact repro sequence). A later click/right-click meant for a
-  different panel then landed on that stale panel's own content instead —
-  the bugbash's "misrouted right-click launches a failing debug session"
-  half of the report.
+  panel was already active until the next real click.
 - Fix (`src/app.rs`, `App::handle_dispatch`): the real fix belongs in
   quadraui (`AppShell::handle` growing a `DoubleClick` arm identical to its
   `MouseDown` one for the activity-bar band — a double-click on an
   activity-bar icon has no distinct meaning from a single click there, for
-  every consumer, not just vimcode). A quadraui issue describing this gap
-  should be filed (not yet filed as of this commit — this repo's workers
-  don't run `gh`). Until it lands, a new rung in the shared `App` (not
+  every consumer, not just vimcode). That gap is now drafted in
+  `docs/PENDING_QUADRAUI_ISSUES.md` for the coordinator to file verbatim
+  (not yet filed/landed as of this commit — this repo's workers don't run
+  `gh`). Until it lands, a new rung in the shared `App` (not
   `src/gtk/`/`src/tui_main/`, so both backends pick it up from one place)
-  catches a `DoubleClick` landing inside `ctx.layout.activity_bar_bounds`,
-  re-synthesizes it as the plain `MouseDown` it was always meant to be, and
-  feeds it back through `AppShell`'s own public `handle()` — the exact
-  dispatch a real single click takes — then through the existing
-  `ShellApp::on_shell_event_ctx` pipeline, same as a real click would.
-- Test: `tui_main::app_on_tui_tests::tests::activity_bar::
+  catches a `DoubleClick` landing inside the activity bar's freshly
+  recomputed layout bounds, re-synthesizes it as the plain `MouseDown` it
+  was always meant to be, and feeds it back through `AppShell`'s own
+  public `handle()` — the exact dispatch a real single click takes — then
+  through the existing `ShellApp::on_shell_event_ctx` pipeline, same as a
+  real click would. This also changes same-icon double-click behaviour on
+  every backend (GTK/mac too, not just TUI) — see that comment block and
+  `src/gtk/testing.rs`'s
+  `activity_bar_double_click_on_active_icon_reopens_sidebar_via_gtk_driver`.
+- Test (Tier-1): `tui_main::app_on_tui_tests::tests::activity_bar::
   activity_bar_adjacent_clicks_are_not_dropped_by_double_click_fold_1762`
-  — replays `tests/smoke-spec/tui.yaml`'s own activity-bar section
-  byte-for-byte (same six real clicks/rows in order, including its
-  deliberately-preserved stale `-1636` row-4 step) with **no simulated
-  time between clicks** (the realistic worst case: that file's own
-  `wait_idle` pacing can be satisfied instantly once the terminal has
-  settled, per its #1741-era header note, so it guarantees no minimum
-  real-time gap either). RED-verified by hand with the new `App::
-  handle_dispatch` rung reverted — every assertion from the Source
-  Control click onward failed, each finding "RUN AND DEBUG" where its own
-  marker was expected, matching the bugbash's exact symptom.
-- Not filed: the quadraui-side issue (`AppShell::handle`'s missing
-  `DoubleClick` arm) — this session cannot run `gh`; the coordinator
-  should file it against `JDonaghy/quadraui` using this entry's root-cause
-  description.
+  — drives the same six rows `tests/smoke-spec/tui.yaml`'s activity-bar
+  section clicks, in order, but with **no simulated time between clicks**
+  (the worst case for the 400ms fold window) to isolate the adjacency-fold
+  bug on its own; it is not a timing-faithful replay of the spec (the
+  spec's own `wait_idle` pacing is ≥500ms between clicks, over the 400ms
+  fold window). RED-verified by hand with the `App::handle_dispatch` rung
+  reverted: only the *first* assertion that exercises the fold ("clicking
+  Source Control right after Debug") is ever observed to fail — `assert!`
+  panics there, so later assertions in the same test are never reached in
+  that run. It fails finding "RUN AND DEBUG" where "SOURCE CONTROL" was
+  expected, confirming the click was dropped.
+- GTK coverage (non-blocking review finding): `src/gtk/testing.rs`'s
+  `activity_bar_double_click_on_active_icon_reopens_sidebar_via_gtk_driver`
+  — the fix is shared code, so it changes behaviour on GTK too (a genuine
+  double-click on an already-active icon now re-shows the sidebar instead
+  of leaving it hidden). RED-verified by hand the same way.
+- **What is NOT demonstrated: that this fold is #1762's reported
+  mechanism.** Two claims in the original version of this entry did not
+  survive a check against the code/spec they cited: (1) the pacing claim —
+  `tui.yaml`'s own activity-bar steps pace every click with a confirmed
+  `expect_within` *and then* a 500ms `wait_idle`, comfortably over the
+  400ms fold window, so the reported lane should not hit this fold under
+  normal timing; no measurement to the contrary is offered. (2) the
+  symptom claim — the issue's own
+  `activity-bar-explorer-reselect-1636` failure is row 5 (Extensions) to
+  row 1 (Explorer), a 4.0-cell gap far outside the 1.5-cell radius, and
+  `DoubleClickDetector::process` resets `last_click_time` to `None` the
+  instant it folds a pair, so the click immediately following any fold is
+  never itself eligible to be folded — under no timing can that specific
+  re-click be dropped by this mechanism. #1762 therefore plausibly still
+  reproduces after this fix; something else is holding the sidebar on
+  Run&Debug in the reported run, not yet identified. The second half of
+  the issue title (the misrouted right-click launching a failing debug
+  session) is a pure downstream consequence of whichever cause turns out
+  to be real, so it is equally unconfirmed by this fix.
+- Filed in `docs/PENDING_QUADRAUI_ISSUES.md`, not yet filed on GitHub: the
+  quadraui-side issue (`AppShell::handle`'s missing `DoubleClick` arm) —
+  this session cannot run `gh`; the coordinator should file it against
+  `JDonaghy/quadraui` using that entry verbatim.
 
 **Last updated:** October 4, 2026 (#1761 — the automatic startup
 extension-registry refresh no longer breaks the idle-silence guarantee):
