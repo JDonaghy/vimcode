@@ -6407,12 +6407,7 @@ pub(crate) fn run_shared_tick_chores(
     // the very next edit that grew the buffer (`o<text><Esc>`) then ran
     // `ensure_cursor_visible` against that stale 1-row belief and scrolled
     // line 0 out of view to keep the cursor's new line "on screen" —
-    // reproduced on a real pty (`tests/
-    // pty_open_line_below_paints_all_lines.rs`) between the idle tick that
-    // cached the 1-row figure and the keystroke that acted on it; neither
-    // in-process driver (`TuiDriver`/`TuiVtDriver`) ever runs a tick
-    // between dispatching a key and rendering its result, so this never
-    // showed up there.
+    // reproduced both over a real pty (tests/pty_open_line_below_paints_all_lines.rs) and in-process (src/tui_main/app_on_tui_tests.rs's opening_a_line_below_the_last_line_paints_every_line_in_order_1779, via TuiDriver::tick()) between the idle tick that caches this value and the keystroke that acts on it.
     if let Some(layout) = app.cached_screen_layout.borrow().as_ref() {
         for rw in &layout.windows {
             engine.set_viewport_for_window(
@@ -31171,14 +31166,19 @@ mod tests {
     /// lines) trusts that number to decide whether the viewport is tall
     /// enough to show the cursor's line without scrolling.
     ///
+    /// This is a supplementary unit test pinning the new field's *value*,
+    /// not the black-box coverage for #1779 — that is the real-pty
+    /// end-to-end test (`tests/pty_open_line_below_paints_all_lines.rs`)
+    /// and the in-process `TuiDriver` regression test
+    /// (`src/tui_main/app_on_tui_tests.rs`'s
+    /// `opening_a_line_below_the_last_line_paints_every_line_in_order_1779`),
+    /// both of which assert on painted screen content, not on this field.
+    ///
     /// RED against the pre-fix shape (`visible_line_capacity` not a field;
     /// callers read `lines.len()` instead): `lines.len()` here is `1`, not
-    /// `24` — exactly the stale-viewport value that made `ensure_cursor_
-    /// visible` believe a 24-row window could show only one line, and
-    /// scroll line 0 out of view the moment `o<text><Esc>` grew the buffer
-    /// to two lines (`tests/pty_open_line_below_paints_all_lines.rs` pins
-    /// the full end-to-end symptom on a real pty, where the idle tick that
-    /// caches this value actually runs between keystrokes).
+    /// `24` — exactly the stale-viewport value that made `ensure_cursor_visible`
+    /// believe a 24-row window could show only one line, and scroll line 0
+    /// out of view the moment `o<text><Esc>` grew the buffer to two lines.
     #[test]
     fn visible_line_capacity_is_the_window_row_capacity_not_the_painted_line_count() {
         use crate::core::Engine;

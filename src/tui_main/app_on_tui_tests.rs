@@ -333,14 +333,20 @@ mod tests {
         /// bare `Engine::handle_key` + content-string assertion — the bug
         /// is specifically in what gets painted, not in the buffer).
         ///
-        /// **Confirmed NOT RED** against unfixed `develop` — `TuiDriver`
-        /// dispatches and renders each key synchronously with no gap, so
-        /// it never reproduces this bug (see the `vt_driver` twin below
-        /// for the full explanation and the real, RED-verified repro).
-        /// Kept as a passing regression test anyway: it drives the same
-        /// production render path the real repro does, just missing the
-        /// one ingredient (an idle tick between keystrokes) that exposes
-        /// the bug — a future regression here would still be real.
+        /// RED-verified in-process: the earlier claim here ("Confirmed NOT
+        /// RED — `TuiDriver` dispatches and renders each key synchronously
+        /// with no gap") was wrong. `TuiDriver::tick()` is public and routes
+        /// straight to `App::tick` -> `render::run_shared_tick_chores` —
+        /// the exact function this bug lives in — so interleaving one
+        /// `driver.tick()` between the initial render and the `o` keystroke
+        /// reproduces the pre-fix sequence without any pty: the tick caches
+        /// `rw.lines.len()` (1, for this one-line buffer) as the window's
+        /// viewport height, and the `o` keystroke's `ensure_cursor_visible`
+        /// then scrolls line 0 out of view to keep the cursor's new line
+        /// "visible" against that stale 1-row belief. Confirmed red against
+        /// the pre-fix `rw.lines.len().max(1)` in `run_shared_tick_chores`
+        /// (`src/render.rs`), green against the
+        /// `rw.visible_line_capacity.max(1)` fix.
         #[test]
         fn opening_a_line_below_the_last_line_paints_every_line_in_order_1779() {
             let mut engine = plain_engine();
@@ -352,6 +358,12 @@ mod tests {
                 driver.screen_has("ZQXW_FOO"),
                 "precondition: the single existing line must be painted"
             );
+            // Caches the window's viewport height from this frame's paint
+            // (`run_shared_tick_chores`) — the pre-fix version of that
+            // function pinned it to the buffer's current 1-line length
+            // instead of the window's real row capacity, reproducing the
+            // bug the moment the next keystroke grows the buffer.
+            driver.tick();
 
             driver.type_char('o');
             for c in "ZQXW_BAR".chars() {
@@ -5981,23 +5993,23 @@ mod tests {
         /// `ctrl_l_repaints_a_stale_cell_...` above exists to catch for a
         /// different trigger).
         ///
-        /// **Confirmed NOT RED** against unfixed `develop`, same as the
-        /// `TestBackend` twin above — both stayed green driving this exact
-        /// key sequence. The real repro needs an actual OS pty: between
-        /// this and the `TestBackend` twin, `App::handle_key_press`
-        /// dispatches and renders each key synchronously with no gap, but
-        /// the real `quadraui::tui::run::Runner` only renders at the top
-        /// of its *next* event-loop pass and runs `App::tick` — which is
-        /// what caches `RenderedWindow`-derived viewport geometry back
-        /// onto the engine — after every batch, including idle ones. The
-        /// real repro is `tests/pty_open_line_below_paints_all_lines.rs`,
-        /// which drives a real `vcd` under a real Unix pty and *was*
-        /// RED-verified there before the `src/render.rs`
-        /// `visible_line_capacity` fix landed in this same commit. Kept
-        /// here anyway as permanent evidence that this exact bug sits
-        /// outside both in-process drivers' reach — the next person
-        /// chasing a similar "only reproduces over a real pty" report can
-        /// rule this pair out in one grep instead of re-deriving it.
+        /// Unlike the `TestBackend` twin above, this one genuinely
+        /// **cannot** be fixed to interleave a tick the same way:
+        /// `quadraui::tui::vt_testing::TuiVtDriver` (at this repo's pinned
+        /// rev) has no public `tick()` — only `TuiDriver`
+        /// (`quadraui::tui::testing`) does. Confirmed by trying it: adding
+        /// `driver.tick()` here is a compile error
+        /// (`no method named 'tick' found for struct 'TuiVtDriver<A>'`),
+        /// not a passing-but-uninformative test, so the earlier "Confirmed
+        /// NOT RED, same as the `TestBackend` twin" framing was doubly
+        /// wrong — the real reason this one can't reproduce the bug
+        /// in-process is a missing driver API, not a gap in what key
+        /// sequence it sends. Kept as-is (no tick) as evidence the ANSI
+        /// diff/vt100 path isn't itself where the bug lives; the real
+        /// end-to-end RED-verified coverage is
+        /// `tests/pty_open_line_below_paints_all_lines.rs`, which drives an
+        /// actual `vcd` over a real pty and needs no driver `tick()` at
+        /// all because the real runner ticks on its own.
         #[test]
         fn opening_a_line_below_the_last_line_paints_every_line_in_order_via_vt_driver_1779() {
             let mut engine = plain_engine();

@@ -2,25 +2,35 @@
 //! new last line is not repainted correctly (line 1 vanishes, content shown
 //! one row too high)".
 //!
-//! # Why a real pty, not `TuiDriver` / `TuiVtDriver`
+//! # Root cause, and why this file exists anyway
 //!
-//! Both in-process drivers were tried first (see
+//! The bug *is* in `src/render.rs`: `run_shared_tick_chores` fed
+//! `Engine::set_viewport_for_window` the previous frame's *painted* line
+//! count (`RenderedWindow::lines.len()`) instead of the window's real row
+//! *capacity* (the new `RenderedWindow::visible_line_capacity` field this
+//! same fix adds). It is reachable in-process, too:
 //! `src/tui_main/app_on_tui_tests.rs`'s
-//! `opening_a_line_below_the_last_line_paints_every_line_in_order_1779` and
-//! `..._via_vt_driver_1779`) and **both stayed green** driving the exact
-//! same key sequence against the exact same `App`/`Engine`/render pipeline
-//! this bug report names — one reading ratatui's own in-memory `Buffer`
-//! directly, the other reading a real `CrosstermBackend`'s ANSI byte
-//! stream through a real `vt100::Parser`. Neither reproduces the bug,
-//! which means it is not in `Engine::handle_key` or `render.rs`'s layout
-//! math (both already covered, by both drivers, and both correct) — it is
-//! specifically a real-terminal/real-pty transport-layer defect, the same
-//! quadraui#302-shaped blind spot `tests/pty_settings_header_delay.rs` and
-//! `tests/conpty_activity_bar_click.rs` already carve real-pty test files
-//! out for. This file is that carve-out for #1779: a real `vcd` binary,
-//! under a real Unix pty, opened directly on a one-line file (the issue's
-//! own repro), typing the exact key sequence the bug report gives and
-//! reading the real byte stream back through `vt100`.
+//! `opening_a_line_below_the_last_line_paints_every_line_in_order_1779`
+//! reproduces it with a plain `TuiDriver` by calling the driver's own
+//! public `tick()` between the initial render and the `o` keystroke — no
+//! pty required. An earlier version of this comment claimed both
+//! in-process drivers stayed green and concluded the defect must be a
+//! real-pty transport-layer issue; that was wrong on both counts; see that
+//! test's own doc for the corrected explanation and the RED-verification
+//! steps.
+//!
+//! This file exists as additional, real-pty, end-to-end coverage for the
+//! same bug — not because the in-process drivers can't reach it, but
+//! because the original bugbash report came in over a real pty and that
+//! exact path is worth pinning directly, the same way
+//! `tests/pty_settings_header_delay.rs` and
+//! `tests/conpty_activity_bar_click.rs` pin other real-pty scenarios. A
+//! real `vcd` binary, under a real Unix pty, opened directly on a one-line
+//! file (the issue's own repro), typing the exact key sequence the bug
+//! report gives and reading the real byte stream back through `vt100`.
+//! (`TuiVtDriver`, the other in-process driver, has no public `tick()` at
+//! this repo's pinned quadraui rev, so it genuinely can't be fixed the same
+//! way as the `TuiDriver` test — see that test's doc for the detail.)
 #![cfg(unix)]
 
 use std::io::{Read, Write};
@@ -198,6 +208,15 @@ fn send_bytes(writer: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8]) {
     w.flush().ok();
 }
 
+/// Same as [`send_bytes`] but never panics — for teardown writes, where the
+/// child may already have exited (an EIO on the pty write would otherwise
+/// panic and mask whatever verdict the test already reached).
+fn send_bytes_best_effort(writer: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8]) {
+    let mut w = writer.lock().unwrap();
+    let _ = w.write_all(bytes);
+    let _ = w.flush();
+}
+
 /// #1779's exact single-line repro: `foo.txt` containing just `foo\n`,
 /// press `o`, type `bar`, press Escape. Both `foo` and `bar` must still be
 /// painted, each on its own row, in order — `foo` must not vanish, and
@@ -255,13 +274,23 @@ fn opening_a_line_below_the_only_line_paints_both_lines_1779() {
         "'o' + \"ZQXW_BETA\" + Escape never painted 'ZQXW_BETA' at all; screen:\n{}",
         screen_text(&parser)
     );
-    // Give the final frame time to fully settle before reading rows back.
-    std::thread::sleep(Duration::from_millis(300));
-    sync_parser(&mut parser, &captured, &mut fed);
+    // Bounded poll for both markers to be present, rather than a fixed
+    // sleep: every other wait in this file already polls with a 15s
+    // budget, and a fixed sample here can be taken before a later repaint
+    // lands on a loaded CI runner, losing the row-adjacency check's RED
+    // behaviour to timing noise rather than the bug itself.
+    let settle_start = Instant::now();
+    let (alpha_row, beta_row) = loop {
+        sync_parser(&mut parser, &captured, &mut fed);
+        let alpha_row = row_of(&parser, "ZQXW_ALPHA");
+        let beta_row = row_of(&parser, "ZQXW_BETA");
+        if (alpha_row.is_some() && beta_row.is_some()) || settle_start.elapsed() >= SETTLE_TIMEOUT {
+            break (alpha_row, beta_row);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
 
     let screen = screen_text(&parser);
-    let alpha_row = row_of(&parser, "ZQXW_ALPHA");
-    let beta_row = row_of(&parser, "ZQXW_BETA");
     assert!(
         alpha_row.is_some() && beta_row.is_some(),
         "#1779: both 'ZQXW_ALPHA' (original line) and 'ZQXW_BETA' (opened \
@@ -289,10 +318,12 @@ fn opening_a_line_below_the_only_line_paints_both_lines_1779() {
          paint (asserted above) is not"
     );
 
-    // Best-effort teardown.
-    send_bytes(&writer, b"\x1b:qa!\r");
+    // Best-effort teardown — the child may already have exited by now, so
+    // these writes must not panic on an EIO and mask the real verdict above.
+    send_bytes_best_effort(&writer, b"\x1b:qa!\r");
     let _ = child.try_wait();
     std::thread::sleep(Duration::from_millis(300));
     let _ = child.kill();
     let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&home);
 }
