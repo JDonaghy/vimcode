@@ -113,6 +113,25 @@
 //! this test (no other change should be needed) once `Cargo.toml`'s
 //! quadraui pin moves past a `crossterm` version — or a quadraui-side
 //! `wait_events` workaround — that breaks on `Ok(0)` instead of looping.
+//!
+//! **#1765 update: still RED, and expected to stay RED here regardless of
+//! which quadraui rev is pinned.** #1765 bumped the pin to `8425673`,
+//! which includes quadraui#1295's dead-pty guard (`TuiBackend::
+//! wait_events`/`poll_events` now check their own `poll(2)` on stdin
+//! before ever delegating to crossterm). That guard cannot affect *this*
+//! test's outcome by construction: this file calls
+//! `ratatui::crossterm::event::poll` directly, the exact bypass the
+//! guard's own doc comment in quadraui spells out — "crossterm is never
+//! entered at all once this check has run," which only holds for a
+//! caller that runs the check, and this file deliberately isn't one (see
+//! this file's own "why this isn't a full end-to-end" section above).
+//! `crossterm` 0.29.0 itself is unpatched by #1765 — only vimcode's
+//! transitive quadraui pin moved, not crossterm's own pinned version —
+//! so this direct repro remains exactly as RED as it was before. See
+//! `tests/pty_dead_master_exit.rs`, added by #1765, for the test that
+//! actually exercises quadraui#1295's guard end-to-end through a real
+//! `vcd` process — and for why *that* test is **also** still `#[ignore]`d
+//! despite exercising the real fix.
 #![cfg(target_os = "linux")]
 
 use std::ffi::CStr;
@@ -246,14 +265,16 @@ fn redirect_stdin_to(fd: RawFd) {
 }
 
 #[test]
-#[ignore = "#1735: RED against the pinned quadraui rev's transitive crossterm \
-            0.29.0 — a confirmed upstream busy-loop bug (crossterm's \
-            UnixInternalEventSource::try_read never breaks on a bare Ok(0) \
-            read), not a vimcode-side regression. See this file's module doc \
-            for the full analysis and docs/PENDING_QUADRAUI_ISSUES.md for the \
-            drafted quadraui issue. Un-ignore once the quadraui pin moves \
-            past a fix; run explicitly with `cargo test --release --test \
-            crossterm_dead_pty_busy_loop -- --ignored` to see it fail today."]
+#[ignore = "#1735/#1765: RED against the pinned quadraui rev's transitive \
+            crossterm 0.29.0 — a confirmed upstream busy-loop bug \
+            (crossterm's UnixInternalEventSource::try_read never breaks on \
+            a bare Ok(0) read), not a vimcode-side regression, and not \
+            something quadraui#1295's TuiBackend-level guard can fix for a \
+            test that bypasses TuiBackend entirely (see this file's module \
+            doc, '#1765 update'). Run explicitly with `cargo test --release \
+            --test crossterm_dead_pty_busy_loop -- --ignored` to see it \
+            fail today. Un-ignore once crossterm itself ships a fix this \
+            crate's pin can pick up."]
 fn crossterm_poll_busy_spins_once_its_only_watched_fd_is_permanently_hung_up() {
     let pty = RawPty::open().expect("allocate a raw Unix 98 pty pair");
     let slave = pty.open_slave().expect("open a slave fd");

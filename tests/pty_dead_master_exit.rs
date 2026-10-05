@@ -1,0 +1,434 @@
+//! #1735/#1765: real-pty regression test that a real `vcd` process exits
+//! promptly (bounded wall-clock time, bounded CPU) once its pty's master
+//! side closes, instead of busy-spinning on the dead fd forever.
+//!
+//! # Why this file exists alongside `crossterm_dead_pty_busy_loop.rs`
+//!
+//! That file drives `ratatui::crossterm::event::poll` directly, in-process,
+//! against a real dead pty — a deliberate, deterministic repro of the
+//! *upstream* `crossterm` 0.29.0 defect (its Linux event source never
+//! breaks out of a TTY read loop on a bare `Ok(0)`/EOF read). Its own
+//! module doc explains at length why that file is `#[ignore]`d: the actual
+//! fix quadraui#1765 picks up (quadraui#1295) does **not** patch `crossterm`
+//! itself — it adds a `poll(2)`-based hangup guard to
+//! `quadraui::tui::backend::TuiBackend::wait_events`/`poll_events` that
+//! refuses to ever delegate into `crossterm` once the watched fd is seen
+//! hung up. A test that calls raw `crossterm::event::poll` bypasses that
+//! guard entirely by construction, so it cannot observe the fix — it can
+//! only observe whether `crossterm` itself was patched, which it was not.
+//!
+//! This file is the test that actually exercises the shipped fix: a real
+//! `vcd` binary, under a real Unix pty (mirrors `tests/
+//! pty_settings_header_delay.rs`'s `spawn_under_pty` shape), whose pty
+//! *master* is closed out from under it — exactly `TuiBackend::
+//! wait_events`'s own documented trigger condition — while this test
+//! watches, from the outside, whether the process exits on its own in
+//! bounded time without pegging a CPU core while it does.
+//!
+//! # Every dup of the master fd must close, not just one handle
+//!
+//! `portable_pty::MasterPty::try_clone_reader`/`take_writer` both `dup(2)`
+//! the master fd (confirmed by reading `portable-pty` 0.9.0's own Unix
+//! implementation: `UnixMasterPty::try_clone_reader`/`take_writer` each
+//! call `self.fd.try_clone()`). The pty's master side stays open — and the
+//! slave never sees a hangup — until *every* dup'd fd referencing it is
+//! closed, not just the original `MasterPty` handle. An earlier version of
+//! this test spawned a background thread holding a long-lived clone of the
+//! reader to capture `vcd`'s startup output (mirroring `tests/
+//! pty_settings_header_delay.rs`'s shape, which never needs to fully close
+//! its master), then dropped only the original `master` object — leaving
+//! that thread's cloned reader fd (and the writer clone it also held)
+//! open, so the master was never actually fully closed and `vcd` correctly
+//! never saw a hangup at all. This file reads everything on the main test
+//! thread instead (no background thread, no fd outliving this function's
+//! own locals) specifically so that a single explicit `drop` of the
+//! reader, writer, and master together is a real, complete close.
+//!
+//! # `#[ignore]`d too — RED-confirmed (5/5 runs) even with quadraui#1295's
+//! guard in place
+//!
+//! This test deliberately is **not** a controlling-terminal pty
+//! (`CommandBuilder::set_controlling_tty(false)`) — see the comment at its
+//! call site for why a controlling terminal makes this test pass for the
+//! wrong reason (a real `SIGHUP`, not the guard, kills `vcd`). Without
+//! that backstop, this test deterministically reproduces #1735 against
+//! the #1765 pin: `sample`-ing the real `vcd` process mid-run (macOS
+//! `sample(1)`, 1ms interval, 2s window) shows the main thread parked
+//! inside `TuiBackend::wait_events` → `ratatui::crossterm::event::poll` →
+//! `UnixInternalEventSource::try_read`, issuing a bare `read()` syscall
+//! ~1390 times in that window with **no** `stdin_hung_up` frame anywhere
+//! on the stack — i.e. the guard was checked, came back `false`, and
+//! crossterm was entered, exactly as designed, right before the hangup
+//! landed.
+//!
+//! Reading `quadraui::tui::backend::TuiBackend::wait_events`'s own source
+//! (the `8425673` pin) explains why that's not a narrow, unlucky race but
+//! close to a *guaranteed* one for this trigger shape: while idle, the
+//! loop re-checks `stdin_hung_up()` only in the brief gap *between* two
+//! consecutive `ratatui::crossterm::event::poll(STDIN_HANGUP_POLL_SLICE)`
+//! calls (20ms each), immediately starting the next slice if nothing was
+//! found. `vcd` idling with no input is therefore inside one of those
+//! 20ms calls essentially 100% of the time, with the inter-call gap
+//! where the guard actually runs measured in microseconds. An external,
+//! asynchronous master-close (this test; a real terminal disconnect in
+//! production) lands during an in-flight call on close to every
+//! occurrence, not occasionally — and once mio reports a hung-up fd as
+//! "ready" and `try_read` takes its first `Ok(0)` read, that specific
+//! call can never return, so the guard never gets another chance to run
+//! either. This matches the b145a55 commit's own review note ("Slicing
+//! narrows, but does not eliminate, that race... a full fix would mean
+//! reimplementing crossterm's own reader") — just quantifies how little
+//! the narrowing actually buys for this exact trigger.
+//!
+//! Per this repo's Platform-Neutrality Rule, the fix for *that* gap
+//! belongs in quadraui (e.g. actually reimplementing the read loop, or
+//! an `epoll`/`kqueue`-level rearm that re-entering `wait_events` can
+//! observe before calling crossterm at all), not as a vimcode-side
+//! workaround — so, mirroring `crossterm_dead_pty_busy_loop.rs`'s own
+//! precedent, this test stays `#[ignore]`d with this analysis rather than
+//! either being weakened to stop asserting the exit, or left to red-wall
+//! `cargo test` until that lands. Run explicitly with `cargo test --test
+//! pty_dead_master_exit -- --ignored` to see it fail today. Un-ignore
+//! once a quadraui fix closes (or substantially narrows, in a way
+//! verified against this exact non-ctty trigger shape) this race.
+#![cfg(unix)]
+
+use std::io::{ErrorKind, Read, Write};
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+const PTY_ROWS: u16 = 30;
+const PTY_COLS: u16 = 100;
+
+/// How long `vcd`'s startup paint is allowed to take before this test
+/// gives up (generous — this is a precondition, not the thing under test).
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Upper bound on how long this test waits, after closing the pty master,
+/// for `vcd` to exit on its own. A fixed build notices the hangup on its
+/// very next `wait_events` call (internally sliced at 20ms —
+/// `STDIN_HANGUP_POLL_SLICE` in quadraui) and exits within roughly one
+/// idle-poll tick; the pre-#1295 bug never exits at all. This budget is
+/// generous relative to "promptly" but still tight enough that a
+/// reproduction of the bug fails this test in a few seconds rather than
+/// hanging the suite.
+const EXIT_BUDGET: Duration = Duration::from_secs(5);
+
+/// Upper bound on how much CPU time (seconds, `utime + stime` as reported
+/// by `ps -o time=`) `vcd` is allowed to consume *during* the dead-pty
+/// wait window. A correct implementation notices the hangup on its next
+/// scheduled wakeup and does ~no work; a busy-spinning process pins close
+/// to 100% of one core for the entire window. `EXIT_BUDGET` is 5s; 1s of
+/// consumed CPU time during that window is already a generous bar — a
+/// reproduction of the bug would consume close to the full 5s.
+const MAX_CPU_SECONDS_WHILE_WAITING: f64 = 1.0;
+
+/// Non-blocking read polling interval while waiting for `vcd`'s startup
+/// output (the pty's master fd is set `O_NONBLOCK`, so each `read()` that
+/// finds nothing yet returns `WouldBlock` immediately rather than
+/// blocking — this is how long this test sleeps between retries).
+const READ_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+fn isolated_home() -> PathBuf {
+    let home = std::env::temp_dir().join(format!(
+        "vimcode_pty_1735_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_dir = home.join(".config").join("vimcode");
+    std::fs::create_dir_all(&config_dir).expect("create isolated $HOME/.config/vimcode");
+    std::fs::write(
+        config_dir.join("settings.json"),
+        r#"{"lsp_enabled": false, "use_nerd_fonts": false}"#,
+    )
+    .expect("seed settings.json");
+    home
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn screen_text(parser: &vt100::Parser) -> String {
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let mut out = String::with_capacity((rows as usize) * (cols as usize + 1));
+    for y in 0..rows {
+        for x in 0..cols {
+            let Some(cell) = screen.cell(y, x) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let s = cell.contents();
+            out.push_str(if s.is_empty() { " " } else { s });
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Sets `O_NONBLOCK` on `fd` (shared by every `dup(2)` of the same open
+/// file description, including the clones `try_clone_reader`/`take_writer`
+/// below hand out — `fcntl(F_SETFL, ...)` flags live on the open file
+/// description, not the per-process fd-table entry).
+fn set_nonblocking(fd: std::os::fd::RawFd) {
+    // SAFETY: `fd` is a valid, open fd for the whole duration of this
+    // call (owned by `master` in the caller, which outlives it); both
+    // `fcntl` calls' returns are checked.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        assert!(
+            flags >= 0,
+            "fcntl(F_GETFL) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let rc = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        assert!(
+            rc == 0,
+            "fcntl(F_SETFL, O_NONBLOCK) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Reads whatever is currently available from `reader` (non-blocking —
+/// `WouldBlock` means "nothing yet", not an error) into `parser`, and
+/// answers the startup `ESC[6n` cursor-position query inline if this
+/// chunk contains it. Returns `false` once the pty signals EOF
+/// (`Ok(0)`) — not expected to happen before this test explicitly closes
+/// the master itself.
+fn pump_once(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    parser: &mut vt100::Parser,
+    buf: &mut [u8],
+) -> bool {
+    match reader.read(buf) {
+        Ok(0) => false,
+        Ok(n) => {
+            let chunk = &buf[..n];
+            parser.process(chunk);
+            if contains_subslice(chunk, b"\x1b[6n") {
+                let _ = writer.write_all(b"\x1b[1;1R");
+                let _ = writer.flush();
+            }
+            true
+        }
+        Err(e) if e.kind() == ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    }
+}
+
+fn wait_for_screen_contains(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    parser: &mut vt100::Parser,
+    needle: &str,
+    timeout: Duration,
+) -> Option<Duration> {
+    let mut buf = [0u8; 4096];
+    let start = Instant::now();
+    loop {
+        pump_once(reader, writer, parser, &mut buf);
+        if screen_text(parser).contains(needle) {
+            return Some(start.elapsed());
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        std::thread::sleep(READ_RETRY_INTERVAL);
+    }
+}
+
+/// Cumulative CPU time (`utime + stime`, in seconds) `ps` reports for
+/// `pid`, parsed from `ps -o time=`'s `[[dd-]hh:]mm:ss[.ff]` format (the
+/// same keyword on both the BSD `ps` macOS ships and Linux's `procps`).
+/// `None` once the process is gone (what `ps -p <dead-pid>` reports as a
+/// non-zero exit with empty stdout) — callers treat that the same as "no
+/// new sample", not an error, since a process that's already exited is
+/// exactly the success case this test is checking for.
+fn ps_cpu_time_secs(pid: u32) -> Option<f64> {
+    let output = Command::new("ps")
+        .args(["-o", "time=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    parse_ps_time(&text)
+}
+
+/// Parses `ps -o time=`'s `[[dd-]hh:]mm:ss[.ff]` into total seconds.
+fn parse_ps_time(text: &str) -> Option<f64> {
+    let (days, rest) = match text.split_once('-') {
+        Some((d, rest)) => (d.parse::<f64>().ok()?, rest),
+        None => (0.0, text),
+    };
+    let fields: Vec<&str> = rest.split(':').collect();
+    let (hours, minutes, seconds) = match fields.as_slice() {
+        [h, m, s] => (
+            h.parse::<f64>().ok()?,
+            m.parse::<f64>().ok()?,
+            s.parse::<f64>().ok()?,
+        ),
+        [m, s] => (0.0, m.parse::<f64>().ok()?, s.parse::<f64>().ok()?),
+        [s] => (0.0, 0.0, s.parse::<f64>().ok()?),
+        _ => return None,
+    };
+    Some(days * 86_400.0 + hours * 3_600.0 + minutes * 60.0 + seconds)
+}
+
+#[test]
+#[ignore = "#1735/#1765: RED-confirmed (5/5 local runs on macOS) even \
+            against the pin that includes quadraui#1295's dead-pty guard \
+            — see this file's module doc, '#[ignore]d too' section, for \
+            the full stack-sample-based analysis of why the guard's \
+            narrow inter-slice checking window doesn't help this trigger \
+            shape in practice. Run explicitly with `cargo test --test \
+            pty_dead_master_exit -- --ignored` to see it fail today."]
+fn vcd_exits_promptly_once_its_pty_master_closes() {
+    let home = isolated_home();
+    let main_rs = home.join("main.rs");
+    std::fs::write(&main_rs, "fn main() {}\n").expect("write main.rs");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: PTY_ROWS,
+            cols: PTY_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty (real Unix pty)");
+
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_vcd"));
+    let mut cmd = CommandBuilder::new(&exe);
+    cmd.arg(&main_rs);
+    cmd.cwd(&home);
+    cmd.env("HOME", &home);
+    cmd.env(
+        "VIMCODE_TEST_DATA_HOME",
+        home.join(".local").join("share").join("vimcode"),
+    );
+    // Deliberately *not* a controlling terminal (`setsid`/`TIOCSCTTY`,
+    // `portable_pty::CommandBuilder`'s default) — a real controlling
+    // terminal's hangup kills the child via the default `SIGHUP`
+    // disposition long before `TuiBackend::wait_events`'s own guard
+    // (quadraui#1295) would ever run, which would make this test pass
+    // for the wrong reason (confirmed: with this left at its default
+    // `true`, the test passes identically against both the pinned
+    // quadraui rev and the pre-#1295 rev it replaces — the guard never
+    // gets a chance to matter either way). This mirrors "exactly what
+    // drives a headless vcd session" per `stdin_hung_up`'s own doc in
+    // quadraui, and the bugbash's own real driving harness
+    // (`coord`'s `tui-pty` driver / `UnixPtyChild`) — see `tests/
+    // crossterm_dead_pty_busy_loop.rs`'s module doc for the same point
+    // made about its own raw-pty repro.
+    cmd.set_controlling_tty(false);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("spawn vcd under a real Unix pty");
+    drop(pair.slave);
+    let pid = child.process_id().expect("vcd reports its own pid");
+
+    let master = pair.master;
+    let master_fd = master
+        .as_raw_fd()
+        .expect("master pty exposes a raw fd on unix");
+    // Shared by every dup of this open file description — see
+    // `set_nonblocking`'s doc.
+    set_nonblocking(master_fd);
+
+    let mut reader = master.try_clone_reader().expect("clone pty reader");
+    let mut writer = master.take_writer().expect("take pty writer");
+
+    let mut parser = vt100::Parser::new(PTY_ROWS, PTY_COLS, 0);
+
+    assert!(
+        wait_for_screen_contains(
+            &mut *reader,
+            &mut *writer,
+            &mut parser,
+            "NORMAL",
+            STARTUP_TIMEOUT
+        )
+        .is_some(),
+        "vcd never painted its first real frame (status bar's NORMAL mode \
+         indicator) within {STARTUP_TIMEOUT:?}; screen:\n{}",
+        screen_text(&parser)
+    );
+
+    // Baseline CPU time right before the hangup, so the assertion below
+    // measures only what vcd spends *after* its pty dies, not whatever
+    // startup/paint work it already did.
+    let cpu_before = ps_cpu_time_secs(pid).unwrap_or(0.0);
+
+    // The bugbash's own trigger: the driving terminal/process goes away.
+    // Every dup'd fd referencing the master (the original handle, the
+    // cloned reader, and the cloned writer — see this file's module doc)
+    // must close for the slave to actually hang up; drop all three
+    // together.
+    drop(reader);
+    drop(writer);
+    drop(master);
+
+    let wait_start = Instant::now();
+    let mut exited = false;
+    let mut peak_cpu_during_wait = 0.0_f64;
+    loop {
+        if let Ok(Some(_status)) = child.try_wait() {
+            exited = true;
+            break;
+        }
+        if let Some(cpu_now) = ps_cpu_time_secs(pid) {
+            let consumed = (cpu_now - cpu_before).max(0.0);
+            if consumed > peak_cpu_during_wait {
+                peak_cpu_during_wait = consumed;
+            }
+        }
+        if wait_start.elapsed() >= EXIT_BUDGET {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let wait_elapsed = wait_start.elapsed();
+
+    // Teardown first, so a failed assertion below doesn't leak a running
+    // (or, if the bug is present, busy-spinning) child process.
+    if !exited {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+
+    assert!(
+        exited,
+        "#1735: vcd did not exit on its own within {EXIT_BUDGET:?} of its \
+         pty master closing — it is still running (and by this point may \
+         be busy-spinning on the dead fd; peak CPU time observed while \
+         waiting: {peak_cpu_during_wait:.2}s). A fixed build notices the \
+         hangup and exits within roughly one idle-poll tick."
+    );
+    assert!(
+        peak_cpu_during_wait < MAX_CPU_SECONDS_WHILE_WAITING,
+        "#1735: vcd exited after its pty master closed ({wait_elapsed:?}), \
+         but consumed {peak_cpu_during_wait:.2}s of CPU time while doing \
+         so — over the {MAX_CPU_SECONDS_WHILE_WAITING}s bar, which is \
+         itself generous. This is the reported busy-spin-on-a-dead-pty \
+         signature (orphaned vcd processes spinning at ~24% CPU each on a \
+         deleted pty), even though it did eventually exit."
+    );
+}
