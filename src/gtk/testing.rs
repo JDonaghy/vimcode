@@ -15290,6 +15290,65 @@ mod app_icon {
         );
     }
 
+    /// #1764 (follow-up to #1763): the same shared `App::handle_dispatch`
+    /// fix `unrecognised_key_closes_a_stale_open_dropdown_on_gtk_1763` just
+    /// above covers also has to stop a dropdown from *opening* in the first
+    /// place when the engine is mid-text-entry — see `render::alt_mnemonic_
+    /// open_allowed`'s own doc for why. #1763's own bugbash finding traced
+    /// a real pty collapsing a fast Escape-then-letter into one `Alt+g`
+    /// chord; letting that chord open the "Go" dropdown swallows the Escape
+    /// it stood in for and leaves Insert mode stuck for every following
+    /// keystroke — #1764's reported `foo bar bazg0wdw:%d` corruption.
+    ///
+    /// GTK can't reproduce the pty collapse itself, but it *can* dispatch a
+    /// real `Alt+g` chord directly (`alt_press`, unlike `TuiDriver::
+    /// type_char`, which never carries `alt: true`) while genuinely in
+    /// Insert mode, exercising the identical shared code this issue's TUI
+    /// regression test (`app_on_tui_tests.rs`'s `colon_opens_the_command_
+    /// line_after_an_alt_chord_swallows_escape_1764`) does.
+    ///
+    /// **Verified RED against unfixed `develop`:** before this fix, "Go to
+    /// File" painted and the status bar stayed on `INSERT` after the
+    /// Alt+g chord.
+    #[test]
+    fn alt_mnemonic_does_not_steal_the_menu_from_insert_mode_on_gtk_1764() {
+        let mut engine = Engine::new_for_test();
+        engine.buffer_mut().insert(0, "foo bar baz\n");
+        engine.handle_key("i", Some('i'), false);
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("INSERT"),
+            "precondition: the engine must start in Insert mode; painted \
+             texts were {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('g'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("Go to File"),
+            "Alt+g must not open the \"Go\" dropdown while the engine is \
+             mid-text-entry; painted texts were {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("NORMAL"),
+            "the unclaimed Alt+g chord must be treated as the Escape it \
+             may stand in for, returning to Normal mode instead of \
+             leaving Insert mode stuck; painted texts were {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     /// vimcode#1673 (bugbash finding): a real Win-GUI click at x=24, y=16
     /// — the title band's historical menu-row-item coordinate, the exact
     /// stale value `tests/smoke-spec/win-gui.yaml`'s original

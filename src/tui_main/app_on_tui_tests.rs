@@ -391,6 +391,114 @@ mod tests {
             );
         }
 
+        /// #1764 (bugbash:tui-pty:macos, follow-up to #1763): a real-pty run
+        /// of `tests/smoke-spec/tui.yaml`'s `vim-dd-deletes-line` setup
+        /// caught `':'`/`'%'`/`'d'` typed as *literal buffer text*
+        /// (`foo bar bazg0wdw:%d`) instead of opening the ex command-line —
+        /// #1763's own fix comment named the still-open root cause this
+        /// reproduces: "a real macOS pty apparently collapsing a fast
+        /// Escape-then-letter into an Alt+g chord ... the mis-decoded
+        /// keystroke is still swallowed by whichever handle_alt_char/
+        /// menu-open arm actually consumes it upstream" (`src/app.rs`'s
+        /// `MenuEvent::Ignored` arm doc).
+        ///
+        /// Standing in for that collapse the same way #1763's own
+        /// `alt_g_dropdown_does_not_survive_a_vim_dw_1763` does (`TuiDriver`
+        /// can't carry a real pty's `alt: true` synthetically — see that
+        /// test's doc): starts in **Insert** mode (mirroring the journey's
+        /// preceding `i`/typing step) and dispatches `Alt+g` directly in
+        /// place of an Escape-then-`'g'` the pty fused into one chord. Before
+        /// this fix, that chord opened the "Go" dropdown *and* swallowed the
+        /// Escape it stood in for — the engine never left Insert mode, so
+        /// every following keystroke (including this test's `':'`/`'%'`/
+        /// `'d'`) inserted literally instead of running as Vim
+        /// motions/ex-commands, exactly #1764's reported corruption.
+        ///
+        /// **Verified RED against unfixed `develop`:** before this fix, the
+        /// final buffer read `g0wdw:%dfoo bar baz` (every one of `g 0 w d w
+        /// : % d` plus the Enter's newline inserted as literal Insert-mode
+        /// text) and the status bar stayed on `INSERT` throughout — this
+        /// test's assertions (buffer cleared, `COMMAND`/`NORMAL` painted)
+        /// failed accordingly.
+        #[test]
+        fn colon_opens_the_command_line_after_an_alt_chord_swallows_escape_1764() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "foo bar baz\n");
+            engine.handle_key("i", Some('i'), false);
+            assert_eq!(
+                engine.mode,
+                crate::core::Mode::Insert,
+                "precondition: the journey enters this sequence from Insert mode"
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            // Stand-in for a real pty collapsing Escape + the first 'g' of
+            // the journey's `gg` rewind into one `Alt+g` chord (#1763's own
+            // repro technique).
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('g'),
+                modifiers: quadraui::Modifiers {
+                    alt: true,
+                    ..quadraui::Modifiers::default()
+                },
+                repeat: false,
+            });
+            assert!(
+                !driver.screen_has("Go to File"),
+                "the Alt+g chord must not open the \"Go\" dropdown while \
+                 the engine is mid-text-entry; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_has("NORMAL"),
+                "the Alt+g chord must be treated as the Escape it stood in \
+                 for, returning to Normal mode, not left stuck in Insert; \
+                 screen:\n{}",
+                driver.screen()
+            );
+
+            // The second 'g' of 'gg', then the exact `vim-dw-deletes-word`
+            // keystrokes from `tui.yaml`.
+            driver.type_char('g');
+            driver.type_char('0');
+            driver.type_char('w');
+            driver.type_char('d');
+            driver.type_char('w');
+            assert!(
+                driver.screen_has("foo baz"),
+                "'dw' must run as a Vim motion (not insert literal text) \
+                 now that the engine recovered to Normal mode; screen:\n{}",
+                driver.screen()
+            );
+
+            // The exact `rebuild5-clear-*` ex-command sequence from
+            // `tui.yaml`: `:%d<Enter>` must clear the whole buffer, not get
+            // typed as literal characters.
+            driver.type_char(':');
+            driver.type_char('%');
+            driver.type_char('d');
+            assert!(
+                driver.screen_has("COMMAND"),
+                "':' must open the ex command-line, not insert a literal \
+                 ':'; screen:\n{}",
+                driver.screen()
+            );
+            driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                !driver.screen_has("foo baz"),
+                "':%d<Enter>' must clear the buffer, not leave 'foo baz' \
+                 (or a literal 'g0wdw:%d') behind; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_has("NORMAL"),
+                "the buffer-clearing ex command must leave the engine back \
+                 in Normal mode; screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// #1763 (review round 1, nit): backs up the `MenuEvent::Ignored`
         /// arm's own comment claim that a plain Escape close ("`handle_
         /// escape`'s own whole-menu close") leaves the toggleable menu

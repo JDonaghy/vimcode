@@ -2889,7 +2889,31 @@ impl App {
                 self.draw_needed.set(true);
                 return;
             }
-            render::AltKeyOutcome::Fallthrough => {}
+            render::AltKeyOutcome::Fallthrough => {
+                // #1764: an Alt-modified key that no rung above claimed
+                // must not reach `Engine::handle_key` as if the modifier
+                // never existed — that function takes no `alt` parameter
+                // at all, so the fallthrough below would redeliver it as
+                // the *bare* key, which in Insert/Replace mode means
+                // inserting the character literally. Treating it as an
+                // implicit Escape instead (and discarding the letter) is
+                // the better of the two unverifiable guesses: Vim mode has
+                // no `<M-x>` mappings for the letter to mean anything else,
+                // while a real pty collapsing a fast Escape-then-letter
+                // into this exact chord is the documented #1763/#1764
+                // mechanism — see `render::alt_mnemonic_open_allowed`'s own
+                // doc for the matching other half of this fix (keeping the
+                // menu bar from stealing the chord first). Escape is a
+                // harmless, idempotent no-op in `Normal` mode, so this is
+                // safe to apply unconditionally rather than only in the
+                // modes actually at risk.
+                if alt {
+                    let action = self.engine.borrow_mut().handle_key("Escape", None, false);
+                    self.dispatch_engine_action(action, false);
+                    self.draw_needed.set(true);
+                    return;
+                }
+            }
         }
 
         // ── Shared hover-popup copy rung (#762 / #734 slice 7) ─────────
@@ -8418,7 +8442,23 @@ impl App {
         };
         let menu_open = menu_system.borrow().is_open();
         let change_review_open = self.engine.borrow().change_review.is_some();
-        if menu_open || (menu_bar_visible && !change_review_open) {
+        // #1764: a *closed* dropdown must not be opened by an Alt+<mnemonic>
+        // `KeyPressed` while the engine is mid-text-entry (Insert/Replace) or
+        // mid-command-line (Command/Search) — see
+        // `render::alt_mnemonic_open_allowed`'s own doc for why (a bugbash
+        // repro traced a real macOS pty's Escape-then-letter collapsing into
+        // exactly this chord, and letting it open a menu here swallows the
+        // keystroke that was supposed to be the Escape, leaving every
+        // following key falling through as literal Insert-mode text).
+        // `menu_open` (a dropdown that's *already* open) is untouched — this
+        // only gates a fresh open.
+        let alt_mnemonic_open_blocked = !menu_open
+            && matches!(
+                event,
+                UiEvent::KeyPressed { modifiers, .. } if modifiers.alt
+            )
+            && !render::alt_mnemonic_open_allowed(self.engine.borrow().mode);
+        if !alt_mnemonic_open_blocked && (menu_open || (menu_bar_visible && !change_review_open)) {
             // `menu_items_rect`, not `menu_row_rect` (#720): the app icon
             // occupies a leading slot, so the items the last frame *painted*
             // start one slot right of the band's left edge. Hit-testing

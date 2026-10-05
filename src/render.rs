@@ -4206,6 +4206,44 @@ pub fn alt_resized_sidebar_width(current: u16, delta: i32) -> u16 {
     next.clamp(ALT_SIDEBAR_WIDTH_MIN as i32, ALT_SIDEBAR_WIDTH_MAX as i32) as u16
 }
 
+/// #1764: whether the engine's current mode is safe for an Alt+<mnemonic>
+/// `KeyPressed` to open a *closed* `quadraui::MenuSystem` dropdown.
+///
+/// Vim mode has no `<M-x>` mapping support at all — nothing in
+/// `src/core/engine` spells a `"<M-"` binding — so the only two things an
+/// Alt-modified keypress reaching the menu-bar intercept can plausibly be
+/// are a genuine (currently unbound, meaningless) Meta-key chord, or — per
+/// the #1763 bugbash finding this issue (#1764) is the follow-up to — a real
+/// pty collapsing a fast Escape-then-letter into exactly this chord, because
+/// that is the standard xterm 8-bit-meta encoding for Alt and a raw
+/// terminal reader cannot always tell the two apart from bytes alone.
+///
+/// Letting that chord open a dropdown while the engine is mid-text-entry
+/// (`Insert`/`Replace`) or mid-command-line (`Command`/`Search`) is strictly
+/// worse than not: it swallows the keystroke that — if this really was a
+/// collapsed Escape — was supposed to return to `Normal` mode, and does so
+/// silently, with no error and no visible cue beyond the dropdown itself.
+/// Every subsequent keystroke then falls through as literal Insert-mode
+/// text (or Command-line text), which is exactly #1764's reported
+/// `foo bar bazg0wdw:%d`-shaped corruption. `Normal` and the `Visual*`
+/// family are where a menu action is conventionally meaningful (and where
+/// an unclaimed bare key is a harmless pending-key latch, not literal
+/// insertion), so only those allow the open.
+///
+/// The other half of this fix is `crate::app::App::handle_key_press`'s own
+/// `AltKeyOutcome::Fallthrough` arm: once this function has kept the menu
+/// from stealing the chord, that arm treats an unclaimed Alt chord as an
+/// implicit Escape instead of letting `Engine::handle_key` see it as the
+/// bare, unmodified key (which has no `alt` parameter to even know the
+/// difference).
+pub fn alt_mnemonic_open_allowed(mode: crate::core::Mode) -> bool {
+    use crate::core::Mode;
+    matches!(
+        mode,
+        Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+    )
+}
+
 /// What [`route_alt_key`] decided about an Alt chord.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AltKeyOutcome {
