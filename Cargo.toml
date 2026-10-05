@@ -412,6 +412,24 @@ win = ["quadraui/win"]
 # compiler required) and quadraui#1103 (`b6fd556`, `b5bf8ad` — optional
 # flex/grid layout over Taffy, feature-gated upstream and not enabled
 # here).
+#
+# Cargo.lock deliberately gains no `taffy`/`slotmap` entries from this bump:
+# quadraui's `layout = ["dep:taffy"]` feature (quadraui/Cargo.toml) is
+# optional and nothing in this crate's feature graph requests
+# `quadraui/layout`, so cargo never walks that dependency edge. Verified
+# three ways against this exact rev, not just asserted: (1) `cargo update -p
+# quadraui` reports "Locking 0 packages to latest compatible versions" and
+# leaves Cargo.lock byte-identical; (2) deleting Cargo.lock and running a
+# full `cargo check` from scratch (no prior-lock bias) regenerates a lock
+# that still has no `taffy`/`slotmap` package, confirming this isn't stale
+# lock-preservation; (3) `cargo tree --target all -e features -i taffy`
+# errors "did not match any packages" — the dependency is not merely
+# inactive, it was never resolved at all. (Contrast with `ratatui-termwiz`/
+# `ratatui-termina`, pre-existing unrelated entries already on `develop`
+# before this PR — those are optional deps of a *registry* package, whose
+# sparse-index metadata cargo pins regardless of activation; a git
+# dependency's unactivated optional deps behave differently, as shown
+# above.)
 quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "a5360532e297deecece65103df8ce61f53230bda", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
