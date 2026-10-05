@@ -1716,7 +1716,7 @@ fn test_vscode_ctrl_x_cut_no_selection_cuts_current_line() {
 fn test_vscode_ctrl_v_pastes_copied_text() {
     let mut e = engine_with("hello world\n");
     vscode_mode(&mut e);
-    // Select "hello" and copy it.
+    // Select "hell" (columns 0..4, exclusive of the cursor) and copy it.
     e.visual_anchor = Some(Cursor { line: 0, col: 0 });
     e.mode = Mode::Visual;
     e.view_mut().cursor = Cursor { line: 0, col: 4 };
@@ -1726,10 +1726,77 @@ fn test_vscode_ctrl_v_pastes_copied_text() {
     e.mode = Mode::Insert;
     e.view_mut().cursor = Cursor { line: 0, col: 11 };
     e.handle_key("v", Some('v'), true);
-    assert!(
-        buf(&e).starts_with("hello world") && buf(&e).len() > "hello world\n".len(),
-        "paste did not insert the copied text: {:?}",
-        buf(&e)
+    // Exact match, not just "something longer got pasted" — a weaker
+    // assertion here would pass against #1788's off-by-one (it pasted
+    // "hello", 5 chars, for this 4-char selection) just as easily as
+    // against a correct fix.
+    assert_eq!(
+        buf(&e),
+        "hello worldhell\n",
+        "paste must insert exactly the 4-char copied span, not one extra char"
+    );
+}
+
+/// #1788: a 6-char Shift+Right selection of "hello " (indices 0..6 in
+/// "hello world") must copy exactly those 6 characters, not 7. VSCode mode's
+/// selection cursor sits *after* the last selected char (exclusive end) —
+/// this used to be extracted with Vim's own inclusive-of-cursor range,
+/// which is correct for Vim's Visual mode but copies one extra trailing
+/// character in VSCode mode.
+///
+/// **Verified RED against unfixed `develop`:** before the fix, the final
+/// assertion fails with `"hello worldhello w"` (7-char selection plus
+/// the extra 'w') instead of `"hello worldhello "`.
+#[test]
+fn test_vscode_ctrl_c_six_char_selection_copies_exactly_six_chars() {
+    let mut e = engine_with("hello world\n");
+    vscode_mode(&mut e);
+    e.handle_key("Home", None, true); // Ctrl+Home
+    for _ in 0..6 {
+        e.handle_key("Shift_Right", None, false);
+    }
+    e.handle_key("c", Some('c'), true); // Ctrl+C
+    let (text, _) = e
+        .get_register_content('+')
+        .expect("Ctrl+C must populate the clipboard register");
+    assert_eq!(
+        text, "hello ",
+        "Ctrl+C must copy exactly the 6-char selection"
+    );
+
+    e.handle_key("End", None, true); // Ctrl+End
+    e.handle_key("v", Some('v'), true); // Ctrl+V
+    assert_eq!(
+        buf(&e),
+        "hello worldhello \n",
+        "Ctrl+V after Ctrl+C must re-insert exactly the 6 copied characters"
+    );
+}
+
+/// Same scenario as above, but via Ctrl+X: the cut-deletion range was
+/// already correct (`vscode_delete_selection` is exclusive-end), only the
+/// clipboard payload was wrong — so this pins both halves independently.
+#[test]
+fn test_vscode_ctrl_x_six_char_selection_cuts_exactly_six_chars() {
+    let mut e = engine_with("hello world\n");
+    vscode_mode(&mut e);
+    e.handle_key("Home", None, true); // Ctrl+Home
+    for _ in 0..6 {
+        e.handle_key("Shift_Right", None, false);
+    }
+    e.handle_key("x", Some('x'), true); // Ctrl+X
+    assert_eq!(
+        buf(&e),
+        "world\n",
+        "Ctrl+X must delete exactly the selection"
+    );
+
+    e.handle_key("End", None, true); // Ctrl+End
+    e.handle_key("v", Some('v'), true); // Ctrl+V
+    assert_eq!(
+        buf(&e),
+        "worldhello \n",
+        "Ctrl+V after Ctrl+X must re-insert exactly the 6 cut characters"
     );
 }
 
