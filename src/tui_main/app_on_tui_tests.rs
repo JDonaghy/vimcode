@@ -396,6 +396,123 @@ mod tests {
             );
         }
 
+        /// #1783 (bugbash:mac-native): same root cause as #1779
+        /// (`run_shared_tick_chores` pinning `view.viewport_lines` to the
+        /// *previous frame's painted line count* instead of the window's
+        /// real row capacity), reached through a different repro the
+        /// mac-native bugbash lane hit instead of #1779's `o<text><Esc>`:
+        /// typing several lines of new text in **Insert** mode (`i` ->
+        /// `aaa` -> Enter -> `bbb` -> Enter -> `ccc` -> Escape) on a
+        /// trivially-short buffer that fits the whole viewport. Each
+        /// `driver.tick()` below stands in for the real runner's idle tick
+        /// between input batches (#1779's own technique — `TuiDriver::
+        /// tick()` is public and routes straight to `App::tick` ->
+        /// `render::run_shared_tick_chores`, the exact function both bugs
+        /// live in), interleaved before every keystroke that could grow the
+        /// buffer past whatever row count got cached by the previous tick.
+        ///
+        /// RED-verified by hand against this file's own pre-#1779 shape
+        /// (reverting `run_shared_tick_chores`'s `rw.visible_line_capacity.
+        /// max(1)` back to `rw.lines.len().max(1)`): with the single-line
+        /// starting buffer, the first tick caches a 1-row viewport, and the
+        /// Enter that grows the buffer to 2 lines scrolls line 0 (`aaa`)
+        /// out of view the same way #1779's `o` did — then the second
+        /// Enter repeats it, scrolling `bbb` out of view too, leaving only
+        /// `ccc` on screen exactly as #1783 reports. GREEN again with that
+        /// line restored (already fixed, by #1779 — no production change
+        /// in this commit): `RenderedWindow::visible_line_capacity` is the
+        /// window's row capacity independent of buffer content, so it never
+        /// gets pinned to a short buffer's current length in the first
+        /// place.
+        #[test]
+        fn multiline_insert_does_not_hide_earlier_lines_1783() {
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+            driver.tick();
+            driver.type_char('i');
+            for c in "ZQXW_AAA".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.tick();
+            for c in "ZQXW_BBB".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.tick();
+            for c in "ZQXW_CCC".chars() {
+                driver.type_char(c);
+            }
+            driver.tick();
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            let screen = driver.screen();
+            assert!(
+                driver.screen_has("ZQXW_AAA"),
+                "the first inserted line must not have scrolled out of view; screen:\n{screen}"
+            );
+            assert!(
+                driver.screen_has("ZQXW_BBB"),
+                "the second inserted line must not have scrolled out of view; screen:\n{screen}"
+            );
+            assert!(
+                driver.screen_has("ZQXW_CCC"),
+                "the third (cursor) line must be painted; screen:\n{screen}"
+            );
+        }
+
+        /// #1783 (bugbash:mac-native), second repro from the same issue:
+        /// deleting a line with `dd` and pasting it back below with `p`
+        /// must not hide earlier lines either — same
+        /// `run_shared_tick_chores` mechanism as
+        /// [`multiline_insert_does_not_hide_earlier_lines_1783`] above, via
+        /// the buffer shrinking (by `dd`) and then growing again (by `p`)
+        /// instead of via Insert-mode typing. Buffer starts as `aaa/bbb/
+        /// ccc`; `j` moves to `bbb`, `dd` deletes it (cursor lands on
+        /// `ccc`), `p` pastes it back below `ccc`, producing `aaa/ccc/bbb`
+        /// — the exact permutation the issue reports.
+        ///
+        /// RED-verified the same way: reverting `run_shared_tick_chores`'s
+        /// `rw.visible_line_capacity.max(1)` to `rw.lines.len().max(1)`
+        /// makes this fail with `aaa` missing from the screen (the tick
+        /// right after `dd` caches a 2-row viewport from the shrunk
+        /// buffer, and `p`'s growth back to 3 lines then scrolls `aaa` out
+        /// of view to keep the cursor's line visible against that stale
+        /// belief) — confirming the same root cause, not a coincidence.
+        /// GREEN again with the fix restored (already fixed, by #1779 — no
+        /// production change in this commit).
+        #[test]
+        fn dd_then_p_does_not_hide_earlier_lines_1783() {
+            let mut engine = plain_engine();
+            engine
+                .buffer_mut()
+                .insert(0, "ZQXW_AAA\nZQXW_BBB\nZQXW_CCC\n");
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+            driver.tick();
+            driver.type_char('j'); // move onto ZQXW_BBB
+            driver.tick();
+            driver.type_char('d');
+            driver.type_char('d'); // delete ZQXW_BBB; cursor lands on ZQXW_CCC
+            driver.tick();
+            driver.type_char('p'); // paste ZQXW_BBB back below ZQXW_CCC
+            driver.tick();
+
+            let screen = driver.screen();
+            assert!(
+                driver.screen_has("ZQXW_AAA"),
+                "the first (untouched) line must not have scrolled out of view; screen:\n{screen}"
+            );
+            assert!(
+                driver.screen_has("ZQXW_CCC"),
+                "the line the cursor stayed on across the delete must still be painted; screen:\n{screen}"
+            );
+            assert!(
+                driver.screen_has("ZQXW_BBB"),
+                "the pasted-back line must be painted; screen:\n{screen}"
+            );
+        }
+
         /// #1763 (bugbash:tui-pty:macos): a real-pty run of
         /// `tests/smoke-spec/tui.yaml`'s `vim-dw-deletes-word` journey
         /// caught the menu bar's "Go" dropdown (mnemonic `'g'`,
