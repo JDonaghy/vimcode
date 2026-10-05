@@ -2530,6 +2530,73 @@ mod tests {
                  'EDIT  F1:palette  Alt-M:vim'; screen:\n{screen}"
             );
         }
+
+        /// #1780 — bugbash catalogue scenario `modeswitch-alt-m-back-to-vim`:
+        /// a second Alt-M (VSCode → Vim) must remove the menu-bar row the
+        /// first Alt-M (Vim → VSCode) added, not just flip the status bar
+        /// back to `NORMAL`. `Engine::toggle_editor_mode` unconditionally
+        /// sets `menu_bar_visible = true` on the Vim → VSCode arm but, before
+        /// this fix, never cleared it back on the VSCode → Vim arm, so the
+        /// row — and the one-row downward shift of the activity bar/sidebar/
+        /// editor content it causes — was permanent after the first toggle.
+        /// "File" is the menu row's own always-first label (same signal
+        /// `colon_opens_the_command_line_after_an_alt_chord_swallows_
+        /// escape_1764` and `hamburger_relocated_click_after_reveal_hides_
+        /// menu_bar_via_app_on_tui` both key off of).
+        ///
+        /// **Verified RED against unfixed `develop`:** before this fix,
+        /// `toggle_editor_mode`'s Vim-mode arm never touched
+        /// `menu_bar_visible`, so after the second Alt-M below the screen
+        /// still painted "File" and this test's final assertion failed.
+        #[test]
+        fn alt_m_round_trip_hides_the_menu_bar_row_again_via_shell_app_1780() {
+            let engine = plain_engine();
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                !driver.screen_contains("File"),
+                "precondition: a fresh Vim-mode engine paints no menu-bar \
+                 row; screen:\n{}",
+                driver.screen()
+            );
+
+            let alt_m = quadraui::Modifiers {
+                alt: true,
+                ..Default::default()
+            };
+
+            // First Alt-M: Vim -> VSCode. The menu-bar row must appear.
+            press(driver, quadraui::Key::Char('m'), alt_m);
+            assert!(
+                driver.screen_has("EDIT"),
+                "first Alt-M must switch to VSCode mode; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_contains("File"),
+                "first Alt-M (Vim -> VSCode) must reveal the menu-bar row; \
+                 screen:\n{}",
+                driver.screen()
+            );
+
+            // Second Alt-M: VSCode -> Vim. The status bar flips back...
+            press(driver, quadraui::Key::Char('m'), alt_m);
+            let screen = driver.screen();
+            assert!(
+                screen.contains("NORMAL"),
+                "second Alt-M must switch back to Vim Normal mode; \
+                 screen:\n{screen}"
+            );
+            // ...and the menu-bar row the first toggle added must be gone,
+            // not left behind permanently shifting everything below it down
+            // by one row.
+            assert!(
+                !screen.contains("File"),
+                "second Alt-M (VSCode -> Vim) must remove the menu-bar row \
+                 the first toggle added; screen:\n{screen}"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

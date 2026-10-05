@@ -1443,6 +1443,13 @@ impl Engine {
             self.menu_bar_visible = true;
         } else {
             self.mode = Mode::Normal;
+            // #1780: VSCode mode's own entry above unconditionally reveals
+            // the menu-bar row (`menu_bar_visible = true`); without the
+            // mirror-image clear here, toggling straight back to Vim mode
+            // left that row permanently on screen (shifting the activity
+            // bar/sidebar/editor content down by one row forever), since
+            // nothing else in the Vim-mode arm ever flips it back off.
+            self.menu_bar_visible = false;
         }
         let _ = self.settings.save();
     }
