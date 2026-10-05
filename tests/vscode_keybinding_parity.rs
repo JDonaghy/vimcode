@@ -127,6 +127,7 @@
 
 mod common;
 use common::*;
+use std::fs;
 use vimcode_core::core::settings::EditorMode;
 use vimcode_core::render::engine_key_from_ui;
 use vimcode_core::{Cursor, EngineAction, Mode};
@@ -203,8 +204,10 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
     // #1744 fixed the five rows that used to live here as `Status::Missing`
     // (`insertCursorAbove`/`Below`, `copyLinesUpAction`/`DownAction`,
     // `navigateBack`/`Forward`, `jumpToBracket`) — see
-    // `gap_ctrl_alt_up_is_move_line_not_insert_cursor_above` and its four
-    // siblings below for the now-`FixLanded`, deleted `KNOWN_GAPS` entries,
+    // `ctrl_alt_up_has_a_distinct_wire_representation_from_alt_up` (renamed
+    // from `gap_ctrl_alt_up_is_move_line_not_insert_cursor_above` once the
+    // fix landed) and its four siblings below for the now-`FixLanded`,
+    // deleted `KNOWN_GAPS` entries,
     // `render::alt_key_router_tests` for `route_alt_key`'s own
     // spelling-identity unit coverage, and — the actual black-box proof for
     // all five chords, per CLAUDE.md's rendered-output rule —
@@ -221,9 +224,9 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
                `false`; `handle_vscode_key`'s `\"Alt_Up\" if ctrl` arm (above \
                the unguarded move-line arm) calls `vscode_add_cursor_above`. \
                Covered by this file's own \
-               gap_ctrl_alt_up_is_move_line_not_insert_cursor_above (its body \
-               asserts the fix, forcing `KNOWN_GAPS` deletion) and \
-               `render::alt_key_router_tests::\
+               ctrl_alt_up_has_a_distinct_wire_representation_from_alt_up \
+               (asserts the fix directly, now ungated since #1744 landed) \
+               and `render::alt_key_router_tests::\
                ctrl_alt_up_down_add_a_cursor_distinct_from_plain_alt_up_down`.",
     },
     VscodeBinding {
@@ -335,7 +338,12 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
         vscode_chord: "Ctrl+D",
         vimcode_key: "d",
         status: Status::Matches,
-        note: "Covered by tests/vscode_mode.rs::test_vscode_ctrl_d_*.",
+        note: "Covered by tests/vscode_mode.rs::test_vscode_ctrl_d_selects_word, \
+               test_vscode_ctrl_d_adds_next_occurrence, \
+               test_vscode_ctrl_d_no_word_noop, \
+               test_vscode_ctrl_d_at_word_start, \
+               test_vscode_ctrl_d_then_type_replaces_all, and \
+               test_vscode_ctrl_d_then_backspace_deletes_all.",
     },
     VscodeBinding {
         command_id: "editor.action.selectHighlights",
@@ -343,7 +351,9 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
         vscode_chord: "Ctrl+Shift+L",
         vimcode_key: "L",
         status: Status::Matches,
-        note: "Covered by tests/vscode_mode.rs::test_vscode_ctrl_shift_l_*.",
+        note: "Covered by tests/vscode_mode.rs::test_vscode_ctrl_shift_l_selects_all, \
+               test_vscode_ctrl_shift_l_then_type_replaces_all, and \
+               test_vscode_ctrl_shift_l_multiline_cursor_mid_word.",
     },
     VscodeBinding {
         command_id: "editor.action.deleteLines",
@@ -767,43 +777,95 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
                Covered by this file's own \
                test_vscode_ctrl_shift_left_extends_selection_by_word.",
     },
+    // ── #1746 review correction: these four rows previously claimed
+    //    `Status::Matches` on the strength of tests that feed
+    //    `handle_key("Shift_Home"/"BackSpace"/..., None, true)` directly —
+    //    triples the one shared decoder (`render::engine_key_from_ui`) can
+    //    never actually emit from a real keypress, on any backend. See each
+    //    row's own KNOWN_GAPS gate below for the exact match-arm proof. ───
     VscodeBinding {
         command_id: "cursorTopSelect",
         os: Os::WinLinux,
         vscode_chord: "Ctrl+Shift+Home",
-        vimcode_key: "Shift_Home (ctrl)",
-        status: Status::Matches,
-        note: "Covered by this file's own \
-               test_vscode_ctrl_shift_home_extends_selection_to_doc_start.",
+        vimcode_key: "(decodes identically to plain Shift+Home, ctrl bit lost)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_SHIFT_HOME_END_CTRL_BIT_DROPPED_BY_DECODER. \
+               `render::engine_key_from_ui`'s `NamedKey::Home if shift` arm \
+               is `Some((\"Shift_Home\".to_string(), None, false))` — it \
+               matches on `shift` alone and returns unconditional \
+               `ctrl: false`, *before* the ctrl-aware `NamedKey::Home => \
+               (\"Home\", None, ctrl)` arm beneath it ever runs. So a real \
+               Ctrl+Shift+Home keypress, on GTK or TUI (kitty or legacy — \
+               this is not a legacy-terminal-only gap, unlike the Ctrl+K \
+               family), decodes exactly like plain Shift+Home: \
+               `handle_vscode_key`'s ctrl=false arm routes `\"Shift_Home\"` \
+               to `vscode_extend_selection(\"SmartHome\")` (select to \
+               smart line start) instead of the ctrl=true arm's \
+               `vscode_extend_selection(\"DocStart\")` (select to document \
+               start) that `test_vscode_ctrl_shift_home_extends_selection_\
+               to_doc_start` exercises directly via `handle_key`. The same \
+               arm also breaks VS Code Mac's `cursorTopSelect` (Cmd+Shift+ \
+               Up): `normalize_mac_cmd_as_ctrl` (`src/app.rs`) translates \
+               that chord to `Home` with `ctrl: true, shift: true` and \
+               forwards it into this same decoder arm, which drops the \
+               ctrl bit identically. See this gap's driver-tier RED proof \
+               below.",
     },
     VscodeBinding {
         command_id: "cursorBottomSelect",
         os: Os::WinLinux,
         vscode_chord: "Ctrl+Shift+End",
-        vimcode_key: "Shift_End (ctrl)",
-        status: Status::Matches,
-        note: "Covered by this file's own \
-               test_vscode_ctrl_shift_end_extends_selection_to_doc_end.",
+        vimcode_key: "(decodes identically to plain Shift+End, ctrl bit lost)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_SHIFT_HOME_END_CTRL_BIT_DROPPED_BY_DECODER. \
+               Mirrors cursorTopSelect above — `NamedKey::End if shift`'s \
+               arm has the identical unconditional-`false` shape, so a real \
+               Ctrl+Shift+End decodes like plain Shift+End \
+               (`vscode_extend_selection(\"LineEnd\")`) instead of \
+               `DocEnd`.",
     },
     VscodeBinding {
         command_id: "deleteWordRight",
         os: Os::WinLinux,
         vscode_chord: "Ctrl+Delete",
-        vimcode_key: "Delete (ctrl)",
-        status: Status::Matches,
-        note: "Covered by this file's own \
-               test_vscode_ctrl_delete_deletes_word_forward.",
+        vimcode_key: "(decodes identically to plain Delete, ctrl bit lost)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_BACKSPACE_DELETE_CTRL_BIT_DROPPED_BY_DECODER. \
+               `render::engine_key_from_ui`'s `NamedKey::Delete` arm is \
+               `Some((\"Delete\".to_string(), None, false))` — it never \
+               inspects the incoming `ctrl` flag at all, unlike every \
+               other named key with a ctrl-sensitive arm. So a real \
+               Ctrl+Delete keypress, on GTK or TUI, decodes exactly like \
+               plain Delete: `handle_vscode_key`'s ctrl=false `\"Delete\"` \
+               arm deletes one character under the cursor instead of \
+               calling `vscode_delete_word_forward` (the ctrl=true arm \
+               `test_vscode_ctrl_delete_deletes_word_forward` exercises \
+               directly via `handle_key`, bypassing the decoder). On a \
+               legacy (non-kitty) terminal this is additionally confusable \
+               with `^?`/`^H`-style control bytes depending on the \
+               terminal's own Delete encoding, but the decoder bug above \
+               means even kitty/GTK/macOS GUI — which *can* report ctrl \
+               correctly — never get the chance to.",
     },
     VscodeBinding {
         command_id: "deleteWordLeft",
         os: Os::WinLinux,
         vscode_chord: "Ctrl+BackSpace",
-        vimcode_key: "BackSpace (ctrl)",
-        status: Status::Matches,
-        note: "Covered by this file's own \
-               test_vscode_ctrl_backspace_deletes_word_backward. VS Code's \
-               own Mac default for this command is Option+Backspace, NOT \
-               a Cmd substitution — see \
+        vimcode_key: "(decodes identically to plain BackSpace, ctrl bit lost)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_BACKSPACE_DELETE_CTRL_BIT_DROPPED_BY_DECODER. \
+               Mirrors deleteWordRight above — `NamedKey::Backspace`'s arm \
+               has the identical unconditional-`false` shape, so a real \
+               Ctrl+BackSpace decodes like plain BackSpace (deletes one \
+               char, not a word) on GTK/TUI-kitty/macOS GUI. On a legacy \
+               (non-kitty) terminal, Ctrl+Backspace conventionally arrives \
+               as the C0 byte `^H` (0x08), which vimcode's own legacy-byte \
+               handling resolves to ctrl+`\"h\"` — opening find-and-replace \
+               — rather than either Backspace behaviour; this file's own \
+               driver-tier gate below pins the GTK/kitty-side decoder bug, \
+               which is the reproducible, surface-independent half of this \
+               gap. VS Code's own Mac default for this command is Option+ \
+               Backspace, NOT a Cmd substitution — see \
                KNOWN_GAPS::OPTION_BACKSPACE_DELETE_WORD_LEFT_UNBOUND_ON_MAC \
                below.",
     },
@@ -1068,7 +1130,175 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
         vscode_chord: "F10",
         vimcode_key: "F10",
         status: Status::Matches,
-        note: "Covered by this file's own test_vscode_f10_toggles_menu_bar.",
+        note: "Review correction (#1746): F10 is NOT actually VS Code's \
+               default for `toggleMenuBar` — that command ships with no \
+               default keybinding at all, and F10 is VS Code's real \
+               default for `workbench.action.debug.stepOver`. vimcode's \
+               own F10-toggles-menu-bar behaviour is fine on its own \
+               terms, it just is not a VS Code parity claim; kept here \
+               (rather than deleted) only as a record of that vimcode \
+               choice, cross-referenced against this file's own \
+               test_vscode_f10_toggles_menu_bar — do not cite this row as \
+               evidence of VS Code parity.",
+    },
+
+    // ── #1746 deliverable 1: the previously-missing categories — save,
+    //    Win/Linux find/replace (Mac already had rows for these via
+    //    Cmd+F/Cmd+Option+F), and the editor-group/tab command family
+    //    (Win/Linux and Mac share these chords unmodified — VS Code's own
+    //    defaults have no Mac override for any of them) ───────────────────
+    VscodeBinding {
+        command_id: "workbench.action.files.save",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+S",
+        vimcode_key: "s (ctrl)",
+        status: Status::Matches,
+        note: "Not inside `handle_vscode_key` at all — `Engine::handle_key`'s \
+               own top-level `ctrl && key_name == \"s\"` check (`src/core/\
+               engine/keys.rs`) runs before the `is_vscode_mode()` dispatch \
+               and calls `save_with_format`, so this works identically in \
+               every editor mode, VS Code included. New test: \
+               test_vscode_ctrl_s_saves_file.",
+    },
+    VscodeBinding {
+        command_id: "actions.find",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+F",
+        vimcode_key: "f (ctrl)",
+        status: Status::Matches,
+        note: "`handle_vscode_key`'s `\"f\"` arm calls `open_find_replace`. \
+               Previously only exercised via the `Os::Mac` `actions.find` \
+               row below (Cmd+F, `MacDriver`-proven) — this Win/Linux row \
+               was the deliverable-1 gap. Covered by this file's own \
+               (pre-existing, previously unreferenced-by-any-row) \
+               test_vscode_ctrl_f_opens_find.",
+    },
+    VscodeBinding {
+        command_id: "editor.action.startFindReplaceAction",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+H",
+        vimcode_key: "h (ctrl)",
+        status: Status::Matches,
+        note: "`handle_vscode_key`'s `\"h\"` arm calls `open_find_replace` \
+               then sets `find_replace_show_replace = true`. Same gap as \
+               actions.find above — only the `Os::Mac` row (a different \
+               chord, Cmd+Option+F, currently `Missing`) existed before \
+               this round. Covered by this file's own (pre-existing, \
+               previously unreferenced-by-any-row) \
+               test_vscode_ctrl_h_opens_find_replace.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.quickOpenPreviousRecentlyUsedEditorInGroup",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+Tab",
+        vimcode_key: "Tab (ctrl)",
+        status: Status::Matches,
+        note: "Not inside `handle_vscode_key` either — `Engine::handle_key`'s \
+               own top-level `ctrl && key_name == \"Tab\"` check (`src/core/\
+               engine/keys.rs`, same pre-dispatch tier as Ctrl+S above) \
+               opens (or cycles forward through) the MRU tab switcher, the \
+               vimcode analogue of VS Code's 'show all editors by most \
+               recently used' overlay. New test: \
+               test_vscode_ctrl_tab_opens_tab_switcher.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.closeActiveEditor",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+W",
+        vimcode_key: "(unbound in VS Code mode)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_W_CLOSE_ACTIVE_EDITOR_UNBOUND_IN_VSCODE_MODE. \
+               `handle_vscode_key` has no `\"w\"` arm outside the Ctrl+K \
+               chord's own `\"w\"` (closeAllEditors, see that row above) — \
+               a plain Ctrl+W falls into the ctrl match's `_ => {}` no-op. \
+               Note this is specific to VS Code mode: the Vim-mode \
+               CTRL-W-as-window-command and panel-focus CTRL-W intercepts \
+               that share the same key name (`src/core/engine/keys.rs`, \
+               lines 313 and 6748) sit either before or inside Vim's own \
+               key-handling path, which `is_vscode_mode()`'s early return \
+               (line 471) never reaches.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.splitEditor",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+\\",
+        vimcode_key: "(unbound)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_BACKSLASH_SPLIT_EDITOR_UNBOUND. \
+               `handle_vscode_key`'s ctrl match has no arm for the literal \
+               backslash key at all (only its Shift-modified sibling, \
+               `\"Shift_backslash\" | \"|\"`, which jumps to the matching \
+               bracket — see that row's REACHABILITY_TABLE entry above); \
+               vimcode has no split-editor command wired to this chord in \
+               VS Code mode.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.previousEditor",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+PageUp",
+        vimcode_key: "(unbound — decodes as plain Page_Up, see below)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_PAGEUP_PAGEDOWN_PREV_NEXT_EDITOR_UNBOUND. \
+               Doubly unimplemented: `handle_vscode_key`'s ctrl match has \
+               no `\"Page_Up\"` arm (only the non-ctrl classifier at line \
+               ~1133 of `vscode.rs`, which exists purely to exclude \
+               Page_Up/Page_Down from undo-group-per-keystroke accounting, \
+               not to handle the ctrl chord), so there is nowhere for this \
+               command to dispatch to even if the ctrl bit arrived intact; \
+               and separately, `render::engine_key_from_ui`'s \
+               `NamedKey::PageUp` arm hardcodes `ctrl: false` \
+               unconditionally (the same arm \
+               `gap_shift_pageup_pagedown_shift_bit_dropped_by_decoder` \
+               already pins for the Shift bit), so a real Ctrl+PageUp \
+               keypress couldn't deliver the ctrl bit anyway.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.nextEditor",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+PageDown",
+        vimcode_key: "(unbound — decodes as plain Page_Down, see above)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_PAGEUP_PAGEDOWN_PREV_NEXT_EDITOR_UNBOUND. \
+               Mirrors previousEditor above, for `NamedKey::PageDown`.",
+    },
+    VscodeBinding {
+        command_id: "workbench.action.focusFirstEditorGroup",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+1",
+        vimcode_key: "(unbound)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_1_FOCUS_FIRST_EDITOR_GROUP_UNBOUND. \
+               `handle_vscode_key`'s ctrl match has no digit arms at all \
+               (`\"1\"` through `\"9\"`); vimcode has no editor-group-focus \
+               command wired to any digit chord in VS Code mode. VS Code \
+               binds Ctrl+2 through Ctrl+9 the same way for groups 2-9; \
+               not enumerated as separate rows since the gap and its gate \
+               are identical for all of them.",
+    },
+    VscodeBinding {
+        command_id: "editor.foldAll",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+K Ctrl+0",
+        vimcode_key: "(unbound)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_K_FOLD_ALL_UNFOLD_ALL_UNBOUND. \
+               `vscode_ctrl_k_dispatch`'s match only has arms for \
+               `\"c\"`/`\"u\"`/`\"w\"`/`\"f\"` (see those rows above); a \
+               second-key `\"0\"` falls through to that function's own \
+               `_ => false` and the chord is dropped with no action.",
+    },
+    VscodeBinding {
+        command_id: "editor.unfoldAll",
+        os: Os::WinLinux,
+        vscode_chord: "Ctrl+K Ctrl+J",
+        vimcode_key: "(unbound)",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_K_FOLD_ALL_UNFOLD_ALL_UNBOUND. Mirrors \
+               editor.foldAll above, for `\"j\"` as the second key — note \
+               this is a *different* `\"j\"` from the plain Ctrl+J \
+               (togglePanel) row above: that one fires without a pending \
+               Ctrl+K chord, this one would need \
+               `vscode_ctrl_k_dispatch` to add its own `\"j\"` arm.",
     },
     VscodeBinding {
         command_id: "deleteLeft",
@@ -1089,12 +1319,17 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
                test_vscode_plain_delete_removes_char_under_cursor.",
     },
     VscodeBinding {
-        command_id: "type (newline)",
+        command_id: "type",
         os: Os::WinLinux,
         vscode_chord: "Enter",
         vimcode_key: "Return",
         status: Status::Matches,
-        note: "Covered by this file's own test_vscode_plain_return_inserts_newline.",
+        note: "VS Code has no dedicated command id for a plain Enter \
+               keypress in a text editor — it dispatches through the \
+               generic `\"type\"` command (args `{\"text\": \"\\n\"}`), the \
+               same command every printable character goes through. \
+               Covered by this file's own \
+               test_vscode_plain_return_inserts_newline.",
     },
     VscodeBinding {
         command_id: "tab",
@@ -1146,10 +1381,22 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
         os: Os::WinLinux,
         vscode_chord: "Ctrl+K Ctrl+W",
         vimcode_key: "k (ctrl) then w (ctrl)",
-        status: Status::Matches,
-        note: "`vscode_ctrl_k_dispatch`'s `\"w\"` arm closes every tab in \
-               the active group. New test: \
-               test_vscode_ctrl_k_ctrl_w_closes_all_editors_in_group.",
+        status: Status::Missing,
+        note: "KNOWN_GAPS::CTRL_K_CTRL_W_LEAVES_ONE_TAB_OPEN. \
+               `vscode_ctrl_k_dispatch`'s `\"w\"` arm loops `Engine::\
+               close_tab`, but `close_tab` itself refuses to close the \
+               last tab in a group (`src/core/engine/windows.rs`: `if \
+               self.active_group().tabs.len() <= 1 { ...; return false; }`), \
+               so the loop always leaves exactly one editor open plus a \
+               \"Cannot close last tab\" message — VS Code's real \
+               `closeAllEditors` leaves none. Previously (first #1746 \
+               round) this row carried `test_vscode_ctrl_k_ctrl_w_closes_\
+               all_editors_in_group`, asserting that current (wrong) \
+               behaviour directly (`Some(1)`, \"should close every tab but \
+               the last\") while the row itself was marked `Matches` — a \
+               false parity claim. That test is now \
+               `gap_ctrl_k_ctrl_w_closes_every_tab` below, asserting the \
+               *correct* `Some(0)` outcome under `gap_gate` instead.",
     },
 
     // ── Mac: more plain Ctrl-to-Cmd substitutions, same \
@@ -1845,28 +2092,45 @@ fn test_vscode_shift_end_extends_selection_without_ctrl() {
     assert_eq!(e.cursor().col, 5);
 }
 
+// ─── #1746 deliverable 1: new engine-level coverage for the save /
+//     tab-switcher rows added above. `test_vscode_ctrl_f_opens_find` and
+//     `test_vscode_ctrl_h_opens_find_replace` already existed in this file
+//     (used only by the two `Os::Mac` rows' notes, never by a Win/Linux
+//     row — exactly the gap this round's new `actions.find`/`editor.
+//     action.startFindReplaceAction` `Os::WinLinux` rows above close) ──────
+
 #[test]
-fn test_vscode_ctrl_k_ctrl_w_closes_all_editors_in_group() {
+fn test_vscode_ctrl_s_saves_file() {
+    let path = std::env::temp_dir().join("vimcode_test_vscode_ctrl_s.txt");
+    let _ = fs::remove_file(&path);
+    let mut e = engine_with("hello\n");
+    vscode_mode(&mut e);
+    e.active_buffer_state_mut().file_path = Some(path.clone());
+    e.handle_key("s", Some('s'), true);
+    let written = fs::read_to_string(&path).expect("Ctrl+S should write the file to disk");
+    assert!(written.contains("hello"), "wrote: {written:?}");
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn test_vscode_ctrl_tab_opens_tab_switcher() {
     let mut e = engine_with("aaa\n");
     vscode_mode(&mut e);
     e.new_tab(None);
-    e.new_tab(None);
-    let group = e.active_group;
-    assert_eq!(
-        e.editor_groups.get(&group).map(|g| g.tabs.len()),
-        Some(3),
-        "test setup should have 3 tabs open"
+    assert!(
+        !e.tab_switcher_open,
+        "test setup: tab switcher starts closed"
     );
-    e.handle_key("k", Some('k'), true);
-    assert!(e.vscode_pending_ctrl_k);
-    e.handle_key("w", Some('w'), true);
-    assert!(!e.vscode_pending_ctrl_k);
-    assert_eq!(
-        e.editor_groups.get(&group).map(|g| g.tabs.len()),
-        Some(1),
-        "Ctrl+K Ctrl+W should close every tab but the last"
-    );
+    e.handle_key("Tab", None, true);
+    assert!(e.tab_switcher_open, "Ctrl+Tab should open the tab switcher");
 }
+
+// #1746 review correction: `test_vscode_ctrl_k_ctrl_w_closes_all_editors_
+// in_group` used to live here, asserting today's (wrong) `Some(1)` outcome,
+// while its own row above was marked `Matches` with a note claiming the
+// opposite ("closes every tab in the active group") — a false parity claim.
+// Moved to section 3 as `gap_ctrl_k_ctrl_w_closes_every_tab`, which asserts
+// the *correct* VS Code outcome and is gated to panic until it lands.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2. Reachability matrix — does real input ever produce the key the table
@@ -1924,6 +2188,27 @@ struct ReachabilityRow {
 /// Terminal's own Win32-input-mode (ConPTY's analogue of the kitty protocol)
 /// is or isn't negotiated.
 static REACHABILITY_TABLE: &[ReachabilityRow] = &[
+    ReachabilityRow {
+        chord: "F1 (show command palette)",
+        tui_legacy_xterm: Reach::Yes,
+        tui_kitty_or_csiu: Reach::Yes,
+        conpty_legacy: Reach::Yes,
+        gtk: Reach::Yes,
+        macos_tui: Reach::Yes,
+        macos_gui: Reach::Yes,
+        reason: "The keystone fact every `fallback` field below leans on \
+                 (\"F1 opens the command palette on every surface\") — \
+                 `render::engine_key_from_ui`'s `NamedKey::F(n) => \
+                 Some((format!(\"F{n}\"), None, false))` arm never \
+                 inspects `ctrl`/`shift` and has no ambiguity to resolve: \
+                 a bare function key is a dedicated escape sequence on \
+                 every surface vimcode ships, with no C0-control-code or \
+                 shift-bit collision the way Ctrl+<letter> has. Proven \
+                 directly below by `f1_decodes_unconditionally_as_f1`.",
+        fallback: "n/a — already `Reach::Yes` everywhere, no fallback \
+                   needed; this is the fallback every other row's \
+                   `fallback` field points at.",
+    },
     ReachabilityRow {
         chord: "Ctrl+K (chord prefix) vs Ctrl+Shift+K (delete line)",
         tui_legacy_xterm: Reach::No,
@@ -2194,7 +2479,58 @@ fn reachability_table_rows_are_well_formed() {
     for row in REACHABILITY_TABLE {
         assert!(!row.chord.is_empty());
         assert!(!row.reason.is_empty());
+        assert!(
+            !row.fallback.is_empty(),
+            "{:?} has an empty fallback",
+            row.chord
+        );
+        // #1746 non-blocking review fix: deliverable 2 asks every row whose
+        // chord is unreachable on a legacy terminal surface to record a
+        // real fallback, not just an empty or placeholder string. A row is
+        // only exempt (`"n/a"`-prefixed) when both legacy surfaces are
+        // already `Yes` — anything else must spell out what to press
+        // instead, enforced here so a future row can't silently skip it
+        // the way the four `Matches`-claimed rows this round downgraded
+        // originally did.
+        let legacy_blocked = row.tui_legacy_xterm == Reach::No || row.conpty_legacy == Reach::No;
+        if legacy_blocked {
+            assert!(
+                !row.fallback.starts_with("n/a"),
+                "{:?} is unreachable on a legacy terminal surface \
+                 (tui_legacy_xterm={:?}, conpty_legacy={:?}) but its \
+                 fallback field starts with \"n/a\" — deliverable 2 \
+                 requires a real fallback here",
+                row.chord,
+                row.tui_legacy_xterm,
+                row.conpty_legacy
+            );
+        }
     }
+}
+
+/// Driver-tier proof for [`REACHABILITY_TABLE`]'s `F1` row: a bare function
+/// key decodes the same regardless of ctrl/shift, since it has no
+/// Ctrl+<letter>-style ambiguity to resolve — the fact every other row's
+/// `fallback` field leans on ("F1 is reachable on every surface").
+#[test]
+fn f1_decodes_unconditionally_as_f1() {
+    use quadraui::{Key, Modifiers, NamedKey};
+    let (name, _, _) =
+        engine_key_from_ui(&Key::Named(NamedKey::F(1)), Modifiers::default(), false).unwrap();
+    assert_eq!(name, "F1");
+    let shift_ctrl = Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Default::default()
+    };
+    let (name_with_mods, _, _) =
+        engine_key_from_ui(&Key::Named(NamedKey::F(1)), shift_ctrl, false).unwrap();
+    assert_eq!(
+        name_with_mods, "F1",
+        "F1 must decode the same name regardless of modifiers held \
+         alongside it — there is no ambiguity for a bare function key to \
+         resolve"
+    );
 }
 
 /// Driver-tier proof for the `Ctrl+K vs Ctrl+Shift+K` / `Ctrl+P vs
@@ -2340,6 +2676,23 @@ const KNOWN_GAPS: &[&str] = &[
     "CTRL_K_CTRL_C_TOGGLES_INSTEAD_OF_ADD_ONLY",
     "CTRL_K_CTRL_U_TOGGLES_INSTEAD_OF_REMOVE_ONLY",
     "SHIFT_PAGEUP_PAGEDOWN_SHIFT_BIT_DROPPED_BY_DECODER",
+    // Added in this #1746 review round: the decoder-level ctrl-bit-drop
+    // gaps the previous round's `Matches` rows missed, plus the
+    // `closeAllEditors` false-parity correction, plus the deliverable-1
+    // rows added for the editor-group/tab family and Win/Linux find/
+    // replace/save. Verified RED against unfixed `develop` the same way as
+    // the six above (all eight labels below temporarily removed, re-ran
+    // this suite: all eight gate tests failed with `Regression` — the
+    // exact panics each one's own doc comment claims — then restored).
+    "CTRL_SHIFT_HOME_END_CTRL_BIT_DROPPED_BY_DECODER",
+    "CTRL_BACKSPACE_DELETE_CTRL_BIT_DROPPED_BY_DECODER",
+    "CTRL_K_CTRL_W_LEAVES_ONE_TAB_OPEN",
+    // Deliverable-1 editor-group/tab family additions, same round.
+    "CTRL_W_CLOSE_ACTIVE_EDITOR_UNBOUND_IN_VSCODE_MODE",
+    "CTRL_BACKSLASH_SPLIT_EDITOR_UNBOUND",
+    "CTRL_PAGEUP_PAGEDOWN_PREV_NEXT_EDITOR_UNBOUND",
+    "CTRL_1_FOCUS_FIRST_EDITOR_GROUP_UNBOUND",
+    "CTRL_K_FOLD_ALL_UNFOLD_ALL_UNBOUND",
 ];
 
 /// Run `body`, gated on whether `label` is listed in [`KNOWN_GAPS`]. Mirrors
@@ -2834,6 +3187,237 @@ fn gap_shift_pageup_pagedown_shift_bit_dropped_by_decoder() {
             down_name, "Shift_Page_Down",
             "Shift+Page Down must decode distinctly from plain Page Down — \
              instead it collapses to {down_name:?}"
+        );
+    });
+}
+
+// ─── #1746 review round: gates for the four `Matches`-claimed-but-
+//     unreachable chords plus the closeAllEditors false-parity claim ───────
+
+/// `KNOWN_GAPS::CTRL_SHIFT_HOME_END_CTRL_BIT_DROPPED_BY_DECODER`. See this
+/// gap's two `VSCODE_BINDINGS` rows (`cursorTopSelect`/`cursorBottomSelect`)
+/// for the full writeup: `engine_key_from_ui`'s `NamedKey::Home if shift`/
+/// `NamedKey::End if shift` arms return an unconditional `ctrl: false`,
+/// before the ctrl-aware arms beneath them ever run. Driver-tier, same
+/// idiom as `gap_shift_pageup_pagedown_shift_bit_dropped_by_decoder` above.
+#[test]
+fn gap_ctrl_shift_home_end_ctrl_bit_dropped_by_decoder() {
+    gap_gate("CTRL_SHIFT_HOME_END_CTRL_BIT_DROPPED_BY_DECODER", || {
+        use quadraui::{Key, Modifiers, NamedKey};
+        let ctrl_shift_mods = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let (home_name, _, home_ctrl) =
+            engine_key_from_ui(&Key::Named(NamedKey::Home), ctrl_shift_mods, false).unwrap();
+        assert!(
+            home_ctrl,
+            "Ctrl+Shift+Home must preserve the ctrl bit so \
+             handle_vscode_key can route to DocStart instead of \
+             SmartHome — decoded as {home_name:?} with ctrl={home_ctrl}"
+        );
+        let (end_name, _, end_ctrl) =
+            engine_key_from_ui(&Key::Named(NamedKey::End), ctrl_shift_mods, false).unwrap();
+        assert!(
+            end_ctrl,
+            "Ctrl+Shift+End must preserve the ctrl bit so \
+             handle_vscode_key can route to DocEnd instead of LineEnd — \
+             decoded as {end_name:?} with ctrl={end_ctrl}"
+        );
+    });
+}
+
+/// `KNOWN_GAPS::CTRL_BACKSPACE_DELETE_CTRL_BIT_DROPPED_BY_DECODER`. See
+/// this gap's two `VSCODE_BINDINGS` rows (`deleteWordRight`/
+/// `deleteWordLeft`) for the full writeup: `engine_key_from_ui`'s
+/// `NamedKey::Backspace`/`NamedKey::Delete` arms never inspect the incoming
+/// `ctrl` flag at all. Driver-tier, same idiom as the Home/End gate above.
+#[test]
+fn gap_ctrl_backspace_delete_ctrl_bit_dropped_by_decoder() {
+    gap_gate("CTRL_BACKSPACE_DELETE_CTRL_BIT_DROPPED_BY_DECODER", || {
+        use quadraui::{Key, Modifiers, NamedKey};
+        let ctrl_mods = Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let (bs_name, _, bs_ctrl) =
+            engine_key_from_ui(&Key::Named(NamedKey::Backspace), ctrl_mods, false).unwrap();
+        assert!(
+            bs_ctrl,
+            "Ctrl+BackSpace must preserve the ctrl bit so \
+             handle_vscode_key can route to vscode_delete_word_backward — \
+             decoded as {bs_name:?} with ctrl={bs_ctrl}"
+        );
+        let (del_name, _, del_ctrl) =
+            engine_key_from_ui(&Key::Named(NamedKey::Delete), ctrl_mods, false).unwrap();
+        assert!(
+            del_ctrl,
+            "Ctrl+Delete must preserve the ctrl bit so handle_vscode_key \
+             can route to vscode_delete_word_forward — decoded as \
+             {del_name:?} with ctrl={del_ctrl}"
+        );
+    });
+}
+
+/// `KNOWN_GAPS::CTRL_K_CTRL_W_LEAVES_ONE_TAB_OPEN`. See this gap's
+/// `VSCODE_BINDINGS` row (`workbench.action.closeAllEditors`) for the full
+/// writeup: `Engine::close_tab` refuses to close the last tab in a single
+/// group, so `vscode_ctrl_k_dispatch`'s `"w"` loop always leaves one editor
+/// open, unlike VS Code's real `closeAllEditors` which leaves none. This
+/// test is the same body the previous review round shipped as a plain
+/// (ungated) assertion of `Some(1)` under a `Matches` row — now asserting
+/// the correct `Some(0)` outcome under `gap_gate`, so it panics until the
+/// divergence is actually fixed.
+#[test]
+fn gap_ctrl_k_ctrl_w_closes_every_tab() {
+    gap_gate("CTRL_K_CTRL_W_LEAVES_ONE_TAB_OPEN", || {
+        let mut e = engine_with("aaa\n");
+        vscode_mode(&mut e);
+        e.new_tab(None);
+        e.new_tab(None);
+        let group = e.active_group;
+        assert_eq!(
+            e.editor_groups.get(&group).map(|g| g.tabs.len()),
+            Some(3),
+            "test setup should have 3 tabs open"
+        );
+        e.handle_key("k", Some('k'), true);
+        assert!(
+            e.vscode_pending_ctrl_k,
+            "test setup: Ctrl+K armed the chord"
+        );
+        e.handle_key("w", Some('w'), true);
+        assert!(!e.vscode_pending_ctrl_k);
+        assert_eq!(
+            e.editor_groups.get(&group).map(|g| g.tabs.len()),
+            Some(0),
+            "Ctrl+K Ctrl+W (closeAllEditors) should close every tab, \
+             unlike Ctrl+W (closeActiveEditor) which must leave at least \
+             one"
+        );
+    });
+}
+
+// ─── #1746 deliverable 1: gates for the editor-group/tab family ────────────
+
+/// `KNOWN_GAPS::CTRL_W_CLOSE_ACTIVE_EDITOR_UNBOUND_IN_VSCODE_MODE`. See this
+/// gap's `VSCODE_BINDINGS` row (`workbench.action.closeActiveEditor`) for
+/// the full writeup: `handle_vscode_key`'s ctrl match has no `"w"` arm
+/// outside the Ctrl+K chord, so a plain Ctrl+W is a no-op.
+#[test]
+fn gap_ctrl_w_closes_active_editor_in_vscode_mode() {
+    gap_gate("CTRL_W_CLOSE_ACTIVE_EDITOR_UNBOUND_IN_VSCODE_MODE", || {
+        let mut e = engine_with("aaa\n");
+        vscode_mode(&mut e);
+        e.new_tab(None);
+        let group = e.active_group;
+        assert_eq!(
+            e.editor_groups.get(&group).map(|g| g.tabs.len()),
+            Some(2),
+            "test setup should have 2 tabs open"
+        );
+        e.handle_key("w", Some('w'), true);
+        assert_eq!(
+            e.editor_groups.get(&group).map(|g| g.tabs.len()),
+            Some(1),
+            "Ctrl+W (closeActiveEditor) should close the active tab"
+        );
+    });
+}
+
+/// `KNOWN_GAPS::CTRL_BACKSLASH_SPLIT_EDITOR_UNBOUND`. See this gap's
+/// `VSCODE_BINDINGS` row (`workbench.action.splitEditor`) for the full
+/// writeup: `handle_vscode_key`'s ctrl match has no arm at all for the
+/// literal backslash key.
+#[test]
+fn gap_ctrl_backslash_splits_editor() {
+    gap_gate("CTRL_BACKSLASH_SPLIT_EDITOR_UNBOUND", || {
+        let mut e = engine_with("aaa\n");
+        vscode_mode(&mut e);
+        let win_a = e.active_window_id().0;
+        e.handle_key("\\", Some('\\'), true);
+        let win_b = e.active_window_id().0;
+        assert_ne!(
+            win_a, win_b,
+            "Ctrl+\\ (splitEditor) should create and focus a new window, \
+             the same way Engine::split_window does"
+        );
+    });
+}
+
+/// `KNOWN_GAPS::CTRL_PAGEUP_PAGEDOWN_PREV_NEXT_EDITOR_UNBOUND`. See this
+/// gap's two `VSCODE_BINDINGS` rows (`previousEditor`/`nextEditor`) for the
+/// full writeup: `handle_vscode_key`'s ctrl match has no `"Page_Up"`/
+/// `"Page_Down"` arms at all.
+#[test]
+fn gap_ctrl_pagedown_switches_to_next_editor() {
+    gap_gate("CTRL_PAGEUP_PAGEDOWN_PREV_NEXT_EDITOR_UNBOUND", || {
+        let mut e = engine_with("aaa\n");
+        vscode_mode(&mut e);
+        e.new_tab(None);
+        let group = e.active_group;
+        let before = e.editor_groups.get(&group).map(|g| g.active_tab);
+        e.handle_key("Page_Down", None, true);
+        let after = e.editor_groups.get(&group).map(|g| g.active_tab);
+        assert_ne!(
+            before, after,
+            "Ctrl+PageDown (nextEditor) should switch to the next tab in \
+             the group — stayed at {before:?}"
+        );
+    });
+}
+
+/// `KNOWN_GAPS::CTRL_1_FOCUS_FIRST_EDITOR_GROUP_UNBOUND`. See this gap's
+/// `VSCODE_BINDINGS` row (`workbench.action.focusFirstEditorGroup`) for the
+/// full writeup: `handle_vscode_key`'s ctrl match has no digit arms at all.
+#[test]
+fn gap_ctrl_1_focuses_first_editor_group() {
+    gap_gate("CTRL_1_FOCUS_FIRST_EDITOR_GROUP_UNBOUND", || {
+        use vimcode_core::core::window::SplitDirection;
+        let mut e = engine_with("file1\n");
+        vscode_mode(&mut e);
+        e.new_tab(None);
+        let gid = e.active_group;
+        // Move the second tab into a brand-new split group, the same way
+        // `tests/tab_drag.rs::move_tab_to_new_split_right` does — leaves
+        // `gid` (the first group) with one tab, and focuses the new group.
+        e.move_tab_to_new_split(gid, 1, gid, SplitDirection::Vertical, false);
+        assert_ne!(
+            e.active_group, gid,
+            "test setup: split should have created and focused a new group"
+        );
+        e.handle_key("1", Some('1'), true);
+        assert_eq!(
+            e.active_group, gid,
+            "Ctrl+1 (focusFirstEditorGroup) should focus the first editor \
+             group"
+        );
+    });
+}
+
+/// `KNOWN_GAPS::CTRL_K_FOLD_ALL_UNFOLD_ALL_UNBOUND`. See this gap's two
+/// `VSCODE_BINDINGS` rows (`editor.foldAll`/`editor.unfoldAll`) for the
+/// full writeup: `vscode_ctrl_k_dispatch`'s match has no `"0"`/`"j"` arms.
+/// Drives the chord all the way from Ctrl+K through the second key, same
+/// idiom as `gap_ctrl_k_ctrl_w_closes_every_tab` above — not a decoder-tier
+/// gate, since the ambiguity here is a missing dispatch arm, not a lost
+/// modifier bit.
+#[test]
+fn gap_ctrl_k_ctrl_0_folds_all() {
+    gap_gate("CTRL_K_FOLD_ALL_UNFOLD_ALL_UNBOUND", || {
+        let mut e = engine_with("fn a() {\n    1\n}\nfn b() {\n    2\n}\n");
+        vscode_mode(&mut e);
+        e.handle_key("k", Some('k'), true);
+        assert!(
+            e.vscode_pending_ctrl_k,
+            "test setup: Ctrl+K armed the chord"
+        );
+        e.handle_key("0", Some('0'), true);
+        assert!(
+            e.view().fold_at(0).is_some() && e.view().fold_at(3).is_some(),
+            "Ctrl+K Ctrl+0 (foldAll) should fold every foldable region \
+             (both fn bodies), the same way Ctrl+Shift+[ folds one"
         );
     });
 }
