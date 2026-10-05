@@ -2683,3 +2683,46 @@ The result: `Key::Char('ƒ')` reaches `App::handle_dispatch`, `modifiers.alt == 
 **Test:** None added upstream by this draft — vimcode#1745's own `tests/vscode_keybinding_parity.rs` has a `KNOWN_GAPS::CMD_OPTION_F_FIND_REPLACE_UNREACHABLE`-gated engine-level test (`gap_cmd_option_f_find_replace_unreachable`) that drives `Engine::handle_key("\u{192}", Some('\u{192}'), true)` directly — the exact character a real Mac keyboard produces for Option+F today — and asserts the *correct* (currently unreached) outcome, so it is RED until this lands. A conformance-style test on the quadraui side (asserting `ns_key_to_uievent`'s output for a synthetic Option+F `NSEvent`, or the live constants it resolves against) is the natural shape once the `Ask` lands.
 
 **Blocks:** `JDonaghy/vimcode#1745`. Leave that issue open behind this one per `GOALS.md`'s milestone-discipline rule — there is no per-backend vimcode-side fix available; the gap is in quadraui's own macOS event translator, and per this repo's Platform-Neutrality Rule a vimcode-side workaround (e.g. special-casing `'ƒ'` and every other US-layout Option-remapped glyph by hand in `src/core/engine/vscode.rs`) is exactly the kind of per-backend, per-layout code that rule exists to prevent.
+
+---
+
+## `AppShell::handle` has no `DoubleClick` arm for the activity bar — a fast double-click on it is silently dropped instead of acting like two single clicks (surfaced by vimcode#1762)
+
+**Title:** `compose::app_shell::AppShell::handle` only matches `UiEvent::MouseDown` for activity-bar hit-testing; `UiEvent::DoubleClick` falls through its own `_ => AppShellEvent::Ignored` arm, so any double-click landing on the activity bar — same icon twice, or two different icons close enough together to fold — does nothing at all, instead of behaving like the two single clicks a consumer would reasonably expect.
+
+**Body:**
+
+Read directly from the pinned rev (`1a87c4eb69361c283d239501077c0604bf25083b`, `quadraui/src/compose/app_shell.rs`, `AppShell::handle`):
+
+```rust
+match event {
+    UiEvent::MouseDown {
+        button: MouseButton::Left,
+        position,
+        ..
+    } => {
+        ...
+        if contains(layout.activity_bar_bounds, p) {
+            if let Some(hit) = self.cached_activity_hit(p) {
+                return self.handle_activity_click(&hit);
+            }
+            return AppShellEvent::Consumed;
+        }
+        AppShellEvent::Ignored
+    }
+    ...
+    _ => AppShellEvent::Ignored,
+}
+```
+
+There is no `UiEvent::DoubleClick` arm anywhere in this `match`, so a `DoubleClick` landing on the activity bar always falls through to `_ => AppShellEvent::Ignored`, regardless of where it lands.
+
+This combines badly with `dispatch::DoubleClickDetector`, which runs ahead of this `handle` call on every backend and folds a `MouseDown` into a `DoubleClick` whenever it lands within its radius of the previous `MouseDown` within `DOUBLE_CLICK_MS` (400ms) — `TuiBackend`'s default radius is `DOUBLE_CLICK_RADIUS` = 1.5 *TUI cells*, and TUI's activity-bar icon rows are exactly 1.0 cell apart, so two genuinely distinct, fast real clicks on **adjacent** icons fold into one `DoubleClick` that this `handle` has no arm for. The second click is silently swallowed — the active panel does not change, with no feedback that anything happened. `MacBackend`/`GtkBackend`/`WinBackend` use a wider, point/pixel-tuned radius (4.0), so the adjacent-row case does not occur there, but the same-icon case still does: a genuine fast double-click on an *already-active* icon folds the same way, and a consumer whose single-click handler toggles the sidebar closed on a repeat click (as `handle_activity_click`'s own toggle branch does) now has its second click silently dropped instead of toggling, leaving the sidebar stuck closed until a third, more widely-spaced click arrives.
+
+**Isolation performed:** confirmed against the pinned rev's own source (`dispatch.rs:934` `DOUBLE_CLICK_RADIUS = 1.5`, `dispatch.rs:925` `DOUBLE_CLICK_MS = 400`, `tui/backend.rs`'s `TuiBackend` using the detector's default radius, `compose/app_shell.rs`'s `handle` match arms as quoted above) and by a vimcode-side regression test exercising the real dispatch path end to end (`src/tui_main/app_on_tui_tests.rs`'s `activity_bar_adjacent_clicks_are_not_dropped_by_double_click_fold_1762`): six real `MouseDown`s with no simulated time between them land on rows 1, 4, 3, 4, 5, 1 of the activity bar; with no workaround, the third click (row 3, adjacent to the second click's row 4) folds into a `DoubleClick` and is dropped — the sidebar stays on row 4's panel instead of switching to row 3's.
+
+**Ask:** give `AppShell::handle` a `UiEvent::DoubleClick` arm for the activity-bar band that does exactly what the existing `MouseDown` arm's `contains(layout.activity_bar_bounds, p)` branch does — hit-test and call `self.handle_activity_click(&hit)` (or `AppShellEvent::Consumed` if the position is in-bounds but hits no icon) — so a double-click on an activity-bar icon behaves identically to the second of two single clicks there, for every consumer on every backend, not just vimcode. (vimcode currently works around this entirely in its own shared `App::handle_dispatch` — not per-backend code — by catching the `DoubleClick`, re-synthesizing it as a plain `MouseDown`, and re-dispatching it through `AppShell::handle`'s own public API; the ask above would make that workaround unnecessary.)
+
+**Test:** `src/tui_main/app_on_tui_tests.rs::tests::activity_bar::activity_bar_adjacent_clicks_are_not_dropped_by_double_click_fold_1762` and `src/gtk/testing.rs::tests::activity_bar_double_click_on_active_icon_reopens_sidebar_via_gtk_driver` (both vimcode-side, pinning the *workaround*'s correctness — not a test against quadraui itself). A conformance-style test on the quadraui side (asserting `AppShell::handle`'s output for a synthetic `DoubleClick` on the activity bar, both the same-icon and adjacent-icon cases) is the natural shape once the `Ask` lands.
+
+**Blocks:** `JDonaghy/vimcode#1762` (partially — see that issue for why this fold does not by itself explain the issue's full reported symptom). Leave that issue open behind this one per `GOALS.md`'s milestone-discipline rule if quadraui's fix is what vimcode's own fix iteration ends up depending on; per this repo's Platform-Neutrality Rule, the workaround living in vimcode's shared `App` is a stopgap, not the real fix.

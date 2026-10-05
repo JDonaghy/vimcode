@@ -3961,6 +3961,72 @@ mod tests {
         );
     }
 
+    /// #1762 (non-blocking review finding): `App::handle_dispatch`'s
+    /// "rescue a double-click that folded away an activity-bar panel
+    /// switch" rung (`src/app.rs`) is shared by every backend, not just
+    /// TUI — GTK's `DoubleClickDetector` uses a 4.0px radius
+    /// (`gtk/backend.rs`), too wide for adjacent activity-bar rows to be
+    /// the failure mode there, but a genuine fast double-click on an
+    /// icon that is *already active* still reaches this rung: before
+    /// #1762's fix, click 1 toggled the sidebar hidden
+    /// (`AppShell::handle_activity_click`'s toggle branch) and click 2
+    /// folded into a `DoubleClick` that `AppShell::handle` has no arm
+    /// for, so it stayed hidden. After the fix, click 2 is replayed as a
+    /// plain `MouseDown` on the same (already-active, but now
+    /// sidebar-hidden) icon, which re-shows it. Dispatches the raw
+    /// `UiEvent`s directly (`h.driver.click` then `h.driver.dispatch`
+    /// with a literal `DoubleClick`), bypassing `GtkDriver`'s own
+    /// double-click folding so the two clicks are independently
+    /// controllable, and asserts on *painted* output
+    /// (`screen_contains("EXPLORER")`), never on `app_shell` state
+    /// (#587/#592's lesson).
+    #[test]
+    fn activity_bar_double_click_on_active_icon_reopens_sidebar_via_gtk_driver() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(true);
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        let mut h = harness(engine, 1400, 900);
+
+        assert!(
+            h.driver.screen_contains("EXPLORER"),
+            "precondition: Explorer must be the active, visible panel; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let (ex, ey) = h
+            .driver
+            .find(crate::icons::EXPLORER.s())
+            .expect("Explorer activity-bar icon must paint");
+
+        // Click 1 on the already-active icon: toggles the sidebar hidden.
+        h.driver.click(ex, ey);
+        assert!(
+            !h.driver.screen_contains("EXPLORER"),
+            "sanity: a single click on the already-active Explorer icon \
+             must hide the sidebar; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Click 2, as a real double-click (not two singles — the folding
+        // path this rung exists for): must re-show the sidebar, not leave
+        // it hidden.
+        h.driver.dispatch(quadraui::UiEvent::DoubleClick {
+            widget: None,
+            position: Point::new(ex, ey),
+        });
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("EXPLORER"),
+            "a double-click on the already-active Explorer icon must \
+             re-show the sidebar (the fold-rescue rung replays it as a \
+             plain MouseDown toggle), not leave it hidden; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     /// #727: a natively-expressible dialog (no `DialogTable`, no text
     /// input — `quit_unsaved`, the "Unsaved Changes" confirm, is exactly
     /// this shape) must be presented via a real `PlatformServices::
