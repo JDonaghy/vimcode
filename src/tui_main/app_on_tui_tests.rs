@@ -2985,6 +2985,110 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // #1785 fix-iteration driver-tier coverage
+    // ─────────────────────────────────────────────────────────────────────────
+    /// #1785 (bugbash:tui-pty:macos) — extends the `vscode-ctrl-d-adds-next-
+    /// occurrence` smoke-spec journey (`tests/smoke-spec/catalogue.yaml`) one
+    /// step further: typing *after* a Ctrl+D multi-cursor edit, then Ctrl+A
+    /// (select-all), then typing again.
+    ///
+    /// `tests/vscode_mode.rs`'s engine-level regression test for the same
+    /// repro drives `Engine::handle_key` directly with hand-built
+    /// `("d", Some('d'), true)` triples, which cannot prove the real TUI key
+    /// decode actually *produces* that shape for Ctrl+D/Ctrl+A — this module
+    /// drives the production `App::handle_dispatch` ->
+    /// `render::engine_key_from_ui` -> `Engine::handle_key` pipeline through
+    /// `TuiDriver`'s real dispatch (`ctrl_char`/`type_char`, same primitives
+    /// `vscode_mode_alt_rung_1744` above uses) and asserts on *painted*
+    /// content, not engine buffer state — a sibling module rather than
+    /// folding into `vscode_mode_alt_rung_1744` since that module is scoped
+    /// to #1744's five brand-new Alt chords, not this chord combination
+    /// (same reasoning `modeswitch_1780`'s own doc gives for being its own
+    /// module).
+    mod vscode_select_all_after_multicursor_edit_1785 {
+        use super::*;
+
+        fn vscode_engine(buffer: &str) -> crate::core::Engine {
+            let mut engine = plain_engine();
+            engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+            engine.mode = crate::core::Mode::Insert;
+            engine.buffer_mut().insert(0, buffer);
+            engine.view_mut().cursor = crate::core::Cursor { line: 0, col: 0 };
+            engine
+        }
+
+        /// Exact bug-bash repro: buffer "foo bar foo", cursor at start,
+        /// Ctrl+D Ctrl+D (selects both "foo"s), type "X" (-> "X bar X", two
+        /// cursors survive the edit), Ctrl+A (select all), type "Y" ->
+        /// expected: the whole painted buffer becomes "Y", same as the
+        /// single-cursor case.
+        ///
+        /// **Verified RED against unfixed `develop`:** with the
+        /// `extra_cursors.clear()` fix in `Engine::vscode_select_all`
+        /// (`src/core/engine/vscode.rs`) reverted, the final
+        /// `driver.type_char('Y')` call below panics the entire test binary
+        /// inside ropey (`rope.rs:952`, `Option::unwrap` on `None`) via
+        /// `vscode_mc_delete_selections`'s `ec.col + 1 - sel_len` underflow —
+        /// the same backtrace the bug report captured
+        /// (`/tmp/bugbash-captures/multicursor-crash.log`). Confirmed by
+        /// temporarily removing that one line and re-running this test with
+        /// `cargo test`: the whole binary aborted (no normal pass/fail
+        /// report) instead of this test merely failing an assertion;
+        /// restored immediately after.
+        #[test]
+        fn ctrl_a_after_ctrl_d_multicursor_edit_then_typing_replaces_the_whole_buffer_via_shell_app(
+        ) {
+            let engine = vscode_engine("foo bar foo");
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                driver.screen_has("foo bar foo"),
+                "precondition: the buffer must paint before any key; \
+                 screen:\n{}",
+                driver.screen()
+            );
+
+            // Ctrl+D twice: select the first "foo", then add a second
+            // cursor on the next "foo" occurrence.
+            driver.ctrl_char('d');
+            driver.ctrl_char('d');
+
+            // Type 'X': both selections get replaced; two cursors survive
+            // the edit (the bug's precondition).
+            driver.type_char('X');
+            assert!(
+                driver.screen_has("X bar X"),
+                "Ctrl+D Ctrl+D then typing 'X' must replace both \"foo\" \
+                 occurrences, proving the multi-cursor edit landed on both; \
+                 screen:\n{}",
+                driver.screen()
+            );
+
+            // Ctrl+A: select all. This used to leave the stale extra
+            // cursor from the Ctrl+D edit in `extra_cursors`.
+            driver.ctrl_char('a');
+
+            // Typing now must not panic (pre-fix: the whole process died
+            // here, see this fn's doc) and must replace the *entire*
+            // painted buffer, same as the single-cursor case.
+            driver.type_char('Y');
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains('Y'),
+                "typing after Ctrl+A must paint the typed character; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("X bar X") && !screen.contains("bar"),
+                "typing after Ctrl+A must replace the *entire* buffer, not \
+                 leave any of the pre-edit text painted; screen:\n{screen}"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Popups
     // ─────────────────────────────────────────────────────────────────────────
     mod popups {
