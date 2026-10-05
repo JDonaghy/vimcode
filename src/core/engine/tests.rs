@@ -16171,7 +16171,15 @@ fn test_vscode_mode_ctrl_c_no_selection_copies_line() {
 
 #[test]
 fn test_vscode_mode_toggle() {
+    // `menu_bar_toggleable` is only ever `true` on a backend with a
+    // runner-drawn, hideable menu bar (TUI); it's `false` by default on a
+    // bare `Engine` (see `new_from_state`), which is exactly what a
+    // `window_chrome` backend (GTK/Win-GUI) leaves it at for the lifetime
+    // of the engine. Set it explicitly here to exercise the TUI-shaped
+    // round trip this test is about; `test_vscode_mode_toggle_gtk_chrome`
+    // below pins the opposite (`menu_bar_toggleable == false`) case.
     let mut engine = Engine::new();
+    engine.menu_bar_toggleable = true;
     assert_eq!(
         engine.settings.editor_mode,
         crate::core::settings::EditorMode::Vim
@@ -16202,6 +16210,27 @@ fn test_vscode_mode_toggle() {
     assert!(
         !engine.menu_bar_visible,
         "VSCode -> Vim must hide the menu bar the previous toggle revealed"
+    );
+}
+
+#[test]
+fn test_vscode_mode_toggle_gtk_chrome() {
+    // On a `window_chrome` backend (GTK, future Win-GUI) the drawn menu bar
+    // doubles as the client-side titlebar and `menu_bar_toggleable` stays
+    // `false` for the engine's whole lifetime (never flipped on, unlike
+    // TUI's `App::setup`). The VSCode -> Vim round trip must leave
+    // `menu_bar_visible` alone on that backend — clearing it unconditionally
+    // would strand GTK with a reserved-but-blank titlebar strip (#1780
+    // review).
+    let mut engine = Engine::new();
+    assert!(!engine.menu_bar_toggleable);
+    engine.toggle_editor_mode(); // Vim -> VSCode
+    assert!(engine.menu_bar_visible);
+    engine.toggle_editor_mode(); // VSCode -> Vim
+    assert!(
+        engine.menu_bar_visible,
+        "menu_bar_toggleable == false (GTK/Win-GUI): the pinned-visible \
+         menu bar must survive a VSCode -> Vim round trip"
     );
 }
 

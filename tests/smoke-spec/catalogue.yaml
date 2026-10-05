@@ -1811,7 +1811,10 @@ journeys:
   reference_detail: 'README ''VSCode Mode'': Alt-M toggles back to Vim mode'
   steps: In VSCode mode; press Alt-M
   expected: Editor switches back to Vim mode, landing in Normal mode; status bar shows a Vim mode indicator
-    again
+    again. On tui-pty (a toggleable, runner-drawn menu bar), the menu-bar row the earlier Vim->VSCode
+    toggle revealed is removed too, with no left-over row shifting the sidebar/editor content down. On
+    gtk-native/win-native/mac-native the drawn menu bar doubles as the window's titlebar and stays visible
+    the whole time, in both modes -- this toggle does not hide it.
   priority: 1
 - id: modeswitch-ex-set-mode-vscode
   area: mode-switch
