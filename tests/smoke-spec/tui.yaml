@@ -1670,6 +1670,16 @@ steps:
     id: 'vim-insert-i-a-o-variants-bar-line-settle'
     ms: 350
     timeout_ms: 4000
+  # vimcode#1779: the 'o' above grows the buffer to a new last line — the
+  # pre-existing line ('fXoo', asserted above) must still be painted on its
+  # own row, not scrolled out of view the way #1779 did. Additive: the
+  # 'bar-line' step above asserts only the new line and stayed green while
+  # #1779 was live (its own evidence is "screen shows only 'bar'"), so this
+  # step is what actually catches a regression here.
+  - type: expect_within
+    id: 'vim-insert-i-a-o-variants-fXoo-still-visible-1779'
+    text: 'fXoo'
+    ms: 5000
 
   # vimcode#1636 ("clicking activity-bar icons does nothing") — real SGR
   # mouse clicks at the icon column, exactly
