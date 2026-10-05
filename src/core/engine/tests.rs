@@ -16177,18 +16177,32 @@ fn test_vscode_mode_toggle() {
         crate::core::settings::EditorMode::Vim
     );
     assert_eq!(engine.mode, Mode::Normal);
+    assert!(
+        !engine.menu_bar_visible,
+        "precondition: a fresh Vim-mode engine has no menu bar revealed"
+    );
     engine.toggle_editor_mode();
     assert_eq!(
         engine.settings.editor_mode,
         crate::core::settings::EditorMode::Vscode
     );
     assert_eq!(engine.mode, Mode::Insert);
+    assert!(
+        engine.menu_bar_visible,
+        "Vim -> VSCode must reveal the menu bar"
+    );
+    // #1780: the round trip back to Vim mode must undo that reveal, not
+    // leave the menu-bar row permanently on screen.
     engine.toggle_editor_mode();
     assert_eq!(
         engine.settings.editor_mode,
         crate::core::settings::EditorMode::Vim
     );
     assert_eq!(engine.mode, Mode::Normal);
+    assert!(
+        !engine.menu_bar_visible,
+        "VSCode -> Vim must hide the menu bar the previous toggle revealed"
+    );
 }
 
 #[test]
