@@ -5747,8 +5747,8 @@ impl Engine {
     /// `.lua` script in the developer's real
     /// `~/.config/vimcode/{plugins,extensions}/`, then fires `VimEnter`) and
     /// `ext_refresh_quiet()` (spawns a thread that fetches the remote
-    /// extension registry over the network). Both make driver-tier tests depend on the
-    /// machine they run on: a user plugin that hooks `ModeChanged` /
+    /// extension registry over the network). Both make driver-tier tests
+    /// depend on the machine they run on: a user plugin that hooks `ModeChanged` /
     /// `InsertEnter` / `cursor_move` can call `vimcode.buf.set_cursor` or
     /// `set_lines` *synchronously inside a keystroke*, so an installed
     /// plugin silently rewrites what a `TuiDriver` test types. That is how

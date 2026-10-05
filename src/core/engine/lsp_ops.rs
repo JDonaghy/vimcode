@@ -1,3 +1,4 @@
+use super::sidebar::PANEL_EXTENSIONS;
 use super::*;
 
 /// Which half of a manifest's install (`[lsp]` or `[dap]`) a background
@@ -293,7 +294,17 @@ impl Engine {
     /// Shared body of [`Self::ext_refresh`] / [`Self::ext_refresh_quiet`].
     fn ext_refresh_inner(&mut self, quiet: bool) {
         if self.ext_registry_fetching {
-            return; // already in progress
+            // Already in progress — dedupe against it rather than spawning a
+            // second fetch. But if *this* caller is non-quiet (an explicit,
+            // user-requested refresh) and the in-flight fetch was armed
+            // quiet (startup's automatic one), upgrade the flag so the
+            // fetch-in-progress still reports its result when it lands
+            // (#1761): otherwise the user's `r` keypress produces no
+            // feedback at all, silently inheriting startup's silence policy.
+            if !quiet {
+                self.ext_registry_quiet = false;
+            }
+            return;
         }
         let urls = self.settings.extension_registries.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -357,15 +368,26 @@ impl Engine {
                     }
                 }
             }
-            // #1761: the quiet (startup) fetch never changes anything the
-            // screen paints — no message, and `ext_registry`'s own data is
-            // only read when the Extensions panel is open (closed by
-            // default). Reporting "no redraw needed" here, instead of
-            // unconditional `true`, is what actually keeps the terminal
-            // silent — the caller's diff-based renderer would emit zero
-            // bytes for an unchanged frame either way, but skipping the
-            // redraw avoids even computing one.
-            !quiet
+            // #1761: on the common quiet (startup) path there is no message
+            // and `ext_registry`'s own data is only read when the
+            // Extensions panel is open (closed by default), so reporting
+            // "no redraw needed" here, instead of unconditional `true`, is
+            // what actually keeps the terminal silent on a cold launch —
+            // the caller's diff-based renderer would emit zero bytes for an
+            // unchanged frame either way, but skipping the redraw avoids
+            // even computing one. That's not quite "never changes anything
+            // painted" though: if the panel is open while the fetch lands
+            // (e.g. opened during the fetch window, see `sidebar.rs`'s
+            // `PANEL_EXTENSIONS` open handler, which deliberately does not
+            // re-arm when a fetch is already in flight), the panel's list
+            // needs the redraw this fetch just produced — hence the
+            // `active_panel_is` check below. `refilter_diagnostics` just
+            // above is a second, narrower exception (gutter signs / Problems
+            // panel can change if a registry entry's `ignore_error_sources`
+            // changed) that this return value does not cover; it is
+            // self-healing on the next unrelated repaint, so it's left as
+            // documented behaviour rather than folded into the check.
+            !quiet || self.active_panel_is(PANEL_EXTENSIONS)
         } else {
             false
         }
@@ -2149,5 +2171,112 @@ mod tests {
              built-in codelldb list; got: {}",
             e.message
         );
+    }
+
+    // ── #1761 review: `ext_refresh_inner`'s dedupe-vs-quiet interaction ──
+
+    /// An explicit, user-requested refresh (`ext_refresh`, non-quiet) that
+    /// arrives while a quiet (startup) fetch is already in flight must
+    /// upgrade the shared flag, not silently inherit the in-flight fetch's
+    /// quiet policy — otherwise the user's `r` keypress in the Extensions
+    /// panel produces no feedback at all when the fetch eventually lands
+    /// (the exact #1761 review finding this covers).
+    #[test]
+    fn explicit_refresh_upgrades_an_in_flight_quiet_fetch() {
+        let mut e = Engine::new_for_test();
+        // Simulate a startup quiet fetch already in flight — deterministic,
+        // no real channel/thread needed to exercise the dedupe branch.
+        e.ext_registry_fetching = true;
+        e.ext_registry_quiet = true;
+
+        e.ext_refresh(); // non-quiet, explicit call
+
+        assert!(
+            e.ext_registry_fetching,
+            "dedupe must not spawn a second fetch — the in-flight one stays armed"
+        );
+        assert!(
+            !e.ext_registry_quiet,
+            "an explicit (non-quiet) refresh that dedupes against an \
+             in-flight quiet fetch must upgrade the flag so the fetch's \
+             eventual completion still reports its result (#1761)"
+        );
+    }
+
+    /// The mirror case: a *quiet* call (startup's own, or a second one
+    /// somehow fired) that dedupes against an already-in-flight *explicit*
+    /// fetch must not downgrade it back to quiet — the user who triggered
+    /// the in-flight fetch is still owed its message.
+    #[test]
+    fn quiet_refresh_does_not_downgrade_an_in_flight_explicit_fetch() {
+        let mut e = Engine::new_for_test();
+        e.ext_registry_fetching = true;
+        e.ext_registry_quiet = false;
+
+        e.ext_refresh_quiet();
+
+        assert!(
+            e.ext_registry_fetching,
+            "dedupe must not spawn a second fetch"
+        );
+        assert!(
+            !e.ext_registry_quiet,
+            "a quiet call deduping against an in-flight explicit fetch must \
+             not downgrade it back to quiet (#1761)"
+        );
+    }
+
+    // ── #1761 review: `poll_ext_registry`'s redraw verdict while the
+    //    Extensions panel is open during a quiet fetch ──
+
+    /// Drive `poll_ext_registry` directly (no real background thread) to
+    /// pin down its return value for the `(quiet, panel_open)` combinations
+    /// the #1761 review found incompletely handled: the panel being open
+    /// while a *quiet* fetch lands must still request a redraw (the panel's
+    /// list needs the fetch result just populated), even though the common
+    /// quiet/closed-panel startup case must not.
+    fn poll_with(quiet: bool, panel_open: bool) -> bool {
+        let mut e = Engine::new_for_test();
+        if panel_open {
+            e.app_shell
+                .show_panel(&quadraui::WidgetId::new(PANEL_EXTENSIONS));
+        }
+        assert_eq!(
+            e.active_panel_is(PANEL_EXTENSIONS),
+            panel_open,
+            "test setup: activating the Extensions panel must actually take \
+             (PANEL_EXTENSIONS must be registered in the test engine's \
+             app_shell panel list)"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(Vec::new())).unwrap();
+        e.ext_registry_rx = Some(rx);
+        e.ext_registry_fetching = true;
+        e.ext_registry_quiet = quiet;
+        e.poll_ext_registry()
+    }
+
+    #[test]
+    fn quiet_fetch_with_panel_closed_reports_no_redraw_needed() {
+        // The common cold-launch case this issue is about: nothing visible
+        // reads `ext_registry` while the panel is closed, so no redraw.
+        assert!(!poll_with(true, false));
+    }
+
+    #[test]
+    fn quiet_fetch_with_panel_open_still_requests_a_redraw() {
+        // #1761 review: opening the Extensions panel while a quiet fetch is
+        // in flight does not re-arm its own refresh (`set_panel_focus`'s
+        // `PANEL_EXTENSIONS` arm only calls `ext_refresh` when nothing is
+        // already fetching), so the panel relies entirely on *this* fetch's
+        // completion to paint anything. Suppressing the redraw here would
+        // leave the open panel showing an empty/stale list.
+        assert!(poll_with(true, true));
+    }
+
+    #[test]
+    fn explicit_fetch_always_requests_a_redraw_regardless_of_panel_state() {
+        assert!(poll_with(false, false));
+        assert!(poll_with(false, true));
     }
 }

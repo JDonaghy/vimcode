@@ -25,8 +25,9 @@ extension-registry refresh no longer breaks the idle-silence guarantee):
   `Engine::ext_registry_quiet` field (`src/core/engine/mod.rs`) threads the
   quiet/non-quiet flag through the async fetch's `mpsc` channel round
   trip.
-- Test: `tui_main::app_on_tui_tests::tests::quiet_startup_registry_
-  refresh_1761` (`src/tui_main/app_on_tui_tests.rs`) — Tier-1, drives the
+- Test:
+  `tui_main::app_on_tui_tests::tests::quiet_startup_registry_refresh_1761::startup_registry_refresh_never_shows_a_message_or_forces_a_repaint`
+  (`src/tui_main/app_on_tui_tests.rs`) — Tier-1, drives the
   real `Engine::ext_refresh_quiet()` production entry point (not a
   hand-rolled channel) through a `TuiDriver`, asserts the status message
   never paints and no repaint fires across a 2s poll window, and confirms
@@ -44,6 +45,24 @@ extension-registry refresh no longer breaks the idle-silence guarantee):
   redundant insurance (the message they were waiting out no longer
   fires) rather than wrong, and removing them wasn't necessary to satisfy
   this issue's acceptance bar (a new Tier-1 regression test).
+- Review fix-iteration 1: `ext_refresh_inner`'s "already in progress" dedupe
+  (`src/core/engine/lsp_ops.rs`) now upgrades `ext_registry_quiet` to
+  `false` when a non-quiet caller dedupes against an in-flight quiet fetch
+  — otherwise a user's explicit `r` refresh pressed during the startup
+  fetch's window silently inherited startup's silence policy and produced
+  no feedback at all. `poll_ext_registry`'s redraw verdict is now
+  `!quiet || self.active_panel_is(PANEL_EXTENSIONS)` — a quiet fetch
+  landing while the Extensions panel happens to be open still redraws, since
+  `sidebar.rs`'s panel-open handler deliberately doesn't re-arm its own
+  refresh when one is already in flight and relies on this fetch's own
+  completion to paint the list. Four new unit tests
+  (`core::engine::lsp_ops::tests`) cover both fixes directly against
+  `ext_refresh`/`ext_refresh_quiet`/`poll_ext_registry` (RED-verified
+  against the pre-fix code). A second Tier-1 test,
+  `tui_main::app_on_tui_tests::tests::quiet_startup_registry_refresh_1761::public_startup_entry_point_uses_the_quiet_refresh`,
+  drives the real public `Engine::startup()` entry point (not just
+  `ext_refresh_quiet()` directly) so a regression at `startup_inner`'s own
+  call site is caught black-box too — RED-verified the same way.
 
 **Last updated:** October 4, 2026 (#1760 — status bar drops the Ln/Col
 cursor-position segment once other optional segments compete for width).
