@@ -1840,10 +1840,10 @@ mod tests {
     /// window-width band that caps the activity bar and sidebar instead of
     /// letting them run past its bottom edge, with a fill colour sourced
     /// from `theme.status_bg` rather than a computed-lighter-than-
-    /// everything-else offset, and (2) its segments are ordered the way
-    /// VS Code's own bar is: far-left `NORMAL`/filename/problems counter,
-    /// far-right `Ln N, Col N` -> `Spaces: N` -> `UTF-8` -> `LF` ->
-    /// language.
+    /// everything-else offset, and (2) its segments are grouped the way VS
+    /// Code's own bar is: far-left `NORMAL`/filename/problems counter,
+    /// far-right the `language` / `LF` / `UTF-8` / `Spaces: N` / `Ln N,
+    /// Col N` cluster.
     ///
     /// RED against unfixed `develop` (confirmed by reverting this issue's
     /// `render.rs`/`app.rs` hunks and re-running): the fill sampled at
@@ -1852,6 +1852,16 @@ mod tests {
     /// capped by it), and `ShowDiagnostics` painted to the *right* of
     /// `ChangeLanguage` instead of to the left of every right-side
     /// segment — the exact reversal this issue reports.
+    ///
+    /// #1760 updated this test's right-side ordering assertion: `Ln N, Col
+    /// N` is no longer the leftmost of the right cluster (VS Code's own
+    /// visual order) — it is now unconditionally the right-most segment of
+    /// the whole bar, because that is the only position
+    /// `StatusBar::layout`'s priority-drop treats as undroppable. See
+    /// `build_window_status_line`'s `right` push-order comment in
+    /// `render.rs` for why visual VS Code parity and "never disappears"
+    /// could not both be had from the leftmost position with quadraui's
+    /// current `StatusBar` primitive.
     #[test]
     fn status_bar_1690_spans_full_window_width_and_orders_segments_vs_code_style() {
         let mut engine = Engine::new_for_test();
@@ -1928,8 +1938,9 @@ mod tests {
             mode_bounds.x
         );
 
-        // Right group, left to right: Ln/Col -> Spaces -> UTF-8 -> LF ->
-        // language.
+        // Right group, left to right: language -> LF -> UTF-8 -> Spaces ->
+        // Ln/Col (#1760: Ln/Col is now the bar's unconditional right-most
+        // segment — see the test's own doc comment above).
         let cursor_x = h
             .status_segment_center(win, crate::core::engine::StatusAction::GoToLine)
             .expect("the ruler must paint into status_segment_map")
@@ -1952,15 +1963,16 @@ mod tests {
             .0;
 
         assert!(
-            diag_x < cursor_x
-                && cursor_x < indent_x
-                && indent_x < encoding_x
-                && encoding_x < eol_x
-                && eol_x < lang_x,
-            "right-side segments must paint in VS Code's left-to-right \
-             order Ln/Col -> Spaces -> UTF-8 -> LF -> language, got x \
-             positions diag={diag_x} cursor={cursor_x} indent={indent_x} \
-             encoding={encoding_x} eol={eol_x} lang={lang_x}"
+            diag_x < lang_x
+                && lang_x < eol_x
+                && eol_x < encoding_x
+                && encoding_x < indent_x
+                && indent_x < cursor_x,
+            "right-side segments must paint in the order language -> LF -> \
+             UTF-8 -> Spaces -> Ln/Col, with Ln/Col unconditionally last \
+             (#1760), got x positions diag={diag_x} lang={lang_x} \
+             eol={eol_x} encoding={encoding_x} indent={indent_x} \
+             cursor={cursor_x}"
         );
     }
 

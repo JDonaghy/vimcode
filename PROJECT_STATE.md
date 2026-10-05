@@ -1,5 +1,46 @@
 # VimCode Project State
 
+**Last updated:** October 4, 2026 (#1760 — status bar drops the Ln/Col
+cursor-position segment once other optional segments compete for width).
+Root cause: `build_window_status_line` (`src/render.rs`, shared by both
+backends) pushed `cursor_seg` (`Ln N, Col N`) **first** into the window
+status bar's `right_segments`, to match VS Code's own left-to-right visual
+order (#1690). quadraui's `StatusBar::layout`/`fit_right_start`
+priority-drop removes `right_segments` from the *front* of the vector and
+always preserves only the *last* one — so pushing the ruler first made it
+the first segment *dropped* the moment a dirty marker (`[+]`), a git
+branch, or VS Code mode's `EDIT  F1:cmd  Alt-M:vim` hint ate into the left
+side's width budget, while lower-value segments (layout toggles, LSP
+status) survived instead.
+
+- Fix: `cursor_seg` is now pushed **last** into `right`, unconditionally
+  the bar's right-most segment, which is the only position quadraui's
+  "always keep the last right segment" rule can guarantee survives any
+  priority-drop. The rest of `right`'s push order was re-ranked
+  least-important-first (LSP status, notifications, layout toggles, then
+  VS Code's filetype/line-ending/encoding/indent cluster, then `showcmd`)
+  so something sensible is sacrificed before the ruler ever could be.
+  `sidebar_toggle_seg`'s text regained its trailing space (quadraui#1155)
+  since it's no longer the bar's default right-most segment.
+- This is a genuine quadraui `StatusBar` primitive limitation, not a
+  per-backend bug: a flat `right_segments` vector conflates visual
+  left-to-right position with drop priority, so VS Code's own visual
+  order (ruler leftmost of the right cluster) and "never disappears"
+  (ruler must be last) cannot both be satisfied with the primitive's
+  current shape — #164 had already flagged this coupling as unresolved.
+  The existing #1690 GTK test asserting the old visual order was updated
+  to assert the new order instead (language → LF → UTF-8 → Spaces →
+  Ln/Col), and two render.rs unit tests (`test_status_bar_toggle_and_
+  bell_glyphs_come_from_icons_rs_constants`, `test_window_status_line_
+  right_most_segment_has_no_trailing_space`) were updated for the same
+  reason.
+- Tests: new Tier-1 TuiDriver test `status_bar_1760_keeps_cursor_
+  position_once_other_segments_compete` (`src/tui_main/app_on_tui_tests.
+  rs`) — dirty marker + git branch + VS Code EDIT hint all competing on an
+  80-column bar, asserting `Ln 1,` still paints. Verified RED against
+  unfixed `develop` (reverting just the `cursor_seg` push-order hunk and
+  re-running prints a status row with no `Ln ` anywhere).
+
 **Last updated:** October 3, 2026 (#1719, partial — detect extension
 prerequisites before install, for LSP and DAP). Fixes the half of #1719
 that lives in this repo without touching the registry (vimcode-ext):
