@@ -413,23 +413,29 @@ win = ["quadraui/win"]
 # flex/grid layout over Taffy, feature-gated upstream and not enabled
 # here).
 #
-# Cargo.lock deliberately gains no `taffy`/`slotmap` entries from this bump:
-# quadraui's `layout = ["dep:taffy"]` feature (quadraui/Cargo.toml) is
-# optional and nothing in this crate's feature graph requests
-# `quadraui/layout`, so cargo never walks that dependency edge. Verified
-# three ways against this exact rev, not just asserted: (1) `cargo update -p
-# quadraui` reports "Locking 0 packages to latest compatible versions" and
-# leaves Cargo.lock byte-identical; (2) deleting Cargo.lock and running a
-# full `cargo check` from scratch (no prior-lock bias) regenerates a lock
-# that still has no `taffy`/`slotmap` package, confirming this isn't stale
-# lock-preservation; (3) `cargo tree --target all -e features -i taffy`
-# errors "did not match any packages" — the dependency is not merely
-# inactive, it was never resolved at all. (Contrast with `ratatui-termwiz`/
-# `ratatui-termina`, pre-existing unrelated entries already on `develop`
-# before this PR — those are optional deps of a *registry* package, whose
-# sparse-index metadata cargo pins regardless of activation; a git
-# dependency's unactivated optional deps behave differently, as shown
-# above.)
+# Note on Cargo.lock across this bump: the only line cargo changes is
+# `quadraui`'s `source = "git+...#rev"` string. In particular the lock gains
+# no `taffy`/`slotmap` entries, even though quadraui `a536053` adds `taffy`
+# as an optional dependency behind its new `layout` feature (quadraui#1103).
+#
+# That is cargo's own output, not an inference, and it is cheap to re-check
+# in either direction with cargo 1.97.1 on this tree:
+#
+#   cargo metadata --locked        # succeeds => committed lock matches
+#   rm Cargo.lock && cargo build   # regenerated lock still has no taffy
+#   # and, flipping `rev` back to the previous pin 84256731 and rebuilding,
+#   # cargo writes a lock that differs from this one by that one source line
+#
+# Do NOT read this as a rule about cargo's resolver. It is specifically not
+# "unactivated optional deps are pruned": every *other* optional dependency
+# of quadraui (`gtk4`, `windows`, `objc2-app-kit`, `trash`, `keyring`, ...)
+# is in the lock, as are `ratatui`'s unactivated `ratatui-termwiz` /
+# `ratatui-termina`, which no vimcode feature can reach. `taffy` is the lone
+# exception and the mechanism behind that is not established here — so if a
+# future bump *does* add `taffy`/`slotmap`, that is unremarkable: commit
+# whatever lock cargo writes. The invariant worth preserving is only the one
+# the #896 note below also relies on — the committed lock must be what cargo
+# produces, verified with `--locked`, never hand-reasoned.
 quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "a5360532e297deecece65103df8ce61f53230bda", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
