@@ -529,7 +529,15 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
     // File
     PaletteCommand {
         label: "File: New Tab",
-        shortcut: "Ctrl+T",
+        // #1789: this used to claim "Ctrl+T", but that chord is actually
+        // bound to `panel_keys.open_terminal` (default `<C-t>`, registered
+        // globally by `render::register_panel_accelerators` regardless of
+        // Vim/VSCode mode — see README § "Integrated Terminal"). There is
+        // no default keybinding for `tabnew` — this entry is reachable
+        // only via the palette itself, the menu, or `:tabnew` — so the
+        // shortcut hint must stay empty rather than advertise a chord that
+        // opens something else.
+        shortcut: "",
         vscode_shortcut: "",
         action: "tabnew",
     },
