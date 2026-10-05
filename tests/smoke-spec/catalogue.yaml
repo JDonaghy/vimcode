@@ -716,6 +716,22 @@ journeys:
   steps: No terminal panel open; press Ctrl+` (Ctrl+backtick)
   expected: An integrated terminal pane opens and receives keyboard focus
   priority: 1
+- id: vscode-ctrl-t-opens-terminal-not-new-tab
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: 'README ''Integrated Terminal'': Ctrl+T (default panel_keys.open_terminal) toggles
+    the integrated terminal panel; it is NOT bound to File: New Tab, despite vimcode#1789''s Command
+    Palette row having claimed otherwise before the fix'
+  steps: Single tab open, no terminal panel open; press Ctrl+T
+  expected: The integrated terminal panel opens and receives keyboard focus; the tab bar still shows
+    only the one editor tab (Ctrl+T does not create a second tab)
+  priority: 1
 - id: vscode-ctrl-comma-opens-settings
   area: vscode-mode
   mode: vscode
