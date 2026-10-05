@@ -8386,22 +8386,82 @@ mod tests {
     /// exactly like the real-pty bugbash did.
     mod quiet_startup_registry_refresh_1761 {
         use super::*;
-        use quadraui::Reaction;
 
-        #[test]
-        fn startup_registry_refresh_never_shows_a_message_or_forces_a_repaint() {
-            // Hermetic: `Engine::ext_refresh_quiet`'s real production code
-            // calls `registry::save_cache` on a successful fetch, which
-            // must not touch the real `~/.config/vimcode/` on whatever
-            // machine runs this suite (mirrors the #1741 review fix).
+        /// Point `$HOME` at a fresh, unique temp dir for the duration of the
+        /// guard it returns. Hermetic: `Engine::ext_refresh_quiet`'s real
+        /// production code calls `registry::save_cache` on a successful
+        /// fetch, which must not touch the real `~/.config/vimcode/` on
+        /// whatever machine runs this suite (mirrors the #1741 review fix).
+        fn fresh_test_home(tag: &str) -> crate::core::paths::TestHomeGuard {
             let home = std::env::temp_dir().join(format!(
-                "vimcode_test_1761_home_{}_{:?}",
+                "vimcode_test_1761_home_{tag}_{}_{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&home);
             std::fs::create_dir_all(&home).unwrap();
-            let _home_guard = crate::core::paths::set_test_home(&home);
+            crate::core::paths::set_test_home(&home)
+        }
+
+        /// Poll `h` for up to 2s — generous relative to the near-instant
+        /// empty-registry fetch both tests in this module arm, nowhere near
+        /// wide enough to mask a real #1761 regression (which would show the
+        /// banned message on the very first tick that drains the channel,
+        /// long before any 15s-scale delay could matter). Stops early once
+        /// the fetch has resolved (`ext_registry` populated) plus a short
+        /// confirmation margin, rather than always burning the full budget —
+        /// and stops at the very first violation so the caller's assertion
+        /// message doesn't accumulate ~100 duplicate lines for one
+        /// violating tick. Panics with every failure found (normally at
+        /// most one, given the early-break) if the idle-silence contract
+        /// was violated.
+        fn assert_registry_fetch_settles_silently<L: quadraui::AppLogic>(
+            h: &mut crate::harness::ConformanceHarness<quadraui::tui::testing::TuiDriver<L>>,
+            screen0: &str,
+        ) {
+            let mut failures: Vec<String> = Vec::new();
+            let start = std::time::Instant::now();
+            let mut resolved_at: Option<std::time::Instant> = None;
+            let confirmation_margin = std::time::Duration::from_millis(200);
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                h.driver.tick();
+                if h.driver.screen_has("Extension registry updated") {
+                    failures.push(
+                        "the automatic startup registry refresh must never \
+                         surface a status message (#1761) — found \
+                         'Extension registry updated' on screen"
+                            .to_string(),
+                    );
+                    break;
+                }
+                if h.driver.screen() != screen0 {
+                    failures.push(
+                        "rendered text changed as a result of the \
+                         automatic startup registry refresh (#1761)"
+                            .to_string(),
+                    );
+                    break;
+                }
+                let fetch_resolved = h.engine.borrow().ext_registry.is_some();
+                if fetch_resolved {
+                    match resolved_at {
+                        None => resolved_at = Some(std::time::Instant::now()),
+                        Some(t) if t.elapsed() >= confirmation_margin => break,
+                        Some(_) => {}
+                    }
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "idle-silence violated by the startup registry refresh:\n{}",
+                failures.join("\n")
+            );
+        }
+
+        #[test]
+        fn startup_registry_refresh_never_shows_a_message_or_forces_a_repaint() {
+            let _home_guard = fresh_test_home("direct");
 
             let mut engine = plain_engine();
             engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
@@ -8428,44 +8488,7 @@ mod tests {
                 engine.ext_refresh_quiet();
             }
 
-            // Poll for up to 2s — generous relative to the near-instant
-            // empty-registry fetch this test arms, nowhere near wide
-            // enough to mask a real #1761 regression (which would show
-            // the banned message on the very first tick that drains the
-            // channel, long before any 15s-scale delay could matter).
-            let mut failures: Vec<String> = Vec::new();
-            let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_secs(2) {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                let reaction = h.driver.tick();
-                if h.driver.screen_has("Extension registry updated") {
-                    failures.push(
-                        "the automatic startup registry refresh must never \
-                         surface a status message (#1761) — found \
-                         'Extension registry updated' on screen"
-                            .to_string(),
-                    );
-                    break;
-                }
-                if reaction != Reaction::Continue {
-                    failures.push(format!(
-                        "the automatic startup registry refresh must not \
-                         force a repaint (#1761) — got {reaction:?}"
-                    ));
-                }
-                if h.driver.screen() != screen0 {
-                    failures.push(
-                        "rendered text changed as a result of the \
-                         automatic startup registry refresh (#1761)"
-                            .to_string(),
-                    );
-                }
-            }
-            assert!(
-                failures.is_empty(),
-                "idle-silence violated by the startup registry refresh:\n{}",
-                failures.join("\n")
-            );
+            assert_registry_fetch_settles_silently(&mut h, &screen0);
 
             // Precondition check, after the loop above: the fetch must
             // actually have completed (not just never started), or the
@@ -8474,6 +8497,57 @@ mod tests {
                 h.engine.borrow().ext_registry.as_ref().map(|v| v.len()),
                 Some(0),
                 "precondition: the quiet startup fetch must have resolved \
+                 (ext_registry populated with the empty registry) within \
+                 the 2s budget — either it never completed or this test's \
+                 own timing assumption is stale"
+            );
+        }
+
+        /// The test above drives `Engine::ext_refresh_quiet()` directly, so
+        /// it would stay green even if the one call site that actually
+        /// fixes #1761 — `Engine::startup_inner`'s `self.ext_refresh()` →
+        /// `self.ext_refresh_quiet()` (`src/core/engine/mod.rs`) — reverted
+        /// to the non-quiet call. This test instead drives the real public
+        /// `Engine::startup` entry point (production's own call path, same
+        /// one both the TUI and GTK front ends use), so a regression at
+        /// that specific call site is caught here too, not only by
+        /// inspection.
+        #[test]
+        fn public_startup_entry_point_uses_the_quiet_refresh() {
+            let _home_guard = fresh_test_home("via_startup");
+
+            // Build and arm *before* `startup()` — `startup_inner` fires
+            // `ext_refresh_quiet()` synchronously as part of the call, so
+            // `extension_registries` must already be empty when it runs
+            // (same reasoning as the direct-call test: an empty registry
+            // list makes the background fetch resolve near-instantly
+            // without any network access).
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+            engine.settings.lsp_enabled = false;
+            engine.settings.extension_registries = Vec::new();
+            // `load_ambient_state = true`'s other effect, `plugin_init()`,
+            // is harmless here: the fresh test `$HOME` has no
+            // `plugins`/`extensions` directories to load from. The session
+            // restore `startup(None)` also performs reads from the same
+            // fresh, session-file-less `$HOME`, so it's a no-op too.
+            engine.startup(None);
+
+            let mut h = harness_no_sidebar(engine);
+            h.driver.tick();
+            assert!(
+                h.driver.screen_has("alpha"),
+                "precondition: the buffer text must actually be painted"
+            );
+            let screen0 = h.driver.screen();
+
+            assert_registry_fetch_settles_silently(&mut h, &screen0);
+
+            assert_eq!(
+                h.engine.borrow().ext_registry.as_ref().map(|v| v.len()),
+                Some(0),
+                "precondition: the quiet startup fetch armed by the real \
+                 `Engine::startup()` entry point must have resolved \
                  (ext_registry populated with the empty registry) within \
                  the 2s budget — either it never completed or this test's \
                  own timing assumption is stale"
