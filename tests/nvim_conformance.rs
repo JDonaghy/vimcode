@@ -7743,6 +7743,50 @@ const CASES_WORD: &[Case] = &[
         "G",
         "vim.o.startofline=true",
     ),
+    // #1772: the reported bug claimed `gg`/`G` reset the column to the
+    // line's first non-blank (like `'startofline'` ON) even with the
+    // default `'nostartofline'`. Verified directly against the real
+    // `nvim --headless -u NONE -i NONE` oracle starting from a non-column-1
+    // cursor (the issue's own repro trivially started at column 1, where
+    // "stays put" and "resets to first non-blank" are indistinguishable) —
+    // real Neovim does NOT reset the column here; it leaves the actual
+    // column alone, clamped to the target line's length, exactly like
+    // `land_line_jump_cursor` already implements. These two cases pin that
+    // down so nobody "fixes" `land_line_jump_cursor` into actually
+    // regressing against the oracle.
+    c(
+        "word:gg from mid-line column (nosol)",
+        &["foo bar baz", "qux quux foo", "short"],
+        3,
+        5,
+        "gg",
+    ),
+    c(
+        "word:G from mid-line column (nosol)",
+        &["foo bar baz", "qux quux foo", "short"],
+        1,
+        9,
+        "G",
+    ),
+    // #1772 follow-up: unlike the above, THIS one is a real divergence.
+    // `w`/`w` sets the actual column to 9 (curswant is None outside
+    // `update_curswant_for_key`'s j/k/ctrl-scroll allowlist, so column 9 is
+    // just the plain stored `cursor.col`, not a recoverable "desired"
+    // column). `G` then jumps to the 5-char last line, clamping that stored
+    // column down to 5 — but real Vim/Neovim's `curswant` is NOT destroyed
+    // by that clamp: it remembers 9 underneath, and `gg` back to the
+    // 11-char first line restores column 9. `land_line_jump_cursor` has no
+    // such memory — once `G` clamps the stored column to 5, `gg` can only
+    // ever see that already-clamped 5, so it lands on column 5 instead of
+    // 9. Confirmed against the real oracle: `nvim --headless -u NONE -i
+    // NONE` on this exact buffer/key sequence reports column 9, not 5.
+    c(
+        "word:gg after G loses curswant through a short line (nosol)",
+        &["foo bar baz", "qux quux foo", "short"],
+        1,
+        1,
+        "wwGgg",
+    ),
     c("word:5G", &["1", "2", "3", "4", "5", "6"], 1, 1, "5G"),
     c("word:5gg", &["1", "2", "3", "4", "5", "6"], 1, 1, "5gg"),
     c("word:10j beyond", &["a", "b", "c"], 1, 1, "10j"),
