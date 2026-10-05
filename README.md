@@ -1421,7 +1421,7 @@ src/                  (~168,600 lines total)
     └── view.rs, registry.rs, buffer.rs, paths.rs, tab.rs, cursor.rs, terminal.rs, mode.rs, mod.rs (~783 lines)
 ```
 
-**Design rule:** `src/core/` has zero GTK/rendering dependencies and is testable in isolation. Both backends consume the same `ScreenLayout` abstraction from `render.rs`, and since #751–#766 the same mouse/keyboard routers and the same `FrameOp` frame sequence — `src/gtk/mod.rs` alone makes 424 `render::` calls. The Direct2D/Win32 backend was removed on 2026-05-11 (`3e4bcff`) and returns as a thin wrapper when quadraui ships its Windows backend; a native macOS backend is blocked upstream (see [`PLAN.md`](PLAN.md)).
+**Design rule:** `src/core/` has zero GTK/rendering dependencies and is testable in isolation. Both backends consume the same `ScreenLayout` abstraction from `render.rs`, and since #751–#766 the same mouse/keyboard routers and the same `FrameOp` frame sequence — `src/gtk/mod.rs` alone makes 424 `render::` calls. The Windows GUI (`src/win/`, `win` feature) and the native macOS GUI (`src/macos/`, `macos` feature) are thin wrappers over quadraui's Direct2D/DirectWrite and AppKit backends.
 
 `dictionaries/` — bundled en_US Hunspell dictionary files (`.aff` + `.dic`) compiled into the binary via `include_bytes!`.
 

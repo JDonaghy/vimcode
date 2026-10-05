@@ -2124,9 +2124,10 @@ Stage 1** (the GTK-side `App` move), not a re-filing task — see `PLAN.md` and
 - **quadraui milestone #9** ("vimcode Platform-Neutral blockers") is **open** (0
   open / 7 closed issues) — it held quadraui#699 and does not need re-opening.
 - **Stale Win-GUI issues.** Roughly a dozen open `Win-GUI:` issues (#160–#178, #61,
-  #172, #176) describe a backend **deleted from this repo on 2026-05-11** (`3e4bcff`).
-  Their live counterparts are quadraui#19–#31 / quadraui#580. They should be migrated or
-  closed rather than left to imply `src/win_gui/` still exists.
+  #172, #176) describe the *old* `src/win_gui/` backend, which was deleted on 2026-05-11
+  (`3e4bcff`). The Windows GUI came back on 2026-09-11 as the `src/win/` thin wrapper
+  over `quadraui::win` (#866, `4e2883d`, `win` feature). Re-check each of those issues
+  against `src/win/` and close the ones that no longer apply.
 
 ### A note on line numbers in this file
 
@@ -2257,7 +2258,7 @@ next piece of the north star's own work.
 - ⚠️ **Hit-test glue partially shared** (#210/#344) — screen-level zone detection (tab bar, window, divider, breadcrumb) and window sub-zone detection (gutter, status bar, scrollbar, text area) now shared via `render::screen_zone_hit_test` + `window_zone_hit_test`. GTK caches ScreenLayout from paint (#344). Remaining per-backend: motion-handler → `selected_idx` wiring for primitive surfaces (#210), tab bar inner slot resolution (Pango vs char-cell).
 - ❌ No `Backend::watch_file(path) -> Stream<FileEvent>` trait method — every backend rolls its own watcher (TUI poll, GTK GIO). Suppress decision is shared (#201) but not the watcher invocation.
 - ✅ **Editor viewport lifted** (Phase C Stage 1 / #276). Both backends paint through `quadraui::{tui,gtk}::draw_editor`. The vim-motion-suite vision (PLAN.md) is now unblocked at the paint layer; engine-slice extraction (Phase 2 — `editor_core` crate carving out `keys.rs` + buffer + LSP) remains as a separate multi-month wave.
-- ⏭️ Win-GUI removed from this repo on 2026-05-11 (`3e4bcff`). Will be re-added as a thin wrapper when quadraui ships its Win backend (quadraui#19–#31, quadraui#580). The `Win-GUI:` issues still open on *this* tracker describe that deleted backend — migrate or close them (see Milestone hygiene above).
+- ✅ Win-GUI is a thin wrapper again: `src/win/` over `quadraui::win`, `win` feature (#866, 2026-09-11). The old `src/win_gui/` backend was deleted on 2026-05-11 (`3e4bcff`); open `Win-GUI:` issues filed before 2026-09-11 may describe that deleted code (see Milestone hygiene above).
 
 ---
 
