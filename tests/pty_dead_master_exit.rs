@@ -76,8 +76,14 @@
 //! `POLLHUP` the instant a hangup happens — including mid-wait, not only
 //! between slices — so the hangup itself is now the wakeup instead of
 //! something a periodic re-check has to race a call that never returns.
-//! This test is GREEN against that pin (confirmed on Linux). Per this
-//! repo's Platform-Neutrality Rule, that fix correctly landed in quadraui,
+//! This test is GREEN against that pin (confirmed on Linux; macOS
+//! unverified by this change — no macOS host was available in this
+//! dispatch to re-run the `sample(1)` measurement above against the new
+//! pin. The fix should carry over: `wait_for_stdin_ready` is `#[cfg(unix)]`
+//! in quadraui, not Linux-only, so macOS takes the same `poll(2)` path —
+//! but `POLLHUP`-on-a-pty-slave is exactly the bit a Linux run alone
+//! doesn't confirm, so treat macOS as structurally-argued, not measured).
+//! Per this repo's Platform-Neutrality Rule, that fix correctly landed in quadraui,
 //! not as a vimcode-side workaround — vimcode's only change here is
 //! consuming the new pin and un-ignoring this test. See
 //! `docs/PENDING_QUADRAUI_ISSUES.md`'s "crossterm 0.29.0 ... busy-spins"
@@ -105,10 +111,11 @@ const PTY_COLS: u16 = 100;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Upper bound on how long this test waits, after closing the pty master,
-/// for `vcd` to exit on its own. A fixed build notices the hangup on its
-/// very next `wait_events` call (internally sliced at 20ms —
-/// `STDIN_HANGUP_POLL_SLICE` in quadraui) and exits within roughly one
-/// idle-poll tick; the pre-#1295 bug never exits at all. This budget is
+/// for `vcd` to exit on its own. A fixed build (quadraui#1301,
+/// `wait_for_stdin_ready`'s own blocking `poll(2)` in `TuiBackend::
+/// wait_events`) observes the hangup as the `POLLHUP` wakeup itself —
+/// not something a periodic re-check has to race — and exits essentially
+/// immediately; the pre-#1301 bug never exits at all. This budget is
 /// generous relative to "promptly" but still tight enough that a
 /// reproduction of the bug fails this test in a few seconds rather than
 /// hanging the suite.
@@ -331,12 +338,13 @@ fn vcd_should_exit_promptly_once_its_pty_master_closes() {
     // Deliberately *not* a controlling terminal (`setsid`/`TIOCSCTTY`,
     // `portable_pty::CommandBuilder`'s default) — a real controlling
     // terminal's hangup kills the child via the default `SIGHUP`
-    // disposition long before `TuiBackend::wait_events`'s own guard
-    // (quadraui#1295) would ever run, which would make this test pass
-    // for the wrong reason (confirmed: with this left at its default
-    // `true`, the test passes identically against both the pinned
-    // quadraui rev and the pre-#1295 rev it replaces — the guard never
-    // gets a chance to matter either way). This mirrors "exactly what
+    // disposition long before `TuiBackend::wait_events`'s own
+    // `wait_for_stdin_ready` poll (quadraui#1301) would ever run, which
+    // would make this test pass for the wrong reason (confirmed: with
+    // this left at its default `true`, the test passes identically
+    // against both the pinned quadraui rev and the pre-#1301 rev it
+    // replaces — the fix never gets a chance to matter either way).
+    // This mirrors "exactly what
     // drives a headless vcd session" per `stdin_hung_up`'s own doc in
     // quadraui, and the bugbash's own real driving harness
     // (`coord`'s `tui-pty` driver / `UnixPtyChild`) — see `tests/

@@ -403,12 +403,15 @@ win = ["quadraui/win"]
 # race a call that never returns. This is what finally fixes vimcode#1735
 # — see `tests/pty_dead_master_exit.rs`, now un-`#[ignore]`d.
 #
-# Also carries quadraui#1099 (`c851834`, `44c95f6` — reshapes `Frame`
-# into an owned type, closes the 14-primitive `Surface` gap, makes
-# `FrameHitMap` serializable; adopted as-is, no vimcode call-site changes
-# needed beyond what the compiler required) and quadraui#1103 (`b6fd556`,
-# `b5bf8ad` — optional flex/grid layout over Taffy, feature-gated
-# upstream and not enabled here).
+# Also carries quadraui#1099 (`c851834`, `44c95f6` — closes the
+# 14-primitive `Surface` gap, makes `FrameHitMap`/`FrameZone` serializable,
+# adds `#[non_exhaustive]` to `Surface`/`FrameZone`; `Surface<'a>`/
+# `ScreenLayout<'a>` still borrow — #1099's "owned Frame" half is
+# deliberately left open upstream, see `44c95f6`'s commit message —
+# adopted as-is, no vimcode call-site changes needed beyond what the
+# compiler required) and quadraui#1103 (`b6fd556`, `b5bf8ad` — optional
+# flex/grid layout over Taffy, feature-gated upstream and not enabled
+# here).
 quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "a5360532e297deecece65103df8ce61f53230bda", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
