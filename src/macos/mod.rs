@@ -1648,4 +1648,256 @@ mod mac_driver_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── #1745: VS Code mode's Cmd-key defaults on the macOS GUI ─────────
+    //
+    // #1730's own parity table (`tests/vscode_keybinding_parity.rs`) wrongly
+    // assumed there was no macOS GUI backend in this repo to regress
+    // against, and left every `MacDiverges` row ungated. There is one
+    // (this file), and `App::normalize_mac_cmd_as_ctrl` (`src/app.rs`) is
+    // the fix: before it existed, `quadraui::Modifiers::cmd` — the bit a
+    // real Cmd keypress sets (confirmed directly from quadraui's own
+    // `macos/events.rs`: `NS_FLAG_COMMAND` -> `cmd`, distinct from
+    // `NS_FLAG_CONTROL` -> `ctrl`) — was read nowhere in
+    // `App::handle_dispatch`, so Cmd+C/V/X/Z/S/P/F/B/J/, didn't merely
+    // *diverge* from VS Code's Mac defaults, they did nothing at all.
+    //
+    // These tests drive the same `MacDriver` every other test in this file
+    // does, through the real `App::handle_dispatch` both `super::run` and
+    // the live AppKit event loop call — not a direct `Engine::handle_key`
+    // call — because the bug this fixes is specifically in the
+    // event-to-`ctrl`-bit translation, not in any engine-level binding
+    // (`tests/vscode_keybinding_parity.rs`'s own 62+ engine-level tests
+    // already cover that half).
+    //
+    // **RED-verification note** (all five tests below): confirmed red by
+    // temporarily short-circuiting `normalize_mac_cmd_as_ctrl` to
+    // `if true { return event; }` (disabling every arm, not just one at a
+    // time) and re-running `cargo test --no-default-features --features
+    // macos --lib vscode_mode_mac_cmd_1745` — all five failed with the
+    // exact "fell back to the unmodified/un-translated key" symptom each
+    // test's own doc below describes; reverted after confirming.
+    mod vscode_mode_mac_cmd_1745 {
+        use quadraui::{Key, Modifiers, NamedKey};
+
+        use crate::core::{Cursor, Mode};
+
+        /// A VSCode-mode, Insert-mode engine seeded with `buffer` — the
+        /// nerd-fonts-off rationale is the same as [`super::plain_engine`]'s
+        /// (the unrelated #620 tab-icon `debug_assert!`).
+        fn vscode_engine(buffer: &str) -> crate::core::Engine {
+            let mut engine = crate::core::Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+            engine.mode = Mode::Insert;
+            engine.buffer_mut().insert(0, buffer);
+            engine.view_mut().cursor = Cursor { line: 0, col: 0 };
+            engine
+        }
+
+        /// Dispatch exactly one `KeyPressed { key, modifiers, repeat: false }`
+        /// — mirrors `src/gtk/testing.rs`'s `mod alt_rung_1744::press`.
+        fn press<A: quadraui::AppLogic>(
+            driver: &mut quadraui::macos::testing::MacDriver<A>,
+            key: Key,
+            modifiers: Modifiers,
+        ) {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key,
+                modifiers,
+                repeat: false,
+            });
+        }
+
+        /// #1745: Cmd+/ (VS Code's Mac default for `editor.action.
+        /// commentLine`) must toggle the line comment, exactly like Ctrl+/
+        /// on Linux/Windows (`tests/vscode_keybinding_parity.rs`'s
+        /// `test_vscode_ctrl_slash_toggles_line_comment`). Paint-based
+        /// assertion per CLAUDE.md's rendered-output rule: the comment
+        /// marker has to actually reach the screen, not just a buffer
+        /// mutation.
+        ///
+        /// RED against the pre-#1745 tree (see the submodule-level
+        /// RED-verification note above): `ctrl` stays `false`, the
+        /// Insert-mode engine treats the keystroke as a plain character
+        /// insertion, and the screen shows the literal `"print(1)/"`
+        /// instead of a commented line.
+        #[test]
+        fn cmd_slash_toggles_line_comment() {
+            let engine = vscode_engine("print(1)\n");
+            let (_guards, mut driver) = super::driver(engine);
+
+            press(
+                &mut driver,
+                Key::Char('/'),
+                Modifiers {
+                    cmd: true,
+                    ..Default::default()
+                },
+            );
+            driver.render();
+
+            assert!(
+                driver.screen_contains("# print(1)"),
+                "Cmd+/ must toggle the line comment on the macOS GUI, the \
+                 same as Ctrl+/ on Linux/Windows; painted text was {:?}",
+                driver.painted_texts()
+            );
+        }
+
+        /// #1745: Cmd+F (VS Code's Mac default for `actions.find`) must
+        /// open find, exactly like Ctrl+F on Linux/Windows
+        /// (`tests/vscode_keybinding_parity.rs`'s `test_vscode_ctrl_f_opens_
+        /// find`). State-based assertion, not paint-based, for the same
+        /// reason `option_right_moves_word_forward_not_navigate_forward`
+        /// (below) gives: this is a dispatch/translation fix, proven by
+        /// `engine.find_replace_open` flipping, the same read `Engine::
+        /// handle_vscode_key`'s own `"f"` arm (`src/core/engine/vscode.rs`)
+        /// is defined in terms of.
+        ///
+        /// RED against the pre-#1745 tree (see the submodule-level
+        /// RED-verification note above): `ctrl` stays `false`, so the
+        /// Insert-mode engine treats the keystroke as a plain character
+        /// insertion instead — `find_replace_open` never flips.
+        #[test]
+        fn cmd_f_opens_find() {
+            let engine = vscode_engine("hello\n");
+            let (_guards, engine, mut driver) = super::driver_with_engine(engine);
+            assert!(
+                !engine.borrow().find_replace_open,
+                "precondition: find must start closed"
+            );
+
+            press(
+                &mut driver,
+                Key::Char('f'),
+                Modifiers {
+                    cmd: true,
+                    ..Default::default()
+                },
+            );
+
+            assert!(
+                engine.borrow().find_replace_open,
+                "Cmd+F must open find on the macOS GUI, the same as Ctrl+F \
+                 on Linux/Windows"
+            );
+            assert!(
+                !engine.borrow().find_replace_show_replace,
+                "Cmd+F opens plain find, not find & replace"
+            );
+        }
+
+        /// #1745: VS Code's real Mac default for word-wise navigation is
+        /// **Option**+Left/Right (`cursorWordLeft`/`cursorWordEndRight`),
+        /// not a plain Alt-to-something substitution of vimcode's existing
+        /// Ctrl+Left/Right word-move — and critically, plain Alt+Right on
+        /// this backend would otherwise be claimed by `route_alt_key`'s
+        /// own VS-Code-mode tier as `workbench.action.navigateForward`
+        /// (correct for Win/Linux, wrong for Mac — Mac's real default for
+        /// that command is Ctrl+-/Ctrl+Shift+-, a still-open gap; see
+        /// `tests/vscode_keybinding_parity.rs`'s `KNOWN_GAPS`).
+        ///
+        /// State-based assertion, not paint-based, for the same reason
+        /// `right_click_opens_then_activated_item_runs_command_without_
+        /// any_render_call` (above) gives: this is a dispatch/translation
+        /// fix (which engine call a decoded key reaches), not a paint fix,
+        /// so the right black-box read is "did the cursor actually move
+        /// like a word-move", via the same `Engine` handle `driver_with_
+        /// engine` hands back everywhere else in this file.
+        ///
+        /// RED against the pre-#1745 tree (see the submodule-level
+        /// RED-verification note above): with no translation, `alt` stays
+        /// set and `ctrl` stays unset, so `route_alt_key` claims the chord
+        /// as `navigateForward` instead — a no-op here (no jump-list entry
+        /// was ever recorded), leaving the cursor at column 0 rather than
+        /// moving it forward by a word.
+        #[test]
+        fn option_right_moves_word_forward_not_navigate_forward() {
+            let engine = vscode_engine("hello world\n");
+            let (_guards, engine, mut driver) = super::driver_with_engine(engine);
+
+            press(
+                &mut driver,
+                Key::Named(NamedKey::Right),
+                Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+            );
+
+            let col = engine.borrow().cursor().col;
+            assert!(
+                col > 0,
+                "Option+Right must move the cursor forward by a word \
+                 (cursorWordEndRight), not fall through to navigateForward \
+                 (a no-op here); cursor stayed at column {col}"
+            );
+        }
+
+        /// #1745: VS Code's real Mac default for `cursorEnd` is **Cmd**+
+        /// Right, not word-move — the two modifiers swap roles relative to
+        /// Linux/Windows' Ctrl=word, Home/End=line split (see
+        /// `tests/vscode_keybinding_parity.rs`'s `cursorWordEndRight /
+        /// cursorWordLeft` row). Same state-based-assertion rationale as
+        /// `option_right_moves_word_forward_not_navigate_forward` above.
+        ///
+        /// RED against the pre-#1745 tree (see the submodule-level
+        /// RED-verification note above): with no translation, the engine
+        /// sees a plain, unmodified `Right` and moves the cursor by
+        /// exactly one column instead of to the end of the line.
+        #[test]
+        fn cmd_right_moves_to_line_end_not_one_column() {
+            let engine = vscode_engine("hello world\n");
+            let (_guards, engine, mut driver) = super::driver_with_engine(engine);
+
+            press(
+                &mut driver,
+                Key::Named(NamedKey::Right),
+                Modifiers {
+                    cmd: true,
+                    ..Default::default()
+                },
+            );
+
+            assert_eq!(
+                engine.borrow().cursor().col,
+                11,
+                "Cmd+Right must move the cursor to the end of the line \
+                 (\"hello world\" is 11 columns wide), not by one column"
+            );
+        }
+
+        /// #1745: VS Code's real Mac default for `cursorBottom` is
+        /// **Cmd**+Down (document end), distinct from `cursorEnd`'s Cmd+
+        /// Right (line end) tested just above — see
+        /// `tests/vscode_keybinding_parity.rs`'s `cursorTop / cursorBottom`
+        /// row.
+        ///
+        /// RED against the pre-#1745 tree (see the submodule-level
+        /// RED-verification note above): with no translation, the engine
+        /// sees a plain, unmodified `Down` and moves the cursor down by
+        /// exactly one line instead of to the last line of the buffer.
+        #[test]
+        fn cmd_down_moves_to_document_end_not_one_line() {
+            let engine = vscode_engine("aaa\nbbb\nccc\n");
+            let (_guards, engine, mut driver) = super::driver_with_engine(engine);
+
+            press(
+                &mut driver,
+                Key::Named(NamedKey::Down),
+                Modifiers {
+                    cmd: true,
+                    ..Default::default()
+                },
+            );
+
+            assert_eq!(
+                engine.borrow().cursor().line,
+                2,
+                "Cmd+Down must move the cursor to the last line of the \
+                 buffer, not down by one line"
+            );
+        }
+    }
 }

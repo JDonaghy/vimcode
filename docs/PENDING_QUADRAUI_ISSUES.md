@@ -2641,3 +2641,34 @@ Whether the bug is actually *reached* in any given run turns out to be a race, n
 
 **Blocks:** `JDonaghy/vimcode#1735`. Leave that issue open behind this one per `GOALS.md`'s milestone-discipline rule — there is no per-backend vimcode-side fix available; the defect is in `crossterm` (reached via `ratatui`, a quadraui dependency), not in this repo, and per this repo's Platform-Neutrality Rule a vimcode-side workaround (e.g. vimcode polling its own fds independently of quadraui's event loop) is exactly the kind of per-backend code that rule exists to prevent.
 
+
+---
+
+## macOS's `ns_key_to_uievent` resolves a printable key's character from `NSEvent.characters()`, which is Option's layout-remapped glyph, not the base letter — blocks Cmd+Option+<letter> shortcuts (vimcode#1745)
+
+**Title:** `macos::events::ns_key_to_uievent`'s printable-key fallback should prefer `charactersIgnoringModifiers` (or expose it alongside `characters`) when Option is held, so apps can recognise Option-modified letter shortcuts
+
+**Body:**
+
+Surfaced by vimcode#1745 (VS Code mode's macOS Cmd-key defaults): VS Code's real Mac default for `editor.action.startFindReplaceAction` (Find & Replace) is **Cmd+Option+F**, not a plain Ctrl-to-Cmd substitution of Ctrl+H — Cmd+H is macOS's own system-wide "Hide application" chord, so VS Code picks a different one entirely on Mac. Implementing that bind in vimcode (`src/core/engine/vscode.rs`'s `handle_vscode_key`) needs the engine to receive something it can recognise for "the user held Option and pressed the physical F key" — and today it cannot, because of how quadraui's own macOS translator resolves the character.
+
+Read directly from the pinned rev (`1a87c4eb69361c283d239501077c0604bf25083b`, `quadraui/src/macos/events.rs`, `ns_key_to_uievent`):
+
+```rust
+// Fall back to the IME-resolved printable character.
+let first = characters?.chars().next()?;
+```
+
+`characters` is `NSEvent.characters()` — the function's own doc comment says so explicitly ("the IME-resolved string from `NSEvent.characters()`"). On a US keyboard layout, AppKit's `characters()` for an Option+F keypress is `"ƒ"` (U+0192 LATIN SMALL LETTER F WITH HOOK), Option's own character-table remap for that physical key — not `"f"`. `charactersIgnoringModifiers()` is the AppKit property that *does* return the base, unremapped letter (`"f"`) regardless of Option, and is what every native macOS app's menu `keyEquivalent` matching uses internally for exactly this reason (so `⌥⌘F`-style menu shortcuts work regardless of keyboard layout).
+
+The result: `Key::Char('ƒ')` reaches `App::handle_dispatch`, `modifiers.alt == true`, `modifiers.cmd == true`. Nothing in vimcode's `handle_vscode_key` (or any future arm added for this chord) can match on `'ƒ'` and also claim to be binding "Option+F" in any layout-independent way — a user on a different keyboard layout, where Option+F resolves to some other remapped glyph, would need a *different* vimcode-side match arm just for their layout. This is not a vimcode binding bug to work around; it is the translator handing apps the wrong half of a two-sided AppKit API.
+
+**Ask:**
+
+1. When the Option modifier is set on a `keyDown:` event, prefer `charactersIgnoringModifiers` over `characters` for the printable-key fallback in `ns_key_to_uievent` — or, if some caller genuinely needs the layout-remapped glyph too (e.g. for literal Option-composed character input, which is a real and legitimate use of Option on macOS — e.g. Option+E for the dead-key acute accent), expose both and let the caller choose (e.g. a second `Option<&str>` parameter, or a `Modifiers`-aware helper function).
+2. Either way, document which one `Key::Char` carries when Option is held, since today's doc comment ("the IME-resolved string from `NSEvent.characters()` ... already layout-aware") reads as a feature, not as the gap it is for shortcut-matching purposes.
+3. This should not regress genuine Option-composed text input (dead keys, accented characters) — whatever `characters()` was serving correctly for that case needs to keep working; the fix is additive (recognise the base letter *too*), not a wholesale swap.
+
+**Test:** None added upstream by this draft — vimcode#1745's own `tests/vscode_keybinding_parity.rs` has a `KNOWN_GAPS::CMD_OPTION_F_FIND_REPLACE_UNREACHABLE`-gated engine-level test (`gap_cmd_option_f_find_replace_unreachable`) that drives `Engine::handle_key("\u{192}", Some('\u{192}'), true)` directly — the exact character a real Mac keyboard produces for Option+F today — and asserts the *correct* (currently unreached) outcome, so it is RED until this lands. A conformance-style test on the quadraui side (asserting `ns_key_to_uievent`'s output for a synthetic Option+F `NSEvent`, or the live constants it resolves against) is the natural shape once the `Ask` lands.
+
+**Blocks:** `JDonaghy/vimcode#1745`. Leave that issue open behind this one per `GOALS.md`'s milestone-discipline rule — there is no per-backend vimcode-side fix available; the gap is in quadraui's own macOS event translator, and per this repo's Platform-Neutrality Rule a vimcode-side workaround (e.g. special-casing `'ƒ'` and every other US-layout Option-remapped glyph by hand in `src/core/engine/vscode.rs`) is exactly the kind of per-backend, per-layout code that rule exists to prevent.
