@@ -385,19 +385,14 @@ win = ["quadraui/win"]
 # but did not change vimcode behaviour — confirmed by a clean build on all
 # three feature sets, no call-site changes needed).
 #
-# quadraui#1295 (`3ebead9`, `b145a55`, `26ed611`) was also meant to fix
-# vimcode#1735 (orphaned `vcd` processes busy-spinning on a dead pty), but
-# a black-box test added alongside this bump
-# (`tests/pty_dead_master_exit.rs`) shows it does not, in practice, for
-# the real trigger shape (a non-controlling-terminal pty, matching a
-# headless `vcd` session): the guard only runs in the brief gap *between*
-# `TuiBackend::wait_events`'s 20ms-sliced `crossterm::event::poll` calls,
-# and an idling `vcd` spends ~100% of its wall-clock time *inside* one of
-# those calls, not in the gap — so an asynchronous master-close lands
-# during an in-flight call on close to every occurrence. RED-confirmed
-# 5/5 local runs; see that test's module doc for the full stack-sample
-# analysis. vimcode#1735 is **not** resolved by this bump; it stays open,
-# tracked against a follow-up quadraui fix.
+# quadraui#1295 (`3ebead9`, `b145a55`, `26ed611`) narrows but does not
+# close vimcode#1735 (dead-pty busy-spin) for a headless, non-ctty `vcd` —
+# see `tests/pty_dead_master_exit.rs`'s module doc for the full
+# inter-slice-window analysis and `docs/PENDING_QUADRAUI_ISSUES.md`'s
+# "crossterm 0.29.0 ... busy-spins" entry for the drafted follow-up
+# quadraui ask (reimplement the read loop, or an epoll/kqueue rearm
+# observable before `wait_events` ever calls into crossterm). vimcode#1735
+# stays open pending that fix.
 quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "84256731fa75705fe9cff6b5b0fa9de66f93bcd3", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
