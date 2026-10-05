@@ -315,6 +315,21 @@ journeys:
   steps: Buffer 'hello world', select 'hello'; press Ctrl+C, move cursor to end of line, press Ctrl+V
   expected: Buffer becomes 'hello worldhello'; original selection is untouched by the copy
   priority: 1
+- id: vscode-ctrl-c-copies-selection-exact-length
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.clipboardCopyAction (Ctrl+C; Cmd+C on macOS)
+  steps: Buffer 'hello world', Ctrl+Home, Shift+Right x6 (selects 'hello ' -- 6 chars including the
+    trailing space); press Ctrl+C, Ctrl+End, Ctrl+V
+  expected: Buffer becomes 'hello worldhello '; the pasted text is exactly the 6 selected characters,
+    not 7 (copying must not include one extra trailing character past the selection)
+  priority: 1
 - id: vscode-ctrl-c-no-selection-copies-whole-line
   area: vscode-mode
   mode: vscode

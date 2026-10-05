@@ -114,22 +114,33 @@ impl Engine {
                 Some((text, RegType::Linewise))
             }
             Mode::Visual => {
-                // Character mode: extract from start to end (inclusive)
+                // Character mode. VSCode mode's selection cursor sits *after*
+                // the last selected character (exclusive end, matching
+                // `vscode_delete_selection`) — Vim's own Visual mode instead
+                // puts the cursor *on* the last selected character (inclusive
+                // end). Mixing the two up here under-copied by one char too
+                // few in Vim and over-copied by one char too many in VSCode
+                // mode (#1788): a 6-char Shift+Right selection of "hello "
+                // copied "hello w".
                 let start_char = self.buffer().line_to_char(start.line) + start.col;
-                let mut end_char_inclusive = self.buffer().line_to_char(end.line) + end.col + 1;
+                let mut end_char = self.buffer().line_to_char(end.line) + end.col;
+                if !self.is_vscode_mode() {
+                    // Vim: inclusive end — the cursor's own char is selected.
+                    end_char += 1;
+                }
 
                 // When $ was used, extend through the newline (Vim curswant=MAXCOL)
                 if self.visual_dollar {
                     let line_len = self.buffer().line_len_chars(end.line);
-                    end_char_inclusive = self.buffer().line_to_char(end.line) + line_len;
+                    end_char = self.buffer().line_to_char(end.line) + line_len;
                 }
 
-                let end_char_inclusive = end_char_inclusive.min(self.buffer().len_chars());
+                let end_char = end_char.min(self.buffer().len_chars());
 
                 let text = self
                     .buffer()
                     .content
-                    .slice(start_char..end_char_inclusive)
+                    .slice(start_char..end_char)
                     .to_string();
 
                 Some((text, RegType::Charwise))

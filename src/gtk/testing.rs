@@ -20657,7 +20657,7 @@ mod engine_key_from_ui_gtk_tests {
     /// `vscode_copy`'s `visual_anchor.is_some()` branch was never taken;
     /// `Ctrl+C` then fell to the "copy current line" branch instead, so the
     /// clipboard hook would have captured `"hello world\n"` (the whole
-    /// line), not `"hello"` (the shift-selected span) — this assertion
+    /// line), not `"hell"` (the shift-selected span) — this assertion
     /// fails against that.
     #[test]
     fn shift_right_extends_selection_and_ctrl_c_copies_it_on_gtk() {
@@ -20676,10 +20676,9 @@ mod engine_key_from_ui_gtk_tests {
         let mut h = harness(engine, 1200, 800);
         h.driver.render();
 
-        // Four Shift+Right presses move the cursor to col 4 ('o'); copying a
-        // `Mode::Visual` selection reuses Vim's own inclusive-of-cursor
-        // range (`get_visual_selection_text`), so [anchor=0, cursor=4]
-        // copies chars 0..=4 — "hello".
+        // Four Shift+Right presses move the cursor to col 4 ('o'); VSCode
+        // mode's selection is exclusive of the cursor (#1788), so
+        // [anchor=0, cursor=4] copies chars 0..4 — "hell".
         for _ in 0..4 {
             press(
                 &mut h,
@@ -20708,9 +20707,10 @@ mod engine_key_from_ui_gtk_tests {
 
         assert_eq!(
             copied.borrow().as_deref(),
-            Some("hello"),
-            "Ctrl+C after Shift+Right x5 must copy exactly the shift-selected \
-             span, proving the selection (not the whole line) was captured"
+            Some("hell"),
+            "Ctrl+C after Shift+Right x4 must copy exactly the shift-selected \
+             span, proving the selection (not the whole line, and not one \
+             extra trailing char per #1788) was captured"
         );
     }
 
