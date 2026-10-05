@@ -83,8 +83,8 @@
 //! in quadraui, not Linux-only, so macOS takes the same `poll(2)` path —
 //! but `POLLHUP`-on-a-pty-slave is exactly the bit a Linux run alone
 //! doesn't confirm, so treat macOS as structurally-argued, not measured).
-//! Per this repo's Platform-Neutrality Rule, that fix correctly landed in quadraui,
-//! not as a vimcode-side workaround — vimcode's only change here is
+//! Per this repo's Platform-Neutrality Rule, that fix correctly landed in
+//! quadraui, not as a vimcode-side workaround — vimcode's only change here is
 //! consuming the new pin and un-ignoring this test. See
 //! `docs/PENDING_QUADRAUI_ISSUES.md`'s "crossterm 0.29.0 ... busy-spins"
 //! entry (its "#1775 update" section) for the full writeup. Note that
