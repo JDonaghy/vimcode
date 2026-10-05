@@ -3329,6 +3329,54 @@ mod tests {
             );
         }
 
+        /// #1760: the `Ln N, Col N` ruler must survive on the window
+        /// status bar even once other optional left-side segments — a
+        /// dirty-file marker (`[+]`), a git branch, and VS Code mode's
+        /// long `EDIT  F1:cmd  Alt-M:vim` hint — are all competing for the
+        /// same 80-column width budget. Before this fix,
+        /// `build_window_status_line` pushed `cursor_seg` *first* into
+        /// `right`, which is the segment quadraui's `StatusBar::layout`
+        /// priority-drop removes *first* under a tight width budget — the
+        /// exact inversion of "always show the cursor position" the bug
+        /// report describes. Confirmed RED against unfixed `develop`
+        /// (reverting this issue's `render.rs` hunk and re-running prints
+        /// a screen with no `Ln ` anywhere on the status row).
+        #[test]
+        fn status_bar_1760_keeps_cursor_position_once_other_segments_compete() {
+            let mut engine = plain_engine();
+            engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+            engine.git_branch = Some("a-fairly-long-feature-branch-name".to_string());
+            engine.buffer_mut().insert(0, "hello world\n");
+            engine.active_buffer_state_mut().dirty = true;
+
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("[+]"),
+                "fixture sanity: the dirty marker must paint; screen:\n{screen}"
+            );
+            // The branch name is long enough that the left side legitimately
+            // clips it at the window edge on an 80-column bar — that clip is
+            // not what this test is about, so only check the (guaranteed to
+            // survive) prefix rather than the full branch string.
+            assert!(
+                screen.contains("a-fairly"),
+                "fixture sanity: the git branch segment must paint; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("F1:cmd"),
+                "fixture sanity: VS Code mode's EDIT hint must paint; screen:\n{screen}"
+            );
+            assert!(
+                driver.screen_has("Ln 1,"),
+                "the ruler must still paint the cursor position even once \
+                 the dirty marker, git branch and EDIT-mode hint are all \
+                 competing for the status bar's width budget; screen:\n{screen}"
+            );
+        }
+
         // ── #1431 tranche 2: quickfix / location-list rows and E42 ──────
 
         /// Mirrors `shell_app.rs`'s test of the same name (#608): the

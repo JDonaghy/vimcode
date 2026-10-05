@@ -26136,25 +26136,38 @@ pub fn build_window_status_line(
         // `name…` placeholder when the server isn't reporting progress.
         let lsp_progress = window.and_then(|w| engine.lsp_progress_for_buffer(w.buffer_id));
 
-        // #1690: segment order now follows VS Code's left/right split
-        // rather than a pure priority ranking. VS Code's status bar puts
-        // the problems counter at the **far left** (with the remote
-        // indicator/workspace trust vimcode has no equivalent of) and, on
+        // #1690 established VS Code's left/right split for this bar: the
+        // problems counter at the **far left** (with the remote-indicator/
+        // workspace-trust segments vimcode has no equivalent of), and on
         // the right, `Ln N, Col N` · `Spaces: N` · `UTF-8` · `LF` ·
-        // language · notification bell, in that left-to-right order —
-        // see the issue for the side-by-side pixel sampling this corrects.
-        // `left`/`right` here are still plain vectors read left-to-right
-        // by `StatusBar::layout` (narrow bars drop from the front of
-        // each), so swapping an item's position in the VS Code sequence
-        // also moves where it sits in that drop order — #164 (priority
-        // drop on narrow Win-GUI widths) is the place to revisit that
-        // coupling, not here.
+        // language · notification bell, in that left-to-right order.
         //
-        // vimcode-only segments with no VS Code counterpart (the layout
-        // toggles, LSP status, and the Vim `showcmd` readout) are appended
-        // after the VS Code sequence on their respective side, mirroring
-        // how `NORMAL`/the filename are prepended ahead of it on the left
-        // — VS Code's own segments stay contiguous and in its order.
+        // #1760: that visual order is **not** the order these segments are
+        // pushed into `right` below anymore. `right`/`left` are plain
+        // vectors `StatusBar::layout`'s priority-drop (quadraui's
+        // `fit_right_start`/`layout_padded`) reads left-to-right — a
+        // narrow bar drops from the *front* of `right_segments` and always
+        // preserves the *last* element, even if it alone overflows (see
+        // that primitive's own doc). So vector order doubles as both the
+        // right group's visual position *and* its drop priority: #1690
+        // pushed `cursor_seg` (Ln/Col) first because that's where it sits
+        // visually in VS Code's own order, which made it the first
+        // segment *dropped* the moment a dirty marker / git branch /
+        // EDIT-mode hint ate into the left side's width budget — reported
+        // as "Ln/Col silently vanishes" even though plenty of lower-value
+        // segments (the layout toggles, LSP status) survived. quadraui's
+        // `StatusBar` has no field to decouple "visual position" from
+        // "drop priority" (a vector is both at once — #164 flagged this
+        // exact coupling as unresolved), so until it does, vimcode cannot
+        // have Ln/Col both leftmost-of-the-group *and* undroppable. This
+        // fix picks undroppable: `cursor_seg` is pushed **last**, after
+        // every other right-side segment, which is the only way
+        // `fit_right_start`'s "always keep the last segment" rule can
+        // guarantee it never disappears. Vimcode's own extras with no VS
+        // Code counterpart (LSP status, the layout toggles, notifications)
+        // are the least important and go first/leftmost of the group;
+        // `showcmd` — prominent exactly when the user is mid-command —
+        // stays pushed just ahead of `cursor_seg`, as before.
         let mut right = Vec::new();
 
         // Build each segment optionally; push at the end in priority order.
@@ -26243,14 +26256,16 @@ pub fn build_window_status_line(
             action: Some(StatusAction::TogglePanel),
         };
 
-        // #1690: no trailing space — this is the right-most segment of the
-        // bar by default (showcmd, the only thing ever pushed after it, is
-        // almost always empty/absent), so the same #1541/quadraui#1155
-        // reasoning that keeps `cursor_seg` trailing-space-free applies
-        // here now instead: a backend-added outer-edge inset plus a
-        // hand-rolled trailing space would double up the right margin.
+        // #1760: this used to be (almost) the right-most segment of the
+        // bar — only `showcmd` ever pushed after it, and that's almost
+        // always empty/absent — so it carried a trailing-space-free
+        // #1541/quadraui#1155 treatment matching `cursor_seg`'s. Now that
+        // `cursor_seg` (Ln/Col) is always the true right-most segment (see
+        // the `right` push-order comment below), this one needs its own
+        // trailing space back so it doesn't touch whichever segment ends
+        // up directly after it.
         let sidebar_toggle_seg = StatusSegment {
-            text: format!(" {}", crate::icons::STATUS_SIDEBAR_TOGGLE.s()),
+            text: format!(" {} ", crate::icons::STATUS_SIDEBAR_TOGGLE.s()),
             fg: toggle_fg(engine.session.explorer_visible),
             bg: bar_bg,
             bold: false,
@@ -26402,26 +26417,23 @@ pub fn build_window_status_line(
         left.push(errors_seg);
         left.push(warnings_seg);
 
-        // Right side, in VS Code's own left-to-right order: `Ln N, Col N`
-        // (leftmost of the group) · `Spaces: N` · `UTF-8` · `LF` ·
-        // language · notification bell (rightmost) — see #1690. vimcode's
-        // own extra segments (LSP status, the layout toggles, Vim's
-        // `showcmd`) are appended after the bell, keeping VS Code's six
-        // segments contiguous and in its order rather than interleaved
-        // with vimcode-only affordances.
-        if let Some(s) = cursor_seg {
-            right.push(s);
-        }
-        right.push(indent_seg);
-        right.push(encoding_seg);
-        right.push(line_ending_seg);
-        if let Some(s) = filetype_seg {
+        // Right side, in drop-priority order (least important first — see
+        // the `right` doc comment above for why this is no longer VS
+        // Code's own visual left-to-right order, #1760): vimcode's own
+        // extras with no VS Code counterpart (LSP status, notifications,
+        // the layout toggles) go first/leftmost, since they are the least
+        // essential and the first to be dropped under a tight width
+        // budget; VS Code's remaining status segments (filetype, line
+        // ending, encoding, indent) follow; `showcmd` — prominent exactly
+        // when the user is mid-command — sits just ahead of `cursor_seg`;
+        // `cursor_seg` (Ln/Col) is pushed **last**, unconditionally the
+        // bar's true right-most segment, so quadraui's "always keep the
+        // last right segment" priority-drop rule guarantees it, and only
+        // it, survives no matter how little width remains.
+        if let Some(s) = lsp_seg {
             right.push(s);
         }
         if let Some(s) = notification_seg {
-            right.push(s);
-        }
-        if let Some(s) = lsp_seg {
             right.push(s);
         }
         if let Some(s) = menu_toggle_seg {
@@ -26429,7 +26441,16 @@ pub fn build_window_status_line(
         }
         right.push(panel_toggle_seg);
         right.push(sidebar_toggle_seg);
+        if let Some(s) = filetype_seg {
+            right.push(s);
+        }
+        right.push(line_ending_seg);
+        right.push(encoding_seg);
+        right.push(indent_seg);
         if let Some(s) = showcmd_seg {
+            right.push(s);
+        }
+        if let Some(s) = cursor_seg {
             right.push(s);
         }
 
@@ -31088,23 +31109,26 @@ mod tests {
         );
     }
 
-    /// #1541 established the rule this test now covers for whichever
-    /// segment #1690's reorder made the bar's actual right-most one — the
-    /// ruler (`Ln N, Col N`) moved to the **leftmost** of the right group
-    /// (VS Code parity, see #1690), so `sidebar_toggle_seg` (a vimcode-only
-    /// extra with no VS Code counterpart, appended after VS Code's own six
-    /// segments) is the right-most by default now. Its own text must not
-    /// carry a trailing space — quadraui#1155 reserves that outer-edge
-    /// margin on pixel backends (GTK/Win/macOS), and TUI has never had a
-    /// scrollbar-style gutter to hide a trailing blank column in. A stray
-    /// trailing space here would double the gap on the backends that
-    /// already get one and would be a visible dangling blank on TUI, which
-    /// gets none.
+    /// #1541 established the rule this test covers; #1690 temporarily
+    /// moved the ruler to the *leftmost* of the right group (VS Code
+    /// parity) which made `sidebar_toggle_seg` the accidental right-most
+    /// segment by default; #1760 moved the ruler (`Ln N, Col N`) back to
+    /// being the bar's unconditional right-most segment — not for visual
+    /// parity this time, but because that is the only position
+    /// `StatusBar::layout`'s priority-drop (quadraui's `fit_right_start`/
+    /// `layout_padded`) treats as undroppable, and #1760 reported the
+    /// ruler silently vanishing once other optional segments competed for
+    /// space. Its text must not carry a trailing space — quadraui#1155
+    /// reserves that outer-edge margin on pixel backends (GTK/Win/macOS),
+    /// and TUI has never had a scrollbar-style gutter to hide a trailing
+    /// blank column in. A stray trailing space here would double the gap
+    /// on the backends that already get one and would be a visible
+    /// dangling blank on TUI, which gets none.
     ///
-    /// RED against the pre-#1690 body for *this* segment (`format!(" {} ",
-    /// ...)`, trailing space included): `last.text` ends in `" "`, and the
-    /// second assertion fails — confirmed by reverting just
-    /// `sidebar_toggle_seg`'s format string and re-running.
+    /// RED against the pre-#1541 body (`format!(" Ln {}, Col {} ", ...)`,
+    /// trailing space included): `last.text` ends in `" "`, and the second
+    /// assertion fails — confirmed by reverting just `cursor_seg`'s format
+    /// string and re-running.
     #[test]
     fn test_window_status_line_right_most_segment_has_no_trailing_space() {
         use crate::core::engine::Engine;
@@ -31117,16 +31141,16 @@ mod tests {
         let wid = engine.active_window_id();
         let status = build_window_status_line(&engine, &theme, wid, true);
 
-        // The ruler is the *leftmost* of the right group now, not the
-        // right-most — see #1690.
+        // #1760: the ruler is the bar's unconditional right-most segment —
+        // see this test's own doc for why that is no longer a VS-Code-
+        // visual-parity claim but a drop-priority one.
+        let last = status
+            .right_segments
+            .last()
+            .expect("ruler on: the active window's bar must have a right-most segment");
         assert!(
-            status
-                .right_segments
-                .first()
-                .expect("ruler on: the active window's bar must have a right-most segment")
-                .text
-                .contains("Ln 1"),
-            "expected the ruler to be the leftmost segment of the right \
+            last.text.contains("Ln 1"),
+            "expected the ruler to be the right-most segment of the right \
              group, got {:?}",
             status
                 .right_segments
@@ -31134,11 +31158,6 @@ mod tests {
                 .map(|s| &s.text)
                 .collect::<Vec<_>>()
         );
-
-        let last = status
-            .right_segments
-            .last()
-            .expect("the active window's bar must have a right-most segment");
         assert!(
             !last.text.ends_with(' '),
             "the right-most segment must not carry a trailing space \
@@ -31878,12 +31897,13 @@ mod tests {
             .iter()
             .find(|s| s.action == Some(StatusAction::ToggleSidebar))
             .expect("expected sidebar toggle segment");
-        // #1690: no trailing space — see `sidebar_toggle_seg`'s own doc in
-        // `build_window_status_line` (it is the bar's default right-most
-        // segment now that the ruler moved left).
+        // #1760: trailing space restored — `sidebar_toggle_seg` is no
+        // longer (even by default) the bar's right-most segment now that
+        // `cursor_seg` unconditionally is; see its own doc in
+        // `build_window_status_line`.
         assert_eq!(
             sidebar_seg.text,
-            format!(" {}", crate::icons::STATUS_SIDEBAR_TOGGLE.s())
+            format!(" {} ", crate::icons::STATUS_SIDEBAR_TOGGLE.s())
         );
 
         let menu_seg = status
@@ -31921,8 +31941,9 @@ mod tests {
             .iter()
             .find(|s| s.action == Some(StatusAction::ToggleSidebar))
             .expect("expected sidebar toggle segment");
-        // #1690: no trailing space — see the nerd-fonts-on assertion above.
-        assert_eq!(sidebar_seg_ascii.text, " [S]");
+        // #1760: trailing space restored — see the nerd-fonts-on assertion
+        // above.
+        assert_eq!(sidebar_seg_ascii.text, " [S] ");
         let menu_seg_ascii = status_ascii
             .right_segments
             .iter()
