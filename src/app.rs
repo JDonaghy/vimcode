@@ -8816,6 +8816,73 @@ impl App {
             _ => {}
         }
 
+        // ── #1762: rescue a double-click that folded away an activity-bar
+        // panel switch ─────────────────────────────────────────────────────
+        //
+        // `quadraui::AppShell::handle` (`compose/app_shell.rs`) only matches
+        // a plain `UiEvent::MouseDown` for activity-bar hit-testing — every
+        // other event variant, `DoubleClick` included, falls through its own
+        // `_ => AppShellEvent::Ignored` arm. `quadraui::dispatch::
+        // DoubleClickDetector` (the backend-agnostic fold both `TuiBackend`
+        // and `MacBackend` run every `MouseDown` through) folds a press into
+        // a `DoubleClick` whenever it lands within `DOUBLE_CLICK_RADIUS`
+        // (1.5 *cells*, TUI's own grid unit) of the previous press within
+        // `DOUBLE_CLICK_MS` (400ms) — a radius wider than one activity-bar
+        // row (adjacent icons are exactly 1.0 cell apart), so two genuinely
+        // distinct, fast real clicks on *adjacent* icons (Source Control
+        // then Debug, Debug then Extensions, …) fold into a `DoubleClick`
+        // the activity bar has no handler for. The second click is then
+        // silently dropped — the sidebar stays on whatever panel was
+        // already active, and a later click/right-click meant for a
+        // different panel (e.g. the Explorer tree) lands on that stale
+        // panel's own content instead. This is the mechanism behind
+        // vimcode#1762's bugbash report (Explorer -> Source Control ->
+        // Extensions -> Explorer getting stuck on "RUN AND DEBUG", then a
+        // right-click meant for the Explorer tree landing on the still-open
+        // Debug panel's own controls and launching a real DAP session).
+        //
+        // The real fix belongs in quadraui (`AppShell::handle` growing a
+        // `DoubleClick` arm identical to its `MouseDown` one for the
+        // activity-bar band — a double-click on an activity-bar icon has no
+        // distinct meaning from a single click there, for every consumer,
+        // not just vimcode) — a quadraui issue describing this gap should be
+        // filed per CLAUDE.md's Platform-Neutrality Rule, and is not yet
+        // filed/landed as of this commit. Until it is, re-synthesize the
+        // dropped click as the plain `MouseDown` it
+        // was always meant to be and feed it back through the shell's own
+        // *public* `handle()` — the exact dispatch a real single click takes
+        // — rather than hand-rolling an activity-bar hit-test here. That
+        // keeps this "thin event-to-engine wiring" against the existing
+        // public API, shared once in `App` (not `src/gtk/`/`src/tui_main/`),
+        // so both backends pick up the fix from one place — the same
+        // pattern `render::consume_hamburger_stale_click_guard`/
+        // `render::sync_runner_sidebar_visibility` already use for other
+        // quadraui-shaped gaps in this exact file.
+        if let UiEvent::DoubleClick { position, .. } = &event {
+            let position = *position;
+            if ctx.layout.activity_bar_bounds.contains(position) {
+                let viewport = backend.viewport();
+                let area = quadraui::Rect::new(0.0, 0.0, viewport.width, viewport.height);
+                let synthetic = UiEvent::MouseDown {
+                    widget: None,
+                    button: MouseButton::Left,
+                    position,
+                    modifiers: quadraui::Modifiers::default(),
+                };
+                let shell_ev = ctx.shell_mut().handle(&synthetic, &*backend, area);
+                if !matches!(shell_ev, quadraui::AppShellEvent::Ignored) {
+                    quadraui::ShellApp::on_shell_event_ctx(self, &shell_ev, ctx);
+                    self.draw_needed.set(true);
+                }
+                return if self.draw_needed.get() {
+                    self.draw_needed.set(false);
+                    quadraui::Reaction::Redraw
+                } else {
+                    quadraui::Reaction::Continue
+                };
+            }
+        }
+
         // Pointer events over the sidebar content area are forwarded to the active
         // panel's controller before the editor click path sees them. In ShellApp
         // mode there is no per-panel DrawingArea, so without this the file explorer
