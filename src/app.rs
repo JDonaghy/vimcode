@@ -8832,10 +8832,16 @@ impl App {
         // `MouseMoved` event. The repaint once the LSP response actually
         // arrives is still `poll_lsp`'s job (`core/engine/panels.rs`
         // setting `redraw = true` on a hover reply), not this arm's.
-        if let UiEvent::MouseMoved { position, .. } = &event {
+        //
+        // `!buttons.left`: a left-button drag (text selection, or a cross-
+        // split continuation in `handle_mouse_drag_msg`) must not also arm
+        // the dwell timer — matches the #751 context-menu-hover guard just
+        // below in the `MouseMoved` event arm itself.
+        if let UiEvent::MouseMoved { position, buttons } = &event {
             let gate_open = {
                 let e = self.engine.borrow();
-                e.settings.hover_delay > 0
+                !buttons.left
+                    && e.settings.hover_delay > 0
                     && !e.editor_hover_has_focus
                     && !e.is_blocking_modal_open()
                     && (matches!(e.mode, core::Mode::Normal | core::Mode::Visual)
@@ -8857,11 +8863,15 @@ impl App {
                         self.cached_frame_hit_map.borrow().as_ref(),
                         &self.cached_tab_bar_zones.borrow(),
                         false, // pure hover query — must not steal focus or fire gutter actions
+                        // scratch: never touched under mutate_focus: false — see click.rs:233-320
                         &mut quadraui::DragState::default(),
                         false, // no Alt-fine-seek context for a plain mouse-move
                     );
+                    let had_hover = engine.editor_hover.is_some();
                     match target {
-                        ClickTarget::BufferPos(_, line, col) => {
+                        ClickTarget::BufferPos(wid, line, col)
+                            if wid == engine.active_window_id() =>
+                        {
                             let on_popup = self.editor_hover_popup_rect.get().is_some_and(|r| {
                                 position.x >= r.x
                                     && position.x < r.x + r.width
@@ -8871,10 +8881,31 @@ impl App {
                             engine.editor_hover_mouse_move(line, col, on_popup);
                         }
                         _ => {
-                            if engine.editor_hover.is_some() {
+                            // Either not a buffer position at all, or a
+                            // `BufferPos` resolved against a *different*
+                            // (unfocused) split's window id — see the review
+                            // finding this guard fixes: without it, dwelling
+                            // in an inactive split would resolve `(line,
+                            // col)` against the hovered window's own scroll
+                            // offset while every downstream consumer
+                            // (`editor_hover_mouse_move`'s `self.buffer()`,
+                            // `active_buffer_diagnostics_key()`,
+                            // `lsp_request_hover_at`'s
+                            // `active_buffer_id()`, and the popup's anchor
+                            // in `render::editor_popup_anchors`) reads
+                            // active-window/active-buffer state, so the
+                            // popup painted in the focused pane could show
+                            // the *other* file's hover for that line/col.
+                            // Treat it exactly like "outside the editor
+                            // area": dismiss any already-visible popup.
+                            if had_hover {
                                 engine.dismiss_editor_hover();
                             }
                         }
+                    }
+                    if had_hover != engine.editor_hover.is_some() {
+                        drop(engine);
+                        self.draw_needed.set(true);
                     }
                 }
             }
