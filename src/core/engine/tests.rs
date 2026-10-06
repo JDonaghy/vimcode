@@ -700,6 +700,91 @@ fn test_startup_without_session_restore_skips_ambient_plugins_and_registry_fetch
     );
 }
 
+/// #1797 (bugbash:win-native): "Source Control panel CHANGES section
+/// never lists modified/untracked files". Root cause traced to
+/// `Engine::startup_inner`'s file-opening branch: opening a *file* (as
+/// opposed to a folder, which `open_folder` already handles) never
+/// touches `self.cwd`/`self.workspace_root` at all, so `cwd` stays
+/// whatever the process's actual working directory happened to be at
+/// `Engine::new()` time. On a terminal launch (`cd workspace && vimcode
+/// main.rs`) that is harmless, since the shell already `cd`ed into the
+/// workspace first — but a native-GUI launch that hands vimcode an
+/// absolute file path without first changing the process's directory
+/// (a desktop shortcut with no "Start in" folder, a file-association
+/// "Open with" launch, or — per this test — any caller that constructs
+/// an `Engine` from one directory and then opens a file that lives in a
+/// completely different one) leaves `cwd` pointing somewhere with no git
+/// repo at all. `git::find_repo_root(&self.cwd)` then returns `None`,
+/// `sc_refresh`'s `git status` runs against the *wrong* directory, and
+/// the CHANGES section — which only ever reads `sc_file_statuses` — stays
+/// permanently empty, exactly matching the report (open the file, open
+/// the panel, even a manual refresh changes nothing, because every one
+/// of those refreshes queries the same wrong directory).
+///
+/// This is shared, platform-neutral `Engine`/`core` code — no backend
+/// touches `cwd` differently — so the fix belongs here, not in
+/// `src/win/`, and a `TuiDriver`/`GtkDriver` test would exercise the
+/// identical code path with strictly more harness overhead for no extra
+/// coverage.
+///
+/// RED-verified: before the fix, `Engine::startup_inner`'s file-path arm
+/// was just `let _ = self.open_file_with_mode(path, OpenMode::Permanent);`
+/// with no preceding `cwd` adjustment — under that body this test's
+/// `sc_section_file_count` assertion observed `0`, not `2` (there is no
+/// git repo at `launch_cwd`, so `git::status_detailed` returns an empty
+/// `Vec`), reproducing the report exactly.
+#[test]
+fn startup_on_a_file_outside_cwd_still_finds_its_repo_for_source_control_1797() {
+    // The git workspace the file actually lives in: one committed file
+    // modified afterward (porcelain " M"), plus one untracked file
+    // (porcelain "??") -- the issue's own exact reproduction shape.
+    let workspace = test_temp_path("vimcode_1797_sc_changes_workspace");
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(&workspace).unwrap();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+    };
+    run_git(&["init"]);
+    run_git(&["config", "user.email", "t@t.com"]);
+    run_git(&["config", "user.name", "T"]);
+    let tracked = workspace.join("main.rs");
+    std::fs::write(&tracked, "fn main() {}\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "init"]);
+    std::fs::write(&tracked, "fn main() { /* changed */ }\n").unwrap();
+    let untracked = workspace.join("extra.rs");
+    std::fs::write(&untracked, "// new\n").unwrap();
+
+    // A completely unrelated directory standing in for "wherever the
+    // process's cwd happened to be at launch" -- deliberately *not* the
+    // workspace above, and not a git repo itself.
+    let launch_cwd = test_temp_path("vimcode_1797_sc_changes_launch_cwd");
+    let _ = std::fs::remove_dir_all(&launch_cwd);
+    std::fs::create_dir_all(&launch_cwd).unwrap();
+
+    let mut engine = Engine::new_for_test();
+    engine.cwd = launch_cwd.clone();
+    engine.settings.swap_file = false;
+    engine.startup_without_session_restore(Some(&tracked));
+
+    engine.sc_refresh();
+    assert_eq!(
+        engine.sc_section_file_count(SC_SECTION_CHANGES),
+        2,
+        "opening a file by absolute path must resolve git status against \
+         the file's own repo, not whatever directory the process started \
+         in -- CHANGES must list both the modified tracked file and the \
+         untracked one"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&launch_cwd);
+}
+
 #[test]
 fn test_restore_session_files_opens_separate_tabs() {
     use crate::core::session::SessionState;
