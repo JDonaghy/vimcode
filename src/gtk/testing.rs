@@ -19430,6 +19430,25 @@ mod issue_1750_editor_hover_dwell {
             h.driver.painted_texts()
         );
 
+        // Enforces (rather than merely documenting) the `lsp_enabled = false`
+        // guard above: `Engine::lsp_manager` starts `None` and is only ever
+        // populated by `ensure_lsp_manager()`, which every spawn path —
+        // `new_tab`'s own `lsp_did_open` and `poll_idle`'s
+        // `lsp_request_hover_at` alike — must pass through before it can
+        // start the registry's real `rust-analyzer` off `PATH`. A review
+        // round of #1750 found the TUI twin's equivalent prose guard silently
+        // defeated by a reordering, so both twins now assert it. See
+        // `tui_main::app_on_tui_tests::tests::editor_hover_dwell_1750::
+        // assert_no_lsp_server_was_spawned` for the full reasoning.
+        assert!(
+            h.engine.borrow().lsp_manager.is_none(),
+            "this test must never start a real language server: \
+             `Engine::lsp_manager` is `Some`, so some path reached \
+             `ensure_lsp_manager()` with `settings.lsp_enabled` still true \
+             and may have spawned (and leaked) a real `rust-analyzer` \
+             indexing this whole workspace (#1750 review)"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

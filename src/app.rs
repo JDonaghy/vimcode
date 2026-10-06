@@ -8868,36 +8868,45 @@ impl App {
                         false, // no Alt-fine-seek context for a plain mouse-move
                     );
                     let had_hover = engine.editor_hover.is_some();
+                    // Popup keep-alive is geometry-independent on purpose
+                    // (#1750 review): the popup can spill over the active
+                    // window's gutter column or into a neighbouring split,
+                    // where `pixel_to_click_target` resolves to
+                    // `ClickTarget::None`/another window id and the `_`
+                    // dismiss arm below would yank the popup out from under
+                    // a pointer that is physically *on* it — e.g. while
+                    // travelling towards the `command:definition` link
+                    // (#272/#491). Checked before the target is classified,
+                    // so "the mouse is over the popup" always wins.
+                    let on_popup = self.editor_hover_popup_rect.get().is_some_and(|r| {
+                        position.x >= r.x
+                            && position.x < r.x + r.width
+                            && position.y >= r.y
+                            && position.y < r.y + r.height
+                    });
+                    // When keep-alive hits, the only arm that could still
+                    // run would be a no-op anyway (`editor_hover_mouse_move`
+                    // returns without touching anything once
+                    // `mouse_on_popup` is true and a popup is visible), so
+                    // keeping the popup alive is simply "change nothing".
+                    let keep_alive = on_popup && had_hover;
                     match target {
+                        _ if keep_alive => {}
                         ClickTarget::BufferPos(wid, line, col)
                             if wid == engine.active_window_id() =>
                         {
-                            let on_popup = self.editor_hover_popup_rect.get().is_some_and(|r| {
-                                position.x >= r.x
-                                    && position.x < r.x + r.width
-                                    && position.y >= r.y
-                                    && position.y < r.y + r.height
-                            });
                             engine.editor_hover_mouse_move(line, col, on_popup);
                         }
                         _ => {
-                            // Either not a buffer position at all, or a
-                            // `BufferPos` resolved against a *different*
-                            // (unfocused) split's window id — see the review
-                            // finding this guard fixes: without it, dwelling
-                            // in an inactive split would resolve `(line,
-                            // col)` against the hovered window's own scroll
-                            // offset while every downstream consumer
-                            // (`editor_hover_mouse_move`'s `self.buffer()`,
-                            // `active_buffer_diagnostics_key()`,
-                            // `lsp_request_hover_at`'s
-                            // `active_buffer_id()`, and the popup's anchor
-                            // in `render::editor_popup_anchors`) reads
-                            // active-window/active-buffer state, so the
-                            // popup painted in the focused pane could show
-                            // the *other* file's hover for that line/col.
-                            // Treat it exactly like "outside the editor
-                            // area": dismiss any already-visible popup.
+                            // Not a buffer position at all, or one resolved
+                            // against a *different* (unfocused) split: both
+                            // mean "outside the editor area we can hover
+                            // against", so dismiss any visible popup.
+                            // #1750 review: the window-id guard above is
+                            // load-bearing because `BufferPos`'s `(line,
+                            // col)` come from the *hovered* window's scroll
+                            // offset while every downstream consumer reads
+                            // active-window/active-buffer state.
                             if had_hover {
                                 engine.dismiss_editor_hover();
                             }
