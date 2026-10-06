@@ -4695,8 +4695,8 @@ mod tests {
         /// requiring it contain both labels: a buffer-swap-in-place bug
         /// leaves exactly one label painted on that row, never both — and
         /// scoping the read to the tab bar's own cells (not a bare
-        /// `screen_has`/`screen_contains` call) matters because review
-        /// round 1 found both filenames are *also* painted by the Explorer
+        /// `screen_has`/`screen_contains` call) matters because #1798's
+        /// review found both filenames are *also* painted by the Explorer
         /// sidebar row and the breadcrumb segment, which stay open/visible
         /// throughout this test and would otherwise satisfy the assertion
         /// regardless of what the tab bar itself painted.
@@ -4711,6 +4711,17 @@ mod tests {
         /// padded with blanks — `"sample.txt"` entirely gone from the row
         /// — failing the second assertion on its own. Restored before
         /// committing.
+        ///
+        /// Note this test is green both before and after #1798's production
+        /// change, and that is correct, not a gap: the defect was the GUI
+        /// sidebar opening ~460px wide and crowding the tab bar out of an
+        /// 800px window (`render::UnitProfile::sidebar_width_lh`), and the
+        /// *cell* profile this backend uses was never mis-scaled — 20 is 20
+        /// terminal columns. The fail-first proof therefore lives in the GTK
+        /// twin (`gtk::testing`'s same-named test, at 800x480). What this
+        /// test contributes is the other half of the multi-backend rule: the
+        /// shared dispatch path keeps working on TUI, and the fix did not
+        /// narrow the TUI sidebar as a side effect.
         #[test]
         fn explorer_double_click_opens_second_file_in_a_second_tab_1798() {
             let dir = std::env::temp_dir().join(format!(
@@ -4744,7 +4755,7 @@ mod tests {
             engine.explorer_expanded.insert(dir.clone());
             engine.explorer_rebuild_rows();
             // `engine.session.explorer_visible` alone drives the TUI
-            // sidebar's painted visibility here — review round 1 flagged
+            // sidebar's painted visibility here — #1798's review flagged
             // `engine.app_shell.show_panel(...)` (present in an earlier
             // revision of this test) as possibly a no-op, citing
             // `collapse_sidebar`'s own doc that the runner-side `AppShell`
@@ -4757,8 +4768,8 @@ mod tests {
             let mut h = harness(engine);
 
             // Scoped to the tab bar's own row (same helper the main
-            // assertions below use), not a bare `screen_has` — review
-            // round 1 found a bare `screen_has("sample.txt")` is also
+            // assertions below use), not a bare `screen_has` — #1798's
+            // review found a bare `screen_has("sample.txt")` is also
             // satisfied by the Explorer sidebar row, so it would pass even
             // if the tab itself never painted.
             let precondition_row = active_group_tab_bar_row(&h, active_group);

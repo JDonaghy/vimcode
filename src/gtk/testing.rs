@@ -660,6 +660,64 @@ mod tests {
         quadraui::WidgetId::new(crate::render::EDITOR_TAB_BAR_WIDGET_ID)
     }
 
+    /// True if a painted text run containing `needle` lands **inside tab
+    /// `idx`'s own slot** on tab bar `bar` — the tab-bar-scoped replacement
+    /// for a bare `screen_contains(label)` (#1798 review).
+    ///
+    /// `GtkDriver::screen_contains`/`find_bounds` match any painted run
+    /// anywhere on screen, and a filename is painted by the explorer tree
+    /// row, the breadcrumb bar and the window title on the very same frame
+    /// — so a needle-only assertion about a *tab* label passes even when the
+    /// tab never painted. (The same trap `tab_zero_left_half` below
+    /// documents from the other direction: a needle-anchored probe silently
+    /// measured the breadcrumb's geometry instead of the tab's.)
+    ///
+    /// Scoping is geometric, which is what makes it robust to a future
+    /// painted run that merely *contains* the needle (`"main.rs > main"`,
+    /// say): the slot comes from the [`quadraui::TabBarLayout`] the
+    /// rasteriser cached while actually painting `bar`, its width recovered
+    /// from the centre-to-centre distance of tabs 0 and 1 (equal-width slots
+    /// ⇒ one slot, the same derivation `tab_zero_left_half` uses), and the
+    /// matched run's rect must sit within it on both axes. Needs at least
+    /// two painted tabs to measure a slot width, which every caller has.
+    ///
+    /// Still worth passing a needle that only a tab bar can paint
+    /// (`TabInfo::name`'s trailing space — `name + " "`), so a failure
+    /// reports "the tab didn't paint" rather than "some other widget's run
+    /// matched first": `find_bounds` returns the *first* matching run, and
+    /// this helper can only reject that one, not search past it.
+    fn painted_label_is_in_tab_slot(
+        h: &mut Harness<impl AppLogic>,
+        bar: &quadraui::WidgetId,
+        idx: usize,
+        needle: &str,
+    ) -> bool {
+        let (Some(c0), Some(c1)) = (h.driver.tab_center(bar, 0), h.driver.tab_center(bar, 1))
+        else {
+            return false;
+        };
+        let Some(centre) = h.driver.tab_center(bar, idx) else {
+            return false;
+        };
+        let Some(label) = h.driver.find_bounds(needle) else {
+            return false;
+        };
+        // Horizontal: the run must lie within this slot's own half-open
+        // span. Equal-width slots ⇒ centre-to-centre is one slot wide.
+        let slot_w = (c1.0 - c0.0).abs();
+        let (slot_left, slot_right) = (centre.0 - slot_w / 2.0, centre.0 + slot_w / 2.0);
+        // Vertical: a label painted *in* the tab row straddles that row's
+        // own centre line, which `tab_center` reports. Checking containment
+        // of the centre (rather than deriving a row height the layout does
+        // not expose) is what rejects a same-needle run on another row — a
+        // breadcrumb or window-title run sits entirely below or above it.
+        const EPS: f32 = 0.5;
+        label.x + EPS >= slot_left
+            && label.x + label.width <= slot_right + EPS
+            && label.y <= centre.1
+            && label.y + label.height >= centre.1
+    }
+
     // ── #753 (mouse ladder slice 3): dividers + drag ────────────────────
     //
     // The GTK half of the rung this slice lifted into `render.rs`
@@ -4368,100 +4426,71 @@ mod tests {
 
     /// #1798 (bugbash:win-native): double-clicking a *second* file in the
     /// Explorer sidebar, while a first file is already open in a real
-    /// (non-preview) tab, must paint a **second** tab — not silently swap
-    /// the first tab's buffer in place while leaving its old label painted.
-    /// The GTK half of the shared-engine fix (`src/tui_main/
-    /// app_on_tui_tests.rs`'s `explorer_double_click_opens_second_file_in_a_
-    /// second_tab_1798` is the TUI half); both drive the identical
+    /// (non-preview) tab, must paint a **second** tab — label and all —
+    /// beside the first, in an **800x480** window.
+    ///
+    /// The GTK half of the shared-engine coverage; `tui_main::
+    /// app_on_tui_tests`'s `explorer_double_click_opens_second_file_in_a_
+    /// second_tab_1798` is the TUI half. Both drive the identical
     /// `App::explorer_ui_event` → `Engine::dispatch_explorer_tree_event` →
-    /// `Engine::open_file_in_tab` path the Platform-Neutrality Rule requires
-    /// (`src/app.rs`, shared by every backend — there is no GTK-specific
-    /// explorer click handler, `src/gtk/explorer.rs` is a type-re-export
-    /// stub).
+    /// `Engine::open_file_in_tab` path (shared by every backend — there is
+    /// no GTK-specific explorer click handler, `src/gtk/explorer.rs` is a
+    /// type-re-export stub), which is also the path the real Win-GUI
+    /// backend takes: quadraui's `src/win/events.rs` sets no `CS_DBLCLKS`
+    /// and handles no `WM_LBUTTONDBLCLK`, so Windows delivers two plain
+    /// `WM_LBUTTONDOWN`s folded by the same shared `DoubleClickDetector`.
     ///
-    /// `sample.txt` is opened the same way the bugbash report's "Open
+    /// `sample.txt` is opened the way the bugbash report's "Open
     /// sample.txt" step did — `Engine::startup_without_session_restore`,
-    /// the CLI-argument path (`Engine::open_file_with_mode` with
-    /// `OpenMode::Permanent`) — rather than `open_file_in_tab` directly, so
-    /// this reproduces the exact pristine-scratch-buffer-reuse precondition
-    /// the real report started from.
+    /// the CLI-argument path — rather than `open_file_in_tab` directly, so
+    /// this reproduces the pristine-scratch-buffer-reuse precondition the
+    /// report started from.
     ///
-    /// Review round 1 found the original `800×480` harness size (picked to
-    /// match the evidence screenshot's own dimensions, `/tmp/j_dblclick_
-    /// main.png`) does **not** in fact rule out a width/scroll explanation.
-    /// Traced empirically: `App::shell_config()` never sets `ShellConfig::
-    /// default_sidebar_width` from the persisted, pixel-valued `Session::
-    /// sidebar_width` (default `260`, `src/core/session.rs`) — it is left
-    /// at `ShellConfig::new`'s generic `20.0`, which `AppShell::
-    /// compute_layout` treats as a *line-height multiple* on every backend
-    /// (`self.sidebar_width.clamp(...) * line_height`), resolving to a
-    /// ~512px-wide sidebar on this harness's font metrics and leaving only
-    /// ~288px for the tab bar at `800` total width. Confirmed empirically:
-    /// at `800×480` `main.rs`'s tab genuinely has nowhere to paint (`bar.
-    /// tabs` has both labels, but only `"sample.txt "` reaches `painted_
-    /// texts()` and `tab_center(&bar, 1)` is `None`), and the *same*
-    /// fixture at `1600×480` paints both.
+    /// # Why 800x480, and why this fails against unfixed `develop`
     ///
-    /// Review round 2 confirmed there is no vimcode-side fix available for
-    /// the `800×480` case: `ShellConfig`/`AppShell` (checked against the
-    /// pinned quadraui rev, `src/shell.rs` + `src/compose/app_shell.rs`)
-    /// expose `activity_bar_width_px`/`with_activity_bar_width_px` — a
-    /// fixed-pixel override independent of `line_height` — for the
-    /// activity bar, but **no pixel-valued equivalent for the sidebar**;
-    /// `default_sidebar_width`/`set_sidebar_width` are *only* ever
-    /// interpreted as a line-height multiple
-    /// (`AppShell::compute_layout`), on every backend, with no override
-    /// knob. Converting the persisted, pixel-valued `Session::
-    /// sidebar_width` into that multiple from `App::shell_config()` would
-    /// require a *final* `line_height`/`char_width` reading at
-    /// config-build time, but `shell_config()` runs before the runner ever
-    /// calls `Backend::set_editor_font` (see `#947`'s comment on
-    /// `with_editor_font` a few lines above this fn) — at that point
-    /// `Backend::line_height()` still answers for the backend's *own*
-    /// built-in fallback font, not the resolved editor font, so any
-    /// px→multiple conversion done here would be computed against the
-    /// wrong metrics and could easily trade this bug for a subtler one.
-    /// Landing a real fix therefore needs a new quadraui knob (a
-    /// `default_sidebar_width_px`/`with_default_sidebar_width_px` mirroring
-    /// `activity_bar_width_px`) — filed upstream first, per `CLAUDE.md`'s
-    /// quadraui-first rule, before any vimcode-side change lands. `1600` is
-    /// used below so this test isolates the double-click dispatch path
-    /// (which **is** fully covered and fixed-path-verified, see the
-    /// RED-verification paragraph below) from that still-open
-    /// sidebar-width question; the `800×480` reproduction itself is not
-    /// fixed and not covered by a passing test here (see this PR's
-    /// `ISSUE_RESOLUTION` for the tracking status).
+    /// 800x480 is the evidence screenshot's own size, and the dispatch path
+    /// above was never the defect — the engine always opened a second tab.
+    /// The tab had nowhere to *paint*. `App::shell_config` left
+    /// `ShellConfig::default_sidebar_width` at quadraui's generic `20.0`,
+    /// which `AppShell::compute_layout` multiplies by `line_height` on
+    /// *every* backend: 20 terminal rows on TUI, but ~460 device pixels on a
+    /// GUI one. Beside the 48px activity bar that left ~290px of an 800px
+    /// window for the editor and its tab bar — room for exactly one tab.
+    /// Hence the report: breadcrumb, content and status bar all followed the
+    /// new buffer, but the tab strip kept reading only `sample.txt x`.
     ///
-    /// Reads painted labels back via `find_bounds` on `"sample.txt "` /
-    /// `"main.rs "` — **with** the trailing space `TabInfo::name`'s doc
-    /// documents (`name + " "`, so the close glyph doesn't paint flush
-    /// against the label) — rather than a bare `screen_contains`/`find`.
-    /// Review round 1 found a bare `"sample.txt"`/`"main.rs"` needle is
-    /// satisfied regardless by the Explorer sidebar row, the breadcrumb
-    /// segment, and the window-title path segments this same frame also
-    /// paints — none of which carry that trailing space (confirmed via
-    /// `painted_texts()`: `"main.rs"` with no trailing space appears
-    /// repeatedly, `"main.rs "` with one does not, until the tab actually
-    /// paints). `tab_center(&bar, 1)` being `Some` additionally proves the
-    /// backend's own `draw_tab_bar_icons_layout` call actually cached a
-    /// second tab slot, not just that `bar.tabs` (the pre-paint primitive)
-    /// has two entries.
+    /// The fix makes that one number per-*unit* rather than per-backend, via
+    /// `render::UnitProfile::sidebar_width_lh` (`ALT_SIDEBAR_WIDTH_MIN`'s 15
+    /// ≈ 345px on a GUI, in the same range as `Session::sidebar_width`'s
+    /// persisted 260 default and VS Code's ~300px; 20 cells on TUI, i.e.
+    /// unchanged). See that field's doc for why it stops at the shared Alt
+    /// rung's floor rather than going narrower.
     ///
-    /// RED-verified the same way as the TUI twin
-    /// (`tui_main::app_on_tui_tests`'s `explorer_double_click_opens_second_
-    /// file_in_a_second_tab_1798`): temporarily swapping
-    /// `open_file_in_tab`'s new-tab branch for an in-place
-    /// `window.buffer_id = buffer_id` assignment makes every assertion
-    /// below fail (tab count drops to 1, `"main.rs "` never appears, and
-    /// `tab_center(&bar, 1)` stays `None`); restored before committing.
-    /// Against unmodified `develop` both this test and its TUI twin pass —
-    /// see this PR's description: the shared dispatch path both exercise is
-    /// identical to the one the real Win-GUI backend uses (confirmed by
-    /// reading `quadraui`'s `src/win/events.rs`/`backend.rs`: no
-    /// `CS_DBLCLKS`/`WM_LBUTTONDBLCLK` handling, so Windows delivers two
-    /// plain `WM_LBUTTONDOWN`s folded by the same `DoubleClickDetector`
-    /// every backend shares), so this investigation could not localise a
-    /// vimcode-side defect to point a fix at.
+    /// RED-verified: restoring the px profile's `sidebar_width_lh` to `20.0`
+    /// makes the `tab_center(&bar, 1)` assertion below fail at this window
+    /// size — the second tab's hit region is never cached because the tab
+    /// never paints — while the whole rest of the suite, the TUI twin
+    /// included, stays green.
+    ///
+    /// # Why the assertions are scoped to the tab bar
+    ///
+    /// A bare `screen_contains("main.rs")` is satisfied regardless by the
+    /// Explorer sidebar row, the breadcrumb segment and the window-title
+    /// path segments this same frame also paints — so it would pass even
+    /// under the reported bug. Two things keep these assertions honest:
+    ///
+    /// * the needle carries the trailing space `TabInfo::name` appends
+    ///   (`name + " "`, so the close glyph doesn't sit flush against the
+    ///   label) — breadcrumb and status-bar text is painted one run *per
+    ///   segment*, so those runs are bare `"main.rs"` with no trailing
+    ///   space and cannot match;
+    /// * [`painted_label_is_in_tab_slot`] then checks the matched run's
+    ///   pixel rect actually lands inside that tab's own slot on the bar,
+    ///   derived from the `TabBarLayout` the rasteriser cached while
+    ///   painting. That is what makes the check robust to a *future*
+    ///   painted run of the form `"main.rs > main"` (a breadcrumb joined
+    ///   before paint), which would contain the needle but sit on a
+    ///   different row.
     #[test]
     fn explorer_double_click_opens_second_file_in_a_second_tab_1798() {
         let dir = std::env::temp_dir().join(format!(
@@ -4489,12 +4518,12 @@ mod tests {
         // `session.explorer_visible` alone drives the painted sidebar.
         engine.session.explorer_visible = true;
 
-        let mut h = harness(engine, 1600, 480);
+        let mut h = harness(engine, 800, 480);
         h.driver.render();
 
         // Scoped to `"sample.txt "` (with the tab-bar-only trailing space
         // `TabInfo::name` appends) rather than a bare `screen_contains`,
-        // same reasoning as the main assertions below (review round 1): a
+        // same reasoning as the main assertions below (#1798 review): a
         // bare `screen_contains("sample.txt")` is also satisfied by the
         // Explorer sidebar row, so it would pass even if the tab itself
         // never painted.
@@ -4530,13 +4559,30 @@ mod tests {
              pre-paint `TabBar` primitive"
         );
         assert!(
-            h.driver.find_bounds("sample.txt ").is_some()
-                && h.driver.find_bounds("main.rs ").is_some(),
+            painted_label_is_in_tab_slot(&mut h, &bar, 0, "sample.txt ")
+                && painted_label_is_in_tab_slot(&mut h, &bar, 1, "main.rs "),
             "both the originally-open sample.txt tab and the newly \
-             double-clicked main.rs tab must have their own label (with \
-             its tab-bar-only trailing space) painted — not just the \
-             sidebar row or breadcrumb segment painting the same filename \
-             elsewhere on screen; painted texts: {:?}",
+             double-clicked main.rs tab must have their own label painted \
+             inside their own slot on the editor tab bar — not just the \
+             sidebar row, breadcrumb segment or window title painting the \
+             same filename elsewhere on screen; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Negative control: the assertion above has teeth only if
+        // `painted_label_is_in_tab_slot` can actually *reject* a run. Drop
+        // the trailing space and `find_bounds` matches the explorer tree row
+        // first — same needle, same frame, same already-correct tab bar — and
+        // the geometric check must say no. Without this, a future change that
+        // made the helper trivially true (or a `find_bounds` that started
+        // matching a joined `"main.rs > main"` breadcrumb run) would silently
+        // re-vacuate the assertion above rather than fail here.
+        assert!(
+            !painted_label_is_in_tab_slot(&mut h, &bar, 1, "main.rs"),
+            "the tab-slot scoping must reject the explorer row's bare \
+             \"main.rs\" run, which `find_bounds` matches before the tab's \
+             own \"main.rs \" — otherwise the assertion above proves nothing \
+             about the tab bar; painted texts: {:?}",
             h.driver.painted_texts()
         );
 
