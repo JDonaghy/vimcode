@@ -10544,8 +10544,41 @@ mod editor_popups {
     /// coordinator triage flagged as the remaining suspects: two URLs
     /// landing on the very same line (so any per-line "stop after first
     /// match" bug in the scanner would show up), and a URL that comes after
-    /// a run of **bold** (proportional-width-ish) text, so a char-count
-    /// hit-region computed from the *wrong* preceding width would drift.
+    /// a run of **bold** text, so a char-count hit-region computed from the
+    /// *wrong* preceding width would drift.
+    ///
+    /// Clicks are aimed at the *painted* link-coloured pixels — located by
+    /// scanning for `theme.md_link`-coloured columns inside the popup
+    /// line's own painted bounds — not at the centre of the registered
+    /// hit rect read straight out of `editor_hover_link_rects`. Clicking
+    /// the registered rect's own centre would be tautologically green no
+    /// matter how far that rect has drifted from where GTK's Pango layout
+    /// actually painted the glyphs, and that drift was the remaining #504
+    /// GTK suspect this test exists to catch: `editor_hover_popup_paint`
+    /// (`src/render.rs`) used to derive the link hit region from a
+    /// char-count estimate (`chars().count() * unit_w`) while the
+    /// rasteriser painted with real, proportional glyph widths. That
+    /// estimate has since been replaced with `Backend::measure_text`
+    /// (same fix), so this test now also pins that fix against a
+    /// regression.
+    ///
+    /// `h.driver.find_bounds`/`find` can't locate an individual URL here:
+    /// quadraui's `draw_rich_text_popup` renders a whole popup *line* as a
+    /// single `pango::Layout`/`show_layout` call — per-span colour comes
+    /// from a `pango::AttrList` inside that one call, not a separate call
+    /// per span (confirmed by reading `rich_text_popup.rs`'s draw loop) —
+    /// and `GtkDriver`'s paint-time text recording captures one run per
+    /// `show_layout` call. So `find_bounds(first_url)` resolves to the
+    /// *whole line's* bounds (it contains both URLs plus the plain text
+    /// around them), confirmed by hand while writing this test: it
+    /// returned the full-line width, and clicking its centre landed in
+    /// the plain-text gap between the two links and queued nothing.
+    /// Pixel-colour scanning is this file's own prior art for exactly
+    /// this situation (CLAUDE.md: "probe pixels when the content is icon
+    /// glyphs") and, unlike `find_bounds` here, it is driven by what the
+    /// rasteriser actually drew rather than by a logical span registered
+    /// elsewhere — so it stays independent of this test's own production
+    /// fix.
     ///
     /// Each case gets its own fresh harness/popup — a `Link` click
     /// dismisses the popup (see `apply_editor_hover_popup_route`), so
@@ -10555,50 +10588,19 @@ mod editor_popups {
     /// **RED against the bug this issue describes:** with only the first
     /// match per line registered, `second_rect` below would not exist (or
     /// would alias `first_rect`), and clicking it would queue no
-    /// `OpenUrl` at all.
+    /// `OpenUrl` at all. Reverting the `measure_text` fix in
+    /// `editor_hover_popup_paint` back to the char-count estimate also
+    /// turns this red: the second URL's painted pixels then sit outside
+    /// its (now too-narrow) registered hit rect, so `click_and_collect`
+    /// finds no `OpenUrl` in `pending_platform_actions`.
     #[test]
     fn editor_hover_popup_registers_every_bare_url_as_its_own_click_region_on_gtk() {
-        let markdown = "**Bold504** then https://example.com/first504 and \
-             https://example.com/second504 end504";
-
-        // Two separate harnesses so each click lands on an untouched popup.
-        let click_and_collect =
-            |url_to_click: &str| -> Vec<crate::core::engine::PendingPlatformAction> {
-                let mut engine = small_engine();
-                engine.show_editor_hover(
-                    1,
-                    4,
-                    markdown,
-                    crate::core::engine::EditorHoverSource::Lsp,
-                    false,
-                    false,
-                );
-                let mut h = harness(engine, 1400, 900);
-                h.driver.render();
-
-                let link_rects = h.editor_hover_link_rects.borrow().clone();
-                let (rect, uri) = link_rects
-                    .iter()
-                    .find(|(_, uri)| uri == url_to_click)
-                    .unwrap_or_else(|| {
-                        panic!("expected a click region for {url_to_click}; got {link_rects:?}")
-                    });
-                assert_eq!(uri, url_to_click);
-
-                let (cx, cy) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-                h.driver.click(cx, cy);
-                h.driver.render();
-
-                let actions = h.engine.borrow().pending_platform_actions.clone();
-                actions
-            };
-
+        let markdown =
+            "**Bold504** then https://example.com/first504 and https://example.com/second504 end504";
         let first_url = "https://example.com/first504";
         let second_url = "https://example.com/second504";
 
-        // Sanity: both URLs must have painted as *distinct* (non-aliased)
-        // rects before either is clicked.
-        {
+        fn fresh_popup(markdown: &str) -> Harness<impl AppLogic> {
             let mut engine = small_engine();
             engine.show_editor_hover(
                 1,
@@ -10610,6 +10612,88 @@ mod editor_popups {
             );
             let mut h = harness(engine, 1400, 900);
             h.driver.render();
+            h
+        }
+
+        /// True if `px` is close enough to `target` to count as "painted
+        /// in that colour" — glyph edges anti-alias towards the
+        /// background, so only pixels deep inside a stroke match exactly;
+        /// ±24 per channel is generous enough to still catch those while
+        /// staying well clear of this popup's `hover_fg`/`hover_bg` (the
+        /// two colours a link pixel could otherwise be mistaken for).
+        fn color_near((r, g, b): (u8, u8, u8), target: (u8, u8, u8)) -> bool {
+            let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 24;
+            near(r, target.0) && near(g, target.1) && near(b, target.2)
+        }
+
+        /// Contiguous x-ranges, within `line_bounds`, of columns that
+        /// contain at least one `target`-coloured pixel somewhere in the
+        /// line's vertical extent. One range per run of link-coloured
+        /// glyphs — i.e. one per bare URL, since the plain text around
+        /// each link (several glyphs *and a 5-character " and "* wide)
+        /// never matches `target` and so always breaks the run. A
+        /// same-link gap between two adjacent glyphs' own ink (the hole
+        /// inside an "o", the gap either side of a thin "l"/"i" stroke,
+        /// kerning — not whitespace) measured by hand against this
+        /// fixture's actual chrome font tops out under 10px, so
+        /// `GAP_TOLERANCE` bridges those while staying well under the
+        /// 40+px a single plain-text word between two links leaves.
+        fn link_colored_x_spans<A: AppLogic>(
+            h: &mut Harness<A>,
+            line_bounds: quadraui::Rect,
+            target: (u8, u8, u8),
+        ) -> Vec<(f32, f32)> {
+            const GAP_TOLERANCE: i32 = 20;
+            let x0 = line_bounds.x.floor() as i32;
+            let x1 = (line_bounds.x + line_bounds.width).ceil() as i32;
+            let y0 = line_bounds.y.floor() as i32;
+            let y1 = (line_bounds.y + line_bounds.height).ceil() as i32;
+
+            let mut spans = Vec::new();
+            let mut run_start: Option<i32> = None;
+            let mut run_last_hit: Option<i32> = None;
+            for x in x0..x1 {
+                let hit = (y0..y1).any(|y| color_near(h.driver.pixel(x, y), target));
+                if hit {
+                    run_start.get_or_insert(x);
+                    run_last_hit = Some(x);
+                } else if let (Some(start), Some(last)) = (run_start, run_last_hit) {
+                    if x - last > GAP_TOLERANCE {
+                        spans.push((start as f32, last as f32 + 1.0));
+                        run_start = None;
+                        run_last_hit = None;
+                    }
+                }
+            }
+            if let (Some(start), Some(last)) = (run_start, run_last_hit) {
+                spans.push((start as f32, last as f32 + 1.0));
+            }
+            spans
+        }
+
+        // Sanity, checked once up front: both URLs must have painted, as
+        // *distinct* (non-aliased) registered hit rects, on the very same
+        // popup line — the #504 symptom was per-*line*, so pin both URLs
+        // there rather than letting a future fixture edit silently
+        // relocate one onto line 2 while this test keeps passing for the
+        // wrong reason. Also pins exactly two link-coloured pixel runs on
+        // that line, which the click loop below relies on to tell "first"
+        // from "second" apart.
+        let line_bounds = {
+            let mut h = fresh_popup(markdown);
+            assert!(
+                h.driver.screen_contains(first_url),
+                "the first bare URL must paint; painted texts: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                h.driver.screen_contains(second_url),
+                "the second bare URL must paint — if this fails, the \
+                 renderer stopped drawing it even though {first_url} \
+                 still did; painted texts: {:?}",
+                h.driver.painted_texts()
+            );
+
             let link_rects = h.editor_hover_link_rects.borrow().clone();
             let first_rect = link_rects
                 .iter()
@@ -10626,29 +10710,123 @@ mod editor_popups {
                 "the first and second bare URL must paint distinct hit \
                  regions, not alias the same rect"
             );
-        }
+            assert_eq!(
+                first_rect.y, second_rect.y,
+                "this fixture only exercises the per-line scanner bug if \
+                 both URLs land on the same popup line; got {first_rect:?} \
+                 vs {second_rect:?}"
+            );
 
-        let actions_from_first = click_and_collect(first_url);
+            let line_bounds = h
+                .driver
+                .find_bounds(first_url)
+                .expect("the popup line containing both URLs must paint");
+            let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+            let md_link = (theme.md_link.r, theme.md_link.g, theme.md_link.b);
+            let spans = link_colored_x_spans(&mut h, line_bounds, md_link);
+            assert_eq!(
+                spans.len(),
+                2,
+                "expected exactly two link-coloured pixel runs on the \
+                 popup line (one per bare URL); got {spans:?} within \
+                 {line_bounds:?}"
+            );
+
+            // The direct geometric check #504's drift is about: the
+            // *registered* hit rect for each URL must track where its
+            // glyphs were *actually painted* (the pixel-coloured span),
+            // not just "close enough that a click happens to land in the
+            // overlap by luck". Caught the char-count-estimate bug this
+            // test guards against with a wide margin while writing it:
+            // reverting `editor_hover_popup_paint` to the old
+            // `chars().count() * unit_w` estimate put the second URL's
+            // registered rect ~120px right of its real span (992 vs a
+            // real span starting at 870) — one order of magnitude past
+            // this ±10px tolerance — while leaving the *click-routing*
+            // assertions below passing, because the oversized registered
+            // rect still happened to overlap the real click point. A
+            // tight bound here is what actually rejects that drift.
+            const EDGE_TOLERANCE: f32 = 10.0;
+            let assert_rect_tracks_span =
+                |label: &str, rect: quadraui::Rect, (sx0, sx1): (f32, f32)| {
+                    assert!(
+                        (rect.x - sx0).abs() <= EDGE_TOLERANCE
+                            && (rect.x + rect.width - sx1).abs() <= EDGE_TOLERANCE,
+                        "{label}'s registered hit rect {rect:?} must track \
+                         its actually-painted pixel span ({sx0}, {sx1}) \
+                         within {EDGE_TOLERANCE}px"
+                    );
+                };
+            assert_rect_tracks_span("the first bare URL", first_rect, spans[0]);
+            assert_rect_tracks_span("the second bare URL", second_rect, spans[1]);
+
+            line_bounds
+        };
+
+        // Click the *painted* link-coloured pixels for each URL in turn,
+        // in its own fresh popup, and confirm each queues its own
+        // `OpenUrl`. Re-locates the spans every time (a fresh popup is a
+        // fresh paint) rather than reusing the sanity block's own
+        // harness — only `span_idx` (first span ⇒ first URL, second span
+        // ⇒ second URL, since the markdown places them in that
+        // left-to-right order) carries over.
+        let click_and_collect = |url_to_click: &str,
+                                 span_idx: usize|
+         -> Vec<crate::core::engine::PendingPlatformAction> {
+            let mut h = fresh_popup(markdown);
+
+            // Precondition: a hit region really was registered for this
+            // URL (distinct from whether the click below lands on it —
+            // that's the drift this test is about).
+            let link_rects = h.editor_hover_link_rects.borrow().clone();
+            assert!(
+                link_rects.iter().any(|(_, uri)| uri == url_to_click),
+                "expected a click region for {url_to_click}; got {link_rects:?}"
+            );
+
+            let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+            let md_link = (theme.md_link.r, theme.md_link.g, theme.md_link.b);
+            let spans = link_colored_x_spans(&mut h, line_bounds, md_link);
+            let (sx0, sx1) = *spans.get(span_idx).unwrap_or_else(|| {
+                panic!(
+                    "expected a link-coloured pixel run at index {span_idx} \
+                     for {url_to_click}; got {spans:?}"
+                )
+            });
+            let (cx, cy) = ((sx0 + sx1) / 2.0, line_bounds.y + line_bounds.height / 2.0);
+            h.driver.click(cx, cy);
+            h.driver.render();
+
+            // Not a redundant binding: as a bare tail expression this
+            // fails to compile (E0597) — the `Ref` guard `.borrow()`
+            // returns is part of the tail-expression's temporary scope,
+            // which isn't dropped until after `h` itself is dropped at
+            // the closing brace; naming the clone forces the `Ref` to
+            // drop first.
+            let actions = h.engine.borrow().pending_platform_actions.clone();
+            actions
+        };
+
+        let actions_from_first = click_and_collect(first_url, 0);
         assert!(
-            actions_from_first
-                .iter()
-                .any(|a| matches!(
-                    a,
-                    crate::core::engine::PendingPlatformAction::OpenUrl(u) if u == first_url
-                )),
-            "clicking the first bare URL's rect must queue OpenUrl({first_url}); got {actions_from_first:?}"
+            actions_from_first.iter().any(|a| matches!(
+                a,
+                crate::core::engine::PendingPlatformAction::OpenUrl(u) if u == first_url
+            )),
+            "clicking the first bare URL's painted location must queue \
+             OpenUrl({first_url}); got {actions_from_first:?}"
         );
 
-        let actions_from_second = click_and_collect(second_url);
+        let actions_from_second = click_and_collect(second_url, 1);
         assert!(
             actions_from_second.iter().any(|a| matches!(
                 a,
                 crate::core::engine::PendingPlatformAction::OpenUrl(u) if u == second_url
             )),
-            "clicking the second bare URL's rect must queue OpenUrl({second_url}) — \
-             this is the #504 regression: only the first bare URL was \
-             clickable, the rest painted in link color but did nothing; \
-             got {actions_from_second:?}"
+            "clicking the second bare URL's painted location must queue \
+             OpenUrl({second_url}) — this is the #504 regression: only the \
+             first bare URL was clickable, the rest painted in link color but \
+             did nothing; got {actions_from_second:?}"
         );
     }
 }

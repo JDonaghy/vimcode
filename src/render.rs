@@ -1616,6 +1616,16 @@ pub fn editor_hover_popup_paint(
         .max(10.0 * unit_w)
         .min((viewport.width - 4.0 * unit_w).max(10.0 * unit_w));
     let measure = quadraui::RichTextPopupMeasure::new(content_w, unit_h);
+    // #504: this used to be a char-count estimate (`chars().count() as f32
+    // * unit_w`) — fine on TUI's fixed-width grid, but on a proportional
+    // GTK font it drifts further from the real painted glyph position with
+    // every preceding span, so a later link on the same line could end up
+    // with a hit region nowhere near where it was actually drawn.
+    // `quadraui::Backend::measure_text` already exists for exactly this
+    // (D-014: real shaped advance on GUI backends, the same cell-count
+    // this closure used to compute by hand on TUI) — route through it
+    // instead of re-deriving the estimate here, so the hit region tracks
+    // the same font the rasteriser paints with.
     let layout = popup.layout(
         popup_x,
         popup_y,
@@ -1626,12 +1636,10 @@ pub fn editor_hover_popup_paint(
                 .line_text
                 .get(line_idx)
                 .map(|t| {
-                    t[start_byte.min(t.len())..end_byte.min(t.len())]
-                        .chars()
-                        .count() as f32
+                    let slice = &t[start_byte.min(t.len())..end_byte.min(t.len())];
+                    backend.measure_text(slice, quadraui::FontRole::Chrome).0
                 })
                 .unwrap_or(0.0)
-                * unit_w
         },
     );
 
