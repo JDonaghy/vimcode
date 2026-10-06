@@ -2092,6 +2092,101 @@ mod tests {
             assert!(driver.screen_has("Close"), "{screen}");
         }
 
+        /// #636: a plugin extension panel's own `?`-triggered keybindings
+        /// help popup must render with a full 4-sided border and the
+        /// title ("Keybindings") embedded in the top border — the same
+        /// shape [`sc_panel_help_dialog_renders_keybindings_table`] (just
+        /// above) pins for the Source Control panel's own help dialog.
+        /// #635 (item C) downgraded this popup to `Backend::draw_tooltip`,
+        /// which at the time could only paint side-bars-only chrome with
+        /// no title (JDonaghy/quadraui#541). The 2026-10-05 triage update
+        /// found the regression had since gotten worse: nothing painted
+        /// the popup at all, because `ExtPanelData.help_open`/
+        /// `help_bindings` were populated but never read by either
+        /// backend. The fix (`render::ext_panel_help_tooltip_layout` +
+        /// `Backend::draw_tooltip_with_chrome`) uses quadraui#541's own
+        /// landed `TooltipChrome` (`TooltipBorder::Full` + a title) — see
+        /// that function's doc for why this is the real fix, not a
+        /// stand-in. Drives the real `?` keypress (the issue's own repro
+        /// step) through a registered `git-insights` ext panel activated
+        /// via the real `render::apply_activity_panel_switch` path (the
+        /// same one a real activity-bar click takes), not a hand-set
+        /// `ext_panel_help_open = true` — so this test can only pass if
+        /// the whole chain (keypress → `Engine::ext_panel_help_bindings`
+        /// lookup → paint) is wired up.
+        #[test]
+        fn ext_panel_help_popup_renders_full_border_and_title() {
+            let mut engine = plain_engine();
+            engine.ext_panels.insert(
+                "git-insights".to_string(),
+                crate::core::plugin::PanelRegistration {
+                    name: "git-insights".to_string(),
+                    title: "Git Insights".to_string(),
+                    icon: '\u{f113}',
+                    fallback_icon: Some('X'),
+                    sections: vec!["Log".to_string()],
+                },
+            );
+            engine.ext_panel_help_bindings.insert(
+                "git-insights".to_string(),
+                vec![
+                    ("j/k".to_string(), "Navigate commits".to_string()),
+                    ("q/Esc".to_string(), "Close panel".to_string()),
+                ],
+            );
+            crate::render::apply_activity_panel_switch(&mut engine, "ext:git-insights");
+
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::ext_panel_help_popup_renders_full_border_and_title",
+                || {
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('?'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+                    let screen = driver.screen();
+                    assert!(
+                        screen.contains("Keybindings"),
+                        "help popup must render its title; screen:\n{screen}"
+                    );
+                    // "Naviga[te commits]": the narrow sidebar column budget
+                    // truncates the Action column, same as
+                    // `sc_panel_help_dialog_renders_keybindings_table` observes
+                    // for the Source Control dialog's own "Naviga[te]" text.
+                    assert!(
+                        screen.contains("Naviga"),
+                        "help popup must render the panel's own registered \
+                     bindings, not the Source Control ones; screen:\n{screen}"
+                    );
+
+                    // The regression (#636) downgraded this popup to side-bars
+                    // only ('│' on the first/last column, no top/bottom rule and
+                    // no border-embedded title) — assert the actual box-drawing
+                    // glyphs a full 4-sided `TooltipBorder::Full` chrome paints
+                    // (top-left/top-right square corners joined by a '─' rule),
+                    // not just that *some* text rendered. A tooltip-only
+                    // regression would fail these two lines while still passing
+                    // the two above.
+                    assert!(
+                        screen.contains('┌') && screen.contains('┐'),
+                        "help popup must paint square top corners (full \
+                     border, not side-bars-only); screen:\n{screen}"
+                    );
+                    let has_top_rule = screen
+                        .lines()
+                        .any(|line| line.contains('┌') && line.contains('─') && line.contains('┐'));
+                    assert!(
+                        has_top_rule,
+                        "help popup's top border must be a continuous rule \
+                     between its corners, not a bare side-bar; screen:\n{screen}"
+                    );
+                },
+            );
+        }
+
         /// Ports `panels.rs::sc_panel_tests::renders_without_panicking_at_
         /// minimum_size` onto `App`: a regression guard that the migrated
         /// `TextInput`/`Palette`/`Dialog` primitives degrade gracefully
