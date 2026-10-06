@@ -20,6 +20,13 @@
 # carrying `{"lsp_enabled": false, "use_nerd_fonts": false}` — same
 # determinism precondition as `tests/smoke-spec/tui.yaml`.
 #
+# vimcode#1795: manually reproducing a settings.json/startup report against
+# this lane over WSL interop? See `docs/PLATFORM_CONFORMANCE.md`'s
+# "WSL-interop env-var gotcha" section first — an env var prefixed on a WSL
+# shell's command line (`VAR=... ./vcd.exe`) silently fails to propagate
+# into the launched Windows process. Use a PowerShell `$env:VAR = '...'`
+# session instead (what every "CONFIRMED" run below actually did).
+#
 # Pixel coordinates: derived by assuming Windows Terminal's default profile
 # (Cascadia Mono, ~9px cell width x ~19px cell height) and a ~40px top band
 # (tab bar + title), i.e. `x = 8 + col * 9`, `y = 40 + row * 19` for a cell
