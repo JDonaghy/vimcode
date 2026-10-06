@@ -4000,6 +4000,13 @@ const CASES_OP: &[Case] = &[
     c("op:ddp last line", &["a", "b", "c"], 3, 1, "ddp"),
     c("op:dd last line cursor", &["  a", "  b", "  c"], 3, 1, "dd"),
     c("op:dd only line", &["abc"], 1, 1, "dd"),
+    // #1796: every other `op:dd` case above starts at column 1, which can't
+    // distinguish "reset cursor to column 0" from "preserve column, clamped"
+    // -- the degeneracy that produced the false bug report. This one starts
+    // at column 3 so the two behaviours disagree; verified against real
+    // `nvim --headless` 0.12.5: buffer becomes "aaa"/"ccc", cursor (2,2)
+    // 0-indexed (column preserved, not reset).
+    c("op:dd nonzero col 1796", &["aaa", "bbb", "ccc"], 2, 3, "dd"),
     c("op:3dd more than lines", &["a", "b"], 1, 1, "3dd"),
     c("op:5dd from last line", &["a", "b", "c"], 3, 1, "5dd"),
     c("op:D on empty", &["", "a"], 1, 1, "D"),

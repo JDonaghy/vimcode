@@ -3322,9 +3322,14 @@ impl Engine {
         if self.view().cursor.line >= new_num_lines && new_num_lines > 0 {
             self.view_mut().cursor.line = new_num_lines - 1;
         }
-        // Vim leaves the cursor on the same column it was on (clamped to the
-        // resulting line's length) — it does NOT reset to column 0 or to the
-        // first non-blank character.
+        // Neovim (this project's documented oracle, `reference: nvim` in
+        // tests/smoke-spec/catalogue.yaml) leaves the cursor on the same
+        // column it was on (clamped to the resulting line's length) — it
+        // does NOT reset to column 0 or to the first non-blank character.
+        // This is Neovim-specific: real Vim 9.1 *does* reset to column 0
+        // here (`'startofline'` defaults on in Vim, off in Neovim — see
+        // #1796 and `test_nvim_dd_preserves_column_not_reset_to_zero_1796`
+        // in src/core/engine/tests.rs for the oracle verification of both).
         self.clamp_cursor_col();
     }
 

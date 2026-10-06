@@ -322,6 +322,64 @@ mod tests {
             );
         }
 
+        /// #1796 ("[bugbash:win-native] dd leaves cursor at the previous
+        /// column instead of column 0 of the line that moves up"): the
+        /// reported symptom was never an engine field — it was the
+        /// *painted* status bar, per the issue's own screenshot evidence
+        /// (`/tmp/j_dd.png`). `test_nvim_dd_preserves_column_not_reset_to_
+        /// zero_1796` in `src/core/engine/tests.rs` pins the engine-state
+        /// half (`view().cursor.{line,col}`); this test pins the rendered
+        /// half so a bug that kept the engine's column right but painted
+        /// the status bar wrong would still fail here.
+        ///
+        /// Repro, matching the issue exactly: type `aaa`, Enter, `bbb`,
+        /// Enter, `ccc`, Escape (cursor now on "ccc", col 2 one-back from
+        /// insert), `k` up onto "bbb"'s last column (col 2, clamped same as
+        /// "ccc"'s length), then `dd`. Oracle-verified against real `nvim
+        /// --headless` 0.12.5 (see the engine test and `tests/nvim_
+        /// conformance.rs`'s "op:dd nonzero col 1796" case): the resulting
+        /// buffer is `aaa`/`ccc` with the cursor on column 3 (1-indexed) of
+        /// line 2 — i.e. the status bar must paint `Ln 2, Col 3`, not
+        /// `Ln 2, Col 1`.
+        ///
+        /// 200-column harness, not this module's usual 80 (see the comment
+        /// on `alt_left_navigates_the_jump_list_in_vscode_mode_via_shell_app`
+        /// above): at 80 columns the status bar's priority-drop sheds the
+        /// "Ln N, Col N" segment before the rightmost ones, so this would
+        /// pass vacuously (the string never painted at all) rather than on
+        /// the actual column value.
+        #[test]
+        fn dd_preserves_painted_status_bar_column_1796() {
+            let engine = plain_engine();
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 200, 24);
+            collapse_sidebar(&mut h.driver);
+            let driver = &mut h.driver;
+
+            driver.type_char('i');
+            for c in "aaa".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            for c in "bbb".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            for c in "ccc".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Escape);
+            driver.type_char('k');
+            driver.type_char('d');
+            driver.type_char('d');
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("Ln 2, Col 3"),
+                "dd must preserve the painted column (clamped), not reset \
+                 it to 1 -- see #1796; screen:\n{screen}"
+            );
+        }
+
         /// #1779 (bugbash:tui-pty:linux): pressing `o` on a buffer whose
         /// last line becomes the buffer's new last line must still paint
         /// *every* line of the result, each in its own row, in order — the
