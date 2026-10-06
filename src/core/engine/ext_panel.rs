@@ -1919,11 +1919,19 @@ impl Engine {
                 } else {
                     &m.display_name
                 };
+                // #1807: an extension whose `requires_vimcode` constraint
+                // isn't met by the running vimcode shows that reason
+                // inline, so it reads as incompatible before the user
+                // ever tries (and is refused) an install.
+                let label = match m.incompatibility_reason(env!("CARGO_PKG_VERSION")) {
+                    Some(reason) => format!("\u{25cb} {display} — {reason}"),
+                    None => format!("\u{25cb} {display}"),
+                };
                 TreeRow {
                     path: vec![i as u16],
                     indent: 0,
                     icon: None,
-                    text: StyledText::plain(format!("\u{25cb} {}", display)),
+                    text: StyledText::plain(label),
                     badge: None,
                     is_expanded: None,
                     decoration: Decoration::Normal,

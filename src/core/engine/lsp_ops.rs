@@ -444,6 +444,17 @@ impl Engine {
         };
         let ext_name = manifest.name.clone();
 
+        // #1807: refuse to install an extension whose `requires_vimcode`
+        // constraint isn't met by the running vimcode — with a clear
+        // message, rather than a silent no-op or an install that leaves
+        // scripts erroring at load time on a `vimcode.*` API this version
+        // doesn't have yet.
+        if let Some(reason) = manifest.incompatibility_reason(env!("CARGO_PKG_VERSION")) {
+            let display = manifest.display_or_name();
+            self.message = format!("Cannot install '{display}' — {reason}");
+            return;
+        }
+
         // Download scripts from the registry (skip files already on disk for local dev)
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
@@ -2305,5 +2316,63 @@ mod tests {
     fn explicit_fetch_always_requests_a_redraw_regardless_of_panel_state() {
         assert!(poll_with(false, false));
         assert!(poll_with(false, true));
+    }
+
+    /// #1807: `ext_install_from_registry` must refuse an extension whose
+    /// `requires_vimcode` constraint isn't met by the running vimcode —
+    /// engine-internal-state half of the acceptance bar; the driver-tier
+    /// black-box twin (asserting on `driver.screen()`) is
+    /// `tui_main::app_on_tui_tests::tests::issue_1807_requires_vimcode_gates_install::
+    /// far_future_requires_vimcode_blocks_install_with_clear_message`.
+    #[test]
+    fn install_refused_when_requires_vimcode_is_unmet() {
+        use crate::core::extensions::ExtensionManifest;
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1807-future-ext";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1807 Future Extension".to_string(),
+            requires_vimcode: Some(">=9999.0.0".to_string()),
+            scripts: vec!["init.lua".to_string()],
+            ..Default::default()
+        }]);
+
+        e.ext_install_from_registry(ext_name);
+
+        assert!(
+            e.message.contains("Cannot install") && e.message.contains("requires vimcode"),
+            "got: {}",
+            e.message
+        );
+        assert!(
+            !e.extension_state.is_installed(ext_name),
+            "a refused install must never mark the extension installed"
+        );
+    }
+
+    /// #1807: absent `requires_vimcode` (the pre-#1807 default) must never
+    /// trip the new gate — the "If the field is missing, behave as today"
+    /// acceptance criterion.
+    #[test]
+    fn install_not_refused_when_requires_vimcode_is_absent() {
+        use crate::core::extensions::ExtensionManifest;
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1807-legacy-ext";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1807 Legacy Extension".to_string(),
+            ..Default::default()
+        }]);
+
+        e.ext_install_from_registry(ext_name);
+
+        assert!(
+            !e.message.contains("Cannot install"),
+            "an extension with no requires_vimcode field must never be \
+             refused by the new gate; got: {}",
+            e.message
+        );
     }
 }

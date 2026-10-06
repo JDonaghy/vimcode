@@ -11688,6 +11688,191 @@ mod tests {
         }
     }
 
+    /// #1807: an extension manifest's `requires_vimcode` semver requirement
+    /// must be surfaced in the Extensions panel (so an incompatible
+    /// extension reads as incompatible before the user tries to install
+    /// it) and must block the install itself — the registry-fetch half of
+    /// the acceptance bar ("a far-future version shows as incompatible...
+    /// and its script does not run").
+    mod issue_1807_requires_vimcode_gates_install {
+        use super::*;
+
+        /// A manifest requiring a vimcode version far beyond anything this
+        /// binary will ever report (`env!("CARGO_PKG_VERSION")`), with one
+        /// bundled script — so "its script does not run" is checkable by
+        /// asserting the script never lands on disk.
+        fn harness_with_far_future_requirement(
+            unique: &str,
+        ) -> (
+            crate::harness::ConformanceHarness<
+                quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            >,
+            String,
+        ) {
+            use crate::core::extensions::ExtensionManifest;
+
+            let mut engine = crate::core::Engine::new_for_test();
+            let ext_name = format!("vc-tui-1807-future-{unique}");
+            engine.ext_registry = Some(vec![ExtensionManifest {
+                name: ext_name.clone(),
+                display_name: format!("1807 Future Extension {unique}"),
+                requires_vimcode: Some(">=9999.0.0".to_string()),
+                scripts: vec!["init.lua".to_string()],
+                registry_base_url: "https://example.invalid/never-fetched".to_string(),
+                ..Default::default()
+            }]);
+
+            // Wide terminal + the real `Alt+Right` "resize sidebar" gesture
+            // (`render::alt_resized_sidebar_width`), same pattern used
+            // elsewhere in this module (e.g. the AI panel's "model: ..."
+            // header) for a panel whose body text is wider than the
+            // default ~20-cell sidebar: at the default width the row
+            // truncates ("1807 Future Exte") before the incompatibility
+            // reason ever reaches the screen.
+            let h = crate::tui_main::testing::conformance_harness(engine, 220, 24);
+            (h, ext_name)
+        }
+
+        /// Opening the Extensions panel must paint the incompatibility
+        /// reason (`"requires vimcode"` and the declared bound) inline
+        /// next to the extension's name, in the "available" section —
+        /// readable as incompatible without ever attempting an install.
+        ///
+        /// RED-verified by hand: with the `incompatibility_reason` call in
+        /// `ext_panel.rs::populate_ext_sidebar_system`'s `available_rows`
+        /// map temporarily reverted to the pre-#1807 plain
+        /// `format!("\u{25cb} {display}")`, this test's `screen_contains`
+        /// assertion fails (the row paints only the display name, no
+        /// "requires vimcode" text, no "9999.0.0") — confirming the test
+        /// can fail against the unfixed behavior, not just pass trivially.
+        #[test]
+        fn far_future_requires_vimcode_shows_as_incompatible_in_extensions_panel() {
+            let (mut h, _ext_name) = harness_with_far_future_requirement("panel");
+
+            // `show_panel` + `explorer_visible`, not `focus_sidebar_panel`:
+            // the latter also sets `ext_sidebar_has_focus`, which routes
+            // every subsequent key (including the Alt+Right resize chord
+            // below) through `dispatch_ext_sidebar_key_unified` instead of
+            // the shared Alt rung — same reasoning
+            // `ai_model_switch_round_trips_via_session_set_config_option_via_shell_app`
+            // above uses for the AI panel.
+            {
+                let mut engine = h.engine.borrow_mut();
+                engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                    crate::core::engine::sidebar::PANEL_EXTENSIONS,
+                ));
+                engine.session.explorer_visible = true;
+            }
+            for _ in 0..150 {
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+            h.driver.render();
+
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("requires vimcode"),
+                "an extension whose requires_vimcode constraint isn't met \
+                 must show that reason in the Extensions panel; painted:\n{screen}"
+            );
+            assert!(
+                screen.contains("9999.0.0"),
+                "the painted reason must name the required version; \
+                 painted:\n{screen}"
+            );
+        }
+
+        /// Attempting to install a `requires_vimcode`-incompatible
+        /// extension (the real `i` keybinding's engine call,
+        /// `ext_install_from_registry`) must refuse with a clear message
+        /// and must never download its bundled script — "its script does
+        /// not run" is the directly-checkable half of this acceptance
+        /// criterion, since a script that's never written to disk can
+        /// never be loaded by `plugin_init`.
+        ///
+        /// RED-verified by hand: with the `incompatibility_reason` early
+        /// return in `lsp_ops.rs::ext_install_from_registry_with_runtime_
+        /// check` temporarily removed, this test's message assertion fails
+        /// (the pre-#1807 code has no "Cannot install" message — it
+        /// proceeds straight to the download step) and, since this
+        /// fixture's `registry_base_url` points at an address with no
+        /// `scripts` directory to download from, the script-presence
+        /// assertion alone would not have caught the regression — the
+        /// message assertion is the one that does.
+        #[test]
+        fn far_future_requires_vimcode_blocks_install_with_clear_message() {
+            let (mut h, ext_name) = harness_with_far_future_requirement("install");
+
+            h.engine.borrow_mut().ext_install_from_registry(&ext_name);
+
+            let engine = h.engine.borrow();
+            assert!(
+                engine.message.contains("Cannot install")
+                    && engine.message.contains("requires vimcode"),
+                "installing an incompatible extension must set a clear \
+                 refusal message naming the requirement; message: {:?}",
+                engine.message
+            );
+            assert!(
+                !engine.extension_state.is_installed(&ext_name),
+                "a refused install must never mark the extension installed"
+            );
+            let script_path = crate::core::paths::vimcode_config_dir()
+                .join("extensions")
+                .join(&ext_name)
+                .join("init.lua");
+            assert!(
+                !script_path.exists(),
+                "a refused install must never download the extension's script \
+                 to disk — its script must never run"
+            );
+        }
+
+        /// `requires_vimcode` absent — the pre-#1807 default — must behave
+        /// exactly as today: no incompatibility text in the panel, and
+        /// install proceeds past the new gate (it may still fail further
+        /// down for unrelated reasons, e.g. no scripts to download in this
+        /// fixture, but never on a "Cannot install" message).
+        #[test]
+        fn absent_requires_vimcode_shows_no_incompatibility_and_does_not_block_install() {
+            use crate::core::extensions::ExtensionManifest;
+
+            let mut engine = crate::core::Engine::new_for_test();
+            let ext_name = "vc-tui-1807-legacy-no-constraint".to_string();
+            engine.ext_registry = Some(vec![ExtensionManifest {
+                name: ext_name.clone(),
+                display_name: "1807 Legacy Extension".to_string(),
+                ..Default::default()
+            }]);
+
+            let mut h = harness(engine);
+            h.engine
+                .borrow_mut()
+                .focus_sidebar_panel(crate::core::engine::sidebar::PANEL_EXTENSIONS);
+            h.driver.render();
+            assert!(
+                !h.driver.screen_contains("requires vimcode"),
+                "an extension with no requires_vimcode field must not show \
+                 any incompatibility text; painted:\n{}",
+                h.driver.screen()
+            );
+
+            h.engine.borrow_mut().ext_install_from_registry(&ext_name);
+            assert!(
+                !h.engine.borrow().message.contains("Cannot install"),
+                "an extension with no requires_vimcode field must never be \
+                 refused by the new gate; message: {:?}",
+                h.engine.borrow().message
+            );
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // #1507: AI panel persistent send/stop/leave hint + `<leader>ai` focus
     // toggle
