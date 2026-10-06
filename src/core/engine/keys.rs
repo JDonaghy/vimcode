@@ -10614,6 +10614,10 @@ impl Engine {
             ) {
                 self.visual_anchor = Some(cursor);
                 self.mode = Mode::Visual;
+                // Mouse selection is inclusive-end (cursor lands on the
+                // hovered cell) in both Vim and VSCode mode — this helper
+                // has no VSCode-mode variant (#1788 review).
+                self.visual_end_exclusive = false;
             }
             self.mouse_drag_active = true;
             self.mouse_drag_origin_window = Some(window_id);
@@ -10627,7 +10631,9 @@ impl Engine {
         let clamped_col = col.min(max_col);
 
         if self.mouse_drag_word_mode {
-            // Word-wise drag: snap to word boundaries
+            // Word-wise drag: snap to word boundaries. Inclusive-end, like
+            // double-click below — no VSCode-mode variant (#1788 review).
+            self.visual_end_exclusive = false;
             if let Some((orig_start, orig_end, orig_line)) = self.mouse_drag_word_origin {
                 let line_text: Vec<char> =
                     self.buffer().content.line(clamped_line).chars().collect();
@@ -10716,6 +10722,8 @@ impl Engine {
         }
 
         // Enter visual mode with anchor at word start, cursor at word end
+        // (inclusive) — no VSCode-mode variant (#1788 review).
+        self.visual_end_exclusive = false;
         self.visual_anchor = Some(Cursor {
             line: cursor_line,
             col: word_start,

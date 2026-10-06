@@ -1603,7 +1603,15 @@ impl Engine {
             self.get_visual_selection_range().map(|(start, end)| {
                 let start_char = self.buffer().line_to_char(start.line) + start.col;
                 let end_line_start = self.buffer().line_to_char(end.line);
-                let end_char = end_line_start + end.col + 1;
+                // Match `sel_text` above: the end bound follows
+                // `visual_end_exclusive`, not a hardcoded inclusive `+1`
+                // (#1788 review) — otherwise replace-in-selection ranges
+                // disagree with the text that was actually captured.
+                let end_char = if self.visual_end_exclusive {
+                    end_line_start + end.col
+                } else {
+                    end_line_start + end.col + 1
+                };
                 (start.line, end.line, start_char, end_char)
             })
         } else {

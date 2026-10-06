@@ -1716,9 +1716,14 @@ fn test_vscode_ctrl_x_cut_no_selection_cuts_current_line() {
 fn test_vscode_ctrl_v_pastes_copied_text() {
     let mut e = engine_with("hello world\n");
     vscode_mode(&mut e);
-    // Select "hell" (columns 0..4, exclusive of the cursor) and copy it.
+    // Select "hell" (columns 0..4) and copy it. This hand-builds the
+    // selection that `Shift+Right` x4 would produce, so it must also set
+    // `visual_end_exclusive` the same way `vscode_extend_selection` does
+    // (#1788 review) — otherwise the selection defaults to Vim's inclusive
+    // convention and this copies "hello" (5 chars) instead of "hell".
     e.visual_anchor = Some(Cursor { line: 0, col: 0 });
     e.mode = Mode::Visual;
+    e.visual_end_exclusive = true;
     e.view_mut().cursor = Cursor { line: 0, col: 4 };
     e.handle_key("c", Some('c'), true);
     // Clear selection, move to end of buffer, paste.

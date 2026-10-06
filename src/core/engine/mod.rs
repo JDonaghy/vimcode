@@ -2960,6 +2960,28 @@ pub struct Engine {
     // --- Visual mode state ---
     /// Visual mode anchor point (where visual selection started).
     pub visual_anchor: Option<Cursor>,
+    /// End-bound convention for the *current* selection, fixed at the moment
+    /// `visual_anchor` is set to a brand-new value (not when an existing
+    /// selection is merely extended).
+    ///
+    /// `false` (inclusive, Vim's own convention): the cursor sits *on* the
+    /// last selected character. This is every plain Vim `v`/`V`/Ctrl-V entry,
+    /// and — even in VSCode mode — mouse selection (click-drag, word-wise
+    /// drag, double-click) and word-select commands (Ctrl+D, Ctrl+Shift+L),
+    /// which all explicitly land the cursor on the last char of the word/
+    /// selection (see `vscode_ctrl_d`'s `we - 1`).
+    ///
+    /// `true` (exclusive, VSCode's keyboard-extension convention): the cursor
+    /// sits one *past* the last selected character, because the selection was
+    /// built by driving the normal insert-mode cursor (`vscode_do_move`) via
+    /// Shift+arrow/Home/End/Ctrl+A/Ctrl+L — the same movement an unmodified
+    /// arrow key would do, just with the anchor left behind.
+    ///
+    /// #1788: `is_vscode_mode()` is NOT a valid proxy for this — VSCode mode
+    /// has both conventions depending on how the selection was made, so this
+    /// must be tracked per-selection. Consumers: `get_visual_selection_text`,
+    /// `vscode_delete_selection`, `open_find_replace`'s `sel_range`.
+    pub visual_end_exclusive: bool,
     /// Set when `$` is used in visual mode — the selection extends through the
     /// end of the line (including newline), matching Vim's curswant=MAXCOL.
     /// Cleared when any other motion is used or visual mode exits.
@@ -5117,6 +5139,7 @@ impl Engine {
             marks: HashMap::new(),
             suppress_mark_line_adjust: false,
             visual_anchor: None,
+            visual_end_exclusive: false,
             visual_dollar: false,
             command_from_visual: None,
             curswant: None,

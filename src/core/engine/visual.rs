@@ -114,18 +114,21 @@ impl Engine {
                 Some((text, RegType::Linewise))
             }
             Mode::Visual => {
-                // Character mode. VSCode mode's selection cursor sits *after*
-                // the last selected character (exclusive end, matching
-                // `vscode_delete_selection`) — Vim's own Visual mode instead
-                // puts the cursor *on* the last selected character (inclusive
-                // end). Mixing the two up here under-copied by one char too
-                // few in Vim and over-copied by one char too many in VSCode
-                // mode (#1788): a 6-char Shift+Right selection of "hello "
-                // copied "hello w".
+                // Character mode. Some selections (VSCode's Shift+arrow/Ctrl+A/
+                // Ctrl+L keyboard extension) leave the cursor *after* the last
+                // selected character (exclusive end); others (plain Vim visual
+                // mode, and — even in VSCode mode — mouse selection and Ctrl+D/
+                // Ctrl+Shift+L) put the cursor *on* the last selected character
+                // (inclusive end). This is NOT a function of editor mode — see
+                // `visual_end_exclusive`'s doc comment (#1788 review). Mixing the
+                // two conventions up here under-copies by one char for inclusive
+                // selections and over-copies by one char for exclusive
+                // selections: a 6-char Shift+Right selection of "hello " used to
+                // copy "hello w".
                 let start_char = self.buffer().line_to_char(start.line) + start.col;
                 let mut end_char = self.buffer().line_to_char(end.line) + end.col;
-                if !self.is_vscode_mode() {
-                    // Vim: inclusive end — the cursor's own char is selected.
+                if !self.visual_end_exclusive {
+                    // Inclusive end — the cursor's own char is selected too.
                     end_char += 1;
                 }
 

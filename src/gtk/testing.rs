@@ -20657,8 +20657,9 @@ mod engine_key_from_ui_gtk_tests {
     /// `vscode_copy`'s `visual_anchor.is_some()` branch was never taken;
     /// `Ctrl+C` then fell to the "copy current line" branch instead, so the
     /// clipboard hook would have captured `"hello world\n"` (the whole
-    /// line), not `"hell"` (the shift-selected span) — this assertion
-    /// fails against that.
+    /// line) — not the `"hell"` this assertion actually expects post-fix
+    /// (the 4-char shift-selected span). This assertion fails against that
+    /// pre-fix behavior.
     #[test]
     fn shift_right_extends_selection_and_ctrl_c_copies_it_on_gtk() {
         let mut engine = Engine::new_for_test();
