@@ -5792,6 +5792,61 @@ impl Engine {
         self.startup_inner(file_path, false, false);
     }
 
+    /// #1797: before opening a *file* at startup (as opposed to a folder,
+    /// which [`Engine::open_folder`] already repoints `cwd`/`workspace_root`
+    /// for), adopt the file's own git repo root — or, if it isn't inside
+    /// one, its immediate parent directory — as `cwd`/`workspace_root`,
+    /// but **only** when `path` is not already reachable from the existing
+    /// `cwd` (i.e. only when the two are unrelated).
+    ///
+    /// Without this, `cwd` stays whatever the process's actual working
+    /// directory happened to be at `Engine::new()` time, which is only ever
+    /// correct by accident: a terminal launch (`cd workspace && vimcode
+    /// main.rs`) already starts the process inside the workspace, so the
+    /// accident is reliable there, but a native-GUI launch that hands over
+    /// an absolute path without first `cd`ing anywhere — a desktop shortcut
+    /// with no "Start in" folder, a file-association "Open with" launch —
+    /// leaves `cwd` pointing at some unrelated directory with no git repo
+    /// at all. Every git-backed feature keyed on `self.cwd`
+    /// (`git::find_repo_root(&self.cwd)`, chiefly `sc_refresh`'s Source
+    /// Control panel and the Explorer's git-status indicators) then queries
+    /// the wrong directory and comes back empty forever, no matter how many
+    /// times the user refreshes — exactly the #1797 bug-bash report.
+    ///
+    /// Deliberately a no-op when `path` is already under `cwd` (the
+    /// ordinary terminal-launch case above, including a file several
+    /// directories deep in the workspace): that case was already correct,
+    /// and second-guessing it by always repointing `cwd` at the file's
+    /// *immediate* parent would itself be a regression — it would narrow
+    /// the Explorer/workspace root to a subdirectory on every launch that
+    /// opens a nested file, where today it stays at the real workspace
+    /// root.
+    ///
+    /// Only mutates the in-memory `cwd`/`workspace_root` fields, not the
+    /// process's actual working directory (unlike `open_folder`, which also
+    /// calls `std::env::set_current_dir`) — this runs once at startup, and
+    /// changing the real process cwd here would be observable by any other
+    /// code (or concurrently-running test) that calls
+    /// `std::env::current_dir()` for an unrelated reason.
+    fn adopt_cwd_for_startup_file(&mut self, path: &Path) {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.cwd.join(path)
+        };
+        let absolute = absolute.canonicalize().unwrap_or(absolute);
+        let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+        if absolute.starts_with(&cwd) {
+            return;
+        }
+        let Some(parent) = absolute.parent() else {
+            return;
+        };
+        let new_cwd = git::find_repo_root(parent).unwrap_or_else(|| parent.to_path_buf());
+        self.cwd = new_cwd.clone();
+        self.workspace_root = Some(new_cwd);
+    }
+
     /// Shared body of [`Engine::startup`] and
     /// [`Engine::startup_without_session_restore`].
     ///
@@ -5813,6 +5868,7 @@ impl Engine {
             if path.is_dir() {
                 self.open_folder(path);
             } else {
+                self.adopt_cwd_for_startup_file(path);
                 let _ = self.open_file_with_mode(path, OpenMode::Permanent);
             }
         } else if restore_session {
