@@ -2115,6 +2115,102 @@ mod tests {
             let _ = h2.driver.screen();
         }
 
+        /// #1797 (bugbash:win-native): the CHANGES section must list a
+        /// modified tracked file with an 'M' badge and an untracked file
+        /// with a 'U' badge once the panel has been refreshed. The report
+        /// claimed the CHANGES list stayed completely empty after a
+        /// manual refresh in a real repo with exactly this shape (one
+        /// modified tracked file, one untracked file). This is a
+        /// `src/render.rs`/`src/core/engine/source_control.rs`
+        /// shared-engine path — not GTK- or TUI-specific — so a passing
+        /// `TuiDriver` scenario here is the Tier-1 shared conformance
+        /// scenario the issue's acceptance bar asks for; win-native shares
+        /// this exact rendering path (no `src/win/` code touches
+        /// `sc_*`/`source_control`, confirmed by grep).
+        #[test]
+        fn sc_panel_changes_section_shows_status_badges_for_modified_and_untracked_files_1797() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1797_sc_changes_badges_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let run_git = |args: &[&str]| {
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .output()
+                    .unwrap();
+            };
+            run_git(&["init"]);
+            run_git(&["config", "user.email", "t@t.com"]);
+            run_git(&["config", "user.name", "T"]);
+
+            // Tracked file, committed, then modified on disk (porcelain
+            // " M") -- the issue's own reproduction: "git status --short
+            // showing 'M main.rs'".
+            let tracked = dir.join("main.rs");
+            std::fs::write(&tracked, "fn main() {}\n").unwrap();
+            run_git(&["add", "."]);
+            run_git(&["commit", "-m", "init"]);
+            std::fs::write(&tracked, "fn main() { /* changed */ }\n").unwrap();
+
+            // Untracked file (porcelain "??") -- the issue's "extra.rs".
+            let untracked = dir.join("extra.rs");
+            std::fs::write(&untracked, "// new file\n").unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.git_branch = Some("main".to_string());
+            engine.sc_has_focus = true;
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_GIT,
+            ));
+            // The manual refresh the report's repro step triggers via the
+            // sync/refresh icon -- `sc_refresh` runs the real `git status
+            // --porcelain -u` against `dir` and populates
+            // `sc_file_statuses`, which `render::populate_sc_sidebar_system`
+            // turns into the CHANGES section's rows.
+            engine.sc_refresh();
+
+            assert_eq!(
+                engine.sc_section_file_count(crate::core::engine::SC_SECTION_CHANGES),
+                2,
+                "both the modified tracked file and the untracked file must \
+                 land in the CHANGES section after a refresh"
+            );
+
+            let h = harness(engine);
+            let driver = &h.driver;
+            let screen = driver.screen();
+            assert!(
+                driver.screen_has("main.rs"),
+                "the modified tracked file's name must be painted in the \
+                 CHANGES list; screen:\n{screen}"
+            );
+            assert!(
+                driver.screen_has("extra.rs"),
+                "the untracked file's name must be painted in the CHANGES \
+                 list; screen:\n{screen}"
+            );
+            assert!(
+                driver.screen_has("M main.rs"),
+                "the modified tracked file must carry an 'M' status badge; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                driver.screen_has("U extra.rs"),
+                "the untracked file must carry a 'U' status badge (VS \
+                 Code's untracked glyph -- see `StatusKind::label`'s own \
+                 doc for why this is 'U', not git's raw '?'); \
+                 screen:\n{screen}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// #1722 review (blocking finding): `render::route_sidebar_hover`
         /// used to return `geometry.contains_x(x)` — "is the pointer's X
         /// inside the sidebar column" — regardless of whether any hover
