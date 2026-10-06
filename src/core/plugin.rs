@@ -665,6 +665,21 @@ pub struct PluginManager {
     /// are long-lived — a source stays registered for the plugin's whole
     /// lifetime, invoked fresh on every `Engine::trigger_completion`.
     completion_sources: RefCell<HashMap<u64, PluginCompletionSource>>,
+    /// `id -> callbacks` for every in-flight `vimcode.fs.walk`/`vimcode.fs.
+    /// grep` handle (#1806). The background thread/receiver live on
+    /// `Engine::plugin_fs_ops`, keyed by the same id — mirrors
+    /// `http_callbacks` except each handle has two callbacks (`on_batch`,
+    /// called zero or more times, then `on_done` once) instead of one.
+    fs_callbacks: RefCell<HashMap<u64, FsCallbacks>>,
+}
+
+/// A `vimcode.fs.walk`/`vimcode.fs.grep` handle's registered callbacks
+/// (#1806). Unlike [`SpawnCallbacks`], both are mandatory — the Lua binding
+/// requires `on_batch` and `on_done` as positional arguments, matching the
+/// issue's `walk(root, opts, on_batch, on_done)` signature.
+struct FsCallbacks {
+    on_batch: LuaRegistryKey,
+    on_done: LuaRegistryKey,
 }
 
 /// A `vimcode.loop.spawn` handle's registered callbacks (#1624). Any of the
@@ -1420,6 +1435,7 @@ impl PluginManager {
             pickers: RefCell::new(HashMap::new()),
             http_callbacks: RefCell::new(HashMap::new()),
             completion_sources: RefCell::new(HashMap::new()),
+            fs_callbacks: RefCell::new(HashMap::new()),
         })
     }
 
@@ -2149,6 +2165,112 @@ impl PluginManager {
             .remove_app_data::<PluginCallContext>()
             .unwrap_or_default();
         (ctx, result)
+    }
+
+    // ─── `vimcode.fs` (#1806) ───────────────────────────────────────────────
+
+    /// Register a `vimcode.fs.walk`/`vimcode.fs.grep` handle's callbacks and
+    /// return its id.
+    pub(crate) fn register_fs_callbacks(
+        &self,
+        on_batch: LuaRegistryKey,
+        on_done: LuaRegistryKey,
+    ) -> u64 {
+        let id = self.next_handle_id();
+        self.fs_callbacks
+            .borrow_mut()
+            .insert(id, FsCallbacks { on_batch, on_done });
+        id
+    }
+
+    /// Drop a handle's stored callbacks (on `on_done`, on `cancel()`, or
+    /// when the owning plugin is unloaded).
+    pub(crate) fn remove_fs_callbacks(&self, id: u64) {
+        self.fs_callbacks.borrow_mut().remove(&id);
+    }
+
+    /// Fire handle `id`'s `on_batch` callback with a batch of walked paths,
+    /// each as a string — relative to the walk's `root` when possible
+    /// (matching `Engine::picker_populate_files`'s display convention),
+    /// falling back to the absolute path otherwise (can't happen for a
+    /// `root`-rooted walk, but a defensive fallback is cheap and avoids
+    /// silently dropping an entry).
+    pub(crate) fn call_fs_walk_batch(
+        &self,
+        id: u64,
+        paths: Vec<PathBuf>,
+        ctx: PluginCallContext,
+    ) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let f = {
+            let cbs = self.fs_callbacks.borrow();
+            cbs.get(&id)
+                .and_then(|c| self.lua.registry_value::<LuaFunction>(&c.on_batch).ok())
+        };
+        if let Some(f) = f {
+            if let Ok(t) = self.lua.create_table() {
+                for (i, path) in paths.iter().enumerate() {
+                    let _ = t.set(i + 1, path.to_string_lossy().into_owned());
+                }
+                let _ = f.call::<LuaTable, ()>(t);
+            }
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
+    }
+
+    /// Fire handle `id`'s `on_batch` callback with a batch of grep matches,
+    /// each as `{path, line, col, text}` — `line`/`col` 1-indexed, matching
+    /// `vimcode.buf.cursor()`'s convention (so a plugin can feed either
+    /// straight into `vimcode.buf.set_cursor`/a picker's `preview`).
+    pub(crate) fn call_fs_grep_batch(
+        &self,
+        id: u64,
+        matches: Vec<crate::core::project_search::FsGrepMatch>,
+        ctx: PluginCallContext,
+    ) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let f = {
+            let cbs = self.fs_callbacks.borrow();
+            cbs.get(&id)
+                .and_then(|c| self.lua.registry_value::<LuaFunction>(&c.on_batch).ok())
+        };
+        if let Some(f) = f {
+            if let Ok(t) = self.lua.create_table() {
+                for (i, m) in matches.iter().enumerate() {
+                    if let Ok(entry) = self.lua.create_table() {
+                        let _ = entry.set("path", m.path.to_string_lossy().into_owned());
+                        let _ = entry.set("line", m.line + 1);
+                        let _ = entry.set("col", m.col + 1);
+                        let _ = entry.set("text", m.text.clone());
+                        let _ = t.set(i + 1, entry);
+                    }
+                }
+                let _ = f.call::<LuaTable, ()>(t);
+            }
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
+    }
+
+    /// Fire handle `id`'s `on_done` callback (no arguments) — once the walk/
+    /// grep has finished delivering every batch. Never fires for a
+    /// cancelled handle (see `Engine::plugin_api_fs_cancel`).
+    pub(crate) fn call_fs_done(&self, id: u64, ctx: PluginCallContext) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let f = {
+            let cbs = self.fs_callbacks.borrow();
+            cbs.get(&id)
+                .and_then(|c| self.lua.registry_value::<LuaFunction>(&c.on_done).ok())
+        };
+        if let Some(f) = f {
+            let _ = f.call::<(), ()>(());
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
     }
 
     // ─── `vimcode.picker` (#1630) ───────────────────────────────────────────
@@ -4580,6 +4702,152 @@ impl PluginManager {
             })?,
         )?;
         vimcode.set("picker", picker_tbl)?;
+
+        // ── vimcode.fs (#1806) ──────────────────────────────────────────────
+        //
+        // `vimcode.fs.walk(root, opts, on_batch, on_done)` /
+        // `vimcode.fs.grep(root, pattern, opts, on_batch, on_done)`: the
+        // same in-process, gitignore-aware `ignore`-crate walker the native
+        // Files/Grep pickers use, exposed to Lua so a finder extension (the
+        // #1212 epic's telescope-style seam) never depends on `rg`/`fd`
+        // being installed. Work runs on a background thread; `on_batch` is
+        // called zero or more times with up to ~100-200 results each, then
+        // `on_done` fires once (never, if the handle is cancelled first).
+        // `root` empty/omitted means the workspace root (`Engine::cwd`);
+        // relative otherwise resolved against it.
+        //
+        // `opts` (either call): `include`/`exclude` are gitignore-glob-
+        // syntax string arrays (matched relative to `root`); `vimcode.fs.
+        // walk` additionally takes `hidden` (bool) and `max_depth` (int);
+        // `vimcode.fs.grep` additionally takes `case_sensitive` (bool),
+        // `use_regex` (bool, default false = literal match), and
+        // `max_results` (int).
+        //
+        // The returned handle's `:cancel()` stops the walk promptly (checked
+        // between every entry/batch) — a finder re-querying on every
+        // keystroke is expected to cancel its previous handle before
+        // starting the next one.
+        let fs_tbl = lua.create_table()?;
+
+        fn lua_table_to_fs_walk_options(
+            opts: &Option<LuaTable>,
+        ) -> LuaResult<crate::core::project_search::FsWalkOptions> {
+            let mut out = crate::core::project_search::FsWalkOptions::default();
+            let Some(opts) = opts else { return Ok(out) };
+            if let Ok(hidden) = opts.get::<_, bool>("hidden") {
+                out.hidden = hidden;
+            }
+            if let Ok(depth) = opts.get::<_, i64>("max_depth") {
+                if depth >= 0 {
+                    out.max_depth = Some(depth as usize);
+                }
+            }
+            if let Ok(include) = opts.get::<_, LuaTable>("include") {
+                out.include = include.sequence_values::<String>().flatten().collect();
+            }
+            if let Ok(exclude) = opts.get::<_, LuaTable>("exclude") {
+                out.exclude = exclude.sequence_values::<String>().flatten().collect();
+            }
+            Ok(out)
+        }
+
+        fn lua_table_to_fs_grep_options(
+            opts: &Option<LuaTable>,
+        ) -> LuaResult<crate::core::project_search::FsGrepOptions> {
+            let mut out = crate::core::project_search::FsGrepOptions::default();
+            let Some(opts) = opts else { return Ok(out) };
+            if let Ok(v) = opts.get::<_, bool>("case_sensitive") {
+                out.case_sensitive = v;
+            }
+            if let Ok(v) = opts.get::<_, bool>("use_regex") {
+                out.use_regex = v;
+            }
+            if let Ok(include) = opts.get::<_, LuaTable>("include") {
+                out.include = include.sequence_values::<String>().flatten().collect();
+            }
+            if let Ok(exclude) = opts.get::<_, LuaTable>("exclude") {
+                out.exclude = exclude.sequence_values::<String>().flatten().collect();
+            }
+            if let Ok(max_results) = opts.get::<_, i64>("max_results") {
+                if max_results > 0 {
+                    out.max_results = (max_results as usize).min(out.max_results);
+                }
+            }
+            Ok(out)
+        }
+
+        fn make_fs_handle(lua: &Lua, id: i64) -> LuaResult<LuaTable<'_>> {
+            let handle = lua.create_table()?;
+            handle.set("id", id)?;
+            handle.set(
+                "cancel",
+                lua.create_function(move |_, _self: LuaValue| {
+                    live_engine("vimcode.fs:cancel", move |e| e.plugin_api_fs_cancel(id))
+                })?,
+            )?;
+            Ok(handle)
+        }
+
+        fs_tbl.set(
+            "walk",
+            lua.create_function(
+                |lua,
+                 (root, opts, on_batch, on_done): (
+                    Option<String>,
+                    Option<LuaTable>,
+                    LuaFunction,
+                    LuaFunction,
+                )| {
+                    let walk_opts = lua_table_to_fs_walk_options(&opts)?;
+                    let on_batch = lua.create_registry_value(on_batch)?;
+                    let on_done = lua.create_registry_value(on_done)?;
+                    let root = root.unwrap_or_default();
+                    let id = live_engine("vimcode.fs.walk", move |e| {
+                        e.plugin_api_fs_walk(root, walk_opts, on_batch, on_done)
+                    })?;
+                    let Some(id) = id else {
+                        return Err(LuaError::RuntimeError(
+                            "vimcode.fs.walk: failed to start (no live plugin manager, or a \
+                             bad include/exclude glob pattern)"
+                                .to_string(),
+                        ));
+                    };
+                    make_fs_handle(lua, id)
+                },
+            )?,
+        )?;
+
+        fs_tbl.set(
+            "grep",
+            lua.create_function(
+                |lua,
+                 (root, pattern, opts, on_batch, on_done): (
+                    Option<String>,
+                    String,
+                    Option<LuaTable>,
+                    LuaFunction,
+                    LuaFunction,
+                )| {
+                    let grep_opts = lua_table_to_fs_grep_options(&opts)?;
+                    let on_batch = lua.create_registry_value(on_batch)?;
+                    let on_done = lua.create_registry_value(on_done)?;
+                    let root = root.unwrap_or_default();
+                    let id = live_engine("vimcode.fs.grep", move |e| {
+                        e.plugin_api_fs_grep(root, pattern, grep_opts, on_batch, on_done)
+                    })?;
+                    let Some(id) = id else {
+                        return Err(LuaError::RuntimeError(
+                            "vimcode.fs.grep: failed to start (no live plugin manager, a bad \
+                             pattern, or a bad include/exclude glob pattern)"
+                                .to_string(),
+                        ));
+                    };
+                    make_fs_handle(lua, id)
+                },
+            )?,
+        )?;
+
+        vimcode.set("fs", fs_tbl)?;
 
         // ── vimcode.editor subtable ────────────────────────────────────────
         let editor_tbl = lua.create_table()?;

@@ -207,6 +207,23 @@ impl Engine {
                 }
             }
         }
+        // #1806: same staleness pattern for `vimcode.fs.walk`/`vimcode.fs.
+        // grep` — a handle whose owning manager just went away is cancelled
+        // (stopping the background walk promptly, same as an explicit
+        // `:cancel()`) and dropped without calling into the dead Lua state.
+        let dead_fs: Vec<u64> = self
+            .plugin_fs_ops
+            .iter()
+            .filter(|(_, handle)| handle.manager.upgrade().is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dead_fs {
+            if let Some(handle) = self.plugin_fs_ops.remove(&id) {
+                handle
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     // ── Plugin-declared UI views (#146) ────────────────────────────────────
