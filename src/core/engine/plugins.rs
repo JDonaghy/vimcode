@@ -1743,6 +1743,16 @@ impl Engine {
                 // Only load extensions that are in extension_state.installed
                 // (or disabled_plugins for the skip check).  Extensions whose
                 // scripts exist on disk but are not marked installed are ignored.
+                // #1807: an extension can become incompatible with the
+                // running vimcode *after* it was installed — most commonly
+                // a vimcode downgrade, or `:ExtUpdate` pulling a newer
+                // manifest that raises `requires_vimcode`. Resolve
+                // manifests once up front so the per-directory loop below
+                // can gate on them; LSP/DAP config (wired separately via
+                // `ext_installed_manifests`) is unaffected by this skip —
+                // only the Lua scripts are gated here.
+                let manifests = self.ext_available_manifests();
+                let mut skipped_incompatible: Vec<String> = Vec::new();
                 if has_extensions {
                     if let Ok(entries) = std::fs::read_dir(&extensions_dir) {
                         let mut dirs: Vec<_> = entries
@@ -1764,6 +1774,23 @@ impl Engine {
                             // not run unless the extension is installed.
                             if !self.extension_state.is_installed(&ext_name) {
                                 continue;
+                            }
+                            // #1807: skip this extension's scripts (not its
+                            // LSP/DAP config) when its `requires_vimcode`
+                            // constraint is no longer met by the running
+                            // vimcode, instead of letting a script error out
+                            // at load time on a missing `vimcode.*` API.
+                            if let Some(manifest) = manifests
+                                .iter()
+                                .find(|m| m.name.eq_ignore_ascii_case(&ext_name))
+                            {
+                                if let Some(reason) =
+                                    manifest.incompatibility_reason_for_running_vimcode()
+                                {
+                                    skipped_incompatible
+                                        .push(format!("{} ({reason})", manifest.display_or_name()));
+                                    continue;
+                                }
                             }
                             mgr.load_plugins_dir(&ext_dir, &self.settings.disabled_plugins);
                         }
@@ -1797,6 +1824,21 @@ impl Engine {
                 self.populate_highlight_overrides();
                 // Fire VimEnter event after plugin initialization is complete
                 self.plugin_event("VimEnter", "");
+                // #1807: surface which installed extensions were skipped for
+                // being incompatible with the running vimcode, naming each
+                // extension and its required version — after `VimEnter` so a
+                // plugin's own startup message doesn't clobber this one.
+                if !skipped_incompatible.is_empty() {
+                    self.message = format!(
+                        "Skipped incompatible extension{}: {}",
+                        if skipped_incompatible.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        skipped_incompatible.join(", ")
+                    );
+                }
             }
             Err(e) => {
                 self.message = format!("Plugin init error: {e}");
@@ -3499,6 +3541,130 @@ mod spawn_cwd_tests {
              relative path: {got:?}"
         );
         assert_eq!(got.as_ref(), unc);
+    }
+}
+
+#[cfg(test)]
+mod requires_vimcode_loader_gate_tests {
+    //! #1807 (fix round 1): `Engine::plugin_init`'s loader-tier gate — the
+    //! half of the issue deferred in the original commit over a live
+    //! file-overlap concern with #1806's branch. An installed extension
+    //! whose `requires_vimcode` constraint is unmet by the running
+    //! vimcode (e.g. after a downgrade) must have its Lua scripts
+    //! skipped — proven here by a script that would register an
+    //! observable panel never actually registering it — while a single
+    //! message names the extension and the required version.
+    use crate::core::engine::Engine;
+
+    /// Write `extensions/<name>/{manifest.toml, init.lua}` under an
+    /// isolated `$HOME` and mark the extension installed, with the given
+    /// `requires_vimcode` (or none at all). The script unconditionally
+    /// calls `vimcode.panel.register`, so whether or not it ran is
+    /// directly observable via `engine.ext_panels` after `plugin_init()`.
+    fn install_fixture_extension(
+        home: &std::path::Path,
+        ext_name: &str,
+        requires_vimcode: Option<&str>,
+    ) -> Engine {
+        let ext_dir = home
+            .join(".config")
+            .join("vimcode")
+            .join("extensions")
+            .join(ext_name);
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let mut manifest =
+            format!("name = \"{ext_name}\"\ndisplay_name = \"1807 Loader Gate Fixture\"\n");
+        if let Some(req) = requires_vimcode {
+            manifest.push_str(&format!("requires_vimcode = \"{req}\"\n"));
+        }
+        std::fs::write(ext_dir.join("manifest.toml"), manifest).unwrap();
+        std::fs::write(
+            ext_dir.join("init.lua"),
+            format!(
+                "vimcode.panel.register(\"{ext_name}\", {{title = \"Fixture\", \
+                 sections = {{\"Default\"}}}})\n"
+            ),
+        )
+        .unwrap();
+
+        let mut engine = Engine::new();
+        engine.extension_state.mark_installed(ext_name);
+        engine
+    }
+
+    /// An installed extension whose `requires_vimcode` is unmet by the
+    /// running vimcode must have its script skipped (never registers its
+    /// panel) and must produce one message naming the extension and the
+    /// required version — LSP/DAP config is untouched by this path (the
+    /// fixture declares none), matching the issue's "Its LSP/DAP config
+    /// should still load" requirement by not needing any change there.
+    ///
+    /// RED-verified by hand: with the `incompatibility_reason_for_running_
+    /// vimcode` check in `plugin_init`'s extensions loop removed, this
+    /// fails both ways — `ext_panels` gains the fixture's panel and
+    /// `message` never mentions "Skipped incompatible extension".
+    #[test]
+    fn incompatible_installed_extension_is_skipped_with_message() {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_1807_loader_gate_incompatible_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let ext_name = "vc-unit-1807-loader-incompatible";
+        let mut engine = install_fixture_extension(&home, ext_name, Some(">=9999.0.0"));
+        engine.plugin_init();
+
+        assert!(
+            !engine.ext_panels.contains_key(ext_name),
+            "an incompatible extension's script must never run — its \
+             vimcode.panel.register call must never execute; ext_panels: {:?}",
+            engine.ext_panels.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            engine.message.contains("Skipped incompatible extension")
+                && engine.message.contains("1807 Loader Gate Fixture")
+                && engine.message.contains("9999.0.0"),
+            "the skip must post one message naming the extension and the \
+             required version; got: {:?}",
+            engine.message
+        );
+
+        drop(_home_guard);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Compatible installed extension (no `requires_vimcode`, the
+    /// pre-#1807 default): script runs normally, no skip message.
+    #[test]
+    fn compatible_installed_extension_still_loads() {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_1807_loader_gate_compatible_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let ext_name = "vc-unit-1807-loader-compatible";
+        let mut engine = install_fixture_extension(&home, ext_name, None);
+        engine.plugin_init();
+
+        assert!(
+            engine.ext_panels.contains_key(ext_name),
+            "a compatible extension's script must run normally; ext_panels: {:?}",
+            engine.ext_panels.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !engine.message.contains("Skipped incompatible extension"),
+            "a compatible extension must never be reported skipped; got: {:?}",
+            engine.message
+        );
+
+        drop(_home_guard);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 

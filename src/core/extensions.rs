@@ -100,6 +100,13 @@ pub struct ExtensionManifest {
     /// vimcode version, matching pre-#1807 behavior exactly. See
     /// [`ExtensionManifest::is_compatible_with_vimcode`] and
     /// [`ExtensionManifest::incompatibility_reason`].
+    ///
+    /// **Write an explicit comparator, not a bare version.** This string is
+    /// parsed as a `semver::VersionReq` as-is — it is *not* normalised to
+    /// `">="` first. A bare `"0.15.0"` means Cargo-style caret
+    /// (`"^0.15.0"`), which pre-1.0 only matches `0.15.x` and rejects
+    /// `0.16.0` and later: the opposite of "needs at least 0.15". Write
+    /// `">=0.15.0"` to mean a minimum, as this field's own name implies.
     #[serde(default)]
     pub requires_vimcode: Option<String>,
 }
@@ -824,17 +831,33 @@ impl ExtensionManifest {
     /// is *also* treated as compatible rather than bricking the extension
     /// over a malformed manifest field or an unparseable running-version
     /// string (should not happen for `env!("CARGO_PKG_VERSION")`, but a
-    /// manifest field is untrusted input).
+    /// manifest field is untrusted input) — a one-line debug note is
+    /// logged for the malformed-requirement case so a registry-side typo
+    /// doesn't go silently invisible forever.
+    ///
+    /// `running_version`'s prerelease component (if any — e.g. a future
+    /// `Cargo.toml` carrying `"0.15.0-rc1"`) is stripped before matching:
+    /// `semver::VersionReq::matches` otherwise excludes prerelease
+    /// versions from a plain `">=0.15.0"` comparator by design, which
+    /// would make every `requires_vimcode` extension read as incompatible
+    /// on a prerelease build even though its release-version core
+    /// satisfies the bound.
     pub fn is_compatible_with_vimcode(&self, running_version: &str) -> bool {
         let Some(req_str) = self.requires_vimcode.as_deref() else {
             return true;
         };
         let Ok(req) = semver::VersionReq::parse(req_str) else {
+            crate::core::lsp_manager::install_log(&format!(
+                "[ext] '{}' has a malformed requires_vimcode requirement \
+                 ({req_str:?}) — treating as no constraint",
+                self.name
+            ));
             return true;
         };
-        let Ok(version) = semver::Version::parse(running_version) else {
+        let Ok(mut version) = semver::Version::parse(running_version) else {
             return true;
         };
+        version.pre = semver::Prerelease::EMPTY;
         req.matches(&version)
     }
 
@@ -843,14 +866,32 @@ impl ExtensionManifest {
     /// no-constraint case). Shared by the marketplace install-refusal
     /// message and the "skip at load" message (#1807).
     pub fn incompatibility_reason(&self, running_version: &str) -> Option<String> {
-        if self.is_compatible_with_vimcode(running_version) {
-            None
+        // Structural rather than defensive: this branch is only reached
+        // once `is_compatible_with_vimcode` has already returned `false`,
+        // which itself only happens when `requires_vimcode` is `Some` (its
+        // own first check returns early on `None`) — so this `if let` can
+        // never actually take the `else` arm, unlike the `unwrap_or("")`
+        // it replaced (#1807 review).
+        if let Some(req) = self.requires_vimcode.as_deref() {
+            if self.is_compatible_with_vimcode(running_version) {
+                None
+            } else {
+                Some(format!(
+                    "requires vimcode {req} (running {running_version})"
+                ))
+            }
         } else {
-            Some(format!(
-                "requires vimcode {} (running {running_version})",
-                self.requires_vimcode.as_deref().unwrap_or("")
-            ))
+            None
         }
+    }
+
+    /// Convenience wrapper over [`Self::incompatibility_reason`] against
+    /// the actual running vimcode (`env!("CARGO_PKG_VERSION")`) — the one
+    /// "what version is running" lookup every call site (marketplace
+    /// install refusal, available-list panel row, loader skip) otherwise
+    /// had to repeat independently (#1807 review nit).
+    pub fn incompatibility_reason_for_running_vimcode(&self) -> Option<String> {
+        self.incompatibility_reason(env!("CARGO_PKG_VERSION"))
     }
 
     /// The name to show the user: `display_name` when set, falling back to
@@ -1599,5 +1640,42 @@ display_name = "Legacy Extension"
         assert!(m.is_compatible_with_vimcode("0.14.0"));
         assert!(m.is_compatible_with_vimcode("0.14.5"));
         assert!(!m.is_compatible_with_vimcode("0.15.0"));
+    }
+
+    /// A prerelease running version (e.g. a future `Cargo.toml` carrying
+    /// `"0.15.0-rc1"`) must not read as incompatible against a plain
+    /// `">=0.15.0"` bound — `semver::VersionReq::matches` excludes
+    /// prereleases from a non-prerelease comparator by design, which this
+    /// method works around by stripping the prerelease component before
+    /// matching (#1807 review).
+    #[test]
+    fn requires_vimcode_tolerates_prerelease_running_version() {
+        let m = ExtensionManifest {
+            name: "x".to_string(),
+            requires_vimcode: Some(">=0.15.0".to_string()),
+            ..Default::default()
+        };
+        assert!(m.is_compatible_with_vimcode("0.15.0-rc1"));
+        assert!(m.is_compatible_with_vimcode("0.15.0-dev"));
+        assert!(!m.is_compatible_with_vimcode("0.14.0-rc1"));
+    }
+
+    /// `incompatibility_reason_for_running_vimcode` is the single
+    /// "compare against the actual running vimcode" convenience every
+    /// call site (marketplace install refusal, available-list panel row,
+    /// loader skip) shares, rather than each repeating
+    /// `env!("CARGO_PKG_VERSION")` independently (#1807 review nit).
+    #[test]
+    fn incompatibility_reason_for_running_vimcode_matches_explicit_call() {
+        let m = ExtensionManifest {
+            name: "x".to_string(),
+            requires_vimcode: Some(">=9999.0.0".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            m.incompatibility_reason_for_running_vimcode(),
+            m.incompatibility_reason(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(m.incompatibility_reason_for_running_vimcode().is_some());
     }
 }

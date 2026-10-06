@@ -324,6 +324,29 @@ fn run_ext_install(name: &str, json: bool) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    // #1807: the headless `--ext-install` entry point must refuse an
+    // incompatible extension the same way the interactive marketplace
+    // does (`Engine::ext_install_from_registry_with_runtime_check`) —
+    // without this check the two paths diverge: the interactive path
+    // refuses, but this CI-facing one (#1719's vimcode-ext driver) would
+    // sail straight through and install scripts that error at load time
+    // on a missing `vimcode.*` API.
+    if let Some(reason) = manifest.incompatibility_reason_for_running_vimcode() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "extension": name,
+                    "status": "incompatible_vimcode",
+                    "reason": reason,
+                })
+            );
+        } else {
+            eprintln!("vimcode: cannot install '{name}' — {reason}");
+        }
+        return ExitCode::FAILURE;
+    }
+
     let present = |dep: &str| vimcode_core::core::lsp_manager::resolve_command(dep).is_some();
 
     // Same gating `Engine::ext_install_from_registry_with_runtime_check`
