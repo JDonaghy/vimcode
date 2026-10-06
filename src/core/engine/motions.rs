@@ -4276,6 +4276,12 @@ impl Engine {
         self.completion_display_only = false;
         self.completion_filter_prefix.clear();
         self.lsp_pending_completion = None;
+        // #1805: bump the generation so a plugin source's async
+        // `vimcode.completion.complete` delivered against the request
+        // issued for this (now-dismissed) popup is recognized as stale and
+        // dropped by `plugin_api_completion_complete`'s generation check,
+        // instead of silently re-opening a popup the user already closed.
+        self.completion_generation = self.completion_generation.wrapping_add(1);
     }
 
     /// Trigger completion popup based on current cursor prefix.
@@ -4341,8 +4347,16 @@ impl Engine {
                         .push(CompletionCandidate::plain(word));
                 }
             }
+            // `completion_start_col` must be derived from the prefix length
+            // regardless of whether the buffer-word scan above found
+            // anything (#1805 review): a plugin source can still merge in
+            // items below, or an LSP/async response can arrive later, and
+            // both anchor their delete/insert on this column via
+            // `apply_completion_candidate`. Leaving it at a stale value
+            // from a prior trigger (its default is `0`) deletes/inserts at
+            // the wrong offset once a plugin-only popup is accepted.
+            self.completion_start_col = self.view().cursor.col - prefix.chars().count();
             if !self.completion_candidates.is_empty() {
-                self.completion_start_col = self.view().cursor.col - prefix.chars().count();
                 self.completion_idx = Some(0);
                 self.completion_display_only = true;
             } else {
@@ -4354,8 +4368,15 @@ impl Engine {
         // Async LSP source — response will update candidates if popup is still active
         self.lsp_request_completion();
         // Plugin sources (#1805) — synchronous results merge immediately;
-        // async ones arrive later via `vimcode.completion.complete`.
-        self.plugin_request_completions(&prefix, manual || plugin_trigger_match, trigger_char);
+        // async ones arrive later via `vimcode.completion.complete`. Pass
+        // the real `manual` flag, not `manual || plugin_trigger_match`:
+        // `plugin_trigger_match` only says *some* source's trigger char
+        // fired, which should let *that* source through on an empty
+        // prefix (via its own `trigger_chars` check inside
+        // `completion_sources_matching`) — it must not be conflated with
+        // `manual`, which lets *every* in-scope source through regardless
+        // of its own `trigger_chars` (review finding).
+        self.plugin_request_completions(&prefix, manual, trigger_char);
     }
 
     /// The character immediately before the current completion prefix —

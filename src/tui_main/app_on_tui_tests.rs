@@ -14606,6 +14606,83 @@ mod tests {
             );
         }
 
+        /// #1805's black-box acceptance scenario, driven through the real
+        /// key pipeline and asserted on **painted output** (review
+        /// finding: the five engine-state tests in `tests/extensions.rs`
+        /// never proved anything actually painted): a `vimcode.completion.
+        /// register` source's item appears in the real completion popup —
+        /// by its `label`, not its `insert_text`, since those differ here
+        /// — the moment its trigger prefix is typed, and accepting it
+        /// inserts `insert_text` into the buffer. Also exercises the
+        /// start-column fix (review finding): the buffer has no word
+        /// anywhere starting with `zq`, so the popup is plugin-only, and
+        /// only a single keystroke is typed (see `tests/extensions.rs`'s
+        /// `completion_accept_on_plugin_only_popup_keeps_preceding_text`
+        /// doc comment for why a single keystroke matters for this repro).
+        ///
+        /// RED against unfixed `develop`: `vimcode.completion` doesn't
+        /// exist there, so `vimcode.completion.register` errors immediately
+        /// and nothing beyond the typed `z` ever paints.
+        #[test]
+        fn completion_plugin_source_label_paints_in_popup_and_accept_inserts_text_via_shell_app() {
+            let engine = engine_with_plugin(
+                "completion_paint_1805",
+                r#"
+                vimcode.completion.register({
+                    name = "static",
+                    source = function(ctx, request_id)
+                        return {
+                            {
+                                label = "zq_label(..)",
+                                insert_text = "zq_insert_text",
+                            },
+                        }
+                    end,
+                })
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char('i'); // Normal -> Insert
+            driver.type_char('z'); // single keystroke — see doc comment above
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("zq_label"),
+                "the plugin source's label must paint in the completion \
+                 popup as soon as its trigger prefix is typed; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("zq_insert_text"),
+                "the popup must show the item's label, not its insert_text \
+                 (they deliberately differ in this fixture); screen:\n{screen}"
+            );
+
+            // Accept — Vim mode's default accept key is `<C-y>` (#800).
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('y'),
+                modifiers: quadraui::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                repeat: false,
+            });
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("zq_insert_text"),
+                "accepting the plugin candidate must paint its insert_text \
+                 in the buffer; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("zzq_insert_text") && !screen.contains("zq_insert_textz"),
+                "accepting must replace the typed prefix exactly, not \
+                 leave a stray leftover character glued to the inserted \
+                 text (the start-column review finding); screen:\n{screen}"
+            );
+        }
+
         // ─────────────────────────────────────────────────────────────────
         // Native Extension API — Phase 2 (#1623): a Lua `ys{motion}`
         // operator, built entirely from `vimcode.*` (keymap.set +

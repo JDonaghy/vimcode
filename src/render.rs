@@ -17884,7 +17884,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
         let max_width = engine
             .completion_candidates
             .iter()
-            .map(|c| c.label.len())
+            .map(|c| c.label.chars().count())
             .max()
             .unwrap_or(0);
         CompletionMenu {

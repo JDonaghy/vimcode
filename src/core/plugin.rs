@@ -695,6 +695,12 @@ struct PluginCompletionSource {
     /// `nil` to deliver later via `vimcode.completion.complete(request_id,
     /// items)`.
     callback: LuaRegistryKey,
+    /// Set the first time this source's callback errors, so
+    /// `Engine::plugin_request_completions` reports a broken source's
+    /// error to the status line once instead of once per keystroke
+    /// (review finding — an un-gated error spams and clobbers whatever
+    /// message was already there).
+    errored: Cell<bool>,
 }
 
 /// Position + request identity for one `vimcode.completion.register`
@@ -1993,6 +1999,7 @@ impl PluginManager {
                 trigger_chars,
                 priority,
                 callback,
+                errored: Cell::new(false),
             },
         );
     }
@@ -2002,6 +2009,19 @@ impl PluginManager {
     /// recreated on reload, which drops this map with it).
     pub(crate) fn remove_completion_source(&self, id: u64) {
         self.completion_sources.borrow_mut().remove(&id);
+    }
+
+    /// First call for a given `id` returns `true` ("report it") and marks
+    /// the source as having already errored; every later call for the same
+    /// `id` returns `false` so a source that keeps failing on every
+    /// keystroke doesn't spam the status line more than once (review
+    /// finding). Resets implicitly on unregister/reload since the whole
+    /// entry is dropped.
+    pub(crate) fn mark_completion_source_errored(&self, id: u64) -> bool {
+        matches!(
+            self.completion_sources.borrow().get(&id),
+            Some(source) if !source.errored.replace(true)
+        )
     }
 
     /// Whether any registered source declares `c` among its
@@ -2021,8 +2041,8 @@ impl PluginManager {
     /// `priority` of a still-registered source, for attaching the right
     /// sort weight to an async `vimcode.completion.complete(request_id,
     /// items)` delivery (the request carries the source id, not the
-    /// priority itself — see `Engine::completion_request_id`). `None` if
-    /// the source has since been unregistered.
+    /// priority itself — see `plugins.rs::pack_completion_request_id`).
+    /// `None` if the source has since been unregistered.
     pub(crate) fn completion_source_priority(&self, id: u64) -> Option<i32> {
         self.completion_sources
             .borrow()
