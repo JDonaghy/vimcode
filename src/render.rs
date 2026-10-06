@@ -25648,6 +25648,17 @@ fn build_selection(
 
     let (start_col, end_col) = match kind {
         SelectionKind::Block => (anchor.col.min(cursor.col), anchor.col.max(cursor.col)),
+        SelectionKind::Char if engine.visual_end_exclusive && end.col > 0 => {
+            // quadraui paints `SelectionKind::Char` as inclusive
+            // (`end_col + 1`, quadraui `primitives/editor.rs`), but an
+            // exclusive-end selection's `end.col` already sits one past the
+            // last selected char — back off by one so highlight, copy and
+            // delete agree (#1788 review non-blocking note). When `end.col`
+            // is 0 (the exclusive end wrapped to the next line's start)
+            // there's no single-line column to back off to; left as-is,
+            // matching this function's pre-existing behavior for that case.
+            (start.col, end.col - 1)
+        }
         _ => (start.col, end.col),
     };
 
@@ -29449,6 +29460,54 @@ pub fn tab_drop_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Visual selection painting (#1788 review) ──────────────────────────
+    //
+    // `build_selection`'s `end_col` must agree with what Ctrl+C/Ctrl+X
+    // actually copy/delete — otherwise the highlighted span and the
+    // clipboard payload disagree (non-blocking note on the #1788 review:
+    // quadraui always paints `SelectionKind::Char` as `end_col + 1`, so an
+    // *exclusive*-end selection's raw cursor column needs to be backed off
+    // by one before being handed to `SelectionRange`).
+
+    /// A VSCode-mode Shift+Right x6 selection (`visual_end_exclusive`,
+    /// cursor one past the last selected char) must paint exactly 6 cells,
+    /// matching the 6 characters Ctrl+C copies — not 7.
+    #[test]
+    fn build_selection_backs_off_exclusive_end_by_one_for_char_kind() {
+        let mut engine = Engine::new_for_test();
+        engine.buffer_mut().insert(0, "hello world\n");
+        engine.mode = Mode::Visual;
+        engine.visual_anchor = Some(Cursor { line: 0, col: 0 });
+        engine.visual_end_exclusive = true;
+        engine.view_mut().cursor = Cursor { line: 0, col: 6 };
+
+        let sel = build_selection(&engine, 0, 10).expect("selection must be emitted");
+        assert_eq!(sel.start_col, 0);
+        assert_eq!(
+            sel.end_col, 5,
+            "quadraui paints Char selections as end_col + 1, so an \
+             exclusive-end selection covering columns 0..6 must report \
+             end_col = 5, not the raw cursor column 6"
+        );
+    }
+
+    /// Plain Vim-style / mouse / Ctrl+D selections are inclusive-end
+    /// (`visual_end_exclusive` is `false`) — `end_col` must stay exactly the
+    /// cursor's own column, unchanged from before #1788.
+    #[test]
+    fn build_selection_leaves_inclusive_end_unchanged_for_char_kind() {
+        let mut engine = Engine::new_for_test();
+        engine.buffer_mut().insert(0, "hello world\n");
+        engine.mode = Mode::Visual;
+        engine.visual_anchor = Some(Cursor { line: 0, col: 0 });
+        engine.visual_end_exclusive = false;
+        engine.view_mut().cursor = Cursor { line: 0, col: 4 };
+
+        let sel = build_selection(&engine, 0, 10).expect("selection must be emitted");
+        assert_eq!(sel.start_col, 0);
+        assert_eq!(sel.end_col, 4);
+    }
 
     // ─── quadraui theme mapping (#1574) ────────────────────────────────────
     //

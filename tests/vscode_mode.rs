@@ -245,6 +245,36 @@ fn test_vscode_ctrl_d_selects_word() {
     assert_eq!(e.cursor().col, 4); // cursor at last char of "hello" (inclusive)
 }
 
+/// #1788 review regression guard: `vscode_ctrl_d`'s word selection is
+/// inclusive-end (cursor lands *on* the last char of the word, see
+/// `test_vscode_ctrl_d_selects_word` above) — unlike the Shift+arrow
+/// keyboard-extended selection, which is exclusive-end. A fix for #1788 that
+/// discriminates on `is_vscode_mode()` instead of the selection's own
+/// end-bound convention (`visual_end_exclusive`) regresses exactly this
+/// case: Ctrl+D then Ctrl+C would copy "hell" (4 chars) instead of "hello"
+/// (5 chars).
+///
+/// **Verified RED without the `visual_end_exclusive` fix** (i.e. against a
+/// version of the #1788 fix that branches on `is_vscode_mode()` alone): the
+/// final assertion fails with `"hell"` instead of `"hello"`.
+#[test]
+fn test_vscode_ctrl_d_then_ctrl_c_copies_whole_word() {
+    let mut e = engine_with("hello world\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    e.handle_key("d", Some('d'), true); // Ctrl+D: select "hello"
+    assert_eq!(e.cursor().col, 4); // inclusive-end, per test above
+
+    e.handle_key("c", Some('c'), true); // Ctrl+C
+    let (text, _) = e
+        .get_register_content('+')
+        .expect("Ctrl+C must populate the clipboard register");
+    assert_eq!(
+        text, "hello",
+        "Ctrl+D then Ctrl+C must copy the whole 5-char word, not 4"
+    );
+}
+
 #[test]
 fn test_vscode_ctrl_d_adds_next_occurrence() {
     let mut e = engine_with("foo bar foo baz foo\n");

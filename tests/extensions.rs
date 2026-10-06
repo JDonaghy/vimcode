@@ -1752,11 +1752,47 @@ fn ext_delete_last_installed_expands_available_if_collapsed() {
 /// Appending the pid gives each run its own fixtures. The pid is stable for
 /// the life of the process, so helpers that need to re-derive the same path
 /// later (a simulated plugin reload) still agree with the original.
+///
+/// The pid suffix means a fixed name can no longer self-clean on the next
+/// run the way the old shared path did, so `/tmp` would otherwise accumulate
+/// one `vc_plugin_api_*_<pid>` tree per `cargo test` invocation forever.
+/// There's no portable std API to ask "is pid N still alive" to clean up
+/// precisely, so instead: on first use per process, sweep away any sibling
+/// fixture dirs whose mtime is old enough that they can only be orphans from
+/// a past run (a live run's own dirs were just created, so they're exempt).
 fn plugin_fixture_dir(plugin_name: &str) -> std::path::PathBuf {
+    cleanup_stale_fixture_dirs();
     std::env::temp_dir().join(format!(
         "vc_plugin_api_{plugin_name}_{}",
         std::process::id()
     ))
+}
+
+/// See `plugin_fixture_dir` — best-effort removal of stale fixture dirs left
+/// behind by past test runs. Runs at most once per process.
+fn cleanup_stale_fixture_dirs() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        let stale_cutoff = std::time::Duration::from_secs(3600);
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with("vc_plugin_api_") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            if now.duration_since(modified).unwrap_or_default() >= stale_cutoff {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    });
 }
 
 /// Helper: create an engine with a PluginManager loaded from a temp dir.

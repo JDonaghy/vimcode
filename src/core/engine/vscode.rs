@@ -123,6 +123,9 @@ impl Engine {
         if self.visual_anchor.is_none() {
             self.visual_anchor = Some(self.view().cursor);
             self.mode = Mode::Visual;
+            // Keyboard extension drives the ordinary insert-mode cursor, which
+            // lands one char *past* the last selected char — exclusive end.
+            self.visual_end_exclusive = true;
         }
         self.vscode_do_move(op);
         if self.visual_anchor == Some(self.view().cursor) {
@@ -132,7 +135,9 @@ impl Engine {
     }
 
     /// Delete the current visual selection and restore Insert mode.
-    /// Uses exclusive-end semantics: selection is [anchor, cursor) (cursor not included).
+    /// Selection end bound follows `visual_end_exclusive` (#1788 review) —
+    /// NOT a hardcoded exclusive-end assumption, since Ctrl+D/Ctrl+Shift+L/
+    /// mouse selections are inclusive-end even in VSCode mode.
     /// Relies on the caller to manage the undo group.
     fn vscode_delete_selection(&mut self, changed: &mut bool) {
         let Some(anchor) = self.visual_anchor else {
@@ -150,7 +155,12 @@ impl Engine {
         };
 
         let start_char = self.buffer().line_to_char(start.line) + start.col;
-        let end_char = self.buffer().line_to_char(end.line) + end.col; // exclusive
+        let mut end_char = self.buffer().line_to_char(end.line) + end.col;
+        if !self.visual_end_exclusive {
+            // Inclusive end — the cursor's own char is part of the selection too.
+            end_char += 1;
+        }
+        let end_char = end_char.min(self.buffer().len_chars());
 
         if end_char > start_char {
             self.delete_with_undo(start_char, end_char);
@@ -349,6 +359,9 @@ impl Engine {
         self.view_mut().extra_cursors.clear();
         self.visual_anchor = Some(Cursor { line: 0, col: 0 });
         self.mode = Mode::Visual;
+        // Cursor lands at `get_line_len_for_insert` below — one past the last
+        // char, same as `vscode_do_move`'s "DocEnd" — exclusive end.
+        self.visual_end_exclusive = true;
         let last = self.buffer().len_lines().saturating_sub(1);
         let last_col = self.get_line_len_for_insert(last);
         self.view_mut().cursor = Cursor {
@@ -787,6 +800,9 @@ impl Engine {
             // First press: anchor at line start, cursor at start of next line.
             self.visual_anchor = Some(Cursor { line, col: 0 });
             self.mode = Mode::Visual;
+            // Cursor lands at the start of the next line (or one past the
+            // last char on the last line) — exclusive end either way.
+            self.visual_end_exclusive = true;
             if line < max_line {
                 self.view_mut().cursor = Cursor {
                     line: line + 1,
@@ -844,6 +860,7 @@ impl Engine {
                     col: ws,
                 });
                 self.mode = Mode::Visual;
+                self.visual_end_exclusive = false;
                 // Cursor at last char of word (inclusive), not one past end
                 self.view_mut().cursor.col = we - 1;
             }
@@ -939,6 +956,8 @@ impl Engine {
             col: ws,
         });
         self.mode = Mode::Visual;
+        self.visual_end_exclusive = false;
+        // Cursor at last char of word (inclusive), matching `vscode_ctrl_d`.
         self.view_mut().cursor.col = we - 1;
 
         // Find all occurrences and place extra cursors at word END

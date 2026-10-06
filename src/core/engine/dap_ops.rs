@@ -1435,8 +1435,12 @@ impl Engine {
             EditorMode::Vim => EditorMode::Vscode,
             EditorMode::Vscode => EditorMode::Vim,
         };
-        // Clear any selection
+        // Clear any selection. Also reset the end-bound convention (#1788) —
+        // otherwise a lingering `true` from a VSCode-mode keyboard-extended
+        // selection would silently apply to the next Vim-mode `v`/`V`
+        // selection, which is always inclusive-end.
         self.visual_anchor = None;
+        self.visual_end_exclusive = false;
         // Set appropriate base mode
         if self.is_vscode_mode() {
             self.mode = Mode::Insert;
