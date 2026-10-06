@@ -4400,13 +4400,37 @@ mod tests {
     /// at `800×480` `main.rs`'s tab genuinely has nowhere to paint (`bar.
     /// tabs` has both labels, but only `"sample.txt "` reaches `painted_
     /// texts()` and `tab_center(&bar, 1)` is `None`), and the *same*
-    /// fixture at `1600×480` paints both. `1600` is used below so this test
-    /// isolates the double-click dispatch path from that unrelated
-    /// sidebar-width/tab-bar-width interaction rather than conflating the
-    /// two. Whether `Session::sidebar_width` going unread is itself a
-    /// vimcode-side bug worth its own issue is left to that issue, not
-    /// settled or fixed here — out of scope for this one's dispatch-path
-    /// question, and no production code changes in this PR either way.
+    /// fixture at `1600×480` paints both.
+    ///
+    /// Review round 2 confirmed there is no vimcode-side fix available for
+    /// the `800×480` case: `ShellConfig`/`AppShell` (checked against the
+    /// pinned quadraui rev, `src/shell.rs` + `src/compose/app_shell.rs`)
+    /// expose `activity_bar_width_px`/`with_activity_bar_width_px` — a
+    /// fixed-pixel override independent of `line_height` — for the
+    /// activity bar, but **no pixel-valued equivalent for the sidebar**;
+    /// `default_sidebar_width`/`set_sidebar_width` are *only* ever
+    /// interpreted as a line-height multiple
+    /// (`AppShell::compute_layout`), on every backend, with no override
+    /// knob. Converting the persisted, pixel-valued `Session::
+    /// sidebar_width` into that multiple from `App::shell_config()` would
+    /// require a *final* `line_height`/`char_width` reading at
+    /// config-build time, but `shell_config()` runs before the runner ever
+    /// calls `Backend::set_editor_font` (see `#947`'s comment on
+    /// `with_editor_font` a few lines above this fn) — at that point
+    /// `Backend::line_height()` still answers for the backend's *own*
+    /// built-in fallback font, not the resolved editor font, so any
+    /// px→multiple conversion done here would be computed against the
+    /// wrong metrics and could easily trade this bug for a subtler one.
+    /// Landing a real fix therefore needs a new quadraui knob (a
+    /// `default_sidebar_width_px`/`with_default_sidebar_width_px` mirroring
+    /// `activity_bar_width_px`) — filed upstream first, per `CLAUDE.md`'s
+    /// quadraui-first rule, before any vimcode-side change lands. `1600` is
+    /// used below so this test isolates the double-click dispatch path
+    /// (which **is** fully covered and fixed-path-verified, see the
+    /// RED-verification paragraph below) from that still-open
+    /// sidebar-width question; the `800×480` reproduction itself is not
+    /// fixed and not covered by a passing test here (see this PR's
+    /// `ISSUE_RESOLUTION` for the tracking status).
     ///
     /// Reads painted labels back via `find_bounds` on `"sample.txt "` /
     /// `"main.rs "` — **with** the trailing space `TabInfo::name`'s doc
@@ -4468,10 +4492,16 @@ mod tests {
         let mut h = harness(engine, 1600, 480);
         h.driver.render();
 
+        // Scoped to `"sample.txt "` (with the tab-bar-only trailing space
+        // `TabInfo::name` appends) rather than a bare `screen_contains`,
+        // same reasoning as the main assertions below (review round 1): a
+        // bare `screen_contains("sample.txt")` is also satisfied by the
+        // Explorer sidebar row, so it would pass even if the tab itself
+        // never painted.
         assert!(
-            h.driver.screen_contains("sample.txt"),
-            "precondition: sample.txt's tab must already be painted; \
-             painted texts: {:?}",
+            h.driver.find_bounds("sample.txt ").is_some(),
+            "precondition: sample.txt's tab must already be painted on the \
+             tab bar itself; painted texts: {:?}",
             h.driver.painted_texts()
         );
 
