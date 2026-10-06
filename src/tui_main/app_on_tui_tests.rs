@@ -4526,6 +4526,16 @@ mod tests {
         /// documents: at the default `breadcrumbs = true` the tab bar's
         /// band is two rows tall and `bounds.y - 1` no longer reliably
         /// lands on the label row.
+        ///
+        /// Note for a future debugger: `col_width` comes straight from
+        /// `bounds.width.round()`, i.e. the tab bar's *current* painted
+        /// width — it has no notion of "label scrolled out of view". If a
+        /// future change adds tab-bar scrolling and a label gets pushed
+        /// past the visible slice, this fn reports it exactly the same as
+        /// "the label never painted at all" (`tab_row.contains(label)` is
+        /// `false` either way) — don't assume a red assertion here means a
+        /// repaint regression before checking whether it's actually a
+        /// scroll-position issue.
         fn active_group_tab_bar_row(
             h: &crate::harness::ConformanceHarness<
                 quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
@@ -4745,14 +4755,20 @@ mod tests {
             engine.session.explorer_visible = true;
             let active_group = engine.active_group;
             let mut h = harness(engine);
-            let driver = &mut h.driver;
 
+            // Scoped to the tab bar's own row (same helper the main
+            // assertions below use), not a bare `screen_has` — review
+            // round 1 found a bare `screen_has("sample.txt")` is also
+            // satisfied by the Explorer sidebar row, so it would pass even
+            // if the tab itself never painted.
+            let precondition_row = active_group_tab_bar_row(&h, active_group);
             assert!(
-                driver.screen_has("sample.txt"),
-                "precondition: sample.txt's tab must already be painted; screen:\n{}",
-                driver.screen()
+                precondition_row.contains("sample.txt"),
+                "precondition: sample.txt's tab must already be painted on \
+                 the tab bar itself; tab bar row:\n{precondition_row}"
             );
 
+            let driver = &mut h.driver;
             let (x, y) = driver
                 .find("main.rs")
                 .expect("the populated explorer row must paint main.rs's file name");
@@ -4822,14 +4838,17 @@ mod tests {
             engine.session.explorer_visible = true;
             let active_group = engine.active_group;
             let mut h = harness(engine);
-            let driver = &mut h.driver;
 
+            // Scoped to the tab bar's own row, not a bare `screen_has` —
+            // same reasoning as the double-click test above.
+            let precondition_row = active_group_tab_bar_row(&h, active_group);
             assert!(
-                driver.screen_has("sample.txt"),
-                "precondition: sample.txt's tab must already be painted; screen:\n{}",
-                driver.screen()
+                precondition_row.contains("sample.txt"),
+                "precondition: sample.txt's tab must already be painted on \
+                 the tab bar itself; tab bar row:\n{precondition_row}"
             );
 
+            let driver = &mut h.driver;
             let (x, y) = driver
                 .find("main.rs")
                 .expect("the populated explorer row must paint main.rs's file name");
