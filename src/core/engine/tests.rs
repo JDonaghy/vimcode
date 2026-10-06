@@ -785,6 +785,87 @@ fn startup_on_a_file_outside_cwd_still_finds_its_repo_for_source_control_1797() 
     let _ = std::fs::remove_dir_all(&launch_cwd);
 }
 
+/// #1797 review (non-blocking finding #2): `adopt_cwd_for_startup_file`'s
+/// doc comment makes "a file already under `cwd` must not repoint
+/// anything" a load-bearing guarantee — it's what keeps an ordinary
+/// `cd workspace && vimcode src/main.rs` terminal launch from narrowing
+/// the workspace root down to `src/`. Nothing pinned that guarantee
+/// before this test, so a future tweak to the `starts_with` check could
+/// silently start re-rooting every nested-file launch.
+#[test]
+fn adopt_cwd_for_startup_file_is_a_no_op_when_the_file_is_already_under_cwd_1797() {
+    let workspace = test_temp_path("vimcode_1797_adopt_cwd_noop_nested");
+    let _ = std::fs::remove_dir_all(&workspace);
+    let nested = workspace.join("src");
+    std::fs::create_dir_all(&nested).unwrap();
+    let file = nested.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+
+    let mut engine = Engine::new_for_test();
+    engine.cwd = workspace.clone();
+    engine.settings.swap_file = false;
+    engine.startup_without_session_restore(Some(&file));
+
+    assert_eq!(
+        engine.cwd.canonicalize().unwrap(),
+        workspace.canonicalize().unwrap(),
+        "opening a file already reachable from cwd must not repoint cwd \
+         at the file's own (nested) parent directory"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// #1797 review (non-blocking finding #1): opening a file *outside* `cwd`
+/// must not repoint `cwd` away from a workspace that already has its own
+/// git repo — `cd ~/myrepo && vimcode ~/.gitconfig` must leave `cwd` at
+/// `~/myrepo`, not silently move it to `~/.gitconfig`'s own repo (or to
+/// `$HOME`, if `.gitconfig` isn't in one). The reported bug is a launch
+/// `cwd` with *no* repo at all (a desktop shortcut, a file-association
+/// "Open with" launch) — this scenario is deliberately excluded from the
+/// fix's scope.
+#[test]
+fn adopt_cwd_for_startup_file_is_a_no_op_when_cwd_already_has_its_own_repo_1797() {
+    let own_workspace = test_temp_path("vimcode_1797_adopt_cwd_noop_own_repo_ws");
+    let _ = std::fs::remove_dir_all(&own_workspace);
+    std::fs::create_dir_all(&own_workspace).unwrap();
+    let run_git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&own_workspace)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "git {args:?} failed");
+    };
+    run_git(&["init"]);
+
+    // An unrelated file in a *different* directory -- not under
+    // `own_workspace` at all, and not inside a git repo itself, so the
+    // only thing that could trigger adoption is the (deliberately absent)
+    // "cwd has no repo" branch.
+    let other_dir = test_temp_path("vimcode_1797_adopt_cwd_noop_own_repo_other");
+    let _ = std::fs::remove_dir_all(&other_dir);
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let other_file = other_dir.join("notes.txt");
+    std::fs::write(&other_file, "hello\n").unwrap();
+
+    let mut engine = Engine::new_for_test();
+    engine.cwd = own_workspace.clone();
+    engine.settings.swap_file = false;
+    engine.startup_without_session_restore(Some(&other_file));
+
+    assert_eq!(
+        engine.cwd.canonicalize().unwrap(),
+        own_workspace.canonicalize().unwrap(),
+        "cwd already had its own git repo, so opening an unrelated file \
+         by absolute path must not repoint cwd at that file's directory"
+    );
+
+    let _ = std::fs::remove_dir_all(&own_workspace);
+    let _ = std::fs::remove_dir_all(&other_dir);
+}
+
 #[test]
 fn test_restore_session_files_opens_separate_tabs() {
     use crate::core::session::SessionState;
