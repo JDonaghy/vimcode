@@ -32,6 +32,19 @@ use std::sync::Arc;
 
 use project_search::{FsGrepMatch, FsGrepOptions, FsWalkOptions};
 
+/// Per-handle, per-`poll_idle`-tick cap on how many queued `FsEvent`s
+/// [`Engine::poll_plugin_fs`] drains before moving to the next handle (or
+/// returning). Draining *all* currently-queued events in one tick (rather
+/// than one per tick) keeps a fast producer's batches from visibly lagging
+/// a frame behind — but with no cap at all, a producer thread that
+/// consistently outruns the consumer (plausible: the walk is a tight
+/// syscall loop, the consumer crosses into Lua and runs plugin code per
+/// batch) means `try_recv` keeps succeeding and this tick never returns
+/// until the whole walk finishes, stalling the UI thread for the walk's
+/// full duration. The cap bounds that worst case while still draining
+/// everything queued *so far* on every ordinary tick (#1806 review).
+const FS_POLL_MAX_EVENTS_PER_TICK: usize = 32;
+
 /// One streamed event from a `vimcode.fs.walk`/`vimcode.fs.grep` background
 /// thread. `Done` is sent exactly once, after the last batch — never sent at
 /// all if the walk was cancelled first (mirrors the doc comment above: no
@@ -63,6 +76,16 @@ impl Engine {
     /// workspace root", and `cwd.join(root)` is a no-op when `root` is
     /// already absolute (`PathBuf::join` replaces the base entirely for an
     /// absolute right-hand side).
+    ///
+    /// Deliberately unconfined: an absolute `root` (e.g. `/`) or a relative
+    /// one containing `..` is not rejected or normalised, so a walk/grep can
+    /// read anywhere the process can, not just under the workspace. Given
+    /// `vimcode.loop.spawn` already grants arbitrary process execution to
+    /// any loaded plugin, this doesn't change the trust model — plugins are
+    /// unrestricted by design (see the module doc at the top of
+    /// `plugin.rs`) — but it's worth stating explicitly so a future reader
+    /// doesn't assume a confinement that was never implemented (#1806
+    /// review).
     fn resolve_fs_root(&self, root: &str) -> std::path::PathBuf {
         if root.is_empty() {
             self.cwd.clone()
@@ -73,28 +96,51 @@ impl Engine {
 
     /// `vimcode.fs.walk(root, opts, on_batch, on_done)`: list files under
     /// `root` on a background thread, the same gitignore/exclude-aware walk
-    /// `Engine::picker_populate_files` uses, streaming paths to `on_batch`
-    /// in batches. Returns the handle id, or `None` if there is no live
-    /// plugin manager or `opts`'s glob patterns don't parse (the Lua
-    /// binding surfaces either as a runtime error, matching `vimcode.loop.
-    /// spawn`'s "failed to start" convention).
+    /// `Engine::picker_populate_files` uses — including that picker's
+    /// `Settings::explorer_exclude` pruning, filled into `opts` here since
+    /// Lua can't set it directly — streaming paths to `on_batch` in batches.
+    /// Returns the handle id, or `Err` with a human-readable reason if there
+    /// is no live plugin manager or `opts`'s glob patterns don't parse (the
+    /// Lua binding surfaces it as a runtime error, matching `vimcode.loop.
+    /// spawn`'s "failed to start" convention — but with the actual
+    /// `SearchError` message included rather than a generic one, since the
+    /// main consumer of this API compiles user-typed glob patterns on every
+    /// call, #1806 review).
     pub(crate) fn plugin_api_fs_walk(
         &mut self,
         root: String,
-        opts: FsWalkOptions,
+        mut opts: FsWalkOptions,
         on_batch: mlua::RegistryKey,
         on_done: mlua::RegistryKey,
-    ) -> Option<i64> {
-        let pm = self.plugin_manager.clone()?;
+    ) -> Result<i64, String> {
+        let pm = self
+            .plugin_manager
+            .clone()
+            .ok_or("no live plugin manager")?;
         let root = self.resolve_fs_root(&root);
-        // Validate glob patterns synchronously, before registering anything
-        // or spawning the thread — a bad pattern must fail the Lua call
-        // immediately, not silently no-op on a background thread.
-        let overrides = project_search::validate_fs_walk_options(&root, &opts).ok()?;
+        opts.explorer_exclude = self.settings.explorer_exclude.clone();
+        // Register the callbacks *before* validating the glob patterns, not
+        // after — the reverse order drops `on_batch`/`on_done`'s
+        // `LuaRegistryKey`s on the ground on a bad-glob call, since nothing
+        // ever reaches `remove_fs_callbacks` to reclaim their registry slot
+        // (same mistake `plugin_api_http_request`'s doc comment calls out
+        // for #1632; #1806 review).
         let id = pm.register_fs_callbacks(on_batch, on_done);
+        let overrides = match project_search::validate_fs_walk_options(&root, &opts) {
+            Ok(overrides) => overrides,
+            Err(e) => {
+                pm.remove_fs_callbacks(id);
+                return Err(e.0);
+            }
+        };
         let cancelled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let thread_cancelled = cancelled.clone();
+        // `root` is consumed by `walk_project_streaming` below; keep a
+        // separate clone to relativize each batch's paths against before
+        // they're sent — see `PluginManager::call_fs_walk_batch`'s doc
+        // comment for why the paths must be root-relative.
+        let display_root = root.clone();
         std::thread::spawn(move || {
             project_search::walk_project_streaming(
                 &root,
@@ -102,6 +148,18 @@ impl Engine {
                 overrides,
                 &thread_cancelled,
                 |batch| {
+                    let batch: Vec<std::path::PathBuf> = batch
+                        .into_iter()
+                        .map(|p| match p.strip_prefix(&display_root) {
+                            Ok(rel) => rel.to_path_buf(),
+                            // Can't happen for a `root`-rooted walk (every
+                            // entry `ignore::WalkBuilder` yields is under the
+                            // root it was built from) — kept as a defensive
+                            // fallback rather than silently dropping the
+                            // entry.
+                            Err(_) => p,
+                        })
+                        .collect();
                     let _ = tx.send(FsEvent::WalkBatch(batch));
                 },
             );
@@ -117,15 +175,18 @@ impl Engine {
                 rx,
             },
         );
-        Some(id as i64)
+        Ok(id as i64)
     }
 
     /// `vimcode.fs.grep(root, pattern, opts, on_batch, on_done)`: regex or
     /// literal content search under `root` on a background thread, streaming
     /// `{path, line, col, text}` matches to `on_batch` in batches. Returns
-    /// `None` (surfaced by the Lua binding as a runtime error) if there is
-    /// no live plugin manager, `pattern` doesn't compile as a regex (when
-    /// `opts.use_regex`), or `opts`'s glob patterns don't parse.
+    /// `Err` with a human-readable reason (surfaced by the Lua binding as a
+    /// runtime error) if there is no live plugin manager, `pattern` doesn't
+    /// compile as a regex (when `opts.use_regex`), or `opts`'s glob patterns
+    /// don't parse — see `plugin_api_fs_walk`'s doc comment for why the
+    /// actual `SearchError` text is surfaced rather than a generic message
+    /// (#1806 review).
     pub(crate) fn plugin_api_fs_grep(
         &mut self,
         root: String,
@@ -133,13 +194,26 @@ impl Engine {
         opts: FsGrepOptions,
         on_batch: mlua::RegistryKey,
         on_done: mlua::RegistryKey,
-    ) -> Option<i64> {
-        let pm = self.plugin_manager.clone()?;
+    ) -> Result<i64, String> {
+        let pm = self
+            .plugin_manager
+            .clone()
+            .ok_or("no live plugin manager")?;
         let root = self.resolve_fs_root(&root);
-        let (re, overrides) =
-            project_search::validate_fs_grep_options(&root, &pattern, &opts).ok()?;
         let max_results = opts.max_results;
+        // Register before validating — see `plugin_api_fs_walk`'s comment on
+        // the same ordering (#1806 review): an invalid regex/glob must still
+        // reclaim `on_batch`/`on_done`'s registry slots via
+        // `remove_fs_callbacks` rather than dropping the keys unregistered.
         let id = pm.register_fs_callbacks(on_batch, on_done);
+        let (re, overrides) = match project_search::validate_fs_grep_options(&root, &pattern, &opts)
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                pm.remove_fs_callbacks(id);
+                return Err(e.0);
+            }
+        };
         let cancelled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let thread_cancelled = cancelled.clone();
@@ -166,7 +240,7 @@ impl Engine {
                 rx,
             },
         );
-        Some(id as i64)
+        Ok(id as i64)
     }
 
     /// `vimcode.fs.walk(...):cancel()` / `vimcode.fs.grep(...):cancel()` —
@@ -194,10 +268,13 @@ impl Engine {
     /// any `on_done` that has arrived), through the plugin dispatch loan.
     /// Called from `poll_idle`.
     ///
-    /// Drains every event currently queued for each handle in one tick
-    /// (rather than one event per tick) so a fast producer's batches don't
-    /// lag behind — a finder repainting its list one batch per frame while
-    /// several are already buffered would look stalled for no reason.
+    /// Drains up to [`FS_POLL_MAX_EVENTS_PER_TICK`] events currently queued
+    /// for each handle in one tick (rather than one event per tick) so a
+    /// fast producer's batches don't lag behind — a finder repainting its
+    /// list one batch per frame while several are already buffered would
+    /// look stalled for no reason. Anything left over after the cap stays
+    /// queued in the handle's `mpsc::Receiver` for the next tick rather than
+    /// being dropped.
     ///
     /// A handle whose owning plugin manager was unloaded is cancelled and
     /// dropped here instead of having its callbacks invoked — same rule as
@@ -222,11 +299,16 @@ impl Engine {
                 }
                 continue;
             }
-            while let Some(ev) = self
-                .plugin_fs_ops
-                .get(&id)
-                .and_then(|h| h.rx.try_recv().ok())
-            {
+            let mut drained = 0usize;
+            while drained < FS_POLL_MAX_EVENTS_PER_TICK {
+                let Some(ev) = self
+                    .plugin_fs_ops
+                    .get(&id)
+                    .and_then(|h| h.rx.try_recv().ok())
+                else {
+                    break;
+                };
+                drained += 1;
                 match ev {
                     FsEvent::WalkBatch(paths) => {
                         let ctx = self.make_plugin_ctx(true);

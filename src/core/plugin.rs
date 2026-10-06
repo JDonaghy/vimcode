@@ -2190,11 +2190,14 @@ impl PluginManager {
     }
 
     /// Fire handle `id`'s `on_batch` callback with a batch of walked paths,
-    /// each as a string — relative to the walk's `root` when possible
-    /// (matching `Engine::picker_populate_files`'s display convention),
-    /// falling back to the absolute path otherwise (can't happen for a
-    /// `root`-rooted walk, but a defensive fallback is cheap and avoids
-    /// silently dropping an entry).
+    /// each as a string. `Engine::plugin_api_fs_walk`'s background thread
+    /// has already relativized every path against the walk's `root`
+    /// (matching `Engine::picker_populate_files`'s display convention)
+    /// before it reaches here, falling back to the absolute path only in
+    /// the defensive, shouldn't-happen-for-a-`root`-rooted-walk case where
+    /// `strip_prefix` fails — so by the time this function runs, `paths` are
+    /// already in their final, relative-when-possible shape; it does no
+    /// path manipulation of its own (#1806 review).
     pub(crate) fn call_fs_walk_batch(
         &self,
         id: u64,
@@ -2221,9 +2224,14 @@ impl PluginManager {
     }
 
     /// Fire handle `id`'s `on_batch` callback with a batch of grep matches,
-    /// each as `{path, line, col, text}` — `line`/`col` 1-indexed, matching
-    /// `vimcode.buf.cursor()`'s convention (so a plugin can feed either
-    /// straight into `vimcode.buf.set_cursor`/a picker's `preview`).
+    /// each as `{path, line, col, text}` — `line`/`col` 1-indexed the way
+    /// `vimcode.buf.cursor()`'s fields are, so a plugin can feed `line`
+    /// straight into `vimcode.buf.set_cursor`. `col`, however, is a **byte**
+    /// offset within the line (`FsGrepMatch::col`'s own doc comment, and
+    /// consistent with the pre-existing `ProjectMatch::col`) — it is *not*
+    /// guaranteed to match `vimcode.buf.cursor()`'s `col`, which is a
+    /// character index; the two disagree on any line with non-ASCII before
+    /// the match (#1806 review).
     pub(crate) fn call_fs_grep_batch(
         &self,
         id: u64,
@@ -4802,16 +4810,12 @@ impl PluginManager {
                     let on_batch = lua.create_registry_value(on_batch)?;
                     let on_done = lua.create_registry_value(on_done)?;
                     let root = root.unwrap_or_default();
-                    let id = live_engine("vimcode.fs.walk", move |e| {
+                    let result = live_engine("vimcode.fs.walk", move |e| {
                         e.plugin_api_fs_walk(root, walk_opts, on_batch, on_done)
                     })?;
-                    let Some(id) = id else {
-                        return Err(LuaError::RuntimeError(
-                            "vimcode.fs.walk: failed to start (no live plugin manager, or a \
-                             bad include/exclude glob pattern)"
-                                .to_string(),
-                        ));
-                    };
+                    let id = result.map_err(|msg| {
+                        LuaError::RuntimeError(format!("vimcode.fs.walk: failed to start: {msg}"))
+                    })?;
                     make_fs_handle(lua, id)
                 },
             )?,
@@ -4832,16 +4836,12 @@ impl PluginManager {
                     let on_batch = lua.create_registry_value(on_batch)?;
                     let on_done = lua.create_registry_value(on_done)?;
                     let root = root.unwrap_or_default();
-                    let id = live_engine("vimcode.fs.grep", move |e| {
+                    let result = live_engine("vimcode.fs.grep", move |e| {
                         e.plugin_api_fs_grep(root, pattern, grep_opts, on_batch, on_done)
                     })?;
-                    let Some(id) = id else {
-                        return Err(LuaError::RuntimeError(
-                            "vimcode.fs.grep: failed to start (no live plugin manager, a bad \
-                             pattern, or a bad include/exclude glob pattern)"
-                                .to_string(),
-                        ));
-                    };
+                    let id = result.map_err(|msg| {
+                        LuaError::RuntimeError(format!("vimcode.fs.grep: failed to start: {msg}"))
+                    })?;
                     make_fs_handle(lua, id)
                 },
             )?,
