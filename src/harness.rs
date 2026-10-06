@@ -2329,6 +2329,163 @@ mod tests {
         },
     }
 
+    // ── #1797 review (non-blocking finding): GTK twin for the CHANGES
+    // badges scenario ──
+    //
+    // The first version of this PR only covered the fix with a
+    // `TuiDriver` scenario (`src/tui_main/app_on_tui_tests.rs`'s
+    // `sc_panel_changes_section_shows_status_badges_for_modified_and_
+    // untracked_files_1797`), even though the fix itself
+    // (`Engine::adopt_cwd_for_startup_file`) is shared, platform-neutral
+    // `core` code that both backends' `sc_refresh`/paint paths read
+    // identically. This fixture mirrors `engine_with_sc_panel` above but
+    // drives the actual fixed code path (`startup_without_session_
+    // restore`, not a hand-set `engine.cwd`) from a launch `cwd` that is
+    // deliberately unrelated to (and has no git repo of its own, same as)
+    // the file's real workspace — exactly the #1797 bug-bash shape — so
+    // the `gtk`/`tui_prod` arms below give GTK and the pre-#1434 TUI shell
+    // the same fail-first coverage the `TuiDriver` scenario already has.
+    fn engine_outside_cwd_with_sc_panel_1797(tag: &str) -> crate::core::Engine {
+        let workspace = scratch_dir(&format!("vimcode_test_1797_sc_panel_ws_{tag}"));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "t@t.com"]);
+        run_git(&["config", "user.name", "T"]);
+
+        let tracked = workspace.join("main.rs");
+        std::fs::write(&tracked, "fn main() {}\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+        std::fs::write(&tracked, "fn main() { /* changed */ }\n").unwrap();
+
+        let untracked = workspace.join("extra.rs");
+        std::fs::write(&untracked, "// new file\n").unwrap();
+
+        // Deliberately not `workspace`: an unrelated, repo-less directory
+        // standing in for "wherever the process's cwd happened to be at
+        // launch" -- only the fixed `adopt_cwd_for_startup_file` can make
+        // `cwd` land on the file's real repo from here.
+        let launch_cwd = scratch_dir(&format!("vimcode_test_1797_sc_panel_launch_{tag}"));
+        let _ = std::fs::remove_dir_all(&launch_cwd);
+        std::fs::create_dir_all(&launch_cwd).unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.swap_file = false;
+        engine.cwd = launch_cwd;
+        engine.startup_without_session_restore(Some(&tracked));
+        engine.git_branch = Some("main".to_string());
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_GIT,
+        ));
+        // The manual refresh the report's repro step triggers via the
+        // sync/refresh icon -- see the `TuiDriver`-level scenario for the
+        // click-driven version of this same gesture. Calling `sc_refresh`
+        // directly here keeps this fixture backend-neutral (an icon-only
+        // toolbar button's painted bounds differ enough between GTK's
+        // pixel layout and TUI's cell layout that locating it generically
+        // across both backends is its own, separate concern from what
+        // this scenario is pinning: that the fix makes `sc_refresh`
+        // itself resolve the right repo, and that both backends paint the
+        // result identically once it does).
+        engine.sc_refresh();
+        engine
+    }
+
+    /// Whether a painted text run reading exactly `badge` sits on the
+    /// same row as, and strictly left of, the first painted run
+    /// containing `filename` -- i.e. the status badge is painted
+    /// immediately before the file's name, the same relationship
+    /// `screen_has("M main.rs")` checks on a single joined-row backend
+    /// like TUI.
+    ///
+    /// Not just `inv.screen_has("M main.rs")` (#1797 review): GTK paints
+    /// the status char and the filename as two *separate* coloured Pango
+    /// labels (`render::populate_sc_sidebar_system`'s `StyledSpan::
+    /// with_fg(ch.to_string(), color)` + a second `StyledSpan::plain`),
+    /// so `screen_has`/`painted_text`'s per-label `contains` check never
+    /// sees the combined substring on that backend -- only TUI's
+    /// `screen_has` incidentally works, because its `screen()` joins an
+    /// entire row into one string before searching it. This instead uses
+    /// [`quadraui::testing::FrameInventory`]'s own relational vocabulary
+    /// (quadraui#490: `left_of`/`same_row`, built exactly for "two
+    /// painted things, however many labels either backend split them
+    /// into"), with an *exact* match on `badge` rather than `contains`
+    /// so a status bar mode indicator like "NORMAL" (which `contains`
+    /// would match against a bare "M" needle) can't false-positive.
+    fn badge_precedes_file(
+        inv: &quadraui::testing::FrameInventory,
+        badge: char,
+        filename: &str,
+    ) -> bool {
+        let badge = badge.to_string();
+        // `filename` can legitimately paint more than once a frame (the
+        // tab bar's own title, the breadcrumb, *and* its CHANGES-section
+        // row all read "main.rs") -- checking only the first match in
+        // paint order found the tab title instead of the CHANGES row and
+        // never saw a badge next to it. Check every occurrence instead;
+        // only one needs a badge immediately to its left.
+        inv.text_runs()
+            .iter()
+            .filter(|r| r.text.contains(filename))
+            .any(|file_run| {
+                inv.text_runs().iter().any(|r| {
+                    r.text == badge
+                        && r.bounds.x + r.bounds.width <= file_run.bounds.x
+                        && r.bounds.y < file_run.bounds.y + file_run.bounds.height
+                        && file_run.bounds.y < r.bounds.y + r.bounds.height
+                })
+            })
+    }
+
+    crate::backend_conformance! {
+        label: sc_panel_changes_section_shows_status_badges_after_startup_cwd_fix_1797,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_outside_cwd_with_sc_panel_1797("badges"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("SOURCE CONTROL"),
+                "precondition: the SC panel must be showing"
+            );
+            assert!(
+                driver.screen_has("CHANGES"),
+                "precondition: the CHANGES section header must be painted"
+            );
+            assert!(
+                driver.screen_has("main.rs"),
+                "the modified tracked file's name must be painted in the \
+                 CHANGES list"
+            );
+            assert!(
+                driver.screen_has("extra.rs"),
+                "the untracked file's name must be painted in the CHANGES \
+                 list"
+            );
+            let inv = driver.inventory();
+            assert!(
+                badge_precedes_file(&inv, 'M', "main.rs"),
+                "the modified tracked file must carry an 'M' status badge"
+            );
+            assert!(
+                badge_precedes_file(&inv, 'U', "extra.rs"),
+                "the untracked file must carry a 'U' status badge (VS \
+                 Code's untracked glyph -- see `StatusKind::label`'s own \
+                 doc for why this is 'U', not git's raw '?')"
+            );
+        },
+    }
+
     // ── #1361 review: hit-testing must account for the reserved hint row ──
     //
     // The acceptance bar for this half names `sweep_hit_band_integrity`

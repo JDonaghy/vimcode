@@ -2069,64 +2069,176 @@ mod tests {
         /// scenario the issue's acceptance bar asks for; win-native shares
         /// this exact rendering path (no `src/win/` code touches
         /// `sc_*`/`source_control`, confirmed by grep).
+        ///
+        /// Two review fixes vs. the first version of this test:
+        ///
+        /// 1. **Drives `Engine::startup_without_session_restore` instead of
+        ///    hand-setting `engine.cwd`.** The bug's actual root cause is
+        ///    `startup_inner`'s file-opening arm never touching `cwd` at
+        ///    all, so a fixture that sets `engine.cwd = <the file's own
+        ///    repo>` directly bypasses the broken code path entirely and
+        ///    cannot fail against unfixed `develop`. Here `engine.cwd`
+        ///    starts out pointing at an unrelated, repo-less `launch_cwd`
+        ///    — standing in for "wherever the process's cwd happened to be
+        ///    at launch" — and only `startup_without_session_restore`
+        ///    (which calls the fixed `adopt_cwd_for_startup_file`) moves it
+        ///    to the file's real repo.
+        /// 2. **Clicks the sync/refresh toolbar icon through the driver**
+        ///    instead of calling `engine.sc_refresh()` directly, matching
+        ///    the report's own repro step ("click the refresh icon"). The
+        ///    production GUI path for a *manual* refresh is exactly this
+        ///    click → `route_sc_sidebar_click` → `sc_button_hit` →
+        ///    `sc_activate_button(3)` → `sc_sync()` → `sc_refresh()`
+        ///    dispatch, not a synchronous engine-method call a test
+        ///    invented.
+        ///
+        /// RED-verified: reverting `adopt_cwd_for_startup_file` to a no-op
+        /// (the pre-fix `startup_inner` body, which never touched `cwd` at
+        /// all) leaves `cwd` at `launch_cwd` — no repo there — so
+        /// `sc_refresh()` (reached via the same toolbar click) returns no
+        /// files and every `screen_has` assertion below goes red.
         #[test]
         fn sc_panel_changes_section_shows_status_badges_for_modified_and_untracked_files_1797() {
-            let dir = std::env::temp_dir().join(format!(
-                "vimcode_test_1797_sc_changes_badges_{}_{:?}",
+            use crate::core::engine::SC_BUTTON_IDS;
+
+            // The git workspace the file actually lives in: one committed
+            // file modified afterward (porcelain " M"), plus one untracked
+            // file (porcelain "??") -- the issue's own exact reproduction
+            // shape ("git status --short showing 'M main.rs' / '??
+            // extra.rs'").
+            let workspace = std::env::temp_dir().join(format!(
+                "vimcode_test_1797_sc_changes_badges_ws_{}_{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+            let _ = std::fs::remove_dir_all(&workspace);
+            std::fs::create_dir_all(&workspace).unwrap();
 
             let run_git = |args: &[&str]| {
-                std::process::Command::new("git")
+                let status = std::process::Command::new("git")
                     .args(args)
-                    .current_dir(&dir)
+                    .current_dir(&workspace)
                     .output()
-                    .unwrap();
+                    .unwrap()
+                    .status;
+                assert!(status.success(), "git {args:?} failed");
             };
             run_git(&["init"]);
             run_git(&["config", "user.email", "t@t.com"]);
             run_git(&["config", "user.name", "T"]);
 
-            // Tracked file, committed, then modified on disk (porcelain
-            // " M") -- the issue's own reproduction: "git status --short
-            // showing 'M main.rs'".
-            let tracked = dir.join("main.rs");
+            let tracked = workspace.join("main.rs");
             std::fs::write(&tracked, "fn main() {}\n").unwrap();
             run_git(&["add", "."]);
             run_git(&["commit", "-m", "init"]);
             std::fs::write(&tracked, "fn main() { /* changed */ }\n").unwrap();
 
-            // Untracked file (porcelain "??") -- the issue's "extra.rs".
-            let untracked = dir.join("extra.rs");
+            let untracked = workspace.join("extra.rs");
             std::fs::write(&untracked, "// new file\n").unwrap();
 
+            // A completely unrelated, repo-less directory standing in for
+            // "wherever the process's cwd happened to be at launch" --
+            // deliberately *not* `workspace` above, so only the fixed
+            // `adopt_cwd_for_startup_file` can make `cwd` land on the
+            // file's real repo.
+            let launch_cwd = std::env::temp_dir().join(format!(
+                "vimcode_test_1797_sc_changes_badges_launch_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&launch_cwd);
+            std::fs::create_dir_all(&launch_cwd).unwrap();
+
             let mut engine = plain_engine();
-            engine.cwd = dir.clone();
+            engine.cwd = launch_cwd.clone();
+            engine.settings.swap_file = false;
+            engine.startup_without_session_restore(Some(&tracked));
             engine.git_branch = Some("main".to_string());
-            engine.sc_has_focus = true;
+            // Deliberately *not* focused yet -- see the Alt+Right loop
+            // below, which needs `sidebar_has_focus()` to be false so the
+            // chord actually reaches `render::route_alt_key` instead of
+            // being swallowed as a plain SC-panel navigation key first.
+            // The sync click further down focuses the panel for real, the
+            // same way a production click does
+            // (`route_sc_sidebar_click`'s `engine.sc_set_focus(true)`).
             engine.app_shell.show_panel(&quadraui::WidgetId::new(
                 crate::core::engine::sidebar::PANEL_GIT,
             ));
-            // The manual refresh the report's repro step triggers via the
-            // sync/refresh icon -- `sc_refresh` runs the real `git status
-            // --porcelain -u` against `dir` and populates
-            // `sc_file_statuses`, which `render::populate_sc_sidebar_system`
-            // turns into the CHANGES section's rows.
-            engine.sc_refresh();
 
-            assert_eq!(
-                engine.sc_section_file_count(crate::core::engine::SC_SECTION_CHANGES),
-                2,
-                "both the modified tracked file and the untracked file must \
-                 land in the CHANGES section after a refresh"
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+            // Default sidebar width (~20 columns, the same budget
+            // `sc_panel_help_dialog_renders_keybindings_table`'s own
+            // comment above documents truncating text elsewhere) only
+            // leaves room for the Commit button -- Push/Pull/Sync get no
+            // painted bounds at all, so the sync click below would have
+            // nothing to find. Widen it the real way: `Engine::app_shell`
+            // is only a shadow copy the runner's own `AppShell` is never
+            // synced from at startup (see `collapse_sidebar`'s own doc),
+            // so mutating it directly has no effect here -- the actual
+            // production gesture is repeated plain `Alt+Right`
+            // (`render::route_alt_key`'s unconditional
+            // `AltBase::Right => ResizeSidebar(1)` arm in non-VSCode
+            // mode), same as a user holding the real resize chord.
+            for _ in 0..20 {
+                driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+
+            // First paint: materialises `Engine::sc_panel_layout`'s cached
+            // toolbar layout, the same cache `Engine::sc_button_hit` reads
+            // for a real click -- needed to locate the sync button's
+            // painted bounds below instead of guessing coordinates.
+            driver.render();
+            assert!(
+                driver.screen_has("SOURCE CONTROL"),
+                "precondition: the SC panel must be showing before the \
+                 refresh click is driven; screen:\n{}",
+                driver.screen()
             );
 
-            let h = harness(engine);
-            let driver = &h.driver;
+            let (sync_x, sync_y) = {
+                let engine = h.engine.borrow();
+                let layout = engine.sc_panel_layout.borrow();
+                let toolbar = layout
+                    .as_ref()
+                    .and_then(|l| l.toolbar_layout.as_ref())
+                    .expect("the SC panel toolbar must have painted a layout");
+                let item = toolbar
+                    .visible_items
+                    .iter()
+                    .find(|v| v.action_id.as_ref().map(|id| id.as_str()) == Some(SC_BUTTON_IDS[3]))
+                    .expect("the sync/refresh toolbar button must be painted");
+                (
+                    item.bounds.x + item.bounds.width / 2.0,
+                    item.bounds.y + item.bounds.height / 2.0,
+                )
+            };
+
+            // The report's actual repro gesture: click the sync/refresh
+            // icon (`sc:sync`, VS Code's circular-arrows "Sync Changes"
+            // icon -- this codebase's own icon constant is
+            // `icons::GIT_SYNC`) through the real dispatch pipeline,
+            // rather than calling `Engine::sc_refresh()` directly.
+            // `sc_activate_button(3)` -> `sc_sync()` tries a pull+push
+            // (which fail harmlessly here -- no remote configured) and
+            // then *unconditionally* calls `sc_refresh()`, so this
+            // exercises the identical production path
+            // `route_sc_sidebar_click` wires a real mouse click through.
+            driver.click(sync_x, sync_y);
+
             let screen = driver.screen();
+            assert!(
+                driver.screen_has("CHANGES"),
+                "precondition: the CHANGES section header must be \
+                 painted; screen:\n{screen}"
+            );
             assert!(
                 driver.screen_has("main.rs"),
                 "the modified tracked file's name must be painted in the \
@@ -2150,7 +2262,8 @@ mod tests {
                  screen:\n{screen}"
             );
 
-            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&workspace);
+            let _ = std::fs::remove_dir_all(&launch_cwd);
         }
 
         /// #1722 review (blocking finding): `render::route_sidebar_hover`
