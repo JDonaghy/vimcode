@@ -14533,6 +14533,99 @@ mod tests {
                  the view within 10s of the button click; screen:\n{screen}"
             );
         }
+
+        /// #1751 review: driver-tier companion to `tests/extensions.rs`'s
+        /// `async_shell_defaults_cwd_to_engine_cwd_when_not_specified_1751`,
+        /// which only asserted on `Engine::message` — an **engine field**,
+        /// not painted output. CLAUDE.md's "assert on rendered output, never
+        /// on state being populated" rule exists precisely because fields
+        /// like that one have gone unpainted for months before (#587/#592),
+        /// and git-insights' blame ghost text (the actual #1751 symptom) is
+        /// exactly that kind of surface. This test drives the real
+        /// `App`/`TuiDriver` pipeline end to end: a `:`-command's Lua
+        /// callback `async_shell`s `pwd` with no `cwd` option, and the
+        /// completion handler writes the result into a scratch buffer
+        /// (`vimcode.buffer.*` + `vimcode.window.set_buf`, the same
+        /// immediately-visible seam `immediate_api_scratch_buffer_paints_
+        /// after_plugin_command_via_shell_app` above already proves paints),
+        /// so the assertion is on `driver.screen()` containing the engine's
+        /// `cwd`, not on any engine field.
+        ///
+        /// RED-verified by hand the same way as the engine-level test: with
+        /// `Engine::apply_plugin_ctx`'s `cmd.current_dir(req.cwd.as_deref()
+        /// .unwrap_or(&self.cwd))` reverted to the old "no fallback at all"
+        /// behaviour, `pwd`'s child inherits this test binary's real OS
+        /// process directory (the repo root `cargo test` runs from) instead
+        /// of `tmp`, so the poll loop below exhausts its deadline and the
+        /// screen never contains `tmp`'s path.
+        #[test]
+        #[cfg(unix)]
+        fn async_shell_cwd_default_paints_into_buffer_via_shell_app_1751() {
+            use std::time::{Duration, Instant};
+
+            let tmp = std::env::temp_dir().join(format!(
+                "vc_app_on_tui_async_shell_cwd_1751_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            // Canonicalize so this matches what the child's `pwd` reports
+            // (resolves any symlink in the temp root, e.g. macOS's `/tmp`
+            // -> `/private/tmp`).
+            let tmp = tmp.canonicalize().unwrap();
+
+            let mut engine = engine_with_plugin(
+                "async_shell_cwd_1751",
+                r#"
+                vimcode.command("RunShellCwd1751", function(_)
+                    vimcode.async_shell("pwd", "shell_cwd_done_1751")
+                end)
+                vimcode.on("shell_cwd_done_1751", function(output)
+                    local trimmed = output:gsub("%s+$", "")
+                    local b = vimcode.buffer.create({ scratch = true, name = "ZQCWD1751" })
+                    vimcode.buffer.set_lines(b, 0, -1, { trimmed })
+                    vimcode.window.set_buf(0, b)
+                end)
+                "#,
+            );
+            // Point the engine's workspace at `tmp` — deliberately different
+            // from this test binary's real OS process directory, which this
+            // test never moves (it overrides the *child's* cwd explicitly
+            // via the production fallback under test, not the process's own).
+            engine.cwd = tmp.clone();
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let tmp_str = tmp.to_string_lossy().into_owned();
+            let before = driver.screen();
+            assert!(
+                !before.contains(&tmp_str),
+                "precondition: the temp path isn't painted before the \
+                 command runs; screen:\n{before}"
+            );
+
+            driver.type_char(':');
+            for c in "RunShellCwd1751".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !screen.contains(&tmp_str) && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+            assert!(
+                screen.contains(&tmp_str),
+                "vimcode.async_shell with no `cwd` option must default to \
+                 the engine's own `cwd` ({tmp_str:?}), painted into the \
+                 scratch buffer within 5s; screen:\n{screen}"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

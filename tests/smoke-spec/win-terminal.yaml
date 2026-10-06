@@ -86,6 +86,26 @@
 # `terminal` element's own buffer content (coordinator-repo work, the same
 # class of gap as the minimap/extension-install primitive noted in
 # `win-gui.yaml`).
+#
+# ── #1751: no Tier-2 step added for the git-insights inline blame ghost
+#    text ──────────────────────────────────────────────────────────────
+#
+# Same reason as `win-gui.yaml`'s matching #1751 section: confirming the
+# blame ghost text painted (or didn't) on a real Windows Terminal window
+# needs reading drawn glyph content from inside the single `terminal` UIA
+# element this file's own header already found Windows Terminal exposes
+# only via a text-pattern read `win_native_driver.py` does not implement —
+# the identical wall the five `-1634`/`-1635`/`-1636` steps above hit. This
+# issue's real acceptance coverage is the same Tier-1, platform-neutral
+# test named in `win-gui.yaml`'s #1751 section
+# (`src/tui_main/app_on_tui_tests.rs`'s `live_plugin_api::
+# async_shell_cwd_default_paints_into_buffer_via_shell_app_1751`) — the
+# fix it covers is core engine code (`Engine::apply_plugin_ctx`'s
+# `vimcode.async_shell` cwd default), not terminal-hosting-specific, so it
+# already exercises this lane's shared code path. A real Win-GUI/Windows-
+# Terminal re-verification of the painted blame ghost text itself remains
+# open pending the companion vimcode-ext fix; see this branch's commit
+# messages.
 name: vimcode-win-terminal
 mode: terminal
 terminal_app: windows-terminal
