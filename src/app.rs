@@ -4376,6 +4376,27 @@ impl App {
                     } else {
                         engine.ext_panel_tree_layout.replace(None);
                     }
+
+                    // #636: the `?`-triggered keybindings help popup, drawn
+                    // over the whole panel content area via `Tooltip` +
+                    // `Backend::draw_tooltip_with_chrome` (JDonaghy/
+                    // quadraui#541, landed at this repo's pinned rev) —
+                    // see `render::ext_panel_help_tooltip_layout`'s own doc
+                    // for why this is the real fix and not a stand-in.
+                    // Nothing painted this popup at all before this change
+                    // (the 2026-10-05 triage update on the issue): `?` set
+                    // `Engine::ext_panel_help_open` but no backend ever read
+                    // it back.
+                    if panel.help_open {
+                        let (tooltip, tlayout, chrome) = render::ext_panel_help_tooltip_layout(
+                            &panel.name,
+                            &panel.help_bindings,
+                            q_sb,
+                            cw as f32,
+                            lh as f32,
+                        );
+                        backend.draw_tooltip_with_chrome(&tooltip, &tlayout, &chrome);
+                    }
                 } else {
                     engine.ext_panel_tree_layout.replace(None);
                 }

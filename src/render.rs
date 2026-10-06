@@ -19035,6 +19035,86 @@ pub fn sc_help_dialog_layout(
     (dialog, layout)
 }
 
+/// Build the `(Tooltip, TooltipLayout, TooltipChrome)` for a plugin
+/// ext-panel's own `?`-triggered keybindings help popup (#636).
+///
+/// #635 (Stage 6b item C) migrated this popup from raw `set_cell`
+/// box-drawing (full 4-sided border + centred title embedded in the top
+/// border) to `Backend::draw_tooltip`, which at the time could only ever
+/// paint TUI's side-bars-only chrome with no way to ask for a full border
+/// or a title at all — a real regression, filed upstream as
+/// JDonaghy/quadraui#541. #541 has since landed at this repo's pinned
+/// quadraui rev: `TooltipChrome` (a sidecar value passed to the new
+/// `Backend::draw_tooltip_with_chrome`, so it doesn't touch `Tooltip`'s or
+/// `TooltipLayout`'s own field sets) carries exactly the `border`/`title`
+/// vocabulary this popup needs, with `TooltipBorder::Full` + a title
+/// landing it in the same full-border-with-embedded-title shape the
+/// original raw-drawing code painted. This is the real fix, not the
+/// "documented temporary stand-in" the issue anticipated needing — #541
+/// was built (and references JDonaghy/vimcode#635 by name in its own doc
+/// comment) specifically to unblock this call site.
+///
+/// `panel_name` namespaces the tooltip's `WidgetId` so two different
+/// plugin panels' help popups (never shown simultaneously, but still)
+/// don't collide; `bindings` is the plugin-registered `(key, description)`
+/// list (`Engine::ext_panel_help_bindings`). `char_width`/`line_height`
+/// follow the same generic char-cell/pixel convention
+/// [`sc_help_dialog_layout`] uses (TUI: `1.0, 1.0`; GTK: real metrics).
+pub fn ext_panel_help_tooltip_layout(
+    panel_name: &str,
+    bindings: &[(String, String)],
+    viewport: quadraui::Rect,
+    char_width: f32,
+    line_height: f32,
+) -> (
+    quadraui::Tooltip,
+    quadraui::TooltipLayout,
+    quadraui::TooltipChrome,
+) {
+    let key_fg_width = bindings
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let lines: Vec<quadraui::StyledText> = bindings
+        .iter()
+        .map(|(key, desc)| quadraui::StyledText {
+            spans: vec![
+                quadraui::StyledSpan::plain(format!("{key:<key_fg_width$} ")),
+                quadraui::StyledSpan::plain(desc.clone()),
+            ],
+        })
+        .collect();
+
+    let mut tooltip = quadraui_tooltip(
+        quadraui::WidgetId::new(format!("ext:help:{panel_name}")),
+        String::new(),
+    );
+    tooltip.styled_lines = Some(lines);
+
+    let content_w = bindings
+        .iter()
+        .map(|(k, d)| k.chars().count() + 1 + d.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("Keybindings".len());
+    let popup_w = ((content_w as f32 + 2.0) * char_width)
+        .min(viewport.width - char_width * 2.0)
+        .max(char_width * 12.0);
+    let popup_h = ((bindings.len() as f32 + 2.0) * line_height).min(viewport.height - line_height);
+    let popup_x = viewport.x + (viewport.width - popup_w) / 2.0;
+    let popup_y = viewport.y + (viewport.height - popup_h) / 2.0;
+
+    let layout = quadraui::TooltipLayout {
+        bounds: quadraui::Rect::new(popup_x, popup_y, popup_w, popup_h),
+        resolved_placement: quadraui::ResolvedPlacement::Bottom,
+    };
+    let mut chrome = quadraui::TooltipChrome::new(quadraui::TooltipBorder::Full);
+    chrome.title = Some("Keybindings".to_string());
+    (tooltip, layout, chrome)
+}
+
 /// Populate the `SidebarSystem` on `engine.dap_sidebar_system` with
 /// current row data for all 4 debug sidebar sections. Call once per
 /// frame before `sidebar_system.render()` or `.handle()`.
