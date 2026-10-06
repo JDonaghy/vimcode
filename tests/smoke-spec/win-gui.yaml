@@ -349,6 +349,41 @@
 # new entry for this issue for the full root-cause investigation and the
 # one open, real-hardware-only question neither of those tests — nor any
 # step this file's vocabulary could add — can close.
+#
+# ── #1751: no Tier-2 step added for the git-insights inline blame ghost
+#    text ──────────────────────────────────────────────────────────────
+#
+# vimcode#1751 reports git-insights' inline blame ghost text (e.g. "John
+# Donaghy • 3 months ago • ..." painted after the cursor line) never
+# appears on Win-GUI. Same structural wall #1668/#1674 above already hit:
+# confirming the annotation painted (or didn't) needs reading drawn glyph
+# content, and this driver's vocabulary — `launch`, `key`, `click`, `wait`,
+# `capture`, `expect_menu`, `expect_hit`, `expect_a11y`/`expect_a11y_within`,
+# `expect_closed` — has no primitive that can see it: `capture` takes a
+# `PrintWindow` snapshot with no `expect_*` shape (CLAUDE.md's "a test that
+# cannot fail is not coverage", #553), and no UIA/AT-provider element
+# exists for vimcode's own drawn virtual text (the same "No UIA/
+# NSAccessibility/AT-SPI provider wiring..." gap `docs/
+# PENDING_QUADRAUI_ISSUES.md` already tracks for #1668/#1674/the minimap).
+# Adding a step here would not satisfy this issue's acceptance bar, only
+# appear to.
+#
+# This issue's real acceptance coverage is the Tier-1, platform-neutral
+# option instead, and it is not Win-GUI-specific in the first place: the
+# root cause this repo's half of #1751 fixes (`Engine::apply_plugin_ctx`'s
+# `vimcode.async_shell` cwd default, `src/core/engine/plugins.rs`) is core
+# engine code that runs identically on every backend, so
+# `src/tui_main/app_on_tui_tests.rs`'s `live_plugin_api::
+# async_shell_cwd_default_paints_into_buffer_via_shell_app_1751` — a real
+# `App`/`TuiDriver` black-box test, painted-output assertion, RED-verified
+# against the unfixed fallback — already is this fix's acceptance coverage
+# for every backend quadraui ships, Win-GUI included, the same way the
+# shared-layout-code Tier-1 pairs #1657/#1675/#1676/#1696 above stand in for
+# a real-hardware-only capture. A real Win-GUI re-verification of the
+# *painted blame ghost text itself* remains open — it depends on
+# git-insights' `blame.lua` (a separate vimcode-ext repo this fix cannot
+# touch) also being fixed, which is why #1751 is not being closed by this
+# PR alone; see this branch's commit messages for the full account.
 name: vimcode-win-gui
 mode: window
 width: 1024

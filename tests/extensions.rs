@@ -5945,33 +5945,53 @@ fn async_shell_large_stdin_write_does_not_block_the_calling_thread() {
 /// the blame ghost text silently never rendered (output discarded on
 /// failure — see `apply_plugin_ctx`'s `Err(_)` arm).
 ///
-/// RED-verified by hand: with the fix's `req.cwd.as_deref().unwrap_or(&self.cwd)`
-/// reverted to the old `if let Some(ref cwd) = req.cwd { cmd.current_dir(cwd); }`
-/// (i.e. no fallback at all), this test's `poll_until` exhausts its full
-/// deadline and fails — `pwd`'s child inherits this test binary's real
-/// process directory (the repo root `cargo test` runs from) instead of
-/// `tmp`, so the message never matches.
+/// RED-verified by hand: with the fix's fallback reverted to the old
+/// `if let Some(ref cwd) = req.cwd { cmd.current_dir(cwd); }` (i.e. no
+/// fallback at all), this test's `poll_until` exhausts its full deadline
+/// and fails — `pwd`'s child inherits this test binary's real process
+/// directory (the repo root `cargo test` runs from) instead of `tmp`, so
+/// the message never matches.
+///
+/// This is the unit-level companion to the driver-tier
+/// `async_shell_cwd_default_paints_into_buffer_via_shell_app_1751` test in
+/// `src/tui_main/app_on_tui_tests.rs`'s `live_plugin_api` module, which
+/// asserts on `TuiDriver::screen()` (painted output) rather than this
+/// test's `Engine::message` field — see that test's doc for why both exist
+/// (#1751 review: an engine-field assertion alone doesn't prove anything
+/// painted).
 #[test]
 #[cfg(unix)]
 fn async_shell_defaults_cwd_to_engine_cwd_when_not_specified_1751() {
     let tmp = std::env::temp_dir().join(format!("vc_async_shell_cwd_1751_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
-    // Canonicalize so this matches what the child's `pwd` reports (resolves
-    // any symlink in the temp root, e.g. macOS's `/tmp` -> `/private/tmp`).
+    // Canonicalize so this matches what the child's `pwd -P` reports
+    // (resolves any symlink in the temp root, e.g. macOS's `/tmp` ->
+    // `/private/tmp`).
     let tmp = tmp.canonicalize().unwrap();
+
+    // Absolute path, `-P` flag: see `posix_tool`'s own doc for why a spawn
+    // test in this file must never let a shell resolve a utility via
+    // `PATH`, and `-P` asks `pwd` to resolve symlinks via `getcwd()`
+    // rather than print whatever logical `$PWD` it inherited from this
+    // test binary's own environment — a shell-builtin `pwd` can echo an
+    // inherited `$PWD` on some `sh` implementations instead of actually
+    // stat-verifying the process's real working directory.
+    let pwd = posix_tool("pwd");
 
     let mut e = engine_with_plugin(
         "",
         "async_shell_cwd_1751",
-        r#"
-        vimcode.command("RunShell", function(_)
-            vimcode.async_shell("pwd", "shell_cwd_done_1751")
-        end)
-        vimcode.on("shell_cwd_done_1751", function(output)
-            vimcode.message(output)
-        end)
-        "#,
+        &format!(
+            r#"
+            vimcode.command("RunShell", function(_)
+                vimcode.async_shell("{pwd} -P", "shell_cwd_done_1751")
+            end)
+            vimcode.on("shell_cwd_done_1751", function(output)
+                vimcode.message(output)
+            end)
+            "#
+        ),
     );
     // Point the engine's workspace at `tmp` — deliberately different from
     // this test binary's real OS process directory, which no test in this
@@ -5983,15 +6003,77 @@ fn async_shell_defaults_cwd_to_engine_cwd_when_not_specified_1751() {
     e.cwd = tmp.clone();
     exec(&mut e, "RunShell");
 
-    let reached = poll_until(&mut e, std::time::Duration::from_secs(15), |e| {
+    // 5s, not 15s: this is a local `pwd -P`, not a network-bound op, and
+    // neighbouring async tests in this file use far tighter budgets — a
+    // 15s wait before a red was painful on CI for no corresponding benefit.
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(5), |e| {
         e.message.trim() == tmp.to_string_lossy()
     });
+    let _ = std::fs::remove_dir_all(&tmp);
     assert!(
         reached,
         "vimcode.async_shell with no `cwd` option must default to the \
          engine's own `cwd` ({:?}), not the OS process's actual working \
          directory; last message: {:?}",
         tmp, e.message
+    );
+}
+
+/// #1751 review (non-blocking edge case): if `Engine::cwd` itself no
+/// longer resolves to a real directory — the workspace folder was deleted,
+/// renamed, or an unmounted network share went away after the fact — an
+/// omitted `cwd` must NOT make `vimcode.async_shell` spawn fail. Before
+/// this guard, handing `Command::current_dir` a known-gone path would make
+/// every such spawn fail, and the plugin would receive the synthetic
+/// empty-output `Err(_)` exit instead of running somewhere valid — a
+/// regression against the pre-#1751 behaviour, where an omitted `cwd`
+/// always spawned successfully (in the OS process's own directory).
+///
+/// RED-verified by hand: with the `None if self.cwd.is_dir()` guard in
+/// `Engine::apply_plugin_ctx` relaxed back to an unconditional
+/// `cmd.current_dir(&self.cwd)` for the "no cwd given" arm, this test's
+/// `poll_until` exhausts its deadline — the child never starts, since
+/// `Command::spawn` fails immediately when `current_dir` names a
+/// nonexistent directory.
+#[test]
+#[cfg(unix)]
+fn async_shell_falls_back_further_when_engine_cwd_no_longer_exists_1751() {
+    let gone = std::env::temp_dir().join(format!(
+        "vc_async_shell_cwd_gone_1751_{}",
+        std::process::id()
+    ));
+    // Deliberately do NOT create this directory — `e.cwd` must point at a
+    // path that genuinely does not exist.
+    let _ = std::fs::remove_dir_all(&gone);
+
+    let echo = posix_tool("echo");
+    let mut e = engine_with_plugin(
+        "",
+        "async_shell_cwd_gone_1751",
+        &format!(
+            r#"
+            vimcode.command("RunShell", function(_)
+                vimcode.async_shell("{echo} ok_1751", "shell_cwd_gone_done_1751")
+            end)
+            vimcode.on("shell_cwd_gone_done_1751", function(output)
+                vimcode.message(output)
+            end)
+            "#
+        ),
+    );
+    e.cwd = gone;
+    exec(&mut e, "RunShell");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(5), |e| {
+        e.message.trim() == "ok_1751"
+    });
+    assert!(
+        reached,
+        "an omitted `cwd` must still spawn successfully (falling back to \
+         `std::process::Command`'s own default) when `Engine::cwd` no \
+         longer resolves to a real directory, instead of failing the \
+         spawn outright; last message: {:?}",
+        e.message
     );
 }
 

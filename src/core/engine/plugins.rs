@@ -2103,19 +2103,75 @@ impl Engine {
             // the open workspace by convention (a terminal that `cd`ed
             // there first) — a GUI launch (desktop shortcut, file-manager
             // "Open with", no "Start in" folder set) can leave it pointed
-            // anywhere. `self.cwd` is the engine's adopted workspace root
-            // (`adopt_cwd_for_startup_file`/`open_folder` keep it correct
-            // without ever calling `std::env::set_current_dir`, #1797), so
-            // it's the right fallback for "run this relative to the open
-            // workspace" — which is what every plugin author assumes
-            // "no cwd given" means. This is git-insights' blame.lua's
-            // exact failure mode on Win-GUI: it calls `vimcode.async_shell`
-            // for `git blame -- <relative path>` with no `cwd` option, so
-            // on a GUI launch outside the repo the child process ran in
-            // the wrong directory and `git` failed outright, silently
-            // (output discarded, see `Err(_)` arm below) dropping the
-            // blame annotation with no error surfaced anywhere.
-            cmd.current_dir(req.cwd.as_deref().unwrap_or(&self.cwd));
+            // anywhere. `self.cwd` is the engine's adopted workspace root.
+            // It can genuinely diverge from the OS process directory: after
+            // `adopt_cwd_for_startup_file` (opening a *file* — shortcut /
+            // "Open with" — whose repo root gets adopted in memory without
+            // ever calling `std::env::set_current_dir`, #1797, `mod.rs`),
+            // `self.cwd` is correct but the process cwd is not. (`open_folder`
+            // is not an instance of that divergence — it *does* call
+            // `std::env::set_current_dir`, `buffers.rs` — so a GUI launch
+            // followed by "Open Folder" already had the process cwd
+            // repointed; the case this repairs is specifically the file-open
+            // path.) `self.cwd` is still the right fallback either way — the
+            // engine's own idea of "the open workspace" is what every plugin
+            // author assumes "no cwd given" means. This is git-insights'
+            // blame.lua's exact failure mode on Win-GUI: it calls
+            // `vimcode.async_shell` for `git blame -- <relative path>` with
+            // no `cwd` option, so on a GUI launch outside the repo the child
+            // process ran in the wrong directory and `git` failed outright,
+            // silently (output discarded, see `Err(_)` arm below) dropping
+            // the blame annotation with no error surfaced anywhere.
+            //
+            // `self.cwd` can itself be stale (workspace folder deleted,
+            // renamed, or an unmounted network share after the fact) — if
+            // it no longer resolves to a real directory, fall all the way
+            // back to "no `current_dir` call at all" (`std::process::
+            // Command`'s own OS-process-cwd default) rather than handing
+            // `Command::current_dir` a path that will make every spawn in
+            // this loop fail; that default is at least as likely to be
+            // valid as a known-gone workspace root, and strictly better
+            // than guaranteed failure.
+            //
+            // Windows: `self.cwd` is frequently the `path.canonicalize()`
+            // result (`open_folder`), which on Windows is the verbatim
+            // `\\?\C:\...` extended-length form. `cmd.exe` — every plugin
+            // shell command on Windows routes through `cmd /C`, `terminal.rs`
+            // `shell_cmd` — refuses a non-drive-rooted current directory
+            // ("UNC paths are not supported"), so hand it the stripped form
+            // via `paths::strip_unc_prefix` (already used for the same
+            // reason by `engine/windows.rs` and `render.rs`) rather than the
+            // raw verbatim path.
+            //
+            // Canonical-seam note (#1751 review): this makes
+            // `vimcode.async_shell`'s "no cwd" default the workspace root.
+            // `vimcode.loop.spawn` (the streamed sibling this call site is
+            // itself built on, `execute::spawn_piped`/`AsyncShellTask` just
+            // above) does not get the same default here and still falls
+            // through to the OS process cwd when its own options table
+            // omits `cwd` — left alone deliberately, since changing a second
+            // public API's documented default is out of scope for this fix;
+            // if `loop.spawn` needs the same treatment, that's a follow-up,
+            // not this one. `workspace_storage_key` (`plugin.rs`) is a third,
+            // intentionally different seam: it keys off `std::env::
+            // current_dir()` rather than `Engine::cwd` by design, to survive
+            // a plugin being reloaded with a different open workspace.
+            match req.cwd.as_deref() {
+                // An explicit `cwd` is passed through exactly as before this
+                // fix, valid or not — if a plugin hands us a bad path, that
+                // is the plugin's bug to see fail, not something to paper
+                // over with a silent fallback.
+                Some(cwd) => {
+                    cmd.current_dir(cwd);
+                }
+                // No `cwd` given: default to the engine's workspace root,
+                // but only if it still resolves to a real directory — see
+                // the edge-case note above.
+                None if self.cwd.is_dir() => {
+                    cmd.current_dir(crate::core::paths::strip_unc_prefix(&self.cwd).as_ref());
+                }
+                None => {}
+            }
             let task = match execute::spawn_piped(cmd, req.stdin) {
                 Ok((_child, _stdin, rx)) => execute::AsyncShellTask {
                     rx,
