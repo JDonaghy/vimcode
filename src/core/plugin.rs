@@ -660,6 +660,11 @@ pub struct PluginManager {
     /// plugin_http_requests`, keyed by the same id — mirrors `spawn_callbacks`
     /// exactly, minus the "three callbacks" shape (HTTP has exactly one).
     http_callbacks: RefCell<HashMap<u64, LuaRegistryKey>>,
+    /// `id -> source` for every live `vimcode.completion.register`
+    /// registration (#1805). Unlike the request-scoped maps above, these
+    /// are long-lived — a source stays registered for the plugin's whole
+    /// lifetime, invoked fresh on every `Engine::trigger_completion`.
+    completion_sources: RefCell<HashMap<u64, PluginCompletionSource>>,
 }
 
 /// A `vimcode.loop.spawn` handle's registered callbacks (#1624). Any of the
@@ -669,6 +674,55 @@ struct SpawnCallbacks {
     on_stdout: Option<LuaRegistryKey>,
     on_stderr: Option<LuaRegistryKey>,
     on_exit: Option<LuaRegistryKey>,
+}
+
+/// A live `vimcode.completion.register` source (#1805): a plugin-supplied
+/// insert-mode completion provider that merges into the built-in buffer-
+/// word/LSP popup.
+struct PluginCompletionSource {
+    /// `filetypes = {"rust", "lua"}` restricts the source to those
+    /// buffers; `None` (the field omitted) means "every filetype".
+    filetypes: Option<Vec<String>>,
+    /// `trigger_chars = {".", "/"}` — characters that let the source fire
+    /// on an otherwise-empty prefix (e.g. member access after `.`), same
+    /// idea as LSP `triggerCharacters`. Empty means the source only runs
+    /// when there's a non-empty word prefix, or on a manual trigger.
+    trigger_chars: Vec<char>,
+    /// Sort weight relative to buffer-word/LSP candidates (priority `0`).
+    priority: i32,
+    /// `source(ctx, request_id)` — called with `ctx = {buf, line, col,
+    /// prefix}`. Returns a table of items for an immediate result, or
+    /// `nil` to deliver later via `vimcode.completion.complete(request_id,
+    /// items)`.
+    callback: LuaRegistryKey,
+}
+
+/// Position + request identity for one `vimcode.completion.register`
+/// source invocation — bundled into one argument so `call_completion_
+/// source` doesn't blow past clippy's `too_many_arguments` (#1805).
+pub(crate) struct CompletionSourceCall<'a> {
+    pub request_id: u64,
+    /// Buffer handle (`0` = current, same convention as every other
+    /// immediate-API buffer handle).
+    pub buf: i64,
+    /// 1-indexed, matching every other immediate-API position.
+    pub line_1indexed: usize,
+    /// 1-indexed, matching every other immediate-API position.
+    pub col_1indexed: usize,
+    pub prefix: &'a str,
+}
+
+/// One `vimcode.completion.register`/`vimcode.completion.complete` item,
+/// parsed from Lua but not yet an engine-side `CompletionCandidate` — that
+/// needs the owning source's `priority`, known only at the call site
+/// (`Engine::plugin_request_completions`/`plugin_api_completion_complete`).
+#[derive(Debug, Clone)]
+pub(crate) struct PluginCompletionItemSpec {
+    pub label: String,
+    pub insert_text: String,
+    pub kind: crate::core::completion::CompletionItemKind,
+    pub detail: Option<String>,
+    pub documentation: Option<String>,
 }
 
 /// A live `vimcode.picker.open` registration (#1630): the three optional
@@ -743,6 +797,39 @@ struct PendingLuaKeymap {
     callback: LuaRegistryKey,
     expr: bool,
     desc: Option<String>,
+}
+
+/// Process-wide id source for `vimcode.completion.register` (#1805).
+///
+/// Every other runtime registration (`register_timer_callback`, `register_
+/// picker`, …) hands out ids via `PluginManager::next_handle_id`, a `Cell`
+/// on `&self` — but completion sources are the one registration that must
+/// also work at **load time** (mirroring `vimcode.keymap.set`'s dual
+/// load-time/runtime path, see `PendingLuaKeymap`'s doc), where there is no
+/// `&PluginManager` yet to call `next_handle_id` on — the `Lua` closures are
+/// built in `setup_vimcode_api` before `PluginManager::new` has anywhere to
+/// put a `Self` for them to capture. A free-standing atomic sidesteps that:
+/// the id can be minted inside the closure itself, before it's known
+/// whether this call will take the load-time (`PluginRegistrations`) or
+/// runtime (`live_engine`) path, and either path's harvest/registration
+/// step then just stores it rather than assigning a fresh one.
+static NEXT_COMPLETION_SOURCE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn next_completion_source_id() -> u64 {
+    NEXT_COMPLETION_SOURCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A `vimcode.completion.register` call harvested during load-time script
+/// execution (#1805) — same reason as [`PendingLuaKeymap`]: the engine-side
+/// registration (needs `&PluginManager`) isn't reachable from inside the
+/// Lua closure `exec()` is running.
+struct PendingCompletionSource {
+    id: u64,
+    filetypes: Option<Vec<String>>,
+    trigger_chars: Vec<char>,
+    priority: i32,
+    callback: LuaRegistryKey,
 }
 
 /// Metadata about a single plugin file / directory.
@@ -875,6 +962,7 @@ struct PluginRegistrations {
     help_bindings: Vec<(String, Vec<(String, String)>)>,
     views: Vec<ViewRegistration>,
     lua_keymaps: Vec<PendingLuaKeymap>,
+    completion_sources: Vec<PendingCompletionSource>,
 }
 
 // ─── Lua → picker vocabulary (#1630) ─────────────────────────────────────────
@@ -920,6 +1008,46 @@ fn lua_table_to_picker_item_spec(lua: &Lua, t: &LuaTable) -> LuaResult<PluginPic
         data,
         preview,
     })
+}
+
+/// Parse one `vimcode.completion.register`/`:complete()` item:
+/// `{label, insert_text?, kind?, detail?, documentation?}`. `insert_text`
+/// defaults to `label`; `kind` is parsed leniently (unknown strings fall
+/// back to `Text`, see `CompletionItemKind::from_str_lenient`).
+fn lua_table_to_completion_item_spec(row: &LuaTable) -> LuaResult<PluginCompletionItemSpec> {
+    let label: String = row.get("label").map_err(|_| {
+        LuaError::RuntimeError("completion item: \"label\" is required".to_string())
+    })?;
+    if label.is_empty() {
+        return Err(LuaError::RuntimeError(
+            "completion item: \"label\" must not be empty".to_string(),
+        ));
+    }
+    let insert_text: String = row.get("insert_text").unwrap_or_else(|_| label.clone());
+    let kind = row
+        .get::<_, String>("kind")
+        .ok()
+        .map(|s| crate::core::completion::CompletionItemKind::from_str_lenient(&s))
+        .unwrap_or_default();
+    let detail: Option<String> = row.get("detail").ok();
+    let documentation: Option<String> = row.get("documentation").ok();
+    Ok(PluginCompletionItemSpec {
+        label,
+        insert_text,
+        kind,
+        detail,
+        documentation,
+    })
+}
+
+/// Parse a whole `vimcode.completion.register`/`:complete()` items array,
+/// in order.
+fn lua_table_to_completion_items(items: &LuaTable) -> LuaResult<Vec<PluginCompletionItemSpec>> {
+    items
+        .clone()
+        .sequence_values::<LuaTable>()
+        .map(|row| lua_table_to_completion_item_spec(&row?))
+        .collect()
 }
 
 /// Parse a whole `items` array-table into specs, in order.
@@ -1285,6 +1413,7 @@ impl PluginManager {
             next_handle_id: Cell::new(0),
             pickers: RefCell::new(HashMap::new()),
             http_callbacks: RefCell::new(HashMap::new()),
+            completion_sources: RefCell::new(HashMap::new()),
         })
     }
 
@@ -1396,6 +1525,18 @@ impl PluginManager {
                     buffer: None,
                     desc: pending.desc,
                 });
+            }
+            // #1805: `vimcode.completion.register` calls made at load time
+            // — same shape as the `lua_keymaps` harvest above, just with no
+            // later leader-expansion/merge step needed.
+            for pending in reg.completion_sources {
+                self.register_completion_source(
+                    pending.id,
+                    pending.filetypes,
+                    pending.trigger_chars,
+                    pending.priority,
+                    pending.callback,
+                );
             }
         }
 
@@ -1829,6 +1970,165 @@ impl PluginManager {
         self.lua
             .remove_app_data::<PluginCallContext>()
             .unwrap_or_default()
+    }
+
+    // ─── `vimcode.completion` (#1805) ──────────────────────────────────────
+
+    /// Register a `vimcode.completion.register` source under an id already
+    /// minted by [`next_completion_source_id`] (the Lua binding mints it
+    /// before deciding whether this call is load-time or runtime — see
+    /// that function's doc for why).
+    pub(crate) fn register_completion_source(
+        &self,
+        id: u64,
+        filetypes: Option<Vec<String>>,
+        trigger_chars: Vec<char>,
+        priority: i32,
+        callback: LuaRegistryKey,
+    ) {
+        self.completion_sources.borrow_mut().insert(
+            id,
+            PluginCompletionSource {
+                filetypes,
+                trigger_chars,
+                priority,
+                callback,
+            },
+        );
+    }
+
+    /// Drop source `id`'s registration (`vimcode.completion.unregister`, or
+    /// when the owning plugin is unloaded — the whole `PluginManager` is
+    /// recreated on reload, which drops this map with it).
+    pub(crate) fn remove_completion_source(&self, id: u64) {
+        self.completion_sources.borrow_mut().remove(&id);
+    }
+
+    /// Whether any registered source declares `c` among its
+    /// `trigger_chars` — used by `Engine::trigger_completion`'s early gate
+    /// to decide whether an otherwise-empty-prefix auto-trigger should
+    /// proceed at all. Over-inclusive on purpose (ignores filetype): the
+    /// precise per-source filetype/trigger check happens in
+    /// [`Self::completion_sources_matching`] once the trigger actually
+    /// runs.
+    pub(crate) fn completion_source_has_trigger_char(&self, c: char) -> bool {
+        self.completion_sources
+            .borrow()
+            .values()
+            .any(|s| s.trigger_chars.contains(&c))
+    }
+
+    /// `priority` of a still-registered source, for attaching the right
+    /// sort weight to an async `vimcode.completion.complete(request_id,
+    /// items)` delivery (the request carries the source id, not the
+    /// priority itself — see `Engine::completion_request_id`). `None` if
+    /// the source has since been unregistered.
+    pub(crate) fn completion_source_priority(&self, id: u64) -> Option<i32> {
+        self.completion_sources
+            .borrow()
+            .get(&id)
+            .map(|s| s.priority)
+    }
+
+    /// Every registered source id (+ priority) that should run for this
+    /// trigger, sorted by priority descending (ties keep registration
+    /// order — `HashMap` iteration order isn't that, so break ties on `id`
+    /// too for a deterministic merge order in tests).
+    ///
+    /// A source runs when its `filetypes` filter (if any) matches, and
+    /// either the prefix is non-empty, the trigger is manual (`<C-Space>`
+    /// falls through to every in-scope source, matching the LSP path), or
+    /// `trigger_char` is one of its declared `trigger_chars`.
+    pub(crate) fn completion_sources_matching(
+        &self,
+        filetype: Option<&str>,
+        prefix_empty: bool,
+        manual: bool,
+        trigger_char: Option<char>,
+    ) -> Vec<(u64, i32)> {
+        let sources = self.completion_sources.borrow();
+        let mut out: Vec<(u64, i32)> = sources
+            .iter()
+            .filter(|(_, s)| {
+                s.filetypes
+                    .as_ref()
+                    .is_none_or(|fts| filetype.is_some_and(|ft| fts.iter().any(|f| f == ft)))
+            })
+            .filter(|(_, s)| {
+                !prefix_empty
+                    || manual
+                    || trigger_char.is_some_and(|c| s.trigger_chars.contains(&c))
+            })
+            .map(|(id, s)| (*id, s.priority))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        out
+    }
+
+    /// Call source `id`'s callback with `ctx = {buf, line, col, prefix}`
+    /// (1-indexed `line`/`col`, matching every other immediate-API
+    /// position) and `request_id`. `Ok(None)` means the source returned
+    /// `nil` (deferring to a later `vimcode.completion.complete` call);
+    /// `Ok(Some(items))` is an immediate result; `Err` surfaces a Lua
+    /// error or a malformed return value without taking the whole
+    /// dispatch down.
+    pub(crate) fn call_completion_source(
+        &self,
+        id: u64,
+        call: CompletionSourceCall<'_>,
+        ctx: PluginCallContext,
+    ) -> (
+        PluginCallContext,
+        Result<Option<Vec<PluginCompletionItemSpec>>, String>,
+    ) {
+        self.lua.set_app_data(ctx);
+        let f = {
+            let sources = self.completion_sources.borrow();
+            sources
+                .get(&id)
+                .and_then(|s| self.lua.registry_value::<LuaFunction>(&s.callback).ok())
+        };
+        let result = match f {
+            None => Ok(None),
+            Some(f) => {
+                let ctx_table = match self.lua.create_table() {
+                    Ok(t) => {
+                        let _ = t.set("buf", call.buf);
+                        let _ = t.set("line", call.line_1indexed as i64);
+                        let _ = t.set("col", call.col_1indexed as i64);
+                        let _ = t.set("prefix", call.prefix);
+                        t
+                    }
+                    Err(e) => return self.finish_completion_source_call(Err(e.to_string())),
+                };
+                match f.call::<(LuaTable, u64), LuaValue>((ctx_table, call.request_id)) {
+                    Ok(LuaValue::Nil) => Ok(None),
+                    Ok(LuaValue::Table(t)) => lua_table_to_completion_items(&t)
+                        .map(Some)
+                        .map_err(|e| e.to_string()),
+                    Ok(_) => Err(
+                        "vimcode.completion.register source must return nil or a table of items"
+                            .to_string(),
+                    ),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        };
+        self.finish_completion_source_call(result)
+    }
+
+    fn finish_completion_source_call(
+        &self,
+        result: Result<Option<Vec<PluginCompletionItemSpec>>, String>,
+    ) -> (
+        PluginCallContext,
+        Result<Option<Vec<PluginCompletionItemSpec>>, String>,
+    ) {
+        let ctx = self
+            .lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default();
+        (ctx, result)
     }
 
     // ─── `vimcode.picker` (#1630) ───────────────────────────────────────────
@@ -4101,6 +4401,110 @@ impl PluginManager {
         )?;
 
         vimcode.set("ui", ui_tbl)?;
+
+        // ── vimcode.completion (#1805) ───────────────────────────────────────
+        //
+        // `vimcode.completion.register({name, filetypes?, trigger_chars?,
+        // priority?, source})` adds a plugin-fed source to the built-in
+        // insert-mode completion popup — the one capability #1212's plugin
+        // triage flagged as missing (snippet/path-completion extensions need
+        // it). `source(ctx, request_id)` is called on every completion
+        // trigger with `ctx = {buf, line, col, prefix}` (1-indexed
+        // `line`/`col`, `buf`/`0` current-buffer handle convention). It
+        // returns a table of `{label, insert_text?, kind?, detail?,
+        // documentation?}` items for an immediate result, or `nil` to
+        // deliver them later — from any async callback (`vimcode.loop.spawn`,
+        // `vimcode.http.request`, a timer) — via
+        // `vimcode.completion.complete(request_id, items)`. A `complete()`
+        // call for a `request_id` from a since-superseded trigger (the user
+        // kept typing) is silently dropped.
+        //
+        // `filetypes` restricts the source to those buffers (omitted = every
+        // filetype). `trigger_chars` lets the source fire on an otherwise-
+        // empty prefix (e.g. member access right after `.`), mirroring LSP
+        // `triggerCharacters`. `priority` (default `0`, same as every
+        // buffer-word/LSP candidate) controls merge order: higher sorts
+        // earlier in the popup.
+        let completion_tbl = lua.create_table()?;
+        completion_tbl.set(
+            "register",
+            lua.create_function(|lua, opts: LuaTable| {
+                let filetypes: Option<Vec<String>> =
+                    opts.get::<_, LuaTable>("filetypes").ok().map(|t| {
+                        t.sequence_values::<String>()
+                            .filter_map(|v| v.ok())
+                            .collect()
+                    });
+                let trigger_chars: Vec<char> = opts
+                    .get::<_, LuaTable>("trigger_chars")
+                    .ok()
+                    .map(|t| {
+                        t.sequence_values::<String>()
+                            .filter_map(|v| v.ok())
+                            .filter_map(|s| s.chars().next())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let priority: i32 = opts.get("priority").unwrap_or(0);
+                let source: LuaFunction = opts.get("source").map_err(|_| {
+                    LuaError::RuntimeError(
+                        "vimcode.completion.register: \"source\" (a function) is required"
+                            .to_string(),
+                    )
+                })?;
+                let callback = lua.create_registry_value(source)?;
+                let id = next_completion_source_id();
+                // Load time: accumulate for harvest, like every other
+                // `vimcode.*` registration call (`vimcode.keymap.set`'s
+                // `PendingLuaKeymap` is the model this mirrors) — there is
+                // no live engine yet to reach `PluginManager` through.
+                if let Some(mut reg) = lua.app_data_mut::<PluginRegistrations>() {
+                    reg.completion_sources.push(PendingCompletionSource {
+                        id,
+                        filetypes,
+                        trigger_chars,
+                        priority,
+                        callback,
+                    });
+                    return Ok(id);
+                }
+                // Runtime: register directly against the live engine's
+                // plugin manager.
+                let ok = live_engine("vimcode.completion.register", move |e| {
+                    e.plugin_api_completion_register(
+                        id,
+                        filetypes,
+                        trigger_chars,
+                        priority,
+                        callback,
+                    )
+                })?;
+                if !ok {
+                    return Err(LuaError::RuntimeError(
+                        "vimcode.completion.register: no live plugin manager".to_string(),
+                    ));
+                }
+                Ok(id)
+            })?,
+        )?;
+        completion_tbl.set(
+            "unregister",
+            lua.create_function(|_, id: u64| {
+                live_engine("vimcode.completion.unregister", move |e| {
+                    e.plugin_api_completion_unregister(id);
+                })
+            })?,
+        )?;
+        completion_tbl.set(
+            "complete",
+            lua.create_function(|_, (request_id, items): (u64, LuaTable)| {
+                let specs = lua_table_to_completion_items(&items)?;
+                live_engine("vimcode.completion.complete", move |e| {
+                    e.plugin_api_completion_complete(request_id, specs);
+                })
+            })?,
+        )?;
+        vimcode.set("completion", completion_tbl)?;
 
         // ── vimcode.picker (#1630) ──────────────────────────────────────────
         //

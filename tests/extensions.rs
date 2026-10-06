@@ -8262,3 +8262,272 @@ fn diagnostic_changed_event_fires_when_diagnostics_are_installed() {
         "DiagnosticChanged must fire with the path whose diagnostics changed"
     );
 }
+
+// ── vimcode.completion (#1805) ──────────────────────────────────────────────
+//
+// A Lua plugin can register an insert-mode completion source that merges
+// into the built-in buffer-word/LSP popup — no second widget, no
+// extension-specific Rust. `source(ctx, request_id)` is called on every
+// `trigger_completion`; it can answer immediately (its return value) or
+// defer to `vimcode.completion.complete(request_id, items)` later.
+//
+// RED against unfixed `develop` for every test below: `vimcode.completion`
+// doesn't exist there at all, so `vimcode.completion.register` errors
+// immediately and the popup never gains a plugin item.
+
+/// The source callback must see the real buffer handle, the 1-indexed
+/// cursor position and the word prefix already typed — exactly the
+/// `ctx = {buf, line, col, prefix}` shape the issue specifies — plus a
+/// request id it can echo back later via `vimcode.completion.complete`.
+#[test]
+fn completion_register_source_runs_with_buf_line_col_and_prefix() {
+    let mut e = engine_with_plugin(
+        "",
+        "completion_ctx_1805",
+        r#"
+        vimcode.completion.register({
+            name = "ctx-probe",
+            source = function(ctx, request_id)
+                vimcode.message(string.format(
+                    "buf=%d line=%d col=%d prefix=%s id_positive=%s",
+                    ctx.buf, ctx.line, ctx.col, ctx.prefix, tostring(request_id > 0)
+                ))
+                return {}
+            end,
+        })
+        "#,
+    );
+    let expected_buf = e.active_buffer_id().0 as i64;
+    press(&mut e, 'i');
+    type_chars(&mut e, "wor");
+    assert_eq!(
+        e.message,
+        format!("buf={expected_buf} line=1 col=4 prefix=wor id_positive=true"),
+        "source must be invoked with the current buf/line/col/prefix and a \
+         positive request_id: {}",
+        e.message
+    );
+}
+
+/// A registered source's item appears in the real popup the moment its
+/// trigger prefix is typed, and accepting it inserts its `insert_text`
+/// (not its `label`) into the buffer — the issue's black-box acceptance
+/// scenario verbatim.
+#[test]
+fn completion_plugin_source_item_shows_in_popup_and_accept_inserts_text() {
+    let mut e = engine_with_plugin(
+        "",
+        "completion_e2e_1805",
+        r#"
+        vimcode.completion.register({
+            name = "static",
+            source = function(ctx, request_id)
+                return {
+                    {
+                        label = "foobar_plugin(..)",
+                        insert_text = "foobar_plugin",
+                        kind = "function",
+                        detail = "fn() -> ()",
+                        documentation = "a plugin-provided completion item",
+                    },
+                }
+            end,
+        })
+        "#,
+    );
+    press(&mut e, 'i');
+    type_chars(&mut e, "foo");
+
+    let idx = e
+        .completion_candidates
+        .iter()
+        .position(|c| c.insert_text == "foobar_plugin")
+        .unwrap_or_else(|| {
+            panic!(
+                "plugin item must appear in the popup after typing its \
+                 matching prefix: {:?}",
+                e.completion_candidates
+            )
+        });
+    let item = &e.completion_candidates[idx];
+    assert_eq!(item.label, "foobar_plugin(..)");
+    assert_eq!(
+        item.kind,
+        vimcode_core::core::completion::CompletionItemKind::Function,
+        "the item's \"kind\" string must thread through to the engine-side kind"
+    );
+    assert_eq!(item.detail.as_deref(), Some("fn() -> ()"));
+    assert_eq!(
+        item.documentation.as_deref(),
+        Some("a plugin-provided completion item")
+    );
+
+    // Accept it — Vim mode's default accept key is `<C-y>` (#800) — and
+    // confirm the buffer gets the *insert_text*, not the label.
+    e.completion_idx = Some(idx);
+    ctrl(&mut e, 'y');
+    assert_eq!(
+        buf(&e).trim_end(),
+        "foobar_plugin",
+        "accepting the plugin candidate must insert its insert_text, not \
+         its label: {:?}",
+        buf(&e)
+    );
+}
+
+/// #1805's merge-order requirement: a source's `priority` is relative to
+/// buffer-word/LSP candidates, which are always priority `0`. A
+/// higher-priority item sorts before them; a lower-priority one sorts
+/// after — buffer-word candidates keep their own relative (alphabetical)
+/// order in between.
+#[test]
+fn completion_plugin_items_merge_by_priority_relative_to_buffer_words() {
+    let mut e = engine_with_plugin(
+        "foobar foobaz football\n",
+        "completion_priority_1805",
+        r#"
+        vimcode.completion.register({
+            name = "high",
+            priority = 10,
+            source = function(ctx, request_id) return { { label = "foo_high" } } end,
+        })
+        vimcode.completion.register({
+            name = "low",
+            priority = -10,
+            source = function(ctx, request_id) return { { label = "foo_low" } } end,
+        })
+        "#,
+    );
+    press(&mut e, 'G');
+    press(&mut e, 'o');
+    type_chars(&mut e, "foo");
+    let labels: Vec<&str> = e
+        .completion_candidates
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["foo_high", "foobar", "foobaz", "football", "foo_low"],
+        "a higher-priority plugin item must sort before buffer-word \
+         candidates (always priority 0), and a lower-priority one after: \
+         {labels:?}"
+    );
+}
+
+/// A source whose `filetypes` filter doesn't include the active buffer's
+/// filetype must not run at all — not merely return no items.
+#[test]
+fn completion_source_is_skipped_for_non_matching_filetype() {
+    let mut e = engine_with_plugin(
+        "foobar\n",
+        "completion_filetype_1805",
+        r#"
+        vimcode.completion.register({
+            name = "python-only",
+            filetypes = { "python" },
+            source = function(ctx, request_id) return { { label = "foo_py" } } end,
+        })
+        "#,
+    );
+    let buf_id = e.active_buffer_id();
+    if let Some(state) = e.buffer_manager.get_mut(buf_id) {
+        state.lsp_language_id = Some("rust".to_string());
+    }
+    press(&mut e, 'G');
+    press(&mut e, 'o');
+    type_chars(&mut e, "foo");
+    assert!(
+        !e.completion_candidates
+            .iter()
+            .any(|c| c.insert_text == "foo_py"),
+        "a source whose filetypes filter doesn't include the active \
+         buffer's filetype must not run: {:?}",
+        e.completion_candidates
+    );
+    // Precondition sanity: the popup itself is active (the ordinary
+    // buffer-word candidate still appears) — proves the source really was
+    // skipped, not that the popup just happened to be empty.
+    assert!(
+        e.completion_candidates
+            .iter()
+            .any(|c| c.insert_text == "foobar"),
+        "precondition: the ordinary buffer-word candidate should still \
+         appear: {:?}",
+        e.completion_candidates
+    );
+
+    // Flip to the matching filetype and retype the prefix — the same
+    // source must now run, proving the filter is a real filetype
+    // comparison and not a check that happens to always skip the source.
+    if let Some(state) = e.buffer_manager.get_mut(buf_id) {
+        state.lsp_language_id = Some("python".to_string());
+    }
+    press_key(&mut e, "Escape");
+    press(&mut e, 'G');
+    press(&mut e, 'o');
+    type_chars(&mut e, "foo");
+    assert!(
+        e.completion_candidates
+            .iter()
+            .any(|c| c.insert_text == "foo_py"),
+        "the same source must run once the buffer's filetype matches its \
+         filter: {:?}",
+        e.completion_candidates
+    );
+}
+
+/// #1805's stale-async-drop requirement: a `vimcode.completion.complete`
+/// call naming a `request_id` from a trigger the user has since typed past
+/// must be silently dropped, while one naming the *current* trigger still
+/// merges in normally.
+#[test]
+fn completion_complete_drops_stale_request_but_accepts_current_one() {
+    let mut e = engine_with_plugin(
+        "",
+        "completion_stale_1805",
+        r#"
+        _G.first_id = nil
+        _G.last_id = nil
+        vimcode.completion.register({
+            name = "async",
+            source = function(ctx, request_id)
+                if _G.first_id == nil then
+                    _G.first_id = request_id
+                end
+                _G.last_id = request_id
+                return nil
+            end,
+        })
+        vimcode.command("DeliverFirst", function(_)
+            vimcode.completion.complete(_G.first_id, { { label = "stale_item" } })
+        end)
+        vimcode.command("DeliverLast", function(_)
+            vimcode.completion.complete(_G.last_id, { { label = "foodelivered" } })
+        end)
+        "#,
+    );
+    press(&mut e, 'i');
+    type_chars(&mut e, "foo"); // trigger #1 — captures `_G.first_id`
+    type_chars(&mut e, "d"); // trigger #2 (prefix "food") — supersedes it
+
+    exec(&mut e, "DeliverFirst");
+    assert!(
+        !e.completion_candidates
+            .iter()
+            .any(|c| c.insert_text == "stale_item"),
+        "a complete() call naming a superseded trigger's request_id must \
+         be dropped: {:?}",
+        e.completion_candidates
+    );
+
+    exec(&mut e, "DeliverLast");
+    assert!(
+        e.completion_candidates
+            .iter()
+            .any(|c| c.insert_text == "foodelivered"),
+        "a complete() call naming the *current* trigger's request_id must \
+         still merge in: {:?}",
+        e.completion_candidates
+    );
+}

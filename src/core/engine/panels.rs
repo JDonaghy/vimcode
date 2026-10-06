@@ -1211,8 +1211,13 @@ impl Engine {
                                 // anything that no longer matches the prefix,
                                 // so existing candidates are still valid.
                                 for cand in lsp_cands {
-                                    if !self.completion_candidates.iter().any(|c| c == &cand) {
-                                        self.completion_candidates.push(cand);
+                                    if !self
+                                        .completion_candidates
+                                        .iter()
+                                        .any(|c| c.insert_text == cand)
+                                    {
+                                        self.completion_candidates
+                                            .push(CompletionCandidate::plain(cand));
                                     }
                                 }
                                 if self.completion_idx.is_none() {

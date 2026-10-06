@@ -637,7 +637,10 @@ fn test_vscode_escape_dismisses_completion() {
     let mut e = engine_with("hello\n");
     vscode_mode(&mut e);
     // Simulate completion popup being open
-    e.completion_candidates = vec!["hello".to_string(), "help".to_string()];
+    e.completion_candidates = vec!["hello", "help"]
+        .into_iter()
+        .map(|s| vimcode_core::core::completion::CompletionCandidate::plain(s.to_string()))
+        .collect();
     e.completion_idx = Some(0);
     e.completion_display_only = true;
     // Press Escape
@@ -661,7 +664,9 @@ fn test_vscode_escape_priority_completion_then_cursors_then_selection() {
     let mut e = engine_with("hello\nworld\n");
     vscode_mode(&mut e);
     // Set up: completion + extra cursors + selection
-    e.completion_candidates = vec!["test".to_string()];
+    e.completion_candidates = vec![vimcode_core::core::completion::CompletionCandidate::plain(
+        "test".to_string(),
+    )];
     e.completion_idx = Some(0);
     e.add_cursor_at_pos(1, 0);
     e.visual_anchor = Some(Cursor { line: 0, col: 0 });

@@ -3539,7 +3539,10 @@ impl Engine {
             .unwrap_or(0);
         let selected_idx = self.acp().command_completion_idx.min(candidates.len() - 1);
         Some(crate::render::CompletionMenu {
-            candidates,
+            candidates: candidates
+                .into_iter()
+                .map(crate::core::completion::CompletionCandidate::plain)
+                .collect(),
             selected_idx,
             max_width,
         })
@@ -3567,7 +3570,7 @@ impl Engine {
         let Some(menu) = self.ai_command_completions() else {
             return false;
         };
-        let chosen = menu.candidates[menu.selected_idx].clone();
+        let chosen = menu.candidates[menu.selected_idx].insert_text.clone();
         let mut chat = self.ai_chat.borrow_mut();
         chat.clear_input();
         chat.input_insert_str(&format!("{chosen} "));
@@ -3710,7 +3713,10 @@ impl Engine {
             .unwrap_or(0);
         let selected_idx = self.acp().mention_completion_idx.min(candidates.len() - 1);
         Some(crate::render::CompletionMenu {
-            candidates,
+            candidates: candidates
+                .into_iter()
+                .map(crate::core::completion::CompletionCandidate::plain)
+                .collect(),
             selected_idx,
             max_width,
         })
@@ -3735,7 +3741,7 @@ impl Engine {
         let Some(menu) = self.ai_mention_completions() else {
             return false;
         };
-        let chosen = menu.candidates[menu.selected_idx].clone();
+        let chosen = menu.candidates[menu.selected_idx].insert_text.clone();
         let input = self.ai_chat.borrow().input_text().to_string();
         let Some((start, _)) = crate::core::acp::trailing_at_mention_query(&input) else {
             return false;
@@ -4616,7 +4622,9 @@ mod ai_mention_completions_exclude_tests {
             .expect("typing @ with a matching prefix should show mention completions");
 
         assert!(
-            menu.candidates.contains(&"@plain1545.rs".to_string()),
+            menu.candidates
+                .iter()
+                .any(|c| c.insert_text == "@plain1545.rs"),
             "the ordinary workspace file must still be offered: {:?}",
             menu.candidates
         );
@@ -4624,7 +4632,7 @@ mod ai_mention_completions_exclude_tests {
             !menu
                 .candidates
                 .iter()
-                .any(|c| c.contains("HEAD1545extpanel")),
+                .any(|c| c.insert_text.contains("HEAD1545extpanel")),
             "'.git/' internals must never surface as @file completions \
              (#1545): {:?}",
             menu.candidates
@@ -4828,7 +4836,10 @@ mod issue_1513_at_symbol_and_at_dir_mentions {
             menu.candidates
         );
         assert!(
-            !menu.candidates.iter().any(|c| c.contains("unrelated_fn")),
+            !menu
+                .candidates
+                .iter()
+                .any(|c| c.insert_text.contains("unrelated_fn")),
             "a non-matching symbol must be filtered out: {:?}",
             menu.candidates
         );
@@ -4905,7 +4916,7 @@ mod issue_1513_at_symbol_and_at_dir_mentions {
             .ai_mention_completions()
             .expect("typing @ with a matching dir prefix should show mention completions");
         assert!(
-            menu.candidates.contains(&"@subdir/".to_string()),
+            menu.candidates.iter().any(|c| c.insert_text == "@subdir/"),
             "expected a trailing-slash directory candidate: {:?}",
             menu.candidates
         );

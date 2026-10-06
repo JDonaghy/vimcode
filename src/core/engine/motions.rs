@@ -4081,9 +4081,9 @@ impl Engine {
         if prev_end > start {
             self.delete_with_undo(line_char + start, line_char + prev_end);
         }
-        let candidate = self.completion_candidates[idx].clone();
+        let candidate = self.completion_candidates[idx].insert_text.clone();
         self.insert_with_undo(line_char + start, &candidate);
-        self.view_mut().cursor.col = start + candidate.len();
+        self.view_mut().cursor.col = start + candidate.chars().count();
     }
 
     // ─── <C-x> completion submode (`:h i_CTRL-X`, #1160) ───────────────────
@@ -4118,7 +4118,10 @@ impl Engine {
             return;
         }
         self.completion_start_col = start_col;
-        self.completion_candidates = candidates;
+        self.completion_candidates = candidates
+            .into_iter()
+            .map(CompletionCandidate::plain)
+            .collect();
         let idx = if next {
             0
         } else {
@@ -4291,7 +4294,20 @@ impl Engine {
     /// scan or LSP request happens to return a smaller set (#467).
     pub(crate) fn trigger_completion(&mut self, manual: bool) {
         let (prefix, _) = self.completion_prefix_at_cursor();
-        if prefix.is_empty() && !manual {
+        let trigger_char = self.completion_trigger_char();
+        // #1805: a `vimcode.completion.register` source that declared this
+        // character among its `trigger_chars` (e.g. `.` for member access)
+        // can open the popup on an otherwise-empty prefix even on an
+        // auto-trigger, same as a manual `<C-Space>` would. Checked before
+        // the early-dismiss below so that case isn't swallowed by it.
+        let plugin_trigger_match = prefix.is_empty()
+            && !manual
+            && trigger_char.is_some_and(|c| {
+                self.plugin_manager
+                    .as_ref()
+                    .is_some_and(|pm| pm.completion_source_has_trigger_char(c))
+            });
+        if prefix.is_empty() && !manual && !plugin_trigger_match {
             self.dismiss_completion();
             return;
         }
@@ -4309,15 +4325,20 @@ impl Engine {
             // previous one; otherwise start fresh.
             if extends {
                 self.completion_candidates
-                    .retain(|c| c.starts_with(&prefix));
+                    .retain(|c| c.insert_text.starts_with(&prefix));
             } else {
                 self.completion_candidates.clear();
             }
             // Use a fast nearby-lines scan instead of scanning the entire buffer.
             // For a 15K-line file, full scan takes 270ms; nearby scan is ~1ms.
             for word in self.word_completions_nearby(&prefix) {
-                if !self.completion_candidates.iter().any(|c| c == &word) {
-                    self.completion_candidates.push(word);
+                if !self
+                    .completion_candidates
+                    .iter()
+                    .any(|c| c.insert_text == word)
+                {
+                    self.completion_candidates
+                        .push(CompletionCandidate::plain(word));
                 }
             }
             if !self.completion_candidates.is_empty() {
@@ -4329,9 +4350,25 @@ impl Engine {
                 self.completion_display_only = false;
             }
         }
-        self.completion_filter_prefix = prefix;
+        self.completion_filter_prefix = prefix.clone();
         // Async LSP source — response will update candidates if popup is still active
         self.lsp_request_completion();
+        // Plugin sources (#1805) — synchronous results merge immediately;
+        // async ones arrive later via `vimcode.completion.complete`.
+        self.plugin_request_completions(&prefix, manual || plugin_trigger_match, trigger_char);
+    }
+
+    /// The character immediately before the current completion prefix —
+    /// e.g. `.` right after typing it, while the prefix itself is still
+    /// empty (`.` isn't a word character). Used only to gate a `vimcode.
+    /// completion.register` source's declared `trigger_chars` (#1805);
+    /// buffer-word/LSP completion don't consult it.
+    pub(crate) fn completion_trigger_char(&self) -> Option<char> {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let chars: Vec<char> = self.buffer().content.line(line).chars().collect();
+        let col = col.min(chars.len());
+        col.checked_sub(1).and_then(|i| chars.get(i).copied())
     }
 
     /// True when an insert-mode keypress would be consumed by completion

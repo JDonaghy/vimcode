@@ -1,5 +1,21 @@
 use super::*;
 
+/// Pack a `vimcode.completion` generation + source id into the opaque
+/// `request_id` a source is handed and must echo back to `vimcode.
+/// completion.complete`. The generation lives in the high 32 bits so a
+/// request from a superseded trigger (the user kept typing) can be told
+/// apart from a current one just by comparing against `Engine::
+/// completion_generation` — no need to track every outstanding request id
+/// explicitly.
+fn pack_completion_request_id(generation: u64, source_id: u64) -> u64 {
+    (generation << 32) | (source_id & 0xFFFF_FFFF)
+}
+
+/// Inverse of [`pack_completion_request_id`]: `(generation, source_id)`.
+fn unpack_completion_request_id(request_id: u64) -> (u64, u64) {
+    (request_id >> 32, request_id & 0xFFFF_FFFF)
+}
+
 /// Upper bound on nested plugin events queued during one dispatch. A plugin
 /// whose edit fires an event whose handler edits again could otherwise cascade
 /// without end; past this point the queue stops growing and the extra events
@@ -2801,6 +2817,201 @@ impl Engine {
             }
         }
         redraw
+    }
+
+    // ─── `vimcode.completion` (#1805) ───────────────────────────────────────
+
+    /// `vimcode.completion.register(...)`'s runtime path — `id` was
+    /// already minted by the Lua binding (`next_completion_source_id`)
+    /// before it knew whether this was a load-time or runtime call. Returns
+    /// `false` if there is no live plugin manager (the Lua binding
+    /// surfaces that as a runtime error, mirroring `plugin_api_picker_
+    /// open`'s convention).
+    pub(crate) fn plugin_api_completion_register(
+        &mut self,
+        id: u64,
+        filetypes: Option<Vec<String>>,
+        trigger_chars: Vec<char>,
+        priority: i32,
+        callback: mlua::RegistryKey,
+    ) -> bool {
+        let Some(pm) = self.plugin_manager.clone() else {
+            return false;
+        };
+        pm.register_completion_source(id, filetypes, trigger_chars, priority, callback);
+        true
+    }
+
+    /// `vimcode.completion.unregister(id)`.
+    pub(crate) fn plugin_api_completion_unregister(&mut self, id: u64) {
+        if let Some(pm) = self.plugin_manager.clone() {
+            pm.remove_completion_source(id);
+        }
+    }
+
+    /// `vimcode.completion.complete(request_id, items)` — async delivery of
+    /// a source's results, from any P3 callback (`vimcode.loop.spawn`'s
+    /// `on_exit`/`on_stdout`, `vimcode.http.request`'s callback, a
+    /// timer...). Dropped silently if `request_id` names a generation
+    /// older than the current one (#1805: "stale async results for an old
+    /// prefix must be dropped" — the user kept typing and a fresh
+    /// `trigger_completion` already superseded this request), if the popup
+    /// is no longer relevant (not in Insert/Vscode mode), or if the owning
+    /// source has since been unregistered.
+    pub(crate) fn plugin_api_completion_complete(
+        &mut self,
+        request_id: u64,
+        items: Vec<plugin::PluginCompletionItemSpec>,
+    ) {
+        let (generation, source_id) = unpack_completion_request_id(request_id);
+        if generation != self.completion_generation {
+            return; // stale — superseded by a later trigger
+        }
+        if !(self.mode == Mode::Insert || self.is_vscode_mode()) {
+            return;
+        }
+        let Some(pm) = self.plugin_manager.clone() else {
+            return;
+        };
+        let Some(priority) = pm.completion_source_priority(source_id) else {
+            return; // source unregistered since the request was issued
+        };
+        // Same prefix narrowing the LSP merge applies (`cur_prefix.starts_
+        // with` in the `CompletionResponse` handler): a matching generation
+        // means no trigger has run since this request was issued, so the
+        // prefix it was issued against is still `completion_filter_prefix`.
+        let items = Self::filter_items_by_prefix(items, &self.completion_filter_prefix);
+        self.merge_plugin_completion_items(items, priority);
+    }
+
+    /// Drop items whose `insert_text` doesn't start with `prefix` — same
+    /// narrowing the built-in LSP merge applies, so a source returning
+    /// candidates unrelated to what the user actually typed can't pollute
+    /// the popup. Skipped when `prefix` is empty (a trigger-char-driven
+    /// invocation, e.g. right after `.`, has no prefix to narrow by).
+    fn filter_items_by_prefix(
+        items: Vec<plugin::PluginCompletionItemSpec>,
+        prefix: &str,
+    ) -> Vec<plugin::PluginCompletionItemSpec> {
+        if prefix.is_empty() {
+            return items;
+        }
+        items
+            .into_iter()
+            .filter(|i| i.insert_text.starts_with(prefix))
+            .collect()
+    }
+
+    /// Run every registered `vimcode.completion.register` source that
+    /// matches this trigger, merging synchronous results (a source's
+    /// direct return value) immediately. Called from `Engine::
+    /// trigger_completion` after the buffer-word scan and the
+    /// `lsp_request_completion` kick-off — a source that needs to answer
+    /// asynchronously instead calls `vimcode.completion.complete` later,
+    /// mirroring how the LSP response merges in on its own event.
+    pub(crate) fn plugin_request_completions(
+        &mut self,
+        prefix: &str,
+        manual: bool,
+        trigger_char: Option<char>,
+    ) {
+        let Some(pm) = self.plugin_manager.clone() else {
+            return;
+        };
+        self.completion_generation = self.completion_generation.wrapping_add(1);
+        let generation = self.completion_generation;
+        let filetype = self.active_buffer_state().lsp_language_id.clone();
+        let sources = pm.completion_sources_matching(
+            filetype.as_deref(),
+            prefix.is_empty(),
+            manual,
+            trigger_char,
+        );
+        if sources.is_empty() {
+            return;
+        }
+        let buf = self.active_buffer_id().0 as i64;
+        let line = self.view().cursor.line + 1;
+        let col = self.view().cursor.col + 1;
+        // Collect every source's synchronous result before merging any of
+        // them, so the final merge sort sees the whole batch at once.
+        let mut batches: Vec<(i32, Vec<plugin::PluginCompletionItemSpec>)> = Vec::new();
+        for (source_id, priority) in sources {
+            let request_id = pack_completion_request_id(generation, source_id);
+            let ctx = self.make_plugin_ctx(true);
+            let call = plugin::CompletionSourceCall {
+                request_id,
+                buf,
+                line_1indexed: line,
+                col_1indexed: col,
+                prefix,
+            };
+            let Some((ctx, result)) =
+                self.with_plugin_dispatch(|pm| pm.call_completion_source(source_id, call, ctx))
+            else {
+                continue;
+            };
+            self.apply_plugin_ctx(ctx);
+            match result {
+                Ok(Some(items)) => {
+                    let items = Self::filter_items_by_prefix(items, prefix);
+                    if !items.is_empty() {
+                        batches.push((priority, items));
+                    }
+                }
+                Ok(None) => {} // deferred — will arrive via `complete()` later
+                Err(e) => self.message = format!("completion source error: {e}"),
+            }
+        }
+        for (priority, items) in batches {
+            self.merge_plugin_completion_items(items, priority);
+        }
+    }
+
+    /// Merge plugin-supplied items into `completion_candidates`, then
+    /// re-sort the whole list by priority descending. `sort_by` is stable,
+    /// so items at equal priority keep their existing relative order —
+    /// buffer/LSP candidates (always priority `0`) stay put unless a
+    /// higher-priority plugin item jumps ahead of them, which is exactly
+    /// #1805's "priority relative to buffer/LSP candidates" merge-order
+    /// requirement. An item whose `insert_text` already matches an
+    /// existing candidate replaces it in place rather than duplicating —
+    /// a streamed source re-delivering the same item with fresher
+    /// detail/documentation doesn't grow the list.
+    fn merge_plugin_completion_items(
+        &mut self,
+        items: Vec<plugin::PluginCompletionItemSpec>,
+        priority: i32,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        for spec in items {
+            let candidate = CompletionCandidate {
+                label: spec.label,
+                insert_text: spec.insert_text,
+                kind: spec.kind,
+                detail: spec.detail,
+                documentation: spec.documentation,
+                priority,
+            };
+            if let Some(existing) = self
+                .completion_candidates
+                .iter_mut()
+                .find(|c| c.insert_text == candidate.insert_text)
+            {
+                *existing = candidate;
+            } else {
+                self.completion_candidates.push(candidate);
+            }
+        }
+        self.completion_candidates
+            .sort_by_key(|c| std::cmp::Reverse(c.priority));
+        match self.completion_idx {
+            None => self.completion_idx = Some(0),
+            Some(idx) => self.completion_idx = Some(idx.min(self.completion_candidates.len() - 1)),
+        }
+        self.completion_display_only = true;
     }
 
     // ─── `vimcode.picker` (#1630) ───────────────────────────────────────────

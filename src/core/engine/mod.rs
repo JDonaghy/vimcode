@@ -10,6 +10,7 @@ use super::ai::AiMessage;
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState};
 use super::comment;
+use super::completion::CompletionCandidate;
 use super::dap::{BreakpointInfo, DapEvent, DapVariable, StackFrame};
 use super::dap_manager::{
     generate_launch_json, parse_launch_json, parse_tasks_json, task_to_shell_command,
@@ -3173,8 +3174,13 @@ pub struct Engine {
     pub scroll_bind_pairs: Vec<(WindowId, WindowId)>,
 
     // --- Completion state ---
-    /// Current completion candidates (populated on first Ctrl-N/P or auto-trigger).
-    pub completion_candidates: Vec<String>,
+    /// Current completion candidates (populated on first Ctrl-N/P or
+    /// auto-trigger). `CompletionCandidate` (#1805) carries display/insert
+    /// text plus optional kind/detail/documentation metadata — buffer-word
+    /// and LSP candidates only ever populate `label`/`insert_text`
+    /// (`CompletionCandidate::plain`); a `vimcode.completion.register`
+    /// plugin source can also set the rest.
+    pub completion_candidates: Vec<crate::core::completion::CompletionCandidate>,
     /// Index of the currently selected candidate, or None when inactive.
     pub completion_idx: Option<usize>,
     /// Buffer column where the prefix that triggered completion starts.
@@ -3188,6 +3194,15 @@ pub struct Engine {
     /// already saw from being silently dropped when a fresh LSP / buffer-word
     /// scan happens to return a smaller set (#467).
     pub completion_filter_prefix: String,
+    /// Monotonic counter bumped once per `trigger_completion` call (#1805).
+    /// Packed into the high bits of the `request_id` handed to every
+    /// `vimcode.completion.register` source invoked by that trigger (see
+    /// `Engine::plugin_request_completions`), so a `vimcode.completion.
+    /// complete(request_id, items)` call arriving after a *later* trigger
+    /// has already superseded it — a stale async result for an old prefix —
+    /// can be detected and dropped instead of repopulating a popup the user
+    /// has moved past.
+    pub(crate) completion_generation: u64,
 
     // --- Project search state ---
     /// Current text typed in the project search input box.
@@ -5195,6 +5210,7 @@ impl Engine {
             completion_start_col: 0,
             completion_display_only: false,
             completion_filter_prefix: String::new(),
+            completion_generation: 0,
             project_search_query: String::new(),
             project_search_results: Vec::new(),
             project_search_options: SearchOptions::default(),
