@@ -5200,6 +5200,17 @@ fn lua_table_to_hl_def(t: &LuaTable) -> LuaResult<HlGroupDef> {
     })
 }
 
+/// Parses a `virt_text_pos` string from Lua into its typed form. Returns
+/// `None` for anything unrecognised — including a typo like `"eo1"` or
+/// `"right_align"` — and `None` is *also* what an absent `virt_text_pos`
+/// field parses to upstream of this function, so both cases are
+/// indistinguishable to the render path (render.rs's `Some(Eol) | None`
+/// arm, #1810): a typo silently paints at end-of-line instead of being
+/// rejected. Neovim errors on an invalid `virt_text_pos` value; this is a
+/// known, harmless-but-surprising divergence, not fixed here because it
+/// would change this function's signature from `Option` to `Result` and
+/// thread a new error path through every caller for a cosmetic typo-safety
+/// improvement, out of scope for #1810.
 fn lua_parse_virt_text_pos(s: &str) -> Option<VirtTextPos> {
     match s {
         "eol" => Some(VirtTextPos::Eol),

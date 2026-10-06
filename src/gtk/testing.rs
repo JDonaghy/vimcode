@@ -25325,6 +25325,9 @@ mod issue_1513_at_dir_and_at_symbol_mentions {
             );
         }
 
+        // #1810 (not #1653 — this test lands in this module only for its
+        // imports/fixtures; see that issue's own comment if this module
+        // ever gets split).
         /// #1810, GTK twin of `app_on_tui_tests`'
         /// `decor_eol_virt_text_paints_after_line_and_follows_insert_above_
         /// via_app_on_tui`: end-of-line virtual text (`virt_text_pos =
@@ -25339,7 +25342,11 @@ mod issue_1513_at_dir_and_at_symbol_mentions {
         ///
         /// Also covers two eol marks on one line drawing in creation
         /// order, space-separated, and the fact that eol text (unlike the
-        /// blame annotation sharing the field) survives Insert mode.
+        /// blame annotation sharing the field) survives Insert mode — a
+        /// `ZQBLAMETEXT` control annotation is asserted present in Normal
+        /// mode and absent in Insert mode, so the Insert-mode assertions
+        /// are provably checking a fresh frame rather than a stale one
+        /// `GtkDriver` simply never repainted.
         ///
         /// RED against unfixed `develop`: `render.rs`'s `Eol | None` arm
         /// was a deliberate no-op there, so "ZQEOLA" is painted nowhere
@@ -25348,6 +25355,14 @@ mod issue_1513_at_dir_and_at_symbol_mentions {
         fn decor_eol_virt_text_paints_after_line_content_via_gtk_driver() {
             let mut engine = plain_engine();
             engine.buffer_mut().insert(0, "ZQBEFORE\nZQOTHERLINE\n");
+            // The blame-sourced annotation this field normally carries — the
+            // control for the Insert-mode assertion below. `GtkDriver` only
+            // repaints on an app-requested redraw, so `painted_texts()` can
+            // be a stale Normal-mode frame if nothing changed; asserting
+            // this control annotation *disappears* (it IS muted in Insert
+            // mode) proves the frame checked below is actually fresh, not
+            // just the same one still sitting there.
+            engine.line_annotations.insert(0, "ZQBLAMETEXT".to_string());
             let ns = engine.decor.namespace("zq_eol_gtk");
             let buf_id = engine.active_buffer_id();
             for text in ["ZQEOLA", "ZQEOLB"] {
@@ -25375,6 +25390,12 @@ mod issue_1513_at_dir_and_at_symbol_mentions {
                 "eol virtual text must paint on GTK, with two marks on one \
                  line drawn in creation order and space-separated; \
                  painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                h.driver.screen_contains("ZQBLAMETEXT"),
+                "precondition: the blame annotation control must paint in \
+                 Normal mode; painted: {:?}",
                 h.driver.painted_texts()
             );
 
@@ -25406,12 +25427,21 @@ mod issue_1513_at_dir_and_at_symbol_mentions {
             );
 
             // Entering Insert mode must not mute it (the blame annotation
-            // sharing this field *is* muted there — see the TUI twin).
+            // sharing this field *is* muted there — see the TUI twin). The
+            // control (`ZQBLAMETEXT` disappearing) proves this is a fresh
+            // Insert-mode frame, not a stale repaint-skipped Normal-mode one.
             h.driver.type_char('i');
             assert!(
                 h.driver.screen_contains("ZQEOLA ZQEOLB"),
                 "eol virtual text must stay painted in Insert mode; \
                  painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                !h.driver.screen_contains("ZQBLAMETEXT"),
+                "the blame annotation control must have muted in Insert \
+                 mode, proving this frame is actually fresh and not a \
+                 stale Normal-mode repaint; painted: {:?}",
                 h.driver.painted_texts()
             );
         }

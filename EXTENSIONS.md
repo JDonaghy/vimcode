@@ -761,17 +761,25 @@ vimcode.decor.clear(buf, ns, start, end)   -- Remove ns's marks; optional row ra
 | `end_row`, `end_col` | End of a range mark (exclusive `end_col`). Default: the anchor, which makes a point mark. |
 | `hl_group` | Highlight the range `[row,col)..(end_row,end_col)`. A point mark highlights nothing. |
 | `virt_text` | List of chunks: `{{"text", "Group"}, ...}` or `{{text = "...", hl_group = "..."}, ...}`. The first chunk's group styles all of it. |
-| `virt_text_pos` | `"overlay"` (draw over the text at `col`, same width) or `"inline"` (insert at `col`, shifting later text). Virtual text without one of these is not drawn. |
+| `virt_text_pos` | `"overlay"` (draw over the text at `col`, same width), `"inline"` (insert at `col`, shifting later text), or `"eol"` (draw after the line's content, truncated at the window edge rather than wrapped). Omitting `virt_text_pos` also draws at end of line — `"eol"` is the default, not "not drawn". |
 | `sign_text` | A gutter sign, shown in the breakpoint column. Only the first character is drawn, and a breakpoint takes priority. |
-| `sign_hl` | Stored and returned by `get_mark`, but not drawn yet. |
+| `sign_hl` | Stored and returned by `get_mark`, but not drawn yet — colouring just the sign glyph needs a per-glyph colour channel quadraui's gutter rasteriser doesn't have (tracked as a pending quadraui gap). |
 
 `get_mark` returns `row`, `col`, `end_row`, `end_col`, plus whichever of `hl_group`,
 `virt_text` (as `{text=, hl_group=}` chunks), `virt_text_pos`, `sign_text` and
 `sign_hl` the mark has, so you can pass it back to `set_mark`. It returns `nil` for a
 mark in another namespace, so a plugin only sees its own marks.
 
-`virt_text_pos = "eol"` is accepted and stored, but end-of-line virtual text is not
-drawn yet. Use `vimcode.buf.annotate_line` for end-of-line text.
+`virt_text_pos = "eol"` (or an omitted `virt_text_pos`, the same default) is now
+drawn, after the line's content, on the same row — the line's *last* visual row
+when it wraps. Several `eol` marks on one line draw in creation order
+(oldest `set_mark` first), space-separated. It paints in the theme's ambient
+annotation colour, not each chunk's own `hl_group`: quadraui has no primitive
+yet for multiple independently-coloured runs in that trailing area (tracked as
+a pending quadraui gap), so per-mark colour is not available. Unlike
+`vimcode.buf.annotate_line`'s blame text — which shares the same paint slot and
+is hidden while typing — `eol` virtual text stays visible in Insert mode, since
+it's plugin-owned inlay/lint text rather than an ambient annotation.
 
 ```lua
 vimcode.command("MarkWord", function(_)
