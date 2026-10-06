@@ -24224,18 +24224,22 @@ fn build_rendered_window(
         // Overlay splices don't need to bump `col_shift` themselves since
         // they replace exactly as many characters as they insert (net-zero
         // width change) — only `Inline` grows the line.
-        let mut virt_text_marks: Vec<&DecorMark> = line_decor
+        //
+        // #1810 split the row's virtual-text marks in two here: `Overlay`
+        // and `Inline` splice into `line_str`/`spans` in the loop below,
+        // while `Eol` (and an unset `virt_text_pos`, which means the same
+        // thing) has no buffer column to splice at and paints through
+        // `RenderedLine::annotation` instead — see `decor_eol_text` below.
+        let (mut virt_text_marks, mut eol_marks): (Vec<&DecorMark>, Vec<&DecorMark>) = line_decor
             .iter()
-            .filter(|m| {
-                m.row == line_idx
-                    && !m.opts.virt_text.is_empty()
-                    && matches!(
-                        m.opts.virt_text_pos,
-                        Some(VirtTextPos::Overlay) | Some(VirtTextPos::Inline)
-                    )
-            })
+            .filter(|m| m.row == line_idx && !m.opts.virt_text.is_empty())
             .copied()
-            .collect();
+            .partition(|m| {
+                matches!(
+                    m.opts.virt_text_pos,
+                    Some(VirtTextPos::Overlay) | Some(VirtTextPos::Inline)
+                )
+            });
         virt_text_marks.sort_by_key(|m| m.col);
         let mut col_shift: usize = 0;
         for m in virt_text_marks {
@@ -24273,13 +24277,11 @@ fn build_rendered_window(
                         .push((m.col, inserted));
                 }
                 Some(VirtTextPos::Eol) | None => {
-                    // Filtered out of `virt_text_marks` above (#1810) —
-                    // eol/unset marks never reach this match arm; see
-                    // `decor_eol_text` below for where they're handled.
-                    unreachable!(
-                        "eol/none virt_text_pos marks are filtered out of \
-                         virt_text_marks above"
-                    )
+                    // `partition`ed into `eol_marks` above (#1810), so this
+                    // arm is dead for every mark that reaches this loop.
+                    // Left as an explicit no-op rather than `unreachable!`
+                    // so a future change to the partition predicate can
+                    // never turn a decor mark into a render-path panic.
                 }
             }
         }
@@ -24295,6 +24297,11 @@ fn build_rendered_window(
         // order (oldest `set_mark` first, i.e. ascending `MarkId`),
         // separated by a space.
         //
+        // Two deliberate differences from the blame annotation it shares
+        // that field with (both applied at the `annotation:` sites below):
+        // on a wrapped line it rides the *last* visual segment, not the
+        // first, and it is not muted while the user is in Insert mode.
+        //
         // Per-mark colour (the chunk's own `hl_group`, as Overlay/Inline
         // get via `resolve_decor_style`) is NOT implemented: quadraui's
         // `EditorLine::annotation` is a single `Option<String>` painted in
@@ -24304,15 +24311,6 @@ fn build_rendered_window(
         // quadraui issue, per the platform-neutrality rule) before eol
         // text can paint in its own highlight's colour rather than
         // `annotation_fg`.
-        let mut eol_marks: Vec<&DecorMark> = line_decor
-            .iter()
-            .filter(|m| {
-                m.row == line_idx
-                    && !m.opts.virt_text.is_empty()
-                    && matches!(m.opts.virt_text_pos, Some(VirtTextPos::Eol) | None)
-            })
-            .copied()
-            .collect();
         eol_marks.sort_by_key(|m| m.id.0);
         let decor_eol_text: Option<String> = {
             let parts: Vec<String> = eol_marks
@@ -24615,16 +24613,29 @@ fn build_rendered_window(
                     is_dap_current,
                     is_wrap_continuation: is_cont,
                     segment_col_offset: seg_start_char,
-                    annotation: if is_cont
-                        || (engine.mode == crate::core::Mode::Insert && !engine.is_vscode_mode())
-                    {
-                        None
-                    } else {
-                        join_annotation(
-                            engine.line_annotations.get(&line_idx).cloned(),
-                            decor_eol_text.as_deref(),
-                        )
-                    },
+                    annotation: join_annotation(
+                        // Blame keeps its pre-#1810 placement exactly:
+                        // first visual row only, hidden while typing.
+                        if is_cont
+                            || (engine.mode == crate::core::Mode::Insert
+                                && !engine.is_vscode_mode())
+                        {
+                            None
+                        } else {
+                            engine.line_annotations.get(&line_idx).cloned()
+                        },
+                        // Decor eol text goes on the *last* visual row of a
+                        // wrapped line — "end of line" means after all of
+                        // the line's content, not after its first wrap
+                        // segment — and stays visible in Insert mode (it is
+                        // plugin-owned inlay/lint text, not the ambient
+                        // blame annotation the Insert-mode mute exists for).
+                        if is_last_seg {
+                            decor_eol_text.as_deref()
+                        } else {
+                            None
+                        },
+                    ),
                     ghost_suffix: if line_idx == cursor_line && seg == cursor_seg {
                         ghost_for_cursor_line.clone()
                     } else {
@@ -24702,15 +24713,16 @@ fn build_rendered_window(
                 is_dap_current,
                 is_wrap_continuation: false,
                 segment_col_offset: 0,
-                annotation: if engine.mode == crate::core::Mode::Insert && !engine.is_vscode_mode()
-                {
-                    None
-                } else {
-                    join_annotation(
-                        engine.line_annotations.get(&line_idx).cloned(),
-                        decor_eol_text.as_deref(),
-                    )
-                },
+                // Same split as the wrapped branch above: blame is muted in
+                // Insert mode, decor eol text is not (#1810).
+                annotation: join_annotation(
+                    if engine.mode == crate::core::Mode::Insert && !engine.is_vscode_mode() {
+                        None
+                    } else {
+                        engine.line_annotations.get(&line_idx).cloned()
+                    },
+                    decor_eol_text.as_deref(),
+                ),
                 ghost_suffix: if line_idx == cursor_line {
                     ghost_for_cursor_line.clone()
                 } else {
