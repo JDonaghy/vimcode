@@ -2728,3 +2728,64 @@ This combines badly with `dispatch::DoubleClickDetector`, which runs ahead of th
 **Test:** `src/tui_main/app_on_tui_tests.rs::tests::activity_bar::activity_bar_adjacent_clicks_are_not_dropped_by_double_click_fold_1762` and `src/gtk/testing.rs::tests::activity_bar_double_click_on_active_icon_reopens_sidebar_via_gtk_driver` (both vimcode-side, pinning the *workaround*'s correctness — not a test against quadraui itself). A conformance-style test on the quadraui side (asserting `AppShell::handle`'s output for a synthetic `DoubleClick` on the activity bar, both the same-icon and adjacent-icon cases) is the natural shape once the `Ask` lands.
 
 **Blocks:** `JDonaghy/vimcode#1762` (partially — see that issue for why this fold does not by itself explain the issue's full reported symptom). Leave that issue open behind this one per `GOALS.md`'s milestone-discipline rule if quadraui's fix is what vimcode's own fix iteration ends up depending on; per this repo's Platform-Neutrality Rule, the workaround living in vimcode's shared `App` is a stopgap, not the real fix.
+
+---
+
+## `PointerShape` has no "clickable hand" variant — a backend can hint `Default` or `Resize(_)` only, so a hover popup's hyperlink hit regions have no way to show the standard pointer/hand cursor (vimcode#489)
+
+**Title:** `backend::PointerShape` needs a third variant (e.g. `PointerShape::Pointer`, matching every native toolkit's "this is a link" hand glyph — CSS's `cursor: pointer`, AppKit's `NSCursor.pointingHandCursor`, Win32's `IDC_HAND`) so a consumer can hint it the same thin way it already hints `Resize` edges.
+
+**Body:**
+
+Surfaced by vimcode#489 (GTK: the mouse pointer stays the plain arrow when hovering a clickable hyperlink inside the LSP hover popup — no visual affordance that the span is clickable, unlike every native app's link-hover behaviour). vimcode already has the exact data this needs to act on: `App::editor_hover_link_rects`/`panel_hover_link_rects` (`src/app.rs`) are a shared, backend-neutral cache of `(quadraui::Rect, String)` hit regions, populated once per paint by `render::route_editor_hover_popup_click`'s sibling paint path and already consumed by both the existing click router (`route_and_apply_editor_hover_popup`) and the existing `MouseMoved` cursor-hint block directly above it:
+
+```rust
+// src/app.rs, App::handle_dispatch — "Outer window border: edge-resize
+// cursor hint (quadraui#406)":
+if let UiEvent::MouseMoved { position, .. } = &event {
+    let shape = match ctx.window_edge(position.x, position.y, render::WINDOW_RESIZE_GRIP_PX) {
+        Some(edge) => quadraui::PointerShape::Resize(edge),
+        None => quadraui::PointerShape::Default,
+    };
+    backend.set_cursor(shape);
+}
+```
+
+This is genuinely thin, shared, event-to-engine wiring — `backend.set_cursor` is called unconditionally from `src/app.rs` (not `src/gtk/` or `src/tui_main/`), and each backend's own `Backend::set_cursor` impl decides what, if anything, to do with the shape (GTK sets a CSS cursor name on the toplevel window; `TuiBackend::set_cursor`'s default is a documented no-op, per that block's own comment). Extending this one block to also consult `editor_hover_link_rects` (composing with the existing `Resize`/`Default` branch — link-hover should lose to a window-edge resize hint when both would apply, same priority order the existing GTK window-border comment already describes for other hover affordances) is all vimcode would need to do — **except there is no third `PointerShape` variant for it to pass**. Confirmed by reading the pinned rev (`a5360532e297deecece65103df8ce61f53230bda`) directly:
+
+```rust
+// quadraui/src/backend.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerShape {
+    /// The platform's normal arrow/default pointer.
+    Default,
+    /// A directional resize pointer for the given window edge/corner.
+    Resize(ResizeEdge),
+}
+```
+
+```rust
+// quadraui/src/gtk/backend.rs — pointer_shape_cursor_name, the only
+// PointerShape -> native-cursor table that exists today:
+fn pointer_shape_cursor_name(shape: PointerShape) -> &'static str {
+    match shape {
+        PointerShape::Default => "default",
+        PointerShape::Resize(ResizeEdge::North) => "n-resize",
+        // ... one CSS cursor-name arm per ResizeEdge variant, no others.
+    }
+}
+```
+
+`PointerShape` is a plain (non-`#[non_exhaustive]`) enum in an external crate, so vimcode cannot add a variant to it from the outside regardless of approach — this is not a case where a vimcode-side `match` could paper over the gap. The issue's own implementation sketch (hand-rolling a `gdk::Cursor::from_name("pointer", None)` call directly inside the GTK DA's motion handler, bypassing `Backend::set_cursor` entirely) is exactly the per-backend code this repo's Platform-Neutrality Rule exists to stop — `quadraui/src/desktop.rs`'s `ALL_RESIZE_EDGES`/`all_pointer_shapes` enum-walk scaffold and its own doc ("every backend still owns its own table... but this gives it a canonical, exhaustively-maintained list... instead of hand-duplicating the variant list per backend") describes precisely the mechanism a new variant should go through instead.
+
+**Ask:**
+
+1. Add `PointerShape::Pointer` (name TBD — `Pointer` reads oddly next to the struct-level doc's own "Deliberately named `PointerShape`, not `CursorShape`" note; `Hand` or `Link` may read better) to `quadraui::backend::PointerShape`.
+2. `GtkBackend::pointer_shape_cursor_name` — add a `PointerShape::Pointer => "pointer"` arm (CSS Basic UI Cursor keyword, the one browsers and GTK's own cursor-theme lookup already use for `<a>` hover).
+3. `desktop::all_pointer_shapes`/`ALL_RESIZE_EDGES` — grow the enum-walk scaffold's return array from 9 to 10 entries so the existing exhaustive per-backend mapping tests (`pointer_shape_cursor_name_maps_every_variant` et al.) keep covering every variant without each backend's test file needing to remember to add the new one by hand.
+4. macOS (`MacBackend`) and Win (`WinBackend`) backends should map it to `NSCursor.pointingHandCursor` / `IDC_HAND` respectively when those backends' own `set_cursor` tables exist — not blocking for vimcode#489 (GTK-only report) but needed before `IRREDUCIBLE_SURFACE.md`'s milestone work reaches those backends for the same feature; a backend with no native mapping yet can legitimately fall back to its existing `Default` arm rather than erroring (same latitude `WindowControl`'s per-method `Unsupported` already grants elsewhere, though `set_cursor` itself is a plain `bool`, not a `ServiceResult`).
+5. TUI (`TuiBackend::set_cursor`) can keep its existing no-op default — the issue's own "Backend coverage" section notes TUI likely already has terminal-emulator-dependent affordance (underline-on-hover or similar) via a different mechanism, not the OS pointer glyph, and that is out of scope for this entry regardless.
+
+**Test:** None added upstream by this draft — this is a drafted gap report with no quadraui-side change yet. The natural coverage shape once the `Ask` lands: extend `pointer_shape_cursor_name_maps_every_variant` (`quadraui/src/gtk/backend.rs`'s existing exhaustive test, already using `all_pointer_shapes()`) to assert the new variant maps to `"pointer"` — it will do so for free once item 3 above lands, since that test already iterates the scaffold's full list rather than a hand-maintained one.
+
+**Blocks:** `JDonaghy/vimcode#489`. Leave that issue open behind this one per `GOALS.md`'s milestone-discipline rule — there is no per-backend vimcode-side fix available; per this repo's Platform-Neutrality Rule, hand-rolling `gdk::Cursor` calls directly in `src/gtk/` to work around the missing variant (as the issue's own implementation sketch proposes) is exactly the kind of per-backend code that rule exists to prevent. Once this lands and the pin bumps, the vimcode-side change is a small addition to the existing shared `MouseMoved` cursor-hint block in `src/app.rs` (compose `editor_hover_link_rects`/`panel_hover_link_rects` hit-testing into the `Resize`/`Default` branch already there) — no new `src/gtk/` or `src/tui_main/` code needed, since `backend.set_cursor` is already called from shared code and TUI's own impl is already a documented no-op.
