@@ -28883,6 +28883,60 @@ pub struct UnitProfile {
     pub activity_bar_width_px: Option<f32>,
     /// [`quadraui::ShellConfig::with_title_bar`]'s `height_lh` argument.
     pub title_bar_lh: f32,
+    /// [`quadraui::ShellConfig::default_sidebar_width`] — the width the
+    /// sidebar opens at, in **line-height multiples** (quadraui's
+    /// `AppShell::compute_layout` multiplies it by `line_height`, so one unit
+    /// is one terminal row on TUI and ~23 device pixels on a GUI backend at
+    /// the default editor font).
+    ///
+    /// #1798: this has to differ per profile, because the unit it is
+    /// measured in differs by more than a factor of twenty. `App::
+    /// shell_config` used to leave it at `ShellConfig::new`'s generic
+    /// `20.0` on *every* backend. On TUI that is a 20-column sidebar beside
+    /// an 80-ish column terminal — fine. On a GUI backend it is a **~460px**
+    /// sidebar: next to the 48px activity bar, an 800x480 window had ~290px
+    /// left for the editor *and* its tab bar, i.e. room for exactly one tab.
+    /// That was the reported symptom — opening a second file moved the
+    /// breadcrumb, content and status bar to it, but the tab strip kept
+    /// reading only `sample.txt x`, because the second tab had nowhere to
+    /// paint.
+    ///
+    /// # Why `15.0` on the GUI profile, and not lower
+    ///
+    /// `15.0` is [`ALT_SIDEBAR_WIDTH_MIN`], the floor `App::shell_config`
+    /// *already* declares for the sidebar on every backend — so this makes
+    /// the opening width agree with the bound sitting two lines from it,
+    /// rather than inheriting an unrelated default. At ~345px it is in the
+    /// same range as [`crate::core::session::Session::sidebar_width`]'s own
+    /// persisted `260` default and VS Code's ~300px sidebar, and it leaves
+    /// ~400px of an 800px window for the editor band — enough for several
+    /// tabs (verified by the 800x480 driver test named below).
+    ///
+    /// It deliberately does **not** go below that floor, even though ~10
+    /// (~230px) would be closer still to the persisted 260. The floor is
+    /// shared with the Alt+Left/Right resize rung
+    /// ([`alt_resized_sidebar_width`], #759), so an opening width beneath it
+    /// makes the user's *first* Alt+Right jump discontinuously up to the
+    /// floor with no way back: measured at `10.0`, the painted sidebar went
+    /// 230px → 345px on Alt+Right and then stayed at 345px on Alt+Left
+    /// (`gtk::testing::alt_rung::alt_right_widens_the_painted_sidebar_on_gtk`
+    /// catches exactly this). Making that floor per-unit too is a change to
+    /// the *shared* Alt rung's cross-backend contract and wants its own
+    /// issue and its own two-backend coverage; it is not needed to fix the
+    /// tab bar, so this field is the whole of #1798's production change and
+    /// `min_sidebar_width`/`max_sidebar_width` stay shared and untouched.
+    ///
+    /// This is an `lh` multiple rather than a pixel value because
+    /// `App::shell_config` runs before the runner's first font measurement
+    /// (see the `#947`/`with_editor_font` comment at that call site), so it
+    /// could not convert pixels into multiples even if quadraui exposed a
+    /// `default_sidebar_width_px` to receive them — and an `lh` multiple is
+    /// the better unit anyway: it tracks `:set font_size` for free.
+    ///
+    /// Behavioural coverage: `gtk::testing`'s
+    /// `explorer_double_click_opens_second_file_in_a_second_tab_1798`, which
+    /// runs at the reported 800x480 and fails if this is `20.0`.
+    pub sidebar_width_lh: f32,
     /// Whether [`crate::app::App::shell_config`] should also request
     /// [`quadraui::ShellConfig::with_client_side_titlebar`].
     pub client_side_titlebar: bool,
@@ -28932,6 +28986,10 @@ impl UnitProfile {
             hit_tolerance: (6.0, 6.0),
             activity_bar_width_px: Some(48.0),
             title_bar_lh: 2.0,
+            // #1798: ~345px at the default editor font, down from the
+            // inherited `20.0`'s ~460px — see the field doc for why this is
+            // exactly `ALT_SIDEBAR_WIDTH_MIN` and not lower.
+            sidebar_width_lh: ALT_SIDEBAR_WIDTH_MIN as f32,
             client_side_titlebar: true,
             is_gui_backend: true,
             explorer_row_h: |lh| (lh * 1.4).round(),
@@ -28972,6 +29030,11 @@ impl UnitProfile {
             hit_tolerance: (1.0, 1.0),
             activity_bar_width_px: None,
             title_bar_lh: 1.0,
+            // #1798: unchanged from what the TUI already shipped — `20.0` is
+            // `ShellConfig::new`'s own default, which `App::shell_config`
+            // used to leave untouched on every backend. In *cells* 20 is the
+            // right number; only the GUI profile was mis-scaled.
+            sidebar_width_lh: 20.0,
             client_side_titlebar: false,
             is_gui_backend: false,
             explorer_row_h: |lh| lh,
@@ -38389,6 +38452,68 @@ mod alt_key_router_tests {
             ALT_SIDEBAR_WIDTH_MAX,
             "Alt+Right must clamp at the shared ceiling"
         );
+    }
+
+    /// #1798: the sidebar's opening width is a line-height *multiple*, so one
+    /// number means a 20-column strip on TUI and a ~460px slab on a GUI
+    /// backend — which left an 800px window no room for a second editor tab.
+    /// [`UnitProfile::sidebar_width_lh`] carries the per-unit value; this
+    /// pins the three properties that split has to keep.
+    ///
+    /// The behavioural proof is in the driver tests — `gtk::testing`'s
+    /// `explorer_double_click_opens_second_file_in_a_second_tab_1798` runs at
+    /// the reported 800x480 and fails if the GUI profile goes back to `20.0`.
+    /// This guards the *invariants* a future edit to either profile could
+    /// break while leaving that test green (or while breaking it for a reason
+    /// its message would not explain).
+    #[test]
+    fn unit_profiles_scale_the_sidebar_width_per_unit_1798() {
+        let (px, cell) = (UnitProfile::px(), UnitProfile::cell());
+
+        // 1. The TUI is untouched: 20 *cells*, the value it already shipped
+        //    (`ShellConfig::new`'s own default, which `App::shell_config`
+        //    used to leave alone on every backend).
+        assert_eq!(cell.sidebar_width_lh, 20.0);
+
+        // 2. The GUI opens narrower than that, because one GUI line height
+        //    is ~23 device pixels rather than one terminal row.
+        assert!(
+            px.sidebar_width_lh < cell.sidebar_width_lh,
+            "the GUI profile must open narrower than the TUI's cell count, or \
+             #1798's 800px window still has no room for a second tab: {} vs {}",
+            px.sidebar_width_lh,
+            cell.sidebar_width_lh
+        );
+
+        // 3. Neither profile may open *below* the shared Alt rung's floor.
+        //    Two independent reasons, both load-bearing:
+        //      * `AppShell::compute_layout` clamps the opening width through
+        //        `min_sidebar_width` (still `ALT_SIDEBAR_WIDTH_MIN` on every
+        //        backend), so a narrower value is silently discarded; and
+        //      * the user's first Alt+Right would jump straight to the floor
+        //        with no way back, since `alt_resized_sidebar_width` clamps to
+        //        the same bound (measured at 10.0 on GTK: 230px -> 345px on
+        //        Alt+Right, then stuck at 345px on Alt+Left).
+        //    Lowering that floor per-unit is a change to the *shared* rung's
+        //    cross-backend contract (#759) and wants its own issue; until
+        //    then this is the real lower bound on `sidebar_width_lh`.
+        for (name, p) in [("px", px), ("cell", cell)] {
+            assert!(
+                p.sidebar_width_lh >= ALT_SIDEBAR_WIDTH_MIN as f32,
+                "{name} profile opens the sidebar at {}, below the shared Alt \
+                 rung's floor of {} — compute_layout would clamp it back up \
+                 and Alt+Left could never return to it",
+                p.sidebar_width_lh,
+                ALT_SIDEBAR_WIDTH_MIN
+            );
+            assert!(
+                p.sidebar_width_lh <= ALT_SIDEBAR_WIDTH_MAX as f32,
+                "{name} profile opens the sidebar at {}, above the shared Alt \
+                 rung's ceiling of {}",
+                p.sidebar_width_lh,
+                ALT_SIDEBAR_WIDTH_MAX
+            );
+        }
     }
 
     /// #1744: VS Code's `workbench.action.navigateBack` (Alt+Left) returns the

@@ -1717,8 +1717,34 @@ impl App {
         let (editor_family, editor_size_pt) =
             resolve_editor_font(&self.engine.borrow().settings, &**self.backend.borrow());
         cfg = cfg.with_editor_font(editor_family, editor_size_pt);
+        // #1798: the width the sidebar *opens* at is a line-height
+        // **multiple** (quadraui's `AppShell::compute_layout` multiplies it
+        // by `line_height`), so leaving it at `ShellConfig::new`'s generic
+        // `20.0` meant a 20-column strip on TUI but a ~460px slab on a GUI
+        // backend — which left an 800px-wide window no room to paint a
+        // second editor tab. `UnitProfile::sidebar_width_lh` carries the
+        // per-unit value; see its field doc for why the GUI profile uses
+        // exactly `ALT_SIDEBAR_WIDTH_MIN` and not less.
+        //
+        // Read from `self.units` for the same reason `activity_bar_width_px`
+        // above is: the value differs per *unit*, not per *backend*, so it
+        // belongs in the one profile each backend already picks at
+        // construction rather than in a `cfg!`/`if gtk` branch here
+        // (Platform-Neutrality Rule).
+        cfg.default_sidebar_width = self.units.sidebar_width_lh;
         // #759: the shared Alt rung clamps sidebar width, so Alt+Left/Right
-        // resolve identically on every backend.
+        // resolve identically on every backend. These two stay *shared*
+        // (unlike the opening width above) — they bound the rung itself, and
+        // quadraui's own `set_sidebar_width` clamp must not be narrower than
+        // it on one backend and not another. #1798 therefore also requires
+        // `default_sidebar_width >= min_sidebar_width`: `compute_layout`
+        // clamps the opening width through this floor, so an opening width
+        // below it would silently resolve back up to it.
+        debug_assert!(
+            self.units.sidebar_width_lh >= render::ALT_SIDEBAR_WIDTH_MIN as f32,
+            "a sidebar that opens below the shared Alt rung's floor cannot be \
+             narrowed back to its opening width by Alt+Left (#1798)"
+        );
         cfg.min_sidebar_width = render::ALT_SIDEBAR_WIDTH_MIN as f32;
         cfg.max_sidebar_width = render::ALT_SIDEBAR_WIDTH_MAX as f32;
         cfg
@@ -11250,6 +11276,28 @@ mod portable_entry_point_tests {
         );
         assert_eq!(cfg.min_sidebar_width, render::ALT_SIDEBAR_WIDTH_MIN as f32);
         assert_eq!(cfg.max_sidebar_width, render::ALT_SIDEBAR_WIDTH_MAX as f32);
+        // #1798: the sidebar must *open* at the profile's own width rather
+        // than inherit `ShellConfig::new`'s cell-flavoured 20.0, which on a
+        // GUI backend is ~460px and left an 800px window no room for a
+        // second editor tab. (This is a `gui`-gated test, so `self.units`
+        // here is `UnitProfile::px()`.)
+        assert_eq!(
+            cfg.default_sidebar_width,
+            render::UnitProfile::px().sidebar_width_lh,
+            "shell_config must take the sidebar's opening width from the unit \
+             profile, not leave quadraui's cell-flavoured 20.0 default in place"
+        );
+        // `compute_layout` clamps the opening width through the bounds above,
+        // so an opening width outside them is silently discarded.
+        assert!(
+            cfg.default_sidebar_width >= cfg.min_sidebar_width
+                && cfg.default_sidebar_width <= cfg.max_sidebar_width,
+            "the opening width ({}) must survive compute_layout's own clamp \
+             to {}..={}",
+            cfg.default_sidebar_width,
+            cfg.min_sidebar_width,
+            cfg.max_sidebar_width,
+        );
     }
 
     /// #949 review: makes the "closes the macOS/Win-GUI settings hot-reload
