@@ -14922,45 +14922,84 @@ mod tests {
         /// (`vimcode.buffer.*` + `vimcode.window.set_buf`, the same
         /// immediately-visible seam `immediate_api_scratch_buffer_paints_
         /// after_plugin_command_via_shell_app` above already proves paints),
-        /// so the assertion is on `driver.screen()` containing the engine's
-        /// `cwd`, not on any engine field.
+        /// so the assertion is on `driver.screen()` containing a marker
+        /// derived from the engine's `cwd`, not on any engine field.
         ///
         /// RED-verified by hand the same way as the engine-level test: with
-        /// `Engine::apply_plugin_ctx`'s `cmd.current_dir(req.cwd.as_deref()
-        /// .unwrap_or(&self.cwd))` reverted to the old "no fallback at all"
-        /// behaviour, `pwd`'s child inherits this test binary's real OS
-        /// process directory (the repo root `cargo test` runs from) instead
-        /// of `tmp`, so the poll loop below exhausts its deadline and the
-        /// screen never contains `tmp`'s path.
+        /// `apply_plugin_ctx`'s whole `match req.cwd.as_deref()` block
+        /// reverted to the old, fallback-free `if let Some(ref cwd) =
+        /// req.cwd { cmd.current_dir(cwd); }`, `pwd -P`'s child inherits
+        /// this test binary's real OS process directory (the repo root
+        /// `cargo test` runs from) instead of `tmp`, so the poll loop below
+        /// exhausts its deadline and the proof marker never paints.
+        ///
+        /// **Why the needle is the temp dir's *basename*, not its full
+        /// path** (#1751 review round 2): this harness is a fixed 80x24 grid
+        /// (`harness()`'s `conformance_harness(engine, 80, 24)`, and the
+        /// module doc's "Why `(80, 24)`" section) and `TuiDriver::screen()`
+        /// emits one `\n` per 80-cell row, so **no string longer than 80
+        /// columns can ever be a contiguous substring of `screen()`** — and
+        /// the line-number gutter eats a few more. On Linux the canonical
+        /// temp root is `/tmp`, so the full path fits and asserting on it
+        /// passes; on macOS `std::env::temp_dir().canonicalize()` is
+        /// `/private/var/folders/<2>/<~32>/T`, which pushes the same needle
+        /// to ~97 chars and makes the assertion a guaranteed red on CI's
+        /// `Test (macOS native, AppKit)` lane (`src/tui_main` is declared
+        /// unconditionally in `src/lib.rs`, so this `#[cfg(unix)]` test does
+        /// run there). Asserting on the basename alone is not a weaker
+        /// proof: the directory name is unique to this test *and* this
+        /// process, so the child could only have printed it by actually
+        /// having been spawned in the engine's `cwd`.
         #[test]
         #[cfg(unix)]
         fn async_shell_cwd_default_paints_into_buffer_via_shell_app_1751() {
             use std::time::{Duration, Instant};
 
-            let tmp = std::env::temp_dir().join(format!(
-                "vc_app_on_tui_async_shell_cwd_1751_{}",
-                std::process::id()
-            ));
+            // Keep the directory name short enough that `MARKER + name`
+            // still fits in one 80-column row after the gutter, while
+            // staying unique per process.
+            let dir_name = format!("vc_aot_cwd_1751_{}", std::process::id());
+            let tmp = std::env::temp_dir().join(&dir_name);
             let _ = std::fs::remove_dir_all(&tmp);
             std::fs::create_dir_all(&tmp).unwrap();
-            // Canonicalize so this matches what the child's `pwd` reports
-            // (resolves any symlink in the temp root, e.g. macOS's `/tmp`
-            // -> `/private/tmp`).
+            // Canonicalize so this matches what the child's `pwd -P`
+            // reports (resolves any symlink in the temp root, e.g. macOS's
+            // `/tmp` -> `/private/tmp`).
             let tmp = tmp.canonicalize().unwrap();
+
+            // Absolute path + `-P`, agreeing with the companion test in
+            // `tests/extensions.rs`: never let the shell resolve a utility
+            // via `PATH`, and `-P` asks `pwd` to resolve via `getcwd()`
+            // rather than print whatever logical `$PWD` it inherited from
+            // this test binary's environment (a shell-builtin `pwd` can
+            // echo the inherited value on some `sh` implementations).
+            let pwd = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+                .iter()
+                .map(|dir| std::path::Path::new(dir).join("pwd"))
+                .find(|candidate| candidate.is_file())
+                .map(|candidate| candidate.to_string_lossy().into_owned())
+                .expect("this test needs the POSIX utility `pwd`");
 
             let mut engine = engine_with_plugin(
                 "async_shell_cwd_1751",
-                r#"
+                &format!(
+                    r#"
                 vimcode.command("RunShellCwd1751", function(_)
-                    vimcode.async_shell("pwd", "shell_cwd_done_1751")
+                    vimcode.async_shell("{pwd} -P", "shell_cwd_done_1751")
                 end)
                 vimcode.on("shell_cwd_done_1751", function(output)
                     local trimmed = output:gsub("%s+$", "")
-                    local b = vimcode.buffer.create({ scratch = true, name = "ZQCWD1751" })
-                    vimcode.buffer.set_lines(b, 0, -1, { trimmed })
+                    -- Only the trailing path component: the full path can
+                    -- exceed this harness's 80-column row width (macOS's
+                    -- temp root is ~56 chars on its own) and would then be
+                    -- unfindable in `screen()` no matter how it painted.
+                    local base = trimmed:match("([^/]+)$") or "NOMATCH"
+                    local b = vimcode.buffer.create({{ scratch = true, name = "ZQCWD1751" }})
+                    vimcode.buffer.set_lines(b, 0, -1, {{ "ZQCWD1751:" .. base }})
                     vimcode.window.set_buf(0, b)
                 end)
-                "#,
+                "#
+                ),
             );
             // Point the engine's workspace at `tmp` — deliberately different
             // from this test binary's real OS process directory, which this
@@ -14970,11 +15009,18 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
-            let tmp_str = tmp.to_string_lossy().into_owned();
+            let needle = format!("ZQCWD1751:{dir_name}");
+            assert!(
+                needle.len() < 70,
+                "the proof marker must fit in one 80-column row with room \
+                 for the gutter, else `screen()` can never contain it: \
+                 {needle:?} is {} chars",
+                needle.len()
+            );
             let before = driver.screen();
             assert!(
-                !before.contains(&tmp_str),
-                "precondition: the temp path isn't painted before the \
+                !before.contains(&needle),
+                "precondition: the proof marker isn't painted before the \
                  command runs; screen:\n{before}"
             );
 
@@ -14987,17 +15033,19 @@ mod tests {
 
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut screen = driver.screen();
-            while !screen.contains(&tmp_str) && Instant::now() < deadline {
+            while !screen.contains(&needle) && Instant::now() < deadline {
                 driver.tick();
                 std::thread::sleep(Duration::from_millis(10));
                 screen = driver.screen();
             }
             let _ = std::fs::remove_dir_all(&tmp);
             assert!(
-                screen.contains(&tmp_str),
+                screen.contains(&needle),
                 "vimcode.async_shell with no `cwd` option must default to \
-                 the engine's own `cwd` ({tmp_str:?}), painted into the \
-                 scratch buffer within 5s; screen:\n{screen}"
+                 the engine's own `cwd` ({:?}, whose basename the child's \
+                 `pwd -P` reports back), painted into the scratch buffer \
+                 within 5s as {needle:?}; screen:\n{screen}",
+                tmp.display()
             );
         }
     }

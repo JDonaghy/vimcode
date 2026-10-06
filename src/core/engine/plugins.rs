@@ -25,6 +25,37 @@ const MAX_SPAWN_EVENTS_PER_TICK: usize = 256;
 /// `Engine::record_async_shell_exit`'s doc for why this exists.
 const MAX_ASYNC_SHELL_LAST_EXIT_ENTRIES: usize = 256;
 
+/// The form of a workspace root that is safe to hand to
+/// [`std::process::Command::current_dir`] for a plugin-spawned shell (#1751).
+///
+/// `Engine::cwd` is frequently a `canonicalize()` result, which on Windows is
+/// the verbatim `\\?\C:\...` extended-length form. Every plugin shell command
+/// on Windows routes through `cmd /C` (`terminal.rs`'s `shell_cmd`), and
+/// `cmd.exe` refuses a non-drive-rooted current directory ("UNC paths are not
+/// supported. Defaulting to Windows directory"), so the verbatim prefix has to
+/// come off — [`crate::core::paths::strip_unc_prefix`], as `engine/windows.rs`
+/// and `render.rs` already do.
+///
+/// The one shape that must *not* be stripped is a **verbatim UNC** root
+/// (`\\?\UNC\server\share\...`, what `canonicalize()` yields for a workspace
+/// on a network share): stripping leaves `UNC\server\share\...`, a *relative*
+/// path that `current_dir` would resolve against the process cwd — strictly
+/// worse than the un-stripped path, since it can silently spawn the child
+/// somewhere real but wrong rather than just failing (#1751 review round 2).
+/// Keeping the original is the conservative choice: `cmd.exe` can't chdir into
+/// a UNC root in either form, so the only difference is "fails loudly" vs
+/// "runs in the wrong place".
+///
+/// A no-op on non-Windows, where `strip_unc_prefix` itself is a no-op.
+fn spawn_cwd(cwd: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
+    let stripped = crate::core::paths::strip_unc_prefix(cwd);
+    if stripped.is_absolute() {
+        stripped
+    } else {
+        std::borrow::Cow::Borrowed(cwd)
+    }
+}
+
 /// Which surface currently owns a `vimcode.ui.register_view` view's keyboard
 /// focus / selection index — the sidebar body or an editor-area tab
 /// (`Engine::open_plugin_view_tab`, #1627).
@@ -2097,65 +2128,29 @@ impl Engine {
         for req in ctx.async_shell_requests {
             let mut cmd = crate::core::terminal::shell_cmd(&req.command);
             // Default to the engine's own workspace `cwd` when the plugin
-            // didn't pass one (#1751). Without this, an omitted `cwd`
-            // falls through to `std::process::Command`'s own default: the
-            // *OS process's* actual current directory, which only matches
-            // the open workspace by convention (a terminal that `cd`ed
-            // there first) — a GUI launch (desktop shortcut, file-manager
-            // "Open with", no "Start in" folder set) can leave it pointed
-            // anywhere. `self.cwd` is the engine's adopted workspace root.
-            // It can genuinely diverge from the OS process directory: after
-            // `adopt_cwd_for_startup_file` (opening a *file* — shortcut /
-            // "Open with" — whose repo root gets adopted in memory without
-            // ever calling `std::env::set_current_dir`, #1797, `mod.rs`),
-            // `self.cwd` is correct but the process cwd is not. (`open_folder`
-            // is not an instance of that divergence — it *does* call
-            // `std::env::set_current_dir`, `buffers.rs` — so a GUI launch
-            // followed by "Open Folder" already had the process cwd
-            // repointed; the case this repairs is specifically the file-open
-            // path.) `self.cwd` is still the right fallback either way — the
-            // engine's own idea of "the open workspace" is what every plugin
-            // author assumes "no cwd given" means. This is git-insights'
-            // blame.lua's exact failure mode on Win-GUI: it calls
-            // `vimcode.async_shell` for `git blame -- <relative path>` with
-            // no `cwd` option, so on a GUI launch outside the repo the child
-            // process ran in the wrong directory and `git` failed outright,
-            // silently (output discarded, see `Err(_)` arm below) dropping
-            // the blame annotation with no error surfaced anywhere.
+            // didn't pass one (#1751). Without it, an omitted `cwd` falls
+            // through to `std::process::Command`'s default — the *OS
+            // process's* current directory, which only matches the open
+            // workspace by convention (a terminal that `cd`ed there first).
+            // The two genuinely diverge after `adopt_cwd_for_startup_file`
+            // (opening a *file* via shortcut / "Open with": the repo root is
+            // adopted in memory and the process cwd is deliberately left
+            // alone — `mod.rs`, #1797), which is exactly the case this
+            // repairs. `open_folder` is *not* an instance: it does call
+            // `std::env::set_current_dir` (`buffers.rs`), so a GUI launch
+            // followed by "Open Folder" already had the process cwd moved.
+            // This is git-insights' blame.lua's failure mode on Win-GUI — it
+            // `async_shell`s `git blame -- <relative path>` with no `cwd`, so
+            // a GUI launch outside the repo ran `git` in the wrong directory
+            // and the blame annotation silently vanished (output discarded,
+            // see the `Err(_)` arm below).
             //
-            // `self.cwd` can itself be stale (workspace folder deleted,
-            // renamed, or an unmounted network share after the fact) — if
-            // it no longer resolves to a real directory, fall all the way
-            // back to "no `current_dir` call at all" (`std::process::
-            // Command`'s own OS-process-cwd default) rather than handing
-            // `Command::current_dir` a path that will make every spawn in
-            // this loop fail; that default is at least as likely to be
-            // valid as a known-gone workspace root, and strictly better
-            // than guaranteed failure.
-            //
-            // Windows: `self.cwd` is frequently the `path.canonicalize()`
-            // result (`open_folder`), which on Windows is the verbatim
-            // `\\?\C:\...` extended-length form. `cmd.exe` — every plugin
-            // shell command on Windows routes through `cmd /C`, `terminal.rs`
-            // `shell_cmd` — refuses a non-drive-rooted current directory
-            // ("UNC paths are not supported"), so hand it the stripped form
-            // via `paths::strip_unc_prefix` (already used for the same
-            // reason by `engine/windows.rs` and `render.rs`) rather than the
-            // raw verbatim path.
-            //
-            // Canonical-seam note (#1751 review): this makes
-            // `vimcode.async_shell`'s "no cwd" default the workspace root.
-            // `vimcode.loop.spawn` (the streamed sibling this call site is
-            // itself built on, `execute::spawn_piped`/`AsyncShellTask` just
-            // above) does not get the same default here and still falls
-            // through to the OS process cwd when its own options table
-            // omits `cwd` — left alone deliberately, since changing a second
-            // public API's documented default is out of scope for this fix;
-            // if `loop.spawn` needs the same treatment, that's a follow-up,
-            // not this one. `workspace_storage_key` (`plugin.rs`) is a third,
-            // intentionally different seam: it keys off `std::env::
-            // current_dir()` rather than `Engine::cwd` by design, to survive
-            // a plugin being reloaded with a different open workspace.
+            // Seam note: `vimcode.loop.spawn` keeps falling through to the
+            // OS process cwd when its own options omit `cwd` (changing a
+            // second public API's documented default is out of scope here),
+            // and `workspace_storage_key` (`plugin.rs`) keys off
+            // `std::env::current_dir()` by design. See `EXTENSIONS.md`'s
+            // `async_shell` options table for the documented default.
             match req.cwd.as_deref() {
                 // An explicit `cwd` is passed through exactly as before this
                 // fix, valid or not — if a plugin hands us a bad path, that
@@ -2165,10 +2160,13 @@ impl Engine {
                     cmd.current_dir(cwd);
                 }
                 // No `cwd` given: default to the engine's workspace root,
-                // but only if it still resolves to a real directory — see
-                // the edge-case note above.
+                // but only if it still resolves to a real directory.
+                // `self.cwd` can be stale (folder deleted/renamed, share
+                // unmounted); when it is, fall all the way back to "no
+                // `current_dir` call at all" rather than guaranteeing every
+                // spawn in this loop fails.
                 None if self.cwd.is_dir() => {
-                    cmd.current_dir(crate::core::paths::strip_unc_prefix(&self.cwd).as_ref());
+                    cmd.current_dir(spawn_cwd(&self.cwd).as_ref());
                 }
                 None => {}
             }
@@ -3197,6 +3195,53 @@ impl Engine {
         }
         self.plugin_event("WinLeave", &old.0.to_string());
         self.plugin_event("WinEnter", &new.0.to_string());
+    }
+}
+
+#[cfg(test)]
+mod spawn_cwd_tests {
+    use super::spawn_cwd;
+    use std::path::Path;
+
+    /// A plain absolute workspace root is handed through untouched on every
+    /// platform — this is the overwhelmingly common case for `async_shell`'s
+    /// `cwd` default (#1751).
+    #[test]
+    fn plain_absolute_path_is_unchanged() {
+        #[cfg(windows)]
+        let cwd = Path::new(r"C:\work\repo");
+        #[cfg(not(windows))]
+        let cwd = Path::new("/work/repo");
+        assert_eq!(spawn_cwd(cwd).as_ref(), cwd);
+    }
+
+    /// Windows: `canonicalize()`'s verbatim `\\?\C:\...` form must lose its
+    /// prefix, because `cmd /C` (every plugin shell on Windows) refuses a
+    /// non-drive-rooted current directory.
+    #[test]
+    #[cfg(windows)]
+    fn verbatim_drive_path_is_stripped() {
+        assert_eq!(
+            spawn_cwd(Path::new(r"\\?\C:\work\repo")).as_ref(),
+            Path::new(r"C:\work\repo")
+        );
+    }
+
+    /// #1751 review round 2: a verbatim **UNC** root must survive intact.
+    /// Naively stripping `\\?\` yields `UNC\server\share\...`, a relative
+    /// path `Command::current_dir` would resolve against the process cwd —
+    /// which can spawn the child somewhere real but wrong.
+    #[test]
+    #[cfg(windows)]
+    fn verbatim_unc_path_is_left_alone_rather_than_made_relative() {
+        let unc = Path::new(r"\\?\UNC\server\share\repo");
+        let got = spawn_cwd(unc);
+        assert!(
+            got.is_absolute(),
+            "a verbatim UNC workspace root must never be turned into a \
+             relative path: {got:?}"
+        );
+        assert_eq!(got.as_ref(), unc);
     }
 }
 

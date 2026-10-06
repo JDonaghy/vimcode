@@ -635,10 +635,10 @@ vimcode.async_shell("git status", "my_result_event")
 vimcode.async_shell("grep -n pattern", "search_done", {
     stdin = "input text",   -- Optional: pipe to stdin
     cwd = "/path/to/dir"    -- Optional: working directory. Default (#1751):
-                             -- the open workspace root, falling back to the
-                             -- editor process's own working directory if
-                             -- that workspace root no longer resolves to a
-                             -- real directory.
+                            -- the open workspace root, falling back to the
+                            -- editor process's own working directory if that
+                            -- workspace root no longer resolves to a real
+                            -- directory.
 })
 
 -- Handle the result
