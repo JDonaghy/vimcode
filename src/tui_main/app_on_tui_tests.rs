@@ -15932,6 +15932,138 @@ mod tests {
                  line's content"
             );
         }
+
+        /// #1810: decor eol virtual text shares `RenderedLine::annotation`
+        /// with `vimcode.buf.annotate_line`'s blame text, but must NOT
+        /// inherit that field's Insert-mode mute. The mute exists so the
+        /// ambient blame annotation stops flickering beside the caret while
+        /// the user types; plugin-owned eol text (inlay hints, lint
+        /// messages) is the opposite — it is most useful exactly while
+        /// editing, and Neovim keeps it painted in insert mode too.
+        ///
+        /// RED against the first #1810 implementation (which routed eol
+        /// text through the shared `if Insert { None }` guard): after `i`,
+        /// `driver.find("ZQEOLINS")` returns `None` and the second
+        /// assertion below fails.
+        #[test]
+        fn decor_eol_virt_text_survives_insert_mode_but_blame_still_mutes_via_app_on_tui() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQLINEONE\n");
+            // The blame-sourced annotation this field normally carries —
+            // the control for the assertion that eol text behaves
+            // differently from it.
+            engine.line_annotations.insert(0, "ZQBLAMETEXT".to_string());
+            let ns = engine.decor.namespace("zq_eol_insert");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                None,
+                DecorOpts {
+                    virt_text: vec![VirtTextChunk {
+                        text: "ZQEOLINS".to_string(),
+                        hl_group: None,
+                    }],
+                    virt_text_pos: Some(VirtTextPos::Eol),
+                    ..Default::default()
+                },
+            );
+
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQBLAMETEXT") && screen.contains("ZQEOLINS"),
+                "precondition: in Normal mode both the blame annotation and \
+                 the decor eol text must paint; screen:\n{screen}"
+            );
+
+            driver.type_char('i');
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQEOLINS"),
+                "decor eol virtual text must stay painted in Insert mode — \
+                 it is plugin-owned inlay/lint text, not the ambient blame \
+                 annotation the Insert-mode mute is for; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("ZQBLAMETEXT"),
+                "the blame annotation must keep its pre-#1810 Insert-mode \
+                 mute; screen:\n{screen}"
+            );
+        }
+
+        /// #1810: on a *wrapped* line, "end of line" means after all of the
+        /// line's content — the eol text must ride the line's LAST visual
+        /// row, not the first one (where the blame annotation sits, and
+        /// where it would read as text spliced into the middle of the
+        /// line).
+        ///
+        /// RED against the first #1810 implementation (which reused the
+        /// blame placement wholesale): the eol text painted on the wrapped
+        /// line's first visual row, so the `eol_y == last_y` assertion
+        /// below fails with the eol text one row above the tail.
+        #[test]
+        fn decor_eol_virt_text_rides_last_visual_row_of_a_wrapped_line_via_app_on_tui() {
+            let mut engine = plain_engine();
+            engine.settings.wrap = true;
+            // Wide enough to wrap at the harness's 80-column terminal, with
+            // two distinctive anchors: one in the first visual row, one in
+            // the last.
+            let long = format!("ZQHEAD{} ZQTAIL\n", " zzz".repeat(30));
+            engine.buffer_mut().insert(0, &long);
+            let ns = engine.decor.namespace("zq_eol_wrap");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                None,
+                DecorOpts {
+                    virt_text: vec![VirtTextChunk {
+                        text: "ZQEOLWRAP".to_string(),
+                        hl_group: None,
+                    }],
+                    virt_text_pos: Some(VirtTextPos::Eol),
+                    ..Default::default()
+                },
+            );
+
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+            let (_, head_y) = driver
+                .find("ZQHEAD")
+                .expect("the wrapped line's first visual row must paint");
+            let (tail_x, tail_y) = driver
+                .find("ZQTAIL")
+                .expect("the wrapped line's last visual row must paint");
+            assert!(
+                tail_y > head_y,
+                "precondition: the line must actually wrap onto a later \
+                 visual row; screen:\n{}",
+                driver.screen()
+            );
+            let (eol_x, eol_y) = driver
+                .find("ZQEOLWRAP")
+                .expect("the eol virtual text must paint");
+            assert_eq!(
+                eol_y,
+                tail_y,
+                "the eol text must paint on the wrapped line's LAST visual \
+                 row (after all its content), not on the first; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                eol_x > tail_x,
+                "the eol text must paint after the tail of the line's own \
+                 content"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

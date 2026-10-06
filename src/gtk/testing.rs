@@ -25324,5 +25324,96 @@ mod issue_1513_at_dir_and_at_symbol_mentions {
                  column: {strip1:?}"
             );
         }
+
+        /// #1810, GTK twin of `app_on_tui_tests`'
+        /// `decor_eol_virt_text_paints_after_line_and_follows_insert_above_
+        /// via_app_on_tui`: end-of-line virtual text (`virt_text_pos =
+        /// "eol"`) must actually reach pixels on GTK too, not just be
+        /// stored. It converges on `RenderedLine::annotation`, which GTK
+        /// paints in its *own* `pango::Layout` (quadraui's
+        /// `gtk::editor::paint_line_text_ghost_and_annotation`) separate
+        /// from the line body's layout — so unlike the body-text
+        /// assertions above, `find_bounds` here returns a rect around the
+        /// annotation run itself, which is what lets this test check it
+        /// lands on the marked line's row and to the right of its content.
+        ///
+        /// Also covers two eol marks on one line drawing in creation
+        /// order, space-separated, and the fact that eol text (unlike the
+        /// blame annotation sharing the field) survives Insert mode.
+        ///
+        /// RED against unfixed `develop`: `render.rs`'s `Eol | None` arm
+        /// was a deliberate no-op there, so "ZQEOLA" is painted nowhere
+        /// and the first `screen_contains` assertion fails.
+        #[test]
+        fn decor_eol_virt_text_paints_after_line_content_via_gtk_driver() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQBEFORE\nZQOTHERLINE\n");
+            let ns = engine.decor.namespace("zq_eol_gtk");
+            let buf_id = engine.active_buffer_id();
+            for text in ["ZQEOLA", "ZQEOLB"] {
+                engine.decor.set_mark(
+                    buf_id,
+                    ns,
+                    0,
+                    0,
+                    None,
+                    None,
+                    DecorOpts {
+                        virt_text: vec![VirtTextChunk {
+                            text: text.to_string(),
+                            hl_group: None,
+                        }],
+                        virt_text_pos: Some(VirtTextPos::Eol),
+                        ..Default::default()
+                    },
+                );
+            }
+
+            let mut h = settled_harness(engine);
+            assert!(
+                h.driver.screen_contains("ZQEOLA ZQEOLB"),
+                "eol virtual text must paint on GTK, with two marks on one \
+                 line drawn in creation order and space-separated; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            let line = h
+                .driver
+                .find_bounds("ZQBEFORE")
+                .expect("the marked line's own text must paint");
+            let eol = h
+                .driver
+                .find_bounds("ZQEOLA")
+                .expect("the eol virtual text must paint");
+            // Same row (the annotation layout is baselined on the line it
+            // annotates), and to the right of where the line's own content
+            // starts — i.e. trailing the content, not replacing it.
+            assert!(
+                (eol.y - line.y).abs() < h.driver.backend().char_width(),
+                "the eol text must paint on the marked line's own row \
+                 (line {line:?} vs eol {eol:?})"
+            );
+            assert!(
+                eol.x > line.x,
+                "the eol text must paint after the line's content, not \
+                 before/over it (line {line:?} vs eol {eol:?})"
+            );
+            assert!(
+                h.driver.screen_contains("ZQOTHERLINE"),
+                "the unmarked line must be untouched; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            // Entering Insert mode must not mute it (the blame annotation
+            // sharing this field *is* muted there — see the TUI twin).
+            h.driver.type_char('i');
+            assert!(
+                h.driver.screen_contains("ZQEOLA ZQEOLB"),
+                "eol virtual text must stay painted in Insert mode; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+        }
     }
 }
