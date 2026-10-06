@@ -10537,6 +10537,120 @@ mod editor_popups {
             "the bare URL must be linkified into a real clickable link rect; got {link_rects:?}"
         );
     }
+
+    /// #504: a hover popup with several bare URLs used to register a click
+    /// region for only the first one — the rest painted in link color but
+    /// did nothing when clicked. Coverage here spans the two things the
+    /// coordinator triage flagged as the remaining suspects: two URLs
+    /// landing on the very same line (so any per-line "stop after first
+    /// match" bug in the scanner would show up), and a URL that comes after
+    /// a run of **bold** (proportional-width-ish) text, so a char-count
+    /// hit-region computed from the *wrong* preceding width would drift.
+    ///
+    /// Each case gets its own fresh harness/popup — a `Link` click
+    /// dismisses the popup (see `apply_editor_hover_popup_route`), so
+    /// clicking the second link in the same popup instance the first click
+    /// already closed would trivially prove nothing.
+    ///
+    /// **RED against the bug this issue describes:** with only the first
+    /// match per line registered, `second_rect` below would not exist (or
+    /// would alias `first_rect`), and clicking it would queue no
+    /// `OpenUrl` at all.
+    #[test]
+    fn editor_hover_popup_registers_every_bare_url_as_its_own_click_region_on_gtk() {
+        let markdown = "**Bold504** then https://example.com/first504 and \
+             https://example.com/second504 end504";
+
+        // Two separate harnesses so each click lands on an untouched popup.
+        let click_and_collect =
+            |url_to_click: &str| -> Vec<crate::core::engine::PendingPlatformAction> {
+                let mut engine = small_engine();
+                engine.show_editor_hover(
+                    1,
+                    4,
+                    markdown,
+                    crate::core::engine::EditorHoverSource::Lsp,
+                    false,
+                    false,
+                );
+                let mut h = harness(engine, 1400, 900);
+                h.driver.render();
+
+                let link_rects = h.editor_hover_link_rects.borrow().clone();
+                let (rect, uri) = link_rects
+                    .iter()
+                    .find(|(_, uri)| uri == url_to_click)
+                    .unwrap_or_else(|| {
+                        panic!("expected a click region for {url_to_click}; got {link_rects:?}")
+                    });
+                assert_eq!(uri, url_to_click);
+
+                let (cx, cy) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+                h.driver.click(cx, cy);
+                h.driver.render();
+
+                let actions = h.engine.borrow().pending_platform_actions.clone();
+                actions
+            };
+
+        let first_url = "https://example.com/first504";
+        let second_url = "https://example.com/second504";
+
+        // Sanity: both URLs must have painted as *distinct* (non-aliased)
+        // rects before either is clicked.
+        {
+            let mut engine = small_engine();
+            engine.show_editor_hover(
+                1,
+                4,
+                markdown,
+                crate::core::engine::EditorHoverSource::Lsp,
+                false,
+                false,
+            );
+            let mut h = harness(engine, 1400, 900);
+            h.driver.render();
+            let link_rects = h.editor_hover_link_rects.borrow().clone();
+            let first_rect = link_rects
+                .iter()
+                .find(|(_, uri)| uri == first_url)
+                .map(|(r, _)| *r)
+                .unwrap_or_else(|| panic!("missing rect for {first_url}; got {link_rects:?}"));
+            let second_rect = link_rects
+                .iter()
+                .find(|(_, uri)| uri == second_url)
+                .map(|(r, _)| *r)
+                .unwrap_or_else(|| panic!("missing rect for {second_url}; got {link_rects:?}"));
+            assert_ne!(
+                first_rect, second_rect,
+                "the first and second bare URL must paint distinct hit \
+                 regions, not alias the same rect"
+            );
+        }
+
+        let actions_from_first = click_and_collect(first_url);
+        assert!(
+            actions_from_first
+                .iter()
+                .any(|a| matches!(
+                    a,
+                    crate::core::engine::PendingPlatformAction::OpenUrl(u) if u == first_url
+                )),
+            "clicking the first bare URL's rect must queue OpenUrl({first_url}); got {actions_from_first:?}"
+        );
+
+        let actions_from_second = click_and_collect(second_url);
+        assert!(
+            actions_from_second.iter().any(|a| matches!(
+                a,
+                crate::core::engine::PendingPlatformAction::OpenUrl(u) if u == second_url
+            )),
+            "clicking the second bare URL's rect must queue OpenUrl({second_url}) — \
+             this is the #504 regression: only the first bare URL was \
+             clickable, the rest painted in link color but did nothing; \
+             got {actions_from_second:?}"
+        );
+    }
 }
 
 /// Black-box paint proof for the four panel-region surfaces #670 ported from
