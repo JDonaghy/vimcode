@@ -740,6 +740,118 @@ mod tests {
         );
     }
 
+    /// TUI twin of `gtk::testing::editor_popups::editor_hover_popup_
+    /// registers_every_bare_url_as_its_own_click_region_on_gtk`. That GTK
+    /// test needs a pixel-colour scan to locate each link independently
+    /// of its own registered hit rect, because GTK's proportional chrome
+    /// font can drift from a char-count estimate; `driver.find`/`click`
+    /// here are *not* the same kind of tautology, because TUI's hit
+    /// region (`editor_hover_popup_paint`'s `unit_w = 1.0` arm) is exact
+    /// per-character-cell arithmetic — the same grid `TestBackend` itself
+    /// paints onto — so clicking the position `find` resolves on the real
+    /// screen buffer is independent of whatever `editor_hover_link_rects`
+    /// recorded. Kept intentionally simpler than the GTK test (no bold
+    /// span, no colour probing) since there is no proportional-font drift
+    /// for this arm to reproduce; what's left to pin is the shared
+    /// per-line bare-URL *scanner* not stopping after the first match
+    /// (#821's own fix), on this backend too.
+    #[test]
+    fn editor_hover_popup_registers_every_bare_url_as_its_own_click_region_via_shell_app() {
+        // Short URLs, deliberately: the 80-column terminal this module
+        // standardises on (see its own module doc) leaves the popup
+        // content area well under 80 cells once the sidebar/gutter
+        // reserve their own columns, and quadraui's `RichTextPopup`
+        // doesn't re-wrap a bare-URL token that doesn't fit — it's
+        // simply clipped off-screen. The GTK twin's longer
+        // `example.com/first504`-style URLs fit its 1400px fixture
+        // without that constraint.
+        let markdown = "Bold504 then http://ex.co/first504 and http://ex.co/second504 end504";
+        let first_url = "http://ex.co/first504";
+        let second_url = "http://ex.co/second504";
+
+        fn fresh_popup(
+            markdown: &str,
+        ) -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            let mut engine = plain_engine();
+            engine.show_editor_hover(
+                1,
+                4,
+                markdown,
+                crate::core::engine::EditorHoverSource::Lsp,
+                false,
+                false,
+            );
+            harness_no_sidebar(engine)
+        }
+
+        // Sanity: both URLs paint at distinct positions on the same row —
+        // the #504/#821 symptom was a per-line scanner stopping after the
+        // first match, so a fixture where both land on one row is what
+        // actually exercises it.
+        {
+            let h = fresh_popup(markdown);
+            let (x1, y1) = h
+                .driver
+                .find(first_url)
+                .expect("the first bare URL must paint");
+            let (x2, y2) = h
+                .driver
+                .find(second_url)
+                .expect("the second bare URL must paint");
+            assert_eq!(
+                y1, y2,
+                "this fixture only exercises the per-line scanner bug if \
+                 both URLs land on the same popup row; got y1={y1} y2={y2}"
+            );
+            assert_ne!(
+                (x1, y1),
+                (x2, y2),
+                "the first and second bare URL must paint at distinct \
+                 positions, not alias the same spot"
+            );
+        }
+
+        // Each case gets its own fresh harness/popup — a `Link` click
+        // dismisses the popup, so clicking the second link in the same
+        // popup instance the first click already closed would trivially
+        // prove nothing (same reasoning as the GTK twin).
+        let click_and_collect =
+            |url_to_click: &str| -> Vec<crate::core::engine::PendingPlatformAction> {
+                let mut h = fresh_popup(markdown);
+                let (x, y) = h
+                    .driver
+                    .find(url_to_click)
+                    .unwrap_or_else(|| panic!("{url_to_click} must be painted on screen"));
+                h.driver.click(x, y);
+                let actions = h.engine.borrow().pending_platform_actions.clone();
+                actions
+            };
+
+        let actions_from_first = click_and_collect(first_url);
+        assert!(
+            actions_from_first.iter().any(|a| matches!(
+                a,
+                crate::core::engine::PendingPlatformAction::OpenUrl(u) if u == first_url
+            )),
+            "clicking the first bare URL must queue OpenUrl({first_url}); \
+             got {actions_from_first:?}"
+        );
+
+        let actions_from_second = click_and_collect(second_url);
+        assert!(
+            actions_from_second.iter().any(|a| matches!(
+                a,
+                crate::core::engine::PendingPlatformAction::OpenUrl(u) if u == second_url
+            )),
+            "clicking the second bare URL must queue OpenUrl({second_url}) \
+             — this is the #504 regression: only the first bare URL was \
+             clickable, the rest painted in link color but did nothing; \
+             got {actions_from_second:?}"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Key dispatch
     // ─────────────────────────────────────────────────────────────────────────
