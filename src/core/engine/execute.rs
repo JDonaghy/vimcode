@@ -3103,7 +3103,15 @@ impl Engine {
         }
 
         match cmd {
-            "write" => {
+            // `:w!` force-writes — vimcode has no readonly/overwrite
+            // distinction to force past, so the bang is a no-op and `:w!`
+            // behaves exactly like plain `:w` (standard Vim compatibility,
+            // #1790). Without this arm, `normalize_ex_command` still
+            // expanded the "w!" abbreviation to "write!" (`EX_ABBREVS`
+            // preserves the bang through the rewrite), but that string
+            // fell through this match's catch-all and printed "Not an
+            // editor command: write!" instead of saving.
+            "write" | "write!" => {
                 let _ = self.save_with_format(false);
                 EngineAction::None
             }

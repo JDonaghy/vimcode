@@ -14249,4 +14249,75 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #1790: `:w!` (force-write) must be recognised as the same ex command as
+    // plain `:w` — Vim accepts a bang on `:write` with no behaviour change
+    // (vimcode has no readonly/overwrite distinction for the bang to force
+    // past). Before the fix, `normalize_ex_command`'s abbreviation table
+    // still expanded "w!" to "write!" (preserving the bang through the
+    // rewrite), but `Engine::execute_command`'s match arm only listed the
+    // bare "write" string, so "write!" fell through to the `_ =>` catch-all
+    // and printed "Not an editor command: write!" instead of saving.
+    // ─────────────────────────────────────────────────────────────────────────
+    mod issue_1790_force_write_bang {
+        use super::*;
+
+        /// RED-verified against unfixed `develop`: with the `"write"` match
+        /// arm reverted to not also match `"write!"`, this fails on both
+        /// assertions — the command-line paints "Not an editor command:
+        /// write!" and the file on disk is left unchanged ("one\ntwo\n").
+        #[test]
+        fn force_write_bang_saves_and_is_recognised_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1790_force_write_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("a.txt");
+            std::fs::write(&path, "one\ntwo\n").unwrap();
+
+            let mut engine = plain_engine();
+            let old_id = engine.active_buffer_id();
+            let _ = engine.buffer_manager.delete(old_id, true);
+            let buf_id = engine.buffer_manager.open_file(&path).unwrap();
+            if let Some(window) = engine.windows.get_mut(&engine.active_window_id()) {
+                window.buffer_id = buf_id;
+            }
+
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            // Change the buffer so the write below has an observable effect
+            // on disk, matching Vim's own `:w!` semantics (same as `:w`).
+            driver.type_char('A');
+            for c in " CHANGED".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            for c in ":w!".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let screen = driver.screen();
+            assert!(
+                !screen.contains("Not an editor command"),
+                "`:w!` must be recognised as the force-write ex command, \
+                 same as plain `:w`; screen:\n{screen}"
+            );
+
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                on_disk, "one CHANGED\ntwo\n",
+                "`:w!` must actually save the buffer to disk, same as `:w`"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
