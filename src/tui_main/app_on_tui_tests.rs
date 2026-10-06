@@ -4605,6 +4605,151 @@ mod tests {
             );
         }
 
+        /// #1798: double-clicking a *second* file in the Explorer sidebar,
+        /// while a first file is already open in a real (non-preview) tab,
+        /// must open it in a **second** tab — not swap the first tab's
+        /// buffer in place. The bugbash report's symptom (breadcrumb/
+        /// content/status bar all moved to the new file, but the tab strip
+        /// kept showing only the old file's label) is exactly what
+        /// `screen_has` on both labels catches: a buffer-swap-in-place bug
+        /// leaves the *old* label painted and the new one entirely absent,
+        /// while the correct behaviour paints both.
+        ///
+        /// RED-verified: temporarily replacing `open_file_in_tab`'s
+        /// "no existing tab — open a new one" branch with an in-place
+        /// `window.buffer_id = buffer_id` swap (mirroring the reported
+        /// symptom exactly) makes this test fail with "must open a second
+        /// tab, not replace the first one in place"; restored before
+        /// committing. Against *unmodified* `develop` this test passes —
+        /// see this PR's own description for why: extensive investigation
+        /// (this test, its GTK twin, and single-click/narrow-window
+        /// variants) could not reproduce the bugbash report through
+        /// vimcode's shared `Engine`/`App` dispatch layer, which is
+        /// identical on every backend including the real Win-GUI one (see
+        /// `src/gtk/testing.rs`'s twin for the pixel-coordinate half of
+        /// that proof).
+        #[test]
+        fn explorer_double_click_opens_second_file_in_a_second_tab_1798() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1798_explorer_dblclick_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let sample = dir.join("sample.txt");
+            let main_rs = dir.join("main.rs");
+            std::fs::write(&sample, "sample contents\n").unwrap();
+            std::fs::write(&main_rs, "fn main() {}\n").unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.open_file_in_tab(&sample);
+            engine.explorer_expanded.insert(dir.clone());
+            engine.explorer_rebuild_rows();
+            engine.session.explorer_visible = true;
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                driver.screen_has("sample.txt"),
+                "precondition: sample.txt's tab must already be painted; screen:\n{}",
+                driver.screen()
+            );
+
+            let (x, y) = driver
+                .find("main.rs")
+                .expect("the populated explorer row must paint main.rs's file name");
+            driver.double_click(x, y);
+            driver.render();
+
+            assert!(
+                h.engine.borrow().active_group().tabs.len() >= 2,
+                "double-clicking a second file in the Explorer must open a \
+                 second tab, not replace the first one in place"
+            );
+            assert!(
+                driver.screen_has("sample.txt") && driver.screen_has("main.rs"),
+                "both the originally-open sample.txt tab and the newly \
+                 double-clicked main.rs tab must have painted labels on the \
+                 tab bar; screen:\n{}",
+                driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #1798: the bugbash report names *single*-click as an alternate
+        /// trigger ("Single- or double-clicking a different file ... updated
+        /// the breadcrumb/content/status bar ... but the tab strip kept
+        /// showing only 'sample.txt x'"). A single click routes through
+        /// `Engine::open_file_preview` (preview-tab mode) rather than
+        /// `open_file_in_tab` — a different engine function from the
+        /// double-click test above, so it needs its own coverage rather
+        /// than assuming the double-click proof covers it.
+        ///
+        /// Primed via `Engine::startup_without_session_restore`, the same
+        /// CLI-argument path (`open_file_with_mode` /
+        /// `OpenMode::Permanent`, pristine-scratch-buffer reuse) the real
+        /// report's "Open sample.txt" step used — not `open_file_in_tab`
+        /// directly.
+        #[test]
+        fn explorer_single_click_opens_second_file_in_a_second_tab_1798() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1798_explorer_click_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let sample = dir.join("sample.txt");
+            let main_rs = dir.join("main.rs");
+            std::fs::write(&sample, "sample contents\n").unwrap();
+            std::fs::write(&main_rs, "fn main() {}\n").unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.startup_without_session_restore(Some(&sample));
+            engine.explorer_expanded.insert(dir.clone());
+            engine.explorer_rebuild_rows();
+            engine.session.explorer_visible = true;
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                driver.screen_has("sample.txt"),
+                "precondition: sample.txt's tab must already be painted; screen:\n{}",
+                driver.screen()
+            );
+
+            let (x, y) = driver
+                .find("main.rs")
+                .expect("the populated explorer row must paint main.rs's file name");
+            driver.click(x, y);
+            driver.render();
+
+            assert!(
+                h.engine.borrow().active_group().tabs.len() >= 2,
+                "single-clicking a second file in the Explorer must open a \
+                 second (preview) tab, not replace the first one in place"
+            );
+            assert!(
+                driver.screen_has("sample.txt") && driver.screen_has("main.rs"),
+                "both the originally-open sample.txt tab and the newly \
+                 clicked main.rs preview tab must have painted labels on \
+                 the tab bar; screen:\n{}",
+                driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// #1586: a *stacked* split (`Ctrl+W s` / `open_editor_group
         /// (Horizontal)`) must paint the lower group's own tab row with its
         /// active tab's label — not overwritten by the group-boundary

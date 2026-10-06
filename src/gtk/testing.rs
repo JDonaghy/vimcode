@@ -4366,6 +4366,103 @@ mod tests {
         );
     }
 
+    /// #1798 (bugbash:win-native): double-clicking a *second* file in the
+    /// Explorer sidebar, while a first file is already open in a real
+    /// (non-preview) tab, must paint a **second** tab — not silently swap
+    /// the first tab's buffer in place while leaving its old label painted.
+    /// The GTK half of the shared-engine fix (`src/tui_main/
+    /// app_on_tui_tests.rs`'s `explorer_double_click_opens_second_file_in_a_
+    /// second_tab_1798` is the TUI half); both drive the identical
+    /// `App::explorer_ui_event` → `Engine::dispatch_explorer_tree_event` →
+    /// `Engine::open_file_in_tab` path the Platform-Neutrality Rule requires
+    /// (`src/app.rs`, shared by every backend — there is no GTK-specific
+    /// explorer click handler, `src/gtk/explorer.rs` is a type-re-export
+    /// stub).
+    ///
+    /// `sample.txt` is opened the same way the bugbash report's "Open
+    /// sample.txt" step did — `Engine::startup_without_session_restore`,
+    /// the CLI-argument path (`Engine::open_file_with_mode` with
+    /// `OpenMode::Permanent`) — rather than `open_file_in_tab` directly, so
+    /// this reproduces the exact pristine-scratch-buffer-reuse precondition
+    /// the real report started from. The `800×480` harness size matches the
+    /// evidence screenshot's own dimensions (`/tmp/j_dblclick_main.png`,
+    /// read via `file(1)`) — ruled out a window-width/tab-bar-scroll
+    /// explanation specifically, not just a generic size.
+    ///
+    /// RED-verified the same way as the TUI twin
+    /// (`tui_main::app_on_tui_tests`'s `explorer_double_click_opens_second_
+    /// file_in_a_second_tab_1798`): temporarily swapping
+    /// `open_file_in_tab`'s new-tab branch for an in-place
+    /// `window.buffer_id = buffer_id` assignment makes this fail with the
+    /// same message. Against unmodified `develop` both this test and its
+    /// TUI twin pass — see this PR's description: the shared dispatch path
+    /// both exercise is identical to the one the real Win-GUI backend uses
+    /// (confirmed by reading `quadraui`'s `src/win/events.rs`/`backend.rs`:
+    /// no `CS_DBLCLKS`/`WM_LBUTTONDBLCLK` handling, so Windows delivers two
+    /// plain `WM_LBUTTONDOWN`s folded by the same `DoubleClickDetector`
+    /// every backend shares), so this investigation could not localise a
+    /// vimcode- or quadraui-side defect to point a fix at.
+    #[test]
+    fn explorer_double_click_opens_second_file_in_a_second_tab_1798() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1798_gtk_explorer_dblclick_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sample = dir.join("sample.txt");
+        let main_rs = dir.join("main.rs");
+        std::fs::write(&sample, "sample contents\n").unwrap();
+        std::fs::write(&main_rs, "fn main() {}\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.startup_without_session_restore(Some(&sample));
+        engine.explorer_expanded.insert(dir.clone());
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+
+        let mut h = harness(engine, 800, 480);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("sample.txt"),
+            "precondition: sample.txt's tab must already be painted; \
+             painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let (x, y) = h
+            .driver
+            .find("main.rs")
+            .expect("the populated explorer row must paint main.rs's file name");
+        h.driver.dispatch(quadraui::UiEvent::DoubleClick {
+            widget: None,
+            position: quadraui::Point::new(x, y),
+        });
+        h.driver.render();
+
+        assert!(
+            h.engine.borrow().active_group().tabs.len() >= 2,
+            "double-clicking a second file in the Explorer must open a \
+             second tab, not replace the first one in place"
+        );
+        assert!(
+            h.driver.screen_contains("sample.txt") && h.driver.screen_contains("main.rs"),
+            "both the originally-open sample.txt tab and the newly \
+             double-clicked main.rs tab must have painted labels on the \
+             tab bar; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1038 (GTK half of the shared-engine fix): `handle_mouse_click`
     /// routes a tab-bar × click through the very same
     /// `Engine::handle_tab_bar_click` `CloseTab` arm the TUI does
