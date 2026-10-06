@@ -24293,14 +24293,24 @@ fn build_rendered_window(
         // (`RenderedLine::annotation`, below), which already paints after
         // the line's content in `theme.annotation_fg` and is hard-truncated
         // at the window edge rather than wrapped — exactly the behaviour
-        // #1810 asks for. Several eol marks on one line draw in priority
-        // order (oldest `set_mark` first, i.e. ascending `MarkId`),
+        // #1810 asks for. Several eol marks on one line draw in creation
+        // order (oldest `set_mark` first, i.e. ascending `MarkId` — note
+        // `DecorOpts` has no `priority` field at all; "creation order" is
+        // what the code below actually does),
         // separated by a space.
         //
         // Two deliberate differences from the blame annotation it shares
         // that field with (both applied at the `annotation:` sites below):
         // on a wrapped line it rides the *last* visual segment, not the
-        // first, and it is not muted while the user is in Insert mode.
+        // first, and it is not muted while the user is in Insert mode. One
+        // consequence of the first-row/last-row split: if the viewport cuts
+        // off before this line's last wrap segment (the `lines.len() >=
+        // visible_lines` guard below can stop early), `decor_eol_text` is
+        // dropped for that line entirely — it never rides an earlier,
+        // still-visible segment the way the blame annotation does. Probably
+        // the right trade-off (there's no "end of line" to show until the
+        // line's actual end scrolls into view), but it means a long wrapped
+        // line's eol text can silently vanish below the fold.
         //
         // Per-mark colour (the chunk's own `hl_group`, as Overlay/Inline
         // get via `resolve_decor_style`) is NOT implemented: quadraui's
@@ -24310,7 +24320,9 @@ fn build_rendered_window(
         // trailing-annotation area. That needs quadraui infra first (a
         // quadraui issue, per the platform-neutrality rule) before eol
         // text can paint in its own highlight's colour rather than
-        // `annotation_fg`.
+        // `annotation_fg` — drafted as a quadraui gap in
+        // `docs/PENDING_QUADRAUI_ISSUES.md` (also covers the TUI-vs-GTK
+        // leading-pad inconsistency) rather than left only in this comment.
         eol_marks.sort_by_key(|m| m.id.0);
         let decor_eol_text: Option<String> = {
             let parts: Vec<String> = eol_marks
@@ -24349,8 +24361,9 @@ fn build_rendered_window(
         // in one colour chosen from `is_breakpoint`/`is_dap_current`/
         // `git_diff`). Per the platform-neutrality rule this needs
         // quadraui-side infra first (a real `bp_col_width`/per-glyph-colour
-        // API) rather than a per-backend workaround here — tracked for a
-        // quadraui issue; until it lands, `sign_text` is truncated to 1
+        // API) rather than a per-backend workaround here — drafted as a
+        // quadraui gap in `docs/PENDING_QUADRAUI_ISSUES.md` rather than
+        // left only in this comment; until it lands, `sign_text` is truncated to 1
         // character and `sign_hl` is parsed/stored (round-trips through
         // `get_mark`) but has no paint effect.
         let decor_sign_glyph: Option<String> = line_decor

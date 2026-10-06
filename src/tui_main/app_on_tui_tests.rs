@@ -15821,8 +15821,9 @@ mod tests {
         /// stored and tracked edits (same as every other decor mark) but
         /// had no paint path at all (render.rs's old `Eol | None` match arm
         /// was a deliberate no-op; see that arm's own comment pre-#1810).
-        /// Also covers two marks on one line drawing in priority order
-        /// (oldest `set_mark` first) separated by a space, and the combined
+        /// Also covers two marks on one line drawing in creation order
+        /// (oldest `set_mark` first — `DecorOpts` has no `priority` field)
+        /// separated by a space, and the combined
         /// text following a line inserted above it (same `O` + Escape
         /// sequence the sibling highlight-follows-insert test above uses).
         ///
@@ -15853,8 +15854,9 @@ mod tests {
                 },
             );
             // A second eol mark on the same line, created after the first,
-            // must draw after it (priority order = creation order),
-            // separated by a space — not glued to the first mark's text.
+            // must draw after it (creation order — `DecorOpts` has no
+            // `priority` field), separated by a space — not glued to the
+            // first mark's text.
             engine.decor.set_mark(
                 buf_id,
                 ns,
@@ -16012,7 +16014,17 @@ mod tests {
             engine.settings.wrap = true;
             // Wide enough to wrap at the harness's 80-column terminal, with
             // two distinctive anchors: one in the first visual row, one in
-            // the last.
+            // the last. `repeat(30)` is deliberately generous: the line is
+            // ~133 chars total, wrapping into a ~57-char final segment
+            // ("... zzz ZQTAIL") against the editor's content width (80
+            // columns minus the gutter), leaving comfortable double-digit
+            // columns of headroom for the 9-char "ZQEOLWRAP" annotation to
+            // fit on that same tail row without truncating. If a future
+            // gutter-width change narrows the content area enough to eat
+            // that headroom, this test should start failing as an obvious
+            // truncation (`ZQEOLWRAP` missing/cut short), not a confusing
+            // one — if it ever does, widen the repeat count rather than
+            // shrink the terminal width assumption.
             let long = format!("ZQHEAD{} ZQTAIL\n", " zzz".repeat(30));
             engine.buffer_mut().insert(0, &long);
             let ns = engine.decor.namespace("zq_eol_wrap");

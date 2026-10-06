@@ -2851,3 +2851,103 @@ Each affected backend already carries both fonts as live fields — this is a wi
 **Test:** None added upstream by this draft — this is a drafted gap report with no quadraui-side change yet. The natural coverage shape once the `Ask` lands: a `GtkDriver`-based render test asserting the *painted* popup text's measured glyph metrics match `editor_font_pango_string()`'s, not `ui_font`'s, when `font_role: FontRole::Editor` is set (mirroring the existing font-metric assertions in `quadraui/src/gtk/backend.rs`'s `measure_char_width_px_matches_pixel_size_for_the_real_editor_font`-style tests) — plus a cheap unit test pinning `FontRole::default() == FontRole::Chrome` so a future caller that never touches the new field keeps today's behaviour. On the vimcode side, once the pin bumps: a `GtkDriver` black-box test asserting the editor hover popup's painted glyph width/height matches the editor pane's own (not the sidebar tooltip's, which should still match chrome) — the rendered-output assertion this repo's CLAUDE.md requires, not a state check that the right `font_role` enum value was set.
 
 **Blocks:** `JDonaghy/vimcode#220`. Leave that issue open behind this one per `GOALS.md`'s milestone-discipline rule — there is no per-backend vimcode-side fix available; the font decision for `RichTextPopup` now lives entirely inside quadraui's three pixel-backend implementations (moved there by #669/#1167/#831, after #220 was filed against the pre-refactor `src/gtk/draw.rs` functions it still names), so hand-patching `src/gtk/`/`src/tui_main/` to intercept or override it would mean either vendoring quadraui's font logic back into vimcode (a platform-neutrality regression) or reaching into a `dyn Backend` trait object's private fields (not possible). Once this lands and the pin bumps, the vimcode-side change is: set `font_role: quadraui::FontRole::Editor` in `render::editor_hover_to_quadraui_rich_text` (leaving `render::panel_hover_to_quadraui_rich_text` on the new default, i.e. untouched) — a one-line, backend-neutral change in already-shared `src/render.rs`, no new `src/gtk/`/`src/tui_main/` code needed on either backend.
+
+---
+
+## `EditorLine::annotation` is one uncoloured `Option<String>` — decor eol virtual text can't paint in its own highlight's colour, and the TUI/GTK annotation runs have inconsistent leading padding (blocks vimcode#1810)
+
+**Title:** `EditorLine::annotation` (and the `theme.annotation_fg`-only paint call in each backend) has no per-run colour or leading-pad control, so vimcode's `virt_text_pos = "eol"` decor marks (#1810) can't honour each chunk's own `hl_group`, and TUI's annotation run has no gap before it while GTK's has a fixed `2 * char_width` one.
+
+**Body:**
+
+vimcode#1810 made `virt_text_pos = "eol"` decor marks (and the default when `virt_text_pos` is omitted) actually paint, converging them onto the same paint slot `vimcode.buf.annotate_line`'s git-blame text already uses: `RenderedLine::annotation` → quadraui's `EditorLine::annotation`. That slot is adequate for blame (one string, one ambient colour) but falls short of what #1810's own issue text (and vimcode-ext#28, the error-lens extension that's the dependent consumer) actually asks for: each `virt_text` chunk carries its own `hl_group` (`VirtTextChunk::hl_group`, `src/core/buffer.rs`), exactly like the `Overlay`/`Inline` positions already honour via `resolve_decor_style` — but once joined into one `annotation: Option<String>`, that per-chunk colour information has nowhere to go.
+
+Confirmed at the pinned rev (`a5360532e297deecece65103df8ce61f53230bda`):
+
+```rust
+// quadraui/src/primitives/editor.rs
+/// Inline annotation (virtual text — git blame, plugin output,
+/// etc.) shown after line content in `annotation_fg`.
+pub annotation: Option<String>,
+```
+
+— one plain `String`, one theme-wide colour (`theme.annotation_fg`), applied by both pixel backends:
+
+```rust
+// quadraui/src/tui/editor.rs — paint_line (annotation block)
+if let Some(ann) = &line.annotation {
+    let visible_cols = total_vis_cols.saturating_sub(scroll_left);
+    let ann_start = x_start + visible_cols.min(max_width as usize) as u16;
+    let ann_fg = qc(theme.annotation_fg);
+    for (i, ch) in ann.chars().enumerate() {
+        let col = ann_start + i as u16;
+        if col >= x_start + max_width { break; }
+        set_cell(buf, col, y, ch, ann_fg, window_bg);
+    }
+}
+```
+
+```rust
+// quadraui/src/gtk/editor.rs — paint_line (annotation block)
+if let Some(ann) = &rl.annotation {
+    let text_pixel_width = layout.pixel_size().0 as f64;
+    let ann_x = text_x_offset + text_pixel_width + char_width * 2.0;
+    let (ar, ag, ab) = cairo_rgb(theme.annotation_fg);
+    ...
+}
+```
+
+So vimcode's `src/render.rs` joins every `eol`-positioned mark's `virt_text` chunks into one space-separated string (`decor_eol_text`, oldest `set_mark` first — creation order, there is no `priority` field) and paints the whole joined string in `annotation_fg`, regardless of each mark's own `hl_group`. That is a deliberate, documented limitation in `src/render.rs`'s own comment at the construction site, not an oversight — but per `GOALS.md`'s milestone-discipline rule ("a comment naming a missing upstream API is an unfiled issue, and grep will not find it for you"), it needs to live here too so the gap survives past the session that found it.
+
+A second, smaller inconsistency in the same code path: TUI starts the annotation run at `x_start + visible_cols` — the very next cell after the line's own content, no gap — while GTK inserts a fixed `2 * char_width` gap first. vimcode's own eol-text black-box test (`decor_eol_virt_text_paints_after_line_and_follows_insert_above_via_app_on_tui`, `src/tui_main/app_on_tui_tests.rs`) renders two eol chunks as `ZQBEFOREZQEOLA ZQEOLB` on TUI — the first chunk glued directly onto the line's own content with no separating space — which is exactly the "reads as text spliced into the line" symptom #1810 moved eol text to the last wrap row to avoid in the first place. This is pre-existing quadraui behaviour shared with the blame annotation (not introduced by #1810), and a vimcode-side fix (prefixing a literal space in `decor_eol_text`) isn't available without regressing `vimcode.buf.annotate_line`'s blame rendering, which shares the exact same field and backend paint call. Neovim always pads `virt_text_pos = "eol"` virtual text by one cell from the line's content, for the same reason GTK's fixed gap exists.
+
+**Ask:**
+
+1. Give `EditorLine::annotation` (or a new sibling field) a way to carry multiple independently-coloured runs instead of one plain `String` — e.g. `Vec<(String, Option<Color>)>` or a small `AnnotationRun { text: String, fg: Option<Color> }` list, falling back to `theme.annotation_fg` per-run when a run's colour is `None` (preserves every existing caller, blame included, with zero changes). Each backend's annotation paint block (quoted above) would iterate the runs instead of painting one string.
+2. Independently, give the annotation paint call a consistent one-cell/one-char leading pad before the first run on both backends — either hardcode it in `tui/editor.rs` to match `gtk/editor.rs`'s existing `char_width` gap (scaled to one cell instead of two, to match Neovim's one-cell convention), or expose the pad width as a themeable/configurable constant both backends read from the same place.
+
+**Test:** None added upstream by this draft — this is a drafted gap report with no quadraui-side change yet. Once Ask 1 lands: extend `quadraui/src/tui/editor.rs` and `quadraui/src/gtk/editor.rs`'s existing annotation-paint tests to assert two runs with different colours paint in their own colours, not one shared one. Once Ask 2 lands: assert the first annotation character's column (TUI) / x-position (GTK) is offset from the line content's end by the same amount on both backends.
+
+**Blocks:** `JDonaghy/vimcode#1810`. Leave that issue open behind this one per `GOALS.md`'s milestone-discipline rule — per-mark colour has no per-backend vimcode-side fix available (the paint decision lives entirely inside quadraui's `tui::editor`/`gtk::editor` modules); the padding half likewise has no vimcode-side fix that doesn't regress the blame annotation sharing the same field/paint call. Once Ask 1 lands and the pin bumps, the vimcode-side change is in `src/render.rs`'s `decor_eol_text` construction (currently `eol_marks.iter().map(|m| ... chunks ...).collect::<String>()`) — pass each mark's `virt_text` chunks through with their own `hl_group` resolved via the existing `resolve_decor_style` helper (already used by `Overlay`/`Inline`) instead of flattening to plain text, still entirely in shared `src/render.rs`.
+
+---
+
+## Gutter rasterisers hardcode the breakpoint/sign slot at exactly one character with one colour — `sign_hl` and multi-character `sign_text` can't paint (blocks vimcode#1653)
+
+**Title:** `gtk::editor::paint_gutter_row_number` and `tui::editor`'s gutter loop both fix the bp/sign column at exactly one character, advanced by a bare `+1` the caller doesn't control, and `EditorLine::gutter_text` is one plain `String` painted in one colour — so vimcode#1653's `sign_text`/`sign_hl` decor options can set a glyph but can't widen it or colour it independently of the line-number text.
+
+**Body:**
+
+vimcode#1653 added `vimcode.decor.set_mark`'s `sign_text`/`sign_hl` options (a gutter sign + its own highlight group), scoped in its own text to "1-2 display cells" of `sign_text` plus `sign_hl` colouring the glyph. Neither half can actually reach pixels through quadraui's gutter column today, and — same as the eol-colour gap above — the reason is a quadraui limitation, not a vimcode one. Confirmed at the pinned rev (`a5360532e297deecece65103df8ce61f53230bda`):
+
+```rust
+// quadraui/src/primitives/editor.rs
+pub gutter_text: String,   // one plain string, no per-glyph colour channel
+```
+
+```rust
+// quadraui/src/gtk/editor.rs, paint_gutter_row_number
+let bp_ch: String = rl.gutter_text.chars().take(1).collect();
+...
+char_offset += 1;   // fixed, not driven by bp_ch's actual width
+let git_ch: String = rl.gutter_text.chars().skip(char_offset).take(1).collect();
+```
+
+```rust
+// quadraui/src/tui/editor.rs, gutter loop
+let bp_offset = if editor.has_breakpoints { 1 } else { 0 };
+let git_offset = if editor.has_git_diff { bp_offset + 1 } else { bp_offset };
+```
+
+Both rasterisers hardcode the bp/sign slot's width at exactly one character and derive the following git-diff column's offset from that fixed `1`, not from any width the caller supplies. Handing either backend a 2-character `gutter_text` wouldn't render a wider sign — it would misalign the git/line-number columns after it, since neither rasteriser's `+1` is driven by any width vimcode controls. And since `gutter_text` is one plain `String` painted in one colour (chosen from `is_breakpoint`/`is_dap_current`/`git_diff` — see the backends' gutter-colour-selection logic adjacent to the snippets above), there's no channel for `sign_hl` to colour just the sign glyph independently of the rest of the gutter.
+
+So, as `src/render.rs`'s own comment at the `decor_sign_glyph` construction site already documents: `sign_text` is truncated to its first character and `sign_hl` is parsed and round-trips through `get_mark`, but has no paint effect — this draft exists so that limitation also lives in a findable place per `GOALS.md`'s milestone-discipline rule, not only in that comment.
+
+**Ask:**
+
+1. Add a `bp_col_width` (or similar) parameter quadraui's gutter rasterisers consult instead of the hardcoded `1`/`+1`, so a host can request a wider sign column and have the following git-diff/line-number columns shift to match.
+2. Give `EditorLine` a per-glyph colour channel for the bp/sign slot specifically (the rest of `gutter_text` — line numbers, fold markers — can stay one colour) — e.g. a `sign_fg: Option<Color>` field alongside `gutter_text`, consulted only for the first `bp_col_width` characters.
+
+**Test:** None added upstream by this draft — this is a drafted gap report with no quadraui-side change yet. Once Ask 1 lands: extend each backend's existing gutter-column tests to assert a 2-character sign renders without clobbering the git-diff column after it. Once Ask 2 lands: assert a `sign_fg`-coloured sign paints in a different colour from the line-number text beside it.
+
+**Blocks:** `JDonaghy/vimcode#1653`. Leave that issue open behind this one per `GOALS.md`'s milestone-discipline rule — there is no per-backend vimcode-side fix available (`src/gtk/`/`src/tui_main/` don't own gutter rasterisation at all any more; it's entirely inside quadraui's `gtk::editor`/`tui::editor` modules). Once this lands and the pin bumps, the vimcode-side change is widening `decor_sign_glyph` past one character and resolving `sign_hl` via the existing `resolve_decor_style` helper, in already-shared `src/render.rs`.
