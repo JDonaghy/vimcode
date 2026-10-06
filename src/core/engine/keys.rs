@@ -6504,7 +6504,10 @@ impl Engine {
                     return;
                 }
                 self.completion_start_col = start_col;
-                self.completion_candidates = candidates;
+                self.completion_candidates = candidates
+                    .into_iter()
+                    .map(CompletionCandidate::plain)
+                    .collect();
                 let idx = if next {
                     0
                 } else {

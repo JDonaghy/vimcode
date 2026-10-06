@@ -1245,30 +1245,66 @@ pub fn wildmenu_to_status_bar(wm: &WildmenuData, theme: &Theme) -> quadraui::Sta
 /// Data needed to render the word-completion popup in insert mode.
 #[derive(Debug, Clone)]
 pub struct CompletionMenu {
-    /// Sorted list of candidates.
-    pub candidates: Vec<String>,
+    /// Sorted list of candidates. `CompletionCandidate` (#1805) carries
+    /// optional kind/detail/documentation metadata — buffer-word and LSP
+    /// candidates leave those `Text`/`None`, a `vimcode.completion.
+    /// register` plugin source can set them.
+    pub candidates: Vec<crate::core::completion::CompletionCandidate>,
     /// Index of the currently highlighted candidate.
     pub selected_idx: usize,
-    /// Length (in chars) of the longest candidate — used for popup width.
+    /// Length (in chars) of the longest candidate's label — used for popup
+    /// width.
     pub max_width: usize,
+}
+
+/// Map vimcode's own [`crate::core::completion::CompletionItemKind`] to
+/// quadraui's `CompletionKind` — the one conversion point between the two
+/// vocabularies (mirrors `plugin_ui`'s "vimcode-owned vocabulary, converted
+/// to quadraui primitives in one place" rule).
+fn completion_item_kind_to_quadraui(
+    kind: crate::core::completion::CompletionItemKind,
+) -> quadraui::CompletionKind {
+    use crate::core::completion::CompletionItemKind as K;
+    match kind {
+        K::Text => quadraui::CompletionKind::Text,
+        K::Method => quadraui::CompletionKind::Method,
+        K::Function => quadraui::CompletionKind::Function,
+        K::Constructor => quadraui::CompletionKind::Constructor,
+        K::Field => quadraui::CompletionKind::Field,
+        K::Variable => quadraui::CompletionKind::Variable,
+        K::Class => quadraui::CompletionKind::Class,
+        K::Interface => quadraui::CompletionKind::Interface,
+        K::Module => quadraui::CompletionKind::Module,
+        K::Property => quadraui::CompletionKind::Property,
+        K::Unit => quadraui::CompletionKind::Unit,
+        K::Value => quadraui::CompletionKind::Value,
+        K::Enum => quadraui::CompletionKind::Enum,
+        K::Keyword => quadraui::CompletionKind::Keyword,
+        K::Snippet => quadraui::CompletionKind::Snippet,
+        K::Color => quadraui::CompletionKind::Color,
+        K::File => quadraui::CompletionKind::File,
+        K::Reference => quadraui::CompletionKind::Reference,
+        K::Folder => quadraui::CompletionKind::Folder,
+        K::EnumMember => quadraui::CompletionKind::EnumMember,
+        K::Constant => quadraui::CompletionKind::Constant,
+        K::Struct => quadraui::CompletionKind::Struct,
+        K::Event => quadraui::CompletionKind::Event,
+        K::Operator => quadraui::CompletionKind::Operator,
+        K::TypeParameter => quadraui::CompletionKind::TypeParameter,
+    }
 }
 
 /// Convert a render-side `CompletionMenu` into a `quadraui::Completions`
 /// for backend rasterisation via the D6 layout pipeline.
-///
-/// vimcode's completion menu is string-only at this stage — no LSP
-/// `CompletionKind` metadata — so every item ships as
-/// `CompletionKind::Text`. A richer adapter lands when LSP
-/// `CompletionItemKind` threads through the engine.
 pub fn completion_menu_to_quadraui_completions(menu: &CompletionMenu) -> quadraui::Completions {
     let items = menu
         .candidates
         .iter()
         .map(|c| quadraui::CompletionItem {
-            label: quadraui::StyledText::plain(c.clone()),
-            detail: None,
-            documentation: None,
-            kind: quadraui::CompletionKind::Text,
+            label: quadraui::StyledText::plain(c.label.clone()),
+            detail: c.detail.clone().map(quadraui::StyledText::plain),
+            documentation: c.documentation.clone().map(quadraui::StyledText::plain),
+            kind: completion_item_kind_to_quadraui(c.kind),
             icon: None,
         })
         .collect();
@@ -17848,7 +17884,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
         let max_width = engine
             .completion_candidates
             .iter()
-            .map(|s| s.len())
+            .map(|c| c.label.len())
             .max()
             .unwrap_or(0);
         CompletionMenu {
@@ -29611,6 +29647,60 @@ pub fn tab_drop_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Completion popup → quadraui primitive (#1805) ─────────────────────
+
+    /// A plugin-sourced `CompletionCandidate`'s `kind`/`detail`/
+    /// `documentation` must thread all the way into the quadraui
+    /// `CompletionItem` the popup actually paints — not just sit on the
+    /// engine-side struct unused. Buffer-word/LSP candidates (`kind =
+    /// Text`, no detail/documentation) must keep painting exactly as
+    /// before (`CompletionKind::Text`, both `None`).
+    #[test]
+    fn completion_menu_to_quadraui_completions_threads_kind_detail_and_documentation() {
+        use crate::core::completion::{CompletionCandidate, CompletionItemKind};
+
+        let menu = CompletionMenu {
+            candidates: vec![
+                CompletionCandidate::plain("plain_word".to_string()),
+                CompletionCandidate {
+                    label: "foobar_plugin(..)".to_string(),
+                    insert_text: "foobar_plugin".to_string(),
+                    kind: CompletionItemKind::Function,
+                    detail: Some("fn() -> ()".to_string()),
+                    documentation: Some("docs".to_string()),
+                    priority: 10,
+                },
+            ],
+            selected_idx: 1,
+            max_width: 18,
+        };
+
+        let completions = completion_menu_to_quadraui_completions(&menu);
+        assert_eq!(completions.items.len(), 2);
+        assert_eq!(completions.selected_idx, 1);
+
+        let plain = &completions.items[0];
+        assert_eq!(plain.label, quadraui::StyledText::plain("plain_word"));
+        assert_eq!(plain.kind, quadraui::CompletionKind::Text);
+        assert_eq!(plain.detail, None);
+        assert_eq!(plain.documentation, None);
+
+        let plugin_item = &completions.items[1];
+        assert_eq!(
+            plugin_item.label,
+            quadraui::StyledText::plain("foobar_plugin(..)")
+        );
+        assert_eq!(plugin_item.kind, quadraui::CompletionKind::Function);
+        assert_eq!(
+            plugin_item.detail,
+            Some(quadraui::StyledText::plain("fn() -> ()"))
+        );
+        assert_eq!(
+            plugin_item.documentation,
+            Some(quadraui::StyledText::plain("docs"))
+        );
+    }
 
     // ─── Visual selection painting (#1788 review) ──────────────────────────
     //

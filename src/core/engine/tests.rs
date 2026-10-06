@@ -8532,7 +8532,10 @@ fn test_completion_narrows_on_prefix_extension() {
         "ScrollAxis".to_string(),
         "ScreenLayout".to_string(),
         "SomethingElse".to_string(), // matches `S` but not `Sc`
-    ];
+    ]
+    .into_iter()
+    .map(CompletionCandidate::plain)
+    .collect();
     engine.completion_idx = Some(0);
     engine.completion_display_only = true;
     engine.completion_filter_prefix = "S".to_string();
@@ -8573,7 +8576,7 @@ fn test_completion_replaces_when_prefix_changes_unrelated() {
     press_char(&mut engine, 'G');
     press_char(&mut engine, 'o');
     // Simulate state from an earlier completion at prefix `S`.
-    engine.completion_candidates = vec!["Scrollbar".to_string()];
+    engine.completion_candidates = vec![CompletionCandidate::plain("Scrollbar".to_string())];
     engine.completion_filter_prefix = "S".to_string();
     // Now type a completely different word — prefix becomes `f`.
     press_char(&mut engine, 'f');
@@ -8820,7 +8823,7 @@ fn test_escape_from_insert_clears_pending_lsp_completion() {
 fn test_completion_dismissed_in_normal_mode() {
     let mut engine = Engine::new();
     // Manually set completion state as if from a race condition
-    engine.completion_candidates = vec!["hello".to_string()];
+    engine.completion_candidates = vec![CompletionCandidate::plain("hello".to_string())];
     engine.completion_idx = Some(0);
     engine.completion_display_only = true;
     assert_eq!(engine.mode, Mode::Normal);

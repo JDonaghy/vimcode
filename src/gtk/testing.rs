@@ -9956,11 +9956,10 @@ mod editor_popups {
     fn completion_popup_paints_and_caches_a_hit_testable_layout() {
         let without = popup_region_pixels(|_| {});
         let with = popup_region_pixels(|e| {
-            e.completion_candidates = vec![
-                "println".to_string(),
-                "print".to_string(),
-                "process".to_string(),
-            ];
+            e.completion_candidates = ["println", "print", "process"]
+                .into_iter()
+                .map(|s| crate::core::completion::CompletionCandidate::plain(s.to_string()))
+                .collect();
             e.completion_idx = Some(0);
             e.completion_start_col = 0;
         });
@@ -9969,11 +9968,10 @@ mod editor_popups {
         // Also verify the layout is cached for the click handler's
         // hit-testing (B.5b Stage 5), separately from the paint proof above.
         let mut engine = small_engine();
-        engine.completion_candidates = vec![
-            "println".to_string(),
-            "print".to_string(),
-            "process".to_string(),
-        ];
+        engine.completion_candidates = ["println", "print", "process"]
+            .into_iter()
+            .map(|s| crate::core::completion::CompletionCandidate::plain(s.to_string()))
+            .collect();
         engine.completion_idx = Some(0);
         engine.completion_start_col = 0;
         let h = harness(engine, 1400, 900);
@@ -10002,7 +10000,9 @@ mod editor_popups {
         let mut engine = Engine::new();
         engine.buffer_mut().insert(0, "\t\tfoo\n");
         engine.view_mut().cursor.col = 5;
-        engine.completion_candidates = vec!["foobar".to_string()];
+        engine.completion_candidates = vec![crate::core::completion::CompletionCandidate::plain(
+            "foobar".to_string(),
+        )];
         engine.completion_idx = Some(0);
         engine.completion_start_col = 2;
 

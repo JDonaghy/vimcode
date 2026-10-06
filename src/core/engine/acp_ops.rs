@@ -3579,7 +3579,9 @@ mod tests {
             menu.candidates
         );
         assert!(
-            menu.candidates.contains(&"@open_buf_extra.rs".to_string()),
+            menu.candidates
+                .iter()
+                .any(|c| c.insert_text == "@open_buf_extra.rs"),
             "the workspace-only file must still be offered: {:?}",
             menu.candidates
         );
