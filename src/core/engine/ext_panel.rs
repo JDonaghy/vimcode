@@ -1891,10 +1891,16 @@ impl Engine {
                     &m.display_name
                 };
                 let has_update = self.ext_has_update(&m.name);
-                let label = if has_update {
-                    format!("\u{25cf} {} \u{2191}", display)
-                } else {
-                    format!("\u{25cf} {}", display)
+                // #1807: an installed extension that's become incompatible
+                // with the running vimcode (e.g. after a downgrade — the
+                // same condition `Engine::plugin_init` skips its scripts
+                // for) must not read as a normal healthy install in the
+                // panel.
+                let incompat = m.incompatibility_reason_for_running_vimcode();
+                let label = match (has_update, &incompat) {
+                    (_, Some(reason)) => format!("\u{25cf} {display} — {reason}"),
+                    (true, None) => format!("\u{25cf} {display} \u{2191}"),
+                    (false, None) => format!("\u{25cf} {display}"),
                 };
                 TreeRow {
                     path: vec![i as u16],
@@ -1923,7 +1929,7 @@ impl Engine {
                 // isn't met by the running vimcode shows that reason
                 // inline, so it reads as incompatible before the user
                 // ever tries (and is refused) an install.
-                let label = match m.incompatibility_reason(env!("CARGO_PKG_VERSION")) {
+                let label = match m.incompatibility_reason_for_running_vimcode() {
                     Some(reason) => format!("\u{25cb} {display} — {reason}"),
                     None => format!("\u{25cb} {display}"),
                 };

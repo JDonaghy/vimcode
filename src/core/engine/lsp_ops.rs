@@ -449,7 +449,7 @@ impl Engine {
         // message, rather than a silent no-op or an install that leaves
         // scripts erroring at load time on a `vimcode.*` API this version
         // doesn't have yet.
-        if let Some(reason) = manifest.incompatibility_reason(env!("CARGO_PKG_VERSION")) {
+        if let Some(reason) = manifest.incompatibility_reason_for_running_vimcode() {
             let display = manifest.display_or_name();
             self.message = format!("Cannot install '{display}' — {reason}");
             return;
@@ -1201,6 +1201,17 @@ impl Engine {
         let ext_name = manifest.name.clone();
         let new_version = manifest.version.clone();
 
+        // #1807: an update is the most realistic route to an incompatible
+        // installed extension — the registry bumping `requires_vimcode`
+        // in a newer manifest version is exactly the shape of change this
+        // field exists for. Refuse the same way the initial install does,
+        // leaving the already-installed (compatible) version untouched.
+        if let Some(reason) = manifest.incompatibility_reason_for_running_vimcode() {
+            let display = manifest.display_or_name();
+            self.message = format!("Cannot update '{display}' — {reason}");
+            return;
+        }
+
         // Re-download scripts (overwrite existing files)
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
@@ -1283,8 +1294,22 @@ impl Engine {
             self.message = "All extensions are up to date".to_string();
             return;
         }
-        let count = updated.len();
+        // #1807: split out any candidate whose newer manifest is
+        // incompatible with the running vimcode — same reasoning as
+        // `ext_update_one`, applied per-extension here since `:ExtUpdate`
+        // batches every installed extension with an available update.
+        let mut skipped_incompatible: Vec<String> = Vec::new();
+        let mut actually_updated = Vec::new();
         for name in &updated {
+            if let Some(manifest) = manifests.iter().find(|m| &m.name == name) {
+                if let Some(reason) = manifest.incompatibility_reason_for_running_vimcode() {
+                    skipped_incompatible.push(format!("{} ({reason})", manifest.display_or_name()));
+                    continue;
+                }
+            }
+            actually_updated.push(name.clone());
+        }
+        for name in &actually_updated {
             // Re-download scripts for each
             if let Some(manifest) = manifests.iter().find(|m| &m.name == name) {
                 let ext_dir = paths::vimcode_config_dir().join("extensions").join(name);
@@ -1306,7 +1331,19 @@ impl Engine {
         let _ = self.extension_state.save();
         self.plugin_manager = None;
         self.plugin_init();
-        self.message = format!("{count} extension(s) updated: {}", updated.join(", "));
+        let count = actually_updated.len();
+        self.message = if skipped_incompatible.is_empty() {
+            format!(
+                "{count} extension(s) updated: {}",
+                actually_updated.join(", ")
+            )
+        } else {
+            format!(
+                "{count} extension(s) updated: {}; skipped incompatible: {}",
+                actually_updated.join(", "),
+                skipped_incompatible.join(", ")
+            )
+        };
     }
 
     /// Returns true if a newer version is available for the given extension.
@@ -2354,9 +2391,27 @@ mod tests {
     /// #1807: absent `requires_vimcode` (the pre-#1807 default) must never
     /// trip the new gate — the "If the field is missing, behave as today"
     /// acceptance criterion.
+    ///
+    /// This install runs to completion (`mark_installed_version` +
+    /// `.save()`, then would reach `plugin_init` in a real session), so it
+    /// uses `set_test_home` to keep that persistence under a throwaway
+    /// directory instead of the developer's real `~/.config/vimcode`
+    /// (review finding on this issue's round 1).
     #[test]
     fn install_not_refused_when_requires_vimcode_is_absent() {
         use crate::core::extensions::ExtensionManifest;
+
+        let unique = format!(
+            "vimcode_test_1807_lsp_ops_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(&unique);
+        std::fs::create_dir_all(&home).unwrap();
+        let _home_guard = crate::core::paths::set_test_home(&home);
 
         let mut e = Engine::new();
         let ext_name = "vc-unit-1807-legacy-ext";
@@ -2374,5 +2429,8 @@ mod tests {
              refused by the new gate; got: {}",
             e.message
         );
+
+        drop(_home_guard);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

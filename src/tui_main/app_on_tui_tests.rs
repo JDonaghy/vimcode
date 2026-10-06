@@ -11810,6 +11810,19 @@ mod tests {
             let (mut h, ext_name) = harness_with_far_future_requirement("install");
 
             h.engine.borrow_mut().ext_install_from_registry(&ext_name);
+            h.driver.render();
+
+            // Primary (black-box) assertion: the refusal message actually
+            // reaches the painted screen via the status line
+            // (`render.rs`'s status-line body reads `engine.message`) — not
+            // just set as internal state (CLAUDE.md "Testing (CRITICAL)"
+            // rule 1).
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("Cannot install"),
+                "installing an incompatible extension must paint a clear \
+                 refusal message naming the requirement; painted:\n{screen}"
+            );
 
             let engine = h.engine.borrow();
             assert!(
@@ -11839,9 +11852,28 @@ mod tests {
         /// install proceeds past the new gate (it may still fail further
         /// down for unrelated reasons, e.g. no scripts to download in this
         /// fixture, but never on a "Cannot install" message).
+        ///
+        /// This install runs to completion and `ext_available_manifests`
+        /// also scans `~/.config/vimcode/extensions/*/manifest.toml`, so
+        /// this uses `set_test_home` to keep both the persisted install
+        /// state and the manifest scan under a throwaway directory instead
+        /// of the developer's real `~/.config/vimcode` — without it, a
+        /// developer with a locally-installed extension declaring an unmet
+        /// `requires_vimcode` would see the `!screen_contains("requires
+        /// vimcode")` assertion below fail spuriously (review finding on
+        /// this issue's round 1).
         #[test]
         fn absent_requires_vimcode_shows_no_incompatibility_and_does_not_block_install() {
             use crate::core::extensions::ExtensionManifest;
+
+            let home = std::env::temp_dir().join(format!(
+                "vimcode_test_1807_absent_requires_home_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            std::fs::create_dir_all(&home).unwrap();
+            let home_guard = crate::core::paths::set_test_home(&home);
 
             let mut engine = crate::core::Engine::new_for_test();
             let ext_name = "vc-tui-1807-legacy-no-constraint".to_string();
@@ -11864,12 +11896,23 @@ mod tests {
             );
 
             h.engine.borrow_mut().ext_install_from_registry(&ext_name);
+            h.driver.render();
+            assert!(
+                !h.driver.screen_contains("Cannot install"),
+                "an extension with no requires_vimcode field must never \
+                 paint a refusal message; painted:\n{}",
+                h.driver.screen()
+            );
             assert!(
                 !h.engine.borrow().message.contains("Cannot install"),
                 "an extension with no requires_vimcode field must never be \
                  refused by the new gate; message: {:?}",
                 h.engine.borrow().message
             );
+
+            drop(h);
+            drop(home_guard);
+            let _ = std::fs::remove_dir_all(&home);
         }
     }
 

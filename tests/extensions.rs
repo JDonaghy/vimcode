@@ -3229,6 +3229,91 @@ fn ext_update_all_when_up_to_date() {
     e.extension_state.installed.clear();
 }
 
+/// #1807 (fix round 1): `ext_update_one` must refuse to update to a newer
+/// manifest version whose `requires_vimcode` is unmet by the running
+/// vimcode — the most realistic route to an incompatible installed
+/// extension is a registry bumping this field in a newer version, exactly
+/// what `:ExtUpdate` pulls down.
+#[test]
+fn ext_update_one_refused_when_new_version_requires_incompatible_vimcode() {
+    use vimcode_core::core::extensions::*;
+    let mut e = engine_with("");
+    let ext_name = "vc-test-1807-update-one";
+    e.extension_state.mark_installed_version(ext_name, "1.0.0");
+    e.ext_registry = Some(vec![ExtensionManifest {
+        name: ext_name.to_string(),
+        display_name: "1807 Update Fixture".to_string(),
+        version: "2.0.0".to_string(),
+        requires_vimcode: Some(">=9999.0.0".to_string()),
+        ..Default::default()
+    }]);
+
+    e.ext_update_one(ext_name);
+
+    assert!(
+        e.message.contains("Cannot update") && e.message.contains("requires vimcode"),
+        "an update to an incompatible newer manifest must be refused with \
+         a clear message; got: {}",
+        e.message
+    );
+    assert_eq!(
+        e.extension_state.installed_version(ext_name),
+        "1.0.0",
+        "a refused update must leave the previously-installed (compatible) \
+         version untouched"
+    );
+    e.extension_state.installed.clear();
+}
+
+/// #1807 (fix round 1): `ext_update_all` must skip an incompatible
+/// candidate while still updating every other installed extension that
+/// has a compatible newer version available, and must say so in its
+/// summary message.
+#[test]
+fn ext_update_all_skips_incompatible_candidate_but_updates_the_rest() {
+    use vimcode_core::core::extensions::*;
+    let mut e = engine_with("");
+    e.extension_state
+        .mark_installed_version("vc-test-1807-ok", "1.0.0");
+    e.extension_state
+        .mark_installed_version("vc-test-1807-incompatible", "1.0.0");
+    e.ext_registry = Some(vec![
+        ExtensionManifest {
+            name: "vc-test-1807-ok".to_string(),
+            display_name: "1807 Compatible Update".to_string(),
+            version: "2.0.0".to_string(),
+            ..Default::default()
+        },
+        ExtensionManifest {
+            name: "vc-test-1807-incompatible".to_string(),
+            display_name: "1807 Incompatible Update".to_string(),
+            version: "2.0.0".to_string(),
+            requires_vimcode: Some(">=9999.0.0".to_string()),
+            ..Default::default()
+        },
+    ]);
+
+    e.ext_update_all();
+
+    assert_eq!(
+        e.extension_state.installed_version("vc-test-1807-ok"),
+        "2.0.0",
+        "the compatible candidate must still update"
+    );
+    assert_eq!(
+        e.extension_state
+            .installed_version("vc-test-1807-incompatible"),
+        "1.0.0",
+        "the incompatible candidate must not update"
+    );
+    assert!(
+        e.message.contains("vc-test-1807-ok") && e.message.contains("skipped incompatible"),
+        "the summary must name the updated extension and report the skip; got: {}",
+        e.message
+    );
+    e.extension_state.installed.clear();
+}
+
 #[test]
 fn config_dir_helper_returns_vimcode() {
     let dir = vimcode_core::core::paths::vimcode_config_dir();

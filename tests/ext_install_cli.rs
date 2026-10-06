@@ -161,3 +161,67 @@ display_name = "Unused"
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// #1807: the headless `--ext-install` entry point must refuse an
+/// extension whose `requires_vimcode` constraint isn't met by the running
+/// vimcode — the same check the interactive marketplace applies
+/// (`Engine::ext_install_from_registry_with_runtime_check`) — rather than
+/// diverging from it and installing scripts that would error at load
+/// time on a missing `vimcode.*` API.
+///
+/// RED-verified by hand: with the `incompatibility_reason_for_running_
+/// vimcode` early-out removed from `run_ext_install` in `src/main.rs`,
+/// this fails — the process proceeds past the new check straight to the
+/// (absent) prerequisite check and exits 0 instead of reporting
+/// `incompatible_vimcode`.
+#[test]
+fn ext_install_refuses_incompatible_requires_vimcode_and_exits_nonzero() {
+    let ext_name = "vc-test-1807-cli-future";
+    let home = home_with_local_extension(
+        ext_name,
+        &format!(
+            r#"
+name = "{ext_name}"
+display_name = "1807 CLI Future Extension"
+requires_vimcode = ">=9999.0.0"
+"#
+        ),
+    );
+
+    let exe = env!("CARGO_BIN_EXE_vimcode");
+    let output = Command::new(exe)
+        .arg("--ext-install")
+        .arg(ext_name)
+        .arg("--json")
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env(
+            "VIMCODE_TEST_HOMEBREW_PREFIXES",
+            home.join("nonexistent-homebrew-prefix"),
+        )
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .expect("failed to run vimcode --ext-install");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an incompatible extension must exit non-zero; status: {:?}\n\
+         stdout: {stdout}\nstderr: {stderr}",
+        output.status.code()
+    );
+
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("not valid JSON: {e}\nstdout: {stdout}"));
+    assert_eq!(json["status"], "incompatible_vimcode");
+    assert!(
+        json["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("9999.0.0")),
+        "got JSON: {json}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
