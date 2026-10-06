@@ -24226,7 +24226,14 @@ fn build_rendered_window(
         // width change) — only `Inline` grows the line.
         let mut virt_text_marks: Vec<&DecorMark> = line_decor
             .iter()
-            .filter(|m| m.row == line_idx && !m.opts.virt_text.is_empty())
+            .filter(|m| {
+                m.row == line_idx
+                    && !m.opts.virt_text.is_empty()
+                    && matches!(
+                        m.opts.virt_text_pos,
+                        Some(VirtTextPos::Overlay) | Some(VirtTextPos::Inline)
+                    )
+            })
             .copied()
             .collect();
         virt_text_marks.sort_by_key(|m| m.col);
@@ -24266,14 +24273,61 @@ fn build_rendered_window(
                         .push((m.col, inserted));
                 }
                 Some(VirtTextPos::Eol) | None => {
-                    // Eol virtual text doesn't paint through `spans`/
-                    // `raw_text` — out of scope for this pass (not one of
-                    // #1653's required black-box scenarios); a mark with
-                    // `virt_text_pos = "eol"` is tracked and survives edits
-                    // like any other, it just has no paint path yet.
+                    // Filtered out of `virt_text_marks` above (#1810) —
+                    // eol/unset marks never reach this match arm; see
+                    // `decor_eol_text` below for where they're handled.
+                    unreachable!(
+                        "eol/none virt_text_pos marks are filtered out of \
+                         virt_text_marks above"
+                    )
                 }
             }
         }
+        // #1810: end-of-line virtual text (`virt_text_pos = "eol"`, or no
+        // `virt_text_pos` at all — the same default) has no buffer column
+        // to splice at like Overlay/Inline above, and must never wrap or
+        // push the line the way real spliced content would. It converges
+        // on `vimcode.buf.annotate_line`'s existing paint path instead
+        // (`RenderedLine::annotation`, below), which already paints after
+        // the line's content in `theme.annotation_fg` and is hard-truncated
+        // at the window edge rather than wrapped — exactly the behaviour
+        // #1810 asks for. Several eol marks on one line draw in priority
+        // order (oldest `set_mark` first, i.e. ascending `MarkId`),
+        // separated by a space.
+        //
+        // Per-mark colour (the chunk's own `hl_group`, as Overlay/Inline
+        // get via `resolve_decor_style`) is NOT implemented: quadraui's
+        // `EditorLine::annotation` is a single `Option<String>` painted in
+        // one theme-wide `annotation_fg` colour — there is no quadraui
+        // primitive for multiple independently-coloured runs in the
+        // trailing-annotation area. That needs quadraui infra first (a
+        // quadraui issue, per the platform-neutrality rule) before eol
+        // text can paint in its own highlight's colour rather than
+        // `annotation_fg`.
+        let mut eol_marks: Vec<&DecorMark> = line_decor
+            .iter()
+            .filter(|m| {
+                m.row == line_idx
+                    && !m.opts.virt_text.is_empty()
+                    && matches!(m.opts.virt_text_pos, Some(VirtTextPos::Eol) | None)
+            })
+            .copied()
+            .collect();
+        eol_marks.sort_by_key(|m| m.id.0);
+        let decor_eol_text: Option<String> = {
+            let parts: Vec<String> = eol_marks
+                .iter()
+                .map(|m| {
+                    m.opts
+                        .virt_text
+                        .iter()
+                        .map(|c| c.text.as_str())
+                        .collect::<String>()
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        };
         // A decor sign for this line's gutter slot (lowest priority — see
         // `bp_part` below): the first mark with `sign_text` touching this
         // line, truncated to its first character.
@@ -24566,7 +24620,10 @@ fn build_rendered_window(
                     {
                         None
                     } else {
-                        engine.line_annotations.get(&line_idx).cloned()
+                        join_annotation(
+                            engine.line_annotations.get(&line_idx).cloned(),
+                            decor_eol_text.as_deref(),
+                        )
                     },
                     ghost_suffix: if line_idx == cursor_line && seg == cursor_seg {
                         ghost_for_cursor_line.clone()
@@ -24649,7 +24706,10 @@ fn build_rendered_window(
                 {
                     None
                 } else {
-                    engine.line_annotations.get(&line_idx).cloned()
+                    join_annotation(
+                        engine.line_annotations.get(&line_idx).cloned(),
+                        decor_eol_text.as_deref(),
+                    )
                 },
                 ghost_suffix: if line_idx == cursor_line {
                     ghost_for_cursor_line.clone()
@@ -25517,6 +25577,22 @@ fn decor_highlight_cols(
         line_chars
     };
     Some((start, end.max(start)))
+}
+
+/// Combine a `vimcode.buf.annotate_line` blame-style annotation with
+/// #1810's decor-sourced eol virtual text, both of which paint through the
+/// same `RenderedLine::annotation` field. `blame` keeps its existing
+/// position (first) so a line with only blame text is byte-for-byte
+/// unchanged from before #1810; eol text (already space-joined across
+/// marks by the caller) follows, separated by one more space.
+fn join_annotation(blame: Option<String>, eol: Option<&str>) -> Option<String> {
+    let eol = eol.filter(|s| !s.is_empty());
+    match (blame, eol) {
+        (Some(b), Some(e)) => Some(format!("{b} {e}")),
+        (Some(b), None) => Some(b),
+        (None, Some(e)) => Some(e.to_string()),
+        (None, None) => None,
+    }
 }
 
 /// Resolve a `vimcode.decor.set_hl` group name to paint-time colours/flags,
