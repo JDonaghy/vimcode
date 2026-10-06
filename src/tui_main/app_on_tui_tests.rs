@@ -15813,6 +15813,125 @@ mod tests {
                  not stayed pinned to the row it started on"
             );
         }
+
+        /// #1810: end-of-line virtual text (`virt_text_pos = "eol"`, or no
+        /// `virt_text_pos` at all) paints after the line's content via the
+        /// same path `vimcode.buf.annotate_line` uses
+        /// (`RenderedLine::annotation`) — before this fix the mark was
+        /// stored and tracked edits (same as every other decor mark) but
+        /// had no paint path at all (render.rs's old `Eol | None` match arm
+        /// was a deliberate no-op; see that arm's own comment pre-#1810).
+        /// Also covers two marks on one line drawing in priority order
+        /// (oldest `set_mark` first) separated by a space, and the combined
+        /// text following a line inserted above it (same `O` + Escape
+        /// sequence the sibling highlight-follows-insert test above uses).
+        ///
+        /// RED against unfixed `develop`: confirmed by temporarily
+        /// restoring the old no-op `Eol | None` arm — "ZQEOLA" then never
+        /// appears in `driver.screen()` at all, this test's very first
+        /// `driver.find` panics.
+        #[test]
+        fn decor_eol_virt_text_paints_after_line_and_follows_insert_above_via_app_on_tui() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQBEFORE\nZQOTHERLINE\n");
+            let ns = engine.decor.namespace("zq_eol");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                None,
+                DecorOpts {
+                    virt_text: vec![VirtTextChunk {
+                        text: "ZQEOLA".to_string(),
+                        hl_group: None,
+                    }],
+                    virt_text_pos: Some(VirtTextPos::Eol),
+                    ..Default::default()
+                },
+            );
+            // A second eol mark on the same line, created after the first,
+            // must draw after it (priority order = creation order),
+            // separated by a space — not glued to the first mark's text.
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                None,
+                DecorOpts {
+                    virt_text: vec![VirtTextChunk {
+                        text: "ZQEOLB".to_string(),
+                        hl_group: None,
+                    }],
+                    virt_text_pos: Some(VirtTextPos::Eol),
+                    ..Default::default()
+                },
+            );
+
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+            let (before_x, before_y) = driver
+                .find("ZQBEFORE")
+                .expect("the marked line's own text must paint");
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQEOLA ZQEOLB"),
+                "two eol marks on one line must draw in creation order, \
+                 separated by a space; screen:\n{screen}"
+            );
+            let (eol_x, eol_y) = driver
+                .find("ZQEOLA")
+                .expect("the eol virtual text must paint");
+            assert_eq!(
+                eol_y, before_y,
+                "the eol text must paint on the same row as the line it's \
+                 anchored to"
+            );
+            assert!(
+                eol_x > before_x,
+                "the eol text must paint after the line's own content, not \
+                 before/over it"
+            );
+
+            // `O` + Escape splices a new line in above row 0 — the eol
+            // marks must follow it down, same as #1653's highlight-anchored
+            // mark does.
+            driver.type_char('O');
+            for c in "NEWTOPLINE".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("NEWTOPLINE") && screen.contains("ZQBEFORE"),
+                "precondition: the insert must have landed; screen:\n{screen}"
+            );
+            let (before_x2, before_y2) = driver
+                .find("ZQBEFORE")
+                .expect("the marked line must still paint after the edit");
+            assert!(
+                before_y2 > before_y,
+                "precondition: ZQBEFORE must have moved down a row"
+            );
+            let (eol_x2, eol_y2) = driver
+                .find("ZQEOLA")
+                .expect("the eol text must still paint after the edit");
+            assert_eq!(
+                eol_y2, before_y2,
+                "the eol text must have followed the mark down to its new \
+                 row, not stayed pinned to the row it started on"
+            );
+            assert!(
+                eol_x2 > before_x2,
+                "the eol text must still paint after the (now-shifted) \
+                 line's content"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
