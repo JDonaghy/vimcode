@@ -8890,6 +8890,13 @@ fn fs_poll_until(
 /// rerunning each alone did not). Symlinking everything *except* `rg`/`fd`
 /// keeps every other tool resolvable while still making the one claim this
 /// test needs to make precisely true: `rg` and `fd` are not on `PATH`.
+///
+/// `#[cfg(unix)]`: the bin-directory list (`/usr/bin`, `/bin`, `/usr/local/
+/// bin`, `/opt/homebrew/bin`) and `std::os::unix::fs::symlink` are both
+/// Unix-only; without this gate the function would silently build an
+/// *empty* directory on Windows and point `PATH` at it — precisely the
+/// blank-`PATH` failure mode described above (#1806 review).
+#[cfg(unix)]
 fn path_dir_without_rg_and_fd(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "vimcode_fs_api_1806_path_{tag}_{}_{:?}",
@@ -8911,7 +8918,6 @@ fn path_dir_without_rg_and_fd(tag: &str) -> std::path::PathBuf {
             if link.exists() {
                 continue;
             }
-            #[cfg(unix)]
             let _ = std::os::unix::fs::symlink(entry.path(), &link);
         }
     }
@@ -8928,9 +8934,33 @@ fn path_dir_without_rg_and_fd(tag: &str) -> std::path::PathBuf {
 /// there, so `Open`'s first `vimcode.fs.walk(...)` call errors immediately
 /// and `e.picker_items` never gets past the empty list `vimcode.picker.
 /// open({title=...})` starts with.
+///
+/// `#[cfg(unix)]` (follows `path_dir_without_rg_and_fd`'s own gate) and
+/// serialized on `TOOL_ACQUIRE_ENV_LOCK`: this test's `EnvVarGuard::set(
+/// "PATH", ...)` would otherwise interleave destructively with the other
+/// `PATH`-mutating tests in this file (L4430/4480/4522 and the Homebrew
+/// ones) — two concurrently-live `EnvVarGuard`s on the same variable step on
+/// each other's `Drop` restore, same hazard `HOMEBREW_ENV_LOCK`/
+/// `TOOL_ACQUIRE_ENV_LOCK`'s own doc comments exist to prevent (#1806
+/// review).
 #[test]
+#[cfg(unix)]
 fn fs_walk_feeds_picker_open_with_no_rg_on_path_1806() {
+    let _lock = TOOL_ACQUIRE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let path_dir = path_dir_without_rg_and_fd("walk_picker");
+    // `path_dir_without_rg_and_fd` never removes its own symlink farm (it's
+    // named uniquely per pid+thread, so it's harmless garbage rather than a
+    // correctness hazard) — clean it up here anyway so repeated local runs
+    // don't accumulate temp-dir cruft (#1806 review).
+    struct RemoveDirOnDrop(std::path::PathBuf);
+    impl Drop for RemoveDirOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RemoveDirOnDrop(path_dir.clone());
     let _path_guard = EnvVarGuard::set("PATH", path_dir.as_os_str());
 
     let (mut e, _project) = engine_with_plugin_and_fs_project(
@@ -8980,6 +9010,173 @@ fn fs_walk_feeds_picker_open_with_no_rg_on_path_1806() {
         displays.iter().any(|d| d.contains("gamma.txt")),
         "picker must list the nested project file too, got: {:?}",
         displays
+    );
+    // #1806 review: `vimcode.fs.walk` must hand Lua `root`-relative paths
+    // (matching `Engine::picker_populate_files`'s own display convention —
+    // the native picker this API replaces), not absolute ones. `contains`
+    // above can't catch an absolute-path regression since an absolute path
+    // also contains "alpha.txt"; assert the exact relative shape instead.
+    //
+    // RED-verified by hand: with `plugin_api_fs_walk`'s `strip_prefix`
+    // relativization removed (paths sent as `entry.into_path()` straight
+    // through), this assertion fails — `displays` contains the project's
+    // absolute temp-dir path instead of the bare relative name.
+    assert!(
+        displays.contains(&"alpha.txt"),
+        "vimcode.fs.walk must return paths relative to root, got: {:?}",
+        displays
+    );
+    assert!(
+        displays
+            .iter()
+            .any(|d| *d == "nested/gamma.txt" || *d == "nested\\gamma.txt"),
+        "vimcode.fs.walk must return nested paths relative to root, got: {:?}",
+        displays
+    );
+}
+
+/// #1806 review: `vimcode.fs.walk(root, { hidden = true })` must still prune
+/// `.git/` the way `Engine::picker_populate_files` does (via
+/// `Settings::explorer_exclude`'s default `**/.git` entry) — `hidden = true`
+/// only lifts the dotfile skip, it must not open the door to `.git`'s
+/// contents (HEAD/config/loose objects, the exact #1545 noise
+/// `explorer_exclude` exists to prevent).
+///
+/// RED-verified by hand: with `FsWalkOptions::explorer_exclude` never
+/// populated (the pre-fix `plugin_api_fs_walk`), this test fails —
+/// `_G.hits` ends up containing a `.git/HEAD` entry.
+#[test]
+fn fs_walk_hidden_still_prunes_dot_git_1806() {
+    let (mut e, project) = engine_with_plugin_and_fs_project(
+        "fs_walk_explorer_exclude_1806",
+        r#"
+        _G.hits = {}
+        _G.done = false
+        vimcode.command("Walk", function(_)
+            vimcode.fs.walk("", { hidden = true }, function(paths)
+                for _, p in ipairs(paths) do
+                    table.insert(_G.hits, p)
+                end
+            end, function()
+                _G.done = true
+            end)
+        end)
+        vimcode.command("Read", function(_)
+            local joined = table.concat(_G.hits, ",")
+            vimcode.message(tostring(_G.done) .. "|" .. joined)
+        end)
+        "#,
+    );
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::write(project.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+    exec(&mut e, "Walk");
+
+    let finished = fs_poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        exec(e, "Read");
+        e.message.starts_with("true|")
+    });
+    assert!(
+        finished,
+        "the walk must finish within 10s, last read: {:?}",
+        e.message
+    );
+    assert!(
+        !e.message.contains(".git"),
+        "hidden=true must not surface .git/'s contents, got: {:?}",
+        e.message
+    );
+    assert!(
+        e.message.contains("alpha.txt"),
+        "the walk must still surface ordinary files, got: {:?}",
+        e.message
+    );
+}
+
+/// #1806 review: a bad `include`/`exclude` glob makes `vimcode.fs.walk`
+/// error immediately (`pcall` catches it) — covers `Engine::
+/// plugin_api_fs_walk`'s register-before-validate reordering (register the
+/// callbacks first, `remove_fs_callbacks` on a validation failure, rather
+/// than dropping them unregistered). This can't directly observe whether
+/// the `LuaRegistryKey` slot was reclaimed (there's no introspection into
+/// `PluginManager::fs_callbacks`'s size from Lua), but it does confirm the
+/// error path doesn't panic or wedge handle-id allocation, and that
+/// `vimcode.fs.walk` stays usable for a subsequent, valid call — the
+/// regression this reordering could plausibly have introduced.
+#[test]
+fn fs_walk_bad_glob_errors_then_api_stays_usable_1806() {
+    let (mut e, _project) = engine_with_plugin_and_fs_project(
+        "fs_walk_bad_glob_1806",
+        r#"
+        _G.bad_ok = nil
+        _G.bad_err = nil
+        _G.hits = {}
+        _G.done = false
+        vimcode.command("BadWalk", function(_)
+            local ok, err = pcall(vimcode.fs.walk, "", { include = { "[" } },
+                function(_) end, function() end)
+            _G.bad_ok = ok
+            _G.bad_err = tostring(err)
+        end)
+        vimcode.command("GoodWalk", function(_)
+            vimcode.fs.walk("", {}, function(paths)
+                for _, p in ipairs(paths) do
+                    table.insert(_G.hits, p)
+                end
+            end, function()
+                _G.done = true
+            end)
+        end)
+        vimcode.command("Read", function(_)
+            vimcode.message(
+                tostring(_G.bad_ok) .. "|" .. tostring(_G.bad_err) .. "|" ..
+                tostring(#_G.hits) .. "|" .. tostring(_G.done)
+            )
+        end)
+        "#,
+    );
+    exec(&mut e, "BadWalk");
+    exec(&mut e, "Read");
+    assert!(
+        e.message.starts_with("false|"),
+        "a bad include glob must make vimcode.fs.walk error (pcall ok=false), got: {:?}",
+        e.message
+    );
+    assert!(
+        e.message.contains("failed to start"),
+        "the error must be the documented \"failed to start\" message, got: {:?}",
+        e.message
+    );
+    // #1806 review: the actual `SearchError` text (naming the offending
+    // glob) must reach Lua, not just a generic "bad glob pattern" — a
+    // finder compiling a user-typed pattern on every keystroke needs to
+    // show *which* pattern/reason failed.
+    assert!(
+        e.message.contains("include glob"),
+        "the error must name which glob failed (include), not a generic message, got: {:?}",
+        e.message
+    );
+
+    exec(&mut e, "GoodWalk");
+    let finished = fs_poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        exec(e, "Read");
+        e.message.ends_with("|true")
+    });
+    assert!(
+        finished,
+        "a valid vimcode.fs.walk call after a failed one must still complete, last read: {:?}",
+        e.message
+    );
+    let hits_count: usize = e
+        .message
+        .rsplitn(3, '|')
+        .nth(1)
+        .expect("Read's message always has a hits-count field")
+        .parse()
+        .expect("hits-count field must be numeric");
+    assert!(
+        hits_count > 0,
+        "the valid walk must have found files, got: {:?}",
+        e.message
     );
 }
 

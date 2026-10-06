@@ -182,12 +182,25 @@ pub fn search_in_project(
 // (`src/core/engine/fs_api.rs`) run these on a background thread and
 // stream the batches back through an `mpsc` channel polled from
 // `poll_idle`, same shape as `vimcode.loop.spawn`/`vimcode.http.request`.
+//
+// `walk_project_streaming` additionally applies `explorer_ops::
+// walk_entry_is_excluded` via `FsWalkOptions::explorer_exclude`
+// (`Engine::plugin_api_fs_walk` fills it in from `Settings::explorer_exclude`
+// before calling in) — the same `filter_entry` `Engine::picker_populate_files`
+// installs, so e.g. `.git`/`.svn` and any user `:set explorer_exclude=...`
+// entry are pruned for `vimcode.fs.walk` exactly like they are for the native
+// Files picker it's meant to replace (#1806 review). `grep_project_streaming`
+// does *not* apply it — it mirrors `search_in_project` above, which never
+// has either, not `picker_populate_files`.
 
 /// Maximum number of paths/matches [`walk_project_streaming`]/
 /// [`grep_project_streaming`] buffer before handing a batch to the caller's
 /// `on_batch`. Small enough that a finder's first results appear quickly,
 /// large enough that a huge repo doesn't send one Lua call per file.
 pub const FS_WALK_BATCH_SIZE: usize = 200;
+/// Same as [`FS_WALK_BATCH_SIZE`], for [`grep_project_streaming`]'s matches
+/// rather than [`walk_project_streaming`]'s paths — kept smaller since each
+/// element carries a full matched line's text, not just a path.
 pub const FS_GREP_BATCH_SIZE: usize = 100;
 
 /// Default cap on the number of grep matches returned, mirroring
@@ -203,7 +216,11 @@ pub struct FsWalkOptions {
     pub hidden: bool,
     /// Stop descending past this many directory levels below `root`
     /// (`ignore::WalkBuilder::max_depth`'s own convention: `root` itself is
-    /// depth 0). `None` means unlimited.
+    /// depth 0, so its direct children are depth 1). `None` means unlimited.
+    /// `Some(0)` is accepted as-is (not rejected) but yields zero *files*,
+    /// matching `ignore::WalkBuilder`: depth 0 is only the root directory
+    /// entry itself, which `walk_project_streaming` always filters out as
+    /// "not a file". Depths are effectively 1-based for file results.
     pub max_depth: Option<usize>,
     /// Glob patterns a path must match at least one of (gitignore glob
     /// syntax, matched relative to `root`) to be included. Empty means
@@ -211,6 +228,13 @@ pub struct FsWalkOptions {
     pub include: Vec<String>,
     /// Glob patterns that exclude a path even if it matched `include`.
     pub exclude: Vec<String>,
+    /// `Settings::explorer_exclude` entries (`**/.git`, `**/.svn`, plus any
+    /// user `:set explorer_exclude=...` addition) — filled in by
+    /// `Engine::plugin_api_fs_walk` from live settings, not settable from
+    /// Lua. Applied the same way `Engine::picker_populate_files` applies it:
+    /// as a `filter_entry` that prunes a matching *directory* rather than
+    /// walking into it and discarding every entry underneath (#1806 review).
+    pub explorer_exclude: Vec<String>,
 }
 
 /// Options for [`grep_project_streaming`] — `vimcode.fs.grep`'s `opts` table.
@@ -280,7 +304,7 @@ fn build_fs_overrides(
 /// a bad glob fails the Lua call immediately (matching `vimcode.loop.spawn`/
 /// `vimcode.http.request`'s "fails to start" convention) instead of only
 /// being discovered once the walk is already running off-thread.
-pub fn validate_fs_walk_options(
+pub(crate) fn validate_fs_walk_options(
     root: &Path,
     opts: &FsWalkOptions,
 ) -> Result<ignore::overrides::Override, SearchError> {
@@ -289,7 +313,7 @@ pub fn validate_fs_walk_options(
 
 /// Same as [`validate_fs_walk_options`], but also compiles the grep regex
 /// so a bad pattern or glob fails `vimcode.fs.grep` immediately too.
-pub fn validate_fs_grep_options(
+pub(crate) fn validate_fs_grep_options(
     root: &Path,
     pattern: &str,
     opts: &FsGrepOptions,
@@ -304,13 +328,20 @@ pub fn validate_fs_grep_options(
     Ok((re, overrides))
 }
 
-/// Walk `root` the same way `search_in_project`/`Engine::picker_populate_
-/// files` do, calling `on_batch` with up to [`FS_WALK_BATCH_SIZE`] paths at
-/// a time as they're found. Checks `cancelled` before visiting each entry
-/// and after each batch flush, returning early (without flushing a final
-/// partial batch) the moment it's set — a cancelled walk delivers no more
-/// batches, promptly.
-pub fn walk_project_streaming(
+/// Walk `root` the same way `Engine::picker_populate_files` does — including
+/// its `opts.explorer_exclude` `filter_entry` pruning, see the module doc
+/// above — calling `on_batch` with up to [`FS_WALK_BATCH_SIZE`] paths at a
+/// time as they're found. Checks `cancelled` before visiting each entry and
+/// after each batch flush, returning early (without flushing a final partial
+/// batch) the moment it's set — a cancelled walk delivers no more batches,
+/// promptly.
+///
+/// A `root` that doesn't exist yields zero batches and then a normal
+/// `on_done` — `ignore::WalkBuilder`'s single `Err` entry for the missing
+/// root is swallowed by the `Err(_) => continue` below, the same as any
+/// other per-entry walk error, so this is indistinguishable from walking an
+/// empty directory.
+pub(crate) fn walk_project_streaming(
     root: &Path,
     opts: &FsWalkOptions,
     overrides: ignore::overrides::Override,
@@ -319,12 +350,16 @@ pub fn walk_project_streaming(
 ) {
     use std::sync::atomic::Ordering;
 
+    let explorer_exclude = opts.explorer_exclude.clone();
     let mut wb = ignore::WalkBuilder::new(root);
     wb.hidden(!opts.hidden)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .overrides(overrides);
+        .overrides(overrides)
+        .filter_entry(move |entry| {
+            !crate::core::engine::explorer_ops::walk_entry_is_excluded(entry, &explorer_exclude)
+        });
     if let Some(depth) = opts.max_depth {
         wb.max_depth(Some(depth));
     }
@@ -359,7 +394,7 @@ pub fn walk_project_streaming(
 /// with up to [`FS_GREP_BATCH_SIZE`] matches at a time as they're found,
 /// stopping once `opts.max_results` total matches have been delivered.
 /// Checks `cancelled` the same way [`walk_project_streaming`] does.
-pub fn grep_project_streaming(
+pub(crate) fn grep_project_streaming(
     root: &Path,
     re: &regex::Regex,
     overrides: ignore::overrides::Override,
@@ -727,7 +762,15 @@ mod tests {
     /// batching/cancel tests below, which need enough files to force
     /// several batches.
     fn make_streaming_project(test_name: &str, n: usize, needle: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("vimcode_fswalk_{}", test_name));
+        // pid+thread-id suffixed (not just `test_name`) so two concurrent
+        // `cargo test` *processes* (as opposed to the threads within one,
+        // which `test_name` alone already disambiguates) don't fight over
+        // the same directory (#1806 review).
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_fswalk_{test_name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         for i in 0..n {
@@ -771,6 +814,52 @@ mod tests {
         assert!(
             seen.iter().any(|p| p.ends_with("file1.txt")),
             "a non-ignored file must still be walked, got: {:?}",
+            seen
+        );
+    }
+
+    /// #1806 review: `walk_project_streaming` must apply
+    /// `FsWalkOptions::explorer_exclude` the same way `Engine::
+    /// picker_populate_files` applies `Settings::explorer_exclude` — pruning
+    /// a matching directory (here `.git`, via the real default pattern
+    /// `**/.git`) rather than descending into it. Uses `hidden: true` so a
+    /// walk that *only* skipped dotfiles (the pre-fix behaviour) would still
+    /// wrongly surface `.git`'s contents, isolating this from
+    /// `fs_walk_streaming_respects_gitignore_1806` above (which never sets
+    /// `hidden`).
+    ///
+    /// RED-verified by hand: with `FsWalkOptions::explorer_exclude` left
+    /// empty (the pre-fix call site, which never populated it), this test
+    /// fails — `seen` contains `.git/tracked.txt`.
+    #[test]
+    fn fs_walk_streaming_respects_explorer_exclude_1806() {
+        let dir = make_temp_project("fs_walk_explorer_exclude_1806");
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join(".git/tracked.txt"), "not a real git object").unwrap();
+
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let overrides = build_fs_overrides(&dir, &[], &[]).unwrap();
+        let opts = FsWalkOptions {
+            hidden: true,
+            explorer_exclude: vec!["**/.git".to_string()],
+            ..Default::default()
+        };
+        let mut seen: Vec<PathBuf> = Vec::new();
+        walk_project_streaming(&dir, &opts, overrides, &cancelled, |batch| {
+            seen.extend(batch)
+        });
+
+        assert!(
+            !seen
+                .iter()
+                .any(|p| p.components().any(|c| c.as_os_str() == ".git")),
+            "explorer_exclude=**/.git must prune .git/ even with hidden=true, got: {:?}",
+            seen
+        );
+        assert!(
+            seen.iter().any(|p| p.ends_with(".hidden/secret.txt")),
+            "hidden=true must still surface other dotfiles/dirs not matched by \
+             explorer_exclude, got: {:?}",
             seen
         );
     }
@@ -896,7 +985,11 @@ mod tests {
 
     #[test]
     fn fs_walk_streaming_include_exclude_globs_1806() {
-        let dir = std::env::temp_dir().join("vimcode_fswalk_globs_1806");
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_fswalk_globs_1806_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("keep.rs"), "fn main() {}").unwrap();

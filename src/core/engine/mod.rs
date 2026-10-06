@@ -4641,6 +4641,14 @@ pub struct Engine {
     /// `grep_project_streaming`), not a child process, so there is no
     /// `Child` to kill on cancel — just an `AtomicBool` the walk checks
     /// between entries.
+    ///
+    /// Dropping `Engine` itself doesn't set that `AtomicBool`: this map (like
+    /// `plugin_spawns`/`plugin_http_requests` above) simply goes away, so an
+    /// in-flight background walk/grep thread keeps running to completion
+    /// detached, with nothing left to deliver its results to. Harmless at
+    /// process exit and consistent with the other two handle maps' existing
+    /// behaviour; only `plugin_api_fs_cancel`/plugin-unload stop a walk early
+    /// (#1806 review).
     plugin_fs_ops: HashMap<u64, fs_api::PluginFsHandle>,
 
     // --- AI assistant panel ---
@@ -6916,7 +6924,12 @@ mod dap_ops;
 pub use dap_ops::DEBUG_BUTTON_IDS;
 mod digraph_ops;
 mod document_ops;
-mod explorer_ops;
+// `pub(crate)` (not the plain `mod` every sibling here uses): #1806's
+// `project_search::walk_project_streaming` — a sibling of `engine`, not a
+// descendant — needs `walk_entry_is_excluded` directly to give
+// `vimcode.fs.walk` the same `explorer_exclude` pruning `picker_populate_
+// files` applies, the same reason `execute` is `pub(crate)` below.
+pub(crate) mod explorer_ops;
 pub use explorer_ops::ExplorerKeyResult;
 // `pub(crate)` (not the plain `mod` every sibling here uses): `vimcode.http`'s
 // response-delivery path (`PluginManager::call_http_response`, #1632) lives in
