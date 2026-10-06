@@ -41,6 +41,13 @@ use std::time::{Duration, Instant};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(15);
+// Shorter than SETTLE_TIMEOUT: the on-disk write poll only has to cover a
+// `:w` round-tripping through the pty, the event loop and a real filesystem
+// write -- all local and fast once the editor has actually processed the
+// command (which the screen waits above already confirmed). Keeps the
+// de-flake's worst case bounded without stacking a second full 15s budget
+// on top of the three screen waits.
+const FILE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_ROWS: u16 = 24;
 const PTY_COLS: u16 = 80;
 
@@ -318,18 +325,11 @@ fn opening_a_line_below_the_only_line_paints_both_lines_1779() {
          {SETTLE_TIMEOUT:?}; screen:\n{}",
         screen_text(&parser)
     );
-    assert!(
-        wait_for_screen_contains(
-            &mut parser,
-            &captured,
-            &mut fed,
-            "ZQXW_BETA",
-            SETTLE_TIMEOUT
-        )
-        .is_some(),
-        "'o' + \"ZQXW_BETA\" + Escape never painted 'ZQXW_BETA' at all; screen:\n{}",
-        screen_text(&parser)
-    );
+    // No separate wait for "ZQXW_BETA" here: the NORMAL wait above already
+    // only returns once a repaint landed with the editor out of INSERT, and
+    // "ZQXW_BETA" was already painted (and asserted) while still in INSERT
+    // mode a few lines up -- a second wait for the same string would be
+    // vacuous, since it was already on screen before this point.
     // Bounded poll for both markers to be present, rather than a fixed
     // sleep: every other wait in this file already polls with a 15s
     // budget, and a fixed sample here can be taken before a later repaint
@@ -371,7 +371,7 @@ fn opening_a_line_below_the_only_line_paints_both_lines_1779() {
     // editor's event loop and a real filesystem write, and a fixed 300ms
     // sample can land before that completes on a loaded runner.
     send_bytes(&writer, b":w\r");
-    let on_disk = wait_for_file_contents(&file_path, "ZQXW_ALPHA\nZQXW_BETA\n", SETTLE_TIMEOUT);
+    let on_disk = wait_for_file_contents(&file_path, "ZQXW_ALPHA\nZQXW_BETA\n", FILE_WRITE_TIMEOUT);
     assert_eq!(
         on_disk,
         "ZQXW_ALPHA\nZQXW_BETA\n",
@@ -382,7 +382,15 @@ fn opening_a_line_below_the_only_line_paints_both_lines_1779() {
 
     // Best-effort teardown — the child may already have exited by now, so
     // these writes must not panic on an EIO and mask the real verdict above.
-    send_bytes_best_effort(&writer, b"\x1b:qa!\r");
+    // Two separate writes, not one coalesced `\x1b:qa!\r`: the comment above
+    // explains exactly why a bare Escape sharing a `read()` with the bytes
+    // after it gets misparsed as `Alt+<char>` instead of Escape -- the same
+    // risk here would just make teardown flaky instead of the test itself
+    // (the `child.kill()` below is the real safety net either way, but
+    // there is no reason to reproduce the bug pattern in the one spot that
+    // explains it).
+    send_bytes_best_effort(&writer, b"\x1b");
+    send_bytes_best_effort(&writer, b":qa!\r");
     let _ = child.try_wait();
     std::thread::sleep(Duration::from_millis(300));
     let _ = child.kill();

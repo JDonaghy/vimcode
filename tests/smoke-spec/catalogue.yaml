@@ -1234,13 +1234,11 @@ journeys:
   - gtk-native
   reference: nvim
   reference_detail: Real Neovim 'dd'
-  steps: Buffer 'aaa\nbbb\nccc', cursor on 'bbb' at its last column (column 3); press
-    dd
-  expected: Buffer becomes 'aaa\nccc'; cursor stays at column 3 on 'ccc' (Neovim's
-    'dd' preserves the column, clamped to the new line's length -- it does NOT
-    reset to column 0; verified via nvim --headless with the cursor explicitly
-    placed at column 3 before 'dd', see issue 1796); 'bbb\n' is now in the
-    unnamed register
+  steps: Buffer 'aaa\nbbb\nccc', cursor on 'bbb' at its last column (column 3); press dd
+  expected: Buffer becomes 'aaa\nccc'; cursor stays at column 3 on 'ccc' (Neovim's 'dd'
+    preserves the column, clamped to the new line's length -- it does NOT reset to column
+    0; verified via nvim --headless with the cursor explicitly placed at column 3 before
+    'dd', see issue 1796); 'bbb\n' is now in the unnamed register
   priority: 1
 - id: vim-count-dd-deletes-n-lines
   area: vim-mode
