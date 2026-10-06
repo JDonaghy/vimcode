@@ -8,6 +8,10 @@ use super::*;
 /// completion_generation` — no need to track every outstanding request id
 /// explicitly.
 fn pack_completion_request_id(generation: u64, source_id: u64) -> u64 {
+    debug_assert!(
+        source_id <= u32::MAX as u64,
+        "completion source id {source_id} doesn't fit in the low 32 bits of the packed request id"
+    );
     (generation << 32) | (source_id & 0xFFFF_FFFF)
 }
 
@@ -2884,11 +2888,16 @@ impl Engine {
         self.merge_plugin_completion_items(items, priority);
     }
 
-    /// Drop items whose `insert_text` doesn't start with `prefix` — same
-    /// narrowing the built-in LSP merge applies, so a source returning
-    /// candidates unrelated to what the user actually typed can't pollute
-    /// the popup. Skipped when `prefix` is empty (a trigger-char-driven
-    /// invocation, e.g. right after `.`, has no prefix to narrow by).
+    /// Drop items whose `label` *and* `insert_text` both fail to start
+    /// with `prefix` — same narrowing the built-in LSP merge applies, so a
+    /// source returning candidates unrelated to what the user actually
+    /// typed can't pollute the popup. Checking `label` too (not just
+    /// `insert_text`) matters for the snippet-source use case #1212/#1805
+    /// motivate: a snippet labeled `forloop` with `insert_text = "for i =
+    /// 1, 10 do\n  \nend"` must survive typing `for`, even though its
+    /// insert text doesn't start with the prefix. Skipped when `prefix` is
+    /// empty (a trigger-char-driven invocation, e.g. right after `.`, has
+    /// no prefix to narrow by).
     fn filter_items_by_prefix(
         items: Vec<plugin::PluginCompletionItemSpec>,
         prefix: &str,
@@ -2898,7 +2907,7 @@ impl Engine {
         }
         items
             .into_iter()
-            .filter(|i| i.insert_text.starts_with(prefix))
+            .filter(|i| i.label.starts_with(prefix) || i.insert_text.starts_with(prefix))
             .collect()
     }
 
@@ -2960,7 +2969,18 @@ impl Engine {
                     }
                 }
                 Ok(None) => {} // deferred — will arrive via `complete()` later
-                Err(e) => self.message = format!("completion source error: {e}"),
+                Err(e) => {
+                    // Report a broken source once, not once per keystroke
+                    // (review finding) — `mark_completion_source_errored`
+                    // returns `true` only the first time for this id.
+                    if self
+                        .plugin_manager
+                        .as_ref()
+                        .is_some_and(|pm| pm.mark_completion_source_errored(source_id))
+                    {
+                        self.message = format!("completion source error: {e}");
+                    }
+                }
             }
         }
         for (priority, items) in batches {
@@ -2978,6 +2998,20 @@ impl Engine {
     /// existing candidate replaces it in place rather than duplicating —
     /// a streamed source re-delivering the same item with fresher
     /// detail/documentation doesn't grow the list.
+    ///
+    /// `completion_idx` is re-found by the *selected candidate's*
+    /// `insert_text` after the sort rather than carried over as a bare
+    /// index (review finding): an async delivery landing while the user
+    /// has cycled the selection to item `n` would otherwise silently
+    /// repoint the selection at whatever candidate the sort happens to put
+    /// at index `n`, and `<C-y>` would then accept the wrong item.
+    ///
+    /// `completion_display_only` is only forced to `true` when the popup
+    /// wasn't already active (`completion_idx` was `None`) — if it lands
+    /// mid `<C-n>`/`<C-p>` cycle (where `display_only` is deliberately
+    /// `false` because the text is already in the buffer), merging must
+    /// not silently flip the key semantics the user is mid-cycle on
+    /// (review finding).
     fn merge_plugin_completion_items(
         &mut self,
         items: Vec<plugin::PluginCompletionItemSpec>,
@@ -2986,6 +3020,11 @@ impl Engine {
         if items.is_empty() {
             return;
         }
+        let was_active = self.completion_idx.is_some();
+        let selected_insert_text = self
+            .completion_idx
+            .and_then(|idx| self.completion_candidates.get(idx))
+            .map(|c| c.insert_text.clone());
         for spec in items {
             let candidate = CompletionCandidate {
                 label: spec.label,
@@ -3007,11 +3046,18 @@ impl Engine {
         }
         self.completion_candidates
             .sort_by_key(|c| std::cmp::Reverse(c.priority));
-        match self.completion_idx {
-            None => self.completion_idx = Some(0),
-            Some(idx) => self.completion_idx = Some(idx.min(self.completion_candidates.len() - 1)),
+        self.completion_idx = Some(
+            selected_insert_text
+                .and_then(|text| {
+                    self.completion_candidates
+                        .iter()
+                        .position(|c| c.insert_text == text)
+                })
+                .unwrap_or(0),
+        );
+        if !was_active {
+            self.completion_display_only = true;
         }
-        self.completion_display_only = true;
     }
 
     // ─── `vimcode.picker` (#1630) ───────────────────────────────────────────

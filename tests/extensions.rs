@@ -8531,3 +8531,203 @@ fn completion_complete_drops_stale_request_but_accepts_current_one() {
         e.completion_candidates
     );
 }
+
+/// Review finding: accepting a plugin-only candidate (nothing in the
+/// buffer-word scan matched the prefix) must delete exactly the typed
+/// prefix, not fall back to a stale `completion_start_col` from before
+/// this trigger. Buffer starts as `"x = "` with no word anywhere that
+/// starts with `"f"`, so `word_completions_nearby` finds nothing and the
+/// popup is plugin-only — exactly the case the review called out. Only a
+/// *single* character is typed (not built up over several keystrokes):
+/// typing a second character would retain the first keystroke's plugin
+/// candidate across the narrowing step and let `trigger_completion`'s own
+/// (buggy, pre-fix) "candidates non-empty" check recompute the column
+/// correctly by accident, masking the bug.
+///
+/// RED against the unfixed merge path: `completion_start_col` stayed at
+/// its stale `0` because it was only assigned inside the "buffer-word scan
+/// found something" branch, so accepting here deleted columns `0..5` and
+/// left the buffer as `"foobar_plugin"` instead of `"x = foobar_plugin"`.
+#[test]
+fn completion_accept_on_plugin_only_popup_keeps_preceding_text() {
+    let mut e = engine_with_plugin(
+        "x = \n",
+        "completion_start_col_1805",
+        r#"
+        vimcode.completion.register({
+            name = "static",
+            source = function(ctx, request_id)
+                return { { label = "foobar_plugin(..)", insert_text = "foobar_plugin" } }
+            end,
+        })
+        "#,
+    );
+    press(&mut e, 'A'); // append at end of "x = "
+    type_chars(&mut e, "f"); // a single keystroke — see doc comment above
+
+    let idx = e
+        .completion_candidates
+        .iter()
+        .position(|c| c.insert_text == "foobar_plugin")
+        .unwrap_or_else(|| {
+            panic!(
+                "plugin item must appear even though no buffer word \
+                 matches the prefix: {:?}",
+                e.completion_candidates
+            )
+        });
+    e.completion_idx = Some(idx);
+    ctrl(&mut e, 'y');
+    assert_eq!(
+        buf(&e).trim_end(),
+        "x = foobar_plugin",
+        "accepting a plugin-only candidate must delete only the typed \
+         prefix, preserving the preceding text: {:?}",
+        buf(&e)
+    );
+}
+
+/// Review finding: `dismiss_completion()` must bump `completion_generation`
+/// so a stale async delivery for a popup the user has already dismissed
+/// (by typing past it, e.g. deleting the prefix back to empty) cannot
+/// re-open it.
+///
+/// RED against the unfixed `dismiss_completion`: it cleared the candidate
+/// list and the filter prefix but left `completion_generation` untouched,
+/// so the async source's deferred `request_id` (captured while the prefix
+/// was still `"fo"`) still matched the current generation when delivered
+/// after the dismiss, and `merge_plugin_completion_items` reopened the
+/// popup with the stale item.
+#[test]
+fn completion_dismiss_drops_later_async_delivery_for_the_dismissed_popup() {
+    let mut e = engine_with_plugin(
+        "",
+        "completion_dismiss_gen_1805",
+        r#"
+        _G.captured_id = nil
+        vimcode.completion.register({
+            name = "async",
+            source = function(ctx, request_id)
+                _G.captured_id = request_id
+                return nil -- always defer
+            end,
+        })
+        vimcode.command("Deliver", function(_)
+            vimcode.completion.complete(_G.captured_id, { { label = "reopened" } })
+        end)
+        "#,
+    );
+    press(&mut e, 'i');
+    type_chars(&mut e, "fo"); // trigger #1 — captures `_G.captured_id`, defers
+    press_key(&mut e, "BackSpace");
+    press_key(&mut e, "BackSpace"); // prefix back to empty — auto-dismiss
+
+    assert!(
+        e.completion_idx.is_none(),
+        "popup must be dismissed once the prefix goes back to empty: {:?}",
+        e.completion_candidates
+    );
+
+    exec(&mut e, "Deliver");
+    assert!(
+        !e.completion_candidates
+            .iter()
+            .any(|c| c.insert_text == "reopened"),
+        "an async delivery for a request issued before the popup was \
+         dismissed must not reopen it: {:?}",
+        e.completion_candidates
+    );
+    assert!(
+        e.completion_idx.is_none(),
+        "the popup must stay dismissed: {:?}",
+        e.completion_candidates
+    );
+}
+
+/// Review finding: the plugin merge must narrow on the stale-prefix
+/// comparison too — covered above — but also must not let a trigger-char
+/// source's `manual` leniency leak into unrelated sources on an empty
+/// prefix. A source with no `trigger_chars` declared must *not* run just
+/// because a different source's trigger char fired the auto-trigger.
+#[test]
+fn completion_trigger_char_for_one_source_does_not_leak_into_another() {
+    let mut e = engine_with_plugin(
+        "",
+        "completion_trigger_leak_1805",
+        r#"
+        vimcode.completion.register({
+            name = "dot-triggered",
+            trigger_chars = { "." },
+            source = function(ctx, request_id) return { { label = "dot_item" } } end,
+        })
+        vimcode.completion.register({
+            name = "word-only",
+            source = function(ctx, request_id) return { { label = "word_item" } } end,
+        })
+        "#,
+    );
+    press(&mut e, 'i');
+    type_chars(&mut e, ".");
+    assert!(
+        e.completion_candidates
+            .iter()
+            .any(|c| c.insert_text == "dot_item"),
+        "the source declaring `.` as a trigger char must run: {:?}",
+        e.completion_candidates
+    );
+    assert!(
+        !e.completion_candidates
+            .iter()
+            .any(|c| c.insert_text == "word_item"),
+        "a source with no trigger_chars must not run on an empty prefix \
+         just because a *different* source's trigger char fired: {:?}",
+        e.completion_candidates
+    );
+}
+
+/// Review finding: `vimcode.completion.register`/`unregister` called at
+/// runtime (from inside a command/event handler, not at plugin load time)
+/// must work the same as load-time registration — the commit message
+/// claimed this but shipped no test for it.
+#[test]
+fn completion_register_and_unregister_work_at_runtime() {
+    let mut e = engine_with_plugin(
+        "",
+        "completion_runtime_register_1805",
+        r#"
+        _G.source_id = nil
+        vimcode.command("Register", function(_)
+            _G.source_id = vimcode.completion.register({
+                name = "runtime",
+                source = function(ctx, request_id) return { { label = "runtime_item" } } end,
+            })
+        end)
+        vimcode.command("Unregister", function(_)
+            vimcode.completion.unregister(_G.source_id)
+        end)
+        "#,
+    );
+    exec(&mut e, "Register");
+    press(&mut e, 'i');
+    type_chars(&mut e, "run");
+    assert!(
+        e.completion_candidates
+            .iter()
+            .any(|c| c.insert_text == "runtime_item"),
+        "a source registered at runtime (not at plugin load time) must \
+         run just like a load-time one: {:?}",
+        e.completion_candidates
+    );
+    press_key(&mut e, "Escape");
+
+    exec(&mut e, "Unregister");
+    press(&mut e, 'o'); // open a fresh line so the new prefix isn't glued to the old "run"
+    type_chars(&mut e, "run");
+    assert!(
+        !e.completion_candidates
+            .iter()
+            .any(|c| c.insert_text == "runtime_item"),
+        "an unregistered source must stop running: {:?}",
+        e.completion_candidates
+    );
+}
