@@ -19291,7 +19291,8 @@ mod editor_mouse_rungs {
 /// a vimcode-side `src/gtk/` workaround should paper over by re-deriving
 /// pixel geometry the backend already owns.
 ///
-/// **No quadraui issue has been filed for this yet** — this worker's own
+/// **TODO(quadraui issue — COORDINATOR ACTION, #1750 follow-up): no
+/// quadraui issue has been filed for this yet** — this worker's own
 /// assignment forbids running `gh` (the coordinator owns GitHub
 /// interactions), so this can only be reported, not filed, from here. Per
 /// CLAUDE.md's testing rule, a `KNOWN_BUGS`-style gap like this one is not
