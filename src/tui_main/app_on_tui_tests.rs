@@ -4499,6 +4499,76 @@ mod tests {
     mod tab_bar {
         use super::*;
 
+        /// Read back the *painted* tab-bar row for `group_id` — scoped to
+        /// exactly the cells `ScreenLayout::group_tab_bars`' `bounds`
+        /// reserves for that group's tab bar, not the whole screen (#1798
+        /// review round 1: a bare `screen_has(label)`/`screen_contains`
+        /// check is satisfied just as well by the Explorer sidebar row or
+        /// the breadcrumb segment painting the same filename, so an
+        /// assertion meant to catch "the tab bar didn't repaint" has to be
+        /// scoped to cells only the tab bar itself can reach — the same
+        /// rule `stacked_groups_bottom_tab_row_shows_its_label_1586` below
+        /// already follows for the row, extended here to the column range
+        /// too so an open sidebar to the left can't leak into the slice).
+        ///
+        /// `bounds.x`/`bounds.width` are *display columns* (the activity
+        /// bar's "☰" hamburger glyph is double-width), so this walks the
+        /// row accumulating [`quadraui::tui::char_cell_width`] rather than
+        /// `.chars().skip(n)` — the same char-vs-column distinction
+        /// `build_tab_bar_icons`'s own doc traces to #1425/#1426. Skipping
+        /// by raw char count instead landed one column short of the
+        /// sidebar-open fixture's tab bar (confirmed empirically: it sliced
+        /// `"ample.txt"`, missing the leading `s`) the first time this was
+        /// written.
+        ///
+        /// Callers must set `engine.settings.breadcrumbs = false` first —
+        /// same precondition `stacked_groups_bottom_tab_row_shows_its_label_1586`
+        /// documents: at the default `breadcrumbs = true` the tab bar's
+        /// band is two rows tall and `bounds.y - 1` no longer reliably
+        /// lands on the label row.
+        fn active_group_tab_bar_row(
+            h: &crate::harness::ConformanceHarness<
+                quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            >,
+            group_id: crate::core::window::GroupId,
+        ) -> String {
+            let bounds = {
+                let layout = h.screen_layout.borrow();
+                let layout = layout.as_ref().expect("a frame must have been painted");
+                layout
+                    .group_tab_bars
+                    .iter()
+                    .find(|gtb| gtb.group_id == group_id)
+                    .map(|gtb| gtb.bounds)
+                    .expect("the group must have its own tab bar entry")
+            };
+            let tab_row_idx = (bounds.y - 1.0).round() as usize;
+            let col_start = bounds.x.round() as usize;
+            let col_width = bounds.width.round() as usize;
+
+            let screen = h.driver.screen();
+            let full_row = screen.lines().nth(tab_row_idx).unwrap_or_else(|| {
+                panic!(
+                    "row {tab_row_idx} (group {group_id:?}'s tab row) is \
+                     off-screen; screen:\n{screen}"
+                )
+            });
+
+            let mut col = 0usize;
+            let mut out = String::new();
+            for c in full_row.chars() {
+                let w = quadraui::tui::char_cell_width(c) as usize;
+                if col >= col_start && col < col_start + col_width {
+                    out.push(c);
+                }
+                col += w;
+                if col >= col_start + col_width {
+                    break;
+                }
+            }
+            out
+        }
+
         /// Mirrors `shell_app.rs`'s test of the same name (#551): the unsplit
         /// case must paint exactly one full-width tab bar, on row 0.
         #[test]
@@ -4610,24 +4680,27 @@ mod tests {
         /// must open it in a **second** tab — not swap the first tab's
         /// buffer in place. The bugbash report's symptom (breadcrumb/
         /// content/status bar all moved to the new file, but the tab strip
-        /// kept showing only the old file's label) is exactly what
-        /// `screen_has` on both labels catches: a buffer-swap-in-place bug
-        /// leaves the *old* label painted and the new one entirely absent,
-        /// while the correct behaviour paints both.
+        /// kept showing only one tab) is caught by reading back the tab
+        /// bar's *own* painted row (see `active_group_tab_bar_row`) and
+        /// requiring it contain both labels: a buffer-swap-in-place bug
+        /// leaves exactly one label painted on that row, never both — and
+        /// scoping the read to the tab bar's own cells (not a bare
+        /// `screen_has`/`screen_contains` call) matters because review
+        /// round 1 found both filenames are *also* painted by the Explorer
+        /// sidebar row and the breadcrumb segment, which stay open/visible
+        /// throughout this test and would otherwise satisfy the assertion
+        /// regardless of what the tab bar itself painted.
         ///
-        /// RED-verified: temporarily replacing `open_file_in_tab`'s
-        /// "no existing tab — open a new one" branch with an in-place
-        /// `window.buffer_id = buffer_id` swap (mirroring the reported
-        /// symptom exactly) makes this test fail with "must open a second
-        /// tab, not replace the first one in place"; restored before
-        /// committing. Against *unmodified* `develop` this test passes —
-        /// see this PR's own description for why: extensive investigation
-        /// (this test, its GTK twin, and single-click/narrow-window
-        /// variants) could not reproduce the bugbash report through
-        /// vimcode's shared `Engine`/`App` dispatch layer, which is
-        /// identical on every backend including the real Win-GUI one (see
-        /// `src/gtk/testing.rs`'s twin for the pixel-coordinate half of
-        /// that proof).
+        /// RED-verified independently for both assertions below:
+        /// temporarily replacing `open_file_in_tab`'s "no existing tab —
+        /// open a new one" branch with an in-place `window.buffer_id =
+        /// buffer_id` swap on the active window (mirroring the reported
+        /// "only one tab ever appears" symptom) drops `tabs.len()` to `1`
+        /// (failing the first assertion) *and*, with that assertion
+        /// disabled, leaves the tab-bar row reading just `"main.rs "`
+        /// padded with blanks — `"sample.txt"` entirely gone from the row
+        /// — failing the second assertion on its own. Restored before
+        /// committing.
         #[test]
         fn explorer_double_click_opens_second_file_in_a_second_tab_1798() {
             let dir = std::env::temp_dir().join(format!(
@@ -4643,14 +4716,34 @@ mod tests {
             std::fs::write(&main_rs, "fn main() {}\n").unwrap();
 
             let mut engine = plain_engine();
+            engine.settings.breadcrumbs = false; // one-row tab bar, simplest geometry
             engine.cwd = dir.clone();
             engine.open_file_in_tab(&sample);
+            // `open_file_in_tab` always *appends* a new tab for a file not
+            // already open anywhere — unlike `open_file_with_mode`'s
+            // `OpenMode::Permanent` path (the single-click twin below uses
+            // that one via `startup_without_session_restore`), it never
+            // reuses `plain_engine()`'s initial pristine `[No Name]`
+            // scratch tab. Left in place, that scratch tab is still open
+            // alongside sample.txt here, so close it the same way
+            // `two_tabs_paint_both_labels` above does — otherwise the
+            // double-click below lands on 3 tabs, not the 2 the bug
+            // report's "sample.txt was the only tab open" setup describes.
+            engine.goto_tab(0);
+            engine.close_tab();
             engine.explorer_expanded.insert(dir.clone());
             engine.explorer_rebuild_rows();
+            // `engine.session.explorer_visible` alone drives the TUI
+            // sidebar's painted visibility here — review round 1 flagged
+            // `engine.app_shell.show_panel(...)` (present in an earlier
+            // revision of this test) as possibly a no-op, citing
+            // `collapse_sidebar`'s own doc that the runner-side `AppShell`
+            // (the one `harness()`'s `App` actually paints from) is never
+            // synced from this *shadow* `app_shell` at startup. Confirmed
+            // empirically: removing that call changes nothing here, so it
+            // is not included.
             engine.session.explorer_visible = true;
-            engine.app_shell.show_panel(&quadraui::WidgetId::new(
-                crate::core::engine::sidebar::PANEL_EXPLORER,
-            ));
+            let active_group = engine.active_group;
             let mut h = harness(engine);
             let driver = &mut h.driver;
 
@@ -4666,17 +4759,19 @@ mod tests {
             driver.double_click(x, y);
             driver.render();
 
-            assert!(
-                h.engine.borrow().active_group().tabs.len() >= 2,
+            assert_eq!(
+                h.engine.borrow().active_group().tabs.len(),
+                2,
                 "double-clicking a second file in the Explorer must open a \
                  second tab, not replace the first one in place"
             );
+            let tab_row = active_group_tab_bar_row(&h, active_group);
             assert!(
-                driver.screen_has("sample.txt") && driver.screen_has("main.rs"),
-                "both the originally-open sample.txt tab and the newly \
-                 double-clicked main.rs tab must have painted labels on the \
-                 tab bar; screen:\n{}",
-                driver.screen()
+                tab_row.contains("sample.txt") && tab_row.contains("main.rs"),
+                "the tab bar's own row must paint both the originally-open \
+                 sample.txt tab and the newly double-clicked main.rs tab's \
+                 labels — not just the sidebar or breadcrumb painting the \
+                 same filename elsewhere on screen; tab bar row:\n{tab_row}"
             );
 
             let _ = std::fs::remove_dir_all(&dir);
@@ -4696,6 +4791,11 @@ mod tests {
         /// `OpenMode::Permanent`, pristine-scratch-buffer reuse) the real
         /// report's "Open sample.txt" step used — not `open_file_in_tab`
         /// directly.
+        ///
+        /// Reads the painted labels back via `active_group_tab_bar_row`
+        /// (scoped to the tab bar's own cells), not a bare
+        /// `screen_has`/`screen_contains` call, for the same reason the
+        /// double-click test above does — see its own doc.
         #[test]
         fn explorer_single_click_opens_second_file_in_a_second_tab_1798() {
             let dir = std::env::temp_dir().join(format!(
@@ -4711,14 +4811,16 @@ mod tests {
             std::fs::write(&main_rs, "fn main() {}\n").unwrap();
 
             let mut engine = plain_engine();
+            engine.settings.breadcrumbs = false; // one-row tab bar, simplest geometry
             engine.cwd = dir.clone();
             engine.startup_without_session_restore(Some(&sample));
             engine.explorer_expanded.insert(dir.clone());
             engine.explorer_rebuild_rows();
+            // See the double-click test above: `app_shell.show_panel` was
+            // confirmed a no-op in this harness and is deliberately not
+            // called here either.
             engine.session.explorer_visible = true;
-            engine.app_shell.show_panel(&quadraui::WidgetId::new(
-                crate::core::engine::sidebar::PANEL_EXPLORER,
-            ));
+            let active_group = engine.active_group;
             let mut h = harness(engine);
             let driver = &mut h.driver;
 
@@ -4734,17 +4836,19 @@ mod tests {
             driver.click(x, y);
             driver.render();
 
-            assert!(
-                h.engine.borrow().active_group().tabs.len() >= 2,
+            assert_eq!(
+                h.engine.borrow().active_group().tabs.len(),
+                2,
                 "single-clicking a second file in the Explorer must open a \
                  second (preview) tab, not replace the first one in place"
             );
+            let tab_row = active_group_tab_bar_row(&h, active_group);
             assert!(
-                driver.screen_has("sample.txt") && driver.screen_has("main.rs"),
-                "both the originally-open sample.txt tab and the newly \
-                 clicked main.rs preview tab must have painted labels on \
-                 the tab bar; screen:\n{}",
-                driver.screen()
+                tab_row.contains("sample.txt") && tab_row.contains("main.rs"),
+                "the tab bar's own row must paint both the originally-open \
+                 sample.txt tab and the newly clicked main.rs preview \
+                 tab's labels — not just the sidebar or breadcrumb painting \
+                 the same filename elsewhere on screen; tab bar row:\n{tab_row}"
             );
 
             let _ = std::fs::remove_dir_all(&dir);
