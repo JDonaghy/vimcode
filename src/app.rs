@@ -8795,6 +8795,91 @@ impl App {
             }
         }
 
+        // ── Editor hover dwell (#1750) ─────────────────────────────────────
+        // Mouse movement over editor text arms the dwell timer that
+        // eventually fires `textDocument/hover` (LSP) or surfaces a plugin's
+        // `vimcode.editor.set_hover` content — `Engine::editor_hover_mouse_
+        // move` is the sole entry point for both; `poll_editor_hover`
+        // (driven by the shared tick, `render::run_shared_tick_chores`) does
+        // the rest once the dwell elapses. #731 deleted the GTK-only polling
+        // block that used to call this — it was gated on a permanently-
+        // `None` Relm4 widget handle, so it had been dead since the #540
+        // cutover — and nothing replaced the call; #1434 then deleted TUI's
+        // own `mouse.rs` copy the same way, so by #1750 no backend ever
+        // armed the dwell timer at all and the hover popup (LSP, and every
+        // extension's own hover) stopped appearing on every backend at
+        // once. This is the shared `MouseMoved` arm both backends already
+        // reach (see the sidebar/gutter-hover blocks just above), not a
+        // per-backend restoration — one fix covers both, same reasoning as
+        // the #754/#1544 rungs above it.
+        //
+        // Resolved via the shared `pixel_to_click_target` (`mutate_focus:
+        // false` — a pure query, the same contract `handle_mouse_drag_msg`'s
+        // cross-split continuation relies on) rather than re-deriving
+        // gutter-width/scroll-offset math by hand the way the pre-#731 GTK
+        // code did: `ClickTarget::BufferPos`'s `(line, col)` is the exact
+        // buffer position `draw_editor` painted at this pixel (via
+        // `Backend::editor_col_at_x`), so hover and click can never resolve
+        // to different cells (the same #560/#515 guarantee the click paths
+        // above already lean on). Any other target (gutter, tab bar,
+        // outside the window entirely, no cached layout yet) dismisses an
+        // already-visible, unfocused popup — mirroring the pre-#731 "mouse
+        // outside editor area" branch.
+        //
+        // No idle-tick redraw reintroduced here (the #1722 worry this issue
+        // was filed against): this arm only ever touches `engine.editor_
+        // hover_dwell`/`editor_hover`/`lsp_hover_text` from a real
+        // `MouseMoved` event. The repaint once the LSP response actually
+        // arrives is still `poll_lsp`'s job (`core/engine/panels.rs`
+        // setting `redraw = true` on a hover reply), not this arm's.
+        if let UiEvent::MouseMoved { position, .. } = &event {
+            let gate_open = {
+                let e = self.engine.borrow();
+                e.settings.hover_delay > 0
+                    && !e.editor_hover_has_focus
+                    && !e.is_blocking_modal_open()
+                    && (matches!(e.mode, core::Mode::Normal | core::Mode::Visual)
+                        || e.is_vscode_mode())
+            };
+            if gate_open {
+                let layout_ref = self.cached_screen_layout.borrow();
+                if let Some(layout) = layout_ref.as_ref() {
+                    let mut engine = self.engine.borrow_mut();
+                    let target = pixel_to_click_target(
+                        &mut engine,
+                        backend,
+                        position.x as f64,
+                        position.y as f64,
+                        self.cached_line_height,
+                        self.cached_char_width,
+                        layout,
+                        &self.cached_group_tab_bar_layouts.borrow(),
+                        self.cached_frame_hit_map.borrow().as_ref(),
+                        &self.cached_tab_bar_zones.borrow(),
+                        false, // pure hover query — must not steal focus or fire gutter actions
+                        &mut quadraui::DragState::default(),
+                        false, // no Alt-fine-seek context for a plain mouse-move
+                    );
+                    match target {
+                        ClickTarget::BufferPos(_, line, col) => {
+                            let on_popup = self.editor_hover_popup_rect.get().is_some_and(|r| {
+                                position.x >= r.x
+                                    && position.x < r.x + r.width
+                                    && position.y >= r.y
+                                    && position.y < r.y + r.height
+                            });
+                            engine.editor_hover_mouse_move(line, col, on_popup);
+                        }
+                        _ => {
+                            if engine.editor_hover.is_some() {
+                                engine.dismiss_editor_hover();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // #955 (ACP-4, review fix): gates the title-bar drag/double-click
         // arms below on the change-review surface being closed. That surface
         // is genuinely full-viewport — its first diff row paints inside

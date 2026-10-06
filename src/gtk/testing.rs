@@ -19255,6 +19255,156 @@ mod editor_mouse_rungs {
     }
 }
 
+/// #1750 — editor hover dwell: `MouseMoved` must arm `Engine::editor_hover_
+/// mouse_move` on GTK too, through the exact same shared `App::handle_
+/// dispatch` arm `tui_main::app_on_tui_tests::tests::editor_hover_dwell_
+/// 1750`'s two TUI tests cover — see that module's doc for the full root
+/// cause (#731 deleted the only, GTK-only, caller; #1434 deleted TUI's own
+/// copy the same way; this fix adds one shared caller both backends reach).
+/// One scenario here (an LSP-sourced diagnostic, mirroring the TUI twin
+/// `lsp_diagnostic_hover_dwell_paints_popup_via_mouse_move_1750`) is enough
+/// to prove GTK reaches the same fixed code path as TUI — the fix itself
+/// has no backend-specific line in it to duplicate coverage for. Dwelling
+/// over a real word (not the annotation ghost-text region the TUI plugin-
+/// hover twin uses) is deliberate here: GTK's `editor_col_at_x` resolves a
+/// pixel past the end of the real text against the *editable* text's own
+/// Pango layout, which doesn't model the separately-painted annotation run
+/// at all, so it does not reliably clamp to (or past) `line_char_len` the
+/// way a monospace-cell TUI column does — confirmed while writing this
+/// test: hovering at the GTK-painted pixel position of an annotation string
+/// resolved to a column still inside the real text, not past it, so the
+/// `on_annotation` gate in `Engine::editor_hover_mouse_move` never armed.
+/// That's a GTK pixel-resolution precision question for a future issue, not
+/// a #1750 regression — hovering a real word sidesteps it entirely while
+/// still exercising the identical dwell-arm code this issue is about.
+#[cfg(test)]
+mod issue_1750_editor_hover_dwell {
+    use super::*;
+
+    /// GTK twin of `tui_main::app_on_tui_tests::tests::editor_hover_dwell_
+    /// 1750::lsp_diagnostic_hover_dwell_paints_popup_via_mouse_move_1750` —
+    /// see that test's doc for why the content source is a diagnostic
+    /// rather than a live `rust-analyzer` round-trip or a direct `Engine::
+    /// lsp_hover_text` pre-seed (the latter paints through a second,
+    /// independent, cursor-anchored widget regardless of mouse/dwell
+    /// state, so it can't RED-verify this fix).
+    ///
+    /// `GtkDriver` has no `tick()` (quadraui, confirmed absent at this
+    /// repo's pinned rev — see the #1779 note on
+    /// `opening_a_line_below_the_last_line_paints_every_line_in_order_1779`'s
+    /// doc comment for the same gap), so this drives `Engine::poll_idle()`
+    /// directly instead, the established idiom this file already uses
+    /// elsewhere (e.g. `busy_status_shows_running_tool_call_and_elapsed_
+    /// time_via_gtk_driver`) to advance time-driven engine state with no
+    /// backend tick seam.
+    ///
+    /// **RED-verified** the same way as the TUI twin: reverting the new
+    /// `MouseMoved` arm in `App::handle_dispatch` (wrapping its `if
+    /// gate_open` in `if false && gate_open`) makes the final assertion
+    /// below fail — the dwell timer never arms, so `poll_idle`'s
+    /// `poll_editor_hover` has nothing to act on.
+    #[test]
+    fn lsp_diagnostic_hover_dwell_paints_popup_via_gtk_driver_1750() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1750_gtk_hover_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let path = dir.join("fixture.rs");
+        std::fs::write(&path, "let needle = 1;\n").expect("write fixture file");
+
+        let mut engine = Engine::new_for_test();
+        // See the TUI twin's identical comment: keeps `lsp_request_hover_at`
+        // (fired alongside the diagnostic section) a no-op, so this test
+        // cannot accidentally spawn a real LSP server process.
+        engine.settings.lsp_enabled = false;
+        engine.new_tab(Some(&path));
+        let diag_key = engine
+            .active_buffer_diagnostics_key()
+            .expect("the just-opened fixture file must have a diagnostics key");
+        engine.lsp_diagnostics.insert(
+            diag_key,
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange {
+                    start: crate::core::lsp::LspPosition {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: crate::core::lsp::LspPosition {
+                        line: 0,
+                        character: 15,
+                    },
+                },
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: "ZQXW_1750_GTK_LSP_DIAG_MARKER".to_string(),
+                source: Some("rust-analyzer".to_string()),
+                code: None,
+            }],
+        );
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        // A freshly constructed `Engine` has no recorded settings-file
+        // mtime, so the first `poll_idle()` unconditionally reloads
+        // `engine.settings` from whatever real `settings.json` this
+        // machine has — clobbering `hover_delay` if set beforehand. Flush
+        // that one-time reload first (see the TUI twin's identical comment
+        // for how this was found).
+        h.engine.borrow_mut().poll_idle();
+        h.engine.borrow_mut().settings.hover_delay = 1;
+        h.driver.render();
+
+        // `find()`'s reported `y` lands exactly on the row-0/row-1 boundary
+        // for this fixture's line height (confirmed by hand: the hit-test
+        // below resolved to `buf_line: 1`, the buffer's blank trailing
+        // line, not `0` where "needle" actually is) — a `GtkDriver::find`
+        // sampling quirk unrelated to #1750, not something to special-case
+        // here. Using the window's own painted top edge
+        // (`rw.rect.y`) plus a few px, comfortably inside row 0, avoids it;
+        // `x` from `find()` is unaffected (no horizontal boundary to hit).
+        let (x, _) = h
+            .driver
+            .find("needle")
+            .expect("the word to hover over must be painted");
+        let y = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .and_then(|l| l.windows.first())
+                .map(|rw| (rw.rect.y + 5.0) as f32)
+                .expect("a window must have painted")
+        };
+
+        h.driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(x, y),
+            buttons: quadraui::ButtonMask::default(),
+        });
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("ZQXW_1750_GTK_LSP_DIAG_MARKER"),
+            "precondition: the popup must not appear before the dwell \
+             delay elapses and a tick polls it"
+        );
+
+        // No key press, no click — only time passing and the idle poll the
+        // real GTK runner drives on its own timer.
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        h.engine.borrow_mut().poll_idle();
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("ZQXW_1750_GTK_LSP_DIAG_MARKER"),
+            "dwelling over a word with an LSP-sourced diagnostic must, with \
+             no intervening key press or click, paint the hover popup once \
+             the dwell timer elapses (#1750); painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod alt_rung {
     //! #759 / #734 slice 4 — the shared Alt-modifier / VSCode-mode rung.

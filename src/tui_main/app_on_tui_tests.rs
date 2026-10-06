@@ -241,6 +241,280 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // #1750 — editor hover dwell: `MouseMoved` must arm `Engine::editor_hover_
+    // mouse_move`, on every backend, with no intervening input event.
+    //
+    // **Exception to this file's "no production code" header note**: both
+    // tests below cover a genuine `src/app.rs` change (the new "Editor hover
+    // dwell" `MouseMoved` arm in `App::handle_dispatch`) — the same kind of
+    // exception #1762/#1763/#1764 already are, not a port of pre-existing
+    // behaviour. #731 (2026-09-02) deleted the GTK-only polling block that
+    // used to call `Engine::editor_hover_mouse_move` (dead since the #540
+    // ShellApp cutover — see that call site's own historical comment,
+    // `src/app.rs`'s `handle_poll_tick`), and nothing replaced the call;
+    // #1434 then deleted TUI's own `mouse.rs` copy of the same wiring the
+    // same way. So by #1750, no backend ever armed the dwell timer at all
+    // and the hover popup — LSP hover *and* every extension's own
+    // `vimcode.editor.set_hover` hover — stopped appearing anywhere. Fixed
+    // once in the shared `MouseMoved` arm both backends already reach (see
+    // the neighbouring sidebar/gutter-hover blocks in `src/app.rs`), so one
+    // test per content source here covers both backends that share `App`.
+    // ─────────────────────────────────────────────────────────────────────────
+    mod editor_hover_dwell_1750 {
+        use super::*;
+
+        /// LSP-sourced hover content, end to end through the shared
+        /// `App::handle_dispatch`: a plain `MouseMoved` dwelling over a word,
+        /// with no key press or click anywhere in the test, must reach
+        /// `Engine::editor_hover_mouse_move` (arming the dwell timer), and
+        /// `TuiDriver::tick()` — the real idle-tick path,
+        /// `render::run_shared_tick_chores` -> `Engine::poll_idle` ->
+        /// `poll_editor_hover` -> `show_editor_hover_at_inner` — must then
+        /// paint the popup once the dwell delay elapses.
+        ///
+        /// Content source is an `Engine::lsp_diagnostics` entry (real LSP
+        /// content — `textDocument/publishDiagnostics` — consumed by
+        /// `show_editor_hover_at_inner`'s section 1, the same function a
+        /// genuine `textDocument/hover` response's section 4 sits beside),
+        /// not a live round-trip to a real `rust-analyzer` session: this
+        /// repo deliberately avoids depending on a live LSP server in tests
+        /// (see `tests/extensions.rs`'s own `ruby-lsp`-on-`PATH` discussion
+        /// for the flakiness this project has already hit doing that), and
+        /// `lsp_enabled = false` below keeps `show_editor_hover_at_inner`'s
+        /// `request_lsp` branch a no-op so this test cannot accidentally
+        /// spawn a real server process. An earlier revision of this test
+        /// pre-seeded `Engine::lsp_hover_text` directly instead — that field
+        /// also feeds a second, independent, cursor-anchored hover widget
+        /// `render.rs`'s `build_content_widgets` paints on *every* frame
+        /// regardless of mouse/dwell state (`let hover = engine.lsp_hover_
+        /// text.as_ref().map(...)`), so the marker painted immediately, even
+        /// before any mouse move — a false green that could not have failed
+        /// against unfixed `develop`. Diagnostics have no such independent
+        /// paint path for their message text, so this version is
+        /// RED-verified: reverting this PR's `src/app.rs` `MouseMoved` arm
+        /// leaves the dwell timer unarmed and the final assertion below
+        /// fails.
+        #[test]
+        fn lsp_diagnostic_hover_dwell_paints_popup_via_mouse_move_1750() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1750_hover_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create fixture dir");
+            let path = dir.join("fixture.rs");
+            std::fs::write(&path, "let needle = 1;\n").expect("write fixture file");
+
+            let mut engine = plain_engine();
+            // Keeps `lsp_request_hover_at` (fired alongside the diagnostic
+            // section, since that function doesn't know a diagnostic already
+            // answered the hover) a no-op — see the doc comment above for why.
+            engine.settings.lsp_enabled = false;
+            engine.new_tab(Some(&path));
+            let diag_key = engine
+                .active_buffer_diagnostics_key()
+                .expect("the just-opened fixture file must have a diagnostics key");
+            engine.lsp_diagnostics.insert(
+                diag_key,
+                vec![crate::core::lsp::Diagnostic {
+                    range: crate::core::lsp::LspRange {
+                        start: crate::core::lsp::LspPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: crate::core::lsp::LspPosition {
+                            line: 0,
+                            character: 15,
+                        },
+                    },
+                    severity: crate::core::lsp::DiagnosticSeverity::Error,
+                    message: "ZQXW_1750_LSP_DIAG_MARKER".to_string(),
+                    source: Some("rust-analyzer".to_string()),
+                    code: None,
+                }],
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            // See the sibling plugin-hover test's identical comment: a fresh
+            // `Engine`'s first idle tick reloads settings from disk, which
+            // would otherwise clobber `hover_delay` before it's set below.
+            driver.tick();
+            h.engine.borrow_mut().settings.hover_delay = 1;
+            driver.render();
+
+            let (x, y) = driver
+                .find("needle")
+                .expect("the word to hover over must be painted");
+
+            hover_move(driver, x, y);
+            assert!(
+                !driver.screen_has("ZQXW_1750_LSP_DIAG_MARKER"),
+                "precondition: the popup must not appear before the dwell \
+                 delay elapses and a tick polls it"
+            );
+
+            // No key press, no click — only time passing and the idle tick
+            // the real TUI runner drives between input batches.
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            driver.tick();
+
+            assert!(
+                driver.screen_has("ZQXW_1750_LSP_DIAG_MARKER"),
+                "dwelling over a word with an LSP-sourced diagnostic must, \
+                 with no intervening key press or click, paint the hover \
+                 popup once the dwell timer elapses (#1750); screen:\n{}",
+                driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Plugin-sourced hover (`vimcode.editor.set_hover`, surfaced to the
+        /// engine as `Engine::editor_hover_content`) — the #1750 triage's own
+        /// finding that every extension hover (git-insights' blame hover
+        /// included) shared this exact dwell-trigger mechanism, so it broke
+        /// identically. Plugin/annotation hover content only counts once the
+        /// mouse is past the end of the line's real text
+        /// (`Engine::editor_hover_mouse_move`'s `on_annotation` gate) — the
+        /// ghost-text region a real inline annotation
+        /// (`Engine::line_annotations`, e.g. inline blame) paints into — so
+        /// `line_annotations` is set purely to give the dwell point a painted
+        /// anchor to find on screen; the content asserted on below is the
+        /// plugin's own `editor_hover_content`, not the annotation text
+        /// (`show_editor_hover_at_inner` prefers that section over the
+        /// annotation one — see that function's own section ordering).
+        #[test]
+        fn plugin_set_hover_dwell_paints_popup_via_mouse_move_1750() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "let x = 1;\n");
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            // A freshly constructed `Engine` has no recorded settings-file
+            // mtime, so the very first idle tick's `settings_file_changed`
+            // check (`App::handle_poll_tick`) unconditionally reloads
+            // `engine.settings` from whatever real `settings.json` this
+            // machine has — clobbering any field this test sets beforehand.
+            // Flush that one-time reload before configuring the fixture, so
+            // `hover_delay` below survives it (confirmed: without this,
+            // `driver.tick()` further down logs a "Settings reloaded"
+            // status message and resets `hover_delay` back to its on-disk
+            // value, so the dwell timer's elapsed check never fires in the
+            // 15ms this test sleeps for).
+            driver.tick();
+
+            {
+                let mut engine = h.engine.borrow_mut();
+                engine.settings.hover_delay = 1;
+                engine
+                    .line_annotations
+                    .insert(0, "ZQXW_1750_BLAME_ANNOTATION".to_string());
+                engine
+                    .editor_hover_content
+                    .insert(0, "ZQXW_1750_PLUGIN_HOVER_MARKER".to_string());
+            }
+            driver.render();
+
+            let (ax, ay) = driver
+                .find("ZQXW_1750_BLAME_ANNOTATION")
+                .expect("the inline annotation must be painted after the line");
+
+            hover_move(driver, ax, ay);
+            assert!(
+                !driver.screen_has("ZQXW_1750_PLUGIN_HOVER_MARKER"),
+                "precondition: the popup must not appear before the dwell \
+                 delay elapses and a tick polls it"
+            );
+
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            driver.tick();
+
+            assert!(
+                driver.screen_has("ZQXW_1750_PLUGIN_HOVER_MARKER"),
+                "dwelling over a plugin-annotated region must, with no \
+                 intervening key press or click, paint the plugin's own \
+                 hover content once the dwell timer elapses (#1750); \
+                 screen:\n{}",
+                driver.screen()
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #272 / #491 — the hover popup's `command:definition` link must navigate
+    // and dismiss the popup.
+    //
+    // Unlike `editor_hover_dwell_1750` above, this covers already-shipped
+    // code (`render::route_editor_hover_popup_click` /
+    // `apply_editor_hover_popup_route`'s `Command` arm, both believed fixed
+    // by c05914e / #755 per #1750's own triage) — not a new `src/app.rs`
+    // change, so it is NOT an exception to this file's "no production code"
+    // header note. It could not be confirmed before #1750's fix because
+    // mouse hover could never open the popup in the first place (dwell never
+    // armed); now that it can, this closes that gap directly rather than
+    // leaving it as an inference from reading the shared route function.
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Builds the popup directly via `Engine::show_editor_hover` (not mouse
+    /// dwell — this test is about the *click* route, an independent code
+    /// path from the dwell-arm fix above) with a literal `[Definition]
+    /// (command:definition)` link, places the cursor away from the link's
+    /// anchor position, clicks the painted link text, and asserts both
+    /// halves of the route's documented contract: the cursor jumps to the
+    /// anchor position `execute_hover_goto` records before dispatching the
+    /// command, and the popup itself is dismissed (so it doesn't cover the
+    /// definition just jumped to — the exact #272/#491 symptom). `lsp_
+    /// enabled = false` keeps the `command:definition` dispatch's own `Engine
+    /// ::lsp_request_definition()` call a no-op, so this test cannot
+    /// accidentally spawn a real LSP server process — the navigate+dismiss
+    /// contract this test pins holds regardless of whether a real server
+    /// ever answers the definition request.
+    #[test]
+    fn hover_popup_definition_link_click_navigates_and_dismisses_the_popup_272_491() {
+        let mut engine = plain_engine();
+        engine.buffer_mut().insert(0, "fn foo() {}\ncall_site();\n");
+        engine.settings.lsp_enabled = false;
+        // Cursor starts on line 2 (1-indexed), away from the link's anchor
+        // (line 0, col 0) — so a jump is actually observable.
+        engine.view_mut().cursor.line = 1;
+        engine.show_editor_hover(
+            0,
+            0,
+            "Go to [Definition](command:definition)",
+            crate::core::engine::EditorHoverSource::Lsp,
+            true,  // take_focus — matches a real keyboard/dwell-opened popup
+            false, // add_goto_links — the markdown above already has one
+        );
+        let mut h = harness_no_sidebar(engine);
+        let driver = &mut h.driver;
+
+        assert!(
+            driver.screen_has("Ln 2, Col 1"),
+            "precondition: cursor starts on line 2, away from the link's \
+             anchor; screen:\n{}",
+            driver.screen()
+        );
+
+        let (x, y) = driver
+            .find("Definition")
+            .expect("the hover popup's link text must be painted");
+        driver.click(x, y);
+
+        assert!(
+            driver.screen_has("Ln 1, Col 1"),
+            "clicking the `command:definition` link must move the cursor to \
+             the hover popup's anchor position (#272); screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_has("Definition"),
+            "the popup must be dismissed after navigating, so it doesn't \
+             cover the definition just jumped to (#491); screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Key dispatch
     // ─────────────────────────────────────────────────────────────────────────
     mod key_dispatch {

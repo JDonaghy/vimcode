@@ -828,10 +828,8 @@ impl Engine {
     /// `sync_scrollbar`/`sync_scrollbar_positions` native-widget path) —
     /// both were already gated on Relm4-era widget handles permanently
     /// `None` under the ShellApp runner, so this had no live caller before
-    /// the deletion either. Kept `pub` (not deleted) because it is
-    /// documented, generically useful core API that the hover-polling
-    /// restoration work #731 flags as follow-up will need again.
-    #[allow(dead_code)]
+    /// the deletion either. #1750 restored the hover-polling caller (the
+    /// shared `MouseMoved` arm in `src/app.rs`), so this is no longer dead.
     pub fn is_blocking_modal_open(&self) -> bool {
         self.picker_open
             || self.tab_switcher_open
