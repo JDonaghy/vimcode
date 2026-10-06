@@ -86,6 +86,22 @@ pub struct ExtensionManifest {
     /// documents as editable buffers.
     #[serde(default)]
     pub document: Option<DocumentProviderConfig>,
+    /// Minimum (or otherwise constrained) running vimcode version this
+    /// extension's Lua scripts require, as a semver requirement string
+    /// (e.g. `">=0.15.0"`) — #1807. Native `vimcode.*` APIs an extension's
+    /// scripts call (completion sources, extension-services, …) can land
+    /// in vimcode after the extension itself is published to the registry;
+    /// without this field a user on an older vimcode would install the
+    /// extension and only discover the gap when a script call errors out
+    /// at load time.
+    ///
+    /// `None` — the default, and what every extension predating #1807
+    /// implicitly declares — means "no constraint": compatible with every
+    /// vimcode version, matching pre-#1807 behavior exactly. See
+    /// [`ExtensionManifest::is_compatible_with_vimcode`] and
+    /// [`ExtensionManifest::incompatibility_reason`].
+    #[serde(default)]
+    pub requires_vimcode: Option<String>,
 }
 
 /// Comment style override specified in an extension manifest `[comment]` section.
@@ -799,6 +815,44 @@ impl ExtensionManifest {
         self.language_ids.iter().any(|l| l == lang)
     }
 
+    /// Returns `true` when this extension's `requires_vimcode` constraint
+    /// (if any) is satisfied by `running_version` (#1807).
+    ///
+    /// A missing constraint is always compatible — the pre-#1807 default.
+    /// A `requires_vimcode` string that fails to parse as a semver
+    /// requirement, or a `running_version` that fails to parse as semver,
+    /// is *also* treated as compatible rather than bricking the extension
+    /// over a malformed manifest field or an unparseable running-version
+    /// string (should not happen for `env!("CARGO_PKG_VERSION")`, but a
+    /// manifest field is untrusted input).
+    pub fn is_compatible_with_vimcode(&self, running_version: &str) -> bool {
+        let Some(req_str) = self.requires_vimcode.as_deref() else {
+            return true;
+        };
+        let Ok(req) = semver::VersionReq::parse(req_str) else {
+            return true;
+        };
+        let Ok(version) = semver::Version::parse(running_version) else {
+            return true;
+        };
+        req.matches(&version)
+    }
+
+    /// Human-readable reason this extension is incompatible with
+    /// `running_version`, or `None` when it's compatible (including the
+    /// no-constraint case). Shared by the marketplace install-refusal
+    /// message and the "skip at load" message (#1807).
+    pub fn incompatibility_reason(&self, running_version: &str) -> Option<String> {
+        if self.is_compatible_with_vimcode(running_version) {
+            None
+        } else {
+            Some(format!(
+                "requires vimcode {} (running {running_version})",
+                self.requires_vimcode.as_deref().unwrap_or("")
+            ))
+        }
+    }
+
     /// The name to show the user: `display_name` when set, falling back to
     /// the internal `name` otherwise. Several install-failure messages
     /// (`lsp_manager.rs`'s `missing_dependency_message` and the two
@@ -1451,5 +1505,99 @@ package = "csharprepl"
             "winget install netcoredbg"
         );
         assert_eq!(cfg.install_cmd_for(Platform::MacOS), "");
+    }
+
+    // ─── #1807: requires_vimcode ─────────────────────────────────────────
+
+    /// Parsing: `requires_vimcode` round-trips from TOML as a plain string
+    /// field, same shape as every other optional manifest field.
+    #[test]
+    fn requires_vimcode_parses_from_toml() {
+        let toml = r#"
+name = "future-ext"
+display_name = "Future Extension"
+requires_vimcode = ">=0.15.0"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        assert_eq!(m.requires_vimcode, Some(">=0.15.0".to_string()));
+    }
+
+    /// Absent case: a manifest with no `requires_vimcode` field at all
+    /// (every extension predating #1807) parses to `None` and is
+    /// compatible with any running version — behaves exactly as today.
+    #[test]
+    fn requires_vimcode_absent_parses_to_none_and_is_always_compatible() {
+        let toml = r#"
+name = "legacy-ext"
+display_name = "Legacy Extension"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        assert_eq!(m.requires_vimcode, None);
+        assert!(m.is_compatible_with_vimcode("0.1.0"));
+        assert!(m.is_compatible_with_vimcode("999.0.0"));
+        assert!(m.incompatibility_reason("0.1.0").is_none());
+    }
+
+    /// Comparing against the running version: `>=` requirement satisfied
+    /// by a running version at or above the bound.
+    #[test]
+    fn requires_vimcode_satisfied_when_running_version_meets_bound() {
+        let m = ExtensionManifest {
+            name: "x".to_string(),
+            requires_vimcode: Some(">=0.15.0".to_string()),
+            ..Default::default()
+        };
+        assert!(m.is_compatible_with_vimcode("0.15.0"));
+        assert!(m.is_compatible_with_vimcode("0.16.0"));
+        assert!(m.is_compatible_with_vimcode("1.0.0"));
+        assert!(m.incompatibility_reason("0.15.0").is_none());
+    }
+
+    /// Comparing against the running version: `>=` requirement NOT
+    /// satisfied by a running version below the bound — the installed
+    /// vimcode is too old for this extension.
+    #[test]
+    fn requires_vimcode_unmet_when_running_version_below_bound() {
+        let m = ExtensionManifest {
+            name: "x".to_string(),
+            requires_vimcode: Some(">=99.0.0".to_string()),
+            ..Default::default()
+        };
+        assert!(!m.is_compatible_with_vimcode("0.14.0"));
+        let reason = m
+            .incompatibility_reason("0.14.0")
+            .expect("should be incompatible");
+        assert!(reason.contains("99.0.0"), "reason: {reason:?}");
+        assert!(reason.contains("0.14.0"), "reason: {reason:?}");
+    }
+
+    /// A malformed `requires_vimcode` string (not a valid semver
+    /// requirement) is treated as "no constraint" rather than bricking
+    /// the extension over a manifest typo.
+    #[test]
+    fn requires_vimcode_malformed_requirement_is_treated_as_compatible() {
+        let m = ExtensionManifest {
+            name: "x".to_string(),
+            requires_vimcode: Some("not-a-semver-range".to_string()),
+            ..Default::default()
+        };
+        assert!(m.is_compatible_with_vimcode("0.14.0"));
+        assert!(m.incompatibility_reason("0.14.0").is_none());
+    }
+
+    /// `^0.14.0` (caret, the default semver operator) excludes `0.15.0`
+    /// under semver's own pre-1.0 "only patch bumps are compatible" rule —
+    /// pinning this so a future change to the comparison semantics (e.g.
+    /// accidentally normalising to `>=`) is caught.
+    #[test]
+    fn requires_vimcode_caret_requirement_is_strict_pre_1_0() {
+        let m = ExtensionManifest {
+            name: "x".to_string(),
+            requires_vimcode: Some("0.14.0".to_string()),
+            ..Default::default()
+        };
+        assert!(m.is_compatible_with_vimcode("0.14.0"));
+        assert!(m.is_compatible_with_vimcode("0.14.5"));
+        assert!(!m.is_compatible_with_vimcode("0.15.0"));
     }
 }
