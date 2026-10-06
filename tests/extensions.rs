@@ -8816,3 +8816,287 @@ fn completion_register_and_unregister_work_at_runtime() {
         e.completion_candidates
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Plugin API (#1806): `vimcode.fs.walk` / `vimcode.fs.grep` — async,
+// in-process (`ignore`-crate-backed, no `rg`/`fd` child process) filesystem
+// walk/grep for a finder extension, streamed through the same `poll_idle`
+// callback-registry machinery as `vimcode.loop.spawn`/`vimcode.http.request`
+// (see `src/core/engine/fs_api.rs`). Prerequisite for the vimcode-ext
+// telescope-style finder (#1212 epic) that's meant to replace the built-in
+// `PickerSource::Files`/`PickerSource::Grep`.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Build a temp project dir with a handful of real files (so `vimcode.fs.
+/// walk`/`grep` have something to find) and an `engine_with_plugin` rooted
+/// at it (`e.cwd` repointed from the plugin-fixture dir `engine_with_plugin`
+/// itself uses).
+fn engine_with_plugin_and_fs_project(
+    plugin_name: &str,
+    lua_code: &str,
+) -> (vimcode_core::Engine, std::path::PathBuf) {
+    let project = std::env::temp_dir().join(format!(
+        "vimcode_fs_api_1806_{plugin_name}_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(project.join("nested")).unwrap();
+    std::fs::write(project.join("alpha.txt"), "alpha content").unwrap();
+    std::fs::write(project.join("beta.txt"), "beta content").unwrap();
+    std::fs::write(project.join("nested/gamma.txt"), "gamma content").unwrap();
+
+    let mut e = engine_with_plugin("", plugin_name, lua_code);
+    e.cwd = project.clone();
+    (e, project)
+}
+
+/// Poll `e.poll_idle()` until `cond(e)` is true or `timeout` elapses. Same
+/// shape as the #1624 `loop.spawn` tests' own `poll_until` above this
+/// section — `vimcode.fs.walk`/`vimcode.fs.grep` genuinely run on a
+/// background thread, so a bounded poll-until-condition is needed instead
+/// of a single `poll_idle()` call.
+fn fs_poll_until(
+    e: &mut vimcode_core::Engine,
+    timeout: std::time::Duration,
+    mut cond: impl FnMut(&mut vimcode_core::Engine) -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        e.poll_idle();
+        if cond(e) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return cond(e);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Build a replacement `PATH` directory that symlinks in every executable
+/// found in the standard system bin directories *except* `rg`/`fd`, and
+/// return its path.
+///
+/// Blanking `PATH` outright (`EnvVarGuard::set("PATH", "")`) was tried first
+/// and is exactly the hazard this file's own `posix_tool()` doc comment
+/// warns about: `cargo test` runs this file's 250+ tests as parallel
+/// threads of one process, and several unrelated tests (`vimcode.http.
+/// request`'s curl-backed ones in particular) resolve `curl`/`git`/`sh` via
+/// a bare command name through the *process-global* `PATH` — blanking it
+/// made five unrelated, already-passing `http_request_*` tests fail with
+/// "command not found" the moment they happened to run concurrently with
+/// this one (confirmed by hand: rerunning them together reproduced it,
+/// rerunning each alone did not). Symlinking everything *except* `rg`/`fd`
+/// keeps every other tool resolvable while still making the one claim this
+/// test needs to make precisely true: `rg` and `fd` are not on `PATH`.
+fn path_dir_without_rg_and_fd(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "vimcode_fs_api_1806_path_{tag}_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for bin_dir in ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"] {
+        let Ok(entries) = std::fs::read_dir(bin_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == "rg" || name == "fd" {
+                continue;
+            }
+            let link = dir.join(&name);
+            if link.exists() {
+                continue;
+            }
+            #[cfg(unix)]
+            let _ = std::os::unix::fs::symlink(entry.path(), &link);
+        }
+    }
+    dir
+}
+
+/// #1806 acceptance: a test plugin feeds `vimcode.fs.walk` results into
+/// `vimcode.picker.open` and the picker lists every project file — with
+/// `rg`/`fd` specifically absent from `PATH` for the whole test, so this
+/// cannot be secretly shelling out to either (the entire point of an
+/// in-process walker).
+///
+/// RED-verified against unfixed `develop`: there is no `vimcode.fs` table
+/// there, so `Open`'s first `vimcode.fs.walk(...)` call errors immediately
+/// and `e.picker_items` never gets past the empty list `vimcode.picker.
+/// open({title=...})` starts with.
+#[test]
+fn fs_walk_feeds_picker_open_with_no_rg_on_path_1806() {
+    let path_dir = path_dir_without_rg_and_fd("walk_picker");
+    let _path_guard = EnvVarGuard::set("PATH", path_dir.as_os_str());
+
+    let (mut e, _project) = engine_with_plugin_and_fs_project(
+        "fs_walk_picker_1806",
+        r#"
+        vimcode.command("Open", function(_)
+            local h = vimcode.picker.open({ title = "Files" })
+            vimcode.fs.walk("", {}, function(paths)
+                local items = {}
+                for i, p in ipairs(paths) do
+                    items[i] = { display = p }
+                end
+                h:append(items)
+            end, function()
+                _G.walk_done = true
+            end)
+        end)
+        "#,
+    );
+    exec(&mut e, "Open");
+
+    let finished = fs_poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        e.picker_items.len() >= 3
+    });
+    assert!(
+        finished,
+        "the picker must list the project's files within 10s, got {} items: {:?}",
+        e.picker_items.len(),
+        e.picker_items
+            .iter()
+            .map(|i| &i.display)
+            .collect::<Vec<_>>()
+    );
+
+    let displays: Vec<&str> = e.picker_items.iter().map(|i| i.display.as_str()).collect();
+    assert!(
+        displays.iter().any(|d| d.contains("alpha.txt")),
+        "picker must list alpha.txt, got: {:?}",
+        displays
+    );
+    assert!(
+        displays.iter().any(|d| d.contains("beta.txt")),
+        "picker must list beta.txt, got: {:?}",
+        displays
+    );
+    assert!(
+        displays.iter().any(|d| d.contains("gamma.txt")),
+        "picker must list the nested project file too, got: {:?}",
+        displays
+    );
+}
+
+/// `vimcode.fs.grep` streams `{path, line, col, text}` matches, 1-indexed
+/// `line`/`col` (matching `vimcode.buf.cursor()`'s convention), then fires
+/// `on_done` exactly once.
+///
+/// RED-verified against unfixed `develop`: no `vimcode.fs` table, so `Grep`
+/// errors immediately and `_G.hits`/`_G.done` never get set.
+#[test]
+fn fs_grep_streams_matches_then_fires_on_done_1806() {
+    let (mut e, project) = engine_with_plugin_and_fs_project(
+        "fs_grep_basic_1806",
+        r#"
+        _G.hits = {}
+        _G.done = false
+        vimcode.command("Grep", function(_)
+            vimcode.fs.grep("", "beta", {}, function(matches)
+                for _, m in ipairs(matches) do
+                    table.insert(_G.hits, m.path .. ":" .. m.line .. ":" .. m.col .. ":" .. m.text)
+                end
+            end, function()
+                _G.done = true
+            end)
+        end)
+        vimcode.command("ReadHits", function(_)
+            vimcode.message(tostring(#_G.hits) .. "|" .. tostring(_G.done) .. "|" .. tostring(_G.hits[1]))
+        end)
+        "#,
+    );
+    exec(&mut e, "Grep");
+
+    let finished = fs_poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        exec(e, "ReadHits");
+        e.message.starts_with("1|true|")
+    });
+    assert!(
+        finished,
+        "expected exactly one match and on_done to fire within 10s, last read: {:?}",
+        e.message
+    );
+
+    let expected_prefix = format!("1|true|{}:1:1:", project.join("beta.txt").display());
+    assert!(
+        e.message.starts_with(&expected_prefix),
+        "expected the single beta.txt match at 1-indexed line 1, col 1, got: {:?} (wanted \
+         prefix {:?})",
+        e.message,
+        expected_prefix
+    );
+    assert!(
+        e.message.ends_with("beta content"),
+        "the match's `text` field must carry the matching line's full text, got: {:?}",
+        e.message
+    );
+}
+
+/// #1806 acceptance: `:cancel()` on a still-in-flight `vimcode.fs.walk`
+/// handle stops delivery promptly — no `on_batch`/`on_done` call reaches
+/// Lua afterward, even though there are far more files left to walk than
+/// one batch's worth.
+///
+/// RED-verified by hand: with `Engine::plugin_api_fs_cancel` changed to a
+/// no-op (`true` without storing into `cancelled`/removing the handle),
+/// this test fails — `_G.batches` ends up `> 0` and/or `_G.done` ends up
+/// `true`, because the background thread keeps delivering after `cancel()`
+/// returns.
+#[test]
+fn fs_walk_cancel_stops_delivery_promptly_1806() {
+    let project = std::env::temp_dir().join(format!(
+        "vimcode_fs_api_1806_cancel_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    // Comfortably more than one `FS_WALK_BATCH_SIZE` (200) worth of files,
+    // so an uncancelled walk would need several `on_batch` calls.
+    for i in 0..500 {
+        std::fs::write(project.join(format!("f{i:04}.txt")), "x").unwrap();
+    }
+
+    let mut e = engine_with_plugin(
+        "",
+        "fs_walk_cancel_1806",
+        r#"
+        _G.batches = 0
+        _G.done = false
+        vimcode.command("Walk", function(_)
+            _G.handle = vimcode.fs.walk("", {}, function(_paths)
+                _G.batches = _G.batches + 1
+            end, function()
+                _G.done = true
+            end)
+        end)
+        vimcode.command("Cancel", function(_)
+            _G.handle:cancel()
+        end)
+        vimcode.command("Read", function(_)
+            vimcode.message(tostring(_G.batches) .. "|" .. tostring(_G.done))
+        end)
+        "#,
+    );
+    e.cwd = project;
+
+    exec(&mut e, "Walk");
+    exec(&mut e, "Cancel");
+    // Give the (already-cancelled) background thread every opportunity to
+    // misbehave: poll for a while, same deadline the positive-path tests
+    // above use.
+    fs_poll_until(&mut e, std::time::Duration::from_secs(2), |_| false);
+    exec(&mut e, "Read");
+
+    assert_eq!(
+        e.message, "0|false",
+        "cancel() must stop delivery promptly: no on_batch call and no on_done call must ever \
+         reach Lua after cancel(), got {:?}",
+        e.message
+    );
+}

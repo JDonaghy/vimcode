@@ -4632,6 +4632,16 @@ pub struct Engine {
     /// (`execute::spawn_http_request`) instead of a streamed one, and
     /// delivers exactly one `HttpResult` instead of a stream of events.
     plugin_http_requests: HashMap<u64, execute::PluginHttpHandle>,
+    /// Live `vimcode.fs.walk`/`vimcode.fs.grep` handles (#1806), keyed by the
+    /// id `PluginManager::register_fs_callbacks` handed out. Polled from
+    /// `poll_idle` via [`Self::poll_plugin_fs`]. Same "background worker,
+    /// deliver through `poll_idle`'s `mpsc` drain" shape as `plugin_spawns`/
+    /// `plugin_http_requests` — the worker here is a plain `ignore`-crate
+    /// walk/grep (`project_search::walk_project_streaming`/
+    /// `grep_project_streaming`), not a child process, so there is no
+    /// `Child` to kill on cancel — just an `AtomicBool` the walk checks
+    /// between entries.
+    plugin_fs_ops: HashMap<u64, fs_api::PluginFsHandle>,
 
     // --- AI assistant panel ---
     /// Whether the AI sidebar has keyboard focus.
@@ -5609,6 +5619,7 @@ impl Engine {
             plugin_spawns: HashMap::new(),
             plugin_pickers: HashMap::new(),
             plugin_http_requests: HashMap::new(),
+            plugin_fs_ops: HashMap::new(),
             ai_ghost_text: None,
             ai_ghost_alternatives: Vec::new(),
             ai_ghost_alt_idx: 0,
@@ -5970,6 +5981,7 @@ impl Engine {
         redraw |= self.poll_plugin_timers();
         redraw |= self.poll_plugin_spawns();
         redraw |= self.poll_plugin_http();
+        redraw |= self.poll_plugin_fs();
         redraw |= self.poll_panel_hover();
         redraw |= self.poll_editor_hover();
         redraw |= self.poll_blame();
@@ -6913,6 +6925,7 @@ pub use explorer_ops::ExplorerKeyResult;
 // signature the way every other `execute` type stays engine-private today.
 pub(crate) mod execute;
 mod ext_panel;
+mod fs_api;
 pub use ext_panel::ExtSidebarKeyResult;
 mod keys;
 mod lsp_ops;
