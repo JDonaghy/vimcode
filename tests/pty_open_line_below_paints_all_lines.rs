@@ -194,6 +194,20 @@ fn wait_for_screen_contains(
     }
 }
 
+/// Poll `path` until it reads back as `expected`, or until `timeout`
+/// elapses. Returns whatever the final read saw, so the caller can assert
+/// on it and get a useful diff when it never converged.
+fn wait_for_file_contents(path: &PathBuf, expected: &str, timeout: Duration) -> String {
+    let start = Instant::now();
+    loop {
+        let contents = std::fs::read_to_string(path).unwrap_or_default();
+        if contents == expected || start.elapsed() >= timeout {
+            return contents;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Row index (0-based) of the first row whose text contains `needle`, or
 /// `None` if it isn't painted anywhere.
 fn row_of(parser: &vt100::Parser, needle: &str) -> Option<usize> {
@@ -256,12 +270,54 @@ fn opening_a_line_below_the_only_line_paints_both_lines_1779() {
         screen_text(&parser)
     );
     // 'o', type "ZQXW_BETA", Escape — exactly the issue's own repro steps.
+    //
+    // Each step waits for the *screen* to confirm the previous keystroke
+    // landed rather than sleeping a fixed interval: on a loaded runner a
+    // fixed sleep can elapse while `o` is still in flight, and every
+    // subsequent keystroke then lands in the wrong mode. See the
+    // `wait_for_screen_contains("NORMAL")` below for the specific failure
+    // this cost us.
     send_bytes(&writer, b"o");
-    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        wait_for_screen_contains(&mut parser, &captured, &mut fed, "INSERT", SETTLE_TIMEOUT)
+            .is_some(),
+        "'o' never put the editor into INSERT mode within {SETTLE_TIMEOUT:?}; screen:\n{}",
+        screen_text(&parser)
+    );
     send_bytes(&writer, b"ZQXW_BETA");
-    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        wait_for_screen_contains(
+            &mut parser,
+            &captured,
+            &mut fed,
+            "ZQXW_BETA",
+            SETTLE_TIMEOUT
+        )
+        .is_some(),
+        "typing \"ZQXW_BETA\" in INSERT mode never painted it within \
+         {SETTLE_TIMEOUT:?}; screen:\n{}",
+        screen_text(&parser)
+    );
     send_bytes(&writer, b"\x1b"); // Escape
 
+    // Wait for the status bar to flip back out of INSERT before doing
+    // anything else. This is a correctness requirement, not just tidiness:
+    // a bare `\x1b` arriving in the *same* `read()` as the bytes that
+    // follow it is parsed by crossterm as `Alt+<next char>`, not as Escape
+    // — so writing `:w\r` microseconds after the Escape byte can be read as
+    // `Alt+:` plus a stray `w`, the editor never leaves INSERT mode, and
+    // the `:w` below silently never runs. That is exactly how this test
+    // failed intermittently: the on-disk assertion reported the untouched
+    // seed content `"ZQXW_ALPHA\n"`, because no write command was ever
+    // executed. Confirming the mode transition on screen guarantees the
+    // Escape byte was consumed on its own.
+    assert!(
+        wait_for_screen_contains(&mut parser, &captured, &mut fed, "NORMAL", SETTLE_TIMEOUT)
+            .is_some(),
+        "Escape never returned the editor to NORMAL mode within \
+         {SETTLE_TIMEOUT:?}; screen:\n{}",
+        screen_text(&parser)
+    );
     assert!(
         wait_for_screen_contains(
             &mut parser,
@@ -309,13 +365,19 @@ fn opening_a_line_below_the_only_line_paints_both_lines_1779() {
 
     // Confirm the file itself was always correct (per the issue report) —
     // isolates this test to the *paint*, not a buffer-content regression.
+    //
+    // Bounded poll rather than a fixed sleep, for the same reason as the
+    // screen waits above: `:w` has to round-trip through the pty, the
+    // editor's event loop and a real filesystem write, and a fixed 300ms
+    // sample can land before that completes on a loaded runner.
     send_bytes(&writer, b":w\r");
-    std::thread::sleep(Duration::from_millis(300));
-    let on_disk = std::fs::read_to_string(&file_path).unwrap_or_default();
+    let on_disk = wait_for_file_contents(&file_path, "ZQXW_ALPHA\nZQXW_BETA\n", SETTLE_TIMEOUT);
     assert_eq!(
-        on_disk, "ZQXW_ALPHA\nZQXW_BETA\n",
+        on_disk,
+        "ZQXW_ALPHA\nZQXW_BETA\n",
         "precondition: the saved file content must be correct even if the \
-         paint (asserted above) is not"
+         paint (asserted above) is not; screen at the time of the check:\n{}",
+        screen_text(&parser)
     );
 
     // Best-effort teardown — the child may already have exited by now, so
