@@ -4384,24 +4384,60 @@ mod tests {
     /// the CLI-argument path (`Engine::open_file_with_mode` with
     /// `OpenMode::Permanent`) — rather than `open_file_in_tab` directly, so
     /// this reproduces the exact pristine-scratch-buffer-reuse precondition
-    /// the real report started from. The `800×480` harness size matches the
-    /// evidence screenshot's own dimensions (`/tmp/j_dblclick_main.png`,
-    /// read via `file(1)`) — ruled out a window-width/tab-bar-scroll
-    /// explanation specifically, not just a generic size.
+    /// the real report started from.
+    ///
+    /// Review round 1 found the original `800×480` harness size (picked to
+    /// match the evidence screenshot's own dimensions, `/tmp/j_dblclick_
+    /// main.png`) does **not** in fact rule out a width/scroll explanation.
+    /// Traced empirically: `App::shell_config()` never sets `ShellConfig::
+    /// default_sidebar_width` from the persisted, pixel-valued `Session::
+    /// sidebar_width` (default `260`, `src/core/session.rs`) — it is left
+    /// at `ShellConfig::new`'s generic `20.0`, which `AppShell::
+    /// compute_layout` treats as a *line-height multiple* on every backend
+    /// (`self.sidebar_width.clamp(...) * line_height`), resolving to a
+    /// ~512px-wide sidebar on this harness's font metrics and leaving only
+    /// ~288px for the tab bar at `800` total width. Confirmed empirically:
+    /// at `800×480` `main.rs`'s tab genuinely has nowhere to paint (`bar.
+    /// tabs` has both labels, but only `"sample.txt "` reaches `painted_
+    /// texts()` and `tab_center(&bar, 1)` is `None`), and the *same*
+    /// fixture at `1600×480` paints both. `1600` is used below so this test
+    /// isolates the double-click dispatch path from that unrelated
+    /// sidebar-width/tab-bar-width interaction rather than conflating the
+    /// two. Whether `Session::sidebar_width` going unread is itself a
+    /// vimcode-side bug worth its own issue is left to that issue, not
+    /// settled or fixed here — out of scope for this one's dispatch-path
+    /// question, and no production code changes in this PR either way.
+    ///
+    /// Reads painted labels back via `find_bounds` on `"sample.txt "` /
+    /// `"main.rs "` — **with** the trailing space `TabInfo::name`'s doc
+    /// documents (`name + " "`, so the close glyph doesn't paint flush
+    /// against the label) — rather than a bare `screen_contains`/`find`.
+    /// Review round 1 found a bare `"sample.txt"`/`"main.rs"` needle is
+    /// satisfied regardless by the Explorer sidebar row, the breadcrumb
+    /// segment, and the window-title path segments this same frame also
+    /// paints — none of which carry that trailing space (confirmed via
+    /// `painted_texts()`: `"main.rs"` with no trailing space appears
+    /// repeatedly, `"main.rs "` with one does not, until the tab actually
+    /// paints). `tab_center(&bar, 1)` being `Some` additionally proves the
+    /// backend's own `draw_tab_bar_icons_layout` call actually cached a
+    /// second tab slot, not just that `bar.tabs` (the pre-paint primitive)
+    /// has two entries.
     ///
     /// RED-verified the same way as the TUI twin
     /// (`tui_main::app_on_tui_tests`'s `explorer_double_click_opens_second_
     /// file_in_a_second_tab_1798`): temporarily swapping
     /// `open_file_in_tab`'s new-tab branch for an in-place
-    /// `window.buffer_id = buffer_id` assignment makes this fail with the
-    /// same message. Against unmodified `develop` both this test and its
-    /// TUI twin pass — see this PR's description: the shared dispatch path
-    /// both exercise is identical to the one the real Win-GUI backend uses
-    /// (confirmed by reading `quadraui`'s `src/win/events.rs`/`backend.rs`:
-    /// no `CS_DBLCLKS`/`WM_LBUTTONDBLCLK` handling, so Windows delivers two
+    /// `window.buffer_id = buffer_id` assignment makes every assertion
+    /// below fail (tab count drops to 1, `"main.rs "` never appears, and
+    /// `tab_center(&bar, 1)` stays `None`); restored before committing.
+    /// Against unmodified `develop` both this test and its TUI twin pass —
+    /// see this PR's description: the shared dispatch path both exercise is
+    /// identical to the one the real Win-GUI backend uses (confirmed by
+    /// reading `quadraui`'s `src/win/events.rs`/`backend.rs`: no
+    /// `CS_DBLCLKS`/`WM_LBUTTONDBLCLK` handling, so Windows delivers two
     /// plain `WM_LBUTTONDOWN`s folded by the same `DoubleClickDetector`
     /// every backend shares), so this investigation could not localise a
-    /// vimcode- or quadraui-side defect to point a fix at.
+    /// vimcode-side defect to point a fix at.
     #[test]
     fn explorer_double_click_opens_second_file_in_a_second_tab_1798() {
         let dir = std::env::temp_dir().join(format!(
@@ -4422,12 +4458,14 @@ mod tests {
         engine.startup_without_session_restore(Some(&sample));
         engine.explorer_expanded.insert(dir.clone());
         engine.explorer_rebuild_rows();
+        // `app_shell.show_panel(...)` is not called here — confirmed a
+        // no-op in this harness (the runner-side `AppShell` the driver
+        // actually paints from is never synced from this *shadow* copy at
+        // startup; `collapse_sidebar`'s TUI-side doc traces the same gap).
+        // `session.explorer_visible` alone drives the painted sidebar.
         engine.session.explorer_visible = true;
-        engine.app_shell.show_panel(&quadraui::WidgetId::new(
-            crate::core::engine::sidebar::PANEL_EXPLORER,
-        ));
 
-        let mut h = harness(engine, 800, 480);
+        let mut h = harness(engine, 1600, 480);
         h.driver.render();
 
         assert!(
@@ -4447,16 +4485,28 @@ mod tests {
         });
         h.driver.render();
 
-        assert!(
-            h.engine.borrow().active_group().tabs.len() >= 2,
+        assert_eq!(
+            h.engine.borrow().active_group().tabs.len(),
+            2,
             "double-clicking a second file in the Explorer must open a \
              second tab, not replace the first one in place"
         );
+
+        let bar = editor_tab_bar_id();
         assert!(
-            h.driver.screen_contains("sample.txt") && h.driver.screen_contains("main.rs"),
+            h.driver.tab_center(&bar, 0).is_some() && h.driver.tab_center(&bar, 1).is_some(),
+            "the tab bar must have actually painted (and cached a hit \
+             region for) two tabs, not just hold two entries in the \
+             pre-paint `TabBar` primitive"
+        );
+        assert!(
+            h.driver.find_bounds("sample.txt ").is_some()
+                && h.driver.find_bounds("main.rs ").is_some(),
             "both the originally-open sample.txt tab and the newly \
-             double-clicked main.rs tab must have painted labels on the \
-             tab bar; painted texts: {:?}",
+             double-clicked main.rs tab must have their own label (with \
+             its tab-bar-only trailing space) painted — not just the \
+             sidebar row or breadcrumb segment painting the same filename \
+             elsewhere on screen; painted texts: {:?}",
             h.driver.painted_texts()
         );
 
