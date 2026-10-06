@@ -19274,9 +19274,34 @@ mod editor_mouse_rungs {
 /// test: hovering at the GTK-painted pixel position of an annotation string
 /// resolved to a column still inside the real text, not past it, so the
 /// `on_annotation` gate in `Engine::editor_hover_mouse_move` never armed.
-/// That's a GTK pixel-resolution precision question for a future issue, not
-/// a #1750 regression — hovering a real word sidesteps it entirely while
-/// still exercising the identical dwell-arm code this issue is about.
+///
+/// Root cause pinned down (not just observed) by reading the quadraui
+/// source at this repo's pinned rev
+/// (`quadraui::gtk::editor::editor_col_at_x`, `src/gtk/editor.rs`): it
+/// calls `pango_layout.xy_to_index(x_pango, 0)`, which returns an `inside:
+/// bool` flag that is `false` exactly when `x` falls outside the laid-out
+/// text's extent — i.e. the unambiguous "you're past the real text, in
+/// annotation territory" signal — but `editor_col_at_x` discards that flag
+/// (`let (_inside, byte_index, _trailing) = ...`) and returns only a
+/// `usize` column clamped into the real text. Fixing this needs either
+/// that flag surfaced through `Backend::editor_col_at_x`'s return type (a
+/// quadraui API change) or `EditorLine` modelling the annotation run so
+/// the laid-out text extends past it — both are quadraui-side changes
+/// under this repo's Platform-Neutrality Rule (`GOALS.md`), not something
+/// a vimcode-side `src/gtk/` workaround should paper over by re-deriving
+/// pixel geometry the backend already owns.
+///
+/// **No quadraui issue has been filed for this yet** — this worker's own
+/// assignment forbids running `gh` (the coordinator owns GitHub
+/// interactions), so this can only be reported, not filed, from here. Per
+/// CLAUDE.md's testing rule, a `KNOWN_BUGS`-style gap like this one is not
+/// supposed to ship without the fix issue's number cited beside it; until
+/// the coordinator files `JDonaghy/quadraui` issue describing the above
+/// and that number lands in this comment, GTK plugin/extension hover
+/// (`vimcode.editor.set_hover`, git-insights' blame hover) past the end of
+/// a line should be treated as **known-broken on GTK only**, independent
+/// of and not reintroduced by this PR's #1750 fix (TUI and the LSP/
+/// diagnostic path on both backends are unaffected — see the test below).
 #[cfg(test)]
 mod issue_1750_editor_hover_dwell {
     use super::*;
@@ -19345,12 +19370,16 @@ mod issue_1750_editor_hover_dwell {
         let mut h = harness(engine, 1200, 800);
         h.driver.render();
 
-        // A freshly constructed `Engine` has no recorded settings-file
-        // mtime, so the first `poll_idle()` unconditionally reloads
-        // `engine.settings` from whatever real `settings.json` this
-        // machine has — clobbering `hover_delay` if set beforehand. Flush
-        // that one-time reload first (see the TUI twin's identical comment
-        // for how this was found).
+        // Unlike the TUI twin, `GtkDriver` never drives the App-side
+        // settings-file reload (`check_settings_reload` lives in
+        // `src/app.rs`, not `Engine::poll_idle` — confirmed by reading
+        // `poll_idle`'s own body, which has no settings-file access at
+        // all — and this module's own doc states "No main loop", so
+        // nothing here ever calls into `App` to trigger it). So this
+        // first `poll_idle()` is not load-bearing for `hover_delay` the
+        // way the TUI twin's first `driver.tick()` is; it's kept only to
+        // mirror that twin's shape and flush any other one-shot idle
+        // work before the fixture is configured.
         h.engine.borrow_mut().poll_idle();
         h.engine.borrow_mut().settings.hover_delay = 1;
         h.driver.render();

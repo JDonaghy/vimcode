@@ -280,7 +280,12 @@ mod tests {
         /// repo deliberately avoids depending on a live LSP server in tests
         /// (see `tests/extensions.rs`'s own `ruby-lsp`-on-`PATH` discussion
         /// for the flakiness this project has already hit doing that), and
-        /// `lsp_enabled = false` below keeps `show_editor_hover_at_inner`'s
+        /// `lsp_enabled = false` below (set *after* the first `driver.tick()`
+        /// — `Engine::check_settings_reload` replaces the whole `settings`
+        /// struct wholesale on that first tick, same as `hover_delay`, so
+        /// setting it any earlier is silently clobbered back to whatever
+        /// `default_lsp_enabled()`/the dev's on-disk `settings.json` says,
+        /// which is `true`) keeps `show_editor_hover_at_inner`'s
         /// `request_lsp` branch a no-op so this test cannot accidentally
         /// spawn a real server process. An earlier revision of this test
         /// pre-seeded `Engine::lsp_hover_text` directly instead — that field
@@ -306,10 +311,6 @@ mod tests {
             std::fs::write(&path, "let needle = 1;\n").expect("write fixture file");
 
             let mut engine = plain_engine();
-            // Keeps `lsp_request_hover_at` (fired alongside the diagnostic
-            // section, since that function doesn't know a diagnostic already
-            // answered the hover) a no-op — see the doc comment above for why.
-            engine.settings.lsp_enabled = false;
             engine.new_tab(Some(&path));
             let diag_key = engine
                 .active_buffer_diagnostics_key()
@@ -337,10 +338,22 @@ mod tests {
             let driver = &mut h.driver;
 
             // See the sibling plugin-hover test's identical comment: a fresh
-            // `Engine`'s first idle tick reloads settings from disk, which
-            // would otherwise clobber `hover_delay` before it's set below.
+            // `Engine`'s first idle tick reloads settings from disk — that
+            // reload replaces the whole `settings` struct, so BOTH
+            // `hover_delay` and `lsp_enabled` have to be set after this
+            // first tick, not before, or they're silently clobbered back to
+            // their on-disk/default values (`lsp_enabled`'s default is
+            // `true` — see the doc comment above for why that would let
+            // this test spawn a real `rust-analyzer` process).
             driver.tick();
-            h.engine.borrow_mut().settings.hover_delay = 1;
+            {
+                let mut engine = h.engine.borrow_mut();
+                engine.settings.hover_delay = 1;
+                // Keeps `lsp_request_hover_at` (fired alongside the
+                // diagnostic section, since that function doesn't know a
+                // diagnostic already answered the hover) a no-op.
+                engine.settings.lsp_enabled = false;
+            }
             driver.render();
 
             let (x, y) = driver
@@ -438,6 +451,114 @@ mod tests {
                  screen:\n{}",
                 driver.screen()
             );
+        }
+
+        /// Review finding on the first #1750 fix: `ClickTarget::BufferPos`'s
+        /// `(line, col)` come from the *hovered* window's own scroll offset
+        /// (`render::window_zone_hit_test`), but `Engine::editor_hover_
+        /// mouse_move` reads `self.buffer()` — the *active* window's buffer
+        /// — unconditionally. Resolving a `BufferPos` that discards its
+        /// window id (binding it to `_`) therefore arms the dwell timer with
+        /// a `(line, col)` pair that means one thing in the window physically
+        /// under the pointer and something else entirely in whichever
+        /// window happens to be focused. With two splits open on two
+        /// different files, dwelling over the *inactive* pane must not
+        /// touch the dwell state at all — it must be treated exactly like
+        /// hovering outside the editor (dismiss any visible popup, arm
+        /// nothing new).
+        ///
+        /// RED-verified: this test is built so the bug is observable
+        /// without waiting out any delay or touching diagnostics/LSP at
+        /// all. `fixture_a.rs`'s line 0 has a word (`needle`) at column 4;
+        /// `fixture_b.rs`'s line 0 has a *different* word (`zzzzz`) at that
+        /// same column 4 — chosen so the buggy, window-id-discarding match
+        /// arm (`ClickTarget::BufferPos(_, line, col) => ...`) would still
+        /// find a word character at `(0, 4)` when it (wrongly) looks it up
+        /// in the *active* window's buffer (`fixture_b.rs`, window B, which
+        /// the split below focuses) and would arm `editor_hover_dwell`
+        /// regardless of which window the pointer is actually over. Fixed,
+        /// the match arm's `wid == engine.active_window_id()` guard rejects
+        /// `fixture_a.rs`'s window (A, left unfocused by the split) outright
+        /// and the dwell timer is never armed. Confirmed RED by hand:
+        /// replacing the match arm's `ClickTarget::BufferPos(wid, line,
+        /// col) if wid == engine.active_window_id() => { ... }` with the
+        /// pre-fix `ClickTarget::BufferPos(_wid, line, col) => { ... }`
+        /// makes the first assertion below panic.
+        #[test]
+        fn hovering_an_inactive_split_does_not_arm_dwell_against_the_wrong_buffer_1750() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1750_split_hover_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create fixture dir");
+            let path_a = dir.join("fixture_a.rs");
+            let path_b = dir.join("fixture_b.rs");
+            std::fs::write(&path_a, "let needle = 1;\n").expect("write fixture_a");
+            std::fs::write(&path_b, "let zzzzz = 9;\n").expect("write fixture_b");
+
+            let mut engine = plain_engine();
+            engine.new_tab(Some(&path_a));
+            let window_a = engine.active_window_id();
+            engine.split_window(SplitDirection::Horizontal, Some(&path_b));
+            let window_b = engine.active_window_id();
+            assert_ne!(
+                window_a, window_b,
+                "precondition: splitting with a different file must focus a \
+                 genuinely different window"
+            );
+
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+            // See the sibling #1750 tests' identical comment: the first
+            // idle tick replaces the whole `settings` struct, so both
+            // fields below must be set after it, not before.
+            driver.tick();
+            {
+                let mut engine = h.engine.borrow_mut();
+                engine.settings.hover_delay = 1;
+                engine.settings.lsp_enabled = false;
+            }
+            driver.render();
+
+            assert_eq!(
+                h.engine.borrow().active_window_id(),
+                window_b,
+                "precondition: window B (fixture_b.rs) must still be the \
+                 active/focused window after the split"
+            );
+            assert!(
+                h.engine.borrow().editor_hover_dwell.is_none(),
+                "precondition: nothing has dwelt yet"
+            );
+
+            let (x, y) = driver
+                .find("needle")
+                .expect("fixture_a.rs's word, painted in the unfocused pane");
+
+            hover_move(driver, x, y);
+
+            assert!(
+                h.engine.borrow().editor_hover_dwell.is_none(),
+                "dwelling over the INACTIVE split (fixture_a.rs, window A) \
+                 must not arm the dwell timer at all — not even against \
+                 the active window's (fixture_b.rs) own buffer content at \
+                 that same (line, col) — because the hovered pixel belongs \
+                 to a window that isn't focused (#1750 review)"
+            );
+
+            // Confirm it stays that way even after the dwell delay elapses
+            // and a tick polls it: no popup from either file's content.
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            driver.tick();
+            assert!(
+                h.engine.borrow().editor_hover.is_none(),
+                "no hover popup must appear from dwelling over an inactive \
+                 split; screen:\n{}",
+                driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
