@@ -263,6 +263,39 @@ mod tests {
     mod editor_hover_dwell_1750 {
         use super::*;
 
+        /// Enforces (rather than merely documenting) the "this test must
+        /// never launch a real language server" invariant the two `.rs`-
+        /// fixture tests below depend on. `Engine::lsp_manager` starts as
+        /// `None` and is only ever populated by `ensure_lsp_manager()`, which
+        /// every spawn path — `lsp_did_open` (reached from `new_tab` /
+        /// `split_window`) and `lsp_request_hover_at` (reached from
+        /// `poll_editor_hover`) alike — has to go through before it can
+        /// `resolve_and_start_server` the registry's `rust-analyzer` off
+        /// `PATH`/`~/.cargo/bin`. So `lsp_manager.is_none()` at the end of
+        /// the test is a sound, cheap proxy for "no server process was
+        /// started, nothing leaked, and nothing indexed this workspace".
+        ///
+        /// This exists because a review round of #1750 found exactly that
+        /// regression: moving `settings.lsp_enabled = false` to *after*
+        /// `new_tab` left `new_tab`'s own `lsp_did_open` running with the
+        /// flag still at its `default_lsp_enabled() == true`. The prose
+        /// comment claiming a server could not spawn stayed green while the
+        /// opposite was true; this assertion would have failed.
+        fn assert_no_lsp_server_was_spawned(engine: &crate::core::Engine) {
+            assert!(
+                engine.lsp_manager.is_none(),
+                "this test must never start a real language server: \
+                 `Engine::lsp_manager` is `Some`, which means some path \
+                 reached `ensure_lsp_manager()` with `settings.lsp_enabled` \
+                 still true and may have spawned (and leaked) a real \
+                 `rust-analyzer` indexing this whole workspace. Check that \
+                 `lsp_enabled = false` is set BOTH before `new_tab`/\
+                 `split_window` and again after the first `driver.tick()` \
+                 (which `check_settings_reload` clobbers) — see this \
+                 module's doc comments (#1750 review)"
+            );
+        }
+
         /// LSP-sourced hover content, end to end through the shared
         /// `App::handle_dispatch`: a plain `MouseMoved` dwelling over a word,
         /// with no key press or click anywhere in the test, must reach
@@ -280,14 +313,43 @@ mod tests {
         /// repo deliberately avoids depending on a live LSP server in tests
         /// (see `tests/extensions.rs`'s own `ruby-lsp`-on-`PATH` discussion
         /// for the flakiness this project has already hit doing that), and
-        /// `lsp_enabled = false` below (set *after* the first `driver.tick()`
-        /// — `Engine::check_settings_reload` replaces the whole `settings`
-        /// struct wholesale on that first tick, same as `hover_delay`, so
-        /// setting it any earlier is silently clobbered back to whatever
-        /// `default_lsp_enabled()`/the dev's on-disk `settings.json` says,
-        /// which is `true`) keeps `show_editor_hover_at_inner`'s
+        /// `lsp_enabled = false` below keeps `show_editor_hover_at_inner`'s
         /// `request_lsp` branch a no-op so this test cannot accidentally
-        /// spawn a real server process. An earlier revision of this test
+        /// spawn a real server process.
+        ///
+        /// That flag has to be cleared **twice**, before `new_tab` *and*
+        /// again after the first `driver.tick()`, because the two writes are
+        /// load-bearing for different server-spawn sites and neither
+        /// subsumes the other:
+        ///
+        /// 1. **Before `Engine::new_tab`** — `new_tab` is itself a spawn
+        ///    site: it calls `self.lsp_did_open(buffer_id)`
+        ///    (`src/core/engine/windows.rs`), which returns early only at
+        ///    `if !self.settings.lsp_enabled` (`src/core/engine/lsp_ops.rs`)
+        ///    and otherwise falls through to `ensure_lsp_manager()` (rooted
+        ///    at `std::env::current_dir()`, i.e. the whole vimcode
+        ///    workspace) and `notify_did_open` ->
+        ///    `ensure_server_for_language("rust")` -> the built-in registry's
+        ///    `rust-analyzer`, resolved off `PATH`/`~/.cargo/bin`. A
+        ///    `plain_engine()` starts from `Settings::default()`, whose
+        ///    `default_lsp_enabled()` is `true`, so without this write the
+        ///    `.rs` fixture below launches a real `rust-analyzer` indexing
+        ///    this repo on any machine that has one installed. (Every
+        ///    *other* `new_tab(Some(..))` in this file sidesteps the issue
+        ///    by using a `.txt` fixture, so `language_id_from_path` returns
+        ///    `None` and `lsp_did_open` bails before the manager. These
+        ///    #1750 tests need a real `.rs` path for the diagnostics key.)
+        /// 2. **After the first `driver.tick()`** — that tick runs
+        ///    `Engine::check_settings_reload`, which replaces the whole
+        ///    `settings` struct wholesale (`self.settings = new_settings`),
+        ///    so write 1 is clobbered back to whatever
+        ///    `default_lsp_enabled()`/the dev's on-disk `settings.json` says
+        ///    (`true`). Re-setting it there is what keeps the *later*
+        ///    `poll_editor_hover` -> `show_editor_hover_at_inner(request_lsp
+        ///    = true)` -> `lsp_request_hover_at` path inert — same reason
+        ///    `hover_delay` has to be set after the tick too.
+        ///
+        /// An earlier revision of this test
         /// pre-seeded `Engine::lsp_hover_text` directly instead — that field
         /// also feeds a second, independent, cursor-anchored hover widget
         /// `render.rs`'s `build_content_widgets` paints on *every* frame
@@ -311,6 +373,11 @@ mod tests {
             std::fs::write(&path, "let needle = 1;\n").expect("write fixture file");
 
             let mut engine = plain_engine();
+            // Write 1 of 2 — see this test's doc comment: `new_tab` calls
+            // `lsp_did_open`, which would spawn a real `rust-analyzer` for
+            // this `.rs` fixture otherwise. (`plain_engine()`'s
+            // `Settings::default()` has `lsp_enabled == true`.)
+            engine.settings.lsp_enabled = false;
             engine.new_tab(Some(&path));
             let diag_key = engine
                 .active_buffer_diagnostics_key()
@@ -340,18 +407,18 @@ mod tests {
             // See the sibling plugin-hover test's identical comment: a fresh
             // `Engine`'s first idle tick reloads settings from disk — that
             // reload replaces the whole `settings` struct, so BOTH
-            // `hover_delay` and `lsp_enabled` have to be set after this
-            // first tick, not before, or they're silently clobbered back to
-            // their on-disk/default values (`lsp_enabled`'s default is
-            // `true` — see the doc comment above for why that would let
-            // this test spawn a real `rust-analyzer` process).
+            // `hover_delay` and `lsp_enabled` have to be (re-)set after this
+            // first tick, or they're silently clobbered back to their
+            // on-disk/default values.
             driver.tick();
             {
                 let mut engine = h.engine.borrow_mut();
                 engine.settings.hover_delay = 1;
-                // Keeps `lsp_request_hover_at` (fired alongside the
-                // diagnostic section, since that function doesn't know a
-                // diagnostic already answered the hover) a no-op.
+                // Write 2 of 2 (see the doc comment): the tick above just
+                // clobbered write 1 back to `true`. Keeps
+                // `lsp_request_hover_at` (fired alongside the diagnostic
+                // section, since that function doesn't know a diagnostic
+                // already answered the hover) a no-op.
                 engine.settings.lsp_enabled = false;
             }
             driver.render();
@@ -379,6 +446,36 @@ mod tests {
                  popup once the dwell timer elapses (#1750); screen:\n{}",
                 driver.screen()
             );
+
+            // ── Dismiss half (#1750 review round 0, finding #2) ───────────
+            // Moving off the word must *repaint* without the popup, driven
+            // by nothing but the `MouseMoved` itself. This is the fail-first
+            // test for the `had_hover != engine.editor_hover.is_some()` ->
+            // `self.draw_needed.set(true)` line the hover arm in
+            // `App::handle_dispatch` grew: `TuiDriver::dispatch` re-renders
+            // the cell grid *only* when the app returns
+            // `EventOutcome::Redraw`, and `handle_dispatch` only returns
+            // `Reaction::Redraw` when `draw_needed` is set. So without that
+            // line the engine clears `editor_hover` but no frame is drawn
+            // and the marker is still in `driver.screen()` — exactly the
+            // "popup lingers until some unrelated event forces a frame"
+            // symptom the review described. (`x - 1.0` is the space at
+            // column 3, one cell left of `needle`'s `n` — whitespace, so
+            // `editor_hover_mouse_move`'s own off-word branch clears
+            // `editor_hover` directly rather than going through the match
+            // arm's `dismiss_editor_hover()`; both dismiss paths funnel
+            // through the same `draw_needed` comparison.)
+            assert!(x >= 1.0, "the fixture's word must not start at column 0");
+            hover_move(driver, x - 1.0, y);
+            assert!(
+                !driver.screen_has("ZQXW_1750_LSP_DIAG_MARKER"),
+                "moving the mouse off the hovered word must repaint without \
+                 the hover popup, with no other event forcing a frame \
+                 (#1750 review); screen:\n{}",
+                driver.screen()
+            );
+
+            assert_no_lsp_server_was_spawned(&h.engine.borrow());
 
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -498,6 +595,12 @@ mod tests {
             std::fs::write(&path_b, "let zzzzz = 9;\n").expect("write fixture_b");
 
             let mut engine = plain_engine();
+            // Write 1 of 2 — see `lsp_diagnostic_hover_dwell_paints_popup_
+            // via_mouse_move_1750`'s doc comment: both `new_tab` and
+            // `split_window` open a file, i.e. both run `lsp_did_open`, which
+            // would spawn a real `rust-analyzer` for these `.rs` fixtures
+            // unless `lsp_enabled` is already false *here*, before them.
+            engine.settings.lsp_enabled = false;
             engine.new_tab(Some(&path_a));
             let window_a = engine.active_window_id();
             engine.split_window(SplitDirection::Horizontal, Some(&path_b));
@@ -557,6 +660,8 @@ mod tests {
                  split; screen:\n{}",
                 driver.screen()
             );
+
+            assert_no_lsp_server_was_spawned(&h.engine.borrow());
 
             let _ = std::fs::remove_dir_all(&dir);
         }
