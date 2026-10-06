@@ -6234,6 +6234,38 @@ fn pid_is_alive(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// Best-effort `kill -9 pid`, same `/bin/sh` indirection as [`pid_is_alive`].
+/// Errors (already dead, no such pid) are swallowed — this is a cleanup
+/// helper, not the assertion under test.
+#[cfg(unix)]
+fn force_kill_pid(pid: i32) {
+    let _ = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("kill -9 {pid} 2>/dev/null"))
+        .status();
+}
+
+/// RAII guard pairing a spawned-child pid with the pidfile it wrote. On
+/// drop — including unwinding past an `assert!` failure, which is exactly
+/// the leak path #1822 reported — this SIGKILLs the pid (idempotent if the
+/// test's own `kill()` assertion already reaped it) and removes the
+/// pidfile, so no outcome of the test (pass, failed assertion, or an
+/// unrelated panic elsewhere while this guard is in scope) can leave the
+/// busy-loop child running past the end of this function.
+#[cfg(unix)]
+struct OrphanChildGuard {
+    pid: i32,
+    pidfile: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for OrphanChildGuard {
+    fn drop(&mut self) {
+        force_kill_pid(self.pid);
+        let _ = std::fs::remove_file(&self.pidfile);
+    }
+}
+
 /// Build a bare [`vimcode_core::core::plugin::PluginManager`] (not yet
 /// installed on any `Engine`) with `lua_code` loaded from a temp dir named
 /// `plugin_name`. Companion to [`engine_with_plugin`] for tests that need to
@@ -6286,6 +6318,28 @@ fn plugin_manager_with(
 /// fails — manager A's child is still alive at the end of the bounded wait,
 /// because manager B's spawn insert silently replaced the map slot before
 /// anything ever reaped A's entry.
+///
+/// #1822: this test's own busy-loop child must not be able to outlive a
+/// *failed* run of the test. Two independent nets, both covering the
+/// scenario #1822 reported (a run that doesn't reach a clean pass — a
+/// failed assertion, a panic elsewhere while the pid is still live, or the
+/// whole test binary being killed/timed out):
+///
+/// 1. [`OrphanChildGuard`] below is constructed the moment the pid is known
+///    and SIGKILLs it on drop. Rust runs drops while unwinding past a failed
+///    `assert!`, so any assertion in this function failing still reaps the
+///    child — the exact gap #1822 reported (nothing upstream of the final
+///    `dead` assertion kills the child).
+/// 2. The spawned script itself polls its own parent (`$PPID`, fixed to
+///    this test binary's pid since `Command::new` spawns `/bin/sh` directly
+///    with no intermediate shell) and exits once that pid is gone. This is
+///    the backstop for the one failure mode a same-process `Drop` guard
+///    cannot cover: the test *binary* itself being SIGKILLed or hitting a
+///    harness timeout mid-test, which skips all Rust unwinding. It does not
+///    change the property under test — manager A's child still only stops
+///    "by itself" if its actual parent (this process) is gone, never merely
+///    because time passed, so the `dead` poll below is still exercising a
+///    real `kill()` call from the engine, not this backstop.
 #[test]
 #[cfg(unix)]
 fn manager_swap_id_collision_does_not_leak_orphaned_spawn_process() {
@@ -6299,7 +6353,7 @@ fn manager_swap_id_collision_does_not_leak_orphaned_spawn_process() {
         &format!(
             r#"
             vimcode.command("StartOrphan", function(_)
-                vimcode.loop.spawn("/bin/sh", {{ "-c", "echo $$ > {path}; while :; do :; done" }})
+                vimcode.loop.spawn("/bin/sh", {{ "-c", "echo $$ > {path}; p=$PPID; while kill -0 \"$p\" 2>/dev/null; do :; done" }})
             end)
             "#,
             path = pidfile.display()
@@ -6320,6 +6374,14 @@ fn manager_swap_id_collision_does_not_leak_orphaned_spawn_process() {
         .trim()
         .parse()
         .expect("child must have written a plain integer pid");
+    // From here on, no matter how this function exits — clean pass, a
+    // failed `assert!` below, or an unrelated panic — dropping this guard
+    // SIGKILLs `pid` and removes the pidfile. See the #1822 doc comment
+    // above.
+    let _orphan_guard = OrphanChildGuard {
+        pid,
+        pidfile: pidfile.clone(),
+    };
     assert!(
         pid_is_alive(pid),
         "setup: manager A's spawned child must actually be running before \
@@ -6353,6 +6415,10 @@ fn manager_swap_id_collision_does_not_leak_orphaned_spawn_process() {
          first spawn reused the exact same handle id"
     );
 
+    // `_orphan_guard` drops here (SIGKILL on an already-dead pid is a
+    // harmless no-op) and removes the pidfile; the explicit cleanup below
+    // is redundant with the guard but kept for the pidfile's read-before-
+    // guard-construction window just above.
     let _ = std::fs::remove_file(&pidfile);
 }
 
