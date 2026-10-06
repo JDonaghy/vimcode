@@ -2096,9 +2096,26 @@ impl Engine {
         // for "just this one" call site) isn't caught by this PR's tests.
         for req in ctx.async_shell_requests {
             let mut cmd = crate::core::terminal::shell_cmd(&req.command);
-            if let Some(ref cwd) = req.cwd {
-                cmd.current_dir(cwd);
-            }
+            // Default to the engine's own workspace `cwd` when the plugin
+            // didn't pass one (#1751). Without this, an omitted `cwd`
+            // falls through to `std::process::Command`'s own default: the
+            // *OS process's* actual current directory, which only matches
+            // the open workspace by convention (a terminal that `cd`ed
+            // there first) — a GUI launch (desktop shortcut, file-manager
+            // "Open with", no "Start in" folder set) can leave it pointed
+            // anywhere. `self.cwd` is the engine's adopted workspace root
+            // (`adopt_cwd_for_startup_file`/`open_folder` keep it correct
+            // without ever calling `std::env::set_current_dir`, #1797), so
+            // it's the right fallback for "run this relative to the open
+            // workspace" — which is what every plugin author assumes
+            // "no cwd given" means. This is git-insights' blame.lua's
+            // exact failure mode on Win-GUI: it calls `vimcode.async_shell`
+            // for `git blame -- <relative path>` with no `cwd` option, so
+            // on a GUI launch outside the repo the child process ran in
+            // the wrong directory and `git` failed outright, silently
+            // (output discarded, see `Err(_)` arm below) dropping the
+            // blame annotation with no error surfaced anywhere.
+            cmd.current_dir(req.cwd.as_deref().unwrap_or(&self.cwd));
             let task = match execute::spawn_piped(cmd, req.stdin) {
                 Ok((_child, _stdin, rx)) => execute::AsyncShellTask {
                     rx,

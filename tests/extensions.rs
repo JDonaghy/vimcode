@@ -5931,6 +5931,70 @@ fn async_shell_large_stdin_write_does_not_block_the_calling_thread() {
     );
 }
 
+/// #1751: `vimcode.async_shell` with no `cwd` option must run the child in
+/// the engine's own workspace `cwd`, not whatever the OS process's actual
+/// working directory happens to be. Before this fix, an omitted `cwd` fell
+/// straight through to `std::process::Command`'s own default (the real OS
+/// process directory), which only matches the open workspace by convention
+/// (a terminal that `cd`ed there first) — a GUI launch (desktop shortcut,
+/// file-manager "Open with", no "Start in" folder) can leave it pointed
+/// anywhere else entirely. This is git-insights' `blame.lua`'s exact
+/// failure mode on Win-GUI (#1751 triage): it calls `vimcode.async_shell`
+/// for `git blame ... -- <path>` with no `cwd` option, so on a GUI launch
+/// outside the repo the child ran in the wrong directory, `git` failed, and
+/// the blame ghost text silently never rendered (output discarded on
+/// failure — see `apply_plugin_ctx`'s `Err(_)` arm).
+///
+/// RED-verified by hand: with the fix's `req.cwd.as_deref().unwrap_or(&self.cwd)`
+/// reverted to the old `if let Some(ref cwd) = req.cwd { cmd.current_dir(cwd); }`
+/// (i.e. no fallback at all), this test's `poll_until` exhausts its full
+/// deadline and fails — `pwd`'s child inherits this test binary's real
+/// process directory (the repo root `cargo test` runs from) instead of
+/// `tmp`, so the message never matches.
+#[test]
+#[cfg(unix)]
+fn async_shell_defaults_cwd_to_engine_cwd_when_not_specified_1751() {
+    let tmp = std::env::temp_dir().join(format!("vc_async_shell_cwd_1751_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    // Canonicalize so this matches what the child's `pwd` reports (resolves
+    // any symlink in the temp root, e.g. macOS's `/tmp` -> `/private/tmp`).
+    let tmp = tmp.canonicalize().unwrap();
+
+    let mut e = engine_with_plugin(
+        "",
+        "async_shell_cwd_1751",
+        r#"
+        vimcode.command("RunShell", function(_)
+            vimcode.async_shell("pwd", "shell_cwd_done_1751")
+        end)
+        vimcode.on("shell_cwd_done_1751", function(output)
+            vimcode.message(output)
+        end)
+        "#,
+    );
+    // Point the engine's workspace at `tmp` — deliberately different from
+    // this test binary's real OS process directory, which no test in this
+    // file moves (that would be a `CwdGuard`-protected writer, see
+    // `src/test_cwd.rs`; this test never calls `std::env::set_current_dir`
+    // and doesn't need to, since the fix overrides the *child's* cwd
+    // explicitly via `Command::current_dir` rather than moving the
+    // process's own).
+    e.cwd = tmp.clone();
+    exec(&mut e, "RunShell");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(15), |e| {
+        e.message.trim() == tmp.to_string_lossy()
+    });
+    assert!(
+        reached,
+        "vimcode.async_shell with no `cwd` option must default to the \
+         engine's own `cwd` ({:?}), not the OS process's actual working \
+         directory; last message: {:?}",
+        tmp, e.message
+    );
+}
+
 #[test]
 #[cfg(unix)]
 fn unloading_plugin_stops_its_timers_and_spawns_from_calling_back() {
