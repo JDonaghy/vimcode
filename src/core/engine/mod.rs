@@ -5820,7 +5820,22 @@ impl Engine {
     /// *immediate* parent would itself be a regression — it would narrow
     /// the Explorer/workspace root to a subdirectory on every launch that
     /// opens a nested file, where today it stays at the real workspace
-    /// root.
+    /// root. Pinned by
+    /// `tests::adopt_cwd_for_startup_file_is_a_no_op_when_the_file_is_
+    /// already_under_cwd_1797` so a future tweak to the `starts_with`
+    /// check can't silently start re-rooting every nested-file launch.
+    ///
+    /// Also a no-op when `cwd` is *itself* already inside a git repo, even
+    /// if that repo isn't the file's own — #1797 review: the reported bug
+    /// is specifically a launch `cwd` with no repo at all (a desktop
+    /// shortcut, a file-association "Open with" launch), not an ordinary
+    /// `cd ~/myrepo && vimcode ~/.gitconfig`. Repointing `cwd` in the
+    /// latter case would be a *new* regression of its own: it would
+    /// silently move the Explorer tree, quick-open search root, and
+    /// per-workspace session key from `~/myrepo` to `$HOME` (or to
+    /// `.gitconfig`'s own repo, if it has one) merely because the user
+    /// opened an unrelated file by absolute path — neither VS Code nor vim
+    /// does that.
     ///
     /// Only mutates the in-memory `cwd`/`workspace_root` fields, not the
     /// process's actual working directory (unlike `open_folder`, which also
@@ -5834,9 +5849,12 @@ impl Engine {
         } else {
             self.cwd.join(path)
         };
-        let absolute = absolute.canonicalize().unwrap_or(absolute);
+        let absolute = absolute.canonicalize().unwrap_or_else(|_| absolute.clone());
         let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
         if absolute.starts_with(&cwd) {
+            return;
+        }
+        if git::find_repo_root(&cwd).is_some() {
             return;
         }
         let Some(parent) = absolute.parent() else {
@@ -5844,7 +5862,18 @@ impl Engine {
         };
         let new_cwd = git::find_repo_root(parent).unwrap_or_else(|| parent.to_path_buf());
         self.cwd = new_cwd.clone();
-        self.workspace_root = Some(new_cwd);
+        self.workspace_root = Some(new_cwd.clone());
+        // Mirrors `open_folder`'s own clear+insert (#1797 review): without
+        // this, `explorer_reveal_path`'s `target.strip_prefix(&root)` is
+        // the *only* thing that would seed `explorer_expanded` with the
+        // new root, and it compares the caller's possibly-uncanonicalised
+        // `path` against this method's canonicalised `new_cwd` — a
+        // mismatched spelling (a Windows 8.3 short path, a symlinked
+        // launch path, `/tmp` vs `/private/tmp` on macOS) makes that strip
+        // fail silently, leaving the Explorer painting a single collapsed
+        // root row on exactly the launch this fix targets.
+        self.explorer_expanded.clear();
+        self.explorer_expanded.insert(new_cwd);
     }
 
     /// Shared body of [`Engine::startup`] and
