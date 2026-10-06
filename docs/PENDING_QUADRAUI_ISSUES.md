@@ -2789,3 +2789,65 @@ fn pointer_shape_cursor_name(shape: PointerShape) -> &'static str {
 **Test:** None added upstream by this draft — this is a drafted gap report with no quadraui-side change yet. The natural coverage shape once the `Ask` lands: extend `pointer_shape_cursor_name_maps_every_variant` (`quadraui/src/gtk/backend.rs`'s existing exhaustive test, already using `all_pointer_shapes()`) to assert the new variant maps to `"pointer"` — it will do so for free once item 3 above lands, since that test already iterates the scaffold's full list rather than a hand-maintained one.
 
 **Blocks:** `JDonaghy/vimcode#489`. Leave that issue open behind this one per `GOALS.md`'s milestone-discipline rule — there is no per-backend vimcode-side fix available; per this repo's Platform-Neutrality Rule, hand-rolling `gdk::Cursor` calls directly in `src/gtk/` to work around the missing variant (as the issue's own implementation sketch proposes) is exactly the kind of per-backend code that rule exists to prevent. Once this lands and the pin bumps, the vimcode-side change is a small addition to the existing shared `MouseMoved` cursor-hint block in `src/app.rs` (compose `editor_hover_link_rects`/`panel_hover_link_rects` hit-testing into the `Resize`/`Default` branch already there) — no new `src/gtk/` or `src/tui_main/` code needed, since `backend.set_cursor` is already called from shared code and TUI's own impl is already a documented no-op.
+
+## `RichTextPopup` is hardcoded `ChromePrimitive::RichTextPopup` (always chrome font) on every pixel backend — vimcode's editor-anchored hover popup can't render in the editor's own font+size the way VS Code does (vimcode#220)
+
+**Title:** `RichTextPopup` needs a per-instance font-role override (`FontRole::Editor` vs the current unconditional `FontRole::Chrome`) so a host can opt one `RichTextPopup` instance into the editor font while another stays chrome.
+
+**Body:**
+
+Surfaced by vimcode#220: VS Code renders LSP hover popups in the *editor's* font+size (monospace, same size as the buffer text it quotes — signatures, type names, doc snippets, Markdown ASCII tables), not its UI chrome font. VimCode currently renders its editor-anchored hover popup through `quadraui::RichTextPopup` / `Backend::draw_rich_text_popup`, and that primitive is unconditionally classified chrome by `quadraui::font_role` (issue #1003/#1077):
+
+```rust
+// quadraui/src/font_role.rs
+pub const ALL: [ChromePrimitive; 13] = [
+    ChromePrimitive::Tree, ChromePrimitive::List, ChromePrimitive::MenuBar,
+    ChromePrimitive::ContextMenu, ChromePrimitive::Dialog,
+    ChromePrimitive::RichTextPopup, // <- always chrome, no instance says otherwise
+    ...
+];
+pub const fn font_role(self) -> FontRole { FontRole::Chrome }
+```
+
+Confirmed at the pinned rev (`a5360532e297deecece65103df8ce61f53230bda`) on all three pixel backends — each hardcodes its own chrome font with no way for the caller to ask for anything else:
+
+```rust
+// quadraui/src/gtk/backend.rs, GtkBackend::draw_rich_text_popup
+let ui_font_desc = crate::gtk::chrome_font_description(&self.ui_font);
+let _ = crate::gtk::draw_rich_text_popup(cr, pango_layout, &ui_font_desc, popup, layout_arg, &theme);
+```
+```rust
+// quadraui/src/macos/backend.rs, MacBackend::draw_rich_text_popup
+// Issue #1003: the rich-text popup is chrome (`ChromePrimitive::RichTextPopup`) — see `draw_tree`'s comment.
+let font = &self.chrome_font;
+```
+```rust
+// quadraui/src/win/backend.rs, WinBackend::draw_rich_text_popup
+// #1077: `RichTextPopup` is `ChromePrimitive::RichTextPopup` (whole primitive, ...)
+let dwrite = self.chrome_dwrite.as_ref().or(self.dwrite.as_ref());
+```
+
+This is the right default for vimcode's *other* `RichTextPopup` consumer — the sidebar-item dwell tooltip (`render::panel_hover_popup_paint`, source-control / extension-panel items) really is chrome, same font as the tree row it's anchored to — but it's the wrong default for the editor-anchored hover popup (`render::editor_hover_popup_paint`), which both vimcode#220 and VS Code's own behaviour say should match the *buffer's* font+size. Both call sites build a `quadraui::RichTextPopup` through the exact same constructor path (`render::markdown_hover_to_quadraui_lines` → `editor_hover_to_quadraui_rich_text` / `panel_hover_to_quadraui_rich_text`) and the exact same `Backend::draw_rich_text_popup` trait method — there is no vimcode-side hook between "build the popup" and "pick the font" to intervene on; the font choice is made entirely inside quadraui's own backend implementations, which vimcode is not allowed to patch directly (not a vimcode repo file). Per this repo's Platform-Neutrality Rule, that is exactly the "file a quadraui issue, build the infrastructure there first" case — there is no `src/gtk/`/`src/tui_main/` workaround available, since neither backend's font selection for this primitive is vimcode code at all any more (it moved into quadraui itself across #669/#1167/#831, well after vimcode#220 was originally filed against the pre-refactor per-backend draw functions it still names).
+
+The module's own doc already anticipated exactly this need, in the one sentence explaining why `font_role()` is a method rather than a bare constant table lookup:
+
+> "a future primitive whose role needs to be context-dependent has a real match arm to grow instead of a new backend reinventing the question from scratch." — `quadraui/src/font_role.rs`, `ChromePrimitive::font_role`'s doc
+
+`RichTextPopup` is that future primitive.
+
+Each affected backend already carries both fonts as live fields — this is a wiring gap, not a missing-capability gap:
+- GTK: `GtkBackend::editor_font_pango_string()` (built from `editor_font_family`/`editor_font_size_pt`, set via `Backend::set_editor_font`) sits right next to the `ui_font`-derived `chrome_font_description` already used.
+- macOS: `MacBackend::current_font: Option<CTFont>` (the editor font, falls back to `chrome_font` when unset — the same "never `None`" convention `MacBackend::set_current_font`'s own doc describes) sits right next to `chrome_font: CTFont`.
+- Win: `WinBackend` already has both a `chrome_dwrite` and an editor `dwrite` handle in scope at the exact call site quoted above (it currently *prefers* chrome and falls back to editor only if chrome is unset).
+- TUI: no `FontRole` concept exists there at all (cell grid, one font by definition, per the module's own doc) — out of scope, nothing to change.
+
+**Ask:**
+
+1. Add a per-instance override to `quadraui::RichTextPopup` (`quadraui/src/primitives/rich_text_popup.rs`) — e.g. `pub font_role: FontRole` (needs `FontRole: Default` with `Chrome` as the default variant, so `#[serde(default)]` preserves every existing caller's behaviour with zero changes — vimcode's own panel-item hover popup included).
+2. `GtkBackend::draw_rich_text_popup`, `MacBackend::draw_rich_text_popup`, `WinBackend::draw_rich_text_popup` — branch on `popup.font_role`: `FontRole::Chrome` keeps today's `ui_font`/`chrome_font`/`chrome_dwrite` behaviour verbatim; `FontRole::Editor` swaps in `editor_font_pango_string()` / `current_font.as_ref().unwrap_or(&chrome_font)` / the editor `dwrite` handle instead.
+3. `quadraui/src/font_role.rs` — update the module doc's "a future primitive whose role needs to be context-dependent" sentence to point at `RichTextPopup` as the (no longer hypothetical) example, and note that `ChromePrimitive::RichTextPopup.font_role()` now describes only the *default* a popup gets when it doesn't set `font_role` itself.
+4. Out of scope for this ask, flagged for whoever implements the vimcode side once this lands: `quadraui::compose::markdown::render_markdown_to_styled`'s per-line heading `line_scales` (`RichTextPopup::line_scales`, `> 1.0` for Markdown headings) was designed against a chrome-font-sized popup body; vimcode#220 itself flags that scaling headings up may look wrong once the body is monospace at editor size, and asks to revisit then — no quadraui change implied by that, just a vimcode-side `RichTextPopup::line_scales` call-site decision to make once the editor-font popup actually exists to look at.
+
+**Test:** None added upstream by this draft — this is a drafted gap report with no quadraui-side change yet. The natural coverage shape once the `Ask` lands: a `GtkDriver`-based render test asserting the *painted* popup text's measured glyph metrics match `editor_font_pango_string()`'s, not `ui_font`'s, when `font_role: FontRole::Editor` is set (mirroring the existing font-metric assertions in `quadraui/src/gtk/backend.rs`'s `measure_char_width_px_matches_pixel_size_for_the_real_editor_font`-style tests) — plus a cheap unit test pinning `FontRole::default() == FontRole::Chrome` so a future caller that never touches the new field keeps today's behaviour. On the vimcode side, once the pin bumps: a `GtkDriver` black-box test asserting the editor hover popup's painted glyph width/height matches the editor pane's own (not the sidebar tooltip's, which should still match chrome) — the rendered-output assertion this repo's CLAUDE.md requires, not a state check that the right `font_role` enum value was set.
+
+**Blocks:** `JDonaghy/vimcode#220`. Leave that issue open behind this one per `GOALS.md`'s milestone-discipline rule — there is no per-backend vimcode-side fix available; the font decision for `RichTextPopup` now lives entirely inside quadraui's three pixel-backend implementations (moved there by #669/#1167/#831, after #220 was filed against the pre-refactor `src/gtk/draw.rs` functions it still names), so hand-patching `src/gtk/`/`src/tui_main/` to intercept or override it would mean either vendoring quadraui's font logic back into vimcode (a platform-neutrality regression) or reaching into a `dyn Backend` trait object's private fields (not possible). Once this lands and the pin bumps, the vimcode-side change is: set `font_role: quadraui::FontRole::Editor` in `render::editor_hover_to_quadraui_rich_text` (leaving `render::panel_hover_to_quadraui_rich_text` on the new default, i.e. untouched) — a one-line, backend-neutral change in already-shared `src/render.rs`, no new `src/gtk/`/`src/tui_main/` code needed on either backend.
