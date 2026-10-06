@@ -35538,3 +35538,45 @@ fn test_1160_ctrl_x_ctrl_f_wins_over_ctrl_f_find_replace_binding() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_nvim_dd_preserves_column_not_reset_to_zero_1796() {
+    // #1796 ("[bugbash:win-native] dd leaves cursor at the previous column
+    // instead of column 0 of the line that moves up") claimed `nvim
+    // --headless` resets `dd`'s cursor to column 0. That claim was checked
+    // with the cursor already sitting at column 0 before `dd` — a
+    // degenerate case where "reset to 0" and "preserve the column" produce
+    // the same answer and can't be told apart.
+    //
+    // Re-run against real `nvim --headless` (0.12.5) with the cursor
+    // explicitly placed on column 3 (the last char of "bbb") before `dd`:
+    // `call cursor(2,3)` then `normal! dd` leaves the cursor at column 3 of
+    // the resulting line "ccc" (`nvim_win_get_cursor` → `(2, 2)`, 0-indexed),
+    // NOT column 0. (Real Vim 9.1 *does* reset to column 0 here — Vim and
+    // Neovim genuinely disagree on this — but this project's documented
+    // oracle is Neovim, per `tests/smoke-spec/catalogue.yaml`'s
+    // `reference: nvim`.)
+    //
+    // VimCode's `delete_lines` (src/core/engine/motions.rs) already
+    // implements the Neovim-matching "preserve column, clamped" behaviour
+    // (added deliberately in #805, "matching real Vim" — a mislabeled but
+    // otherwise-correct-for-Neovim fix). This test pins that behaviour down
+    // via the exact #1796 repro (type "aaa<CR>bbb<CR>ccc<Esc>", move up to
+    // "bbb" with the cursor landing on its last column via Escape's
+    // one-back-from-insert rule, then `dd`) so a future "fix" that resets
+    // the column to 0 to match #1796's flawed report fails loudly here.
+    let mut engine = Engine::new();
+    engine.feed_keys("iaaa<CR>bbb<CR>ccc<Esc>kdd");
+    assert_eq!(engine.buffer().to_string(), "aaa\nccc");
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "dd must preserve the column (clamped), not reset to 0 -- see #1796"
+    );
+
+    // Same assertion via the `nvim_case` harness with an explicit cursor
+    // placement, matching the `call cursor(2,3)` / `normal! dd` oracle
+    // check above (columns here are 0-indexed, so col 2 == "column 3").
+    nvim_case("aaa\nbbb\nccc", 1, 2, "dd", "aaa\nccc", 1, 2);
+}
