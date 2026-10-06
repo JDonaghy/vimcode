@@ -1874,6 +1874,30 @@ journeys:
   expected: Buffer text and cursor position are unchanged after the round trip; no edit, undo-tree entry,
     or scroll-position change results purely from toggling
   priority: 1
+# vimcode#1795 investigation note: this journey's "quit, inspect
+# settings.json, relaunch" shape cannot currently be pinned as an exact
+# Tier-2 driver step (`tests/smoke-spec/tui.yaml`/`win-terminal.yaml`/
+# `win-gui.yaml`/`mac-gui.yaml`/`gtk-gui.yaml`) the way this catalogue's
+# own doc comment (above) says those files do for other journeys.
+# Confirmed by inspecting the real, installed `code-coordinator` package
+# (`coord.tui_pty_driver.parse_smoke_spec`, `coord.win_native_driver`/
+# `coord.mac_native_driver`/`coord.gtk_native_driver.parse_native_spec`):
+# every driver's `launch` step takes no settings/env fields at all (the
+# settings.json each spec file assumes is fixed per-file, supplied
+# entirely outside the YAML by whatever calls `run_smoke_spec`/
+# `run_native_spec`), and no driver has a second "relaunch" or "read a
+# file back" step type — only one `launch` per spec, matching every
+# existing file in this directory. Pinning this exact journey at Tier-2
+# therefore needs new coordinator-side driver support (a per-spec
+# settings-seed field, and a relaunch-or-inspect-file step type) before a
+# YAML-only change in *this* repo can express it — filing that gap as a
+# `claude-coordinator` issue is coordinator-side follow-up, not something
+# a vimcode worktree commit can do. Until that lands, the closest
+# available black-box coverage is `tests/editor_mode_startup_persistence.rs`
+# (real `vcd` binary, real pty, asserts on the painted screen) — it is not
+# a drop-in substitute for a cross-platform Tier-2 step (it only runs on
+# `#[cfg(unix)]` hosts) but it is strictly more than the zero coverage this
+# journey had before.
 - id: modeswitch-persisted-in-settings-json
   area: mode-switch
   mode: any

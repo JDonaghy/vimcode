@@ -277,6 +277,38 @@ guard exists to catch, so the two protections are complementary: crt-static
 keeps the binary from silently failing to start, and the zero-tests guard
 catches it if some *other* silent-failure mode ever gets past that.
 
+### WSL-interop env-var gotcha for *manual* win-native investigation (#1795)
+
+Not a `platform-conformance.sh` lane issue (that lane never launches the
+`.exe` by hand — see `cargo xwin test` above) — this is specifically for a
+human or agent manually reproducing a win-native bugbash report by invoking
+the cross-compiled `.exe` from a `dell64` WSL shell, env-var-prefixed on the
+command line, e.g.:
+
+```bash
+# DOES NOT WORK — silently drops the override:
+APPDATA=/custom/path ./vcd.exe
+env APPDATA=/custom/path ./vcd.exe
+```
+
+Confirmed while investigating vimcode#1795 ("settings.json's
+`editor_mode: vscode` not honoured at win-native startup"): launching this
+way, the spawned Windows process reads the **real** `%APPDATA%\vimcode\
+settings.json`, not the throwaway one just edited for the repro — a
+WSL-interop process-creation quirk silently drops a command-line-prefixed
+env var rather than propagating it into the Windows process's own
+environment block. The resulting false "settings edited but a different
+file got read" symptom looks exactly like a vimcode bug but is a harness
+artifact of *how the exe was launched*, not of vimcode's own
+`Settings::load()`. Every real run that actually confirmed vimcode-side
+startup behaviour in this repo's history (`tests/smoke-spec/win-gui.yaml`'s
+and `win-terminal.yaml`'s own "CONFIRMED" header sections) used a
+**PowerShell session** (`$env:APPDATA = '...'; .\vcd.exe`) instead, which
+does not have this gap — do the same for any future win-native settings-
+path investigation, or launch via `win_native_driver.py`'s own `WinCalls`
+seam (which sets the child's environment block directly, not via a shell
+command-line prefix).
+
 ### Any other machine
 
 A machine with none of `gtk4`, Darwin, or `cargo-xwin`+WSL-interop runs only

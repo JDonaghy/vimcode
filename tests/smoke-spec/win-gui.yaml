@@ -14,6 +14,14 @@
 # determinism reasons `tests/conpty_activity_bar_click.rs`'s
 # `isolated_home()` sets those.
 #
+# vimcode#1795: if you're manually reproducing a settings.json/startup
+# report against this lane over WSL interop, see
+# `docs/PLATFORM_CONFORMANCE.md`'s "WSL-interop env-var gotcha" section
+# before launching the `.exe` with an env var prefixed on a WSL shell's
+# command line — that silently fails to propagate into the Windows
+# process. Use a PowerShell `$env:VAR = '...'` session instead (what every
+# "CONFIRMED" run below actually did).
+#
 # Pixel coordinates below are derived from the drawn title band's known
 # `band_height = 32` DIP convention (`quadraui/src/win/run.rs`) and
 # vimcode's own fixed 7-item File/Edit/View/Go/Run/Terminal/Help menu order
