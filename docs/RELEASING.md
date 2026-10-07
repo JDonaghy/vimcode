@@ -335,7 +335,16 @@ you are shipping and confirm it starts, paints a first frame, and takes input:
 - **Linux GTK** — `./target/release/vimcode`
 - **macOS** — the artifact you are shipping (currently the *GTK* build), plus the
   native build if you are exercising it, with **the native menu bar** specifically
-  (§1.3 — nothing automated covers it)
+  (§1.3 — nothing automated covers it). **Keyboard input specifically, not just
+  "takes input" in general** (vimcode#1825): launch the GTK artifact from
+  Terminal.app, click into the window, and type — as of #1825 every macOS GTK
+  release (including v0.14.0) paints and takes mouse input but every keystroke
+  goes to the launching terminal instead, because the bare binary is never made
+  the frontmost application. Root-caused to a `quadraui::gtk::run` gap (no
+  macOS foreground-activation call) — drafted in
+  `docs/PENDING_QUADRAUI_ISSUES.md`, blocked on that landing upstream; do not
+  mark this smoke step green until a real keystroke is confirmed to land in the
+  buffer on real macOS hardware.
 - **Windows** — `vcd.exe`, plus `win-smoke-tests.md` if shipping any GUI build
 
 **Run every one of these under a throwaway `HOME`** (`env HOME=$(mktemp -d) ...`),
@@ -462,3 +471,4 @@ dated list rather than a habit.
 | `install_menu_bar` main-thread panic, caught (§1.3) | macOS native | Expected — test-runner threading; vimcode#901 closed, native menu bar untested |
 | No Win-GUI test suite | Windows | Gap — `src/win/` has zero `#[test]`s |
 | Flatpak bundle unbuildable (§2.2) | Linux | Gap — #975; `cargo-sources.json` predates the #691 git dep; not shipping in v0.11.0 |
+| Shipped macOS GTK artifact never takes keyboard input — every keystroke goes to the launching terminal (§1.5) | macOS GTK | Gap — #1825; `quadraui::gtk::run` never activates the process as the macOS frontmost app; drafted in `docs/PENDING_QUADRAUI_ISSUES.md`, blocked on quadraui landing a fix |
