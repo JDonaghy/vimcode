@@ -22,42 +22,89 @@ ancestor of this repo's pinned `quadraui` rev
 quadraui-side or vimcode-side production code changed in this PR.**
 
 What this PR adds: `src/tui_main/app_on_tui_tests.rs`'s
-`minimap::minimap_viewport_highlight_band_paints_a_distinct_background` —
-a black-box `TuiDriver` test that reads back the *painted* `CellStyle::bg`
-(via `style_at`, not `MinimapLayout::viewport_highlight`'s geometry alone —
-see #587/#592's "state vs. rendered output" lesson) both inside and
-outside the band, at the top and after scrolling to the very bottom of a
-2000-line buffer, and asserts the two backgrounds differ. This test did
-not exist anywhere in the suite before now, so the real-hardware
-regression had no CI signal to catch it. RED-verified by hand: temporarily
-overriding `.cargo/config.toml`'s `paths` to a scratch copy of the pinned
-quadraui checkout with `highlight_bg` forced to equal the plain strip
-`bg` (the literal "band not painted / indistinguishable" defect the issue
-describes) reproduces the failure cleanly; forcing it back to the
-pre-#1181 *opaque* `accent_bg` (no blend) still passed this test, because
-opaque accent colours are not actually indistinguishable from background —
-confirming the issue's real defect class is "unpainted/identical", not
-"too strong", and that this test catches exactly that class. The override
-was never committed — restored via `git checkout -- .cargo/config.toml`
-after verification, confirmed clean (`git status`/`git diff` show no stray
+`minimap::minimap_viewport_highlight_band_paints_a_distinct_background`
+(default `onedark` theme) and its `_under_light_theme` sibling
+(`vscode-light`) — black-box `TuiDriver` tests that read back the
+*painted* `CellStyle::bg` (via `style_at`, not
+`MinimapLayout::viewport_highlight`'s geometry alone — see #587/#592's
+"state vs. rendered output" lesson) both inside and outside the band, at
+the top and (the `onedark` test) after scrolling to the very bottom of a
+2000-line buffer, and assert the two backgrounds differ by at least a
+minimum combined RGB delta (not mere inequality — a one-unit rounding
+difference would pass a plain `assert_ne!` while still reading as flat on
+real hardware). Neither test existed anywhere in the suite before now, so
+the real-hardware regression had no CI signal to catch it.
+
+RED-verified by hand, precisely: temporarily overriding
+`.cargo/config.toml`'s `paths` to a scratch copy of the pinned quadraui
+checkout with `highlight_bg` forced to equal the plain strip `bg` — the
+literal "band not painted / identical colour" defect — reproduces the
+failure cleanly (both assertions fail). Forcing the same override back to
+the pre-#1181 *opaque*, un-blended `accent_bg` instead left the test
+**passing**: in the `onedark` theme used here, an opaque accent colour
+happens to differ enough from `background` to clear the test's delta
+threshold. That result means this test's RED coverage is narrower than it
+might look — it catches the "unpainted / exactly identical" defect class
+cleanly, but it does **not** establish that the issue's defect class is
+"unpainted" rather than "painted too faintly to see" (see below — that
+conclusion does not follow from this one data point, and an earlier
+version of this entry stated it backwards). The override was never
+committed — restored via `git checkout -- .cargo/config.toml` after
+verification, confirmed clean (`git status`/`git diff` show no stray
 changes to that file).
+
+**The investigation's leading hypothesis, corrected:** an earlier version
+of this entry argued that because the opaque pre-#1181 `accent_bg` still
+passed the RED check, the issue's real defect class must be
+"unpainted/identical" rather than "too strong/faint" — that reasoning runs
+backwards. The pre-#1181 code painted an *opaque, full-strength*
+`accent_bg`, which is the easiest case to see; `9f47ca9c` *reduced* that to
+a 25%-blend tint specifically to look less like a solid overlay. On
+vimcode's own `onedark` theme that tint is `rgb(26,26,26)` →
+`rgb(44,63,79)` — a real but modest delta on an already near-black strip,
+and one that can plausibly quantize down to adjacent, hard-to-distinguish
+greys/blues once a real terminal negotiates 256-colour instead of
+truecolor (`COLORTERM` unset, a non-default Windows Terminal profile,
+RDP/mosh in the path, etc.). So the most likely remaining explanation for
+dell64's report is **not** "stale build predating the pin bump" — it is
+that `9f47ca9c`'s fix is itself a plausible *cause* of a still-faint band
+on real hardware, even though it is a strict improvement over the
+pre-#1181 opaque-but-differently-shaped defect. This is a hypothesis to
+rule in or out with real hardware, not a settled conclusion either way.
+
+**Not done by this investigation, left for a human or a follow-up PR:**
+- No step was added to `tests/smoke-spec/win-terminal.yaml` for this
+  check. That file is this repo's Tier-2 carrier for exactly this kind of
+  real-host confirmation, and the dell64 re-confirmation below has nowhere
+  to land until a step exists there.
+- If the "0.25 tint is too faint on a near-black strip" hypothesis above
+  is pursued, the fix (e.g. a stronger blend ratio, or a minimum-contrast
+  floor) lives in `quadraui/src/tui/minimap.rs`, and the
+  Platform-Neutrality Rule requires a **filed** quadraui GitHub issue
+  before any such change, not just this note. No such issue has been filed
+  by this investigation (filing GitHub issues is outside what this agent's
+  assignment allows — the coordinator owns that step).
 
 **Still unknown, needs a human:** this issue's own acceptance bar is "a
 person on dell64 confirms the thumb is visible and tracks the viewport" —
-something this investigation cannot perform. Two explanations remain open
-for why the real-hardware smoke saw nothing: (1) the dell64 build predated
-the quadraui pin bump that carries `9f47ca9c` (most likely, given #1828's
-drag half was *also* only just fixed this session in `97b1af9`, so a
-stale `vcd.exe` is plausible), in which case a fresh build should already
-resolve it; or (2) something specific to that real terminal/profile (color
-depth negotiation, `COLORTERM`, a non-default Windows Terminal colour
-scheme, or a reduced-contrast rendering mode) still washes the blend out
-in a way this headless `TestBackend` run cannot reproduce — `TestBackend`
-only proves the `Buffer` cells carry visibly different RGB values, not
-that a given real terminal renders that difference visibly. If a fresh
-build on dell64 still shows no thumb, the next step is reading back the
-*actual* colour reported by that terminal (e.g. a direct ANSI truecolor
-probe) rather than assuming the paint-layer bug reproduced here.
+something this investigation cannot perform, and nothing above resolves
+it. Two explanations remain open for why the real-hardware smoke saw
+nothing: (1) the dell64 build predated the quadraui pin bump that carries
+`9f47ca9c` (possible, given #1828's drag half was *also* only just fixed
+this session in `97b1af9`, so a stale `vcd.exe` is plausible), in which
+case a fresh build should resolve it; or (2) — now considered the more
+likely of the two, per the corrected reasoning above — the 25%-blend tint
+itself is too faint on real hardware (colour depth negotiation,
+`COLORTERM`, a non-default Windows Terminal colour scheme, or a
+reduced-contrast rendering mode), in which case a fresh build will **not**
+fix it and the next step is a quadraui-side contrast increase (filed
+upstream first) rather than a vimcode-side rebuild. `TestBackend` only
+proves the `Buffer` cells carry a certain RGB delta, not that a given real
+terminal renders that delta visibly — a headless green run here cannot
+distinguish between these two explanations. If a fresh build on dell64
+still shows no thumb, the next step is reading back the *actual* colour
+reported by that terminal (e.g. a direct ANSI truecolor probe) rather than
+assuming either explanation without hardware evidence.
 `ISSUE_RESOLUTION: investigation`.
 
 **Last updated:** October 7, 2026 (#1739 — bugbash:tui-pty "Extensions

@@ -107,6 +107,31 @@
 # open pending the companion vimcode-ext fix; see this branch's commit
 # messages.
 #
+# ── #1842: no Tier-2 step added for "TUI minimap viewport thumb invisible
+#    in Windows Terminal" ───────────────────────────────────────────────
+#
+# #1842's own acceptance bar is a human on dell64 confirming the
+# viewport-highlight band is visibly distinct from the rest of the
+# minimap strip in a real Windows Terminal window — exactly the kind of
+# check this file exists to carry, but `win_native_driver.py`'s step
+# vocabulary has no pixel-colour-sampling step today (only UIA
+# element/text matches, clicks, and whole-window screenshot *diffing* for
+# `expect_idle_stable` — not a "read the colour at (x, y) and compare
+# against a threshold" primitive), so a step here would either silently
+# no-op or require inventing an unsupported key — the same trap #1829's
+# section above explicitly avoided. The investigation in
+# `PROJECT_STATE.md` found the known pre-fix defect (quadraui#1181,
+# opaque `accent_bg` with no blend) is already fixed and pinned, added
+# in-repo `TuiDriver` coverage for the "band identical to strip" defect
+# class under two themes, but left open whether the current 25%-blend
+# tint is itself too faint to see once a real terminal negotiates
+# 256-colour instead of truecolor — a question only real hardware (or a
+# driver that can sample terminal pixel colour) can answer. Until
+# `win_native_driver.py` grows that primitive (coordinator-repo work),
+# the dell64 re-confirmation this issue's acceptance bar requires has to
+# happen as a manual human check, tracked in `PROJECT_STATE.md`, not as
+# an automated step in this file.
+#
 # ── #1829: no Tier-2 step added for ":term opens a blank panel, no
 #    PowerShell prompt" ──────────────────────────────────────────────────
 #
