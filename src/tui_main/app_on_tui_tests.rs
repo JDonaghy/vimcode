@@ -16522,4 +16522,186 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #1739 — Extensions marketplace `i` (install) keystroke, driven through
+    // the real focus-routed key path (`App::handle_key_press` ->
+    // `render::dispatch_sidebar_panel_key` -> `Engine::
+    // dispatch_ext_sidebar_key_unified` -> `dispatch_ext_sidebar_action_key`),
+    // not by calling `Engine::ext_install_from_registry` directly the way
+    // every pre-existing `i`-key test in this file (and `issue_1346_*`/
+    // `issue_1807_*` above) does. That gap is exactly what let the bug
+    // through: the engine-level function has its own direct-call coverage,
+    // but nothing drove a real `KeyPressed(Down)`/`KeyPressed('i')` sequence
+    // with the sidebar actually focused.
+    //
+    // Root cause found while writing this test (not the issue body's own
+    // "readme-fetch network block" hypothesis, which this fixture's
+    // scriptless/registry-URL-less manifests rule out entirely —
+    // `Engine::ext_install_from_registry_with_runtime_check` never shells
+    // out to `curl` here): `quadraui::SidebarSystem::move_selection_by`
+    // only ever moves the selection *within* the already-active section.
+    // At the bottom of a section (or while it's empty) it returns
+    // `Consumed`/`Ignored` rather than crossing into the next one. A fresh
+    // install (the #1739 repro's own "cwd with no stale extension state")
+    // starts with an empty INSTALLED section, so `active_section` was
+    // permanently stuck at 0 and plain `Down` presses could never reach
+    // AVAILABLE at all — `dispatch_ext_sidebar_action_key`'s `"i"` arm then
+    // read `(in_installed: true, idx: 0)` indexing an empty list and
+    // silently did nothing, exactly matching the reported symptom.
+    mod issue_1739_ext_install_key {
+        use super::*;
+        use crate::core::engine::sidebar::PANEL_EXTENSIONS;
+        use crate::core::extensions::ExtensionManifest;
+
+        fn down_key() -> quadraui::UiEvent {
+            quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Named(quadraui::NamedKey::Down),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            }
+        }
+
+        fn i_key() -> quadraui::UiEvent {
+            quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('i'),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            }
+        }
+
+        /// Build an engine with an empty INSTALLED section and one
+        /// *available* extension — the #1739 repro's exact starting state
+        /// ("a cwd with no stale extension state"). No scripts, no
+        /// registry base URL: install must be a pure local no-op (mark
+        /// installed + status message), no network involved to confound
+        /// the result.
+        fn harness_with_one_available_extension(
+            unique: &str,
+        ) -> (
+            crate::harness::ConformanceHarness<
+                quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            >,
+            String,
+        ) {
+            let home = std::env::temp_dir().join(format!(
+                "vimcode_test_1739_ext_install_{unique}_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            std::fs::create_dir_all(&home).unwrap();
+            // Leaked deliberately: the guard must outlive this function
+            // (it restores `HOME` on drop) and the test only ever runs
+            // this fixture once, so leaking it for the process lifetime is
+            // harmless and matches the pattern other direct-call fixtures
+            // in this file use via `set_test_home`.
+            let guard = crate::core::paths::set_test_home(&home);
+            std::mem::forget(guard);
+
+            let available_name = format!("vc-tui-1739-available-{unique}");
+
+            // Short display name: the sidebar body column is narrow
+            // enough (even at this module's usual 80-column harness) to
+            // truncate anything much longer than this before the
+            // identifying text ever reaches the screen (same column-width
+            // constraint `harness_with_far_future_requirement` above works
+            // around with a 220-column terminal + repeated Alt+Right
+            // resizes — overkill for this fixture's short name).
+            let mut engine = plain_engine();
+            engine.ext_registry = Some(vec![ExtensionManifest {
+                name: available_name.clone(),
+                display_name: "Zavail".to_string(),
+                ..Default::default()
+            }]);
+
+            engine.focus_sidebar_panel(PANEL_EXTENSIONS);
+
+            let h = harness(engine);
+            (h, available_name)
+        }
+
+        /// RED-verified by hand against this PR's own fix reverted (the
+        /// `ext_sidebar_navigate`/`ext_sidebar_cross_section_on_edge` change
+        /// in `ext_panel.rs` removed): with that revert, the screen after
+        /// pressing `Down` then `i` is unchanged from before either
+        /// keypress — no "installed" message, extension never marked
+        /// installed — confirming the test fails against the real,
+        /// pre-fix dispatch path rather than passing trivially.
+        #[test]
+        fn down_then_i_installs_the_only_available_extension_via_shell_app() {
+            let (mut h, available_name) = harness_with_one_available_extension("keyboard");
+            let driver = &mut h.driver;
+
+            driver.render();
+            let before = driver.screen();
+            assert!(
+                before.contains("AVAILABLE") && before.contains("Zavail"),
+                "precondition: the Extensions sidebar must list the \
+                 available extension; screen:\n{before}"
+            );
+
+            // The #1739 repro's pure-keyboard path: Enter-into-panel
+            // already happened via `focus_sidebar_panel` above, so this is
+            // just the "arrow-key Down" half, selecting the sidebar's one
+            // and only row (INSTALLED is empty).
+            driver.dispatch(down_key());
+            driver.dispatch(i_key());
+            driver.render();
+
+            let after = driver.screen();
+            assert!(
+                after.contains("installed"),
+                "#1739: pressing Down then `i` must select the available \
+                 extension and paint an 'installed' status message via \
+                 the real key dispatch path; screen:\n{after}"
+            );
+
+            let engine = h.engine.borrow();
+            assert!(
+                engine.message.contains(&available_name) && engine.message.contains("installed"),
+                "#1739: `Engine::message` must name the installed extension; \
+                 message: {:?}",
+                engine.message
+            );
+            assert!(
+                engine.extension_state.is_installed(&available_name),
+                "#1739: pressing `i` must actually mark the extension \
+                 installed, not just paint a message"
+            );
+        }
+
+        /// The repro's mouse variant: clicking directly on the available
+        /// row must select it (and, critically, must not regress now that
+        /// `ext_sidebar_navigate` grew cross-section logic) so that `i`
+        /// still installs it with no keyboard navigation at all.
+        #[test]
+        fn click_then_i_installs_the_clicked_available_extension_via_shell_app() {
+            let (mut h, available_name) = harness_with_one_available_extension("mouse");
+            let driver = &mut h.driver;
+
+            driver.render();
+            let (zx, zy) = driver
+                .find("Zavail")
+                .expect("the available extension's row must paint its text");
+            driver.click(zx, zy);
+            driver.dispatch(i_key());
+            driver.render();
+
+            let after = driver.screen();
+            assert!(
+                after.contains("installed"),
+                "#1739: clicking the available row then pressing `i` must \
+                 install it; screen:\n{after}"
+            );
+            assert!(
+                h.engine
+                    .borrow()
+                    .extension_state
+                    .is_installed(&available_name),
+                "#1739: clicking then pressing `i` must actually mark the \
+                 extension installed"
+            );
+        }
+    }
 }
