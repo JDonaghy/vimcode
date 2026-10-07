@@ -451,13 +451,19 @@ impl Engine {
     /// [`Self::ext_show_readme_or_fetch_async`]. Wired into
     /// [`Self::poll_idle`] — same shape as [`Self::poll_ext_registry`].
     pub fn poll_ext_readme(&mut self) -> bool {
-        let result = if let Some(rx) = &self.ext_readme_rx {
-            rx.try_recv().ok()
-        } else {
-            return false;
-        };
-        let Some(maybe_content) = result else {
-            return false;
+        let maybe_content = match &self.ext_readme_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(content) => content,
+                // #1739 review round 2 nit: a plain `.ok()` collapses this
+                // arm into the "still running" `None` below, so if the
+                // fetch thread ever died without sending, `ext_readme_rx`
+                // would stay `Some` forever and get polled every idle
+                // tick for nothing. Treat a dead sender the same as a
+                // completed-with-no-content fetch.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            },
+            None => return false,
         };
         self.ext_readme_rx = None;
         let name = std::mem::take(&mut self.ext_readme_pending_name);
@@ -473,6 +479,40 @@ impl Engine {
             None => {}
         }
         true
+    }
+
+    /// Non-blocking check for completed background script downloads
+    /// started by [`Self::ext_install_from_registry_with_runtime_check`]
+    /// (#1739 review round 2). Wired into [`Self::poll_idle`] alongside
+    /// [`Self::poll_ext_readme`]. Drains every receiver that has a result
+    /// ready (not just the first) — see [`Engine::ext_scripts_fetch_rx`]'s
+    /// doc for why this is a `Vec` rather than a single slot — and
+    /// reloads plugins (`plugin_manager = None; plugin_init()`) once, if
+    /// any did, so newly-downloaded Lua for an extension installed in
+    /// *this* session becomes active without the user having to restart
+    /// vimcode. The content of the signal itself carries no information
+    /// (downloads still discard their own errors, matching the pre-#1739
+    /// inline loop) — only its arrival matters, because that's what
+    /// means the files are now actually on disk for `plugin_init()` to
+    /// find.
+    pub fn poll_ext_scripts(&mut self) -> bool {
+        if self.ext_scripts_fetch_rx.is_empty() {
+            return false;
+        }
+        let mut any_completed = false;
+        self.ext_scripts_fetch_rx.retain(|rx| match rx.try_recv() {
+            Ok(()) => {
+                any_completed = true;
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+        });
+        if any_completed {
+            self.plugin_manager = None;
+            self.plugin_init();
+        }
+        any_completed
     }
 
     /// Resolve the base URL for downloading extension files.
@@ -547,11 +587,22 @@ impl Engine {
         // download inline, per script, right here on the key-dispatch
         // path — a second blocking leg of the same freeze the `i` key's
         // README fetch had (see `ext_show_readme_or_fetch_async`'s doc).
-        // Nothing downstream of this block ever depended on the download's
-        // result (the old loop already discarded errors with `let _ =`),
-        // so it's a pure fire-and-forget background thread: kick it off
-        // and move straight on to the LSP/DAP resolution below, which is
-        // all local PATH/version checks with no network I/O of its own.
+        // The download itself is still fire-and-forget (errors are
+        // discarded with `let _ =`, same as the old inline loop), but its
+        // *side effect* — the `.lua` files landing on disk — is not
+        // something downstream can ignore: `plugin_init()` a few lines
+        // below enumerates this same `ext_dir` and loads whatever `.lua`
+        // it finds there *right now*, before the background thread has
+        // had a chance to write anything. Left alone, that races the
+        // download essentially 100% of the time, so a freshly installed
+        // Lua-scripted extension would silently register none of its
+        // commands/keymaps until the next launch (#1739 review round 2).
+        // The fix mirrors `ext_show_readme_or_fetch_async`'s
+        // `ext_readme_rx`/`poll_ext_readme` pair: the thread signals
+        // completion over a channel, and `poll_ext_scripts` (wired into
+        // `poll_idle` alongside `poll_ext_readme`) reloads plugins once
+        // the files are actually on disk, so the newly installed
+        // extension's Lua becomes active in the installing session too.
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
             .join(&ext_name);
@@ -566,6 +617,7 @@ impl Engine {
             // block, so both move into the thread outright rather than
             // cloning (only `ext_name` is still needed below, for the
             // LSP/DAP status messages).
+            let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 for script in &scripts {
                     let dest = ext_dir.join(script);
@@ -574,7 +626,9 @@ impl Engine {
                         let _ = registry::download_script(&url, &dest);
                     }
                 }
+                let _ = tx.send(());
             });
+            self.ext_scripts_fetch_rx.push(rx);
         }
 
         let mut status_parts: Vec<String> = Vec::new();
@@ -809,7 +863,12 @@ impl Engine {
             .mark_installed_version(&ext_name, &manifest.version);
         let _ = self.extension_state.save();
 
-        // Reload plugins so newly extracted scripts are active
+        // Reload plugins now so already-on-disk scripts (re-installs,
+        // local dev extensions, or an install with no `scripts` to fetch)
+        // are active immediately. For a *freshly* downloaded script this
+        // reload is a no-op — the background thread kicked off above
+        // hasn't written the files yet — so `poll_ext_scripts` runs this
+        // same reload again once that download actually completes.
         self.plugin_manager = None;
         self.plugin_init();
 
