@@ -1959,7 +1959,7 @@ impl Engine {
         self.populate_ext_sidebar_system();
         let rect = self.ext_sidebar_body_rect.get();
         let ev = quadraui::UiEvent::KeyPressed {
-            key,
+            key: key.clone(),
             modifiers: quadraui::Modifiers::default(),
             repeat: false,
         };
@@ -1967,7 +1967,59 @@ impl Engine {
             .ext_sidebar_system
             .borrow_mut()
             .handle_cached(&ev, rect);
+        // #1739: `SidebarSystem::move_selection_by` only moves the
+        // selection *within* the already-active section — at the bottom
+        // of a section (or while it's empty) it comes back `Consumed` (no
+        // row actually changed) or `Ignored` rather than crossing into the
+        // next section. A fresh install starts with an empty INSTALLED
+        // section, so without this, `active_section` is permanently stuck
+        // at 0 and Down can *never* reach AVAILABLE at all — the root
+        // cause of #1739's "pressing `i` is a silent no-op": the `i`
+        // handler reads `(in_installed: true, idx: 0)` indexing an empty
+        // list, and silently does nothing. Cross the boundary ourselves
+        // through `SidebarSystem`'s own public API
+        // (`active_section`/`set_active_section`/`set_selected_path`) —
+        // no quadraui change needed, matching the Platform-Neutrality
+        // Rule's "thin wiring" bar.
+        let needs_cross_section = matches!(
+            sidebar_event,
+            quadraui::SidebarEvent::Consumed | quadraui::SidebarEvent::Ignored
+        );
         self.dispatch_ext_sidebar_event(sidebar_event);
+        if needs_cross_section {
+            self.ext_sidebar_cross_section_on_edge(&key);
+        }
+    }
+
+    /// See [`Self::ext_sidebar_navigate`]'s #1739 doc. `Down`/`j` move into
+    /// the AVAILABLE section's first row when INSTALLED is at its last row
+    /// (or empty); `Up`/`k` move into INSTALLED's last row the same way.
+    /// Only the two sections `populate_ext_sidebar_system` ever builds
+    /// ("installed" = 0, "available" = 1), so the target index is a plain
+    /// flip rather than a general cycle.
+    fn ext_sidebar_cross_section_on_edge(&mut self, key: &quadraui::Key) {
+        use quadraui::{Key, NamedKey};
+        let forward = match key {
+            Key::Named(NamedKey::Down) | Key::Char('j') => true,
+            Key::Named(NamedKey::Up) | Key::Char('k') => false,
+            _ => return,
+        };
+        let target_section = if forward { 1usize } else { 0usize };
+        let mut sidebar = self.ext_sidebar_system.borrow_mut();
+        if sidebar.active_section() == Some(target_section) {
+            return;
+        }
+        let target_len = if target_section == 0 {
+            self.ext_installed_items().len()
+        } else {
+            self.ext_available_items().len()
+        };
+        if target_len == 0 {
+            return;
+        }
+        let row = if forward { 0 } else { target_len - 1 };
+        sidebar.set_active_section(Some(target_section));
+        sidebar.set_selected_path(target_section, Some(vec![row as u16]));
     }
 
     pub fn dispatch_ext_sidebar_key_unified(
