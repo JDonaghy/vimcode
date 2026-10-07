@@ -16535,7 +16535,8 @@ mod tests {
     // but nothing drove a real `KeyPressed(Down)`/`KeyPressed('i')` sequence
     // with the sidebar actually focused.
     //
-    // Two separate root causes, both fixed:
+    // Two separate root causes, both fixed, plus a regression the round-2
+    // fix for the second one introduced and round 2's own review caught:
     //
     // 1. `quadraui::SidebarSystem::move_selection_by` only ever moves the
     //    selection *within* the already-active section. At the bottom of a
@@ -16546,9 +16547,12 @@ mod tests {
     //    permanently stuck at 0 and plain `Down` presses could never reach
     //    AVAILABLE at all — `dispatch_ext_sidebar_action_key`'s `"i"` arm
     //    then read `(in_installed: true, idx: 0)` indexing an empty list
-    //    and silently did nothing. This fixture's scriptless/registry-
-    //    URL-less manifest keeps that path (and *only* that path) the
-    //    one this module's two tests below exercise.
+    //    and silently did nothing. `harness_with_one_available_extension`
+    //    below clears `settings.extension_registries` specifically so this
+    //    leg's two tests (`down_then_i_...`/`click_then_i_...`) exercise
+    //    *only* this path: both network calls below hit their own
+    //    `is_empty()`/`base_url.is_empty()` early return synchronously,
+    //    with no real registry fetch in flight to race against.
     //
     // 2. A prior round of review on this fix correctly pointed out that
     //    (1) alone does not explain the issue body's own byte-level
@@ -16560,17 +16564,30 @@ mod tests {
     //    key-dispatch path, and `ext_install_from_registry_with_runtime_
     //    check` itself blocks on `registry::download_script` (`--max-time
     //    30`, once per manifest script) before that. Fixed by moving both
-    //    off the UI thread (`Engine::ext_show_readme_or_fetch_async`/
-    //    `poll_ext_readme` in `lsp_ops.rs`, and a fire-and-forget
-    //    background thread for the script-download loop) — see
-    //    `PROJECT_STATE.md`'s #1739 entry for the full writeup. This
-    //    fixture's scriptless/registry-URL-less manifest means neither of
-    //    *this* module's two tests exercises that leg (both network calls
-    //    hit their own `is_empty()` early return synchronously) — they
-    //    cover root cause 1 only. Root cause 2 has no Tier-1/Tier-2 test
-    //    in this PR; it needed a live, registry-backed PTY session to
-    //    reproduce, and the review itself identifies that gap as still
-    //    open (see `PROJECT_STATE.md`).
+    //    off the UI thread: `Engine::ext_show_readme_or_fetch_async`/
+    //    `poll_ext_readme` for the README, and a channel-backed background
+    //    thread for the script-download loop (`lsp_ops.rs`) — see
+    //    `pressing_i_against_an_unresponsive_registry_does_not_block_
+    //    dispatch_1739` below, which proves `i` no longer blocks even
+    //    against a registry that never answers at all.
+    //
+    // 3. Round 2's fix for (2) backgrounded the script download with a
+    //    plain fire-and-forget `std::thread::spawn` — but `plugin_init()`
+    //    (which enumerates the extension's directory *on disk* and loads
+    //    whatever `.lua` it finds there right now) runs synchronously a
+    //    few lines later in the very same `"i"` handler, racing the
+    //    download essentially 100% of the time. A freshly installed
+    //    Lua-scripted extension would register none of its
+    //    commands/keymaps until the next launch — that round's own
+    //    review caught it. Fixed by giving the download thread a
+    //    completion channel (`Engine::ext_scripts_fetch_rx`, drained by
+    //    `poll_ext_scripts`, wired into `poll_idle` next to
+    //    `poll_ext_readme`) that re-runs `plugin_init()` once the files
+    //    are actually on disk. See
+    //    `installed_extensions_script_becomes_callable_without_restart_1739`
+    //    below, which installs a real Lua-scripted extension against a
+    //    local registry fixture and proves its command is callable, via
+    //    the real `:`-command line, within this same session.
     mod issue_1739_ext_install_key {
         use super::*;
         use crate::core::engine::sidebar::PANEL_EXTENSIONS;
@@ -16635,6 +16652,17 @@ mod tests {
             // around with a 220-column terminal + repeated Alt+Right
             // resizes — overkill for this fixture's short name).
             let mut engine = plain_engine();
+            // #1739 review round 2 nit: without this, `plain_engine()`'s
+            // own startup still fires a real, backgrounded fetch against
+            // the *default* public registry (`ext_refresh_quiet`), which
+            // can land mid-test (e.g. while a later test here ticks the
+            // idle loop waiting on its own fixture) and overwrite
+            // `ext_registry` below with 19 real extensions, clobbering
+            // this fixture's single-entry list out from under the test
+            // that set it. Clearing `extension_registries` first makes
+            // that startup fetch a same-tick no-op (`ext_refresh_inner`'s
+            // `urls` is empty) instead of a live network race.
+            engine.settings.extension_registries = Vec::new();
             engine.ext_registry = Some(vec![ExtensionManifest {
                 name: available_name.clone(),
                 display_name: "Zavail".to_string(),
@@ -16746,8 +16774,9 @@ mod tests {
         /// `dispatch_ext_sidebar_action_key`'s `"i"` arm blocking on
         /// `registry::fetch_readme`/`download_script` (`curl --max-time
         /// 10`/`30` subprocesses) directly on the key-dispatch path — a
-        /// mechanism this module's other two tests, built on a
-        /// scriptless/registry-URL-less manifest, cannot exercise at all.
+        /// mechanism the `down_then_i_...`/`click_then_i_...` tests above,
+        /// built on a scriptless/registry-URL-less manifest, cannot
+        /// exercise at all.
         ///
         /// This test closes that gap without a real PTY or real network
         /// access: it points the available extension's `registry_base_url`
@@ -16760,10 +16789,14 @@ mod tests {
         /// `download_script` inline, `driver.dispatch(i_key())` itself
         /// would block for several seconds. It doesn't: both calls now run
         /// on background threads (`Engine::ext_show_readme_or_fetch_async`
-        /// / `poll_ext_readme`, and a fire-and-forget thread for the
+        /// / `poll_ext_readme`, and a channel-backed thread for the
         /// script-download loop — see `PROJECT_STATE.md`'s #1739 entry),
         /// so `dispatch` returns as soon as the local, synchronous half of
-        /// the `"i"` handler finishes.
+        /// the `"i"` handler finishes. (That the download thread's
+        /// *content* actually lands and gets used is what the next test,
+        /// `installed_extensions_script_becomes_callable_without_restart_
+        /// 1739`, covers — this one only proves the dispatch path doesn't
+        /// block.)
         ///
         /// RED-verified by hand: temporarily inlining `registry::
         /// fetch_readme(&base_url, &name)` back into the `"i"` arm (reverting
@@ -16837,6 +16870,200 @@ mod tests {
                  immediately even though the registry never responds; \
                  screen:\n{}",
                 driver.screen()
+            );
+        }
+
+        /// A minimal loopback HTTP fixture: binds an ephemeral port and
+        /// answers *every* request it receives with a fixed 200 response
+        /// and `body`, until the test process exits. Unlike
+        /// `live_plugin_api`'s `spawn_one_shot_http_fixture` (a few
+        /// thousand lines up in this file — that one's `mod`-private, so
+        /// this module gets its own), this one must survive more than one
+        /// connection: pressing `i` fires off *two* requests against the
+        /// same `registry_base_url` — the script download
+        /// (`ext_install_from_registry_with_runtime_check`) and the
+        /// post-install README fetch (`ext_show_readme_or_fetch_async`,
+        /// `ext_panel.rs`'s `"i"` arm) — racing each other to connect. A
+        /// one-shot listener serves whichever wins and refuses the other
+        /// outright (the listening socket is gone once that single
+        /// `accept()` returns), which silently drops the script download
+        /// on a coin flip and made this fixture's own test flaky under
+        /// parallel `cargo test` load.
+        fn spawn_multi_shot_http_fixture(body: &'static str) -> String {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind an ephemeral loopback port");
+            let addr = listener.local_addr().expect("resolve bound local_addr");
+            let base_url = format!("http://{addr}");
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    // Each connection gets its own thread so the script
+                    // download and README fetch can both be served
+                    // concurrently rather than queueing behind each other.
+                    std::thread::spawn(move || {
+                        use std::io::{Read as _, Write as _};
+                        let mut stream = stream;
+                        // Drain the request up to the blank line ending its
+                        // headers before responding — curl doesn't start
+                        // reading a response until it has finished writing
+                        // the request.
+                        let mut chunk = [0u8; 4096];
+                        let mut seen = Vec::new();
+                        loop {
+                            let Ok(n) = stream.read(&mut chunk) else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            seen.extend_from_slice(&chunk[..n]);
+                            if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                            if seen.len() > 65_536 {
+                                return;
+                            }
+                        }
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    });
+                }
+            });
+            base_url
+        }
+
+        /// Review round 2 blocking finding: backgrounding the script
+        /// download (the fix for the test above) raced `plugin_init()` —
+        /// called synchronously a few lines later in the very same `"i"`
+        /// handler — against the download thread actually writing the
+        /// `.lua` file, so a freshly installed Lua-scripted extension
+        /// registered none of its commands until the *next* launch. This
+        /// test drives a real registry (a one-shot loopback HTTP fixture,
+        /// not a stuck one) that serves a real `init.lua` defining
+        /// `vimcode.command("Hello1739Ext", ...)`, installs it via the
+        /// real key-dispatch path, then proves the command becomes
+        /// callable *in this session* — through `:Hello1739Ext`, typed and
+        /// run via the real command line, with its message painted to the
+        /// status line — without any explicit `:Plugin reload` or
+        /// restart.
+        ///
+        /// RED-verified by hand: reverting `Engine::ext_scripts_fetch_rx`/
+        /// `poll_ext_scripts` back to the plain fire-and-forget
+        /// `std::thread::spawn` this review round replaced (no channel, no
+        /// re-run of `plugin_init()` on completion) makes this test fail —
+        /// `:Hello1739Ext` never produces its message within the 5s
+        /// bound, because nothing ever re-runs `plugin_init()` after the
+        /// download lands, matching #1739 round 2's reported regression
+        /// exactly.
+        #[test]
+        fn installed_extensions_script_becomes_callable_without_restart_1739() {
+            use std::time::{Duration, Instant};
+
+            let init_lua = r#"
+                vimcode.command("Hello1739Ext", function(args)
+                    vimcode.message("Hello1739Ext says: " .. args)
+                end)
+            "#;
+            let base_url = spawn_multi_shot_http_fixture(init_lua);
+
+            let (mut h, available_name, _home_guard) = harness_with_one_available_extension("scr");
+            {
+                let mut engine = h.engine.borrow_mut();
+                if let Some(reg) = engine.ext_registry.as_mut() {
+                    for m in reg.iter_mut() {
+                        if m.name == available_name {
+                            m.scripts = vec!["init.lua".to_string()];
+                            m.registry_base_url = base_url.clone();
+                        }
+                    }
+                }
+            }
+
+            let driver = &mut h.driver;
+            driver.render();
+            driver.dispatch(down_key());
+            driver.dispatch(i_key());
+            driver.render();
+            assert!(
+                driver.screen().contains("' installed"),
+                "precondition: the install itself must still succeed \
+                 synchronously; screen:\n{}",
+                driver.screen()
+            );
+
+            // Escape first: the Extensions sidebar still has focus after
+            // the install, and single letters in the command about to be
+            // typed below (`world` contains `r`) would otherwise route
+            // through `dispatch_ext_sidebar_action_key` instead of
+            // reaching the command line at all (`r` there re-triggers
+            // `ext_refresh()` — exactly what an earlier version of this
+            // test tripped over, surfacing as a spurious "Extension
+            // registry updated" message rather than the plugin's own).
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Named(quadraui::NamedKey::Escape),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+
+            // Poll the real idle hook (same `tick` both backends call every
+            // frame) until the background download lands and
+            // `poll_ext_scripts` reloads plugins — bounded so a
+            // regression back to fire-and-forget hangs this loop instead
+            // of silently passing. State inspection only gates the loop;
+            // the actual pass/fail assertion below is on painted output
+            // from running the command for real, exactly once. 10s (not
+            // this file's usual 5s) because this one shells out to a real
+            // `curl` subprocess, which can be slow to schedule under a
+            // fully parallel `cargo test` run on a loaded machine.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut loaded = false;
+            while Instant::now() < deadline {
+                driver.tick();
+                loaded = h
+                    .engine
+                    .borrow()
+                    .plugin_manager
+                    .as_ref()
+                    .is_some_and(|pm| pm.plugins.iter().any(|p| p.error.is_none()));
+                if loaded {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                loaded,
+                "#1739 review round 2: the install's background script \
+                 download must land and `poll_ext_scripts` must reload \
+                 plugins within 5s, so the extension's `init.lua` is \
+                 loaded without restarting vimcode"
+            );
+
+            driver.type_char(':');
+            for c in "Hello1739Ext world".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            let screen = driver.screen();
+
+            assert!(
+                screen.contains("Hello1739Ext says: world"),
+                "#1739 review round 2: an extension's script, downloaded \
+                 by the backgrounded install, must become callable \
+                 (its command runnable, its message painted) within this \
+                 session — no restart, no explicit `:Plugin reload` — \
+                 within 5s of the install; screen:\n{screen}"
+            );
+            assert!(
+                h.engine
+                    .borrow()
+                    .extension_state
+                    .is_installed(&available_name),
+                "#1739: the extension must still be marked installed"
             );
         }
     }

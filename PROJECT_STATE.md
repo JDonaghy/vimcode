@@ -2,13 +2,15 @@
 
 **Last updated:** October 7, 2026 (#1739 — bugbash:tui-pty "Extensions
 marketplace 'install' keystroke (i) is a silent no-op under real terminal
-input"). **Fixed — two real root causes, both addressed.** Review round 1
-on this issue's first PR found the originally-shipped fix (a real
-cross-section navigation bug — see below — that genuinely matches the
-report's symptom in the scriptless/registry-URL-less fixture it was tested
-against) did not explain the report's own byte-level evidence: a live,
-registry-backed session freezes the whole UI thread for up to several
-seconds on `i`, which the nav-bug theory alone cannot produce.
+input"). **Fixed — two real root causes, both addressed, plus a
+plugin-reload regression review round 2 introduced and then caught in the
+same round.** Review round 1 on this issue's first PR found the
+originally-shipped fix (a real cross-section navigation bug — see below —
+that genuinely matches the report's symptom in the scriptless/registry-
+URL-less fixture it was tested against) did not explain the report's own
+byte-level evidence: a live, registry-backed session freezes the whole UI
+thread for up to several seconds on `i`, which the nav-bug theory alone
+cannot produce.
 
 - **Root cause 2 (the one the byte-level evidence actually points at):**
   `Engine::dispatch_ext_sidebar_action_key`'s `"i"` arm calls
@@ -22,17 +24,41 @@ seconds on `i`, which the nav-bug theory alone cannot produce.
   PTY output — the "i" key looking like a no-op was really "blocked on a
   subprocess, then finally repainting once it returns (or times out)".
   Fixed by moving both off the UI thread (`src/core/engine/lsp_ops.rs`):
-  the script-download loop is now a fire-and-forget background thread
-  (nothing downstream ever consumed its result — the old loop already
-  discarded errors with `let _ =`); the README fetch is now a proper
-  async round-trip (`Engine::ext_show_readme_or_fetch_async` spawns a
-  thread, `Engine::poll_ext_readme` drains it from `poll_idle`, same shape
-  as the pre-existing `ext_refresh`/`poll_ext_registry` pattern) shared by
-  both the `"i"` arm and `Engine::ext_open_selected_readme` (Enter/
+  the README fetch is a proper async round-trip
+  (`Engine::ext_show_readme_or_fetch_async` spawns a thread,
+  `Engine::poll_ext_readme` drains it from `poll_idle`, same shape as the
+  pre-existing `ext_refresh`/`poll_ext_registry` pattern) shared by both
+  the `"i"` arm and `Engine::ext_open_selected_readme` (Enter/
   double-click), which had the identical blocking call. The install's own
   `self.message` assignment (`ext_install_from_registry_with_runtime_
   check`'s final lines) stays synchronous, so the status line still
   repaints immediately — only the two network legs became async.
+  Verified against a real, non-stuck registry fixture: see
+  `installed_extensions_script_becomes_callable_without_restart_1739`
+  below.
+- **Round 2 regression, caught by round 2's own review before merge:** the
+  script-download thread above was first shipped as a plain
+  fire-and-forget `std::thread::spawn` — but `plugin_init()` (which
+  enumerates the extension's directory *on disk* and loads whatever
+  `.lua` it finds there) runs synchronously a few lines later in the very
+  same `"i"` handler, racing the download thread essentially 100% of the
+  time. A freshly installed Lua-scripted extension would register none of
+  its commands/keymaps until the *next launch* — silently reintroducing a
+  "nothing visible happened" symptom for exactly the extensions `i` is
+  supposed to activate. Fixed by giving the download thread a completion
+  channel, `Engine::ext_scripts_fetch_rx` (a `Vec` — concurrent installs
+  can have more than one download in flight — not a single `Option` like
+  `ext_readme_rx`), drained by `Engine::poll_ext_scripts` (wired into
+  `poll_idle` next to `poll_ext_registry`/`poll_ext_readme`), which re-runs
+  `plugin_init()` once the files actually land. Covered by
+  `installed_extensions_script_becomes_callable_without_restart_1739`
+  (`src/tui_main/app_on_tui_tests.rs`): installs a real Lua-scripted
+  extension against a local multi-request HTTP fixture (both the script
+  download and the README fetch hit the same base URL and both must
+  succeed — a one-shot fixture server made the test itself flaky by
+  serving only whichever request won the race) and proves the extension's
+  `vimcode.command(...)`-registered command is callable through the real
+  `:`-command line, in the installing session, with no restart.
 - **Root cause 1 (cross-section navigation — real, but not what the
   byte-level evidence was pointing at):** `quadraui::SidebarSystem::
   move_selection_by` only moves the selection *within* the already-active
@@ -71,10 +97,12 @@ seconds on `i`, which the nav-bug theory alone cannot produce.
   have to duplicate; a shared quadraui method would let all four collapse
   onto one implementation later.
 - Still open from review: no Tier-2 `tests/smoke-spec/tui.yaml` PTY step
-  against a real registry-backed fixture was added in this round — the two
-  async-ified network calls fix the mechanism the byte-level evidence
-  pointed at, but a live end-to-end PTY confirmation against a real
-  (non-scriptless) registry fixture remains unverified on real hardware.
+  against a real registry-backed fixture was added in this round. Unit/
+  driver-tier coverage now exercises a real (non-scriptless, non-stuck)
+  registry fixture end to end — install, backgrounded download, plugin
+  reload, command callable — but that's still a `TuiDriver` harness, not a
+  live PTY on real hardware; the acceptance bar's Tier-2 step is the
+  remaining gap.
 
 **Last updated:** October 7, 2026 (#1828 — TUI minimap on real terminals:
 no visible thumb on Windows Terminal; drag behaves like the scrollbar on

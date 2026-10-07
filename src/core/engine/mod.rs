@@ -4428,6 +4428,20 @@ pub struct Engine {
     /// sites disagree on this.
     pub(crate) ext_readme_show_missing_message: bool,
 
+    /// One completion signal per in-flight background script-download
+    /// thread spawned by [`Self::ext_install_from_registry_with_runtime_check`]
+    /// (#1739 review round 2). Each `()` sent means that install's scripts
+    /// have finished landing on disk (or failed — errors are still
+    /// discarded, same as the pre-#1739 inline loop); [`Self::
+    /// poll_ext_scripts`] drains every ready receiver and reloads plugins
+    /// so the newly-extracted Lua becomes active in the *installing*
+    /// session rather than only on the next launch. A `Vec` rather than a
+    /// single `Option` because a second `i` press can start a second
+    /// install (different extension) while the first's download is still
+    /// in flight — a single slot would silently drop that first
+    /// completion's reload the moment it's overwritten.
+    pub(crate) ext_scripts_fetch_rx: Vec<std::sync::mpsc::Receiver<()>>,
+
     // --- Native tool acquisition (#1345) ---
     /// In-flight background acquisitions (`tool_acquire::acquire_and_install`),
     /// keyed by the same `install_key` scheme `lsp_installing` uses (e.g.
@@ -5595,6 +5609,7 @@ impl Engine {
             ext_readme_pending_name: String::new(),
             ext_readme_pending_display: String::new(),
             ext_readme_show_missing_message: false,
+            ext_scripts_fetch_rx: Vec::new(),
             tool_acquire_tasks: HashMap::new(),
             tool_acquire_groups: HashMap::new(),
             ext_sidebar_system: {
@@ -6009,6 +6024,7 @@ impl Engine {
         redraw |= self.poll_dap();
         redraw |= self.poll_ext_registry();
         redraw |= self.poll_ext_readme();
+        redraw |= self.poll_ext_scripts();
         redraw |= self.poll_tool_acquire();
         redraw |= self.poll_sc_diff();
         self.tick_board();
