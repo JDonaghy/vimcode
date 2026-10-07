@@ -114,7 +114,7 @@ jobs:
           - **GUI builds (`vimcode`) are not ready for use on any platform.** On macOS the GUI window does not receive keyboard input when launched (#1825). The native macOS and Windows GUIs are not published. GUI artifacts are attached for testing only.
 
           <!-- Update this section every release: highlights since the previous tag. -->
-          **Since v0.14.0:** native Lua API additions (completion sources, async `fs.walk`/`fs.grep`, minimum-vimcode-version declarations for extensions), end-of-line virtual text, VS Code-mode fixes, hover popups working again, git status resolved per file, Windows TUI flicker fixes.
+          **Since v0.14.0:** the integrated terminal (`:term`) now works on Windows (#1829); installing an extension from the TUI no longer freezes the editor (#1739); minimap drag now scrolls within the minimap's own scale like VS Code, with Alt for file-wide (#1828); native Lua API additions (completion sources, async `fs.walk`/`fs.grep`, minimum-vimcode-version declarations for extensions); end-of-line virtual text; VS Code-mode fixes; hover popups working again; git status resolved per file; Windows TUI flicker fixes.
 
           ## Installation
 
