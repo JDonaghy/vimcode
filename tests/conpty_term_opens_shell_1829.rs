@@ -42,9 +42,10 @@
 //! It spawns `vcd.exe` under a real ConPTY on a small text file (mirroring
 //! the issue's own repro: launched as if from a terminal, on a real file),
 //! waits for the first real frame, sends the literal keystrokes `:term` +
-//! Enter — exactly what a user types — waits for the terminal panel's own
-//! "TERMINAL" header to actually paint (not a fixed sleep — see
-//! [`wait_for_screen_contains`]'s doc for why), then sends the issue's own
+//! Enter — exactly what a user types — waits for the terminal toolbar's own
+//! `[1]` tab label to actually paint (not a fixed sleep — see
+//! [`wait_for_screen_contains`]'s doc for why, and [`PANEL_OPEN_NEEDLE`]
+//! for why *that* string and not the panel's other chrome), then sends the issue's own
 //! acceptance probe: `echo <marker> > '<path>'` + Enter, straight into the
 //! PTY exactly as a real keystroke stream would arrive. It then polls the
 //! filesystem (not the screen — the probe's whole point is that it proves
@@ -80,8 +81,29 @@
 //! comment for why, and for the promotion condition) so it actually
 //! executes somewhere: `#![cfg(windows)]` alone makes this file compile to
 //! zero tests on every Linux/macOS lane, and CI's own `windows-latest`
-//! runner hosts a real native ConPTY, so it can produce this test's
-//! RED/GREEN signal with no attached physical Windows host required.
+//! runner hosts a real native ConPTY, so no attached physical Windows host
+//! is required to run it.
+//!
+//! What a result from that step means depends on *when* it was produced:
+//!
+//! * **Today**, at the quadraui pin this test landed against, a RED result
+//!   is the *expected* outcome and carries no new information — the
+//!   investigation that added this file attributed #1829 to quadraui's own
+//!   untested Windows ConPTY leg (`docs/PENDING_QUADRAUI_ISSUES.md`), which
+//!   has not been fixed yet. The useful signal from a red run today is the
+//!   *shape* of the failure: which of the two assertions below fired, and
+//!   the captured screen attached to it — enough to confirm this test
+//!   behaves as designed (reaches the probe, then times out waiting on the
+//!   dead shell) rather than failing for a reason of its own.
+//! * **After** the upstream fix lands and this repo's pin is bumped past
+//!   it, a GREEN result is what promotes this step off
+//!   `continue-on-error`, and a RED one becomes a real regression signal.
+//!
+//! The precondition needle this test waits on ([`PANEL_OPEN_NEEDLE`]) is
+//! separately pinned down on Linux, with no Windows host at all, by
+//! `src/tui_main/app_on_tui_tests.rs`'s
+//! `term_ex_command_paints_bracketed_tab_label_not_uppercase_terminal`, so
+//! "the needle is wrong" cannot masquerade as "ConPTY is broken" here.
 #![cfg(windows)]
 
 use std::io::{Read, Write};
@@ -100,6 +122,37 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 const PTY_ROWS: u16 = 40;
 const PTY_COLS: u16 = 120;
+
+/// The painted string this test uses as its "`:term` actually opened the
+/// terminal panel" precondition: the terminal toolbar's first per-tab
+/// label, `format!("[{}]", i + 1)` in `render::build_terminal_toolbar`.
+///
+/// Why this string and not the panel's other chrome:
+///
+/// * **`"TERMINAL"` (uppercase) is unreachable.** It is the toolbar tab
+///   strip's `if tabs.is_empty()` fallback label, so it paints only when
+///   `TerminalPanel::tab_count == 0`. `tab_count` is
+///   `engine.terminal_panes.len()`, and `render::terminal_panel_desc`
+///   early-returns `None` — painting no panel at all — when there are no
+///   panes, so `tab_count >= 1` whenever the panel paints. On the
+///   `TerminalSession::spawn` *failure* path, `Engine::terminal_new_tab_at`
+///   never sets `terminal_open`, so the panel is not painted either. The
+///   needle is therefore unreachable in every state this test can reach:
+///   waiting on it would burn `SETTLE_TIMEOUT` and fail identically on a
+///   working build and a broken one, never reaching the probe below.
+///   (The uppercase sidebar needles in
+///   `tests/conpty_activity_bar_click.rs` — `"EXPLORER"` et al — come from
+///   `Engine::fixed_panel_title_tooltip`, which covers *sidebar* panels
+///   only and has no terminal entry; the analogy does not carry over.)
+/// * **`"Terminal"` (title case) is vacuous.** It is the bottom-panel tab
+///   bar's label, but it is *also* a permanent top-level menu-bar title, so
+///   it is already on screen before `:term` is ever typed.
+/// * `"[1]"` is present exactly when a terminal pane exists, and absent
+///   before. `src/tui_main/app_on_tui_tests.rs`'s
+///   `term_ex_command_paints_bracketed_tab_label_not_uppercase_terminal`
+///   asserts both halves of that on Linux, so this constant is verifiable
+///   with no Windows host attached.
+const PANEL_OPEN_NEEDLE: &str = "[1]";
 
 /// Byte sink the reader thread appends to; read back (cloned) by the
 /// polling helpers below. A bare `Arc<Mutex<Vec<u8>>>` would say the same
@@ -341,18 +394,34 @@ impl TermTestGuard {
 
 impl Drop for TermTestGuard {
     fn drop(&mut self) {
-        // Best-effort graceful shutdown first, so a healthy session exits
-        // cleanly rather than merely being killed.
+        // Best-effort `:qa!`, matching the sibling ConPTY files' teardown.
+        // Note this only lands on vimcode's own ex line *before* `:term`
+        // succeeds: once `terminal_has_focus` is set,
+        // `render::route_terminal_key` forwards these bytes to the nested
+        // shell instead, so in the (common) healthy case the `kill()` below
+        // is what actually ends the session. Kept anyway because it does
+        // cover the early-failure paths — a panic from the startup-frame or
+        // panel-open assertion, where vimcode is still in Normal mode.
+        //
+        // Every `lock()` here uses `unwrap_or_else(|e| e.into_inner())`
+        // rather than `unwrap()`: `Drop` runs while unwinding past a failed
+        // assertion, and a panic *inside* `Drop` during an unwind aborts the
+        // process, destroying the captured-screen diagnostics the assertion
+        // message exists to deliver. A poisoned mutex must not cost us that.
         {
-            let mut w = self.writer.lock().unwrap();
+            let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
             w.write_all(b"\x1b\x1b:qa!\r").ok();
             w.flush().ok();
         }
-        let _ = self.child.try_wait();
         std::thread::sleep(Duration::from_millis(500));
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(p) = self.probe_path.lock().unwrap().take() {
+        if let Some(p) = self
+            .probe_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = std::fs::remove_file(&p);
         }
         let _ = std::fs::remove_dir_all(&self.home);
@@ -396,18 +465,31 @@ fn term_command_opens_a_working_shell_over_real_conpty_1829() {
         w.flush().ok();
     }
 
-    // Wait for the terminal panel's own header to actually paint, rather
-    // than sleeping a fixed duration — see [`wait_for_screen_contains`]'s
-    // doc for why a fixed settle window is flaky on real hardware. The
-    // header paints even if the shell inside the panel is dead (it's drawn
-    // by vimcode's own shared panel chrome, not by anything the nested
-    // shell writes), so this is a precondition check on `OpenTerminal`
-    // having dispatched, not part of what #1829 is actually testing.
+    // Wait for the terminal toolbar's own first tab label to actually
+    // paint, rather than sleeping a fixed duration — see
+    // [`wait_for_screen_contains`]'s doc for why a fixed settle window is
+    // flaky on real hardware, and [`PANEL_OPEN_NEEDLE`] for why this
+    // particular string. The label is drawn by vimcode's own shared panel
+    // chrome from `terminal_panes.len()`, not by anything the nested shell
+    // writes, so it paints even if the shell inside the panel is dead —
+    // which is exactly the distinction #1829 needs. This is a precondition
+    // check on `OpenTerminal` having dispatched and `TerminalSession::
+    // spawn` having returned `Ok`, not part of what #1829 is actually
+    // testing.
     assert!(
-        wait_for_screen_contains(&mut parser, &captured, &mut fed, "TERMINAL", SETTLE_TIMEOUT),
-        "`:term` never painted the terminal panel's \"TERMINAL\" header \
-         within {SETTLE_TIMEOUT:?} — the panel itself never opened; \
-         screen:\n{}",
+        wait_for_screen_contains(
+            &mut parser,
+            &captured,
+            &mut fed,
+            PANEL_OPEN_NEEDLE,
+            SETTLE_TIMEOUT
+        ),
+        "`:term` never painted the terminal toolbar's \"{PANEL_OPEN_NEEDLE}\" \
+         tab label within {SETTLE_TIMEOUT:?} — the panel itself never \
+         opened, so this is *not* #1829's symptom (which is a panel that \
+         opens but has no working shell in it); suspect `:term` dispatch or \
+         a `TerminalSession::spawn` error instead, and check the status line \
+         for \"terminal: failed to open PTY\". Screen:\n{}",
         screen_text(&parser)
     );
 
