@@ -437,25 +437,66 @@ win = ["quadraui/win"]
 # the #896 note below also relies on — the committed lock must be what cargo
 # produces, verified with `--locked`, never hand-reasoned.
 #
-# #1843 bumps to `4e71a8b` (quadraui `develop` HEAD, 1 commit ahead of
-# `a536053`) for quadraui#1327: ConPTY VT handshake answers plus the
-# `default_shell()` `$SHELL` gate. This is the fix for the Windows TUI
-# `:term` blank-panel bug (vimcode#1829) and very likely also the Win-GUI
-# terminal (vimcode#1668) — confirmed on dell64's real Windows host: the
-# same `tests/conpty_term_opens_shell_1829.rs` test against quadraui
-# `a536053` FAILED (no probe file within 20s), and against `4e71a8b`
-# PASSED (1.9s). See the comments on vimcode#1829 and quadraui#1327.
+# #1843 bumps to `4e71a8b` (quadraui `develop` HEAD, **19 commits** ahead
+# of `a536053` — `git rev-list --count a5360532..4e71a8bb`, same by
+# `--first-parent`; 63 files changed, +5896/-160) for quadraui#1327:
+# ConPTY VT handshake answers plus the `default_shell()` `$SHELL` gate.
+# This is the fix for the Windows TUI `:term` blank-panel bug
+# (vimcode#1829) and very likely also the Win-GUI terminal (vimcode#1668)
+# — confirmed on dell64's real Windows host: the same
+# `tests/conpty_term_opens_shell_1829.rs` test against quadraui `a536053`
+# FAILED (no probe file within 20s), and against `4e71a8b` PASSED (1.9s).
+# See the comments on vimcode#1829 and quadraui#1327.
 #
 # Also carries quadraui#1325 (macOS GTK foreground activation, vimcode
 # #1825) — unconfirmed by a person on real macOS hardware yet, but that's
 # fine since the macOS GUI build is marked not-ready regardless.
 #
+# The rest of the 19-commit range this bump drags in, for anyone bisecting
+# a future regression:
+#   - `be97a62e` adds a `DoubleClick` arm for the activity bar to
+#     `AppShell::handle`. vimcode's own `App::handle_dispatch` carries a
+#     rescue rung (search "#1762 rescue" in `src/app.rs`) that exists
+#     specifically because this arm was missing upstream; traced after
+#     this bump and confirmed there is no double-handling — the rung
+#     intercepts `UiEvent::DoubleClick` first, re-synthesizes a
+#     `MouseDown`, and returns before the new upstream arm is ever
+#     reached. The rung itself is now redundant and should be removed as
+#     separate platform-neutrality follow-up work (GOALS.md milestone #7),
+#     not in this PR.
+#   - `18eda743`/`a1898415` add
+#     `Backend::draw_rich_text_popup_with_font_role`, closing the
+#     quadraui#220 gap (`RichTextPopup` previously hardcoded its chrome
+#     font).
+#   - `8b072205`/`066d5bae` add new `Canvas` and `Float` primitives, with
+#     accompanying `Surface`/`Backend`/`modal_stack` surface changes
+#     (`quadraui/src/{backend,frame,modal_stack}.rs`). No vimcode call-site
+#     changes needed beyond what the compiler required.
+#   - The `gtk` feature now pulls in `dep:objc2`/`dep:objc2-app-kit` on
+#     macOS as part of quadraui#1325's activation fix (previously those
+#     crates were only reachable via the `macos` feature); both are
+#     already present in this lockfile via that feature, so the lock gains
+#     no new entries.
+#   - The remaining commits in the range (`primitives/status_bar.rs`,
+#     `tui/braille.rs`, test/doc/refactor commits) are doc/test/refactor
+#     only — no rendering change, consistent with zero snapshot churn in
+#     this diff.
+#
+# Note on Cargo.lock across *this* bump (same invariant as the #896/#1775
+# notes above, verified the same way): the only line cargo changes is
+# `quadraui`'s `source = "git+...#rev"` string. The upstream manifest diff
+# (`quadraui/Cargo.toml`, `a536053..4e71a8b`) adds no new *external*
+# dependencies — it only adds `dep:objc2`/`dep:objc2-app-kit` to the
+# existing `gtk` feature, and both packages are already present in this
+# lockfile via the `macos` feature. Verified with `cargo metadata --locked`
+# against the committed lock.
+#
 # This PR also removes `continue-on-error: true` from the
 # `conpty_term_opens_shell_1829` step in `build-windows-tui` (ci.yml), so
-# it's a required gate like `conpty_idle_flicker` / `conpty_activity_bar_
-# click` — vimcode#1829 itself is NOT closed by this bump (`Refs`, not
-# `Fixes`); it closes only after a person sees a live PowerShell prompt in
-# `vcd.exe` on dell64.
+# it's a required gate like `conpty_idle_flicker` /
+# `conpty_activity_bar_click` — vimcode#1829 itself is NOT closed by this
+# bump (`Refs`, not `Fixes`); it closes only after a person sees a live
+# PowerShell prompt in `vcd.exe` on dell64.
 quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "4e71a8bb25966db0f43fd2ec9eae9a284a5230e4", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries

@@ -386,11 +386,17 @@ jobs:
     # root cause to quadraui's own untested Windows ConPTY leg, so it was
     # *expected* to run RED until that upstream fix landed. #1843 bumps the
     # quadraui pin past quadraui#1327 (the ConPTY VT handshake + shell-gate
-    # fix) and promotes this to a hard gate per the two-part bar above: (1)
-    # the upstream fix has landed and this repo's pin has bumped past it,
-    # and (2) the step has been observed GREEN on real `dell64` Windows
-    # hardware after that bump (1.9s) — same bar #1636's own step comment
-    # states for why that step is a hard gate.
+    # fix) and promotes this to a hard gate: the upstream fix has landed and
+    # this repo's pin has bumped past it, and the step has been observed
+    # RED against the prior pin then GREEN against the new one (1.9s), both
+    # on real `dell64` Windows hardware — but that is **one** green run, not
+    # the three consecutive green runs #1636's own step comment above
+    # required before promoting that step to a hard gate. This test's
+    # 20s `SETTLE_TIMEOUT` over a cold real PowerShell startup is exactly
+    # the profile that can go intermittently red; if this step flakes,
+    # gather repeat green runs (including from CI itself) before assuming a
+    # real regression, and consider matching #1636's three-run bar by hand
+    # on `dell64` if it keeps flaking.
     - name: Run tests/conpty_term_opens_shell_1829.rs (#1829, real ConPTY on windows-latest)
       run: cargo test --release --test conpty_term_opens_shell_1829 --no-default-features
 

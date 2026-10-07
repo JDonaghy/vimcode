@@ -151,16 +151,21 @@
 # opacity entirely — it reads the raw byte stream, not an accessibility
 # tree), types `:term` + Enter then the issue's own `echo <marker> >
 # '<path>'` probe, and polls the filesystem for the marker. That test now
-# runs in CI too (`.github/workflows/ci.yml`'s `build-windows-tui` job, a
-# `continue-on-error: true` step pending the quadraui fix this traces the
-# root cause to — see that step's own comment), and can also be run by hand
-# via `cargo xwin test --target x86_64-pc-windows-msvc --test
+# runs in CI too (`.github/workflows/ci.yml`'s `build-windows-tui` job) as
+# a **required** step — vimcode#1843 bumped the quadraui pin to `4e71a8b`
+# (quadraui#1327: ConPTY VT handshake answers plus the `default_shell()`
+# `$SHELL` gate) and removed `continue-on-error: true` once this test was
+# RED-verified against the prior pin and GREEN-verified against the new
+# one on dell64's real Windows hardware — and can also be run by hand via
+# `cargo xwin test --target x86_64-pc-windows-msvc --test
 # conpty_term_opens_shell_1829 --no-default-features` on real Windows
 # hardware. That test, plus the issue's own step 3 (a person watching a
 # real PowerShell prompt appear on `dell64`'s screen), are both still
 # required before #1829 can be considered verified; see `PROJECT_STATE.md`
-# and `docs/PENDING_QUADRAUI_ISSUES.md` for the full investigation and the
-# drafted-but-not-yet-filed quadraui issue this traces the root cause to.
+# and `docs/PENDING_QUADRAUI_ISSUES.md` for the full investigation (the
+# quadraui gap this traced the root cause to is now struck there as
+# resolved by #1843's bump — #1829 itself stays open until the
+# real-hardware confirmation above happens).
 name: vimcode-win-terminal
 mode: terminal
 terminal_app: windows-terminal
