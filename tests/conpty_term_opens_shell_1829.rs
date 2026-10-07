@@ -77,27 +77,20 @@
 //! # CI wiring
 //!
 //! `.github/workflows/ci.yml`'s `build-windows-tui` job runs this test
-//! explicitly (as a `continue-on-error: true` step — see that job's own
-//! comment for why, and for the promotion condition) so it actually
-//! executes somewhere: `#![cfg(windows)]` alone makes this file compile to
-//! zero tests on every Linux/macOS lane, and CI's own `windows-latest`
-//! runner hosts a real native ConPTY, so no attached physical Windows host
-//! is required to run it.
+//! explicitly so it actually executes somewhere: `#![cfg(windows)]` alone
+//! makes this file compile to zero tests on every Linux/macOS lane, and
+//! CI's own `windows-latest` runner hosts a real native ConPTY, so no
+//! attached physical Windows host is required to run it.
 //!
-//! What a result from that step means depends on *when* it was produced:
-//!
-//! * **Today**, at the quadraui pin this test landed against, a RED result
-//!   is the *expected* outcome and carries no new information — the
-//!   investigation that added this file attributed #1829 to quadraui's own
-//!   untested Windows ConPTY leg (`docs/PENDING_QUADRAUI_ISSUES.md`), which
-//!   has not been fixed yet. The useful signal from a red run today is the
-//!   *shape* of the failure: which of the two assertions below fired, and
-//!   the captured screen attached to it — enough to confirm this test
-//!   behaves as designed (reaches the probe, then times out waiting on the
-//!   dead shell) rather than failing for a reason of its own.
-//! * **After** the upstream fix lands and this repo's pin is bumped past
-//!   it, a GREEN result is what promotes this step off
-//!   `continue-on-error`, and a RED one becomes a real regression signal.
+//! **As of vimcode#1843** (quadraui pin bumped to `4e71a8b`, which carries
+//! quadraui#1327's ConPTY VT handshake fix and `default_shell()` `$SHELL`
+//! gate — the upstream fix this file was originally written to detect the
+//! absence of), this step is a **required gate**, no longer
+//! `continue-on-error`: it ran RED (no probe file within 20s) against the
+//! prior `a536053` pin and GREEN (1.9s) against `4e71a8b`, both on dell64's
+//! real Windows hardware, before the `continue-on-error: true` was removed
+//! from `build-windows-tui`'s step for this file. A RED result from here on
+//! is a real regression signal, not expected noise.
 //!
 //! The precondition needle this test waits on ([`PANEL_OPEN_NEEDLE`]) is
 //! separately pinned down on Linux, with no Windows host at all, by

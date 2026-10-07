@@ -1,5 +1,36 @@
 # VimCode Project State
 
+**Last updated:** October 7, 2026 (#1843 — bump quadraui pin to `4e71a8b`,
+make the Windows `:term` CI test a required gate). **Pin bumped, no
+vimcode production code changed.** `4e71a8b` is 19 commits ahead of the
+prior `a536053` pin (`git rev-list --count a5360532..4e71a8bb` = 19, same
+by `--first-parent`; 63 files, +5896/-160 — see `Cargo.toml`'s own comment
+block for the full list of what else the range carries). Headline fixes:
+quadraui#1327 (ConPTY VT handshake answers + the `default_shell()`
+`$SHELL` gate — the real fix for #1829's Windows TUI `:term` blank panel,
+RED-verified against the prior pin and GREEN-verified against this one on
+dell64's real Windows hardware, 1.9s) and quadraui#1325 (macOS GTK
+foreground activation for #1825, not yet confirmed by a person on real
+macOS hardware). `tests/conpty_term_opens_shell_1829.rs`'s
+`continue-on-error: true` step in `.github/workflows/ci.yml`'s
+`build-windows-tui` job is now a required gate, matching
+`conpty_idle_flicker`/`conpty_activity_bar_click`. Four
+`docs/PENDING_QUADRAUI_ISSUES.md` entries this bump resolves are struck:
+the ConPTY/`$SHELL` gap (quadraui#1327, this PR's own headline), the macOS
+activation gap (quadraui#1325), `AppShell::handle`'s missing `DoubleClick`
+arm for the activity bar (landed as `be97a62e` — vimcode's own "#1762
+rescue" rung in `App::handle_dispatch` is now redundant but not removed in
+this PR), and `RichTextPopup`'s hardcoded chrome font (landed as
+`18eda743`/`a1898415` — the vimcode-side adoption at
+`render::editor_hover_to_quadraui_rich_text` is not done in this PR
+either; both are GOALS.md milestone #7 follow-up work). Neither #1829 nor
+#1825 is closed by this bump (`Refs`, not `Fixes`) — both stay open until
+a person confirms on real hardware. `Cargo.lock`'s only change is the
+`quadraui` `source` line; the upstream manifest adds no new external
+dependency, only `dep:objc2`/`dep:objc2-app-kit` to the existing `gtk`
+feature, both already present in the lock via the `macos` feature
+(verified with `cargo metadata --locked`).
+
 **Last updated:** October 7, 2026 (#1842 — TUI minimap viewport thumb
 reported invisible in Windows Terminal, split off #1828's drag half).
 **Investigated — the known pre-fix defect is already fixed and pinned;
