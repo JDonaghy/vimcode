@@ -106,6 +106,32 @@
 # Terminal re-verification of the painted blame ghost text itself remains
 # open pending the companion vimcode-ext fix; see this branch's commit
 # messages.
+#
+# ── #1829: no Tier-2 step added for ":term opens a blank panel, no
+#    PowerShell prompt" ──────────────────────────────────────────────────
+#
+# The issue's own acceptance criteria ask for a step that types a command
+# into the terminal panel and asserts a probe file's *filesystem* content —
+# this driver's step vocabulary (`win_native_driver.py`, a different repo
+# this file's own header already names as out of this worker's reach) has
+# no filesystem-assertion step type today, so a YAML step here would
+# silently no-op rather than gate anything; none was added rather than
+# invent an unsupported key. Nor would a UIA-text step help even if one
+# existed — same wall the five `-1634`/`-1635`/`-1636` steps above hit,
+# since the whole panel (editor chrome and every nested terminal pane
+# alike) lives inside Windows Terminal's one opaque `terminal` UIA
+# element. The closest automatable substitute is Tier-1:
+# `tests/conpty_term_opens_shell_1829.rs` (new), which spawns `vcd.exe`
+# under a *real* Win32 ConPTY directly (bypassing Windows Terminal's UIA
+# opacity entirely — it reads the raw byte stream, not an accessibility
+# tree), types `:term` + Enter then the issue's own `echo <marker> >
+# "<path>"` probe, and polls the filesystem for the marker — run it via
+# `cargo xwin test --target x86_64-pc-windows-msvc` on real Windows
+# hardware. That test, plus the issue's own step 3 (a person watching a
+# real PowerShell prompt appear on `dell64`'s screen), are both still
+# required before #1829 can be considered verified; see `PROJECT_STATE.md`
+# for the full investigation and the drafted-but-not-yet-filed quadraui
+# issue this traces the root cause to.
 name: vimcode-win-terminal
 mode: terminal
 terminal_app: windows-terminal
