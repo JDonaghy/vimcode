@@ -1,5 +1,69 @@
 # VimCode Project State
 
+**Last updated:** October 7, 2026 (#1828 — TUI minimap on real terminals:
+no visible thumb on Windows Terminal; drag behaves like the scrollbar on
+macOS). **Split into a shared-code fix (macOS drag mapping) + a quadraui
+gap (Windows Terminal thumb contrast) — the two reported symptoms had two
+different, independent root causes.**
+
+1. **Drag-mapping fix, shipped directly in vimcode (no quadraui change
+   needed):** the real root cause of "dragging the minimap feels like the
+   scrollbar" was that the **default** (no-modifier) minimap thumb drag
+   was already #1187's intentional file-wide/scrollbar-equivalent
+   mapping, with #1271's minimap-own-scale ("fine") mapping gated behind
+   Alt — the opposite of VS Code, where the plain drag is the
+   minimap-scale one. Both backends already shared one resolver
+   (`click::pixel_to_click_target` -> `render::minimap_press`), so this
+   was a pure shared-code fix: flipped the boolean vimcode passes in
+   (`!alt` instead of `alt`), so a plain drag now gets #1271's
+   minimap-own-scale mapping and **Alt-held** gets the old #1187
+   file-wide one (kept as a power-user "fast scroll" affordance rather
+   than deleted). Also fixed a genuine, independent latent bug this
+   flip exposed: `render::fine_seek_geometry` re-derived its own,
+   unclamped `thumb_length` (`Sh * viewport_lines / span`) instead of
+   reusing the real, already-painted `viewport_highlight` band height —
+   diverging from it whenever a file is short enough that quadraui's
+   `fit_thumb` minimum-thumb-length floor is in play (caught by the
+   pre-existing `minimap_drag_keeps_seeking_while_the_button_is_held`
+   GTK test going from ~50% to ~19% once "fine" became the default).
+   Fixed by threading the real band height straight through — the
+   virtual track's endpoint math is provably independent of which
+   `thumb_length` is used (it cancels out of dispatch's own
+   `track_length - thumb_length`), so this costs nothing.
+
+   **Black-box coverage, both backends, RED-verified:** four new/updated
+   driver tests — GTK's
+   `dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_on_gtk`
+   (now Alt-held) + new sibling
+   `..._scrolls_within_its_own_scale_by_default_on_gtk`, and the TUI
+   twins `..._scrolls_the_whole_file_with_alt_held` +
+   `..._scrolls_within_its_own_scale_by_default` in
+   `tui_main/app_on_tui_tests.rs`. Confirmed RED against the pre-fix
+   mapping by hand (temporarily reverting `click.rs`'s `!alt` back to
+   `alt` and re-running all four — all four failed, the two new
+   "default" tests landing past 90% of a 200,000-line file instead of
+   under 10%). The pre-existing `minimap_drag_keeps_seeking_while_the_button_is_held`
+   GTK test was updated to hold Alt (its point — drag-continuation keeps
+   re-seeking — is orthogonal to which of the two mappings is active;
+   its specific "~50% of the whole file" assertion only holds under the
+   file-wide one).
+
+2. **Windows Terminal thumb invisibility — quadraui gap, drafted, not
+   fixable in vimcode.** Traced the viewport-highlight band's paint
+   colour to `quadraui::tui::minimap::draw_minimap_with_scale`'s
+   `theme.background.blend(theme.accent_bg, 0.25)` — a fixed, no-floor
+   25% blend entirely inside quadraui; vimcode supplies only the two
+   source colours (`to_quadraui_theme`) and wires no terminal
+   colour-depth/`COLORTERM` detection anywhere in `src/tui_main/`
+   (confirmed by grep — there is no vimcode-side seam to intervene at
+   without adding new per-backend logic, which `CLAUDE.md`'s
+   Platform-Neutrality Rule forbids). Drafted as a new entry in
+   `docs/PENDING_QUADRAUI_ISSUES.md` for the coordinator to file;
+   `ISSUE_RESOLUTION: partial` on #1828 — the macOS drag-mapping half is
+   fixed, the Windows Terminal thumb-visibility half still needs the
+   quadraui fix and a real Windows Terminal re-check per the issue's own
+   acceptance criteria.
+
 **Last updated:** October 7, 2026 (#1786 — bugbash: Alt-M back to Vim mode
 leaves the VSCode-mode menu bar permanently visible). **Duplicate, already
 fixed — no new code.** #1786 is the identical bug (same repro: Alt-M,

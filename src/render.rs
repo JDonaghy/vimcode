@@ -15164,12 +15164,20 @@ pub struct MinimapPress {
 /// never mutates scroll/cursor state itself — see [`MinimapPress::jump`] for
 /// why the caller still might need to call that function too.
 ///
-/// `fine` is #1271's Alt-drag fine seek: when set, the geometry armed for the
-/// subsequent `ScrollbarY` drag is remapped from the whole file (`max_scroll`
-/// stays file-wide — #1187's own guarantee, unchanged) onto the strip's
-/// *currently painted window* instead, via a **virtual track** fed to the
-/// same primitive — see [`fine_seek_geometry`] for the derivation. `false`
-/// reproduces the exact pre-#1271 (file-wide, #1187) geometry.
+/// `fine` is #1271's minimap-scale seek, **the default since #1828**: when
+/// set, the geometry armed for the subsequent `ScrollbarY` drag is remapped
+/// from the whole file (`max_scroll` stays file-wide — #1187's own
+/// guarantee, unchanged) onto the strip's *currently painted window*
+/// instead, via a **virtual track** fed to the same primitive — see
+/// [`fine_seek_geometry`] for the derivation. This is the mapping VS Code
+/// itself uses: the viewport slider moves within the minimap's own
+/// (possibly sliding, #1093) scale, never the whole file's. `false`
+/// reproduces the pre-#1828 (file-wide, #1187) geometry — a drag that
+/// traverses virtually the whole file in one gesture, like a real
+/// scrollbar handle. `click::pixel_to_click_target`'s call site passes
+/// `!alt`, so holding **Alt** is now what reaches *this* geometry (the old
+/// #1187 default), kept as a power-user "fast scroll" affordance rather
+/// than dropped outright (#1828).
 pub fn minimap_press(
     engine: &Engine,
     screen: &ScreenLayout,
@@ -15210,7 +15218,7 @@ pub fn minimap_press(
                     &bounds,
                     &mm.minimap,
                     max_scroll,
-                    viewport_lines,
+                    band.height,
                     scroll_top,
                     py,
                     in_band,
@@ -15237,8 +15245,9 @@ pub fn minimap_press(
     None
 }
 
-/// Derive the **virtual track** #1271's Alt-drag fine seek arms in place of
-/// the real, file-wide one — remapping the same strip pixels onto the
+/// Derive the **virtual track** #1271's fine seek arms in place of
+/// the real, file-wide one (#1828: the default drag mapping; the old
+/// file-wide one now needs Alt held) — remapping the same strip pixels onto the
 /// strip's *currently painted window* (`~MINIMAP_LINES_PER_ROW` lines per
 /// cell) instead of the whole file (`~max_scroll / track_length` lines per
 /// cell), while still feeding `quadraui::dispatch_mouse_drag`'s unmodified
@@ -15254,14 +15263,31 @@ pub fn minimap_press(
 /// ```text
 /// effective_track = Sh * M / span      // dispatch's own track_length - thumb_length
 /// track_start     = S0 - base * Sh / span
-/// thumb_length    = Sh * viewport_lines / span
 /// track_length    = effective_track + thumb_length
 /// ```
+///
+/// `thumb_length` is taken straight from the caller's own, already-painted
+/// [`quadraui::MinimapLayout::viewport_highlight`] band height — **not**
+/// re-derived here as a naive `Sh * viewport_lines / span` proportion
+/// (#1828 review: that naive form omits `quadraui::fit_thumb`'s
+/// `min_thumb_len` floor, so on a file small enough that the real band is
+/// clamped to the floor — the exact regime
+/// `minimap_drag_keeps_seeking_while_the_button_is_held`'s short fixture
+/// exercises — the naive thumb came out *smaller* than what is actually
+/// painted/hit-tested, throwing off `effective_track`'s complement
+/// `track_length - thumb_length` dispatch itself recomputes and landing a
+/// drag to the strip's middle at ~19% of the file instead of ~50%).
+/// Whichever `thumb_length` is passed in cancels exactly out of dispatch's
+/// own `track_length - thumb_length` (since `track_length` is *defined* as
+/// `effective_track + thumb_length` above), so reusing the real band height
+/// costs nothing and keeps this virtual track's thumb bound to the one
+/// users actually see and click.
 ///
 /// Check: at `y = S0`, dispatch's `rel = base/M` → offset `base`; at
 /// `y = S0 + Sh`, `rel = (base+span)/M` → offset `base + span` — the virtual
 /// strip spans exactly the painted window, at `M/span` times the real
-/// strip's resolution.
+/// strip's resolution. This holds regardless of `thumb_length`'s value, by
+/// the cancellation above.
 ///
 /// `grab_offset` is derived by requiring the mapping to be an **identity at
 /// the press point** (dragging zero pixels must reproduce the current
@@ -15279,7 +15305,7 @@ fn fine_seek_geometry(
     bounds: &quadraui::Rect,
     minimap: &quadraui::Minimap,
     max_scroll: usize,
-    viewport_lines: usize,
+    thumb_length: f32,
     scroll_top: usize,
     py: f32,
     in_band: bool,
@@ -15297,7 +15323,6 @@ fn fine_seek_geometry(
 
     let effective_track = sh * m / span;
     let track_start = s0 - base * sh / span;
-    let thumb_length = sh * viewport_lines as f32 / span;
     let track_length = effective_track + thumb_length;
 
     let grab_offset = if in_band {
@@ -34530,7 +34555,14 @@ mod tests {
     /// that silently degenerated to the coarse, file-wide one would produce
     /// a visibly different (and wrong) result rather than an accidental
     /// match) inside a `bounds`/`max_scroll` pair distinct from either.
-    fn fine_geometry_fixture() -> (quadraui::Rect, quadraui::Minimap, usize, usize) {
+    ///
+    /// The returned `thumb_length` is an arbitrary, non-zero stand-in for
+    /// the real, already-painted `viewport_highlight.height` a live caller
+    /// would pass (#1828 review: `fine_seek_geometry` no longer re-derives
+    /// this itself — see its doc comment) — neither test below depends on
+    /// its actual value, only that it is threaded straight through
+    /// unmodified into `track_length`.
+    fn fine_geometry_fixture() -> (quadraui::Rect, quadraui::Minimap, usize, f32) {
         let bounds = quadraui::Rect::new(0.0, 10.0, 5.0, 20.0); // S0 = 10, Sh = 20
         let minimap = quadraui::Minimap {
             id: quadraui::WidgetId::new("mm"),
@@ -34550,8 +34582,8 @@ mod tests {
             total_buffer_lines: 50_000,
         };
         let max_scroll = 40_000; // M
-        let viewport_lines = 30;
-        (bounds, minimap, max_scroll, viewport_lines)
+        let thumb_length = 1.5; // arbitrary; see doc comment above
+        (bounds, minimap, max_scroll, thumb_length)
     }
 
     /// Drive a [`fine_seek_geometry`] result through the real,
@@ -34601,7 +34633,7 @@ mod tests {
     /// visibly miss.
     #[test]
     fn fine_seek_geometry_grab_offset_is_an_identity_at_the_press_point() {
-        let (bounds, minimap, max_scroll, viewport_lines) = fine_geometry_fixture();
+        let (bounds, minimap, max_scroll, fixture_thumb_length) = fine_geometry_fixture();
         let scroll_top = 12_345;
         let py = 15.0; // inside [S0, S0 + Sh) = [10.0, 30.0)
 
@@ -34609,7 +34641,7 @@ mod tests {
             &bounds,
             &minimap,
             max_scroll,
-            viewport_lines,
+            fixture_thumb_length,
             scroll_top,
             py,
             true, // in_band: the identity derivation only applies here
@@ -34641,7 +34673,7 @@ mod tests {
     /// visibly different from `base` (1000) and `base + span` (1401) here.
     #[test]
     fn fine_seek_geometry_endpoints_span_exactly_the_painted_window() {
-        let (bounds, minimap, max_scroll, viewport_lines) = fine_geometry_fixture();
+        let (bounds, minimap, max_scroll, fixture_thumb_length) = fine_geometry_fixture();
         let base = minimap.lines.first().unwrap().line_idx;
         let span = minimap.lines.last().unwrap().line_idx + 1 - base;
 
@@ -34653,7 +34685,7 @@ mod tests {
             &bounds,
             &minimap,
             max_scroll,
-            viewport_lines,
+            fixture_thumb_length,
             0,
             bounds.y,
             false,
