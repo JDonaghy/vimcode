@@ -1813,16 +1813,18 @@ impl Engine {
                             available[idx].display_name.clone()
                         };
                         self.ext_install_from_registry(&name);
-                        let readme_path = crate::core::paths::vimcode_config_dir()
-                            .join("extensions")
-                            .join(&name)
-                            .join("README.md");
-                        let content = std::fs::read_to_string(&readme_path)
-                            .ok()
-                            .or_else(|| crate::core::registry::fetch_readme(&base_url, &name));
-                        if let Some(content) = content {
-                            self.open_markdown_preview_in_tab(&content, &display);
-                        }
+                        // #1739: this was a second blocking `curl
+                        // --max-time 10` subprocess call right here on the
+                        // key-dispatch path, on top of the install itself
+                        // — see `ext_show_readme_or_fetch_async`'s doc for
+                        // why that froze the whole UI thread. The install
+                        // above already set `self.message` synchronously
+                        // (unconditionally, per `ext_install_from_registry_
+                        // with_runtime_check`'s doc) by the time this
+                        // returns, so the status line repaints immediately
+                        // even though the README preview itself may still
+                        // be a tick or two away.
+                        self.ext_show_readme_or_fetch_async(&name, &display, &base_url, false);
                         self.ext_sidebar_system.borrow_mut().set_collapsed(0, false);
                         let new_installed = self.ext_installed_items();
                         if let Some(pos) = new_installed.iter().position(|m| m.name == name) {
@@ -1958,8 +1960,19 @@ impl Engine {
     fn ext_sidebar_navigate(&mut self, key: quadraui::Key) {
         self.populate_ext_sidebar_system();
         let rect = self.ext_sidebar_body_rect.get();
+        // Computed before `key` moves into the `UiEvent` below (#1739
+        // review nit — avoids the `key.clone()` the first version of this
+        // fix needed to keep a post-move copy around).
+        let forward = matches!(
+            key,
+            quadraui::Key::Named(quadraui::NamedKey::Down) | quadraui::Key::Char('j')
+        );
+        let backward = matches!(
+            key,
+            quadraui::Key::Named(quadraui::NamedKey::Up) | quadraui::Key::Char('k')
+        );
         let ev = quadraui::UiEvent::KeyPressed {
-            key: key.clone(),
+            key,
             modifiers: quadraui::Modifiers::default(),
             repeat: false,
         };
@@ -1977,49 +1990,75 @@ impl Engine {
         // cause of #1739's "pressing `i` is a silent no-op": the `i`
         // handler reads `(in_installed: true, idx: 0)` indexing an empty
         // list, and silently does nothing. Cross the boundary ourselves
-        // through `SidebarSystem`'s own public API
-        // (`active_section`/`set_active_section`/`set_selected_path`) —
-        // no quadraui change needed, matching the Platform-Neutrality
-        // Rule's "thin wiring" bar.
-        let needs_cross_section = matches!(
-            sidebar_event,
-            quadraui::SidebarEvent::Consumed | quadraui::SidebarEvent::Ignored
-        );
+        // through `SidebarSystem`'s own public API — no quadraui change
+        // needed, matching the Platform-Neutrality Rule's "thin wiring"
+        // bar.
+        //
+        // Only `Down`/`j`/`Up`/`k` cross a boundary here; `PageUp`/
+        // `PageDown`/`Home`/`End` deliberately do not (#1739 review
+        // non-blocking note). Those are jump-by-many/jump-to-extreme
+        // commands with no well-defined "how far into the next section"
+        // semantics the way a single-row step has — e.g. `PageDown`
+        // overflowing INSTALLED by 3 rows has no obvious meaning in
+        // AVAILABLE's unrelated list. They still just stop at the section
+        // boundary rather than dead-ending permanently, since (unlike the
+        // single empty-INSTALLED-section case above) a user can always
+        // reach the far section with repeated `Down`/`j`/`Up`/`k` instead.
+        let needs_cross_section = (forward || backward)
+            && matches!(
+                sidebar_event,
+                quadraui::SidebarEvent::Consumed | quadraui::SidebarEvent::Ignored
+            );
         self.dispatch_ext_sidebar_event(sidebar_event);
-        if needs_cross_section {
-            self.ext_sidebar_cross_section_on_edge(&key);
+        if needs_cross_section && self.ext_sidebar_cross_section_on_edge(forward, rect) {
+            // Mirror `SidebarEvent::RowSelected`'s side effect
+            // (`dispatch_ext_sidebar_event`'s arm just above): a
+            // within-section `Down`/`Up` exits filter mode via that arm,
+            // but a boundary-crossing move never produces a `RowSelected`
+            // event (it runs *after* `dispatch_ext_sidebar_event`, driven
+            // off `Consumed`/`Ignored` instead) — so without this, crossing
+            // the boundary while `/` filter mode is active left it active,
+            // and the very next `i` got appended to the filter query
+            // instead of installing (#1739 review).
+            self.ext_sidebar_input_active = false;
         }
     }
 
-    /// See [`Self::ext_sidebar_navigate`]'s #1739 doc. `Down`/`j` move into
-    /// the AVAILABLE section's first row when INSTALLED is at its last row
-    /// (or empty); `Up`/`k` move into INSTALLED's last row the same way.
-    /// Only the two sections `populate_ext_sidebar_system` ever builds
-    /// ("installed" = 0, "available" = 1), so the target index is a plain
-    /// flip rather than a general cycle.
-    fn ext_sidebar_cross_section_on_edge(&mut self, key: &quadraui::Key) {
-        use quadraui::{Key, NamedKey};
-        let forward = match key {
-            Key::Named(NamedKey::Down) | Key::Char('j') => true,
-            Key::Named(NamedKey::Up) | Key::Char('k') => false,
-            _ => return,
-        };
+    /// See [`Self::ext_sidebar_navigate`]'s #1739 doc. `forward` (`Down`/
+    /// `j`) moves into the AVAILABLE section's first row when INSTALLED is
+    /// at its last row (or empty); backward (`Up`/`k`) moves into
+    /// INSTALLED's last row the same way. Only the two sections
+    /// `populate_ext_sidebar_system` ever builds ("installed" = 0,
+    /// "available" = 1), so the target index is a plain flip rather than a
+    /// general cycle. Returns whether a cross actually happened (target
+    /// section already active, or empty, are both no-ops).
+    ///
+    /// Uses `SidebarSystem::reveal` rather than `set_selected_path` — this
+    /// sidebar has `set_allow_collapse(true)`, and plain `set_selected_path`
+    /// would happily select a row inside a *collapsed* target section
+    /// (invisible, but still actionable by `i`/`d`/`u`) and never scrolls
+    /// the crossed-to row into view. `reveal` un-collapses the section,
+    /// selects the row, and scrolls it on-screen in one call — the same
+    /// three things interactive nav already gets via `scroll_to_visible`
+    /// (#1739 review).
+    fn ext_sidebar_cross_section_on_edge(&mut self, forward: bool, rect: quadraui::Rect) -> bool {
         let target_section = if forward { 1usize } else { 0usize };
-        let mut sidebar = self.ext_sidebar_system.borrow_mut();
-        if sidebar.active_section() == Some(target_section) {
-            return;
-        }
         let target_len = if target_section == 0 {
             self.ext_installed_items().len()
         } else {
             self.ext_available_items().len()
         };
         if target_len == 0 {
-            return;
+            return false;
+        }
+        let mut sidebar = self.ext_sidebar_system.borrow_mut();
+        if sidebar.active_section() == Some(target_section) {
+            return false;
         }
         let row = if forward { 0 } else { target_len - 1 };
         sidebar.set_active_section(Some(target_section));
-        sidebar.set_selected_path(target_section, Some(vec![row as u16]));
+        sidebar.reveal(target_section, &vec![row as u16], rect);
+        true
     }
 
     pub fn dispatch_ext_sidebar_key_unified(

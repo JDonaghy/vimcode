@@ -388,6 +388,93 @@ impl Engine {
         }
     }
 
+    /// Show the README for an extension, fetching it in the background if
+    /// it isn't already on disk (#1739). Call sites: [`Self::
+    /// ext_open_selected_readme`] (Enter / double-click on a sidebar row,
+    /// `show_missing_message: true`) and the Extensions sidebar's `i` key
+    /// handler (install-then-preview, `show_missing_message: false` — the
+    /// generic "No README available... Press i to install" wording would
+    /// be actively wrong right after an install just succeeded, so that
+    /// call site keeps its pre-#1739 behaviour of silently not opening a
+    /// preview tab when there's no README to show).
+    ///
+    /// The on-disk check is a plain `fs::read_to_string` — fast, local,
+    /// stays synchronous. Only the network fallback
+    /// (`registry::fetch_readme`, a `curl --max-time 10` subprocess) moves
+    /// to a background thread: that blocking call on the key-dispatch path
+    /// is #1739's actual root cause. A fresh install's `README.md` isn't
+    /// on disk yet (the script download that would place it is itself now
+    /// backgrounded too — see the comment in
+    /// `ext_install_from_registry_with_runtime_check`), so the install path
+    /// hits this same async fallback on every first "i" press, not just a
+    /// cache-miss edge case.
+    ///
+    /// No-op (or, if `show_missing_message`, a synchronous "no README"
+    /// message) when `base_url` is empty — matches `registry::
+    /// fetch_readme`'s own `base_url.is_empty()` early return, so there is
+    /// nothing to wait on.
+    pub(crate) fn ext_show_readme_or_fetch_async(
+        &mut self,
+        name: &str,
+        display: &str,
+        base_url: &str,
+        show_missing_message: bool,
+    ) {
+        let readme_path = paths::vimcode_config_dir()
+            .join("extensions")
+            .join(name)
+            .join("README.md");
+        if let Ok(content) = std::fs::read_to_string(&readme_path) {
+            self.open_markdown_preview_in_tab(&content, display);
+            return;
+        }
+        if base_url.is_empty() {
+            if show_missing_message {
+                self.message = format!("No README available for '{name}'. Press i to install.");
+            }
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base_url = base_url.to_string();
+        let name_bg = name.to_string();
+        std::thread::spawn(move || {
+            let content = registry::fetch_readme(&base_url, &name_bg);
+            let _ = tx.send(content);
+        });
+        self.ext_readme_rx = Some(rx);
+        self.ext_readme_pending_name = name.to_string();
+        self.ext_readme_pending_display = display.to_string();
+        self.ext_readme_show_missing_message = show_missing_message;
+    }
+
+    /// Non-blocking check for a completed README fetch started by
+    /// [`Self::ext_show_readme_or_fetch_async`]. Wired into
+    /// [`Self::poll_idle`] — same shape as [`Self::poll_ext_registry`].
+    pub fn poll_ext_readme(&mut self) -> bool {
+        let result = if let Some(rx) = &self.ext_readme_rx {
+            rx.try_recv().ok()
+        } else {
+            return false;
+        };
+        let Some(maybe_content) = result else {
+            return false;
+        };
+        self.ext_readme_rx = None;
+        let name = std::mem::take(&mut self.ext_readme_pending_name);
+        let display = std::mem::take(&mut self.ext_readme_pending_display);
+        let show_missing_message = self.ext_readme_show_missing_message;
+        match maybe_content {
+            Some(content) => {
+                self.open_markdown_preview_in_tab(&content, &display);
+            }
+            None if show_missing_message => {
+                self.message = format!("No README available for '{name}'. Press i to install.");
+            }
+            None => {}
+        }
+        true
+    }
+
     /// Resolve the base URL for downloading extension files.
     /// Uses the manifest's `registry_base_url` if available, otherwise derives it
     /// from the first configured registry URL (the field is `#[serde(skip)]` so it's
@@ -455,7 +542,16 @@ impl Engine {
             return;
         }
 
-        // Download scripts from the registry (skip files already on disk for local dev)
+        // Download scripts from the registry (skip files already on disk
+        // for local dev). #1739: this used to run the `curl --max-time 30`
+        // download inline, per script, right here on the key-dispatch
+        // path — a second blocking leg of the same freeze the `i` key's
+        // README fetch had (see `ext_show_readme_or_fetch_async`'s doc).
+        // Nothing downstream of this block ever depended on the download's
+        // result (the old loop already discarded errors with `let _ =`),
+        // so it's a pure fire-and-forget background thread: kick it off
+        // and move straight on to the LSP/DAP resolution below, which is
+        // all local PATH/version checks with no network I/O of its own.
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
             .join(&ext_name);
@@ -464,13 +560,21 @@ impl Engine {
             && !base_url.is_empty()
             && std::fs::create_dir_all(&ext_dir).is_ok()
         {
-            for script in &manifest.scripts {
-                let dest = ext_dir.join(script);
-                if !dest.exists() {
-                    let url = format!("{}/{}/{}", base_url, ext_name, script);
-                    let _ = registry::download_script(&url, &dest);
+            let scripts = manifest.scripts.clone();
+            let ext_name_bg = ext_name.clone();
+            // Neither `base_url` nor `ext_dir` is read again past this
+            // block, so both move into the thread outright rather than
+            // cloning (only `ext_name` is still needed below, for the
+            // LSP/DAP status messages).
+            std::thread::spawn(move || {
+                for script in &scripts {
+                    let dest = ext_dir.join(script);
+                    if !dest.exists() {
+                        let url = format!("{}/{}/{}", base_url, ext_name_bg, script);
+                        let _ = registry::download_script(&url, &dest);
+                    }
                 }
-            }
+            });
         }
 
         let mut status_parts: Vec<String> = Vec::new();
@@ -958,18 +1062,10 @@ impl Engine {
                 manifest.display_name.clone()
             };
             let base_url = self.resolve_registry_base_url(manifest);
-            let readme_path = paths::vimcode_config_dir()
-                .join("extensions")
-                .join(&name)
-                .join("README.md");
-            let content = std::fs::read_to_string(&readme_path)
-                .ok()
-                .or_else(|| registry::fetch_readme(&base_url, &name));
-            if let Some(content) = content {
-                self.open_markdown_preview_in_tab(&content, &display);
-            } else {
-                self.message = format!("No README available for '{name}'. Press i to install.");
-            }
+            // #1739: was a blocking `curl --max-time 10` subprocess call
+            // (`registry::fetch_readme`) right here on the key-dispatch
+            // path — see `ext_show_readme_or_fetch_async`'s doc.
+            self.ext_show_readme_or_fetch_async(&name, &display, &base_url, true);
         }
     }
 
