@@ -2455,7 +2455,15 @@ mod tests {
     /// decoded, not error out.
     #[test]
     fn test_reload_from_disk_utf16le_bom() {
-        let path = std::env::temp_dir().join("vimcode_buffer_manager_test_reload_utf16le.txt");
+        // Per-process scratch path (#1498's `harness::scratch_dir`): the fixed
+        // shared name this used to hardcode is byte-identical across test
+        // *processes*, so any other concurrent `cargo test` on the machine (a
+        // second worktree, the coordinator running several workers) truncated
+        // or deleted the file between this test's own write and reload — see
+        // `buffer.rs`'s `unique_temp_path` for the full mechanism and its RED
+        // reproduction.
+        let path = crate::harness::scratch_dir("vimcode_buffer_manager_test_reload_utf16le")
+            .with_extension("txt");
         std::fs::write(&path, "old content").unwrap();
 
         let buffer = Buffer::from_file(crate::core::buffer::BufferId(0), &path).unwrap();

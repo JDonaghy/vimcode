@@ -708,6 +708,75 @@ impl DecorState {
 mod tests {
     use super::*;
 
+    /// A scratch path for this file's encoding fixtures that is unique per
+    /// *process* as well as per thread — [`crate::harness::scratch_dir`] (the
+    /// #1498 helper) with the `.txt` extension preserved, exactly as
+    /// `engine/tests.rs`'s `test_temp_path` does.
+    ///
+    /// These tests used to each hardcode a single fixed name in the shared
+    /// system temp dir (`vimcode_buffer_test_<case>.txt`). That is unique
+    /// *within* one `cargo test` run (libtest gives every `#[test]` its own
+    /// thread) but byte-identical across *processes*, so two concurrent runs
+    /// on one machine — two git worktrees, the coordinator running several
+    /// workers, a local run racing CI on a shared box — derive the same
+    /// absolute path. Each fixture then interleaves its `fs::write` (which
+    /// truncates first) and its closing `remove_file` with the other run's
+    /// `from_file`, so a test reads a deleted, zero-length or half-written
+    /// file and sees a bogus result. This is the same collision #1498/#1732
+    /// were filed for, in two more files that never adopted the helper.
+    ///
+    /// RED against the fixed-name form: restore the literal
+    /// `std::env::temp_dir().join("vimcode_buffer_test_<case>.txt")` paths and
+    /// run the lib test binary 8-way concurrently — 14 of 24 runs fail, with
+    /// `from_file` returning `NotFound` ("No such file or directory") for the
+    /// decode cases and the `is_err()` cases (invalid-UTF-8, UTF-32LE BOM)
+    /// going green-to-red because an empty or 2-byte truncation decodes
+    /// successfully instead of erroring. With this helper, 0 of 8 fail.
+    fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+        crate::harness::scratch_dir(&format!("vimcode_buffer_test_{tag}")).with_extension("txt")
+    }
+
+    /// Guards the property every encoding fixture in this file now depends on,
+    /// and which the bare `std::env::temp_dir().join("literal")` form it
+    /// replaced did not have: the scratch path must carry the pid, so two
+    /// concurrent `cargo test` processes cannot write, read and delete the
+    /// same file.
+    ///
+    /// RED against the pre-fix form: substitute the old literal body
+    /// (`std::env::temp_dir().join(format!("vimcode_buffer_test_{tag}.txt"))`)
+    /// back into [`unique_temp_path`] and the pid assertion below fails
+    /// immediately — which is the whole mechanism behind the intermittent
+    /// `NotFound` / mis-decode failures these fixtures showed when the suite
+    /// was not the only `cargo test` on the box.
+    #[test]
+    fn encoding_fixture_paths_are_process_unique_and_keep_the_txt_extension() {
+        let path = unique_temp_path("probe");
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "an encoding fixture path must carry the pid so two concurrent \
+             `cargo test` processes cannot clobber each other's file, got {name}"
+        );
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("txt"),
+            "the uniquifying suffix must be spliced in before the extension, \
+             got {path:?}"
+        );
+        assert_ne!(
+            path,
+            std::env::temp_dir().join("vimcode_buffer_test_probe.txt"),
+            "the path must not be the shared fixed literal this replaced"
+        );
+
+        // Two different cases must not collide inside one process either.
+        assert_ne!(
+            unique_temp_path("utf16le-bom"),
+            unique_temp_path("utf8-bom")
+        );
+    }
+
     #[test]
     fn test_buffer_editing() {
         let mut buffer = Buffer::new(BufferId(1));
@@ -729,7 +798,7 @@ mod tests {
     /// returns `Err`, not the decoded "12345" this asserts on.
     #[test]
     fn test_from_file_utf16le_bom() {
-        let path = std::env::temp_dir().join("vimcode_buffer_test_utf16le_bom.txt");
+        let path = unique_temp_path("utf16le-bom");
         let mut bytes: Vec<u8> = vec![0xFF, 0xFE]; // UTF-16LE BOM
         for unit in "12345".encode_utf16() {
             bytes.extend_from_slice(&unit.to_le_bytes());
@@ -745,7 +814,7 @@ mod tests {
     /// #1560: mirror of the LE case for a UTF-16BE-with-BOM file.
     #[test]
     fn test_from_file_utf16be_bom() {
-        let path = std::env::temp_dir().join("vimcode_buffer_test_utf16be_bom.txt");
+        let path = unique_temp_path("utf16be-bom");
         let mut bytes: Vec<u8> = vec![0xFE, 0xFF]; // UTF-16BE BOM
         for unit in "hello".encode_utf16() {
             bytes.extend_from_slice(&unit.to_be_bytes());
@@ -763,7 +832,7 @@ mod tests {
     /// under a stricter reader, an error) in the buffer content.
     #[test]
     fn test_from_file_utf8_bom() {
-        let path = std::env::temp_dir().join("vimcode_buffer_test_utf8_bom.txt");
+        let path = unique_temp_path("utf8-bom");
         let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
         bytes.extend_from_slice("hello world".as_bytes());
         fs::write(&path, &bytes).unwrap();
@@ -777,7 +846,7 @@ mod tests {
     /// A plain UTF-8 file with no BOM must keep working exactly as before.
     #[test]
     fn test_from_file_plain_utf8() {
-        let path = std::env::temp_dir().join("vimcode_buffer_test_plain_utf8.txt");
+        let path = unique_temp_path("plain-utf8");
         fs::write(&path, "no bom here\n").unwrap();
 
         let buffer = Buffer::from_file(BufferId(1), &path).unwrap();
@@ -791,7 +860,7 @@ mod tests {
     /// succeeding with mangled content.
     #[test]
     fn test_from_file_invalid_utf8_errors() {
-        let path = std::env::temp_dir().join("vimcode_buffer_test_invalid_utf8.txt");
+        let path = unique_temp_path("invalid-utf8");
         fs::write(&path, [0xFF, 0x00, 0xFF, 0x01]).unwrap();
 
         let result = Buffer::from_file(BufferId(1), &path);
@@ -807,7 +876,7 @@ mod tests {
     /// encoding" `io::Error`.
     #[test]
     fn test_from_file_utf32le_bom_errors_instead_of_misdecoding() {
-        let path = std::env::temp_dir().join("vimcode_buffer_test_utf32le_bom.txt");
+        let path = unique_temp_path("utf32le-bom");
         let mut bytes: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x00]; // UTF-32LE BOM
         for ch in "hi".chars() {
             bytes.extend_from_slice(&(ch as u32).to_le_bytes());
