@@ -2688,7 +2688,22 @@ The result: `Key::Char('ƒ')` reaches `App::handle_dispatch`, `modifiers.alt == 
 
 ---
 
-## `AppShell::handle` has no `DoubleClick` arm for the activity bar — a fast double-click on it is silently dropped instead of acting like two single clicks (surfaced by vimcode#1762)
+## ~~`AppShell::handle` has no `DoubleClick` arm for the activity bar — a fast double-click on it is silently dropped instead of acting like two single clicks (surfaced by vimcode#1762)~~ — **RESOLVED upstream, struck 2026-10-07 (#1843)**
+
+> **This entry is resolved.** quadraui `be97a62e` (landed between `a536053`
+> and `4e71a8b`, picked up by vimcode#1843's pin bump) adds exactly the
+> `UiEvent::DoubleClick` arm the **Ask** below requested to
+> `AppShell::handle`, hit-testing the activity bar and calling
+> `handle_activity_click` the same way the existing `MouseDown` arm does.
+> vimcode's own workaround — the "#1762 rescue" rung in
+> `App::handle_dispatch` (`src/app.rs`) that intercepts `DoubleClick` and
+> re-synthesizes a `MouseDown` before re-dispatching through
+> `AppShell::handle`'s public API — is now redundant: traced after the bump
+> and confirmed there is no double-handling (the rung still runs first and
+> returns before the new upstream arm is ever reached), but removing the
+> now-dead rung is separate platform-neutrality follow-up work (GOALS.md
+> milestone #7), not done as part of #1843. The original repro/isolation/
+> ask below is left intact for history.
 
 **Title:** `compose::app_shell::AppShell::handle` only matches `UiEvent::MouseDown` for activity-bar hit-testing; `UiEvent::DoubleClick` falls through its own `_ => AppShellEvent::Ignored` arm, so any double-click landing on the activity bar — same icon twice, or two different icons close enough together to fold — does nothing at all, instead of behaving like the two single clicks a consumer would reasonably expect.
 
@@ -2790,7 +2805,23 @@ fn pointer_shape_cursor_name(shape: PointerShape) -> &'static str {
 
 **Blocks:** `JDonaghy/vimcode#489`. Leave that issue open behind this one per `GOALS.md`'s milestone-discipline rule — there is no per-backend vimcode-side fix available; per this repo's Platform-Neutrality Rule, hand-rolling `gdk::Cursor` calls directly in `src/gtk/` to work around the missing variant (as the issue's own implementation sketch proposes) is exactly the kind of per-backend code that rule exists to prevent. Once this lands and the pin bumps, the vimcode-side change is a small addition to the existing shared `MouseMoved` cursor-hint block in `src/app.rs` (compose `editor_hover_link_rects`/`panel_hover_link_rects` hit-testing into the `Resize`/`Default` branch already there) — no new `src/gtk/` or `src/tui_main/` code needed, since `backend.set_cursor` is already called from shared code and TUI's own impl is already a documented no-op.
 
-## `RichTextPopup` is hardcoded `ChromePrimitive::RichTextPopup` (always chrome font) on every pixel backend — vimcode's editor-anchored hover popup can't render in the editor's own font+size the way VS Code does (vimcode#220)
+## ~~`RichTextPopup` is hardcoded `ChromePrimitive::RichTextPopup` (always chrome font) on every pixel backend — vimcode's editor-anchored hover popup can't render in the editor's own font+size the way VS Code does (vimcode#220)~~ — **RESOLVED upstream, struck 2026-10-07 (#1843)**
+
+> **This entry is resolved.** quadraui `18eda743`/`a1898415` (landed
+> between `a536053` and `4e71a8b`, picked up by vimcode#1843's pin bump)
+> add `Backend::draw_rich_text_popup_with_font_role` plus a per-call
+> `FontRole` sidecar (not a `RichTextPopup` struct field, per `a1898415`'s
+> own review-findings commit — a deliberate deviation from Ask item 1
+> below, which proposed a `pub font_role: FontRole` field; the landed
+> shape achieves the same per-instance override without touching the
+> primitive's own `#[serde(default)]` shape), implemented on all three
+> pixel backends (GTK/macOS/Win). The vimcode-side adoption this unblocks —
+> setting `FontRole::Editor` at
+> `render::editor_hover_to_quadraui_rich_text`'s call site, leaving the
+> sidebar-tooltip call site on the default — is GOALS.md milestone #7
+> platform-neutral adoption work, not done as part of #1843. The original
+> repro/isolation/ask below is left intact for history, including its
+> now-superseded API shape.
 
 **Title:** `RichTextPopup` needs a per-instance font-role override (`FontRole::Editor` vs the current unconditional `FontRole::Chrome`) so a host can opt one `RichTextPopup` instance into the editor font while another stays chrome.
 
@@ -2954,7 +2985,27 @@ So, as `src/render.rs`'s own comment at the `decor_sign_glyph` construction site
 
 ---
 
-## `quadraui::gtk::run` never activates the process as the foreground app on macOS — the shipped macOS GTK artifact paints but cannot take keyboard input (blocks vimcode#1825)
+## ~~`quadraui::gtk::run` never activates the process as the foreground app on macOS — the shipped macOS GTK artifact paints but cannot take keyboard input (blocks vimcode#1825)~~ — **RESOLVED upstream, struck 2026-10-07 (#1843)**
+
+> **This entry is resolved.** quadraui `5c1e747b`/`77154206` (landed
+> between `a536053` and `4e71a8b`, picked up by vimcode#1843's pin bump)
+> add the `target_os = "macos"` foreground-activation call this entry's
+> **Ask** requested to `quadraui::gtk::run`, including `setActivationPolicy`
+> (`77154206`'s own review-findings fixup on top of `5c1e747b`'s initial
+> `activateIgnoringOtherApps` call), and make the `gtk` feature's own
+> dependency list pull in `dep:objc2`/`dep:objc2-app-kit` directly (Cargo
+> change, not just the Rust change) so they compile under `--features gtk`
+> on macOS without also requiring `--features macos`. **Unconfirmed by a
+> person on real macOS hardware as of this bump** — vimcode#1843's own
+> description says exactly this, and this entry's own body noted the root
+> cause itself was "a code-reading inference, not yet confirmed on macOS
+> hardware" even before the fix. vimcode#1825 stays open until a person
+> confirms on real hardware (type `ihello<Esc>` into the shipped macOS GTK
+> artifact, confirm the text lands in the buffer) — this bump does not
+> close it. `docs/RELEASING.md` §1.5's manual macOS smoke step should be
+> updated per this entry's own suggestion below once that confirmation
+> happens; not done as part of #1843. The original repro/isolation/ask
+> below is left intact for history.
 
 **Title:** `gtk::run::run`/`run_with`/`activate` build a real `GtkApplication` + `ApplicationWindow` and call `window.present()`, but on macOS (GTK's quartz backend) that may not be enough to make the *process* the active/frontmost application — and only the frontmost application receives keystrokes on macOS. A bare, non-`.app` binary launched from Terminal.app is never handed frontmost status by the window server, so every keystroke keeps going to the launching terminal even after the GTK window appears, paints, and is clicked into.
 
@@ -2978,7 +3029,25 @@ A black-box smoke-spec step covering this does **not** need a new buffer-readbac
 
 ---
 
-## `quadraui::terminal_engine`'s Windows ConPTY spawn/poll path has essentially no automated test coverage, and `default_shell()` checks `$SHELL` before `target_os` (blocks vimcode#1829)
+## ~~`quadraui::terminal_engine`'s Windows ConPTY spawn/poll path has essentially no automated test coverage, and `default_shell()` checks `$SHELL` before `target_os` (blocks vimcode#1829)~~ — **RESOLVED upstream, struck 2026-10-07 (#1843)**
+
+> **This entry is resolved.** quadraui `a226794a` adds Windows-gated
+> ConPTY spawn/poll coverage to `terminal_engine.rs` (Ask item 1) and
+> fixes the `$SHELL`-before-`target_os` gate in `default_shell()` (Ask
+> item 2); `4e71a8bb` itself answers the ConPTY VT handshake queries that
+> turned out to be the actual blocker for vimcode#1829's blank-panel
+> symptom. vimcode#1843 bumped the pin to `4e71a8b` to pick this up and,
+> per this entry's own **Test** section, promoted
+> `tests/conpty_term_opens_shell_1829.rs` from a `continue-on-error: true`
+> step to a required gate in `.github/workflows/ci.yml`'s
+> `build-windows-tui` job.
+> RED/GREEN-verified on dell64's real Windows hardware: FAILED (no probe
+> file within 20s) against the prior `a536053` pin, PASSED (1.9s) against
+> `4e71a8b`. vimcode#1829 stays open per `GOALS.md`'s milestone-discipline
+> rule — this bump is `Refs`, not `Fixes` — until a person confirms a live
+> PowerShell prompt in `vcd.exe` on dell64, which is the issue's own
+> acceptance bar and has not yet happened. The original repro/isolation/
+> ask below is left intact for history.
 
 **Title:** vimcode#1829 — Windows ConPTY spawn/poll path (`TerminalSession::spawn`/`poll`) has essentially no automated test coverage, and `default_shell()` checks `$SHELL` before `target_os`
 
