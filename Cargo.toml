@@ -436,7 +436,27 @@ win = ["quadraui/win"]
 # whatever lock cargo writes. The invariant worth preserving is only the one
 # the #896 note below also relies on — the committed lock must be what cargo
 # produces, verified with `--locked`, never hand-reasoned.
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "a5360532e297deecece65103df8ce61f53230bda", features = ["tui", "terminal"] }
+#
+# #1843 bumps to `4e71a8b` (quadraui `develop` HEAD, 1 commit ahead of
+# `a536053`) for quadraui#1327: ConPTY VT handshake answers plus the
+# `default_shell()` `$SHELL` gate. This is the fix for the Windows TUI
+# `:term` blank-panel bug (vimcode#1829) and very likely also the Win-GUI
+# terminal (vimcode#1668) — confirmed on dell64's real Windows host: the
+# same `tests/conpty_term_opens_shell_1829.rs` test against quadraui
+# `a536053` FAILED (no probe file within 20s), and against `4e71a8b`
+# PASSED (1.9s). See the comments on vimcode#1829 and quadraui#1327.
+#
+# Also carries quadraui#1325 (macOS GTK foreground activation, vimcode
+# #1825) — unconfirmed by a person on real macOS hardware yet, but that's
+# fine since the macOS GUI build is marked not-ready regardless.
+#
+# This PR also removes `continue-on-error: true` from the
+# `conpty_term_opens_shell_1829` step in `build-windows-tui` (ci.yml), so
+# it's a required gate like `conpty_idle_flicker` / `conpty_activity_bar_
+# click` — vimcode#1829 itself is NOT closed by this bump (`Refs`, not
+# `Fixes`); it closes only after a person sees a live PowerShell prompt in
+# `vcd.exe` on dell64.
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "4e71a8bb25966db0f43fd2ec9eae9a284a5230e4", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
