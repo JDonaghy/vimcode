@@ -5803,6 +5803,86 @@ mod tests {
     mod terminal {
         use super::*;
 
+        /// #1829: pins down **which literal strings the `:term` ex-command
+        /// actually paints into the terminal panel's chrome**, so a
+        /// real-ConPTY test on a Windows host can wait on a needle that is
+        /// genuinely reachable.
+        ///
+        /// `tests/conpty_term_opens_shell_1829.rs` needs a precondition
+        /// "the panel opened" gate between typing `:term` and sending its
+        /// filesystem probe. Its first attempt waited on `"TERMINAL"`
+        /// (uppercase), by analogy with
+        /// `tests/conpty_activity_bar_click.rs`'s sidebar needles
+        /// (`"EXPLORER"`, `"SOURCE CONTROL"`, …, which come from
+        /// `Engine::fixed_panel_title_tooltip` and have no terminal entry).
+        /// That needle is unreachable in **every** state that test can
+        /// reach: the only uppercase `"TERMINAL"` literal in `src/` is the
+        /// terminal toolbar tab strip's `if tabs.is_empty()` fallback, i.e.
+        /// it paints only when `TerminalPanel::tab_count == 0` — but
+        /// `tab_count` is `engine.terminal_panes.len()`, and
+        /// `render::terminal_panel_desc` early-returns `None` (painting no
+        /// panel at all) when there are no panes. So `tab_count` is `>= 1`
+        /// whenever the panel paints, and the fallback is dead for any
+        /// `:term`-driven flow.
+        ///
+        /// This test is the Linux-side, no-Windows-host-required proof of
+        /// that: after `:term`, the toolbar's per-tab `"[1]"` label paints
+        /// and `"TERMINAL"` does not. It is deliberately *also* a negative
+        /// assertion — a needle-verification test whose whole value is
+        /// failing if someone changes the chrome the ConPTY test waits on.
+        #[test]
+        fn term_ex_command_paints_bracketed_tab_label_not_uppercase_terminal() {
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+
+            // Baseline: neither needle may be painted before `:term` runs,
+            // or the precondition gate downstream would be vacuous. (This
+            // is why `"Terminal"` — title-case — is a *bad* needle: it is
+            // also a permanent top-level menu-bar title, so it is already
+            // on screen here. See
+            // `menu_terminal_activation_opens_terminal_pane_via_shell_app`
+            // below for the same gotcha.)
+            assert!(
+                !driver.screen_has("[1]"),
+                "precondition: the terminal toolbar's \"[1]\" tab label must \
+                 not be painted before `:term` runs; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                !driver.screen_has("TERMINAL"),
+                "precondition: uppercase \"TERMINAL\" must not be painted \
+                 before `:term` runs; screen:\n{}",
+                driver.screen()
+            );
+
+            // The real user gesture, through the ex-command parse path.
+            driver.type_char(':');
+            for c in "term".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.tick();
+            driver.render();
+
+            assert!(
+                driver.screen_has("[1]"),
+                "`:term` must paint the terminal toolbar's \"[1]\" tab label \
+                 — this is the needle \
+                 `tests/conpty_term_opens_shell_1829.rs` waits on as its \
+                 \"the panel opened\" precondition; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                !driver.screen_has("TERMINAL"),
+                "uppercase \"TERMINAL\" is the terminal toolbar's \
+                 `tabs.is_empty()` fallback label and is unreachable once a \
+                 pane exists — if this now paints, \
+                 `tests/conpty_term_opens_shell_1829.rs`'s precondition \
+                 needle should be revisited; screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// Mirrors `shell_app.rs`'s test of the same name (focus rung): with a
         /// terminal pane focused, a key that would otherwise be a Normal-mode
         /// buffer edit must not reach the editor buffer.

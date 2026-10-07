@@ -124,11 +124,15 @@ wired into CI, is the closest automatable substitute, same reasoning
 ISSUE_RESOLUTION: investigation — root cause isolated to quadraui's
 Windows ConPTY leg (untested at the pinned rev) and a separate latent
 `default_shell()` ordering bug, both outside vimcode's own source per the
-Platform-Neutrality Rule; a new real-ConPTY regression test is added and
-compiles cleanly cross-compiled for Windows, but has not been run on real
-hardware, and the quadraui-side issue could not be drafted into
-`docs/PENDING_QUADRAUI_ISSUES.md` due to a live file-overlap conflict with
-#1825 — see the full draft recorded above for whoever picks this up next.
+Platform-Neutrality Rule. The quadraui-side issue is **drafted** in its
+designated home, `docs/PENDING_QUADRAUI_ISSUES.md` (the file-overlap fence
+with #1825 that blocked that in the first pass has cleared — see "Quadraui
+issue drafted" above), but **not yet filed** as a real GitHub issue on
+`JDonaghy/quadraui`; a drafted entry is not a filed issue. A new
+real-ConPTY regression test is added and is now wired into CI's
+`windows-latest` job, but has not yet produced a readable RED/GREEN result
+anywhere, and the issue's own acceptance step 3 — a person confirming a
+PowerShell prompt on `dell64`'s screen — is still outstanding.
 
 **Review round 1 fixes:** the quadraui draft has moved to its designated
 home (`docs/PENDING_QUADRAUI_ISSUES.md`, #1825's conflicting branch has
@@ -136,8 +140,8 @@ since landed); `.github/workflows/ci.yml`'s `build-windows-tui` job now
 actually runs `conpty_term_opens_shell_1829` (`continue-on-error: true`,
 per #1829's own blocking review finding that the test previously executed
 nowhere); the test itself replaced its fixed `AFTER_OPEN_SETTLE` sleep and
-O(n²) re-parse with a persistent-parser `wait_for_screen_contains("TERMINAL",
-...)` poll (mirroring `conpty_activity_bar_click.rs`'s own documented
+O(n²) re-parse with a persistent-parser `wait_for_screen_contains(...)`
+poll (mirroring `conpty_activity_bar_click.rs`'s own documented
 reasoning for why a fixed quiet-window is flaky on real hardware), gained
 an RAII `TermTestGuard` so the child/temp-home/probe-file are cleaned up on
 every exit path including a failed assertion before the old explicit
@@ -147,6 +151,54 @@ softened to stop overstating "the premise does not hold" against an issue
 the bug report itself says was reopened the same day. See this session's
 commit for the full list (probe path now single-quoted in the PowerShell
 command line, `&Path` instead of `&PathBuf`, UTF-16BE doc note).
+
+**Review round 2 fixes:** round 1's new "the panel opened" precondition
+waited on the needle `"TERMINAL"` (uppercase), which **can never paint in
+any state that test can reach** — it is the terminal toolbar tab strip's
+`if tabs.is_empty()` fallback label (`src/render.rs`), so it needs
+`TerminalPanel::tab_count == 0`, but `tab_count` is
+`engine.terminal_panes.len()` and `render::terminal_panel_desc`
+early-returns `None` (painting no panel at all) when there are no panes;
+on the `TerminalSession::spawn` failure path `terminal_new_tab_at` never
+sets `terminal_open`, so nothing paints there either. The uppercase
+assumption was carried over by false analogy from
+`conpty_activity_bar_click.rs`'s sidebar needles, which come from
+`fixed_panel_title_tooltip` (sidebar panels only, no terminal entry). As
+written it would have burned the 20 s `SETTLE_TIMEOUT` and failed
+identically on a working build and a broken one, never reaching the
+filesystem probe — i.e. it neutralised the exact CI signal round 1 added
+the step to produce, and made that step's own promotion condition
+("observed GREEN at least once") unsatisfiable. Fixed: the needle is now a
+documented `PANEL_OPEN_NEEDLE` constant = `"[1]"`, the toolbar's first
+per-tab label (`format!("[{}]", i + 1)`), which is painted exactly when a
+terminal pane exists. Title-case `"Terminal"` was rejected as a substitute
+because it is also a permanent top-level menu-bar title, so it is on
+screen before `:term` runs and the gate would be vacuous. **The needle is
+now verified on Linux with no Windows host**, which is what would have
+caught this in round 1:
+`src/tui_main/app_on_tui_tests.rs`'s
+`term_ex_command_paints_bracketed_tab_label_not_uppercase_terminal` drives
+the real `:term` ex-command through `TuiDriver` and asserts both halves —
+`"[1]"` absent before and painted after, `"TERMINAL"` absent in both — so
+"the needle is wrong" can no longer masquerade as "ConPTY is broken".
+Also: `TermTestGuard::drop` now takes every lock with
+`unwrap_or_else(|e| e.into_inner())` (a panic inside `Drop` during an
+assertion unwind aborts the process and destroys the captured-screen
+diagnostics the panic message exists to deliver); dropped the no-op
+`let _ = self.child.try_wait();` that preceded an unconditional
+sleep-then-kill; corrected `Drop`'s "graceful shutdown" comment, which
+claimed a `:qa!` that `render::route_terminal_key` actually forwards to
+the nested shell once `terminal_has_focus` is set (it only reaches
+vimcode's ex line on the early-failure paths, which is now what the
+comment says); and the test's "CI wiring" module doc now spells out what a
+red result means *today* (expected, carries no new information beyond the
+failure's shape) versus after the quadraui pin bump (a real regression
+signal, and the thing that promotes the step off `continue-on-error`). The
+contradictory `ISSUE_RESOLUTION` paragraph above — which still claimed the
+quadraui draft "could not be drafted into
+`docs/PENDING_QUADRAUI_ISSUES.md`" that the same commit had in fact landed
+there — was reconciled, and now states plainly that the draft exists but
+the GitHub issue is still unfiled.
 
 **Last updated:** October 6, 2026 (#1798 — bugbash:win-native "Tab bar label doesn't update when switching the active file via the Explorer; only one tab ever appears"). **Fixed.** Root cause was never the Explorer dispatch path — `Engine::open_file_in_tab` always appended the second tab, which is why breadcrumb, content and status bar all followed the new buffer. The second tab had nowhere to **paint**: `App::shell_config` (`src/app.rs`) set `min_sidebar_width`/`max_sidebar_width` but left `ShellConfig::default_sidebar_width` at quadraui's generic `20.0`, and `AppShell::compute_layout` multiplies that by `line_height` on *every* backend. On TUI that is 20 terminal columns (correct); on a GUI backend it is ~460 device pixels, so beside the 48px activity bar the bugbash's 800x480 window had ~290px left for the editor *and* its tab bar — room for exactly one tab, hence "only one tab ever appears". Fix is one number made per-*unit* rather than per-backend, in the sanctioned shared place: `render::UnitProfile::sidebar_width_lh` (`src/render.rs`), joining `activity_bar_width_px`/`title_bar_lh` — `ALT_SIDEBAR_WIDTH_MIN`'s 15 (~345px, in the same range as `Session::sidebar_width`'s persisted 260 default and VS Code's ~300px) on the `px` profile, 20 cells unchanged on `cell`. No per-backend code, no new quadraui knob needed — the earlier rounds' claim that this needed a pixel-valued `ShellConfig::default_sidebar_width_px` upstream was wrong, and the review that pushed back on it was right. It deliberately stops *at* the shared Alt rung's floor rather than going narrower (~10 lh / ~230px would be closer to 260): `alt_resized_sidebar_width` clamps to `ALT_SIDEBAR_WIDTH_MIN..=ALT_SIDEBAR_WIDTH_MAX` on both backends, so an opening width below that floor makes the user's first Alt+Right jump discontinuously to it with no way back (measured on GTK at 10.0: painted sidebar 230px -> 345px on Alt+Right, then stuck at 345px on Alt+Left), and `compute_layout` would clamp it back up anyway. Making that floor per-unit too is a change to the shared Alt rung's cross-backend contract (#759) and wants its own issue. Coverage, fail-first per the acceptance bar: `gtk::testing`'s `explorer_double_click_opens_second_file_in_a_second_tab_1798` now runs at the reported **800x480** (it had been widened to 1600x480 in an earlier round to dodge this very bug) and is RED against unfixed `develop` — restoring `sidebar_width_lh` to `20.0` makes `tab_center(&bar, 1)` `None` because the tab never paints — plus `render::unit_profiles_scale_the_sidebar_width_per_unit_1798` pinning the three invariants, and the `shell_config` assertions in `src/app.rs`. Tab-bar assertions are geometrically scoped via a new `painted_label_is_in_tab_slot` helper (the matched run's rect must fall inside that tab's own slot in the cached `TabBarLayout`), with a negative control asserting the helper rejects the Explorer row's bare `"main.rs"` run — a bare `screen_contains` would pass under the reported bug. The two TUI twins are green both before and after, correctly: the `cell` profile was never mis-scaled, so they cover the shared dispatch path and guard against the fix narrowing the TUI sidebar as a side effect. Full `cargo test` green (4299 passed); the narrower GUI sidebar required no fixture updates at 15 lh.
 
