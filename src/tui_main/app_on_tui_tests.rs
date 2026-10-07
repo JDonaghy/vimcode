@@ -7348,6 +7348,166 @@ mod tests {
                  panes; screen:\n{screen}"
             );
         }
+
+        /// The lowest `line N` number among the frame's painted text —
+        /// the TUI twin of `gtk::testing`'s identically-named helper on its
+        /// own pair of acceptance tests below.
+        fn top_line(screen: &str) -> Option<usize> {
+            screen
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|w| w[0] == "line")
+                .filter_map(|w| w[1].parse::<usize>().ok())
+                .min()
+        }
+
+        /// #1187/#1828 acceptance (black-box, driver tier, TUI): **holding
+        /// Alt** while dragging the minimap's own viewport-highlight thumb
+        /// from the top of the strip to the bottom must scroll through
+        /// virtually the whole file in one gesture — exactly like dragging
+        /// the real vertical scrollbar handle the same distance. TUI
+        /// counterpart of
+        /// `gtk::testing::dragging_the_minimap_viewport_highlight_scrolls_
+        /// the_whole_file_on_gtk` — both backends share the one resolver
+        /// (`click::pixel_to_click_target` -> `render::minimap_press`), so
+        /// this confirms the Alt-gating reaches production through TUI's
+        /// own `App::handle_dispatch` path too, not only GTK's.
+        ///
+        /// **RED against unfixed `develop`:** before #1828, a plain
+        /// (no-modifier) drag already took this file-wide path
+        /// unconditionally, so this assertion passed either way and gave
+        /// no signal on the Alt-gating specifically — see the sibling test
+        /// immediately below for the half that *was* RED (a plain drag
+        /// landing far past 10% of the file, where #1828 requires under
+        /// 10%).
+        #[test]
+        fn dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_with_alt_held() {
+            const TOTAL_LINES: usize = 200_000;
+            let mut engine = plain_engine();
+            let text: String = (0..TOTAL_LINES)
+                .map(|i| format!("line {i} content\n"))
+                .collect();
+            engine.buffer_mut().insert(0, &text);
+
+            let mut h = harness_no_sidebar(engine);
+            let win = h.engine.borrow().active_window_id();
+            h.driver.render();
+
+            assert_eq!(
+                h.engine.borrow().windows.get(&win).unwrap().view.scroll_top,
+                0,
+                "fixture must start at the top of the file"
+            );
+
+            let strip = {
+                let layout = h.screen_layout.borrow();
+                let mm = layout
+                    .as_ref()
+                    .expect("render_content must have painted a ScreenLayout")
+                    .minimap
+                    .iter()
+                    .find(|m| m.window_id == win)
+                    .expect("a 200,000-line buffer must publish a minimap strip");
+                crate::render::minimap_strip_rect(mm)
+            };
+
+            let x = strip.x + strip.width / 2.0;
+            h.driver.click_with(
+                quadraui::MouseButton::Left,
+                quadraui::Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+                x,
+                strip.y + 1.0,
+            );
+            h.driver.mouse_move(x, strip.y + strip.height - 1.0);
+            h.driver.mouse_up(x, strip.y + strip.height - 1.0);
+            h.driver.render();
+
+            let screen = h.driver.screen();
+            let top = top_line(&screen).unwrap_or_else(|| {
+                panic!("the editor must still paint line numbers; screen:\n{screen}")
+            });
+
+            assert!(
+                top > TOTAL_LINES * 9 / 10,
+                "an Alt-held drag from the highlight's top edge to the \
+                 strip's bottom row must scroll through virtually the \
+                 whole file in one gesture, not crawl within one strip \
+                 window — landed on line {top} of {TOTAL_LINES}; \
+                 screen:\n{screen}"
+            );
+        }
+
+        /// #1828 acceptance (black-box, driver tier, TUI): the **plain**
+        /// (no-modifier) minimap thumb drag must map within the minimap's
+        /// own scale — the sliding window #1093 paints — not jump
+        /// proportionally across the whole file the way the real
+        /// scrollbar handle does. TUI counterpart of `gtk::testing`'s
+        /// `dragging_the_minimap_viewport_highlight_scrolls_within_its_
+        /// own_scale_by_default_on_gtk`. Same gesture/fixture as the Alt-
+        /// held sibling test above, only the modifier differs.
+        ///
+        /// **RED against unfixed `develop`:** confirmed by hand — before
+        /// #1828, `click::pixel_to_click_target` passed `alt` straight
+        /// through to `render::minimap_press`'s `fine` parameter, so a
+        /// plain (no-Alt) drag took the file-wide #1187 mapping
+        /// unconditionally and landed past 90% of the file — the `top <
+        /// TOTAL_LINES / 10` bound below fails on that code.
+        #[test]
+        fn dragging_the_minimap_viewport_highlight_scrolls_within_its_own_scale_by_default() {
+            const TOTAL_LINES: usize = 200_000;
+            let mut engine = plain_engine();
+            let text: String = (0..TOTAL_LINES)
+                .map(|i| format!("line {i} content\n"))
+                .collect();
+            engine.buffer_mut().insert(0, &text);
+
+            let mut h = harness_no_sidebar(engine);
+            let win = h.engine.borrow().active_window_id();
+            h.driver.render();
+
+            assert_eq!(
+                h.engine.borrow().windows.get(&win).unwrap().view.scroll_top,
+                0,
+                "fixture must start at the top of the file"
+            );
+
+            let strip = {
+                let layout = h.screen_layout.borrow();
+                let mm = layout
+                    .as_ref()
+                    .expect("render_content must have painted a ScreenLayout")
+                    .minimap
+                    .iter()
+                    .find(|m| m.window_id == win)
+                    .expect("a 200,000-line buffer must publish a minimap strip");
+                crate::render::minimap_strip_rect(mm)
+            };
+
+            let x = strip.x + strip.width / 2.0;
+            // Plain press/drag — no modifier.
+            h.driver.mouse_down(x, strip.y + 1.0);
+            h.driver.mouse_move(x, strip.y + strip.height - 1.0);
+            h.driver.mouse_up(x, strip.y + strip.height - 1.0);
+            h.driver.render();
+
+            let screen = h.driver.screen();
+            let top = top_line(&screen).unwrap_or_else(|| {
+                panic!("the editor must still paint line numbers; screen:\n{screen}")
+            });
+
+            assert!(
+                top < TOTAL_LINES / 10,
+                "a plain (no-modifier) drag from the highlight's top edge \
+                 to the strip's bottom row must stay within roughly the \
+                 minimap's own painted window, not traverse virtually the \
+                 whole file — landed on line {top} of {TOTAL_LINES}; \
+                 screen:\n{screen}"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

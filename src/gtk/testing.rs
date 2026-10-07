@@ -14087,14 +14087,16 @@ mod minimap {
         );
     }
 
-    /// #1187 acceptance (black-box, driver tier, GTK): dragging the
-    /// minimap's own viewport-highlight thumb from the top of the strip to
-    /// the bottom must scroll through virtually the whole file in one
-    /// gesture — exactly like dragging the real vertical scrollbar handle
-    /// the same distance — not crawl within roughly one strip-window's
-    /// worth of lines. GTK counterpart of the TUI acceptance test
-    /// `tui_main::shell_app::tests::
-    /// dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_not_a_crawl`.
+    /// #1187/#1828 acceptance (black-box, driver tier, GTK): **holding
+    /// Alt** while dragging the minimap's own viewport-highlight thumb from
+    /// the top of the strip to the bottom must scroll through virtually the
+    /// whole file in one gesture — exactly like dragging the real vertical
+    /// scrollbar handle the same distance — not crawl within roughly one
+    /// strip-window's worth of lines. This is #1187's original file-wide
+    /// drag mapping, which #1828 moved behind the Alt modifier (the plain,
+    /// no-modifier drag now maps within the minimap's own scale instead —
+    /// see
+    /// [`dragging_the_minimap_viewport_highlight_scrolls_within_its_own_scale_by_default_on_gtk`]).
     ///
     /// With the file scrolled to the top, the highlight band's own top edge
     /// coincides with the strip's top row (#1093: the highlight always
@@ -14155,8 +14157,21 @@ mod minimap {
         let x = strip.x + strip.width / 2.0;
         // Press on the strip's very top row — with the file scrolled to the
         // top, that coincides with the viewport-highlight band's own top
-        // edge — then drag to the strip's bottom row.
-        h.driver.mouse_down(x, strip.y + 1.0);
+        // edge — then drag to the strip's bottom row. #1828: Alt held at
+        // press time is what now reaches the old #1187 file-wide mapping —
+        // dispatched directly as a `UiEvent::MouseDown` (rather than
+        // `h.driver.mouse_down`, which always sends `Modifiers::default()`)
+        // since that's the only way to hold a modifier through this
+        // driver's click helpers.
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(x as f32, (strip.y + 1.0) as f32),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        });
         h.driver.mouse_move(x, strip.y + strip.height - 1.0);
         h.driver.mouse_up(x, strip.y + strip.height - 1.0);
         h.driver.render();
@@ -14183,10 +14198,99 @@ mod minimap {
 
         assert!(
             top > TOTAL_LINES * 9 / 10,
-            "dragging from the highlight's top edge to the strip's bottom \
-             row must scroll through virtually the whole file in one \
-             gesture, not crawl within one strip window — landed on line \
-             {top} of {TOTAL_LINES}"
+            "an Alt-held drag from the highlight's top edge to the strip's \
+             bottom row must scroll through virtually the whole file in \
+             one gesture, not crawl within one strip window — landed on \
+             line {top} of {TOTAL_LINES}"
+        );
+    }
+
+    /// #1828 acceptance (black-box, driver tier, GTK): the **plain**
+    /// (no-modifier) minimap thumb drag must map within the minimap's own
+    /// scale — the same sliding window #1093 paints — not jump
+    /// proportionally across the whole file like the real scrollbar handle
+    /// does. This is the VS Code mapping the bug report asks for: "a
+    /// minimap drag moves the viewport slider within the minimap's own
+    /// scale ... A scrollbar drag maps the whole file's length." #1828
+    /// moved the old (#1187) file-wide mapping behind Alt (see the sibling
+    /// test immediately above) and made this one the default.
+    ///
+    /// Same gesture, fixture and geometry as the sibling Alt-held test
+    /// above (full top-to-bottom drag on a 200,000-line buffer) — only the
+    /// modifier differs — so a regression that left the Alt-gating dead
+    /// (e.g. always taking the file-wide branch) would fail *this* test
+    /// while the sibling kept passing.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — this is
+    /// exactly the plain drag unfixed `develop` already ran through
+    /// `#1187`'s file-wide mapping unconditionally, landing past 90% of
+    /// the file (the sibling test's own assertion); the `top <
+    /// TOTAL_LINES / 10` bound below fails there.
+    #[test]
+    fn dragging_the_minimap_viewport_highlight_scrolls_within_its_own_scale_by_default_on_gtk() {
+        const TOTAL_LINES: usize = 200_000;
+        fn engine_with_very_long_buffer() -> Engine {
+            let mut engine = Engine::new();
+            let text: String = (0..TOTAL_LINES)
+                .map(|i| format!("line {i} content\n"))
+                .collect();
+            engine.buffer_mut().insert(0, &text);
+            engine
+        }
+
+        let mut h = harness(engine_with_very_long_buffer(), 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.driver.render();
+
+        assert_eq!(
+            h.engine.borrow().windows.get(&win).unwrap().view.scroll_top,
+            0,
+            "fixture must start at the top of the file"
+        );
+
+        let strip = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("a 200,000-line buffer must publish a minimap strip");
+            crate::render::minimap_strip_rect(mm)
+        };
+
+        let x = strip.x + strip.width / 2.0;
+        // Plain press/drag — no modifier — must now stay scoped to the
+        // minimap's own scale rather than traversing the whole file.
+        h.driver.mouse_down(x, strip.y + 1.0);
+        h.driver.mouse_move(x, strip.y + strip.height - 1.0);
+        h.driver.mouse_up(x, strip.y + strip.height - 1.0);
+        h.driver.render();
+
+        fn top_line(texts: &[&str]) -> Option<usize> {
+            texts
+                .iter()
+                .filter_map(|t| {
+                    t.strip_prefix("line ")?
+                        .split_whitespace()
+                        .next()?
+                        .parse()
+                        .ok()
+                })
+                .min()
+        }
+        let texts = h.driver.painted_texts();
+        let top = top_line(&texts).unwrap_or_else(|| {
+            panic!("the editor must still paint line numbers; painted: {texts:?}")
+        });
+
+        assert!(
+            top < TOTAL_LINES / 10,
+            "a plain (no-modifier) drag from the highlight's top edge to \
+             the strip's bottom row must stay within roughly the minimap's \
+             own painted window, not traverse virtually the whole file — \
+             landed on line {top} of {TOTAL_LINES}"
         );
     }
 
@@ -14458,6 +14562,15 @@ mod minimap {
     /// Acceptance (#35): pressing and holding on the minimap and dragging
     /// keeps seeking — not just the pixel under the initial mouse-down.
     ///
+    /// Presses with **Alt held** (#1828: the plain, no-modifier press now
+    /// maps within the minimap's own scale instead — see
+    /// `dragging_the_minimap_viewport_highlight_scrolls_within_its_own_scale_by_default_on_gtk`
+    /// — so this test's own "~50% of the *whole file*" assertion, which
+    /// only the old #1187 file-wide mapping satisfies, needs the modifier
+    /// to keep testing that mapping specifically; its actual point — that
+    /// a held-button drag keeps re-seeking, not just the initial
+    /// mouse-down — is orthogonal to which of the two mappings is active).
+    ///
     /// RED-first regression: before this fix, `pixel_to_click_target`'s
     /// minimap hit-test only ran when `mutate_focus` was true, and
     /// `handle_mouse_drag` (the drag-continuation path) always called it
@@ -14490,12 +14603,20 @@ mod minimap {
             "fixture must start at the top of the file"
         );
 
-        // Press down near the top of the strip — mouse-down alone already
-        // seeks there (covered by the click test above).
-        h.driver.mouse_down(
-            (strip.x + strip.width / 2.0) as f32,
-            (strip.y + strip.height * 0.1) as f32,
-        );
+        // Press down near the top of the strip, Alt held (#1828) — mouse-down
+        // alone already seeks there (covered by the click test above).
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(
+                (strip.x + strip.width / 2.0) as f32,
+                (strip.y + strip.height * 0.1) as f32,
+            ),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        });
         let after_down = h.engine.borrow().scroll_top();
 
         // Continue the SAME held-button gesture down to the vertical
