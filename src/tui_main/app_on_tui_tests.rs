@@ -7362,43 +7362,100 @@ mod tests {
                 .min()
         }
 
-        /// #1842 acceptance (black-box, driver tier, TUI): the minimap's
+        /// Minimum combined |Δr| + |Δg| + |Δb| for two backgrounds to
+        /// count as "clearly visually distinct" rather than merely "not
+        /// bit-identical". Chosen well below the onedark delta the
+        /// `minimap_viewport_highlight_band_paints_a_distinct_background`
+        /// test observes (strip `rgb(26,26,26)` vs. band `rgb(44,63,79)`,
+        /// combined delta 18+37+53=108) so a real regression toward
+        /// low-contrast has room to be caught before it reaches full
+        /// identity.
+        const MIN_PERCEPTIBLE_RGB_DELTA: i32 = 24;
+
+        /// Fail unless `a` and `b` differ by at least
+        /// `MIN_PERCEPTIBLE_RGB_DELTA` combined RGB units — stronger than
+        /// `assert_ne!`, which a one-unit rounding difference would
+        /// satisfy while still reading as flat on real hardware. Falls
+        /// back to plain inequality for non-`Rgb` `Color` variants (named
+        /// colours, indexed, reset), where no component-wise delta is
+        /// meaningful.
+        fn assert_clearly_distinct(a: ratatui::style::Color, b: ratatui::style::Color, ctx: &str) {
+            use ratatui::style::Color;
+            if let (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) = (a, b) {
+                let delta = (r1 as i32 - r2 as i32).abs()
+                    + (g1 as i32 - g2 as i32).abs()
+                    + (b1 as i32 - b2 as i32).abs();
+                assert!(
+                    delta >= MIN_PERCEPTIBLE_RGB_DELTA,
+                    "{ctx}: {a:?} vs {b:?} differ by only {delta} combined RGB \
+                     units, below the {MIN_PERCEPTIBLE_RGB_DELTA}-unit threshold \
+                     for a reliably perceptible difference on real hardware"
+                );
+            } else {
+                assert_ne!(a, b, "{ctx}: colours must differ ({a:?} vs {b:?})");
+            }
+        }
+
+        /// #1842 coverage (black-box, driver tier, TUI): the minimap's
         /// viewport-highlight band must paint a **distinct background
         /// colour** from the rest of the strip — the actual rendered
         /// pixels, read back via `TuiDriver::style_at`, not just a
         /// nonzero `MinimapLayout::viewport_highlight` height (which only
         /// proves the *geometry* was computed, not that anything visibly
-        /// different landed in the `Buffer`; see this file header's "state
-        /// in the PR" rule and #587/#592's history of exactly that gap).
+        /// different landed in the `Buffer`; see `CLAUDE.md`'s "Testing
+        /// (CRITICAL)" rule and #587/#592's history of exactly that gap).
+        /// **This is not #1842's own acceptance bar** — that bar is a
+        /// human on dell64 confirming the thumb is visible in a real
+        /// Windows Terminal session, which is still outstanding and which
+        /// no headless `TestBackend` run can stand in for (see
+        /// `PROJECT_STATE.md`'s open hypotheses for why the real-hardware
+        /// report and this green test can both be true at once).
         ///
         /// #1842 split this off #1828 as "the half that remains" after
         /// 97b1af9 shipped the drag-mapping half: on dell64's real Windows
         /// Terminal the operator saw no visible thumb at all, though
-        /// dragging worked. Root-caused here to quadraui#1181
-        /// ("TUI minimap viewport slider uses the blended tint, not opaque
-        /// accent_bg", quadraui commit 9f47ca9c) — pre-fix, the band was
-        /// *theme.accent_bg* painted at full, opaque strength with no
-        /// blend against the background at all; the fix pre-mixes
+        /// dragging worked. The known pre-fix defect in this paint path is
+        /// quadraui#1181 ("TUI minimap viewport slider uses the blended
+        /// tint, not opaque accent_bg", quadraui commit 9f47ca9c) — pre-fix,
+        /// the band was *theme.accent_bg* painted at full, opaque strength
+        /// with no blend against the background at all; the fix pre-mixes
         /// `background.blend(accent_bg, 0.25)` on the CPU (a terminal
         /// cell's bg has no alpha channel to composite through) so the
         /// band reads as a visibly tinted strip background instead.
         /// `9f47ca9c` is already an ancestor of this repo's pinned
         /// `quadraui` rev (`git merge-base --is-ancestor` confirms it), so
-        /// no quadraui-side change is needed — this test is new coverage
-        /// for an already-landed fix, closing the gap that let #1842's
-        /// real-hardware regression go unnoticed by CI in the first place.
+        /// this test cannot and does not exercise a code change — it is
+        /// coverage against the one defect class ("unpainted / identical
+        /// colour") this investigation could rule out here, closing the
+        /// gap that let that class go unnoticed by CI. It does **not**
+        /// rule out the issue's other named hypothesis — a real terminal
+        /// quantising the 25%-blend tint down to indistinguishable in
+        /// 256-colour/truecolor negotiation — which only a real-hardware
+        /// smoke can confirm or refute.
         ///
-        /// **RED-verified by hand**: temporarily pointing this repo's
-        /// `quadraui` git dependency at `7ac04dae` (the parent of
-        /// `9f47ca9c`, i.e. one commit before the fix) and re-running this
-        /// test fails both assertions below — the pre-fix band painted
-        /// opaque `accent_bg` while this test's unrelated non-viewport
-        /// probe row still read plain `background`, so the two colours
-        /// *did* differ pre-fix too in that specific onedark-theme case;
-        /// the real regression this guards is a *future* change that
-        /// collapses the blend back toward (or past) indistinguishable —
-        /// this test pins the invariant exactly so quadraui or vimcode
-        /// can never silently regress it again without a red CI run.
+        /// **RED-verified by hand**: temporarily overriding the pinned
+        /// quadraui checkout (via a local `.cargo/config.toml` `paths`
+        /// override, never committed) so the band's `highlight_bg` is
+        /// forced equal to the plain strip `bg` — the literal "band not
+        /// painted / indistinguishable" defect this test guards against —
+        /// and re-running reliably fails both assertions below. Forcing
+        /// the same override back to the pre-#1181 *opaque*, un-blended
+        /// `accent_bg` instead left both assertions **passing**: an opaque
+        /// accent colour is not actually indistinguishable from
+        /// `background` in the onedark theme used here, so that pre-fix
+        /// state is outside what a plain `assert_ne!` can catch. To get
+        /// closer to the issue's actual "indistinguishable in a real
+        /// terminal" wording (not just "not bit-identical"), the
+        /// assertions below require a minimum combined per-channel RGB
+        /// delta (`MIN_PERCEPTIBLE_RGB_DELTA`), not mere inequality — a
+        /// one-unit rounding difference would pass `assert_ne!` but still
+        /// read as flat on real hardware.
+        ///
+        /// Covered under both the default `onedark` (dark) theme and
+        /// `vscode-light`, since the issue's own "Wanted" section names
+        /// both dark (Windows Terminal default) and light colour schemes —
+        /// see `minimap_viewport_highlight_band_paints_a_distinct_
+        /// background` and its `_under_light_theme` sibling below.
         #[test]
         fn minimap_viewport_highlight_band_paints_a_distinct_background() {
             const TOTAL_LINES: usize = 2000;
@@ -7415,11 +7472,13 @@ mod tests {
             let strip_and_highlight =
                 |h: &crate::harness::ConformanceHarness<quadraui::tui::testing::TuiDriver<_>>| {
                     let layout = h.screen_layout.borrow();
+                    let win = h.engine.borrow().active_window_id();
                     let mm = layout
                         .as_ref()
                         .expect("render_content must have painted a ScreenLayout")
                         .minimap
-                        .first()
+                        .iter()
+                        .find(|m| m.window_id == win)
                         .expect("a long, scrolling buffer must publish a minimap strip");
                     let strip = crate::render::minimap_strip_rect(mm);
                     let hl = mm
@@ -7441,7 +7500,13 @@ mod tests {
                  highlight={highlight:?}"
             );
             let strip_x = (strip.x as u16) + (strip.width as u16 / 2);
-            let in_band_y = highlight.y as u16;
+            // Probe the band's *midpoint* row, not its top edge: quadraui's
+            // rasteriser decides row membership on `row_mid` (the row's
+            // vertical centre), so a non-integral `highlight.y` can place
+            // the top edge's row just outside the band while the midpoint
+            // is reliably inside it (quadraui/src/tui/minimap.rs:237).
+            let in_band_y = (highlight.y as u16 + (highlight.height as u16 / 2))
+                .min((strip.y as u16) + (strip.height as u16) - 1);
             let out_band_y = (strip.y as u16) + (strip.height as u16) - 1;
             let in_style = h
                 .driver
@@ -7451,27 +7516,27 @@ mod tests {
                 .driver
                 .style_at(strip_x, out_band_y)
                 .expect("the strip's last row must be a painted cell");
-            assert_ne!(
-                in_style.bg, out_style.bg,
-                "the minimap's viewport-highlight band must paint a \
-                 background colour visibly different from the rest of the \
-                 strip — got the same bg {:?} both inside ({in_band_y}) and \
-                 outside ({out_band_y}) the band at column {strip_x}",
-                in_style.bg
+            assert_clearly_distinct(
+                in_style.bg,
+                out_style.bg,
+                &format!(
+                    "the minimap's viewport-highlight band at column \
+                     {strip_x} (inside row {in_band_y}, outside row \
+                     {out_band_y})"
+                ),
             );
 
             // Scroll to the very bottom and re-check — the band must still
             // be distinct, tracking the new viewport position (not stuck
             // painting the old one, and not silently losing its tint once
             // it's no longer flush with the strip's top row).
+            // Use the engine's own scroll setter (not a direct field poke)
+            // so this exercises the same fold-snapping/clamping path a real
+            // `G` keypress or scrollbar drag would go through.
             let win = h.engine.borrow().active_window_id();
             h.engine
                 .borrow_mut()
-                .windows
-                .get_mut(&win)
-                .unwrap()
-                .view
-                .scroll_top = TOTAL_LINES - 1;
+                .set_scroll_top_for_window(win, TOTAL_LINES - 1);
             h.driver.render();
             let (strip2, highlight2) = strip_and_highlight(&h);
             assert!(
@@ -7491,14 +7556,81 @@ mod tests {
                 .driver
                 .style_at(strip_x2, out_band_y2)
                 .expect("the strip's first row must be a painted cell");
-            assert_ne!(
-                in_style2.bg, out_style2.bg,
-                "after scrolling to the bottom, the minimap's \
-                 viewport-highlight band must still paint a distinct \
-                 background — got the same bg {:?} both inside \
-                 ({in_band_y2}) and outside ({out_band_y2}) the band at \
-                 column {strip_x2}",
-                in_style2.bg
+            assert_clearly_distinct(
+                in_style2.bg,
+                out_style2.bg,
+                &format!(
+                    "after scrolling to the bottom, the minimap's \
+                     viewport-highlight band at column {strip_x2} (inside \
+                     row {in_band_y2}, outside row {out_band_y2})"
+                ),
+            );
+        }
+
+        /// #1842 coverage, light-theme sibling of
+        /// `minimap_viewport_highlight_band_paints_a_distinct_background`:
+        /// the issue's own "Wanted" section names both Windows Terminal's
+        /// dark default *and* macOS Terminal.app/iTerm defaults, and
+        /// `theme.background.blend(theme.accent_bg, 0.25)` is a per-theme
+        /// computation — confirming it clears the perceptible-delta bar
+        /// under one dark and one light theme is strictly more coverage
+        /// than the dark-only case alone (though still not a substitute
+        /// for the dell64 human smoke this issue's acceptance bar
+        /// actually requires).
+        #[test]
+        fn minimap_viewport_highlight_band_paints_a_distinct_background_under_light_theme() {
+            const TOTAL_LINES: usize = 2000;
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            let text: String = (0..TOTAL_LINES)
+                .map(|i| format!("line {i} content\n"))
+                .collect();
+            engine.buffer_mut().insert(0, &text);
+            let mut h = harness_no_sidebar(engine);
+            h.driver.render();
+
+            let layout = h.screen_layout.borrow();
+            let win = h.engine.borrow().active_window_id();
+            let mm = layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("a long, scrolling buffer must publish a minimap strip");
+            let strip = crate::render::minimap_strip_rect(mm);
+            let highlight = mm
+                .resolved_layout
+                .borrow()
+                .as_ref()
+                .expect("draw_minimap_strip must have painted a resolved layout")
+                .viewport_highlight;
+            assert!(
+                highlight.height > 0.0,
+                "a 2000-line buffer taller than the strip must produce a \
+                 nonzero-height viewport highlight under vscode-light too; \
+                 strip={strip:?} highlight={highlight:?}"
+            );
+            let strip_x = (strip.x as u16) + (strip.width as u16 / 2);
+            let in_band_y = (highlight.y as u16 + (highlight.height as u16 / 2))
+                .min((strip.y as u16) + (strip.height as u16) - 1);
+            let out_band_y = (strip.y as u16) + (strip.height as u16) - 1;
+            let in_style = h
+                .driver
+                .style_at(strip_x, in_band_y)
+                .expect("the highlight row must be a painted cell");
+            let out_style = h
+                .driver
+                .style_at(strip_x, out_band_y)
+                .expect("the strip's last row must be a painted cell");
+            assert_clearly_distinct(
+                in_style.bg,
+                out_style.bg,
+                &format!(
+                    "under vscode-light, the minimap's viewport-highlight \
+                     band at column {strip_x} (inside row {in_band_y}, \
+                     outside row {out_band_y})"
+                ),
             );
         }
 
