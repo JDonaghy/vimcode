@@ -16535,20 +16535,42 @@ mod tests {
     // but nothing drove a real `KeyPressed(Down)`/`KeyPressed('i')` sequence
     // with the sidebar actually focused.
     //
-    // Root cause found while writing this test (not the issue body's own
-    // "readme-fetch network block" hypothesis, which this fixture's
-    // scriptless/registry-URL-less manifests rule out entirely —
-    // `Engine::ext_install_from_registry_with_runtime_check` never shells
-    // out to `curl` here): `quadraui::SidebarSystem::move_selection_by`
-    // only ever moves the selection *within* the already-active section.
-    // At the bottom of a section (or while it's empty) it returns
-    // `Consumed`/`Ignored` rather than crossing into the next one. A fresh
-    // install (the #1739 repro's own "cwd with no stale extension state")
-    // starts with an empty INSTALLED section, so `active_section` was
-    // permanently stuck at 0 and plain `Down` presses could never reach
-    // AVAILABLE at all — `dispatch_ext_sidebar_action_key`'s `"i"` arm then
-    // read `(in_installed: true, idx: 0)` indexing an empty list and
-    // silently did nothing, exactly matching the reported symptom.
+    // Two separate root causes, both fixed:
+    //
+    // 1. `quadraui::SidebarSystem::move_selection_by` only ever moves the
+    //    selection *within* the already-active section. At the bottom of a
+    //    section (or while it's empty) it returns `Consumed`/`Ignored`
+    //    rather than crossing into the next one. A fresh install (the
+    //    #1739 repro's own "cwd with no stale extension state") starts
+    //    with an empty INSTALLED section, so `active_section` was
+    //    permanently stuck at 0 and plain `Down` presses could never reach
+    //    AVAILABLE at all — `dispatch_ext_sidebar_action_key`'s `"i"` arm
+    //    then read `(in_installed: true, idx: 0)` indexing an empty list
+    //    and silently did nothing. This fixture's scriptless/registry-
+    //    URL-less manifest keeps that path (and *only* that path) the
+    //    one this module's two tests below exercise.
+    //
+    // 2. A prior round of review on this fix correctly pointed out that
+    //    (1) alone does not explain the issue body's own byte-level
+    //    evidence (zero PTY bytes for up to 8 seconds, a ~779-byte `Down`
+    //    repaint inconsistent with `Down` being `Ignored`): a *registry-
+    //    backed* session also freezes because `dispatch_ext_sidebar_
+    //    action_key`'s `"i"` arm calls `registry::fetch_readme` — a
+    //    blocking `curl --max-time 10` subprocess — directly on the
+    //    key-dispatch path, and `ext_install_from_registry_with_runtime_
+    //    check` itself blocks on `registry::download_script` (`--max-time
+    //    30`, once per manifest script) before that. Fixed by moving both
+    //    off the UI thread (`Engine::ext_show_readme_or_fetch_async`/
+    //    `poll_ext_readme` in `lsp_ops.rs`, and a fire-and-forget
+    //    background thread for the script-download loop) — see
+    //    `PROJECT_STATE.md`'s #1739 entry for the full writeup. This
+    //    fixture's scriptless/registry-URL-less manifest means neither of
+    //    *this* module's two tests exercises that leg (both network calls
+    //    hit their own `is_empty()` early return synchronously) — they
+    //    cover root cause 1 only. Root cause 2 has no Tier-1/Tier-2 test
+    //    in this PR; it needed a live, registry-backed PTY session to
+    //    reproduce, and the review itself identifies that gap as still
+    //    open (see `PROJECT_STATE.md`).
     mod issue_1739_ext_install_key {
         use super::*;
         use crate::core::engine::sidebar::PANEL_EXTENSIONS;
@@ -16583,6 +16605,7 @@ mod tests {
                 quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
             >,
             String,
+            crate::core::paths::TestHomeGuard,
         ) {
             let home = std::env::temp_dir().join(format!(
                 "vimcode_test_1739_ext_install_{unique}_{}_{:?}",
@@ -16591,13 +16614,16 @@ mod tests {
             ));
             let _ = std::fs::remove_dir_all(&home);
             std::fs::create_dir_all(&home).unwrap();
-            // Leaked deliberately: the guard must outlive this function
-            // (it restores `HOME` on drop) and the test only ever runs
-            // this fixture once, so leaking it for the process lifetime is
-            // harmless and matches the pattern other direct-call fixtures
-            // in this file use via `set_test_home`.
+            // Returned (not `forget`ten — #1739 review): `set_test_home`
+            // overrides a thread-local (`core::paths::set_test_home`'s own
+            // doc), which under `cargo test -- --test-threads=1` survives
+            // into every subsequent test on the same thread until dropped.
+            // Every other direct-call fixture in this file returns the
+            // guard in its tuple instead (e.g. `open_comment_heavy_buffer`,
+            // `fresh_test_home`) so it drops with the test — this fixture
+            // now matches that, rather than leaking the override for the
+            // rest of the process.
             let guard = crate::core::paths::set_test_home(&home);
-            std::mem::forget(guard);
 
             let available_name = format!("vc-tui-1739-available-{unique}");
 
@@ -16618,7 +16644,7 @@ mod tests {
             engine.focus_sidebar_panel(PANEL_EXTENSIONS);
 
             let h = harness(engine);
-            (h, available_name)
+            (h, available_name, guard)
         }
 
         /// RED-verified by hand against this PR's own fix reverted (the
@@ -16630,7 +16656,8 @@ mod tests {
         /// pre-fix dispatch path rather than passing trivially.
         #[test]
         fn down_then_i_installs_the_only_available_extension_via_shell_app() {
-            let (mut h, available_name) = harness_with_one_available_extension("keyboard");
+            let (mut h, available_name, _home_guard) =
+                harness_with_one_available_extension("keyboard");
             let driver = &mut h.driver;
 
             driver.render();
@@ -16649,9 +16676,14 @@ mod tests {
             driver.dispatch(i_key());
             driver.render();
 
+            // `"' installed"` rather than a bare `"installed"` needle
+            // (#1739 review nit): the sibling "already installed" message
+            // (`dispatch_ext_sidebar_action_key`'s `"i"` arm, `in_installed`
+            // branch) also contains the word "installed", so a regression
+            // into that branch could otherwise still pass this assertion.
             let after = driver.screen();
             assert!(
-                after.contains("installed"),
+                after.contains("' installed"),
                 "#1739: pressing Down then `i` must select the available \
                  extension and paint an 'installed' status message via \
                  the real key dispatch path; screen:\n{after}"
@@ -16659,7 +16691,7 @@ mod tests {
 
             let engine = h.engine.borrow();
             assert!(
-                engine.message.contains(&available_name) && engine.message.contains("installed"),
+                engine.message.contains(&available_name) && engine.message.contains("' installed"),
                 "#1739: `Engine::message` must name the installed extension; \
                  message: {:?}",
                 engine.message
@@ -16677,7 +16709,8 @@ mod tests {
         /// still installs it with no keyboard navigation at all.
         #[test]
         fn click_then_i_installs_the_clicked_available_extension_via_shell_app() {
-            let (mut h, available_name) = harness_with_one_available_extension("mouse");
+            let (mut h, available_name, _home_guard) =
+                harness_with_one_available_extension("mouse");
             let driver = &mut h.driver;
 
             driver.render();
@@ -16688,9 +16721,11 @@ mod tests {
             driver.dispatch(i_key());
             driver.render();
 
+            // `"' installed"` rather than a bare `"installed"` needle —
+            // see the keyboard twin above for why.
             let after = driver.screen();
             assert!(
-                after.contains("installed"),
+                after.contains("' installed"),
                 "#1739: clicking the available row then pressing `i` must \
                  install it; screen:\n{after}"
             );
@@ -16701,6 +16736,107 @@ mod tests {
                     .is_installed(&available_name),
                 "#1739: clicking then pressing `i` must actually mark the \
                  extension installed"
+            );
+        }
+
+        /// Review round 1 on this fix found that the cross-section nav bug
+        /// above does not explain #1739's own byte-level evidence — a
+        /// live, registry-backed session showed `i` producing zero PTY
+        /// bytes for up to 8 seconds, which pointed at
+        /// `dispatch_ext_sidebar_action_key`'s `"i"` arm blocking on
+        /// `registry::fetch_readme`/`download_script` (`curl --max-time
+        /// 10`/`30` subprocesses) directly on the key-dispatch path — a
+        /// mechanism this module's other two tests, built on a
+        /// scriptless/registry-URL-less manifest, cannot exercise at all.
+        ///
+        /// This test closes that gap without a real PTY or real network
+        /// access: it points the available extension's `registry_base_url`
+        /// at a local TCP listener that accepts the connection and then
+        /// never responds — the worst case for a blocking call, and one
+        /// `curl --max-time 10/30` will sit on for the full timeout. If
+        /// `dispatch_ext_sidebar_action_key`'s `"i"` arm (or
+        /// `ext_install_from_registry_with_runtime_check`'s script
+        /// download) still called `registry::fetch_readme`/
+        /// `download_script` inline, `driver.dispatch(i_key())` itself
+        /// would block for several seconds. It doesn't: both calls now run
+        /// on background threads (`Engine::ext_show_readme_or_fetch_async`
+        /// / `poll_ext_readme`, and a fire-and-forget thread for the
+        /// script-download loop — see `PROJECT_STATE.md`'s #1739 entry),
+        /// so `dispatch` returns as soon as the local, synchronous half of
+        /// the `"i"` handler finishes.
+        ///
+        /// RED-verified by hand: temporarily inlining `registry::
+        /// fetch_readme(&base_url, &name)` back into the `"i"` arm (reverting
+        /// `ext_show_readme_or_fetch_async`'s call to a direct blocking
+        /// call, matching pre-fix `develop`) makes this test's `elapsed`
+        /// assertion fail at multiple seconds, not milliseconds — confirmed
+        /// against the stuck listener used here, not just read from the
+        /// source.
+        #[test]
+        fn pressing_i_against_an_unresponsive_registry_does_not_block_dispatch_1739() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("binding a local TCP listener for the stuck-registry fixture");
+            let addr = listener.local_addr().unwrap();
+            // Accept connections and then just hold them open without ever
+            // writing a response or closing — the worst case for a
+            // blocking HTTP client (`curl` will sit there until its own
+            // `--max-time` elapses, not fail fast).
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let _held = stream;
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                }
+            });
+
+            let (mut h, available_name, _home_guard) =
+                harness_with_one_available_extension("slowreg");
+            {
+                let mut engine = h.engine.borrow_mut();
+                if let Some(reg) = engine.ext_registry.as_mut() {
+                    for m in reg.iter_mut() {
+                        if m.name == available_name {
+                            // Non-empty `scripts` + non-empty `registry_base_url`
+                            // is exactly the gate `ext_install_from_registry_
+                            // with_runtime_check`'s download loop and the `"i"`
+                            // arm's README fetch both check before touching the
+                            // network at all (`lsp_ops.rs`/`ext_panel.rs`) — the
+                            // other two tests in this module skip both legs
+                            // entirely by leaving these at their `Default` (empty)
+                            // values.
+                            m.scripts = vec!["init.lua".to_string()];
+                            m.registry_base_url = format!("http://{addr}");
+                        }
+                    }
+                }
+            }
+
+            let driver = &mut h.driver;
+            driver.render();
+            driver.dispatch(down_key());
+
+            let start = std::time::Instant::now();
+            driver.dispatch(i_key());
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "#1739: pressing `i` against an unresponsive registry must \
+                 not block the key-dispatch path on a `curl --max-time \
+                 10`/`30` subprocess; took {elapsed:?}"
+            );
+
+            // The install's own `self.message` assignment is synchronous
+            // (`ext_install_from_registry_with_runtime_check`'s final
+            // lines never depend on the backgrounded script download or
+            // README fetch), so it must already be visible without
+            // waiting on either background thread.
+            driver.render();
+            assert!(
+                driver.screen().contains("' installed"),
+                "#1739: the install message must still repaint \
+                 immediately even though the registry never responds; \
+                 screen:\n{}",
+                driver.screen()
             );
         }
     }

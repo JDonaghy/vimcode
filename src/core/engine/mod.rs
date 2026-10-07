@@ -4402,6 +4402,32 @@ pub struct Engine {
     /// be the bug.
     pub(crate) ext_registry_quiet: bool,
 
+    /// Channel for the background README fetch kicked off by
+    /// [`Self::ext_show_readme_or_fetch_async`] (#1739). `None` when no
+    /// fetch is in flight. Draining it is [`Self::poll_ext_readme`]'s job —
+    /// wired into [`Self::poll_idle`] alongside every other background-task
+    /// receiver on this struct (`ext_registry_rx`, `tool_acquire_tasks`,
+    /// ...). This exists because `registry::fetch_readme` shells out to
+    /// `curl --max-time 10`: calling it inline on the key-dispatch path
+    /// (the pre-#1739 behaviour) froze the whole UI thread — no repaint,
+    /// no cursor blink, nothing — for up to 10 seconds on every README
+    /// fetch, which is the actual root cause #1739 reported (the "i" key
+    /// looking like a no-op was really "blocked until the subprocess
+    /// returns, then finally repainting").
+    pub(crate) ext_readme_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
+    /// The extension name the in-flight [`Self::ext_readme_rx`] fetch is
+    /// for — used by [`Self::poll_ext_readme`] to build its "no README
+    /// available" fallback message once the fetch resolves to `None`.
+    pub(crate) ext_readme_pending_name: String,
+    /// The display name (title) to open the markdown preview tab under
+    /// once [`Self::ext_readme_rx`] resolves to `Some(content)`.
+    pub(crate) ext_readme_pending_display: String,
+    /// Whether [`Self::poll_ext_readme`] should set a "no README
+    /// available" message if the in-flight fetch resolves to `None` — see
+    /// [`Self::ext_show_readme_or_fetch_async`]'s doc for why its two call
+    /// sites disagree on this.
+    pub(crate) ext_readme_show_missing_message: bool,
+
     // --- Native tool acquisition (#1345) ---
     /// In-flight background acquisitions (`tool_acquire::acquire_and_install`),
     /// keyed by the same `install_key` scheme `lsp_installing` uses (e.g.
@@ -5565,6 +5591,10 @@ impl Engine {
             ext_registry_fetching: false,
             ext_registry_rx: None,
             ext_registry_quiet: false,
+            ext_readme_rx: None,
+            ext_readme_pending_name: String::new(),
+            ext_readme_pending_display: String::new(),
+            ext_readme_show_missing_message: false,
             tool_acquire_tasks: HashMap::new(),
             tool_acquire_groups: HashMap::new(),
             ext_sidebar_system: {
@@ -5978,6 +6008,7 @@ impl Engine {
         redraw |= self.poll_terminal();
         redraw |= self.poll_dap();
         redraw |= self.poll_ext_registry();
+        redraw |= self.poll_ext_readme();
         redraw |= self.poll_tool_acquire();
         redraw |= self.poll_sc_diff();
         self.tick_board();

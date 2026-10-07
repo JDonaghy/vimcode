@@ -1,5 +1,81 @@
 # VimCode Project State
 
+**Last updated:** October 7, 2026 (#1739 — bugbash:tui-pty "Extensions
+marketplace 'install' keystroke (i) is a silent no-op under real terminal
+input"). **Fixed — two real root causes, both addressed.** Review round 1
+on this issue's first PR found the originally-shipped fix (a real
+cross-section navigation bug — see below — that genuinely matches the
+report's symptom in the scriptless/registry-URL-less fixture it was tested
+against) did not explain the report's own byte-level evidence: a live,
+registry-backed session freezes the whole UI thread for up to several
+seconds on `i`, which the nav-bug theory alone cannot produce.
+
+- **Root cause 2 (the one the byte-level evidence actually points at):**
+  `Engine::dispatch_ext_sidebar_action_key`'s `"i"` arm calls
+  `crate::core::registry::fetch_readme` synchronously right after
+  installing, and `ext_install_from_registry_with_runtime_check` itself
+  synchronously downloads every manifest script before doing anything
+  else — both shell out to `curl` (`registry.rs`'s `fetch_readme`:
+  `--max-time 10`; `download_script`: `--max-time 30`, once per script)
+  directly on the key-dispatch path. On a registry with real scripts and a
+  live base URL, that is a multi-second-to-tens-of-seconds freeze with zero
+  PTY output — the "i" key looking like a no-op was really "blocked on a
+  subprocess, then finally repainting once it returns (or times out)".
+  Fixed by moving both off the UI thread (`src/core/engine/lsp_ops.rs`):
+  the script-download loop is now a fire-and-forget background thread
+  (nothing downstream ever consumed its result — the old loop already
+  discarded errors with `let _ =`); the README fetch is now a proper
+  async round-trip (`Engine::ext_show_readme_or_fetch_async` spawns a
+  thread, `Engine::poll_ext_readme` drains it from `poll_idle`, same shape
+  as the pre-existing `ext_refresh`/`poll_ext_registry` pattern) shared by
+  both the `"i"` arm and `Engine::ext_open_selected_readme` (Enter/
+  double-click), which had the identical blocking call. The install's own
+  `self.message` assignment (`ext_install_from_registry_with_runtime_
+  check`'s final lines) stays synchronous, so the status line still
+  repaints immediately — only the two network legs became async.
+- **Root cause 1 (cross-section navigation — real, but not what the
+  byte-level evidence was pointing at):** `quadraui::SidebarSystem::
+  move_selection_by` only moves the selection *within* the already-active
+  section; at a section's edge (or while it's empty) it returns `Consumed`/
+  `Ignored` instead of crossing into the next section. A fresh install
+  starts with an empty INSTALLED section, so `active_section` was
+  permanently stuck at 0 and `Down` could never reach AVAILABLE at all —
+  `dispatch_ext_sidebar_action_key`'s `"i"` arm then read `(in_installed:
+  true, idx: 0)` indexing an empty list and silently did nothing.
+  `Engine::ext_sidebar_navigate` (`src/core/engine/ext_panel.rs`) now
+  detects the `Consumed`/`Ignored` case and crosses the boundary itself via
+  `SidebarSystem::reveal` (not `set_selected_path` — `reveal` also
+  un-collapses the target section and scrolls the row into view, which
+  `set_selected_path` alone does not; this sidebar has
+  `set_allow_collapse(true)`, so a collapsed-target-section cross would
+  otherwise select an invisible row). The crossing also now clears
+  `ext_sidebar_input_active` to mirror `SidebarEvent::RowSelected`'s side
+  effect — a within-section `Down`/`Up` exits `/` filter mode via that
+  event; a boundary-crossing move previously did not, so `i` right after a
+  crossing `Down` from a filtered list got appended to the filter query
+  instead of installing.
+- Only `Down`/`j`/`Up`/`k` cross a boundary; `PageUp`/`PageDown`/`Home`/
+  `End` deliberately do not (documented in `ext_sidebar_navigate`'s own
+  comment) — they're jump-by-many/jump-to-extreme commands with no
+  well-defined "how far into the next section" semantics, and (unlike the
+  empty-INSTALLED case) a user can always still reach the far section via
+  repeated `Down`/`j`/`Up`/`k`.
+- Added a `src/tui_main/app_on_tui_tests.rs` mouse-click-then-`i` test
+  alongside the existing keyboard one (`click_then_i_installs_the_clicked_
+  available_extension_via_shell_app`) — both were already green against
+  the review-requested fix, pinning the mouse repro leg against
+  regression. Filed the generic "arrow keys should cross a `SidebarSystem`
+  section boundary" gap in `docs/PENDING_QUADRAUI_ISSUES.md` — this fix's
+  ~50 lines in `ext_panel.rs` are panel-local nav semantics that Explorer/
+  Source Control/Search's sidebars (same `SidebarSystem`) would otherwise
+  have to duplicate; a shared quadraui method would let all four collapse
+  onto one implementation later.
+- Still open from review: no Tier-2 `tests/smoke-spec/tui.yaml` PTY step
+  against a real registry-backed fixture was added in this round — the two
+  async-ified network calls fix the mechanism the byte-level evidence
+  pointed at, but a live end-to-end PTY confirmation against a real
+  (non-scriptless) registry fixture remains unverified on real hardware.
+
 **Last updated:** October 7, 2026 (#1828 — TUI minimap on real terminals:
 no visible thumb on Windows Terminal; drag behaves like the scrollbar on
 macOS). **Split into a shared-code fix (macOS drag mapping) + a quadraui
