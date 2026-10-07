@@ -1,5 +1,27 @@
 # VimCode Project State
 
+**Last updated:** October 7, 2026 (#1786 — bugbash: Alt-M back to Vim mode
+leaves the VSCode-mode menu bar permanently visible). **Duplicate, already
+fixed — no new code.** #1786 is the identical bug (same repro: Alt-M,
+Alt-M, row 0 still shows the File/Edit/.../Help menu bar) as #1780, whose
+fix (`ad939abf`/`6bb1fbcf`, gating `Engine::toggle_editor_mode`'s
+VSCode->Vim arm to clear `menu_bar_visible` when `menu_bar_toggleable`) is
+already merged to `develop` — confirmed by `git fetch origin develop`
+landing on the exact same SHA (`e2466e97`) this branch was created from,
+i.e. this branch's diff against `develop` is empty. The acceptance
+criterion in #1786 ("must add a Tier-1 shared conformance scenario or
+Tier-2 smoke-spec step that fails first") is also already satisfied by
+#1780's own fix: `tests/smoke-spec/catalogue.yaml`'s
+`modeswitch-alt-m-back-to-vim` entry, the TUI `TuiDriver` test
+(`alt_m_round_trip_hides_the_menu_bar_row_again_via_shell_app_1780` in
+`src/tui_main/app_on_tui_tests.rs`), and the GTK mirror
+(`mod alt_rung_1744` in `src/gtk/testing.rs`) were all added/tightened in
+#1780's round 2. Re-ran the TUI test this session
+(`cargo test --no-default-features --lib
+alt_m_round_trip_hides_the_menu_bar_row_again_via_shell_app_1780`) — passes
+clean against current `develop`. `ISSUE_RESOLUTION: resolved` — #1786
+should close as a duplicate of #1780, not as new work merged.
+
 **Last updated:** October 6, 2026 (#1824 — macOS native real-screen smoke: Dock icon, window activation, icon font, text quality — investigation, no production fix). **Investigated on real macmini hardware this session; no vimcode-repo fix exists for any of the three confirmed/partially-confirmed findings.** Built `cargo build --release --bin vimcode --no-default-features --features macos` and drove it live (real `screencapture`, `osascript`/`System Events`, `lsappinfo`) rather than reading code alone. Findings, most to least confirmed:
 
 1. **Window activation (regression 2 of 4) — reproduced cleanly.** Launched from inside a real, frontmost Terminal.app window (not a detached automation harness — that path did *not* reproduce it, which mattered). Result: `lsappinfo` reports vimcode `(in front)`/`Foreground`, but `System Events`'s frontmost-process query still names `Terminal`, and the composited screenshot shows Terminal's window literally covering vimcode's. Root-caused to quadraui, not vimcode: `quadraui::macos::run::run_with` (`src/macos/run.rs:2082`) calls the *deprecated* `-[NSApplication activateIgnoringOtherApps:]` (Apple's own SDK note, visible in the pinned `objc2-app-kit` 0.3.2 binding, says "Use NSApp.activate instead" — and the non-deprecated `NSApplication::activate()` already exists in that same pinned crate, unused). `src/macos/mod.rs` is confirmed thin wiring with no activation seam of its own. Drafted as a quadraui issue in `docs/PENDING_QUADRAUI_ISSUES.md` (new entry, directly below the pre-existing #1825 GTK-activation draft — this finding is stronger evidence than that draft had, since the native backend already calls an activation API and still fails, where GTK calls none at all).
