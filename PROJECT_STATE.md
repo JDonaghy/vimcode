@@ -1,5 +1,159 @@
 # VimCode Project State
 
+**Last updated:** October 6, 2026 (#1829 — Windows TUI: `:term` opens a
+blank panel with no PowerShell prompt). **Investigation only — no
+production change, real-hardware verification still required.** Traced
+every vimcode-side hop between the `:term` ex-command and the PTY write and
+confirmed each one is already shared, platform-neutral code with no
+Windows-specific branch: `Engine::execute_command`'s `"terminal"` arm ->
+`EngineAction::OpenTerminal` (`src/core/engine/execute.rs`) ->
+`render::handle_action`'s `OpenTerminal` arm -> `Engine::terminal_new_tab`
+(`src/render.rs`, identical on every backend) -> once
+`terminal_has_focus` is set, every subsequent keystroke is forwarded by
+`render::route_terminal_key`'s `TerminalKeyAction::SendToPty` arm
+(`src/render.rs`, also shared). `TerminalSession::spawn`/`poll` themselves
+are `quadraui::terminal_engine` — not vimcode source at all, confirmed
+against the pinned rev (`a5360532e297deecece65103df8ce61f53230bda`). So
+there is **no per-backend vimcode-side fix available** here, per the
+Platform-Neutrality Rule — this is a quadraui/`portable_pty` ConPTY
+question, and confirmed to have essentially zero existing coverage there:
+`quadraui/src/terminal_engine.rs`'s own `#[cfg(test)] mod tests` is almost
+entirely `#[cfg(unix)]`-gated (grep finds dozens of hits, zero
+Windows-gated spawn/poll tests), so the exact path this bug lives in has
+never been exercised automatically on the platform it was reported on.
+
+Also confirmed: **the issue's own "likely the same root cause as #1668"
+premise does not hold.** #1668 (Win-GUI's embedded terminal painting
+blank) was root-caused to `AppLogic::tick` never re-firing on Win-GUI
+absent an explicit `request_frame_in` re-arm (Win-GUI has no unconditional
+idle-poll fallback, unlike every other backend) — already fixed
+(`5401a24e`/`f321ac37`, `App::tick_dispatch`'s `terminal_poll_rearm_delay`)
+and landed on `develop` well before this session. That fix is explicitly
+inert on TUI (`src/app.rs`'s own comment: "Harmless on GTK/TUI/macOS (they
+already tick regardless, via their own `IDLE_POLL_CEILING` fallback)"), so
+whatever is wrong with the **TUI** `:term` panel on Windows is a different
+bug from #1668's, sharing nothing but the symptom description and the
+underlying `quadraui::terminal_engine` dependency.
+
+Added `tests/conpty_term_opens_shell_1829.rs` — a new, `#[cfg(windows)]`-
+gated real-ConPTY regression test following the exact precedent of
+`tests/conpty_idle_flicker.rs` (#1634) and
+`tests/conpty_activity_bar_click.rs` (#1636): spawns `vcd.exe` cross-
+compiled for `x86_64-pc-windows-msvc` under a real Win32 ConPTY, types the
+literal keystrokes `:term` + Enter, waits, then types the issue's own
+acceptance probe (`echo <marker> > "<path>"` + Enter) and polls the
+**filesystem** (not the screen — the whole point is proving the shell
+actually ran a command) for the marker file to appear. Verified to compile
+cleanly both ways from this Linux session (no Windows host attached here):
+`cargo xwin check --target x86_64-pc-windows-msvc --test
+conpty_term_opens_shell_1829` and plain `cargo check --test
+conpty_term_opens_shell_1829` (compiles to an empty, no-op crate on
+non-Windows via its `#![cfg(windows)]`) both succeed; `cargo fmt --check`
+and the normal host-target `cargo clippy -D warnings` lane are clean. **Not
+yet run** — that needs `cargo xwin test --target x86_64-pc-windows-msvc`
+executed on real Windows hardware (`dell64`), which this session has no
+access to. (A Windows-cross-target `cargo xwin clippy` run surfaced 4
+pre-existing lint failures in unrelated `src/core/paths.rs`/`src/core/
+swap.rs` Windows-only code — not part of this diff, not part of this
+repo's mandated host-target pre-commit gate, left alone.)
+
+Also confirmed, reading the issue body against the pinned quadraui source:
+the separately-named latent bug is real — `quadraui::terminal_engine::
+default_shell()` reads `$SHELL` **before** checking `target_os`, so a
+Windows host with `$SHELL` set (a Git Bash or WSL tab, per the issue's own
+note) hands a Unix shell path straight to `TerminalSession::spawn`'s
+`CommandBuilder`, which would plausibly also produce a dead/blank panel —
+distinct from dell64's own repro (confirmed `$SHELL` unset there) but
+explicitly in-scope per the issue body ("the fix should cover it"). This
+is quadraui code (`quadraui/src/terminal_engine.rs:2175`), not reachable
+from vimcode source — no vimcode-side fix available for this half either.
+
+**Blocker: could not draft the quadraui issue in its usual home.**
+`docs/PENDING_QUADRAUI_ISSUES.md` is the designated place for exactly this
+kind of drafted-but-unfiled upstream gap, but it is listed in this
+session's live file-overlap fence as being edited *right now* by #1825's
+own branch — per that fence's own instruction ("if your own changes would
+touch the SAME file(s), STOP and report the conflict instead of editing
+around it"), this session left it untouched. The full draft (title, body,
+ask, test, blocks) is recorded here instead so it isn't lost; **whoever
+picks up #1829 next should move it into `docs/PENDING_QUADRAUI_ISSUES.md`
+once #1825's branch has landed**, then have the coordinator file it on
+`JDonaghy/quadraui` per that file's own process:
+
+> **Title:** vimcode#1829 — Windows ConPTY spawn/poll path
+> (`TerminalSession::spawn`/`poll`) has essentially no automated test
+> coverage, and `default_shell()` checks `$SHELL` before `target_os`
+>
+> **Body:** A downstream bug report (vimcode#1829 — Windows TUI's `:term`
+> opens a blank panel, no prompt, no echo, nothing runs) traced every
+> vimcode-side hop to shared, platform-neutral code with no Windows
+> branch, landing the remaining suspect entirely inside
+> `quadraui::terminal_engine::TerminalSession::spawn`/`poll` and the
+> `portable_pty` Windows (ConPTY) backend it wraps. At the pinned rev
+> (`a5360532e297deecece65103df8ce61f53230bda`), `terminal_engine.rs`'s own
+> test module is almost entirely `#[cfg(unix)]`-gated — the spawn/poll
+> path has no Windows-gated automated coverage at all, so a regression
+> here would not be caught by quadraui's own suite either. Separately:
+> `default_shell()` (`terminal_engine.rs:2175`) returns `std::env::var("SHELL")`
+> unconditionally before ever checking `target_os`, so a Windows host
+> with `$SHELL` set (Git Bash/WSL tab) gets a Unix shell path handed to a
+> native ConPTY spawn — plausibly its own distinct cause of a dead
+> terminal pane on Windows, unrelated to whatever dell64's own ConPTY-
+> native repro turns out to be.
+>
+> **Ask:**
+> 1. Add Windows-gated (`#[cfg(target_os = "windows")]`, executed via
+>    `cargo xwin test`/`windows-latest` CI) coverage of
+>    `TerminalSession::spawn` + `poll` against a real ConPTY — spawn a
+>    known-good Windows binary (e.g. `cmd.exe /C echo ...`), confirm bytes
+>    arrive, confirm `is_exited()`/`exit_code()` resolve. Mirrors the
+>    `#[cfg(unix)]` tests already in the same file.
+> 2. Gate the `$SHELL` read in `default_shell()` to
+>    `#[cfg(not(target_os = "windows"))]` (or equivalent explicit check),
+>    so a Unix-style `$SHELL` set by an interop shell on a Windows host
+>    never reaches a native ConPTY spawn.
+>
+> **Test:** vimcode's own `tests/conpty_term_opens_shell_1829.rs` (new,
+> this PR) is the closest thing to a reproduction available without
+> quadraui-side changes — cross-compiled, not yet run on real hardware.
+> Once Ask 1 lands upstream: a Windows-gated unit test in
+> `terminal_engine.rs` itself, mirroring its own `#[cfg(unix)]` siblings.
+>
+> **Blocks:** `JDonaghy/vimcode#1829`. Leave open behind this per
+> `GOALS.md`'s milestone-discipline rule until a real-hardware run (dell64)
+> both confirms the symptom against vimcode's new ConPTY test and confirms
+> whatever fix lands (upstream `portable_pty`, or `default_shell()`'s
+> ordering, or both) resolves it.
+
+**What remains before #1829 can be considered resolved, let alone closed**
+(explicitly per the issue's own acceptance criteria): a person with
+`dell64` access needs to (1) run `cargo xwin test --target
+x86_64-pc-windows-msvc` for the new `conpty_term_opens_shell_1829` test and
+report RED/GREEN, and (2) separately, actually launch `vcd.exe` from a
+PowerShell tab, run `:term`, and visually confirm whether a real prompt
+appears — the acceptance criteria's own "a person confirms on dell64's
+screen" step, which no test run (real-ConPTY or otherwise) substitutes
+for. No `tests/smoke-spec/win-terminal.yaml` step was added for this: that
+file's own step vocabulary is interpreted by `coord`'s
+`win_native_driver.py` (a different repo this worker cannot see or edit),
+which has no filesystem-assertion step type today — the same class of
+testing-infrastructure gap `win-terminal.yaml`'s own header already
+documents for #1635/#1636 (UIA can only see Windows Terminal's single
+opaque `terminal` element, not step content). Inventing an unsupported
+YAML key here would silently no-op rather than gate anything, so none was
+added; the new Tier-1 `conpty_term_opens_shell_1829.rs` test is the
+closest automatable substitute, same reasoning `win-terminal.yaml`'s own
+#1751 section gives for the identical situation.
+
+ISSUE_RESOLUTION: investigation — root cause isolated to quadraui's
+Windows ConPTY leg (untested at the pinned rev) and a separate latent
+`default_shell()` ordering bug, both outside vimcode's own source per the
+Platform-Neutrality Rule; a new real-ConPTY regression test is added and
+compiles cleanly cross-compiled for Windows, but has not been run on real
+hardware, and the quadraui-side issue could not be drafted into
+`docs/PENDING_QUADRAUI_ISSUES.md` due to a live file-overlap conflict with
+#1825 — see the full draft recorded above for whoever picks this up next.
+
 **Last updated:** October 6, 2026 (#1798 — bugbash:win-native "Tab bar label doesn't update when switching the active file via the Explorer; only one tab ever appears"). **Fixed.** Root cause was never the Explorer dispatch path — `Engine::open_file_in_tab` always appended the second tab, which is why breadcrumb, content and status bar all followed the new buffer. The second tab had nowhere to **paint**: `App::shell_config` (`src/app.rs`) set `min_sidebar_width`/`max_sidebar_width` but left `ShellConfig::default_sidebar_width` at quadraui's generic `20.0`, and `AppShell::compute_layout` multiplies that by `line_height` on *every* backend. On TUI that is 20 terminal columns (correct); on a GUI backend it is ~460 device pixels, so beside the 48px activity bar the bugbash's 800x480 window had ~290px left for the editor *and* its tab bar — room for exactly one tab, hence "only one tab ever appears". Fix is one number made per-*unit* rather than per-backend, in the sanctioned shared place: `render::UnitProfile::sidebar_width_lh` (`src/render.rs`), joining `activity_bar_width_px`/`title_bar_lh` — `ALT_SIDEBAR_WIDTH_MIN`'s 15 (~345px, in the same range as `Session::sidebar_width`'s persisted 260 default and VS Code's ~300px) on the `px` profile, 20 cells unchanged on `cell`. No per-backend code, no new quadraui knob needed — the earlier rounds' claim that this needed a pixel-valued `ShellConfig::default_sidebar_width_px` upstream was wrong, and the review that pushed back on it was right. It deliberately stops *at* the shared Alt rung's floor rather than going narrower (~10 lh / ~230px would be closer to 260): `alt_resized_sidebar_width` clamps to `ALT_SIDEBAR_WIDTH_MIN..=ALT_SIDEBAR_WIDTH_MAX` on both backends, so an opening width below that floor makes the user's first Alt+Right jump discontinuously to it with no way back (measured on GTK at 10.0: painted sidebar 230px -> 345px on Alt+Right, then stuck at 345px on Alt+Left), and `compute_layout` would clamp it back up anyway. Making that floor per-unit too is a change to the shared Alt rung's cross-backend contract (#759) and wants its own issue. Coverage, fail-first per the acceptance bar: `gtk::testing`'s `explorer_double_click_opens_second_file_in_a_second_tab_1798` now runs at the reported **800x480** (it had been widened to 1600x480 in an earlier round to dodge this very bug) and is RED against unfixed `develop` — restoring `sidebar_width_lh` to `20.0` makes `tab_center(&bar, 1)` `None` because the tab never paints — plus `render::unit_profiles_scale_the_sidebar_width_per_unit_1798` pinning the three invariants, and the `shell_config` assertions in `src/app.rs`. Tab-bar assertions are geometrically scoped via a new `painted_label_is_in_tab_slot` helper (the matched run's rect must fall inside that tab's own slot in the cached `TabBarLayout`), with a negative control asserting the helper rejects the Explorer row's bare `"main.rs"` run — a bare `screen_contains` would pass under the reported bug. The two TUI twins are green both before and after, correctly: the `cell` profile was never mis-scaled, so they cover the shared dispatch path and guard against the fix narrowing the TUI sidebar as a side effect. Full `cargo test` green (4299 passed); the narrower GUI sidebar required no fixture updates at 15 lh.
 
 **Last updated:** October 5, 2026 (#1797 — bugbash:win-native "Source Control panel CHANGES section never lists modified/untracked files"). **Fixed.** Root cause: `Engine::startup_inner`'s file-opening branch (as opposed to the folder-opening branch, which `open_folder` already repoints) never touched `cwd`/`workspace_root` at all, so `cwd` stayed whatever the process's actual working directory happened to be at `Engine::new()` time — correct by accident on a terminal launch (`cd workspace && vimcode main.rs`, since the shell already `cd`ed there first), but wrong on any native-GUI launch that hands over an absolute file path without first changing the process's directory (a desktop shortcut with no "Start in" folder, a file-association "Open with" launch). With `cwd` pointing somewhere unrelated, `git::find_repo_root(&self.cwd)` returns `None`, `sc_refresh`'s `git status` queries the wrong directory, and the CHANGES section (which only ever reads `sc_file_statuses`) stays empty no matter how many times the panel is refreshed — exactly the report. This is shared, platform-neutral `Engine`/`core` code (no backend touches `cwd` differently), so the fix lives entirely in `src/core/engine/mod.rs`: a new `adopt_cwd_for_startup_file` resolves the file's own git repo root (falling back to its immediate parent directory) and adopts it as `cwd`/`workspace_root`, but only when the file is not already reachable from the existing `cwd` — so the ordinary terminal-launch case (including a file nested several directories into the workspace) is untouched, and only the "file lives somewhere `cwd` has no path to" case is repointed. RED-verified: `src/core/engine/tests.rs`'s `startup_on_a_file_outside_cwd_still_finds_its_repo_for_source_control_1797` builds a real git repo (one modified tracked file, one untracked file) in one temp dir, points the engine's `cwd` at a second, unrelated temp dir, calls the real `Engine::startup_without_session_restore(Some(&file))`, and asserts `sc_section_file_count(SC_SECTION_CHANGES) == 2` — observed `0` before the fix (confirmed by reverting `adopt_cwd_for_startup_file`'s call site), `2` after.
