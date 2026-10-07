@@ -125,13 +125,17 @@
 # under a *real* Win32 ConPTY directly (bypassing Windows Terminal's UIA
 # opacity entirely — it reads the raw byte stream, not an accessibility
 # tree), types `:term` + Enter then the issue's own `echo <marker> >
-# "<path>"` probe, and polls the filesystem for the marker — run it via
-# `cargo xwin test --target x86_64-pc-windows-msvc` on real Windows
+# '<path>'` probe, and polls the filesystem for the marker. That test now
+# runs in CI too (`.github/workflows/ci.yml`'s `build-windows-tui` job, a
+# `continue-on-error: true` step pending the quadraui fix this traces the
+# root cause to — see that step's own comment), and can also be run by hand
+# via `cargo xwin test --target x86_64-pc-windows-msvc --test
+# conpty_term_opens_shell_1829 --no-default-features` on real Windows
 # hardware. That test, plus the issue's own step 3 (a person watching a
 # real PowerShell prompt appear on `dell64`'s screen), are both still
 # required before #1829 can be considered verified; see `PROJECT_STATE.md`
-# for the full investigation and the drafted-but-not-yet-filed quadraui
-# issue this traces the root cause to.
+# and `docs/PENDING_QUADRAUI_ISSUES.md` for the full investigation and the
+# drafted-but-not-yet-filed quadraui issue this traces the root cause to.
 name: vimcode-win-terminal
 mode: terminal
 terminal_app: windows-terminal

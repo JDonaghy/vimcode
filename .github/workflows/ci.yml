@@ -295,7 +295,11 @@ jobs:
   # run; the Linux jobs below already cover the shared test suite). Without
   # that step, `conpty_idle_flicker.rs`'s `#[cfg(windows)]`-gated tests
   # would never execute anywhere in CI — the file compiles to zero tests on
-  # every Linux job — and could bit-rot silently forever.
+  # every Linux job — and could bit-rot silently forever. The same rule
+  # applies to every other `#[cfg(windows)]`-gated real-ConPTY test added
+  # since: each one needs its own explicitly named step below, or it is
+  # dead code in every lane (#1829 review round 1 — a file was added
+  # without one, and it ran nowhere until this comment's fix).
   build-windows-tui:
     name: Build (Windows TUI, vcd.exe)
     runs-on: windows-latest
@@ -371,6 +375,27 @@ jobs:
     # result here is a real signal worth blocking on.
     - name: Run tests/conpty_activity_bar_click.rs (#1636, real ConPTY on windows-latest)
       run: cargo test --release --test conpty_activity_bar_click --no-default-features
+
+    # #1829: real-ConPTY regression test for "Windows TUI: `:term` opens a
+    # blank panel with no PowerShell prompt" — same real Win32 pseudo
+    # console as the two steps above, typing `:term` + Enter then the
+    # issue's own acceptance probe (`echo <marker> > '<path>'` + Enter) and
+    # polling the filesystem for the marker. Unlike #1634/#1636 above, this
+    # is `continue-on-error: true`: the investigation that added this test
+    # (see `PROJECT_STATE.md`/`docs/PENDING_QUADRAUI_ISSUES.md`) isolated
+    # the root cause to quadraui's own untested Windows ConPTY leg, so this
+    # is *expected* to run RED until that upstream fix lands and this
+    # repo's quadraui pin is bumped — a hard gate here would block every
+    # unrelated PR in the meantime. Promote to a hard gate (drop
+    # `continue-on-error`) once: (1) the quadraui fix for the drafted
+    # "`quadraui::terminal_engine`'s Windows ConPTY spawn/poll path..."
+    # issue (`docs/PENDING_QUADRAUI_ISSUES.md`) has landed and this repo's
+    # pin has bumped past it, and (2) this step has been observed GREEN at
+    # least once after that bump — the same two-part bar #1636's own step
+    # comment above states for why *that* step is a hard gate.
+    - name: Run tests/conpty_term_opens_shell_1829.rs (#1829, real ConPTY on windows-latest)
+      continue-on-error: true
+      run: cargo test --release --test conpty_term_opens_shell_1829 --no-default-features
 
   # #1554: no job before this one ever compiled the Windows *GUI* build
   # (`--features win --bin vimcode`), so a whole class of loader failures

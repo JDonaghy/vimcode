@@ -7,16 +7,17 @@
 //! write is already shared, platform-neutral code with no Windows-specific
 //! branch in it: `Engine::execute_command` maps `"terminal"` straight to
 //! `EngineAction::OpenTerminal` (`src/core/engine/execute.rs`),
-//! `render::handle_action`'s `OpenTerminal` arm calls
-//! `Engine::terminal_new_tab` (`src/render.rs`) — the *same* function on
-//! every backend — and once `terminal_has_focus` is set, every subsequent
-//! keystroke is forwarded to the PTY by `render::route_terminal_key`
-//! (`src/render.rs`), also shared. `TerminalSession::spawn`/`poll` is
-//! `quadraui::terminal_engine` — not vimcode source at all. So if the panel
-//! really does come up blank on Windows while working on Linux/macOS, the
-//! fault has to be below this line, in the Windows ConPTY leg of
-//! `portable_pty` that `quadraui::terminal_engine::TerminalSession` wraps —
-//! confirmed, not assumed: at this repo's pinned quadraui rev,
+//! `render::handle_action`'s `OpenTerminal` arm (`src/render.rs`) calls
+//! `Engine::terminal_new_tab` (`src/core/engine/terminal_ops.rs`) — the
+//! *same* function on every backend — and once `terminal_has_focus` is
+//! set, every subsequent keystroke is forwarded to the PTY by
+//! `render::route_terminal_key` (`src/render.rs`), also shared.
+//! `TerminalSession::spawn`/`poll` is `quadraui::terminal_engine` — not
+//! vimcode source at all. So if the panel really does come up blank on
+//! Windows while working on Linux/macOS, the fault has to be below this
+//! line, in the Windows ConPTY leg of `portable_pty` that
+//! `quadraui::terminal_engine::TerminalSession` wraps — confirmed, not
+//! assumed: at this repo's pinned quadraui rev,
 //! `quadraui/src/terminal_engine.rs`'s own `#[cfg(test)] mod tests` is
 //! almost entirely `#[cfg(unix)]`-gated (`grep -c '#\[cfg(unix)\]'` finds
 //! dozens of hits, zero Windows-gated spawn/poll tests), so this exact path
@@ -41,12 +42,14 @@
 //! It spawns `vcd.exe` under a real ConPTY on a small text file (mirroring
 //! the issue's own repro: launched as if from a terminal, on a real file),
 //! waits for the first real frame, sends the literal keystrokes `:term` +
-//! Enter — exactly what a user types — then, after a settle window, sends
-//! the issue's own acceptance probe: `echo <marker> > "<path>"` + Enter,
-//! straight into the PTY exactly as a real keystroke stream would arrive.
-//! It then polls the filesystem (not the screen — the probe's whole point
-//! is that it proves the shell actually *ran a command*, not merely that
-//! something painted) for that file to appear containing the marker.
+//! Enter — exactly what a user types — waits for the terminal panel's own
+//! "TERMINAL" header to actually paint (not a fixed sleep — see
+//! [`wait_for_screen_contains`]'s doc for why), then sends the issue's own
+//! acceptance probe: `echo <marker> > '<path>'` + Enter, straight into the
+//! PTY exactly as a real keystroke stream would arrive. It then polls the
+//! filesystem (not the screen — the probe's whole point is that it proves
+//! the shell actually *ran* a command, not merely that something painted)
+//! for that file to appear containing the marker.
 //!
 //! If `:term` really opens a dead/blank panel on Windows, the nested shell
 //! never receives (or never acts on) the echoed command, the probe file
@@ -63,50 +66,45 @@
 //! default encoding) writes UTF-16LE with a BOM, not UTF-8 — reading the
 //! probe file back as UTF-8 and doing a substring match would silently
 //! fail even when the command *did* run. [`contains_marker`] below accepts
-//! either encoding so this test cannot produce a false negative purely from
-//! that cosmetic difference.
+//! plain UTF-8/ASCII or UTF-16LE (the PowerShell 5.1 case above); it also
+//! accepts UTF-16BE defensively (neither PowerShell 5.1 nor pwsh 7, the
+//! only two shells `default_shell()` can select, ever emits big-endian
+//! UTF-16, so that branch is not expected to ever match in practice — it
+//! costs nothing to keep and avoids this test silently depending on which
+//! endianness happens to be in fashion).
 //!
-//! # Not yet run on real hardware
+//! # CI wiring
 //!
-//! Unlike `tests/conpty_idle_flicker.rs` and `tests/conpty_activity_bar_click.rs`,
-//! this file has **not** been built with `cargo xwin` and executed on
-//! `dell64` as part of this change — this session has no attached Windows
-//! host. It follows those two files' already-proven spawn/capture pattern
-//! closely enough to compile with reasonable confidence, but per this
-//! issue's own acceptance criteria, a real run on `dell64` (`cargo xwin
-//! test --target x86_64-pc-windows-msvc`) plus a person watching the
-//! screen for an actual PowerShell prompt are both still required before
-//! #1829 can be considered verified, let alone closed.
+//! `.github/workflows/ci.yml`'s `build-windows-tui` job runs this test
+//! explicitly (as a `continue-on-error: true` step — see that job's own
+//! comment for why, and for the promotion condition) so it actually
+//! executes somewhere: `#![cfg(windows)]` alone makes this file compile to
+//! zero tests on every Linux/macOS lane, and CI's own `windows-latest`
+//! runner hosts a real native ConPTY, so it can produce this test's
+//! RED/GREEN signal with no attached physical Windows host required.
 #![cfg(windows)]
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-/// Upper bound on how long this test waits for the startup paint, and
-/// separately for the probe file to appear. Generous for the same reason
-/// `tests/conpty_activity_bar_click.rs`'s `SETTLE_TIMEOUT` is: a cold
-/// real-hardware PowerShell startup (profile scripts, etc.) can legitimately
-/// take several seconds.
+/// Upper bound on how long this test waits for the startup paint, the
+/// terminal panel's own header, and separately for the probe file to
+/// appear. Generous for the same reason `tests/conpty_activity_bar_click.rs`'s
+/// `SETTLE_TIMEOUT` is: a cold real-hardware PowerShell startup (profile
+/// scripts, etc.) can legitimately take several seconds.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// How long to wait after sending `:term` + Enter before typing the probe
-/// command, so the `OpenTerminal` dispatch (synchronous in vimcode, per
-/// `src/app.rs`'s own "Create the terminal tab immediately ... so the panel
-/// appears on this same draw cycle" comment) has unambiguously already run
-/// before the probe keystrokes are sent — not because the dispatch is slow,
-/// but so a real-timing race between this test's own two writes is never
-/// what's under test here.
-const AFTER_OPEN_SETTLE: Duration = Duration::from_millis(1500);
 
 const PTY_ROWS: u16 = 40;
 const PTY_COLS: u16 = 120;
 
-/// Mirrors `tests/conpty_idle_flicker.rs`/`tests/conpty_activity_bar_click.rs`'s
-/// identical struct.
+/// Byte sink the reader thread appends to; read back (cloned) by the
+/// polling helpers below. A bare `Arc<Mutex<Vec<u8>>>` would say the same
+/// thing — kept as a one-field struct only so call sites read
+/// `captured.lock().unwrap().bytes` rather than a doubly-wrapped `Vec`.
 struct Captured {
     bytes: Vec<u8>,
 }
@@ -155,20 +153,23 @@ fn contains_marker(bytes: &[u8], marker: &str) -> bool {
     contains_subslice(bytes, &utf16le) || contains_subslice(bytes, &utf16be)
 }
 
-/// Spawn `vcd.exe` under a real ConPTY, opened on `main_rs`, with `cwd` as
-/// its working directory. See `tests/conpty_activity_bar_click.rs`'s
-/// `spawn_under_conpty` doc for why the reader thread must also answer
-/// `ESC [ 6 n` from an independently spawned thread (a real, reproducible
-/// ConPTY deadlock otherwise) — this is the identical responder.
-fn spawn_under_conpty(
-    main_rs: &PathBuf,
-    home: &PathBuf,
-) -> (
+/// The pieces [`spawn_under_conpty`] hands back: the spawned child, the
+/// growing captured-bytes buffer, a shared writer for sending keystrokes,
+/// and the PTY's master handle (kept alive for the duration of the test;
+/// dropping it would close the PTY).
+type SpawnedConpty = (
     Box<dyn portable_pty::Child + Send + Sync>,
     Arc<Mutex<Captured>>,
     Arc<Mutex<Box<dyn Write + Send>>>,
     Box<dyn portable_pty::MasterPty + Send>,
-) {
+);
+
+/// Spawn `vcd.exe` under a real ConPTY, opened on `main_rs`, with `home` as
+/// its working directory. See `tests/conpty_activity_bar_click.rs`'s
+/// `spawn_under_conpty` doc for why the reader thread must also answer
+/// `ESC [ 6 n` from an independently spawned thread (a real, reproducible
+/// ConPTY deadlock otherwise) — this is the identical responder.
+fn spawn_under_conpty(main_rs: &Path, home: &Path) -> SpawnedConpty {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -231,22 +232,43 @@ fn spawn_under_conpty(
     (child, captured, writer, pair.master)
 }
 
-/// Poll the captured byte stream until [`screen_text`] (fed through a fresh
-/// `vt100::Parser`) contains `needle`, or fail after `timeout`. Mirrors
-/// `tests/conpty_activity_bar_click.rs`'s `wait_for_screen_contains`
-/// (duplicated rather than imported — see that file's own module doc for
-/// why the fixed-quiet-window alternative is flaky on real hardware).
+/// Feed every byte captured so far (from `*fed` onward) into `parser`,
+/// advancing `*fed` to the new total. Mirrors
+/// `tests/conpty_activity_bar_click.rs`'s `sync_parser`: keeping one
+/// persistent `vt100::Parser` across the whole test and feeding it
+/// incrementally, rather than re-parsing the whole captured stream from
+/// byte 0 on every poll, is just an efficiency choice — `vt100::Parser::
+/// process` is a pure state transition, so the two converge on the same
+/// screen either way, but incremental feeding is O(n) over the run instead
+/// of O(n^2).
+fn sync_parser(parser: &mut vt100::Parser, captured: &Arc<Mutex<Captured>>, fed: &mut usize) {
+    let new_bytes = {
+        let c = captured.lock().unwrap();
+        c.bytes[*fed..].to_vec()
+    };
+    *fed += new_bytes.len();
+    parser.process(&new_bytes);
+}
+
+/// Poll the captured byte stream, syncing `parser` via [`sync_parser`] each
+/// time, until [`screen_text`] contains `needle` — or fail (return `false`)
+/// after `timeout` total. Polling actual painted content (rather than a
+/// fixed "settle" sleep) is deliberate: `tests/conpty_activity_bar_click.rs`'s
+/// own module doc records this RED-verified by hand on real hardware — a
+/// fixed quiet/settle window fails the very first assertion even on an
+/// otherwise-working build, because cold real-hardware startup (profile
+/// scripts, etc.) can legitimately exceed any fixed bound.
 fn wait_for_screen_contains(
+    parser: &mut vt100::Parser,
     captured: &Arc<Mutex<Captured>>,
+    fed: &mut usize,
     needle: &str,
     timeout: Duration,
 ) -> bool {
     let start = Instant::now();
     loop {
-        let bytes = { captured.lock().unwrap().bytes.clone() };
-        let mut parser = vt100::Parser::new(PTY_ROWS, PTY_COLS, 0);
-        parser.process(&bytes);
-        if screen_text(&parser).contains(needle) {
+        sync_parser(parser, captured, fed);
+        if screen_text(parser).contains(needle) {
             return true;
         }
         if start.elapsed() >= timeout {
@@ -269,7 +291,7 @@ fn screen_text(parser: &vt100::Parser) -> String {
                 continue;
             }
             let s = cell.contents();
-            out.push_str(if s.is_empty() { " " } else { &s });
+            out.push_str(if s.is_empty() { " " } else { s });
         }
         out.push('\n');
     }
@@ -278,7 +300,7 @@ fn screen_text(parser: &vt100::Parser) -> String {
 
 /// Poll the filesystem for `path` to exist and contain `marker` (in any of
 /// the encodings [`contains_marker`] accepts), or fail after `timeout`.
-fn wait_for_probe_file(path: &PathBuf, marker: &str, timeout: Duration) -> bool {
+fn wait_for_probe_file(path: &Path, marker: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     loop {
         if let Ok(bytes) = std::fs::read(path) {
@@ -293,20 +315,77 @@ fn wait_for_probe_file(path: &PathBuf, marker: &str, timeout: Duration) -> bool 
     }
 }
 
+/// RAII guard ensuring the spawned `vcd.exe` child, this test's isolated
+/// `%APPDATA%`/`%USERPROFILE%` tree, and the probe file are all cleaned up
+/// no matter how the test function exits — including unwinding past a
+/// failed `assert!`, which Rust still runs `Drop` for. Mirrors
+/// `tests/extensions.rs`'s `OrphanChildGuard` (#1822's "make the collision
+/// test leak-proof on any exit path") for the identical property: teardown
+/// must not depend on reaching the function's own final assertion.
+struct TermTestGuard {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    home: PathBuf,
+    probe_path: Mutex<Option<PathBuf>>,
+}
+
+impl TermTestGuard {
+    /// Record the probe file's path so `Drop` can remove it too. Called
+    /// once the path is actually computed, which happens after this guard
+    /// is already constructed (the guard must exist *before* the first
+    /// assertion, i.e. before the probe path is even known).
+    fn set_probe_path(&self, path: PathBuf) {
+        *self.probe_path.lock().unwrap() = Some(path);
+    }
+}
+
+impl Drop for TermTestGuard {
+    fn drop(&mut self) {
+        // Best-effort graceful shutdown first, so a healthy session exits
+        // cleanly rather than merely being killed.
+        {
+            let mut w = self.writer.lock().unwrap();
+            w.write_all(b"\x1b\x1b:qa!\r").ok();
+            w.flush().ok();
+        }
+        let _ = self.child.try_wait();
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(p) = self.probe_path.lock().unwrap().take() {
+            let _ = std::fs::remove_file(&p);
+        }
+        let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+
 #[test]
 fn term_command_opens_a_working_shell_over_real_conpty_1829() {
     let home = isolated_home();
     let main_rs = home.join("main.rs");
     std::fs::write(&main_rs, "fn main() {}\n").expect("write main.rs");
 
-    let (mut child, captured, writer, _master) = spawn_under_conpty(&main_rs, &home);
+    let (child, captured, writer, _master) = spawn_under_conpty(&main_rs, &home);
+
+    // Constructed immediately after spawn, before any assertion can fail —
+    // see `TermTestGuard`'s own doc for why this ordering matters.
+    let guard = TermTestGuard {
+        child,
+        writer: Arc::clone(&writer),
+        home: home.clone(),
+        probe_path: Mutex::new(None),
+    };
+
+    let mut parser = vt100::Parser::new(PTY_ROWS, PTY_COLS, 0);
+    let mut fed = 0usize;
 
     // Wait for the first real frame (status bar's NORMAL mode indicator) —
     // same precondition `tests/conpty_activity_bar_click.rs` waits on.
     assert!(
-        wait_for_screen_contains(&captured, "NORMAL", SETTLE_TIMEOUT),
+        wait_for_screen_contains(&mut parser, &captured, &mut fed, "NORMAL", SETTLE_TIMEOUT),
         "vcd.exe never painted its first real frame (status bar's NORMAL \
-         mode indicator) within {SETTLE_TIMEOUT:?}"
+         mode indicator) within {SETTLE_TIMEOUT:?}; screen:\n{}",
+        screen_text(&parser)
     );
 
     // Type `:term` + Enter — the issue's own repro gesture, byte-for-byte
@@ -317,7 +396,20 @@ fn term_command_opens_a_working_shell_over_real_conpty_1829() {
         w.flush().ok();
     }
 
-    std::thread::sleep(AFTER_OPEN_SETTLE);
+    // Wait for the terminal panel's own header to actually paint, rather
+    // than sleeping a fixed duration — see [`wait_for_screen_contains`]'s
+    // doc for why a fixed settle window is flaky on real hardware. The
+    // header paints even if the shell inside the panel is dead (it's drawn
+    // by vimcode's own shared panel chrome, not by anything the nested
+    // shell writes), so this is a precondition check on `OpenTerminal`
+    // having dispatched, not part of what #1829 is actually testing.
+    assert!(
+        wait_for_screen_contains(&mut parser, &captured, &mut fed, "TERMINAL", SETTLE_TIMEOUT),
+        "`:term` never painted the terminal panel's \"TERMINAL\" header \
+         within {SETTLE_TIMEOUT:?} — the panel itself never opened; \
+         screen:\n{}",
+        screen_text(&parser)
+    );
 
     // The issue's own acceptance probe, generalised to an isolated,
     // collision-free path under this test's own temp root rather than a
@@ -336,8 +428,14 @@ fn term_command_opens_a_working_shell_over_real_conpty_1829() {
     // exact path (should be impossible given the nanosecond-resolution
     // name, but costs nothing to guard).
     let _ = std::fs::remove_file(&probe_path);
+    guard.set_probe_path(probe_path.clone());
 
-    let command_line = format!("echo {marker} > \"{}\"\r", probe_path.display());
+    // Single-quoted PowerShell string literal: the probe path comes from
+    // `std::env::temp_dir()`, which this test does not control the
+    // contents of, and single quotes are inert in PowerShell (no `$`/
+    // backtick interpolation), unlike the double quotes a straight
+    // `Path::display()` interpolation would otherwise sit inside.
+    let command_line = format!("echo {marker} > '{}'\r", probe_path.display());
     {
         let mut w = writer.lock().unwrap();
         w.write_all(command_line.as_bytes())
@@ -347,29 +445,17 @@ fn term_command_opens_a_working_shell_over_real_conpty_1829() {
 
     let found = wait_for_probe_file(&probe_path, &marker, SETTLE_TIMEOUT);
 
-    // Best-effort teardown before asserting, so a failed assertion doesn't
-    // leave a `vcd.exe`/shell process tree behind.
-    {
-        let mut w = writer.lock().unwrap();
-        w.write_all(b"\x1b\x1b:qa!\r").ok();
-        w.flush().ok();
-    }
-    let _ = child.try_wait();
-    std::thread::sleep(Duration::from_millis(500));
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_file(&probe_path);
-
     let final_screen = {
-        let bytes = captured.lock().unwrap().bytes.clone();
-        let mut p = vt100::Parser::new(PTY_ROWS, PTY_COLS, 0);
-        p.process(&bytes);
-        screen_text(&p)
+        sync_parser(&mut parser, &captured, &mut fed);
+        screen_text(&parser)
     };
 
+    // `guard` drops at the end of this function on every path (including
+    // unwinding past the assertion below), tearing down the child, the
+    // isolated home, and the probe file — see `TermTestGuard`'s doc.
     assert!(
         found,
-        "typing `:term` then `echo {marker} > \"{}\"` + Enter over a real \
+        "typing `:term` then `echo {marker} > '{}'` + Enter over a real \
          ConPTY never produced the probe file within {SETTLE_TIMEOUT:?} — \
          this is #1829's exact symptom (the terminal panel opened but the \
          shell inside it never ran the command, i.e. no working PowerShell \
