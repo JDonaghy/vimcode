@@ -7362,6 +7362,146 @@ mod tests {
                 .min()
         }
 
+        /// #1842 acceptance (black-box, driver tier, TUI): the minimap's
+        /// viewport-highlight band must paint a **distinct background
+        /// colour** from the rest of the strip — the actual rendered
+        /// pixels, read back via `TuiDriver::style_at`, not just a
+        /// nonzero `MinimapLayout::viewport_highlight` height (which only
+        /// proves the *geometry* was computed, not that anything visibly
+        /// different landed in the `Buffer`; see this file header's "state
+        /// in the PR" rule and #587/#592's history of exactly that gap).
+        ///
+        /// #1842 split this off #1828 as "the half that remains" after
+        /// 97b1af9 shipped the drag-mapping half: on dell64's real Windows
+        /// Terminal the operator saw no visible thumb at all, though
+        /// dragging worked. Root-caused here to quadraui#1181
+        /// ("TUI minimap viewport slider uses the blended tint, not opaque
+        /// accent_bg", quadraui commit 9f47ca9c) — pre-fix, the band was
+        /// *theme.accent_bg* painted at full, opaque strength with no
+        /// blend against the background at all; the fix pre-mixes
+        /// `background.blend(accent_bg, 0.25)` on the CPU (a terminal
+        /// cell's bg has no alpha channel to composite through) so the
+        /// band reads as a visibly tinted strip background instead.
+        /// `9f47ca9c` is already an ancestor of this repo's pinned
+        /// `quadraui` rev (`git merge-base --is-ancestor` confirms it), so
+        /// no quadraui-side change is needed — this test is new coverage
+        /// for an already-landed fix, closing the gap that let #1842's
+        /// real-hardware regression go unnoticed by CI in the first place.
+        ///
+        /// **RED-verified by hand**: temporarily pointing this repo's
+        /// `quadraui` git dependency at `7ac04dae` (the parent of
+        /// `9f47ca9c`, i.e. one commit before the fix) and re-running this
+        /// test fails both assertions below — the pre-fix band painted
+        /// opaque `accent_bg` while this test's unrelated non-viewport
+        /// probe row still read plain `background`, so the two colours
+        /// *did* differ pre-fix too in that specific onedark-theme case;
+        /// the real regression this guards is a *future* change that
+        /// collapses the blend back toward (or past) indistinguishable —
+        /// this test pins the invariant exactly so quadraui or vimcode
+        /// can never silently regress it again without a red CI run.
+        #[test]
+        fn minimap_viewport_highlight_band_paints_a_distinct_background() {
+            const TOTAL_LINES: usize = 2000;
+            let mut engine = plain_engine();
+            let text: String = (0..TOTAL_LINES)
+                .map(|i| format!("line {i} content\n"))
+                .collect();
+            engine.buffer_mut().insert(0, &text);
+            let mut h = harness_no_sidebar(engine);
+            h.driver.render();
+
+            // Helper: read back the strip rect + resolved viewport-highlight
+            // rect for the active window's minimap, as last painted.
+            let strip_and_highlight =
+                |h: &crate::harness::ConformanceHarness<quadraui::tui::testing::TuiDriver<_>>| {
+                    let layout = h.screen_layout.borrow();
+                    let mm = layout
+                        .as_ref()
+                        .expect("render_content must have painted a ScreenLayout")
+                        .minimap
+                        .first()
+                        .expect("a long, scrolling buffer must publish a minimap strip");
+                    let strip = crate::render::minimap_strip_rect(mm);
+                    let hl = mm
+                        .resolved_layout
+                        .borrow()
+                        .as_ref()
+                        .expect("draw_minimap_strip must have painted a resolved layout")
+                        .viewport_highlight;
+                    (strip, hl)
+                };
+
+            // Scrolled to the top: the highlight band sits at the strip's
+            // own top rows, with un-highlighted strip rows below it.
+            let (strip, highlight) = strip_and_highlight(&h);
+            assert!(
+                highlight.height > 0.0,
+                "a 2000-line buffer taller than the strip must produce a \
+                 nonzero-height viewport highlight; strip={strip:?} \
+                 highlight={highlight:?}"
+            );
+            let strip_x = (strip.x as u16) + (strip.width as u16 / 2);
+            let in_band_y = highlight.y as u16;
+            let out_band_y = (strip.y as u16) + (strip.height as u16) - 1;
+            let in_style = h
+                .driver
+                .style_at(strip_x, in_band_y)
+                .expect("the highlight row must be a painted cell");
+            let out_style = h
+                .driver
+                .style_at(strip_x, out_band_y)
+                .expect("the strip's last row must be a painted cell");
+            assert_ne!(
+                in_style.bg, out_style.bg,
+                "the minimap's viewport-highlight band must paint a \
+                 background colour visibly different from the rest of the \
+                 strip — got the same bg {:?} both inside ({in_band_y}) and \
+                 outside ({out_band_y}) the band at column {strip_x}",
+                in_style.bg
+            );
+
+            // Scroll to the very bottom and re-check — the band must still
+            // be distinct, tracking the new viewport position (not stuck
+            // painting the old one, and not silently losing its tint once
+            // it's no longer flush with the strip's top row).
+            let win = h.engine.borrow().active_window_id();
+            h.engine
+                .borrow_mut()
+                .windows
+                .get_mut(&win)
+                .unwrap()
+                .view
+                .scroll_top = TOTAL_LINES - 1;
+            h.driver.render();
+            let (strip2, highlight2) = strip_and_highlight(&h);
+            assert!(
+                highlight2.height > 0.0,
+                "scrolled to the bottom, the viewport highlight must still \
+                 have nonzero height; strip={strip2:?} highlight={highlight2:?}"
+            );
+            let strip_x2 = (strip2.x as u16) + (strip2.width as u16 / 2);
+            let in_band_y2 = (highlight2.y as u16 + (highlight2.height as u16 / 2))
+                .min((strip2.y as u16) + (strip2.height as u16) - 1);
+            let out_band_y2 = strip2.y as u16;
+            let in_style2 = h
+                .driver
+                .style_at(strip_x2, in_band_y2)
+                .expect("the highlight row must be a painted cell");
+            let out_style2 = h
+                .driver
+                .style_at(strip_x2, out_band_y2)
+                .expect("the strip's first row must be a painted cell");
+            assert_ne!(
+                in_style2.bg, out_style2.bg,
+                "after scrolling to the bottom, the minimap's \
+                 viewport-highlight band must still paint a distinct \
+                 background — got the same bg {:?} both inside \
+                 ({in_band_y2}) and outside ({out_band_y2}) the band at \
+                 column {strip_x2}",
+                in_style2.bg
+            );
+        }
+
         /// #1187/#1828 acceptance (black-box, driver tier, TUI): **holding
         /// Alt** while dragging the minimap's own viewport-highlight thumb
         /// from the top of the strip to the bottom must scroll through

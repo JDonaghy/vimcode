@@ -1,5 +1,65 @@
 # VimCode Project State
 
+**Last updated:** October 7, 2026 (#1842 — TUI minimap viewport thumb
+reported invisible in Windows Terminal, split off #1828's drag half).
+**Investigated — the known pre-fix defect is already fixed and pinned;
+added the missing regression test; real-hardware re-confirmation still
+needed before closing.** #1842 reports no visible viewport-highlight band
+on dell64's real Windows Terminal, though dragging (hit-testing) works —
+the same symptom #1828's own title named as its second half. Root-caused
+the shared TUI paint path (`quadraui::tui::minimap::draw_minimap_with_scale`,
+reached via this repo's `render::draw_minimap_strip`): before quadraui
+commit `9f47ca9c` ("TUI minimap viewport slider uses the blended tint, not
+opaque accent_bg", closing quadraui#1181), the band was painted as a flat,
+un-blended `theme.accent_bg`; after it, the band is
+`theme.background.blend(theme.accent_bg, 0.25)`, visibly distinct from the
+surrounding strip's plain `background` in every theme checked (confirmed
+numerically for vimcode's own default `onedark` theme: strip bg
+`rgb(26,26,26)` vs. band `rgb(44,63,79)`). `9f47ca9c` is already an
+ancestor of this repo's pinned `quadraui` rev
+(`a5360532e297deecece65103df8ce61f53230bda` — `git merge-base
+--is-ancestor` confirms it, and the rev predates this branch), so **no
+quadraui-side or vimcode-side production code changed in this PR.**
+
+What this PR adds: `src/tui_main/app_on_tui_tests.rs`'s
+`minimap::minimap_viewport_highlight_band_paints_a_distinct_background` —
+a black-box `TuiDriver` test that reads back the *painted* `CellStyle::bg`
+(via `style_at`, not `MinimapLayout::viewport_highlight`'s geometry alone —
+see #587/#592's "state vs. rendered output" lesson) both inside and
+outside the band, at the top and after scrolling to the very bottom of a
+2000-line buffer, and asserts the two backgrounds differ. This test did
+not exist anywhere in the suite before now, so the real-hardware
+regression had no CI signal to catch it. RED-verified by hand: temporarily
+overriding `.cargo/config.toml`'s `paths` to a scratch copy of the pinned
+quadraui checkout with `highlight_bg` forced to equal the plain strip
+`bg` (the literal "band not painted / indistinguishable" defect the issue
+describes) reproduces the failure cleanly; forcing it back to the
+pre-#1181 *opaque* `accent_bg` (no blend) still passed this test, because
+opaque accent colours are not actually indistinguishable from background —
+confirming the issue's real defect class is "unpainted/identical", not
+"too strong", and that this test catches exactly that class. The override
+was never committed — restored via `git checkout -- .cargo/config.toml`
+after verification, confirmed clean (`git status`/`git diff` show no stray
+changes to that file).
+
+**Still unknown, needs a human:** this issue's own acceptance bar is "a
+person on dell64 confirms the thumb is visible and tracks the viewport" —
+something this investigation cannot perform. Two explanations remain open
+for why the real-hardware smoke saw nothing: (1) the dell64 build predated
+the quadraui pin bump that carries `9f47ca9c` (most likely, given #1828's
+drag half was *also* only just fixed this session in `97b1af9`, so a
+stale `vcd.exe` is plausible), in which case a fresh build should already
+resolve it; or (2) something specific to that real terminal/profile (color
+depth negotiation, `COLORTERM`, a non-default Windows Terminal colour
+scheme, or a reduced-contrast rendering mode) still washes the blend out
+in a way this headless `TestBackend` run cannot reproduce — `TestBackend`
+only proves the `Buffer` cells carry visibly different RGB values, not
+that a given real terminal renders that difference visibly. If a fresh
+build on dell64 still shows no thumb, the next step is reading back the
+*actual* colour reported by that terminal (e.g. a direct ANSI truecolor
+probe) rather than assuming the paint-layer bug reproduced here.
+`ISSUE_RESOLUTION: investigation`.
+
 **Last updated:** October 7, 2026 (#1739 — bugbash:tui-pty "Extensions
 marketplace 'install' keystroke (i) is a silent no-op under real terminal
 input"). **Fixed — two real root causes, both addressed, plus a
