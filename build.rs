@@ -16,15 +16,16 @@ fn main() {
         .warnings(false)
         .compile("tree_sitter_latex");
 
-    // ── quadraui rev (#691) ─────────────────────────────────────────────────
+    // ── quadraui version (#691, registry dep since #1848) ──────────────────
     //
-    // quadraui is a git dependency pinned to a `rev` in `Cargo.toml` (see the
-    // dependency comment there for the history of why — it used to be an
-    // unpinned sibling path dep, #638/#625/#659). Cargo/rustc give no built-in
-    // way to name "the rev this crate was built against" at runtime, so bake
-    // it into the binary here for `vimcode --version` / `vcd --version`
+    // quadraui is a crates.io dependency version-pinned in `Cargo.toml` (see
+    // the dependency comment there for the history — a relative sibling path
+    // dep, then a git rev pin from #691, then this registry dependency from
+    // #1848). Cargo/rustc give no built-in way to name "the quadraui version
+    // this crate was built against" at runtime, so bake it into the binary
+    // here for `vimcode --version` / `vcd --version`
     // (`src/quadraui_pin.rs::version_line`).
-    export_quadraui_rev();
+    export_quadraui_version();
 
     // ── Windows Common-Controls v6 manifest (#1554) ────────────────────────
     embed_windows_comctl_v6_manifest();
@@ -78,18 +79,21 @@ fn embed_windows_comctl_v6_manifest() {
     }
 }
 
-/// Resolve the quadraui git rev this build is locked to, and export it as
-/// `VIMCODE_QUADRAUI_REV` for `src/quadraui_pin.rs` to bake into the binary.
+/// Resolve the quadraui version this build is locked to, and export it as
+/// `VIMCODE_QUADRAUI_VERSION` for `src/quadraui_pin.rs` to bake into the
+/// binary.
 ///
-/// Prefers `Cargo.lock`'s resolved rev — the actual commit Cargo fetched and
-/// compiled — falling back to the `rev = "..."` in `Cargo.toml` (e.g. a
-/// from-scratch build before a lockfile exists). A `paths` override in
-/// `.cargo/config.toml` (the local-quadraui co-development workflow; see
+/// Prefers `Cargo.lock`'s resolved version for the `quadraui` package — the
+/// actual version Cargo fetched and compiled — falling back to the
+/// `version = "..."` requirement in `Cargo.toml` (e.g. a from-scratch build
+/// before a lockfile exists). A `paths` override in `.cargo/config.toml`
+/// (the local-quadraui co-development workflow; see
 /// `cargo-config-local-quadraui.toml.example`) redirects compilation to a
 /// local checkout without changing either file, so this still reports the
-/// pinned rev in that case — accurate for "what does vimcode intend to build
-/// against", not necessarily "what's on disk right now".
-fn export_quadraui_rev() {
+/// pinned version requirement in that case — accurate for "what does
+/// vimcode intend to build against", not necessarily "what's on disk right
+/// now".
+fn export_quadraui_version() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let lock_path = manifest_dir.join("Cargo.lock");
     let toml_path = manifest_dir.join("Cargo.toml");
@@ -97,37 +101,31 @@ fn export_quadraui_rev() {
     println!("cargo:rerun-if-changed={}", lock_path.display());
     println!("cargo:rerun-if-changed={}", toml_path.display());
 
-    let rev = std::fs::read_to_string(&lock_path)
+    let version = std::fs::read_to_string(&lock_path)
         .ok()
-        .and_then(|s| rev_from_lockfile(&s))
+        .and_then(|s| version_from_lockfile(&s))
         .or_else(|| {
             std::fs::read_to_string(&toml_path)
                 .ok()
-                .and_then(|s| rev_from_manifest(&s))
+                .and_then(|s| version_from_manifest(&s))
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    println!("cargo:rustc-env=VIMCODE_QUADRAUI_REV={rev}");
+    println!("cargo:rustc-env=VIMCODE_QUADRAUI_VERSION={version}");
 }
 
-/// Pull the resolved 40-char SHA out of `Cargo.lock`'s `quadraui` package
-/// entry, e.g. `source = "git+https://.../quadraui.git?rev=<rev>#<sha>"`.
-/// The `#<sha>` suffix is Cargo's *resolved* commit — authoritative, and
-/// present even if `rev` in `Cargo.toml` is a branch name or short SHA.
-fn rev_from_lockfile(lock: &str) -> Option<String> {
+/// Pull the resolved version out of `Cargo.lock`'s `quadraui` package entry,
+/// e.g. `version = "0.1.0"` in the `[[package]] name = "quadraui"` block.
+fn version_from_lockfile(lock: &str) -> Option<String> {
     let mut lines = lock.lines().peekable();
     while let Some(line) = lines.next() {
         if line.trim() == "name = \"quadraui\"" {
-            // The `source` line follows `name`/`version` within the same
+            // The `version` line follows `name` within the same
             // `[[package]]` block.
-            for follow in lines.by_ref().take(4) {
-                if let Some(rest) = follow.trim().strip_prefix("source = \"") {
-                    if let Some((_, sha)) = rest.rsplit_once('#') {
-                        let sha = sha.trim_end_matches('"');
-                        if is_full_sha(sha) {
-                            return Some(sha.to_string());
-                        }
-                    }
+            if let Some(follow) = lines.peek() {
+                if let Some(rest) = follow.trim().strip_prefix("version = \"") {
+                    let version = rest.trim_end_matches('"');
+                    return Some(version.to_string());
                 }
             }
         }
@@ -135,17 +133,14 @@ fn rev_from_lockfile(lock: &str) -> Option<String> {
     None
 }
 
-/// Fall back to the `rev = "..."` pinned on the `quadraui` dependency line in
-/// `Cargo.toml`, for a from-scratch build with no `Cargo.lock` yet.
-fn rev_from_manifest(manifest: &str) -> Option<String> {
+/// Fall back to the `version = "..."` requirement on the `quadraui`
+/// dependency line in `Cargo.toml`, for a from-scratch build with no
+/// `Cargo.lock` yet.
+fn version_from_manifest(manifest: &str) -> Option<String> {
     let line = manifest
         .lines()
-        .find(|l| l.trim_start().starts_with("quadraui = ") && l.contains("git ="))?;
-    let after = line.split_once("rev = \"")?.1;
-    let rev = after.split('"').next()?;
-    Some(rev.to_string())
-}
-
-fn is_full_sha(s: &str) -> bool {
-    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+        .find(|l| l.trim_start().starts_with("quadraui = ") && l.contains("version ="))?;
+    let after = line.split_once("version = \"")?.1;
+    let version = after.split('"').next()?;
+    Some(version.to_string())
 }
