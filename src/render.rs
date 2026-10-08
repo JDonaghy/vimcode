@@ -931,11 +931,66 @@ const NERD_FONT_FALLBACK_FAMILY: &str = "Symbols Nerd Font";
 /// `None` falls back to [`NERD_FONT_FALLBACK_FAMILY`], the literal name the
 /// font is known to register under, so `set_nerd_font_fallback` still gets
 /// a usable family either way.
+///
+/// # Why it registers at most once per process (#1853)
+///
+/// "Call once" is the contract, but a *process* can legitimately build many
+/// `App`s/backends — every `GtkDriver`/`TuiDriver` harness in the test suite
+/// does, several hundred times per `cargo test` run — and each one used to
+/// hand the whole font to its backend again. Registration is **not** free
+/// and **not** idempotent on the platform side:
+///
+/// - GTK registers via Fontconfig's `FcConfigAppFontAddFile`, which has no
+///   in-memory entry point, so quadraui writes the bytes to a fresh temp
+///   file per call and deliberately never deletes it (Fontconfig/FreeType
+///   may re-open it lazily at shape time). Each call also appends another
+///   `FcPattern` — with its full charset — to the process's application
+///   font set, which every subsequent font match then has to sort.
+/// - macOS fails outright on the second call (duplicate PostScript name).
+///
+/// With the pre-#1853 114-glyph subset (29 KB) the per-harness copies were
+/// invisible. With the full Symbols Nerd Font (2.5 MB) the same suite wrote
+/// ~1.5 GB of temp files and grew the application font set by ~600 copies of
+/// a 10,627-codepoint font in a single `cargo test` run — enough to redden a
+/// CI runner that has far less headroom (disk and RAM) than a dev box.
+///
+/// So the first backend that *accepts* the font wins: its resolved family is
+/// remembered for the process, and later backends are only handed the font
+/// again if they cannot already see that family themselves
+/// ([`quadraui::Backend::has_font_family`]). That keeps the semantics each
+/// platform actually needs rather than assuming process-global registration:
+/// GTK/Fontconfig and Core Text both register process-wide, so a later
+/// backend answers `Some(true)` and skips; Win-GUI's DirectWrite custom
+/// collection is per-backend, so a fresh `WinBackend` answers `Some(false)`
+/// and does register; the TUI backend answers `None` ("can't know") and
+/// takes the no-op default exactly as before.
 pub fn register_nerd_font_fallback(b: &mut dyn quadraui::Backend) {
-    let family = b
+    /// The family the bundled icon font actually registered under, the
+    /// first time any backend in this process accepted it.
+    static REGISTERED_FAMILY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    if let Some(family) = REGISTERED_FAMILY.get() {
+        // Already registered in this process *and* this backend can
+        // resolve it — handing it the same 2.5 MB again would only leak
+        // another copy. `Some(false)`/`None` both fall through to a real
+        // registration attempt: the font must be registered per backend
+        // (Win-GUI), or the backend cannot answer at all (TUI).
+        if b.has_font_family(family) == Some(true) {
+            b.set_nerd_font_fallback(family);
+            return;
+        }
+    }
+
+    let registered = b
         .register_font_from_memory(crate::app_support::ICON_FONT_BYTES)
-        .and_then(|families| families.into_iter().next())
-        .unwrap_or_else(|| NERD_FONT_FALLBACK_FAMILY.to_string());
+        .and_then(|families| families.into_iter().next());
+    if let Some(family) = &registered {
+        // Only a *successful* registration may be remembered: a `None`
+        // (TUI's no-op default, or macOS's duplicate-name rejection) must
+        // not stop a later, more capable backend from registering for real.
+        let _ = REGISTERED_FAMILY.set(family.clone());
+    }
+    let family = registered.unwrap_or_else(|| NERD_FONT_FALLBACK_FAMILY.to_string());
     b.set_nerd_font_fallback(&family);
 }
 

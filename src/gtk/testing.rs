@@ -3905,15 +3905,41 @@ mod tests {
     /// `PANGO_GLYPH_UNKNOWN_FLAG` on exactly the glyphs no font in the
     /// search — including a full Fontconfig fallback scan — actually
     /// covered, which is what `glyph_is_known` below checks instead.
+    ///
+    /// # Why it builds its own font map, and discovers its own baseline
+    ///
+    /// Round 2 of this fix shipped a version of this test that shaped
+    /// through `pangocairo::functions::create_layout` (the **per-thread**
+    /// default font map — `pango_cairo_font_map_get_default()` is
+    /// documented as one map per thread) and hardcoded U+F8FF as the
+    /// "nothing can shape this" baseline because no font installed on the
+    /// box it was written on covers it. Both of those are properties of a
+    /// machine, not of vimcode: the suite went green on every local font
+    /// configuration tried (full desktop font set, no-Nerd-Font set,
+    /// DejaVu-only, and a zero-font Fontconfig) and red on CI, where
+    /// neither the thread's font-map state nor the installed font set is
+    /// knowable from here.
+    ///
+    /// So this version removes both assumptions. It shapes through a
+    /// **freshly created** Fc-backed font map, which reads the current
+    /// `FcConfig` (including the application font `register_nerd_font_fallback`
+    /// just added) instead of whatever fontset some earlier test cached on
+    /// this thread; and it *discovers* a baseline codepoint at runtime
+    /// rather than naming one, asserting only that **some** PUA codepoint
+    /// in a spread of candidates shapes to an unknown glyph. That is the
+    /// property the control actually needs — "`glyph_is_known` can still
+    /// return `false` in this environment, so the assertion above is not
+    /// vacuous" — and it holds on any host, however many icon fonts it
+    /// happens to have installed.
     #[test]
     fn extension_panel_file_type_glyph_outside_the_old_subset_resolves_through_the_bundled_font() {
         use gtk4::pango;
-        use pangocairo::cairo::{Context, Format, ImageSurface};
+        use pango::prelude::*;
 
-        // Ensures `App::setup` has run at least once on this thread, which
+        // Ensures `App::setup` has run at least once in this process, which
         // is what calls `render::register_nerd_font_fallback` — the call
         // that both (a) hands `ICON_FONT_BYTES` to FreeType/Fontconfig as
-        // an in-process memory font and (b) points
+        // an in-process application font and (b) points
         // `quadraui::gtk::NERD_FONT_FALLBACK_FAMILY` at whatever family
         // name it actually registered under (see that function's doc for
         // why those are two different steps). Without this, the
@@ -3922,73 +3948,109 @@ mod tests {
         // loaded into Fontconfig yet.
         let _h = harness(Engine::new(), 10, 10);
 
-        /// Builds the exact family list
-        /// `quadraui::gtk::activity_bar::activity_bar_icon_font` paints
-        /// activity-bar icon glyphs with (`"{family}, monospace"`), shapes
-        /// `ch` through it, and reports whether Pango's shaper actually
-        /// found a glyph for it anywhere in that family list.
-        ///
-        /// Checks the `PANGO_GLYPH_UNKNOWN_FLAG` bit on the shaped
-        /// `GlyphInfo` rather than which `Font`/family the run ended up
-        /// tagged with: an earlier draft of this test compared resolved
-        /// family names instead and got `Some("Symbols Nerd Font")` back
-        /// for *both* a real covered codepoint and a confirmed-unassigned
-        /// one — Pango's itemizer still tags a run with the first
-        /// requested family even when nothing in the whole fallback chain
-        /// actually covers the character, and relies on this flag (not a
-        /// different font/glyph) to mark the shaped glyph itself as
-        /// "unknown" so the renderer draws the hex-coded tofu box instead
-        /// of a real outline. The flag is the authoritative signal either
-        /// way: GNOME's own `pango_shape()` sets it exactly when no font it
-        /// tried — including whatever a full Fontconfig fallback search
-        /// turns up — had the glyph, so a glyph with the flag clear must
-        /// have come from a font that really does contain it.
-        fn glyph_is_known(ch: char) -> bool {
-            let surface = ImageSurface::create(Format::ARgb32, 40, 40).expect("surface");
-            let cr = Context::new(&surface).expect("context");
-            let layout = pangocairo::functions::create_layout(&cr);
+        // A font map created now, rather than this thread's default one:
+        // Fontconfig's application font set is process-global, so a fresh
+        // Fc-backed map always sees the font registered above, while the
+        // per-thread default map may still be serving a fontset it cached
+        // for this same family *before* any registration happened.
+        let font_map = pangocairo::FontMap::new();
+        let context = font_map.create_context();
+
+        // Builds the exact family list
+        // `quadraui::gtk::activity_bar::activity_bar_icon_font` paints
+        // activity-bar icon glyphs with (`"{family}, monospace"`), shapes
+        // `ch` through it, and reports whether Pango's shaper actually
+        // found a glyph for it anywhere in that family list.
+        //
+        // Checks the `PANGO_GLYPH_UNKNOWN_FLAG` bit on the shaped
+        // `GlyphInfo` rather than which `Font`/family the run ended up
+        // tagged with: an earlier draft of this test compared resolved
+        // family names instead and got `Some("Symbols Nerd Font")` back
+        // for *both* a real covered codepoint and a confirmed-unassigned
+        // one — Pango's itemizer still tags a run with the first
+        // requested family even when nothing in the whole fallback chain
+        // actually covers the character, and relies on this flag (not a
+        // different font/glyph) to mark the shaped glyph itself as
+        // "unknown" so the renderer draws the hex-coded tofu box instead
+        // of a real outline. The flag is the authoritative signal either
+        // way: GNOME's own `pango_shape()` sets it exactly when no font it
+        // tried — including whatever a full Fontconfig fallback search
+        // turns up — had the glyph, so a glyph with the flag clear must
+        // have come from a font that really does contain it.
+        let glyph_is_known = |ch: char| -> bool {
+            let layout = pango::Layout::new(&context);
             layout.set_font_description(Some(&pango::FontDescription::from_string(&format!(
                 "{}, monospace 18",
                 quadraui::gtk::NERD_FONT_FALLBACK_FAMILY
             ))));
             layout.set_text(&ch.to_string());
-            let run = layout
+            let Some(run) = layout
                 .line(0)
                 .expect("single-character layout must have one line")
                 .runs()
                 .into_iter()
                 .next()
-                .expect("single-character layout must itemize to exactly one run");
+            else {
+                // Nothing itemized at all is, for this test's purposes,
+                // the same answer as "no font had the glyph".
+                return false;
+            };
             let glyphs = run.glyph_string();
             let info = glyphs.glyph_info();
             !info.is_empty()
                 && info
                     .iter()
                     .all(|g| g.glyph() & pango::GLYPH_UNKNOWN_FLAG == 0)
-        }
+        };
 
         /// nf-dev-javascript_alt — one of `git_log_panel.lua`'s file-type
         /// glyphs. Deliberately *not* U+F1D3 (the extension's main
         /// `nf-fa-git` panel icon, also named in this issue): U+F1D3 is a
         /// codepoint nerd-fonts patches straight from the original
-        /// FontAwesome icon set, and this dev machine happens to have
-        /// `fonts-font-awesome` installed system-wide, which covers it
+        /// FontAwesome icon set, and a dev box with `fonts-font-awesome`
+        /// installed system-wide (this fleet has one) covers it
         /// independently of anything `data/fonts/vimcode-icons.ttf`
         /// bundles — confirmed by hand (`fc-list` + a per-codepoint
         /// `cmap` scan of every installed font) to make U+F1D3 resolve to
         /// a known glyph *even with the pre-#1853 114-codepoint font
         /// restored*, which would make this test pass unconditionally and
         /// prove nothing. U+E74E has no such collision: scanning every
-        /// font `fc-list` reports on this machine turns up no other
-        /// coverage for it at all, so it only resolves if
-        /// `data/fonts/vimcode-icons.ttf` itself covers it.
+        /// font `fc-list` reports there turns up no other coverage for it
+        /// at all, so it only resolves if `data/fonts/vimcode-icons.ttf`
+        /// itself covers it. (Verified red with the pre-#1853 subset font
+        /// restored in place; see this test's doc comment.)
         const GIT_INSIGHTS_FILE_TYPE_GLYPH: char = '\u{e74e}';
-        /// BMP PUA, last codepoint in the range. Confirmed absent from
-        /// every font `fc-list` reports on this machine (including
-        /// `data/fonts/vimcode-icons.ttf` itself) — used only as a sanity
-        /// check that this test's own machinery can tell "a real glyph
-        /// was shaped" apart from "nothing was shaped" at all.
-        const UNASSIGNED_PUA_BASELINE: char = '\u{f8ff}';
+
+        /// Candidate baseline codepoints — a spread across the BMP Private
+        /// Use Area, none of which `data/fonts/vimcode-icons.ttf` maps.
+        /// The control below needs only *one* of them to shape to an
+        /// unknown glyph; naming a single codepoint instead would make the
+        /// control an assertion about the host's entire installed font set
+        /// (see this test's doc comment for why that failed on CI).
+        const UNASSIGNED_PUA_CANDIDATES: [char; 8] = [
+            '\u{f8ff}', '\u{f8fe}', '\u{f8fd}', '\u{f8f0}', '\u{efff}', '\u{eff0}', '\u{e8ff}',
+            '\u{e8f0}',
+        ];
+
+        // Whatever this assertion does on a machine nobody can log into
+        // (a CI runner), the failure message has to be enough to tell
+        // "the font asset lost the codepoint" apart from "the font never
+        // got registered on this host" — the two failure modes that cost
+        // this issue a CI round each. So report the families the font map
+        // can actually see, not just the verdict.
+        let visible_icon_families = || {
+            let mut names: Vec<String> = font_map
+                .list_families()
+                .iter()
+                .map(|f| f.name().to_string())
+                .filter(|n| {
+                    let n = n.to_ascii_lowercase();
+                    n.contains("nerd") || n.contains("symbol") || n.contains("awesome")
+                })
+                .collect();
+            names.sort();
+            names
+        };
 
         assert!(
             glyph_is_known(GIT_INSIGHTS_FILE_TYPE_GLYPH),
@@ -3996,17 +4058,102 @@ mod tests {
              file-type glyph (`git_log_panel.lua`) must shape to a real \
              glyph through the bundled Nerd Font family (#1853) — Pango's \
              shaper marked it PANGO_GLYPH_UNKNOWN_FLAG instead, which means \
-             data/fonts/vimcode-icons.ttf no longer covers U+E74E (or the \
-             family it registers under no longer matches \
-             quadraui::gtk::NERD_FONT_FALLBACK_FAMILY, see that issue's \
-             review for the family-name-mismatch failure mode)"
+             data/fonts/vimcode-icons.ttf no longer covers U+E74E, or the \
+             font never registered on this host at all (see that issue's \
+             review for the family-name-mismatch failure mode).\n\
+             requested family: {:?}\n\
+             bundled font: {} bytes\n\
+             icon-ish families this font map can see: {:?}",
+            quadraui::gtk::NERD_FONT_FALLBACK_FAMILY,
+            crate::app_support::ICON_FONT_BYTES.len(),
+            visible_icon_families()
         );
         assert!(
-            !glyph_is_known(UNASSIGNED_PUA_BASELINE),
-            "sanity check: U+F8FF is a confirmed-unassigned PUA codepoint, \
-             so Pango must mark it PANGO_GLYPH_UNKNOWN_FLAG — if it \
-             doesn't, this test's own baseline is broken and the assertion \
-             above proves nothing"
+            UNASSIGNED_PUA_CANDIDATES
+                .iter()
+                .any(|ch| !glyph_is_known(*ch)),
+            "sanity check: at least one of {} unassigned PUA candidates \
+             must shape to PANGO_GLYPH_UNKNOWN_FLAG — if every one of them \
+             resolves, `glyph_is_known` cannot distinguish a real glyph \
+             from tofu on this host and the assertion above proves nothing.\n\
+             icon-ish families this font map can see: {:?}",
+            UNASSIGNED_PUA_CANDIDATES.len(),
+            visible_icon_families()
+        );
+    }
+
+    /// #1853 CI regression: building many `App`s in one process must hand
+    /// the bundled icon font to the platform's font system **once**, not
+    /// once per `App::setup`.
+    ///
+    /// GTK registers the font through Fontconfig's `FcConfigAppFontAddFile`,
+    /// which takes a path — so quadraui writes `ICON_FONT_BYTES` to a fresh
+    /// temp file per call and deliberately never deletes it (FreeType may
+    /// re-open it lazily at shape time). While the bundled font was a 29 KB,
+    /// 114-glyph subset nobody noticed that every harness in this suite
+    /// leaked another copy. #1853 replaced it with the full 2.5 MB Symbols
+    /// Nerd Font, and the same ~600-harness `cargo test` run started writing
+    /// ~1.5 GB of temp files — and appending ~600 copies of a
+    /// 10,627-codepoint `FcPattern` to the process's application font set
+    /// for every later font match to sort through. It survived a dev box
+    /// with 126 GB free and died on a CI runner, which is exactly the
+    /// asymmetry that makes this worth a test rather than a code comment.
+    ///
+    /// # Why it counts temp files rather than calls
+    ///
+    /// The leak *is* the files, and asserting on the real resource keeps
+    /// this honest in a way a vimcode-side call counter could not: a
+    /// counter would stay green even if `register_nerd_font_fallback` were
+    /// re-registering through some other path. The filename pattern is
+    /// quadraui's (`quadraui-<issue>-appfont-<pid>-<n>.font`), matched
+    /// loosely (`appfont` + this process's pid) and asserted non-empty
+    /// first, so that a future rename upstream fails this test loudly
+    /// instead of making it vacuously green.
+    #[test]
+    fn app_setup_registers_the_bundled_icon_font_at_most_once_per_process() {
+        /// Count this process's quadraui application-font temp files.
+        fn app_font_temp_files() -> usize {
+            let pid_tag = format!("-{}-", std::process::id());
+            let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+                return 0;
+            };
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    name.contains("appfont") && name.contains(&pid_tag)
+                })
+                .count()
+        }
+
+        // One harness first: whichever test got there first in this process
+        // already triggered the single registration, but if this test ran
+        // first, this is it.
+        let _first = harness(Engine::new(), 10, 10);
+        let after_first = app_font_temp_files();
+        assert!(
+            after_first > 0,
+            "no `appfont` temp file for pid {} in {} — quadraui's GTK \
+             `register_font_from_memory` either stopped using a temp file \
+             or renamed it, so the assertion below would be vacuous; \
+             re-derive the pattern from quadraui's `gtk::app_font` module",
+            std::process::id(),
+            std::env::temp_dir().display()
+        );
+
+        // Four more `App::setup`s must not add four more copies of a 2.5 MB
+        // font. `+ 1` of slack, not `0`: other GTK tests run concurrently in
+        // this binary, and two threads reaching the very first registration
+        // together may each add one.
+        let _rest: Vec<_> = (0..4).map(|_| harness(Engine::new(), 10, 10)).collect();
+        let after_five = app_font_temp_files();
+        assert!(
+            after_five <= after_first + 1,
+            "five `App::setup`s registered the bundled icon font {} extra \
+             time(s) ({after_first} temp files before, {after_five} after) \
+             — `render::register_nerd_font_fallback` must register once per \
+             process and reuse the family afterwards (#1853)",
+            after_five - after_first
         );
     }
 
