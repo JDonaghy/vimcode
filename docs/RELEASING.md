@@ -19,6 +19,7 @@ and the per-PR CI covers exactly one of them.
 | `vimcode-linux-x86_64`, `vimcode_*.deb` | ubuntu-24.04 | GTK4 (glibc) | **yes** |
 | `vcd-linux-x86_64` | ubuntu-24.04 | TUI (musl, static) | **yes** |
 | `vimcode-macos-arm64.tar.gz`, `vcd-macos-arm64.tar.gz` | macos-latest | GTK4 via Homebrew / TUI | **yes** — `RELEASE_MACOS=true` |
+| `vimcode-macos-native-arm64.tar.gz` | macos-latest | native AppKit (`--features macos`) | **yes, testing only** (since v0.15.1) — `RELEASE_MACOS=true` |
 | `vcd-windows-x86_64.exe` | windows-latest | TUI | **yes** — `RELEASE_WINDOWS=true` |
 | `vimcode-windows-x86_64.exe` | windows-latest | native Win32 (`--features win`) | **yes, testing only** (since v0.15.1) — `RELEASE_WINDOWS=true` |
 | `vimcode.flatpak` | ubuntu-24.04 | GTK4 | no — `RELEASE_FLATPAK` unset, and **broken**, see §2.2 |
@@ -30,8 +31,9 @@ the release-notes body (the jobs were gated, the notes were trimmed).
 
 **Two things that surprise people, both true as of v0.10.0:**
 
-1. **The macOS GUI artifact is the GTK build, not the native one.** `--features macos`
-   (AppKit / Core Graphics / Core Text, `src/macos/mod.rs`) ships in no artifact yet.
+1. **macOS ships two GUI artifacts, both testing-only.** `vimcode-macos-arm64.tar.gz`
+   is the GTK build (needs Homebrew GTK4). Since v0.15.1, `vimcode-macos-native-arm64.tar.gz`
+   is the native AppKit build (`--features macos`, `src/macos/mod.rs`, no dependencies).
 2. **The Windows GUI artifact is testing-only.** Since v0.15.1 the release attaches
    `vimcode-windows-x86_64.exe` (the native backend behind `--features win`,
    `src/win/mod.rs`), labelled "testing only, not ready for use" in the notes.
