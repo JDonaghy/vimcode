@@ -1,5 +1,41 @@
 # VimCode Project State
 
+**Last updated:** October 8, 2026 (#1853 CI fix round 1 — register the
+bundled icon font **once per process**, and stop the new GTK glyph test
+measuring the host's font set). **Fix, not reimplementation.** Round 2's
+branch was CI-red on exactly one leg, `Test (Linux, headless, GUI feature
+on)`, while a full `cargo test` stayed green here under four different
+Fontconfig environments (full desktop set, no-Nerd-Font set, DejaVu-only,
+zero fonts) and under a 4-core `taskset`. The mechanism was a resource
+blowup the font swap turned from invisible into fatal: GTK registers
+`ICON_FONT_BYTES` through Fontconfig's `FcConfigAppFontAddFile`, which takes
+a *path*, so quadraui writes the bytes to a temp file per call and never
+deletes it — and `render::register_nerd_font_fallback` ran on **every**
+`App::setup`, i.e. once per `GtkDriver` harness. At 29 KB nobody noticed;
+at 2.5 MB one `cargo test` run wrote ~1.5 GB of temp files and appended
+~600 copies of a 10,627-codepoint `FcPattern` to the process's application
+font set (measured: 3,031 leaked copies = 7.3 GiB across one day's runs on
+this box, which has 126 GB free — a CI runner does not). Round 1 leaked
+identically and passed, because nothing asserted glyph resolution; round 2
+added the test that notices when a mid-run registration fails.
+`register_nerd_font_fallback` now remembers the family the first backend
+that *accepted* the font registered under and re-registers only for a
+backend that cannot already see it (`Backend::has_font_family` — `Some(true)`
+skips, `Some(false)` re-registers for Win-GUI's per-backend DirectWrite
+collection, `None` keeps TUI's no-op path unchanged). A full `cargo test`
+now leaks **1** temp file instead of ~600. The new GTK test also dropped its
+two host-dependent assumptions: it shapes through a freshly created Fc-backed
+`pangocairo::FontMap` instead of the **per-thread** default one (which is what
+the once-only registration makes mandatory — `notify_fontmap_config_changed`
+only nudges the registering thread's map), and it *discovers* its
+unknown-glyph control from 8 PUA candidates instead of hardcoding U+F8FF,
+which was an assertion about every font installed on the box it was written
+on. `app_setup_registers_the_bundled_icon_font_at_most_once_per_process`
+(`src/gtk/testing.rs`) is the named anchor — RED-verified by reinstating the
+unguarded registration (5 setups → 5 temp files), and the glyph test is still
+RED with the pre-#1853 subset font restored in all three font environments.
+`ISSUE_RESOLUTION: resolved`.
+
 **Last updated:** October 8, 2026 (#1853 review round 1 — bundle the
 **non-Mono** full Symbols Nerd Font, not `SymbolsNerdFontMono-Regular.ttf`).
 **Fix, not reimplementation.** Round 1's own diff (bundling the *entire*
