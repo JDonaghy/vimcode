@@ -409,27 +409,17 @@ push to `main` triggers the workflow, which reads the version out of `Cargo.toml
 builds, and publishes the GitHub Release tagged `v$VERSION`. Nothing is built on
 your laptop. The §1 gate is the only part you run by hand.
 
-### 2.1 The quadraui pin needs nothing — it is a public git dep
+### 2.1 quadraui comes from crates.io
 
-The recurring worry is that a `rev`-pinned git dependency can't be resolved by a
-hosted runner. It can, and already is:
+vimcode depends on the published `quadraui` crate (#1848), so hosted runners
+resolve it like any other crates.io dependency: no token, no git fetch.
 
-- `JDonaghy/quadraui` is a **public** repo — `git ls-remote` over anonymous HTTPS
-  succeeds, so cargo needs no token, no secret, no submodule, no deploy key.
-- The pinned rev is an **ancestor of quadraui's `develop`** (check with
-  `gh api repos/JDonaghy/quadraui/compare/develop...<rev> --jq .status` — `behind`
-  or `identical` is good, `diverged` is not). It is permanently reachable, so a
-  fresh clone can fetch it even after the feature branch that carried it is deleted.
-- Per-PR CI on `develop` is green today on GitHub-hosted runners, which *is* the
-  proof that a clean checkout resolves the pin.
-
-`[patch.crates-io] vt100` is gone — quadraui#795 removed the vendored shim upstream.
-`CLAUDE.md` still mentions keeping the two pins in sync; there is only one pin now.
-
-**Bumping the pin before a release is optional, not required.** If you do bump it,
-it is a code change like any other: branch, edit `rev`, `cargo test` (snapshots
-re-run against the new rev), land through the normal workflow — not something to
-slip into the release PR.
+**A release can only ship quadraui code that has been published.** If the release
+needs a quadraui fix, cut a quadraui release first (CHANGELOG, version bump, tag,
+`cargo publish`), then `cargo update -p quadraui` in vimcode, `cargo test`, and
+land that through the normal workflow before the release PR. `vcd --version`
+prints the quadraui version a binary was built against; check it on the
+published artifacts (§2.3 step 7).
 
 ### 2.2 Flatpak is broken and is not shipping ([#975](https://github.com/JDonaghy/vimcode/issues/975))
 
