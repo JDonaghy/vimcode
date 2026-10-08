@@ -664,6 +664,66 @@ mod mac_driver_tests {
         );
     }
 
+    /// #1860: an un-customized `font_size` must resolve to the DPI-corrected
+    /// `Menlo 16` [`crate::app_support::macos_1x_dpi_bump`] computes — not
+    /// `MacBackend::default_fonts()`'s raw `Menlo 12` — when running at 1x
+    /// scale, which [`MacDriver`](quadraui::macos::testing::MacDriver) always
+    /// does (it hard-codes `scale: 1.0` into every `begin_frame`/`render`
+    /// call it makes — see `quadraui::macos::testing`'s own source). That
+    /// makes this driver permanently exercise exactly the "35% too small"
+    /// scenario real-hardware testing reported on a 1x macmini monitor: the
+    /// production-shaped path (`App::shell_config`'s pre-seed, then
+    /// `App::sync_per_frame_backend_state`'s per-frame sync, both reached
+    /// through the same `impl ShellApp for App` the live `macos::run` hands
+    /// `run_with_shell`) rather than a bare call into `app_support`'s helper.
+    ///
+    /// Reads `backend.char_width()`/`line_height()` — CoreText's own measured
+    /// metrics for whatever font `Backend::set_editor_font` actually
+    /// installed — the same "compare against a known font/size's real
+    /// metrics" shape `editor_font_family_default_resolves_a_real_font_on_macos`
+    /// above uses, not an internal flag: a wrong `font_size` reaching
+    /// `set_editor_font` changes what CoreText measures, so this fails if the
+    /// correction silently stopped firing.
+    ///
+    /// RED-verified against unfixed `develop`: with `app_support::
+    /// macos_1x_dpi_bump`'s `if` short-circuited to never fire, this test
+    /// fails with `char_width 7.2246094 does not match the DPI-corrected
+    /// Menlo 16 metrics 9.6328125 — still resolving the raw Menlo 12
+    /// default (7.224609375)?` — i.e. the measured metrics are exactly
+    /// `Menlo 12`'s, not `Menlo 16`'s.
+    #[test]
+    fn editor_font_bumped_for_1x_scale_via_shell_app() {
+        use quadraui::Backend;
+
+        let (_guards, mut driver) = driver(plain_engine());
+        driver.render();
+
+        let expected_font = quadraui::macos::text::make_font_exact("Menlo", 16.0)
+            .expect("Menlo must resolve on any Mac this test runs on");
+        let expected = quadraui::macos::text::font_metrics(&expected_font);
+        let unbumped_font = quadraui::macos::text::make_font_exact("Menlo", 12.0)
+            .expect("Menlo must resolve on any Mac this test runs on");
+        let unbumped = quadraui::macos::text::font_metrics(&unbumped_font);
+
+        let backend = driver.backend();
+        assert!(
+            (backend.char_width() as f64 - expected.char_width).abs() < 0.01,
+            "char_width {} does not match the DPI-corrected Menlo 16 metrics \
+             {} — still resolving the raw Menlo 12 default ({})?",
+            backend.char_width(),
+            expected.char_width,
+            unbumped.char_width
+        );
+        assert!(
+            (backend.line_height() as f64 - expected.line_height).abs() < 0.01,
+            "line_height {} does not match the DPI-corrected Menlo 16 metrics \
+             {} — still resolving the raw Menlo 12 default ({})?",
+            backend.line_height(),
+            expected.line_height,
+            unbumped.line_height
+        );
+    }
+
     // ── #901: native menu bar adoption ──────────────────────────────────
 
     /// A plain engine, safe to drive through `MacBackend` — same
