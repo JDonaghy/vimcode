@@ -4,6 +4,8 @@
 
 A Vim+VSCode hybrid editor written in Rust. 169K lines of code, 3,873 `#[test]` functions, two rendering backends (GTK4 and terminal).
 
+VimCode is built on **[quadraui](https://crates.io/crates/quadraui)**, a cross-platform Rust UI toolkit developed alongside it and published on crates.io: one `AppLogic` runs unmodified on the terminal, GTK4, native macOS (AppKit) and native Windows (Direct2D).
+
 ### Who’s this for?
 
 If you want Vim’s modal editing with VSCode’s UI — or VSCode’s ease of use with Vim’s power — VimCode bridges both worlds. Run it in a terminal and it looks like Vim; run it in a window and it looks like VSCode. Press `Alt-M` to switch between Vim mode and VSCode mode at any time.
@@ -1440,7 +1442,7 @@ src/                  (~168,600 lines total)
 |-----------|---------|
 | Language | Rust 2021 |
 | GTK UI | GTK4 (Linux, macOS) — Relm4 removed in #540 |
-| Shared UI toolkit | [quadraui](https://github.com/JDonaghy/quadraui), pinned by git rev |
+| Shared UI toolkit | [quadraui](https://crates.io/crates/quadraui) ([source](https://github.com/JDonaghy/quadraui)), published on crates.io |
 | TUI | ratatui 0.29 + crossterm (all platforms) |
 | Text rendering | Pango + Cairo (GTK), ratatui cells (TUI) |
 | Text storage | Ropey (rope data structure) |
