@@ -13938,6 +13938,23 @@ mod minimap {
     /// because it's a process-global atomic another test in this binary can
     /// have moved (mirrors `minimap_gtk_distinct_colors_for_indent` above).
     fn engine_with_shaped_buffer() -> Engine {
+        let mut engine = shaped_buffer_engine_with_default_settings();
+        // #1858: the minimap is experimental and off by default on every
+        // backend now — this whole fixture exists to exercise the minimap,
+        // so turn it on explicitly rather than lean on the (now-off) default.
+        engine.settings.minimap = true;
+        engine
+    }
+
+    /// The same fixture as [`engine_with_shaped_buffer`], minus the #1858
+    /// `minimap = true` override — i.e. whatever `Settings::default()`
+    /// actually resolves `minimap` to. Exists only for
+    /// [`minimap_is_absent_from_the_layout_by_default`], which needs a
+    /// fixture that genuinely never touches the setting (not even to pin it
+    /// explicitly to `false`) so a regression that flips `default_minimap()`
+    /// back to `true` — or any fixture upstream of it forcing the setting
+    /// on — turns that test red.
+    fn shaped_buffer_engine_with_default_settings() -> Engine {
         crate::core::buffer_manager::set_syntax_max_lines(20_000);
 
         let dir = std::env::temp_dir().join(format!(
@@ -13960,10 +13977,6 @@ mod minimap {
         engine
             .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
             .unwrap();
-        // #1858: the minimap is experimental and off by default on every
-        // backend now — this whole fixture exists to exercise the minimap,
-        // so turn it on explicitly rather than lean on the (now-off) default.
-        engine.settings.minimap = true;
         engine
     }
 
@@ -13997,7 +14010,7 @@ mod minimap {
              exercising it at all"
         );
         h_on.window_center(win_on)
-            .expect("editor pane must paint with the default settings");
+            .expect("editor pane must paint with the minimap explicitly enabled");
 
         let (strip, pane_w, on_cols) = {
             let layout = h_on.screen_layout.borrow();
@@ -14092,6 +14105,81 @@ mod minimap {
         );
     }
 
+    /// #1858 (driver tier): the minimap must default off, not merely be
+    /// *turnable* off — the GTK twin of `app_on_tui_tests.rs`'s
+    /// `no_minimap_braille_by_default`. [`shaped_buffer_engine_with_default_settings`]
+    /// never touches `engine.settings.minimap`, so this asserts the
+    /// *default* geometry is identical to the explicit-`false` geometry: no
+    /// layout entry, and the same `text_viewport_cols` an explicit `minimap
+    /// = false` twin gets (reusing
+    /// `minimap_paints_a_strip_whose_width_matches_reserved_width`'s own
+    /// on/off comparison shape, rather than re-deriving the column formula).
+    /// Flipping `default_minimap()` back to `true` (or any fixture upstream
+    /// forcing the setting on) turns this red while leaving the explicit
+    /// on/off test above green — the gap the #1858 review round found:
+    /// before this test existed, nothing at the driver tier observed the
+    /// default.
+    ///
+    /// Verified RED against unfixed `develop` (where `default_minimap()`
+    /// still returns `true`): `l.minimap.is_empty()` failed with a real
+    /// entry present, confirming this exercises the default rather than
+    /// passing vacuously.
+    #[test]
+    fn minimap_is_absent_from_the_layout_by_default() {
+        let h_default = harness(shaped_buffer_engine_with_default_settings(), 1400, 900);
+        let win_default = h_default.engine.borrow().active_window_id();
+        assert!(
+            !h_default.engine.borrow().settings.minimap,
+            "test setup sanity: a fresh engine must carry the (#1858) \
+             off-by-default minimap setting, or this test isn't exercising \
+             the default at all"
+        );
+        h_default
+            .window_center(win_default)
+            .expect("editor pane must paint with the default settings");
+        let (default_minimap_present, default_cols) = {
+            let layout = h_default.screen_layout.borrow();
+            let l = layout.as_ref().unwrap();
+            let present = l.minimap.iter().any(|m| m.window_id == win_default);
+            let rw = l
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_default)
+                .unwrap();
+            (present, rw.text_viewport_cols)
+        };
+        assert!(
+            !default_minimap_present,
+            "the minimap must be absent from the layout by default (#1858)"
+        );
+
+        // The explicit-`false` twin: same fixture, same window size, just
+        // with the setting pinned rather than left untouched. Its
+        // `text_viewport_cols` is this test's ground truth for "the editor
+        // got every reserved column back" — computed the real way (through
+        // a second real paint), not re-derived from the reservation formula.
+        let mut engine_off = shaped_buffer_engine_with_default_settings();
+        engine_off.settings.minimap = false;
+        let h_off = harness(engine_off, 1400, 900);
+        let win_off = h_off.engine.borrow().active_window_id();
+        h_off
+            .window_center(win_off)
+            .expect("editor pane must paint with the minimap explicitly disabled");
+        let off_cols = {
+            let layout = h_off.screen_layout.borrow();
+            let l = layout.as_ref().unwrap();
+            let rw = l.windows.iter().find(|w| w.window_id == win_off).unwrap();
+            rw.text_viewport_cols
+        };
+
+        assert_eq!(
+            default_cols, off_cols,
+            "the default (no explicit setting) must paint the identical \
+             column count as an explicit `minimap: false` (default={default_cols}, \
+             explicit-off={off_cols})"
+        );
+    }
+
     /// #828 acceptance (driver tier): on a narrow pane the minimap strip
     /// settles well *below* the wide-pane plateau
     /// (`minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane`'s
@@ -14121,7 +14209,7 @@ mod minimap {
         let h = harness(engine_with_shaped_buffer(), 1050, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win)
-            .expect("editor pane must paint with the default settings");
+            .expect("editor pane must paint with the minimap explicitly enabled");
 
         let (strip_width, pane_width) = {
             let layout = h.screen_layout.borrow();
@@ -14179,7 +14267,7 @@ mod minimap {
         let h = harness(engine_with_shaped_buffer(), 1600, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win)
-            .expect("editor pane must paint with the default settings");
+            .expect("editor pane must paint with the minimap explicitly enabled");
 
         let (strip_width, pane_width) = {
             let layout = h.screen_layout.borrow();

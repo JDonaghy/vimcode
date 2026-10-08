@@ -236,9 +236,10 @@ mod mac_driver_tests {
     const H: u32 = 900;
 
     /// An in-memory engine with enough lines for the minimap to have
-    /// something to draw, and the minimap explicitly **on** — the default is
-    /// not this test's business to depend on, since the whole point is to
-    /// reach `draw_minimap`.
+    /// something to draw, and the minimap explicitly **on** — (#1858: the
+    /// minimap now defaults *off* everywhere) pinned explicitly here
+    /// regardless of which way the default points, since the whole point of
+    /// this fixture is to reach `draw_minimap`.
     fn engine_with_minimap() -> Engine {
         let mut engine = Engine::new_for_test();
         let text: String = (0..500).map(|i| format!("line {i}\n")).collect();

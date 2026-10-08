@@ -7316,6 +7316,47 @@ mod tests {
             );
         }
 
+        /// #1858: the minimap must be off *by default*, not merely
+        /// controllable via an explicit `false`. Identical to
+        /// `no_minimap_braille_when_setting_is_off` above except it never
+        /// touches `engine.settings.minimap` at all — this is the driver-
+        /// tier regression test for the default itself. Flipping
+        /// `default_minimap()` back to `true` (or forcing the setting on
+        /// anywhere upstream of this fixture) turns this red while leaving
+        /// every other minimap test in this module green, which is the gap
+        /// the #1858 review round found: before this test existed, nothing
+        /// at the painted-output tier observed the default.
+        ///
+        /// Verified RED against unfixed `develop` (where `default_minimap()`
+        /// still returns `true`): this assertion failed with braille present
+        /// on screen, confirming the test actually exercises the default
+        /// rather than passing vacuously.
+        #[test]
+        fn no_minimap_braille_by_default() {
+            let mut engine = plain_engine();
+            let text = (1..=200)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            engine.buffer_mut().insert(0, &text);
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+
+            assert!(
+                driver.screen_has("line 1"),
+                "precondition: buffer text must be painted before the \
+                 minimap default can be meaningfully tested; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                !has_braille(&driver.screen()),
+                "the minimap must default to off (#1858): a fresh engine \
+                 with no explicit `minimap` setting must reserve no strip, \
+                 so no braille may reach the cells; screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// A vertical split must paint minimap braille in *both* panes, not
         /// just one — mirrors `shell_app.rs`'s
         /// `split_paints_two_independent_minimap_strips_via_shell_app`.
