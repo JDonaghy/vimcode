@@ -20,6 +20,7 @@ and the per-PR CI covers exactly one of them.
 | `vcd-linux-x86_64` | ubuntu-24.04 | TUI (musl, static) | **yes** |
 | `vimcode-macos-arm64.tar.gz`, `vcd-macos-arm64.tar.gz` | macos-latest | GTK4 via Homebrew / TUI | **yes** — `RELEASE_MACOS=true` |
 | `vcd-windows-x86_64.exe` | windows-latest | TUI | **yes** — `RELEASE_WINDOWS=true` |
+| `vimcode-windows-x86_64.exe` | windows-latest | native Win32 (`--features win`) | **yes, testing only** (since v0.15.1) — `RELEASE_WINDOWS=true` |
 | `vimcode.flatpak` | ubuntu-24.04 | GTK4 | no — `RELEASE_FLATPAK` unset, and **broken**, see §2.2 |
 
 Each non-Linux job carries `if: ${{ vars.<NAME> == 'true' }}`, so an unset repo
@@ -31,10 +32,10 @@ the release-notes body (the jobs were gated, the notes were trimmed).
 
 1. **The macOS GUI artifact is the GTK build, not the native one.** `--features macos`
    (AppKit / Core Graphics / Core Text, `src/macos/mod.rs`) ships in no artifact yet.
-2. **No Windows GUI artifact exists.** `README.md`'s platform table advertises
-   "Native Win32 + Direct2D + DirectWrite (**alpha**)" — that is the in-repo backend
-   behind `--features win` (`src/win/mod.rs`), not something the release produces.
-   Windows users get `vcd.exe`, the TUI, only.
+2. **The Windows GUI artifact is testing-only.** Since v0.15.1 the release attaches
+   `vimcode-windows-x86_64.exe` (the native backend behind `--features win`,
+   `src/win/mod.rs`), labelled "testing only, not ready for use" in the notes.
+   `vcd.exe`, the TUI, is the recommended Windows build.
 
 Test the two native backends anyway (§1.3, §1.4). They are the next artifacts, and
 the gate is where you find out they regressed — not after you've promised them.
