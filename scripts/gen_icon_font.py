@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate/verify the bundled vimcode-icons.ttf Nerd Font.
 
-Since #1853, this bundles the **entire** Symbols Nerd Font (Mono) cmap, not
-a subset keyed off `src/icons.rs`. The previous 114-codepoint subset (built
+Since #1853, this bundles the **entire** Symbols Nerd Font cmap, not a
+subset keyed off `src/icons.rs`. The previous 114-codepoint subset (built
 from exactly the codepoints `Icon::new(...)` references, see git history
 before #1853) covered every icon vimcode itself draws, but nothing else:
 any registry extension (`vimcode-ext`) that picks its own Nerd Font
@@ -12,6 +12,20 @@ Font (native macOS/Windows, or GTK without one installed), because that
 codepoint was never vimcode's own and so never made it into the subset.
 Bundling the full font closes that whole class of bug: there is no longer a
 "wanted" codepoint list to fall behind.
+
+The source is the **proportional** `SymbolsNerdFont-Regular.ttf`, not
+`SymbolsNerdFontMono-Regular.ttf`. Both ship in the same
+`NerdFontsSymbolsOnly.zip` release; the Mono variant registers under a
+different family name (`Symbols Nerd Font Mono` / `SymbolsNFM`, vs. the
+proportional variant's `Symbols Nerd Font` / `SymbolsNF`) and rescales every
+glyph to a fixed 1-em advance width, which would have silently changed the
+painted size/offset of all 114 pre-#1853 icons and broken the family-name
+match `src/render.rs::NERD_FONT_FALLBACK_FAMILY` (and upstream quadraui's
+own `gtk::NERD_FONT_FALLBACK_FAMILY` / `gtk::activity_bar::ICON_FONT_DESC`)
+depend on. Using the proportional variant keeps all 114 pre-existing glyph
+outlines and advance widths byte-identical to the pre-#1853 font while still
+closing the coverage gap -- see `tests/icon_font_coverage.rs` for the
+regression anchor.
 
 `--verify` (and the Rust CI gate, `tests/icon_font_coverage.rs`) still check
 that every nerd codepoint `src/icons.rs` itself references is covered --
@@ -27,20 +41,21 @@ instead -- they are deliberately excluded. See `src/icons.rs`'s "Window
 Controls" section for why.
 
 Usage:
-    # Regenerate the bundled font from a source Nerd Font. Get the source
-    # from https://github.com/ryanoasis/nerd-fonts releases
-    # (NerdFontsSymbolsOnly.zip -> SymbolsNerdFontMono-Regular.ttf) -- it is
-    # not vendored in this repo.
-    python3 scripts/gen_icon_font.py --source SymbolsNerdFontMono-Regular.ttf \
-        --legacy-source /tmp/legacy-vimcode-icons.ttf
-
-    # The --legacy-source above supplies three codepoints upstream nerd-fonts
-    # dropped (see LEGACY_DROPPED_CODEPOINTS / _merge_legacy_glyphs) that
-    # vimcode's own icons.rs still references (DBG_VARIABLES, FILE_JS,
-    # FILE_PYTHON). Get it by copying the *currently bundled* font somewhere
-    # outside data/fonts/ first, so --output doesn't overwrite it mid-run --
-    # it already carries all three, having been merged the same way before:
+    # First, get a --legacy-source: it supplies three codepoints upstream
+    # nerd-fonts dropped (see LEGACY_DROPPED_CODEPOINTS / _merge_legacy_glyphs)
+    # that vimcode's own icons.rs still references (DBG_VARIABLES, FILE_JS,
+    # FILE_PYTHON). Copy the *currently bundled* font somewhere outside
+    # data/fonts/ first, so --output doesn't overwrite it mid-run -- it
+    # already carries all three, having been merged the same way before:
     cp data/fonts/vimcode-icons.ttf /tmp/legacy-vimcode-icons.ttf
+
+    # Then regenerate the bundled font from a source Nerd Font. Get the
+    # source from https://github.com/ryanoasis/nerd-fonts releases
+    # (NerdFontsSymbolsOnly.zip -> SymbolsNerdFont-Regular.ttf -- the
+    # proportional variant, NOT SymbolsNerdFontMono-Regular.ttf; see the
+    # module docstring above for why) -- it is not vendored in this repo.
+    python3 scripts/gen_icon_font.py --source SymbolsNerdFont-Regular.ttf \
+        --legacy-source /tmp/legacy-vimcode-icons.ttf
 
     # Verify (used by hand, or CI) that the bundled font covers every nerd
     # codepoint referenced in src/icons.rs -- no source font needed. This is
@@ -252,7 +267,14 @@ def generate(source: Path, output: Path, legacy_source: Path | None = None) -> i
     actual_source = source
     if legacy_source is not None:
         primary_cmap = TTFont(str(source)).getBestCmap()
-        missing = [cp for cp in LEGACY_DROPPED_CODEPOINTS if cp not in primary_cmap]
+        # Keyed off LEGACY_DROPPED_CODEPOINTS *and* every codepoint
+        # `nerd_codepoints()` (icons.rs) itself references, not just the
+        # hardcoded 3-tuple: if a future upstream release drops a 4th
+        # codepoint vimcode uses, this still catches and merges it instead
+        # of silently emitting a font missing it (#1853 review nit --
+        # `dict.fromkeys` dedupes while preserving order).
+        candidates = dict.fromkeys((*LEGACY_DROPPED_CODEPOINTS, *nerd_codepoints()))
+        missing = [cp for cp in candidates if cp not in primary_cmap]
         if missing:
             actual_source = _merge_legacy_glyphs(source, legacy_source, missing)
 
@@ -269,6 +291,9 @@ def generate(source: Path, output: Path, legacy_source: Path | None = None) -> i
     ]
     subset.main(args)
 
+    bundled = len(TTFont(str(output)).getBestCmap())
+    print(f"{output}: {bundled} codepoint(s) bundled")
+
     return verify(output)
 
 
@@ -280,7 +305,8 @@ def main() -> int:
         "--source",
         type=Path,
         help="Source Nerd Font to bundle in full (e.g. "
-        "SymbolsNerdFontMono-Regular.ttf)",
+        "SymbolsNerdFont-Regular.ttf -- the proportional variant, not "
+        "SymbolsNerdFontMono-Regular.ttf; see the module docstring)",
     )
     parser.add_argument(
         "--output",

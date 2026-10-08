@@ -1,5 +1,45 @@
 # VimCode Project State
 
+**Last updated:** October 8, 2026 (#1853 review round 1 — bundle the
+**non-Mono** full Symbols Nerd Font, not `SymbolsNerdFontMono-Regular.ttf`).
+**Fix, not reimplementation.** Round 1's own diff (bundling the *entire*
+Symbols Nerd Font to close the Git Insights extension's U+F1D3 coverage
+gap) closed the actual bug but shipped the wrong variant: `SymbolsNerdFontMono-Regular.ttf`
+registers under `Symbols Nerd Font Mono`/`SymbolsNFM`, not the
+`Symbols Nerd Font`/`SymbolsNF` family `src/render.rs`'s
+`NERD_FONT_FALLBACK_FAMILY` (and upstream quadraui's own constant of the
+same name) hardcode, and Mono normalises every glyph to a fixed 1-em
+advance — changing metrics/outlines for 106/111 of the 114 pre-existing
+icons with no test catching it. Re-extracted the **proportional**
+`SymbolsNerdFont-Regular.ttf` from the same nerd-fonts v3.5.1
+`NerdFontsSymbolsOnly.zip` release and regenerated through the unmodified
+`_merge_legacy_glyphs` path; hand-verified (via a throwaway
+`fontTools`-in-a-venv checkout, this box doesn't have it installed) that
+all 114 shared codepoints are now byte-identical in both advance width and
+glyph outline to the pre-#1853 blob, the family name matches
+`NERD_FONT_FALLBACK_FAMILY`, and the new font still covers 10,627
+codepoints including U+F1D3 and the other `git_log_panel.lua` glyphs. Added
+a GTK driver-tier test
+(`extension_panel_file_type_glyph_outside_the_old_subset_resolves_through_the_bundled_font`,
+`src/gtk/testing.rs`) per the review's demand for painted-output coverage,
+not just a `cmap` assertion — two dead ends are recorded in its own doc
+comment before landing on checking `PANGO_GLYPH_UNKNOWN_FLAG` on the shaped
+`GlyphInfo`: a raw pixel diff and a "which font did Pango tag the run
+with" check were both defeated by this dev machine's system-installed
+`fonts-font-awesome` package, which happens to cover U+F1D3 (nerd-fonts
+patches it straight from FontAwesome) independently of whatever
+`data/fonts/vimcode-icons.ttf` bundles — confirmed by hand that both
+approaches gave a false green even with the pre-#1853 font restored. The
+glyph-unknown-flag check, and the choice of U+E74E (a `git_log_panel.lua`
+file-type glyph with no such collision, verified via a full `fc-list` cmap
+scan of every font on the box) instead of U+F1D3 as the test codepoint,
+sidesteps that: RED-verified against the pre-#1853 font, GREEN against the
+fix. `scripts/gen_icon_font.py`, `data/fonts/LICENSE-NerdFonts` and
+`tests/icon_font_coverage.rs`'s doc comments updated to say "proportional,
+not Mono" throughout; the `LEGACY_DROPPED_CODEPOINTS` auto-repair and
+`generate()` codepoint-count-printed nits from the same review round were
+also applied. `ISSUE_RESOLUTION: resolved`.
+
 **Last updated:** October 7, 2026 (#1843 — bump quadraui pin to `4e71a8b`,
 make the Windows `:term` CI test a required gate). **Pin bumped, no
 vimcode production code changed.** `4e71a8b` is 19 commits ahead of the
@@ -331,7 +371,7 @@ should close as a duplicate of #1780, not as new work merged.
 **Last updated:** October 6, 2026 (#1824 — macOS native real-screen smoke: Dock icon, window activation, icon font, text quality — investigation, no production fix). **Investigated on real macmini hardware this session; no vimcode-repo fix exists for any of the three confirmed/partially-confirmed findings.** Built `cargo build --release --bin vimcode --no-default-features --features macos` and drove it live (real `screencapture`, `osascript`/`System Events`, `lsappinfo`) rather than reading code alone. Findings, most to least confirmed:
 
 1. **Window activation (regression 2 of 4) — reproduced cleanly.** Launched from inside a real, frontmost Terminal.app window (not a detached automation harness — that path did *not* reproduce it, which mattered). Result: `lsappinfo` reports vimcode `(in front)`/`Foreground`, but `System Events`'s frontmost-process query still names `Terminal`, and the composited screenshot shows Terminal's window literally covering vimcode's. Root-caused to quadraui, not vimcode: `quadraui::macos::run::run_with` (`src/macos/run.rs:2082`) calls the *deprecated* `-[NSApplication activateIgnoringOtherApps:]` (Apple's own SDK note, visible in the pinned `objc2-app-kit` 0.3.2 binding, says "Use NSApp.activate instead" — and the non-deprecated `NSApplication::activate()` already exists in that same pinned crate, unused). `src/macos/mod.rs` is confirmed thin wiring with no activation seam of its own. Drafted as a quadraui issue in `docs/PENDING_QUADRAUI_ISSUES.md` (new entry, directly below the pre-existing #1825 GTK-activation draft — this finding is stronger evidence than that draft had, since the native backend already calls an activation API and still fails, where GTK calls none at all).
-2. **Icon-font glyphs (regression 3 of 4) — reproduced cleanly, root cause narrowed but not found.** Real painted activity bar: Explorer/Source Control/Run&Debug show a generic `?`-box placeholder; Search/Extensions/AI Chat show their correct Nerd-Font glyphs, same frame, same font registration. Hand-parsed `data/fonts/vimcode-icons.ttf`'s raw `cmap`(fmt 4 + fmt 12)/`glyf` tables (no `fontTools` — not installed, can't `pip install` per this session's tooling policy) for all six codepoints: **every one** has a valid GID in both cmap formats and non-empty `glyf` outline data (216-350 bytes) — the font asset is not the bug, contradicting the plausible "missing glyph in the subset" hypothesis before it could cause anyone to chase it. This is new, stronger evidence than vimcode#937 (closed) had — that issue's own test documented it *could not verify* real-hardware glyph resolution at all. Drafted as a quadraui issue (`MacBackend`'s Core Text fallback cascade, `macos/text.rs::font_with_fallback`) with the full per-codepoint table; root cause of *why* exactly these three and not the other three is left open for the next pass (candidates listed in the draft, none confirmed).
+2. **Icon-font glyphs (regression 3 of 4) — reproduced cleanly, root cause narrowed but not found.** Real painted activity bar: Explorer/Source Control/Run&Debug show a generic `?`-box placeholder; Search/Extensions/AI Chat show their correct Nerd-Font glyphs, same frame, same font registration. Hand-parsed `data/fonts/vimcode-icons.ttf`'s raw `cmap`(fmt 4 + fmt 12)/`glyf` tables (no `fontTools` — not installed, can't `pip install` per this session's tooling policy) for all six codepoints: **every one** has a valid GID in both cmap formats and non-empty `glyf` outline data (216-350 bytes) — the font asset is not the bug, contradicting the plausible "missing glyph in the subset" hypothesis before it could cause anyone to chase it. This is new, stronger evidence than vimcode#937 (closed) had — that issue's own test documented it *could not verify* real-hardware glyph resolution at all. Drafted as a quadraui issue (`MacBackend`'s Core Text fallback cascade, `macos/text.rs::font_with_fallback`) with the full per-codepoint table; root cause of *why* exactly these three and not the other three is left open for the next pass (candidates listed in the draft, none confirmed). *(Scoped by #1853, 2026-10-07: "the font asset is not the bug" above is true only for `src/icons.rs`'s own 114 codepoints — the ones this entry's six were drawn from. It does not generalize to codepoints a registry extension picks on its own; #1853 found exactly that gap (the Git Insights extension's U+F1D3 panel icon, absent from the then-114-codepoint subset) and closed it by bundling the entire Symbols Nerd Font rather than a subset. This entry's six activity-bar codepoints were vimcode's own all along, so #1853 doesn't change their diagnosis — just don't read "the font asset is not the bug" as covering extension-supplied codepoints too.)*
 3. **Dock icon (regression 1 of 4) — not reproduced on a clean launch.** Polled the Dock's UI-element list for 20+ seconds after a fresh launch; the tile was present throughout with the correct embedded icon. Did observe it absent once, but only right after this session's own `killall Dock` (used to defeat autohide for screenshotting) restarted Dock out from under an *already-running*, older instance — a plausible Dock-restart reconnection artifact, not evidence of #1824's reported "used to show, now doesn't" on an ordinary launch. Not drafted upstream; needs a clean re-test (fresh launch, no Dock-process interference) before concluding anything.
 4. **Text quality (regression 4 of 4, long-standing) — not investigated further.** `sips -z` nearest-neighbour upscaling (the only inspection tool available this session) makes any crop look blocky regardless of real on-screen rendering quality, so no credible new evidence either way. #1824 itself frames this as longstanding ("has always been poor"), not a new regression; #1069/#1542 already closed against the same complaint. Needs a native-resolution, non-upscaled capture method to make progress.
 

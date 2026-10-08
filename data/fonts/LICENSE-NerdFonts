@@ -1,9 +1,12 @@
 # Nerd Fonts Licensing
 
 This license covers `data/fonts/vimcode-icons.ttf`, bundled as the **full**
-Symbols Nerd Font Mono (nerd-fonts v3.5.1 release,
-`SymbolsNerdFontMono-Regular.ttf`) rather than a per-codepoint subset as of
-#1853 -- see `scripts/gen_icon_font.py`'s module docstring for why bundling
+Symbols Nerd Font (nerd-fonts v3.5.1 release,
+`SymbolsNerdFont-Regular.ttf`, the proportional variant -- not
+`SymbolsNerdFontMono-Regular.ttf`, which registers under a different family
+name (`Symbols Nerd Font Mono`) and would have rescaled every glyph's
+metrics, see `scripts/gen_icon_font.py`'s module docstring) rather than a
+per-codepoint subset as of #1853 -- see that docstring for why bundling
 the whole font (rather than only the codepoints vimcode's own `src/icons.rs`
 references) is necessary for registry extensions that pick their own Nerd
 Font codepoints. Three codepoints upstream nerd-fonts dropped after v3.0.0
