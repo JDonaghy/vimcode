@@ -33188,7 +33188,12 @@ mod tests {
             text.push_str(&"    ".repeat(depth));
             text.push_str(&format!("line {i} content\n"));
         }
-        test_engine(&text)
+        let mut e = test_engine(&text);
+        // #1858: the minimap is experimental and off by default on every
+        // backend now — this fixture exists specifically to exercise it, so
+        // turn it on explicitly rather than lean on the (now-off) default.
+        e.settings.minimap = true;
+        e
     }
 
     /// A large, syntax-free buffer used to force the strip into #1093's
@@ -33206,7 +33211,12 @@ mod tests {
         for i in 0..n {
             text.push_str(&format!("line {i} content\n"));
         }
-        test_engine(&text)
+        let mut e = test_engine(&text);
+        // #1858: the minimap is experimental and off by default on every
+        // backend now — this fixture exists specifically to exercise it, so
+        // turn it on explicitly rather than lean on the (now-off) default.
+        e.settings.minimap = true;
+        e
     }
 
     /// A synthetic file large enough to make an O(buffer) per-frame cost
@@ -33762,9 +33772,13 @@ mod tests {
     #[test]
     fn minimap_suppresses_itself_when_the_pane_cannot_afford_both_the_strip_and_the_scroll_gutter()
     {
-        let engine = test_engine(
+        let mut engine = test_engine(
             "a line of text long enough to fill the whole pane width and then some more text",
         );
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about the minimap's self-suppression, so turn it on
+        // explicitly.
+        engine.settings.minimap = true;
         let theme = Theme::onedark();
         // Same 40-column pane `build_screen_layout_honors_an_explicit_
         // scrollbar_reserve_even_at_char_width_one` uses: wide enough to
@@ -35270,6 +35284,9 @@ mod tests {
     #[test]
     fn split_gives_every_pane_its_own_minimap_over_its_own_buffer() {
         let mut e = test_engine("");
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about the minimap, so turn it on explicitly.
+        e.settings.minimap = true;
         e.buffer_mut().insert(0, &"left\n".repeat(50));
         e.split_window(SplitDirection::Vertical, None);
         // The split's new window starts on the same buffer; give it its own
