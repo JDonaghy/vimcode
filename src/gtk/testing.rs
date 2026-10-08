@@ -13960,6 +13960,10 @@ mod minimap {
         engine
             .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
             .unwrap();
+        // #1858: the minimap is experimental and off by default on every
+        // backend now — this whole fixture exists to exercise the minimap,
+        // so turn it on explicitly rather than lean on the (now-off) default.
+        engine.settings.minimap = true;
         engine
     }
 
@@ -13989,8 +13993,8 @@ mod minimap {
         let win_on = h_on.engine.borrow().active_window_id();
         assert!(
             h_on.engine.borrow().settings.minimap,
-            "test setup sanity: the minimap must default on, or this test \
-             isn't exercising the default at all"
+            "test setup sanity: the minimap must be on, or this test isn't \
+             exercising it at all"
         );
         h_on.window_center(win_on)
             .expect("editor pane must paint with the default settings");
@@ -14434,6 +14438,9 @@ mod minimap {
                 .map(|i| format!("line {i} content\n"))
                 .collect();
             engine.buffer_mut().insert(0, &text);
+            // #1858: minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
             engine
         }
 
@@ -14540,6 +14547,9 @@ mod minimap {
                 .map(|i| format!("line {i} content\n"))
                 .collect();
             engine.buffer_mut().insert(0, &text);
+            // #1858: minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
             engine
         }
 
@@ -14659,6 +14669,9 @@ mod minimap {
         let mut engine = Engine::new_for_test();
         let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
         engine.buffer_mut().insert(0, &text);
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about the minimap, so turn it on explicitly.
+        engine.settings.minimap = true;
 
         let mut h = harness(engine, 1400, 900);
         let win = h.engine.borrow().active_window_id();
@@ -14785,6 +14798,9 @@ mod minimap {
         let mut engine = Engine::new_for_test();
         let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
         engine.buffer_mut().insert(0, &text);
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about the minimap, so turn it on explicitly.
+        engine.settings.minimap = true;
 
         let mut h = harness(engine, 1400, 900);
         let win = h.engine.borrow().active_window_id();
@@ -15288,6 +15304,9 @@ mod minimap {
         engine
             .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
             .unwrap();
+        // #1858: minimap is experimental and off by default — this fixture
+        // is specifically about minimap colouring, so turn it on explicitly.
+        engine.settings.minimap = true;
         engine.settings.minimap_render_characters = render_characters;
         let win_id = engine.active_window_id();
         let buf_id = engine.windows.get(&win_id).unwrap().buffer_id;
@@ -15463,6 +15482,10 @@ mod minimap {
         engine
             .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
             .unwrap();
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about minimap syntax colouring, so turn it on
+        // explicitly.
+        engine.settings.minimap = true;
         let win_id = engine.active_window_id();
         let buf_id = engine.windows.get(&win_id).unwrap().buffer_id;
         let n_highlights = engine.buffer_manager.get(buf_id).unwrap().highlights.len();
@@ -15613,6 +15636,10 @@ mod minimap {
         // here to keep testing the block-mode path this test's own name and
         // doc comment describe.
         engine.settings.minimap_render_characters = false;
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about minimap block rendering, so turn it on
+        // explicitly.
+        engine.settings.minimap = true;
 
         let mut h = harness(engine, 1400, 900);
         let win = h.engine.borrow().active_window_id();
@@ -15761,6 +15788,10 @@ mod minimap {
             text.push('\n');
         }
         engine.buffer_mut().insert(0, &text);
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about minimap glyph rendering, so turn it on
+        // explicitly.
+        engine.settings.minimap = true;
         assert!(
             engine.settings.minimap_render_characters,
             "test setup sanity: `minimap_render_characters` must default \
@@ -19493,6 +19524,10 @@ mod editor_mouse_rungs {
             text.push_str(&format!("line {i} content\n"));
         }
         engine.buffer_mut().insert(0, &text);
+        // #1858: minimap is experimental and off by default — this fixture
+        // exists specifically to exercise the minimap rung, so turn it on
+        // explicitly.
+        engine.settings.minimap = true;
         engine
     }
 

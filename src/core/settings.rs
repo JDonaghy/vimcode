@@ -920,6 +920,14 @@ pub struct Settings {
     pub indent_guides: bool,
 
     /// Show the code-overview minimap on the right edge of each editor pane.
+    ///
+    /// **Experimental, off by default** (#1858): real-hardware testing
+    /// (2026-10-06/07) found no visible viewport thumb in Windows Terminal
+    /// (#1828/#1842), a drag on macOS that felt like the scrollbar, and a
+    /// dark Windows GUI strip until quadraui#1354 — none of which is fit
+    /// for a default-on experience on any backend yet. Enable it with
+    /// `:set minimap` for the session, or `"minimap": true` in
+    /// `settings.json` to persist it.
     #[serde(default = "default_minimap")]
     pub minimap: bool,
 
@@ -1194,8 +1202,10 @@ fn default_indent_guides() -> bool {
     true
 }
 
+/// #1858: the minimap is experimental and off by default on every backend —
+/// see [`Settings::minimap`]'s doc comment for why.
 fn default_minimap() -> bool {
-    true
+    false
 }
 
 fn default_minimap_render_characters() -> bool {
@@ -4812,7 +4822,8 @@ pub static SETTING_DEFS: &[SettingDef] = &[
     SettingDef {
         key: "minimap",
         label: "Minimap",
-        description: "Show the code-overview minimap on the right edge of each editor pane",
+        description: "Show the code-overview minimap on the right edge of each editor pane \
+                      (experimental, off by default)",
         category: "Editor",
         setting_type: SettingType::Bool,
     },
@@ -5084,41 +5095,47 @@ mod tests {
     // works from `:set` but not the settings UI (or vice versa). One test
     // per site so a regression names the site it broke.
 
+    /// #1858: real-hardware testing (2026-10-06/07) found the minimap not
+    /// ready to default on, on any backend — see `Settings::minimap`'s doc
+    /// comment for the specific failures. It is now experimental and off by
+    /// default everywhere; `:set minimap` / `"minimap": true` still turn it
+    /// on, covered by the sibling tests below.
     #[test]
-    fn minimap_defaults_on() {
+    fn minimap_defaults_off() {
         assert!(
-            Settings::default().minimap,
-            "minimap must default on, matching VS Code"
+            !Settings::default().minimap,
+            "the minimap is experimental (#1858) and must default off on \
+             every backend"
         );
     }
 
     #[test]
     fn set_minimap_and_nominimap_both_parse() {
         let mut s = Settings::default();
-        s.parse_set_option("nominimap").expect("nominimap");
-        assert!(!s.minimap, "`:set nominimap` must turn the minimap off");
         s.parse_set_option("minimap").expect("minimap");
-        assert!(s.minimap, "`:set minimap` must turn it back on");
+        assert!(s.minimap, "`:set minimap` must turn the minimap on");
+        s.parse_set_option("nominimap").expect("nominimap");
+        assert!(!s.minimap, "`:set nominimap` must turn it back off");
     }
 
     #[test]
     fn set_minimap_query_form_reports_both_states() {
         let mut s = Settings::default();
-        assert_eq!(s.parse_set_option("minimap?").unwrap(), "minimap");
-        s.minimap = false;
         assert_eq!(s.parse_set_option("minimap?").unwrap(), "nominimap");
+        s.minimap = true;
+        assert_eq!(s.parse_set_option("minimap?").unwrap(), "minimap");
     }
 
     #[test]
     fn minimap_round_trips_through_get_set_by_key() {
         // The settings UI reads/writes by key string, not by field.
         let mut s = Settings::default();
-        assert_eq!(s.get_value_str("minimap"), "true");
-        s.set_value_str("minimap", "false").expect("set");
-        assert!(!s.minimap);
         assert_eq!(s.get_value_str("minimap"), "false");
         s.set_value_str("minimap", "true").expect("set");
         assert!(s.minimap);
+        assert_eq!(s.get_value_str("minimap"), "true");
+        s.set_value_str("minimap", "false").expect("set");
+        assert!(!s.minimap);
     }
 
     #[test]
@@ -5136,17 +5153,19 @@ mod tests {
     #[test]
     fn minimap_round_trips_through_the_settings_file() {
         let mut s = Settings::default();
-        s.minimap = false;
+        s.minimap = true;
         let json = serde_json::to_string(&s).expect("serialize");
         let back: Settings = serde_json::from_str(&json).expect("deserialize");
-        assert!(!back.minimap, "`minimap: false` must survive a save/load");
+        assert!(back.minimap, "`minimap: true` must survive a save/load");
 
-        // …and an older settings file with no `minimap` key at all must come
-        // back with the default (on), not `false` from `bool::default()`.
+        // …and a settings file with no `minimap` key at all (legacy, or
+        // simply never touched) must come back with the #1858 default
+        // (off), not `true` from a stale pre-#1858 assumption.
         let legacy: Settings = serde_json::from_str("{}").expect("deserialize legacy");
         assert!(
-            legacy.minimap,
-            "a settings file predating #35 must default the minimap on"
+            !legacy.minimap,
+            "a settings file with no `minimap` key must default the \
+             (experimental, #1858) minimap off"
         );
     }
 

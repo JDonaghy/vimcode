@@ -7252,11 +7252,16 @@ mod tests {
             s.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
         }
 
-        /// With the setting on (the default), a buffer with enough lines to
-        /// need scrolling must paint minimap braille somewhere on screen.
+        /// With the setting explicitly on, a buffer with enough lines to need
+        /// scrolling must paint minimap braille somewhere on screen.
+        ///
+        /// #1858: the minimap is experimental and off by default on every
+        /// backend now, so this test turns it on explicitly rather than
+        /// relying on the (now-off) default.
         #[test]
         fn minimap_paints_braille_when_enabled() {
             let mut engine = plain_engine();
+            engine.settings.minimap = true;
             let text = (1..=200)
                 .map(|n| format!("line {n}"))
                 .collect::<Vec<_>>()
@@ -7317,6 +7322,9 @@ mod tests {
         #[test]
         fn split_paints_minimap_in_both_panes() {
             let mut engine = plain_engine();
+            // #1858: minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
             let text = (1..=200)
                 .map(|n| format!("line {n}"))
                 .collect::<Vec<_>>()
@@ -7460,6 +7468,9 @@ mod tests {
         fn minimap_viewport_highlight_band_paints_a_distinct_background() {
             const TOTAL_LINES: usize = 2000;
             let mut engine = plain_engine();
+            // #1858: minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
             let text: String = (0..TOTAL_LINES)
                 .map(|i| format!("line {i} content\n"))
                 .collect();
@@ -7582,6 +7593,9 @@ mod tests {
             const TOTAL_LINES: usize = 2000;
             let mut engine = plain_engine();
             engine.settings.colorscheme = "vscode-light".to_string();
+            // #1858: minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
             let text: String = (0..TOTAL_LINES)
                 .map(|i| format!("line {i} content\n"))
                 .collect();
@@ -7657,6 +7671,9 @@ mod tests {
         fn dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_with_alt_held() {
             const TOTAL_LINES: usize = 200_000;
             let mut engine = plain_engine();
+            // #1858: minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
             let text: String = (0..TOTAL_LINES)
                 .map(|i| format!("line {i} content\n"))
                 .collect();
@@ -7732,6 +7749,9 @@ mod tests {
         fn dragging_the_minimap_viewport_highlight_scrolls_within_its_own_scale_by_default() {
             const TOTAL_LINES: usize = 200_000;
             let mut engine = plain_engine();
+            // #1858: minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
             let text: String = (0..TOTAL_LINES)
                 .map(|i| format!("line {i} content\n"))
                 .collect();
