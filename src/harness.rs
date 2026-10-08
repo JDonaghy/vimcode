@@ -3310,11 +3310,14 @@ mod issue_984_explorer_chevron_needs_a_double_click {
 // `cell_width` before that window's edge -- which, for any window sitting
 // immediately left of a group divider (the reported "left group"), is
 // within `GTK_DIVIDER_METRICS`'s 6-unit grab band around the divider's own
-// `position` (confirmed: with the default minimap painting a wide strip
-// between a window's own rect and the next group's divider, the two don't
-// overlap and the resize half does not fire -- every fixture below
-// explicitly disables the minimap, `engine.settings.minimap = false`, to
-// reproduce the adjacency the report describes). A window with no divider
+// `position` (confirmed: with the minimap turned on and painting a wide
+// strip between a window's own rect and the next group's divider, the two
+// don't overlap and the resize half does not fire -- every fixture below
+// explicitly disables the minimap, `engine.settings.minimap = false` (#1858:
+// now also this repo's own default everywhere, but pinned explicitly here
+// regardless, since this module's whole point is the *adjacency* the
+// minimap being off produces), to reproduce the adjacency the report
+// describes). A window with no divider
 // on its scrollbar-adjacent side (the **right** group in a two-group
 // layout) is simply inert, with no resize side effect -- deliverable 3
 // below pins exactly that distinction.
@@ -3368,10 +3371,13 @@ mod issue_987_group_scrollbar_inert_and_click_resizes {
     /// share this one fixture rather than two near-identical copies.
     ///
     /// `engine.settings.minimap = false` reproduces the adjacency the
-    /// report describes -- see this module's own top doc for why a
-    /// default-on minimap would put ~50 columns of unrelated space between
-    /// a window's own scrollbar and the group divider, hiding the "click
-    /// resizes" half entirely.
+    /// report describes -- see this module's own top doc for why turning
+    /// the minimap on would put ~50 columns of unrelated space between a
+    /// window's own scrollbar and the group divider, hiding the "click
+    /// resizes" half entirely. (#1858: the minimap now also defaults off
+    /// everywhere, but this is pinned explicitly regardless — this
+    /// fixture's whole point is the adjacency the setting being off
+    /// produces, not whatever the default happens to be.)
     fn engine_two_groups(tag: &str, focus_left: bool) -> (Engine, WindowId, WindowId) {
         let mut engine = Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);

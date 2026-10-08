@@ -2007,6 +2007,11 @@ mod win_driver_tests {
         // vscode-*light* instead would make "painted white" and "hit the
         // bug" indistinguishable, defeating the point of this probe.
         engine.settings.colorscheme = "vscode-dark".to_string();
+        // #1858: minimap is off by default on every backend now — this
+        // probe is about the minimap's painted background, so it must
+        // turn the setting on explicitly rather than rely on a default
+        // that no longer exists.
+        engine.settings.minimap = true;
         // Every inserted line is blank: `win::minimap::paint_row_blocks`
         // skips whitespace columns entirely and `paint_row_glyphs` draws
         // an empty string either way, so no row in the strip ever paints
