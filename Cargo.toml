@@ -497,7 +497,16 @@ win = ["quadraui/win"]
 # `conpty_activity_bar_click` — vimcode#1829 itself is NOT closed by this
 # bump (`Refs`, not `Fixes`); it closes only after a person sees a live
 # PowerShell prompt in `vcd.exe` on dell64.
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "4e71a8bb25966db0f43fd2ec9eae9a284a5230e4", features = ["tui", "terminal"] }
+#
+# v0.15.0 release prep bumps to `80b96f5` (quadraui `develop` HEAD, 5 commits
+# ahead of `4e71a8b`) for quadraui#1334: the Linux TUI under Windows Terminal
+# (WSL, `WT_SESSION` set) now strips SGR 58 underline colours. ConPTY
+# misparsed the semicolon form as SGR 2 (faint), so C# files showed runs of
+# faded text and line numbers after every LSP-hint underline (confirmed on
+# real Windows Terminal -> WSL Ubuntu). Also carries quadraui#1328 (macOS
+# native `NSApplication::activate()`, confirmed by a person on macOS 26) and
+# the #1329 Core Text fallback investigation hook (no behaviour change).
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "80b96f550650816ea267427af85b641e1f573107", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
