@@ -43,28 +43,29 @@ line-level confirmation — not the first move.
 6. Run `gh issue list --state open` to see active work and priorities
 7. Prompt user to update `PROJECT_STATE.md` and `PLAN.md` after significant tasks
 
-### quadraui is a pinned git dependency, not a sibling checkout (#691)
+### quadraui is a crates.io dependency, not a sibling checkout (#1848)
 
-Vimcode depends on `quadraui` via a **git dependency pinned to a `rev`** in `Cargo.toml` — `quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "<sha>", ... }`. (There is **one** pin now: the `[patch.crates-io] vt100` entry that used to shadow it was removed once quadraui#795 dropped the vendored shim upstream — see the comment above `[patch...]` in `Cargo.toml`.) The repo is public, so cargo resolves the pin anonymously with no token — which is what lets GitHub-hosted CI and release runners build it. Cargo clones the pinned rev into `~/.cargo/git/` itself and locks the resolved SHA in `Cargo.lock`. **`~/src/quadraui` is not consulted by a normal build at all** — a plain `cargo build` is reproducible regardless of what's checked out there, including on a machine running several agents concurrently.
+Vimcode depends on the **published `quadraui` crate** — `quadraui = { version = "0.1", features = [...] }` in `Cargo.toml`, locked to an exact version in `Cargo.lock` (`source = "registry+https://github.com/rust-lang/crates.io-index"`). **`~/src/quadraui` is not consulted by a normal build at all**, so a plain `cargo build` is reproducible regardless of what's checked out there.
 
 ```bash
-# Build against the pin (the normal case, and the only case for a plain checkout):
+# Build against the locked crate (the normal case):
 cargo build
 
-# Bump the pin: edit `rev = "..."` in Cargo.toml, then:
-cargo test    # updates Cargo.lock and re-runs snapshots against the new rev
+# Pick up a new quadraui patch release (0.1.x): just
+cargo update -p quadraui && cargo test
+# A breaking release (0.2) is a `version = "0.2"` edit in Cargo.toml.
 
-# Co-developing quadraui on a local branch? Opt in per-checkout, not per-env-var:
-cp cargo-config-local-quadraui.toml.example .cargo/config.toml   # git-ignored
+# Co-developing quadraui on a local branch? Opt in per-checkout:
+cp cargo-config-local-quadraui.toml.example .cargo/config.toml   # git-ignored, `paths` override
 # ... edit ~/src/quadraui, rebuild ...
-rm .cargo/config.toml   # back to the pinned rev
+rm .cargo/config.toml   # back to the crates.io version
 ```
 
-`cargo update -p quadraui` alone will **not** move a rev-pinned git dep — the `Cargo.toml` edit is the bump, and it is deliberately a reviewable one-line diff for the same reason `quadraui-pin.txt` used to be one (see `docs/QUADRAUI_GUIDE.md` for the #625/#638/#659 history this replaced).
+A quadraui fix vimcode needs has to be **published** (a quadraui release + `cargo publish`) before vimcode can depend on it; until then use the local override, never a git dep in a committed `Cargo.toml`.
 
-`vimcode --version` / `vcd --version` print the resolved quadraui rev, so "which quadraui?" is answerable from any binary.
+`vimcode --version` / `vcd --version` print the resolved quadraui version (e.g. `quadraui 0.1.0`), so "which quadraui?" is answerable from any binary.
 
-Do not "fix" vimcode to match a stale local quadraui checkout — with the git dep, "stale local checkout" can no longer affect a normal build in the first place; if you see it, check for a stray `.cargo/config.toml`.
+Do not "fix" vimcode to match a stale local quadraui checkout — it can't affect a normal build; if you see it, check for a stray `.cargo/config.toml`.
 
 ## Conditional Reference Files
 
