@@ -111,7 +111,7 @@ jobs:
           ## Status: use the TUI
 
           - **TUI (`vcd`) is the recommended way to use VimCode.** Usable on **Linux** and **macOS**. **Windows:** usable, with known rough edges (for example, the minimap viewport thumb is not visible in Windows Terminal, #1828).
-          - **GUI builds (`vimcode`) are not ready for use on any platform.** GUI artifacts are attached **for testing only**: GTK4 on Linux and macOS, and (new) the native Windows GUI. The native macOS GUI is not published.
+          - **GUI builds (`vimcode`) are not ready for use on any platform.** GUI artifacts are attached **for testing only**: GTK4 on Linux and macOS, and (new) the native Windows and native macOS GUIs.
 
           <!-- Update this section every release: highlights since the previous tag. -->
           **Since v0.15.0:** **The minimap is now off by default and marked experimental** (#1858) — enable it with `:set minimap` or `"minimap": true` in `settings.json`. Also: VimCode now builds against [quadraui](https://crates.io/crates/quadraui) from crates.io (0.1.1); the bundled icon font is the full Symbols Nerd Font, so extension panel icons (e.g. Git Insights) no longer render as `?` in the GUIs (#1853); the native Windows GUI minimap now shows a real miniature instead of a dark strip (quadraui#1354), and the Windows GUI is attached as a testing-only download.
@@ -161,7 +161,8 @@ jobs:
           ```
 
           **GUI — testing only, not ready for use**
-          `brew install vimcode` (GTK4 GUI + TUI), or download `vimcode-macos-arm64.tar.gz`. The macOS GUI binary is the GTK4 build and requires GTK4 via Homebrew: `brew install gtk4`.
+          - **Native (AppKit, no dependencies):** download `vimcode-macos-native-arm64.tar.gz`, then `tar xzf vimcode-macos-native-arm64.tar.gz && xattr -d com.apple.quarantine vimcode && ./vimcode`. Launch it from a normal Terminal window: launched from a tmux server that predates your login session, macOS won't let it come to the front.
+          - **GTK4:** `brew install vimcode` (GTK4 GUI + TUI), or download `vimcode-macos-arm64.tar.gz`; requires GTK4 via Homebrew (`brew install gtk4`).
 
           ### Windows
 
@@ -229,6 +230,9 @@ jobs:
       run: |
         cargo build --release --bin vimcode
         cargo build --release --bin vcd --no-default-features
+        # Native AppKit GUI (testing only). Separate target dir so it
+        # doesn't overwrite the GTK `vimcode` binary above.
+        cargo build --release --bin vimcode --no-default-features --features macos --target-dir target-native
 
     - name: Strip and ad-hoc codesign
       run: |
@@ -236,11 +240,14 @@ jobs:
         strip target/release/vcd
         codesign --sign - --force target/release/vimcode
         codesign --sign - --force target/release/vcd
+        strip target-native/release/vimcode
+        codesign --sign - --force target-native/release/vimcode
 
     - name: Package as tarballs
       run: |
         tar czf vimcode-macos-arm64.tar.gz -C target/release vimcode
         tar czf vcd-macos-arm64.tar.gz -C target/release vcd
+        tar czf vimcode-macos-native-arm64.tar.gz -C target-native/release vimcode
 
     - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v2
@@ -249,6 +256,7 @@ jobs:
         files: |
           vimcode-macos-arm64.tar.gz
           vcd-macos-arm64.tar.gz
+          vimcode-macos-native-arm64.tar.gz
 
   # ── Windows TUI ─────────────────────────────────────────────────────────────
   build-windows:
