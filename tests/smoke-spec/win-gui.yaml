@@ -1,0 +1,834 @@
+# Tier-2 Windows-native smoke spec for vimcode#1646 (claude-coordinator epic
+# #3482, v0.5.551's new real-platform acceptance drivers).
+#
+# Driver: `win-native`, `mode: window` (coord/win_native_driver.py) —
+# launches the real `vimcode.exe` GUI, finds its real top-level window, and
+# probes it with real Win32/UIA calls (`WM_NCHITTEST`, `GetMenu`,
+# `SendInput`, the UI Automation tree). `coord` supplies the actual
+# `launch_command`/`cwd`; this file assumes that command opens a small,
+# real, non-empty text file (kept non-empty for parity with the other
+# Tier-2 specs and so a future minimap-content check — see this file's
+# "DELIBERATELY OMITTED" comment below — has something to show once one
+# exists) with a settings.json carrying
+# `{"lsp_enabled": false, "use_nerd_fonts": false}` for the same
+# determinism reasons `tests/conpty_activity_bar_click.rs`'s
+# `isolated_home()` sets those.
+#
+# vimcode#1795: if you're manually reproducing a settings.json/startup
+# report against this lane over WSL interop, see
+# `docs/PLATFORM_CONFORMANCE.md`'s "WSL-interop env-var gotcha" section
+# before launching the `.exe` with an env var prefixed on a WSL shell's
+# command line — that silently fails to propagate into the Windows
+# process. Use a PowerShell `$env:VAR = '...'` session instead (what every
+# "CONFIRMED" run below actually did).
+#
+# Pixel coordinates below are derived from the drawn title band's known
+# `band_height = 32` DIP convention (`quadraui/src/win/run.rs`) and
+# vimcode's own fixed 7-item File/Edit/View/Go/Run/Terminal/Help menu order
+# (`src/render.rs`'s `MENU_STRUCTURE`), evenly spaced across the left
+# two-thirds of a 1024-wide window, with three ~46px-wide caption buttons
+# (minimize/maximize/close, the standard Windows caption-button width)
+# against the right edge.
+#
+# CONFIRMED against a real, running `vimcode.exe` on real Windows hardware
+# (dell64's attached Windows 11 host, reached directly over WSL interop —
+# no `coord` Python environment on that host yet, so this run drove the
+# exact same real OS primitives `win_native_driver.py` itself wraps
+# (`WM_NCHITTEST` via `SendMessage`, `GetMenu`, real `SendInput`-equivalent
+# clicks, the UI Automation tree, `IsWindow`) directly via a PowerShell
+# harness, rather than through `coord`'s own Python driver code — see the
+# PR for the exact script and raw output). `cargo xwin build --release
+# --target x86_64-pc-windows-msvc --no-default-features --features win`
+# against this branch's pinned quadraui rev (`d292a4c`, i.e. BEFORE
+# quadraui#1232), run against a non-empty `sample.txt` with the same
+# `{"lsp_enabled": false, "use_nerd_fonts": false}` settings.json this
+# file's launch-command assumption already documented:
+#
+#   hit-test-file-menu-item-1232:        FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-edit-menu-item-1232:        FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-view-menu-item-1232:        FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-go-menu-item-1232:          FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-run-menu-item-1232:         FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-terminal-menu-item-1232:    FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-help-menu-item-1232:        FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-minimize-button-1232:       FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-maximize-button-1232:       FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-close-button-1232:          FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-empty-band-is-caption-1232: PASS got=HTCAPTION want=HTCAPTION
+#   no-native-win32-menu-1228:           PASS (GetMenu returned NULL)
+#   file-dropdown-opens-1232:            FAIL (no UIA element named "New
+#                                         Tab" appeared within 3000ms — the
+#                                         click at (24,16) is swallowed as
+#                                         a caption drag before it ever
+#                                         reaches the drawn menu, so this
+#                                         fails for quadraui#1232's reason
+#                                         alone; the separate UIA-wiring gap
+#                                         below it in this file could not
+#                                         even be isolated yet)
+#   close-button-actually-closes-window-1232: FAIL (window still existed
+#                                         after 5000ms — same #1232 cause:
+#                                         the close-button click at (978,16)
+#                                         is also classified HTCAPTION)
+#
+# None of these pixel coordinates needed adjustment — every one matched
+# this header's derivation on the first real run, including all 7 of the
+# 7 menu-row items (not just File/Help — the initial version of this file
+# sampled only those two; this run confirmed the remaining 5 land on the
+# same evenly-spaced x positions and are equally misclassified HTCAPTION
+# today). Every check gated on quadraui#1232 is confirmed RED exactly as
+# this file predicted; the one check NOT gated on it
+# (`no-native-win32-menu-1228`) is confirmed GREEN. Re-run once the
+# quadraui pin moves to `fc94f21` or later to confirm the flip to GREEN.
+#
+# quadraui pin check (Cargo.toml, as of this file's authoring): rev
+# `d292a4c` — `fix(quadraui): update stale install_menu_bar trait doc for
+# Win-GUI (#1228)`. quadraui#1232 (`fix(quadraui): Win-GUI title band
+# widgets register their own nc_hit_test zones`, commit `fc94f21`) is ONE
+# commit later and is NOT yet in this pin. #1232's own commit message:
+# before it, "every point in the band was... classified HTCAPTION in a
+# live app, swallowing clicks before they reached the widget as a
+# MouseDown" — i.e. the menu row and the inline minimize/maximize/close
+# buttons do not yet actually receive clicks. Every step below that
+# depends on a menu-row or caption-button click landing is therefore
+# expected RED on today's develop, and expected GREEN once the pin moves
+# to `fc94f21` or later. Do not "fix" these by weakening the assertion —
+# bump the pin instead.
+#
+# UPDATE (vimcode#1656): the pin DID move to `fc94f2136bf66139be4da04ce5f16d78736b55cf`
+# (confirmed the exact `rev` in `Cargo.toml` at investigation time) and a
+# real-hardware re-run found the "flip to GREEN" prediction above only
+# half came true:
+#
+#   hit-test-file-menu-item-1232:        PASS got=HTCLIENT want=HTCLIENT
+#   hit-test-edit-menu-item-1232:        PASS got=HTCLIENT want=HTCLIENT
+#   hit-test-view-menu-item-1232:        PASS got=HTCLIENT want=HTCLIENT
+#   hit-test-go-menu-item-1232:          PASS got=HTCLIENT want=HTCLIENT
+#   hit-test-run-menu-item-1232:         PASS got=HTCLIENT want=HTCLIENT
+#   hit-test-terminal-menu-item-1232:    PASS got=HTCLIENT want=HTCLIENT
+#   hit-test-help-menu-item-1232:        PASS got=HTCLIENT want=HTCLIENT
+#   file-dropdown-opens-1232:            PASS (File menu's dropdown opens
+#                                         and paints "New Tab")
+#   hit-test-minimize-button-1232:       FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-maximize-button-1232:       FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-close-button-1232:          FAIL got=HTCAPTION want=HTCLIENT
+#   close-button-actually-closes-window-1232: FAIL (window still existed
+#                                         after 5000ms — real click at the
+#                                         close icon's remeasured real
+#                                         centre is still swallowed as a
+#                                         caption drag)
+#   hit-test-empty-band-is-caption-1232: PASS got=HTCAPTION want=HTCAPTION
+#   no-native-win32-menu-1228:           PASS (GetMenu returned NULL)
+#
+# So the menu row and the command-centre search box (not a step in this
+# file today, but confirmed clickable by the same sweep — see
+# vimcode#1656's own evidence) are genuinely fixed; the three caption
+# buttons are not, despite #1232's own commit message naming them
+# explicitly ("status-bar segments (vimcode's inline minimize/maximize/
+# close buttons)"). Root-caused to a *different* bug than the one #1232
+# fixed for the other two widget kinds — `WinBackend::
+# register_status_bar_segment_zones` registers each button's *bar-local*
+# `StatusBarLayout` bounds as if they were already absolute window
+# coordinates, unlike the sibling `register_menu_bar_item_zones`/
+# `register_command_center_zones` helpers, whose source primitives already
+# return absolute bounds — see `docs/PENDING_QUADRAUI_ISSUES.md`'s new
+# entry (quadraui#1232 follow-up) for the full source-level trace. The
+# four `FAIL` steps above are this issue's own Tier-2 acceptance coverage
+# ("a Tier-2 smoke-spec step that fails first, covering this exact
+# behaviour") — do not mark them expected-green again until that entry is
+# filed and fixed upstream; re-run once the pin moves past the fix to
+# confirm the flip.
+#
+# The three "FAIL got=HTCAPTION want=HTCLIENT" steps named above
+# (`hit-test-minimize-button-1232`, `hit-test-maximize-button-1232`,
+# `hit-test-close-button-1232`) and `close-button-actually-closes-window-1232`
+# are left completely unmodified below (same ids, same x/y, same
+# `expect_*` shape) — this UPDATE block only adds new context above and a
+# new, additional step below; per #3509/#3487 this file is additive-only,
+# so nothing that already existed in this file on `develop` is deleted,
+# renamed, or loosened by vimcode#1656.
+#
+# ── #1657: the "evenly spaced, big empty band" model above was wrong ───
+#
+# The derivation two sections up never accounted for the Command Center
+# (back/forward nav arrows + search box, #676/#939) — it paints between
+# the menu row and the caption buttons on any `window_chrome` backend
+# (Win-GUI included, now that quadraui#1228/#1232 are both in the pin) and
+# was not live when this file's coordinates were first measured. A
+# bugbash lane re-running this file's own `expect_hit` steps at today's
+# pin (`fc94f2136bf66139be4da04ce5f16d78736b55cf`) found 6 of 7 menu items
+# and all 3 caption buttons FAIL, and a PrintWindow re-capture
+# (`/tmp/crop-zoom-left.png`, `/tmp/crop-zoom-mid.png`) found:
+#
+#   - the File label's real left edge sits at x≈55-88, not x=24 — the old
+#     value lands in blank menu-row padding to its left;
+#   - the three caption-button glyphs are centered ≈x=914/954/994, not
+#     x=886/932/978;
+#   - x=620 (the old "empty band, must stay HTCAPTION" assumption) now
+#     falls *inside* the Command Center's search box, a real `HTCLIENT`
+#     widget — not a bug, just a stale assumption about what's empty.
+#
+# This file is an additive-only Tier-2 lane entry point (#3509): a fix for
+# stale coordinates may NOT edit or delete the existing `-1232`-suffixed
+# steps below, even though some of their original assumptions no longer
+# hold — doing so would defeat `coord bugbash`'s regression ratchet
+# (#3487), which expects every fix to grow this spec, never shrink or
+# rewrite it. So this fix is purely additive:
+#
+#   - every `-1232` step below is byte-for-byte what it was before this
+#     issue — same id, same x/y, same expected `ht` — and is left exactly
+#     where real Win-GUI hardware (or, for the Command Center-affected
+#     ones, the layout shift this issue reports) leaves it;
+#   - a new, parallel `-1657` step is added beside each `-1232` step this
+#     issue's findings affect, carrying the corrected coordinate;
+#   - `hit-test-empty-band-is-caption-1232` (x=620, expects `HTCAPTION`)
+#     is now KNOWN to conflict with reality: the Command Center's search
+#     box occupies that x today, so this step is expected to flip from its
+#     historical PASS to FAIL once a real run executes it at the current
+#     pin. That is an intentional, accepted consequence of this file's
+#     additive-only policy, not an oversight — rewriting or deleting this
+#     step to make it agree with the new layout is exactly the kind of
+#     edit #3509 forbids. The new `hit-test-search-box-is-client-1657`
+#     step beside it carries the corrected, currently-true expectation.
+#     Deciding whether/when to retire `hit-test-empty-band-is-caption-1232`
+#     itself is a separate, deliberate call for a future issue — not a
+#     side effect of this stale-coordinate fix.
+#
+# The 7 menu-item `-1657` x positions are NOT independently re-measured on
+# real Windows hardware beyond File (only File's real span was reported)
+# — they are re-derived from `src/gtk/testing.rs`'s
+# `win_gui_smoke_spec_title_band_coordinates_are_stale_1657` /
+# `src/win/mod.rs::win_driver_tests::
+# win_gui_smoke_spec_title_band_coordinates_are_stale_1657`, the Tier-1
+# shared conformance pair this fix added: both backends declare
+# `BackendCaps::window_chrome` and run the identical platform-neutral
+# title-band composition (`App::render_content`'s `presence.
+# command_center` block, `render::measure_title_bar_bands`), so the GTK
+# arm's real painted centers (File 68, Edit 114, View 165, Go 211, Run
+# 253, Terminal 319, Help 388, at this file's own 1024x768) are a faithful
+# *shape* for the real layout, even though glyph metrics (Pango vs
+# DirectWrite) mean the exact pixel values can still drift slightly on
+# real Win-GUI. A future bugbash pass should re-confirm these 6 against a
+# real PrintWindow capture the same way File and the caption buttons were
+# confirmed here, and tighten this comment once it has.
+#
+# UNRESOLVED: the bugbash report's own reproduction notes that even after
+# correcting the caption-button x values to 914/954/994, all three still
+# reported FAIL (still `HTCAPTION`, not `HTCLIENT`) on real hardware —
+# unlike the 6 corrected menu items, which all flipped to PASS. That is
+# *not* explained by stale coordinates alone and could not be
+# independently reproduced or ruled out from this fix's Linux worktree (no
+# attached Windows host here). Left as an open, UNVERIFIED finding rather
+# than silently fixed — do not read the corrected 914/954/994 values below
+# as a confirmed-working fix for the caption buttons specifically; treat
+# them as the best current coordinates pending a real-hardware re-run that
+# either confirms the flip to PASS or isolates a second, distinct
+# quadraui-level hit-test registration gap worth its own issue.
+#
+# ── #1661: the blank strip between the menu row and the caption buttons ──
+#
+# A real `WM_NCHITTEST` sweep from x=350 to x=820 at y=16 — past the last
+# (`Help`) menu label and before the caption-button strip — found
+# `HTCLIENT` at every sampled point except one isolated x=540 result that
+# correctly read `HTCAPTION` (likely an inter-widget gap, not the wide
+# empty strip itself; see this session's own transcript, quoted verbatim
+# in vimcode#1661). Combined with the still-open caption-button finding
+# above, the drawn title band has no mouse-draggable region at all: the
+# parts that should be `HTCLIENT` (the caption buttons) are `HTCAPTION`,
+# and the parts that should be `HTCAPTION` (this blank strip) are
+# `HTCLIENT`. Root-caused (so far as source review alone can) in
+# `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry — not a vimcode-side fix,
+# per the Platform-Neutrality Rule; this file's steps are this issue's own
+# Tier-2 acceptance coverage, additive per #3509/#3487, expected RED today.
+#
+# ── #1673: independent reconfirmation of #1657's stale x=24, no new bug ──
+#
+# A fresh bugbash reproduction (twice, with window focus explicitly
+# confirmed before the click) found the `-1232` click-and-open pair below
+# swallowed again despite a correct `HTCLIENT` hit-test — see the UPDATE
+# (vimcode#1673) note inline above that pair for the full account and
+# `src/win/mod.rs`'s new `#1673` doc section for the source + empirical
+# investigation (GTK-side empirical confirmation that x=24 genuinely
+# misses "File"'s real bounds while the real bounds open it fine, same
+# shared layout code both backends run). No new quadraui issue filed:
+# this is the same gap #1657 already diagnosed, not a second, distinct
+# defect. The `-1657` click/expect pair (x=70) a few steps below is this
+# file's live, forward-looking acceptance coverage for "clicking File
+# opens its dropdown" — confirming it on real Windows hardware (not just
+# GTK's faithful-but-not-identical stand-in) remains this issue's own
+# open acceptance item.
+#
+# ── #1675: independent reconfirmation of the still-open #1656 defect ───
+#
+# A fresh bugbash reproduction (`WM_NCHITTEST` at (886,16)/(932,16)/(978,16)
+# — this file's original `-1232` caption-button coordinates — all still
+# answer `HTCAPTION`; a real click at (978,16) leaves the window open after
+# 2000ms, in two independent isolated runs) found the exact same defect
+# `docs/PENDING_QUADRAUI_ISSUES.md`'s "`WinBackend::register_status_bar_
+# segment_zones` ... registers ... bar-local bounds as if they were already
+# absolute" entry already describes, confirmed still live at the pin
+# current at investigation time
+# (`ca7fcc83afad01ec3422f79366566f3a263b22bf`) by reading that exact rev's
+# source directly (see that doc entry's own `UPDATE (vimcode#1675)` note).
+# No new quadraui issue filed and no new steps added here: this is the same
+# upstream gap #1656 already diagnosed and this file's existing
+# `hit-test-minimize-button-1232`/`hit-test-maximize-button-1232`/
+# `hit-test-close-button-1232`/`close-button-actually-closes-window-1232`
+# (and their remeasured `-1656`/`-1657` siblings below) already serve as
+# this issue's own Tier-2 acceptance coverage per the additive-only policy
+# (#3509/#3487) — adding a byte-for-byte duplicate step at the same
+# coordinates would assert nothing new. `src/win/mod.rs::win_driver_tests::
+# caption_button_real_click_position_is_misclassified_htcaption_1675` adds
+# this issue's own Tier-1 shared-conformance-harness coverage instead,
+# closing the specific gap `win_gui_smoke_spec_title_band_coordinates_are_
+# stale_1657`'s own doc named ("the caption-button half of that test has no
+# equivalent here").
+#
+# ── #1668: no Tier-2 step added for the blank embedded-terminal panel ──
+#
+# vimcode#1668's own acceptance line asks for "a Tier-1 shared conformance
+# scenario or a Tier-2 smoke-spec step that fails first, covering this
+# exact behaviour". This file deliberately gets neither a terminal-open
+# nor a terminal-content step for it, for the same structural reason this
+# file's own "DELIBERATELY OMITTED" comment below already documents for
+# the minimap/extension-install seed checks: confirmed directly against
+# this machine's installed `coord` (`win_native_driver.py`'s own
+# `_REQUIRED_FIELDS`, `coord --version` 0.5.567, newer than the 0.5.551
+# the minimap comment below checked — same result), the full `mode:
+# window` step vocabulary is `launch`, `key`, `click`, `wait`, `capture`,
+# `expect_menu`, `expect_hit`, `expect_a11y`/`expect_a11y_within`,
+# `expect_closed`. None of these can observe "did the terminal panel
+# paint a shell prompt/echoed command" — that needs a pixel-sampling
+# primitive this driver doesn't have (the same `expect_capture_nonblank`-
+# shaped gap the minimap comment names), since vimcode's embedded
+# terminal paints its own glyphs into the client area with no AT-provider
+# wiring behind them (same gap `file-dropdown-opens-1232`/`-1657` above
+# are gated on — confirmed still RED, not actually passing, per this
+# file's own "UPDATE (vimcode#1656)" comment on that step). A step that
+# can never go red regardless of whether the bug is fixed is not coverage
+# (CLAUDE.md's "a test that cannot fail is not coverage", #553) — adding
+# one here would not satisfy this issue's acceptance bar, only appear to.
+#
+# This issue's real acceptance coverage is instead the Tier-1 option the
+# same acceptance line offers: `src/tui_main/app_on_tui_tests.rs`'s
+# `terminal_poll_rearm_1668` module drives the real, shared
+# `App::tick_dispatch` through `quadraui::tui::testing::TuiDriver::tick()`
+# and asserts on `TuiBackend::frame_requests`/`pending_frame_delay`
+# (quadraui#832's real `Backend::request_frame_in` call-count/deadline
+# instrumentation) — a genuine driver-tier, black-box test of the exact
+# platform-neutral scheduling decision Win-GUI's own `WM_TIMER` loop
+# depends on, RED-verified against the pre-fix behaviour. See that
+# module's own doc, and `terminal_poll_rearm_delay`'s doc in `src/app.rs`,
+# for the full reasoning including the one link it cannot reach:
+# `WinBackend` itself, tracked in `docs/PENDING_QUADRAUI_ISSUES.md`'s new
+# entry. A future bugbash pass with real Windows hardware access could
+# still add a best-effort `click`-into-Terminal-menu `wait` sequence here
+# once (a) `coord` grows a pixel-content primitive, or (b) vimcode/
+# quadraui ship real AT-provider wiring for drawn content — tracked the
+# same way as the minimap/extension-install gap below, not duplicated
+# here.
+#
+# ── #1674: no Tier-2 step added for Ctrl+`/Ctrl+B dispatch ─────────────
+#
+# vimcode#1674 reports neither Ctrl+` (toggle terminal) nor Ctrl+B (toggle
+# sidebar) has any visible effect on Win-GUI. Same structural reason as
+# #1668 immediately above: even a `key` step that injects the real
+# `WM_KEYDOWN`/`WM_CHAR`/`GetKeyState` sequence this bug is actually about
+# could only confirm the chord did or didn't work by observing the
+# sidebar/terminal panel's painted content changing, and no AT-provider
+# wiring exists for either (same gap #1668's own entry names) — an
+# `expect_a11y`/`expect_hit`/`expect_menu` step has nothing it could ever
+# observe toggling. This issue's real acceptance coverage is the Tier-1
+# option the same acceptance line offers:
+# `src/win/mod.rs::win_ctrl_key_translation_tests_1674` (two genuinely
+# *executing* tests against quadraui's own public `win::events` API,
+# confirming the `WM_CHAR` → `UiEvent` translation is correct for both
+# chords given the payload Windows is documented to deliver) plus
+# `win_driver_tests::ctrl_accelerator_dispatch_reaches_engine_via_
+# win_driver_1674` (isolating the shared accelerator-dispatch pipeline
+# downstream of that translation). See `docs/PENDING_QUADRAUI_ISSUES.md`'s
+# new entry for this issue for the full root-cause investigation and the
+# one open, real-hardware-only question neither of those tests — nor any
+# step this file's vocabulary could add — can close.
+#
+# ── #1751: no Tier-2 step added for the git-insights inline blame ghost
+#    text ──────────────────────────────────────────────────────────────
+#
+# vimcode#1751 reports git-insights' inline blame ghost text (e.g. "John
+# Donaghy • 3 months ago • ..." painted after the cursor line) never
+# appears on Win-GUI. Same structural wall #1668/#1674 above already hit:
+# confirming the annotation painted (or didn't) needs reading drawn glyph
+# content, and this driver's vocabulary — `launch`, `key`, `click`, `wait`,
+# `capture`, `expect_menu`, `expect_hit`, `expect_a11y`/`expect_a11y_within`,
+# `expect_closed` — has no primitive that can see it: `capture` takes a
+# `PrintWindow` snapshot with no `expect_*` shape (CLAUDE.md's "a test that
+# cannot fail is not coverage", #553), and no UIA/AT-provider element
+# exists for vimcode's own drawn virtual text (the same "No UIA/
+# NSAccessibility/AT-SPI provider wiring..." gap `docs/
+# PENDING_QUADRAUI_ISSUES.md` already tracks for #1668/#1674/the minimap).
+# Adding a step here would not satisfy this issue's acceptance bar, only
+# appear to.
+#
+# This issue's real acceptance coverage is the Tier-1, platform-neutral
+# option instead, and it is not Win-GUI-specific in the first place: the
+# root cause this repo's half of #1751 fixes (`Engine::apply_plugin_ctx`'s
+# `vimcode.async_shell` cwd default, `src/core/engine/plugins.rs`) is core
+# engine code that runs identically on every backend, so
+# `src/tui_main/app_on_tui_tests.rs`'s `live_plugin_api::
+# async_shell_cwd_default_paints_into_buffer_via_shell_app_1751` — a real
+# `App`/`TuiDriver` black-box test, painted-output assertion, RED-verified
+# against the unfixed fallback — already is this fix's acceptance coverage
+# for every backend quadraui ships, Win-GUI included, the same way the
+# shared-layout-code Tier-1 pairs #1657/#1675/#1676/#1696 above stand in for
+# a real-hardware-only capture. A real Win-GUI re-verification of the
+# *painted blame ghost text itself* remains open — it depends on
+# git-insights' `blame.lua` (a separate vimcode-ext repo this fix cannot
+# touch) also being fixed, which is why #1751 is not being closed by this
+# PR alone; see this branch's commit messages for the full account.
+name: vimcode-win-gui
+mode: window
+width: 1024
+height: 768
+steps:
+  - type: launch
+    id: launch
+    timeout_ms: 15000
+
+  - type: wait
+    id: startup-settle
+    ms: 1500
+
+  # quadraui#1232 — before it lands, these are all misclassified HTCAPTION.
+  # All 7 of vimcode's fixed File/Edit/View/Go/Run/Terminal/Help menu-row
+  # items get their own step (not just the first/last), per #1646's own
+  # "each menu-row item" wording — confirmed real-hardware-identical
+  # (all HTCAPTION today) in this file's header comment above.
+  #
+  # UPDATE (vimcode#1656): confirmed GREEN at the current pin — see this
+  # file's "UPDATE (vimcode#1656)" header comment above for the full
+  # real-hardware re-run. Left unmodified here; the three caption-button
+  # steps right below remain RED, now gated on the vimcode#1656 follow-up
+  # bug (`docs/PENDING_QUADRAUI_ISSUES.md`) rather than on quadraui#1232
+  # (which landed).
+  #
+  # #1657: these x values are now known stale (derived before the Command
+  # Center existed) but are left exactly as originally authored per this
+  # file's additive-only policy (see this file's "#1657" header section) —
+  # the corrected `-1657` steps below carry the current, real-hardware
+  # x values instead.
+  - type: expect_hit
+    id: hit-test-file-menu-item-1232
+    x: 24
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-edit-menu-item-1232
+    x: 75
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-view-menu-item-1232
+    x: 126
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-go-menu-item-1232
+    x: 177
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-run-menu-item-1232
+    x: 228
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-terminal-menu-item-1232
+    x: 279
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-help-menu-item-1232
+    x: 330
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-minimize-button-1232
+    x: 886
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-maximize-button-1232
+    x: 932
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-close-button-1232
+    x: 978
+    y: 16
+    ht: HTCLIENT
+
+  # vimcode#1656 ADDS this step rather than touching the one above (this
+  # file is additive-only, #3509/#3487) — it remeasured the close button's
+  # real click centre against a real 4x-zoom crop of the painted glyph
+  # (`/tmp/crop-zoom-caption.png` in that issue's evidence) rather than
+  # this header's derived estimate: 994, not 978. Confirmed FAIL
+  # (HTCAPTION) at that exact point too, so the gap isn't "the old
+  # estimate missed the button by a few px" — the whole caption-button
+  # strip is misclassified, both the original derived estimate and this
+  # remeasured real centre.
+  - type: expect_hit
+    id: hit-test-close-button-remeasured-1656
+    x: 994
+    y: 16
+    ht: HTCLIENT
+
+  # The empty band between the menu row and the caption buttons — no widget
+  # is painted there, so it must stay the window's drag handle.
+  #
+  # #1657: this assumption is now KNOWN stale — the Command Center's
+  # search box paints at this x today, so a real run is expected to FAIL
+  # this step (`got=HTCLIENT want=HTCAPTION`). Left unmodified per this
+  # file's additive-only policy; see this file's "#1657" header section
+  # for why, and see `hit-test-search-box-is-client-1657` below for the
+  # corrected, currently-true expectation at the same x.
+  - type: expect_hit
+    id: hit-test-empty-band-is-caption-1232
+    x: 620
+    y: 16
+    ht: HTCAPTION
+
+  # #1657: corrected, additive re-derivation of the ten `-1232` hit-test
+  # steps above, per this file's "#1657" header section. x values: File
+  # from the real-hardware PrintWindow remeasurement (real span ≈55-88);
+  # Edit/View/Go/Run/Terminal/Help from the Tier-1 GTK/Win-GUI conformance
+  # pair's shared-layout-code painted centers (UNVERIFIED on real Windows
+  # hardware beyond File); the three caption buttons from the real-hardware
+  # remeasurement (≈914/954/994) — UNRESOLVED whether these three alone
+  # fix the caption-button hit-test; see that section before reading a
+  # future PASS/FAIL here as conclusive.
+  - type: expect_hit
+    id: hit-test-file-menu-item-1657
+    x: 70
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-edit-menu-item-1657
+    x: 114
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-view-menu-item-1657
+    x: 165
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-go-menu-item-1657
+    x: 211
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-run-menu-item-1657
+    x: 253
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-terminal-menu-item-1657
+    x: 319
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-help-menu-item-1657
+    x: 388
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-minimize-button-1657
+    x: 914
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-maximize-button-1657
+    x: 954
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-close-button-1657
+    x: 994
+    y: 16
+    ht: HTCLIENT
+
+  # #1657: x=620 — the old `-1232` "empty band, must stay HTCAPTION"
+  # assumption above — now lands inside the Command Center's search box
+  # (confirmed both by a real-hardware PrintWindow capture and by the
+  # Tier-1 GTK conformance test's painted `search_bounds`), a real,
+  # clickable widget. Added beside (not instead of) the old step per this
+  # file's additive-only policy: per
+  # `quadraui::CommandCenterLayout::hit_regions`, only the back/forward
+  # arrows and the search box register as HTCLIENT inside the Command
+  # Center's span — the thin blank padding around them (if any survives on
+  # real Win-GUI's own font metrics) is too fragile a target to pin a
+  # coordinate to without a dedicated real-hardware remeasurement, which
+  # this fix's Linux worktree cannot perform.
+  - type: expect_hit
+    id: hit-test-search-box-is-client-1657
+    x: 620
+    y: 16
+    ht: HTCLIENT
+
+  # #1629/quadraui#1228 (already in the pin, confirmed by the rev check
+  # above): Win-GUI switched back to the same *drawn* menu row GTK/TUI
+  # already use — no native HMENU is attached any more. Expected GREEN
+  # today (this is the one check in this file that is NOT gated on #1232).
+  - type: expect_menu
+    id: no-native-win32-menu-1228
+    items: ["File"]
+
+  # Blocked on quadraui#1232 (the click never lands) AND on the separate,
+  # lower-level gap docs/PENDING_QUADRAUI_ISSUES.md's "No UIA/
+  # NSAccessibility/AT-SPI provider wiring..." entry describes: vimcode
+  # paints its dropdown into the same HWND's client area rather than a
+  # separate child window, so even once #1232 lands, nothing registers a
+  # `MenuItem`-role UIA element for the drawn dropdown's own content.
+  # Expected RED on today's develop for both reasons; do not close this
+  # issue's "File opens its dropdown" acceptance item on #1232 landing
+  # alone — the UIA gap needs its own fix first.
+  # `role:` here is UIA's `LocalizedControlType` string for a menu item,
+  # which (per Microsoft's own default English localization) is the
+  # two-word, lowercase "menu item", NOT "MenuItem" — `_find_a11y_match`
+  # (shared by every coord native driver) does an exact, case-insensitive
+  # match against the real OS string, so getting this wrong silently turns
+  # a real check into one that can never pass even once the underlying bug
+  # is fixed. The real dell64 run must confirm this exact string.
+  #
+  # UPDATE (vimcode#1656): quadraui#1232 landed and the click itself now
+  # lands (real-hardware re-run confirmed: the dropdown genuinely opens and
+  # paints "New Tab" — see `/tmp/vimcode-filemenu.png` in that issue's
+  # evidence). What's still blocked is the separate, lower-level UIA-wiring
+  # gap described above — vimcode paints its dropdown into the same HWND's
+  # client area rather than a separate child window, so nothing registers a
+  # `MenuItem`-role UIA element regardless of the click landing. This step
+  # is therefore still expected RED, but for the UIA-wiring reason alone
+  # now, not for #1232's reason too. Left unmodified below.
+  #
+  # UPDATE (vimcode#1673): an independent bugbash reproduction — twice,
+  # with window focus explicitly confirmed (`GetForegroundWindow() ==
+  # target hwnd`) immediately before the click — found this exact click
+  # swallowed again: `WM_NCHITTEST` at (24,16) correctly reports
+  # `HTCLIENT`, but no dropdown paints and no UIA `New Tab` element ever
+  # appears (3000ms timeout). This is NOT a reopening of quadraui#1232
+  # (that hit-test classification is still confirmed correct) and no new
+  # quadraui-side defect was found for it — see `src/win/mod.rs`'s new
+  # `#1673` doc section for the full source + empirical investigation. It
+  # is the SAME gap vimcode#1657 already diagnosed from the opposite
+  # direction (a stale `expect_hit` sweep): x=24 is stale, landing in
+  # blank padding left of "File"'s real painted bounds at this window
+  # width, not on the label itself — the once-GREEN result the #1656
+  # UPDATE above recorded for this exact step no longer reflects the
+  # current title-band layout (the app-icon slot and/or Command Center
+  # have since shifted every menu-row item right of x=24). This step is
+  # therefore expected RED again, for #1657's reason, and the corrected
+  # `-1657` click/expect pair below (x=70) is this file's live acceptance
+  # coverage going forward — re-run it specifically to confirm the fix on
+  # real hardware; do not read a future flip back to GREEN on *this*
+  # x=24 step as evidence the stale-coordinate explanation was wrong.
+  - type: click
+    id: click-file-menu-item-1232
+    x: 24
+    y: 16
+  - type: expect_a11y_within
+    id: file-dropdown-opens-1232
+    role: "menu item"
+    name: "New Tab"
+    timeout_ms: 3000
+
+  - type: key
+    id: dismiss-dropdown
+    key: esc
+
+  # #1657: corrected, additive re-run of the click-and-open sequence above
+  # at the real File label x (see this file's "#1657" header section) —
+  # the `-1232` click above never reaches the drawn menu even setting
+  # #1232 aside, since x=24 lands in blank menu-row padding left of the
+  # real label.
+  - type: click
+    id: click-file-menu-item-1657
+    x: 70
+    y: 16
+  - type: expect_a11y_within
+    id: file-dropdown-opens-1657
+    role: "menu item"
+    name: "New Tab"
+    timeout_ms: 3000
+
+  - type: key
+    id: dismiss-dropdown-1657
+    key: esc
+
+  # vimcode#1646's two "All GUI specs" seed checks — "the minimap shows
+  # content for a non-empty file" and "the extension-install flow reaches a
+  # completed state within a budget" — are DELIBERATELY OMITTED from this
+  # file rather than represented by a bare `capture` step.
+  #
+  # A bare `capture` step (confirmed against `win_native_driver.py`'s own
+  # `_REQUIRED_FIELDS`/step-execution code: `capture` takes a `PrintWindow`
+  # snapshot and attaches it to its OWN step result, pass or fail, but has
+  # no `expect_*` shape and therefore no condition that can ever fail) is
+  # not a real assertion — CLAUDE.md's "a test that cannot fail is not
+  # coverage" rule (#553) applies to it directly. A prior version of this
+  # file shipped exactly that placeholder; this revision removes it rather
+  # than keep a check that always "passes" on the books.
+  #
+  # Confirmed directly against `coord`'s real `win_native_driver.py`
+  # (installed `code-coordinator==0.5.551`, the same version pinned by this
+  # issue): its full step vocabulary is `launch`, `key`, `click`, `wait`,
+  # `capture`, `expect_menu`, `expect_hit`, `expect_a11y`/
+  # `expect_a11y_within`, `expect_closed`, plus the terminal-mode-only
+  # `expect_idle_stable`/`expect_menu_latency`/`expect_panel_switch`. None
+  # of these can observe "did the minimap paint non-blank pixels" or "did
+  # the extensions list reach an install-complete state" — the former needs
+  # a pixel-sampling primitive (e.g. an `expect_capture_nonblank`-shaped
+  # step comparing a sub-rectangle of a `PrintWindow` capture against a
+  # blank-color threshold), the latter needs either the same pixel
+  # primitive pointed at the extensions list, or a UIA/AX element exposing
+  # the install-state text — and vimcode has no AT-provider wiring for any
+  # of its own drawn content yet (`docs/PENDING_QUADRAUI_ISSUES.md`'s "No
+  # UIA/NSAccessibility/AT-SPI provider wiring..." entry).
+  #
+  # Per this issue's own review guidance: "needs either a real primitive
+  # added driver-side first ... or some other oracle, not a capture step
+  # that cannot go red." No such primitive exists in the installed driver
+  # and no other oracle is reachable from vimcode/quadraui alone, so these
+  # two seed checks are held back from every GUI spec (mirrored in
+  # `mac-gui.yaml`/`gtk-gui.yaml`) until one of:
+  #   (a) `coord`'s win/mac/gtk-native drivers grow a pixel-content or
+  #       install-state-aware primitive (coordinator-repo work — this repo
+  #       must not add it, same as it must not edit `coordinator.yml`), or
+  #   (b) vimcode/quadraui ship real AT-provider wiring for drawn content,
+  #       which would let `expect_a11y_within` cover the extension-install
+  #       case (the minimap would still need (a) — it has no text content
+  #       to expose via an accessible name).
+  # Track the follow-up primitive as a new claude-coordinator issue; this
+  # vimcode PR cannot itself open one (vimcode workers don't file issues in
+  # other repos).
+  #
+  # vimcode#1676 ("the minimap strip renders solid white instead of the
+  # active theme") is the same gap this comment already describes, from
+  # the opposite direction: that report needs "did the minimap paint the
+  # *themed background*, not raw white" rather than "did it paint any
+  # non-blank pixels at all" — still an `expect_capture_nonblank`-shaped
+  # (or stricter, colour-comparing) primitive this driver doesn't have.
+  # See `docs/PENDING_QUADRAUI_ISSUES.md`'s matching #1676 entry and
+  # `src/win/mod.rs::win_driver_tests::
+  # minimap_strip_background_matches_theme_once_a_surface_is_attached_1676`
+  # for the Tier-1 coverage this repo *can* add without that primitive.
+  #
+  # vimcode#1696 (editor text not inset by the minimap strip; tab-strip
+  # overflow-action toolbar clipped off the window's right edge) hits the
+  # identical driver-vocabulary wall from a third direction: its own
+  # acceptance bar ("no glyph pixels painted within the minimap strip's
+  # x-range"; "the tab-strip toolbar's right edge is strictly inside the
+  # window") needs exactly the same colour/content-aware pixel primitive
+  # this comment already names as missing, plus a known-long buffer line
+  # to probe against (this spec's seed file is "small", per this file's own
+  # header, not "has a line wide enough to overflow the pane"). See
+  # `docs/PENDING_QUADRAUI_ISSUES.md`'s two matching #1696 entries — both
+  # root-caused to quadraui-side gaps (`Editor`/`EditorPaintOptions` has no
+  # way to reserve trailing content width independently of the scrollbar
+  # anchor; `TabBar::layout`'s right segments have no outer-edge inset,
+  # unlike `StatusBar`'s `PIXEL_EDGE_INSET`) — and `src/render.rs::render::
+  # tests::to_q_editor_does_not_narrow_the_viewport_for_the_minimap_strip_
+  # 1696` for the backend-neutral (runs on any host, no driver needed) test
+  # that pins the first gap numerically.
+
+  # quadraui#1232 again — the close button's click is swallowed the same
+  # way the menu row's is.
+  #
+  # UPDATE (vimcode#1656): NOT quadraui#1232 any more (that fixed the menu
+  # row's equivalent click) — this is the follow-up bug vimcode#1656 found
+  # and `docs/PENDING_QUADRAUI_ISSUES.md` drafts: `WinBackend::
+  # register_status_bar_segment_zones` registers the close button's
+  # *bar-local* bounds as if they were absolute, so the real click still
+  # lands as HTCAPTION. Left unmodified below — still this issue's real-
+  # click acceptance coverage. vimcode#1656 does NOT add a second
+  # click/expect_closed pair at the remeasured 994 centre: a hit-test is
+  # side-effect-free and safe to duplicate (see
+  # `hit-test-close-button-remeasured-1656` above), but a second real click
+  # is not — once this bug is fixed upstream and the click below genuinely
+  # closes the window, a second click step targeting an already-closed
+  # window would error the driver rather than cleanly pass or fail. The
+  # hit-test sweep in this file's header comment already confirms x=978
+  # (this existing step's own coordinate) sits inside the same
+  # misclassified HTCAPTION strip as the remeasured 994 centre, so this one
+  # step is already this issue's real-click acceptance coverage without
+  # needing a duplicate.
+  #
+  # #1657 revisits that last call: it DOES add the second click/
+  # expect_closed pair at 994 below, because this issue's remeasurement
+  # makes x=978 a coordinate that is expected to *miss* the real button
+  # rather than hit a misclassified one — so the `-1232` pair above is
+  # expected to leave the window open, and the `-1657` pair is reached
+  # with a live window. If the upstream fix ever makes the `-1232` click
+  # genuinely close the window, the `-1657` pair below becomes the
+  # already-closed-window case #1656 warned about and should be revisited
+  # then (a deliberate future call, not a silent edit now).
+  - type: click
+    id: click-close-button-1232
+    x: 978
+    y: 16
+  - type: expect_closed
+    id: close-button-actually-closes-window-1232
+    timeout_ms: 5000
+
+  # #1657: corrected, additive re-run of the close-button click above at
+  # the real close-button x (see this file's "#1657" header section) —
+  # still UNRESOLVED whether the corrected x alone makes the click land;
+  # re-confirm on real hardware before reading a future PASS here as proof
+  # it does. Only reached if the `-1232` step above left the window open
+  # (its own expectation is that it will, since x=978 misses the real
+  # button).
+  - type: click
+    id: click-close-button-1657
+    x: 994
+    y: 16
+  - type: expect_closed
+    id: close-button-actually-closes-window-1657
+    timeout_ms: 5000
+
+  # #1661: the blank strip between the last menu label and the
+  # caption-button region — see this file's "#1661" header section for the
+  # full real-hardware sweep this is derived from. A representative
+  # subsample of the swept x=350..820 range (deliberately excluding x=540,
+  # the one point the sweep found already correct — see the header
+  # section), evenly spaced the same way the menu-row `-1232`/`-1657`
+  # steps above are. Expected RED today: the real sweep found `HTCLIENT`
+  # at every one of these x values instead of the `HTCAPTION` a
+  # mouse-draggable title bar needs.
+  - type: expect_hit
+    id: hit-test-blank-strip-a-1661
+    x: 350
+    y: 16
+    ht: HTCAPTION
+  - type: expect_hit
+    id: hit-test-blank-strip-b-1661
+    x: 450
+    y: 16
+    ht: HTCAPTION
+  - type: expect_hit
+    id: hit-test-blank-strip-c-1661
+    x: 600
+    y: 16
+    ht: HTCAPTION
+  - type: expect_hit
+    id: hit-test-blank-strip-d-1661
+    x: 700
+    y: 16
+    ht: HTCAPTION
+  - type: expect_hit
+    id: hit-test-blank-strip-e-1661
+    x: 750
+    y: 16
+    ht: HTCAPTION
+  - type: expect_hit
+    id: hit-test-blank-strip-f-1661
+    x: 820
+    y: 16
+    ht: HTCAPTION

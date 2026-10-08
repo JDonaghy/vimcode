@@ -85,17 +85,22 @@ Git subprocess integration. All git operations via `Command` spawning.
 - `blame_line(repo, file, line)` — single-line blame
 - `log_file(repo, file, limit)` — file history
 
-## plugin.rs — 1,915 lines
-Lua 5.4 plugin manager (mlua 0.9).
+## plugin.rs — 2,523 lines
+Lua 5.4 plugin manager (mlua 0.9). Two API tiers: legacy queued `vimcode.buf.*`
+(snapshot in / queue out) and immediate `vimcode.buffer.*` / `vimcode.window.*`
+(live `&mut Engine`, #1214) — see the module doc for conventions.
 ### Types
 - `PluginManager` — Lua VM, loaded plugins, registered commands/keymaps/hooks
 - `LoadedPlugin` — plugin name + path
-- `PluginCallContext` — input/output struct for plugin dispatch (avoids double-borrow)
+- `PluginCallContext` — input/output struct for legacy queued dispatch (avoids double-borrow)
+- `EngineLoan<'a>` — RAII loan of `&mut Engine` to Lua for one dispatch; documents/asserts the borrow discipline
 ### Key Functions
 - `PluginManager::new()` — create Lua VM, install `vimcode.*` API
 - `load_plugins_dir(dir, disabled)` — scan and load plugins
 - `call_command(name, args, ctx)` / `call_event(event, ctx)` / `call_keymap(mode, key, ctx)` — dispatch
 - `setup_vimcode_api(lua)` — register `vimcode.*` Lua globals
+- `setup_live_api(lua, vimcode)` — register the immediate `vimcode.buffer.*` / `vimcode.window.*` tables
+- `with_live_engine(f)` — reborrow the loaned engine (refuses nesting)
 
 ## buffer_manager.rs — 1,571 lines
 Buffer storage and management.

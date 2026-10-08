@@ -3322,9 +3322,14 @@ impl Engine {
         if self.view().cursor.line >= new_num_lines && new_num_lines > 0 {
             self.view_mut().cursor.line = new_num_lines - 1;
         }
-        // Vim leaves the cursor on the same column it was on (clamped to the
-        // resulting line's length) — it does NOT reset to column 0 or to the
-        // first non-blank character.
+        // Neovim (this project's documented oracle, `reference: nvim` in
+        // tests/smoke-spec/catalogue.yaml) leaves the cursor on the same
+        // column it was on (clamped to the resulting line's length) — it
+        // does NOT reset to column 0 or to the first non-blank character.
+        // This is Neovim-specific: real Vim 9.1 *does* reset to column 0
+        // here (`'startofline'` defaults on in Vim, off in Neovim — see
+        // #1796 and `test_nvim_dd_preserves_column_not_reset_to_zero_1796`
+        // in src/core/engine/tests.rs for the oracle verification of both).
         self.clamp_cursor_col();
     }
 
@@ -4076,9 +4081,9 @@ impl Engine {
         if prev_end > start {
             self.delete_with_undo(line_char + start, line_char + prev_end);
         }
-        let candidate = self.completion_candidates[idx].clone();
+        let candidate = self.completion_candidates[idx].insert_text.clone();
         self.insert_with_undo(line_char + start, &candidate);
-        self.view_mut().cursor.col = start + candidate.len();
+        self.view_mut().cursor.col = start + candidate.chars().count();
     }
 
     // ─── <C-x> completion submode (`:h i_CTRL-X`, #1160) ───────────────────
@@ -4113,7 +4118,10 @@ impl Engine {
             return;
         }
         self.completion_start_col = start_col;
-        self.completion_candidates = candidates;
+        self.completion_candidates = candidates
+            .into_iter()
+            .map(CompletionCandidate::plain)
+            .collect();
         let idx = if next {
             0
         } else {
@@ -4268,6 +4276,12 @@ impl Engine {
         self.completion_display_only = false;
         self.completion_filter_prefix.clear();
         self.lsp_pending_completion = None;
+        // #1805: bump the generation so a plugin source's async
+        // `vimcode.completion.complete` delivered against the request
+        // issued for this (now-dismissed) popup is recognized as stale and
+        // dropped by `plugin_api_completion_complete`'s generation check,
+        // instead of silently re-opening a popup the user already closed.
+        self.completion_generation = self.completion_generation.wrapping_add(1);
     }
 
     /// Trigger completion popup based on current cursor prefix.
@@ -4286,7 +4300,20 @@ impl Engine {
     /// scan or LSP request happens to return a smaller set (#467).
     pub(crate) fn trigger_completion(&mut self, manual: bool) {
         let (prefix, _) = self.completion_prefix_at_cursor();
-        if prefix.is_empty() && !manual {
+        let trigger_char = self.completion_trigger_char();
+        // #1805: a `vimcode.completion.register` source that declared this
+        // character among its `trigger_chars` (e.g. `.` for member access)
+        // can open the popup on an otherwise-empty prefix even on an
+        // auto-trigger, same as a manual `<C-Space>` would. Checked before
+        // the early-dismiss below so that case isn't swallowed by it.
+        let plugin_trigger_match = prefix.is_empty()
+            && !manual
+            && trigger_char.is_some_and(|c| {
+                self.plugin_manager
+                    .as_ref()
+                    .is_some_and(|pm| pm.completion_source_has_trigger_char(c))
+            });
+        if prefix.is_empty() && !manual && !plugin_trigger_match {
             self.dismiss_completion();
             return;
         }
@@ -4304,19 +4331,32 @@ impl Engine {
             // previous one; otherwise start fresh.
             if extends {
                 self.completion_candidates
-                    .retain(|c| c.starts_with(&prefix));
+                    .retain(|c| c.insert_text.starts_with(&prefix));
             } else {
                 self.completion_candidates.clear();
             }
             // Use a fast nearby-lines scan instead of scanning the entire buffer.
             // For a 15K-line file, full scan takes 270ms; nearby scan is ~1ms.
             for word in self.word_completions_nearby(&prefix) {
-                if !self.completion_candidates.iter().any(|c| c == &word) {
-                    self.completion_candidates.push(word);
+                if !self
+                    .completion_candidates
+                    .iter()
+                    .any(|c| c.insert_text == word)
+                {
+                    self.completion_candidates
+                        .push(CompletionCandidate::plain(word));
                 }
             }
+            // `completion_start_col` must be derived from the prefix length
+            // regardless of whether the buffer-word scan above found
+            // anything (#1805 review): a plugin source can still merge in
+            // items below, or an LSP/async response can arrive later, and
+            // both anchor their delete/insert on this column via
+            // `apply_completion_candidate`. Leaving it at a stale value
+            // from a prior trigger (its default is `0`) deletes/inserts at
+            // the wrong offset once a plugin-only popup is accepted.
+            self.completion_start_col = self.view().cursor.col - prefix.chars().count();
             if !self.completion_candidates.is_empty() {
-                self.completion_start_col = self.view().cursor.col - prefix.chars().count();
                 self.completion_idx = Some(0);
                 self.completion_display_only = true;
             } else {
@@ -4324,9 +4364,32 @@ impl Engine {
                 self.completion_display_only = false;
             }
         }
-        self.completion_filter_prefix = prefix;
+        self.completion_filter_prefix = prefix.clone();
         // Async LSP source — response will update candidates if popup is still active
         self.lsp_request_completion();
+        // Plugin sources (#1805) — synchronous results merge immediately;
+        // async ones arrive later via `vimcode.completion.complete`. Pass
+        // the real `manual` flag, not `manual || plugin_trigger_match`:
+        // `plugin_trigger_match` only says *some* source's trigger char
+        // fired, which should let *that* source through on an empty
+        // prefix (via its own `trigger_chars` check inside
+        // `completion_sources_matching`) — it must not be conflated with
+        // `manual`, which lets *every* in-scope source through regardless
+        // of its own `trigger_chars` (review finding).
+        self.plugin_request_completions(&prefix, manual, trigger_char);
+    }
+
+    /// The character immediately before the current completion prefix —
+    /// e.g. `.` right after typing it, while the prefix itself is still
+    /// empty (`.` isn't a word character). Used only to gate a `vimcode.
+    /// completion.register` source's declared `trigger_chars` (#1805);
+    /// buffer-word/LSP completion don't consult it.
+    pub(crate) fn completion_trigger_char(&self) -> Option<char> {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let chars: Vec<char> = self.buffer().content.line(line).chars().collect();
+        let col = col.min(chars.len());
+        col.checked_sub(1).and_then(|i| chars.get(i).copied())
     }
 
     /// True when an insert-mode keypress would be consumed by completion
@@ -7638,18 +7701,26 @@ impl Engine {
     }
 
     /// Land the cursor on `line` for `G`/`gg`/`H`/`M`/`L` — Vim's
-    /// `'startofline'` option names all five. `curswant` is already `None`
-    /// here (these keys aren't in `update_curswant_for_key`'s preserved
-    /// list), so unlike the `<C-d>`-family helper
-    /// (`land_vertical_scroll_cursor`) there is no remembered column to fall
-    /// back on when the option is off — the baseline behavior is simply
-    /// "leave the actual column alone, clamped to the new line".
+    /// `'startofline'` option names all five, and (#1772) they are
+    /// `curswant`-preserving exactly like the `<C-d>` family when the
+    /// option is off: `update_curswant_for_key` keeps `self.curswant` alive
+    /// across these keys (and across `gg`'s own two-keystroke sequence), so
+    /// bouncing through a short line and back to a long one restores the
+    /// original desired column instead of staying wherever the short line
+    /// clamped it to — confirmed against the real `nvim --headless` oracle
+    /// (`"word:gg after G loses curswant through a short line (nosol)"` in
+    /// `tests/nvim_conformance.rs`). This mirrors
+    /// `land_vertical_scroll_cursor` exactly; the only difference is the
+    /// `'startofline'`-on column (first non-blank) also becomes the new
+    /// `curswant`, same as that helper does.
     pub(crate) fn land_line_jump_cursor(&mut self, line: usize) {
         if self.settings.startofline {
             self.move_cursor_to_first_non_blank(line);
+            self.curswant = Some(self.view().cursor.col);
         } else {
+            let want = self.curswant();
             self.view_mut().cursor.line = line;
-            self.clamp_cursor_col();
+            self.apply_curswant(want);
         }
     }
 }

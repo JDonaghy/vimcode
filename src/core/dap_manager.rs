@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use super::dap::DapServer;
 use super::extensions;
 use super::extensions::Platform;
+#[cfg(not(target_os = "windows"))]
 use super::tool_acquire::Arch;
 
 // ---------------------------------------------------------------------------
@@ -48,9 +49,14 @@ static ADAPTER_REGISTRY: &[AdapterInfo] = &[
     AdapterInfo {
         name: "delve",
         binary: "dlv",
-        args: &["dap"],
+        // `dlv dap` does NOT speak DAP over stdio — it always starts a TCP
+        // server and prints "DAP server listening at: host:port" to stdout
+        // (verified #1716). We pick the port ourselves (like codelldb) and
+        // pass it via `--listen host:0`; `spawn_tcp` substitutes the real
+        // port before connecting, so we never have to parse adapter stdout.
+        args: &["dap", "--listen", "127.0.0.1:0"],
         languages: &["go"],
-        use_tcp: false,
+        use_tcp: true,
     },
     AdapterInfo {
         name: "js-debug",
@@ -173,6 +179,56 @@ pub fn resolve_binary(name: &str) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Built-in adapter install prerequisites (#1719)
+// ---------------------------------------------------------------------------
+
+/// System binaries the **built-in** install branch of `install_cmd_for_
+/// adapter` shells out to, for a given adapter and target platform.
+///
+/// These are independent of any extension manifest's `dap.dependencies`
+/// (new in #1719, for registry-declared adapters) — codelldb, debugpy,
+/// delve, and netcoredbg ship their installers *inside vimcode itself*
+/// (the `match adapter_name` arm below), so nothing in the registry ever
+/// gets a chance to declare their prerequisites. Before #1719 none of this
+/// was checked anywhere: a DAP install just failed inside the terminal pane
+/// with an opaque "command not found" for `go`/`python3`/`curl`/`unzip`.
+/// `Engine::ext_install_from_registry_with_runtime_check` calls this
+/// *before* building the install command, same treatment `LspConfig::
+/// dependencies` already got for LSP servers.
+pub fn adapter_dependencies(adapter_name: &str, platform: Platform) -> &'static [&'static str] {
+    match adapter_name {
+        // `codelldb_install_cmd_for` (Unix): `curl` downloads the VSIX,
+        // `unzip` unpacks it. `codelldb_install_cmd_windows`: `curl.exe`
+        // plus PowerShell's built-in `Expand-Archive` — no external unzip.
+        "codelldb" => {
+            if matches!(platform, Platform::Windows) {
+                &["curl"]
+            } else {
+                &["curl", "unzip"]
+            }
+        }
+        // `install_cmd_for_adapter`'s "debugpy" arm runs
+        // `{python3} -m venv ... && pip install debugpy` against whatever
+        // `find_python_binary()` resolved, falling back to the bare name
+        // `python3` when nothing resolved yet — so `python3` itself must
+        // be present for that fallback to have any chance of working.
+        "debugpy" => &["python3"],
+        // `go install github.com/go-delve/delve/cmd/dlv@latest`.
+        "delve" => &["go"],
+        // `netcoredbg_install_cmd_unix_for`: `curl` + `tar -xzf`.
+        // `netcoredbg_install_cmd_windows`: `curl.exe` + `Expand-Archive`.
+        "netcoredbg" => {
+            if matches!(platform, Platform::Windows) {
+                &["curl"]
+            } else {
+                &["curl", "tar"]
+            }
+        }
+        _ => &[],
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Install commands
 // ---------------------------------------------------------------------------
 
@@ -182,7 +238,13 @@ pub fn resolve_binary(name: &str) -> Option<PathBuf> {
 /// built-in install logic.  Returns `None` for adapters that require manual
 /// installation.
 ///
-/// On Unix the command is run via `sh -c`; on Windows via `cmd /C`.
+/// Run inside a visible terminal pane (`terminal_run_command`): `sh` on Unix,
+/// and on Windows `powershell.exe` (Windows PowerShell 5.1, the pane's
+/// `default_shell()` — **not** `cmd /C`, despite what this comment used to
+/// say). #1715: every string this function can return must therefore be
+/// valid PowerShell 5.1 on Windows, not `cmd.exe` batch syntax — no `&&`
+/// statement separators (a PS5.1 parse error) and no `%VAR%` expansions
+/// (PowerShell never substitutes these; use `$env:VAR`).
 pub fn install_cmd_for_adapter(
     adapter_name: &str,
     ext_manifests: &[extensions::ExtensionManifest],
@@ -218,8 +280,13 @@ pub fn install_cmd_for_adapter(
             let venv_python = format!("{venv}\\Scripts\\python");
             #[cfg(not(target_os = "windows"))]
             let venv_python = format!("{venv}/bin/python");
+            // `;` not `&&` (#1715): PowerShell 5.1 — the Windows install
+            // pane's shell — has no `&&` statement separator at all, and
+            // `;` already works on both it and POSIX `sh` (same convention
+            // `lsp_ops.rs` uses when it joins several adapters' install
+            // commands together).
             Some(format!(
-                "{system_python} -m venv {venv} && {venv_python} -m pip install debugpy"
+                "{system_python} -m venv {venv} ; {venv_python} -m pip install debugpy"
             ))
         }
         "delve" => Some("go install github.com/go-delve/delve/cmd/dlv@latest".to_string()),
@@ -238,16 +305,38 @@ pub fn install_cmd_for_adapter(
 
 #[cfg(target_os = "windows")]
 fn codelldb_install_cmd() -> String {
-    // cmd /C runs this; inner PowerShell uses single-quoted strings to avoid cmd
-    // escaping issues.  codelldb only ships x64 for Windows currently.
+    codelldb_install_cmd_windows()
+}
+
+/// Windows codelldb install command, as plain PowerShell 5.1 (#1715).
+///
+/// `default_shell()` on Windows is `powershell.exe` — Windows PowerShell
+/// 5.1, never `cmd.exe` — and `terminal_run_command` embeds this string
+/// verbatim into a `.ps1` file that shell runs directly (`terminal_ops::
+/// build_terminal_install_wrapper`). There is no `cmd /C` anywhere in that
+/// path, so this must be valid PowerShell 5.1 on its own, not a `cmd.exe`
+/// one-liner with a nested `powershell -Command` escape hatch (the
+/// previous shape of this function): PowerShell 5.1 has no `&&` statement
+/// separator at all ("The token '&&' is not a valid statement separator in
+/// this version") — statements are joined with `;` instead, same
+/// convention `lsp_ops.rs` already uses — and `%TEMP%` is a `cmd.exe`-only
+/// expansion that PowerShell never substitutes, so every reference uses
+/// `$env:TEMP` instead. codelldb only ships x64 for Windows currently.
+///
+/// Deliberately **not** `#[cfg(windows)]`: it's a pure string builder, so
+/// keeping it compiled on every target lets the Linux test suite — the one
+/// CI actually runs on every PR, per `build-windows-tui`'s own comment
+/// about never running `cargo test` on Windows — assert on its exact
+/// contents. Only the real dispatch to it, `codelldb_install_cmd()` above,
+/// is Windows-only.
+fn codelldb_install_cmd_windows() -> String {
     concat!(
         "curl.exe -fSL https://github.com/vadimcn/codelldb/releases/latest/download/",
-        "codelldb-win32-x64.vsix -o %TEMP%\\vimcode-codelldb.vsix",
-        " && powershell -NoProfile -Command \"",
-        "Expand-Archive $env:TEMP\\vimcode-codelldb.vsix $env:TEMP\\vimcode-codelldb -Force;",
-        "$d=$env:USERPROFILE+'\\.local\\bin';",
-        "New-Item -ItemType Directory -Force $d|Out-Null;",
-        "Copy-Item $env:TEMP\\vimcode-codelldb\\extension\\adapter\\codelldb.exe $d\"",
+        "codelldb-win32-x64.vsix -o $env:TEMP\\vimcode-codelldb.vsix; ",
+        "Expand-Archive $env:TEMP\\vimcode-codelldb.vsix $env:TEMP\\vimcode-codelldb -Force; ",
+        "$d = $env:USERPROFILE + '\\.local\\bin'; ",
+        "New-Item -ItemType Directory -Force $d | Out-Null; ",
+        "Copy-Item $env:TEMP\\vimcode-codelldb\\extension\\adapter\\codelldb.exe $d",
     )
     .to_string()
 }
@@ -311,17 +400,83 @@ fn codelldb_install_cmd_for(platform: Platform, arch: Arch) -> String {
     )
 }
 
+#[cfg(target_os = "windows")]
 fn netcoredbg_install_cmd() -> String {
+    netcoredbg_install_cmd_windows()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn netcoredbg_install_cmd() -> String {
+    netcoredbg_install_cmd_unix()
+}
+
+/// Windows netcoredbg install command, as plain PowerShell 5.1 (#1715). No
+/// Windows branch existed before this — the install pane just ran the Unix
+/// `curl … && tar … && cp …` chain verbatim as PowerShell, which fails at
+/// parse time on the first `&&` — so C# debugging could never be installed
+/// on Windows at all. See `codelldb_install_cmd_windows`'s doc comment for
+/// why plain PowerShell (`;`, `$env:TEMP`) rather than `cmd.exe` syntax.
+/// netcoredbg's Windows release asset is `netcoredbg-win64.zip`
+/// (https://github.com/Samsung/netcoredbg/releases), which — like the
+/// Linux/macOS tarballs below — unpacks to a `netcoredbg/` subdirectory
+/// containing the binary, here `netcoredbg.exe`.
+///
+/// Deliberately **not** `#[cfg(windows)]`, same testability rationale as
+/// `codelldb_install_cmd_windows`.
+fn netcoredbg_install_cmd_windows() -> String {
+    concat!(
+        "curl.exe -fSL https://github.com/Samsung/netcoredbg/releases/latest/download/",
+        "netcoredbg-win64.zip -o $env:TEMP\\vimcode-netcoredbg.zip; ",
+        "Expand-Archive $env:TEMP\\vimcode-netcoredbg.zip $env:TEMP\\vimcode-netcoredbg -Force; ",
+        "$d = $env:USERPROFILE + '\\.local\\bin'; ",
+        "New-Item -ItemType Directory -Force $d | Out-Null; ",
+        "Copy-Item $env:TEMP\\vimcode-netcoredbg\\netcoredbg\\netcoredbg.exe $d",
+    )
+    .to_string()
+}
+
+/// Unix (Linux/macOS) netcoredbg install command.
+///
+/// #1717: this used to `cp` only the `netcoredbg` binary out of the
+/// unpacked tarball, leaving `libdbgshim.so` and the managed `*.dll`
+/// support files behind. netcoredbg resolves `libdbgshim.so` relative to
+/// its own executable's directory, so a binary-only copy dies immediately
+/// with `dlopen() error: …/libdbgshim.so: cannot open shared object file`
+/// the moment it's launched. Fixed by copying the **whole** unpacked
+/// `netcoredbg/` directory (`cp -r … /.`) into `~/.local/bin`, so every
+/// support file the binary needs lands right next to it — `resolve_binary`
+/// (via `extra_tool_dirs`) already probes `~/.local/bin`, so no change is
+/// needed on the resolution side, only on what install actually places
+/// there.
+#[cfg(not(target_os = "windows"))]
+fn netcoredbg_install_cmd_unix() -> String {
+    netcoredbg_install_cmd_unix_for(Platform::host(), Arch::host())
+}
+
+/// Build the Unix netcoredbg install command for an explicit
+/// platform/arch rather than always resolving against the host (#1395-style
+/// testable seam, matching `codelldb_install_cmd_for` above).
+#[cfg(not(target_os = "windows"))]
+fn netcoredbg_install_cmd_unix_for(platform: Platform, arch: Arch) -> String {
     // netcoredbg releases: https://github.com/Samsung/netcoredbg/releases
-    let arch = if std::env::consts::ARCH == "aarch64" {
-        "arm64"
-    } else {
-        "amd64"
-    };
-    let os = if std::env::consts::OS == "macos" {
+    //
+    // #1717: Samsung publishes `netcoredbg-osx-amd64.tar.gz` and
+    // `netcoredbg-linux-{amd64,arm64}.tar.gz` — there is NO
+    // `netcoredbg-osx-arm64.tar.gz`. Asking for it 404s outright on Apple
+    // Silicon. Until/unless Samsung ships a native arm64 macOS build, fall
+    // back to the amd64 build, which runs fine under Rosetta 2.
+    let os = if platform == Platform::MacOS {
         "osx"
     } else {
         "linux"
+    };
+    let arch = if platform == Platform::MacOS {
+        "amd64"
+    } else {
+        match arch {
+            Arch::Arm64 => "arm64",
+            Arch::Amd64 => "amd64",
+        }
     };
     format!(
         "curl -fSL 'https://github.com/Samsung/netcoredbg/releases/latest/download/\
@@ -329,7 +484,7 @@ fn netcoredbg_install_cmd() -> String {
          mkdir -p /tmp/vimcode-netcoredbg && \
          tar -xzf /tmp/vimcode-netcoredbg.tar.gz -C /tmp/vimcode-netcoredbg && \
          mkdir -p \"$HOME/.local/bin\" && \
-         cp /tmp/vimcode-netcoredbg/netcoredbg/netcoredbg \"$HOME/.local/bin/netcoredbg\" && \
+         cp -r /tmp/vimcode-netcoredbg/netcoredbg/. \"$HOME/.local/bin/\" && \
          chmod +x \"$HOME/.local/bin/netcoredbg\""
     )
 }
@@ -787,6 +942,18 @@ impl DapManager {
     /// then falls back to the built-in `ADAPTER_REGISTRY`.
     /// `name_or_lang` may be an adapter name (e.g. `"codelldb"`) or a language
     /// identifier (e.g. `"rust"`).
+    ///
+    /// #1716 cross-repo note: the manifest branch below takes priority over
+    /// `ADAPTER_REGISTRY` whenever `ext_manifests` has a non-empty-binary
+    /// entry for this language — and callers pass `ext_available_manifests()`
+    /// (every manifest in the cached registry), not just installed ones. So
+    /// fixing `ADAPTER_REGISTRY`'s `delve` entry here only helps users whose
+    /// cached registry has no `go` entry at all. As of this writing,
+    /// `vimcode-ext`'s live `registry.json` still ships `go.dap.transport =
+    /// "stdio"` / `args = ["dap"]` for delve, which is the same bug this
+    /// module's registry just fixed — so most real users still hit it via
+    /// the manifest branch until that registry is updated to match (tracked
+    /// as a cross-repo follow-up on #1716).
     pub fn start_adapter(
         &mut self,
         name_or_lang: &str,
@@ -924,6 +1091,59 @@ impl Default for DapManager {
 mod tests {
     use super::*;
 
+    // ── #1719: built-in adapter install prerequisites ──────────────────
+
+    #[test]
+    fn adapter_dependencies_codelldb_needs_curl_and_unzip_on_unix() {
+        let deps = adapter_dependencies("codelldb", Platform::Linux);
+        assert_eq!(deps, &["curl", "unzip"]);
+        let deps = adapter_dependencies("codelldb", Platform::MacOS);
+        assert_eq!(deps, &["curl", "unzip"]);
+    }
+
+    #[test]
+    fn adapter_dependencies_codelldb_needs_only_curl_on_windows() {
+        // `Expand-Archive` is a built-in PowerShell cmdlet — no external
+        // `unzip` is ever invoked on Windows (`codelldb_install_cmd_windows`).
+        assert_eq!(
+            adapter_dependencies("codelldb", Platform::Windows),
+            &["curl"]
+        );
+    }
+
+    #[test]
+    fn adapter_dependencies_netcoredbg_needs_curl_and_tar_on_unix() {
+        let deps = adapter_dependencies("netcoredbg", Platform::Linux);
+        assert_eq!(deps, &["curl", "tar"]);
+    }
+
+    #[test]
+    fn adapter_dependencies_netcoredbg_needs_only_curl_on_windows() {
+        assert_eq!(
+            adapter_dependencies("netcoredbg", Platform::Windows),
+            &["curl"]
+        );
+    }
+
+    #[test]
+    fn adapter_dependencies_debugpy_needs_python3() {
+        assert_eq!(
+            adapter_dependencies("debugpy", Platform::Linux),
+            &["python3"]
+        );
+    }
+
+    #[test]
+    fn adapter_dependencies_delve_needs_go() {
+        assert_eq!(adapter_dependencies("delve", Platform::Linux), &["go"]);
+    }
+
+    #[test]
+    fn adapter_dependencies_unknown_adapter_has_none() {
+        assert!(adapter_dependencies("js-debug", Platform::Linux).is_empty());
+        assert!(adapter_dependencies("totally-unknown", Platform::Linux).is_empty());
+    }
+
     #[test]
     fn test_dap_adapter_registry_rust() {
         let info = DapManager::adapter_for_language("rust");
@@ -969,6 +1189,97 @@ mod tests {
     fn test_dap_resolve_binary_not_found() {
         let result = resolve_binary("__vimcode_nonexistent_dap_binary_xyzzy__");
         assert!(result.is_none(), "nonexistent binary should return None");
+    }
+
+    /// #1715: fail-closed check that a string the Windows install pane will
+    /// type into `powershell.exe` (Windows PowerShell 5.1, never `cmd.exe`
+    /// — `default_shell()`/`terminal_run_command`) can't possibly hit the
+    /// two concrete failures the bugbash found:
+    /// - `&&` — not a valid PowerShell 5.1 statement separator at all (a
+    ///   parse-time error, "The token '&&' is not a valid statement
+    ///   separator in this version"), unlike POSIX `sh` where it's fine.
+    /// - `%SOMETHING%` — a `cmd.exe`-only expansion; PowerShell never
+    ///   substitutes it, so a literal `%TEMP%\foo` reaches `curl.exe` as
+    ///   that exact literal path string instead of a real temp directory.
+    ///
+    /// This is the acceptance bar's "at minimum" fallback (a real PS5.1
+    /// parser only exists on a Windows host, and `cargo test` never runs
+    /// there in CI — see `build-windows-tui`'s own header comment) rather
+    /// than a full grammar check, but it is exactly the string-shaped bug
+    /// both `codelldb_install_cmd_windows` and (before this fix)
+    /// `netcoredbg_install_cmd`'s missing Windows branch shipped.
+    fn assert_powershell5_safe(label: &str, cmd: &str) {
+        assert!(
+            !cmd.contains("&&"),
+            "{label}: PowerShell 5.1 has no `&&` statement separator — use `;`: {cmd}"
+        );
+        // A crude `%VAR%` detector: cmd.exe-style expansions are a `%`,
+        // some non-`%` text, then another `%` — reject that shape rather
+        // than literal bare `%` (e.g. a URL-encoded byte) to avoid false
+        // positives.
+        let mut rest = cmd;
+        while let Some(open) = rest.find('%') {
+            let after_open = &rest[open + 1..];
+            if let Some(close) = after_open.find('%') {
+                let candidate = &after_open[..close];
+                assert!(
+                    candidate.is_empty() || candidate.contains(char::is_whitespace),
+                    "{label}: looks like a cmd.exe `%VAR%` expansion \
+                     (PowerShell never substitutes these — use $env:VAR \
+                     instead): %{candidate}% in {cmd}"
+                );
+                rest = &after_open[close + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn test_codelldb_install_cmd_windows_is_powershell5_safe() {
+        assert_powershell5_safe("codelldb", &codelldb_install_cmd_windows());
+    }
+
+    #[test]
+    fn test_netcoredbg_install_cmd_windows_is_powershell5_safe() {
+        assert_powershell5_safe("netcoredbg", &netcoredbg_install_cmd_windows());
+    }
+
+    #[test]
+    fn test_debugpy_install_cmd_is_powershell5_safe() {
+        // Unlike the codelldb/netcoredbg builders above, debugpy's install
+        // command doesn't have a separately callable Windows-only builder
+        // (its Windows-vs-Unix difference is just the venv `python` path,
+        // behind a `#[cfg(target_os = "windows")]` on one `let` binding) —
+        // but the `&&` joiner this test guards against was never behind
+        // that cfg at all, so it's reachable here on every platform.
+        let cmd = install_cmd_for_adapter("debugpy", &[]).expect("debugpy should have install cmd");
+        assert_powershell5_safe("debugpy", &cmd);
+    }
+
+    /// #1715: every string the *Windows* install pane can actually type
+    /// into `powershell.exe` for a built-in adapter must be PowerShell-5.1
+    /// safe — not just the ones the bugbash happened to hit — so a future
+    /// adapter addition can't reintroduce the same bug silently. Checks the
+    /// Windows-specific builders directly (`codelldb_install_cmd_windows`,
+    /// `netcoredbg_install_cmd_windows`) rather than going through
+    /// `install_cmd_for_adapter`/`codelldb_install_cmd`/
+    /// `netcoredbg_install_cmd`, since *those* dispatch on the host OS at
+    /// compile time and would hand back the Unix variant's command (which
+    /// legitimately uses `&&` — it runs under `sh`, not PowerShell) on a
+    /// non-Windows test run. `delve`'s single `go install …` line and
+    /// `debugpy`'s command (fixed above to use `;` unconditionally, not
+    /// just on Windows) have no OS-conditional builder to call separately,
+    /// so they're covered through `install_cmd_for_adapter` directly.
+    #[test]
+    fn test_all_builtin_windows_dap_install_cmds_are_powershell5_safe() {
+        assert_powershell5_safe("codelldb (windows)", &codelldb_install_cmd_windows());
+        assert_powershell5_safe("netcoredbg (windows)", &netcoredbg_install_cmd_windows());
+        for adapter in ["delve", "debugpy"] {
+            let cmd = install_cmd_for_adapter(adapter, &[])
+                .unwrap_or_else(|| panic!("{adapter} should have a built-in install command"));
+            assert_powershell5_safe(adapter, &cmd);
+        }
     }
 
     #[test]
@@ -1029,6 +1340,118 @@ mod tests {
             cmd.contains("codelldb-linux-x64.vsix"),
             "linux/amd64 install cmd should reference the linux-x64 asset: {cmd}"
         );
+    }
+
+    /// #1717 bug 1: unpacking only the binary left `libdbgshim.so` (and the
+    /// managed `*.dll` support files) behind, so the installed netcoredbg
+    /// died at launch with `dlopen() error: …/libdbgshim.so: cannot open
+    /// shared object file`. The fix must copy the *whole* unpacked
+    /// `netcoredbg/` directory into `~/.local/bin`, not just the binary —
+    /// confirm the install command actually says so (`cp -r … netcoredbg/.`),
+    /// and that it no longer contains the old binary-only `cp` of just the
+    /// `netcoredbg` file. This test was observed RED against unfixed
+    /// `develop`, which only emitted
+    /// `cp .../netcoredbg/netcoredbg "$HOME/.local/bin/netcoredbg"`.
+    #[test]
+    fn test_netcoredbg_install_cmd_copies_whole_directory() {
+        let cmd = netcoredbg_install_cmd_unix_for(Platform::Linux, Arch::Amd64);
+        assert!(
+            cmd.contains("cp -r /tmp/vimcode-netcoredbg/netcoredbg/. \"$HOME/.local/bin/\""),
+            "install cmd must recursively copy the whole unpacked netcoredbg/ \
+             directory (binary + libdbgshim.so + managed dlls) into \
+             ~/.local/bin, not just the netcoredbg binary: {cmd}"
+        );
+        assert!(
+            !cmd.contains("cp /tmp/vimcode-netcoredbg/netcoredbg/netcoredbg "),
+            "install cmd must not go back to copying only the netcoredbg \
+             binary (the #1717 bug): {cmd}"
+        );
+    }
+
+    /// #1717 bug 2: Samsung does not publish `netcoredbg-osx-arm64.tar.gz`
+    /// — only `netcoredbg-osx-amd64.tar.gz` — so asking for the arm64 asset
+    /// 404s outright on Apple Silicon. Apple Silicon must fall back to the
+    /// amd64 build (it runs fine under Rosetta 2) instead of 404ing.
+    #[test]
+    fn test_netcoredbg_install_cmd_macos_arm64_falls_back_to_amd64() {
+        let cmd = netcoredbg_install_cmd_unix_for(Platform::MacOS, Arch::Arm64);
+        assert!(
+            cmd.contains("netcoredbg-osx-amd64.tar.gz"),
+            "macOS arm64 install cmd must fall back to the osx-amd64 asset \
+             (no native osx-arm64 build is published): {cmd}"
+        );
+        assert!(
+            !cmd.contains("osx-arm64"),
+            "macOS arm64 install cmd must never reference the \
+             nonexistent osx-arm64 asset: {cmd}"
+        );
+    }
+
+    /// Companion to the arm64 fallback test above: macOS/amd64 and Linux
+    /// (either arch) must keep resolving to their own real assets.
+    #[test]
+    fn test_netcoredbg_install_cmd_macos_amd64_and_linux_unchanged() {
+        let macos_amd64 = netcoredbg_install_cmd_unix_for(Platform::MacOS, Arch::Amd64);
+        assert!(
+            macos_amd64.contains("netcoredbg-osx-amd64.tar.gz"),
+            "{macos_amd64}"
+        );
+
+        let linux_amd64 = netcoredbg_install_cmd_unix_for(Platform::Linux, Arch::Amd64);
+        assert!(
+            linux_amd64.contains("netcoredbg-linux-amd64.tar.gz"),
+            "{linux_amd64}"
+        );
+
+        let linux_arm64 = netcoredbg_install_cmd_unix_for(Platform::Linux, Arch::Arm64);
+        assert!(
+            linux_arm64.contains("netcoredbg-linux-arm64.tar.gz"),
+            "{linux_arm64}"
+        );
+    }
+
+    /// #1712: the real rust/cpp combined install (`rustup component add
+    /// rust-analyzer ; <codelldb install command>`) is itself longer than
+    /// macOS's 1024-byte tty canon cap, for every `(Platform, Arch)`
+    /// combination codelldb builds a non-Windows command for. Confirms the
+    /// actual bytes `terminal_run_command` now types into the PTY —
+    /// `terminal_ops::build_terminal_install_launch_line`, not this
+    /// module's own command string — stay under that cap regardless, since
+    /// the fix for #1712 moved the command itself into a temp script file.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn rust_cpp_codelldb_install_launch_line_under_canon_cap_every_platform_arch() {
+        use crate::core::engine::terminal_ops::{
+            build_terminal_install_launch_line, install_script_path,
+        };
+
+        const MACOS_MAX_CANON: usize = 1024;
+        for platform in Platform::ALL {
+            for arch in Arch::ALL {
+                let codelldb_cmd = codelldb_install_cmd_for(platform, arch);
+                let combined = format!("rustup component add rust-analyzer ; {codelldb_cmd}");
+                assert!(
+                    combined.len() > MACOS_MAX_CANON,
+                    "fixture should reproduce a combined install command \
+                     longer than the macOS canon cap (platform={platform:?}, \
+                     arch={arch:?}), otherwise it isn't exercising the bug: \
+                     {} bytes",
+                    combined.len()
+                );
+                for is_powershell in [false, true] {
+                    let script_path = install_script_path("dap:codelldb", is_powershell);
+                    let launch_line =
+                        build_terminal_install_launch_line(&script_path, is_powershell);
+                    assert!(
+                        launch_line.len() < MACOS_MAX_CANON,
+                        "platform={platform:?} arch={arch:?} is_powershell={is_powershell}: \
+                         PTY-typed launch line is {} bytes, must stay under the \
+                         {MACOS_MAX_CANON}-byte macOS tty canon cap; got:\n{launch_line}",
+                        launch_line.len()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1131,6 +1554,82 @@ mod tests {
             !info.args.contains(&"--listen"),
             "debugpy must not use --listen (TCP mode): {:?}",
             info.args
+        );
+    }
+
+    #[test]
+    fn test_delve_uses_tcp_not_stdio() {
+        // #1716: `dlv dap` always starts a TCP server (it prints "DAP server
+        // listening at: host:port" to stdout) — it never speaks DAP over
+        // stdin/stdout. The registry entry must say so, or `start_adapter`
+        // wires up the wrong transport and debugging silently never starts.
+        let info = DapManager::adapter_by_name("delve").expect("delve registered");
+        assert!(info.use_tcp, "delve must use TCP (use_tcp=true)");
+        assert!(
+            info.args.contains(&"--listen"),
+            "delve args must pass --listen: {:?}",
+            info.args
+        );
+    }
+
+    #[test]
+    fn test_delve_adapter_end_to_end_initialize() {
+        // #1716 black-box regression: launch the real `dlv` binary through
+        // `DapManager::start_adapter` exactly as the engine would for a Go
+        // debug session, and confirm we get a DAP `initialize` response back
+        // over the wire. Before the fix this test hangs/times out forever
+        // because `dlv dap` never answers on stdio (confirmed manually: the
+        // adapter only listens on a TCP socket). Gated on `dlv` being
+        // resolvable so it's a no-op (not a failure) on machines without Go
+        // tooling installed.
+        if resolve_binary("dlv").is_none() {
+            eprintln!("skipping test_delve_adapter_end_to_end_initialize: dlv not found");
+            return;
+        }
+
+        let mut manager = DapManager::new();
+        manager
+            .start_adapter("go", &[])
+            .expect("delve adapter should start");
+
+        let seq = manager
+            .server
+            .as_mut()
+            .expect("server should be running")
+            .initialize("go");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut got_response = false;
+        while std::time::Instant::now() < deadline {
+            let events = manager
+                .server
+                .as_mut()
+                .expect("server should still be running")
+                .poll();
+            for ev in events {
+                if let super::super::dap::DapEvent::RequestComplete {
+                    seq: resp_seq,
+                    command,
+                    success,
+                    ..
+                } = ev
+                {
+                    if resp_seq == seq && command == "initialize" {
+                        assert!(success, "initialize request should succeed");
+                        got_response = true;
+                    }
+                }
+            }
+            if got_response {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        manager.stop();
+        assert!(
+            got_response,
+            "never received an initialize response from delve over TCP"
         );
     }
 

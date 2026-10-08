@@ -1036,7 +1036,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 - **Layout:** activity bar (3 cols) | sidebar | editor area; status line + command line full-width at bottom
 - **Sidebar:** same file explorer as GTK with Nerd Font icons
 - **Mouse support:** click-to-position, double-click word select, click-and-drag visual selection, window switching, scroll wheel (targets pane under cursor), scrollbar click-to-jump and drag; drag event coalescing for smooth scrollbar tracking; bracketed paste support; click branch name in status bar to open branch picker
-- **Sidebar resize:** drag separator column; `Alt+Left` / `Alt+Right` keyboard resize (min 15, max 60 cols)
+- **Sidebar resize:** drag separator column; `Alt+Left` / `Alt+Right` keyboard resize in Vim mode (min 15, max 60 cols) — in VSCode mode those keys navigate back/forward through the jump list instead, and `Ctrl+Shift+Alt+Left` / `Ctrl+Shift+Alt+Right` is the keyboard resize there
 - **Scrollbars:** `█` / `░` thumb/track in uniform grey; vsplit separator doubles as left-pane vertical scrollbar; horizontal scrollbar row when content wider than viewport; `┘` corner when both axes present
 - **Scroll sync:** `:Gblame` pairs stay in sync across keyboard nav and mouse events
 - **Frame rate cap:** renders limited to ~60fps so rapid LSP or search events don't peg the CPU
@@ -1421,7 +1421,7 @@ src/                  (~168,600 lines total)
     └── view.rs, registry.rs, buffer.rs, paths.rs, tab.rs, cursor.rs, terminal.rs, mode.rs, mod.rs (~783 lines)
 ```
 
-**Design rule:** `src/core/` has zero GTK/rendering dependencies and is testable in isolation. Both backends consume the same `ScreenLayout` abstraction from `render.rs`, and since #751–#766 the same mouse/keyboard routers and the same `FrameOp` frame sequence — `src/gtk/mod.rs` alone makes 424 `render::` calls. The Direct2D/Win32 backend was removed on 2026-05-11 (`3e4bcff`) and returns as a thin wrapper when quadraui ships its Windows backend; a native macOS backend is blocked upstream (see [`PLAN.md`](PLAN.md)).
+**Design rule:** `src/core/` has zero GTK/rendering dependencies and is testable in isolation. Both backends consume the same `ScreenLayout` abstraction from `render.rs`, and since #751–#766 the same mouse/keyboard routers and the same `FrameOp` frame sequence — `src/gtk/mod.rs` alone makes 424 `render::` calls. The Windows GUI (`src/win/`, `win` feature) and the native macOS GUI (`src/macos/`, `macos` feature) are thin wrappers over quadraui's Direct2D/DirectWrite and AppKit backends.
 
 `dictionaries/` — bundled en_US Hunspell dictionary files (`.aff` + `.dic`) compiled into the binary via `include_bytes!`.
 

@@ -1435,14 +1435,37 @@ impl Engine {
             EditorMode::Vim => EditorMode::Vscode,
             EditorMode::Vscode => EditorMode::Vim,
         };
-        // Clear any selection
+        // Clear any selection. Also reset the end-bound convention (#1788) —
+        // otherwise a lingering `true` from a VSCode-mode keyboard-extended
+        // selection would silently apply to the next Vim-mode `v`/`V`
+        // selection, which is always inclusive-end.
         self.visual_anchor = None;
+        self.visual_end_exclusive = false;
         // Set appropriate base mode
         if self.is_vscode_mode() {
             self.mode = Mode::Insert;
             self.menu_bar_visible = true;
         } else {
             self.mode = Mode::Normal;
+            // #1780: VSCode mode's own entry above unconditionally reveals
+            // the menu-bar row (`menu_bar_visible = true`); without a
+            // mirror-image clear here, toggling straight back to Vim mode
+            // left that row permanently on screen (shifting the activity
+            // bar/sidebar/editor content down by one row forever), since
+            // nothing else in the Vim-mode arm ever flips it back off.
+            //
+            // Gated on `menu_bar_toggleable` (true only on backends with a
+            // runner-drawn, hideable menu bar — i.e. TUI): on a
+            // `window_chrome` backend (GTK, future Win-GUI) the drawn menu
+            // bar doubles as the client-side titlebar and is pinned visible
+            // once at `App::setup` (`menu_bar_toggleable` stays `false`
+            // there). Clearing `menu_bar_visible` unconditionally would
+            // leave those backends with a reserved-but-blank titlebar strip
+            // after a VSCode->Vim round trip, with no in-app way back short
+            // of `:set menu` (see review discussion on #1780).
+            if self.menu_bar_toggleable {
+                self.menu_bar_visible = false;
+            }
         }
         let _ = self.settings.save();
     }

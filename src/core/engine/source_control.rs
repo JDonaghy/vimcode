@@ -92,7 +92,29 @@ impl Engine {
 
     /// Check whether the background `sc_refresh_async` thread has
     /// delivered a snapshot and, if so, apply it to the engine state.
-    /// Returns `true` when new data was applied so the UI can redraw.
+    /// Returns `true` only when the applied snapshot actually *differs*
+    /// from what was already cached, so the UI redraws exactly when
+    /// there is new content to show.
+    ///
+    /// #1650: this used to return `true` unconditionally whenever a
+    /// snapshot arrived, regardless of whether `git status`/`log`/
+    /// `worktree list` actually changed since the last poll. Paired with
+    /// `render::run_shared_tick_chores`'s 2s auto-refresh timer (gated
+    /// only on the sidebar being visible, not on anything actually having
+    /// changed), an idle `vcd` with the Explorer or Source Control sidebar
+    /// open — the default startup state — kicked off a fresh
+    /// `sc_refresh_async` every 2 seconds, and every single one of those
+    /// forced a real repaint on arrival even though a quiescent git repo's
+    /// status/log/worktree list is byte-for-byte identical each time. Each
+    /// of those repaints is one real `ratatui::Terminal::draw` call, and
+    /// `Backend::draw`/`hide_cursor` (`ratatui-crossterm`'s
+    /// `CrosstermBackend`) unconditionally emits an SGR-reset + cursor-hide
+    /// escape burst on *every* `draw`, even when the content diff is
+    /// empty — that is exactly the invisible, periodic byte stream
+    /// `tests/smoke-spec/tui.yaml`'s `idle-truly-silent` step caught. Only
+    /// `invalidate_explorer_indicators` (and the `true` return driving a
+    /// redraw) when something genuinely changed turns the periodic kickoff
+    /// back into the true no-op it should be at idle.
     pub fn poll_sc_refresh(&mut self) -> bool {
         let Some(ref rx) = self.sc_refresh_rx else {
             return false;
@@ -100,15 +122,22 @@ impl Engine {
         let result = rx.try_recv();
         match result {
             Ok((statuses, worktrees, ahead, behind, log)) => {
+                self.sc_refresh_rx = None;
+                self.sc_refresh_in_flight = false;
+                let changed = statuses != self.sc_file_statuses
+                    || worktrees != self.sc_worktrees
+                    || ahead != self.sc_ahead
+                    || behind != self.sc_behind
+                    || log != self.sc_log;
                 self.sc_file_statuses = statuses;
                 self.sc_worktrees = worktrees;
                 self.sc_ahead = ahead;
                 self.sc_behind = behind;
                 self.sc_log = log;
-                self.sc_refresh_rx = None;
-                self.sc_refresh_in_flight = false;
-                self.invalidate_explorer_indicators();
-                true
+                if changed {
+                    self.invalidate_explorer_indicators();
+                }
+                changed
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -1469,5 +1498,123 @@ impl Engine {
             .borrow_mut()
             .handle_cached(&event, rect);
         self.dispatch_sc_sidebar_event(sidebar_event)
+    }
+}
+
+#[cfg(test)]
+mod poll_sc_refresh_tests {
+    //! #1650: direct coverage for [`Engine::poll_sc_refresh`]'s
+    //! change-detection — the decision `render::run_shared_tick_chores`'s
+    //! 2s auto-refresh timer relies on to stay a true no-op at idle. See
+    //! that method's own doc for the full chain this closes: an unchanged
+    //! `poll_sc_refresh` result used to still report "redraw needed" on
+    //! every arrival, which (via `App::tick_dispatch` /
+    //! `quadraui::tui::TuiRunner`'s `needs_redraw` gate) forced a real
+    //! `ratatui::Terminal::draw` call every ~2 seconds indefinitely while
+    //! the Explorer/Git sidebar was visible — the default startup state —
+    //! and every one of those draws writes an SGR-reset + cursor-hide
+    //! escape burst regardless of whether the diff was empty
+    //! (`ratatui-crossterm`'s `CrosstermBackend::draw`/`hide_cursor`, not
+    //! this crate's code, so there is no in-crate seam to assert on the
+    //! byte stream itself — `tests/smoke-spec/tui.yaml`'s
+    //! `idle-truly-silent` step, run under a real pty by the external
+    //! smoke-test harness, is the black-box oracle for *that* half; this
+    //! module covers the pure decision feeding it, exactly the pattern
+    //! `App::dedup_window_title`/`dedup_caret_shape` already established
+    //! for #1634's sibling bug).
+    //!
+    //! The driver-tier half of this fix's coverage lives in
+    //! `tui_main::app_on_tui_tests::tests::idle_stability_1650` — a
+    //! `TuiDriver` with the Explorer sidebar actually painted, asserting
+    //! the `Reaction` every idle tick returns across several of those 2s
+    //! boundaries is `Continue`, not `Redraw` (the redraw signal the
+    //! runner turns into the real `draw` call, i.e. into the escape
+    //! burst), plus that the painted screen text never changes.
+    //!
+    //! RED-verified: reverting [`Engine::poll_sc_refresh`] to always
+    //! `return true` on `Ok(..)` (the pre-fix behavior) makes
+    //! `poll_sc_refresh_returns_false_when_snapshot_is_unchanged` fail.
+    use crate::core::engine::Engine;
+    use crate::core::git::{FileStatus, GitLogEntry, StatusKind, WorktreeEntry};
+
+    fn send_snapshot(
+        engine: &mut Engine,
+        statuses: Vec<FileStatus>,
+        worktrees: Vec<WorktreeEntry>,
+        ahead: u32,
+        behind: u32,
+        log: Vec<GitLogEntry>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = tx.send((statuses, worktrees, ahead, behind, log));
+        engine.sc_refresh_rx = Some(rx);
+        engine.sc_refresh_in_flight = true;
+    }
+
+    #[test]
+    fn poll_sc_refresh_returns_false_when_snapshot_is_unchanged() {
+        let mut engine = Engine::new_for_test();
+        let statuses = vec![FileStatus {
+            path: "src/main.rs".to_string(),
+            staged: None,
+            unstaged: Some(StatusKind::Modified),
+            unmerged: None,
+        }];
+        let log = vec![GitLogEntry {
+            hash: "abc1234".to_string(),
+            message: "initial commit".to_string(),
+        }];
+
+        // First arrival: the cache starts empty, so this is always a real
+        // change — establishes the baseline the second poll compares
+        // against.
+        send_snapshot(&mut engine, statuses.clone(), vec![], 0, 0, log.clone());
+        assert!(
+            engine.poll_sc_refresh(),
+            "first snapshot must report changed — the cache started empty"
+        );
+
+        // Second arrival: byte-for-byte identical snapshot, exactly what a
+        // quiescent repo's `git status`/`log`/`worktree list` produces on
+        // every one of `render::run_shared_tick_chores`'s 2s re-polls while
+        // nothing on disk has actually changed.
+        send_snapshot(&mut engine, statuses, vec![], 0, 0, log);
+        assert!(
+            !engine.poll_sc_refresh(),
+            "an idle repo's unchanged snapshot must not report a redraw-worthy change \
+             — this is the exact decision behind #1650's idle SGR-reset/cursor-hide burst"
+        );
+    }
+
+    #[test]
+    fn poll_sc_refresh_returns_true_when_snapshot_changes() {
+        let mut engine = Engine::new_for_test();
+        let statuses = vec![FileStatus {
+            path: "src/lib.rs".to_string(),
+            staged: None,
+            unstaged: Some(StatusKind::Modified),
+            unmerged: None,
+        }];
+        send_snapshot(&mut engine, statuses.clone(), vec![], 0, 0, vec![]);
+        assert!(
+            engine.poll_sc_refresh(),
+            "precondition: the engine's default cache is empty, so a non-empty \
+             first snapshot must register as changed"
+        );
+
+        // A second file is modified — a real change the sidebar must
+        // repaint to show, on top of the one already applied above.
+        let mut next = statuses;
+        next.push(FileStatus {
+            path: "src/main.rs".to_string(),
+            staged: None,
+            unstaged: Some(StatusKind::Modified),
+            unmerged: None,
+        });
+        send_snapshot(&mut engine, next, vec![], 0, 0, vec![]);
+        assert!(
+            engine.poll_sc_refresh(),
+            "a genuinely different snapshot must still report changed"
+        );
     }
 }

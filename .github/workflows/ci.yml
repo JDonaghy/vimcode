@@ -92,6 +92,35 @@ jobs:
       run: |
         cargo test --no-default-features
 
+  # #1646: `tests/smoke-spec/*.yaml` are consumed by claude-coordinator's
+  # Tier-2 real-platform acceptance drivers (`coord/tui_pty_driver.py`,
+  # `coord/win_native_driver.py`, `coord/mac_native_driver.py`,
+  # `coord/gtk_native_driver.py`), which this repo does not vendor. This job
+  # only proves the specs still *parse* against those drivers' own loaders —
+  # it cannot run them (no pty/native OS to drive here) — so a future driver
+  # change that silently stops accepting a step shape this repo relies on is
+  # caught here instead of only discovered the next time someone runs a real
+  # acceptance pass. `scripts/validate_smoke_specs.py` does the importing;
+  # this step only installs its one dependency and runs it.
+  test-smoke-specs:
+    name: Validate Tier-2 smoke specs
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # Floor, not an exact pin: the four `parse_*_spec` entry points this job
+    # imports first shipped together in 0.5.551, and tracking the latest
+    # release above that floor is the whole point — a driver change that stops
+    # accepting a step shape these specs use should redden *this* lane, which
+    # is a required check (.github/branch-protection.json), rather than be
+    # discovered mid-acceptance-pass on fleet hardware.
+    - name: Install code-coordinator
+      run: pip install --quiet 'code-coordinator>=0.5.551'
+
+    - name: Validate tests/smoke-spec/*.yaml against coord's real spec loaders
+      run: python3 scripts/validate_smoke_specs.py
+
   # #645: the job above compiles GTK OUT (`--no-default-features`), so a green
   # run there carries zero information about `src/gtk/`. This job is the lane
   # that actually compiles and tests the GTK backend. It runs headlessly — no
@@ -258,8 +287,19 @@ jobs:
   # The release ships `vcd-windows-x86_64.exe` (release.yml's `build-windows`
   # job), but no other job compiles for Windows at all — without this, the
   # first Windows build a change ever saw was the release run itself, after
-  # the Linux release had already been published. Build-only: the same
-  # command release.yml uses, so a red here means a red release.
+  # the Linux release had already been published. Mostly build-only (the
+  # same command release.yml uses, so a red build here means a red release)
+  # plus one scoped `cargo test` for `tests/conpty_idle_flicker.rs` (#1634)
+  # — not a full `cargo test`, which this job still deliberately never runs
+  # (that would turn a fast build-verification job into a full Windows test
+  # run; the Linux jobs below already cover the shared test suite). Without
+  # that step, `conpty_idle_flicker.rs`'s `#[cfg(windows)]`-gated tests
+  # would never execute anywhere in CI — the file compiles to zero tests on
+  # every Linux job — and could bit-rot silently forever. The same rule
+  # applies to every other `#[cfg(windows)]`-gated real-ConPTY test added
+  # since: each one needs its own explicitly named step below, or it is
+  # dead code in every lane (#1829 review round 1 — a file was added
+  # without one, and it ran nowhere until this comment's fix).
   build-windows-tui:
     name: Build (Windows TUI, vcd.exe)
     runs-on: windows-latest
@@ -312,6 +352,53 @@ jobs:
           exit 1
         }
         Write-Host "OK: vcd.exe has no VCRUNTIME140.dll import (statically linked CRT)."
+
+    # #1634: the raw-output ConPTY idle regression test — spawns the
+    # `vcd.exe` just built under a real Win32 pseudo console (`portable_pty`,
+    # a `[target.'cfg(windows)'.dev-dependencies]` entry) and asserts the
+    # byte stream goes silent after settle. Scoped to this one integration
+    # test (`--test conpty_idle_flicker`), not a full `cargo test`, per this
+    # job's header comment. `windows-latest` hosts a real ConPTY natively, so
+    # this runs the same way it does on `dell64` — no emulation involved.
+    - name: Run tests/conpty_idle_flicker.rs (#1634, real ConPTY on windows-latest)
+      run: cargo test --release --test conpty_idle_flicker --no-default-features
+
+    # #1636: the real-ConPTY activity-bar click regression test — sends real
+    # SGR mouse-click bytes into the `vcd.exe` just built and asserts each
+    # activity-bar icon actually switches panels, over the same real Win32
+    # pseudo console as the #1634 step above. Scoped to this one integration
+    # test, per this job's own header comment. A hard (non-`continue-on-
+    # error`) gate: RED/GREEN-verified by hand on real `dell64` Windows
+    # hardware (three consecutive green runs) before landing — see the
+    # file's own module doc for the full investigation — so, unlike a test
+    # that was only ever cross-compiled and never actually executed, a red
+    # result here is a real signal worth blocking on.
+    - name: Run tests/conpty_activity_bar_click.rs (#1636, real ConPTY on windows-latest)
+      run: cargo test --release --test conpty_activity_bar_click --no-default-features
+
+    # #1829: real-ConPTY regression test for "Windows TUI: `:term` opens a
+    # blank panel with no PowerShell prompt" — same real Win32 pseudo
+    # console as the two steps above, typing `:term` + Enter then the
+    # issue's own acceptance probe (`echo <marker> > '<path>'` + Enter) and
+    # polling the filesystem for the marker. This used to be `continue-on-
+    # error: true`: the investigation that added this test (see
+    # `PROJECT_STATE.md`/`docs/PENDING_QUADRAUI_ISSUES.md`) isolated the
+    # root cause to quadraui's own untested Windows ConPTY leg, so it was
+    # *expected* to run RED until that upstream fix landed. #1843 bumps the
+    # quadraui pin past quadraui#1327 (the ConPTY VT handshake + shell-gate
+    # fix) and promotes this to a hard gate: the upstream fix has landed and
+    # this repo's pin has bumped past it, and the step has been observed
+    # RED against the prior pin then GREEN against the new one (1.9s), both
+    # on real `dell64` Windows hardware — but that is **one** green run, not
+    # the three consecutive green runs #1636's own step comment above
+    # required before promoting that step to a hard gate. This test's
+    # 20s `SETTLE_TIMEOUT` over a cold real PowerShell startup is exactly
+    # the profile that can go intermittently red; if this step flakes,
+    # gather repeat green runs (including from CI itself) before assuming a
+    # real regression, and consider matching #1636's three-run bar by hand
+    # on `dell64` if it keeps flaking.
+    - name: Run tests/conpty_term_opens_shell_1829.rs (#1829, real ConPTY on windows-latest)
+      run: cargo test --release --test conpty_term_opens_shell_1829 --no-default-features
 
   # #1554: no job before this one ever compiled the Windows *GUI* build
   # (`--features win --bin vimcode`), so a whole class of loader failures

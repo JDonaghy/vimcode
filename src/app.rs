@@ -110,6 +110,7 @@ use crate::core;
 use crate::render;
 
 use core::engine::EngineAction;
+use core::engine::PluginViewHost;
 use core::{Engine, WindowRect};
 use render::Theme;
 
@@ -744,6 +745,44 @@ pub(crate) struct App {
     /// `GtkPlatformServices` itself), leaving only the change-detection use
     /// below.
     pub(crate) last_colorscheme: String,
+    /// #1634: the OS/terminal window title as of the last tick that actually
+    /// wrote it via `WindowControl::set_title` (`render::run_shared_tick_
+    /// chores`). `None` until the first write. Every other cached-value
+    /// guard `handle_poll_tick`'s chores use (`last_colorscheme` right
+    /// above, `last_caret_shape` below) compares before writing; this one
+    /// didn't, so `run_shared_tick_chores` called `w.set_title(&win_title)`
+    /// unconditionally on *every* tick — on TUI, `TuiBackend::set_title`
+    /// writes a real OSC 0/2 escape sequence straight to `std::io::
+    /// stdout()` (bypassing the `ratatui::Terminal`'s buffered `Write`
+    /// entirely), so an idle session wrote a fresh title-set escape every
+    /// poll cycle (`quadraui::runtime::IDLE_POLL_CEILING`, ~250ms) even
+    /// though the title text never changed — real waste on every idle tick,
+    /// invisible to #1583's in-process idle-stability test since it only
+    /// inspects the `TestBackend`/vt100 buffer `Terminal::draw` writes to,
+    /// and `set_title`'s direct-to-stdout write never goes through that
+    /// sink at all (live or test-driven `TuiBackend` alike).
+    ///
+    /// **Not confirmed as #1634's flicker cause.** A raw-ConPTY capture
+    /// (`tests/conpty_idle_flicker.rs`, on real Windows 11 hardware) of an
+    /// idle session showed the byte stream silent at this window's output
+    /// *both* with this guard reverted and with it in place — i.e. whatever
+    /// downstream consumes the pseudo console (ConPTY itself, and/or a real
+    /// terminal emulator) already appears to suppress a redundant OSC 0/2
+    /// title write before it reaches a reader on the other end, so this
+    /// guard's fix is a real, worthwhile efficiency win (a syscall + a
+    /// write vimcode no longer makes 4×/second for nothing) but is not
+    /// shown to be what the operator saw flicker. See that test file's
+    /// module doc for the full finding and what it rules out.
+    pub(crate) last_window_title: Option<String>,
+    /// #1634: same guard, for `Backend::set_caret_shape` — see `last_window_
+    /// title`'s doc just above for the shared reasoning (including the "not
+    /// confirmed as the flicker cause" caveat). `tick_dispatch`'s `self.live`
+    /// gate (real terminal only, never a test driver) already keeps this one
+    /// out of `cargo test`'s stdout, but it still repainted the identical
+    /// DECSCUSR cursor-style escape (`ratatui::crossterm::cursor::
+    /// SetCursorStyle`, via `TuiBackend::set_caret_shape`) every idle tick in
+    /// a real session, with no change-detection of its own.
+    pub(crate) last_caret_shape: Option<quadraui::EditorCursorShape>,
     /// A second, standalone `quadraui::Backend`-impl handle, distinct from
     /// the `&mut dyn quadraui::Backend` the `ShellApp` runner hands
     /// `setup`/`handle`/`tick` — owned outright by `App` for the callers that
@@ -1013,6 +1052,281 @@ fn app_icon_image_for_paint() -> quadraui::Image {
     crate::render::app_icon_image()
 }
 
+/// #1634: the change-detection decision `render::run_shared_tick_chores`
+/// gates its `WindowControl::set_title` call on — pulled out of that call
+/// site into its own pure, `Backend`-free function so the dedup guard
+/// itself (not just its call site) is directly unit-testable.
+///
+/// Returns `true` (and records `title` as the new baseline in `*last`)
+/// exactly when `title` differs from the last title this function was
+/// told got written; returns `false` (leaving `*last` untouched) when it
+/// is unchanged, so the caller must skip the write.
+///
+/// # Why a pure function, not a `Backend`-call-count driver test
+///
+/// The natural black-box shape for this fix — construct a counting/mock
+/// `Backend`, drive two ticks with no state change, assert `set_title` is
+/// called once instead of twice — is not achievable in this crate:
+///
+/// - `quadraui::Backend` is a **sealed trait** (`pub(crate) mod sealed`
+///   in `quadraui/src/backend.rs`, restated at the very top of the
+///   `Backend` trait's own doc). An external crate — vimcode included —
+///   cannot write `impl quadraui::Backend for MyMock` at all; the only
+///   externally-constructible full implementor quadraui ships is
+///   `quadraui::testing::RecordingBackend`, and that type does not
+///   override `Backend::window()` (its trait default returns `None`, so
+///   `run_shared_tick_chores`'s `if let Some(w) = backend.window()` body —
+///   the guard under test — would never even execute against it) or
+///   `Backend::set_caret_shape` (trait default is a no-op with no call
+///   recorded), so it cannot distinguish "guard present" from "guard
+///   absent" for either write this fix touches.
+/// - Even the one real `Backend` this crate *can* construct in-process
+///   (`quadraui::tui::TuiBackend`, via `quadraui::tui::testing::
+///   driver_with_shell`) offers no interception point for this specific
+///   pair of writes: `TuiBackend::set_title`/`set_caret_shape` both write
+///   straight to real `std::io::stdout()` with no `Terminal`/`Buffer`
+///   indirection and no test-mode guard of their own (see each method's
+///   own doc in `quadraui/src/tui/backend.rs`, and `set_caret_shape`'s in
+///   particular: "there is no real terminal under `TestBackend`") — which
+///   is exactly why `tests/conpty_idle_flicker.rs` exists as a *real*
+///   ConPTY driver test instead of an in-process one, and exactly why
+///   that file's own module doc says #1583's in-process idle-stability
+///   test "can only see bytes that flow through the `ratatui::Terminal`'s
+///   own `Write` sink."
+///
+/// This function is the closest available substitute: it isolates the
+/// *decision* `run_shared_tick_chores`/`App::tick_dispatch` make before
+/// ever touching a `Backend`, with zero I/O, so a regression in the guard
+/// itself — the actual code change this issue's fix iteration shipped —
+/// is a fast, Linux-runnable, RED/GREEN unit test
+/// (`window_title_dedup_tests`, below), independent of real Windows
+/// hardware. It cannot prove what happens downstream of the write (that
+/// remains `tests/conpty_idle_flicker.rs` and real-hardware/operator
+/// verification's job), only that the write is skipped exactly when it
+/// should be.
+pub(crate) fn dedup_window_title(last: &mut Option<String>, title: &str) -> bool {
+    if last.as_deref() == Some(title) {
+        false
+    } else {
+        *last = Some(title.to_string());
+        true
+    }
+}
+
+/// #1634: same guard, for `Backend::set_caret_shape` — see
+/// [`dedup_window_title`]'s doc for the full reasoning (including why a
+/// `Backend`-call-count driver test is not achievable in this crate).
+fn dedup_caret_shape(
+    last: &mut Option<quadraui::EditorCursorShape>,
+    shape: quadraui::EditorCursorShape,
+) -> bool {
+    if *last == Some(shape) {
+        false
+    } else {
+        *last = Some(shape);
+        true
+    }
+}
+
+/// #1668: whether `App::tick_dispatch` must re-arm a future `tick` via
+/// `Backend::request_frame_in` so `Engine::poll_terminal` (reached via
+/// `poll_idle`, inside `handle_poll_tick`/`render::run_shared_tick_chores`)
+/// keeps draining a terminal pane's PTY output.
+///
+/// GTK/TUI/macOS call `tick` unconditionally every
+/// `quadraui::runtime::IDLE_POLL_CEILING` (250ms — see
+/// `quadraui::runner::ShellApp::tick`'s own per-backend table) regardless
+/// of whether anything asked to be woken, so a terminal pane's output
+/// drains on its own there even with no explicit re-arm. Win-GUI has
+/// **no** such fallback (same table: "Windows | none") — confirmed
+/// against the pinned rev: `quadraui::win::run::wndproc` only ever calls
+/// `AppLogic::tick` from its own `WM_TIMER` handler
+/// (`grep -n "tick(ws" quadraui/src/win/run.rs` has exactly one call
+/// site), and that timer only fires once something has called
+/// `Backend::request_frame_in` (`WinBackend::request_frame_in`'s
+/// `SetTimer`). Dispatching a keypress goes through `App::handle`/
+/// `dispatch_event`, never `tick` — so typing into an open terminal pane
+/// does not drain its output either. Without this re-arm, a Win-GUI
+/// terminal pane's shell output is never drained past the very first
+/// frame: vimcode#1668's "panel opens blank and stays blank; typing
+/// `echo hello-vimcode` + Enter produces no visible output at all" report.
+///
+/// A pure, `Backend`-free decision function, mirroring
+/// [`dedup_window_title`]'s shape, so the decision itself (not just its
+/// call site) is directly unit-testable
+/// (`terminal_poll_rearm_tests`, below) — fast, Linux-runnable, no
+/// `Backend` of any kind required.
+///
+/// # Driver-tier coverage lives alongside the TUI port, not here
+///
+/// [`dedup_window_title`]'s doc explains why a `Backend`-call-count
+/// driver test is unreachable via `quadraui::testing::RecordingBackend`
+/// (a sealed trait, and that mock's `request_frame_in` is a documented
+/// no-op) — that reasoning still holds here, for that one mock. It does
+/// **not** hold for every in-process `Backend`, though: the real
+/// `quadraui::tui::TuiBackend` a `quadraui::tui::testing::TuiDriver`
+/// wraps *does* record every `request_frame_in` call
+/// (`TuiBackend::frame_requests`/`pending_frame_delay`, quadraui#832,
+/// built for exactly this "prove an app's scheduling decision, not just
+/// its painted output" need). `tick_dispatch`'s terminal-pane re-arm
+/// above is platform-neutral code — gated only on
+/// `Engine::terminal_panes`, never on which concrete `Backend` is
+/// plugged in — so driving it through `TuiDriver::tick()` exercises the
+/// exact same decision Win-GUI's `WM_TIMER` loop depends on. See
+/// `src/tui_main/app_on_tui_tests.rs`'s `terminal_poll_rearm_1668`
+/// module for that black-box coverage (RED-verified against this
+/// function always returning `None`).
+///
+/// What that TUI-side driver test still cannot reach is `WinBackend`
+/// itself: `WinBackend::attach_headless` (what `WinDriver::new` uses)
+/// never sets `self.hwnd`, so `request_frame_in` degrades to its
+/// documented "no window to nudge yet" no-op through that harness, and
+/// there is no Windows-native equivalent of `TuiDriver::tick()` to drive
+/// a real `WM_TIMER` cycle headlessly either (see
+/// `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry). Between the pure-
+/// function unit test, the `TuiDriver`-based driver test, and that
+/// documented gap, what remains unverified by anything in this repo is
+/// only the one link this fix cannot touch: whether a real Win32
+/// `SetTimer`/`WM_TIMER` cycle actually re-fires `tick` on real Windows
+/// hardware — `tick_dispatch` asking for it is now covered twice over.
+pub(crate) fn terminal_poll_rearm_delay(
+    any_terminal_pane_open: bool,
+) -> Option<std::time::Duration> {
+    if any_terminal_pane_open {
+        Some(std::time::Duration::from_millis(100))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod window_title_dedup_tests {
+    //! #1634: direct coverage for [`dedup_window_title`]/
+    //! [`dedup_caret_shape`] — see [`dedup_window_title`]'s own doc for why
+    //! these pure functions, rather than a `Backend`-call-count driver
+    //! test, are this fix's unit coverage.
+    //!
+    //! RED-verified: replacing either function's body with `true` (i.e.
+    //! reverting to the pre-#1634 "write unconditionally every tick"
+    //! behaviour) makes each module's second assertion below fail — the
+    //! repeated call with an unchanged value stops returning `false`.
+    //! Restored before committing.
+
+    use super::*;
+
+    #[test]
+    fn window_title_write_is_skipped_only_when_unchanged() {
+        let mut last: Option<String> = None;
+
+        assert!(
+            dedup_window_title(&mut last, "main.rs"),
+            "first call must report a write is needed (no prior baseline)"
+        );
+        assert_eq!(last.as_deref(), Some("main.rs"));
+
+        assert!(
+            !dedup_window_title(&mut last, "main.rs"),
+            "a second call with the identical title must report the write \
+             should be skipped — this is the exact #1634 regression: \
+             `run_shared_tick_chores` used to call `WindowControl::set_title` \
+             unconditionally on every idle tick even when the title never \
+             changed"
+        );
+        assert_eq!(
+            last.as_deref(),
+            Some("main.rs"),
+            "skipping the write must not disturb the cached baseline"
+        );
+
+        assert!(
+            dedup_window_title(&mut last, "right.rs"),
+            "a genuinely changed title must still report a write is needed"
+        );
+        assert_eq!(last.as_deref(), Some("right.rs"));
+
+        assert!(
+            !dedup_window_title(&mut last, "right.rs"),
+            "and immediately dedups again once the new value is the baseline"
+        );
+    }
+
+    #[test]
+    fn caret_shape_write_is_skipped_only_when_unchanged() {
+        let mut last: Option<quadraui::EditorCursorShape> = None;
+
+        assert!(
+            dedup_caret_shape(&mut last, quadraui::EditorCursorShape::Block),
+            "first call must report a write is needed (no prior baseline)"
+        );
+        assert_eq!(last, Some(quadraui::EditorCursorShape::Block));
+
+        assert!(
+            !dedup_caret_shape(&mut last, quadraui::EditorCursorShape::Block),
+            "a second call with the identical shape must report the write \
+             should be skipped — the exact #1634 regression for \
+             `Backend::set_caret_shape`: `App::tick_dispatch` used to call \
+             it unconditionally on every idle tick even when the caret \
+             shape never changed"
+        );
+
+        assert!(
+            dedup_caret_shape(&mut last, quadraui::EditorCursorShape::Bar),
+            "a genuinely changed shape must still report a write is needed"
+        );
+        assert_eq!(last, Some(quadraui::EditorCursorShape::Bar));
+
+        assert!(
+            !dedup_caret_shape(&mut last, quadraui::EditorCursorShape::Bar),
+            "and immediately dedups again once the new value is the baseline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_poll_rearm_tests {
+    //! #1668: isolated unit coverage for [`terminal_poll_rearm_delay`]'s
+    //! decision in a vacuum — zero `Backend` of any kind, so it is fast
+    //! and trivially RED/GREEN. This is *not* this fix's only coverage:
+    //! see [`terminal_poll_rearm_delay`]'s own doc for why a real
+    //! `Backend`-call-count driver test is unreachable for
+    //! `quadraui::testing::RecordingBackend`/`WinDriver` specifically but
+    //! *is* reachable via `quadraui::tui::testing::TuiDriver` — that
+    //! black-box half lives in
+    //! `src/tui_main/app_on_tui_tests.rs`'s `terminal_poll_rearm_1668`
+    //! module, driving the real, shared `App::tick_dispatch` and
+    //! asserting on `TuiBackend::frame_requests`/`pending_frame_delay`.
+    //!
+    //! RED-verified: reverting `terminal_poll_rearm_delay` to always
+    //! return `None` (the pre-#1668 behaviour — nothing ever re-arms a
+    //! tick for an open terminal pane) makes the first assertion below
+    //! fail. Restored before committing.
+
+    use super::*;
+
+    #[test]
+    fn rearm_is_requested_only_while_a_terminal_pane_is_open() {
+        assert_eq!(
+            terminal_poll_rearm_delay(true),
+            Some(std::time::Duration::from_millis(100)),
+            "with at least one open terminal pane, `tick_dispatch` must \
+             ask to be woken again soon so `Engine::poll_terminal` keeps \
+             draining the pane's PTY output — this is the exact #1668 \
+             regression on Win-GUI: `win::run`'s message loop only calls \
+             `tick` again when something explicitly asks via \
+             `Backend::request_frame_in`/`SetTimer`, so with no re-arm a \
+             terminal pane's shell output (prompt, echoed input, command \
+             output) is never drained past the very first frame"
+        );
+
+        assert_eq!(
+            terminal_poll_rearm_delay(false),
+            None,
+            "with no terminal pane open, there is nothing to keep polling \
+             for — must not request a wake-up"
+        );
+    }
+}
+
 /// Create a new `App` instance.
 ///
 /// All widget-dependent setup (window handle) is deferred to
@@ -1185,8 +1499,8 @@ impl App {
         Some(match id {
             "panel:explorer" => crate::icons::EXPLORER.s(),
             "panel:search" => crate::icons::SEARCH.s(),
-            "panel:debug" => crate::icons::DEBUG.s(),
-            "panel:git" => crate::icons::GIT_BRANCH.s(),
+            "panel:debug" => crate::icons::RUN_AND_DEBUG.s(),
+            "panel:git" => crate::icons::SOURCE_CONTROL.s(),
             "panel:extensions" => crate::icons::EXTENSIONS.s(),
             "panel:ai" => crate::icons::AI_CHAT.s(),
             "panel:board" => crate::icons::BOARD.s(),
@@ -1403,8 +1717,34 @@ impl App {
         let (editor_family, editor_size_pt) =
             resolve_editor_font(&self.engine.borrow().settings, &**self.backend.borrow());
         cfg = cfg.with_editor_font(editor_family, editor_size_pt);
+        // #1798: the width the sidebar *opens* at is a line-height
+        // **multiple** (quadraui's `AppShell::compute_layout` multiplies it
+        // by `line_height`), so leaving it at `ShellConfig::new`'s generic
+        // `20.0` meant a 20-column strip on TUI but a ~460px slab on a GUI
+        // backend — which left an 800px-wide window no room to paint a
+        // second editor tab. `UnitProfile::sidebar_width_lh` carries the
+        // per-unit value; see its field doc for why the GUI profile uses
+        // exactly `ALT_SIDEBAR_WIDTH_MIN` and not less.
+        //
+        // Read from `self.units` for the same reason `activity_bar_width_px`
+        // above is: the value differs per *unit*, not per *backend*, so it
+        // belongs in the one profile each backend already picks at
+        // construction rather than in a `cfg!`/`if gtk` branch here
+        // (Platform-Neutrality Rule).
+        cfg.default_sidebar_width = self.units.sidebar_width_lh;
         // #759: the shared Alt rung clamps sidebar width, so Alt+Left/Right
-        // resolve identically on every backend.
+        // resolve identically on every backend. These two stay *shared*
+        // (unlike the opening width above) — they bound the rung itself, and
+        // quadraui's own `set_sidebar_width` clamp must not be narrower than
+        // it on one backend and not another. #1798 therefore also requires
+        // `default_sidebar_width >= min_sidebar_width`: `compute_layout`
+        // clamps the opening width through this floor, so an opening width
+        // below it would silently resolve back up to it.
+        debug_assert!(
+            self.units.sidebar_width_lh >= render::ALT_SIDEBAR_WIDTH_MIN as f32,
+            "a sidebar that opens below the shared Alt rung's floor cannot be \
+             narrowed back to its opening width by Alt+Left (#1798)"
+        );
         cfg.min_sidebar_width = render::ALT_SIDEBAR_WIDTH_MIN as f32;
         cfg.max_sidebar_width = render::ALT_SIDEBAR_WIDTH_MAX as f32;
         cfg
@@ -1536,6 +1876,8 @@ impl App {
             editor_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
             editor_hover_scrollbar: Rc::new(Cell::new(None)),
             last_colorscheme,
+            last_window_title: None,
+            last_caret_shape: None,
             backend,
             units,
             // #1064: seeded to `None` rather than the active panel — GTK
@@ -1890,6 +2232,39 @@ impl App {
         if self.route_and_apply_editor_hover_popup(backend, x, y) {
             return;
         }
+        // ── Editor-tab-hosted plugin view double-click (#1631) ─────────
+        //
+        // Mirrors `handle_mouse_click_msg`'s tab-hosted press routing: a
+        // body-kind view's `List`/`Table` row activates (`ItemActivated`)
+        // rather than just selecting, and a field-stack `Form` falls back
+        // to `render::handle_plugin_view_tab_ui_event` exactly as the press
+        // handler does (that function's own `DoubleClick` arm probes it as
+        // a `MouseDown` for `FormController`).
+        if let Some((name, rect)) = self.plugin_view_tab_hit(x, y) {
+            let mut engine = self.engine.borrow_mut();
+            engine.clear_sidebar_focus();
+            let event = quadraui::UiEvent::DoubleClick {
+                widget: None,
+                position: quadraui::Point::new(x as f32, y as f32),
+            };
+            let backend_rc = self.backend.clone();
+            let mut b = backend_rc.borrow_mut();
+            let consumed = render::route_plugin_view_body_event(
+                &mut engine,
+                &name,
+                PluginViewHost::Tab,
+                &event,
+                rect,
+                &mut **b,
+            );
+            drop(b);
+            if consumed.is_none() {
+                render::handle_plugin_view_tab_ui_event(&mut engine, &name, &event, rect);
+            }
+            drop(engine);
+            self.draw_needed.set(true);
+            return;
+        }
         let mut engine = self.engine.borrow_mut();
         if engine.picker_open {
             let in_tree_mode = engine.picker_source
@@ -1979,6 +2354,47 @@ impl App {
             drop(engine);
             self.draw_needed.set(true);
             return;
+        }
+        // ── Editor-tab-hosted plugin view scroll (#1631) ───────────────
+        //
+        // Mirrors the press/double-click tab routing in
+        // `handle_mouse_click_msg`/`handle_mouse_double_click_msg`: a wheel
+        // notch over a body-kind view's window scrolls its own content
+        // instead of falling through to the generic per-window viewport
+        // scroll below, and a field-stack `Form` falls back to
+        // `render::handle_plugin_view_tab_ui_event` the same way those two
+        // handlers do. `delta_y` is negated back to quadraui's polarity —
+        // see this function's own doc comment — since `route_plugin_view_
+        // body_event`'s `Scroll` arm (shared with the sidebar's already-
+        // quadraui-polarity `UiEvent`s) expects it.
+        if delta_y.abs() > 0.01 {
+            if let Some((px, py)) = self.last_editor_pointer.get() {
+                if let Some((name, rect)) = self.plugin_view_tab_hit(px, py) {
+                    engine.clear_sidebar_focus();
+                    let event = quadraui::UiEvent::Scroll {
+                        widget: None,
+                        position: quadraui::Point::new(px as f32, py as f32),
+                        delta: quadraui::ScrollDelta::new(delta_x as f32, -(delta_y as f32)),
+                    };
+                    let backend_rc = self.backend.clone();
+                    let mut b = backend_rc.borrow_mut();
+                    let consumed = render::route_plugin_view_body_event(
+                        &mut engine,
+                        &name,
+                        PluginViewHost::Tab,
+                        &event,
+                        rect,
+                        &mut **b,
+                    );
+                    drop(b);
+                    if consumed.is_none() {
+                        render::handle_plugin_view_tab_ui_event(&mut engine, &name, &event, rect);
+                    }
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
+            }
         }
         // Route scroll through dispatch_scroll using cached scroll surfaces.
         if let Some((px, py)) = self.last_editor_pointer.get() {
@@ -2484,6 +2900,7 @@ impl App {
             &key_name,
             unicode,
             shift,
+            ctrl,
             alt,
         );
         match alt_outcome {
@@ -2498,7 +2915,71 @@ impl App {
                 self.draw_needed.set(true);
                 return;
             }
-            render::AltKeyOutcome::Fallthrough => {}
+            render::AltKeyOutcome::Fallthrough => {
+                // #1764: an Alt-modified *printable-character* key that no
+                // rung above claimed must not reach `Engine::handle_key` as
+                // if the modifier never existed — that function takes no
+                // `alt` parameter at all, so the fallthrough below would
+                // redeliver it as the *bare* key, which in Insert/Replace
+                // mode means inserting the character literally. Treating it
+                // as an implicit Escape instead (and discarding the letter)
+                // is the better of the two unverifiable guesses: Vim mode
+                // has no `<M-x>` mappings for a letter to mean anything
+                // else, while a real pty collapsing a fast Escape-then-letter
+                // into this exact chord is the documented #1763/#1764
+                // mechanism — see `render::alt_mnemonic_open_allowed`'s own
+                // doc for the matching other half of this fix (keeping the
+                // menu bar from stealing the chord first). Escape is a
+                // harmless no-op in `Normal` mode (though *not* in the
+                // `Visual*` family, which `alt_mnemonic_open_allowed` also
+                // admits and where Escape exits Visual mode — still the
+                // right substitution there, since the alternative is
+                // literal-text corruption, not a no-op either way), so this
+                // is safe to apply across every mode this rung can see.
+                //
+                // Gated on `render::alt_chord_is_printable_char` (review
+                // finding, #1764 round 1), not on `alt` alone: a real pty's
+                // Escape-then-letter fusion only ever produces a
+                // printable-char chord (`alt_chord_is_printable_char`'s own
+                // doc), so narrowing to that shape keeps the #1764 fix while
+                // restoring every named-key Alt fallthrough that predates it
+                // — `Alt+Enter`/`Alt+BackSpace` in Insert mode,
+                // `Alt+Up`/`Alt+Down` moving the cursor in Vim mode outside
+                // VSCode mode, and `Alt+]`/`Alt+[`/`Home`/`End`/`Delete`/
+                // `Page_Up`/`Page_Down` falling through exactly as
+                // `route_alt_key`'s own arms document.
+                //
+                // Not gated on `menu_bar_toggleable` the way
+                // `alt_mnemonic_open_allowed` is: on macOS GUI, `Option+
+                // <letter>` is the system dead-key/special-character
+                // modifier, so a printable-char Alt chord can arrive there
+                // too without any pty involved. Pre-#1764 an `Option+e` in
+                // Insert mode inserted `e` literally (already the wrong
+                // character for that key combo); post-#1764 it exits Insert
+                // mode instead, which is a more surprising failure in
+                // isolation — but this crate has no `alt`-aware dead-key
+                // decoding on any backend today, so "literal wrong
+                // character" was never the correct behaviour to preserve
+                // either. Left as a known, narrow trade-off (quadraui's
+                // macOS backend's dead-key handling, if it grows one, is the
+                // real fix) rather than threading a third backend-shaped
+                // condition through this already-shared rung.
+                if alt && render::alt_chord_is_printable_char(&key_name, unicode) {
+                    let action = self.engine.borrow_mut().handle_key("Escape", None, false);
+                    self.dispatch_engine_action(action, false);
+                    self.draw_needed.set(true);
+                    // No `run_post_key_epilogue(ctx)` call, matching every
+                    // sibling early-return rung above (`ModalKeyRoute::Engine`
+                    // included, which also dispatches an engine action and
+                    // returns without it) — review finding confirmed: the
+                    // epilogue's only work (sidebar autohide/focus,
+                    // explorer-after-move refresh, quickfix scroll clamp) is
+                    // driven by state a plain Insert→Normal Escape never
+                    // touches, so skipping it here changes nothing it would
+                    // have done.
+                    return;
+                }
+            }
         }
 
         // ── Shared hover-popup copy rung (#762 / #734 slice 7) ─────────
@@ -3066,6 +3547,27 @@ impl App {
             .unwrap_or(0.0)
     }
 
+    /// Resolve `(x, y)` against the currently-painted `screen.windows`,
+    /// returning the name and rect of the editor-tab-hosted plugin view
+    /// under it, if any (#1627, #1631).
+    ///
+    /// Shared by every mouse route that needs to know whether a pixel
+    /// belongs to a `vimcode.ui.register_view` view opened as an editor-area
+    /// tab (`Engine::open_plugin_view_tab`) — press, double-click and wheel
+    /// alike — so the three routes can't disagree about which window a
+    /// pixel landed in. Walks the same `screen.windows` rects `click.rs`
+    /// itself resolves clicks against.
+    fn plugin_view_tab_hit(&self, x: f64, y: f64) -> Option<(String, quadraui::Rect)> {
+        self.cached_screen_layout.borrow().as_ref().and_then(|l| {
+            l.windows.iter().find_map(|w| {
+                let name = w.plugin_view.clone()?;
+                let rect: quadraui::Rect = w.rect.into();
+                rect.contains(quadraui::Point::new(x as f32, y as f32))
+                    .then_some((name, rect))
+            })
+        })
+    }
+
     /// Both divider lists for the frame just painted, plus whether `(x, y)`
     /// lands on a group's tab bar — everything
     /// [`render::route_divider_grab`] needs from this backend.
@@ -3135,6 +3637,94 @@ impl App {
         for rw in &screen.windows {
             let editor = render::to_q_editor(rw);
             let rect = editor.rect;
+
+            // #1627: an editor-tab-hosted `vimcode.ui.register_view` view
+            // paints a `Form`, not buffer text — the same shared
+            // `quadraui::Form` primitive + adapter
+            // (`render::plugin_view_to_form`) the sidebar body already paints
+            // through, just routed through its own `FormController`/rect pair
+            // (`Engine::plugin_view_tab_form_controller`/`_tab_form_rect`) so
+            // a simultaneously-visible sidebar view can't clobber this one's
+            // cached click geometry. `window_editors` still gets `editor`
+            // (an empty placeholder — `rw.lines` is `vec![]` for a
+            // plugin-view window, see `render::build_rendered_window`'s
+            // short-circuit) so its indices stay 1:1 with `screen.windows`
+            // for `compose_editor_band_rungs`' later `FrameHitMap` build.
+            if let Some(view_name) = &rw.plugin_view {
+                let engine = self.engine.borrow();
+                engine.plugin_view_tab_form_rect.set(rect);
+                // #1631: same body-kind branch as the sidebar arm
+                // (`paint_sidebar_panel_rung`'s `ext:` case) — see that
+                // arm's comment for why `plugin_view_tab_form_rect` is
+                // reused as "the rect the active body last painted into"
+                // for every body kind, not just the field-stack `Form`.
+                let kind = engine
+                    .plugin_views
+                    .get(view_name)
+                    .and_then(|v| v.body.as_ref())
+                    .map(|b| b.kind_name());
+                match kind {
+                    Some("list") => {
+                        render::paint_plugin_view_list(
+                            &engine,
+                            view_name,
+                            PluginViewHost::Tab,
+                            rw.is_active,
+                            rect,
+                            backend,
+                        );
+                    }
+                    Some("tree") => {
+                        if render::populate_plugin_view_tree_controller(
+                            &engine,
+                            view_name,
+                            PluginViewHost::Tab,
+                            rw.is_active,
+                        ) {
+                            engine
+                                .plugin_view_tab_tree_controller
+                                .borrow()
+                                .render(backend, rect);
+                        }
+                    }
+                    Some("table") => {
+                        render::paint_plugin_view_table(
+                            &engine,
+                            view_name,
+                            PluginViewHost::Tab,
+                            rw.is_active,
+                            rect,
+                            backend,
+                        );
+                    }
+                    Some("text_view") => {
+                        render::paint_plugin_view_text(
+                            &engine,
+                            view_name,
+                            PluginViewHost::Tab,
+                            rw.is_active,
+                            rect,
+                            backend,
+                        );
+                    }
+                    _ => {
+                        if render::populate_plugin_view_tab_form_controller(
+                            &engine,
+                            view_name,
+                            rw.is_active,
+                        ) {
+                            engine
+                                .plugin_view_tab_form_controller
+                                .borrow_mut()
+                                .render_and_cache(backend, rect);
+                        }
+                    }
+                }
+                drop(engine);
+                window_editors.push(editor);
+                continue;
+            }
+
             let mut frame = QSL::new();
             frame.push(Surface::Editor {
                 rect,
@@ -3159,6 +3749,36 @@ impl App {
                 status,
                 quadraui::WidgetId::new(format!("status:{}", rw.window_id.0)),
             );
+            // #1690: with exactly one window (no `:split`/`:vsplit`), paint
+            // a plain backdrop fill edge-to-edge across the real window/
+            // terminal width *before* the real (window-bounded) bar below —
+            // VS Code's status bar runs under the activity bar and sidebar
+            // too, not just the editor pane (see the issue's side-by-side
+            // pixel sampling). `AppShell::render` paints the sidebar/
+            // activity bar *before* `render_content` ever runs (see
+            // `shell_adapter::render`), so this backdrop, painted here,
+            // after, simply draws over their bottom edge, capping them —
+            // with no `AppShellLayout`/sidebar-height change needed. See
+            // `render::paint_status_backdrop`'s doc for why this is a
+            // separate, content-free paint rather than widening `sb_rect`
+            // itself. With two or more windows there is no single
+            // VS-Code-shaped bar to backdrop this way — each split keeps
+            // its own, Vim-style, window-bounded status line, unchanged.
+            if screen.windows.len() == 1 {
+                let real_bg = win_bar
+                    .left_segments
+                    .first()
+                    .or(win_bar.right_segments.first())
+                    .map(|s| s.bg);
+                let backdrop_rect =
+                    quadraui::Rect::new(0.0, bar_y as f32, backend.viewport().width, lh as f32);
+                render::paint_status_backdrop(
+                    backend,
+                    &format!("status-backdrop:{}", rw.window_id.0),
+                    backdrop_rect,
+                    real_bg,
+                );
+            }
             // #672: recover segment hit zones the same way the dead
             // `draw.rs::draw_window_status_bar` did, so `pixel_to_click_target`'s
             // `WindowZone::StatusBar` arm has a real `status_segment_map` entry
@@ -3256,9 +3876,20 @@ impl App {
                 // `Engine` can be the body directly instead of the
                 // hand-copied `render::paint_sidebar_panel_chrome` split
                 // #1242 needed before #1059 existed.
+                // #1693: `StatusBars` reserves one row above the tree for
+                // the view-actions toolbar (New File / New Folder /
+                // Refresh / Collapse All / "..." overflow) — the same
+                // `SidebarPanelChrome` variant the Debug sidebar's title/
+                // action bars already use (`debug_sidebar_chrome`, just
+                // below). `body_rect` (what the closure receives) is
+                // already narrowed below the chrome row, so
+                // `explorer_tree_rect`/`explorer_viewport_rows` need no
+                // change to account for it.
                 let panel = render::SidebarPanelBody {
                     background: None,
-                    chrome: render::SidebarPanelChrome::None,
+                    chrome: render::SidebarPanelChrome::StatusBars(vec![
+                        render::explorer_toolbar_status_bar(theme),
+                    ]),
                     scrollbar_gutter: None,
                 };
                 render::populate_explorer_tree_controller(engine, theme);
@@ -3268,11 +3899,14 @@ impl App {
                 // re-apply them and resolve the correct row. (#540)
                 self.cached_explorer_metrics
                     .set((backend.line_height() as f64, backend.char_width() as f64));
-                panel.render_with(backend, q_sb, |backend, body_rect| {
+                let layout = panel.render_with(backend, q_sb, |backend, body_rect| {
                     engine.explorer_tree_rect.set(body_rect);
                     engine.explorer_viewport_rows.set(body_rect.height as usize);
                     engine.explorer_tree.borrow().render(backend, body_rect);
                 });
+                engine
+                    .explorer_toolbar_hits
+                    .replace(layout.status_bar_hit_regions);
             }
             PANEL_SEARCH => {
                 // #1065: `search_sidebar_system` never had `set_backend_info`
@@ -3585,6 +4219,105 @@ impl App {
                         .render_and_cache(backend, body_rect);
                 });
             }
+            id if id
+                .strip_prefix("ext:")
+                .is_some_and(|name| engine.is_plugin_view(name)) =>
+            {
+                // #146: a `vimcode.ui.register_view` panel — the plugin declared
+                // a widget tree, so paint it as a `quadraui::Form` through the
+                // *same* shared `FormController` the `PANEL_SETTINGS` arm above
+                // uses, rather than as `ExtPanelItem` tree rows. This is the
+                // whole per-surface cost of plugin UI: one arm in the shared
+                // shell, zero lines in `src/gtk/` or `src/tui_main/`.
+                //
+                // #1631: a view whose `render()` returned a `kind = "..."`
+                // table instead of `fields` paints through the matching
+                // `ListView`/`TreeView`/`DataTable`/`TextDisplay` primitive
+                // instead — still one arm here, still zero lines in
+                // `src/gtk/`/`src/tui_main/`. `plugin_view_form_rect` is
+                // reused as "the rect the active body last painted into"
+                // regardless of which body kind is active (mutually
+                // exclusive per view, so there is no collision).
+                let name = id.strip_prefix("ext:").unwrap_or(id).to_string();
+                let panel = render::SidebarPanelBody {
+                    background: Some(theme.tab_bar_bg),
+                    chrome: render::SidebarPanelChrome::Header(format!(
+                        " {}",
+                        screen
+                            .ext_panel
+                            .as_ref()
+                            .map(|p| p.title.clone())
+                            .unwrap_or_default()
+                    )),
+                    scrollbar_gutter: None,
+                };
+                panel.render_with(backend, q_sb, |backend, body_rect| {
+                    // Same contract as the Settings arm: cache the exact rect
+                    // painted, because the click routers re-derive row
+                    // geometry from it.
+                    engine.plugin_view_form_rect.set(body_rect);
+                    engine.ext_panel_content_rect.set(q_sb);
+                    let has_focus = engine.ext_panel_has_focus;
+                    let kind = engine
+                        .plugin_views
+                        .get(&name)
+                        .and_then(|v| v.body.as_ref())
+                        .map(|b| b.kind_name());
+                    match kind {
+                        Some("list") => {
+                            render::paint_plugin_view_list(
+                                engine,
+                                &name,
+                                PluginViewHost::Sidebar,
+                                has_focus,
+                                body_rect,
+                                backend,
+                            );
+                        }
+                        Some("tree") => {
+                            if render::populate_plugin_view_tree_controller(
+                                engine,
+                                &name,
+                                PluginViewHost::Sidebar,
+                                has_focus,
+                            ) {
+                                engine
+                                    .plugin_view_tree_controller
+                                    .borrow()
+                                    .render(backend, body_rect);
+                            }
+                        }
+                        Some("table") => {
+                            render::paint_plugin_view_table(
+                                engine,
+                                &name,
+                                PluginViewHost::Sidebar,
+                                has_focus,
+                                body_rect,
+                                backend,
+                            );
+                        }
+                        Some("text_view") => {
+                            render::paint_plugin_view_text(
+                                engine,
+                                &name,
+                                PluginViewHost::Sidebar,
+                                has_focus,
+                                body_rect,
+                                backend,
+                            );
+                        }
+                        _ => {
+                            if render::populate_plugin_view_form_controller(engine) {
+                                engine
+                                    .plugin_view_form_controller
+                                    .borrow_mut()
+                                    .render_and_cache(backend, body_rect);
+                            }
+                        }
+                    }
+                });
+            }
             id if id.starts_with("ext:") => {
                 // #1089: a plugin-provided panel — paint its own sections +
                 // items via `render::ext_panel_to_tree_view` +
@@ -3642,6 +4375,27 @@ impl App {
                             .replace(Some((layout.body_rect, tree_layout)));
                     } else {
                         engine.ext_panel_tree_layout.replace(None);
+                    }
+
+                    // #636: the `?`-triggered keybindings help popup, drawn
+                    // over the whole panel content area via `Tooltip` +
+                    // `Backend::draw_tooltip_with_chrome` (JDonaghy/
+                    // quadraui#541, landed at this repo's pinned rev) —
+                    // see `render::ext_panel_help_tooltip_layout`'s own doc
+                    // for why this is the real fix and not a stand-in.
+                    // Nothing painted this popup at all before this change
+                    // (the 2026-10-05 triage update on the issue): `?` set
+                    // `Engine::ext_panel_help_open` but no backend ever read
+                    // it back.
+                    if panel.help_open {
+                        let (tooltip, tlayout, chrome) = render::ext_panel_help_tooltip_layout(
+                            &panel.name,
+                            &panel.help_bindings,
+                            q_sb,
+                            cw as f32,
+                            lh as f32,
+                        );
+                        backend.draw_tooltip_with_chrome(&tooltip, &tlayout, &chrome);
                     }
                 } else {
                     engine.ext_panel_tree_layout.replace(None);
@@ -4272,6 +5026,30 @@ impl App {
                         main.width,
                         el.separated_status_h as f32,
                     );
+                    // #1690: backdrop fill, full window/terminal width (not
+                    // `main.width` — main-content-column-only), painted
+                    // *before* the real, window-bounded bar below — see
+                    // `render::paint_status_backdrop`'s doc (the same
+                    // helper `paint_editor_windows_rung`'s single-window
+                    // case uses) for why this is a separate, content-free
+                    // paint rather than widening `sb_rect` itself.
+                    let real_bg = status
+                        .left_segments
+                        .first()
+                        .or(status.right_segments.first())
+                        .map(|s| quadraui::Color::rgb(s.bg.r, s.bg.g, s.bg.b));
+                    let backdrop_rect = quadraui::Rect::new(
+                        0.0,
+                        separated_status_y as f32,
+                        backend.viewport().width,
+                        el.separated_status_h as f32,
+                    );
+                    render::paint_status_backdrop(
+                        backend,
+                        "status-backdrop:separated",
+                        backdrop_rect,
+                        real_bg,
+                    );
                     // #672: segment hit-zone recovery keyed by
                     // `active_window_id` — the separated line shows the active
                     // window's status, so that's the id `pixel_to_click_target`
@@ -4592,7 +5370,11 @@ impl App {
             }
             render::PickerRoute::Consume => {}
             render::PickerRoute::Dismiss => {
-                self.engine.borrow_mut().close_picker();
+                // #1630 review: clicking away from a `vimcode.picker.open`
+                // picker is a user-initiated cancel exactly like Escape —
+                // use the same helper so `on_cancel` fires and the plugin's
+                // registration is released instead of leaking forever.
+                self.engine.borrow_mut().close_picker_cancelling_plugin();
                 backend.modal_stack_handle().borrow_mut().pop(&picker_id);
             }
         }
@@ -5169,6 +5951,52 @@ impl App {
                         self.divider_grab = Some(grab);
                         return;
                     }
+                }
+
+                // ── Editor-tab-hosted plugin view click (#1627, #1631) ─────
+                //
+                // A `vimcode.ui.register_view` view opened as an editor-area
+                // tab (`Engine::open_plugin_view_tab`) paints either a
+                // `Form` or a body-kind primitive (`List`/`Tree`/`Table`/
+                // `TextView`), not buffer text (`App::paint_editor_windows_
+                // rung`) — a click inside its window rect has no
+                // buffer-click meaning for `click::handle_mouse_click` to
+                // resolve (no cursor to place, no file to reveal), so it's
+                // routed through `render::route_plugin_view_body_event`
+                // first (the same body-kind router the sidebar's `ExtPanel`
+                // arm uses) and, when that reports the view is a
+                // field-stack `Form` instead (`None`), through
+                // `render::handle_plugin_view_tab_ui_event` — before falling
+                // into the generic buffer-click block below.
+                // `Self::plugin_view_tab_hit` walks the same `screen.windows`
+                // rects `click.rs` itself resolves clicks against, so the
+                // two can't disagree about which window a click landed in.
+                if let Some((name, rect)) = self.plugin_view_tab_hit(x, y) {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.clear_sidebar_focus();
+                    let event = quadraui::UiEvent::MouseDown {
+                        widget: None,
+                        button: quadraui::MouseButton::Left,
+                        position: quadraui::Point::new(x as f32, y as f32),
+                        modifiers: quadraui::Modifiers::default(),
+                    };
+                    let backend_rc = self.backend.clone();
+                    let mut b = backend_rc.borrow_mut();
+                    let consumed = render::route_plugin_view_body_event(
+                        &mut engine,
+                        &name,
+                        PluginViewHost::Tab,
+                        &event,
+                        rect,
+                        &mut **b,
+                    );
+                    drop(b);
+                    if consumed.is_none() {
+                        render::handle_plugin_view_tab_ui_event(&mut engine, &name, &event, rect);
+                    }
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
                 }
 
                 {
@@ -6087,6 +6915,54 @@ impl App {
         self.draw_needed.set(true);
     }
 
+    /// Resolve a press against the Explorer header's view-actions toolbar
+    /// row (#1693) — mirrors `Self::route_debug_sidebar_event`'s
+    /// chrome-band check for the Debug sidebar's own title/action bars.
+    /// `render::explorer_toolbar_hit_at` does the engine-only hit-test
+    /// (button index); this wrapper adds the one thing it can't do without
+    /// a `Backend` handle — converting `pos` to the character-cell
+    /// coordinates `Engine::open_explorer_overflow_menu` needs to anchor
+    /// the "..." popup, using `self.cached_explorer_metrics` (the same
+    /// paint-time metrics `explorer_ui_event` re-applies for its own
+    /// hit-test, #540).
+    ///
+    /// Returns `false` (and does nothing) when `pos` doesn't land on a
+    /// toolbar segment, so the caller falls through to the tree's own
+    /// click routing.
+    fn route_explorer_toolbar_click(&mut self, pos: quadraui::Point) -> bool {
+        let idx = {
+            let engine = self.engine.borrow();
+            render::explorer_toolbar_hit_at(&engine, pos)
+        };
+        let Some(idx) = idx else {
+            return false;
+        };
+        let mut engine = self.engine.borrow_mut();
+        if idx == 4 {
+            let (line_height, char_width) = self.cached_explorer_metrics.get();
+            let col = (pos.x as f64 / char_width.max(1.0)) as u16;
+            let row = (pos.y as f64 / line_height.max(1.0)) as u16;
+            engine.open_explorer_overflow_menu(col, row, 1.0);
+        } else {
+            engine.explorer_activate_toolbar_action(idx);
+        }
+        // "Refresh" (idx 2) sets this immediately rather than waiting for
+        // the next idle poll tick — same immediacy
+        // `apply_context_menu_route`/`dispatch_context_menu_key` already
+        // give a context-menu-driven explorer action.
+        let needs_refresh = engine.explorer_needs_refresh;
+        if needs_refresh {
+            engine.explorer_needs_refresh = false;
+        }
+        drop(engine);
+        if needs_refresh {
+            self.refresh_file_tree();
+        }
+        self.queue_explorer_draw();
+        self.draw_needed.set(true);
+        true
+    }
+
     /// `UiEvent` (scroll, mouse) over the explorer panel — routed through
     /// `TreeController::handle` for scrollbar interaction.
     /// Sidebar routing for the Explorer panel (#540/#754).
@@ -6431,7 +7307,16 @@ impl App {
 
         let consumed = match &owner {
             render::SidebarOwner::Explorer => {
-                self.explorer_ui_event(event.clone());
+                // #1693: the view-actions toolbar row sits above the tree
+                // (`paint_sidebar_panel_rung`'s `PANEL_EXPLORER` arm), so a
+                // press is checked against it first — mirrors
+                // `Self::route_debug_sidebar_event`'s chrome-band check.
+                // Only a genuine press/release (`starts_interaction`) can
+                // open the overflow menu or run an action; a drag
+                // follow-through always falls to the tree.
+                if !starts_interaction || !self.route_explorer_toolbar_click(pos) {
+                    self.explorer_ui_event(event.clone());
+                }
                 true
             }
             render::SidebarOwner::Search => {
@@ -6505,7 +7390,43 @@ impl App {
                 if is_press {
                     engine.ext_panel_has_focus = true;
                 }
+                // #146: a view-backed panel painted a `quadraui::Form`, so its
+                // clicks resolve through `FormController` (and dispatch to the
+                // plugin's `on_event`), not through the tree-row router.
+                let is_view = engine
+                    .ext_panel_active
+                    .as_deref()
+                    .is_some_and(|n| engine.is_plugin_view(n));
+                // `handle_plugin_view_ui_event`'s own `bool` return is ignored
+                // for the same reason the Settings arm ignores it: the position
+                // is already known to be inside the sidebar, so even a click on
+                // empty panel padding belongs here rather than leaking to the
+                // editor underneath.
                 match event {
+                    // #1631: a `ViewBody`-kind view routes through its own
+                    // matching primitive's click/scroll resolution instead
+                    // of `FormController` — `render::route_plugin_view_body_
+                    // event`, shared with the tab-hosted arm below. See the
+                    // paint arm (`paint_sidebar_panel_rung`'s `ext:` case)
+                    // for the matching kind branch.
+                    _ if is_view => {
+                        let name = engine.ext_panel_active.clone().unwrap_or_default();
+                        let rect = engine.plugin_view_form_rect.get();
+                        let backend_rc = self.backend.clone();
+                        let mut b = backend_rc.borrow_mut();
+                        let consumed = render::route_plugin_view_body_event(
+                            &mut engine,
+                            &name,
+                            PluginViewHost::Sidebar,
+                            event,
+                            rect,
+                            &mut **b,
+                        );
+                        drop(b);
+                        if consumed.is_none() {
+                            render::handle_plugin_view_ui_event(&mut engine, event, rect);
+                        }
+                    }
                     UiEvent::Scroll { delta, .. } => {
                         let flat_len = engine.ext_panel_flat_len();
                         let step = (delta.y.abs() * 3.0).round().max(1.0) as usize;
@@ -7366,6 +8287,156 @@ impl App {
     }
 }
 
+/// #1745: on the native macOS GUI, a real Cmd keypress reaches this crate as
+/// `quadraui::Modifiers::cmd`, a bit `engine_key_from_ui`/`handle_key_press`/
+/// every other `modifiers.ctrl` check in this file has never read — see
+/// `tests/vscode_keybinding_parity.rs`'s corrected `macos_gui` column. So
+/// before this fix Cmd+C/V/X/Z/S/P/… didn't merely *diverge* from VS Code's
+/// Mac defaults, they did **nothing at all**: `ctrl` stayed `false` and the
+/// plain, unmodified character fell through to whatever Insert-mode typing
+/// does with it.
+///
+/// Folds `cmd` into `ctrl` for a `KeyPressed` event, but only when the live
+/// backend's own [`quadraui::PlatformServices::platform_name`] — a runtime
+/// capability query, not a `cfg!(target_os = "macos")` guess — reports
+/// `"macos"`. That is true only for `quadraui::macos::MacBackend`: GTK's own
+/// Cmd-reporting convention (Super/Meta -> `cmd`, quadraui's
+/// `gtk/events.rs`) is left completely alone, so a GNOME user's Super key
+/// does not suddenly start acting like Ctrl. This is the one shared
+/// dispatcher both GTK and the macOS GUI already run through (`App::handle`
+/// -> `handle_dispatch`), so the fix lives here once rather than in any
+/// backend-specific file — see this file's own module doc and CLAUDE.md's
+/// Platform-Neutrality Rule.
+///
+/// Mouse events are deliberately left untouched: the issue this fixes
+/// (#1745) is scoped to VS Code mode's keyboard chords, and folding `cmd`
+/// into the `MouseButton::Left if modifiers.ctrl` go-to-definition chord
+/// would be a second, separate behaviour change with no test coverage here.
+///
+/// ## Arrow keys are handled separately, and only in VS Code mode
+///
+/// VS Code's real Mac defaults do **not** treat Cmd+Arrow as a plain
+/// Ctrl-to-Cmd substitution the way every letter/symbol chord above does:
+/// Option (`alt`) is the word-wise-navigation modifier on Mac
+/// (`cursorWordLeft`/`cursorWordRight`, vimcode's existing Ctrl+Left/Right),
+/// while Cmd+Left/Right is line start/end (`cursorHome`/`cursorEnd`, plain
+/// `Home`/`End`) and Cmd+Up/Down is document start/end
+/// (`cursorTop`/`cursorBottom`, Ctrl+Home/Ctrl+End) — see
+/// tests/vscode_keybinding_parity.rs's `cursorWordEndRight / cursorWordLeft` and
+/// `cursorTop / cursorBottom` rows. A blanket `cmd -> ctrl` fold would make
+/// Cmd+Right *word-move* (vimcode's Ctrl+Right), which is not what either
+/// VS Code or this fix wants, so arrows are excluded from the fold above
+/// and translated here instead — a key-identity translation (not just a
+/// modifier fold), gated on VS Code mode specifically because that's this
+/// issue's scope and `route_alt_key`'s own Alt+Left/Right handling (VS
+/// Code's Win/Linux `navigateBack`/`navigateForward` default) is itself
+/// VS-Code-mode-gated.
+///
+/// `alt` is cleared on the Option+Left/Right arm so `route_alt_key` (called
+/// later in `handle_dispatch`, unconditionally whenever `alt` is set) sees
+/// `alt == false` and takes its own `Fallthrough` path instead of also
+/// claiming the chord as `navigateBack`/`navigateForward` — Mac's own
+/// default for that command is Ctrl+-/Ctrl+Shift+- instead (tracked as a
+/// still-open gap; see `tests/vscode_keybinding_parity.rs`'s `KNOWN_GAPS`).
+fn normalize_mac_cmd_as_ctrl(
+    event: quadraui::UiEvent,
+    backend: &dyn quadraui::Backend,
+    vscode_mode: bool,
+) -> quadraui::UiEvent {
+    use quadraui::{Key, Modifiers, NamedKey, UiEvent};
+    if backend.services().platform_name() != "macos" {
+        return event;
+    }
+    match event {
+        // Option+Left/Right (no Cmd, no physical Ctrl already held): word
+        // move, matching vimcode's existing Ctrl+Left/Right.
+        UiEvent::KeyPressed {
+            key: key @ (Key::Named(NamedKey::Left) | Key::Named(NamedKey::Right)),
+            modifiers,
+            repeat,
+        } if vscode_mode && modifiers.alt && !modifiers.cmd && !modifiers.ctrl => {
+            UiEvent::KeyPressed {
+                key,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    alt: false,
+                    ..modifiers
+                },
+                repeat,
+            }
+        }
+        // Cmd+Left/Right (no Option): line start/end.
+        UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::Left),
+            modifiers,
+            repeat,
+        } if vscode_mode && modifiers.cmd && !modifiers.alt => UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::Home),
+            modifiers,
+            repeat,
+        },
+        UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::Right),
+            modifiers,
+            repeat,
+        } if vscode_mode && modifiers.cmd && !modifiers.alt => UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::End),
+            modifiers,
+            repeat,
+        },
+        // Cmd+Up/Down (no Option): document start/end — `Home`/`End` with
+        // an extra `ctrl` bit, the same shape `engine_key_from_ui`'s
+        // `NamedKey::Home`/`End` arms already use for Ctrl+Home/Ctrl+End.
+        UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::Up),
+            modifiers,
+            repeat,
+        } if vscode_mode && modifiers.cmd && !modifiers.alt => UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::Home),
+            modifiers: Modifiers {
+                ctrl: true,
+                ..modifiers
+            },
+            repeat,
+        },
+        UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::Down),
+            modifiers,
+            repeat,
+        } if vscode_mode && modifiers.cmd && !modifiers.alt => UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::End),
+            modifiers: Modifiers {
+                ctrl: true,
+                ..modifiers
+            },
+            repeat,
+        },
+        // Every other chord: fold `cmd` into `ctrl` unchanged (the plain
+        // Ctrl-to-Cmd substitution that covers every letter/symbol VS Code
+        // Mac default this file's own doc enumerates). Gated on
+        // `vscode_mode`, same as the arrow arms above — this issue is
+        // scoped to VS Code mode on the macOS GUI (#1745), and without the
+        // gate it would also change default Vim-mode behaviour on Mac:
+        // Cmd+W would enter vim's window-command prefix, Cmd+V would enter
+        // visual-block, Cmd+D would scroll a half page, etc. Vim mode's own
+        // Mac Cmd semantics (if any are ever wanted) are a separate,
+        // untested design decision and not part of this fix.
+        UiEvent::KeyPressed {
+            key,
+            mut modifiers,
+            repeat,
+        } if vscode_mode && modifiers.cmd => {
+            modifiers.ctrl = true;
+            UiEvent::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+            }
+        }
+        other => other,
+    }
+}
+
 impl App {
     /// The actual body of `ShellApp::handle`, moved to an inherent
     /// method (#813) so the trait impl can wrap it with a single
@@ -7379,6 +8450,24 @@ impl App {
         ctx: &quadraui::ShellContext<'_>,
     ) -> quadraui::Reaction {
         use quadraui::{Key, MouseButton, UiEvent};
+        // #1745: must run before anything else reads `event`'s modifiers —
+        // see `normalize_mac_cmd_as_ctrl`'s own doc. The `matches!` guard
+        // is a cheap hardening (#1745 review), not a behaviour change:
+        // `normalize_mac_cmd_as_ctrl`'s own `match` only has arms for
+        // `UiEvent::KeyPressed`, falling through every other variant via
+        // `other => other` regardless of `vscode_mode`'s value — so
+        // skipping the borrow entirely for a non-`KeyPressed` event (mouse
+        // moves/window events, the overwhelming majority of dispatches)
+        // changes nothing it would have computed. Without the guard this
+        // was an *unconditional* immutable borrow at the top of the one
+        // shared dispatcher, on every event; `dispatch_engine_action`
+        // holds a `borrow_mut()` across the whole `apply_engine_action`
+        // call, and quadraui's macOS dialogs drive nested modal loops, so
+        // any nested re-entry into `handle` that previously passed through
+        // a non-engine-borrowing arm would have panicked on this borrow.
+        let vscode_mode =
+            matches!(event, UiEvent::KeyPressed { .. }) && self.engine.borrow().is_vscode_mode();
+        let event = normalize_mac_cmd_as_ctrl(event, backend, vscode_mode);
 
         // ── #1427: shared menu-bar reveal/hide routing ───────────────────────
         // The #318 Alt+<letter> shim (only fires while the bar is hidden —
@@ -7440,7 +8529,23 @@ impl App {
         };
         let menu_open = menu_system.borrow().is_open();
         let change_review_open = self.engine.borrow().change_review.is_some();
-        if menu_open || (menu_bar_visible && !change_review_open) {
+        // #1764: a *closed* dropdown must not be opened by an Alt+<mnemonic>
+        // `KeyPressed` while the engine is mid-text-entry (Insert/Replace) or
+        // mid-command-line (Command/Search) — see
+        // `render::alt_mnemonic_open_allowed`'s own doc for why (a bugbash
+        // repro traced a real macOS pty's Escape-then-letter collapsing into
+        // exactly this chord, and letting it open a menu here swallows the
+        // keystroke that was supposed to be the Escape, leaving every
+        // following key falling through as literal Insert-mode text).
+        // `menu_open` (a dropdown that's *already* open) is untouched — this
+        // only gates a fresh open.
+        let alt_mnemonic_open_blocked = !menu_open
+            && matches!(
+                event,
+                UiEvent::KeyPressed { modifiers, .. } if modifiers.alt
+            )
+            && !render::alt_mnemonic_open_allowed(self.engine.borrow().mode, menu_bar_toggleable);
+        if !alt_mnemonic_open_blocked && (menu_open || (menu_bar_visible && !change_review_open)) {
             // `menu_items_rect`, not `menu_row_rect` (#720): the app icon
             // occupies a leading slot, so the items the last frame *painted*
             // start one slot right of the band's left edge. Hit-testing
@@ -7472,7 +8577,84 @@ impl App {
                     self.draw_needed.set(true);
                     return quadraui::Reaction::Redraw;
                 }
-                quadraui::MenuEvent::Ignored => {}
+                // #1763: a dropdown that was genuinely open (`menu_open`,
+                // not just the bar revealed) and a `KeyPressed` it doesn't
+                // recognise (anything but Escape/arrows/Enter/a matching
+                // Alt+<letter>, all handled above) falls all the way
+                // through to `Ignored` — `quadraui::MenuSystem::handle` has
+                // no type-ahead/dismiss-on-any-key behaviour of its own
+                // (`quadraui/src/compose/menu_system.rs`'s own `handle`:
+                // the match's final arm is a bare `_ => MenuEvent::Ignored`
+                // for exactly this case). Left alone, the dropdown stays
+                // `is_open()` and keeps painting every subsequent frame
+                // (`render_content`'s unconditional `menu_system.render()`
+                // call) while this same event keeps flowing to the Vim/
+                // editor dispatch below and is applied there as normal —
+                // so a key sequence that happens to open a menu (Alt+<its
+                // mnemonic>, or — per #1763's own bugbash repro — a
+                // terminal that collapses a fast Escape-then-letter into
+                // an Alt+letter chord) leaves every following keystroke
+                // editing the buffer correctly *underneath* a dropdown
+                // that visually never goes away, exactly the "unexpected
+                // 'Go' menu dropdown" symptom. Closing here mirrors the
+                // private `handle_escape`'s own whole-menu close inside
+                // `MenuSystem::handle` (same `close()` call) for the one
+                // case that handler can't reach: the key wasn't Escape, so
+                // `MenuSystem::handle` never ran that arm itself.
+                //
+                // This lives in *shared* `handle_dispatch`, not TUI-side
+                // wiring, so the same dismiss-on-unrecognised-key behaviour
+                // lands on GTK and macOS too, where `menu_bar_visible` is
+                // always `true` and `menu_open` is reachable by a plain
+                // mouse click on a bar label — see GTK's
+                // `unrecognised_key_closes_a_stale_open_dropdown_on_gtk_1763`
+                // (`src/gtk/testing.rs`) for that side's coverage.
+                //
+                // Deliberately does not also return early or consume the
+                // key (no `engine.menu_bar_visible` touch, no early
+                // return) — the event must still fall through to the rest
+                // of this dispatch unchanged. That is a conscious choice,
+                // not an oversight: a dropdown open from a genuine user
+                // click, dismissed by a stray letter, now also lets that
+                // letter reach and mutate the buffer underneath (a
+                // pre-existing leak this does not introduce — the key
+                // already flowed through before this arm existed, just
+                // with a stale dropdown left on top of it). Swallowing the
+                // key instead would avoid that, but would also silently
+                // eat whatever the user actually meant to type, which is
+                // the worse failure mode of the two. A plain Escape close
+                // already leaves the toggleable bar row itself visible too
+                // (TUI: `escape_closes_the_dropdown_but_leaves_the_
+                // toggleable_bar_row_visible_1763` below), so an
+                // unrecognised key closing only the dropdown — and letting
+                // the key fall through — is the narrower, consistent fix.
+                //
+                // NOT fixed here, and still open: #1763's own repro traces
+                // the spurious dropdown open back to a real macOS pty
+                // apparently collapsing a fast keystroke into an `Alt+g`
+                // chord — `TuiDriver` can't carry that modifier
+                // synthetically (see `alt_g_dropdown_does_not_survive_a_
+                // vim_dw_1763`'s own doc), so the mis-decode itself is
+                // neither reproduced nor fixed by this arm, and the
+                // mis-decoded keystroke is still swallowed by whichever
+                // `handle_alt_char`/menu-open arm actually consumes it
+                // upstream of this one. A follow-up issue for that
+                // raw-terminal-decode question (vimcode or quadraui) still
+                // needs to be filed — track it from there, not from this
+                // comment, once it exists.
+                //
+                // A generic "dismiss an open menu on any unrecognised key"
+                // is also arguably `quadraui::MenuSystem::handle`'s own
+                // policy to own (every quadraui consumer would want it,
+                // not just vimcode) rather than a vimcode-side patch — a
+                // quadraui issue for type-ahead/dismiss-on-any-key would
+                // let this arm be deleted later; also not yet filed.
+                quadraui::MenuEvent::Ignored => {
+                    if menu_open && matches!(event, UiEvent::KeyPressed { .. }) {
+                        menu_system.borrow_mut().close(backend);
+                        self.draw_needed.set(true);
+                    }
+                }
             }
         }
 
@@ -7660,6 +8842,131 @@ impl App {
             }
         }
 
+        // ── Editor hover dwell (#1750) ─────────────────────────────────────
+        // Mouse movement over editor text arms the dwell timer that
+        // eventually fires `textDocument/hover` (LSP) or surfaces a plugin's
+        // `vimcode.editor.set_hover` content — `Engine::editor_hover_mouse_
+        // move` is the sole entry point for both; `poll_editor_hover`
+        // (driven by the shared tick, `render::run_shared_tick_chores`) does
+        // the rest once the dwell elapses. #731 deleted the GTK-only polling
+        // block that used to call this — it was gated on a permanently-
+        // `None` Relm4 widget handle, so it had been dead since the #540
+        // cutover — and nothing replaced the call; #1434 then deleted TUI's
+        // own `mouse.rs` copy the same way, so by #1750 no backend ever
+        // armed the dwell timer at all and the hover popup (LSP, and every
+        // extension's own hover) stopped appearing on every backend at
+        // once. This is the shared `MouseMoved` arm both backends already
+        // reach (see the sidebar/gutter-hover blocks just above), not a
+        // per-backend restoration — one fix covers both, same reasoning as
+        // the #754/#1544 rungs above it.
+        //
+        // Resolved via the shared `pixel_to_click_target` (`mutate_focus:
+        // false` — a pure query, the same contract `handle_mouse_drag_msg`'s
+        // cross-split continuation relies on) rather than re-deriving
+        // gutter-width/scroll-offset math by hand the way the pre-#731 GTK
+        // code did: `ClickTarget::BufferPos`'s `(line, col)` is the exact
+        // buffer position `draw_editor` painted at this pixel (via
+        // `Backend::editor_col_at_x`), so hover and click can never resolve
+        // to different cells (the same #560/#515 guarantee the click paths
+        // above already lean on). Any other target (gutter, tab bar,
+        // outside the window entirely, no cached layout yet) dismisses an
+        // already-visible, unfocused popup — mirroring the pre-#731 "mouse
+        // outside editor area" branch.
+        //
+        // No idle-tick redraw reintroduced here (the #1722 worry this issue
+        // was filed against): this arm only ever touches `engine.editor_
+        // hover_dwell`/`editor_hover`/`lsp_hover_text` from a real
+        // `MouseMoved` event. The repaint once the LSP response actually
+        // arrives is still `poll_lsp`'s job (`core/engine/panels.rs`
+        // setting `redraw = true` on a hover reply), not this arm's.
+        //
+        // `!buttons.left`: a left-button drag (text selection, or a cross-
+        // split continuation in `handle_mouse_drag_msg`) must not also arm
+        // the dwell timer — matches the #751 context-menu-hover guard just
+        // below in the `MouseMoved` event arm itself.
+        if let UiEvent::MouseMoved { position, buttons } = &event {
+            let gate_open = {
+                let e = self.engine.borrow();
+                !buttons.left
+                    && e.settings.hover_delay > 0
+                    && !e.editor_hover_has_focus
+                    && !e.is_blocking_modal_open()
+                    && (matches!(e.mode, core::Mode::Normal | core::Mode::Visual)
+                        || e.is_vscode_mode())
+            };
+            if gate_open {
+                let layout_ref = self.cached_screen_layout.borrow();
+                if let Some(layout) = layout_ref.as_ref() {
+                    let mut engine = self.engine.borrow_mut();
+                    let target = pixel_to_click_target(
+                        &mut engine,
+                        backend,
+                        position.x as f64,
+                        position.y as f64,
+                        self.cached_line_height,
+                        self.cached_char_width,
+                        layout,
+                        &self.cached_group_tab_bar_layouts.borrow(),
+                        self.cached_frame_hit_map.borrow().as_ref(),
+                        &self.cached_tab_bar_zones.borrow(),
+                        false, // pure hover query — must not steal focus or fire gutter actions
+                        // scratch: never touched under mutate_focus: false — see click.rs:233-320
+                        &mut quadraui::DragState::default(),
+                        false, // no Alt-fine-seek context for a plain mouse-move
+                    );
+                    let had_hover = engine.editor_hover.is_some();
+                    // Popup keep-alive is geometry-independent on purpose
+                    // (#1750 review): the popup can spill over the active
+                    // window's gutter column or into a neighbouring split,
+                    // where `pixel_to_click_target` resolves to
+                    // `ClickTarget::None`/another window id and the `_`
+                    // dismiss arm below would yank the popup out from under
+                    // a pointer that is physically *on* it — e.g. while
+                    // travelling towards the `command:definition` link
+                    // (#272/#491). Checked before the target is classified,
+                    // so "the mouse is over the popup" always wins.
+                    let on_popup = self.editor_hover_popup_rect.get().is_some_and(|r| {
+                        position.x >= r.x
+                            && position.x < r.x + r.width
+                            && position.y >= r.y
+                            && position.y < r.y + r.height
+                    });
+                    // When keep-alive hits, the only arm that could still
+                    // run would be a no-op anyway (`editor_hover_mouse_move`
+                    // returns without touching anything once
+                    // `mouse_on_popup` is true and a popup is visible), so
+                    // keeping the popup alive is simply "change nothing".
+                    let keep_alive = on_popup && had_hover;
+                    match target {
+                        _ if keep_alive => {}
+                        ClickTarget::BufferPos(wid, line, col)
+                            if wid == engine.active_window_id() =>
+                        {
+                            engine.editor_hover_mouse_move(line, col, on_popup);
+                        }
+                        _ => {
+                            // Not a buffer position at all, or one resolved
+                            // against a *different* (unfocused) split: both
+                            // mean "outside the editor area we can hover
+                            // against", so dismiss any visible popup.
+                            // #1750 review: the window-id guard above is
+                            // load-bearing because `BufferPos`'s `(line,
+                            // col)` come from the *hovered* window's scroll
+                            // offset while every downstream consumer reads
+                            // active-window/active-buffer state.
+                            if had_hover {
+                                engine.dismiss_editor_hover();
+                            }
+                        }
+                    }
+                    if had_hover != engine.editor_hover.is_some() {
+                        drop(engine);
+                        self.draw_needed.set(true);
+                    }
+                }
+            }
+        }
+
         // #955 (ACP-4, review fix): gates the title-bar drag/double-click
         // arms below on the change-review surface being closed. That surface
         // is genuinely full-viewport — its first diff row paints inside
@@ -7761,6 +9068,115 @@ impl App {
             _ => {}
         }
 
+        // ── #1762: rescue a double-click that folded away an activity-bar
+        // panel switch ─────────────────────────────────────────────────────
+        //
+        // `quadraui::AppShell::handle` (`compose/app_shell.rs`) only matches
+        // a plain `UiEvent::MouseDown` for activity-bar hit-testing — every
+        // other event variant, `DoubleClick` included, falls through its own
+        // `_ => AppShellEvent::Ignored` arm. `quadraui::dispatch::
+        // DoubleClickDetector` folds a press into a `DoubleClick` whenever
+        // it lands within its radius of the previous press within
+        // `DOUBLE_CLICK_MS` (400ms). Only `TuiBackend` runs the *default*
+        // 1.5-*cell* radius (TUI's own character-grid unit, where adjacent
+        // activity-bar rows are exactly 1.0 cell apart); `MacBackend` uses
+        // `DoubleClickDetector::with_radius(MAC_DOUBLE_CLICK_RADIUS)` = 4.0
+        // *points*, explicitly because the cell-tuned 1.5 is meaningless in
+        // AppKit's point-precision coordinates, and GTK/Windows use their
+        // own 4.0px radius — so adjacent-row folding is a TUI-only failure
+        // mode. On TUI, two genuinely distinct, fast real clicks on
+        // *adjacent* icons (Source Control then Debug, Debug then
+        // Extensions, …) land within that 1.5-cell radius and fold into one
+        // `DoubleClick`, which the activity bar has no handler for — the
+        // second click is silently dropped and the sidebar stays on
+        // whatever panel was already active.
+        //
+        // This is a real, previously-unknown latent bug in its own right,
+        // confirmed by `activity_bar_adjacent_clicks_are_not_dropped_by_double_click_fold_1762`
+        // in `src/tui_main/app_on_tui_tests.rs`. It is NOT a confirmed
+        // explanation for vimcode#1762's reported "Explorer -> Source
+        // Control -> Extensions -> Explorer" symptom: the final Explorer
+        // re-click sits 4.0 cells from the row it follows, far outside the
+        // 1.5-cell radius, so that specific re-click cannot be dropped by
+        // this fold under any timing — see that test's doc comment and
+        // `PROJECT_STATE.md` for the full accounting of what this fix does
+        // and does not demonstrate about #1762's exact reported run.
+        //
+        // The real fix belongs in quadraui (`AppShell::handle` growing a
+        // `DoubleClick` arm identical to its `MouseDown` one for the
+        // activity-bar band — a double-click on an activity-bar icon has no
+        // distinct meaning from a single click there, for every consumer,
+        // not just vimcode). That gap is drafted in
+        // `docs/PENDING_QUADRAUI_ISSUES.md` for the coordinator to file
+        // verbatim (not yet filed/landed as of this commit, per CLAUDE.md's
+        // Platform-Neutrality Rule). Until it lands, re-synthesize the
+        // dropped click as the plain `MouseDown` it was always meant to be
+        // and feed it back through the shell's own *public* `handle()` —
+        // the exact dispatch a real single click takes — rather than
+        // hand-rolling an activity-bar hit-test here. That keeps this "thin
+        // event-to-engine wiring" against the existing public API, shared
+        // once in `App` (not `src/gtk/`/`src/tui_main/`), so both backends
+        // pick up the fix from one place — the same pattern
+        // `render::consume_hamburger_stale_click_guard`/
+        // `render::sync_runner_sidebar_visibility` already use for other
+        // quadraui-shaped gaps in this exact file.
+        //
+        // The synthetic is hard-coded to `MouseButton::Left` because
+        // `UiEvent::DoubleClick` carries no button — `DoubleClickDetector`
+        // folds same-button pairs of any button, so a fast double-*right*-
+        // click on the activity bar is replayed as a left click. Harmless
+        // in practice (it only switches panels, same as a left click
+        // would), but worth flagging since it's not quite faithful replay.
+        //
+        // Note this also changes behaviour on every backend, not just TUI:
+        // a genuine fast double-click on an activity-bar icon that is
+        // *already active* used to be swallowed as `Ignored` (the first
+        // click already toggled the sidebar hidden); it is now replayed as
+        // a second plain `MouseDown`, which `AppShell::handle_activity_click`
+        // treats as a toggle and re-shows the sidebar. That is arguably
+        // more VS-Code-like (a double-click has no special meaning on this
+        // chrome), but it is a user-visible semantic change with its own
+        // GTK-side coverage below (`src/gtk/testing.rs`'s
+        // `activity_bar_double_click_on_active_icon_reopens_sidebar_via_gtk_driver`).
+        if let UiEvent::DoubleClick { position, .. } = &event {
+            let position = *position;
+            let viewport = backend.viewport();
+            let area = quadraui::Rect::new(0.0, 0.0, viewport.width, viewport.height);
+            // Recompute the layout fresh (not `ctx.layout`, the cached
+            // per-frame copy) so this gate agrees with the hit-test
+            // `handle()` performs two lines down, matching
+            // `render::route_menu_bar_reveal`'s own
+            // `ctx.shell().layout(area, backend.line_height())` pattern for
+            // the same "gate must match the hit-test" reason: both run
+            // inside `handle_dispatch`, which can have already mutated
+            // shell chrome earlier in this same dispatch.
+            let layout = ctx.shell().layout(area, backend.line_height());
+            if layout.activity_bar_bounds.contains(position) {
+                let synthetic = UiEvent::MouseDown {
+                    widget: None,
+                    button: MouseButton::Left,
+                    position,
+                    modifiers: quadraui::Modifiers::default(),
+                };
+                let shell_ev = ctx.shell_mut().handle(&synthetic, &*backend, area);
+                if !matches!(shell_ev, quadraui::AppShellEvent::Ignored) {
+                    quadraui::ShellApp::on_shell_event_ctx(self, &shell_ev, ctx);
+                    self.draw_needed.set(true);
+                    return if self.draw_needed.get() {
+                        self.draw_needed.set(false);
+                        quadraui::Reaction::Redraw
+                    } else {
+                        quadraui::Reaction::Continue
+                    };
+                }
+                // `shell_ev` was `Ignored` (e.g. the double-click landed in
+                // the activity bar's bounds but hit no zone) — fall through
+                // to the rest of the dispatch pipeline instead of
+                // unconditionally consuming it, same as every other arm in
+                // this function.
+            }
+        }
+
         // Pointer events over the sidebar content area are forwarded to the active
         // panel's controller before the editor click path sees them. In ShellApp
         // mode there is no per-panel DrawingArea, so without this the file explorer
@@ -7791,6 +9207,26 @@ impl App {
                     repeat,
                 };
                 let (key_name, unicode) = match key {
+                    // #1744: Ctrl+Shift+\ (VS Code's `editor.action.
+                    // jumpToBracket`) needs to decode distinctly from plain
+                    // Ctrl+\ (`open_editor_group`/split-editor). Most
+                    // surfaces (GDK, and a kitty/CSI-u terminal with
+                    // character-resolution keyboard enhancement) already
+                    // deliver the resolved glyph `'|'` here, which matches
+                    // `Engine::handle_vscode_key`'s own `"Shift_backslash" |
+                    // "|"` arm unchanged below — no special case needed for
+                    // that shape. A kitty/CSI-u terminal reporting the base
+                    // key `'\\'` plus an explicit Shift *bit* instead (rather
+                    // than the shifted glyph) needs this one extra arm to
+                    // reach the same arm — `render::engine_key_from_ui` has
+                    // the mirror logic for this chord too, but is never
+                    // called from this `Key::Char` match (see that
+                    // function's own module doc on why GTK/TUI's `Key::Char`
+                    // decode stays independent of it), so it alone cannot
+                    // make this shape reachable.
+                    Key::Char('\\') if modifiers.ctrl && modifiers.shift => {
+                        ("Shift_backslash".to_string(), Some('\\'))
+                    }
                     Key::Char(c) => (c.to_string(), Some(c)),
                     Key::Named(_) => {
                         // #826: `Escape`/`Enter`->`Return`/`Backspace`->
@@ -8211,11 +9647,25 @@ impl App {
         // (`Backend::set_caret_shape`'s trait default), so gating this
         // costs nothing there.
         if self.live {
-            let engine = self.engine.borrow();
-            backend.set_caret_shape(render::caret_shape_for_mode(
-                &engine,
-                engine.sidebar_has_focus(),
-            ));
+            let shape = {
+                let engine = self.engine.borrow();
+                render::caret_shape_for_mode(&engine, engine.sidebar_has_focus())
+            };
+            // #1634: only write when the shape actually changed since the
+            // last tick — see `last_caret_shape`'s own doc (including its
+            // "not confirmed as the flicker cause" caveat). Without this,
+            // `TuiBackend::set_caret_shape` re-emitted the identical
+            // DECSCUSR escape (`ratatui::crossterm::cursor::SetCursorStyle`)
+            // to the real terminal on every idle poll cycle
+            // (`quadraui::runtime::IDLE_POLL_CEILING`, ~250ms) for no reason
+            // — real waste, independent of whether it's what the operator
+            // saw flicker. The decision itself is `dedup_caret_shape`, a
+            // free function so it's directly unit-tested without a
+            // `Backend` — see that function's own doc for why a
+            // `Backend`-call-count driver test isn't achievable here.
+            if dedup_caret_shape(&mut self.last_caret_shape, shape) {
+                backend.set_caret_shape(shape);
+            }
         }
 
         // Keep cached metrics up to date.
@@ -8299,6 +9749,18 @@ impl App {
             .any(|s| s.ai_streaming)
         {
             backend.request_frame_in(std::time::Duration::from_millis(100));
+        }
+
+        // #1668: while any terminal pane has a live PTY session, keep
+        // re-arming `tick` so `Engine::poll_terminal` keeps draining its
+        // output — see `terminal_poll_rearm_delay`'s own doc for why this
+        // matters specifically (and only) on Win-GUI, and why it's a
+        // harmless no-op re-arm on GTK/TUI/macOS (they already tick
+        // regardless, via their own `IDLE_POLL_CEILING` fallback).
+        if let Some(delay) =
+            terminal_poll_rearm_delay(!self.engine.borrow().terminal_panes.is_empty())
+        {
+            backend.request_frame_in(delay);
         }
 
         if self.draw_needed.get() {
@@ -8631,19 +10093,19 @@ impl quadraui::ShellApp for App {
         let menu_defs = render::build_menu_defs(is_vscode_mode);
         if backend.backend_caps().native_menu {
             let bar = render::menu_defs_to_menu_bar(&menu_defs);
-            // `install_menu_bar`'s only in-tree implementation (macOS's
-            // `MacBackend`) asserts it is called on the real AppKit main
-            // thread and panics otherwise — a documented quadraui
-            // limitation with no portable pre-check exposed through the
-            // `Backend` trait. Every real invocation of `ShellApp::setup`
-            // *is* on the main thread (`quadraui::macos::shell_runner`'s
-            // only entry point), so this never fires outside a test
-            // harness — but `quadraui::macos::testing::driver_with_shell`
-            // (used by `src/macos/mod.rs::mac_driver_tests`) necessarily
-            // calls `setup` from a spawned test thread, same as every
-            // other `#[test]` fn, per Rust's own test runner. Catching it
-            // here keeps `setup()` — which every backend, including the
-            // ones with no native menu, must be able to complete without
+            // `install_menu_bar`'s macOS implementation (`MacBackend`)
+            // asserts it is called on the real AppKit main thread and
+            // panics otherwise — a documented quadraui limitation with no
+            // portable pre-check exposed through the `Backend` trait.
+            // Every real invocation of `ShellApp::setup` *is* on the main
+            // thread (`quadraui::macos::shell_runner`'s only entry point),
+            // so this never fires outside a test harness — but
+            // `quadraui::macos::testing::driver_with_shell` (used by
+            // `src/macos/mod.rs::mac_driver_tests`) necessarily calls
+            // `setup` from a spawned test thread, same as every other
+            // `#[test]` fn, per Rust's own test runner. Catching it here
+            // keeps `setup()` — which every backend, including the ones
+            // with no native menu, must be able to complete without
             // aborting the process — from taking the whole test process
             // down over a call this method doesn't otherwise depend on.
             // Filed upstream: `install_menu_bar` should degrade
@@ -8651,6 +10113,18 @@ impl quadraui::ShellApp for App {
             // helpers already do (`menu_bar_install.rs`'s `let Some(mtm)
             // = MainThreadMarker::new() else { return }`), not hard
             // `.expect()`.
+            //
+            // #1618 found `WinBackend` (quadraui#1200) briefly also
+            // declared `native_menu: true` and implemented
+            // `install_menu_bar` (a real Win32 `HMENU` via `SetMenu`) —
+            // quadraui#1228 (#1629) reverted that: `WinBackend` no longer
+            // declares `native_menu`, `install_menu_bar` is back to the
+            // trait's no-op default on that backend, and Windows now
+            // takes the `window_chrome` arm below instead (a drawn menu
+            // row, matching GTK). `MacBackend` remains the only in-tree
+            // `native_menu` implementation this `catch_unwind` guards
+            // against, so its panic-recovery rationale stays
+            // macOS-specific again.
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 backend.install_menu_bar(&bar);
             }))
@@ -9823,6 +11297,28 @@ mod portable_entry_point_tests {
         );
         assert_eq!(cfg.min_sidebar_width, render::ALT_SIDEBAR_WIDTH_MIN as f32);
         assert_eq!(cfg.max_sidebar_width, render::ALT_SIDEBAR_WIDTH_MAX as f32);
+        // #1798: the sidebar must *open* at the profile's own width rather
+        // than inherit `ShellConfig::new`'s cell-flavoured 20.0, which on a
+        // GUI backend is ~460px and left an 800px window no room for a
+        // second editor tab. (This is a `gui`-gated test, so `self.units`
+        // here is `UnitProfile::px()`.)
+        assert_eq!(
+            cfg.default_sidebar_width,
+            render::UnitProfile::px().sidebar_width_lh,
+            "shell_config must take the sidebar's opening width from the unit \
+             profile, not leave quadraui's cell-flavoured 20.0 default in place"
+        );
+        // `compute_layout` clamps the opening width through the bounds above,
+        // so an opening width outside them is silently discarded.
+        assert!(
+            cfg.default_sidebar_width >= cfg.min_sidebar_width
+                && cfg.default_sidebar_width <= cfg.max_sidebar_width,
+            "the opening width ({}) must survive compute_layout's own clamp \
+             to {}..={}",
+            cfg.default_sidebar_width,
+            cfg.min_sidebar_width,
+            cfg.max_sidebar_width,
+        );
     }
 
     /// #949 review: makes the "closes the macOS/Win-GUI settings hot-reload
@@ -10332,6 +11828,81 @@ mod portable_entry_point_tests {
             matches!(backend.window().unwrap().is_maximized(), Ok(true)),
             "restore_window_geometry did not maximize the real window when \
              the saved session says maximized: true"
+        );
+    }
+
+    /// #1722: a tab-bar width correction that doesn't move the active
+    /// tab's resolved scroll offset must not schedule a redraw — the
+    /// shared-code half of "spurious full repaints: idle tick returns
+    /// Redraw ~4×/s with several tabs open". Backend-neutral (`TuiBackend`,
+    /// no `gui` feature needed — unlike
+    /// `handle_poll_tick_scrolls_the_active_tab_back_into_view_on_gtk`
+    /// above) because the bug lives in
+    /// `render::run_shared_tick_chores`/`Engine::post_draw_apply_widths`,
+    /// code both backends share equally; this additionally proves the fix
+    /// reaches the real tick path a runner drives (`App::handle_poll_tick`
+    /// → `run_shared_tick_chores` → `self.draw_needed`), the exact signal
+    /// `tick_dispatch` turns into `Reaction::Redraw`/`Continue` — the same
+    /// observable `app_on_tui_tests`'s `idle_stability_1583`/`_1650` assert
+    /// on via `driver.tick()`.
+    ///
+    /// Stands in for a real paint by pushing straight into
+    /// `App::tab_visible_counts`, the same technique
+    /// `handle_poll_tick_scrolls_the_active_tab_back_into_view_on_gtk`
+    /// above uses and documents the rationale for (no headless way to pump
+    /// a real paint here yet) — on a pixel-measuring backend (GTK/Win-GUI/
+    /// macOS) the measured width genuinely can wobble by a sub-pixel-
+    /// rounding unit between otherwise-identical frames; this test
+    /// reproduces that shape directly rather than depending on real GTK
+    /// float jitter happening to land on a test machine.
+    ///
+    /// RED-verified: reverting `Engine::post_draw_apply_widths` to its
+    /// pre-#1722 `width_bookkeeping_changed || scroll_changed` contract
+    /// makes this fail — the second tick below (a one-column width wobble
+    /// with no effect on the resolved scroll offset) sets `draw_needed`
+    /// instead of leaving it clear. Confirmed by hand before committing.
+    #[test]
+    fn handle_poll_tick_does_not_redraw_on_a_cosmetic_tab_width_wobble() {
+        let engine = Rc::new(RefCell::new(Engine::new()));
+        // Three tabs, active = last (idx 2); each "[No Name]" tab is 16
+        // display columns wide (see `Engine::tab_display_width`).
+        engine.borrow_mut().new_tab(None);
+        engine.borrow_mut().new_tab(None);
+        let group_id = engine.borrow().active_group;
+
+        let mut app = App::new_headless_with_backend(
+            Rc::clone(&engine),
+            Rc::new(RefCell::new(
+                Box::new(quadraui::tui::TuiBackend::new()) as Box<dyn quadraui::Backend>
+            )),
+            render::UnitProfile::cell(),
+        );
+        let mut backend: Box<dyn quadraui::Backend> = Box::new(quadraui::tui::TuiBackend::new());
+
+        // First tick: bar only wide enough for one tab (16 <= 30 < 32) —
+        // a real correction, since the active tab (idx 2) wasn't visible
+        // at the engine's default offset.
+        app.tab_visible_counts.borrow_mut().push((group_id, 30));
+        app.handle_poll_tick(&mut *backend);
+        assert!(
+            app.draw_needed.get(),
+            "test setup: narrowing the bar enough to hide the active tab \
+             must schedule a redraw"
+        );
+        app.draw_needed.set(false);
+
+        // Second tick: one column narrower, still only enough for exactly
+        // one tab — the resolved scroll offset is identical, so nothing
+        // painted this frame would differ from what's already on screen.
+        app.tab_visible_counts.borrow_mut().push((group_id, 29));
+        app.handle_poll_tick(&mut *backend);
+        assert!(
+            !app.draw_needed.get(),
+            "a one-column tab-bar width wobble with no effect on which tab \
+             is scrolled into view must not schedule a redraw (#1722) — on \
+             a pixel-measuring backend (GTK/Win-GUI/macOS) this is exactly \
+             the kind of sub-pixel-rounding noise that forced a redraw \
+             every ~250ms idle tick with several tabs open"
         );
     }
 }

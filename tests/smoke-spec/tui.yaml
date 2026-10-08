@@ -1,0 +1,1871 @@
+# Tier-2 real-terminal smoke spec for vimcode#1646 (claude-coordinator epic
+# #3482, v0.5.551's new real-platform acceptance drivers).
+#
+# Driver: `tui-pty` (coord/tui_pty_driver.py) — launches the real `vcd`
+# binary under a real pty (`UnixPtyChild` on Linux/macOS, ConPTY on
+# Windows), sends real terminal byte sequences, and asserts on the resulting
+# VT screen. This is the TIER THIS REPO ALREADY HAS DIRECT, RUN-ON-REAL-
+# HARDWARE EXPERIENCE WITH: `tests/conpty_idle_flicker.rs` (#1634) and
+# `tests/conpty_activity_bar_click.rs` (#1636) exercise the identical idea
+# in Rust via `portable_pty` on real Windows ConPTY (dell64). This YAML file
+# is the cross-platform, coord-driven analogue of those two files, reusing
+# the same layout facts they already derived (see per-step comments below)
+# so the Linux/macOS run coord's `tui-pty` driver performs and the Windows
+# ConPTY run those Rust tests perform are checking the same thing two ways.
+#
+# `coord`'s driver supplies the actual `launch_command`/`cwd` (this file
+# only names the rendered-screen oracle) — the launch command this spec was
+# authored and real-pty-verified against opens vcd on a small, real,
+# non-empty text file (a handful of short lines) with LSP disabled and nerd
+# fonts off, e.g. `vcd sample.txt` with `HOME` pointed at a settings.json
+# carrying `{"lsp_enabled": false, "use_nerd_fonts": false}` — the same
+# determinism precondition `tests/conpty_activity_bar_click.rs`'s own
+# `isolated_home()` sets up, and for the same reason (nerd-fonts-off makes
+# the activity bar paint its single-ASCII-character fallback glyphs, which
+# is what pins `ICON_COLUMN`/the per-row markers below to fixed values
+# instead of a font-dependent one).
+#
+# Grid and row/column layout confirmed by a real run of this exact binary
+# under a real Linux pty, `cols: 100` x `rows: 30`, HOME pointed at a fresh
+# (no stale state) config dir: the activity bar is always the screen's
+# leftmost column (`x = 0` accent, `x = 1` icon glyph — exactly
+# `tests/conpty_activity_bar_click.rs`'s own `ICON_COLUMN = 1`), and with no
+# title/tab-bar row inserted above it, row 0 is the hamburger menu toggle,
+# rows 1-7 are Explorer/Search/Debug/Source Control(Git)/Extensions/AI
+# Assistant/Board in that fixed order (`src/render.rs`'s `fixed` array,
+# `build_activity_bar`), and the last row (here, row 29) is Settings.
+#
+# #1740 UPDATE: the "Explorer/Search/Debug/Source Control" order claimed two
+# paragraphs up is now known stale — `src/core/engine/sidebar.rs`'s
+# `FIXED_ACTIVITY_PANEL_IDS` (the single source of truth `build_activity_bar`'s
+# `fixed` array now reads from, guarded by a `debug_assert_eq!` against
+# drifting back out of sync) was reordered by #1698 to match VS Code's real
+# top-to-bottom order — Explorer, Search, Source Control, Debug — putting
+# Source Control at row 3 and Debug at row 4, the reverse of this header's
+# original claim. That makes the `click-source-control-icon`/
+# `activity-bar-source-control-switches-panel-1636` pair below, which clicks
+# row 4 expecting "SOURCE CONTROL", land on the Debug panel instead and time
+# out. Per #3509's additive-only policy for this file, that pair is left
+# byte-for-byte unchanged rather than edited to agree with the corrected
+# order — see the new `-1740`-suffixed step pair placed right after it
+# below (row 3 for Source Control, row 4 for Debug) for this issue's actual,
+# currently-true acceptance coverage, and
+# `src/tui_main/app_on_tui_tests.rs`'s
+# `activity_bar_row_click_order_matches_fixed_activity_panel_ids` for the
+# Tier-1 in-process pin of the same row→panel mapping.
+name: vimcode-tui-pty
+cols: 100
+rows: 30
+steps:
+  - type: launch
+    id: launch
+
+  # Precondition, not one of this file's own regression oracles: the first
+  # real frame must have painted (status bar's NORMAL mode indicator)
+  # before anything below can mean anything. Deliberately `expect_within`
+  # (poll for the real content), never `wait_idle` followed by a one-shot
+  # `expect_screen`: extension-registry refresh (`Engine::ext_refresh`,
+  # spawned unconditionally by the real `vcd` startup path, never by the
+  # deterministic `startup_without_session_restore` test entry point) does
+  # a real network fetch before the very first frame settles, and a child
+  # that has not yet sent *any* bytes trivially satisfies "quiet for 800ms"
+  # from the instant it launches — RED-verified by hand against this exact
+  # file with the `wait_idle`-then-`expect_screen` shape it used to have:
+  # `wait_idle` returned immediately (nothing had arrived yet to be
+  # "unquiet"), so `expect_screen` checked a genuinely blank screen and
+  # failed, and the *next* step (`expect_silent`) then saw real startup
+  # bytes still arriving and failed too — both false negatives from
+  # checking before the real paint, not real regressions. Polling for the
+  # actual expected text (mirroring
+  # `tests/conpty_activity_bar_click.rs`'s own
+  # `wait_for_screen_contains`/its module doc's explanation of the
+  # identical false-negative shape for a fixed quiet-window) sidesteps the
+  # question entirely: it succeeds the moment the real paint lands,
+  # however long that takes, up to a generous budget here (mirrors that
+  # same Rust test's `SETTLE_TIMEOUT = 15s`).
+  - type: expect_within
+    id: first-frame-painted
+    text: "NORMAL"
+    ms: 20000
+
+  # vimcode#1736 — a bugbash report that row 1 of the Explorer sidebar
+  # shows "a spurious 'n  N  r  c  …' hint row ... where `▾ + WORK`
+  # belongs", pushing the tree down one row. **#1736 is still open and
+  # this step is not its fix** (see `src/tui_main/app_on_tui_tests.rs`'s
+  # two `*_1736` tests for the full investigation, and for what is still
+  # undecided and needs a human product call). What this step pins, at
+  # the pty layer and under the report's own conditions — fresh HOME,
+  # first settled frame, zero keys or clicks sent, which is why it sits
+  # here above every `click`/`key` step rather than at the end of the
+  # file — is the one part the investigation did settle: `n  N  r  c  …`
+  # is neither corruption nor a race. It is #1693's view-actions toolbar
+  # rendering its documented nerd-fonts-off ASCII fallbacks
+  # (`icons::EXPLORER_NEW_FILE` `n` / `_NEW_FOLDER` `N` / `_REFRESH` `r`
+  # / `_COLLAPSE_ALL` `c` / `_OVERFLOW` `…`), on row 1, which is exactly
+  # where the `right-click-explorer-root-row-1703` comment below already
+  # documents it belongs.
+  #
+  # `region:` confines the assertion to the sidebar band (cols 3..22 —
+  # the activity bar owns cols 0..2, `x = 0` accent / `x = 1` icon / `x
+  # = 2` the `│` divider, and the editor band's content starts at col
+  # 25), so it cannot be accidentally satisfied by editor content. It is
+  # launch-independent: neither the sidebar's default width nor the
+  # toolbar's 3-cell-per-button `" {} "` segments depend on the launch
+  # `cwd`/file the way `right-click-explorer-row` below does. Column
+  # band and glyph columns (`n` at 9, `N` 12, `r` 15, `c` 18, `…` 21)
+  # confirmed by a real `coord.tui_pty_driver` run of this exact file
+  # against a real Linux pty at this grid. Falsifiability confirmed the
+  # same way: re-running this step with `region.row: 2` fails, so it
+  # really is pinned to row 1 and would catch the one-row push-down the
+  # report describes. `expect_within` rather than `expect_screen` for
+  # the same reason every other check in this file uses it — see the
+  # `first-frame-painted` comment above.
+  #
+  # Only the Explorer half of #1736 is checkable at this tier. The
+  # report's other half (the tree being "out of alignment relative to"
+  # the editor pane) needs the editor's own row-1/row-2 content, and
+  # there is no launch-independent anchor for it here: the breadcrumb
+  # bar renders the launch file's own basename, the editor body renders
+  # that file's own text, line numbers are off in the default config,
+  # and the default theme paints the breadcrumb bar's background
+  # identically to the editor's (`bg == '000000'` for both, probed over
+  # a real pty). That half is covered at Tier-1 by
+  # `explorer_root_row_matches_editor_first_content_row_1736`, where the
+  # harness owns the file content. Do not "upgrade" it to a step here by
+  # hardcoding `sample.txt`/its text — this file's header deliberately
+  # describes the launch command as an example, not a contract.
+  - type: expect_within
+    id: explorer-toolbar-owns-row-1-1736
+    region: {row: 1, col: 3, height: 1, width: 20}
+    text: "n  N  r  c  …"
+    ms: 5000
+
+  # vimcode#1741 — this control failed ~100% of real-pty runs (2168-2377
+  # bytes received during the supposed-silent 3s window below) because it
+  # started measuring immediately after `first-frame-painted`/the #1736
+  # toolbar check above, with no settle margin for `Engine::ext_refresh`'s
+  # background extension-registry network fetch to actually land. That
+  # fetch is spawned unconditionally at real `vcd` startup (never by the
+  # deterministic Tier-1 harness entry points, which is why no in-process
+  # test saw this) and its completion repaint — the same one
+  # `tui_main::app_on_tui_tests::idle_stability_1737`'s module doc traces to
+  # `Engine::poll_ext_registry` consuming the fetch result on the first
+  # `poll_idle` tick after first paint, visible later as the "Extension
+  # registry updated (N extensions)" status message — can land anywhere in
+  # the first few seconds after first paint, not necessarily before this
+  # step would otherwise start. A probe spec (launch -> expect_within
+  # NORMAL -> `wait_idle` 2000ms/30000ms budget -> `expect_silent` 3s)
+  # passed cleanly, isolating the cause to missing settle time here, not to
+  # ongoing churn — i.e. still the #1634 control it always was, just
+  # started too early. This `wait_idle` gives the fetch's one legitimate
+  # repaint room to happen *before* the silence window opens, rather than
+  # inside it.
+  - type: wait_idle
+    id: settle-ext-registry-fetch-1741
+    ms: 2000
+    timeout_ms: 30000
+
+  # vimcode#1634 was specifically a Windows-Terminal *rendering* bug — a real
+  # ~1Hz foreground flicker with a genuinely silent underlying byte stream
+  # (confirmed in `tests/conpty_idle_flicker.rs`'s own module doc: the bug
+  # lives in the terminal emulator layer, which a real pty on Linux/macOS
+  # cannot reproduce — see `coord/tui_pty_driver.py`'s module doc, "What this
+  # tier does NOT see"). This step cannot catch #1634 itself. It guards the
+  # backend-neutral precondition #1634 depends on staying true everywhere:
+  # an idle `vcd` must emit zero repaint bytes, on every platform, not just
+  # the one the bug was filed against. Expected GREEN today — this is the
+  # control, not the reproduction.
+  - type: expect_silent
+    id: idle-truly-silent
+    seconds: 3
+
+  # vimcode#1702 and #1737 each independently caught a one-off real-pty
+  # failure of the 3s check above: a repeating paired SGR-reset +
+  # hide-cursor burst (`\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?25l`), roughly
+  # every ~2s, persisting "10+ seconds straight" in both reports — but
+  # neither could reproduce it again across 8-9 follow-up fresh-HOME
+  # attempts, and a direct code audit both times (`render::
+  # run_shared_tick_chores` and every 2s periodic chore `Engine::poll_idle`
+  # runs) found every one of them already gates its redraw on an actual
+  # before/after difference, matching the #1650 fix neither has regressed
+  # from since. This step cannot force the intermittent failure to
+  # reproduce any more reliably than the two bugbash runs that found it
+  # did, but it widens this control's own window well past the 3s original
+  # (and past the sidebar-open `idle_stability_1650`/#1702 Tier-1 test's
+  # 12s) to the "10-15s" duration #1737's own reproduction steps describe,
+  # so a *persistent* (not one-off) recurrence has a real chance of being
+  # caught here before the next bugbash run finds it on real hardware
+  # again. See `tui_main::app_on_tui_tests::idle_stability_1737` for the
+  # in-process (Tier-1) sibling of this step, including the one concrete,
+  # 100%-reproducible-in-this-PR finding its own investigation turned up:
+  # a single, legitimate extra repaint shortly after first paint from
+  # `Engine::poll_ext_registry` settling the startup extension-registry
+  # fetch — consistent with #1737's own evidence capture's first (lone,
+  # unpaired) logged write, but not with the recurring pairs reported
+  # afterward.
+  - type: expect_silent
+    id: idle-truly-silent-extended-1737
+    seconds: 13
+
+  # ─────────────────────────────────────────────────────────────────────
+  # vimcode#1731 -- priority-1 vim-mode catalogue journeys (tests/smoke-spec/
+  # catalogue.yaml), real-pty-verified (3 consecutive clean `coord`
+  # tui-pty-driver runs against this exact build/spec, HOME-isolated with
+  # `use_nerd_fonts`/`lsp_enabled` off, same precondition as this file's own
+  # header). Each journey below clears the buffer (':%d') and types its own
+  # known fixture text via `i`/`o` rather than relying on the fixture
+  # `sample.txt` (alpha/beta/gamma has no spaces, so word-motion/operator
+  # journeys need real multi-word content) -- this also makes every journey
+  # independent of the activity-bar/context-menu steps above, so neither
+  # section can break the other under the additive-only rule (#3509).
+  #
+  # Two real-build findings from authoring this batch, not fixed here
+  # (filed as their own finding in the PR, not papered over by a weaker
+  # assertion that happens to still pass):
+  #   - 'gg'/'G' move the cursor's LINE correctly but do not reset its
+  #     COLUMN to the line's first non-blank the way real Neovim does --
+  #     confirmed directly (move to column 9 via 'w' 'w', then 'gg': lands
+  #     at column 11, the line's length, not column 1). The checks below
+  #     therefore only assert the line half of each gg/G journey's expected
+  #     outcome, not the column half.
+  #   - A single key sent in the same instant a multi-key motion
+  #     immediately follows a just-passed `expect_within` can still land
+  #     before the app's input queue is truly ready for it (silently
+  #     typed as a literal character instead of executing as a motion/
+  #     command) -- every mode transition and multi-key motion below is
+  #     followed by a short `wait_idle` margin for exactly this reason.
+
+  # Settle past the startup transient (extension-registry refresh,
+  # initial layout) before the first real buffer interaction below.
+  - type: key
+    id: 'vim-batch-settle-esc'
+    key: 'esc'
+  - type: wait_idle
+    id: 'vim-batch-settle-wait'
+    ms: 500
+    timeout_ms: 15000
+  # vim-gg-and-g-goto-buffer-ends setup
+  - type: key
+    id: 'rebuild1-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild1-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild1-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild1-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild1-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild1-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'z'
+  - type: key
+    id: 'rebuild1-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild1-line0-landed'
+    text: 'foo bar baz'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild1-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  - type: key
+    id: 'rebuild1-mode1'
+    key: 'o'
+  - type: key
+    key: 'q'
+  - type: key
+    key: 'u'
+  - type: key
+    key: 'x'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'q'
+  - type: key
+    key: 'u'
+  - type: key
+    key: 'u'
+  - type: key
+    key: 'x'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild1-esc1'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild1-line1-landed'
+    text: 'qux quux foo'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild1-line1-normal'
+    text: 'NORMAL'
+    ms: 3000
+  - type: key
+    id: 'rebuild1-mode2'
+    key: 'o'
+  - type: key
+    key: 's'
+  - type: key
+    key: 'h'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'r'
+  - type: key
+    key: 't'
+  - type: key
+    id: 'rebuild1-esc2'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild1-line2-landed'
+    text: 'short'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild1-line2-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild1-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild1-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-gg-1-key'
+    key: 'g'
+  - type: key
+    id: 'vim-gg-1-key2'
+    key: 'g'
+  # vim-gg-and-g-goto-buffer-ends: 'gg' from the last line reaches line 1
+  - type: expect_within
+    id: 'vim-gg-and-g-goto-buffer-ends-top'
+    text: 'Ln 1'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-gg-and-g-goto-buffer-ends-top-settle'
+    ms: 350
+    timeout_ms: 4000
+  - type: key
+    id: 'vim-G-key'
+    key: 'G'
+  # vim-gg-and-g-goto-buffer-ends: 'G' reaches the last line (3)
+  - type: expect_within
+    id: 'vim-gg-and-g-goto-buffer-ends-bottom'
+    text: 'Ln 3'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-gg-and-g-goto-buffer-ends-bottom-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-0-and-dollar-line-boundaries setup
+  - type: key
+    id: 'rebuild2-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild2-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild2-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild2-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild2-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild2-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'z'
+  - type: key
+    id: 'rebuild2-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild2-line0-landed'
+    text: 'foo bar baz'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild2-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild2-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild2-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-boundaries-l1'
+    key: 'l'
+  - type: key
+    id: 'vim-boundaries-l2'
+    key: 'l'
+  - type: key
+    id: 'vim-boundaries-dollar'
+    key: '$'
+  # vim-0-and-dollar-line-boundaries: '$' reaches the last column (11)
+  - type: expect_within
+    id: 'vim-0-and-dollar-line-boundaries-end'
+    text: 'Ln 1, Col 11'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-0-and-dollar-line-boundaries-end-settle'
+    ms: 350
+    timeout_ms: 4000
+  - type: key
+    id: 'vim-boundaries-zero'
+    key: '0'
+  # vim-0-and-dollar-line-boundaries: '0' returns to column 1
+  - type: expect_within
+    id: 'vim-0-and-dollar-line-boundaries-start'
+    text: 'Ln 1, Col 1'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-0-and-dollar-line-boundaries-start-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-w-moves-word-forward setup
+  - type: key
+    id: 'rebuild3-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild3-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild3-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild3-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild3-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild3-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'z'
+  - type: key
+    id: 'rebuild3-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild3-line0-landed'
+    text: 'foo bar baz'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild3-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild3-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild3-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-w-zero'
+    key: '0'
+  - type: key
+    id: 'vim-w-key'
+    key: 'w'
+  # vim-w-moves-word-forward: 'w' from column 1 lands on 'bar' (column 5)
+  - type: expect_within
+    id: 'vim-w-moves-word-forward-check'
+    text: 'Ln 1, Col 5'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-w-moves-word-forward-check-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-dw-deletes-word setup
+  - type: key
+    id: 'rebuild4-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild4-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild4-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild4-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild4-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild4-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'z'
+  - type: key
+    id: 'rebuild4-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild4-line0-landed'
+    text: 'foo bar baz'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild4-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild4-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild4-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-dw-zero'
+    key: '0'
+  - type: key
+    id: 'vim-dw-w1'
+    key: 'w'
+  - type: key
+    id: 'vim-dw-d'
+    key: 'd'
+  - type: key
+    id: 'vim-dw-w2'
+    key: 'w'
+  # vim-dw-deletes-word: 'dw' on 'bar ' leaves 'foo baz'
+  - type: expect_within
+    id: 'vim-dw-deletes-word-check'
+    text: 'foo baz'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-dw-deletes-word-check-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-dd-deletes-line setup
+  - type: key
+    id: 'rebuild5-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild5-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild5-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild5-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild5-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild5-mode0'
+    key: 'i'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'n'
+  - type: key
+    key: 'e'
+  - type: key
+    id: 'rebuild5-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild5-line0-landed'
+    text: 'one'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild5-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  - type: key
+    id: 'rebuild5-mode1'
+    key: 'o'
+  - type: key
+    key: 't'
+  - type: key
+    key: 'w'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild5-esc1'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild5-line1-landed'
+    text: 'two'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild5-line1-normal'
+    text: 'NORMAL'
+    ms: 3000
+  - type: key
+    id: 'rebuild5-mode2'
+    key: 'o'
+  - type: key
+    key: 't'
+  - type: key
+    key: 'h'
+  - type: key
+    key: 'r'
+  - type: key
+    key: 'e'
+  - type: key
+    key: 'e'
+  - type: key
+    id: 'rebuild5-esc2'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild5-line2-landed'
+    text: 'three'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild5-line2-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild5-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild5-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-dd-zero'
+    key: '0'
+  - type: key
+    id: 'vim-dd-d1'
+    key: 'd'
+  - type: key
+    id: 'vim-dd-d2'
+    key: 'd'
+  # vim-dd-deletes-line: 'dd' on line 1 ('one') leaves 'two' as the new line 1
+  - type: expect_within
+    id: 'vim-dd-deletes-line-content'
+    text: 'two'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-dd-deletes-line-content-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-dd-deletes-line: cursor lands on the new line 1 at column 1
+  - type: expect_within
+    id: 'vim-dd-deletes-line-cursor'
+    text: 'Ln 1, Col 1'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-dd-deletes-line-cursor-settle'
+    ms: 350
+    timeout_ms: 4000
+  - type: key
+    id: 'vim-dd-verify-G'
+    key: 'G'
+  # vim-dd-deletes-line: only 2 lines remain ('dd' really removed one, not just blanked it)
+  - type: expect_within
+    id: 'vim-dd-deletes-line-linecount'
+    text: 'Ln 2, Col 1'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-dd-deletes-line-linecount-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-yy-and-p-yank-and-paste-line setup
+  - type: key
+    id: 'rebuild6-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild6-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild6-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild6-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild6-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild6-mode0'
+    key: 'i'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'l'
+  - type: key
+    key: 'e'
+  - type: key
+    key: 'f'
+  - type: key
+    id: 'rebuild6-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild6-line0-landed'
+    text: 'alef'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild6-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  - type: key
+    id: 'rebuild6-mode1'
+    key: 'o'
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'e'
+  - type: key
+    key: 't'
+  - type: key
+    id: 'rebuild6-esc1'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild6-line1-landed'
+    text: 'bet'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild6-line1-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild6-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild6-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-yy-y1'
+    key: 'y'
+  - type: key
+    id: 'vim-yy-y2'
+    key: 'y'
+  - type: key
+    id: 'vim-yy-j'
+    key: 'j'
+  - type: key
+    id: 'vim-yy-p'
+    key: 'p'
+  # vim-yy-and-p-yank-and-paste-line: 'p' pastes the yanked line below, cursor on the new line 3
+  - type: expect_within
+    id: 'vim-yy-and-p-yank-and-paste-line-cursor'
+    text: 'Ln 3, Col 1'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-yy-and-p-yank-and-paste-line-cursor-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-yy-and-p-yank-and-paste-line: the pasted line 3 is a copy of the yanked 'alef'
+  - type: expect_within
+    id: 'vim-yy-and-p-yank-and-paste-line-content'
+    text: 'alef'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-yy-and-p-yank-and-paste-line-content-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-yy-and-p-yank-and-paste-line: the content check above ('alef') also
+  # passes if 'p' pasted nothing at all, since the original line 1 ('alef')
+  # is still on screen regardless. Deleting line 1 and confirming 'alef'
+  # still appears proves the text on line 3 is a real pasted copy, not just
+  # the untouched original -- if 'p' had been a no-op, this 'dd' would
+  # remove the buffer's only 'alef' and the check below would fail.
+  - type: key
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-gg1'
+    key: 'g'
+  - type: key
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-d1'
+    key: 'd'
+  - type: key
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-d2'
+    key: 'd'
+  - type: wait_idle
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-settle'
+    ms: 350
+    timeout_ms: 4000
+  - type: expect_within
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-copy-survives'
+    text: 'alef'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-yy-and-p-yank-and-paste-line-verify-copy-survives-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-cc-changes-line setup
+  - type: key
+    id: 'rebuild7-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild7-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild7-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild7-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild7-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild7-mode0'
+    key: 'i'
+  - type: key
+    key: ' '
+  - type: key
+    key: ' '
+  - type: key
+    key: ' '
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild7-esc0'
+    key: 'esc'
+  # Fixture carries a 4-space leading indent (catalogue: '    foo') so the
+  # 'cc' step below can prove indent preservation, not just content
+  # replacement -- see vim-cc-changes-line-text.
+  - type: expect_within
+    id: 'rebuild7-line0-landed'
+    text: '    foo'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild7-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild7-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild7-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-cc-c1'
+    key: 'c'
+  - type: key
+    id: 'vim-cc-c2'
+    key: 'c'
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    id: 'vim-cc-esc'
+    key: 'esc'
+  # vim-cc-changes-line: 'cc' replaces the line's content with the typed text,
+  # preserving the original line's leading indent ('    foo' -> '    bar') --
+  # a bare 'bar' substring check would also pass if indent were dropped, so
+  # this asserts the indented form specifically.
+  - type: expect_within
+    id: 'vim-cc-changes-line-text'
+    text: '    bar'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-cc-changes-line-text-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-cc-changes-line: Escape after 'cc' leaves Normal mode, not stuck in Insert
+  - type: expect_within
+    id: 'vim-cc-changes-line-mode'
+    text: 'NORMAL'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-cc-changes-line-mode-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-ciw-changes-inner-word setup
+  - type: key
+    id: 'rebuild8-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild8-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild8-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild8-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild8-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild8-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'z'
+  - type: key
+    id: 'rebuild8-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild8-line0-landed'
+    text: 'foo bar baz'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild8-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild8-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild8-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-ciw-0'
+    key: '0'
+  - type: key
+    id: 'vim-ciw-w'
+    key: 'w'
+  - type: key
+    id: 'vim-ciw-c'
+    key: 'c'
+  - type: key
+    id: 'vim-ciw-i'
+    key: 'i'
+  - type: key
+    id: 'vim-ciw-w2'
+    key: 'w'
+  - type: key
+    key: 'q'
+  - type: key
+    key: 'u'
+  - type: key
+    key: 'x'
+  - type: key
+    id: 'vim-ciw-esc'
+    key: 'esc'
+  # vim-ciw-changes-inner-word: 'ciw' on 'bar' replaces just that word
+  - type: expect_within
+    id: 'vim-ciw-changes-inner-word-text'
+    text: 'foo qux baz'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-ciw-changes-inner-word-text-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-dot-repeats-last-change setup
+  - type: key
+    id: 'rebuild9-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild9-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild9-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild9-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild9-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild9-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild9-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild9-line0-landed'
+    text: 'foo foo foo'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild9-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild9-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild9-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-dot-0'
+    key: '0'
+  - type: key
+    id: 'vim-dot-x'
+    key: 'x'
+  - type: key
+    id: 'vim-dot-w1'
+    key: 'w'
+  - type: key
+    id: 'vim-dot-w2'
+    key: 'w'
+  - type: key
+    id: 'vim-dot-dot'
+    key: '.'
+  # vim-dot-repeats-last-change: '.' repeats the 'x' deletion on the 3rd 'foo'
+  - type: expect_within
+    id: 'vim-dot-repeats-last-change-text'
+    text: 'oo foo oo'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-dot-repeats-last-change-text-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-undo-and-redo setup
+  - type: key
+    id: 'rebuild10-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild10-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild10-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild10-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild10-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild10-mode0'
+    key: 'i'
+  - type: key
+    key: 'h'
+  - type: key
+    key: 'e'
+  - type: key
+    key: 'l'
+  - type: key
+    key: 'l'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild10-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild10-line0-landed'
+    text: 'hello'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild10-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild10-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild10-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-undo-d1'
+    key: 'd'
+  - type: key
+    id: 'vim-undo-d2'
+    key: 'd'
+  - type: key
+    id: 'vim-undo-u1'
+    key: 'u'
+  # vim-undo-and-redo: 'u' restores the line 'dd' deleted
+  - type: expect_within
+    id: 'vim-undo-and-redo-after-undo'
+    text: 'hello'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-undo-and-redo-after-undo-settle'
+    ms: 350
+    timeout_ms: 4000
+  - type: key
+    id: 'vim-undo-redo'
+    key: 'ctrl+r'
+  # vim-undo-and-redo: Ctrl-R re-deletes it, leaving an empty buffer at Ln 1
+  - type: expect_within
+    id: 'vim-undo-and-redo-after-redo'
+    text: 'Ln 1, Col 1'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-undo-and-redo-after-redo-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-visual-v-selects-and-d-deletes setup
+  - type: key
+    id: 'rebuild11-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild11-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild11-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild11-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild11-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild11-mode0'
+    key: 'i'
+  - type: key
+    key: 'h'
+  - type: key
+    key: 'e'
+  - type: key
+    key: 'l'
+  - type: key
+    key: 'l'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'w'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'r'
+  - type: key
+    key: 'l'
+  - type: key
+    key: 'd'
+  - type: key
+    id: 'rebuild11-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild11-line0-landed'
+    text: 'hello world'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild11-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild11-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild11-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-visual-0'
+    key: '0'
+  - type: key
+    id: 'vim-visual-v'
+    key: 'v'
+  - type: key
+    id: 'vim-visual-l1'
+    key: 'l'
+  - type: key
+    id: 'vim-visual-l2'
+    key: 'l'
+  - type: key
+    id: 'vim-visual-l3'
+    key: 'l'
+  - type: key
+    id: 'vim-visual-l4'
+    key: 'l'
+  - type: key
+    id: 'vim-visual-d'
+    key: 'd'
+  # vim-visual-v-selects-and-d-deletes: 'v'+motion+'d' deletes 'hello', leaving ' world'
+  - type: expect_within
+    id: 'vim-visual-v-selects-and-d-deletes-text'
+    text: ' world'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-visual-v-selects-and-d-deletes-text-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-visual-v-selects-and-d-deletes: deleting the selection returns to Normal mode
+  - type: expect_within
+    id: 'vim-visual-v-selects-and-d-deletes-mode'
+    text: 'NORMAL'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-visual-v-selects-and-d-deletes-mode-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-visual-v-selects-and-d-deletes: the substring check above (text ' world')
+  # also passes if only 4 chars ('hell') were deleted (leaving 'o world', which
+  # contains ' world' starting at index 1) -- a length check via '$' distinguishes
+  # the two outcomes. ' world' is 6 chars, so '$' (last char, 1-indexed) lands on
+  # Col 6; the under-selecting bug's 'o world' is 7 chars and would land on Col 7.
+  - type: key
+    id: 'vim-visual-v-selects-and-d-deletes-dollar'
+    key: '$'
+  - type: expect_within
+    id: 'vim-visual-v-selects-and-d-deletes-length'
+    text: 'Ln 1, Col 6'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-visual-v-selects-and-d-deletes-length-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-ex-substitute-current-line setup
+  - type: key
+    id: 'rebuild12-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild12-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild12-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild12-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild12-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild12-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild12-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild12-line0-landed'
+    text: 'foo foo foo'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild12-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild12-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild12-rewind-gg2'
+    key: 'g'
+  - type: key
+    key: ':'
+  - type: key
+    key: 's'
+  - type: key
+    key: '/'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: '/'
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: '/'
+  - type: key
+    id: 'vim-exsub-enter'
+    key: 'enter'
+  # vim-ex-substitute-current-line: ':s/foo/bar/' replaces only the first occurrence
+  - type: expect_within
+    id: 'vim-ex-substitute-current-line-check'
+    text: 'bar foo foo'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-ex-substitute-current-line-check-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-ex-substitute-global-flag setup
+  - type: key
+    id: 'rebuild13-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild13-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild13-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild13-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild13-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild13-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: ' '
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild13-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild13-line0-landed'
+    text: 'foo foo foo'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild13-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild13-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild13-rewind-gg2'
+    key: 'g'
+  - type: key
+    key: ':'
+  - type: key
+    key: 's'
+  - type: key
+    key: '/'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    key: '/'
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    key: '/'
+  - type: key
+    key: 'g'
+  - type: key
+    id: 'vim-exsubg-enter'
+    key: 'enter'
+  # vim-ex-substitute-global-flag: the 'g' flag replaces every occurrence on the line
+  - type: expect_within
+    id: 'vim-ex-substitute-global-flag-check'
+    text: 'bar bar bar'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-ex-substitute-global-flag-check-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vim-insert-i-a-o-variants setup
+  - type: key
+    id: 'rebuild14-clear-colon'
+    key: ':'
+  - type: key
+    id: 'rebuild14-clear-pct'
+    key: '%'
+  - type: key
+    id: 'rebuild14-clear-d'
+    key: 'd'
+  - type: key
+    id: 'rebuild14-clear-enter'
+    key: 'enter'
+  - type: wait_idle
+    id: 'rebuild14-clear-settle'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'rebuild14-mode0'
+    key: 'i'
+  - type: key
+    key: 'f'
+  - type: key
+    key: 'o'
+  - type: key
+    key: 'o'
+  - type: key
+    id: 'rebuild14-esc0'
+    key: 'esc'
+  - type: expect_within
+    id: 'rebuild14-line0-landed'
+    text: 'foo'
+    ms: 5000
+  - type: expect_within
+    id: 'rebuild14-line0-normal'
+    text: 'NORMAL'
+    ms: 3000
+  # Rewind to the buffer top: the viewport follows the cursor, so
+  # after building the last line via 'o' the earlier lines have
+  # scrolled out of view -- 'gg' restores Ln 1 before this journey's
+  # own motion/edit begins.
+  - type: key
+    id: 'rebuild14-rewind-gg1'
+    key: 'g'
+  - type: key
+    id: 'rebuild14-rewind-gg2'
+    key: 'g'
+  - type: key
+    id: 'vim-insert-0'
+    key: '0'
+  - type: key
+    id: 'vim-insert-a'
+    key: 'a'
+  - type: key
+    key: 'X'
+  - type: key
+    id: 'vim-insert-esc2'
+    key: 'esc'
+  # vim-insert-i-a-o-variants: 'a' appends after the cursor ('foo' -> 'fXoo')
+  - type: expect_within
+    id: 'vim-insert-i-a-o-variants-fXoo'
+    text: 'fXoo'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-insert-i-a-o-variants-fXoo-settle'
+    ms: 350
+    timeout_ms: 4000
+  - type: key
+    id: 'vim-insert-o2'
+    key: 'o'
+  - type: key
+    key: 'b'
+  - type: key
+    key: 'a'
+  - type: key
+    key: 'r'
+  - type: key
+    id: 'vim-insert-esc3'
+    key: 'esc'
+  # vim-insert-i-a-o-variants: 'o' opens a new line below with the typed text
+  - type: expect_within
+    id: 'vim-insert-i-a-o-variants-bar-line'
+    text: 'bar'
+    ms: 5000
+  - type: wait_idle
+    id: 'vim-insert-i-a-o-variants-bar-line-settle'
+    ms: 350
+    timeout_ms: 4000
+  # vimcode#1779: the 'o' above grows the buffer to a new last line — the
+  # pre-existing line ('fXoo', asserted above) must still be painted on its
+  # own row, not scrolled out of view the way #1779 did. Additive: the
+  # 'bar-line' step above asserts only the new line and stayed green while
+  # #1779 was live (its own evidence is "screen shows only 'bar'"), so this
+  # step is what actually catches a regression here.
+  - type: expect_within
+    id: 'vim-insert-i-a-o-variants-fXoo-still-visible-1779'
+    text: 'fXoo'
+    ms: 5000
+
+  # vimcode#1636 ("clicking activity-bar icons does nothing") — real SGR
+  # mouse clicks at the icon column, exactly
+  # `tests/conpty_activity_bar_click.rs`'s own `send_sgr_click`, confirmed on
+  # real ConPTY hardware to require real input-decoding (not just in-process
+  # dispatch) to reproduce or clear.
+  #
+  # `expect_within` (poll for the real content), not `wait_idle` followed
+  # by a one-shot `expect_screen`, for the identical reason the startup
+  # check above now uses it: RED-verified by hand against this exact file
+  # with the `wait_idle`-then-`expect_screen` shape these three checks used
+  # to have — a click's response can take a moment to start streaming
+  # bytes, during which `wait_idle` trivially reads "quiet" and returns
+  # immediately, so `expect_screen` right after it can check the screen
+  # *before* the real repaint lands. A `wait_idle` still follows each
+  # successful `expect_within` (not before it) as deliberate pacing before
+  # the next click — this is safe precisely because the content it's
+  # pacing *after* has already been confirmed present, unlike the removed
+  # pre-check usage — and pays the same margin
+  # `tests/conpty_activity_bar_click.rs`'s own `DOUBLE_CLICK_MARGIN`
+  # (450ms) exists for: quadraui's `DoubleClickDetector` folds two clicks
+  # on the same activity-bar zone within its window into a `DoubleClick`,
+  # which has no "activate panel" handler (quadraui#1432).
+  - type: click
+    id: click-explorer-icon
+    row: 1
+    col: 1
+  - type: expect_within
+    id: activity-bar-explorer-switches-panel-1636
+    text: "EXPLORER"
+    ms: 5000
+  - type: wait_idle
+    id: settle-after-explorer-click
+    ms: 500
+    timeout_ms: 5000
+
+  - type: click
+    id: click-source-control-icon
+    row: 4
+    col: 1
+  - type: expect_within
+    id: activity-bar-source-control-switches-panel-1636
+    text: "SOURCE CONTROL"
+    ms: 5000
+  - type: wait_idle
+    id: settle-after-source-control-click
+    ms: 500
+    timeout_ms: 5000
+
+  # #1740: the `click-source-control-icon`/`...-1636` pair above is stale
+  # (see the header comment's "#1740 UPDATE") and left untouched per
+  # #3509's additive-only policy; this pair carries the row→panel mapping
+  # that's actually true today, confirmed against
+  # `src/core/engine/sidebar.rs`'s `FIXED_ACTIVITY_PANEL_IDS`: row 3 is
+  # Source Control (Git), row 4 is Debug.
+  - type: click
+    id: click-source-control-icon-1740
+    row: 3
+    col: 1
+  - type: expect_within
+    id: activity-bar-source-control-switches-panel-1740
+    text: "SOURCE CONTROL"
+    ms: 5000
+  - type: wait_idle
+    id: settle-after-source-control-click-1740
+    ms: 500
+    timeout_ms: 5000
+
+  - type: click
+    id: click-debug-icon-1740
+    row: 4
+    col: 1
+  - type: expect_within
+    id: activity-bar-debug-switches-panel-1740
+    text: "RUN AND DEBUG"
+    ms: 5000
+  - type: wait_idle
+    id: settle-after-debug-click-1740
+    ms: 500
+    timeout_ms: 5000
+
+  - type: click
+    id: click-extensions-icon
+    row: 5
+    col: 1
+  - type: expect_within
+    id: activity-bar-extensions-switches-panel-1636
+    text: "EXTENSIONS"
+    ms: 5000
+  - type: wait_idle
+    id: settle-after-extensions-click
+    ms: 500
+    timeout_ms: 5000
+
+  # Re-select Explorer so its file tree (not the Extensions list) is the
+  # sidebar content the next step's right-click lands on.
+  - type: click
+    id: click-explorer-icon-again
+    row: 1
+    col: 1
+  - type: expect_within
+    id: activity-bar-explorer-reselect-1636
+    text: "EXPLORER"
+    ms: 5000
+  - type: wait_idle
+    id: settle-after-second-explorer-click
+    ms: 500
+    timeout_ms: 5000
+
+  # vimcode#1635 ("slow right-click context menus") — a real SGR right-click
+  # (button 2) on an Explorer row, confirmed by a real run of this exact
+  # binary under a real Linux pty to open the file-tree context menu
+  # ("New File...", "New Folder...", ...) in well under a second. `tui-pty`
+  # has no dedicated latency-measuring step (unlike `win-native`'s
+  # `expect_menu_latency`); `expect_within`'s own `ms` budget stands in as
+  # the latency bound here — a menu that needs the full budget to appear is
+  # exactly as much a regression as one that never appears at all.
+  - type: click
+    id: right-click-explorer-row
+    row: 3
+    col: 10
+    button: right
+  - type: expect_within
+    id: context-menu-opens-within-budget-1635
+    text: "New File"
+    ms: 1500
+
+  # Dismiss the still-open context menu. No explicit `:qa!` quit sequence
+  # follows — `coord/tui_pty_driver.py`'s own teardown (`PtyChild.close()`)
+  # terminates the child unconditionally once the spec finishes, the same
+  # way `tests/conpty_activity_bar_click.rs`'s own teardown falls back to
+  # `child.kill()` after a best-effort `:qa!` write.
+  - type: key
+    id: dismiss-context-menu
+    key: esc
+
+  # vimcode#1703 — an *additional* (not a replacement) right-click check,
+  # deliberately added beside `right-click-explorer-row` rather than
+  # changing it: #3509 treats this file as additive-only, so a brittle
+  # existing step never gets silently rewritten away even when its own
+  # coordinate turns out to depend on launch `cwd` contents (see below).
+  #
+  # A real bugbash run (coord `tui-pty` lane, explorer `e8c1584af040`,
+  # 2026-10-03) failed `context-menu-opens-within-budget-1635` because that
+  # run's launch `cwd` held only plain files, no subfolder, and `row: 3`
+  # landed on one of those files — whose context menu correctly omits
+  # "New File.../New Folder..." (folder-only actions). Right-clicking an
+  # *actual* folder row in that same run opened the full folder menu
+  # ("New File...", "New Folder...", "Open Containing Folder", ..., "Delete")
+  # well within budget (<100ms observed) — i.e. this was the existing
+  # step's own hardcoded-coordinate coupling to a specific `cwd` layout,
+  # not a functional regression in the app. `src/tui_main/app_on_tui_tests.rs`'s
+  # `right_click_row_3_on_a_folderless_cwd_hits_a_file_not_a_folder_1703`
+  # reproduces and confirms this at the unit level.
+  #
+  # `row: 2, col: 10` is cwd-layout-independent: `build_explorer_rows`
+  # (`src/core/engine/explorer_ops.rs`) pushes the Explorer's root entry
+  # unconditionally with `is_dir: true`, before listing any children, so
+  # the root entry's row is always a directory regardless of what the
+  # launch `cwd` happens to contain. This step is therefore a reliable
+  # Tier-2 oracle for #1635 ("slow right-click context menus") that cannot
+  # flake the way `right-click-explorer-row` can on an unexpected `cwd`
+  # layout.
+  #
+  # Why row 2 and not row 1 (#1693): the Explorer panel's rows in this grid
+  # are 0 = sidebar header ("EXPLORER"), 1 = the view-actions toolbar
+  # (New File / New Folder / Refresh / Collapse All / "...") that #1693
+  # added above the tree, 2 = the root entry, 3+ = its children. #1703 was
+  # authored before #1693 landed and originally aimed at row 1; a row-1
+  # right-click now hits the toolbar, which opens no context menu at all.
+  # The toolbar is an unconditional single-row
+  # `SidebarPanelChrome::StatusBars` (`src/app.rs`), so this is a fixed
+  # one-row offset, not a return of the `cwd` coupling above. The unit
+  # test named below asserts row 2 really is the root entry, so further
+  # header chrome breaks that test rather than silently re-aiming this
+  # step; keep the two in sync.
+  - type: click
+    id: right-click-explorer-root-row-1703
+    row: 2
+    col: 10
+    button: right
+  - type: expect_within
+    id: context-menu-opens-within-budget-root-row-1703
+    text: "New File"
+    ms: 1500
+  - type: key
+    id: dismiss-context-menu-root-row-1703
+    key: esc
+

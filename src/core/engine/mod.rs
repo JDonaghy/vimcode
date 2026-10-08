@@ -10,6 +10,7 @@ use super::ai::AiMessage;
 use super::buffer::{Buffer, BufferId};
 use super::buffer_manager::{BufferManager, BufferState};
 use super::comment;
+use super::completion::CompletionCandidate;
 use super::dap::{BreakpointInfo, DapEvent, DapVariable, StackFrame};
 use super::dap_manager::{
     generate_launch_json, parse_launch_json, parse_tasks_json, task_to_shell_command,
@@ -529,7 +530,15 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
     // File
     PaletteCommand {
         label: "File: New Tab",
-        shortcut: "Ctrl+T",
+        // #1789: this used to claim "Ctrl+T", but that chord is actually
+        // bound to `panel_keys.open_terminal` (default `<C-t>`, registered
+        // globally by `render::register_panel_accelerators` regardless of
+        // Vim/VSCode mode — see README § "Integrated Terminal"). There is
+        // no default keybinding for `tabnew` — this entry is reachable
+        // only via the palette itself, the menu, or `:tabnew` — so the
+        // shortcut hint must stay empty rather than advertise a chord that
+        // opens something else.
+        shortcut: "",
         vscode_shortcut: "",
         action: "tabnew",
     },
@@ -1612,6 +1621,14 @@ pub enum ContextMenuTarget {
     ExplorerDir {
         path: PathBuf,
     },
+    /// The Explorer header's "..." overflow menu (#1693) — opened from the
+    /// view-actions toolbar row, not a right-clicked row, so (unlike
+    /// [`Self::ExplorerFile`]/[`Self::ExplorerDir`]) it carries no target
+    /// path: every action it offers (New File, New Folder, Refresh,
+    /// Collapse All) is the same panel-level operation the toolbar's own
+    /// buttons run, fully resolved inside `Engine::context_menu_confirm`
+    /// with no backend follow-up needed.
+    ExplorerPanel,
     Editor,
     EditorActionMenu {
         group_id: GroupId,
@@ -1967,6 +1984,15 @@ pub enum UserKeymapAction {
     /// Key sequence to feed back through `Engine::handle_key`, in the same
     /// encoded-token form as `UserKeymap::keys` (e.g. `["<Esc>"]`).
     Keys(Vec<String>),
+    /// A Lua callback registered via `vimcode.keymap.set` (#1623), identified
+    /// by an opaque id into `plugin::PluginManager`'s callback table (the
+    /// registry key itself can't live here — this enum has no `Lua`
+    /// dependency and derives `PartialEq`, which `mlua::RegistryKey` does
+    /// not). Consulted through the same before-built-ins path as a config
+    /// keymap, which is what lets a plugin own a key with a built-in meaning
+    /// (`s`, `ys`, `gc`, …). Dispatch lives in
+    /// `Engine::dispatch_lua_keymap`.
+    Lua(u64),
 }
 
 impl std::fmt::Display for UserKeymapAction {
@@ -1974,11 +2000,15 @@ impl std::fmt::Display for UserKeymapAction {
         match self {
             UserKeymapAction::Ex(cmd) => write!(f, ":{cmd}"),
             UserKeymapAction::Keys(keys) => write!(f, "{}", keys.join("")),
+            UserKeymapAction::Lua(id) => write!(f, "<lua:{id}>"),
         }
     }
 }
 
-/// A parsed user-defined key mapping from settings.json.
+/// A parsed user-defined key mapping from settings.json, or a Lua keymap
+/// registered via `vimcode.keymap.set` (#1623) — both are consulted through
+/// the same before-built-ins path (`Engine::try_user_keymap`), which is what
+/// lets a Lua map own a key with a built-in meaning.
 #[derive(Debug, Clone)]
 pub struct UserKeymap {
     /// Mode: "n", "v", "x", "o", "i", "c", "s" (vim's `:map-modes` letters;
@@ -1988,12 +2018,22 @@ pub struct UserKeymap {
     /// `true` for a `noremap`-family definition: the rhs is fed through
     /// `handle_key` with user-keymap matching disabled, so it cannot recurse
     /// into another mapping. `false` (`map`-family) allows recursion, guarded
-    /// by [`MAXMAPDEPTH`].
+    /// by [`MAXMAPDEPTH`]. Always `true` for a Lua keymap (there is no
+    /// recursive-rhs concept for a callback).
     pub noremap: bool,
     /// Parsed key sequence, e.g. `["g", "c", "c"]` or `["<C-/>"]`.
     pub keys: Vec<String>,
     /// What firing this mapping does.
     pub action: UserKeymapAction,
+    /// `None` for a global mapping (every config keymap, and a Lua keymap
+    /// registered without `{buffer = ...}`); `Some(id)` restricts matching to
+    /// that one buffer (#1623, `vimcode.keymap.set(mode, lhs, fn, {buffer =
+    /// handle})`).
+    pub buffer: Option<BufferId>,
+    /// Human-readable description (`opts.desc` on a Lua keymap), surfaced by
+    /// keymap enumeration (`vimcode.keymap.list()`, #1623) for a which-key
+    /// style extension. Always `None` for a config keymap.
+    pub desc: Option<String>,
 }
 
 /// Normalize one `<...>` key-notation token to vimcode's canonical encoded
@@ -2065,7 +2105,7 @@ pub(crate) fn expand_leader_tokens(toks: Vec<String>, leader: &str) -> Vec<Strin
 /// `"gcc"` → `["g", "c", "c"]`; `"<C-/>x"` → `["<C-/>", "x"]`.
 /// Recognises vim's `<Esc> <CR> <Tab> <C-x> <A-x> <leader> <Plug>` notation
 /// (case-insensitively) via [`normalize_key_token`] (#1151).
-fn parse_key_sequence(s: &str) -> Vec<String> {
+pub(crate) fn parse_key_sequence(s: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -2134,6 +2174,8 @@ fn parse_keymap_def(s: &str) -> Option<UserKeymap> {
         noremap,
         keys,
         action,
+        buffer: None,
+        desc: None,
     })
 }
 
@@ -2545,6 +2587,9 @@ Page Up / Down      Page up / down
 Ctrl+G              Go to line (prompt)
 Ctrl+P              Fuzzy file finder                     :fuzzy
 Ctrl+Shift+P        Command palette                       :palette
+Alt+Left / Right    Navigate back / forward
+Ctrl+Shift+Alt+L/R  Resize sidebar
+Ctrl+Shift+\\       Jump to matching bracket
 
 ── Selection ───────────────────────────────────────────
 Shift+Arrow         Extend selection by char / line
@@ -2557,13 +2602,14 @@ Ctrl+D              Select word; repeat = add next occurrence
 Ctrl+Shift+L        Select all occurrences (multi-cursor)
 
 ── Multi-Cursor ────────────────────────────────────────
-Alt+Shift+Up/Down   Add cursor above / below
+Ctrl+Alt+Up/Down    Add cursor above / below
 Ctrl+D              Progressive: word → next occurrence
 Ctrl+Shift+L        All occurrences at once
 Escape              Collapse to single cursor
 
 ── Line Operations ─────────────────────────────────────
 Alt+Up / Down       Move line(s) up / down
+Alt+Shift+Up/Down   Duplicate line(s) up / down
 Alt+Z               Toggle word wrap
 
 ── Indentation ─────────────────────────────────────────
@@ -2750,6 +2796,26 @@ pub(crate) struct JumpEntry {
 /// varying length instead of the (shorter) column `$` happened to land on.
 pub(crate) const CURSWANT_EOL: usize = usize::MAX;
 
+/// Scheduling state for one live `vimcode.loop.timer`/`vimcode.schedule`/
+/// `vimcode.defer` registration (#1624). The Lua callback itself lives in
+/// `PluginManager::timer_callbacks`, keyed by the same id — see that map's
+/// doc for why the split.
+struct PluginTimerEntry {
+    /// Weak so a plugin-manager replacement (the unload mechanism —
+    /// `Engine::set_plugin_manager` installs a fresh `Rc`, dropping the old
+    /// one once every strong reference is gone) makes this entry's owner
+    /// unreachable without `Engine` having to know which timers belonged to
+    /// which manager. `Self::manager.upgrade()` failing is exactly "the
+    /// owning plugin was unloaded" — see `Engine::poll_plugin_timers`.
+    manager: std::rc::Weak<plugin::PluginManager>,
+    interval: std::time::Duration,
+    repeat: bool,
+    next_due: std::time::Instant,
+    /// Tie-breaker for timers due at the same instant (`plugin_timer_seq`'s
+    /// doc).
+    seq: u64,
+}
+
 pub struct Engine {
     // --- Multi-buffer/window state ---
     pub buffer_manager: BufferManager,
@@ -2903,6 +2969,28 @@ pub struct Engine {
     // --- Visual mode state ---
     /// Visual mode anchor point (where visual selection started).
     pub visual_anchor: Option<Cursor>,
+    /// End-bound convention for the *current* selection, fixed at the moment
+    /// `visual_anchor` is set to a brand-new value (not when an existing
+    /// selection is merely extended).
+    ///
+    /// `false` (inclusive, Vim's own convention): the cursor sits *on* the
+    /// last selected character. This is every plain Vim `v`/`V`/Ctrl-V entry,
+    /// and — even in VSCode mode — mouse selection (click-drag, word-wise
+    /// drag, double-click) and word-select commands (Ctrl+D, Ctrl+Shift+L),
+    /// which all explicitly land the cursor on the last char of the word/
+    /// selection (see `vscode_ctrl_d`'s `we - 1`).
+    ///
+    /// `true` (exclusive, VSCode's keyboard-extension convention): the cursor
+    /// sits one *past* the last selected character, because the selection was
+    /// built by driving the normal insert-mode cursor (`vscode_do_move`) via
+    /// Shift+arrow/Home/End/Ctrl+A/Ctrl+L — the same movement an unmodified
+    /// arrow key would do, just with the anchor left behind.
+    ///
+    /// #1788: `is_vscode_mode()` is NOT a valid proxy for this — VSCode mode
+    /// has both conventions depending on how the selection was made, so this
+    /// must be tracked per-selection. Consumers: `get_visual_selection_text`,
+    /// `vscode_delete_selection`, `open_find_replace`'s `sel_range`.
+    pub visual_end_exclusive: bool,
     /// Set when `$` is used in visual mode — the selection extends through the
     /// end of the line (including newline), matching Vim's curswant=MAXCOL.
     /// Cleared when any other motion is used or visual mode exits.
@@ -3086,8 +3174,13 @@ pub struct Engine {
     pub scroll_bind_pairs: Vec<(WindowId, WindowId)>,
 
     // --- Completion state ---
-    /// Current completion candidates (populated on first Ctrl-N/P or auto-trigger).
-    pub completion_candidates: Vec<String>,
+    /// Current completion candidates (populated on first Ctrl-N/P or
+    /// auto-trigger). `CompletionCandidate` (#1805) carries display/insert
+    /// text plus optional kind/detail/documentation metadata — buffer-word
+    /// and LSP candidates only ever populate `label`/`insert_text`
+    /// (`CompletionCandidate::plain`); a `vimcode.completion.register`
+    /// plugin source can also set the rest.
+    pub completion_candidates: Vec<crate::core::completion::CompletionCandidate>,
     /// Index of the currently selected candidate, or None when inactive.
     pub completion_idx: Option<usize>,
     /// Buffer column where the prefix that triggered completion starts.
@@ -3101,6 +3194,15 @@ pub struct Engine {
     /// already saw from being silently dropped when a fresh LSP / buffer-word
     /// scan happens to return a smaller set (#467).
     pub completion_filter_prefix: String,
+    /// Monotonic counter bumped once per `trigger_completion` call (#1805).
+    /// Packed into the high bits of the `request_id` handed to every
+    /// `vimcode.completion.register` source invoked by that trigger (see
+    /// `Engine::plugin_request_completions`), so a `vimcode.completion.
+    /// complete(request_id, items)` call arriving after a *later* trigger
+    /// has already superseded it — a stale async result for an old prefix —
+    /// can be detected and dropped instead of repopulating a popup the user
+    /// has moved past.
+    pub(crate) completion_generation: u64,
 
     // --- Project search state ---
     /// Current text typed in the project search input box.
@@ -3194,6 +3296,13 @@ pub struct Engine {
 
     /// Set when cursor moves; backends flush the actual hook after a debounce delay (150ms).
     pub cursor_move_pending: Option<std::time::Instant>,
+    /// Set when the cursor moves, in *any* mode (#1623) — independent of
+    /// `cursor_move_pending` above, which is the legacy `cursor_move` hook and
+    /// is deliberately Normal-mode-only; this one drives the new
+    /// `CursorMoved`/`CursorMovedI` events and must not change that legacy
+    /// hook's firing scope. Flushed the same way, via
+    /// `Engine::flush_cursor_moved_event`.
+    pub cursor_moved_event_pending: Option<std::time::Instant>,
 
     /// Language IDs for which a background install is in progress.
     lsp_installing: std::collections::HashSet<String>,
@@ -3289,7 +3398,29 @@ pub struct Engine {
 
     // --- Plugin system ---
     /// Manages loaded Lua plugins. `None` if no plugins dir or plugins disabled.
-    pub plugin_manager: Option<plugin::PluginManager>,
+    ///
+    /// Behind an `Rc` so a dispatch can clone the handle out instead of
+    /// `take()`ing the manager (#1214): the field stays populated for the whole
+    /// Lua call, which is both what lets a nested event see that plugins exist
+    /// (rather than silently no-op'ing) and what makes loaning `&mut Engine` to
+    /// Lua sound — no borrow of this field is held across the call. Install one
+    /// with [`Engine::set_plugin_manager`].
+    pub plugin_manager: Option<std::rc::Rc<plugin::PluginManager>>,
+    /// Non-zero while a Lua plugin callback is executing. The reentrancy guard:
+    /// Lua must not be re-entered while `&mut Engine` is loaned to it, so a
+    /// plugin-triggered event is deferred (see `deferred_plugin_events`) and a
+    /// plugin-triggered command/keymap dispatch reports "not found".
+    pub(crate) plugin_dispatch_depth: u32,
+    /// `(event, arg)` pairs that fired during a plugin dispatch and will be
+    /// dispatched once it finishes. Bounded; see `MAX_DEFERRED_PLUGIN_EVENTS`.
+    pub(crate) deferred_plugin_events: Vec<(String, String)>,
+    /// Set while draining `deferred_plugin_events`, so the drain is not itself
+    /// re-entered by the events it dispatches.
+    pub(crate) plugin_events_draining: bool,
+    /// Buffers with an undo group opened by the immediate API during the
+    /// current dispatch. Committed when the dispatch ends, so a plugin's
+    /// immediate edits collapse into one undo step per buffer.
+    pub(crate) plugin_undo_groups: Vec<BufferId>,
 
     // --- Comment toggling ---
     /// Runtime overrides for comment styles, keyed by LSP language ID.
@@ -3392,6 +3523,13 @@ pub struct Engine {
     /// [`Engine::open_picker`] like every other picker-session field, so a
     /// plain `<leader>fg`/Command-Center grep never inherits a stale scope.
     pub picker_grep_scope: Option<std::path::PathBuf>,
+    /// `vimcode.picker.open(...):set_loading(bool)` (#1630): a plugin-fed
+    /// picker's "still fetching" flag. Purely state today — no renderer
+    /// paints it yet (out of scope: `render.rs`/backends weren't touched
+    /// beyond the one `has_preview` line #1630 needed, see that method's
+    /// doc) — so this must not be read as user-visible until a follow-up
+    /// wires a spinner/hint into the picker header.
+    pub picker_loading: bool,
 
     // --- Find/Replace overlay (Ctrl+F) ---
     /// Whether the find/replace overlay is open.
@@ -3665,6 +3803,13 @@ pub struct Engine {
     pub explorer_tree_rect: std::cell::Cell<quadraui::Rect>,
     /// Cached viewport row count from last render frame.
     pub explorer_viewport_rows: std::cell::Cell<usize>,
+    /// Hit regions for the Explorer panel's view-actions toolbar row
+    /// (#1693: New File / New Folder / Refresh / Collapse All / "..."
+    /// overflow) — populated straight from `SidebarPanelBodyLayout::
+    /// status_bar_hit_regions`, not re-derived. Mirrors
+    /// `dap_sidebar_action_hits` (see that field's doc for the "paint
+    /// caches, click reads" contract this follows).
+    pub explorer_toolbar_hits: std::cell::RefCell<Vec<(quadraui::Rect, quadraui::StatusBarHit)>>,
     /// Whether the debug toolbar strip is shown (persistent for now; later: only during DAP session).
     pub debug_toolbar_visible: bool,
     /// Cached layout of the debug action-button `quadraui::Toolbar` from the
@@ -4238,6 +4383,64 @@ pub struct Engine {
     /// Channel for receiving the registry fetch result from the background thread.
     pub ext_registry_rx:
         Option<std::sync::mpsc::Receiver<Option<Vec<extensions::ExtensionManifest>>>>,
+    /// True when the in-flight fetch armed by [`Self::ext_registry_rx`] was
+    /// started by [`Self::ext_refresh_quiet`] (startup's automatic, no
+    /// user-visible-change refresh) rather than [`Self::ext_refresh`] (an
+    /// explicit, user-initiated one — opening the Extensions panel, the
+    /// panel's own refresh key, or `:ExtRefresh`). `poll_ext_registry`
+    /// consults this to decide whether to surface a status message (#1761:
+    /// the startup fetch is unconditional, backgrounded, and its own
+    /// completion time is bounded only by `registry::fetch_registry`'s
+    /// `curl --max-time 15` — i.e. it can land anywhere from under a second
+    /// to ~15s after the first frame paints, entirely outside the user's
+    /// control. Surfacing a status message for it, however briefly,
+    /// breaks the "perfectly silent once idle" contract the
+    /// `idle-no-repaint-bytes-when-idle` journey promises, for however long
+    /// the fetch happens to take on the machine it runs on. An explicit,
+    /// user-requested refresh is the opposite case: the user just took an
+    /// action and is watching for its result, so staying silent there would
+    /// be the bug.
+    pub(crate) ext_registry_quiet: bool,
+
+    /// Channel for the background README fetch kicked off by
+    /// [`Self::ext_show_readme_or_fetch_async`] (#1739). `None` when no
+    /// fetch is in flight. Draining it is [`Self::poll_ext_readme`]'s job —
+    /// wired into [`Self::poll_idle`] alongside every other background-task
+    /// receiver on this struct (`ext_registry_rx`, `tool_acquire_tasks`,
+    /// ...). This exists because `registry::fetch_readme` shells out to
+    /// `curl --max-time 10`: calling it inline on the key-dispatch path
+    /// (the pre-#1739 behaviour) froze the whole UI thread — no repaint,
+    /// no cursor blink, nothing — for up to 10 seconds on every README
+    /// fetch, which is the actual root cause #1739 reported (the "i" key
+    /// looking like a no-op was really "blocked until the subprocess
+    /// returns, then finally repainting").
+    pub(crate) ext_readme_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
+    /// The extension name the in-flight [`Self::ext_readme_rx`] fetch is
+    /// for — used by [`Self::poll_ext_readme`] to build its "no README
+    /// available" fallback message once the fetch resolves to `None`.
+    pub(crate) ext_readme_pending_name: String,
+    /// The display name (title) to open the markdown preview tab under
+    /// once [`Self::ext_readme_rx`] resolves to `Some(content)`.
+    pub(crate) ext_readme_pending_display: String,
+    /// Whether [`Self::poll_ext_readme`] should set a "no README
+    /// available" message if the in-flight fetch resolves to `None` — see
+    /// [`Self::ext_show_readme_or_fetch_async`]'s doc for why its two call
+    /// sites disagree on this.
+    pub(crate) ext_readme_show_missing_message: bool,
+
+    /// One completion signal per in-flight background script-download
+    /// thread spawned by [`Self::ext_install_from_registry_with_runtime_check`]
+    /// (#1739 review round 2). Each `()` sent means that install's scripts
+    /// have finished landing on disk (or failed — errors are still
+    /// discarded, same as the pre-#1739 inline loop); [`Self::
+    /// poll_ext_scripts`] drains every ready receiver and reloads plugins
+    /// so the newly-extracted Lua becomes active in the *installing*
+    /// session rather than only on the next launch. A `Vec` rather than a
+    /// single `Option` because a second `i` press can start a second
+    /// install (different extension) while the first's download is still
+    /// in flight — a single slot would silently drop that first
+    /// completion's reload the moment it's overwritten.
+    pub(crate) ext_scripts_fetch_rx: Vec<std::sync::mpsc::Receiver<()>>,
 
     // --- Native tool acquisition (#1345) ---
     /// In-flight background acquisitions (`tool_acquire::acquire_and_install`),
@@ -4409,10 +4612,84 @@ pub struct Engine {
     /// Receiver for async blame results (background thread).
     blame_rx: Option<std::sync::mpsc::Receiver<Vec<crate::core::git::BlameInfo>>>,
 
+    // --- Plugin decorations (#1653, Native API P5) ---
+    /// Namespaced extmarks, named highlight groups, virtual text and signs
+    /// registered through `vimcode.decor.*`. Lives alongside `line_annotations`
+    /// rather than replacing it — `annotate_line`/`clear_annotations` keep
+    /// their existing, unchanged implementation; this is the new, richer
+    /// mechanism plugins reach for `set_mark` onward. See
+    /// [`crate::core::buffer::DecorState`].
+    pub decor: crate::core::buffer::DecorState,
+
     // --- Async shell tasks (plugin background commands) ---
     /// Background shell tasks spawned by plugins via `vimcode.async_shell()`.
-    /// Keyed by callback_event name (last-writer-wins: new request replaces old).
-    async_shell_tasks: HashMap<String, std::sync::mpsc::Receiver<(bool, String)>>,
+    /// Keyed by callback_event name (last-writer-wins: new request replaces
+    /// old). Built on the same [`execute::spawn_piped`]/[`execute::
+    /// PluginSpawnEvent`] core `vimcode.loop.spawn` uses (#1624) — the
+    /// stdout chunks are accumulated here until `Exit` arrives, matching
+    /// `async_shell`'s frozen "deliver the whole output at exit" contract,
+    /// rather than streamed to Lua per chunk the way `loop.spawn` streams.
+    async_shell_tasks: HashMap<String, execute::AsyncShellTask>,
+    /// Last known exit code per `async_shell` callback_event (#1624), read by
+    /// `vimcode.async_shell_exit_code(event)`. `None` inside the map means
+    /// the process was killed/errored without a code (e.g. a signal death);
+    /// absent means no result has landed yet for that event.
+    pub(crate) async_shell_last_exit: HashMap<String, Option<i32>>,
+    /// Insertion-order FIFO of `async_shell_last_exit`'s keys, so that map
+    /// can be bounded (`Engine::record_async_shell_exit`) instead of growing
+    /// for the life of the session when a plugin uses a unique/dynamic
+    /// callback_event name per `async_shell` call.
+    async_shell_last_exit_order: VecDeque<String>,
+
+    // --- Plugin loop API: timers/schedule/defer/spawn (#1624) ---
+    /// Live `vimcode.loop.timer`/`vimcode.schedule`/`vimcode.defer`
+    /// registrations, keyed by the id `PluginManager::register_timer_
+    /// callback` handed out. Polled from `poll_idle` via
+    /// [`Self::poll_plugin_timers`].
+    plugin_timers: HashMap<u64, PluginTimerEntry>,
+    /// Monotonic counter for `PluginTimerEntry::seq`, breaking ties between
+    /// timers/schedules due at the same instant so `schedule(a); schedule(b)`
+    /// always fires `a` before `b` — a plain `HashMap` iteration order gives
+    /// no such guarantee.
+    plugin_timer_seq: u64,
+    /// Live `vimcode.loop.spawn` child processes, keyed by the id
+    /// `PluginManager::register_spawn_callbacks` handed out. Polled from
+    /// `poll_idle` via [`Self::poll_plugin_spawns`].
+    plugin_spawns: HashMap<u64, execute::PluginSpawnHandle>,
+    /// Live `vimcode.picker.open` handles (#1630), keyed by the id
+    /// `PluginManager::register_picker` handed out — `PickerSource::
+    /// Custom("plugin:<id>")` names the same id. `Weak` for the same
+    /// unload-detection reason as `PluginTimerEntry::manager`: when
+    /// `Engine::set_plugin_manager` replaces the manager, `Self::
+    /// reap_stale_plugin_timers_and_spawns` closes any of these whose
+    /// `upgrade()` now fails.
+    plugin_pickers: HashMap<u64, std::rc::Weak<plugin::PluginManager>>,
+    /// Live `vimcode.http.request` handles (#1632), keyed by the id
+    /// `PluginManager::register_http_callback` handed out. Polled from
+    /// `poll_idle` via [`Self::poll_plugin_http`]. Same "spawn a background
+    /// worker, deliver the result through `poll_idle`'s `mpsc` drain" shape
+    /// as `plugin_spawns` — the worker here runs a single `curl` child
+    /// (`execute::spawn_http_request`) instead of a streamed one, and
+    /// delivers exactly one `HttpResult` instead of a stream of events.
+    plugin_http_requests: HashMap<u64, execute::PluginHttpHandle>,
+    /// Live `vimcode.fs.walk`/`vimcode.fs.grep` handles (#1806), keyed by the
+    /// id `PluginManager::register_fs_callbacks` handed out. Polled from
+    /// `poll_idle` via [`Self::poll_plugin_fs`]. Same "background worker,
+    /// deliver through `poll_idle`'s `mpsc` drain" shape as `plugin_spawns`/
+    /// `plugin_http_requests` — the worker here is a plain `ignore`-crate
+    /// walk/grep (`project_search::walk_project_streaming`/
+    /// `grep_project_streaming`), not a child process, so there is no
+    /// `Child` to kill on cancel — just an `AtomicBool` the walk checks
+    /// between entries.
+    ///
+    /// Dropping `Engine` itself doesn't set that `AtomicBool`: this map (like
+    /// `plugin_spawns`/`plugin_http_requests` above) simply goes away, so an
+    /// in-flight background walk/grep thread keeps running to completion
+    /// detached, with nothing left to deliver its results to. Harmless at
+    /// process exit and consistent with the other two handle maps' existing
+    /// behaviour; only `plugin_api_fs_cancel`/plugin-unload stop a walk early
+    /// (#1806 review).
+    plugin_fs_ops: HashMap<u64, fs_api::PluginFsHandle>,
 
     // --- AI assistant panel ---
     /// Whether the AI sidebar has keyboard focus.
@@ -4522,6 +4799,127 @@ pub struct Engine {
     pub ext_panel_selected: usize,
     /// Scroll offset for the extension panel.
     pub ext_panel_scroll_top: usize,
+    /// Last widget tree each `vimcode.ui.register_view` view's `render` callback
+    /// returned, by view name (#146).
+    ///
+    /// Presence in this map is what makes an `ext:` panel paint a
+    /// `quadraui::Form` (through [`Engine::plugin_view_form_controller`]) instead
+    /// of the `ExtPanelItem` tree rows a `vimcode.panel.register` panel paints.
+    /// The map is seeded when the `PluginManager` is attached, so a view-backed
+    /// panel is distinguishable from a tree panel before its first render.
+    pub plugin_views: HashMap<String, crate::core::plugin_ui::PluginView>,
+    /// The shared `quadraui::FormController` a plugin view is painted through —
+    /// the same compose-tier host the Settings panel uses, so neither backend
+    /// needs per-backend row geometry for plugin UI.
+    pub plugin_view_form_controller: std::cell::RefCell<quadraui::FormController>,
+    /// The exact rect the last frame painted the plugin view's form into, cached
+    /// for the click router (same contract as
+    /// [`Engine::settings_form_rect`](Self::settings_form_rect)).
+    pub plugin_view_form_rect: std::cell::Cell<quadraui::Rect>,
+    /// Recursion bound for `Engine::refresh_plugin_view` — a `render` callback
+    /// may call `vimcode.ui.refresh`, which re-enters it.
+    pub(crate) plugin_view_render_depth: u32,
+    /// Local text-edit state for whichever plugin-view `Text`/`Password`/
+    /// `TextArea` field currently has keyboard focus (#1627) — in the
+    /// sidebar or in an editor-area tab, never both: only one surface can
+    /// hold keyboard focus at a time, so one field suffices. vimcode owns
+    /// cursor/selection here; Lua sees only the committed value
+    /// (`ViewEventKind::TextChanged`/`TextCommitted`) — see `core::plugin_ui`'s
+    /// module doc for why the ABI never hands a plugin a cursor offset.
+    /// Primed on focus (`Engine::plugin_view_focus_field`) from the field's
+    /// then-current declared value; cleared on blur.
+    pub plugin_view_text_edit: Option<crate::core::plugin_ui::PluginViewTextEditState>,
+    /// Flat selection index for a `vimcode.ui.register_view` view hosted as
+    /// an editor-area tab (#1627, `Engine::open_plugin_view_tab`) — the tab
+    /// twin of `ext_panel_selected`. Kept separate from `ext_panel_selected`
+    /// (rather than shared) because the sidebar and a tab can be showing
+    /// *different* views at once; only one may hold keyboard focus, but both
+    /// may be painted in the same frame, and sharing one index would let
+    /// moving the sidebar's selection visibly move the tab's highlighted row
+    /// (or vice versa) even when the two views differ.
+    pub plugin_view_tab_selected: usize,
+    /// Scroll offset for a plugin view hosted as an editor-area tab — the tab
+    /// twin of `ext_panel_scroll_top`, kept separate for the same reason as
+    /// `plugin_view_tab_selected`.
+    pub plugin_view_tab_scroll_top: usize,
+    /// The `quadraui::FormController` an editor-tab-hosted plugin view is
+    /// painted through — kept separate from `plugin_view_form_controller`
+    /// (the sidebar's) so a simultaneously-visible sidebar view and tab view
+    /// don't overwrite each other's cached click-routing geometry.
+    pub plugin_view_tab_form_controller: std::cell::RefCell<quadraui::FormController>,
+    /// The exact rect the last frame painted the editor-tab-hosted plugin
+    /// view's form into (tab twin of `plugin_view_form_rect`).
+    pub plugin_view_tab_form_rect: std::cell::Cell<quadraui::Rect>,
+    /// View names `Engine::open_plugin_view_tab` couldn't refresh immediately
+    /// (`plugin_dispatch_depth > 0` — it always runs nested inside the
+    /// `vimcode.ui.open_view` Lua call that triggered it, since that call is
+    /// only reachable from within another live callback, #1627). Drained by
+    /// `Engine::with_plugin_dispatch` the moment depth returns to `0`, the
+    /// same "defer until the outer call returns" fix `vimcode.ui.refresh`
+    /// already uses for the identical reentrancy problem via
+    /// `PluginCallContext::plugin_view_refresh` — this field exists only
+    /// because `open_plugin_view_tab` runs through the immediate
+    /// (`live_engine`) API, which has no `PluginCallContext` to queue into.
+    pub(crate) plugin_view_tab_pending_refresh: Vec<String>,
+    /// The shared `quadraui::TreeController` a `ViewBody::Tree`-kind plugin
+    /// view is painted through in the sidebar (#1631) — the `Tree` twin of
+    /// `plugin_view_form_controller`. Selection is a `TreePath` (an index
+    /// chain into the plugin-declared `ViewTreeNode` hierarchy), resolved
+    /// back to the node's own id via `ViewTreeNode::resolve` rather than a
+    /// flat index, which would be unstable across expand/collapse.
+    ///
+    /// Its own `WidgetId` (set once at construction, `"plugin-view-tree"`)
+    /// deliberately names the *sidebar's plugin-tree host slot*, not
+    /// whichever view currently occupies it — unlike `render::plugin_view_
+    /// to_list`/`_to_table`/`_to_text_display`, which rebuild a fresh,
+    /// per-view-namespaced widget every paint, this controller is one
+    /// long-lived object reused across whichever `Tree`-kind view is
+    /// active, so a per-view id would have to change out from under a
+    /// live, possibly-retained widget identity every time the active view
+    /// switched.
+    pub plugin_view_tree_controller: std::rc::Rc<std::cell::RefCell<quadraui::TreeController>>,
+    /// Tab twin of `plugin_view_tree_controller`, kept separate for the same
+    /// reason `plugin_view_tab_form_controller` is kept separate from
+    /// `plugin_view_form_controller`.
+    pub plugin_view_tab_tree_controller: std::rc::Rc<std::cell::RefCell<quadraui::TreeController>>,
+    /// The `Backend::list_layout` cached from the last frame that painted a
+    /// `ViewBody::List`-kind plugin view in the sidebar (#1631), alongside
+    /// the rect it was resolved against — same "paint caches, click reads"
+    /// split as `Engine::ext_panel_tree_layout` / `Engine::board_layout`.
+    /// `selected_idx`/`scroll_offset` are *not* re-derived from here; they
+    /// live on `ext_panel_selected`/`ext_panel_scroll_top`, reused verbatim
+    /// from the field-stack view (both are "vimcode-owned flat interaction
+    /// state for whichever body the active view currently has").
+    #[allow(clippy::type_complexity)]
+    pub plugin_view_list_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::ListViewLayout)>>,
+    /// Tab twin of `plugin_view_list_layout`.
+    #[allow(clippy::type_complexity)]
+    pub plugin_view_tab_list_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::ListViewLayout)>>,
+    /// The `Backend::data_table_layout` cached from the last frame that
+    /// painted a `ViewBody::Table`-kind plugin view in the sidebar (#1631).
+    /// Tab twin is `plugin_view_tab_table_layout`.
+    #[allow(clippy::type_complexity)]
+    pub plugin_view_table_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::DataTableLayout)>>,
+    /// Tab twin of `plugin_view_table_layout`.
+    #[allow(clippy::type_complexity)]
+    pub plugin_view_tab_table_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::DataTableLayout)>>,
+    /// The selected *column* within a `ViewBody::Table`-kind view's selected
+    /// row, in the sidebar (#1631). Separate from `ext_panel_selected`
+    /// (which is the row) because a table author may mark more than one
+    /// column `editable` (e.g. #147's "Key"/"Value" pair) — without this,
+    /// `Enter` could only ever reach the *first* editable column, since
+    /// there was nothing else to disambiguate which one the user meant.
+    /// Clamped to a valid editable column on every row/view change by
+    /// `Engine::plugin_view_table_col` rather than stored pre-clamped, the
+    /// same "read-time clamp" contract `Engine::plugin_view_selected` uses.
+    pub ext_panel_table_col: usize,
+    /// Tab twin of `ext_panel_table_col`, kept separate for the same reason
+    /// `plugin_view_tab_selected` is kept separate from `ext_panel_selected`.
+    pub plugin_view_tab_table_col: usize,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
     /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
@@ -4822,6 +5220,7 @@ impl Engine {
             marks: HashMap::new(),
             suppress_mark_line_adjust: false,
             visual_anchor: None,
+            visual_end_exclusive: false,
             visual_dollar: false,
             command_from_visual: None,
             curswant: None,
@@ -4869,6 +5268,7 @@ impl Engine {
             completion_start_col: 0,
             completion_display_only: false,
             completion_filter_prefix: String::new(),
+            completion_generation: 0,
             project_search_query: String::new(),
             project_search_results: Vec::new(),
             project_search_options: SearchOptions::default(),
@@ -4910,6 +5310,7 @@ impl Engine {
             lsp_show_code_action_popup_pending: false,
             pending_code_action_choices: Vec::new(),
             cursor_move_pending: None,
+            cursor_moved_event_pending: None,
             lsp_installing: std::collections::HashSet::new(),
             lsp_lookup_in_flight: std::collections::HashSet::new(),
             leader_partial: None,
@@ -4981,6 +5382,10 @@ impl Engine {
             sc_branch_create_input: String::new(),
             sc_help_open: false,
             plugin_manager: None,
+            plugin_dispatch_depth: 0,
+            deferred_plugin_events: Vec::new(),
+            plugin_events_draining: false,
+            plugin_undo_groups: Vec::new(),
             comment_overrides: HashMap::new(),
             highlight_overrides: HashMap::new(),
             cwd,
@@ -5010,6 +5415,7 @@ impl Engine {
             picker_history_index: None,
             picker_history_typing_buffer: String::new(),
             picker_grep_scope: None,
+            picker_loading: false,
             breadcrumb_focus: false,
             breadcrumb_selected: 0,
             breadcrumb_segments: Vec::new(),
@@ -5081,6 +5487,7 @@ impl Engine {
             explorer_new_entry_pending: None,
             explorer_tree_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             explorer_viewport_rows: std::cell::Cell::new(0),
+            explorer_toolbar_hits: std::cell::RefCell::new(Vec::new()),
             debug_toolbar_visible: false,
             debug_toolbar_layout: std::cell::RefCell::new(None),
             debug_button_hovered: None,
@@ -5197,6 +5604,12 @@ impl Engine {
             ext_registry: registry::load_cache(),
             ext_registry_fetching: false,
             ext_registry_rx: None,
+            ext_registry_quiet: false,
+            ext_readme_rx: None,
+            ext_readme_pending_name: String::new(),
+            ext_readme_pending_display: String::new(),
+            ext_readme_show_missing_message: false,
+            ext_scripts_fetch_rx: Vec::new(),
             tool_acquire_tasks: HashMap::new(),
             tool_acquire_groups: HashMap::new(),
             ext_sidebar_system: {
@@ -5250,7 +5663,16 @@ impl Engine {
             line_annotations: HashMap::new(),
             blame_annotations_active: false,
             blame_rx: None,
+            decor: crate::core::buffer::DecorState::default(),
             async_shell_tasks: HashMap::new(),
+            async_shell_last_exit: HashMap::new(),
+            async_shell_last_exit_order: VecDeque::new(),
+            plugin_timers: HashMap::new(),
+            plugin_timer_seq: 0,
+            plugin_spawns: HashMap::new(),
+            plugin_pickers: HashMap::new(),
+            plugin_http_requests: HashMap::new(),
+            plugin_fs_ops: HashMap::new(),
             ai_ghost_text: None,
             ai_ghost_alternatives: Vec::new(),
             ai_ghost_alt_idx: 0,
@@ -5283,6 +5705,34 @@ impl Engine {
             ext_panel_has_focus: false,
             ext_panel_selected: 0,
             ext_panel_scroll_top: 0,
+            plugin_views: HashMap::new(),
+            plugin_view_form_controller: std::cell::RefCell::new(quadraui::FormController::new(
+                "plugin-view".to_string(),
+            )),
+            plugin_view_form_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            plugin_view_render_depth: 0,
+            plugin_view_text_edit: None,
+            plugin_view_tab_selected: 0,
+            plugin_view_tab_scroll_top: 0,
+            plugin_view_tab_form_controller: std::cell::RefCell::new(
+                quadraui::FormController::new("plugin-view-tab".to_string()),
+            ),
+            plugin_view_tab_form_rect: std::cell::Cell::new(quadraui::Rect::new(
+                0.0, 0.0, 0.0, 0.0,
+            )),
+            plugin_view_tab_pending_refresh: Vec::new(),
+            plugin_view_tree_controller: std::rc::Rc::new(std::cell::RefCell::new(
+                quadraui::TreeController::new("plugin-view-tree"),
+            )),
+            plugin_view_tab_tree_controller: std::rc::Rc::new(std::cell::RefCell::new(
+                quadraui::TreeController::new("plugin-view-tab-tree"),
+            )),
+            plugin_view_list_layout: std::cell::RefCell::new(None),
+            plugin_view_tab_list_layout: std::cell::RefCell::new(None),
+            plugin_view_table_layout: std::cell::RefCell::new(None),
+            plugin_view_tab_table_layout: std::cell::RefCell::new(None),
+            ext_panel_table_col: 0,
+            plugin_view_tab_table_col: 0,
             ext_panel_sections_expanded: HashMap::new(),
             ext_panel_tree_expanded: HashMap::new(),
             ext_panel_input_text: HashMap::new(),
@@ -5407,9 +5857,9 @@ impl Engine {
     /// `startup` performs — `plugin_init()` (loads and **executes** every
     /// `.lua` script in the developer's real
     /// `~/.config/vimcode/{plugins,extensions}/`, then fires `VimEnter`) and
-    /// `ext_refresh()` (spawns a thread that fetches the remote extension
-    /// registry over the network). Both make driver-tier tests depend on the
-    /// machine they run on: a user plugin that hooks `ModeChanged` /
+    /// `ext_refresh_quiet()` (spawns a thread that fetches the remote
+    /// extension registry over the network). Both make driver-tier tests
+    /// depend on the machine they run on: a user plugin that hooks `ModeChanged` /
     /// `InsertEnter` / `cursor_move` can call `vimcode.buf.set_cursor` or
     /// `set_lines` *synchronously inside a keystroke*, so an installed
     /// plugin silently rewrites what a `TuiDriver` test types. That is how
@@ -5420,6 +5870,90 @@ impl Engine {
     /// whatever the developer happens to have installed.
     pub fn startup_without_session_restore(&mut self, file_path: Option<&Path>) {
         self.startup_inner(file_path, false, false);
+    }
+
+    /// #1797: before opening a *file* at startup (as opposed to a folder,
+    /// which [`Engine::open_folder`] already repoints `cwd`/`workspace_root`
+    /// for), adopt the file's own git repo root — or, if it isn't inside
+    /// one, its immediate parent directory — as `cwd`/`workspace_root`,
+    /// but **only** when `path` is not already reachable from the existing
+    /// `cwd` (i.e. only when the two are unrelated).
+    ///
+    /// Without this, `cwd` stays whatever the process's actual working
+    /// directory happened to be at `Engine::new()` time, which is only ever
+    /// correct by accident: a terminal launch (`cd workspace && vimcode
+    /// main.rs`) already starts the process inside the workspace, so the
+    /// accident is reliable there, but a native-GUI launch that hands over
+    /// an absolute path without first `cd`ing anywhere — a desktop shortcut
+    /// with no "Start in" folder, a file-association "Open with" launch —
+    /// leaves `cwd` pointing at some unrelated directory with no git repo
+    /// at all. Every git-backed feature keyed on `self.cwd`
+    /// (`git::find_repo_root(&self.cwd)`, chiefly `sc_refresh`'s Source
+    /// Control panel and the Explorer's git-status indicators) then queries
+    /// the wrong directory and comes back empty forever, no matter how many
+    /// times the user refreshes — exactly the #1797 bug-bash report.
+    ///
+    /// Deliberately a no-op when `path` is already under `cwd` (the
+    /// ordinary terminal-launch case above, including a file several
+    /// directories deep in the workspace): that case was already correct,
+    /// and second-guessing it by always repointing `cwd` at the file's
+    /// *immediate* parent would itself be a regression — it would narrow
+    /// the Explorer/workspace root to a subdirectory on every launch that
+    /// opens a nested file, where today it stays at the real workspace
+    /// root. Pinned by
+    /// `tests::adopt_cwd_for_startup_file_is_a_no_op_when_the_file_is_
+    /// already_under_cwd_1797` so a future tweak to the `starts_with`
+    /// check can't silently start re-rooting every nested-file launch.
+    ///
+    /// Also a no-op when `cwd` is *itself* already inside a git repo, even
+    /// if that repo isn't the file's own — #1797 review: the reported bug
+    /// is specifically a launch `cwd` with no repo at all (a desktop
+    /// shortcut, a file-association "Open with" launch), not an ordinary
+    /// `cd ~/myrepo && vimcode ~/.gitconfig`. Repointing `cwd` in the
+    /// latter case would be a *new* regression of its own: it would
+    /// silently move the Explorer tree, quick-open search root, and
+    /// per-workspace session key from `~/myrepo` to `$HOME` (or to
+    /// `.gitconfig`'s own repo, if it has one) merely because the user
+    /// opened an unrelated file by absolute path — neither VS Code nor vim
+    /// does that.
+    ///
+    /// Only mutates the in-memory `cwd`/`workspace_root` fields, not the
+    /// process's actual working directory (unlike `open_folder`, which also
+    /// calls `std::env::set_current_dir`) — this runs once at startup, and
+    /// changing the real process cwd here would be observable by any other
+    /// code (or concurrently-running test) that calls
+    /// `std::env::current_dir()` for an unrelated reason.
+    fn adopt_cwd_for_startup_file(&mut self, path: &Path) {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.cwd.join(path)
+        };
+        let absolute = absolute.canonicalize().unwrap_or_else(|_| absolute.clone());
+        let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+        if absolute.starts_with(&cwd) {
+            return;
+        }
+        if git::find_repo_root(&cwd).is_some() {
+            return;
+        }
+        let Some(parent) = absolute.parent() else {
+            return;
+        };
+        let new_cwd = git::find_repo_root(parent).unwrap_or_else(|| parent.to_path_buf());
+        self.cwd = new_cwd.clone();
+        self.workspace_root = Some(new_cwd.clone());
+        // Mirrors `open_folder`'s own clear+insert (#1797 review): without
+        // this, `explorer_reveal_path`'s `target.strip_prefix(&root)` is
+        // the *only* thing that would seed `explorer_expanded` with the
+        // new root, and it compares the caller's possibly-uncanonicalised
+        // `path` against this method's canonicalised `new_cwd` — a
+        // mismatched spelling (a Windows 8.3 short path, a symlinked
+        // launch path, `/tmp` vs `/private/tmp` on macOS) makes that strip
+        // fail silently, leaving the Explorer painting a single collapsed
+        // root row on exactly the launch this fix targets.
+        self.explorer_expanded.clear();
+        self.explorer_expanded.insert(new_cwd);
     }
 
     /// Shared body of [`Engine::startup`] and
@@ -5437,12 +5971,13 @@ impl Engine {
     ) {
         if load_ambient_state {
             self.plugin_init();
-            self.ext_refresh();
+            self.ext_refresh_quiet();
         }
         if let Some(path) = file_path {
             if path.is_dir() {
                 self.open_folder(path);
             } else {
+                self.adopt_cwd_for_startup_file(path);
                 let _ = self.open_file_with_mode(path, OpenMode::Permanent);
             }
         } else if restore_session {
@@ -5475,6 +6010,7 @@ impl Engine {
         let mut redraw = false;
         redraw |= self.process_pending_sidebar();
         redraw |= self.flush_cursor_move_hook();
+        redraw |= self.flush_cursor_moved_event();
         self.lsp_flush_changes();
         redraw |= self.poll_lsp();
         redraw |= self.poll_acp();
@@ -5487,6 +6023,8 @@ impl Engine {
         redraw |= self.poll_terminal();
         redraw |= self.poll_dap();
         redraw |= self.poll_ext_registry();
+        redraw |= self.poll_ext_readme();
+        redraw |= self.poll_ext_scripts();
         redraw |= self.poll_tool_acquire();
         redraw |= self.poll_sc_diff();
         self.tick_board();
@@ -5495,6 +6033,10 @@ impl Engine {
         redraw |= self.poll_board_action();
         redraw |= self.poll_ai();
         redraw |= self.poll_async_shells();
+        redraw |= self.poll_plugin_timers();
+        redraw |= self.poll_plugin_spawns();
+        redraw |= self.poll_plugin_http();
+        redraw |= self.poll_plugin_fs();
         redraw |= self.poll_panel_hover();
         redraw |= self.poll_editor_hover();
         redraw |= self.poll_blame();
@@ -6429,10 +6971,21 @@ mod dap_ops;
 pub use dap_ops::DEBUG_BUTTON_IDS;
 mod digraph_ops;
 mod document_ops;
-mod explorer_ops;
+// `pub(crate)` (not the plain `mod` every sibling here uses): #1806's
+// `project_search::walk_project_streaming` — a sibling of `engine`, not a
+// descendant — needs `walk_entry_is_excluded` directly to give
+// `vimcode.fs.walk` the same `explorer_exclude` pruning `picker_populate_
+// files` applies, the same reason `execute` is `pub(crate)` below.
+pub(crate) mod explorer_ops;
 pub use explorer_ops::ExplorerKeyResult;
-mod execute;
+// `pub(crate)` (not the plain `mod` every sibling here uses): `vimcode.http`'s
+// response-delivery path (`PluginManager::call_http_response`, #1632) lives in
+// `plugin.rs` — a sibling of `engine`, not a descendant — so it needs to name
+// `execute::HttpResult` directly rather than through an `Engine` method
+// signature the way every other `execute` type stays engine-private today.
+pub(crate) mod execute;
 mod ext_panel;
+mod fs_api;
 pub use ext_panel::ExtSidebarKeyResult;
 mod keys;
 mod lsp_ops;
@@ -6440,6 +6993,7 @@ mod motions;
 mod panels;
 mod picker;
 mod plugins;
+pub(crate) use plugins::PluginViewHost;
 mod search;
 pub use search::{find_word_boundaries, SearchKeyResult};
 mod review_comment_ops;

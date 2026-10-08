@@ -207,6 +207,10 @@ impl Engine {
                 *line += line_count;
             }
         }
+        // #1653: plugin decoration marks (`vimcode.decor.set_mark`) follow
+        // the same full-line-insertion rule as the vim marks just above.
+        self.decor
+            .shift_insert(buffer_id, at_line, line_count, at_line_start);
     }
 
     /// Shift/remove marks for a full-line deletion covering `[at_line,
@@ -237,6 +241,8 @@ impl Engine {
                 *line -= line_count;
             }
         }
+        // #1653: same full-line-deletion rule for plugin decoration marks.
+        self.decor.shift_delete(buffer_id, at_line, line_count);
     }
 
     /// Read every local mark (active buffer) and global mark (pointing at
@@ -323,6 +329,7 @@ impl Engine {
 
     /// Perform undo on the active buffer. Returns true if undo was performed.
     pub fn undo(&mut self) -> bool {
+        let old_text = self.buffer().to_string();
         if let Some(cursor) = self.active_buffer_state_mut().undo() {
             self.view_mut().cursor = cursor;
             self.clamp_cursor_col();
@@ -331,6 +338,15 @@ impl Engine {
             let active_id = self.active_buffer_id();
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
+            self.shift_decor_across_undo_nav(&old_text);
+            // #1787: an undo swaps in an entire prior buffer snapshot, so any
+            // open completion popup's `completion_candidates` (computed from
+            // the pre-undo text, e.g. the whole word the user was mid-typing)
+            // is now stale — nothing else re-triggers completion on an undo,
+            // so without this the popup rides along showing text that no
+            // longer exists in the buffer until the next keystroke happens
+            // to dismiss or refresh it.
+            self.dismiss_completion();
             true
         } else {
             self.message = "Already at oldest change".to_string();
@@ -340,6 +356,7 @@ impl Engine {
 
     /// Perform redo on the active buffer. Returns true if redo was performed.
     pub fn redo(&mut self) -> bool {
+        let old_text = self.buffer().to_string();
         if let Some(cursor) = self.active_buffer_state_mut().redo() {
             self.view_mut().cursor = cursor;
             self.clamp_cursor_col();
@@ -348,11 +365,32 @@ impl Engine {
             let active_id = self.active_buffer_id();
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
+            self.shift_decor_across_undo_nav(&old_text);
+            // #1787: see the matching comment in `undo` above — a redo swaps
+            // in a different buffer snapshot too, so the same staleness
+            // applies.
+            self.dismiss_completion();
             true
         } else {
             self.message = "Already at newest change".to_string();
             false
         }
+    }
+
+    /// Relocate `self.decor`'s marks across an undo-tree jump that replaced
+    /// the *entire* buffer text in one step (`undo`/`redo`/`g_earlier`/
+    /// `g_later`/`:earlier`/`:later` all swap a full `UndoNode::text`
+    /// snapshot rather than applying a per-edit insert/delete, so there's no
+    /// `shift_marks_for_line_insert`/`_delete`-style line/count to hook —
+    /// see `BufferState::undo`/`redo` in `buffer_manager.rs`). Called with
+    /// the buffer's text from *before* the jump; reads the text *after* off
+    /// `self.buffer()` directly, since by the time this runs the swap has
+    /// already happened.
+    fn shift_decor_across_undo_nav(&mut self, old_text: &str) {
+        let buffer_id = self.active_window().buffer_id;
+        let new_text = self.buffer().to_string();
+        self.decor
+            .shift_for_text_replace(buffer_id, old_text, &new_text);
     }
 
     /// Apply the side effects common to every undo-tree navigation that
@@ -374,9 +412,11 @@ impl Engine {
     /// plain `u`, this crosses into a branch a prior `u` + new edit
     /// abandoned (#1156).
     pub fn g_earlier(&mut self) -> bool {
+        let old_text = self.buffer().to_string();
         match self.active_buffer_state_mut().undo_older() {
             Some(cursor) => {
                 self.report_undo_nav(cursor, "g-");
+                self.shift_decor_across_undo_nav(&old_text);
                 true
             }
             None => false,
@@ -385,9 +425,11 @@ impl Engine {
 
     /// Navigate to a later buffer state chronologically (`g+`).
     pub fn g_later(&mut self) -> bool {
+        let old_text = self.buffer().to_string();
         match self.active_buffer_state_mut().undo_newer() {
             Some(cursor) => {
                 self.report_undo_nav(cursor, "g+");
+                self.shift_decor_across_undo_nav(&old_text);
                 true
             }
             None => false,
@@ -410,6 +452,7 @@ impl Engine {
     fn ex_earlier_later(&mut self, spec: &str, earlier: bool) -> Result<(), String> {
         let spec = spec.trim();
         let label = if earlier { "earlier" } else { "later" };
+        let old_text = self.buffer().to_string();
         if let Some(cutoff) = parse_undo_time_spec(spec) {
             let bs = self.active_buffer_state_mut();
             let result = if earlier {
@@ -418,7 +461,10 @@ impl Engine {
                 bs.undo_at_or_after(cutoff)
             };
             match result {
-                Some(cursor) => self.report_undo_nav(cursor, label),
+                Some(cursor) => {
+                    self.report_undo_nav(cursor, label);
+                    self.shift_decor_across_undo_nav(&old_text);
+                }
                 None => self.message = "Already at oldest change".to_string(),
             }
             return Ok(());
@@ -448,7 +494,10 @@ impl Engine {
             }
         }
         match last_cursor {
-            Some(cursor) => self.report_undo_nav(cursor, label),
+            Some(cursor) => {
+                self.report_undo_nav(cursor, label);
+                self.shift_decor_across_undo_nav(&old_text);
+            }
             None => {
                 self.message = if earlier {
                     "Already at oldest change".to_string()
@@ -520,12 +569,31 @@ impl Engine {
         if self.active_buffer_state().review_verdict.is_some() {
             return self.save_review_verdict_buffer();
         }
+        // Plugin-owned write (`BufWriteCmd` shape, #1623): a plugin claimed
+        // this buffer's writes via `vimcode.buffer.set_write_handler` (the
+        // oil.nvim pattern — a scratch buffer whose ":w" means "apply my
+        // edits", not "write these lines to a file"). The plugin owns
+        // persistence entirely; the normal disk-write path below never runs.
+        let active_id = self.active_buffer_id();
+        if self
+            .plugin_manager
+            .as_ref()
+            .is_some_and(|pm| pm.has_write_handler(active_id.0 as i64))
+        {
+            return self.run_plugin_write_handler(active_id);
+        }
 
         // Promote preview on save
-        let active_id = self.active_buffer_id();
         self.preview_tab_promote(active_id);
         let state = self.active_buffer_state_mut();
         if let Some(ref path) = state.file_path.clone() {
+            let path_str = path.to_string_lossy().into_owned();
+            // #1623: BufWritePre fires *before* the write — unlike `save`/
+            // `BufWrite` below, which both fire after (kept exactly as-is
+            // for back-compat: shipped extensions rely on "the file is
+            // already on disk" at that point).
+            self.plugin_event("BufWritePre", &path_str);
+            let state = self.active_buffer_state_mut();
             match state.save() {
                 Ok(line_count) => {
                     let rel = self.copy_relative_path(path);
@@ -538,7 +606,6 @@ impl Engine {
                     // Delete swap file — content is safely on disk now.
                     self.swap_delete_for_buffer(id);
                     self.swap_write_needed.remove(&id);
-                    let path_str = path.to_string_lossy().into_owned();
                     self.plugin_event("save", &path_str);
                     self.plugin_event("BufWrite", &path_str);
                     Ok(())
@@ -550,6 +617,40 @@ impl Engine {
             }
         } else {
             self.message = "No file name".to_string();
+            Err(self.message.clone())
+        }
+    }
+
+    /// Run a plugin's `vimcode.buffer.set_write_handler` callback instead of
+    /// writing `buf_id` to disk (#1623). Fires `BufWritePre` first, same as
+    /// the normal disk-write path, so a `BufWritePre` hook sees the same
+    /// "about to be written" moment either way. On success, clears `dirty`
+    /// (there is no `vim.bo.modified`-equivalent Lua setter yet for the
+    /// callback to do this itself) and leaves `self.message` for the
+    /// callback to set via `vimcode.message`.
+    fn run_plugin_write_handler(&mut self, buf_id: BufferId) -> Result<(), String> {
+        let path_str = self
+            .buffer_manager
+            .get(buf_id)
+            .and_then(|s| s.file_path.clone())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.plugin_event("BufWritePre", &path_str);
+        let ctx = self.make_plugin_ctx(false);
+        let Some((found, ctx)) =
+            self.with_plugin_dispatch(|pm| pm.call_write_handler(buf_id.0 as i64, ctx))
+        else {
+            self.message = "no live editor for plugin write handler".to_string();
+            return Err(self.message.clone());
+        };
+        self.apply_plugin_ctx(ctx);
+        if found {
+            if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                state.dirty = false;
+            }
+            Ok(())
+        } else {
+            self.message = "plugin write handler vanished".to_string();
             Err(self.message.clone())
         }
     }

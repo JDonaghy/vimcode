@@ -1,0 +1,97 @@
+# Tier-2 Linux/GTK-native smoke spec for vimcode#1646 (claude-coordinator
+# epic #3482, v0.5.551's new real-platform acceptance drivers).
+#
+# Driver: `gtk-native` (coord/gtk_native_driver.py) — launches the real
+# compiled `vimcode` GTK binary under a real (if headless) X11 display,
+# finds its real window, and probes it with real `xdotool` input
+# injection, the AT-SPI accessibility tree, and `xwd -id <windowid>`
+# captures. Needs a live `$DISPLAY` plus `xdotool`/`xwd`/the AT-SPI
+# GObject-introspection binding on whatever fleet host runs this — see
+# that driver module's own "headless by construction" note; this spec
+# does not start its own `Xvfb`. `coord` supplies the actual
+# `launch_command`/`cwd`; this file assumes that command opens a small,
+# real, non-empty text file (kept non-empty for parity with the other
+# Tier-2 specs and so a future minimap-content check — see this file's
+# "DELIBERATELY OMITTED" comment below — has something to show once one
+# exists).
+#
+# Unlike macOS (`tests/smoke-spec/mac-gui.yaml`), GTK has no native menu
+# bar or native window-chrome buttons to lean on: `quadraui`'s
+# `GtkBackend::backend_caps()` does not declare `native_menu` (confirmed
+# via `src/gtk/testing.rs`'s own "GTK has no native context menu"
+# assertions), and vimcode calls `WindowControl::set_decorated(false)`
+# on its GTK window (`src/app.rs`) for the same client-side-decorations,
+# custom-painted-chrome reason Win-GUI does — "the same [drawn menu] row
+# GTK already ships" that the quadraui#1228 commit message (quoted in
+# `win-gui.yaml`) points at when describing what Win-GUI switched back
+# to. Every click/menu/dropdown check below is therefore gated the exact
+# same way Win-GUI's dropdown check is (not its hit-test-specific
+# #1232 bug — GTK was not reported broken there — but the shared,
+# lower-level docs/PENDING_QUADRAUI_ISSUES.md "No UIA/NSAccessibility/
+# AT-SPI provider wiring..." gap: nothing registers an `AtkObject`/AT-SPI
+# provider for any of vimcode's own drawn content on any platform).
+#
+# Pixel coordinates are first-approximation (same ~32px drawn-band-height
+# convention `win-gui.yaml` uses, since GTK paints the identical row).
+#
+# UNLIKE `win-gui.yaml`/`win-terminal.yaml` (real-hardware-confirmed via WSL
+# interop to dell64's attached Windows host), this file has NOT had a real
+# run: `gtk-native`'s own driver needs `xdotool`/`xwd` plus a live `$DISPLAY`
+# and the AT-SPI GObject-introspection binding (see this file's driver
+# paragraph above); the sandboxed Linux worktree this fix iteration ran in
+# has `at-spi2-core`'s D-Bus pieces installed but neither `xdotool` nor
+# `Xvfb`, and no passwordless `sudo` to install them. Saying so explicitly
+# rather than leaving the coordinates looking confirmed — they remain
+# first-approximation guesses pending an operator with a real (or
+# `Xvfb`-provisioned, package-installable) Linux desktop running this spec
+# and recording pass/fail back into this comment.
+name: vimcode-gtk-gui
+width: 1024
+height: 768
+steps:
+  - type: launch
+    id: launch
+    timeout_ms: 15000
+
+  - type: wait
+    id: startup-settle
+    ms: 1500
+
+  # Gated on docs/PENDING_QUADRAUI_ISSUES.md's AT-provider-wiring entry —
+  # expected RED today, same reasoning as `win-gui.yaml`'s identical
+  # check (minus that file's additional #1232 hit-test gate, which is
+  # Win-GUI-specific). No `-NNNN` issue suffix on `file-dropdown-opens`
+  # (unlike `win-gui.yaml`'s `-1232`) for the same reason `mac-gui.yaml`
+  # notes on its own identical check: the AT-provider-wiring gap is
+  # drafted in that doc but not yet filed as a numbered quadraui issue.
+  - type: click
+    id: click-file-menu-item
+    x: 24
+    y: 16
+  - type: expect_a11y_within
+    id: file-dropdown-opens
+    role: "menu item"
+    name: "New Tab"
+    timeout_ms: 3000
+
+  - type: key
+    id: dismiss-dropdown
+    key: esc
+
+  # vimcode#1646's two "All GUI specs" seed checks are DELIBERATELY OMITTED
+  # from this file, same as `win-gui.yaml`/`mac-gui.yaml` (see
+  # `win-gui.yaml`'s comment for the full reasoning): confirmed directly
+  # against `coord`'s installed `gtk_native_driver.py`
+  # (`code-coordinator==0.5.551`), its step vocabulary is `launch`, `key`,
+  # `click`, `wait`, `capture`, `expect_a11y`/`expect_a11y_within`,
+  # `expect_closed` — `capture` alone has no `expect_*` shape, so it can
+  # never fail. No pixel-content or install-state-aware primitive exists in
+  # this driver to replace it with.
+
+  - type: click
+    id: click-close-button
+    x: 978
+    y: 16
+  - type: expect_closed
+    id: close-button-actually-closes-window
+    timeout_ms: 5000

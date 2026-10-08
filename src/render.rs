@@ -13,18 +13,17 @@
 // and the tab-bar hit struct plus a syntax-highlight span shape (quadraui#822/
 // #823) that this file used. #1490 migrated every `draw_status_bar` call site
 // to `draw_status_bar_interactive`; #1491 migrated every tab-bar paint/measure
-// call site off the now-removed deprecated struct onto `TabBarLayout`.
-// `draw_toolbar`/`draw_sidebar_panel`/the syntax-span shape are still
-// deprecated and still used here — migrating those to the `_interactive`
-// hover/pressed API and its `MinimapSpan`-shaped replacement is unrelated,
-// cross-backend follow-up work, silenced with a narrow `allow` at each
-// remaining call site instead of a file-level one.
+// call site off the now-removed deprecated struct onto `TabBarLayout`. #1652
+// (quadraui#1108/#1109) finished the set: `draw_toolbar`/`draw_sidebar_panel`
+// now call their `_interactive` twins directly, and `raw_syntax_spans` is
+// `Vec<quadraui::MinimapSpan>` — no `quadraui`-only `#[allow(deprecated)]`
+// remains in this file.
 //
 // `dead_code` dropped by #1489: the ~600 lines it was silently covering
 // (two whole dead data pipelines plus five dead helpers) are gone; any new
 // dead code in this file is a real warning again.
 
-use crate::core::buffer::Buffer;
+use crate::core::buffer::{Buffer, DecorMark, VirtTextPos};
 use crate::core::engine::sidebar::{
     HAMBURGER_PANEL_ID, PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT,
     PANEL_SEARCH, PANEL_SETTINGS,
@@ -1073,7 +1072,29 @@ pub struct RenderedWindow {
     /// truncate before using it.
     pub rect: WindowRect,
     /// Visible lines, one per row.
+    ///
+    /// **Not** the window's row *capacity* — `build_rendered_window`'s
+    /// fill loop stops the moment it runs out of buffer content
+    /// (`line_idx < total_lines`), so on a buffer shorter than the
+    /// viewport this is shorter than the number of rows the window
+    /// actually has room to paint. Use [`Self::visible_line_capacity`]
+    /// for "how many rows could this window show" — e.g. feeding
+    /// `Engine::set_viewport_for_window` (#1779: using `lines.len()`
+    /// there pinned a 1-line buffer's `view.viewport_lines` to `1`, so
+    /// the very next `ensure_cursor_visible` — on the keystroke that grew
+    /// the buffer to 2 lines — believed the viewport could show only one
+    /// line and scrolled line 0 out of view to keep the cursor's new
+    /// line "visible").
     pub lines: Vec<RenderedLine>,
+    /// This window's row *capacity* at the geometry `rect`/`line_height`
+    /// this frame painted with — `(rect.height / line_height).floor()`,
+    /// minus one for the per-window status row when that's shown (exactly
+    /// the `visible_lines` local `build_screen_layout`'s window loop
+    /// computes and feeds into `build_rendered_window`). Unlike
+    /// [`Self::lines`]`.len()`, this does **not** shrink just because the
+    /// buffer itself is shorter than the viewport — see that field's doc
+    /// for the #1779 bug this distinction exists to keep fixed.
+    pub visible_line_capacity: usize,
     /// Cursor position + shape, or `None` if the cursor is scrolled off-screen.
     pub cursor: Option<(CursorPos, CursorShape)>,
     /// Secondary cursor positions (multi-cursor Alt-D). Rendered as dimmed blocks.
@@ -1138,6 +1159,14 @@ pub struct RenderedWindow {
     pub cursorline: bool,
     /// Per-window status line (Vim-style), or `None` when the setting is off.
     pub status_line: Option<WindowStatusLine>,
+    /// Set when this window's buffer hosts a `vimcode.ui.register_view` view
+    /// as an editor-area tab (`BufferState::plugin_view`, #1627), naming the
+    /// view. `lines`/`cursor`/every other buffer-content field is left at its
+    /// `build_rendered_window`-`empty()` default when this is `Some` — the
+    /// window's content is a `Form`, painted by
+    /// `App::paint_editor_windows_rung` instead of `Surface::Editor`, not
+    /// buffer text.
+    pub plugin_view: Option<String>,
 }
 
 // ─── CommandLineData ──────────────────────────────────────────────────────────
@@ -1216,30 +1245,66 @@ pub fn wildmenu_to_status_bar(wm: &WildmenuData, theme: &Theme) -> quadraui::Sta
 /// Data needed to render the word-completion popup in insert mode.
 #[derive(Debug, Clone)]
 pub struct CompletionMenu {
-    /// Sorted list of candidates.
-    pub candidates: Vec<String>,
+    /// Sorted list of candidates. `CompletionCandidate` (#1805) carries
+    /// optional kind/detail/documentation metadata — buffer-word and LSP
+    /// candidates leave those `Text`/`None`, a `vimcode.completion.
+    /// register` plugin source can set them.
+    pub candidates: Vec<crate::core::completion::CompletionCandidate>,
     /// Index of the currently highlighted candidate.
     pub selected_idx: usize,
-    /// Length (in chars) of the longest candidate — used for popup width.
+    /// Length (in chars) of the longest candidate's label — used for popup
+    /// width.
     pub max_width: usize,
+}
+
+/// Map vimcode's own [`crate::core::completion::CompletionItemKind`] to
+/// quadraui's `CompletionKind` — the one conversion point between the two
+/// vocabularies (mirrors `plugin_ui`'s "vimcode-owned vocabulary, converted
+/// to quadraui primitives in one place" rule).
+fn completion_item_kind_to_quadraui(
+    kind: crate::core::completion::CompletionItemKind,
+) -> quadraui::CompletionKind {
+    use crate::core::completion::CompletionItemKind as K;
+    match kind {
+        K::Text => quadraui::CompletionKind::Text,
+        K::Method => quadraui::CompletionKind::Method,
+        K::Function => quadraui::CompletionKind::Function,
+        K::Constructor => quadraui::CompletionKind::Constructor,
+        K::Field => quadraui::CompletionKind::Field,
+        K::Variable => quadraui::CompletionKind::Variable,
+        K::Class => quadraui::CompletionKind::Class,
+        K::Interface => quadraui::CompletionKind::Interface,
+        K::Module => quadraui::CompletionKind::Module,
+        K::Property => quadraui::CompletionKind::Property,
+        K::Unit => quadraui::CompletionKind::Unit,
+        K::Value => quadraui::CompletionKind::Value,
+        K::Enum => quadraui::CompletionKind::Enum,
+        K::Keyword => quadraui::CompletionKind::Keyword,
+        K::Snippet => quadraui::CompletionKind::Snippet,
+        K::Color => quadraui::CompletionKind::Color,
+        K::File => quadraui::CompletionKind::File,
+        K::Reference => quadraui::CompletionKind::Reference,
+        K::Folder => quadraui::CompletionKind::Folder,
+        K::EnumMember => quadraui::CompletionKind::EnumMember,
+        K::Constant => quadraui::CompletionKind::Constant,
+        K::Struct => quadraui::CompletionKind::Struct,
+        K::Event => quadraui::CompletionKind::Event,
+        K::Operator => quadraui::CompletionKind::Operator,
+        K::TypeParameter => quadraui::CompletionKind::TypeParameter,
+    }
 }
 
 /// Convert a render-side `CompletionMenu` into a `quadraui::Completions`
 /// for backend rasterisation via the D6 layout pipeline.
-///
-/// vimcode's completion menu is string-only at this stage — no LSP
-/// `CompletionKind` metadata — so every item ships as
-/// `CompletionKind::Text`. A richer adapter lands when LSP
-/// `CompletionItemKind` threads through the engine.
 pub fn completion_menu_to_quadraui_completions(menu: &CompletionMenu) -> quadraui::Completions {
     let items = menu
         .candidates
         .iter()
         .map(|c| quadraui::CompletionItem {
-            label: quadraui::StyledText::plain(c.clone()),
-            detail: None,
-            documentation: None,
-            kind: quadraui::CompletionKind::Text,
+            label: quadraui::StyledText::plain(c.label.clone()),
+            detail: c.detail.clone().map(quadraui::StyledText::plain),
+            documentation: c.documentation.clone().map(quadraui::StyledText::plain),
+            kind: completion_item_kind_to_quadraui(c.kind),
             icon: None,
         })
         .collect();
@@ -1587,6 +1652,16 @@ pub fn editor_hover_popup_paint(
         .max(10.0 * unit_w)
         .min((viewport.width - 4.0 * unit_w).max(10.0 * unit_w));
     let measure = quadraui::RichTextPopupMeasure::new(content_w, unit_h);
+    // #504: this used to be a char-count estimate (`chars().count() as f32
+    // * unit_w`) — fine on TUI's fixed-width grid, but on a proportional
+    // GTK font it drifts further from the real painted glyph position with
+    // every preceding span, so a later link on the same line could end up
+    // with a hit region nowhere near where it was actually drawn.
+    // `quadraui::Backend::measure_text` already exists for exactly this
+    // (D-014: real shaped advance on GUI backends, the same cell-count
+    // this closure used to compute by hand on TUI) — route through it
+    // instead of re-deriving the estimate here, so the hit region tracks
+    // the same font the rasteriser paints with.
     let layout = popup.layout(
         popup_x,
         popup_y,
@@ -1597,12 +1672,10 @@ pub fn editor_hover_popup_paint(
                 .line_text
                 .get(line_idx)
                 .map(|t| {
-                    t[start_byte.min(t.len())..end_byte.min(t.len())]
-                        .chars()
-                        .count() as f32
+                    let slice = &t[start_byte.min(t.len())..end_byte.min(t.len())];
+                    backend.measure_text(slice, quadraui::FontRole::Chrome).0
                 })
                 .unwrap_or(0.0)
-                * unit_w
         },
     );
 
@@ -3075,6 +3148,21 @@ pub fn apply_picker_row_click(engine: &mut Engine, idx: usize) {
 // the symbolic name. GTK has no such ambiguity (GDK always hands over the
 // real keysym for the physical key pressed), so it always passes `true`,
 // which simply disables those terminal-only fallback arms.
+//
+// #1744: `App::handle_dispatch` (the *one* shared dispatcher both GTK and
+// TUI run through, not a GTK-only thing despite the paragraph above calling
+// it "GTK's own decode") only calls this function from its `Key::Named`
+// arm — its `Key::Char` arm has its own, independent one-line decode
+// (`c.to_string()`), matching the "GTK never needs this function's
+// `Key::Char` ambiguity-resolution" reasoning above for GTK, but also
+// (accidentally) true for TUI since the #1422/#1499 unification. This
+// function's own `Key::Char` arm therefore has no production caller at
+// all — every one of its branches, old and new, is exercised only by this
+// file's own unit tests below, not by a real keypress on either backend.
+// `App::handle_dispatch`'s `Key::Char` arm carries the one special case
+// that chord actually needs (Ctrl+Shift+\'s `"Shift_backslash"`, mirrored
+// from this function's own arms for the same chord) directly, rather than
+// calling into this function — see that match's own comment.
 pub fn engine_key_from_ui(
     key: &quadraui::Key,
     modifiers: quadraui::Modifiers,
@@ -3095,10 +3183,49 @@ pub fn engine_key_from_ui(
                 // Some special chars use GTK-style names to match GTK backend conventions.
                 let name = if lower == ' ' {
                     "space".to_string()
+                } else if lower == '|' {
+                    // Ctrl+Shift+\: the literal already-shifted glyph —
+                    // same pattern as the bracket pairs' literal '}'/'{'
+                    // arms below. #1744: VS Code's
+                    // `editor.action.jumpToBracket`.
+                    //
+                    // This whole `Key::Char` arm has no production caller
+                    // (see this function's own module doc: the only live
+                    // call site, `App::handle_dispatch`, only reaches
+                    // `engine_key_from_ui` from the `Key::Named` arm), so
+                    // renaming `'|'` to `"Shift_backslash"` here is not
+                    // what makes this shape reachable in production —
+                    // `App::handle_dispatch`'s own `Key::Char` arm forwards
+                    // the raw `"|".to_string()` unchanged, and
+                    // `Engine::handle_vscode_key`'s `"Shift_backslash" |
+                    // "|"` arm already accepts that literal spelling
+                    // directly. Kept here anyway so this function's test
+                    // coverage for every other Ctrl+symbol spelling
+                    // continues to exercise one real decode table rather
+                    // than a partial, stale copy of it.
+                    "Shift_backslash".to_string()
+                } else if lower == '\\' && shift {
+                    // Ctrl+Shift+\ via an explicit Shift modifier bit
+                    // (kitty/CSI-u reporting the base key plus SHIFT rather
+                    // than the shifted glyph) — same pattern as the bracket
+                    // pairs' `&& shift` arms below. #1744. See the sibling
+                    // arm above: also dead in production, mirrored by
+                    // `App::handle_dispatch`'s own `Key::Char('\\') if
+                    // modifiers.ctrl && modifiers.shift` arm, which is what
+                    // actually makes this chord reachable.
+                    "Shift_backslash".to_string()
                 } else if lower == '\\' || (!keyboard_enhanced && lower == '4') {
                     // Ctrl+\ sends byte 0x1C; without keyboard enhancement crossterm decodes
                     // 0x1C as KeyCode::Char('4')+CONTROL (formula: 0x1C-0x1C+'4'='4').
                     // Map both to "backslash" so Ctrl+\ works in all terminals.
+                    //
+                    // #1744: a *legacy* (non-keyboard-enhanced) terminal has
+                    // no way to report Ctrl+Shift+\ distinctly from Ctrl+\ at
+                    // all — Ctrl+\ is the ANSI C0 byte 0x1C regardless of
+                    // Shift (same shift-blindness as the Ctrl+K/Ctrl+P
+                    // family; see `tests/vscode_keybinding_parity.rs`'s
+                    // `REACHABILITY_TABLE`), so this fallback arm stays
+                    // shift-blind on purpose.
                     "backslash".to_string()
                 } else if lower == '/' || (!keyboard_enhanced && lower == '7') {
                     // Ctrl+/ sends byte 0x1F; without keyboard enhancement crossterm
@@ -3406,6 +3533,45 @@ mod engine_key_from_ui_tests {
         let (key, mods) = ctrl_char('4');
         let (name, ..) = engine_key_from_ui(&key, mods, true).unwrap();
         assert_eq!(name, "4");
+    }
+
+    /// #1744: GTK (and a terminal that resolves the shifted glyph before
+    /// reporting it) delivers Ctrl+Shift+\ as the literal shifted character
+    /// '|', same pattern as the bracket pairs' literal '}'/'{' arms — must
+    /// decode distinctly from plain Ctrl+\'s `"backslash"` (VS Code's
+    /// `jumpToBracket` vs `open_editor_group`).
+    #[test]
+    fn ctrl_pipe_literal_is_shift_backslash() {
+        let (key, mods) = ctrl_char('|');
+        let (name, _, ctrl) = engine_key_from_ui(&key, mods, true).unwrap();
+        assert_eq!(name, "Shift_backslash");
+        assert!(ctrl);
+    }
+
+    /// #1744: the kitty/CSI-u counterpart — the base key plus an explicit
+    /// Shift bit, rather than the shifted glyph — must decode to the same
+    /// distinct name.
+    #[test]
+    fn ctrl_shift_backslash_with_explicit_shift_bit_is_shift_backslash() {
+        let mods = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let (name, _, ctrl) = engine_key_from_ui(&Key::Char('\\'), mods, true).unwrap();
+        assert_eq!(name, "Shift_backslash");
+        assert!(ctrl);
+    }
+
+    /// Without keyboard enhancement, Ctrl+\ and Ctrl+Shift+\ are
+    /// indistinguishable at the byte level (same ANSI-C0 shift-blindness as
+    /// the Ctrl+K/Ctrl+P family) — plain Ctrl+\ must still decode to
+    /// `"backslash"`, not the Shift variant, when no Shift bit is present.
+    #[test]
+    fn ctrl_backslash_without_shift_stays_backslash() {
+        let (key, mods) = ctrl_char('\\');
+        let (name, ..) = engine_key_from_ui(&key, mods, false).unwrap();
+        assert_eq!(name, "backslash");
     }
 
     /// Named keys carry no engine binding today for the handful crossterm
@@ -4077,6 +4243,19 @@ pub fn route_terminal_resize(engine: &mut Engine, panel_cols: u16, rows: u16) {
 // visible and TUI's is visible in VSCode mode, so the reachable case is TUI in
 // Vim mode. Converging the rung does not change that ordering — it is the same
 // on both backends, which is the point.
+//
+// #1764 (non-blocking review note) narrows this slightly on the *toggleable*
+// (TUI) profile only: `alt_mnemonic_open_allowed` now refuses a fresh menu
+// open while mid-text-entry (Insert/Replace) or mid-command-line
+// (Command/Search), so on TUI a Shift+Alt+F pressed in one of those modes no
+// longer gets swallowed by the menu tier — it reaches this arm and runs
+// `lsp_format_current()` instead. GTK (never toggleable) is unaffected: its
+// menu tier still claims the chord first in every mode, exactly as before.
+// Plausibly an improvement (formatting while typing is a reasonable thing to
+// want), but it is a real, if narrow, ordering change worth knowing about
+// when reading the "reachable case is TUI in Vim mode" sentence above — that
+// sentence is now true only for the menu-open half of the story, not for
+// where this specific chord ends up executing on every TUI mode.
 
 /// Lower bound Alt+Left clamps the sidebar width to, in `AppShell` width units
 /// (columns on TUI, line-heights on GTK — see
@@ -4104,6 +4283,63 @@ pub const ALT_SIDEBAR_WIDTH_MAX: u16 = 150;
 pub fn alt_resized_sidebar_width(current: u16, delta: i32) -> u16 {
     let next = current as i32 + delta;
     next.clamp(ALT_SIDEBAR_WIDTH_MIN as i32, ALT_SIDEBAR_WIDTH_MAX as i32) as u16
+}
+
+/// #1764: whether the engine's current mode is safe for an Alt+<mnemonic>
+/// `KeyPressed` to open a *closed* `quadraui::MenuSystem` dropdown.
+///
+/// Vim mode has no `<M-x>` mapping support at all — nothing in
+/// `src/core/engine` spells a `"<M-"` binding — so the only two things an
+/// Alt-modified keypress reaching the menu-bar intercept can plausibly be
+/// are a genuine (currently unbound, meaningless) Meta-key chord, or — per
+/// the #1763 bugbash finding this issue (#1764) is the follow-up to — a real
+/// pty collapsing a fast Escape-then-letter into exactly this chord, because
+/// that is the standard xterm 8-bit-meta encoding for Alt and a raw
+/// terminal reader cannot always tell the two apart from bytes alone.
+///
+/// That ambiguity is **terminal-only**: it exists because a pty delivers Alt
+/// as a byte-level encoding a raw reader has to *infer* rather than a
+/// discrete, unambiguous modifier bit. `menu_bar_toggleable` (true only on
+/// the `cell`/TUI profile — `App::setup`'s own doc) is this crate's existing,
+/// non-`cfg` discriminator for exactly that backend shape (see e.g.
+/// `App::handle_dispatch`'s `menu_bar_intercept_rect` call and
+/// `render::menu_bar_intercept_rect`'s own doc). On every other backend
+/// (GTK/macOS/Win — always `false` here) a `Modifiers { alt: true }`
+/// `KeyPressed` is a real, unambiguous keystroke from a real keyboard; there
+/// is no pty to fuse anything, so the standard Alt+<mnemonic> menu gesture
+/// stays allowed in every mode there, matching pre-#1764 behaviour exactly.
+///
+/// On the toggleable (TUI) profile, letting the fused chord open a dropdown
+/// while the engine is mid-text-entry (`Insert`/`Replace`) or
+/// mid-command-line (`Command`/`Search`) is strictly worse than not: it
+/// swallows the keystroke that — if this really was a collapsed Escape —
+/// was supposed to return to `Normal` mode, and does so silently, with no
+/// error and no visible cue beyond the dropdown itself. Every subsequent
+/// keystroke then falls through as literal Insert-mode text (or
+/// Command-line text), which is exactly #1764's reported
+/// `foo bar bazg0wdw:%d`-shaped corruption. `Normal` and the `Visual*`
+/// family are where a menu action is conventionally meaningful there (and
+/// where an unclaimed bare key is a harmless pending-key latch, not literal
+/// insertion), so only those allow the open on that profile.
+///
+/// The other half of this fix is `crate::app::App::handle_key_press`'s own
+/// `AltKeyOutcome::Fallthrough` arm: once this function has kept the menu
+/// from stealing the chord, that arm treats an unclaimed *printable-char*
+/// Alt chord (see `alt_chord_is_printable_char`) as an implicit Escape
+/// instead of letting `Engine::handle_key` see it as the bare, unmodified
+/// key (which has no `alt` parameter to even know the difference). That
+/// substitution is not itself gated on `menu_bar_toggleable` — see its own
+/// call site for why a bare-letter fallthrough is equally wrong to redeliver
+/// on every backend, pty or not.
+pub fn alt_mnemonic_open_allowed(mode: crate::core::Mode, menu_bar_toggleable: bool) -> bool {
+    use crate::core::Mode;
+    if !menu_bar_toggleable {
+        return true;
+    }
+    matches!(
+        mode,
+        Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+    )
 }
 
 /// What [`route_alt_key`] decided about an Alt chord.
@@ -4156,6 +4392,26 @@ fn alt_chord_base(key_name: &str, unicode: Option<char>) -> Option<AltBase> {
     unicode.or(from_name).map(AltBase::Char)
 }
 
+/// #1764: whether an unclaimed Alt chord's base key is a printable
+/// character (letter/digit/punctuation) rather than a named key
+/// (`Enter`/`BackSpace`/`Up`/`Down`/`Home`/`Delete`/`Page_Up`/…). Only the
+/// printable-char shape is what a real pty's Escape-then-letter fusion (the
+/// #1763/#1764 mechanism — the standard xterm 8-bit-meta encoding collapsing
+/// a fast `Escape` + letter into one `Alt+<letter>` byte sequence) can
+/// produce; a named key can never be the second half of that fusion.
+///
+/// Exposed for `App::handle_key_press`'s `AltKeyOutcome::Fallthrough` arm,
+/// which must not treat *every* unclaimed Alt chord as an implicit Escape —
+/// doing so swallowed pre-existing, meaningful bare-key fallthroughs for
+/// named keys (`Alt+Enter`/`Alt+BackSpace` inserting/deleting in Insert
+/// mode, `Alt+Up`/`Alt+Down` moving the cursor in Vim mode outside VSCode
+/// mode, `Alt+]`/`Alt+[` falling through outside Insert mode per
+/// [`route_alt_key`]'s own comment on that arm) that have nothing to do with
+/// the pty-fusion bug this function exists to let that arm recognise.
+pub(crate) fn alt_chord_is_printable_char(key_name: &str, unicode: Option<char>) -> bool {
+    matches!(alt_chord_base(key_name, unicode), Some(AltBase::Char(_)))
+}
+
 /// The single statement of what **VSCode mode** means for an Alt chord: the
 /// `Alt_*` key name `Engine::handle_vscode_key` decodes, or `None` when the
 /// chord is not a VS Code editor command.
@@ -4163,12 +4419,23 @@ fn alt_chord_base(key_name: &str, unicode: Option<char>) -> Option<AltBase> {
 /// In Vim mode this function is not consulted at all — the chord falls through
 /// to the vim mapping layer instead. That asymmetry *is* the mode semantics,
 /// and it now exists once rather than once per backend.
+///
+/// `Left`/`Right` were added by #1744: in VSCode mode a plain Alt+Left/Right
+/// is `workbench.action.navigateBack`/`navigateForward`
+/// (`Engine::jump_list_back`/`jump_list_forward`, the same mechanism Vim
+/// mode's Ctrl-O/Ctrl-I already use), not sidebar resize — see
+/// [`route_alt_key`]'s mode-independent tier, which now only claims
+/// `Left`/`Right` for resize outside VSCode mode (or with both `ctrl` *and*
+/// `shift` held, VSCode mode's own alternate home for the same resize — see
+/// that tier's own doc for why plain `ctrl` alone was the wrong choice).
 fn vscode_alt_key_name(base: AltBase, shift: bool) -> Option<&'static str> {
     Some(match (base, shift) {
         (AltBase::Up, true) => "Alt_Shift_Up",
         (AltBase::Down, true) => "Alt_Shift_Down",
         (AltBase::Up, false) => "Alt_Up",
         (AltBase::Down, false) => "Alt_Down",
+        (AltBase::Left, false) => "Alt_Left",
+        (AltBase::Right, false) => "Alt_Right",
         (AltBase::Char('z') | AltBase::Char('Z'), false) => "Alt_z",
         _ => return None,
     })
@@ -4179,16 +4446,51 @@ fn vscode_alt_key_name(base: AltBase, shift: bool) -> Option<&'static str> {
 ///
 /// Call it with the backend's own key spelling (see [`alt_chord_base`]) once
 /// the menu tier above has declined the event. Returns [`AltKeyOutcome`];
-/// `Fallthrough` means nothing here claimed the chord and the caller must keep
-/// dispatching.
+/// `Fallthrough` means nothing here claimed the chord. Through #1763, the
+/// caller always kept dispatching it as if `alt` had never been set — #1764
+/// changed that for a chord whose base is a printable character (see
+/// [`alt_chord_is_printable_char`]): `App::handle_key_press`'s
+/// `Fallthrough` arm now treats *that* shape as an implicit Escape instead
+/// of redelivering the bare key, so this rung is no longer a pure filter for
+/// printable-char chords — only for the named-key chords (`Enter`,
+/// `BackSpace`, `Home`/`End`/`Delete`/`Page_Up`/`Page_Down`, and `Left`/
+/// `Right`/`Up`/`Down` outside the arms above) that still fall all the way
+/// through exactly as before.
 ///
 /// `alt == false` is an immediate `Fallthrough`, so a caller may invoke this
 /// unconditionally rather than wrapping it in its own modifier test.
+///
+/// `ctrl` (#1744) distinguishes two chords that otherwise share a base/shift
+/// shape: Ctrl+Alt+Up/Down is VS Code's real `insertCursorAbove`/
+/// `insertCursorBelow` (forwarded to `Engine::handle_vscode_key` as `Alt_Up`/
+/// `Alt_Down` with `ctrl` now passed through instead of hardcoded `false`,
+/// letting that function's own `if ctrl` guard tell it apart from plain
+/// Alt+Up/Down's move-line); and Ctrl+Shift+Alt+Left/Right is VSCode mode's
+/// alternate home for sidebar resize, now that plain Alt+Left/Right means
+/// navigate back/forward in that mode (see [`vscode_alt_key_name`]'s doc).
+///
+/// That alternate home is Ctrl+**Shift**+Alt+Left/Right, not plain
+/// Ctrl+Alt+Left/Right: the latter is already the shipped default binding
+/// for `panel_keys.nav_back`/`nav_forward`
+/// (`Settings::PanelKeys::nav_back`/`nav_forward`, `"<C-A-Left>"`/
+/// `"<C-A-Right>"`), registered as a `AcceleratorScope::Global` accelerator
+/// by [`register_panel_accelerators`] below. quadraui's accelerator tier
+/// sits *above* this rung and **replaces** a matched key event with the
+/// fired accelerator rather than letting it fall through
+/// (`accelerator_match_replaces_keypressed_with_accelerator`, quadraui's own
+/// `tui/backend.rs`), so a plain Ctrl+Alt+Left/Right arm here would never
+/// actually run in the live app — it would be silently shadowed by tab
+/// history nav on every real keypress, reachable only when a test calls
+/// this function directly below the accelerator tier. Ctrl+Shift+Alt is
+/// free on both backends and is not itself a VS Code default binding either
+/// (unlike Ctrl+Alt+Left/Right, which upstream binds to
+/// `workbench.action.moveEditorToPreviousGroup`/`NextGroup`).
 pub fn route_alt_key(
     engine: &mut Engine,
     key_name: &str,
     unicode: Option<char>,
     shift: bool,
+    ctrl: bool,
     alt: bool,
 ) -> AltKeyOutcome {
     if !alt {
@@ -4206,8 +4508,28 @@ pub fn route_alt_key(
     // working exactly as it did, and gives GTK (which never had the chord at
     // all) the same tolerance.
     match base {
-        AltBase::Left => return AltKeyOutcome::ResizeSidebar(-1),
-        AltBase::Right => return AltKeyOutcome::ResizeSidebar(1),
+        // #1744: in VSCode mode, Ctrl+Shift+Alt+Left/Right is sidebar
+        // resize's alternate home — plain Alt+Left/Right now means navigate
+        // back/forward in that mode (the arm below, via
+        // `vscode_alt_key_name`), and plain Ctrl+Alt+Left/Right is already
+        // claimed, above this rung, by the `panel_keys.nav_back`/
+        // `nav_forward` global accelerator — see this function's own doc
+        // for why `ctrl` alone is not a usable alternate home. Outside
+        // VSCode mode `ctrl`/`shift` are ignored, same as every other
+        // mode-independent arm here, so Vim mode keeps resizing on plain
+        // Alt+Left/Right (with or without Shift, as before #1744) exactly
+        // as before — Shift+Alt+Left/Right's own VSCode-mode fate (nothing:
+        // deliberately left unbound, since Ctrl+Shift+Alt is the chord that
+        // now owns this) is documented on the arm below that doesn't match
+        // it.
+        AltBase::Left if ctrl && shift && engine.is_vscode_mode() => {
+            return AltKeyOutcome::ResizeSidebar(-1);
+        }
+        AltBase::Right if ctrl && shift && engine.is_vscode_mode() => {
+            return AltKeyOutcome::ResizeSidebar(1);
+        }
+        AltBase::Left if !engine.is_vscode_mode() => return AltKeyOutcome::ResizeSidebar(-1),
+        AltBase::Right if !engine.is_vscode_mode() => return AltKeyOutcome::ResizeSidebar(1),
         // Shift+Alt+F: LSP format document. Reachable only when the menu tier
         // above is not live — see this rung's header comment.
         AltBase::Char('F') if shift => {
@@ -4247,7 +4569,7 @@ pub fn route_alt_key(
     // ── VSCode-mode chords ───────────────────────────────────────────────
     if engine.is_vscode_mode() {
         if let Some(name) = vscode_alt_key_name(base, shift) {
-            engine.handle_key(name, None, false);
+            engine.handle_key(name, None, ctrl);
             return AltKeyOutcome::Handled;
         }
     }
@@ -5710,7 +6032,12 @@ pub fn disarm_hamburger_stale_click_guard(engine: &mut Engine) {
 ///    `engine.menu_bar_visible = true` and lets the event keep flowing: the
 ///    caller's own `MenuSystem` intercept, called immediately after this
 ///    returns `None`, is what actually opens the menu using the
-///    just-flipped flag.
+///    just-flipped flag. #1764: gated on the same
+///    [`alt_mnemonic_open_allowed`] predicate the caller's intercept uses,
+///    so the reveal and the open stay in lock-step — a mode this predicate
+///    refuses (mid-text-entry on the toggleable profile) never reveals the
+///    bar in the first place, rather than revealing it and then having the
+///    caller refuse to open anything into it.
 /// 2. **Stale hamburger-corner click** — revealing the bar shifts the whole
 ///    activity bar (hamburger included) down one row; a second click at the
 ///    *exact screen position* that revealed it (muscle memory) lands one row
@@ -5742,7 +6069,16 @@ pub fn route_menu_bar_reveal(
 ) -> Option<quadraui::Reaction> {
     if !engine.menu_bar_visible {
         if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
-            if modifiers.alt {
+            // #1764 (review finding, round 1): this shim and the caller's
+            // own `MenuSystem` intercept are two halves of one action (see
+            // this function's own doc, point 1) — gating only the intercept
+            // and not this reveal left the bar *half*-opened: a fused pty
+            // chord flipped `menu_bar_visible` true here, the caller then
+            // refused to open the dropdown, and the bar row stayed revealed
+            // with nothing in it, consuming a terminal row and shifting the
+            // whole layout for the rest of the session. Same predicate as
+            // the caller's gate, so the two halves agree in every mode.
+            if modifiers.alt && alt_mnemonic_open_allowed(engine.mode, engine.menu_bar_toggleable) {
                 if let quadraui::Key::Char(c) = key {
                     let bar = engine.menu_system.borrow().menu_bar();
                     if bar.find_alt_target(*c).is_some() {
@@ -6105,11 +6441,22 @@ pub(crate) fn run_shared_tick_chores(
     // Exact per-window viewport dimensions from the last paint, so
     // `ensure_cursor_visible` uses real geometry rather than a whole-screen
     // approximation that can't see splits.
+    //
+    // `rw.visible_line_capacity`, not `rw.lines.len()` (#1779): the latter
+    // is how many rows the *buffer* had content for last frame, which on a
+    // buffer shorter than the window is less than the window's actual row
+    // capacity — `RenderedWindow::lines`'s own doc has the full case this
+    // under-counted. Feeding that short count into `view.viewport_lines`
+    // pinned a freshly-opened one-line buffer's viewport to "1 row tall";
+    // the very next edit that grew the buffer (`o<text><Esc>`) then ran
+    // `ensure_cursor_visible` against that stale 1-row belief and scrolled
+    // line 0 out of view to keep the cursor's new line "on screen" —
+    // reproduced both over a real pty (tests/pty_open_line_below_paints_all_lines.rs) and in-process (src/tui_main/app_on_tui_tests.rs's opening_a_line_below_the_last_line_paints_every_line_in_order_1779, via TuiDriver::tick()) between the idle tick that caches this value and the keystroke that acts on it.
     if let Some(layout) = app.cached_screen_layout.borrow().as_ref() {
         for rw in &layout.windows {
             engine.set_viewport_for_window(
                 rw.window_id,
-                rw.lines.len().max(1),
+                rw.visible_line_capacity.max(1),
                 rw.text_viewport_cols.max(1),
             );
         }
@@ -6131,7 +6478,24 @@ pub(crate) fn run_shared_tick_chores(
     // backend.
     let win_title = window_title(engine);
     if let Some(w) = backend.window() {
-        let _ = w.set_title(&win_title);
+        // #1634: only write when the title actually changed since the last
+        // tick — see `App::last_window_title`'s own doc (including its "not
+        // confirmed as the flicker cause" caveat). `window_title` is stable
+        // at idle (derived only from the active buffer's name), so before
+        // this guard every idle tick re-issued the identical `WindowControl
+        // ::set_title` call for no reason; on TUI that is a real OSC 0/2
+        // escape sequence written straight to `std::io::stdout()`
+        // (`TuiBackend::set_title` bypasses the `ratatui::Terminal`'s
+        // buffered `Write` entirely) — invisible to #1583's in-process
+        // idle-stability test, which only inspects the `TestBackend`/vt100
+        // sink `Terminal::draw` writes to. The decision itself is
+        // `crate::app::dedup_window_title`, a free function so it's
+        // directly unit-tested without a `Backend` — see that function's
+        // own doc for why a `Backend`-call-count driver test isn't
+        // achievable here.
+        if crate::app::dedup_window_title(&mut app.last_window_title, &win_title) {
+            let _ = w.set_title(&win_title);
+        }
         // Refresh the session-restore maximized cache (#1529) unconditionally
         // — unlike size/position below, this is exactly the one moment those
         // freeze, so it must always be current.
@@ -6193,6 +6557,21 @@ pub(crate) fn run_shared_tick_chores(
     // hidden, the 2s timer is never reset, so it fires once (and resets)
     // the first tick after the sidebar is shown again, no matter how long
     // it was hidden for.
+    //
+    // #1650: kicking off `sc_refresh_async` here must NOT by itself set
+    // `needs_redraw` — spawning a background thread has no visible effect
+    // of its own, and this block runs every 2s indefinitely while the
+    // Explorer/Git sidebar is visible (the default startup state). This
+    // used to force a real `ratatui::Terminal::draw` call every single
+    // time regardless of whether `git status`/`log`/`worktree list`
+    // actually changed, and every one of those draws writes an invisible
+    // SGR-reset + cursor-hide escape burst (`ratatui-crossterm`'s
+    // `CrosstermBackend::draw`/`hide_cursor` do this unconditionally, even
+    // for a zero-cell diff) — exactly the non-silent idle byte stream
+    // `tests/smoke-spec/tui.yaml`'s `idle-truly-silent` step caught. The
+    // only thing that should trigger a redraw is `poll_sc_refresh`
+    // actually finding changed data (see its own doc), once the async
+    // fetch below completes.
     if engine.app_shell.sidebar_visible()
         && app.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2)
     {
@@ -6203,7 +6582,6 @@ pub(crate) fn run_shared_tick_chores(
         ) {
             engine.sc_refresh_async();
         }
-        needs_redraw = true;
     }
     if engine.poll_sc_refresh() {
         needs_redraw = true;
@@ -6525,6 +6903,17 @@ pub fn status_bar_zones_from_layout(layout: &quadraui::StatusBarLayout) -> Statu
 /// backend's own per-window and separated-status paint sites.
 /// `separated`/`global` are `None` whenever that band did not paint this
 /// frame — the empty/absent convention [`ChromeState`] documents.
+///
+/// #1690: the painted *background fill* under a single window's status bar
+/// now extends edge-to-edge under the sidebar/activity bar too (see
+/// `App::paint_editor_windows_rung`'s backdrop fill), but the clickable
+/// band/zones recovered here deliberately stay window-bounded — AppShell's
+/// own activity-bar/sidebar hit-test runs *before* `App::handle` ever sees
+/// the event (quadraui's `ShellAdapter::handle`), so a click over that
+/// visually-capped region never reaches this router at all; widening the
+/// band here without widening *that* hit-test first would just make
+/// `status_bar_zone_hit_test` resolve a position no click can actually
+/// arrive at. See the issue for why this is paint-only.
 pub fn status_bands<'a>(
     windows: &[RenderedWindow],
     lh: f64,
@@ -8267,7 +8656,7 @@ pub fn apply_activity_panel_switch(engine: &mut Engine, panel_id: &str) -> Activ
                 engine.ext_panel_has_focus = true;
                 if !already_showing {
                     engine.ext_panel_selected = 0;
-                    engine.plugin_event("panel_focus", name);
+                    engine.on_ext_panel_focused(name);
                 }
             }
         }
@@ -8466,8 +8855,18 @@ pub fn route_gutter_hover(
 /// hover card itself" — dismissing while the pointer is on the card is what
 /// makes a hover card impossible to read.
 ///
-/// Returns `true` when the pointer was inside the sidebar body (so the caller
-/// can skip its editor-hover rungs).
+/// Returns `true` when this call actually changed something this function
+/// paints synchronously — today that's only `engine.sc_button_hovered` (the
+/// SC toolbar hover highlight), since every other mutation here
+/// (`panel_hover_mouse_move`/`dismiss_panel_hover`) only arms a dwell/dismiss
+/// *timer*; the popup itself (`engine.panel_hover`, what paint actually
+/// reads) only flips later, from the tick loop's own `poll_panel_hover`,
+/// which already reports its own redraw need independently. Do **not** read
+/// this as "pointer is inside the sidebar body" — #1722 review: it used to
+/// return `geometry.contains_x(x)` regardless of whether any hover state
+/// changed, so every `MouseMoved` whose X falls in the sidebar column (most
+/// of the left strip whenever the sidebar is open) forced a full repaint,
+/// even two consecutive moves to the same pixel.
 pub fn route_sidebar_hover(
     engine: &mut Engine,
     owner: &SidebarOwner,
@@ -8478,6 +8877,7 @@ pub fn route_sidebar_hover(
     mouse_on_popup: bool,
 ) -> bool {
     let inside = sidebar_visible && geometry.contains_x(x);
+    let sc_button_hovered_before = engine.sc_button_hovered;
     match owner {
         SidebarOwner::Git if inside => {
             // Route via the cached `SidebarPanelLayout` (#509) — no per-frame
@@ -8548,7 +8948,7 @@ pub fn route_sidebar_hover(
             }
         }
     }
-    inside
+    engine.sc_button_hovered != sc_button_hovered_before
 }
 
 // ─── Sidebar panel body dispatch (#754) ───────────────────────────────────────
@@ -9740,6 +10140,50 @@ pub fn paint_separated_status_rung(
     let bar = window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:separated"));
     let _ = b.draw_status_bar_interactive(rect, &bar, &quadraui::InteractionState::new());
     b.status_bar_layout(rect, &bar)
+}
+
+/// Paint a plain, content-free fill behind the "real" status bar at
+/// `real_bg` — #1690's edge-to-edge VS Code parity backdrop, shared by
+/// `App::paint_editor_windows_rung`'s single-window case and
+/// `App::compose_bottom_band_rungs`'s `SeparatedStatus` arm.
+///
+/// Deliberately a *separate* paint rather than widening the real bar's own
+/// rect: AppShell's activity-bar/sidebar click hit-test runs before
+/// `App::handle` ever sees the event (quadraui's `ShellAdapter::handle`),
+/// so widening the real bar would move its segments' hit zones into screen
+/// positions a click can never actually reach — see [`status_bands`]'s doc
+/// for the longer version. This backdrop carries no segments of its own
+/// (so it is never stored in a click-hit map and can't be clicked), just
+/// the real bar's own fill colour, painted into `rect` — which callers
+/// widen to the real window/terminal width (`Backend::viewport().width`)
+/// while the real bar underneath stays window/main-content-bounded.
+///
+/// `real_bg` is `None` when the real bar has no segments at all (nothing
+/// to colour-match), in which case this is a no-op — matching
+/// `status_bar.rs::paint`'s own "no segments → `theme.background`" default
+/// would risk painting a visibly different fill than whatever the real bar
+/// ends up using once it *does* have segments.
+pub fn paint_status_backdrop(
+    b: &mut dyn quadraui::Backend,
+    id: &str,
+    rect: quadraui::Rect,
+    real_bg: Option<quadraui::Color>,
+) {
+    let Some(bg) = real_bg else {
+        return;
+    };
+    let backdrop = quadraui::StatusBar {
+        id: quadraui::WidgetId::new(id),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: String::new(),
+            fg: bg,
+            bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: Vec::new(),
+    };
+    let _ = b.draw_status_bar_interactive(rect, &backdrop, &quadraui::InteractionState::new());
 }
 
 /// The unit system one backend composes [`paint_bottom_panel_rung`] in.
@@ -12234,65 +12678,60 @@ pub fn debug_toolbar(engine: &Engine) -> quadraui::Toolbar {
         }
     };
 
-    Toolbar {
-        id: WidgetId::new("debug:toolbar"),
-        bg: None,
-        focused_index: None,
-        buttons: vec![
-            // 0: Continue — enabled when session active and stopped
-            action(
-                0,
-                "Continue",
-                icons::DBG_CONTINUE.fallback,
-                Some("F5"),
-                session && stopped,
-            ),
-            // 1: Pause — enabled when session active and running (not stopped)
-            action(
-                1,
-                "Pause",
-                icons::DBG_PAUSE.fallback,
-                Some("F6"),
-                session && !stopped,
-            ),
-            // 2: Stop — enabled when session active
-            action(2, "Stop", icons::DBG_STOP.fallback, Some("⇧F5"), session),
-            // 3: Restart — enabled when session active
-            action(
-                3,
-                "Restart",
-                icons::DBG_RESTART.fallback,
-                Some("^⇧F5"),
-                session,
-            ),
-            // Separator between restart and step controls
-            ToolbarButton::Separator,
-            // 4: Step Over — enabled when session active and stopped
-            action(
-                4,
-                "Step Over",
-                icons::DBG_STEP_OVER.fallback,
-                Some("F10"),
-                session && stopped,
-            ),
-            // 5: Step Into — enabled when session active and stopped
-            action(
-                5,
-                "Step Into",
-                icons::DBG_RESTART.fallback,
-                Some("F11"),
-                session && stopped,
-            ),
-            // 6: Step Out — enabled when session active and stopped
-            action(
-                6,
-                "Step Out",
-                icons::DBG_STEP_OUT.fallback,
-                Some("⇧F11"),
-                session && stopped,
-            ),
-        ],
-    }
+    Toolbar::new(WidgetId::new("debug:toolbar")).with_buttons(vec![
+        // 0: Continue — enabled when session active and stopped
+        action(
+            0,
+            "Continue",
+            icons::DBG_CONTINUE.fallback,
+            Some("F5"),
+            session && stopped,
+        ),
+        // 1: Pause — enabled when session active and running (not stopped)
+        action(
+            1,
+            "Pause",
+            icons::DBG_PAUSE.fallback,
+            Some("F6"),
+            session && !stopped,
+        ),
+        // 2: Stop — enabled when session active
+        action(2, "Stop", icons::DBG_STOP.fallback, Some("⇧F5"), session),
+        // 3: Restart — enabled when session active
+        action(
+            3,
+            "Restart",
+            icons::DBG_RESTART.fallback,
+            Some("^⇧F5"),
+            session,
+        ),
+        // Separator between restart and step controls
+        ToolbarButton::Separator,
+        // 4: Step Over — enabled when session active and stopped
+        action(
+            4,
+            "Step Over",
+            icons::DBG_STEP_OVER.fallback,
+            Some("F10"),
+            session && stopped,
+        ),
+        // 5: Step Into — enabled when session active and stopped
+        action(
+            5,
+            "Step Into",
+            icons::DBG_RESTART.fallback,
+            Some("F11"),
+            session && stopped,
+        ),
+        // 6: Step Out — enabled when session active and stopped
+        action(
+            6,
+            "Step Out",
+            icons::DBG_STEP_OUT.fallback,
+            Some("⇧F11"),
+            session && stopped,
+        ),
+    ])
 }
 
 /// Draw the debug action-button toolbar through backend `b` and cache its
@@ -12309,11 +12748,8 @@ pub fn draw_debug_toolbar(b: &mut dyn quadraui::Backend, engine: &Engine, rect: 
     let pressed = engine
         .debug_button_pressed
         .and_then(Engine::debug_button_id);
-    // `draw_toolbar` (quadraui#819) is deprecated in favour of an
-    // `_interactive`-style hover/pressed API this call doesn't use yet —
-    // unrelated to #1491's tab-bar migration; see this file's module doc.
-    #[allow(deprecated)]
-    let layout = b.draw_toolbar(rect, &bar, hovered.as_ref(), pressed.as_ref());
+    let interaction = quadraui::InteractionState::from_parts(hovered, pressed);
+    let layout = b.draw_toolbar_interactive(rect, &bar, &interaction);
     engine.debug_toolbar_layout.replace(Some(layout));
 }
 
@@ -12393,6 +12829,72 @@ fn debug_sidebar_status_bars(
     };
 
     (title, action)
+}
+
+/// Build the Explorer header's view-actions toolbar row (#1693): New File,
+/// New Folder, Refresh, Collapse All, and a "..." overflow menu — mirrors
+/// VS Code's Explorer view-actions row. Returned as `SidebarPanelChrome::
+/// StatusBars(vec![...])`'s single bar so `paint_sidebar_panel_rung`'s
+/// `PANEL_EXPLORER` arm can thread it through the same composer the Debug
+/// sidebar's title/action bars (`debug_sidebar_chrome`) and the SC panel's
+/// own toolbar (`sc_sidebar_panel`) already use — no new paint/hit-test
+/// mechanism, just a new row through an existing one.
+///
+/// Unlike `debug_sidebar_status_bars`'s title bar, this carries no title
+/// text of its own: the shell's own sidebar header already titles this
+/// panel "EXPLORER" (`sidebar.rs`'s `fixed_panel_title_tooltip`), and a
+/// second title row here would be the exact double-header shape
+/// `sc_sidebar_panel`'s doc warns against (#1256).
+pub fn explorer_toolbar_status_bar(theme: &Theme) -> quadraui::StatusBar {
+    let bg = theme.status_bg;
+    let fg = theme.status_fg;
+    let button = |idx: usize, icon: &icons::Icon| quadraui::StatusBarSegment {
+        text: format!(" {} ", icon.s()),
+        fg,
+        bg,
+        bold: false,
+        action_id: Engine::explorer_toolbar_action_id(idx),
+    };
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("explorer:toolbar"),
+        left_segments: Vec::new(),
+        right_segments: vec![
+            button(0, &icons::EXPLORER_NEW_FILE),
+            button(1, &icons::EXPLORER_NEW_FOLDER),
+            button(2, &icons::EXPLORER_REFRESH),
+            button(3, &icons::EXPLORER_COLLAPSE_ALL),
+            button(4, &icons::EXPLORER_OVERFLOW),
+        ],
+    }
+}
+
+/// Resolve a press against the Explorer header's view-actions toolbar row
+/// (#1693), given `pos` in the same absolute space `SidebarPanelBody::
+/// render_with` painted the chrome into — the same contract
+/// `dap_sidebar_action_click_at` follows for the Debug sidebar's own
+/// chrome row (see that function's doc). `engine.explorer_toolbar_hits` is
+/// populated straight from `SidebarPanelBodyLayout::status_bar_hit_regions`
+/// at paint time, so there is no per-backend translation step.
+///
+/// Button 4 (the "..." overflow menu) is handled by the caller instead of
+/// dispatched through `Engine::explorer_activate_toolbar_action` — opening
+/// the popup needs the click's own cell-space position and the toolbar
+/// row's trigger height, neither of which this engine-only function has
+/// (`App::try_route_sidebar_mouse_event`'s Explorer arm has both). Returns
+/// the matched button index, or `None` when `pos` doesn't land on a toolbar
+/// segment at all (the caller falls through to the tree's own click
+/// routing in that case).
+pub fn explorer_toolbar_hit_at(engine: &Engine, pos: quadraui::Point) -> Option<usize> {
+    let hits = engine.explorer_toolbar_hits.borrow();
+    hits.iter().find_map(|(rect, hit)| {
+        if !rect.contains(pos) {
+            return None;
+        }
+        match hit {
+            quadraui::StatusBarHit::Segment(id) => Engine::explorer_toolbar_action_index(id),
+            _ => None,
+        }
+    })
 }
 
 /// `action_id` for each inline window-control button drawn by
@@ -12558,7 +13060,11 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
         &[
             MenuItemData {
                 label: "New Tab",
-                shortcut: "Ctrl+T",
+                // #1789: see `core::engine::mod::PALETTE_COMMANDS`'s
+                // "File: New Tab" entry — this used to mirror its stale
+                // "Ctrl+T" claim, but that chord is live-bound to the
+                // integrated terminal toggle, not `tabnew`.
+                shortcut: "",
                 vscode_shortcut: "",
                 action: "tabnew",
                 enabled: true,
@@ -12727,6 +13233,104 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 shortcut: "",
                 vscode_shortcut: "Ctrl+H",
                 action: "replace",
+                enabled: true,
+                separator: false,
+            },
+        ],
+    ),
+    (
+        // VS Code's menu bar is File · Edit · Selection · View · Go · Run ·
+        // Terminal · Help (#1697) — `Selection` sits here, between `Edit`
+        // and `View`. Only entries with a backing engine command are
+        // listed; VS Code's Expand/Shrink Selection, Copy Line Up/Down,
+        // Duplicate Selection, Add Cursors to Line Ends, Add Previous
+        // Occurrence and Column Selection Mode have no vimcode equivalent
+        // yet and are deliberately left out rather than wired to dead
+        // actions.
+        "Selection",
+        's',
+        &[
+            MenuItemData {
+                label: "Select All",
+                shortcut: "",
+                vscode_shortcut: "Ctrl+A",
+                action: "select_all",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                vscode_shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Move Line Up",
+                shortcut: "",
+                vscode_shortcut: "Alt+Up",
+                action: "MoveLineUp",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Move Line Down",
+                shortcut: "",
+                vscode_shortcut: "Alt+Down",
+                action: "MoveLineDown",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                vscode_shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                // #1744: the real VS Code chord for this command is
+                // Ctrl+Alt+Up, not Alt+Shift+Up — that chord now duplicates
+                // the line instead (`render::route_alt_key`'s `ctrl`
+                // parameter; see `Engine::vscode_copy_line_up`).
+                label: "Add Cursor Above",
+                shortcut: "",
+                vscode_shortcut: "Ctrl+Alt+Up",
+                action: "add_cursor_above",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Add Cursor Below",
+                shortcut: "",
+                vscode_shortcut: "Ctrl+Alt+Down",
+                action: "add_cursor_below",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                vscode_shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Add Next Occurrence",
+                shortcut: "",
+                vscode_shortcut: "Ctrl+D",
+                action: "add_next_occurrence",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Select All Occurrences",
+                shortcut: "",
+                vscode_shortcut: "Ctrl+Shift+L",
+                action: "select_all_occurrences",
                 enabled: true,
                 separator: false,
             },
@@ -13701,11 +14305,7 @@ pub struct RenderedMinimap {
     /// (rather than one `RenderedMinimap::raw_spans` living beside an
     /// eagerly-aggregated `syntax_spans`) so there is exactly one place
     /// aggregation ever happens, not two that could silently drift.
-    // `SyntaxSpan` (quadraui#822) is deprecated in favour of a
-    // `MinimapSpan`-shaped replacement this field doesn't use yet —
-    // unrelated to #1491's tab-bar migration; see this file's module doc.
-    #[allow(deprecated)]
-    pub raw_syntax_spans: Vec<quadraui::SyntaxSpan>,
+    pub raw_syntax_spans: Vec<quadraui::MinimapSpan>,
     /// Backend-resolved layout from this frame's [`draw_minimap_strip`] paint
     /// of this strip, if any (#1253) — read back by [`minimap_click_line`]
     /// and [`minimap_press`] instead of each re-deriving its own
@@ -13819,7 +14419,7 @@ pub(crate) fn scroll_gutter_width(scrollbar_reserve: f64, char_width: f64) -> f6
 /// window/buffer has gone away. All sampling (`sample_blocks`) and colour
 /// reduction (`aggregate_spans`) is quadraui's — this function only maps
 /// vimcode's tree-sitter byte-offset highlights into quadraui's
-/// `SyntaxSpan` input type.
+/// `MinimapSpan` input type.
 ///
 /// `editor_visible_rows` is the *editor pane's* own visible row count —
 /// deliberately a separate parameter from `rect`/`line_height` (which size
@@ -14073,10 +14673,7 @@ pub fn build_minimap_data(
     if bounds.len() < 2 {
         return None;
     }
-    // `SyntaxSpan` (quadraui#822) is deprecated — unrelated to #1491's
-    // tab-bar migration; see this file's module doc.
-    #[allow(deprecated)]
-    let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
+    let mut raw_spans: Vec<quadraui::MinimapSpan> = Vec::new();
     for r in 0..bounds.len() - 1 {
         let indices: Vec<usize> = quadraui::primitives::minimap::block_sample_indices(
             bounds[r],
@@ -14135,8 +14732,7 @@ pub fn build_minimap_data(
                     continue;
                 }
                 let c = theme.scope_color(scope);
-                #[allow(deprecated)] // `SyntaxSpan` (quadraui#822); see module doc
-                raw_spans.push(quadraui::SyntaxSpan {
+                raw_spans.push(quadraui::MinimapSpan {
                     line_idx: r,
                     start_col,
                     end_col,
@@ -14568,12 +15164,20 @@ pub struct MinimapPress {
 /// never mutates scroll/cursor state itself — see [`MinimapPress::jump`] for
 /// why the caller still might need to call that function too.
 ///
-/// `fine` is #1271's Alt-drag fine seek: when set, the geometry armed for the
-/// subsequent `ScrollbarY` drag is remapped from the whole file (`max_scroll`
-/// stays file-wide — #1187's own guarantee, unchanged) onto the strip's
-/// *currently painted window* instead, via a **virtual track** fed to the
-/// same primitive — see [`fine_seek_geometry`] for the derivation. `false`
-/// reproduces the exact pre-#1271 (file-wide, #1187) geometry.
+/// `fine` is #1271's minimap-scale seek, **the default since #1828**: when
+/// set, the geometry armed for the subsequent `ScrollbarY` drag is remapped
+/// from the whole file (`max_scroll` stays file-wide — #1187's own
+/// guarantee, unchanged) onto the strip's *currently painted window*
+/// instead, via a **virtual track** fed to the same primitive — see
+/// [`fine_seek_geometry`] for the derivation. This is the mapping VS Code
+/// itself uses: the viewport slider moves within the minimap's own
+/// (possibly sliding, #1093) scale, never the whole file's. `false`
+/// reproduces the pre-#1828 (file-wide, #1187) geometry — a drag that
+/// traverses virtually the whole file in one gesture, like a real
+/// scrollbar handle. `click::pixel_to_click_target`'s call site passes
+/// `!alt`, so holding **Alt** is now what reaches *this* geometry (the old
+/// #1187 default), kept as a power-user "fast scroll" affordance rather
+/// than dropped outright (#1828).
 pub fn minimap_press(
     engine: &Engine,
     screen: &ScreenLayout,
@@ -14614,7 +15218,7 @@ pub fn minimap_press(
                     &bounds,
                     &mm.minimap,
                     max_scroll,
-                    viewport_lines,
+                    band.height,
                     scroll_top,
                     py,
                     in_band,
@@ -14641,8 +15245,9 @@ pub fn minimap_press(
     None
 }
 
-/// Derive the **virtual track** #1271's Alt-drag fine seek arms in place of
-/// the real, file-wide one — remapping the same strip pixels onto the
+/// Derive the **virtual track** #1271's fine seek arms in place of
+/// the real, file-wide one (#1828: the default drag mapping; the old
+/// file-wide one now needs Alt held) — remapping the same strip pixels onto the
 /// strip's *currently painted window* (`~MINIMAP_LINES_PER_ROW` lines per
 /// cell) instead of the whole file (`~max_scroll / track_length` lines per
 /// cell), while still feeding `quadraui::dispatch_mouse_drag`'s unmodified
@@ -14658,14 +15263,31 @@ pub fn minimap_press(
 /// ```text
 /// effective_track = Sh * M / span      // dispatch's own track_length - thumb_length
 /// track_start     = S0 - base * Sh / span
-/// thumb_length    = Sh * viewport_lines / span
 /// track_length    = effective_track + thumb_length
 /// ```
+///
+/// `thumb_length` is taken straight from the caller's own, already-painted
+/// [`quadraui::MinimapLayout::viewport_highlight`] band height — **not**
+/// re-derived here as a naive `Sh * viewport_lines / span` proportion
+/// (#1828 review: that naive form omits `quadraui::fit_thumb`'s
+/// `min_thumb_len` floor, so on a file small enough that the real band is
+/// clamped to the floor — the exact regime
+/// `minimap_drag_keeps_seeking_while_the_button_is_held`'s short fixture
+/// exercises — the naive thumb came out *smaller* than what is actually
+/// painted/hit-tested, throwing off `effective_track`'s complement
+/// `track_length - thumb_length` dispatch itself recomputes and landing a
+/// drag to the strip's middle at ~19% of the file instead of ~50%).
+/// Whichever `thumb_length` is passed in cancels exactly out of dispatch's
+/// own `track_length - thumb_length` (since `track_length` is *defined* as
+/// `effective_track + thumb_length` above), so reusing the real band height
+/// costs nothing and keeps this virtual track's thumb bound to the one
+/// users actually see and click.
 ///
 /// Check: at `y = S0`, dispatch's `rel = base/M` → offset `base`; at
 /// `y = S0 + Sh`, `rel = (base+span)/M` → offset `base + span` — the virtual
 /// strip spans exactly the painted window, at `M/span` times the real
-/// strip's resolution.
+/// strip's resolution. This holds regardless of `thumb_length`'s value, by
+/// the cancellation above.
 ///
 /// `grab_offset` is derived by requiring the mapping to be an **identity at
 /// the press point** (dragging zero pixels must reproduce the current
@@ -14683,7 +15305,7 @@ fn fine_seek_geometry(
     bounds: &quadraui::Rect,
     minimap: &quadraui::Minimap,
     max_scroll: usize,
-    viewport_lines: usize,
+    thumb_length: f32,
     scroll_top: usize,
     py: f32,
     in_band: bool,
@@ -14701,7 +15323,6 @@ fn fine_seek_geometry(
 
     let effective_track = sh * m / span;
     let track_start = s0 - base * sh / span;
-    let thumb_length = sh * viewport_lines as f32 / span;
     let track_length = effective_track + thumb_length;
 
     let grab_offset = if in_band {
@@ -16810,7 +17431,18 @@ impl Theme {
 
     /// Return the foreground colour for a Tree-sitter scope name.
     pub fn scope_color(&self, scope: &str) -> Color {
-        match scope {
+        self.scope_color_opt(scope).unwrap_or(self.default_fg)
+    }
+
+    /// Same scope-name -> colour mapping as [`scope_color`](Self::scope_color),
+    /// but `None` for a name this theme doesn't recognise instead of
+    /// silently falling back to `default_fg`. Lets a caller (e.g. #1653's
+    /// `vimcode.decor.set_hl` `link` resolution in `resolve_decor_style`)
+    /// tell "this is a real theme role" apart from "unknown name, use the
+    /// default foreground" — `scope_color` can't make that distinction once
+    /// it's collapsed to a concrete `Color`.
+    pub fn scope_color_opt(&self, scope: &str) -> Option<Color> {
+        Some(match scope {
             "keyword" => self.keyword,
             "keyword.control" => self.control_flow,
             "operator" => self.operator,
@@ -16833,8 +17465,8 @@ impl Theme {
             "module" | "namespace" => self.module,
             "parameter" => self.parameter,
             "property" | "field" => self.property,
-            _ => self.default_fg,
-        }
+            _ => return None,
+        })
     }
 
     /// Map an LSP semantic token type + modifiers to a style.
@@ -17277,7 +17909,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
         let max_width = engine
             .completion_candidates
             .iter()
-            .map(|s| s.len())
+            .map(|c| c.label.chars().count())
             .max()
             .unwrap_or(0);
         CompletionMenu {
@@ -17628,9 +18260,14 @@ pub fn build_screen_layout_with_breadcrumb_row(
         source_control,
         picker: engine.picker_open.then(|| {
             use crate::core::engine::PickerSource;
+            // `PickerSource::Custom` also covers `vimcode.picker.open`
+            // (#1630) — a plugin item may declare a file/buffer preview
+            // (`Engine::picker_load_preview`'s plugin branch), and gating it
+            // out here would leave that state populated but never painted,
+            // the exact "state vs. paint" bug class #587/#592 warn about.
             let has_preview = matches!(
                 engine.picker_source,
-                PickerSource::Files | PickerSource::Grep
+                PickerSource::Files | PickerSource::Grep | PickerSource::Custom(_)
             );
             PickerPanel {
                 title: engine.picker_title.clone(),
@@ -17956,23 +18593,18 @@ pub fn sc_button_toolbar(sc: &SourceControlData) -> quadraui::Toolbar {
     };
 
     let commit_enabled = !sc.commit_message.trim().is_empty();
-    Toolbar {
-        id: WidgetId::new("sc:buttons"),
-        bg: None,
-        focused_index: None,
-        buttons: vec![
-            action(
-                0,
-                "Commit",
-                icons::GIT_COMMIT.s(),
-                Some("c"),
-                commit_enabled,
-            ),
-            action(1, "", icons::GIT_PUSH.s(), None, true),
-            action(2, "", icons::GIT_PULL.s(), None, true),
-            action(3, "", icons::GIT_SYNC.s(), None, true),
-        ],
-    }
+    Toolbar::new(WidgetId::new("sc:buttons")).with_buttons(vec![
+        action(
+            0,
+            "Commit",
+            icons::GIT_COMMIT.s(),
+            Some("c"),
+            commit_enabled,
+        ),
+        action(1, "", icons::GIT_PUSH.s(), None, true),
+        action(2, "", icons::GIT_PULL.s(), None, true),
+        action(3, "", icons::GIT_SYNC.s(), None, true),
+    ])
 }
 
 /// Build the SC `SidebarPanel` — a `quadraui::SidebarPanel` wrapping the
@@ -18002,11 +18634,8 @@ pub fn draw_sc_sidebar_panel(
     let panel = sc_sidebar_panel(sc);
     let hovered = sc.button_hovered.and_then(Engine::sc_button_id);
     let pressed = sc.button_focused.and_then(Engine::sc_button_id);
-    // `draw_sidebar_panel` (quadraui#819) is deprecated in favour of an
-    // `_interactive`-style hover/pressed API this call doesn't use yet —
-    // unrelated to #1491's tab-bar migration; see this file's module doc.
-    #[allow(deprecated)]
-    let layout = b.draw_sidebar_panel(rect, &panel, hovered.as_ref(), pressed.as_ref());
+    let interaction = quadraui::InteractionState::from_parts(hovered, pressed);
+    let layout = b.draw_sidebar_panel_interactive(rect, &panel, &interaction);
     engine.sc_panel_layout.replace(Some(layout));
 }
 
@@ -18298,22 +18927,18 @@ pub fn sc_commit_message_to_text_input(sc: &SourceControlData) -> quadraui::Text
         sc.commit_message.split('\n').map(str::to_string).collect()
     };
 
-    TextInput {
-        id: WidgetId::new("sc:commit_input"),
-        lines,
-        cursor_line,
-        cursor_col,
-        // Only shown while not actively editing an empty message — matches
-        // the pre-migration behaviour of hiding the prompt text as soon as
-        // the cursor is live in an empty input.
-        placeholder: if sc.commit_input_active {
-            None
-        } else {
-            Some("Message (press c)".to_string())
-        },
-        scroll_offset: 0,
-        scroll_col: 0,
-        has_focus: sc.commit_input_active,
+    let input = TextInput::new(WidgetId::new("sc:commit_input"))
+        .with_lines(lines)
+        .with_cursor_line(cursor_line)
+        .with_cursor_col(cursor_col)
+        .with_has_focus(sc.commit_input_active);
+    // Only shown while not actively editing an empty message — matches the
+    // pre-migration behaviour of hiding the prompt text as soon as the
+    // cursor is live in an empty input.
+    if sc.commit_input_active {
+        input
+    } else {
+        input.with_placeholder("Message (press c)")
     }
 }
 
@@ -18477,6 +19102,86 @@ pub fn sc_help_dialog_layout(
         quadraui::ToolbarItemMeasure::new(0.0)
     });
     (dialog, layout)
+}
+
+/// Build the `(Tooltip, TooltipLayout, TooltipChrome)` for a plugin
+/// ext-panel's own `?`-triggered keybindings help popup (#636).
+///
+/// #635 (Stage 6b item C) migrated this popup from raw `set_cell`
+/// box-drawing (full 4-sided border + centred title embedded in the top
+/// border) to `Backend::draw_tooltip`, which at the time could only ever
+/// paint TUI's side-bars-only chrome with no way to ask for a full border
+/// or a title at all — a real regression, filed upstream as
+/// JDonaghy/quadraui#541. #541 has since landed at this repo's pinned
+/// quadraui rev: `TooltipChrome` (a sidecar value passed to the new
+/// `Backend::draw_tooltip_with_chrome`, so it doesn't touch `Tooltip`'s or
+/// `TooltipLayout`'s own field sets) carries exactly the `border`/`title`
+/// vocabulary this popup needs, with `TooltipBorder::Full` + a title
+/// landing it in the same full-border-with-embedded-title shape the
+/// original raw-drawing code painted. This is the real fix, not the
+/// "documented temporary stand-in" the issue anticipated needing — #541
+/// was built (and references JDonaghy/vimcode#635 by name in its own doc
+/// comment) specifically to unblock this call site.
+///
+/// `panel_name` namespaces the tooltip's `WidgetId` so two different
+/// plugin panels' help popups (never shown simultaneously, but still)
+/// don't collide; `bindings` is the plugin-registered `(key, description)`
+/// list (`Engine::ext_panel_help_bindings`). `char_width`/`line_height`
+/// follow the same generic char-cell/pixel convention
+/// [`sc_help_dialog_layout`] uses (TUI: `1.0, 1.0`; GTK: real metrics).
+pub fn ext_panel_help_tooltip_layout(
+    panel_name: &str,
+    bindings: &[(String, String)],
+    viewport: quadraui::Rect,
+    char_width: f32,
+    line_height: f32,
+) -> (
+    quadraui::Tooltip,
+    quadraui::TooltipLayout,
+    quadraui::TooltipChrome,
+) {
+    let key_fg_width = bindings
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let lines: Vec<quadraui::StyledText> = bindings
+        .iter()
+        .map(|(key, desc)| quadraui::StyledText {
+            spans: vec![
+                quadraui::StyledSpan::plain(format!("{key:<key_fg_width$} ")),
+                quadraui::StyledSpan::plain(desc.clone()),
+            ],
+        })
+        .collect();
+
+    let mut tooltip = quadraui_tooltip(
+        quadraui::WidgetId::new(format!("ext:help:{panel_name}")),
+        String::new(),
+    );
+    tooltip.styled_lines = Some(lines);
+
+    let content_w = bindings
+        .iter()
+        .map(|(k, d)| k.chars().count() + 1 + d.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("Keybindings".len());
+    let popup_w = ((content_w as f32 + 2.0) * char_width)
+        .min(viewport.width - char_width * 2.0)
+        .max(char_width * 12.0);
+    let popup_h = ((bindings.len() as f32 + 2.0) * line_height).min(viewport.height - line_height);
+    let popup_x = viewport.x + (viewport.width - popup_w) / 2.0;
+    let popup_y = viewport.y + (viewport.height - popup_h) / 2.0;
+
+    let layout = quadraui::TooltipLayout {
+        bounds: quadraui::Rect::new(popup_x, popup_y, popup_w, popup_h),
+        resolved_placement: quadraui::ResolvedPlacement::Bottom,
+    };
+    let mut chrome = quadraui::TooltipChrome::new(quadraui::TooltipBorder::Full);
+    chrome.title = Some("Keybindings".to_string());
+    (tooltip, layout, chrome)
 }
 
 /// Populate the `SidebarSystem` on `engine.dap_sidebar_system` with
@@ -19343,12 +20048,17 @@ pub fn build_activity_bar(
             "Search (Ctrl+Shift+F)",
             "activity:search",
         ),
-        (PANEL_DEBUG, icons::DEBUG.s(), "Debug", "activity:debug"),
         (
             PANEL_GIT,
-            icons::GIT_BRANCH.s(),
+            icons::SOURCE_CONTROL.s(),
             "Source Control",
             "activity:git",
+        ),
+        (
+            PANEL_DEBUG,
+            icons::RUN_AND_DEBUG.s(),
+            "Run and Debug",
+            "activity:debug",
         ),
         (
             PANEL_EXTENSIONS,
@@ -20026,6 +20736,1438 @@ pub fn handle_settings_form_ui_event(
             }
             true
         }
+    }
+}
+
+// ─── Plugin-declared UI views (#146) ────────────────────────────────────────
+
+/// Adapt a plugin-declared [`crate::core::plugin_ui::PluginView`] into a
+/// `quadraui::Form`.
+///
+/// This function is the *entire* translation layer between the vimcode-owned
+/// widget vocabulary plugins author (see `core::plugin_ui`'s module doc for why
+/// the ABI is vimcode-owned rather than quadraui's serde shape) and the
+/// primitive both backends paint. A breaking change to `quadraui::Form` is
+/// absorbed here and nowhere else — no plugin has to be rewritten for it.
+///
+/// Widget ids are namespaced (`plugin:<view>:<field>`, #146 invariant 4) so two
+/// plugins that both name a button `"send"` cannot collide, and so
+/// [`handle_plugin_view_ui_event`] can tell a plugin field from a Settings one.
+///
+/// `selected` / `scroll_top` / `has_focus` are vimcode-owned interaction state
+/// (the existing `ext_panel_*` fields, or their editor-tab twins), *not*
+/// plugin-declared: a re-render must not move the user's cursor.
+///
+/// `text_edit` is `Engine::plugin_view_text_edit` — when it names a field in
+/// `view`, that field's *live* (possibly uncommitted) value/cursor/selection
+/// paint instead of the plugin's declared value, with a real caret
+/// (`cursor: Some(_)`, #1627). Every other field — including every field when
+/// `text_edit` is `None` — keeps painting read-only (`cursor: None`), exactly
+/// as before #1627: the plugin's declared value is authoritative whenever
+/// vimcode isn't actively editing it.
+pub fn plugin_view_to_form(
+    view_name: &str,
+    view: &crate::core::plugin_ui::PluginView,
+    selected: usize,
+    scroll_top: usize,
+    has_focus: bool,
+    text_edit: Option<&crate::core::plugin_ui::PluginViewTextEditState>,
+) -> quadraui::Form {
+    use crate::core::plugin_ui::{namespaced_widget_id, ViewFieldKind};
+    use quadraui::{
+        ButtonRowItem, FieldKind, Form, FormField, StyledText, ToggleGroupItem, ValidationState,
+        WidgetId,
+    };
+
+    let wid = |field: &str| WidgetId::new(namespaced_widget_id(view_name, field));
+    let live = |field_id: &str| text_edit.filter(|e| e.view == view_name && e.field_id == field_id);
+
+    let fields: Vec<FormField> = view
+        .fields
+        .iter()
+        .map(|f| {
+            let kind = match &f.kind {
+                ViewFieldKind::Label => FieldKind::Label,
+                ViewFieldKind::Text { value, placeholder } => {
+                    // `cursor: None` renders read-only (no caret) — the
+                    // plugin's own declared value, whenever vimcode isn't
+                    // actively editing this field. `Some(live)` (#1627) paints
+                    // the live buffer with a real caret instead.
+                    match live(&f.id) {
+                        Some(e) => FieldKind::TextInput {
+                            value: e.value.clone(),
+                            placeholder: placeholder.clone(),
+                            cursor: Some(e.cursor),
+                            selection_anchor: e.selection_anchor,
+                        },
+                        None => FieldKind::TextInput {
+                            value: value.clone(),
+                            placeholder: placeholder.clone(),
+                            cursor: None,
+                            selection_anchor: None,
+                        },
+                    }
+                }
+                ViewFieldKind::Password { value, placeholder } => match live(&f.id) {
+                    Some(e) => FieldKind::PasswordInput {
+                        value: e.value.clone(),
+                        placeholder: placeholder.clone(),
+                        cursor: Some(e.cursor),
+                        mask_char: '•',
+                    },
+                    None => FieldKind::PasswordInput {
+                        value: value.clone(),
+                        placeholder: placeholder.clone(),
+                        cursor: None,
+                        mask_char: '•',
+                    },
+                },
+                ViewFieldKind::TextArea {
+                    value,
+                    placeholder,
+                    rows,
+                } => match live(&f.id) {
+                    Some(e) => FieldKind::TextArea {
+                        value: e.value.clone(),
+                        placeholder: placeholder.clone(),
+                        cursor: Some(e.cursor),
+                        visible_rows: (*rows).max(1),
+                    },
+                    None => FieldKind::TextArea {
+                        value: value.clone(),
+                        placeholder: placeholder.clone(),
+                        cursor: None,
+                        visible_rows: (*rows).max(1),
+                    },
+                },
+                ViewFieldKind::Toggle { value } => FieldKind::Toggle { value: *value },
+                ViewFieldKind::Button => FieldKind::Button,
+                ViewFieldKind::ReadOnly { value } => FieldKind::ReadOnly {
+                    value: StyledText::plain(value.clone()),
+                },
+                ViewFieldKind::Dropdown { options, selected } => FieldKind::Dropdown {
+                    options: options.iter().map(StyledText::plain).collect(),
+                    selected_idx: (*selected).min(options.len().saturating_sub(1)),
+                },
+                ViewFieldKind::Segmented { options, selected } => FieldKind::SegmentedControl {
+                    options: options.clone(),
+                    selected_idx: (*selected).min(options.len().saturating_sub(1)),
+                },
+                ViewFieldKind::Buttons { buttons } => FieldKind::ButtonRow {
+                    buttons: buttons
+                        .iter()
+                        .map(|b| ButtonRowItem {
+                            id: wid(&b.id),
+                            label: b.label.clone(),
+                            disabled: b.disabled,
+                            icon: None,
+                        })
+                        .collect(),
+                },
+                ViewFieldKind::Toggles { toggles } => FieldKind::ToggleGroup {
+                    toggles: toggles
+                        .iter()
+                        .map(|t| ToggleGroupItem {
+                            id: wid(&t.id),
+                            label: t.label.clone(),
+                            value: t.value,
+                        })
+                        .collect(),
+                },
+            };
+            FormField {
+                id: wid(&f.id),
+                label: StyledText::plain(&f.label),
+                kind,
+                hint: StyledText::plain(&f.hint),
+                disabled: f.disabled,
+                validation: match (&f.error, &f.warning) {
+                    (Some(e), _) => Some(ValidationState::Error(e.clone())),
+                    (None, Some(w)) => Some(ValidationState::Warning(w.clone())),
+                    (None, None) => None,
+                },
+            }
+        })
+        .collect();
+
+    let focused_field = fields.get(selected).map(|f| f.id.clone());
+
+    Form {
+        id: WidgetId::new(if view.id.is_empty() {
+            format!("plugin-view-{view_name}")
+        } else {
+            crate::core::plugin_ui::namespaced_widget_id(view_name, &view.id)
+        }),
+        fields,
+        focused_field,
+        scroll_offset: scroll_top,
+        has_focus,
+    }
+}
+
+/// Populate `Engine::plugin_view_form_controller` from the active plugin view.
+///
+/// Returns `false` when the active sidebar panel is not a plugin view, so the
+/// caller can fall through to the ordinary `ExtPanelItem` tree body. This is the
+/// plugin-view twin of [`populate_settings_form_controller`].
+pub fn populate_plugin_view_form_controller(engine: &Engine) -> bool {
+    let Some(name) = engine.ext_panel_active.clone() else {
+        return false;
+    };
+    let Some(view) = engine.plugin_views.get(&name) else {
+        return false;
+    };
+    let form = plugin_view_to_form(
+        &name,
+        view,
+        engine.ext_panel_selected,
+        engine.ext_panel_scroll_top,
+        engine.ext_panel_has_focus,
+        engine.plugin_view_text_edit.as_ref(),
+    );
+    let mut fc = engine.plugin_view_form_controller.borrow_mut();
+    fc.set_form(form);
+    fc.set_scroll_offset(engine.ext_panel_scroll_top);
+    fc.set_has_focus(engine.ext_panel_has_focus);
+    true
+}
+
+/// Populate `Engine::plugin_view_tab_form_controller` from the named plugin
+/// view — the editor-tab twin of [`populate_plugin_view_form_controller`],
+/// which instead resolves the view name from `Engine::ext_panel_active` (the
+/// sidebar's active panel) and reads `ext_panel_*` interaction state. A tab
+/// has no activity-bar panel id to read the name from, so the caller
+/// (`App::paint_editor_windows_rung`) passes it explicitly — the
+/// `RenderedWindow::plugin_view` field set by `build_rendered_window`.
+///
+/// Returns `false` when `name` isn't a registered view.
+pub fn populate_plugin_view_tab_form_controller(
+    engine: &Engine,
+    name: &str,
+    has_focus: bool,
+) -> bool {
+    let Some(view) = engine.plugin_views.get(name) else {
+        return false;
+    };
+    let form = plugin_view_to_form(
+        name,
+        view,
+        engine.plugin_view_tab_selected,
+        engine.plugin_view_tab_scroll_top,
+        has_focus,
+        engine.plugin_view_text_edit.as_ref(),
+    );
+    let mut fc = engine.plugin_view_tab_form_controller.borrow_mut();
+    fc.set_form(form);
+    fc.set_scroll_offset(engine.plugin_view_tab_scroll_top);
+    fc.set_has_focus(has_focus);
+    true
+}
+
+/// Route a pointer event over a plugin view through the shared
+/// `quadraui::FormController` and dispatch whatever widget event it resolves to
+/// the plugin's `on_event` callback.
+///
+/// `rect` must be the *same* rect the last frame passed to
+/// `FormController::render_and_cache` (cached in
+/// `Engine::plugin_view_form_rect`) — `handle_cached` re-derives its row layout
+/// from it. Same contract, and the same reason, as
+/// [`handle_settings_form_ui_event`].
+///
+/// Returns `true` when the event was consumed.
+pub fn handle_plugin_view_ui_event(
+    engine: &mut Engine,
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+
+    if !populate_plugin_view_form_controller(engine) {
+        return false;
+    }
+    // `FormController` has no `DoubleClick` arm — probe with the equivalent
+    // press (mirrors `handle_settings_form_ui_event`).
+    let probe = match event {
+        quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::MouseDown {
+            widget: widget.clone(),
+            button: quadraui::MouseButton::Left,
+            position: *position,
+            modifiers: quadraui::Modifiers::default(),
+        },
+        other => other.clone(),
+    };
+    let result = engine
+        .plugin_view_form_controller
+        .borrow_mut()
+        .handle_cached(&probe, rect);
+
+    let sync_scroll = |engine: &mut Engine| {
+        let offset = engine.plugin_view_form_controller.borrow().scroll_offset();
+        engine.ext_panel_scroll_top = offset;
+    };
+
+    let action = match result {
+        quadraui::FormControllerEvent::Ignored => return false,
+        quadraui::FormControllerEvent::ScrollChanged | quadraui::FormControllerEvent::Consumed => {
+            sync_scroll(engine);
+            return true;
+        }
+        quadraui::FormControllerEvent::FormAction(action) => action,
+    };
+    sync_scroll(engine);
+
+    let Some((view_name, field_id, kind)) = plugin_view_event_from_form_event(&action) else {
+        return true;
+    };
+    // Selection follows the click, so j/k continues from where the user
+    // clicked, and a click on a `Text`/`Password`/`TextArea` field primes it
+    // for typing (#1627) exactly as keyboard navigation does.
+    if let Some(view) = engine.plugin_views.get(&view_name) {
+        // `field_id` may name a sub-widget (a `buttons`/`toggles` entry) that is
+        // not itself a row; only move the selection when it *is* a row.
+        if let Some(idx) = view.field_index(&field_id) {
+            engine.plugin_view_focus_field(
+                &view_name,
+                crate::core::engine::PluginViewHost::Sidebar,
+                idx,
+            );
+        }
+    }
+    engine.ext_panel_has_focus = true;
+    if matches!(kind, ViewEventKind::FocusChanged) {
+        // A plain focus move is not something a plugin needs to hear about on
+        // every click; it is reported only so a handler can track selection.
+        // Keep it, but don't re-render for it beyond the selection change above.
+        return true;
+    }
+    engine.dispatch_plugin_view_event(PluginViewEvent {
+        view: view_name,
+        widget_id: field_id,
+        kind,
+    });
+    true
+}
+
+/// Route a pointer event over an editor-tab-hosted plugin view — the tab
+/// twin of [`handle_plugin_view_ui_event`] (#1627). `name` is the view name
+/// (`RenderedWindow::plugin_view`), since a tab has no `ext_panel_active` to
+/// resolve it from; `rect` must be the same rect
+/// `App::paint_editor_windows_rung` last painted this window's `Form` into
+/// (cached in `Engine::plugin_view_tab_form_rect`).
+///
+/// Returns `true` when the event was consumed.
+pub fn handle_plugin_view_tab_ui_event(
+    engine: &mut Engine,
+    name: &str,
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+
+    if !populate_plugin_view_tab_form_controller(engine, name, true) {
+        return false;
+    }
+    let probe = match event {
+        quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::MouseDown {
+            widget: widget.clone(),
+            button: quadraui::MouseButton::Left,
+            position: *position,
+            modifiers: quadraui::Modifiers::default(),
+        },
+        other => other.clone(),
+    };
+    let result = engine
+        .plugin_view_tab_form_controller
+        .borrow_mut()
+        .handle_cached(&probe, rect);
+
+    let sync_scroll = |engine: &mut Engine| {
+        let offset = engine
+            .plugin_view_tab_form_controller
+            .borrow()
+            .scroll_offset();
+        engine.plugin_view_tab_scroll_top = offset;
+    };
+
+    let action = match result {
+        quadraui::FormControllerEvent::Ignored => return false,
+        quadraui::FormControllerEvent::ScrollChanged | quadraui::FormControllerEvent::Consumed => {
+            sync_scroll(engine);
+            return true;
+        }
+        quadraui::FormControllerEvent::FormAction(action) => action,
+    };
+    sync_scroll(engine);
+
+    let Some((view_name, field_id, kind)) = plugin_view_event_from_form_event(&action) else {
+        return true;
+    };
+    if let Some(view) = engine.plugin_views.get(&view_name) {
+        if let Some(idx) = view.field_index(&field_id) {
+            engine.plugin_view_focus_field(
+                &view_name,
+                crate::core::engine::PluginViewHost::Tab,
+                idx,
+            );
+        }
+    }
+    if matches!(kind, ViewEventKind::FocusChanged) {
+        return true;
+    }
+    engine.dispatch_plugin_view_event(PluginViewEvent {
+        view: view_name,
+        widget_id: field_id,
+        kind,
+    });
+    true
+}
+
+/// Route a `UiEvent` over a body-kind (`List`/`Tree`/`Table`/`TextView`)
+/// plugin view at `host`, through the matching primitive's click/scroll
+/// resolution instead of `FormController` (#1631). `rect` is the rect the
+/// view was last painted into for this host — only the `Tree` arm needs it
+/// live (a `TreeController` needs a real rect + backend to `handle` against);
+/// `List`/`Table` resolve through their own cached layouts
+/// (`route_plugin_view_list_click`/`route_plugin_view_table_click`) instead.
+///
+/// Shared by both hosts: the sidebar's `ExtPanel` click router and
+/// [`handle_plugin_view_tab_ui_event`]'s caller both dispatch here first —
+/// see `paint_sidebar_panel_rung`'s `ext:` arm and `paint_editor_windows_
+/// rung`'s tab arm for the matching *paint*-side kind branch.
+///
+/// Returns `None` when `name` isn't a body-kind view at all (i.e. it's a
+/// field-stack `Form`), so the caller falls back to the `Form` routing path;
+/// `Some(bool)` otherwise, `true` when the event was consumed.
+pub(crate) fn route_plugin_view_body_event(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+    backend: &mut dyn quadraui::Backend,
+) -> Option<bool> {
+    let kind = engine
+        .plugin_views
+        .get(name)
+        .and_then(|v| v.body.as_ref())
+        .map(|b| b.kind_name());
+    // Positive `delta.y` = scroll content up (toward the top) — the same
+    // convention the sidebar's fallback `Scroll` arm documents.
+    let scroll_step = |delta: &quadraui::ScrollDelta| -> i32 {
+        let step = (delta.y.abs() * 3.0).round().max(1.0) as i32;
+        if delta.y > 0.0 {
+            -step
+        } else {
+            step
+        }
+    };
+    match kind {
+        Some("list") => Some(match event {
+            quadraui::UiEvent::MouseDown {
+                position,
+                button: quadraui::MouseButton::Left,
+                ..
+            } => route_plugin_view_list_click(engine, name, host, *position, false),
+            quadraui::UiEvent::DoubleClick { position, .. } => {
+                route_plugin_view_list_click(engine, name, host, *position, true)
+            }
+            quadraui::UiEvent::Scroll { delta, .. } => {
+                scroll_plugin_view_flat_selection_list(engine, name, host, scroll_step(delta))
+            }
+            _ => false,
+        }),
+        Some("tree") => Some(route_plugin_view_tree_event(
+            engine, name, host, true, event, rect, backend,
+        )),
+        Some("table") => Some(match event {
+            quadraui::UiEvent::MouseDown {
+                position,
+                button: quadraui::MouseButton::Left,
+                ..
+            } => route_plugin_view_table_click(engine, name, host, *position, false),
+            quadraui::UiEvent::DoubleClick { position, .. } => {
+                route_plugin_view_table_click(engine, name, host, *position, true)
+            }
+            quadraui::UiEvent::Scroll { delta, .. } => {
+                scroll_plugin_view_flat_selection_table(engine, name, host, scroll_step(delta))
+            }
+            _ => false,
+        }),
+        Some("text_view") => Some(match event {
+            quadraui::UiEvent::Scroll { delta, .. } => {
+                scroll_plugin_view_text(engine, name, host, scroll_step(delta))
+            }
+            _ => false,
+        }),
+        _ => None,
+    }
+}
+
+/// Decompose a `quadraui::FormEvent` into `(view, plugin-authored field id,
+/// event kind)`, or `None` when the event's widget is not in the plugin
+/// namespace (a Settings field, say) or carries no plugin meaning.
+///
+/// Kept separate from [`handle_plugin_view_ui_event`] so the mapping is unit
+/// testable without a `FormController`.
+pub(crate) fn plugin_view_event_from_form_event(
+    action: &quadraui::FormEvent,
+) -> Option<(String, String, crate::core::plugin_ui::ViewEventKind)> {
+    use crate::core::plugin_ui::{split_widget_id, ViewEventKind};
+    let (id, kind) = match action {
+        quadraui::FormEvent::ButtonClicked { id } => (id, ViewEventKind::ButtonClicked),
+        quadraui::FormEvent::ToggleChanged { id, value } => {
+            (id, ViewEventKind::ToggleChanged { value: *value })
+        }
+        quadraui::FormEvent::DropdownChanged { id, selected_idx } => (
+            id,
+            ViewEventKind::DropdownChanged {
+                selected: *selected_idx,
+            },
+        ),
+        quadraui::FormEvent::SegmentedControlChanged { id, selected_idx } => (
+            id,
+            ViewEventKind::SegmentedChanged {
+                selected: *selected_idx,
+            },
+        ),
+        quadraui::FormEvent::TextInputChanged { id, value } => (
+            id,
+            ViewEventKind::TextChanged {
+                value: value.clone(),
+            },
+        ),
+        quadraui::FormEvent::TextInputCommitted { id, value } => (
+            id,
+            ViewEventKind::TextCommitted {
+                value: value.clone(),
+            },
+        ),
+        quadraui::FormEvent::FocusChanged { id } => (id, ViewEventKind::FocusChanged),
+        _ => return None,
+    };
+    let (view, field) = split_widget_id(id.as_str())?;
+    Some((view.to_string(), field.to_string(), kind))
+}
+
+// ─── ViewBody: List / Tree / Table / TextView (#1631) ───────────────────────
+//
+// #146/#1627's field stack paints through `quadraui::Form`/`FormController`.
+// A `ViewBody`-kind view instead paints through the matching quadraui
+// primitive directly — `ListView`, `TreeView` (via the existing
+// `TreeController`, same one `Engine::explorer_tree` uses), `DataTable`, or
+// `TextDisplay` — one sibling translation per kind, per #1631's design note,
+// rather than wedging four different widget shapes into `Form`'s flat field
+// rows. `List`/`Table` have no composed quadraui controller (unlike `Tree`'s
+// `TreeController` and the field stack's `FormController`), so selection/
+// scroll interaction for those two is hand-rolled here — in this
+// backend-neutral module, not in `src/gtk/` or `src/tui_main/` — following
+// the exact "paint caches a `Backend::*_layout`, a click reads it back" split
+// `Engine::board_layout`/`Engine::ext_panel_tree_layout` already established
+// for the same reason (#521/#1089).
+//
+// Selection/scroll reuse `ext_panel_selected`/`ext_panel_scroll_top` (sidebar)
+// and `plugin_view_tab_selected`/`plugin_view_tab_scroll_top` (tab) verbatim
+// instead of new per-body-kind fields — a view's body is one kind at a time,
+// so there is never a collision, and it keeps `Engine`'s field count from
+// growing by one pair per widget kind.
+
+use crate::core::engine::PluginViewHost;
+use crate::core::plugin_ui::{
+    table_cell_field_id, ViewBody, ViewListItem, ViewTableColumn, ViewTableRow, ViewTreeNode,
+};
+
+/// Resolve the active view name for `host`, or `None` when nothing is hosted
+/// there (mirrors the two paint arms' own resolution: `ext_panel_active` for
+/// the sidebar, an explicit tab name for `Tab` — passed in directly since a
+/// tab has no single "active view" field on `Engine`).
+fn plugin_view_body<'a>(engine: &'a Engine, name: &str) -> Option<&'a ViewBody> {
+    engine.plugin_views.get(name)?.body.as_ref()
+}
+
+// ── List ─────────────────────────────────────────────────────────────────
+
+fn plugin_view_to_list(
+    view: &str,
+    title: &Option<String>,
+    items: &[ViewListItem],
+    selected: usize,
+    scroll_top: usize,
+    has_focus: bool,
+) -> quadraui::ListView {
+    use crate::core::plugin_ui::namespaced_widget_id;
+    use quadraui::{Decoration, ListItem, ListView, StyledText, WidgetId};
+    ListView {
+        // #1631 review: namespaced like every other plugin-owned id (#146
+        // invariant 4) — a view-scoped body widget, not a shared
+        // long-lived controller like `Engine::plugin_view_tree_controller`
+        // (whose own fixed id names the *host slot*, not the currently
+        // active view; see that field's construction for why it's
+        // different). This `ListView` is rebuilt fresh every paint, so
+        // there is no retained-identity reason to keep it un-namespaced.
+        id: WidgetId::new(namespaced_widget_id(view, "list")),
+        title: title.as_deref().map(StyledText::plain),
+        items: items
+            .iter()
+            .map(|it| ListItem {
+                text: StyledText::plain(&it.text),
+                icon: None,
+                detail: it.detail.as_deref().map(StyledText::plain),
+                decoration: Decoration::default(),
+            })
+            .collect(),
+        selected_idx: selected.min(items.len().saturating_sub(1)),
+        scroll_offset: scroll_top,
+        has_focus,
+        bordered: false,
+        h_scroll: 0,
+        max_content_width: None,
+        show_v_scrollbar: true,
+    }
+}
+
+/// Paint a `ViewBody::List`-kind view into `rect` and cache the resolved
+/// `Backend::list_layout` for [`route_plugin_view_list_click`]. Returns
+/// `false` when `name` isn't a `List`-kind view.
+pub(crate) fn paint_plugin_view_list(
+    engine: &Engine,
+    name: &str,
+    host: PluginViewHost,
+    has_focus: bool,
+    rect: quadraui::Rect,
+    backend: &mut dyn quadraui::Backend,
+) -> bool {
+    let Some(ViewBody::List { title, items }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    let selected = engine.plugin_view_selected(host);
+    let scroll_top = engine.plugin_view_scroll_top(host);
+    let list = plugin_view_to_list(name, title, items, selected, scroll_top, has_focus);
+    backend.draw_list(rect, &list);
+    let layout = backend.list_layout(rect, &list);
+    let cache = match host {
+        PluginViewHost::Sidebar => &engine.plugin_view_list_layout,
+        PluginViewHost::Tab => &engine.plugin_view_tab_list_layout,
+    };
+    cache.replace(Some((rect, layout)));
+    true
+}
+
+/// Resolve a click at `pos` (same units the last frame painted the list
+/// into) against the cached layout, move the selection, and dispatch
+/// `ItemSelected`/`ItemActivated` to the plugin. Returns `false` when there
+/// is no cached layout, or the click missed every row.
+pub(crate) fn route_plugin_view_list_click(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    pos: quadraui::Point,
+    is_double_click: bool,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+    let cache = match host {
+        PluginViewHost::Sidebar => &engine.plugin_view_list_layout,
+        PluginViewHost::Tab => &engine.plugin_view_tab_list_layout,
+    };
+    let idx = {
+        let borrowed = cache.borrow();
+        let Some((rect, layout)) = borrowed.as_ref() else {
+            return false;
+        };
+        match layout.hit_test(pos.x - rect.x, pos.y - rect.y) {
+            quadraui::ListViewHit::Item(i) => Some(i),
+            quadraui::ListViewHit::Title | quadraui::ListViewHit::Empty => None,
+        }
+    };
+    let Some(idx) = idx else { return false };
+    engine.set_plugin_view_selected(host, idx);
+    engine.dispatch_plugin_view_event(PluginViewEvent {
+        view: name.to_string(),
+        widget_id: String::new(),
+        kind: ViewEventKind::ItemSelected { index: idx },
+    });
+    if is_double_click {
+        engine.dispatch_plugin_view_event(PluginViewEvent {
+            view: name.to_string(),
+            widget_id: String::new(),
+            kind: ViewEventKind::ItemActivated { index: idx },
+        });
+    }
+    true
+}
+
+/// Keyboard navigation for a `List`/`Table` body — `j`/`Down`/`k`/`Up` move
+/// the flat selection, `Enter` activates it. Shared by both kinds since both
+/// reduce to "one selected index into a flat row count" (#1631). Uses the
+/// same vimcode-internal key-name vocabulary as `Engine::handle_plugin_view_
+/// key`'s field-stack navigation (`"Down"`/`"j"`/... — not `quadraui::Key`),
+/// since this is called from that same function. Returns `false` when
+/// `len == 0` (nothing to navigate) or the key isn't a navigation key.
+fn navigate_flat_selection(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    len: usize,
+    key: &str,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+    if len == 0 {
+        return false;
+    }
+    let sel = engine.plugin_view_selected(host).min(len - 1);
+    let new_sel = match key {
+        "Down" | "j" => Some((sel + 1).min(len - 1)),
+        "Up" | "k" => Some(sel.saturating_sub(1)),
+        "Home" | "g" => Some(0),
+        "End" | "G" => Some(len - 1),
+        _ => None,
+    };
+    if let Some(new_sel) = new_sel {
+        engine.set_plugin_view_selected(host, new_sel);
+        // #1631: without this, `Down`/`End`/`G` can walk `selected` out of
+        // the visible scroll window on a list/table with more rows than fit
+        // the viewport — see `Engine::plugin_view_ensure_visible`'s doc.
+        engine.plugin_view_ensure_visible(host);
+        engine.dispatch_plugin_view_event(PluginViewEvent {
+            view: name.to_string(),
+            widget_id: String::new(),
+            kind: ViewEventKind::ItemSelected { index: new_sel },
+        });
+        return true;
+    }
+    if matches!(key, "Return" | "Enter") {
+        engine.dispatch_plugin_view_event(PluginViewEvent {
+            view: name.to_string(),
+            widget_id: String::new(),
+            kind: ViewEventKind::ItemActivated { index: sel },
+        });
+        return true;
+    }
+    false
+}
+
+/// Keyboard handling for a `ViewBody::List`-kind view. Returns `false` when
+/// `name` isn't a `List`-kind view or the key wasn't consumed.
+pub(crate) fn handle_plugin_view_list_key(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    key: &str,
+) -> bool {
+    let Some(ViewBody::List { items, .. }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    let len = items.len();
+    navigate_flat_selection(engine, name, host, len, key)
+}
+
+/// Scroll-wheel handling for a `ViewBody::List`-kind view: adjusts the
+/// scroll offset (not the selection) by `delta` rows, clamped to
+/// `[0, items.len())`. Returns `false` when `name` isn't a `List`-kind view.
+pub(crate) fn scroll_plugin_view_flat_selection_list(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    delta: i32,
+) -> bool {
+    let Some(ViewBody::List { items, .. }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    let len = items.len();
+    let cur = engine.plugin_view_scroll_top(host) as i64;
+    let new_top = (cur + delta as i64).clamp(0, len.saturating_sub(1) as i64) as usize;
+    engine.set_plugin_view_scroll_top(host, new_top);
+    true
+}
+
+// ── Tree ─────────────────────────────────────────────────────────────────
+
+/// Recursively flatten `nodes` into quadraui's pre-flattened `TreeRow` shape.
+/// A node is a "branch" (shows a chevron, `is_expanded: Some(_)`) iff it
+/// declares children; a collapsed branch's children are simply omitted from
+/// the flattened list (mirrors `TreeView`'s own "purely declarative" backend
+/// contract — vimcode, not quadraui, decides which rows are visible).
+fn flatten_tree_nodes(
+    nodes: &[ViewTreeNode],
+    depth: u16,
+    path: &mut quadraui::TreePath,
+) -> Vec<quadraui::TreeRow> {
+    use quadraui::{StyledText, TreeRow};
+    let mut out = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        path.push(i as u16);
+        let is_branch = node.is_branch();
+        out.push(TreeRow {
+            path: path.clone(),
+            indent: depth,
+            icon: None,
+            text: StyledText::plain(&node.label),
+            badge: None,
+            is_expanded: is_branch.then_some(node.expanded),
+            decoration: quadraui::Decoration::default(),
+            edit: None,
+        });
+        if is_branch && node.expanded {
+            out.extend(flatten_tree_nodes(&node.children, depth + 1, path));
+        }
+        path.pop();
+    }
+    out
+}
+
+/// Populate the shared `TreeController` (sidebar or tab, per `host`) from
+/// the named view's `ViewBody::Tree`. Returns `false` when `name` isn't a
+/// `Tree`-kind view. Mirrors `populate_explorer_tree_controller`/
+/// `populate_plugin_view_form_controller`.
+pub(crate) fn populate_plugin_view_tree_controller(
+    engine: &Engine,
+    name: &str,
+    host: PluginViewHost,
+    has_focus: bool,
+) -> bool {
+    let Some(ViewBody::Tree { nodes }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    let controller = match host {
+        PluginViewHost::Sidebar => &engine.plugin_view_tree_controller,
+        PluginViewHost::Tab => &engine.plugin_view_tab_tree_controller,
+    };
+    let mut tc = controller.borrow_mut();
+    tc.set_has_focus(has_focus);
+    tc.set_rows(flatten_tree_nodes(nodes, 0, &mut Vec::new()));
+    true
+}
+
+/// Route an event over a `ViewBody::Tree`-kind view through its
+/// `TreeController` and dispatch the resulting semantic action to the
+/// plugin. Mirrors `route_explorer_tree_event`'s shape (a `TreeController`
+/// needs a live `&mut dyn Backend` to `handle`, unlike `FormController`'s
+/// cache-then-read split). Returns `false` when `name` isn't a `Tree`-kind
+/// view.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn route_plugin_view_tree_event(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    has_focus: bool,
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+    backend: &mut dyn quadraui::Backend,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+    if !populate_plugin_view_tree_controller(engine, name, host, has_focus) {
+        return false;
+    }
+    let controller = match host {
+        PluginViewHost::Sidebar => engine.plugin_view_tree_controller.clone(),
+        PluginViewHost::Tab => engine.plugin_view_tab_tree_controller.clone(),
+    };
+    let tree_event = controller.borrow_mut().handle(event, backend, rect);
+
+    let node_id = |path: &quadraui::TreePath| -> Option<String> {
+        let ViewBody::Tree { nodes } = plugin_view_body(engine, name)? else {
+            return None;
+        };
+        ViewTreeNode::resolve(nodes, path).map(|n| n.id.clone())
+    };
+
+    match tree_event {
+        quadraui::TreeControllerEvent::RowSelected { path } => {
+            let Some(id) = node_id(&path) else {
+                return true;
+            };
+            engine.dispatch_plugin_view_event(PluginViewEvent {
+                view: name.to_string(),
+                widget_id: String::new(),
+                kind: ViewEventKind::NodeSelected { id },
+            });
+            true
+        }
+        quadraui::TreeControllerEvent::RowActivated { path } => {
+            let Some(id) = node_id(&path) else {
+                return true;
+            };
+            engine.dispatch_plugin_view_event(PluginViewEvent {
+                view: name.to_string(),
+                widget_id: String::new(),
+                kind: ViewEventKind::NodeActivated { id },
+            });
+            true
+        }
+        quadraui::TreeControllerEvent::RowToggleExpand { path } => {
+            let Some(ViewBody::Tree { nodes }) = plugin_view_body(engine, name) else {
+                return true;
+            };
+            let Some(node) = ViewTreeNode::resolve(nodes, &path) else {
+                return true;
+            };
+            let kind = if node.expanded {
+                ViewEventKind::Collapsed {
+                    id: node.id.clone(),
+                }
+            } else {
+                ViewEventKind::Expanded {
+                    id: node.id.clone(),
+                }
+            };
+            engine.dispatch_plugin_view_event(PluginViewEvent {
+                view: name.to_string(),
+                widget_id: String::new(),
+                kind,
+            });
+            true
+        }
+        quadraui::TreeControllerEvent::ScrollChanged | quadraui::TreeControllerEvent::Consumed => {
+            true
+        }
+        quadraui::TreeControllerEvent::Ignored => false,
+        _ => true,
+    }
+}
+
+/// Keyboard handling for a `ViewBody::Tree`-kind view, entirely backend-free
+/// (unlike [`route_plugin_view_tree_event`], which needs a live
+/// `&mut dyn Backend` for `TreeController::handle`'s mouse-oriented API) —
+/// this is what lets it be reached from `Engine::handle_plugin_view_key`,
+/// which (like every `core/engine` function) has no backend reference to
+/// hand it. Walks `TreeController::rows()` directly: `j`/`Down`/`k`/`Up`
+/// move the flat selection (dispatching `NodeSelected`), `Enter`/`Space`
+/// toggles a branch's expand state or activates a leaf.
+pub(crate) fn handle_plugin_view_tree_key(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    key: &str,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+
+    if !populate_plugin_view_tree_controller(engine, name, host, true) {
+        return false;
+    }
+    let controller = match host {
+        PluginViewHost::Sidebar => engine.plugin_view_tree_controller.clone(),
+        PluginViewHost::Tab => engine.plugin_view_tab_tree_controller.clone(),
+    };
+    let (rows, selected_path) = {
+        let tc = controller.borrow();
+        (tc.rows().to_vec(), tc.selected_path().cloned())
+    };
+    if rows.is_empty() {
+        return false;
+    }
+    let cur = selected_path
+        .and_then(|p| rows.iter().position(|r| r.path == p))
+        .unwrap_or(0);
+
+    let new_idx = match key {
+        "Down" | "j" => Some((cur + 1).min(rows.len() - 1)),
+        "Up" | "k" => Some(cur.saturating_sub(1)),
+        "Home" | "g" => Some(0),
+        "End" | "G" => Some(rows.len() - 1),
+        _ => None,
+    };
+    if let Some(new_idx) = new_idx {
+        let path = rows[new_idx].path.clone();
+        // #1631: fixed 20-row viewport guess, same fallback
+        // `Engine::plugin_view_ensure_visible`/`ext_panel_ensure_visible`
+        // use for the List/Table/field-stack cases — without this a
+        // `Down`/`End`/`G` press can walk the selection out of the visible
+        // scroll window with nothing to compensate.
+        let mut tc = controller.borrow_mut();
+        tc.set_selected_path(Some(path.clone()));
+        tc.scroll_to_visible(new_idx, 20);
+        drop(tc);
+        let Some(ViewBody::Tree { nodes }) = plugin_view_body(engine, name) else {
+            return true;
+        };
+        let Some(id) = ViewTreeNode::resolve(nodes, &path).map(|n| n.id.clone()) else {
+            return true;
+        };
+        engine.dispatch_plugin_view_event(PluginViewEvent {
+            view: name.to_string(),
+            widget_id: String::new(),
+            kind: ViewEventKind::NodeSelected { id },
+        });
+        return true;
+    }
+
+    if matches!(key, "Return" | "Enter" | "Space" | " ") {
+        let row = &rows[cur];
+        let Some(ViewBody::Tree { nodes }) = plugin_view_body(engine, name) else {
+            return true;
+        };
+        let Some(node) = ViewTreeNode::resolve(nodes, &row.path) else {
+            return true;
+        };
+        let kind = match row.is_expanded {
+            Some(true) => ViewEventKind::Collapsed {
+                id: node.id.clone(),
+            },
+            Some(false) => ViewEventKind::Expanded {
+                id: node.id.clone(),
+            },
+            None => ViewEventKind::NodeActivated {
+                id: node.id.clone(),
+            },
+        };
+        engine.dispatch_plugin_view_event(PluginViewEvent {
+            view: name.to_string(),
+            widget_id: String::new(),
+            kind,
+        });
+        return true;
+    }
+    false
+}
+
+// ── Table ────────────────────────────────────────────────────────────────
+
+fn plugin_view_to_table(
+    view: &str,
+    columns: &[ViewTableColumn],
+    rows: &[ViewTableRow],
+    selected: usize,
+    scroll_top: usize,
+    has_focus: bool,
+    cell_edit: Option<&crate::core::plugin_ui::PluginViewTextEditState>,
+) -> quadraui::DataTable {
+    use crate::core::plugin_ui::namespaced_widget_id;
+    use quadraui::{Column, ColumnWidth, DataRow, DataTable, Decoration, StyledText, WidgetId};
+    let q_columns: Vec<Column> = columns
+        .iter()
+        .map(|c| Column {
+            title: c.title.clone(),
+            width: ColumnWidth::Flex(1.0),
+            align: quadraui::ColumnAlign::Left,
+        })
+        .collect();
+    let q_rows: Vec<DataRow> = rows
+        .iter()
+        .enumerate()
+        .map(|(row_idx, row)| DataRow {
+            cells: row
+                .cells
+                .iter()
+                .enumerate()
+                .map(|(col_idx, cell)| {
+                    // A live edit in progress on this exact cell paints the
+                    // uncommitted buffer instead of the plugin's declared
+                    // value — same "live overrides declared" rule
+                    // `plugin_view_to_form`'s `Text` arm uses (#1627).
+                    match cell_edit.filter(|e| e.field_id == table_cell_field_id(row_idx, col_idx))
+                    {
+                        Some(e) => StyledText::plain(&e.value),
+                        None => StyledText::plain(cell),
+                    }
+                })
+                .collect(),
+            decoration: Decoration::default(),
+        })
+        .collect();
+    DataTable {
+        // #1631 review: see `plugin_view_to_list`'s matching comment —
+        // rebuilt fresh every paint, so it's namespaced like every other
+        // plugin-owned id rather than the shared controllers.
+        id: WidgetId::new(namespaced_widget_id(view, "table")),
+        columns: q_columns,
+        rows: q_rows,
+        selected_idx: (!rows.is_empty()).then(|| selected.min(rows.len().saturating_sub(1))),
+        scroll_offset: scroll_top,
+        sort: None,
+        has_focus,
+        show_scrollbar: true,
+        min_total_width: None,
+        h_scroll: 0.0,
+        column_overrides: Vec::new(),
+        footer: None,
+    }
+}
+
+/// Paint a `ViewBody::Table`-kind view into `rect` and cache the resolved
+/// `Backend::data_table_layout` for [`route_plugin_view_table_click`].
+/// Returns `false` when `name` isn't a `Table`-kind view.
+pub(crate) fn paint_plugin_view_table(
+    engine: &Engine,
+    name: &str,
+    host: PluginViewHost,
+    has_focus: bool,
+    rect: quadraui::Rect,
+    backend: &mut dyn quadraui::Backend,
+) -> bool {
+    let Some(ViewBody::Table { columns, rows }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    let selected = engine.plugin_view_selected(host);
+    let scroll_top = engine.plugin_view_scroll_top(host);
+    let cell_edit = engine
+        .plugin_view_text_edit
+        .as_ref()
+        .filter(|e| e.view == name);
+    let table = plugin_view_to_table(
+        name, columns, rows, selected, scroll_top, has_focus, cell_edit,
+    );
+    let layout = backend.draw_data_table(rect, &table, None);
+    let cache = match host {
+        PluginViewHost::Sidebar => &engine.plugin_view_table_layout,
+        PluginViewHost::Tab => &engine.plugin_view_tab_table_layout,
+    };
+    cache.replace(Some((rect, layout)));
+    true
+}
+
+/// Resolve a click at `pos` against the cached table layout, move the
+/// selection, and dispatch `ItemSelected`/`ItemActivated`. Returns `false`
+/// when there is no cached layout or the click missed a row.
+pub(crate) fn route_plugin_view_table_click(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    pos: quadraui::Point,
+    is_double_click: bool,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+    let cache = match host {
+        PluginViewHost::Sidebar => &engine.plugin_view_table_layout,
+        PluginViewHost::Tab => &engine.plugin_view_tab_table_layout,
+    };
+    let Some(ViewBody::Table { columns, rows }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    let total_rows = rows.len();
+    let scroll_offset = engine.plugin_view_scroll_top(host);
+    // #1631 review: `DataTableHit` (the pinned quadraui rev's hit-test
+    // result) only ever reports `Row { idx }` — no column component — so a
+    // click's column is resolved separately here from the same per-column
+    // `x`/`width` (`ResolvedColumn`) the layout already carries for
+    // painting, rather than a hand-rolled backend-specific hit-test. Only
+    // an `editable` column is worth recording; a click on a read-only
+    // column leaves the last editable selection alone rather than clearing
+    // it to a column `Enter` could never open anyway.
+    let (idx, col) = {
+        let borrowed = cache.borrow();
+        let Some((rect, layout)) = borrowed.as_ref() else {
+            return false;
+        };
+        let idx = match layout.hit_test(pos.x - rect.x, pos.y - rect.y, scroll_offset, total_rows) {
+            quadraui::DataTableHit::Row { idx } => Some(idx),
+            _ => None,
+        };
+        let local_x = pos.x - rect.x;
+        let col = layout
+            .columns
+            .iter()
+            .position(|c| local_x >= c.x && local_x < c.x + c.width)
+            .filter(|&c| columns.get(c).is_some_and(|c| c.editable));
+        (idx, col)
+    };
+    let Some(idx) = idx else { return false };
+    engine.set_plugin_view_selected(host, idx);
+    if let Some(col) = col {
+        engine.set_plugin_view_table_col(host, col);
+    }
+    engine.dispatch_plugin_view_event(PluginViewEvent {
+        view: name.to_string(),
+        widget_id: String::new(),
+        kind: ViewEventKind::ItemSelected { index: idx },
+    });
+    if is_double_click {
+        engine.dispatch_plugin_view_event(PluginViewEvent {
+            view: name.to_string(),
+            widget_id: String::new(),
+            kind: ViewEventKind::ItemActivated { index: idx },
+        });
+    }
+    true
+}
+
+/// Keyboard handling for a `ViewBody::Table`-kind view (#1631). Uses the
+/// same vimcode-internal key-name vocabulary as `Engine::handle_plugin_view_
+/// key`/`handle_plugin_view_text_key` (`"Escape"`, `"BackSpace"`, ... — not
+/// `quadraui::Key`), since it is called from the former.
+///
+/// Not editing: `j`/`k`/Up/Down move the row selection, `Left`/`Right` move
+/// the *column* selection among the row's editable columns (when there is
+/// more than one — e.g. #147's "Key"/"Value" pair — so a second `editable`
+/// column is actually reachable, not just accepted by the vocabulary), and
+/// `Enter` on a row with at least one editable column starts editing the
+/// currently-selected one (reusing `Engine::plugin_view_text_edit`, #1627's
+/// model, keyed by [`table_cell_field_id`]) — a row with no editable column
+/// instead emits `ItemActivated`.
+///
+/// Editing: character keys insert, `BackSpace`/`Left`/`Right` edit/move the
+/// cursor, `Enter` commits (`CellEdited`) and ends editing, `Escape` cancels
+/// without emitting anything.
+///
+/// Returns `false` when `name` isn't a `Table`-kind view or the key wasn't
+/// consumed.
+pub(crate) fn handle_plugin_view_table_key(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    key: &str,
+    unicode: Option<char>,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, PluginViewTextEditState, ViewEventKind};
+
+    let Some(ViewBody::Table { columns, rows }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    // Snapshot everything the non-editing branches need as owned values so
+    // the borrow of `engine.plugin_views` ends here — the branches below
+    // call `engine.dispatch_plugin_view_event`/`navigate_flat_selection`,
+    // which need `&mut Engine`.
+    let rows_len = rows.len();
+    // Every column marked `editable`, in declaration order — not just the
+    // first one (#1631 review: a table author who marks two columns
+    // editable could previously never reach the second).
+    let editable_cols: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.editable)
+        .map(|(i, _)| i)
+        .collect();
+    // The engine's stored column selection, clamped to the nearest actually-
+    // editable column — a stale value (a `ui.refresh` that dropped a column,
+    // or the field's untouched `0` default when column 0 isn't editable)
+    // never panics or points at a non-editable column, it just falls back to
+    // `editable_cols[0]`.
+    let current_col = |engine: &Engine| -> Option<usize> {
+        let raw = engine.plugin_view_table_col(host);
+        if editable_cols.contains(&raw) {
+            Some(raw)
+        } else {
+            editable_cols.first().copied()
+        }
+    };
+    let cell_value = |sel: usize, col: usize| -> String {
+        rows.get(sel)
+            .and_then(|r| r.cells.get(col))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let editable_col = current_col(engine);
+    let cell_value = if let Some(col) = editable_col {
+        let sel = engine
+            .plugin_view_selected(host)
+            .min(rows_len.saturating_sub(1));
+        Some(cell_value(sel, col))
+    } else {
+        None
+    };
+
+    if let Some(edit) = engine.plugin_view_text_edit.clone() {
+        if edit.view != name {
+            return false;
+        }
+        let Some((row, col)) = crate::core::plugin_ui::parse_table_cell_field_id(&edit.field_id)
+        else {
+            return false;
+        };
+        match key {
+            "Escape" => {
+                engine.plugin_view_text_edit = None;
+                true
+            }
+            "Return" | "Enter" => {
+                engine.plugin_view_text_edit = None;
+                engine.dispatch_plugin_view_event(PluginViewEvent {
+                    view: name.to_string(),
+                    widget_id: String::new(),
+                    kind: ViewEventKind::CellEdited {
+                        row,
+                        col,
+                        value: edit.value,
+                    },
+                });
+                true
+            }
+            "BackSpace" => {
+                let mut e = edit;
+                if e.cursor > 0 {
+                    let prev = quadraui::text_util::prev_char_boundary(&e.value, e.cursor);
+                    e.value.replace_range(prev..e.cursor, "");
+                    e.cursor = prev;
+                }
+                engine.plugin_view_text_edit = Some(e);
+                true
+            }
+            "Left" => {
+                let mut e = edit;
+                e.cursor = quadraui::text_util::prev_char_boundary(&e.value, e.cursor);
+                engine.plugin_view_text_edit = Some(e);
+                true
+            }
+            "Right" => {
+                let mut e = edit;
+                e.cursor = quadraui::text_util::next_char_boundary(&e.value, e.cursor);
+                engine.plugin_view_text_edit = Some(e);
+                true
+            }
+            _ => {
+                let Some(c) = unicode.filter(|c| !c.is_control()) else {
+                    return false;
+                };
+                let mut e = edit;
+                e.value.insert(e.cursor, c);
+                e.cursor += c.len_utf8();
+                engine.plugin_view_text_edit = Some(e);
+                true
+            }
+        }
+    } else if let (true, true, Some(col)) = (
+        rows_len > 0,
+        matches!(key, "Return" | "Enter"),
+        editable_col,
+    ) {
+        // Checked *before* `navigate_flat_selection` (which also treats
+        // `Enter` as `ItemActivated`) — a row with an editable column starts
+        // editing on Enter instead of activating, and `navigate_flat_
+        // selection`'s own `Enter` arm would otherwise always win first.
+        // `rows_len > 0` guards a table with an editable column but zero
+        // rows (#1631 review) — without it, `sel`'s `saturating_sub(1)`
+        // clamp let Enter "edit" a row 0 that was never declared, which
+        // could later dispatch `CellEdited { row: 0, .. }` for it.
+        let sel = engine
+            .plugin_view_selected(host)
+            .min(rows_len.saturating_sub(1));
+        let value = cell_value.unwrap_or_default();
+        engine.plugin_view_text_edit = Some(PluginViewTextEditState {
+            view: name.to_string(),
+            field_id: table_cell_field_id(sel, col),
+            cursor: value.len(),
+            selection_anchor: None,
+            value,
+        });
+        true
+    } else if matches!(key, "Left" | "Right") && editable_cols.len() > 1 {
+        // Column selection among the row's editable columns — checked
+        // before `navigate_flat_selection` (which doesn't handle Left/Right
+        // at all, so this can't shadow anything there). A single (or zero)
+        // editable column has nothing to move between, so the key falls
+        // through unconsumed rather than becoming a no-op `true`.
+        let cur = editable_col.and_then(|c| editable_cols.iter().position(|&x| x == c));
+        let cur = cur.unwrap_or(0);
+        let next = if key == "Left" {
+            cur.saturating_sub(1)
+        } else {
+            (cur + 1).min(editable_cols.len() - 1)
+        };
+        engine.set_plugin_view_table_col(host, editable_cols[next]);
+        true
+    } else {
+        navigate_flat_selection(engine, name, host, rows_len, key)
+    }
+}
+
+/// Scroll-wheel handling for a `ViewBody::Table`-kind view — the `Table`
+/// twin of [`scroll_plugin_view_flat_selection_list`].
+pub(crate) fn scroll_plugin_view_flat_selection_table(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    delta: i32,
+) -> bool {
+    let Some(ViewBody::Table { rows, .. }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    let len = rows.len();
+    let cur = engine.plugin_view_scroll_top(host) as i64;
+    let new_top = (cur + delta as i64).clamp(0, len.saturating_sub(1) as i64) as usize;
+    engine.set_plugin_view_scroll_top(host, new_top);
+    true
+}
+
+// ── TextView ─────────────────────────────────────────────────────────────
+
+fn plugin_view_to_text_display(
+    view: &str,
+    text: &str,
+    scroll_top: usize,
+    has_focus: bool,
+) -> quadraui::TextDisplay {
+    use crate::core::plugin_ui::namespaced_widget_id;
+    use quadraui::{StyledSpan, TextDisplay, TextDisplayLine, WidgetId};
+    let lines: Vec<TextDisplayLine> = text
+        .split('\n')
+        .map(|line| TextDisplayLine {
+            spans: vec![StyledSpan::plain(line)],
+            decoration: quadraui::Decoration::default(),
+            timestamp: None,
+        })
+        .collect();
+    TextDisplay {
+        // #1631 review: see `plugin_view_to_list`'s matching comment.
+        id: WidgetId::new(namespaced_widget_id(view, "text")),
+        lines,
+        scroll_offset: scroll_top,
+        auto_scroll: false,
+        max_lines: 0,
+        has_focus,
+        title: None,
+        show_scrollbar: true,
+    }
+}
+
+/// Paint a `ViewBody::TextView`-kind view into `rect`. Returns `false` when
+/// `name` isn't a `TextView`-kind view.
+pub(crate) fn paint_plugin_view_text(
+    engine: &Engine,
+    name: &str,
+    host: PluginViewHost,
+    has_focus: bool,
+    rect: quadraui::Rect,
+    backend: &mut dyn quadraui::Backend,
+) -> bool {
+    let Some(ViewBody::TextView { text, .. }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    let scroll_top = engine.plugin_view_scroll_top(host);
+    let display = plugin_view_to_text_display(name, text, scroll_top, has_focus);
+    backend.draw_text_display(rect, &display);
+    true
+}
+
+/// Scroll a `ViewBody::TextView`-kind view by `delta` lines (positive =
+/// down). Returns `false` when `name` isn't a `TextView`-kind view.
+pub(crate) fn scroll_plugin_view_text(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    delta: i32,
+) -> bool {
+    let Some(ViewBody::TextView { text, .. }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    let line_count = text.split('\n').count();
+    let cur = engine.plugin_view_scroll_top(host) as i64;
+    let new_top = (cur + delta as i64).clamp(0, line_count.saturating_sub(1) as i64) as usize;
+    engine.set_plugin_view_scroll_top(host, new_top);
+    true
+}
+
+/// Keyboard handling for a `ViewBody::TextView`-kind view: `j`/`Down`/`k`/
+/// `Up` scroll by one line, `PageDown`/`PageUp` by `page` lines, `Home`/`End`
+/// (`g`/`G`) jump to the top/bottom. Uses the same vimcode-internal key-name
+/// vocabulary as `Engine::handle_plugin_view_key` (not `quadraui::Key`).
+/// Returns `false` when `name` isn't a `TextView` or the key wasn't a scroll
+/// key.
+pub(crate) fn handle_plugin_view_text_key(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    key: &str,
+    page: i32,
+) -> bool {
+    if plugin_view_body(engine, name).is_none() {
+        return false;
+    }
+    match key {
+        "Down" | "j" => scroll_plugin_view_text(engine, name, host, 1),
+        "Up" | "k" => scroll_plugin_view_text(engine, name, host, -1),
+        "PageDown" | "Page_Down" => scroll_plugin_view_text(engine, name, host, page.max(1)),
+        "PageUp" | "Page_Up" => scroll_plugin_view_text(engine, name, host, -page.max(1)),
+        "Home" | "g" => scroll_plugin_view_text(engine, name, host, i32::MIN),
+        "End" | "G" => scroll_plugin_view_text(engine, name, host, i32::MAX),
+        _ => false,
     }
 }
 
@@ -21590,6 +23732,7 @@ fn build_rendered_window(
         window_id: id,
         rect: *rect,
         lines: vec![],
+        visible_line_capacity: visible_lines.max(1),
         cursor: None,
         extra_cursors: vec![],
         selection: None,
@@ -21613,6 +23756,7 @@ fn build_rendered_window(
         tabstop: engine.settings.tabstop.max(1) as usize,
         cursorline: engine.settings.cursorline,
         status_line: None,
+        plugin_view: None,
     };
 
     let window = match engine.windows.get(&window_id) {
@@ -21623,6 +23767,16 @@ fn build_rendered_window(
         Some(s) => s,
         None => return empty(window_id),
     };
+    // #1627: an editor-tab-hosted plugin view's window paints a `Form`
+    // (`App::paint_editor_windows_rung`), never buffer text — short-circuit
+    // before any of the syntax/diagnostic/fold work below, all of which is
+    // meaningless against the tiny scratch buffer backing it.
+    if let Some(name) = &buffer_state.plugin_view {
+        return RenderedWindow {
+            plugin_view: Some(name.clone()),
+            ..empty(window_id)
+        };
+    }
 
     let buffer = &buffer_state.buffer;
     let view = &window.view;
@@ -21716,9 +23870,33 @@ fn build_rendered_window(
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
     let bp_lines: Vec<u64> = bp_infos.iter().map(|bp| bp.line).collect();
-    // Show the breakpoint column when any BP is set for this file, or a DAP
-    // session is active (so the column width stays stable during a session).
-    let has_bp = !bp_lines.is_empty() || engine.dap_session_active;
+
+    // #1653: plugin decoration marks (`vimcode.decor.*`) touching the
+    // viewport — fetched once per window per frame (not per visible line,
+    // and never a full-buffer scan: `DecorState::marks_touching` only walks
+    // its per-buffer `by_row` index up to `end_row`), then filtered to the
+    // exact line inside the per-line loop below. `+1` covers the one extra
+    // trailing row `approx_end_line` (below) also pads for.
+    let decor_viewport_end = (scroll_top + visible_lines + 1).min(total_lines.saturating_sub(1));
+    let decor_marks_near_viewport: Vec<&crate::core::buffer::DecorMark> = if total_lines > 0 {
+        engine
+            .decor
+            .marks_touching(window.buffer_id, scroll_top, decor_viewport_end)
+    } else {
+        Vec::new()
+    };
+    // Gutter sign glyphs (`sign_text`) reuse the breakpoint column rather
+    // than reserving a new one (see the `bp_part` composition below for the
+    // paint-time priority: DAP-current-line/breakpoint beats a decor sign,
+    // which beats blank) — so a buffer with decor signs but no real
+    // breakpoints still needs that column shown.
+    let has_decor_sign = decor_marks_near_viewport
+        .iter()
+        .any(|m| m.opts.sign_text.is_some());
+    // Show the breakpoint column when any BP is set for this file, a DAP
+    // session is active (so the column width stays stable during a
+    // session), or a decor sign needs it.
+    let has_bp = !bp_lines.is_empty() || engine.dap_session_active || has_decor_sign;
 
     // Stopped-line path for per-line comparison (try canonical, then raw).
     let dap_stop_path = engine.dap_current_line.as_ref().map(|(p, _)| p.as_str());
@@ -21851,6 +24029,14 @@ fn build_rendered_window(
 
     // Build rendered lines (fold-aware: skip hidden lines, jump over fold bodies)
     let mut lines = Vec::with_capacity(visible_lines);
+
+    // #1653: inline virtual text (`virt_text_pos = "inline"`) shifts later
+    // text on its line right — `(anchor_col, inserted_chars)` pairs per
+    // `line_idx`, consulted once the cursor's screen column is computed
+    // below (`view.cursor.col` itself stays in *buffer* coordinates; only
+    // the painted cursor cell needs to account for text inserted before it).
+    let mut inline_shifts: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
 
     // When aligned diff data exists, iterate through the aligned sequence
     // so padding lines appear at the correct visual positions.
@@ -22015,6 +24201,202 @@ fn build_rendered_window(
             )
         };
 
+        // #1653: apply plugin decorations anchored to this line — highlight
+        // spans first (merged into `spans` so the wrapped-line segmentation
+        // below slices them exactly like any syntax span), then overlay/
+        // inline virtual text, which mutates `line_str` + `spans` together
+        // so later text and its highlighting both reflect the splice.
+        let line_decor: Vec<&DecorMark> = decor_marks_near_viewport
+            .iter()
+            .filter(|m| m.row <= line_idx && m.end_row >= line_idx)
+            .copied()
+            .collect();
+        let mut spans = spans;
+        let mut line_str = line_str;
+        // #1653 review: LSP diagnostics/spell-check ranges below are
+        // computed from UTF-16/byte offsets measured against the buffer's
+        // real text, *before* any decor splice below mutates `line_str` —
+        // reusing the (possibly already-spliced) `line_str` there would
+        // land those ranges on the wrong columns on a line that also has
+        // an inline/overlay decoration. Snapshot the pre-splice text now,
+        // while it's still guaranteed to match those ranges.
+        let line_str_pre_decor = line_str.clone();
+        for m in &line_decor {
+            if let Some(hl) = &m.opts.hl_group {
+                if let Some((start_col, end_col)) =
+                    decor_highlight_cols(m, line_idx, line_str.chars().count())
+                {
+                    if end_col > start_col {
+                        let start_byte =
+                            quadraui::text_util::char_to_byte_idx(&line_str, start_col);
+                        let end_byte = quadraui::text_util::char_to_byte_idx(&line_str, end_col);
+                        spans.push(StyledSpan {
+                            start_byte,
+                            end_byte,
+                            style: resolve_decor_style(engine, theme, Some(hl.as_str())),
+                        });
+                    }
+                }
+            }
+        }
+        // #1653 review: process left-to-right by anchor column, tracking
+        // how many characters earlier *inline* splices on this same line
+        // have already inserted (`col_shift`) — `m.col` is a buffer column,
+        // fixed at `set_mark` time, but `line_str` keeps growing as each
+        // earlier inline splice runs, so a second mark's splice point has
+        // to be adjusted by however much text landed before it, or it (and
+        // everything after it) lands `col_shift` characters too early.
+        // Overlay splices don't need to bump `col_shift` themselves since
+        // they replace exactly as many characters as they insert (net-zero
+        // width change) — only `Inline` grows the line.
+        //
+        // #1810 split the row's virtual-text marks in two here: `Overlay`
+        // and `Inline` splice into `line_str`/`spans` in the loop below,
+        // while `Eol` (and an unset `virt_text_pos`, which means the same
+        // thing) has no buffer column to splice at and paints through
+        // `RenderedLine::annotation` instead — see `decor_eol_text` below.
+        let (mut virt_text_marks, mut eol_marks): (Vec<&DecorMark>, Vec<&DecorMark>) = line_decor
+            .iter()
+            .filter(|m| m.row == line_idx && !m.opts.virt_text.is_empty())
+            .copied()
+            .partition(|m| {
+                matches!(
+                    m.opts.virt_text_pos,
+                    Some(VirtTextPos::Overlay) | Some(VirtTextPos::Inline)
+                )
+            });
+        virt_text_marks.sort_by_key(|m| m.col);
+        let mut col_shift: usize = 0;
+        for m in virt_text_marks {
+            let text: String = m.opts.virt_text.iter().map(|c| c.text.as_str()).collect();
+            if text.is_empty() {
+                continue;
+            }
+            let first_chunk_hl = m.opts.virt_text[0].hl_group.as_deref();
+            let style = resolve_decor_style(engine, theme, first_chunk_hl);
+            let splice_col = m.col + col_shift;
+            match m.opts.virt_text_pos {
+                Some(VirtTextPos::Overlay) => {
+                    let replace_chars = text.chars().count();
+                    splice_virt_text(
+                        &mut line_str,
+                        &mut spans,
+                        splice_col,
+                        replace_chars,
+                        &text,
+                        style,
+                    );
+                }
+                Some(VirtTextPos::Inline) => {
+                    splice_virt_text(&mut line_str, &mut spans, splice_col, 0, &text, style);
+                    let inserted = text.chars().count();
+                    col_shift += inserted;
+                    // `inline_shifts` drives the painted-cursor-column
+                    // correction (below), which compares against
+                    // `view.cursor.col` — a buffer column — so the anchor
+                    // recorded here must stay in buffer-column space
+                    // (`m.col`, not `splice_col`).
+                    inline_shifts
+                        .entry(line_idx)
+                        .or_default()
+                        .push((m.col, inserted));
+                }
+                Some(VirtTextPos::Eol) | None => {
+                    // `partition`ed into `eol_marks` above (#1810), so this
+                    // arm is dead for every mark that reaches this loop.
+                    // Left as an explicit no-op rather than `unreachable!`
+                    // so a future change to the partition predicate can
+                    // never turn a decor mark into a render-path panic.
+                }
+            }
+        }
+        // #1810: end-of-line virtual text (`virt_text_pos = "eol"`, or no
+        // `virt_text_pos` at all — the same default) has no buffer column
+        // to splice at like Overlay/Inline above, and must never wrap or
+        // push the line the way real spliced content would. It converges
+        // on `vimcode.buf.annotate_line`'s existing paint path instead
+        // (`RenderedLine::annotation`, below), which already paints after
+        // the line's content in `theme.annotation_fg` and is hard-truncated
+        // at the window edge rather than wrapped — exactly the behaviour
+        // #1810 asks for. Several eol marks on one line draw in creation
+        // order (oldest `set_mark` first, i.e. ascending `MarkId` — note
+        // `DecorOpts` has no `priority` field at all; "creation order" is
+        // what the code below actually does),
+        // separated by a space.
+        //
+        // Two deliberate differences from the blame annotation it shares
+        // that field with (both applied at the `annotation:` sites below):
+        // on a wrapped line it rides the *last* visual segment, not the
+        // first, and it is not muted while the user is in Insert mode. One
+        // consequence of the first-row/last-row split: if the viewport cuts
+        // off before this line's last wrap segment (the `lines.len() >=
+        // visible_lines` guard below can stop early), `decor_eol_text` is
+        // dropped for that line entirely — it never rides an earlier,
+        // still-visible segment the way the blame annotation does. Probably
+        // the right trade-off (there's no "end of line" to show until the
+        // line's actual end scrolls into view), but it means a long wrapped
+        // line's eol text can silently vanish below the fold.
+        //
+        // Per-mark colour (the chunk's own `hl_group`, as Overlay/Inline
+        // get via `resolve_decor_style`) is NOT implemented: quadraui's
+        // `EditorLine::annotation` is a single `Option<String>` painted in
+        // one theme-wide `annotation_fg` colour — there is no quadraui
+        // primitive for multiple independently-coloured runs in the
+        // trailing-annotation area. That needs quadraui infra first (a
+        // quadraui issue, per the platform-neutrality rule) before eol
+        // text can paint in its own highlight's colour rather than
+        // `annotation_fg` — drafted as a quadraui gap in
+        // `docs/PENDING_QUADRAUI_ISSUES.md` (also covers the TUI-vs-GTK
+        // leading-pad inconsistency) rather than left only in this comment.
+        eol_marks.sort_by_key(|m| m.id.0);
+        let decor_eol_text: Option<String> = {
+            let parts: Vec<String> = eol_marks
+                .iter()
+                .map(|m| {
+                    m.opts
+                        .virt_text
+                        .iter()
+                        .map(|c| c.text.as_str())
+                        .collect::<String>()
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        };
+        // A decor sign for this line's gutter slot (lowest priority — see
+        // `bp_part` below): the first mark with `sign_text` touching this
+        // line, truncated to its first character.
+        //
+        // #1653's own scope text asks for "1-2 display cells" of sign_text
+        // plus `sign_hl`, but neither half of that can actually paint
+        // through this column today, and the reason is a *quadraui*
+        // limitation, not a vimcode one: both backends' gutter rasterisers
+        // hardcode the breakpoint/sign slot at exactly one character —
+        // quadraui's `gtk/editor.rs::paint_gutter_row_number` does
+        // `rl.gutter_text.chars().take(1)` for the bp glyph and then
+        // advances its own `char_offset` by a bare `1` before reading the
+        // git column; `tui/editor.rs`'s gutter loop computes `git_offset =
+        // bp_offset + 1` the same fixed way. Handing either backend a
+        // 2-character `gutter_text` here would not render a wider sign —
+        // it would misalign the git/line-number columns after it, since
+        // neither rasteriser's `+1` is driven by any width this crate
+        // controls. Likewise, colouring just the sign glyph with `sign_hl`
+        // would need a per-glyph colour channel on quadraui's `EditorLine`
+        // that doesn't exist (`gutter_text` is one plain `String`, painted
+        // in one colour chosen from `is_breakpoint`/`is_dap_current`/
+        // `git_diff`). Per the platform-neutrality rule this needs
+        // quadraui-side infra first (a real `bp_col_width`/per-glyph-colour
+        // API) rather than a per-backend workaround here — drafted as a
+        // quadraui gap in `docs/PENDING_QUADRAUI_ISSUES.md` rather than
+        // left only in this comment; until it lands, `sign_text` is truncated to 1
+        // character and `sign_hl` is parsed/stored (round-trips through
+        // `get_mark`) but has no paint effect.
+        let decor_sign_glyph: Option<String> = line_decor
+            .iter()
+            .find_map(|m| m.opts.sign_text.as_deref())
+            .and_then(|s| s.chars().next())
+            .map(|c| c.to_string());
+
         // Git diff status for this line, falling back to the #1515
         // ACP-turn overlay (`acp_turn_status`) where the real git diff has
         // nothing to say about it — a file already git-dirty before the
@@ -22078,7 +24460,11 @@ fn build_rendered_window(
                 } else if is_breakpoint {
                     "●" // breakpoint
                 } else {
-                    " "
+                    // #1653: a plugin decor sign shows in this column when
+                    // there's no real breakpoint/DAP marker on the line —
+                    // priority is DAP-current/breakpoint, then decor sign,
+                    // then blank.
+                    decor_sign_glyph.as_deref().unwrap_or(" ")
                 }
             } else {
                 ""
@@ -22101,13 +24487,21 @@ fn build_rendered_window(
             diags
                 .iter()
                 .map(|d| {
-                    // Reuse line_str already computed above — avoids redundant rope lookup.
-                    let start_col =
-                        crate::core::lsp::utf16_offset_to_char(&line_str, d.range.start.character);
+                    // #1653 review: must use the pre-decor-splice text —
+                    // `d.range` is measured against the buffer's real
+                    // content, not whatever `line_str` looks like after an
+                    // inline/overlay virtual-text splice shifted its bytes.
+                    let start_col = crate::core::lsp::utf16_offset_to_char(
+                        &line_str_pre_decor,
+                        d.range.start.character,
+                    );
                     let end_col = if d.range.end.line as usize == line_idx {
-                        crate::core::lsp::utf16_offset_to_char(&line_str, d.range.end.character)
+                        crate::core::lsp::utf16_offset_to_char(
+                            &line_str_pre_decor,
+                            d.range.end.character,
+                        )
                     } else {
-                        line_str.len()
+                        line_str_pre_decor.len()
                     };
                     DiagnosticMark {
                         start_col,
@@ -22130,9 +24524,12 @@ fn build_rendered_window(
                     .and_then(|p| p.to_str())
                     .and_then(crate::core::syntax::SyntaxLanguage::from_path);
                 let line_start_byte = buffer.content.line_to_byte(line_idx);
+                // #1653 review: same pre-splice-text rationale as the
+                // diagnostics block above — spell errors are columns into
+                // the buffer's real line text.
                 crate::core::spell::check_line(
                     checker,
-                    &line_str,
+                    &line_str_pre_decor,
                     &buffer_state.highlights,
                     line_start_byte,
                     syntax_lang,
@@ -22254,13 +24651,29 @@ fn build_rendered_window(
                     is_dap_current,
                     is_wrap_continuation: is_cont,
                     segment_col_offset: seg_start_char,
-                    annotation: if is_cont
-                        || (engine.mode == crate::core::Mode::Insert && !engine.is_vscode_mode())
-                    {
-                        None
-                    } else {
-                        engine.line_annotations.get(&line_idx).cloned()
-                    },
+                    annotation: join_annotation(
+                        // Blame keeps its pre-#1810 placement exactly:
+                        // first visual row only, hidden while typing.
+                        if is_cont
+                            || (engine.mode == crate::core::Mode::Insert
+                                && !engine.is_vscode_mode())
+                        {
+                            None
+                        } else {
+                            engine.line_annotations.get(&line_idx).cloned()
+                        },
+                        // Decor eol text goes on the *last* visual row of a
+                        // wrapped line — "end of line" means after all of
+                        // the line's content, not after its first wrap
+                        // segment — and stays visible in Insert mode (it is
+                        // plugin-owned inlay/lint text, not the ambient
+                        // blame annotation the Insert-mode mute exists for).
+                        if is_last_seg {
+                            decor_eol_text.as_deref()
+                        } else {
+                            None
+                        },
+                    ),
                     ghost_suffix: if line_idx == cursor_line && seg == cursor_seg {
                         ghost_for_cursor_line.clone()
                     } else {
@@ -22338,12 +24751,16 @@ fn build_rendered_window(
                 is_dap_current,
                 is_wrap_continuation: false,
                 segment_col_offset: 0,
-                annotation: if engine.mode == crate::core::Mode::Insert && !engine.is_vscode_mode()
-                {
-                    None
-                } else {
-                    engine.line_annotations.get(&line_idx).cloned()
-                },
+                // Same split as the wrapped branch above: blame is muted in
+                // Insert mode, decor eol text is not (#1810).
+                annotation: join_annotation(
+                    if engine.mode == crate::core::Mode::Insert && !engine.is_vscode_mode() {
+                        None
+                    } else {
+                        engine.line_annotations.get(&line_idx).cloned()
+                    },
+                    decor_eol_text.as_deref(),
+                ),
                 ghost_suffix: if line_idx == cursor_line {
                     ghost_for_cursor_line.clone()
                 } else {
@@ -22470,8 +24887,23 @@ fn build_rendered_window(
                         _ => CursorShape::Block,
                     }
                 };
+                // #1653: inline virtual text anchored before the cursor's
+                // buffer column on this line shifted the painted text right
+                // by its character count — the cursor's painted column has
+                // to follow, even though `view.cursor.col` itself stays in
+                // buffer coordinates (untouched by any decoration).
+                let inline_shift: usize = inline_shifts
+                    .get(&l.line_idx)
+                    .map(|shifts| {
+                        shifts
+                            .iter()
+                            .filter(|&&(anchor, _)| anchor <= view.cursor.col)
+                            .map(|&(_, len)| len)
+                            .sum()
+                    })
+                    .unwrap_or(0);
                 // When wrapping, the cursor col is relative to the segment start.
-                let col = view.cursor.col.saturating_sub(l.segment_col_offset);
+                let col = (view.cursor.col + inline_shift).saturating_sub(l.segment_col_offset);
                 (CursorPos { view_line, col }, shape)
             })
     } else {
@@ -22783,6 +25215,7 @@ fn build_rendered_window(
         window_id,
         rect: *rect,
         lines,
+        visible_line_capacity: visible_lines.max(1),
         cursor,
         extra_cursors,
         selection,
@@ -22820,6 +25253,7 @@ fn build_rendered_window(
         },
         cursorline: engine.settings.cursorline,
         status_line: None,
+        plugin_view: None,
     }
 }
 
@@ -23161,6 +25595,135 @@ fn compute_search_matches_for_buffer(
     matches
 }
 
+// ─── Decoration paint helpers (#1653, Native API P5) ─────────────────────────
+//
+// Shared by both backends (called only from `build_rendered_window` above,
+// well before the GTK/TUI split) — per the Platform-Neutrality Rule, a
+// decoration's colours/splice land in `RenderedLine`'s existing `raw_text`/
+// `spans` here, not in new `src/gtk/` or `src/tui_main/` code.
+
+/// The `[start_col, end_col)` character range `m`'s highlight paints on
+/// `line_idx` — `None` when `m` doesn't touch `line_idx` at all (shouldn't
+/// happen for marks already filtered by `DecorState::marks_touching`, but
+/// keeps this usable standalone). Columns are clamped to `line_chars` (the
+/// line's current character count), since a range mark's `end_col` can
+/// point past the end of a line that's since gotten shorter.
+fn decor_highlight_cols(
+    m: &crate::core::buffer::DecorMark,
+    line_idx: usize,
+    line_chars: usize,
+) -> Option<(usize, usize)> {
+    if line_idx < m.row || line_idx > m.end_row {
+        return None;
+    }
+    let start = if line_idx == m.row {
+        m.col.min(line_chars)
+    } else {
+        0
+    };
+    let end = if line_idx == m.end_row {
+        m.end_col.min(line_chars)
+    } else {
+        line_chars
+    };
+    Some((start, end.max(start)))
+}
+
+/// Combine a `vimcode.buf.annotate_line` blame-style annotation with
+/// #1810's decor-sourced eol virtual text, both of which paint through the
+/// same `RenderedLine::annotation` field. `blame` keeps its existing
+/// position (first) so a line with only blame text is byte-for-byte
+/// unchanged from before #1810; eol text (already space-joined across
+/// marks by the caller) follows, separated by one more space.
+fn join_annotation(blame: Option<String>, eol: Option<&str>) -> Option<String> {
+    let eol = eol.filter(|s| !s.is_empty());
+    match (blame, eol) {
+        (Some(b), Some(e)) => Some(format!("{b} {e}")),
+        (Some(b), None) => Some(b),
+        (None, Some(e)) => Some(e.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Resolve a `vimcode.decor.set_hl` group name to paint-time colours/flags,
+/// falling back to the theme's default foreground when the group (or its
+/// `fg`) isn't registered — e.g. a group that only sets `bg` still gets a
+/// readable foreground instead of defaulting to black.
+///
+/// #1653 scope item 6: a group's `link` is first chased one hop against
+/// other *plugin* groups by `DecorState::resolve_hl` (unchanged); when the
+/// link target isn't a registered plugin group at all, it's treated as a
+/// `Theme` role name instead (`Theme::scope_color_opt`, matched
+/// case-insensitively against Neovim's own built-in group spelling, e.g.
+/// `link = "Comment"`) — resolved fresh on every call rather than frozen at
+/// `set_hl` time, so it keeps tracking the live theme across `ColorScheme`
+/// switches, same as every other colour here.
+fn resolve_decor_style(engine: &Engine, theme: &Theme, hl_group: Option<&str>) -> Style {
+    let def = hl_group.and_then(|g| engine.decor.resolve_hl(g));
+    let theme_role_fg = def
+        .and_then(|d| d.link.as_deref())
+        .filter(|link| !engine.decor.highlight_groups.contains_key(*link))
+        .and_then(|link| theme.scope_color_opt(&link.to_ascii_lowercase()));
+    let fg = def
+        .and_then(|d| d.fg.as_deref())
+        .and_then(|h| try_from_hex_over(h, theme.background))
+        .or(theme_role_fg)
+        .unwrap_or(theme.foreground);
+    let bg = def
+        .and_then(|d| d.bg.as_deref())
+        .and_then(|h| try_from_hex_over(h, theme.background));
+    Style {
+        fg,
+        bg,
+        bold: def.is_some_and(|d| d.bold),
+        italic: def.is_some_and(|d| d.italic),
+        font_scale: 1.0,
+    }
+}
+
+/// Splice `text` into `line_str` at character column `col`, replacing
+/// `replace_chars` existing characters (`0` for a pure insert — `inline`
+/// virtual text; the character count of `text` itself for a same-width swap
+/// — `overlay` virtual text). Spans entirely before the splice are left
+/// alone; ones entirely after shift by the resulting byte-length delta; any
+/// span that overlapped the replaced region is dropped outright (the text it
+/// styled no longer exists). Pushes one new span covering the spliced text
+/// in `style`.
+fn splice_virt_text(
+    line_str: &mut String,
+    spans: &mut Vec<StyledSpan>,
+    col: usize,
+    replace_chars: usize,
+    text: &str,
+    style: Style,
+) {
+    let char_count = line_str.chars().count();
+    let col = col.min(char_count);
+    let replace_chars = replace_chars.min(char_count - col);
+    let start_byte = quadraui::text_util::char_to_byte_idx(line_str, col);
+    let end_byte = quadraui::text_util::char_to_byte_idx(line_str, col + replace_chars);
+    let old_len = end_byte - start_byte;
+    let new_len = text.len();
+    let delta = new_len as isize - old_len as isize;
+    spans.retain_mut(|s| {
+        if s.end_byte <= start_byte {
+            true
+        } else if s.start_byte >= end_byte {
+            s.start_byte = (s.start_byte as isize + delta).max(0) as usize;
+            s.end_byte = (s.end_byte as isize + delta).max(0) as usize;
+            true
+        } else {
+            false
+        }
+    });
+    line_str.replace_range(start_byte..end_byte, text);
+    spans.push(StyledSpan {
+        start_byte,
+        end_byte: start_byte + new_len,
+        style,
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_spans(
     engine: &Engine,
@@ -23335,6 +25898,17 @@ fn build_selection(
 
     let (start_col, end_col) = match kind {
         SelectionKind::Block => (anchor.col.min(cursor.col), anchor.col.max(cursor.col)),
+        SelectionKind::Char if engine.visual_end_exclusive && end.col > 0 => {
+            // quadraui paints `SelectionKind::Char` as inclusive
+            // (`end_col + 1`, quadraui `primitives/editor.rs`), but an
+            // exclusive-end selection's `end.col` already sits one past the
+            // last selected char — back off by one so highlight, copy and
+            // delete agree (#1788 review non-blocking note). When `end.col`
+            // is 0 (the exclusive end wrapped to the next line's start)
+            // there's no single-line column to back off to; left as-is,
+            // matching this function's pre-existing behavior for that case.
+            (start.col, end.col - 1)
+        }
         _ => (start.col, end.col),
     };
 
@@ -23859,17 +26433,21 @@ pub fn build_window_status_line(
         .and_then(|p| crate::core::lsp::language_id_from_path(p))
         .unwrap_or_default();
 
-    // Derive per-window status bar colors from the editor background.
-    // Active: bg shifted ~10% from editor bg (lighter on dark themes, darker on light).
-    // Inactive: uses theme's status_inactive_bg/fg.
-    let lum = 0.299 * theme.background.r as f64
-        + 0.587 * theme.background.g as f64
-        + 0.114 * theme.background.b as f64;
-    let bar_bg = if lum < 128.0 {
-        theme.background.lighten(0.10)
-    } else {
-        theme.background.darken(0.10)
-    };
+    // #1690: the active window's status bar reads its background from the
+    // theme's own dedicated status-bar key (`theme.status_bg` — the same
+    // field `build_global_status_bar`/the sidebar header/the source-control
+    // header already read) rather than a `lighten`/`darken` offset computed
+    // from the editor background. The offset always *increased* contrast
+    // against a dark background, which is what made the bar read as a
+    // lighter slab instead of a footer (vimcode#1690's Win-GUI report:
+    // `#303030` fill against a `#14161e` editor, both sampled from a real
+    // window) — every color-scheme author already has a considered
+    // `status_bg` value (down to "equal to `background`", VS Code's own
+    // convention under several of its built-in themes) and this is the one
+    // place that value should come from.
+    // Inactive windows keep their own dedicated key (`status_inactive_bg`),
+    // unaffected by this change.
+    let bar_bg = theme.status_bg;
     let bar_fg = theme.foreground;
 
     // Mode text color — use the mode badge color as a subtle text tint
@@ -23970,22 +26548,38 @@ pub fn build_window_status_line(
         // `name…` placeholder when the server isn't reporting progress.
         let lsp_progress = window.and_then(|w| engine.lsp_progress_for_buffer(w.buffer_id));
 
-        // Right side — ordered least-important → most-important (left → right
-        // when right-aligned). Narrow bars drop from the front of this list,
-        // so cursor position (highest priority) stays at the right edge.
-        // See issue #159 for priority rationale.
+        // #1690 established VS Code's left/right split for this bar: the
+        // problems counter at the **far left** (with the remote-indicator/
+        // workspace-trust segments vimcode has no equivalent of), and on
+        // the right, `Ln N, Col N` · `Spaces: N` · `UTF-8` · `LF` ·
+        // language · notification bell, in that left-to-right order.
         //
-        // Drop order (least → most important):
-        //   notification · menu toggle · panel toggle · sidebar toggle ·
-        //   problems · utf-8 · line ending · indent · language · LSP ·
-        //   cursor pos
-        //
-        // #1548: the problems counter sits above the encoding/line-ending/
-        // indent trio — diagnostics are more consequential to a narrow bar
-        // dropping segments than "how is this file encoded", but it's still
-        // below the toggles (those are single always-present icon buttons,
-        // not counters) and below language/LSP/cursor (higher-signal, more
-        // frequently glanced at).
+        // #1760: that visual order is **not** the order these segments are
+        // pushed into `right` below anymore. `right`/`left` are plain
+        // vectors `StatusBar::layout`'s priority-drop (quadraui's
+        // `fit_right_start`/`layout_padded`) reads left-to-right — a
+        // narrow bar drops from the *front* of `right_segments` and always
+        // preserves the *last* element, even if it alone overflows (see
+        // that primitive's own doc). So vector order doubles as both the
+        // right group's visual position *and* its drop priority: #1690
+        // pushed `cursor_seg` (Ln/Col) first because that's where it sits
+        // visually in VS Code's own order, which made it the first
+        // segment *dropped* the moment a dirty marker / git branch /
+        // EDIT-mode hint ate into the left side's width budget — reported
+        // as "Ln/Col silently vanishes" even though plenty of lower-value
+        // segments (the layout toggles, LSP status) survived. quadraui's
+        // `StatusBar` has no field to decouple "visual position" from
+        // "drop priority" (a vector is both at once — #164 flagged this
+        // exact coupling as unresolved), so until it does, vimcode cannot
+        // have Ln/Col both leftmost-of-the-group *and* undroppable. This
+        // fix picks undroppable: `cursor_seg` is pushed **last**, after
+        // every other right-side segment, which is the only way
+        // `fit_right_start`'s "always keep the last segment" rule can
+        // guarantee it never disappears. Vimcode's own extras with no VS
+        // Code counterpart (LSP status, the layout toggles, notifications)
+        // are the least important and go first/leftmost of the group;
+        // `showcmd` — prominent exactly when the user is mid-command —
+        // stays pushed just ahead of `cursor_seg`, as before.
         let mut right = Vec::new();
 
         // Build each segment optionally; push at the end in priority order.
@@ -24074,6 +26668,14 @@ pub fn build_window_status_line(
             action: Some(StatusAction::TogglePanel),
         };
 
+        // #1760: this used to be (almost) the right-most segment of the
+        // bar — only `showcmd` ever pushed after it, and that's almost
+        // always empty/absent — so it carried a trailing-space-free
+        // #1541/quadraui#1155 treatment matching `cursor_seg`'s. Now that
+        // `cursor_seg` (Ln/Col) is always the true right-most segment (see
+        // the `right` push-order comment below), this one needs its own
+        // trailing space back so it doesn't touch whichever segment ends
+        // up directly after it.
         let sidebar_toggle_seg = StatusSegment {
             text: format!(" {} ", crate::icons::STATUS_SIDEBAR_TOGGLE.s()),
             fg: toggle_fg(engine.session.explorer_visible),
@@ -24088,6 +26690,12 @@ pub fn build_window_status_line(
         // zero is what the previous (non-window) status line did. Two
         // segments sharing one action so a click anywhere in the counter
         // opens the workspace Problems (quickfix) list.
+        //
+        // #1690: pushed onto `left`, not `right` — VS Code puts the
+        // problems counter at the **far left** of the bar (after its own
+        // remote-indicator/workspace-trust segments, which vimcode has no
+        // counterpart for), not mixed into the right-hand encoding/
+        // language/cursor cluster.
         let (diag_errors, diag_warnings) = engine.diagnostic_counts();
         let errors_seg = StatusSegment {
             text: format!(" {} {}", crate::icons::STATUS_ERROR.s(), diag_errors),
@@ -24186,17 +26794,24 @@ pub fn build_window_status_line(
             None
         };
 
-        // 'showcmd' (#1190): the partially-typed Normal-mode command,
-        // shown immediately left of the ruler like Vim's own showcmd area
-        // (`:h 'showcmd'`). Only present in the *active* window's bar — an
+        // 'showcmd' (#1190): the partially-typed Normal-mode command (`:h
+        // 'showcmd'`). Only present in the *active* window's bar — an
         // inactive window's pane never has pending Normal-mode input.
+        //
+        // #1690: no VS Code counterpart, so it is pushed last — the
+        // right-most of vimcode's own appended extras, past VS Code's own
+        // six segments. When present it is therefore the bar's true
+        // right-most segment (ahead of it, `sidebar_toggle_seg` is the
+        // fallback right-most and carries the same no-trailing-space
+        // treatment for the same reason — see its own doc), so no trailing
+        // space here either.
         let showcmd_seg = if engine.settings.showcmd {
             let sc = engine.showcmd_text();
             if sc.is_empty() {
                 None
             } else {
                 Some(StatusSegment {
-                    text: format!(" {sc} "),
+                    text: format!(" {sc}"),
                     fg: bar_fg,
                     bg: bar_bg,
                     bold: false,
@@ -24207,7 +26822,29 @@ pub fn build_window_status_line(
             None
         };
 
-        // Push in priority order: least-important first.
+        // #1690: the problems counter is a *left*-side segment now (VS
+        // Code parity — see the comment above `diag_errors`), pushed right
+        // after the branch so the far-left order reads `NORMAL · filename
+        // [+] [branch] · ⊗ N  ⚠ N`.
+        left.push(errors_seg);
+        left.push(warnings_seg);
+
+        // Right side, in drop-priority order (least important first — see
+        // the `right` doc comment above for why this is no longer VS
+        // Code's own visual left-to-right order, #1760): vimcode's own
+        // extras with no VS Code counterpart (LSP status, notifications,
+        // the layout toggles) go first/leftmost, since they are the least
+        // essential and the first to be dropped under a tight width
+        // budget; VS Code's remaining status segments (filetype, line
+        // ending, encoding, indent) follow; `showcmd` — prominent exactly
+        // when the user is mid-command — sits just ahead of `cursor_seg`;
+        // `cursor_seg` (Ln/Col) is pushed **last**, unconditionally the
+        // bar's true right-most segment, so quadraui's "always keep the
+        // last right segment" priority-drop rule guarantees it, and only
+        // it, survives no matter how little width remains.
+        if let Some(s) = lsp_seg {
+            right.push(s);
+        }
         if let Some(s) = notification_seg {
             right.push(s);
         }
@@ -24216,17 +26853,12 @@ pub fn build_window_status_line(
         }
         right.push(panel_toggle_seg);
         right.push(sidebar_toggle_seg);
-        right.push(errors_seg);
-        right.push(warnings_seg);
-        right.push(encoding_seg);
-        right.push(line_ending_seg);
-        right.push(indent_seg);
         if let Some(s) = filetype_seg {
             right.push(s);
         }
-        if let Some(s) = lsp_seg {
-            right.push(s);
-        }
+        right.push(line_ending_seg);
+        right.push(encoding_seg);
+        right.push(indent_seg);
         if let Some(s) = showcmd_seg {
             right.push(s);
         }
@@ -24852,49 +27484,62 @@ pub fn tui_editor_text_layout(rw: &RenderedWindow) -> (quadraui::Editor, quadrau
 /// per-window status line is **not** included — the caller paints
 /// it after calling `draw_editor` (status-line lift was Session 241).
 pub fn to_q_editor(rw: &RenderedWindow) -> quadraui::Editor {
-    quadraui::Editor {
-        id: quadraui::WidgetId::new(format!("editor:{}", rw.window_id.0)),
-        rect: quadraui::Rect::new(
-            rw.rect.x as f32,
-            rw.rect.y as f32,
-            rw.rect.width as f32,
-            rw.rect.height as f32,
-        ),
-        lines: rw.lines.iter().map(to_q_editor_line).collect(),
-        cursor: rw.cursor.map(|(pos, shape)| quadraui::EditorCursor {
-            pos: to_q_cursor_pos(pos),
-            shape: to_q_cursor_shape(shape),
-        }),
-        extra_cursors: rw
-            .extra_cursors
+    let rect = quadraui::Rect::new(
+        rw.rect.x as f32,
+        rw.rect.y as f32,
+        rw.rect.width as f32,
+        rw.rect.height as f32,
+    );
+    let mut editor = quadraui::Editor::new(
+        quadraui::WidgetId::new(format!("editor:{}", rw.window_id.0)),
+        rect,
+    )
+    .with_lines(rw.lines.iter().map(to_q_editor_line).collect())
+    .with_extra_cursors(
+        rw.extra_cursors
             .iter()
             .copied()
             .map(to_q_cursor_pos)
             .collect(),
-        selection: rw.selection.as_ref().map(to_q_selection),
-        extra_selections: rw.extra_selections.iter().map(to_q_selection).collect(),
-        yank_highlight: rw.yank_highlight.as_ref().map(to_q_selection),
-        scroll_top: rw.scroll_top,
-        scroll_left: rw.scroll_left,
-        total_lines: rw.total_lines,
-        max_col: rw.max_col,
-        gutter_char_width: rw.gutter_char_width,
-        is_active: rw.is_active,
-        show_active_bg: rw.show_active_bg,
-        has_git_diff: rw.has_git_diff,
-        has_breakpoints: rw.has_breakpoints,
-        diagnostic_gutter: rw
-            .diagnostic_gutter
+    )
+    .with_extra_selections(rw.extra_selections.iter().map(to_q_selection).collect())
+    .with_scroll_top(rw.scroll_top)
+    .with_scroll_left(rw.scroll_left)
+    .with_total_lines(rw.total_lines)
+    .with_max_col(rw.max_col)
+    .with_gutter_char_width(rw.gutter_char_width)
+    .with_is_active(rw.is_active)
+    .with_show_active_bg(rw.show_active_bg)
+    .with_has_git_diff(rw.has_git_diff)
+    .with_has_breakpoints(rw.has_breakpoints)
+    .with_diagnostic_gutter(
+        rw.diagnostic_gutter
             .iter()
             .map(|(&l, &s)| (l, to_q_severity(s)))
             .collect(),
-        code_action_lines: rw.code_action_lines.iter().copied().collect(),
-        bracket_match_positions: rw.bracket_match_positions.clone(),
-        active_indent_col: rw.active_indent_col,
-        tabstop: rw.tabstop,
-        cursorline: rw.cursorline,
-        lightbulb_glyph: crate::icons::LIGHTBULB.c(),
+    )
+    .with_code_action_lines(rw.code_action_lines.iter().copied().collect())
+    .with_bracket_match_positions(rw.bracket_match_positions.clone())
+    .with_tabstop(rw.tabstop)
+    .with_cursorline(rw.cursorline)
+    .with_lightbulb_glyph(crate::icons::LIGHTBULB.c());
+
+    if let Some(cursor) = rw.cursor.map(|(pos, shape)| quadraui::EditorCursor {
+        pos: to_q_cursor_pos(pos),
+        shape: to_q_cursor_shape(shape),
+    }) {
+        editor = editor.with_cursor(cursor);
     }
+    if let Some(selection) = rw.selection.as_ref().map(to_q_selection) {
+        editor = editor.with_selection(selection);
+    }
+    if let Some(yank_highlight) = rw.yank_highlight.as_ref().map(to_q_selection) {
+        editor = editor.with_yank_highlight(yank_highlight);
+    }
+    if let Some(active_indent_col) = rw.active_indent_col {
+        editor = editor.with_active_indent_col(active_indent_col);
+    }
+    editor
 }
 
 fn to_q_editor_line(rl: &RenderedLine) -> quadraui::EditorLine {
@@ -26488,6 +29133,60 @@ pub struct UnitProfile {
     pub activity_bar_width_px: Option<f32>,
     /// [`quadraui::ShellConfig::with_title_bar`]'s `height_lh` argument.
     pub title_bar_lh: f32,
+    /// [`quadraui::ShellConfig::default_sidebar_width`] — the width the
+    /// sidebar opens at, in **line-height multiples** (quadraui's
+    /// `AppShell::compute_layout` multiplies it by `line_height`, so one unit
+    /// is one terminal row on TUI and ~23 device pixels on a GUI backend at
+    /// the default editor font).
+    ///
+    /// #1798: this has to differ per profile, because the unit it is
+    /// measured in differs by more than a factor of twenty. `App::
+    /// shell_config` used to leave it at `ShellConfig::new`'s generic
+    /// `20.0` on *every* backend. On TUI that is a 20-column sidebar beside
+    /// an 80-ish column terminal — fine. On a GUI backend it is a **~460px**
+    /// sidebar: next to the 48px activity bar, an 800x480 window had ~290px
+    /// left for the editor *and* its tab bar, i.e. room for exactly one tab.
+    /// That was the reported symptom — opening a second file moved the
+    /// breadcrumb, content and status bar to it, but the tab strip kept
+    /// reading only `sample.txt x`, because the second tab had nowhere to
+    /// paint.
+    ///
+    /// # Why `15.0` on the GUI profile, and not lower
+    ///
+    /// `15.0` is [`ALT_SIDEBAR_WIDTH_MIN`], the floor `App::shell_config`
+    /// *already* declares for the sidebar on every backend — so this makes
+    /// the opening width agree with the bound sitting two lines from it,
+    /// rather than inheriting an unrelated default. At ~345px it is in the
+    /// same range as [`crate::core::session::Session::sidebar_width`]'s own
+    /// persisted `260` default and VS Code's ~300px sidebar, and it leaves
+    /// ~400px of an 800px window for the editor band — enough for several
+    /// tabs (verified by the 800x480 driver test named below).
+    ///
+    /// It deliberately does **not** go below that floor, even though ~10
+    /// (~230px) would be closer still to the persisted 260. The floor is
+    /// shared with the Alt+Left/Right resize rung
+    /// ([`alt_resized_sidebar_width`], #759), so an opening width beneath it
+    /// makes the user's *first* Alt+Right jump discontinuously up to the
+    /// floor with no way back: measured at `10.0`, the painted sidebar went
+    /// 230px → 345px on Alt+Right and then stayed at 345px on Alt+Left
+    /// (`gtk::testing::alt_rung::alt_right_widens_the_painted_sidebar_on_gtk`
+    /// catches exactly this). Making that floor per-unit too is a change to
+    /// the *shared* Alt rung's cross-backend contract and wants its own
+    /// issue and its own two-backend coverage; it is not needed to fix the
+    /// tab bar, so this field is the whole of #1798's production change and
+    /// `min_sidebar_width`/`max_sidebar_width` stay shared and untouched.
+    ///
+    /// This is an `lh` multiple rather than a pixel value because
+    /// `App::shell_config` runs before the runner's first font measurement
+    /// (see the `#947`/`with_editor_font` comment at that call site), so it
+    /// could not convert pixels into multiples even if quadraui exposed a
+    /// `default_sidebar_width_px` to receive them — and an `lh` multiple is
+    /// the better unit anyway: it tracks `:set font_size` for free.
+    ///
+    /// Behavioural coverage: `gtk::testing`'s
+    /// `explorer_double_click_opens_second_file_in_a_second_tab_1798`, which
+    /// runs at the reported 800x480 and fails if this is `20.0`.
+    pub sidebar_width_lh: f32,
     /// Whether [`crate::app::App::shell_config`] should also request
     /// [`quadraui::ShellConfig::with_client_side_titlebar`].
     pub client_side_titlebar: bool,
@@ -26537,6 +29236,10 @@ impl UnitProfile {
             hit_tolerance: (6.0, 6.0),
             activity_bar_width_px: Some(48.0),
             title_bar_lh: 2.0,
+            // #1798: ~345px at the default editor font, down from the
+            // inherited `20.0`'s ~460px — see the field doc for why this is
+            // exactly `ALT_SIDEBAR_WIDTH_MIN` and not lower.
+            sidebar_width_lh: ALT_SIDEBAR_WIDTH_MIN as f32,
             client_side_titlebar: true,
             is_gui_backend: true,
             explorer_row_h: |lh| (lh * 1.4).round(),
@@ -26577,6 +29280,11 @@ impl UnitProfile {
             hit_tolerance: (1.0, 1.0),
             activity_bar_width_px: None,
             title_bar_lh: 1.0,
+            // #1798: unchanged from what the TUI already shipped — `20.0` is
+            // `ShellConfig::new`'s own default, which `App::shell_config`
+            // used to leave untouched on every backend. In *cells* 20 is the
+            // right number; only the GUI profile was mis-scaled.
+            sidebar_width_lh: 20.0,
             client_side_titlebar: false,
             is_gui_backend: false,
             explorer_row_h: |lh| lh,
@@ -27065,6 +29773,108 @@ pub fn tab_drop_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Completion popup → quadraui primitive (#1805) ─────────────────────
+
+    /// A plugin-sourced `CompletionCandidate`'s `kind`/`detail`/
+    /// `documentation` must thread all the way into the quadraui
+    /// `CompletionItem` the popup actually paints — not just sit on the
+    /// engine-side struct unused. Buffer-word/LSP candidates (`kind =
+    /// Text`, no detail/documentation) must keep painting exactly as
+    /// before (`CompletionKind::Text`, both `None`).
+    #[test]
+    fn completion_menu_to_quadraui_completions_threads_kind_detail_and_documentation() {
+        use crate::core::completion::{CompletionCandidate, CompletionItemKind};
+
+        let menu = CompletionMenu {
+            candidates: vec![
+                CompletionCandidate::plain("plain_word".to_string()),
+                CompletionCandidate {
+                    label: "foobar_plugin(..)".to_string(),
+                    insert_text: "foobar_plugin".to_string(),
+                    kind: CompletionItemKind::Function,
+                    detail: Some("fn() -> ()".to_string()),
+                    documentation: Some("docs".to_string()),
+                    priority: 10,
+                },
+            ],
+            selected_idx: 1,
+            max_width: 18,
+        };
+
+        let completions = completion_menu_to_quadraui_completions(&menu);
+        assert_eq!(completions.items.len(), 2);
+        assert_eq!(completions.selected_idx, 1);
+
+        let plain = &completions.items[0];
+        assert_eq!(plain.label, quadraui::StyledText::plain("plain_word"));
+        assert_eq!(plain.kind, quadraui::CompletionKind::Text);
+        assert_eq!(plain.detail, None);
+        assert_eq!(plain.documentation, None);
+
+        let plugin_item = &completions.items[1];
+        assert_eq!(
+            plugin_item.label,
+            quadraui::StyledText::plain("foobar_plugin(..)")
+        );
+        assert_eq!(plugin_item.kind, quadraui::CompletionKind::Function);
+        assert_eq!(
+            plugin_item.detail,
+            Some(quadraui::StyledText::plain("fn() -> ()"))
+        );
+        assert_eq!(
+            plugin_item.documentation,
+            Some(quadraui::StyledText::plain("docs"))
+        );
+    }
+
+    // ─── Visual selection painting (#1788 review) ──────────────────────────
+    //
+    // `build_selection`'s `end_col` must agree with what Ctrl+C/Ctrl+X
+    // actually copy/delete — otherwise the highlighted span and the
+    // clipboard payload disagree (non-blocking note on the #1788 review:
+    // quadraui always paints `SelectionKind::Char` as `end_col + 1`, so an
+    // *exclusive*-end selection's raw cursor column needs to be backed off
+    // by one before being handed to `SelectionRange`).
+
+    /// A VSCode-mode Shift+Right x6 selection (`visual_end_exclusive`,
+    /// cursor one past the last selected char) must paint exactly 6 cells,
+    /// matching the 6 characters Ctrl+C copies — not 7.
+    #[test]
+    fn build_selection_backs_off_exclusive_end_by_one_for_char_kind() {
+        let mut engine = Engine::new_for_test();
+        engine.buffer_mut().insert(0, "hello world\n");
+        engine.mode = Mode::Visual;
+        engine.visual_anchor = Some(Cursor { line: 0, col: 0 });
+        engine.visual_end_exclusive = true;
+        engine.view_mut().cursor = Cursor { line: 0, col: 6 };
+
+        let sel = build_selection(&engine, 0, 10).expect("selection must be emitted");
+        assert_eq!(sel.start_col, 0);
+        assert_eq!(
+            sel.end_col, 5,
+            "quadraui paints Char selections as end_col + 1, so an \
+             exclusive-end selection covering columns 0..6 must report \
+             end_col = 5, not the raw cursor column 6"
+        );
+    }
+
+    /// Plain Vim-style / mouse / Ctrl+D selections are inclusive-end
+    /// (`visual_end_exclusive` is `false`) — `end_col` must stay exactly the
+    /// cursor's own column, unchanged from before #1788.
+    #[test]
+    fn build_selection_leaves_inclusive_end_unchanged_for_char_kind() {
+        let mut engine = Engine::new_for_test();
+        engine.buffer_mut().insert(0, "hello world\n");
+        engine.mode = Mode::Visual;
+        engine.visual_anchor = Some(Cursor { line: 0, col: 0 });
+        engine.visual_end_exclusive = false;
+        engine.view_mut().cursor = Cursor { line: 0, col: 4 };
+
+        let sel = build_selection(&engine, 0, 10).expect("selection must be emitted");
+        assert_eq!(sel.start_col, 0);
+        assert_eq!(sel.end_col, 4);
+    }
 
     // ─── quadraui theme mapping (#1574) ────────────────────────────────────
     //
@@ -28443,7 +31253,7 @@ mod tests {
 
     #[test]
     fn test_from_vscode_json() {
-        let dir = std::env::temp_dir().join("vimcode_test_theme");
+        let dir = crate::harness::scratch_dir("vimcode_test_theme");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test-theme.json");
         std::fs::write(
@@ -28497,7 +31307,7 @@ mod tests {
     /// independent colours, not one derived from the other.
     #[test]
     fn from_vscode_json_prefers_explicit_active_border_over_foreground() {
-        let dir = std::env::temp_dir().join("vimcode_test_1547_active_border");
+        let dir = crate::harness::scratch_dir("vimcode_test_1547_active_border");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test-theme.json");
         std::fs::write(
@@ -28532,7 +31342,7 @@ mod tests {
     /// whatever built-in default `Theme::onedark()` seeded it with.
     #[test]
     fn from_vscode_json_falls_back_to_foreground_when_active_border_absent() {
-        let dir = std::env::temp_dir().join("vimcode_test_1547_active_border_fallback");
+        let dir = crate::harness::scratch_dir("vimcode_test_1547_active_border_fallback");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test-theme.json");
         std::fs::write(
@@ -28596,6 +31406,63 @@ mod tests {
         assert_eq!(bar.active_accent, Some(expected));
     }
 
+    /// #1688: the *descriptor* boundary for the editor tab-bar accent line.
+    /// `build_screen_layout`'s per-group loop sets `accent = Some(theme.
+    /// tab_active_accent)` only for `gid == engine.active_group`, so this
+    /// pins that the `quadraui::TabBar` handed to every backend already
+    /// carries the right `active_accent` for both the active and inactive
+    /// group of a split — before any backend rasteriser gets a chance to
+    /// drop it. #1688 found Win-GUI painting zero accent pixels anywhere in
+    /// the tab strip; this test rules out "the descriptor itself is wrong"
+    /// as the cause, narrowing the bug to the Win-GUI rasteriser (tracked
+    /// upstream, see `docs/PENDING_QUADRAUI_ISSUES.md`'s "Seven Win-GUI
+    /// rasterisers" entry / quadraui#1261) rather than anything in this
+    /// file.
+    #[test]
+    fn build_screen_layout_sets_tab_bar_active_accent_only_on_active_group() {
+        use crate::core::engine::Engine;
+        use crate::core::window::WindowRect;
+
+        let line_height = 20.0;
+        let char_width = 8.0;
+        let theme = Theme::vscode_dark();
+
+        let mut engine = Engine::new();
+        engine.execute_command("EditorGroupSplit");
+        assert_eq!(engine.group_layout.leaf_count(), 2);
+        let content_bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+        let (rects, _) = engine.calculate_group_window_rects(content_bounds, 32.0);
+        let screen = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            gtk_minimap_sizing(),
+        );
+        assert_eq!(screen.group_tab_bars.len(), 2);
+
+        let expected = Some(theme.tab_active_accent);
+        let mut saw_active_some = false;
+        for gtb in &screen.group_tab_bars {
+            if gtb.group_id == engine.active_group {
+                assert_eq!(
+                    gtb.bar.active_accent, expected,
+                    "the active group's tab bar must carry `theme.tab_active_accent`"
+                );
+                saw_active_some = true;
+            } else {
+                assert_eq!(
+                    gtb.bar.active_accent, None,
+                    "an inactive group's tab bar must carry no accent"
+                );
+            }
+        }
+        assert!(saw_active_some, "exactly one group must be active");
+    }
+
     /// #1127: `themes_dir()` must derive from the cross-platform
     /// `core::paths::vimcode_config_dir()` (which handles `APPDATA` on
     /// Windows), not read `$HOME` directly — reading `$HOME` raw would put
@@ -28629,7 +31496,7 @@ mod tests {
         use crate::core::engine::{Engine, OpenMode};
         use crate::core::window::SplitDirection;
 
-        let dir = std::env::temp_dir().join("vimcode_render_diff_groups");
+        let dir = crate::harness::scratch_dir("vimcode_render_diff_groups");
         std::fs::create_dir_all(&dir).unwrap();
         let f1 = dir.join("a.txt");
         let f2 = dir.join("b.txt");
@@ -28717,6 +31584,70 @@ mod tests {
         );
         assert_eq!(first_line.spell_errors[0].start_col, 4);
         assert_eq!(first_line.spell_errors[0].end_col, 8);
+    }
+
+    // ── RenderedWindow::visible_line_capacity (#1779) ────────────────────────
+
+    /// A one-line buffer in a 24-row window must report a row *capacity*
+    /// of 24 even though only 1 row of actual content was painted —
+    /// `run_shared_tick_chores` (`src/render.rs`) feeds this straight into
+    /// `Engine::set_viewport_for_window`, and `ensure_cursor_visible` (run
+    /// on every keystroke, including the one that grows this buffer to 2
+    /// lines) trusts that number to decide whether the viewport is tall
+    /// enough to show the cursor's line without scrolling.
+    ///
+    /// This is a supplementary unit test pinning the new field's *value*,
+    /// not the black-box coverage for #1779 — that is the real-pty
+    /// end-to-end test (`tests/pty_open_line_below_paints_all_lines.rs`)
+    /// and the in-process `TuiDriver` regression test
+    /// (`src/tui_main/app_on_tui_tests.rs`'s
+    /// `opening_a_line_below_the_last_line_paints_every_line_in_order_1779`),
+    /// both of which assert on painted screen content, not on this field.
+    ///
+    /// RED against the pre-fix shape (`visible_line_capacity` not a field;
+    /// callers read `lines.len()` instead): `lines.len()` here is `1`, not
+    /// `24` — exactly the stale-viewport value that made `ensure_cursor_visible`
+    /// believe a 24-row window could show only one line, and scroll line 0
+    /// out of view the moment `o<text><Esc>` grew the buffer to two lines.
+    #[test]
+    fn visible_line_capacity_is_the_window_row_capacity_not_the_painted_line_count() {
+        use crate::core::Engine;
+
+        let mut engine = Engine::new();
+        // No per-window status row, so the window's whole 24-row rect is
+        // text rows — keeps the expected capacity a round number instead
+        // of also pinning `window_status_row_reserved`'s own default.
+        engine.settings.window_status_line = false;
+        engine.buffer_mut().insert(0, "ZQXW_ONELINE\n");
+
+        let rects = vec![(
+            engine.active_window_id(),
+            WindowRect::new(0.0, 0.0, 80.0, 24.0),
+        )];
+        let theme = Theme::onedark();
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        );
+
+        let window = &layout.windows[0];
+        assert_eq!(
+            window.lines.len(),
+            1,
+            "precondition: a 1-line buffer only paints 1 line of content"
+        );
+        assert_eq!(
+            window.visible_line_capacity, 24,
+            "the window's row capacity must reflect its actual 24-row \
+             rect, not how many lines the buffer currently has content \
+             for"
+        );
     }
 
     // ── status_bar_zone_hit_test (#672) ──────────────────────────────────────
@@ -28819,20 +31750,28 @@ mod tests {
         );
     }
 
-    /// #1541: the ruler segment is the right-most segment of the active
-    /// window's bar, so its own text must not carry a trailing space —
-    /// quadraui#1155 now reserves that outer-edge margin on pixel backends
-    /// (GTK/Win/macOS), and TUI has never had a scrollbar-style gutter to
-    /// hide a trailing blank column in. A stray trailing space here would
-    /// double the gap on the backends that already get one and would be a
-    /// visible dangling blank on TUI, which gets none.
+    /// #1541 established the rule this test covers; #1690 temporarily
+    /// moved the ruler to the *leftmost* of the right group (VS Code
+    /// parity) which made `sidebar_toggle_seg` the accidental right-most
+    /// segment by default; #1760 moved the ruler (`Ln N, Col N`) back to
+    /// being the bar's unconditional right-most segment — not for visual
+    /// parity this time, but because that is the only position
+    /// `StatusBar::layout`'s priority-drop (quadraui's `fit_right_start`/
+    /// `layout_padded`) treats as undroppable, and #1760 reported the
+    /// ruler silently vanishing once other optional segments competed for
+    /// space. Its text must not carry a trailing space — quadraui#1155
+    /// reserves that outer-edge margin on pixel backends (GTK/Win/macOS),
+    /// and TUI has never had a scrollbar-style gutter to hide a trailing
+    /// blank column in. A stray trailing space here would double the gap
+    /// on the backends that already get one and would be a visible
+    /// dangling blank on TUI, which gets none.
     ///
     /// RED against the pre-#1541 body (`format!(" Ln {}, Col {} ", ...)`,
-    /// trailing space included): `right_text` ends in `" "`, and this
-    /// assertion fails — confirmed by reverting just this segment's format
+    /// trailing space included): `last.text` ends in `" "`, and the second
+    /// assertion fails — confirmed by reverting just `cursor_seg`'s format
     /// string and re-running.
     #[test]
-    fn test_window_status_line_ruler_segment_has_no_trailing_space() {
+    fn test_window_status_line_right_most_segment_has_no_trailing_space() {
         use crate::core::engine::Engine;
         let mut engine = Engine::new();
         engine.settings.window_status_line = true;
@@ -28843,14 +31782,22 @@ mod tests {
         let wid = engine.active_window_id();
         let status = build_window_status_line(&engine, &theme, wid, true);
 
+        // #1760: the ruler is the bar's unconditional right-most segment —
+        // see this test's own doc for why that is no longer a VS-Code-
+        // visual-parity claim but a drop-priority one.
         let last = status
             .right_segments
             .last()
             .expect("ruler on: the active window's bar must have a right-most segment");
         assert!(
             last.text.contains("Ln 1"),
-            "expected the ruler to be the right-most segment, got '{}'",
-            last.text
+            "expected the ruler to be the right-most segment of the right \
+             group, got {:?}",
+            status
+                .right_segments
+                .iter()
+                .map(|s| &s.text)
+                .collect::<Vec<_>>()
         );
         assert!(
             !last.text.ends_with(' '),
@@ -28964,8 +31911,9 @@ mod tests {
         assert!(status.left_segments[0].text.contains("INSERT"));
         // Mode color used as text tint, not background
         assert_eq!(status.left_segments[0].fg, theme.status_mode_insert_bg);
-        // Background is derived from theme.background.lighten(0.10)
-        assert_eq!(status.left_segments[0].bg, theme.background.lighten(0.10));
+        // #1690: background comes straight from the theme's own
+        // `status_bg` key now, not a `background.lighten(0.10)` offset.
+        assert_eq!(status.left_segments[0].bg, theme.status_bg);
     }
 
     #[test]
@@ -29266,8 +32214,10 @@ mod tests {
         let wid = engine.active_window_id();
         let status = build_window_status_line(&engine, &theme, wid, true);
 
+        // #1690: the problems counter moved to `left_segments` (VS Code
+        // parity — far left of the bar, not mixed into the right cluster).
         let diag_segs: Vec<&StatusSegment> = status
-            .right_segments
+            .left_segments
             .iter()
             .filter(|s| s.action == Some(StatusAction::ShowDiagnostics))
             .collect();
@@ -29332,8 +32282,10 @@ mod tests {
         let theme = Theme::onedark();
         let wid = engine.active_window_id();
         let status = build_window_status_line(&engine, &theme, wid, true);
+        // #1690: see the sibling "always shown at zero" test above for why
+        // this reads `left_segments` now.
         let combined: String = status
-            .right_segments
+            .left_segments
             .iter()
             .filter(|s| s.action == Some(StatusAction::ShowDiagnostics))
             .map(|s| s.text.clone())
@@ -29586,6 +32538,10 @@ mod tests {
             .iter()
             .find(|s| s.action == Some(StatusAction::ToggleSidebar))
             .expect("expected sidebar toggle segment");
+        // #1760: trailing space restored — `sidebar_toggle_seg` is no
+        // longer (even by default) the bar's right-most segment now that
+        // `cursor_seg` unconditionally is; see its own doc in
+        // `build_window_status_line`.
         assert_eq!(
             sidebar_seg.text,
             format!(" {} ", crate::icons::STATUS_SIDEBAR_TOGGLE.s())
@@ -29626,6 +32582,8 @@ mod tests {
             .iter()
             .find(|s| s.action == Some(StatusAction::ToggleSidebar))
             .expect("expected sidebar toggle segment");
+        // #1760: trailing space restored — see the nerd-fonts-on assertion
+        // above.
         assert_eq!(sidebar_seg_ascii.text, " [S] ");
         let menu_seg_ascii = status_ascii
             .right_segments
@@ -30838,6 +33796,7 @@ mod tests {
             window_id: WindowId(0),
             rect,
             lines: vec![],
+            visible_line_capacity: 1,
             cursor: None,
             extra_cursors: vec![],
             selection: None,
@@ -30861,6 +33820,7 @@ mod tests {
             tabstop: 4,
             cursorline: false,
             status_line: None,
+            plugin_view: None,
         }
     }
 
@@ -30935,6 +33895,68 @@ mod tests {
             matches!(zone, WindowZone::TextArea { .. }),
             "a point in the real text columns must still resolve to \
              WindowZone::TextArea; got {zone:?}"
+        );
+    }
+
+    /// vimcode#1696: `to_q_editor`'s `editor.rect` is `rw.rect` verbatim —
+    /// the *pane's* full-width rect, by #1094's own design (the minimap
+    /// strip and quadraui's own drawn v/h scrollbar both have to sit
+    /// somewhere inside that wide rect, past the narrower text; see that
+    /// function's own doc comment and `build_screen_layout_with_breadcrumb_
+    /// row`'s "#1094" section above). `RenderedWindow.minimap_reserved_w`
+    /// never reaches `editor.rect`, so nothing then re-narrows the viewport
+    /// `quadraui::Editor::layout` computes `EditorLayout::text_bounds` from
+    /// — the exact value both backends' rasterisers size their glyph-
+    /// drawing budget off (Win-GUI's `visible_cols`-bounded
+    /// `win::editor::paint_line_text`; GTK's Cairo clip set to
+    /// `text_bounds.width`). This test pins that gap numerically rather
+    /// than by reading the source, so it is a **concrete regression target**
+    /// for the missing quadraui capability `docs/PENDING_QUADRAUI_ISSUES.md`'s
+    /// matching #1696 entry asks for (a way to reserve trailing content
+    /// width independently of where the v/h scrollbar anchors): once that
+    /// lands and vimcode adopts it, `text_bounds`'s right edge below should
+    /// land at `rect.width - minimap_reserved_w`, not `rect.width` itself.
+    ///
+    /// Deliberately **not** "fixed" by narrowing `to_q_editor`'s `rect`
+    /// directly — doing so moves `EditorLayout::v_scrollbar_bounds`/
+    /// `h_scrollbar_bounds` (both anchored to `viewport.x + viewport.width`)
+    /// in to sit flush against the now-narrower text instead of past the
+    /// strip at the pane's true right edge, which is the exact regression
+    /// #1094's own fix (and `window_zone_hit_test_h_scrollbar_click_
+    /// accounts_for_the_minimap_strip` above) was written to prevent. A
+    /// correct fix needs `Editor`/`EditorPaintOptions` to let a caller
+    /// reserve extra trailing width for content layout alone, leaving the
+    /// scrollbar anchor at the full `viewport.width` untouched — which does
+    /// not exist upstream today (confirmed by reading `layout_with_options`
+    /// at the pinned rev: `text_w`/`visible_cols` and
+    /// `v_scrollbar_bounds`/`h_scrollbar_bounds` are both derived from the
+    /// one `viewport.width`, with no second parameter to decouple them).
+    #[test]
+    fn to_q_editor_does_not_narrow_the_viewport_for_the_minimap_strip_1696() {
+        let rect = WindowRect::new(0.0, 0.0, 40.0, 10.0);
+        let minimap_reserved_w = 10.0;
+        // `total_lines <= visible_lines` (height 10 / line_height 1.0) keeps
+        // `has_v_scrollbar` false, so `text_w` below reduces to plain
+        // `viewport.width - gutter_w` and isolates exactly the minimap gap
+        // this test is about — no scrollbar-width term to account for too.
+        let rw = fixture_window(rect, 0, 1, 1, 30, minimap_reserved_w);
+
+        let editor = to_q_editor(&rw);
+        let layout = editor.layout(editor.rect, 1.0, 1.0);
+
+        let minimap_left_edge = rect.width - minimap_reserved_w;
+        let text_right_edge = (layout.text_bounds.x + layout.text_bounds.width) as f64;
+        assert!(
+            text_right_edge > minimap_left_edge,
+            "expected today's (unfixed) `text_bounds` to reach past the \
+             minimap strip's own left edge ({minimap_left_edge}) — got \
+             text_bounds ending at {text_right_edge}. If this now fails, \
+             `to_q_editor`/`Editor::layout` has started narrowing for the \
+             minimap; update this test and the matching \
+             `docs/PENDING_QUADRAUI_ISSUES.md` #1696 entry rather than \
+             deleting either — see this test's own doc comment for why a \
+             naive `to_q_editor` narrowing would itself be a regression of \
+             #1094 and needs a new quadraui capability instead."
         );
     }
 
@@ -31533,7 +34555,14 @@ mod tests {
     /// that silently degenerated to the coarse, file-wide one would produce
     /// a visibly different (and wrong) result rather than an accidental
     /// match) inside a `bounds`/`max_scroll` pair distinct from either.
-    fn fine_geometry_fixture() -> (quadraui::Rect, quadraui::Minimap, usize, usize) {
+    ///
+    /// The returned `thumb_length` is an arbitrary, non-zero stand-in for
+    /// the real, already-painted `viewport_highlight.height` a live caller
+    /// would pass (#1828 review: `fine_seek_geometry` no longer re-derives
+    /// this itself — see its doc comment) — neither test below depends on
+    /// its actual value, only that it is threaded straight through
+    /// unmodified into `track_length`.
+    fn fine_geometry_fixture() -> (quadraui::Rect, quadraui::Minimap, usize, f32) {
         let bounds = quadraui::Rect::new(0.0, 10.0, 5.0, 20.0); // S0 = 10, Sh = 20
         let minimap = quadraui::Minimap {
             id: quadraui::WidgetId::new("mm"),
@@ -31553,8 +34582,8 @@ mod tests {
             total_buffer_lines: 50_000,
         };
         let max_scroll = 40_000; // M
-        let viewport_lines = 30;
-        (bounds, minimap, max_scroll, viewport_lines)
+        let thumb_length = 1.5; // arbitrary; see doc comment above
+        (bounds, minimap, max_scroll, thumb_length)
     }
 
     /// Drive a [`fine_seek_geometry`] result through the real,
@@ -31604,7 +34633,7 @@ mod tests {
     /// visibly miss.
     #[test]
     fn fine_seek_geometry_grab_offset_is_an_identity_at_the_press_point() {
-        let (bounds, minimap, max_scroll, viewport_lines) = fine_geometry_fixture();
+        let (bounds, minimap, max_scroll, fixture_thumb_length) = fine_geometry_fixture();
         let scroll_top = 12_345;
         let py = 15.0; // inside [S0, S0 + Sh) = [10.0, 30.0)
 
@@ -31612,7 +34641,7 @@ mod tests {
             &bounds,
             &minimap,
             max_scroll,
-            viewport_lines,
+            fixture_thumb_length,
             scroll_top,
             py,
             true, // in_band: the identity derivation only applies here
@@ -31644,7 +34673,7 @@ mod tests {
     /// visibly different from `base` (1000) and `base + span` (1401) here.
     #[test]
     fn fine_seek_geometry_endpoints_span_exactly_the_painted_window() {
-        let (bounds, minimap, max_scroll, viewport_lines) = fine_geometry_fixture();
+        let (bounds, minimap, max_scroll, fixture_thumb_length) = fine_geometry_fixture();
         let base = minimap.lines.first().unwrap().line_idx;
         let span = minimap.lines.last().unwrap().line_idx + 1 - base;
 
@@ -31656,7 +34685,7 @@ mod tests {
             &bounds,
             &minimap,
             max_scroll,
-            viewport_lines,
+            fixture_thumb_length,
             0,
             bounds.y,
             false,
@@ -32841,7 +35870,7 @@ mod tests {
     #[test]
     fn test_open_file_preview_does_not_replace_permanent() {
         let mut e = test_engine("first file\n");
-        let dir = std::env::temp_dir().join("vimcode_test_preview");
+        let dir = crate::harness::scratch_dir("vimcode_test_preview");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         let f2 = dir.join("b.txt");
@@ -32882,7 +35911,7 @@ mod tests {
     #[test]
     fn test_open_file_in_tab_creates_new_tab() {
         let mut e = test_engine("scratch\n");
-        let dir = std::env::temp_dir().join("vimcode_test_tab");
+        let dir = crate::harness::scratch_dir("vimcode_test_tab");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         let f2 = dir.join("b.txt");
@@ -32939,7 +35968,7 @@ mod tests {
     #[test]
     fn test_behavior_tab_click_switches_tab() {
         let mut e = test_engine("first\n");
-        let dir = std::env::temp_dir().join("vimcode_test_tab_click");
+        let dir = crate::harness::scratch_dir("vimcode_test_tab_click");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         let f2 = dir.join("b.txt");
@@ -32967,7 +35996,7 @@ mod tests {
     #[test]
     fn test_behavior_tab_close_removes_tab() {
         let mut e = test_engine("scratch\n");
-        let dir = std::env::temp_dir().join("vimcode_test_tab_close");
+        let dir = crate::harness::scratch_dir("vimcode_test_tab_close");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         std::fs::write(&f1, "file A\n").unwrap();
@@ -32992,7 +36021,7 @@ mod tests {
     #[test]
     fn test_behavior_dirty_check_before_tab_close() {
         let mut e = test_engine("");
-        let dir = std::env::temp_dir().join("vimcode_test_dirty_close");
+        let dir = crate::harness::scratch_dir("vimcode_test_dirty_close");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         std::fs::write(&f1, "original\n").unwrap();
@@ -33059,7 +36088,7 @@ mod tests {
     #[test]
     fn test_behavior_explorer_context_menu() {
         let mut e = test_engine("");
-        let dir = std::env::temp_dir().join("vimcode_test_ctx_explorer");
+        let dir = crate::harness::scratch_dir("vimcode_test_ctx_explorer");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("test.txt");
         std::fs::write(&f1, "content\n").unwrap();
@@ -33283,7 +36312,7 @@ mod tests {
     #[test]
     fn test_behavior_tab_drag_drop_creates_split() {
         let mut e = test_engine("scratch\n");
-        let dir = std::env::temp_dir().join("vimcode_test_drag_drop");
+        let dir = crate::harness::scratch_dir("vimcode_test_drag_drop");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         std::fs::write(&f1, "file A\n").unwrap();
@@ -33313,7 +36342,7 @@ mod tests {
     #[test]
     fn test_behavior_goto_tab_promotes_preview() {
         let mut e = test_engine("scratch\n");
-        let dir = std::env::temp_dir().join("vimcode_test_promote");
+        let dir = crate::harness::scratch_dir("vimcode_test_promote");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         std::fs::write(&f1, "file A\n").unwrap();
@@ -33375,7 +36404,7 @@ mod tests {
     #[test]
     fn test_behavior_preview_reuse_then_permanent() {
         let mut e = test_engine("scratch\n");
-        let dir = std::env::temp_dir().join("vimcode_test_preview_reuse");
+        let dir = crate::harness::scratch_dir("vimcode_test_preview_reuse");
         let _ = std::fs::create_dir_all(&dir);
         let f1 = dir.join("a.txt");
         let f2 = dir.join("b.txt");
@@ -35447,8 +38476,10 @@ mod alt_key_router_tests {
     //! is precisely how the old duplicated blocks were able to drift without
     //! anyone noticing. These tests feed both spellings of one chord into
     //! [`route_alt_key`] and assert the two resolve identically; the
-    //! rendered-output halves live in `src/tui_main/shell_app.rs`
-    //! (`alt_*_via_shell_app`) and `src/gtk/testing.rs` (`alt_*_on_gtk`).
+    //! rendered-output halves live in `src/tui_main/app_on_tui_tests.rs`
+    //! (`alt_*_via_shell_app`, plus #1744's `mod vscode_mode_alt_rung_1744`)
+    //! and `src/gtk/testing.rs` (`alt_*_on_gtk`, plus #1744's
+    //! `mod alt_rung_1744`).
     use super::*;
     use crate::core::Mode;
 
@@ -35469,27 +38500,62 @@ mod alt_key_router_tests {
         tui: (&'static str, Option<char>),
         gtk: (&'static str, Option<char>),
         shift: bool,
+        ctrl: bool,
     }
 
     const ALT_Z: Chord = Chord {
         tui: ("", Some('z')),
         gtk: ("z", Some('z')),
         shift: false,
+        ctrl: false,
     };
     const ALT_SHIFT_UP: Chord = Chord {
         tui: ("Shift_Up", None),
         gtk: ("Up", None),
         shift: true,
+        ctrl: false,
+    };
+    const ALT_SHIFT_DOWN: Chord = Chord {
+        tui: ("Shift_Down", None),
+        gtk: ("Down", None),
+        shift: true,
+        ctrl: false,
     };
     const ALT_DOWN: Chord = Chord {
         tui: ("Down", None),
         gtk: ("Down", None),
         shift: false,
+        ctrl: false,
+    };
+    const ALT_LEFT: Chord = Chord {
+        tui: ("Left", None),
+        gtk: ("Left", None),
+        shift: false,
+        ctrl: false,
     };
     const ALT_RIGHT: Chord = Chord {
         tui: ("Right", None),
         gtk: ("Right", None),
         shift: false,
+        ctrl: false,
+    };
+    const CTRL_ALT_UP: Chord = Chord {
+        tui: ("Up", None),
+        gtk: ("Up", None),
+        shift: false,
+        ctrl: true,
+    };
+    const CTRL_ALT_DOWN: Chord = Chord {
+        tui: ("Down", None),
+        gtk: ("Down", None),
+        shift: false,
+        ctrl: true,
+    };
+    const CTRL_SHIFT_ALT_RIGHT: Chord = Chord {
+        tui: ("Right", None),
+        gtk: ("Right", None),
+        shift: true,
+        ctrl: true,
     };
 
     /// Run `chord` through the rung twice — once in each backend's spelling,
@@ -35503,7 +38569,7 @@ mod alt_key_router_tests {
                 e.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
                 e.mode = Mode::Insert;
             }
-            let outcome = route_alt_key(&mut e, name, unicode, chord.shift, true);
+            let outcome = route_alt_key(&mut e, name, unicode, chord.shift, chord.ctrl, true);
             (outcome, e.buffer().to_string(), e.message.clone())
         };
         let tui = run(chord.tui);
@@ -35540,11 +38606,14 @@ mod alt_key_router_tests {
     }
 
     /// Alt+Down moves the current line down in VSCode mode; Alt+Shift+Down
-    /// adds a cursor instead. The shift discrimination is the part TUI wrote
-    /// against crossterm's raw `KeyCode` + modifier flags and GTK never wrote
-    /// at all, so it is the arm most likely to drift again.
+    /// duplicates it downward instead (#1744 — it used to add a cursor,
+    /// VS Code's real chord for *that* is Ctrl+Alt+Down, see
+    /// [`ctrl_alt_up_down_add_a_cursor_distinct_from_plain_alt_up_down`]
+    /// below). The shift discrimination is the part TUI wrote against
+    /// crossterm's raw `KeyCode` + modifier flags and GTK never wrote at
+    /// all, so it is the arm most likely to drift again.
     #[test]
-    fn alt_down_moves_a_line_and_alt_shift_down_adds_a_cursor() {
+    fn alt_down_moves_a_line_and_alt_shift_down_duplicates_it() {
         let (outcome, text, _) = resolves_identically(&ALT_DOWN, true);
         assert_eq!(outcome, AltKeyOutcome::Handled);
         assert!(
@@ -35553,31 +38622,134 @@ mod alt_key_router_tests {
              below; buffer was {text:?}"
         );
 
-        // Alt+Shift+Up from line 0 has nowhere to add a cursor, so use it to
-        // prove the *decode* differs from Alt+Up: the line order must be
-        // untouched, where a mis-decoded `Alt_Up` would have moved it.
+        // Alt+Shift+Up from line 0 duplicates "alpha" above itself — proving
+        // the *decode* differs from plain Alt+Up (which would have swapped
+        // lines instead, and there is nothing above line 0 to swap with).
         let (outcome, text, _) = resolves_identically(&ALT_SHIFT_UP, true);
         assert_eq!(outcome, AltKeyOutcome::Handled);
         assert!(
-            text.starts_with("alpha\nbravo\n"),
-            "Alt+Shift+Up must decode as `Alt_Shift_Up` (add cursor), not \
-             `Alt_Up` (move line); buffer was {text:?}"
+            text.starts_with("alpha\nalpha\nbravo\n"),
+            "Alt+Shift+Up must decode as `Alt_Shift_Up` (duplicate line up), \
+             not `Alt_Up` (move line); buffer was {text:?}"
+        );
+
+        // Alt+Shift+Down duplicates "alpha" below itself, mirrored.
+        let (outcome, text, _) = resolves_identically(&ALT_SHIFT_DOWN, true);
+        assert_eq!(outcome, AltKeyOutcome::Handled);
+        assert!(
+            text.starts_with("alpha\nalpha\nbravo\n"),
+            "Alt+Shift+Down must duplicate the line downward; buffer was \
+             {text:?}"
         );
     }
 
-    /// Alt+Left / Alt+Right are mode-independent and hand the width change
-    /// back to the caller, because the two backends store the sidebar width in
-    /// different places. The *clamp* is shared.
+    /// #1744: VS Code's real `insertCursorAbove`/`insertCursorBelow` is
+    /// Ctrl+Alt+Up/Down, not plain Alt+Up/Down — and must leave the buffer
+    /// untouched (unlike the move-line chord it shares a base key with).
+    /// Verified RED against unfixed `develop`: before this change
+    /// `route_alt_key` had no `ctrl` parameter at all, so Ctrl+Alt+Up was
+    /// indistinguishable from plain Alt+Up and moved the line instead of
+    /// adding a cursor (`tests/vscode_keybinding_parity.rs`'s
+    /// `KNOWN_GAPS::CTRL_ALT_UP_IS_MOVE_LINE` pinned exactly this).
     #[test]
-    fn alt_arrows_ask_the_caller_to_resize_in_either_mode() {
-        for vscode in [false, true] {
-            let (outcome, ..) = resolves_identically(&ALT_RIGHT, vscode);
-            assert_eq!(
+    fn ctrl_alt_up_down_add_a_cursor_distinct_from_plain_alt_up_down() {
+        // `insertCursorAbove` has nowhere to add a cursor from line 0, so run
+        // this half directly (not through `resolves_identically`'s default-
+        // cursor fixture) with the cursor seeded on line 1, once per backend
+        // spelling.
+        let run_up = |(name, unicode): (&str, Option<char>)| {
+            let mut e = engine();
+            e.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+            e.mode = Mode::Insert;
+            e.view_mut().cursor.line = 1;
+            let outcome = route_alt_key(&mut e, name, unicode, false, true, true);
+            (
                 outcome,
-                AltKeyOutcome::ResizeSidebar(1),
-                "Alt+Right must widen the sidebar regardless of editor mode"
-            );
-        }
+                e.buffer().to_string(),
+                e.view().extra_cursors.len(),
+            )
+        };
+        let tui_up = run_up(CTRL_ALT_UP.tui);
+        let gtk_up = run_up(CTRL_ALT_UP.gtk);
+        assert_eq!(
+            tui_up, gtk_up,
+            "Ctrl+Alt+Up must resolve identically whichever backend spelled \
+             it: TUI said {tui_up:?}, GTK said {gtk_up:?}"
+        );
+        let (outcome, text, cursors) = tui_up;
+        assert_eq!(outcome, AltKeyOutcome::Handled);
+        assert_eq!(
+            text, "alpha\nbravo\ncharlie\n",
+            "Ctrl+Alt+Up (insertCursorAbove) must not move any line"
+        );
+        assert_eq!(cursors, 1, "Ctrl+Alt+Up must add exactly one cursor");
+
+        // `insertCursorBelow` has room from line 0 (there are lines below),
+        // so the default-cursor fixture is fine here.
+        let (outcome, text, _) = resolves_identically(&CTRL_ALT_DOWN, true);
+        assert_eq!(outcome, AltKeyOutcome::Handled);
+        assert_eq!(
+            text, "alpha\nbravo\ncharlie\n",
+            "Ctrl+Alt+Down (insertCursorBelow) must not move any line"
+        );
+        let mut e = engine();
+        e.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        e.mode = Mode::Insert;
+        route_alt_key(&mut e, "Down", None, false, true, true);
+        assert_eq!(
+            e.view().extra_cursors.len(),
+            1,
+            "Ctrl+Alt+Down must add exactly one cursor"
+        );
+    }
+
+    /// Alt+Left / Alt+Right resize the sidebar in Vim mode (mode-independent,
+    /// handing the width change back to the caller because the two backends
+    /// store the sidebar width in different places — the *clamp* is shared).
+    /// #1744: in VSCode mode the plain chord means navigate back/forward
+    /// instead (see [`vscode_mode_alt_left_right_navigate_instead_of_resize`]
+    /// below), so Ctrl+**Shift**+Alt+Right is VSCode mode's alternate resize
+    /// home — plain Ctrl+Alt+Right is already the shipped
+    /// `panel_keys.nav_forward` accelerator, which the accelerator tier
+    /// claims *above* this rung in the live app (see [`route_alt_key`]'s own
+    /// doc), so it cannot be the alternate home.
+    #[test]
+    fn alt_arrows_resize_in_vim_mode_and_vscode_mode_ctrl_shift_alt() {
+        let (outcome, ..) = resolves_identically(&ALT_RIGHT, false);
+        assert_eq!(
+            outcome,
+            AltKeyOutcome::ResizeSidebar(1),
+            "Vim-mode Alt+Right must widen the sidebar"
+        );
+
+        let (outcome, ..) = resolves_identically(&CTRL_SHIFT_ALT_RIGHT, true);
+        assert_eq!(
+            outcome,
+            AltKeyOutcome::ResizeSidebar(1),
+            "VSCode-mode Ctrl+Shift+Alt+Right must widen the sidebar, now \
+             that plain Alt+Right means navigate-forward in that mode and \
+             plain Ctrl+Alt+Right is the shipped tab-history accelerator"
+        );
+
+        // Ctrl+Alt+Right alone (no Shift) must NOT resize in VSCode mode —
+        // the resize arms above require both `ctrl` and `shift`, so this
+        // falls through to the same `vscode_alt_key_name` lookup plain
+        // Alt+Right uses (navigate-forward; `ctrl` is not part of that
+        // lookup's key, only its *shift* half is). This function is never
+        // actually called with this exact shape in the live app — the
+        // accelerator tier above it claims plain Ctrl+Alt+Right first (see
+        // this function's own doc) — but pinning what it *would* do keeps
+        // the resize arms' `ctrl && shift` guard from silently degrading to
+        // `ctrl` alone again.
+        let mut e = engine();
+        e.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        e.mode = Mode::Insert;
+        assert_eq!(
+            route_alt_key(&mut e, "Right", None, false, true, true),
+            AltKeyOutcome::Handled,
+            "plain Ctrl+Alt+Right (no Shift) must not resize — it falls to \
+             the navigate-forward arm instead, same as plain Alt+Right"
+        );
 
         assert_eq!(alt_resized_sidebar_width(30, 1), 31);
         assert_eq!(alt_resized_sidebar_width(30, -1), 29);
@@ -35593,14 +38765,136 @@ mod alt_key_router_tests {
         );
     }
 
-    /// A chord with no arm must fall through untouched — the rung is a filter,
-    /// not a sink. `Alt+q` is deliberately not bound to anything.
+    /// #1798: the sidebar's opening width is a line-height *multiple*, so one
+    /// number means a 20-column strip on TUI and a ~460px slab on a GUI
+    /// backend — which left an 800px window no room for a second editor tab.
+    /// [`UnitProfile::sidebar_width_lh`] carries the per-unit value; this
+    /// pins the three properties that split has to keep.
+    ///
+    /// The behavioural proof is in the driver tests — `gtk::testing`'s
+    /// `explorer_double_click_opens_second_file_in_a_second_tab_1798` runs at
+    /// the reported 800x480 and fails if the GUI profile goes back to `20.0`.
+    /// This guards the *invariants* a future edit to either profile could
+    /// break while leaving that test green (or while breaking it for a reason
+    /// its message would not explain).
+    #[test]
+    fn unit_profiles_scale_the_sidebar_width_per_unit_1798() {
+        let (px, cell) = (UnitProfile::px(), UnitProfile::cell());
+
+        // 1. The TUI is untouched: 20 *cells*, the value it already shipped
+        //    (`ShellConfig::new`'s own default, which `App::shell_config`
+        //    used to leave alone on every backend).
+        assert_eq!(cell.sidebar_width_lh, 20.0);
+
+        // 2. The GUI opens narrower than that, because one GUI line height
+        //    is ~23 device pixels rather than one terminal row.
+        assert!(
+            px.sidebar_width_lh < cell.sidebar_width_lh,
+            "the GUI profile must open narrower than the TUI's cell count, or \
+             #1798's 800px window still has no room for a second tab: {} vs {}",
+            px.sidebar_width_lh,
+            cell.sidebar_width_lh
+        );
+
+        // 3. Neither profile may open *below* the shared Alt rung's floor.
+        //    Two independent reasons, both load-bearing:
+        //      * `AppShell::compute_layout` clamps the opening width through
+        //        `min_sidebar_width` (still `ALT_SIDEBAR_WIDTH_MIN` on every
+        //        backend), so a narrower value is silently discarded; and
+        //      * the user's first Alt+Right would jump straight to the floor
+        //        with no way back, since `alt_resized_sidebar_width` clamps to
+        //        the same bound (measured at 10.0 on GTK: 230px -> 345px on
+        //        Alt+Right, then stuck at 345px on Alt+Left).
+        //    Lowering that floor per-unit is a change to the *shared* rung's
+        //    cross-backend contract (#759) and wants its own issue; until
+        //    then this is the real lower bound on `sidebar_width_lh`.
+        for (name, p) in [("px", px), ("cell", cell)] {
+            assert!(
+                p.sidebar_width_lh >= ALT_SIDEBAR_WIDTH_MIN as f32,
+                "{name} profile opens the sidebar at {}, below the shared Alt \
+                 rung's floor of {} — compute_layout would clamp it back up \
+                 and Alt+Left could never return to it",
+                p.sidebar_width_lh,
+                ALT_SIDEBAR_WIDTH_MIN
+            );
+            assert!(
+                p.sidebar_width_lh <= ALT_SIDEBAR_WIDTH_MAX as f32,
+                "{name} profile opens the sidebar at {}, above the shared Alt \
+                 rung's ceiling of {}",
+                p.sidebar_width_lh,
+                ALT_SIDEBAR_WIDTH_MAX
+            );
+        }
+    }
+
+    /// #1744: VS Code's `workbench.action.navigateBack` (Alt+Left) returns the
+    /// cursor to the last jump-list entry — the same mechanism Vim mode's
+    /// Ctrl-O already uses (`Engine::jump_list_back`) — rather than resizing
+    /// the sidebar, which is where this chord used to land unconditionally
+    /// (`AltBase::Left`'s old mode-independent arm, with no VSCode-mode
+    /// exception at all). Verified RED against unfixed `develop`: the old
+    /// unconditional `AltBase::Left => ResizeSidebar(-1)` arm ran before the
+    /// VSCode-mode tier ever got a chance, so this chord could never reach
+    /// `jump_list_back` (`KNOWN_GAPS::ALT_LEFT_RIGHT_IS_SIDEBAR_RESIZE`).
+    #[test]
+    fn vscode_mode_alt_left_right_navigate_instead_of_resize() {
+        let mut e = engine();
+        e.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        e.mode = Mode::Insert;
+        e.push_jump_location();
+        e.view_mut().cursor.line = 2;
+
+        let outcome = route_alt_key(&mut e, "Left", None, false, false, true);
+        assert_eq!(
+            outcome,
+            AltKeyOutcome::Handled,
+            "VSCode-mode Alt+Left must be handled here, not handed back as \
+             ResizeSidebar"
+        );
+        assert_eq!(
+            e.view().cursor.line,
+            0,
+            "Alt+Left (navigateBack) must return to the jump-list entry"
+        );
+
+        e.view_mut().cursor.line = 2;
+        let outcome = route_alt_key(&mut e, "Right", None, false, false, true);
+        assert_eq!(
+            outcome,
+            AltKeyOutcome::Handled,
+            "VSCode-mode Alt+Right must be handled here, not handed back as \
+             ResizeSidebar"
+        );
+        assert_eq!(
+            e.view().cursor.line,
+            2,
+            "Alt+Right (navigateForward) must move forward in the jump \
+             list, back to the line Alt+Left just left — not leave the \
+             cursor on line 0 where Alt+Left's own assertion above left it"
+        );
+
+        // Sanity: the same chords still resize in Vim mode.
+        let (outcome, ..) = resolves_identically(&ALT_LEFT, false);
+        assert_eq!(outcome, AltKeyOutcome::ResizeSidebar(-1));
+    }
+
+    /// A chord with no arm must fall through untouched — this rung itself
+    /// never sinks it. `Alt+q` is deliberately not bound to anything.
+    ///
+    /// #1764: this rung's own `Fallthrough` return is no longer the end of
+    /// the story for a printable-char base like `'q'` — the caller
+    /// (`App::handle_key_press`'s `Fallthrough` arm) now substitutes an
+    /// implicit Escape for it instead of redelivering the bare key. That
+    /// substitution lives in `app.rs`, one layer above what this function
+    /// and this test can see; what this test still pins is this rung's own
+    /// contract, that it does not claim the chord itself.
     #[test]
     fn an_unclaimed_alt_chord_falls_through_on_both_spellings() {
         let unbound = Chord {
             tui: ("", Some('q')),
             gtk: ("q", Some('q')),
             shift: false,
+            ctrl: false,
         };
         for vscode in [false, true] {
             let (outcome, ..) = resolves_identically(&unbound, vscode);
@@ -35617,13 +38911,46 @@ mod alt_key_router_tests {
         let mut e = engine();
         e.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
         assert_eq!(
-            route_alt_key(&mut e, "Down", None, false, false),
+            route_alt_key(&mut e, "Down", None, false, false, false),
             AltKeyOutcome::Fallthrough
         );
         assert!(
             e.buffer().to_string().starts_with("alpha\n"),
             "a plain Down must not have been decoded as `Alt_Down`"
         );
+    }
+
+    /// #1764 (review nit, round 1): every other predicate on this rung has
+    /// its own exhaustive-over-`Mode` unit test here; `alt_mnemonic_open_
+    /// allowed` had none. Pins both halves of its contract: on the
+    /// toggleable (TUI) profile only Normal/Visual* allow a fresh open, and
+    /// on every other (GTK/macOS/Win) profile every mode allows it — there
+    /// is no pty-fusion ambiguity to defend against there.
+    #[test]
+    fn alt_mnemonic_open_allowed_is_normal_and_visual_only_on_the_toggleable_profile() {
+        let toggleable_allowed = [
+            Mode::Normal,
+            Mode::Visual,
+            Mode::VisualLine,
+            Mode::VisualBlock,
+        ];
+        let toggleable_blocked = [Mode::Insert, Mode::Replace, Mode::Command, Mode::Search];
+        for mode in toggleable_allowed {
+            assert!(
+                alt_mnemonic_open_allowed(mode, true),
+                "{mode:?} must allow a fresh mnemonic open on the toggleable profile"
+            );
+            // Every mode is allowed on a non-toggleable (GTK/macOS/Win)
+            // profile — there is no pty to fuse an Escape into the chord.
+            assert!(alt_mnemonic_open_allowed(mode, false));
+        }
+        for mode in toggleable_blocked {
+            assert!(
+                !alt_mnemonic_open_allowed(mode, true),
+                "{mode:?} must block a fresh mnemonic open on the toggleable profile"
+            );
+            assert!(alt_mnemonic_open_allowed(mode, false));
+        }
     }
 }
 
@@ -36398,5 +39725,145 @@ mod slice7_router_tests {
             marked, "foo",
             "diagnostic mark must land on 'foo', not shifted left"
         );
+    }
+
+    // ── #146: plugin-declared view → `quadraui::Form` ───────────────────
+
+    fn fixture_view() -> crate::core::plugin_ui::PluginView {
+        use crate::core::plugin_ui::{PluginView, ViewField, ViewFieldKind, VIEW_SCHEMA_VERSION};
+        let f = |id: &str, label: &str, kind: ViewFieldKind| ViewField {
+            id: id.to_string(),
+            label: label.to_string(),
+            hint: String::new(),
+            disabled: false,
+            error: None,
+            warning: None,
+            kind,
+        };
+        PluginView {
+            id: "main".to_string(),
+            schema_version: VIEW_SCHEMA_VERSION,
+            body: None,
+            fields: vec![
+                f("hdr", "Header", ViewFieldKind::Label),
+                f(
+                    "url",
+                    "URL",
+                    ViewFieldKind::Text {
+                        value: "https://x".to_string(),
+                        placeholder: String::new(),
+                    },
+                ),
+                f("send", "Send", ViewFieldKind::Button),
+            ],
+        }
+    }
+
+    #[test]
+    fn plugin_view_form_namespaces_every_widget_id() {
+        let form = plugin_view_to_form("my-ext", &fixture_view(), 1, 0, true, None);
+        let ids: Vec<String> = form
+            .fields
+            .iter()
+            .map(|f| f.id.as_str().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "plugin:my-ext:hdr".to_string(),
+                "plugin:my-ext:url".to_string(),
+                "plugin:my-ext:send".to_string(),
+            ]
+        );
+        // Interaction state is vimcode-owned, taken from the arguments rather
+        // than from anything the plugin declared.
+        assert_eq!(
+            form.focused_field.as_ref().map(|w| w.as_str()),
+            Some("plugin:my-ext:url")
+        );
+        assert!(form.has_focus);
+    }
+
+    #[test]
+    fn plugin_view_form_never_hands_a_plugin_the_text_cursor() {
+        // `cursor`/`selection_anchor` are byte offsets into the value; letting a
+        // plugin set them is how you get a caret mid-codepoint. #146's ABI
+        // decision keeps them out of the vocabulary entirely — assert the
+        // adapter does not invent one either.
+        let form = plugin_view_to_form("my-ext", &fixture_view(), 0, 0, false, None);
+        match &form.fields[1].kind {
+            quadraui::FieldKind::TextInput {
+                cursor,
+                selection_anchor,
+                ..
+            } => {
+                assert!(cursor.is_none());
+                assert!(selection_anchor.is_none());
+            }
+            other => panic!("expected a TextInput field, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_settings_form_event_is_not_mistaken_for_a_plugin_one() {
+        // The Settings panel paints through the *same* `FormController` shape,
+        // with ids like `cat-0` / `core-tabstop`. If the namespace check were
+        // dropped, a Settings click would be dispatched into a plugin.
+        assert!(
+            plugin_view_event_from_form_event(&quadraui::FormEvent::ButtonClicked {
+                id: quadraui::WidgetId::new("save"),
+            })
+            .is_none()
+        );
+        let plugin = plugin_view_event_from_form_event(&quadraui::FormEvent::ButtonClicked {
+            id: quadraui::WidgetId::new("plugin:my-ext:send"),
+        })
+        .expect("a namespaced id must resolve");
+        assert_eq!(plugin.0, "my-ext");
+        assert_eq!(plugin.1, "send");
+        assert_eq!(
+            plugin.2,
+            crate::core::plugin_ui::ViewEventKind::ButtonClicked
+        );
+    }
+
+    #[test]
+    fn a_toggle_group_entry_keeps_its_own_id_through_the_round_trip() {
+        use crate::core::plugin_ui::{
+            PluginView, ViewEventKind, ViewField, ViewFieldKind, ViewToggle, VIEW_SCHEMA_VERSION,
+        };
+        let view = PluginView {
+            id: "f".to_string(),
+            schema_version: VIEW_SCHEMA_VERSION,
+            body: None,
+            fields: vec![ViewField {
+                id: "flags".to_string(),
+                label: "Flags".to_string(),
+                hint: String::new(),
+                disabled: false,
+                error: None,
+                warning: None,
+                kind: ViewFieldKind::Toggles {
+                    toggles: vec![ViewToggle {
+                        id: "case".to_string(),
+                        label: "Aa".to_string(),
+                        value: false,
+                    }],
+                },
+            }],
+        };
+        let form = plugin_view_to_form("my-ext", &view, 0, 0, false, None);
+        let inner = match &form.fields[0].kind {
+            quadraui::FieldKind::ToggleGroup { toggles } => toggles[0].id.clone(),
+            other => panic!("expected a ToggleGroup, got {other:?}"),
+        };
+        assert_eq!(inner.as_str(), "plugin:my-ext:case");
+        let resolved = plugin_view_event_from_form_event(&quadraui::FormEvent::ToggleChanged {
+            id: inner,
+            value: true,
+        })
+        .expect("the sub-widget id must resolve back to the plugin");
+        assert_eq!(resolved.1, "case");
+        assert_eq!(resolved.2, ViewEventKind::ToggleChanged { value: true });
     }
 }

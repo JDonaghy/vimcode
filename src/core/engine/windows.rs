@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::settings::ExplorerAction;
 
 /// A window's own `View::viewport_lines`/`viewport_cols` are content-space —
 /// chrome (each window's own status line) already subtracted, per
@@ -654,12 +655,16 @@ impl Engine {
 
     /// Move focus to the next window in the current tab.
     pub fn focus_next_window(&mut self) {
+        let old = self.active_window_id();
         self.active_tab_mut().cycle_next_window();
+        self.fire_win_focus_change(old, self.active_window_id());
     }
 
     /// Move focus to the previous window in the current tab.
     pub fn focus_prev_window(&mut self) {
+        let old = self.active_window_id();
         self.active_tab_mut().cycle_prev_window();
+        self.fire_win_focus_change(old, self.active_window_id());
     }
 
     /// Move focus to a window in the given direction.
@@ -686,8 +691,10 @@ impl Engine {
                 }
             });
             if let Some(next_group) = adjacent {
+                let old = self.active_window_id();
                 self.prev_active_group = Some(self.active_group);
                 self.active_group = next_group;
+                self.fire_win_focus_change(old, self.active_window_id());
             } else {
                 // No adjacent group → signal overflow to TUI/GTK
                 self.window_nav_overflow = Some(forward);
@@ -740,10 +747,12 @@ impl Engine {
     /// (`Engine::mouse_click`); this is the first that needs the activation
     /// alone.
     pub(crate) fn activate_window(&mut self, window_id: WindowId) {
+        let old = self.active_window_id();
         self.focus_group_for_window(window_id);
         if self.windows.contains_key(&window_id) {
             self.active_tab_mut().focus_window(window_id);
         }
+        self.fire_win_focus_change(old, self.active_window_id());
     }
 
     /// The window occupying the screen's top-left (`last == false`) or
@@ -781,7 +790,9 @@ impl Engine {
     pub fn set_cursor_for_window(&mut self, window_id: WindowId, line: usize, col: usize) {
         // Make the window active
         if self.windows.contains_key(&window_id) {
+            let old = self.active_window_id();
             self.active_tab_mut().focus_window(window_id);
+            self.fire_win_focus_change(old, self.active_window_id());
 
             // Get buffer and clamp line
             let buffer = self.buffer();
@@ -1611,6 +1622,56 @@ impl Engine {
         });
     }
 
+    /// Open the Explorer header's "..." overflow menu (#1693) — the
+    /// dropdown twin of the view-actions toolbar row's own four buttons
+    /// (New File / New Folder / Refresh Explorer / Collapse Folders in
+    /// Explorer), triggered from the overflow button rather than a
+    /// right-clicked row. `x`/`y` are the button's position in character
+    /// cells (mirrors `open_editor_action_menu`'s contract) and
+    /// `trigger_height` the button row's height in `line_height` units, so
+    /// the popup opens flush below the button rather than anchored to the
+    /// cursor.
+    pub fn open_explorer_overflow_menu(&mut self, x: u16, y: u16, trigger_height: f32) {
+        let items = vec![
+            ContextMenuItem {
+                label: "New File...".into(),
+                action: "new_file".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "New Folder...".into(),
+                action: "new_folder".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Refresh Explorer".into(),
+                action: "refresh_explorer".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Collapse Folders in Explorer".into(),
+                action: "collapse_all".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+        ];
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::ExplorerPanel,
+            items,
+            selected: 0,
+            screen_x: x,
+            screen_y: y,
+            trigger_height,
+        });
+    }
+
     /// Open a context menu for the editor area (right-click on buffer text).
     pub fn open_editor_context_menu(&mut self, x: u16, y: u16) {
         let has_file = self.file_path().is_some();
@@ -1878,6 +1939,26 @@ impl Engine {
                     _ => {}
                 }
             }
+            // #1693: unlike the per-row menu above, every action here is
+            // fully resolved in-engine — there is no right-clicked row to
+            // set as the selection first, so `dispatch_explorer_crud`'s own
+            // "fall back to the current selection, or `cwd`" behaviour is
+            // already correct with no backend plumbing needed.
+            ContextMenuTarget::ExplorerPanel => match action.as_str() {
+                "new_file" => {
+                    self.dispatch_explorer_crud(ExplorerAction::NewFile);
+                }
+                "new_folder" => {
+                    self.dispatch_explorer_crud(ExplorerAction::NewFolder);
+                }
+                "refresh_explorer" => {
+                    self.explorer_needs_refresh = true;
+                }
+                "collapse_all" => {
+                    self.explorer_collapse_all();
+                }
+                _ => {}
+            },
             ContextMenuTarget::Editor => match action.as_str() {
                 "goto_definition" => {
                     self.lsp_request_definition();
@@ -2657,8 +2738,8 @@ impl Engine {
 
     /// Apply per-group tab bar widths (in char-cells) measured by the most
     /// recent draw, then re-check that every group's active tab is on-screen.
-    /// Returns `true` iff any width or any `tab_scroll_offset` actually
-    /// changed — when true, the calling backend should trigger one more
+    /// Returns `true` iff any group's `tab_scroll_offset` actually changed as
+    /// a result — when true, the calling backend should trigger one more
     /// draw cycle so the corrected scroll offset reaches the screen.
     ///
     /// **This is the single contract every UI backend must call after each
@@ -2683,17 +2764,30 @@ impl Engine {
     ///   returns true, `self.draw_needed.set(true)` schedules the next
     ///   `tick_dispatch` to return `Reaction::Redraw`.
     ///
-    /// The width/scroll change-tracking lets backends avoid an unconditional
-    /// extra paint per frame; the feedback loop converges in ≤2 frames
-    /// because the second draw measures the same width and reports no change.
+    /// #1722: the return value used to be `width_bookkeeping_changed ||
+    /// scroll_changed` — i.e. it also forced a redraw whenever the raw
+    /// `tab_bar_width` value this call just stored differed from what was
+    /// stored before, even if that difference never moved
+    /// `tab_scroll_offset` (same tabs visible, same offset, same pixels on
+    /// screen either way). That raw value is *itself* derived from the
+    /// paint that already happened this frame, so a bare change in it has
+    /// nothing left to correct — unlike a `tab_scroll_offset` correction,
+    /// which does change what the next paint draws. On a pixel-measuring
+    /// backend (GTK/Win-GUI/macOS) the per-frame width can wobble by a
+    /// sub-pixel-rounding unit with several tabs open — each wobble is a
+    /// legitimate "the width changed" but a no-op "did anything paint
+    /// differently", and the old contract turned every one of those into
+    /// a forced repaint, which re-measured a slightly different width and
+    /// forced another, indefinitely. Basing the signal purely on
+    /// `tab_scroll_offset` (the one piece of state a width correction can
+    /// actually move) keeps the real "active tab was scrolled out of view"
+    /// case working (covered by
+    /// `test_post_draw_apply_widths_detects_scroll_change`, `tests.rs`) while
+    /// making the cosmetic-only case report no change
+    /// (`test_post_draw_apply_widths_reports_changes`, same file).
     pub fn post_draw_apply_widths(&mut self, widths: &[(GroupId, usize)]) -> bool {
-        let mut changed = false;
         for &(gid, width) in widths {
-            let before = self.editor_groups.get(&gid).map(|g| g.tab_bar_width);
             self.set_tab_visible_count(gid, width);
-            if before != self.editor_groups.get(&gid).map(|g| g.tab_bar_width) {
-                changed = true;
-            }
         }
         let scrolls_before: std::collections::HashMap<GroupId, usize> = self
             .editor_groups
@@ -2701,11 +2795,9 @@ impl Engine {
             .map(|(&gid, g)| (gid, g.tab_scroll_offset))
             .collect();
         self.ensure_all_groups_tabs_visible();
-        let scroll_changed = self
-            .editor_groups
+        self.editor_groups
             .iter()
-            .any(|(gid, g)| scrolls_before.get(gid) != Some(&g.tab_scroll_offset));
-        changed || scroll_changed
+            .any(|(gid, g)| scrolls_before.get(gid) != Some(&g.tab_scroll_offset))
     }
 
     // =======================================================================

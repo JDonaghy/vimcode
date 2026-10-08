@@ -1,0 +1,117 @@
+# Tier-2 macOS-native smoke spec for vimcode#1646 (claude-coordinator epic
+# #3482, v0.5.551's new real-platform acceptance drivers).
+#
+# Driver: `mac-native` (coord/mac_native_driver.py) — launches the real
+# vimcode `.app`/binary, finds its real window, and probes it with real
+# `CGEvent` input injection, the Accessibility (AX) tree, and
+# `screencapture -l <windowid>`. `coord` supplies the actual
+# `launch_command`/`cwd`; this file assumes that command opens a small,
+# real, non-empty text file (kept non-empty for parity with the other
+# Tier-2 specs and so a future minimap-content check — see this file's
+# "DELIBERATELY OMITTED" comment below — has something to show once one
+# exists).
+#
+# Unlike Win-GUI (`tests/smoke-spec/win-gui.yaml`, which draws its own menu
+# row into the window's client area with no native menu at all —
+# #1629/quadraui#1228), macOS keeps a genuinely **native** menu bar
+# (`quadraui`'s `MacBackend::backend_caps()` is the one backend that still
+# declares `native_menu: true`) and genuinely native traffic-light window
+# buttons (`quadraui/src/macos/run.rs`'s `window_style_mask`: `Titled |
+# Closable | ...` with `titlebarAppearsTransparent`/`fullSizeContentView`
+# for the custom-painted titlebar *background*, while "the native traffic
+# lights float on top of it" — that file's own comment). Both are real
+# AppKit controls, so (unlike the Win-GUI dropdown/caption buttons) they
+# are already Accessibility-visible without any of the custom AT-provider
+# wiring docs/PENDING_QUADRAUI_ISSUES.md's "No UIA/NSAccessibility/AT-SPI
+# provider wiring..." entry describes being missing for vimcode's own
+# *drawn* content. The menu-bar and close-button checks below are
+# therefore expected GREEN today, not expected-red regression guards —
+# this file's only expected-red seed checks are the two "All GUI specs"
+# ones shared with every other platform.
+#
+# `move_window` (`NativeRunner._do_launch`) positions the window's top-left
+# at screen `(0, 0)`. A `CGEventPost` click is a real *screen*-coordinate
+# injection regardless of window z-order, so a small `y` (within the
+# macOS menu bar's own ~22px height) lands on the always-on-top global
+# menu bar even though the app's own window renders underneath/behind it
+# there — this is what lets a `mac-native` click reach "File" at all.
+# `x` for "File" (the first real menu after the Apple logo and the bold
+# application-name menu) is a first-approximation guess, NOT yet confirmed
+# against a real running `vimcode` process's actual menu-bar layout on real
+# macOS hardware (macmini).
+#
+# UNLIKE `win-gui.yaml`/`win-terminal.yaml` (both real-hardware-confirmed
+# via WSL interop to dell64's attached Windows host — see those files' own
+# header comments), this file has NOT had a real run: the worker that wrote
+# this fix iteration operates from a sandboxed Linux worktree with no path
+# to macOS hardware (no macmini access, no macOS cross-compile target that
+# produces a runnable binary the way `cargo xwin` does for Windows). Saying
+# so explicitly here rather than leaving the coordinates looking confirmed
+# — this file's pixel coordinates and `AXMenuBarItem`/`AXMenuItem` role
+# strings remain first-approximation guesses pending an operator with
+# actual macmini access running this spec (or driving `vimcode` by hand
+# with the same checks) and recording pass/fail back into this comment.
+name: vimcode-mac-gui
+width: 1024
+height: 768
+steps:
+  - type: launch
+    id: launch
+    timeout_ms: 15000
+
+  - type: wait
+    id: startup-settle
+    ms: 1500
+
+  # Real native global menu bar — `AXRoleAttribute` for a top-level menu
+  # bar entry is literally `AXMenuBarItem` (not the Win32/UIA
+  # `LocalizedControlType` spelling `win-gui.yaml`/`win-terminal.yaml` use;
+  # each native driver's `role:` is whatever string the real OS actually
+  # returns, never a shared vocabulary across platforms).
+  - type: expect_a11y
+    id: native-menu-bar-has-file-item
+    role: AXMenuBarItem
+    name: File
+
+  # No `-NNNN` issue suffix on `file-dropdown-opens` (unlike
+  # `win-gui.yaml`'s `-1232`): the gap this guards —
+  # `docs/PENDING_QUADRAUI_ISSUES.md`'s "No UIA/NSAccessibility/AT-SPI
+  # provider wiring..." entry — is drafted there but not yet filed as a
+  # numbered quadraui issue (filing is coordinator work); there is no
+  # number to attach yet. Update this id once one exists.
+  - type: click
+    id: click-file-menu-item
+    x: 95
+    y: 11
+  - type: expect_a11y_within
+    id: file-dropdown-opens
+    role: AXMenuItem
+    name: "New Tab"
+    timeout_ms: 3000
+
+  - type: key
+    id: dismiss-dropdown
+    key: esc
+
+  # vimcode#1646's two "All GUI specs" seed checks ("minimap shows content
+  # for a non-empty file" / "extension-install reaches a completed state")
+  # are DELIBERATELY OMITTED from this file, same as `win-gui.yaml` (see
+  # that file's identical comment for the full reasoning): confirmed
+  # directly against `coord`'s installed `mac_native_driver.py`
+  # (`code-coordinator==0.5.551`), its step vocabulary is `launch`, `key`,
+  # `click`, `wait`, `capture`, `expect_a11y`/`expect_a11y_within`,
+  # `expect_closed` — `capture` alone has no `expect_*` shape, so it can
+  # never fail, and CLAUDE.md's "a test that cannot fail is not coverage"
+  # rule (#553) rules it out as a seed check. No pixel-content or
+  # install-state-aware primitive exists in this driver to replace it with.
+  # See `win-gui.yaml`'s comment for the exact follow-up this needs
+  # (coordinator-repo work this PR cannot do itself).
+
+  # Real native traffic-light close button.
+  - type: click
+    id: click-close-button
+    x: 20
+    y: 20
+  - type: expect_closed
+    id: close-button-actually-closes-window
+    timeout_ms: 5000

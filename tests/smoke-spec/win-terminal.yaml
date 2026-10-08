@@ -1,0 +1,286 @@
+# Tier-2 Windows-Terminal-hosted smoke spec for vimcode#1646 (claude-
+# coordinator epic #3482, v0.5.551's new real-platform acceptance drivers).
+#
+# Driver: `win-native`, `mode: terminal`, `terminal_app: windows-terminal`
+# (coord/win_native_driver.py) — launches the real `vcd.exe` TUI binary
+# *inside a real Windows Terminal window* (`wt.exe vcd.exe ...`) rather than
+# probing `vcd.exe`'s own console window directly, then probes the TERMINAL
+# HOST's window with real Win32/UIA/`PrintWindow` calls. This is deliberately
+# the tier below `tests/conpty_idle_flicker.rs`/`conpty_activity_bar_click.rs`
+# (which drive a raw ConPTY with no terminal emulator window at all): those
+# two Rust tests already proved vimcode#1634/#1635/#1636's underlying byte
+# stream is correct — idle really is silent, a right-click menu really does
+# paint in ~50µs, activity-bar clicks really do dispatch — while the
+# *operator* still saw flicker/lag/dead clicks in a real terminal **window**.
+# This spec is the tier that can actually see that gap: Windows Terminal's
+# own rendering/input-translation layer.
+#
+# `coord` supplies the actual launch command/cwd; this file assumes it opens
+# `vcd.exe` on a small, real, non-empty text file, with a settings.json
+# carrying `{"lsp_enabled": false, "use_nerd_fonts": false}` — same
+# determinism precondition as `tests/smoke-spec/tui.yaml`.
+#
+# vimcode#1795: manually reproducing a settings.json/startup report against
+# this lane over WSL interop? See `docs/PLATFORM_CONFORMANCE.md`'s
+# "WSL-interop env-var gotcha" section first — an env var prefixed on a WSL
+# shell's command line (`VAR=... ./vcd.exe`) silently fails to propagate
+# into the launched Windows process. Use a PowerShell `$env:VAR = '...'`
+# session instead (what every "CONFIRMED" run below actually did).
+#
+# Pixel coordinates: derived by assuming Windows Terminal's default profile
+# (Cascadia Mono, ~9px cell width x ~19px cell height) and a ~40px top band
+# (tab bar + title), i.e. `x = 8 + col * 9`, `y = 40 + row * 19` for a cell
+# at 0-indexed `(row, col)` — the same `(row, col)` activity-bar/tree
+# positions `tests/smoke-spec/tui.yaml` already uses and
+# `tests/conpty_activity_bar_click.rs` already verified on real ConPTY
+# (`ICON_COLUMN = 1`; rows 1-7 = Explorer/Search/Debug/Source Control/
+# Extensions/AI Assistant/Board).
+#
+# CONFIRMED via a real run on dell64's attached Windows 11 host (WSL
+# interop, same methodology as `win-gui.yaml`'s header comment describes —
+# no `coord` Python environment on the Windows host itself, so this drove
+# the same real `wt.exe`/`SendInput`-equivalent/UIA primitives directly via
+# a PowerShell harness; see the PR for the script and raw output), real
+# `vcd.exe` cross-compiled from this branch, launched as `wt.exe -d
+# <workdir> vcd.exe sample.txt`:
+#
+#   idle-flicker-1634:                     FAIL — one of 50 consecutive
+#     100ms-apart whole-window captures differed at ~200ms into the 5s
+#     window (all others were byte-identical). This does NOT match the
+#     originally-reported ~1Hz (~1000ms) flicker cadence, and a single run
+#     cannot rule out capture-harness noise (GPU compositing, a stray
+#     repaint from `SetForegroundWindow`/`SendKeys` settling) vs. a real,
+#     faster artifact. Recorded as-observed rather than discarded or
+#     "fixed" by loosening the comparison; needs a repeat, longer-settled
+#     run to establish whether it reproduces before treating it as #1634
+#     evidence either way.
+#   explorer-row-context-menu-latency-1635:     FAIL — no UIA element with
+#     `ControlType.MenuItem` ever appeared within 2000ms after the
+#     right-click.
+#   activity-bar-*-panel-switch-1636 (all five):  FAIL — no UIA element
+#     named EXPLORER/SEARCH/DEBUG/SOURCE CONTROL/EXTENSIONS ever appeared
+#     within 5000ms after the click.
+#
+# The open structural question above this paragraph is now SETTLED, not
+# open: a full UIA tree dump of the real `wt.exe` window hosting `vcd.exe`
+# (two tabs, after `Ctrl+T`) returned exactly 10 named elements — all
+# window chrome (`tab item`/`text` "VimCode - sample.txt", `button` "Close
+# Tab", `split button` "New Tab", 4 scrollbar buttons, 1 scrollbar) plus
+# exactly ONE `terminal`-type element whose `Name` is fixed to the
+# executable's own path (`C:\...\vcd.exe`) — never per-row, per-panel, or
+# per-menu-item text content. `_find_a11y_match` (shared by every coord
+# native driver) matches on exactly that `Name` string, so
+# `expect_menu_latency`/`expect_panel_switch` as written here CANNOT
+# structurally detect #1635/#1636 being fixed OR still broken through this
+# driver's current UIA-by-name vocabulary, regardless of what `vcd.exe`
+# actually renders inside that one `terminal` element. This is a Windows
+# Terminal accessibility-implementation limitation (it exposes buffer
+# content only via the UIA *text pattern* on that single element, which
+# `win_native_driver.py` does not currently read), not a vimcode or
+# quadraui regression, and not something a spec-file change in this repo
+# can work around without "fixing" the check by weakening it (explicitly
+# against this issue's own guidance). The five steps below are left
+# unchanged — they still encode the correct intended regression check —
+# but are recorded here as structurally unable to pass OR meaningfully
+# fail until `win_native_driver.py` grows a text-pattern-aware read of the
+# `terminal` element's own buffer content (coordinator-repo work, the same
+# class of gap as the minimap/extension-install primitive noted in
+# `win-gui.yaml`).
+#
+# ── #1751: no Tier-2 step added for the git-insights inline blame ghost
+#    text ──────────────────────────────────────────────────────────────
+#
+# Same reason as `win-gui.yaml`'s matching #1751 section: confirming the
+# blame ghost text painted (or didn't) on a real Windows Terminal window
+# needs reading drawn glyph content from inside the single `terminal` UIA
+# element this file's own header already found Windows Terminal exposes
+# only via a text-pattern read `win_native_driver.py` does not implement —
+# the identical wall the five `-1634`/`-1635`/`-1636` steps above hit. This
+# issue's real acceptance coverage is the same Tier-1, platform-neutral
+# test named in `win-gui.yaml`'s #1751 section
+# (`src/tui_main/app_on_tui_tests.rs`'s `live_plugin_api::
+# async_shell_cwd_default_paints_into_buffer_via_shell_app_1751`) — the
+# fix it covers is core engine code (`Engine::apply_plugin_ctx`'s
+# `vimcode.async_shell` cwd default), not terminal-hosting-specific, so it
+# already exercises this lane's shared code path. A real Win-GUI/Windows-
+# Terminal re-verification of the painted blame ghost text itself remains
+# open pending the companion vimcode-ext fix; see this branch's commit
+# messages.
+#
+# ── #1842: no Tier-2 step added for "TUI minimap viewport thumb invisible
+#    in Windows Terminal" ───────────────────────────────────────────────
+#
+# #1842's own acceptance bar is a human on dell64 confirming the
+# viewport-highlight band is visibly distinct from the rest of the
+# minimap strip in a real Windows Terminal window — exactly the kind of
+# check this file exists to carry, but `win_native_driver.py`'s step
+# vocabulary has no pixel-colour-sampling step today (only UIA
+# element/text matches, clicks, and whole-window screenshot *diffing* for
+# `expect_idle_stable` — not a "read the colour at (x, y) and compare
+# against a threshold" primitive), so a step here would either silently
+# no-op or require inventing an unsupported key — the same trap #1829's
+# section above explicitly avoided. The investigation in
+# `PROJECT_STATE.md` found the known pre-fix defect (quadraui#1181,
+# opaque `accent_bg` with no blend) is already fixed and pinned, added
+# in-repo `TuiDriver` coverage for the "band identical to strip" defect
+# class under two themes, but left open whether the current 25%-blend
+# tint is itself too faint to see once a real terminal negotiates
+# 256-colour instead of truecolor — a question only real hardware (or a
+# driver that can sample terminal pixel colour) can answer. Until
+# `win_native_driver.py` grows that primitive (coordinator-repo work),
+# the dell64 re-confirmation this issue's acceptance bar requires has to
+# happen as a manual human check, tracked in `PROJECT_STATE.md`, not as
+# an automated step in this file.
+#
+# ── #1829: no Tier-2 step added for ":term opens a blank panel, no
+#    PowerShell prompt" ──────────────────────────────────────────────────
+#
+# The issue's own acceptance criteria ask for a step that types a command
+# into the terminal panel and asserts a probe file's *filesystem* content —
+# this driver's step vocabulary (`win_native_driver.py`, a different repo
+# this file's own header already names as out of this worker's reach) has
+# no filesystem-assertion step type today, so a YAML step here would
+# silently no-op rather than gate anything; none was added rather than
+# invent an unsupported key. Nor would a UIA-text step help even if one
+# existed — same wall the five `-1634`/`-1635`/`-1636` steps above hit,
+# since the whole panel (editor chrome and every nested terminal pane
+# alike) lives inside Windows Terminal's one opaque `terminal` UIA
+# element. The closest automatable substitute is Tier-1:
+# `tests/conpty_term_opens_shell_1829.rs` (new), which spawns `vcd.exe`
+# under a *real* Win32 ConPTY directly (bypassing Windows Terminal's UIA
+# opacity entirely — it reads the raw byte stream, not an accessibility
+# tree), types `:term` + Enter then the issue's own `echo <marker> >
+# '<path>'` probe, and polls the filesystem for the marker. That test now
+# runs in CI too (`.github/workflows/ci.yml`'s `build-windows-tui` job, a
+# `continue-on-error: true` step pending the quadraui fix this traces the
+# root cause to — see that step's own comment), and can also be run by hand
+# via `cargo xwin test --target x86_64-pc-windows-msvc --test
+# conpty_term_opens_shell_1829 --no-default-features` on real Windows
+# hardware. That test, plus the issue's own step 3 (a person watching a
+# real PowerShell prompt appear on `dell64`'s screen), are both still
+# required before #1829 can be considered verified; see `PROJECT_STATE.md`
+# and `docs/PENDING_QUADRAUI_ISSUES.md` for the full investigation and the
+# drafted-but-not-yet-filed quadraui issue this traces the root cause to.
+#
+# ── vimcode#1843 update (2026-10-07): the above paragraph is now stale,
+#    kept verbatim rather than edited because this file is additive-only
+#    (#3509) ──────────────────────────────────────────────────────────────
+#
+# vimcode#1843 bumped the quadraui pin to `4e71a8b`, which carries
+# quadraui#1327 (ConPTY VT handshake answers plus the `default_shell()`
+# `$SHELL` gate). The `tests/conpty_term_opens_shell_1829.rs` CI step named
+# above was RED-verified against the prior pin (`a536053`, no probe file
+# within the timeout) and GREEN-verified against `4e71a8b` (1.9s) on
+# dell64's real Windows hardware, so `continue-on-error: true` was removed
+# from that step in `.github/workflows/ci.yml`'s `build-windows-tui` job —
+# it is now a required gate, not an expected-RED one. The
+# "drafted-but-not-yet-filed quadraui issue" the paragraph above points at
+# is quadraui#1327 itself, now landed and struck in
+# `docs/PENDING_QUADRAUI_ISSUES.md`. #1829 itself stays open until a person
+# watches a real PowerShell prompt appear on `dell64`'s screen (the issue's
+# own step 3, still unconfirmed).
+name: vimcode-win-terminal
+mode: terminal
+terminal_app: windows-terminal
+width: 1024
+height: 768
+steps:
+  - type: launch
+    id: launch
+    timeout_ms: 15000
+
+  - type: wait
+    id: startup-settle
+    ms: 2000
+
+  # vimcode#1634: the ~1Hz foreground-flicker regression, reported against a
+  # real Windows Terminal window specifically (both
+  # `tests/conpty_idle_flicker.rs`'s raw-ConPTY byte stream AND this file's
+  # own `tests/smoke-spec/tui.yaml`'s `expect_silent` already confirmed the
+  # underlying byte stream is silent — this step is the one tier that can
+  # actually see Windows Terminal's own repaint behaviour, independent of
+  # what bytes `vcd.exe` sent it). "a horizontally stacked tab group open" —
+  # `Ctrl+T` opens vimcode's own second editor tab (`MENU_STRUCTURE`'s "New
+  # Tab", shortcut `Ctrl+T`), landing two tabs side by side in vimcode's own
+  # tab bar.
+  - type: key
+    id: open-second-tab
+    key: "ctrl+t"
+  - type: wait
+    id: settle-after-tab-open
+    ms: 500
+  - type: expect_idle_stable
+    id: idle-flicker-1634
+    ms: 5000
+    interval_ms: 100
+
+  # vimcode#1635: slow right-click context menus, reported against a real
+  # Windows Terminal window. `(row=3, col=10)` matches
+  # `tests/smoke-spec/tui.yaml`'s own right-click target (an Explorer-tree
+  # row) — real pixel point per this file's own cell-size assumption above.
+  # `role:` left unset here, which defers to `win_native_driver.py`'s own
+  # default (`"MenuItem"`) rather than this file picking a value — see
+  # `win-gui.yaml`'s own comment on why the real UIA `LocalizedControlType`
+  # string may need to be the two-word lowercase "menu item" instead; if
+  # the real dell64 run shows the driver's own default never matches, that
+  # is itself worth reporting back (it would affect every spec using this
+  # step, not just this one).
+  - type: expect_menu_latency
+    id: explorer-row-context-menu-latency-1635
+    x: 98
+    y: 97
+    button: right
+    max_ms: 2000
+
+  - type: key
+    id: dismiss-context-menu
+    key: esc
+
+  # vimcode#1636: activity-bar icon clicks doing nothing, reported against a
+  # real Windows Terminal window (the exact bug class
+  # `tests/conpty_activity_bar_click.rs` already proved does NOT reproduce at
+  # the raw-ConPTY input-decoding layer on real hardware when clicks are
+  # spaced apart — see that file's own module doc's "What this means for
+  # #1636 itself" section). This tier checks the remaining, untested layer:
+  # does the *terminal window* itself ever fail to deliver/translate the
+  # click at all. One step per activity-bar icon, each its own `id` so a
+  # single icon's regression doesn't hide behind the others passing.
+  - type: expect_panel_switch
+    id: activity-bar-explorer-panel-switch-1636
+    x: 17
+    y: 59
+    role: Text
+    name: EXPLORER
+    timeout_ms: 5000
+
+  - type: expect_panel_switch
+    id: activity-bar-search-panel-switch-1636
+    x: 17
+    y: 78
+    role: Text
+    name: SEARCH
+    timeout_ms: 5000
+
+  - type: expect_panel_switch
+    id: activity-bar-debug-panel-switch-1636
+    x: 17
+    y: 97
+    role: Text
+    name: DEBUG
+    timeout_ms: 5000
+
+  - type: expect_panel_switch
+    id: activity-bar-source-control-panel-switch-1636
+    x: 17
+    y: 116
+    role: Text
+    name: "SOURCE CONTROL"
+    timeout_ms: 5000
+
+  - type: expect_panel_switch
+    id: activity-bar-extensions-panel-switch-1636
+    x: 17
+    y: 135
+    role: Text
+    name: EXTENSIONS
+    timeout_ms: 5000

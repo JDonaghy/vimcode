@@ -1648,4 +1648,449 @@ mod mac_driver_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── #1745: VS Code mode's Cmd-key defaults on the macOS GUI ─────────
+    //
+    // #1730's own parity table (`tests/vscode_keybinding_parity.rs`) wrongly
+    // assumed there was no macOS GUI backend in this repo to regress
+    // against, and left every `MacDiverges` row ungated. There is one
+    // (this file), and `normalize_mac_cmd_as_ctrl` (`src/app.rs`) is
+    // the fix: before it existed, `quadraui::Modifiers::cmd` — the bit a
+    // real Cmd keypress sets (confirmed directly from quadraui's own
+    // `macos/events.rs`: `NS_FLAG_COMMAND` -> `cmd`, distinct from
+    // `NS_FLAG_CONTROL` -> `ctrl`) — was read nowhere in
+    // `App::handle_dispatch`, so Cmd+C/V/X/Z/S/P/F/B/J/, didn't merely
+    // *diverge* from VS Code's Mac defaults, they did nothing at all.
+    //
+    // These tests drive the same `MacDriver` every other test in this file
+    // does, through the real `App::handle_dispatch` both `super::run` and
+    // the live AppKit event loop call — not a direct `Engine::handle_key`
+    // call — because the bug this fixes is specifically in the
+    // event-to-`ctrl`-bit translation, not in any engine-level binding
+    // (`tests/vscode_keybinding_parity.rs`'s own 62+ engine-level tests
+    // already cover that half).
+    //
+    // **RED-verification note** (all five tests below): confirmed red by
+    // temporarily short-circuiting `normalize_mac_cmd_as_ctrl` to
+    // `if true { return event; }` (disabling every arm, not just one at a
+    // time) and re-running `cargo test --no-default-features --features
+    // macos --lib vscode_mode_mac_cmd_1745` — all five failed with the
+    // exact "fell back to the unmodified/un-translated key" symptom each
+    // test's own doc below describes; reverted after confirming.
+    mod vscode_mode_mac_cmd_1745 {
+        use quadraui::{Key, Modifiers, NamedKey};
+
+        use crate::core::{Cursor, Mode};
+
+        /// A VSCode-mode, Insert-mode engine seeded with `buffer` — the
+        /// nerd-fonts-off rationale is the same as [`super::plain_engine`]'s
+        /// (the unrelated #620 tab-icon `debug_assert!`).
+        fn vscode_engine(buffer: &str) -> crate::core::Engine {
+            let mut engine = crate::core::Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+            engine.mode = Mode::Insert;
+            engine.buffer_mut().insert(0, buffer);
+            engine.view_mut().cursor = Cursor { line: 0, col: 0 };
+            engine
+        }
+
+        /// Dispatch exactly one `KeyPressed { key, modifiers, repeat: false }`
+        /// — mirrors `src/gtk/testing.rs`'s `mod alt_rung_1744::press`.
+        fn press<A: quadraui::AppLogic>(
+            driver: &mut quadraui::macos::testing::MacDriver<A>,
+            key: Key,
+            modifiers: Modifiers,
+        ) {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key,
+                modifiers,
+                repeat: false,
+            });
+        }
+
+        /// #1745: Cmd+/ (VS Code's Mac default for `editor.action.
+        /// commentLine`) must toggle the line comment, exactly like Ctrl+/
+        /// on Linux/Windows (`tests/vscode_keybinding_parity.rs`'s
+        /// `test_vscode_ctrl_slash_toggles_line_comment`). Paint-based
+        /// assertion per CLAUDE.md's rendered-output rule: the comment
+        /// marker has to actually reach the screen, not just a buffer
+        /// mutation.
+        ///
+        /// RED against the pre-#1745 tree (see the submodule-level
+        /// RED-verification note above): `ctrl` stays `false`, the
+        /// Insert-mode engine treats the keystroke as a plain character
+        /// insertion, and the screen shows the literal `"print(1)/"`
+        /// instead of a commented line.
+        #[test]
+        fn cmd_slash_toggles_line_comment() {
+            let engine = vscode_engine("print(1)\n");
+            let (_guards, mut driver) = super::driver(engine);
+
+            press(
+                &mut driver,
+                Key::Char('/'),
+                Modifiers {
+                    cmd: true,
+                    ..Default::default()
+                },
+            );
+            driver.render();
+
+            assert!(
+                driver.screen_contains("# print(1)"),
+                "Cmd+/ must toggle the line comment on the macOS GUI, the \
+                 same as Ctrl+/ on Linux/Windows; painted text was {:?}",
+                driver.painted_texts()
+            );
+        }
+
+        /// #1745: Cmd+F (VS Code's Mac default for `actions.find`) must
+        /// open find, exactly like Ctrl+F on Linux/Windows
+        /// (`tests/vscode_keybinding_parity.rs`'s
+        /// `test_vscode_ctrl_f_opens_find`). Paint-based per CLAUDE.md's
+        /// rendered-output rule: the find/replace panel's own case-
+        /// sensitivity toggle (`render.rs`'s `FindReplacePanel`, label
+        /// `"Aa"`) is painted once the panel opens and nowhere else on this
+        /// fixture — the only other `"Aa"` literal in `render.rs` belongs to
+        /// the separate sidebar *Search* panel's own toggle, which this
+        /// fixture never opens.
+        ///
+        /// RED against the pre-#1745 tree (see the submodule-level
+        /// RED-verification note above): `ctrl` stays `false`, so the
+        /// Insert-mode engine treats the keystroke as a plain character
+        /// insertion instead — the find/replace panel never opens and
+        /// `"Aa"` never paints.
+        #[test]
+        fn cmd_f_opens_find() {
+            let engine = vscode_engine("hello\n");
+            let (_guards, mut driver) = super::driver(engine);
+            driver.render();
+            assert!(
+                !driver.screen_contains("Aa"),
+                "precondition: find/replace must start closed, so its \"Aa\" \
+                 toggle must not be painted yet; painted text was {:?}",
+                driver.painted_texts()
+            );
+
+            press(
+                &mut driver,
+                Key::Char('f'),
+                Modifiers {
+                    cmd: true,
+                    ..Default::default()
+                },
+            );
+            driver.render();
+
+            assert!(
+                driver.screen_contains("Aa"),
+                "Cmd+F must open find on the macOS GUI, the same as Ctrl+F \
+                 on Linux/Windows — the find/replace panel's \"Aa\" toggle \
+                 must now be painted; painted text was {:?}",
+                driver.painted_texts()
+            );
+        }
+
+        /// #1745: VS Code's real Mac default for word-wise navigation is
+        /// **Option**+Left/Right (`cursorWordLeft`/`cursorWordEndRight`),
+        /// not a plain Alt-to-something substitution of vimcode's existing
+        /// Ctrl+Left/Right word-move — and critically, plain Alt+Right on
+        /// this backend would otherwise be claimed by `route_alt_key`'s
+        /// own VS-Code-mode tier as `workbench.action.navigateForward`
+        /// (correct for Win/Linux, wrong for Mac — Mac's real default for
+        /// that command is Ctrl+-/Ctrl+Shift+-, a still-open gap; see
+        /// `tests/vscode_keybinding_parity.rs`'s `KNOWN_GAPS`).
+        ///
+        /// Paint-based per CLAUDE.md's rendered-output rule: presses the
+        /// chord, then types an unmodified marker character so where it
+        /// lands reveals where the cursor actually ended up — the same
+        /// idiom `cmd_slash_toggles_line_comment` (above) uses, applied to
+        /// a cursor-motion chord instead of an edit.
+        /// `Engine::move_word_forward` on `"hello world\n"` from column 0
+        /// lands on column 6 (the start of "world"), confirmed directly by
+        /// driving `Engine::handle_key` the same way
+        /// `test_vscode_ctrl_f_opens_find`'s sibling tests in
+        /// `tests/vscode_keybinding_parity.rs` do.
+        ///
+        /// RED against the pre-#1745 tree (see the submodule-level
+        /// RED-verification note above): with no translation, `alt` stays
+        /// set and `ctrl` stays unset, so `route_alt_key` claims the chord
+        /// as `navigateForward` instead — a no-op here (no jump-list entry
+        /// was ever recorded), leaving the cursor at column 0 and the
+        /// marker landing as "Xhello world" instead.
+        #[test]
+        fn option_right_moves_word_forward_not_navigate_forward() {
+            let engine = vscode_engine("hello world\n");
+            let (_guards, mut driver) = super::driver(engine);
+
+            press(
+                &mut driver,
+                Key::Named(NamedKey::Right),
+                Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+            );
+            press(&mut driver, Key::Char('X'), Modifiers::default());
+            driver.render();
+
+            assert!(
+                driver.screen_contains("hello Xworld"),
+                "Option+Right must move the cursor forward by a word \
+                 (cursorWordEndRight) before the marker keystroke lands, \
+                 not fall through to navigateForward (a no-op here, which \
+                 would leave the marker at column 0 instead); painted text \
+                 was {:?}",
+                driver.painted_texts()
+            );
+        }
+
+        /// #1745: VS Code's real Mac default for `cursorEnd` is **Cmd**+
+        /// Right, not word-move — the two modifiers swap roles relative to
+        /// Linux/Windows' Ctrl=word, Home/End=line split (see
+        /// `tests/vscode_keybinding_parity.rs`'s `cursorWordEndRight /
+        /// cursorWordLeft` row). Same marker-keystroke, paint-based idiom as
+        /// `option_right_moves_word_forward_not_navigate_forward` above.
+        ///
+        /// RED against the pre-#1745 tree (see the submodule-level
+        /// RED-verification note above): with no translation, the engine
+        /// sees a plain, unmodified `Right` and moves the cursor by exactly
+        /// one column instead of to the end of the line, so the marker
+        /// lands as "hXello world" instead.
+        #[test]
+        fn cmd_right_moves_to_line_end_not_one_column() {
+            let engine = vscode_engine("hello world\n");
+            let (_guards, mut driver) = super::driver(engine);
+
+            press(
+                &mut driver,
+                Key::Named(NamedKey::Right),
+                Modifiers {
+                    cmd: true,
+                    ..Default::default()
+                },
+            );
+            press(&mut driver, Key::Char('X'), Modifiers::default());
+            driver.render();
+
+            assert!(
+                driver.screen_contains("hello worldX"),
+                "Cmd+Right must move the cursor to the end of the line \
+                 (\"hello world\" is 11 columns wide) before the marker \
+                 keystroke lands, not by one column; painted text was {:?}",
+                driver.painted_texts()
+            );
+        }
+
+        /// #1745: VS Code's real Mac default for `cursorBottom` is
+        /// **Cmd**+Down (document end), distinct from `cursorEnd`'s Cmd+
+        /// Right (line end) tested just above — see
+        /// `tests/vscode_keybinding_parity.rs`'s `cursorTop / cursorBottom`
+        /// row. Same marker-keystroke, paint-based idiom as
+        /// `option_right_moves_word_forward_not_navigate_forward` above.
+        /// `Engine::handle_key("End", ..., true)` (Ctrl+End, the binding
+        /// this translation reuses) from line 0 of `"aaa\nbbb\nccc\n"` lands
+        /// on line 2, column 3 (the end of "ccc") — confirmed the same way
+        /// as `option_right_moves_word_forward_not_navigate_forward`'s own
+        /// doc describes.
+        ///
+        /// RED against the pre-#1745 tree (see the submodule-level
+        /// RED-verification note above): with no translation, the engine
+        /// sees a plain, unmodified `Down` and moves the cursor down by
+        /// exactly one line instead of to the last line of the buffer, so
+        /// the marker lands as "Xbbb" instead.
+        #[test]
+        fn cmd_down_moves_to_document_end_not_one_line() {
+            let engine = vscode_engine("aaa\nbbb\nccc\n");
+            let (_guards, mut driver) = super::driver(engine);
+
+            press(
+                &mut driver,
+                Key::Named(NamedKey::Down),
+                Modifiers {
+                    cmd: true,
+                    ..Default::default()
+                },
+            );
+            press(&mut driver, Key::Char('X'), Modifiers::default());
+            driver.render();
+
+            assert!(
+                driver.screen_contains("cccX"),
+                "Cmd+Down must move the cursor to the last line of the \
+                 buffer before the marker keystroke lands, not down by one \
+                 line; painted text was {:?}",
+                driver.painted_texts()
+            );
+        }
+
+        /// #1745 review: the `toggleSidebarVisibility` row
+        /// (`tests/vscode_keybinding_parity.rs`) originally claimed Cmd+B
+        /// `Matches` on the macOS GUI, on the theory that
+        /// `normalize_mac_cmd_as_ctrl`'s fold plus `Engine::handle_vscode_key`'s
+        /// "b" arm is enough. It isn't: that arm returns
+        /// `EngineAction::ToggleSidebar`, but `render::apply_engine_action`'s
+        /// own arm for it is a bare `app.draw_needed.set(true)` — the real
+        /// toggle (`Engine::toggle_sidebar`) only ever runs via the *separate*
+        /// `panel_keys` accelerator path (`DeferredAction::ToggleSidebar`,
+        /// drained by `tick`). That accelerator is registered as
+        /// `quadraui::KeyBinding::Literal(pk.toggle_sidebar)` (default
+        /// `"<C-b>"`), and quadraui's own `macos_universal_binding_modifiers`
+        /// deliberately leaves `Literal` bindings untouched — so it matches a
+        /// physical Ctrl+B and never a Cmd+B. quadraui's shared
+        /// `runtime::preprocess_event` runs that accelerator match *before*
+        /// an unmatched keypress ever reaches `App::handle_dispatch` (where
+        /// this issue's Cmd-fold lives), so by the time the fold sees a real
+        /// Cmd+B it is already too late — the fold can produce a `ctrl`-true
+        /// event for `handle_vscode_key`, but that path's `ToggleSidebar`
+        /// action is the dead one. `KNOWN_GAPS::
+        /// PANEL_ACCELERATOR_CMD_CHORDS_DEAD_ON_MACOS_GUI` in
+        /// `tests/vscode_keybinding_parity.rs` names this; this test is that
+        /// entry's RED proof (that file's own `gap_gate` can't reach this —
+        /// the defect is in `render::apply_engine_action`, `pub(crate)` and
+        /// only reachable from inside this crate).
+        ///
+        /// Oracle: `engine.app_shell.sidebar_visible()`, not painted text.
+        /// This is the one place in this submodule that reads state instead
+        /// of paint, and it is deliberate, not a shortcut: this driver's
+        /// `painted_texts()` recorder accumulates across frames rather than
+        /// clearing per frame, so it cannot prove a widget *disappeared* —
+        /// see [`ctrl_b_toggle_sidebar_proves_sidebar_visible_is_a_real_
+        /// paint_oracle`] below, which presses the *working* accelerator
+        /// chord and shows exactly that limitation directly. `sidebar_
+        /// visible()` is not an unused parallel field like the #587
+        /// `ScreenLayout.picker` incident the repo's testing rules warn
+        /// about — it is the exact flag `render.rs`'s own sidebar-paint gate
+        /// reads, and that sibling test proves reading it here is a real,
+        /// production-faithful oracle, not a state-populated-but-never-
+        /// painted field.
+        ///
+        /// RED against the pre-fix tree (today, unfixed): confirmed by the
+        /// sibling test just below — Ctrl+B (the working accelerator path)
+        /// flips `sidebar_visible()` from `true` to `false` on the exact
+        /// same fixture; Cmd+B does not move it at all.
+        #[test]
+        fn cmd_b_does_not_toggle_sidebar_dead_panel_accelerator() {
+            // #1745 review: avoid polluting this run with the real on-disk
+            // `settings.json` — `handle_poll_tick` (run by `driver.tick()`
+            // below) unconditionally calls `Engine::check_settings_reload`,
+            // and a fresh `Engine::new_for_test()` leaves `settings_mtime`
+            // at `None` specifically so ambient disk state is never loaded
+            // implicitly (see that constructor's own doc) — which means the
+            // *first* poll against a real settings file always looks like
+            // an external edit and reloads it, overwriting `panel_keys` with
+            // whatever the local developer's own settings happen to be.
+            // Point it at a path that cannot exist instead.
+            use crate::core::settings::TestSettingsPathGuard;
+            let tmp = std::env::temp_dir().join(format!(
+                "vimcode_test_1745_cmd_b_{:?}.json",
+                std::thread::current().id()
+            ));
+            let _settings_guard = TestSettingsPathGuard::install(tmp);
+
+            let mut engine = vscode_engine("hello\n");
+            // Start from a known, deliberately-visible state via the real
+            // `Engine::toggle_sidebar` — not the buggy dispatch path under
+            // test — so a no-op bug can't hide behind "it was already
+            // closed".
+            if !engine.app_shell.sidebar_visible() {
+                engine.toggle_sidebar();
+            }
+            let (_guards, engine, mut driver) = super::driver_with_engine(engine);
+            assert!(
+                engine.borrow().app_shell.sidebar_visible(),
+                "precondition: sidebar must start visible"
+            );
+
+            press(
+                &mut driver,
+                Key::Char('b'),
+                Modifiers {
+                    cmd: true,
+                    ..Default::default()
+                },
+            );
+            driver.tick();
+
+            assert!(
+                engine.borrow().app_shell.sidebar_visible(),
+                "KNOWN_GAPS::PANEL_ACCELERATOR_CMD_CHORDS_DEAD_ON_MACOS_GUI: \
+                 today, Cmd+B does NOT toggle the sidebar on the macOS GUI \
+                 (see this test's own doc for the full dispatch-ordering \
+                 reason) — this assertion pins that wrong behaviour. If it \
+                 ever fails, the gap closed: flip this assertion to \
+                 `!engine.borrow().app_shell.sidebar_visible()`, delete the \
+                 `KNOWN_GAPS` entry, and flip the matching \
+                 `VSCODE_BINDINGS` row back to `Matches`."
+            );
+        }
+
+        /// Companion to [`cmd_b_does_not_toggle_sidebar_dead_panel_
+        /// accelerator`] above — proves two things that test's doc relies
+        /// on, on the exact same fixture shape: (1) the `panel_keys`
+        /// accelerator path genuinely works end to end (so the sibling
+        /// test's Cmd+B failure is a real Cmd-vs-Ctrl gap, not a broken
+        /// fixture), and (2) this driver's `painted_texts()` recorder
+        /// cannot prove a widget's *disappearance* — it still reports
+        /// `screen_contains("EXPLORER")` as `true` a full frame after the
+        /// sidebar genuinely closed (`sidebar_visible()` is `false`),
+        /// which is why the sibling test reads that state flag instead of
+        /// painted text for its own assertion.
+        #[test]
+        fn ctrl_b_toggle_sidebar_proves_sidebar_visible_is_a_real_paint_oracle() {
+            use crate::core::settings::TestSettingsPathGuard;
+            let tmp = std::env::temp_dir().join(format!(
+                "vimcode_test_1745_ctrl_b_{:?}.json",
+                std::thread::current().id()
+            ));
+            let _settings_guard = TestSettingsPathGuard::install(tmp);
+
+            let mut engine = vscode_engine("hello\n");
+            if !engine.app_shell.sidebar_visible() {
+                engine.toggle_sidebar();
+            }
+            let (_guards, engine, mut driver) = super::driver_with_engine(engine);
+            driver.render();
+            assert!(
+                engine.borrow().app_shell.sidebar_visible(),
+                "precondition: sidebar must start visible"
+            );
+            assert!(
+                driver.screen_contains("EXPLORER"),
+                "precondition: the visible sidebar's header must have \
+                 painted"
+            );
+
+            press(
+                &mut driver,
+                Key::Char('b'),
+                Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            );
+            driver.tick();
+            driver.render();
+
+            assert!(
+                !engine.borrow().app_shell.sidebar_visible(),
+                "Ctrl+B must close the sidebar via the real `panel_keys` \
+                 accelerator — if this fails, the fixture itself is broken \
+                 and the sibling Cmd+B test's failure would not mean what \
+                 its doc says it means"
+            );
+            assert!(
+                driver.screen_contains("EXPLORER"),
+                "this assertion is expected to hold even though the \
+                 sidebar just closed — it exists to document (not to \
+                 regression-test) that this driver's `painted_texts()` \
+                 recorder accumulates across frames and so cannot prove a \
+                 widget disappeared; if this ever starts failing it means \
+                 the recorder started clearing per frame, and the sibling \
+                 Cmd+B test above should be revisited to use \
+                 `screen_contains` instead of `sidebar_visible()`"
+            );
+        }
+    }
 }

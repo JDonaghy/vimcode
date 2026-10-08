@@ -86,6 +86,29 @@ pub struct ExtensionManifest {
     /// documents as editable buffers.
     #[serde(default)]
     pub document: Option<DocumentProviderConfig>,
+    /// Minimum (or otherwise constrained) running vimcode version this
+    /// extension's Lua scripts require, as a semver requirement string
+    /// (e.g. `">=0.15.0"`) — #1807. Native `vimcode.*` APIs an extension's
+    /// scripts call (completion sources, extension-services, …) can land
+    /// in vimcode after the extension itself is published to the registry;
+    /// without this field a user on an older vimcode would install the
+    /// extension and only discover the gap when a script call errors out
+    /// at load time.
+    ///
+    /// `None` — the default, and what every extension predating #1807
+    /// implicitly declares — means "no constraint": compatible with every
+    /// vimcode version, matching pre-#1807 behavior exactly. See
+    /// [`ExtensionManifest::is_compatible_with_vimcode`] and
+    /// [`ExtensionManifest::incompatibility_reason`].
+    ///
+    /// **Write an explicit comparator, not a bare version.** This string is
+    /// parsed as a `semver::VersionReq` as-is — it is *not* normalised to
+    /// `">="` first. A bare `"0.15.0"` means Cargo-style caret
+    /// (`"^0.15.0"`), which pre-1.0 only matches `0.15.x` and rejects
+    /// `0.16.0` and later: the opposite of "needs at least 0.15". Write
+    /// `">=0.15.0"` to mean a minimum, as this field's own name implies.
+    #[serde(default)]
+    pub requires_vimcode: Option<String>,
 }
 
 /// Comment style override specified in an extension manifest `[comment]` section.
@@ -558,6 +581,18 @@ pub struct DapConfig {
     /// Arguments passed to the DAP binary.
     #[serde(default)]
     pub args: Vec<String>,
+    /// System binaries that must be on PATH for the DAP adapter's **install
+    /// step** to work (#1719) — the `DapConfig` analogue of `LspConfig::
+    /// dependencies`. E.g. a manifest-declared adapter whose `install_*`
+    /// shells out to a package manager names it here. Checked by
+    /// `Engine::ext_install_from_registry_with_runtime_check` *before* the
+    /// install command is dispatched to the terminal pane — distinct from
+    /// the built-in adapters' (codelldb/debugpy/delve/netcoredbg) own
+    /// prerequisites, which are hardcoded in `dap_manager::
+    /// adapter_dependencies` since those installers ship with vimcode, not
+    /// the registry.
+    #[serde(default)]
+    pub dependencies: Vec<String>,
     /// Native tool acquisition (#1345) — see `LspConfig::acquire`'s doc.
     #[serde(default)]
     pub acquire: Option<crate::core::tool_acquire::AcquireConfig>,
@@ -639,10 +674,17 @@ const PREREQ_INSTALLS: &[(&str, PrereqInstall)] = &[
             windows: "winget install Microsoft.DotNet.SDK.8",
         },
     ),
+    // #1719 bugbash (vimcode-ext#17): Ubuntu 24.04's `golang-go` apt package
+    // is Go 1.22, but `gopls@latest` (and anything else resolved with
+    // `@latest`) wants a materially newer `go` — and Debian's packaged Go
+    // pins `GOTOOLCHAIN=local`, so it can't just self-upgrade the way a
+    // stock `go` toolchain would. `snap install go --classic` tracks the
+    // current stable release instead of whatever a distro happened to
+    // package, so the retry after this hint actually succeeds.
     (
         "go",
         PrereqInstall {
-            linux: "sudo apt install golang-go",
+            linux: "sudo snap install go --classic",
             macos: "brew install go",
             windows: "winget install GoLang.Go",
         },
@@ -683,6 +725,72 @@ const PREREQ_INSTALLS: &[(&str, PrereqInstall)] = &[
             windows: "winget install Python.Python.3",
         },
     ),
+    // #1719: several registry manifests' `install_macos` shells straight
+    // to `brew install …` (cpp, java, lua, markdown, latex, ruby,
+    // terraform) with nothing declaring Homebrew itself as a prerequisite
+    // — a Mac without it got no instruction, just `brew: command not
+    // found` inside the install pane. Homebrew's own installer is the one
+    // true "how do I get brew" command; it also supports Linux
+    // ("Homebrew on Linux"), so the same one-liner covers that platform
+    // too. Windows has no Homebrew port; the realistic path there is WSL,
+    // so the hint installs WSL and then runs the same installer inside it
+    // rather than a placeholder.
+    (
+        "brew",
+        PrereqInstall {
+            linux: "NONINTERACTIVE=1 /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"",
+            macos: "NONINTERACTIVE=1 /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"",
+            windows: "wsl --install ; wsl bash -c 'NONINTERACTIVE=1 /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"'",
+        },
+    ),
+    // #1719: the `java` extension's install needs a JDK on PATH; nothing
+    // in the shared table named it before.
+    (
+        "java",
+        PrereqInstall {
+            linux: "sudo apt install openjdk-17-jdk",
+            macos: "brew install openjdk@17",
+            windows: "winget install EclipseAdoptium.Temurin.17.JDK",
+        },
+    ),
+    // #1719: curl/unzip/tar back the built-in codelldb/netcoredbg DAP
+    // installers (`dap_manager::codelldb_install_cmd_for`/
+    // `netcoredbg_install_cmd_unix_for`) — see
+    // `dap_manager::adapter_dependencies`, which is what actually checks
+    // these before dispatch. macOS and most Linux distros ship `curl`/
+    // `tar` already, but a minimal/container image may not, so a real
+    // install command still belongs here rather than skipping the entry.
+    (
+        "curl",
+        PrereqInstall {
+            linux: "sudo apt install curl",
+            macos: "brew install curl",
+            windows: "winget install cURL.cURL",
+        },
+    ),
+    (
+        "unzip",
+        PrereqInstall {
+            linux: "sudo apt install unzip",
+            macos: "brew install unzip",
+            // codelldb's Windows install uses PowerShell's built-in
+            // `Expand-Archive` (`dap_manager::codelldb_install_cmd_windows`)
+            // — `unzip` itself is never invoked on Windows, so `adapter_
+            // dependencies` never asks for it there. Kept as a real,
+            // accurate (not placeholder) runnable command regardless.
+            windows: "echo 'unzip is not required on Windows -- Expand-Archive is built into PowerShell'",
+        },
+    ),
+    (
+        "tar",
+        PrereqInstall {
+            linux: "sudo apt install tar",
+            macos: "brew install gnu-tar",
+            // Same reasoning as `unzip` above: netcoredbg's Windows install
+            // uses `Expand-Archive`, never `tar.exe`.
+            windows: "echo 'tar is not required on Windows -- Expand-Archive is built into PowerShell'",
+        },
+    ),
 ];
 
 /// Return a runnable install command for a known prerequisite binary (e.g.
@@ -712,6 +820,78 @@ impl ExtensionManifest {
 
     pub fn matches_language_id(&self, lang: &str) -> bool {
         self.language_ids.iter().any(|l| l == lang)
+    }
+
+    /// Returns `true` when this extension's `requires_vimcode` constraint
+    /// (if any) is satisfied by `running_version` (#1807).
+    ///
+    /// A missing constraint is always compatible — the pre-#1807 default.
+    /// A `requires_vimcode` string that fails to parse as a semver
+    /// requirement, or a `running_version` that fails to parse as semver,
+    /// is *also* treated as compatible rather than bricking the extension
+    /// over a malformed manifest field or an unparseable running-version
+    /// string (should not happen for `env!("CARGO_PKG_VERSION")`, but a
+    /// manifest field is untrusted input) — a one-line debug note is
+    /// logged for the malformed-requirement case so a registry-side typo
+    /// doesn't go silently invisible forever.
+    ///
+    /// `running_version`'s prerelease component (if any — e.g. a future
+    /// `Cargo.toml` carrying `"0.15.0-rc1"`) is stripped before matching:
+    /// `semver::VersionReq::matches` otherwise excludes prerelease
+    /// versions from a plain `">=0.15.0"` comparator by design, which
+    /// would make every `requires_vimcode` extension read as incompatible
+    /// on a prerelease build even though its release-version core
+    /// satisfies the bound.
+    pub fn is_compatible_with_vimcode(&self, running_version: &str) -> bool {
+        let Some(req_str) = self.requires_vimcode.as_deref() else {
+            return true;
+        };
+        let Ok(req) = semver::VersionReq::parse(req_str) else {
+            crate::core::lsp_manager::install_log(&format!(
+                "[ext] '{}' has a malformed requires_vimcode requirement \
+                 ({req_str:?}) — treating as no constraint",
+                self.name
+            ));
+            return true;
+        };
+        let Ok(mut version) = semver::Version::parse(running_version) else {
+            return true;
+        };
+        version.pre = semver::Prerelease::EMPTY;
+        req.matches(&version)
+    }
+
+    /// Human-readable reason this extension is incompatible with
+    /// `running_version`, or `None` when it's compatible (including the
+    /// no-constraint case). Shared by the marketplace install-refusal
+    /// message and the "skip at load" message (#1807).
+    pub fn incompatibility_reason(&self, running_version: &str) -> Option<String> {
+        // Structural rather than defensive: this branch is only reached
+        // once `is_compatible_with_vimcode` has already returned `false`,
+        // which itself only happens when `requires_vimcode` is `Some` (its
+        // own first check returns early on `None`) — so this `if let` can
+        // never actually take the `else` arm, unlike the `unwrap_or("")`
+        // it replaced (#1807 review).
+        if let Some(req) = self.requires_vimcode.as_deref() {
+            if self.is_compatible_with_vimcode(running_version) {
+                None
+            } else {
+                Some(format!(
+                    "requires vimcode {req} (running {running_version})"
+                ))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Convenience wrapper over [`Self::incompatibility_reason`] against
+    /// the actual running vimcode (`env!("CARGO_PKG_VERSION")`) — the one
+    /// "what version is running" lookup every call site (marketplace
+    /// install refusal, available-list panel row, loader skip) otherwise
+    /// had to repeat independently (#1807 review nit).
+    pub fn incompatibility_reason_for_running_vimcode(&self) -> Option<String> {
+        self.incompatibility_reason(env!("CARGO_PKG_VERSION"))
     }
 
     /// The name to show the user: `display_name` when set, falling back to
@@ -1306,6 +1486,49 @@ package = "csharprepl"
         assert!(prereq_install_cmd("python3").is_some());
     }
 
+    /// #1719 acceptance criterion: every `PREREQ_INSTALLS` entry, on every
+    /// platform, resolves to a single runnable command string — never
+    /// empty and never a placeholder (`TODO`, `<...>`, `xxx`) that would
+    /// just move the "command not found" failure from the install pane to
+    /// the retry the hint told the user to run.
+    #[test]
+    fn every_prereq_install_entry_is_runnable_on_every_platform() {
+        for (name, table) in PREREQ_INSTALLS {
+            for (platform, cmd) in [
+                (Platform::Linux, table.linux),
+                (Platform::MacOS, table.macos),
+                (Platform::Windows, table.windows),
+            ] {
+                assert!(
+                    !cmd.trim().is_empty(),
+                    "{name} on {platform} has an empty install hint"
+                );
+                for placeholder in ["TODO", "<", ">", "xxx", "PLACEHOLDER"] {
+                    assert!(
+                        !cmd.contains(placeholder),
+                        "{name} on {platform} looks like a placeholder, not a \
+                         runnable command: {cmd:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #1719: `brew`, `java`, `curl`, `unzip`, `tar` are the new entries
+    /// this issue adds to the shared hint table (Homebrew itself, a JDK,
+    /// and the archive tools the built-in codelldb/netcoredbg DAP
+    /// installers shell out to) — pinned individually so a future refactor
+    /// of the table can't silently drop one of them.
+    #[test]
+    fn prereq_install_cmd_covers_the_1719_additions() {
+        for dep in ["brew", "java", "curl", "unzip", "tar"] {
+            assert!(
+                prereq_install_cmd(dep).is_some(),
+                "{dep} should have a built-in install hint"
+            );
+        }
+    }
+
     #[test]
     fn dap_install_cmd_for_resolves_explicit_platform() {
         let cfg = DapConfig {
@@ -1323,5 +1546,136 @@ package = "csharprepl"
             "winget install netcoredbg"
         );
         assert_eq!(cfg.install_cmd_for(Platform::MacOS), "");
+    }
+
+    // ─── #1807: requires_vimcode ─────────────────────────────────────────
+
+    /// Parsing: `requires_vimcode` round-trips from TOML as a plain string
+    /// field, same shape as every other optional manifest field.
+    #[test]
+    fn requires_vimcode_parses_from_toml() {
+        let toml = r#"
+name = "future-ext"
+display_name = "Future Extension"
+requires_vimcode = ">=0.15.0"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        assert_eq!(m.requires_vimcode, Some(">=0.15.0".to_string()));
+    }
+
+    /// Absent case: a manifest with no `requires_vimcode` field at all
+    /// (every extension predating #1807) parses to `None` and is
+    /// compatible with any running version — behaves exactly as today.
+    #[test]
+    fn requires_vimcode_absent_parses_to_none_and_is_always_compatible() {
+        let toml = r#"
+name = "legacy-ext"
+display_name = "Legacy Extension"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        assert_eq!(m.requires_vimcode, None);
+        assert!(m.is_compatible_with_vimcode("0.1.0"));
+        assert!(m.is_compatible_with_vimcode("999.0.0"));
+        assert!(m.incompatibility_reason("0.1.0").is_none());
+    }
+
+    /// Comparing against the running version: `>=` requirement satisfied
+    /// by a running version at or above the bound.
+    #[test]
+    fn requires_vimcode_satisfied_when_running_version_meets_bound() {
+        let m = ExtensionManifest {
+            name: "x".to_string(),
+            requires_vimcode: Some(">=0.15.0".to_string()),
+            ..Default::default()
+        };
+        assert!(m.is_compatible_with_vimcode("0.15.0"));
+        assert!(m.is_compatible_with_vimcode("0.16.0"));
+        assert!(m.is_compatible_with_vimcode("1.0.0"));
+        assert!(m.incompatibility_reason("0.15.0").is_none());
+    }
+
+    /// Comparing against the running version: `>=` requirement NOT
+    /// satisfied by a running version below the bound — the installed
+    /// vimcode is too old for this extension.
+    #[test]
+    fn requires_vimcode_unmet_when_running_version_below_bound() {
+        let m = ExtensionManifest {
+            name: "x".to_string(),
+            requires_vimcode: Some(">=99.0.0".to_string()),
+            ..Default::default()
+        };
+        assert!(!m.is_compatible_with_vimcode("0.14.0"));
+        let reason = m
+            .incompatibility_reason("0.14.0")
+            .expect("should be incompatible");
+        assert!(reason.contains("99.0.0"), "reason: {reason:?}");
+        assert!(reason.contains("0.14.0"), "reason: {reason:?}");
+    }
+
+    /// A malformed `requires_vimcode` string (not a valid semver
+    /// requirement) is treated as "no constraint" rather than bricking
+    /// the extension over a manifest typo.
+    #[test]
+    fn requires_vimcode_malformed_requirement_is_treated_as_compatible() {
+        let m = ExtensionManifest {
+            name: "x".to_string(),
+            requires_vimcode: Some("not-a-semver-range".to_string()),
+            ..Default::default()
+        };
+        assert!(m.is_compatible_with_vimcode("0.14.0"));
+        assert!(m.incompatibility_reason("0.14.0").is_none());
+    }
+
+    /// `^0.14.0` (caret, the default semver operator) excludes `0.15.0`
+    /// under semver's own pre-1.0 "only patch bumps are compatible" rule —
+    /// pinning this so a future change to the comparison semantics (e.g.
+    /// accidentally normalising to `>=`) is caught.
+    #[test]
+    fn requires_vimcode_caret_requirement_is_strict_pre_1_0() {
+        let m = ExtensionManifest {
+            name: "x".to_string(),
+            requires_vimcode: Some("0.14.0".to_string()),
+            ..Default::default()
+        };
+        assert!(m.is_compatible_with_vimcode("0.14.0"));
+        assert!(m.is_compatible_with_vimcode("0.14.5"));
+        assert!(!m.is_compatible_with_vimcode("0.15.0"));
+    }
+
+    /// A prerelease running version (e.g. a future `Cargo.toml` carrying
+    /// `"0.15.0-rc1"`) must not read as incompatible against a plain
+    /// `">=0.15.0"` bound — `semver::VersionReq::matches` excludes
+    /// prereleases from a non-prerelease comparator by design, which this
+    /// method works around by stripping the prerelease component before
+    /// matching (#1807 review).
+    #[test]
+    fn requires_vimcode_tolerates_prerelease_running_version() {
+        let m = ExtensionManifest {
+            name: "x".to_string(),
+            requires_vimcode: Some(">=0.15.0".to_string()),
+            ..Default::default()
+        };
+        assert!(m.is_compatible_with_vimcode("0.15.0-rc1"));
+        assert!(m.is_compatible_with_vimcode("0.15.0-dev"));
+        assert!(!m.is_compatible_with_vimcode("0.14.0-rc1"));
+    }
+
+    /// `incompatibility_reason_for_running_vimcode` is the single
+    /// "compare against the actual running vimcode" convenience every
+    /// call site (marketplace install refusal, available-list panel row,
+    /// loader skip) shares, rather than each repeating
+    /// `env!("CARGO_PKG_VERSION")` independently (#1807 review nit).
+    #[test]
+    fn incompatibility_reason_for_running_vimcode_matches_explicit_call() {
+        let m = ExtensionManifest {
+            name: "x".to_string(),
+            requires_vimcode: Some(">=9999.0.0".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            m.incompatibility_reason_for_running_vimcode(),
+            m.incompatibility_reason(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(m.incompatibility_reason_for_running_vimcode().is_some());
     }
 }

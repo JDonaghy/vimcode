@@ -1,6 +1,91 @@
 use super::super::settings::LineNumberMode;
 use super::*;
 
+/// A scratch path under `$TMPDIR` that is unique **per test process**, not
+/// just per test — [`crate::harness::scratch_dir`] (the #1498 helper) with
+/// the file extension, if any, preserved.
+///
+/// #1732: this file's scratch paths used to be bare
+/// `std::env::temp_dir().join("vimcode_test_<something>")` literals. Those
+/// are unique *within* one `cargo test` run (libtest gives every `#[test]`
+/// its own thread and never runs one twice), but they are byte-identical
+/// across *processes* — so two `cargo test` runs on one machine (two git
+/// worktrees, the coordinator running several workers, a human run racing
+/// automation on a shared box) derive every one of them identically. Since
+/// nearly every one of these fixtures opens with `remove_dir_all` and then
+/// writes files it later asserts on, one run deletes the other's fixture
+/// mid-test and the damage surfaces as a stampede of unrelated-looking
+/// assertion failures in whichever tests lost the race.
+///
+/// This is exactly the collision [`crate::harness::scratch_dir`] was
+/// introduced for (#1498) — the same reproduction, in the one file that
+/// never adopted it. The #1732 quadraui bump was blamed for 16 such
+/// failures (`test_command_center_task_prefix_filter`,
+/// `test_git_branch_picker_checkout_action`,
+/// `test_confirm_delete_file_cancel`, `test_git_diff_split_*`, …); they
+/// reproduce on unmodified `develop` by running the lib test binary twice
+/// at once, and vanish when it is run alone.
+///
+/// The uniquifying suffix goes *before* the extension so a `.rs`/`.txt`/
+/// `.tf` name keeps it — several callers depend on the extension for
+/// language detection, so `foo.rs` must stay `<something>.rs` rather than
+/// becoming `foo.rs_1234_ThreadId(5)`.
+fn test_temp_path(name: &str) -> std::path::PathBuf {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => {
+            crate::harness::scratch_dir(stem).with_extension(ext)
+        }
+        _ => crate::harness::scratch_dir(name),
+    }
+}
+
+/// Guards the two properties every one of this file's ~128 filesystem
+/// fixtures now depends on, and which the bare
+/// `std::env::temp_dir().join("literal")` form it replaced had neither of.
+///
+/// RED against the pre-#1732 form: substitute the old body
+/// (`std::env::temp_dir().join(name)`) back into [`test_temp_path`] and the
+/// first assertion fails immediately — the path carries no pid, so two
+/// concurrent test processes derive the same directory. Drop the
+/// extension-preserving arm instead (always
+/// `crate::harness::scratch_dir(name)`) and the third assertion fails —
+/// `fixture.rs` comes back as `fixture.rs_<pid>_ThreadId(n)`, which
+/// `Buffer`'s extension-based language detection no longer recognises as
+/// Rust, silently defeating every syntax/LSP fixture in this file.
+#[test]
+fn test_temp_path_is_process_unique_and_keeps_the_extension() {
+    let plain = test_temp_path("vimcode_test_temp_path_probe");
+    let plain_name = plain.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        plain_name.contains(&std::process::id().to_string()),
+        "a scratch path must carry the pid so two concurrent `cargo test` \
+         processes cannot `remove_dir_all` each other's fixture, got \
+         {plain_name}"
+    );
+
+    let dotted = test_temp_path("vimcode_test_temp_path_probe.rs");
+    assert_eq!(
+        dotted.extension().and_then(|e| e.to_str()),
+        Some("rs"),
+        "the uniquifying suffix must be spliced in before the extension, \
+         got {dotted:?}"
+    );
+    let dotted_name = dotted.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        dotted_name.contains(&std::process::id().to_string()),
+        "an extension-carrying scratch path must still carry the pid, got \
+         {dotted_name}"
+    );
+
+    // A dotless name and its dotted sibling must not collide, and neither
+    // may be the raw literal.
+    assert_ne!(plain, dotted);
+    assert_ne!(
+        plain,
+        std::env::temp_dir().join("vimcode_test_temp_path_probe")
+    );
+}
+
 fn press_char(engine: &mut Engine, ch: char) {
     engine.handle_key(&ch.to_string(), Some(ch), false);
 }
@@ -488,7 +573,11 @@ fn test_qa_bang_force_quits() {
 #[test]
 fn test_startup_without_session_restore_ignores_workspace_session() {
     use crate::core::session::SessionState;
-    let dir = std::env::temp_dir();
+    // #1732: a per-process scratch dir, not bare `$TMPDIR` — the fixture
+    // files below have fixed names, so two concurrent `cargo test` runs
+    // would write and `remove_file` the same paths.
+    let dir = test_temp_path("vimcode_no_restore_ws_root");
+    std::fs::create_dir_all(&dir).unwrap();
     let p1 = dir.join("vimcode_no_restore_a.txt");
     let p2 = dir.join("vimcode_no_restore_b.txt");
     std::fs::write(&p1, "aaa").unwrap();
@@ -611,10 +700,178 @@ fn test_startup_without_session_restore_skips_ambient_plugins_and_registry_fetch
     );
 }
 
+/// #1797 (bugbash:win-native): "Source Control panel CHANGES section
+/// never lists modified/untracked files". Root cause traced to
+/// `Engine::startup_inner`'s file-opening branch: opening a *file* (as
+/// opposed to a folder, which `open_folder` already handles) never
+/// touches `self.cwd`/`self.workspace_root` at all, so `cwd` stays
+/// whatever the process's actual working directory happened to be at
+/// `Engine::new()` time. On a terminal launch (`cd workspace && vimcode
+/// main.rs`) that is harmless, since the shell already `cd`ed into the
+/// workspace first — but a native-GUI launch that hands vimcode an
+/// absolute file path without first changing the process's directory
+/// (a desktop shortcut with no "Start in" folder, a file-association
+/// "Open with" launch, or — per this test — any caller that constructs
+/// an `Engine` from one directory and then opens a file that lives in a
+/// completely different one) leaves `cwd` pointing somewhere with no git
+/// repo at all. `git::find_repo_root(&self.cwd)` then returns `None`,
+/// `sc_refresh`'s `git status` runs against the *wrong* directory, and
+/// the CHANGES section — which only ever reads `sc_file_statuses` — stays
+/// permanently empty, exactly matching the report (open the file, open
+/// the panel, even a manual refresh changes nothing, because every one
+/// of those refreshes queries the same wrong directory).
+///
+/// This is shared, platform-neutral `Engine`/`core` code — no backend
+/// touches `cwd` differently — so the fix belongs here, not in
+/// `src/win/`, and a `TuiDriver`/`GtkDriver` test would exercise the
+/// identical code path with strictly more harness overhead for no extra
+/// coverage.
+///
+/// RED-verified: before the fix, `Engine::startup_inner`'s file-path arm
+/// was just `let _ = self.open_file_with_mode(path, OpenMode::Permanent);`
+/// with no preceding `cwd` adjustment — under that body this test's
+/// `sc_section_file_count` assertion observed `0`, not `2` (there is no
+/// git repo at `launch_cwd`, so `git::status_detailed` returns an empty
+/// `Vec`), reproducing the report exactly.
+#[test]
+fn startup_on_a_file_outside_cwd_still_finds_its_repo_for_source_control_1797() {
+    // The git workspace the file actually lives in: one committed file
+    // modified afterward (porcelain " M"), plus one untracked file
+    // (porcelain "??") -- the issue's own exact reproduction shape.
+    let workspace = test_temp_path("vimcode_1797_sc_changes_workspace");
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(&workspace).unwrap();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+    };
+    run_git(&["init"]);
+    run_git(&["config", "user.email", "t@t.com"]);
+    run_git(&["config", "user.name", "T"]);
+    let tracked = workspace.join("main.rs");
+    std::fs::write(&tracked, "fn main() {}\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "init"]);
+    std::fs::write(&tracked, "fn main() { /* changed */ }\n").unwrap();
+    let untracked = workspace.join("extra.rs");
+    std::fs::write(&untracked, "// new\n").unwrap();
+
+    // A completely unrelated directory standing in for "wherever the
+    // process's cwd happened to be at launch" -- deliberately *not* the
+    // workspace above, and not a git repo itself.
+    let launch_cwd = test_temp_path("vimcode_1797_sc_changes_launch_cwd");
+    let _ = std::fs::remove_dir_all(&launch_cwd);
+    std::fs::create_dir_all(&launch_cwd).unwrap();
+
+    let mut engine = Engine::new_for_test();
+    engine.cwd = launch_cwd.clone();
+    engine.settings.swap_file = false;
+    engine.startup_without_session_restore(Some(&tracked));
+
+    engine.sc_refresh();
+    assert_eq!(
+        engine.sc_section_file_count(SC_SECTION_CHANGES),
+        2,
+        "opening a file by absolute path must resolve git status against \
+         the file's own repo, not whatever directory the process started \
+         in -- CHANGES must list both the modified tracked file and the \
+         untracked one"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&launch_cwd);
+}
+
+/// #1797 review (non-blocking finding #2): `adopt_cwd_for_startup_file`'s
+/// doc comment makes "a file already under `cwd` must not repoint
+/// anything" a load-bearing guarantee — it's what keeps an ordinary
+/// `cd workspace && vimcode src/main.rs` terminal launch from narrowing
+/// the workspace root down to `src/`. Nothing pinned that guarantee
+/// before this test, so a future tweak to the `starts_with` check could
+/// silently start re-rooting every nested-file launch.
+#[test]
+fn adopt_cwd_for_startup_file_is_a_no_op_when_the_file_is_already_under_cwd_1797() {
+    let workspace = test_temp_path("vimcode_1797_adopt_cwd_noop_nested");
+    let _ = std::fs::remove_dir_all(&workspace);
+    let nested = workspace.join("src");
+    std::fs::create_dir_all(&nested).unwrap();
+    let file = nested.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+
+    let mut engine = Engine::new_for_test();
+    engine.cwd = workspace.clone();
+    engine.settings.swap_file = false;
+    engine.startup_without_session_restore(Some(&file));
+
+    assert_eq!(
+        engine.cwd.canonicalize().unwrap(),
+        workspace.canonicalize().unwrap(),
+        "opening a file already reachable from cwd must not repoint cwd \
+         at the file's own (nested) parent directory"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// #1797 review (non-blocking finding #1): opening a file *outside* `cwd`
+/// must not repoint `cwd` away from a workspace that already has its own
+/// git repo — `cd ~/myrepo && vimcode ~/.gitconfig` must leave `cwd` at
+/// `~/myrepo`, not silently move it to `~/.gitconfig`'s own repo (or to
+/// `$HOME`, if `.gitconfig` isn't in one). The reported bug is a launch
+/// `cwd` with *no* repo at all (a desktop shortcut, a file-association
+/// "Open with" launch) — this scenario is deliberately excluded from the
+/// fix's scope.
+#[test]
+fn adopt_cwd_for_startup_file_is_a_no_op_when_cwd_already_has_its_own_repo_1797() {
+    let own_workspace = test_temp_path("vimcode_1797_adopt_cwd_noop_own_repo_ws");
+    let _ = std::fs::remove_dir_all(&own_workspace);
+    std::fs::create_dir_all(&own_workspace).unwrap();
+    let run_git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&own_workspace)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "git {args:?} failed");
+    };
+    run_git(&["init"]);
+
+    // An unrelated file in a *different* directory -- not under
+    // `own_workspace` at all, and not inside a git repo itself, so the
+    // only thing that could trigger adoption is the (deliberately absent)
+    // "cwd has no repo" branch.
+    let other_dir = test_temp_path("vimcode_1797_adopt_cwd_noop_own_repo_other");
+    let _ = std::fs::remove_dir_all(&other_dir);
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let other_file = other_dir.join("notes.txt");
+    std::fs::write(&other_file, "hello\n").unwrap();
+
+    let mut engine = Engine::new_for_test();
+    engine.cwd = own_workspace.clone();
+    engine.settings.swap_file = false;
+    engine.startup_without_session_restore(Some(&other_file));
+
+    assert_eq!(
+        engine.cwd.canonicalize().unwrap(),
+        own_workspace.canonicalize().unwrap(),
+        "cwd already had its own git repo, so opening an unrelated file \
+         by absolute path must not repoint cwd at that file's directory"
+    );
+
+    let _ = std::fs::remove_dir_all(&own_workspace);
+    let _ = std::fs::remove_dir_all(&other_dir);
+}
+
 #[test]
 fn test_restore_session_files_opens_separate_tabs() {
     use crate::core::session::SessionState;
-    let dir = std::env::temp_dir();
+    // #1732: per-process scratch dir — see `test_temp_path`.
+    let dir = test_temp_path("vimcode_restore_ws_root");
+    std::fs::create_dir_all(&dir).unwrap();
     let p1 = dir.join("vimcode_restore_a.txt");
     let p2 = dir.join("vimcode_restore_b.txt");
     let p3 = dir.join("vimcode_restore_c.txt");
@@ -674,7 +931,9 @@ fn test_restore_session_files_opens_separate_tabs() {
 #[test]
 fn test_restore_session_does_not_bleed_across_workspaces() {
     use crate::core::session::SessionState;
-    let dir = std::env::temp_dir();
+    // #1732: per-process scratch dir — see `test_temp_path`.
+    let dir = test_temp_path("vimcode_bleed_ws_root");
+    std::fs::create_dir_all(&dir).unwrap();
     let p1 = dir.join("vimcode_bleed_a.txt");
     std::fs::write(&p1, "from workspace A").unwrap();
 
@@ -712,7 +971,9 @@ fn test_restore_session_does_not_bleed_across_workspaces() {
 
 #[test]
 fn test_ctrl_s_saves_in_normal_mode() {
-    let dir = std::env::temp_dir();
+    // #1732: per-process scratch dir — see `test_temp_path`.
+    let dir = test_temp_path("vimcode_ctrl_s_ws_root");
+    std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("vimcode_test_ctrl_s.txt");
     std::fs::write(&path, "original").unwrap();
     let mut engine = Engine::open(&path);
@@ -866,7 +1127,7 @@ fn test_command_line_number_jump() {
 #[test]
 fn test_command_save() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_save");
+    let dir = test_temp_path("vimcode_test_save");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("test_save.txt");
 
@@ -1791,7 +2052,7 @@ fn test_open_nonexistent_file() {
 #[test]
 fn test_open_existing_file() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_open.txt");
+    let path = test_temp_path("vimcode_test_open.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"test content").unwrap();
@@ -1907,7 +2168,7 @@ fn test_buffer_navigation() {
     engine.buffer_mut().insert(0, "buffer 1");
 
     // Open a new file (creates second buffer)
-    let path = std::env::temp_dir().join("vimcode_test_buf2.txt");
+    let path = test_temp_path("vimcode_test_buf2.txt");
     std::fs::write(&path, "buffer 2").unwrap();
 
     engine.split_window(SplitDirection::Vertical, Some(&path));
@@ -1934,8 +2195,8 @@ fn test_list_buffers() {
 #[test]
 fn test_ex_bfirst_blast_jump_to_ends_1154() {
     let mut engine = Engine::new();
-    let path2 = std::env::temp_dir().join("vimcode_test_bfirst_blast_2.txt");
-    let path3 = std::env::temp_dir().join("vimcode_test_bfirst_blast_3.txt");
+    let path2 = test_temp_path("vimcode_test_bfirst_blast_2.txt");
+    let path3 = test_temp_path("vimcode_test_bfirst_blast_3.txt");
     std::fs::write(&path2, "two").unwrap();
     std::fs::write(&path3, "three").unwrap();
 
@@ -1958,7 +2219,7 @@ fn test_ex_bfirst_blast_jump_to_ends_1154() {
 #[test]
 fn test_ex_bwipeout_deletes_buffer_like_bdelete_1154() {
     let mut engine = Engine::new();
-    let path = std::env::temp_dir().join("vimcode_test_bwipeout.txt");
+    let path = test_temp_path("vimcode_test_bwipeout.txt");
     std::fs::write(&path, "wipe me").unwrap();
 
     let buf1_id = engine.active_buffer_id();
@@ -1987,7 +2248,7 @@ fn test_ex_bw_abbreviation_wipes_active_buffer_1154() {
     // entry) — exercise the abbreviation wiring, not just the canonical
     // spelling, against the *active* buffer (no explicit N argument).
     let mut engine = Engine::new();
-    let path = std::env::temp_dir().join("vimcode_test_bw_abbrev.txt");
+    let path = test_temp_path("vimcode_test_bw_abbrev.txt");
     std::fs::write(&path, "wipe me too").unwrap();
 
     let buf1_id = engine.active_buffer_id();
@@ -6108,7 +6369,7 @@ fn test_mouse_click_single_character_line() {
 #[test]
 fn test_preview_open_marks_buffer() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_preview1.txt");
+    let path = test_temp_path("vimcode_test_preview1.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"preview").unwrap();
@@ -6129,7 +6390,7 @@ fn test_preview_open_marks_buffer() {
 #[test]
 fn test_permanent_open_not_preview() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_preview2.txt");
+    let path = test_temp_path("vimcode_test_preview2.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"permanent").unwrap();
@@ -6150,8 +6411,8 @@ fn test_permanent_open_not_preview() {
 #[test]
 fn test_preview_replaced_by_new_preview() {
     use std::io::Write;
-    let path1 = std::env::temp_dir().join("vimcode_test_preview3a.txt");
-    let path2 = std::env::temp_dir().join("vimcode_test_preview3b.txt");
+    let path1 = test_temp_path("vimcode_test_preview3a.txt");
+    let path2 = test_temp_path("vimcode_test_preview3b.txt");
     {
         let mut f = std::fs::File::create(&path1).unwrap();
         f.write_all(b"file1").unwrap();
@@ -6185,7 +6446,7 @@ fn test_preview_replaced_by_new_preview() {
 #[test]
 fn test_double_click_promotes_preview() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_preview4.txt");
+    let path = test_temp_path("vimcode_test_preview4.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"promote").unwrap();
@@ -6212,7 +6473,7 @@ fn test_double_click_promotes_preview() {
 #[test]
 fn test_edit_promotes_preview() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_preview5.txt");
+    let path = test_temp_path("vimcode_test_preview5.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"editme").unwrap();
@@ -6240,7 +6501,7 @@ fn test_edit_promotes_preview() {
 #[test]
 fn test_save_promotes_preview() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_preview6.txt");
+    let path = test_temp_path("vimcode_test_preview6.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"saveme").unwrap();
@@ -6265,7 +6526,7 @@ fn test_save_promotes_preview() {
 #[test]
 fn test_ls_shows_preview_flag() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_preview7.txt");
+    let path = test_temp_path("vimcode_test_preview7.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"ls").unwrap();
@@ -6285,7 +6546,7 @@ fn test_ls_shows_preview_flag() {
 #[test]
 fn test_already_permanent_ignores_preview_mode() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_preview8.txt");
+    let path = test_temp_path("vimcode_test_preview8.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"perm").unwrap();
@@ -6311,7 +6572,7 @@ fn test_already_permanent_ignores_preview_mode() {
 #[test]
 fn test_delete_preview_clears_tracking() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_preview9.txt");
+    let path = test_temp_path("vimcode_test_preview9.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"del").unwrap();
@@ -6333,7 +6594,7 @@ fn test_delete_preview_clears_tracking() {
 #[test]
 fn test_preview_never_dirty_and_preview() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_preview10.txt");
+    let path = test_temp_path("vimcode_test_preview10.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"dirtytest").unwrap();
@@ -6365,7 +6626,7 @@ fn test_preview_never_dirty_and_preview() {
 #[test]
 fn test_open_file_preview_creates_preview_tab() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_sidebar_preview1.txt");
+    let path = test_temp_path("vimcode_test_sidebar_preview1.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"hello").unwrap();
@@ -6385,8 +6646,8 @@ fn test_open_file_preview_creates_preview_tab() {
 #[test]
 fn test_open_file_preview_replaced_by_second_single_click() {
     use std::io::Write;
-    let path1 = std::env::temp_dir().join("vimcode_test_sidebar_preview2a.txt");
-    let path2 = std::env::temp_dir().join("vimcode_test_sidebar_preview2b.txt");
+    let path1 = test_temp_path("vimcode_test_sidebar_preview2a.txt");
+    let path2 = test_temp_path("vimcode_test_sidebar_preview2b.txt");
     {
         let mut f = std::fs::File::create(&path1).unwrap();
         f.write_all(b"file1").unwrap();
@@ -6425,7 +6686,7 @@ fn test_open_file_preview_replaced_by_second_single_click() {
 #[test]
 fn test_open_file_preview_double_click_promotes() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_sidebar_preview3.txt");
+    let path = test_temp_path("vimcode_test_sidebar_preview3.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"hello").unwrap();
@@ -6450,8 +6711,8 @@ fn test_open_file_preview_double_click_promotes() {
 #[test]
 fn test_open_file_preview_permanent_file_just_switches() {
     use std::io::Write;
-    let path1 = std::env::temp_dir().join("vimcode_test_sidebar_preview4a.txt");
-    let path2 = std::env::temp_dir().join("vimcode_test_sidebar_preview4b.txt");
+    let path1 = test_temp_path("vimcode_test_sidebar_preview4a.txt");
+    let path2 = test_temp_path("vimcode_test_sidebar_preview4b.txt");
     {
         let mut f = std::fs::File::create(&path1).unwrap();
         f.write_all(b"file1").unwrap();
@@ -8271,7 +8532,10 @@ fn test_completion_narrows_on_prefix_extension() {
         "ScrollAxis".to_string(),
         "ScreenLayout".to_string(),
         "SomethingElse".to_string(), // matches `S` but not `Sc`
-    ];
+    ]
+    .into_iter()
+    .map(CompletionCandidate::plain)
+    .collect();
     engine.completion_idx = Some(0);
     engine.completion_display_only = true;
     engine.completion_filter_prefix = "S".to_string();
@@ -8312,7 +8576,7 @@ fn test_completion_replaces_when_prefix_changes_unrelated() {
     press_char(&mut engine, 'G');
     press_char(&mut engine, 'o');
     // Simulate state from an earlier completion at prefix `S`.
-    engine.completion_candidates = vec!["Scrollbar".to_string()];
+    engine.completion_candidates = vec![CompletionCandidate::plain("Scrollbar".to_string())];
     engine.completion_filter_prefix = "S".to_string();
     // Now type a completely different word — prefix becomes `f`.
     press_char(&mut engine, 'f');
@@ -8559,7 +8823,7 @@ fn test_escape_from_insert_clears_pending_lsp_completion() {
 fn test_completion_dismissed_in_normal_mode() {
     let mut engine = Engine::new();
     // Manually set completion state as if from a race condition
-    engine.completion_candidates = vec!["hello".to_string()];
+    engine.completion_candidates = vec![CompletionCandidate::plain("hello".to_string())];
     engine.completion_idx = Some(0);
     engine.completion_display_only = true;
     assert_eq!(engine.mode, Mode::Normal);
@@ -9223,7 +9487,7 @@ fn test_cip_leaves_trailing_blank_line_intact() {
 
 fn make_search_dir(test_name: &str) -> std::path::PathBuf {
     use std::io::Write;
-    let dir = std::env::temp_dir().join(format!("vimcode_engine_search_{}", test_name));
+    let dir = test_temp_path(&format!("vimcode_engine_search_{test_name}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut f = std::fs::File::create(dir.join("sample.txt")).unwrap();
@@ -9780,7 +10044,7 @@ fn test_lsp_commands() {
 
 #[test]
 fn test_lsp_language_id_set_on_buffer() {
-    let rs_path = std::env::temp_dir().join("vimcode_lsp_test.rs");
+    let rs_path = test_temp_path("vimcode_lsp_test.rs");
     std::fs::write(&rs_path, "fn main() {}\n").unwrap();
 
     let mut engine = Engine::new();
@@ -9792,7 +10056,7 @@ fn test_lsp_language_id_set_on_buffer() {
 
 #[test]
 fn test_set_filetype() {
-    let tf_path = std::env::temp_dir().join("vimcode_ft_test.tf");
+    let tf_path = test_temp_path("vimcode_ft_test.tf");
     std::fs::write(&tf_path, "resource \"null\" {}\n").unwrap();
 
     let mut engine = Engine::new();
@@ -9826,7 +10090,7 @@ fn test_set_filetype() {
 
 #[test]
 fn test_set_filetype_bicep() {
-    let bp_path = std::env::temp_dir().join("vimcode_ft_test.bicepparam");
+    let bp_path = test_temp_path("vimcode_ft_test.bicepparam");
     std::fs::write(&bp_path, "param env = 'dev'\n").unwrap();
 
     let mut engine = Engine::new();
@@ -9841,7 +10105,7 @@ fn test_set_filetype_bicep() {
 
 #[test]
 fn test_language_map_override_on_open() {
-    let path = std::env::temp_dir().join("vimcode_langmap_test.h");
+    let path = test_temp_path("vimcode_langmap_test.h");
     std::fs::write(&path, "// header\n").unwrap();
 
     let mut engine = Engine::new();
@@ -9861,7 +10125,7 @@ fn test_language_map_override_on_open() {
     engine.new_tab(Some(&path));
     // The existing buffer is reused, but language_map was applied
     // Let's test with a truly new file
-    let path2 = std::env::temp_dir().join("vimcode_langmap_test2.h");
+    let path2 = test_temp_path("vimcode_langmap_test2.h");
     std::fs::write(&path2, "// header2\n").unwrap();
     engine.new_tab(Some(&path2));
     assert_eq!(
@@ -9892,7 +10156,7 @@ fn test_lsp_flush_clears_diagnostics_by_canonical_path() {
     // with. When they differed, remove was a silent no-op and the gutter
     // kept showing stale error markers after a git discard / revert.
     use std::path::PathBuf;
-    let dir = std::env::temp_dir().join("vimcode_test_diag_canonical");
+    let dir = test_temp_path("vimcode_test_diag_canonical");
     let _ = std::fs::create_dir_all(&dir);
     let abs_path = dir.join("file.rs");
     std::fs::write(&abs_path, "fn main() {}\n").unwrap();
@@ -9985,7 +10249,7 @@ fn test_lsp_flush_changes_resets_semantic_tokens_received() {
     // `semantic_tokens_received` bool. lsp_flush_changes must clear that
     // bool when it clears the cached tokens, so the indicator can briefly
     // return to Initializing while the re-request is in flight.
-    let path = std::env::temp_dir().join("vimcode_test_sem_tokens_received.rs");
+    let path = test_temp_path("vimcode_test_sem_tokens_received.rs");
     std::fs::write(&path, "fn main() {}\n").unwrap();
     let mut engine = Engine::new();
     engine.new_tab(Some(&path));
@@ -10040,7 +10304,7 @@ fn test_reload_marks_lsp_dirty() {
     // runs for buffers in lsp_dirty_buffers, so the resync (clear
     // semantic_tokens + notify_did_change + re-request semantic_tokens)
     // never happened.
-    let path = std::env::temp_dir().join("vimcode_test_reload_lsp_dirty.rs");
+    let path = test_temp_path("vimcode_test_reload_lsp_dirty.rs");
     std::fs::write(&path, "fn main() {}\n").unwrap();
     let mut engine = Engine::new();
     engine.new_tab(Some(&path));
@@ -10778,7 +11042,7 @@ fn test_jump_list_ctrl_o_returns_to_original_split() {
 /// `develop`: the buffer-content assertion sees "BBB" instead of "AAA".
 #[test]
 fn test_jump_list_ctrl_o_reopens_file_when_buffer_swapped_in_place() {
-    let dir = std::env::temp_dir().join("vimcode_jumplist_swap_in_place");
+    let dir = test_temp_path("vimcode_jumplist_swap_in_place");
     std::fs::create_dir_all(&dir).unwrap();
     let file_a = dir.join("file_a_swap.txt");
     let file_b = dir.join("file_b_swap.txt");
@@ -10841,7 +11105,7 @@ fn test_jump_list_ctrl_o_reopens_file_when_buffer_swapped_in_place() {
 /// jump_list length assertion sees 1 instead of 0.
 #[test]
 fn test_split_same_file_does_not_push_jump_entry() {
-    let dir = std::env::temp_dir().join("vimcode_jumplist_split_same_file");
+    let dir = test_temp_path("vimcode_jumplist_split_same_file");
     std::fs::create_dir_all(&dir).unwrap();
     let file_a = dir.join("file_a_split_same.txt");
     let content_a: String = (0..30).map(|i| format!("AAA line {}\n", i)).collect();
@@ -10880,7 +11144,7 @@ fn test_split_same_file_does_not_push_jump_entry() {
 /// buffer was actually different from the one being left.
 #[test]
 fn test_new_tab_same_file_does_not_push_jump_entry() {
-    let dir = std::env::temp_dir().join("vimcode_jumplist_tab_same_file");
+    let dir = test_temp_path("vimcode_jumplist_tab_same_file");
     std::fs::create_dir_all(&dir).unwrap();
     let file_a = dir.join("file_a_tab_same.txt");
     let content_a: String = (0..30).map(|i| format!("AAA line {}\n", i)).collect();
@@ -10973,7 +11237,7 @@ fn test_jump_list_prunes_entry_on_tab_close() {
 /// a different buffer (confirmed against a live oracle).
 #[test]
 fn test_ex_jumps_drops_tab_column_and_shows_file_text_preview() {
-    let dir = std::env::temp_dir().join("vimcode_jumps_file_text_preview");
+    let dir = test_temp_path("vimcode_jumps_file_text_preview");
     std::fs::create_dir_all(&dir).unwrap();
     let file_a = dir.join("file_a.txt");
     std::fs::write(&file_a, "one\ntwo\nthree\n").unwrap();
@@ -12111,7 +12375,7 @@ fn test_fuzzy_score_with_positions() {
 #[test]
 fn test_picker_confirm_opens_file() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_picker_confirm");
+    let dir = test_temp_path("vimcode_picker_confirm");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("testfile.txt");
@@ -12146,7 +12410,7 @@ fn test_picker_confirm_opens_file() {
 #[test]
 fn test_picker_files_populates_preview() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_picker_preview");
+    let dir = test_temp_path("vimcode_picker_preview");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     // Initialize a git repo so ignore crate doesn't skip everything
@@ -12187,7 +12451,7 @@ fn test_picker_files_populates_preview() {
 #[test]
 fn test_picker_grep_source_live_search() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_picker_grep");
+    let dir = test_temp_path("vimcode_picker_grep");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut f = std::fs::File::create(dir.join("sample.txt")).unwrap();
@@ -12241,7 +12505,7 @@ fn test_picker_grep_source_live_search() {
 #[test]
 fn test_picker_grep_confirm_opens_at_line() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_picker_grep_confirm");
+    let dir = test_temp_path("vimcode_picker_grep_confirm");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("target.txt");
@@ -12626,7 +12890,7 @@ fn test_command_center_grep_short_query() {
 #[test]
 fn test_command_center_grep_runs_search() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_cc_grep");
+    let dir = test_temp_path("vimcode_test_cc_grep");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     // Create a test file with searchable content
@@ -12693,7 +12957,7 @@ fn test_command_center_debug_prefix_no_launch_json() {
     // Set cwd to a temp dir with no launch.json.
     // A minimal Cargo.toml anchors find_workspace_root to this dir,
     // preventing it from walking up to /tmp which may have stale config.
-    let dir = std::env::temp_dir().join("vimcode_test_cc_debug_none");
+    let dir = test_temp_path("vimcode_test_cc_debug_none");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -12717,7 +12981,7 @@ fn test_command_center_debug_prefix_no_launch_json() {
 #[test]
 fn test_command_center_debug_prefix_with_configs() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_cc_debug_configs");
+    let dir = test_temp_path("vimcode_test_cc_debug_configs");
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
@@ -12757,7 +13021,7 @@ fn test_command_center_debug_prefix_with_configs() {
 #[test]
 fn test_command_center_debug_prefix_filter() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_cc_debug_filter");
+    let dir = test_temp_path("vimcode_test_cc_debug_filter");
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
@@ -12797,7 +13061,7 @@ fn test_command_center_debug_prefix_filter() {
 #[test]
 fn test_command_center_debug_confirm_sets_config_index() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_cc_debug_confirm");
+    let dir = test_temp_path("vimcode_test_cc_debug_confirm");
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
@@ -12871,7 +13135,7 @@ fn test_command_center_help_confirm_debug_prefix() {
 #[test]
 fn test_command_center_debug_reads_vscode_fallback() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_cc_debug_vscode");
+    let dir = test_temp_path("vimcode_test_cc_debug_vscode");
     let _ = std::fs::remove_dir_all(&dir);
     // No .vimcode dir, but .vscode/launch.json exists.
     // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
@@ -12911,7 +13175,7 @@ fn test_command_center_debug_reads_vscode_fallback() {
 #[test]
 fn test_command_center_task_prefix_no_tasks_json() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_test_cc_task_none");
+    let dir = test_temp_path("vimcode_test_cc_task_none");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
@@ -12934,7 +13198,7 @@ fn test_command_center_task_prefix_no_tasks_json() {
 #[test]
 fn test_command_center_task_prefix_with_tasks() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_cc_task_list");
+    let dir = test_temp_path("vimcode_test_cc_task_list");
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
@@ -12976,7 +13240,7 @@ fn test_command_center_task_prefix_with_tasks() {
 #[test]
 fn test_command_center_task_prefix_filter() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_cc_task_filter");
+    let dir = test_temp_path("vimcode_test_cc_task_filter");
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
@@ -13016,7 +13280,7 @@ fn test_command_center_task_prefix_filter() {
 #[test]
 fn test_command_center_task_confirm_returns_run_in_terminal() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_cc_task_confirm");
+    let dir = test_temp_path("vimcode_test_cc_task_confirm");
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
@@ -13052,7 +13316,7 @@ fn test_command_center_task_confirm_returns_run_in_terminal() {
 #[test]
 fn test_command_center_task_reads_vscode_fallback() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_cc_task_vscode");
+    let dir = test_temp_path("vimcode_test_cc_task_vscode");
     let _ = std::fs::remove_dir_all(&dir);
     // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
     std::fs::create_dir_all(&dir).unwrap();
@@ -13121,7 +13385,7 @@ fn test_command_center_help_confirm_task_prefix() {
 
 #[test]
 fn test_command_center_task_create_tasks_json() {
-    let dir = std::env::temp_dir().join("vimcode_test_cc_task_create");
+    let dir = test_temp_path("vimcode_test_cc_task_create");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
@@ -13259,7 +13523,7 @@ fn test_command_center_placeholder_select_go_to_file() {
 #[test]
 fn test_leader_sw_opens_grep_with_word() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_leader_sw");
+    let dir = test_temp_path("vimcode_test_leader_sw");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     // Create a file with the word "foobar" so grep can find it
@@ -13305,7 +13569,7 @@ fn test_leader_sw_no_word() {
 #[test]
 fn test_grep_word_command() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_grep_word_cmd");
+    let dir = test_temp_path("vimcode_test_grep_word_cmd");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let test_file = dir.join("test.txt");
@@ -13806,7 +14070,7 @@ fn test_grep_empty_pattern() {
 
 #[test]
 fn test_grep_no_matches() {
-    let dir = std::env::temp_dir().join("vimcode_qf_no_match");
+    let dir = test_temp_path("vimcode_qf_no_match");
     std::fs::create_dir_all(&dir).unwrap();
     let mut engine = Engine::new();
     engine.cwd = dir.clone();
@@ -13818,7 +14082,7 @@ fn test_grep_no_matches() {
 #[test]
 fn test_grep_populates_quickfix() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_qf_grep_pop");
+    let dir = test_temp_path("vimcode_qf_grep_pop");
     std::fs::create_dir_all(&dir).unwrap();
     let file_path = dir.join("qftest.rs");
     let mut f = std::fs::File::create(&file_path).unwrap();
@@ -13844,7 +14108,7 @@ fn test_grep_populates_quickfix() {
 #[test]
 fn test_vimgrep_alias() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_qf_vimgrep");
+    let dir = test_temp_path("vimcode_qf_vimgrep");
     std::fs::create_dir_all(&dir).unwrap();
     let file_path = dir.join("vgtest.rs");
     let mut f = std::fs::File::create(&file_path).unwrap();
@@ -13866,7 +14130,7 @@ fn test_vimgrep_alias() {
 
 #[test]
 fn test_rename_file_updates_buffer_path() {
-    let dir = std::env::temp_dir().join("vimcode_rename_upd");
+    let dir = test_temp_path("vimcode_rename_upd");
     std::fs::create_dir_all(&dir).unwrap();
     let old = dir.join("rename_old.txt");
     std::fs::write(&old, "hello").unwrap();
@@ -13910,7 +14174,7 @@ fn test_rename_file_empty_name() {
 
 #[test]
 fn test_move_file_basic() {
-    let base = std::env::temp_dir().join("vimcode_move_basic");
+    let base = test_temp_path("vimcode_move_basic");
     let dest = base.join("subdir_mv");
     std::fs::create_dir_all(&dest).unwrap();
     let src = base.join("moveme.txt");
@@ -13935,7 +14199,7 @@ fn test_move_file_invalid_dest() {
 
 #[test]
 fn test_confirm_move_shows_dialog() {
-    let base = std::env::temp_dir().join("vimcode_confirm_move_dlg");
+    let base = test_temp_path("vimcode_confirm_move_dlg");
     let dest = base.join("target_dir");
     std::fs::create_dir_all(&dest).unwrap();
     let src = base.join("confirm_me.txt");
@@ -13973,7 +14237,7 @@ fn test_confirm_move_shows_dialog() {
 
 #[test]
 fn test_confirm_move_cancel() {
-    let base = std::env::temp_dir().join("vimcode_confirm_move_cancel");
+    let base = test_temp_path("vimcode_confirm_move_cancel");
     let dest = base.join("target_dir_c");
     std::fs::create_dir_all(&dest).unwrap();
     let src = base.join("stay_put.txt");
@@ -13998,7 +14262,7 @@ fn test_confirm_move_cancel() {
 
 #[test]
 fn test_move_file_into_own_subtree() {
-    let base = std::env::temp_dir().join("vimcode_move_subtree");
+    let base = test_temp_path("vimcode_move_subtree");
     let parent = base.join("parent_dir");
     let child = parent.join("child_dir");
     std::fs::create_dir_all(&child).unwrap();
@@ -14017,7 +14281,7 @@ fn test_move_file_into_own_subtree() {
 
 #[test]
 fn test_move_file_same_directory_noop() {
-    let base = std::env::temp_dir().join("vimcode_move_noop");
+    let base = test_temp_path("vimcode_move_noop");
     std::fs::create_dir_all(&base).unwrap();
     let src = base.join("stay.txt");
     std::fs::write(&src, "stay").unwrap();
@@ -14034,7 +14298,7 @@ fn test_move_file_same_directory_noop() {
 
 #[test]
 fn test_move_directory_basic() {
-    let base = std::env::temp_dir().join("vimcode_move_dir");
+    let base = test_temp_path("vimcode_move_dir");
     let src = base.join("src_dir");
     let dest = base.join("dest_dir");
     std::fs::create_dir_all(&src).unwrap();
@@ -14056,7 +14320,7 @@ fn test_move_directory_basic() {
 
 #[test]
 fn test_move_file_updates_buffer_path() {
-    let base = std::env::temp_dir().join("vimcode_move_bufupd");
+    let base = test_temp_path("vimcode_move_bufupd");
     let dest = base.join("dest_mv");
     std::fs::create_dir_all(&dest).unwrap();
     let src = base.join("tracked.txt");
@@ -14241,7 +14505,7 @@ fn test_diffthis_one_window_then_diffoff() {
 
 #[test]
 fn test_diffthis_two_windows() {
-    let dir = std::env::temp_dir().join("vimcode_diffthis_two");
+    let dir = test_temp_path("vimcode_diffthis_two");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("file_a_dt.txt");
     let f2 = dir.join("file_b_dt.txt");
@@ -14272,7 +14536,7 @@ fn test_diffthis_two_windows() {
 
 #[test]
 fn test_diffsplit_command() {
-    let dir = std::env::temp_dir().join("vimcode_diffsplit_vc");
+    let dir = test_temp_path("vimcode_diffsplit_vc");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("src_ds.txt");
     let f2 = dir.join("cmp_ds.txt");
@@ -14313,7 +14577,7 @@ fn test_diffsplit_trailing_newline_aligned_length_matches_buffer() {
     // re-splits on '\n' internally and would otherwise reproduce the same
     // phantom element). This test uses single-line files with a real change
     // on the last (only) line, mirroring the review's minimal repro.
-    let dir = std::env::temp_dir().join("vimcode_diffsplit_trailing_nl");
+    let dir = test_temp_path("vimcode_diffsplit_trailing_nl");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("hello.txt");
     let f2 = dir.join("world.txt");
@@ -14359,7 +14623,7 @@ fn test_diffsplit_trailing_newline_aligned_length_matches_buffer() {
 #[test]
 fn test_diff_change_regions() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_diff_regions");
+    let dir = test_temp_path("vimcode_diff_regions");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("a_regions.txt");
     let f2 = dir.join("b_regions.txt");
@@ -14381,7 +14645,7 @@ fn test_diff_change_regions() {
 #[test]
 fn test_diff_jump_next_prev() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_diff_jump");
+    let dir = test_temp_path("vimcode_diff_jump");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("a_jump.txt");
     let f2 = dir.join("b_jump.txt");
@@ -14418,7 +14682,7 @@ fn test_diff_jump_next_prev() {
 #[test]
 fn test_diff_toggle_hide_unchanged() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_diff_fold");
+    let dir = test_temp_path("vimcode_diff_fold");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("a_fold.txt");
     let f2 = dir.join("b_fold.txt");
@@ -14454,7 +14718,7 @@ fn test_diff_toggle_hide_unchanged() {
 #[test]
 fn test_diff_aligned_scroll_sync() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_diff_aligned_scroll");
+    let dir = test_temp_path("vimcode_diff_aligned_scroll");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("a_scroll.txt");
     let f2 = dir.join("b_scroll.txt");
@@ -14502,7 +14766,7 @@ fn test_diff_aligned_scroll_sync() {
 #[test]
 fn test_diff_aligned_no_drift_past_multi_hunks() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_diff_no_drift");
+    let dir = test_temp_path("vimcode_diff_no_drift");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("a_drift.txt");
     let f2 = dir.join("b_drift.txt");
@@ -14592,7 +14856,7 @@ fn test_diff_aligned_no_drift_past_multi_hunks() {
 #[test]
 fn test_diff_aligned_top_renders_leading_padding() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_diff_leading_pad");
+    let dir = test_temp_path("vimcode_diff_leading_pad");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("a_pad.txt");
     let f2 = dir.join("b_pad.txt");
@@ -14631,7 +14895,7 @@ fn test_diff_aligned_top_renders_leading_padding() {
 #[test]
 fn test_diff_current_change_index() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_diff_idx");
+    let dir = test_temp_path("vimcode_diff_idx");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("a_idx.txt");
     let f2 = dir.join("b_idx.txt");
@@ -14667,7 +14931,7 @@ fn test_diff_current_change_index() {
 #[test]
 fn test_jump_hunk_delegates_in_diff_mode() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_diff_delegate");
+    let dir = test_temp_path("vimcode_diff_delegate");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("a_deleg.txt");
     let f2 = dir.join("b_deleg.txt");
@@ -14692,7 +14956,7 @@ fn test_jump_hunk_delegates_in_diff_mode() {
 #[test]
 fn test_diffthis_toolbar_and_scroll_sync() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_diffthis_toolbar");
+    let dir = test_temp_path("vimcode_diffthis_toolbar");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("a_dt.txt");
     let f2 = dir.join("b_dt.txt");
@@ -14742,7 +15006,7 @@ fn test_diffthis_toolbar_and_scroll_sync() {
 #[test]
 fn test_diffthis_across_editor_groups() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_diffthis_groups");
+    let dir = test_temp_path("vimcode_diffthis_groups");
     std::fs::create_dir_all(&dir).unwrap();
     let f1 = dir.join("a_grp.txt");
     let f2 = dir.join("b_grp.txt");
@@ -14797,7 +15061,7 @@ fn test_diffthis_across_editor_groups() {
 /// Returns (repo_dir, file_path).
 fn setup_git_diff_split_repo(suffix: &str) -> (PathBuf, PathBuf) {
     use std::process::Command;
-    let dir = std::env::temp_dir().join(format!("vimcode_gds_{suffix}"));
+    let dir = test_temp_path(&format!("vimcode_gds_{suffix}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     // Canonicalize to resolve symlinks (e.g. /tmp → /private/tmp on macOS)
@@ -14911,7 +15175,7 @@ fn test_git_diff_split_head_scratch_name() {
 #[cfg(not(target_os = "windows"))]
 fn test_git_diff_split_untracked_file_errors() {
     use std::process::Command;
-    let dir = std::env::temp_dir().join("vimcode_gds_untracked");
+    let dir = test_temp_path("vimcode_gds_untracked");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let dir = dir.canonicalize().unwrap();
@@ -15203,7 +15467,7 @@ fn test_bare_ll_and_ll_count_jump_like_cc() {
 #[test]
 fn test_lgrep_populates_the_active_window_location_list_not_quickfix() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_loclist_lgrep_1155");
+    let dir = test_temp_path("vimcode_loclist_lgrep_1155");
     std::fs::create_dir_all(&dir).unwrap();
     let file_path = dir.join("lgreptest.rs");
     let mut f = std::fs::File::create(&file_path).unwrap();
@@ -15360,7 +15624,7 @@ fn test_cdo_runs_command_once_per_entry_cfdo_once_per_file() {
 
     // :cdo touches every entry — two entries in file_a (same line) plus one
     // in file_b means file_a's line is appended to twice, file_b's once.
-    let dir = std::env::temp_dir().join("vimcode_qf_cdo_1155");
+    let dir = test_temp_path("vimcode_qf_cdo_1155");
     std::fs::create_dir_all(&dir).unwrap();
     let file_a = dir.join("cdo_a.txt");
     let file_b = dir.join("cdo_b.txt");
@@ -15378,7 +15642,7 @@ fn test_cdo_runs_command_once_per_entry_cfdo_once_per_file() {
     // :cfdo visits each distinct file once, in first-seen order — a fresh
     // engine/directory so there's no already-open buffer left over from the
     // :cdo run above to shadow the on-disk reset.
-    let dir = std::env::temp_dir().join("vimcode_qf_cfdo_1155");
+    let dir = test_temp_path("vimcode_qf_cfdo_1155");
     std::fs::create_dir_all(&dir).unwrap();
     let file_a = dir.join("cfdo_a.txt");
     let file_b = dir.join("cfdo_b.txt");
@@ -15971,6 +16235,66 @@ fn test_vscode_mode_ctrl_a_select_all() {
     assert_eq!(engine.view().cursor.line, 1);
 }
 
+/// #1697: the `Selection` menu's `select_all`/`move_line_up`/
+/// `move_line_down`/`add_cursor_above`/`add_cursor_below`/
+/// `add_next_occurrence`/`select_all_occurrences` actions are
+/// `execute_command` wiring onto the exact same logic the key dispatch
+/// above already runs — `execute_selection_menu_action`
+/// (`core/engine/vscode.rs`) is the single function both paths call, so
+/// these are a direct mirror of `test_vscode_mode_ctrl_a_select_all` using
+/// the menu's string-action entry point instead of a keystroke.
+#[test]
+fn test_selection_menu_select_all_action_matches_ctrl_a() {
+    let mut engine = make_vscode_engine("hello\nworld");
+    engine.update_syntax();
+    engine.execute_command("select_all");
+    assert!(engine.visual_anchor.is_some());
+    assert_eq!(engine.visual_anchor.unwrap().line, 0);
+    assert_eq!(engine.visual_anchor.unwrap().col, 0);
+    assert_eq!(engine.mode, Mode::Visual);
+    assert_eq!(engine.view().cursor.line, 1);
+}
+
+#[test]
+fn test_selection_menu_move_line_down_action_moves_current_line() {
+    let mut engine = make_vscode_engine("one\ntwo\nthree");
+    engine.update_syntax();
+    engine.execute_command("MoveLineDown");
+    assert_eq!(engine.buffer().to_string(), "two\none\nthree");
+}
+
+#[test]
+fn test_selection_menu_add_next_occurrence_action_selects_word_under_cursor() {
+    let mut engine = make_vscode_engine("foo bar foo baz foo");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 0; // on "foo"
+    engine.execute_command("add_next_occurrence");
+    assert_eq!(engine.mode, Mode::Visual);
+    assert_eq!(engine.visual_anchor, Some(Cursor { line: 0, col: 0 }));
+    assert_eq!(engine.view().cursor.col, 2); // end of first "foo"
+}
+
+#[test]
+fn test_selection_menu_select_all_occurrences_action_adds_a_cursor_per_match() {
+    let mut engine = make_vscode_engine("foo bar foo baz foo");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 0; // on "foo"
+    engine.execute_command("select_all_occurrences");
+    assert_eq!(engine.mode, Mode::Visual);
+    // Two other occurrences of "foo" besides the primary selection.
+    assert_eq!(engine.view().extra_cursors.len(), 2);
+}
+
+#[test]
+fn test_selection_menu_add_cursor_below_action_adds_extra_cursor() {
+    let mut engine = make_vscode_engine("one\ntwo\nthree");
+    engine.update_syntax();
+    assert!(engine.view().extra_cursors.is_empty());
+    engine.execute_command("add_cursor_below");
+    assert_eq!(engine.view().extra_cursors.len(), 1);
+    assert_eq!(engine.view().extra_cursors[0].line, 1);
+}
+
 #[test]
 fn test_vscode_mode_escape_clears_selection() {
     let mut engine = make_vscode_engine("hello");
@@ -16016,24 +16340,67 @@ fn test_vscode_mode_ctrl_c_no_selection_copies_line() {
 
 #[test]
 fn test_vscode_mode_toggle() {
+    // `menu_bar_toggleable` is only ever `true` on a backend with a
+    // runner-drawn, hideable menu bar (TUI); it's `false` by default on a
+    // bare `Engine` (see `new_from_state`), which is exactly what a
+    // `window_chrome` backend (GTK/Win-GUI) leaves it at for the lifetime
+    // of the engine. Set it explicitly here to exercise the TUI-shaped
+    // round trip this test is about; `test_vscode_mode_toggle_gtk_chrome`
+    // below pins the opposite (`menu_bar_toggleable == false`) case.
     let mut engine = Engine::new();
+    engine.menu_bar_toggleable = true;
     assert_eq!(
         engine.settings.editor_mode,
         crate::core::settings::EditorMode::Vim
     );
     assert_eq!(engine.mode, Mode::Normal);
+    assert!(
+        !engine.menu_bar_visible,
+        "precondition: a fresh Vim-mode engine has no menu bar revealed"
+    );
     engine.toggle_editor_mode();
     assert_eq!(
         engine.settings.editor_mode,
         crate::core::settings::EditorMode::Vscode
     );
     assert_eq!(engine.mode, Mode::Insert);
+    assert!(
+        engine.menu_bar_visible,
+        "Vim -> VSCode must reveal the menu bar"
+    );
+    // #1780: the round trip back to Vim mode must undo that reveal, not
+    // leave the menu-bar row permanently on screen.
     engine.toggle_editor_mode();
     assert_eq!(
         engine.settings.editor_mode,
         crate::core::settings::EditorMode::Vim
     );
     assert_eq!(engine.mode, Mode::Normal);
+    assert!(
+        !engine.menu_bar_visible,
+        "VSCode -> Vim must hide the menu bar the previous toggle revealed"
+    );
+}
+
+#[test]
+fn test_vscode_mode_toggle_gtk_chrome() {
+    // On a `window_chrome` backend (GTK, future Win-GUI) the drawn menu bar
+    // doubles as the client-side titlebar and `menu_bar_toggleable` stays
+    // `false` for the engine's whole lifetime (never flipped on, unlike
+    // TUI's `App::setup`). The VSCode -> Vim round trip must leave
+    // `menu_bar_visible` alone on that backend — clearing it unconditionally
+    // would strand GTK with a reserved-but-blank titlebar strip (#1780
+    // review).
+    let mut engine = Engine::new();
+    assert!(!engine.menu_bar_toggleable);
+    engine.toggle_editor_mode(); // Vim -> VSCode
+    assert!(engine.menu_bar_visible);
+    engine.toggle_editor_mode(); // VSCode -> Vim
+    assert!(
+        engine.menu_bar_visible,
+        "menu_bar_toggleable == false (GTK/Win-GUI): the pinned-visible \
+         menu bar must survive a VSCode -> Vim round trip"
+    );
 }
 
 #[test]
@@ -16183,7 +16550,7 @@ fn test_menu_bar_toggle() {
 #[test]
 fn test_menu_dispatch_action() {
     let mut engine = Engine::new();
-    let tmp = std::env::temp_dir().join("vimcode_menu_test_save.txt");
+    let tmp = test_temp_path("vimcode_menu_test_save.txt");
     let _ = std::fs::write(&tmp, "hello");
     engine
         .buffer_manager
@@ -16384,7 +16751,7 @@ fn test_dap_fields_default() {
 #[test]
 fn test_rust_debug_binary_no_cargo_toml() {
     // A temp dir with no Cargo.toml should return an error.
-    let dir = std::env::temp_dir().join("vimcode_test_no_cargo");
+    let dir = test_temp_path("vimcode_test_no_cargo");
     let _ = std::fs::create_dir_all(&dir);
     let result = rust_debug_binary(&dir);
     assert!(
@@ -17093,7 +17460,7 @@ use crate::test_cwd::CwdGuard;
 #[test]
 fn test_open_folder_resets_cwd() {
     let _cwd = CwdGuard::new();
-    let dir = std::env::temp_dir().join("vimcode_test_open_folder");
+    let dir = test_temp_path("vimcode_test_open_folder");
     std::fs::create_dir_all(&dir).unwrap();
 
     let mut engine = Engine::new();
@@ -17114,7 +17481,7 @@ fn test_open_folder_resets_cwd() {
 #[test]
 fn test_open_workspace_parses_json() {
     let _cwd = CwdGuard::new();
-    let dir = std::env::temp_dir().join("vimcode_test_workspace_json");
+    let dir = test_temp_path("vimcode_test_workspace_json");
     std::fs::create_dir_all(&dir).unwrap();
     let ws_path = dir.join(".vimcode-workspace");
     let json =
@@ -17148,7 +17515,7 @@ fn test_open_workspace_parses_json() {
 #[test]
 fn open_folder_does_not_leak_the_process_cwd() {
     let before = std::env::current_dir().expect("test process must have a cwd");
-    let dir = std::env::temp_dir().join("vimcode_test_cwd_guard");
+    let dir = test_temp_path("vimcode_test_cwd_guard");
     std::fs::create_dir_all(&dir).unwrap();
 
     {
@@ -17178,7 +17545,7 @@ fn open_folder_does_not_leak_the_process_cwd() {
 // =========================================================================
 
 fn write_plugin_lua(name: &str, code: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("vimcode_plugins_{name}"));
+    let dir = test_temp_path(&format!("vimcode_plugins_{name}"));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{name}.lua"));
     std::fs::write(&path, code).unwrap();
@@ -17195,7 +17562,7 @@ fn test_plugin_loads_and_command_runs() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -17214,11 +17581,11 @@ fn test_plugin_on_save_fires() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
-    let tmp_file = std::env::temp_dir().join("vimcode_save_hook_test.txt");
+    let tmp_file = test_temp_path("vimcode_save_hook_test.txt");
     std::fs::write(&tmp_file, "hello\n").unwrap();
     engine.open_file_in_tab(&tmp_file);
     let _ = engine.save();
@@ -17240,7 +17607,7 @@ fn test_plugin_disabled_not_registered() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &["test_disabled".to_string()]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -20253,7 +20620,7 @@ fn test_hide_single_tab_two_tabs() {
     let mut engine = Engine::new();
     engine.settings.hide_single_tab = true;
     // Open a second tab
-    let dir = std::env::temp_dir().join("vimcode_test_hst_twotabs");
+    let dir = test_temp_path("vimcode_test_hst_twotabs");
     let _ = std::fs::create_dir_all(&dir);
     let f = dir.join("a.txt");
     std::fs::write(&f, "hello").unwrap();
@@ -20347,7 +20714,7 @@ fn test_hide_single_tab_multi_group() {
     }
 
     // Even after opening a second tab, still visible (multi-group)
-    let dir = std::env::temp_dir().join("vimcode_test_hst_multigroup");
+    let dir = test_temp_path("vimcode_test_hst_multigroup");
     let _ = std::fs::create_dir_all(&dir);
     let f = dir.join("b.txt");
     std::fs::write(&f, "world").unwrap();
@@ -20378,7 +20745,7 @@ fn test_hide_single_tab_transition_one_to_two() {
     );
 
     // Open a second tab
-    let dir = std::env::temp_dir().join("vimcode_test_hst_transition");
+    let dir = test_temp_path("vimcode_test_hst_transition");
     let _ = std::fs::create_dir_all(&dir);
     let f = dir.join("x.txt");
     std::fs::write(&f, "test").unwrap();
@@ -21103,7 +21470,7 @@ fn test_git_branch_picker_escape_closes() {
 #[test]
 fn test_git_branch_picker_populates_items() {
     // In a git repo, should show at least one branch
-    let dir = std::env::temp_dir().join("vimcode_test_branch_picker_pop");
+    let dir = test_temp_path("vimcode_test_branch_picker_pop");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     // Init a git repo with user config (needed in CI where no global git config exists)
@@ -21144,7 +21511,7 @@ fn test_git_branch_picker_populates_items() {
 
 #[test]
 fn test_git_branch_picker_checkout_action() {
-    let dir = std::env::temp_dir().join("vimcode_test_branch_checkout");
+    let dir = test_temp_path("vimcode_test_branch_checkout");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let _ = std::process::Command::new("git")
@@ -21197,7 +21564,7 @@ fn test_gbranches_command_opens_picker() {
 
 #[test]
 fn test_git_branch_picker_filter_typing() {
-    let dir = std::env::temp_dir().join("vimcode_test_branch_filter");
+    let dir = test_temp_path("vimcode_test_branch_filter");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let _ = std::process::Command::new("git")
@@ -21254,7 +21621,7 @@ fn test_git_branch_picker_filter_typing() {
 #[test]
 fn test_explorer_new_file_start() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_test_new_file_start");
+    let dir = test_temp_path("vimcode_test_new_file_start");
     let _ = std::fs::create_dir_all(&dir);
     engine.start_explorer_new_file(dir.clone());
     assert!(engine.explorer_new_entry.is_some());
@@ -21269,7 +21636,7 @@ fn test_explorer_new_file_start() {
 #[test]
 fn test_explorer_new_folder_start() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_test_new_folder_start");
+    let dir = test_temp_path("vimcode_test_new_folder_start");
     let _ = std::fs::create_dir_all(&dir);
     engine.start_explorer_new_folder(dir.clone());
     assert!(engine.explorer_new_entry.is_some());
@@ -21282,7 +21649,7 @@ fn test_explorer_new_folder_start() {
 #[test]
 fn test_explorer_new_entry_typing() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_test_new_entry_typing");
+    let dir = test_temp_path("vimcode_test_new_entry_typing");
     let _ = std::fs::create_dir_all(&dir);
     engine.start_explorer_new_file(dir.clone());
 
@@ -21299,7 +21666,7 @@ fn test_explorer_new_entry_typing() {
 #[test]
 fn test_explorer_new_entry_escape_cancels() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_test_new_entry_escape");
+    let dir = test_temp_path("vimcode_test_new_entry_escape");
     let _ = std::fs::create_dir_all(&dir);
     engine.start_explorer_new_file(dir.clone());
     engine.handle_explorer_new_entry_key("a", Some('a'), false);
@@ -21312,7 +21679,7 @@ fn test_explorer_new_entry_escape_cancels() {
 #[test]
 fn test_explorer_new_file_enter_creates() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_test_new_file_enter");
+    let dir = test_temp_path("vimcode_test_new_file_enter");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     engine.start_explorer_new_file(dir.clone());
@@ -21331,7 +21698,7 @@ fn test_explorer_new_file_enter_creates() {
 #[test]
 fn test_explorer_new_folder_enter_creates() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_test_new_folder_enter");
+    let dir = test_temp_path("vimcode_test_new_folder_enter");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     engine.start_explorer_new_folder(dir.clone());
@@ -21351,7 +21718,7 @@ fn test_explorer_new_folder_enter_creates() {
 #[test]
 fn test_explorer_new_entry_empty_name_silent_cancel() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_test_new_entry_empty");
+    let dir = test_temp_path("vimcode_test_new_entry_empty");
     let _ = std::fs::create_dir_all(&dir);
     engine.start_explorer_new_file(dir.clone());
     // Press Enter with empty input
@@ -21364,7 +21731,7 @@ fn test_explorer_new_entry_empty_name_silent_cancel() {
 #[test]
 fn test_explorer_new_entry_duplicate_shows_error() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_test_new_entry_dup");
+    let dir = test_temp_path("vimcode_test_new_entry_dup");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     // Create existing file
@@ -21385,7 +21752,7 @@ fn test_explorer_new_entry_duplicate_shows_error() {
 #[test]
 fn test_explorer_new_entry_backspace() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_test_new_entry_bs");
+    let dir = test_temp_path("vimcode_test_new_entry_bs");
     let _ = std::fs::create_dir_all(&dir);
     engine.start_explorer_new_file(dir.clone());
 
@@ -21402,7 +21769,7 @@ fn test_explorer_new_entry_backspace() {
 #[test]
 fn test_explorer_new_entry_cursor_movement() {
     let mut engine = Engine::new();
-    let dir = std::env::temp_dir().join("vimcode_test_new_entry_cursor");
+    let dir = test_temp_path("vimcode_test_new_entry_cursor");
     let _ = std::fs::create_dir_all(&dir);
     engine.start_explorer_new_file(dir.clone());
 
@@ -21435,7 +21802,7 @@ fn test_explorer_new_entry_cursor_movement() {
 
 #[test]
 fn test_confirm_delete_file_shows_dialog() {
-    let dir = std::env::temp_dir().join("vimcode_test_confirm_delete_dialog");
+    let dir = test_temp_path("vimcode_test_confirm_delete_dialog");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("target.txt");
@@ -21457,7 +21824,7 @@ fn test_confirm_delete_file_shows_dialog() {
 
 #[test]
 fn test_confirm_delete_file_cancel() {
-    let dir = std::env::temp_dir().join("vimcode_test_confirm_delete_cancel");
+    let dir = test_temp_path("vimcode_test_confirm_delete_cancel");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("keep.txt");
@@ -21479,7 +21846,7 @@ fn test_confirm_delete_file_cancel() {
 
 #[test]
 fn test_confirm_delete_file_confirm() {
-    let dir = std::env::temp_dir().join("vimcode_test_confirm_delete_confirm");
+    let dir = test_temp_path("vimcode_test_confirm_delete_confirm");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("deleteme.txt");
@@ -21502,7 +21869,7 @@ fn test_confirm_delete_file_confirm() {
 
 #[test]
 fn test_confirm_delete_folder() {
-    let dir = std::env::temp_dir().join("vimcode_test_confirm_delete_folder");
+    let dir = test_temp_path("vimcode_test_confirm_delete_folder");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let subdir = dir.join("mydir");
@@ -21621,7 +21988,7 @@ fn test_check_nerd_fonts_cancel_leaves_setting_unset() {
 
 #[test]
 fn test_move_file_dialog_shows_with_input() {
-    let dir = std::env::temp_dir().join("vimcode_test_move_dialog");
+    let dir = test_temp_path("vimcode_test_move_dialog");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("source.txt");
@@ -21644,7 +22011,7 @@ fn test_move_file_dialog_shows_with_input() {
 
 #[test]
 fn test_move_file_dialog_cancel() {
-    let dir = std::env::temp_dir().join("vimcode_test_move_dialog_cancel");
+    let dir = test_temp_path("vimcode_test_move_dialog_cancel");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("stay.txt");
@@ -21664,7 +22031,7 @@ fn test_move_file_dialog_cancel() {
 
 #[test]
 fn test_move_file_dialog_confirm() {
-    let dir = std::env::temp_dir().join("vimcode_test_move_dialog_confirm");
+    let dir = test_temp_path("vimcode_test_move_dialog_confirm");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let dest_dir = dir.join("dest");
@@ -21880,15 +22247,23 @@ fn test_tab_scroll_offset_accounts_for_wide_display_name() {
 
 #[test]
 fn test_post_draw_apply_widths_reports_changes() {
+    // #1722: a lone tab fits at any sane width, so none of the three calls
+    // below ever has anything to correct — `tab_scroll_offset` is `0` before
+    // and after every one of them. The pre-#1722 contract reported "changed"
+    // on the *first* call purely because `tab_bar_width` starts at
+    // `usize::MAX` and any real width differs from that sentinel, and again
+    // on the *third* call purely because 60 != 80 — in both cases forcing a
+    // redraw that would have painted pixel-for-pixel the same frame. See
+    // `Engine::post_draw_apply_widths`'s own doc for why only a
+    // `tab_scroll_offset` change is a real signal.
     let mut engine = Engine::new();
     let group_id = engine.active_group;
 
-    // First call with a fresh width must report change (tab_bar_width
-    // defaults to usize::MAX, so any reported value differs).
     let changed = engine.post_draw_apply_widths(&[(group_id, 80)]);
     assert!(
-        changed,
-        "first apply with new width should report change so backend redraws"
+        !changed,
+        "a single tab always fits — the first apply has nothing to correct \
+         and must not force a redraw (#1722)"
     );
 
     // Second call with the same width is idempotent — must report no change
@@ -21899,9 +22274,67 @@ fn test_post_draw_apply_widths_reports_changes() {
         "no-op apply must report no change to avoid redraw loops"
     );
 
-    // Different width reports change.
+    // A different raw width that still leaves the lone tab fully visible
+    // (no scroll-offset change) must likewise report no change — this is
+    // exactly the #1722 bug: on a pixel-measuring backend this width can
+    // wobble by a sub-pixel-rounding unit every frame with nothing painted
+    // differently, and the old contract turned every such wobble into a
+    // forced repaint.
     let changed = engine.post_draw_apply_widths(&[(group_id, 60)]);
-    assert!(changed, "width change must be reported");
+    assert!(
+        !changed,
+        "a width change with no visible effect must not be reported (#1722)"
+    );
+}
+
+/// #1722: the scroll-affecting sibling of
+/// [`test_post_draw_apply_widths_reports_changes`] — confirms a tiny,
+/// cosmetic-only width change (one that doesn't cross any tab-fit boundary)
+/// reports no change even with *several* tabs open and the bar already
+/// scrolled, which is the exact "idle tick returns `Redraw` continuously
+/// with several tabs open" shape the issue reported. A width change that
+/// *does* cross a fit boundary (covered by
+/// `test_post_draw_apply_widths_detects_scroll_change` below) must still be
+/// reported.
+#[test]
+fn test_post_draw_apply_widths_ignores_cosmetic_width_wobble_with_several_tabs() {
+    let mut engine = Engine::new();
+    let group_id = engine.active_group;
+    // Three tabs total (one default + two new), each "[No Name]" tab is 16
+    // display columns wide (see `tab_display_width`), active = last (idx 2).
+    engine.new_tab(None);
+    engine.new_tab(None);
+    assert_eq!(engine.active_group().active_tab, 2);
+
+    // Bar only wide enough for one tab (16 <= 30 < 32) — forces a real
+    // scroll correction so the active tab (idx 2) is actually visible.
+    let changed = engine.post_draw_apply_widths(&[(group_id, 30)]);
+    assert!(
+        changed,
+        "test setup: narrowing the bar enough to hide the active tab must \
+         report a real scroll correction"
+    );
+    assert_eq!(
+        engine.active_group().tab_scroll_offset,
+        2,
+        "test setup: only the active tab should be visible at this width"
+    );
+
+    // One column narrower — still enough for exactly one tab, so the
+    // resolved scroll offset is identical. This is the cosmetic wobble: the
+    // raw width value differs (30 -> 29) but nothing about what's painted
+    // does.
+    let changed = engine.post_draw_apply_widths(&[(group_id, 29)]);
+    assert!(
+        !changed,
+        "a one-column width wobble that doesn't change which tab is \
+         scrolled into view must not force a redraw (#1722)"
+    );
+    assert_eq!(
+        engine.active_group().tab_scroll_offset,
+        2,
+        "scroll offset must be unaffected by the cosmetic wobble"
+    );
 }
 
 #[test]
@@ -22188,7 +22621,7 @@ fn test_buffer_picker_opens() {
 #[test]
 fn test_buffer_picker_lists_open_buffers() {
     let mut e = engine_with_text("hello");
-    let dir = std::env::temp_dir().join("vimcode_test_bufpick");
+    let dir = test_temp_path("vimcode_test_bufpick");
     let _ = std::fs::create_dir_all(&dir);
     let f1 = dir.join("alpha.rs");
     let f2 = dir.join("beta.rs");
@@ -23137,7 +23570,7 @@ fn test_command_center_hints_include_chat() {
 #[test]
 fn test_breadcrumb_click_directory_opens_file_picker() {
     let mut e = engine_with_text("hello");
-    let dir = std::env::temp_dir().join("vimcode_test_bc_dir");
+    let dir = test_temp_path("vimcode_test_bc_dir");
     let _ = std::fs::create_dir_all(&dir);
     // Clicking a directory segment should open the file picker
     e.breadcrumb_click(false, Some(&dir));
@@ -23152,7 +23585,7 @@ fn test_breadcrumb_click_directory_opens_file_picker() {
 #[test]
 fn test_breadcrumb_click_file_opens_sibling_files() {
     let mut e = engine_with_text("hello");
-    let file = std::env::temp_dir().join("vimcode_test_bc_file.rs");
+    let file = test_temp_path("vimcode_test_bc_file.rs");
     std::fs::write(&file, "fn foo() {}").unwrap();
     e.breadcrumb_click(false, Some(&file));
     assert!(e.picker_open, "breadcrumb file click should open picker");
@@ -23369,7 +23802,7 @@ fn test_breadcrumb_enter_on_symbol_opens_scoped_picker() {
 #[test]
 fn test_breadcrumb_enter_on_path_opens_file_picker() {
     let mut e = engine_with_text("hello");
-    let dir = std::env::temp_dir().join("vimcode_test_bc_focus");
+    let dir = test_temp_path("vimcode_test_bc_focus");
     let _ = std::fs::create_dir_all(&dir);
     e.breadcrumb_segments = vec![BreadcrumbSegmentInfo {
         label: "test_dir".to_string(),
@@ -24577,7 +25010,7 @@ fn test_percent_centers_viewport_on_far_match() {
 #[test]
 fn test_goto_tab_promotes_preview() {
     use std::io::Write;
-    let path = std::env::temp_dir().join("vimcode_test_goto_tab_promote.txt");
+    let path = test_temp_path("vimcode_test_goto_tab_promote.txt");
     {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"preview content").unwrap();
@@ -27561,7 +27994,7 @@ fn test_lua_feedkeys_deletes_word() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27581,7 +28014,7 @@ fn test_lua_feedkeys_insert_and_escape() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27605,7 +28038,7 @@ fn test_lua_eval_register() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27630,7 +28063,7 @@ fn test_lua_eval_cursor_position() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27660,7 +28093,7 @@ fn test_lua_get_lines() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27684,7 +28117,7 @@ fn test_lua_get_lines_negative_index() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27718,7 +28151,7 @@ fn test_lua_set_lines_replace_range() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27741,7 +28174,7 @@ fn test_lua_set_lines_insert_at_beginning() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27911,6 +28344,64 @@ fn test_nvim_cc_replaces_line() {
 fn test_nvim_dd_last_line() {
     // Neovim: dd on last line leaves "first\n". VimCode leaves "first" (no trailing newline).
     nvim_case("first\nsecond\n", 1, 0, "dd", "first\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_dd_preserves_column_not_reset_to_zero_1796() {
+    // #1796 ("[bugbash:win-native] dd leaves cursor at the previous column
+    // instead of column 0 of the line that moves up") claimed `nvim
+    // --headless` resets `dd`'s cursor to column 0. That claim was checked
+    // with the cursor already sitting at column 0 before `dd` — a
+    // degenerate case where "reset to 0" and "preserve the column" produce
+    // the same answer and can't be told apart.
+    //
+    // Re-run against real `nvim --headless` (0.12.5 -- fleet-pinned version,
+    // see tests/nvim_conformance.rs; later than the 0.12.1 this section's
+    // header was originally verified against, but `dd`'s column handling is
+    // unchanged between those releases) with the cursor explicitly placed
+    // on column 3 (the last char of "bbb") before `dd`: `call cursor(2,3)`
+    // then `normal! dd` leaves the cursor at column 3 of the resulting line
+    // "ccc" (`nvim_win_get_cursor` → `(2, 2)`, 0-indexed), NOT column 0.
+    // (Real Vim 9.1 *does* reset to column 0 here, because Vim ships
+    // `'startofline'` on by default while Neovim ships it off -- Vim and
+    // Neovim genuinely disagree on this. But this project's documented
+    // oracle is Neovim, per `tests/smoke-spec/catalogue.yaml`'s
+    // `reference: nvim`. Note `'startofline'` itself doesn't explain the
+    // disagreement by being *set*: re-running with `set startofline` under
+    // nvim still preserves the column for `dd` -- `:h 'startofline'` lists
+    // `dd`-style linewise operators among the commands it governs, but
+    // nvim's own default for the option, not its value, is what differs
+    // from Vim's.)
+    //
+    // VimCode's `delete_lines` (src/core/engine/motions.rs) already
+    // implements the Neovim-matching "preserve column, clamped" behaviour
+    // (added deliberately in #805, "matching real Vim" — a mislabeled but
+    // otherwise-correct-for-Neovim fix). This test pins that behaviour down
+    // via the exact #1796 repro (type "aaa<CR>bbb<CR>ccc<Esc>", move up to
+    // "bbb" with the cursor landing on its last column via Escape's
+    // one-back-from-insert rule, then `dd`) so a future "fix" that resets
+    // the column to 0 to match #1796's flawed report fails loudly here.
+    //
+    // This is engine-state coverage only. The reported symptom was the
+    // *painted* status bar, not an engine field -- see
+    // `dd_preserves_painted_status_bar_column_1796` in
+    // `src/tui_main/app_on_tui_tests.rs` for the rendered-output assertion.
+    let mut engine = Engine::new();
+    engine.feed_keys("iaaa<CR>bbb<CR>ccc<Esc>kdd");
+    assert_eq!(engine.buffer().to_string(), "aaa\nccc");
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "dd must preserve the column (clamped), not reset to 0 -- see #1796"
+    );
+
+    // Same assertion via the `nvim_case` harness with an explicit cursor
+    // placement, matching the `call cursor(2,3)` / `normal! dd` oracle
+    // check above (columns here are 0-indexed, so col 2 == "column 3").
+    // Also directly covered, oracle-verified, by the CASES_OP case
+    // "op:dd nonzero col 1796" in tests/nvim_conformance.rs.
+    nvim_case("aaa\nbbb\nccc", 1, 2, "dd", "aaa\nccc", 1, 2);
 }
 
 // ── #882: operator counts (`2cc`, `5dd` past end, `c3c`, `2dd` on last
@@ -31550,7 +32041,7 @@ fn test_tick_git_branch_fires_plugin_event() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -31579,7 +32070,7 @@ fn test_tick_git_branch_no_event_when_unchanged() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -33143,7 +33634,7 @@ fn test_gtab_with_three_tabs() {
 fn test_gf_open_file_at_line() {
     use std::io::Write;
     // Create a temp file with 10 lines
-    let dir = std::env::temp_dir().join("vimcode_test_gf");
+    let dir = test_temp_path("vimcode_test_gf");
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("target.txt");
     {
@@ -33178,7 +33669,7 @@ fn test_gf_open_file_at_line() {
 #[test]
 fn test_gf_open_file_no_line_suffix() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_gf2");
+    let dir = test_temp_path("vimcode_test_gf2");
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("plain.txt");
     {
@@ -33209,7 +33700,7 @@ fn test_gf_open_file_no_line_suffix() {
 #[test]
 fn test_gf_open_file_with_line_and_col_suffix() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("vimcode_test_gf3");
+    let dir = test_temp_path("vimcode_test_gf3");
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("multi.txt");
     {
@@ -33243,7 +33734,7 @@ fn test_gf_open_file_with_line_and_col_suffix() {
 
 #[test]
 fn test_alternate_file_register_hash() {
-    let dir = std::env::temp_dir().join("vimcode_test_alt_reg_1161");
+    let dir = test_temp_path("vimcode_test_alt_reg_1161");
     let _ = std::fs::create_dir_all(&dir);
     let file_a = dir.join("first.txt");
     let file_b = dir.join("other.txt");
@@ -33405,7 +33896,7 @@ end)
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -33431,7 +33922,7 @@ end)
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -33461,7 +33952,7 @@ end)
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -33626,7 +34117,7 @@ fn explorer_selected_file(engine: &Engine) -> Option<std::path::PathBuf> {
 
 #[test]
 fn test_goto_tab_reveals_file_in_explorer() {
-    let dir = std::env::temp_dir().join("vimcode_test_goto_tab_reveal");
+    let dir = test_temp_path("vimcode_test_goto_tab_reveal");
     let sub = dir.join("subdir");
     let _ = std::fs::create_dir_all(&sub);
     let file_a = dir.join("a.txt");
@@ -33654,7 +34145,7 @@ fn test_goto_tab_reveals_file_in_explorer() {
 
 #[test]
 fn test_handle_tab_bar_click_reveals_file_in_explorer() {
-    let dir = std::env::temp_dir().join("vimcode_test_tab_bar_click_reveal");
+    let dir = test_temp_path("vimcode_test_tab_bar_click_reveal");
     let _ = std::fs::create_dir_all(&dir);
     let file_a = dir.join("a.txt");
     let file_b = dir.join("b.txt");
@@ -33677,7 +34168,7 @@ fn test_handle_tab_bar_click_reveals_file_in_explorer() {
 
 #[test]
 fn test_open_file_in_tab_reveals_file_in_explorer() {
-    let dir = std::env::temp_dir().join("vimcode_test_open_file_reveal");
+    let dir = test_temp_path("vimcode_test_open_file_reveal");
     let sub = dir.join("deep");
     let _ = std::fs::create_dir_all(&sub);
     let file = sub.join("nested.txt");
@@ -35237,7 +35728,7 @@ fn test_1160_ctrl_x_unbacked_submodes_report_and_do_not_panic() {
 
 #[test]
 fn test_1160_ctrl_x_ctrl_f_completes_filename_in_cwd() {
-    let dir = std::env::temp_dir().join("vimcode_test_1160_ctrl_x_ctrl_f");
+    let dir = test_temp_path("vimcode_test_1160_ctrl_x_ctrl_f");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("vimcode_ctrlxf_target.txt"), "").unwrap();
 
@@ -35256,7 +35747,7 @@ fn test_1160_ctrl_x_ctrl_f_wins_over_ctrl_f_find_replace_binding() {
     // VSCode-mode's default `ctrl_f_action` is "find" (opens find/replace on
     // a bare `<C-f>` in Insert mode) — `<C-x><C-f>` must still reach filename
     // completion instead of being swallowed by that global binding (#1160).
-    let dir = std::env::temp_dir().join("vimcode_test_1160_ctrl_x_ctrl_f_vscode");
+    let dir = test_temp_path("vimcode_test_1160_ctrl_x_ctrl_f_vscode");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("vimcode_ctrlxf_vscode_target.txt"), "").unwrap();
 

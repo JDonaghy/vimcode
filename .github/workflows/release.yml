@@ -108,17 +108,34 @@ jobs:
         tag_name: v${{ env.VERSION }}
         name: "VimCode v${{ env.VERSION }}"
         body: |
+          ## Status: use the TUI
+
+          - **TUI (`vcd`) is the recommended way to use VimCode.** Usable on **Linux** and **macOS**. **Windows:** usable, with known rough edges (for example, the minimap viewport thumb is not visible in Windows Terminal, #1828).
+          - **GUI builds (`vimcode`) are not ready for use on any platform.** The native macOS and Windows GUIs are not published. GUI artifacts are attached for testing only.
+
+          <!-- Update this section every release: highlights since the previous tag. -->
+          **Since v0.14.0:** the integrated terminal (`:term`) now works on Windows (#1829); installing an extension from the TUI no longer freezes the editor (#1739); the Linux TUI under Windows Terminal (WSL) no longer shows runs of faded text after LSP hint underlines; minimap drag now scrolls within the minimap's own scale like VS Code, with Alt for file-wide (#1828); native Lua API additions (completion sources, async `fs.walk`/`fs.grep`, minimum-vimcode-version declarations for extensions); end-of-line virtual text; VS Code-mode fixes; hover popups working again; git status resolved per file; Windows TUI flicker fixes.
+
           ## Installation
 
           ### Linux
 
-          **Option A — .deb package (recommended for Ubuntu/Debian)**
+          **Recommended: TUI-only binary (no GTK required, statically linked)**
+          ```
+          chmod +x vcd-linux-x86_64
+          ./vcd-linux-x86_64
+          ```
+          Statically linked with musl — runs on any Linux (Ubuntu 20.04+, CentOS 7+, Alpine, etc.). No GTK4 or other libraries needed.
+
+          **GUI — testing only, not ready for use**
+
+          .deb package:
           ```
           sudo dpkg -i ${{ env.DEB_NAME }}
           sudo apt -f install    # installs any missing GTK4 runtime libraries
           ```
 
-          **Option B — raw binary (GUI)**
+          Raw binary:
           ```
           # First install runtime dependencies:
           sudo apt install libgtk-4-1 libglib2.0-0 libpango-1.0-0 libcairo2
@@ -127,33 +144,24 @@ jobs:
           ./vimcode-linux-x86_64
           ```
 
-          **Option C — TUI-only binary (no GTK required, statically linked)**
-          ```
-          chmod +x vcd-linux-x86_64
-          ./vcd-linux-x86_64
-          ```
-          Statically linked with musl — runs on any Linux (Ubuntu 20.04+, CentOS 7+, Alpine, etc.). No GTK4 or other libraries needed.
-
           > GUI binary requires GTK 4.10+. Ubuntu 22.04 ships GTK 4.6 which is too old; Ubuntu 24.04+ recommended.
 
           ### macOS (Apple Silicon)
 
-          **Option A — Homebrew (recommended)**
+          **Recommended: TUI**
           ```
           brew tap JDonaghy/vimcode
-          brew install vimcode    # GTK4 GUI + TUI
-          # or
           brew install vcd        # TUI only (no GTK4 dependency)
           ```
-
-          **Option B — direct download**
-          Download `vimcode-macos-arm64.tar.gz` (GUI) or `vcd-macos-arm64.tar.gz` (TUI only), extract, and run:
+          or download `vcd-macos-arm64.tar.gz`, extract, and run:
           ```
           tar xzf vcd-macos-arm64.tar.gz
           xattr -d com.apple.quarantine vcd   # binaries are ad-hoc signed, not notarized
           ./vcd
           ```
-          > The macOS GUI binary is the GTK4 build and requires GTK4 via Homebrew: `brew install gtk4`
+
+          **GUI — testing only, not ready for use**
+          `brew install vimcode` (GTK4 GUI + TUI), or download `vimcode-macos-arm64.tar.gz`. The macOS GUI binary is the GTK4 build and requires GTK4 via Homebrew: `brew install gtk4`.
 
           ### Windows
 

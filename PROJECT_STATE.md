@@ -1,5 +1,817 @@
 # VimCode Project State
 
+**Last updated:** October 7, 2026 (#1843 — bump quadraui pin to `4e71a8b`,
+make the Windows `:term` CI test a required gate). **Pin bumped, no
+vimcode production code changed.** `4e71a8b` is 19 commits ahead of the
+prior `a536053` pin (`git rev-list --count a5360532..4e71a8bb` = 19, same
+by `--first-parent`; 63 files, +5896/-160 — see `Cargo.toml`'s own comment
+block for the full list of what else the range carries). Headline fixes:
+quadraui#1327 (ConPTY VT handshake answers + the `default_shell()`
+`$SHELL` gate — the real fix for #1829's Windows TUI `:term` blank panel,
+RED-verified against the prior pin and GREEN-verified against this one on
+dell64's real Windows hardware, 1.9s) and quadraui#1325 (macOS GTK
+foreground activation for #1825, not yet confirmed by a person on real
+macOS hardware). `tests/conpty_term_opens_shell_1829.rs`'s
+`continue-on-error: true` step in `.github/workflows/ci.yml`'s
+`build-windows-tui` job is now a required gate, matching
+`conpty_idle_flicker`/`conpty_activity_bar_click`. Four
+`docs/PENDING_QUADRAUI_ISSUES.md` entries this bump resolves are struck:
+the ConPTY/`$SHELL` gap (quadraui#1327, this PR's own headline), the macOS
+activation gap (quadraui#1325), `AppShell::handle`'s missing `DoubleClick`
+arm for the activity bar (landed as `be97a62e` — vimcode's own "#1762
+rescue" rung in `App::handle_dispatch` is now redundant but not removed in
+this PR), and `RichTextPopup`'s hardcoded chrome font (landed as
+`18eda743`/`a1898415` — the vimcode-side adoption at
+`render::editor_hover_to_quadraui_rich_text` is not done in this PR
+either; both are GOALS.md milestone #7 follow-up work). Neither #1829 nor
+#1825 is closed by this bump (`Refs`, not `Fixes`) — both stay open until
+a person confirms on real hardware. `Cargo.lock`'s only change is the
+`quadraui` `source` line; the upstream manifest adds no new external
+dependency, only `dep:objc2`/`dep:objc2-app-kit` to the existing `gtk`
+feature, both already present in the lock via the `macos` feature
+(verified with `cargo metadata --locked`).
+
+**Last updated:** October 7, 2026 (#1842 — TUI minimap viewport thumb
+reported invisible in Windows Terminal, split off #1828's drag half).
+**Investigated — the known pre-fix defect is already fixed and pinned;
+added the missing regression test; real-hardware re-confirmation still
+needed before closing.** #1842 reports no visible viewport-highlight band
+on dell64's real Windows Terminal, though dragging (hit-testing) works —
+the same symptom #1828's own title named as its second half. Root-caused
+the shared TUI paint path (`quadraui::tui::minimap::draw_minimap_with_scale`,
+reached via this repo's `render::draw_minimap_strip`): before quadraui
+commit `9f47ca9c` ("TUI minimap viewport slider uses the blended tint, not
+opaque accent_bg", closing quadraui#1181), the band was painted as a flat,
+un-blended `theme.accent_bg`; after it, the band is
+`theme.background.blend(theme.accent_bg, 0.25)`, visibly distinct from the
+surrounding strip's plain `background` in every theme checked (confirmed
+numerically for vimcode's own default `onedark` theme: strip bg
+`rgb(26,26,26)` vs. band `rgb(44,63,79)`). `9f47ca9c` is already an
+ancestor of this repo's pinned `quadraui` rev
+(`a5360532e297deecece65103df8ce61f53230bda` — `git merge-base
+--is-ancestor` confirms it, and the rev predates this branch), so **no
+quadraui-side or vimcode-side production code changed in this PR.**
+
+What this PR adds: `src/tui_main/app_on_tui_tests.rs`'s
+`minimap::minimap_viewport_highlight_band_paints_a_distinct_background`
+(default `onedark` theme) and its `_under_light_theme` sibling
+(`vscode-light`) — black-box `TuiDriver` tests that read back the
+*painted* `CellStyle::bg` (via `style_at`, not
+`MinimapLayout::viewport_highlight`'s geometry alone — see #587/#592's
+"state vs. rendered output" lesson) both inside and outside the band, at
+the top and (the `onedark` test) after scrolling to the very bottom of a
+2000-line buffer, and assert the two backgrounds differ by at least a
+minimum combined RGB delta (not mere inequality — a one-unit rounding
+difference would pass a plain `assert_ne!` while still reading as flat on
+real hardware). Neither test existed anywhere in the suite before now, so
+the real-hardware regression had no CI signal to catch it.
+
+RED-verified by hand, precisely: temporarily overriding
+`.cargo/config.toml`'s `paths` to a scratch copy of the pinned quadraui
+checkout with `highlight_bg` forced to equal the plain strip `bg` — the
+literal "band not painted / identical colour" defect — reproduces the
+failure cleanly (both assertions fail). Forcing the same override back to
+the pre-#1181 *opaque*, un-blended `accent_bg` instead left the test
+**passing**: in the `onedark` theme used here, an opaque accent colour
+happens to differ enough from `background` to clear the test's delta
+threshold. That result means this test's RED coverage is narrower than it
+might look — it catches the "unpainted / exactly identical" defect class
+cleanly, but it does **not** establish that the issue's defect class is
+"unpainted" rather than "painted too faintly to see" (see below — that
+conclusion does not follow from this one data point, and an earlier
+version of this entry stated it backwards). The override was never
+committed — restored via `git checkout -- .cargo/config.toml` after
+verification, confirmed clean (`git status`/`git diff` show no stray
+changes to that file).
+
+**The investigation's leading hypothesis, corrected:** an earlier version
+of this entry argued that because the opaque pre-#1181 `accent_bg` still
+passed the RED check, the issue's real defect class must be
+"unpainted/identical" rather than "too strong/faint" — that reasoning runs
+backwards. The pre-#1181 code painted an *opaque, full-strength*
+`accent_bg`, which is the easiest case to see; `9f47ca9c` *reduced* that to
+a 25%-blend tint specifically to look less like a solid overlay. On
+vimcode's own `onedark` theme that tint is `rgb(26,26,26)` →
+`rgb(44,63,79)` — a real but modest delta on an already near-black strip,
+and one that can plausibly quantize down to adjacent, hard-to-distinguish
+greys/blues once a real terminal negotiates 256-colour instead of
+truecolor (`COLORTERM` unset, a non-default Windows Terminal profile,
+RDP/mosh in the path, etc.). So the most likely remaining explanation for
+dell64's report is **not** "stale build predating the pin bump" — it is
+that `9f47ca9c`'s fix is itself a plausible *cause* of a still-faint band
+on real hardware, even though it is a strict improvement over the
+pre-#1181 opaque-but-differently-shaped defect. This is a hypothesis to
+rule in or out with real hardware, not a settled conclusion either way.
+
+**Not done by this investigation, left for a human or a follow-up PR:**
+- No step was added to `tests/smoke-spec/win-terminal.yaml` for this
+  check. That file is this repo's Tier-2 carrier for exactly this kind of
+  real-host confirmation, and the dell64 re-confirmation below has nowhere
+  to land until a step exists there.
+- If the "0.25 tint is too faint on a near-black strip" hypothesis above
+  is pursued, the fix (e.g. a stronger blend ratio, or a minimum-contrast
+  floor) lives in `quadraui/src/tui/minimap.rs`, and the
+  Platform-Neutrality Rule requires a **filed** quadraui GitHub issue
+  before any such change, not just this note. No such issue has been filed
+  by this investigation (filing GitHub issues is outside what this agent's
+  assignment allows — the coordinator owns that step).
+
+**Still unknown, needs a human:** this issue's own acceptance bar is "a
+person on dell64 confirms the thumb is visible and tracks the viewport" —
+something this investigation cannot perform, and nothing above resolves
+it. Two explanations remain open for why the real-hardware smoke saw
+nothing: (1) the dell64 build predated the quadraui pin bump that carries
+`9f47ca9c` (possible, given #1828's drag half was *also* only just fixed
+this session in `97b1af9`, so a stale `vcd.exe` is plausible), in which
+case a fresh build should resolve it; or (2) — now considered the more
+likely of the two, per the corrected reasoning above — the 25%-blend tint
+itself is too faint on real hardware (colour depth negotiation,
+`COLORTERM`, a non-default Windows Terminal colour scheme, or a
+reduced-contrast rendering mode), in which case a fresh build will **not**
+fix it and the next step is a quadraui-side contrast increase (filed
+upstream first) rather than a vimcode-side rebuild. `TestBackend` only
+proves the `Buffer` cells carry a certain RGB delta, not that a given real
+terminal renders that delta visibly — a headless green run here cannot
+distinguish between these two explanations. If a fresh build on dell64
+still shows no thumb, the next step is reading back the *actual* colour
+reported by that terminal (e.g. a direct ANSI truecolor probe) rather than
+assuming either explanation without hardware evidence.
+`ISSUE_RESOLUTION: investigation`.
+
+**Last updated:** October 7, 2026 (#1739 — bugbash:tui-pty "Extensions
+marketplace 'install' keystroke (i) is a silent no-op under real terminal
+input"). **Fixed — two real root causes, both addressed, plus a
+plugin-reload regression review round 2 introduced and then caught in the
+same round.** Review round 1 on this issue's first PR found the
+originally-shipped fix (a real cross-section navigation bug — see below —
+that genuinely matches the report's symptom in the scriptless/registry-
+URL-less fixture it was tested against) did not explain the report's own
+byte-level evidence: a live, registry-backed session freezes the whole UI
+thread for up to several seconds on `i`, which the nav-bug theory alone
+cannot produce.
+
+- **Root cause 2 (the one the byte-level evidence actually points at):**
+  `Engine::dispatch_ext_sidebar_action_key`'s `"i"` arm calls
+  `crate::core::registry::fetch_readme` synchronously right after
+  installing, and `ext_install_from_registry_with_runtime_check` itself
+  synchronously downloads every manifest script before doing anything
+  else — both shell out to `curl` (`registry.rs`'s `fetch_readme`:
+  `--max-time 10`; `download_script`: `--max-time 30`, once per script)
+  directly on the key-dispatch path. On a registry with real scripts and a
+  live base URL, that is a multi-second-to-tens-of-seconds freeze with zero
+  PTY output — the "i" key looking like a no-op was really "blocked on a
+  subprocess, then finally repainting once it returns (or times out)".
+  Fixed by moving both off the UI thread (`src/core/engine/lsp_ops.rs`):
+  the README fetch is a proper async round-trip
+  (`Engine::ext_show_readme_or_fetch_async` spawns a thread,
+  `Engine::poll_ext_readme` drains it from `poll_idle`, same shape as the
+  pre-existing `ext_refresh`/`poll_ext_registry` pattern) shared by both
+  the `"i"` arm and `Engine::ext_open_selected_readme` (Enter/
+  double-click), which had the identical blocking call. The install's own
+  `self.message` assignment (`ext_install_from_registry_with_runtime_
+  check`'s final lines) stays synchronous, so the status line still
+  repaints immediately — only the two network legs became async.
+  Verified against a real, non-stuck registry fixture: see
+  `installed_extensions_script_becomes_callable_without_restart_1739`
+  below.
+- **Round 2 regression, caught by round 2's own review before merge:** the
+  script-download thread above was first shipped as a plain
+  fire-and-forget `std::thread::spawn` — but `plugin_init()` (which
+  enumerates the extension's directory *on disk* and loads whatever
+  `.lua` it finds there) runs synchronously a few lines later in the very
+  same `"i"` handler, racing the download thread essentially 100% of the
+  time. A freshly installed Lua-scripted extension would register none of
+  its commands/keymaps until the *next launch* — silently reintroducing a
+  "nothing visible happened" symptom for exactly the extensions `i` is
+  supposed to activate. Fixed by giving the download thread a completion
+  channel, `Engine::ext_scripts_fetch_rx` (a `Vec` — concurrent installs
+  can have more than one download in flight — not a single `Option` like
+  `ext_readme_rx`), drained by `Engine::poll_ext_scripts` (wired into
+  `poll_idle` next to `poll_ext_registry`/`poll_ext_readme`), which re-runs
+  `plugin_init()` once the files actually land. Covered by
+  `installed_extensions_script_becomes_callable_without_restart_1739`
+  (`src/tui_main/app_on_tui_tests.rs`): installs a real Lua-scripted
+  extension against a local multi-request HTTP fixture (both the script
+  download and the README fetch hit the same base URL and both must
+  succeed — a one-shot fixture server made the test itself flaky by
+  serving only whichever request won the race) and proves the extension's
+  `vimcode.command(...)`-registered command is callable through the real
+  `:`-command line, in the installing session, with no restart.
+- **Root cause 1 (cross-section navigation — real, but not what the
+  byte-level evidence was pointing at):** `quadraui::SidebarSystem::
+  move_selection_by` only moves the selection *within* the already-active
+  section; at a section's edge (or while it's empty) it returns `Consumed`/
+  `Ignored` instead of crossing into the next section. A fresh install
+  starts with an empty INSTALLED section, so `active_section` was
+  permanently stuck at 0 and `Down` could never reach AVAILABLE at all —
+  `dispatch_ext_sidebar_action_key`'s `"i"` arm then read `(in_installed:
+  true, idx: 0)` indexing an empty list and silently did nothing.
+  `Engine::ext_sidebar_navigate` (`src/core/engine/ext_panel.rs`) now
+  detects the `Consumed`/`Ignored` case and crosses the boundary itself via
+  `SidebarSystem::reveal` (not `set_selected_path` — `reveal` also
+  un-collapses the target section and scrolls the row into view, which
+  `set_selected_path` alone does not; this sidebar has
+  `set_allow_collapse(true)`, so a collapsed-target-section cross would
+  otherwise select an invisible row). The crossing also now clears
+  `ext_sidebar_input_active` to mirror `SidebarEvent::RowSelected`'s side
+  effect — a within-section `Down`/`Up` exits `/` filter mode via that
+  event; a boundary-crossing move previously did not, so `i` right after a
+  crossing `Down` from a filtered list got appended to the filter query
+  instead of installing.
+- Only `Down`/`j`/`Up`/`k` cross a boundary; `PageUp`/`PageDown`/`Home`/
+  `End` deliberately do not (documented in `ext_sidebar_navigate`'s own
+  comment) — they're jump-by-many/jump-to-extreme commands with no
+  well-defined "how far into the next section" semantics, and (unlike the
+  empty-INSTALLED case) a user can always still reach the far section via
+  repeated `Down`/`j`/`Up`/`k`.
+- Added a `src/tui_main/app_on_tui_tests.rs` mouse-click-then-`i` test
+  alongside the existing keyboard one (`click_then_i_installs_the_clicked_
+  available_extension_via_shell_app`) — both were already green against
+  the review-requested fix, pinning the mouse repro leg against
+  regression. Filed the generic "arrow keys should cross a `SidebarSystem`
+  section boundary" gap in `docs/PENDING_QUADRAUI_ISSUES.md` — this fix's
+  ~50 lines in `ext_panel.rs` are panel-local nav semantics that Explorer/
+  Source Control/Search's sidebars (same `SidebarSystem`) would otherwise
+  have to duplicate; a shared quadraui method would let all four collapse
+  onto one implementation later.
+- Still open from review: no Tier-2 `tests/smoke-spec/tui.yaml` PTY step
+  against a real registry-backed fixture was added in this round. Unit/
+  driver-tier coverage now exercises a real (non-scriptless, non-stuck)
+  registry fixture end to end — install, backgrounded download, plugin
+  reload, command callable — but that's still a `TuiDriver` harness, not a
+  live PTY on real hardware; the acceptance bar's Tier-2 step is the
+  remaining gap.
+
+**Last updated:** October 7, 2026 (#1828 — TUI minimap on real terminals:
+no visible thumb on Windows Terminal; drag behaves like the scrollbar on
+macOS). **Split into a shared-code fix (macOS drag mapping) + a quadraui
+gap (Windows Terminal thumb contrast) — the two reported symptoms had two
+different, independent root causes.**
+
+1. **Drag-mapping fix, shipped directly in vimcode (no quadraui change
+   needed):** the real root cause of "dragging the minimap feels like the
+   scrollbar" was that the **default** (no-modifier) minimap thumb drag
+   was already #1187's intentional file-wide/scrollbar-equivalent
+   mapping, with #1271's minimap-own-scale ("fine") mapping gated behind
+   Alt — the opposite of VS Code, where the plain drag is the
+   minimap-scale one. Both backends already shared one resolver
+   (`click::pixel_to_click_target` -> `render::minimap_press`), so this
+   was a pure shared-code fix: flipped the boolean vimcode passes in
+   (`!alt` instead of `alt`), so a plain drag now gets #1271's
+   minimap-own-scale mapping and **Alt-held** gets the old #1187
+   file-wide one (kept as a power-user "fast scroll" affordance rather
+   than deleted). Also fixed a genuine, independent latent bug this
+   flip exposed: `render::fine_seek_geometry` re-derived its own,
+   unclamped `thumb_length` (`Sh * viewport_lines / span`) instead of
+   reusing the real, already-painted `viewport_highlight` band height —
+   diverging from it whenever a file is short enough that quadraui's
+   `fit_thumb` minimum-thumb-length floor is in play (caught by the
+   pre-existing `minimap_drag_keeps_seeking_while_the_button_is_held`
+   GTK test going from ~50% to ~19% once "fine" became the default).
+   Fixed by threading the real band height straight through — the
+   virtual track's endpoint math is provably independent of which
+   `thumb_length` is used (it cancels out of dispatch's own
+   `track_length - thumb_length`), so this costs nothing.
+
+   **Black-box coverage, both backends, RED-verified:** four new/updated
+   driver tests — GTK's
+   `dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_on_gtk`
+   (now Alt-held) + new sibling
+   `..._scrolls_within_its_own_scale_by_default_on_gtk`, and the TUI
+   twins `..._scrolls_the_whole_file_with_alt_held` +
+   `..._scrolls_within_its_own_scale_by_default` in
+   `tui_main/app_on_tui_tests.rs`. Confirmed RED against the pre-fix
+   mapping by hand (temporarily reverting `click.rs`'s `!alt` back to
+   `alt` and re-running all four — all four failed, the two new
+   "default" tests landing past 90% of a 200,000-line file instead of
+   under 10%). The pre-existing `minimap_drag_keeps_seeking_while_the_button_is_held`
+   GTK test was updated to hold Alt (its point — drag-continuation keeps
+   re-seeking — is orthogonal to which of the two mappings is active;
+   its specific "~50% of the whole file" assertion only holds under the
+   file-wide one).
+
+2. **Windows Terminal thumb invisibility — quadraui gap, drafted, not
+   fixable in vimcode.** Traced the viewport-highlight band's paint
+   colour to `quadraui::tui::minimap::draw_minimap_with_scale`'s
+   `theme.background.blend(theme.accent_bg, 0.25)` — a fixed, no-floor
+   25% blend entirely inside quadraui; vimcode supplies only the two
+   source colours (`to_quadraui_theme`) and wires no terminal
+   colour-depth/`COLORTERM` detection anywhere in `src/tui_main/`
+   (confirmed by grep — there is no vimcode-side seam to intervene at
+   without adding new per-backend logic, which `CLAUDE.md`'s
+   Platform-Neutrality Rule forbids). Drafted as a new entry in
+   `docs/PENDING_QUADRAUI_ISSUES.md` for the coordinator to file;
+   `ISSUE_RESOLUTION: partial` on #1828 — the macOS drag-mapping half is
+   fixed, the Windows Terminal thumb-visibility half still needs the
+   quadraui fix and a real Windows Terminal re-check per the issue's own
+   acceptance criteria.
+
+**Last updated:** October 7, 2026 (#1786 — bugbash: Alt-M back to Vim mode
+leaves the VSCode-mode menu bar permanently visible). **Duplicate, already
+fixed — no new code.** #1786 is the identical bug (same repro: Alt-M,
+Alt-M, row 0 still shows the File/Edit/.../Help menu bar) as #1780, whose
+fix (`ad939abf`/`6bb1fbcf`, gating `Engine::toggle_editor_mode`'s
+VSCode->Vim arm to clear `menu_bar_visible` when `menu_bar_toggleable`) is
+already merged to `develop` — confirmed by `git fetch origin develop`
+landing on the exact same SHA (`e2466e97`) this branch was created from,
+i.e. this branch's diff against `develop` is empty. The acceptance
+criterion in #1786 ("must add a Tier-1 shared conformance scenario or
+Tier-2 smoke-spec step that fails first") is also already satisfied by
+#1780's own fix: `tests/smoke-spec/catalogue.yaml`'s
+`modeswitch-alt-m-back-to-vim` entry, the TUI `TuiDriver` test
+(`alt_m_round_trip_hides_the_menu_bar_row_again_via_shell_app_1780` in
+`src/tui_main/app_on_tui_tests.rs`), and the GTK mirror
+(`mod alt_rung_1744` in `src/gtk/testing.rs`) were all added/tightened in
+#1780's round 2. Re-ran the TUI test this session
+(`cargo test --no-default-features --lib
+alt_m_round_trip_hides_the_menu_bar_row_again_via_shell_app_1780`) — passes
+clean against current `develop`. `ISSUE_RESOLUTION: resolved` — #1786
+should close as a duplicate of #1780, not as new work merged.
+
+**Last updated:** October 6, 2026 (#1824 — macOS native real-screen smoke: Dock icon, window activation, icon font, text quality — investigation, no production fix). **Investigated on real macmini hardware this session; no vimcode-repo fix exists for any of the three confirmed/partially-confirmed findings.** Built `cargo build --release --bin vimcode --no-default-features --features macos` and drove it live (real `screencapture`, `osascript`/`System Events`, `lsappinfo`) rather than reading code alone. Findings, most to least confirmed:
+
+1. **Window activation (regression 2 of 4) — reproduced cleanly.** Launched from inside a real, frontmost Terminal.app window (not a detached automation harness — that path did *not* reproduce it, which mattered). Result: `lsappinfo` reports vimcode `(in front)`/`Foreground`, but `System Events`'s frontmost-process query still names `Terminal`, and the composited screenshot shows Terminal's window literally covering vimcode's. Root-caused to quadraui, not vimcode: `quadraui::macos::run::run_with` (`src/macos/run.rs:2082`) calls the *deprecated* `-[NSApplication activateIgnoringOtherApps:]` (Apple's own SDK note, visible in the pinned `objc2-app-kit` 0.3.2 binding, says "Use NSApp.activate instead" — and the non-deprecated `NSApplication::activate()` already exists in that same pinned crate, unused). `src/macos/mod.rs` is confirmed thin wiring with no activation seam of its own. Drafted as a quadraui issue in `docs/PENDING_QUADRAUI_ISSUES.md` (new entry, directly below the pre-existing #1825 GTK-activation draft — this finding is stronger evidence than that draft had, since the native backend already calls an activation API and still fails, where GTK calls none at all).
+2. **Icon-font glyphs (regression 3 of 4) — reproduced cleanly, root cause narrowed but not found.** Real painted activity bar: Explorer/Source Control/Run&Debug show a generic `?`-box placeholder; Search/Extensions/AI Chat show their correct Nerd-Font glyphs, same frame, same font registration. Hand-parsed `data/fonts/vimcode-icons.ttf`'s raw `cmap`(fmt 4 + fmt 12)/`glyf` tables (no `fontTools` — not installed, can't `pip install` per this session's tooling policy) for all six codepoints: **every one** has a valid GID in both cmap formats and non-empty `glyf` outline data (216-350 bytes) — the font asset is not the bug, contradicting the plausible "missing glyph in the subset" hypothesis before it could cause anyone to chase it. This is new, stronger evidence than vimcode#937 (closed) had — that issue's own test documented it *could not verify* real-hardware glyph resolution at all. Drafted as a quadraui issue (`MacBackend`'s Core Text fallback cascade, `macos/text.rs::font_with_fallback`) with the full per-codepoint table; root cause of *why* exactly these three and not the other three is left open for the next pass (candidates listed in the draft, none confirmed).
+3. **Dock icon (regression 1 of 4) — not reproduced on a clean launch.** Polled the Dock's UI-element list for 20+ seconds after a fresh launch; the tile was present throughout with the correct embedded icon. Did observe it absent once, but only right after this session's own `killall Dock` (used to defeat autohide for screenshotting) restarted Dock out from under an *already-running*, older instance — a plausible Dock-restart reconnection artifact, not evidence of #1824's reported "used to show, now doesn't" on an ordinary launch. Not drafted upstream; needs a clean re-test (fresh launch, no Dock-process interference) before concluding anything.
+4. **Text quality (regression 4 of 4, long-standing) — not investigated further.** `sips -z` nearest-neighbour upscaling (the only inspection tool available this session) makes any crop look blocky regardless of real on-screen rendering quality, so no credible new evidence either way. #1824 itself frames this as longstanding ("has always been poor"), not a new regression; #1069/#1542 already closed against the same complaint. Needs a native-resolution, non-upscaled capture method to make progress.
+
+System left exactly as found: Dock `autohide` restored to `true` (`killall Dock` to apply), no stray vimcode processes left running. No `src/` changes in this PR — per CLAUDE.md's Platform-Neutrality Rule, none of these three findings has a legitimate vimcode-repo fix (all three root causes, where found, point inside `quadraui::macos`, which this repo's workers may not edit directly). `ISSUE_RESOLUTION: investigation` on #1824 — ships two new quadraui issue drafts plus the Dock/text-quality notes in `docs/PENDING_QUADRAUI_ISSUES.md` for the coordinator to file; #1824 should stay open behind those two upstream issues per `GOALS.md`'s milestone-discipline rule.
+
+**Last updated:** October 6, 2026 (#1829 — Windows TUI: `:term` opens a
+blank panel with no PowerShell prompt). **Investigation only — no
+production change, real-hardware verification still required.** Traced
+every vimcode-side hop between the `:term` ex-command and the PTY write and
+confirmed each one is already shared, platform-neutral code with no
+Windows-specific branch: `Engine::execute_command`'s `"terminal"` arm ->
+`EngineAction::OpenTerminal` (`src/core/engine/execute.rs`) ->
+`render::handle_action`'s `OpenTerminal` arm (`src/render.rs`) ->
+`Engine::terminal_new_tab` (`src/core/engine/terminal_ops.rs`, identical on
+every backend) -> once
+`terminal_has_focus` is set, every subsequent keystroke is forwarded by
+`render::route_terminal_key`'s `TerminalKeyAction::SendToPty` arm
+(`src/render.rs`, also shared). `TerminalSession::spawn`/`poll` themselves
+are `quadraui::terminal_engine` — not vimcode source at all, confirmed
+against the pinned rev (`a5360532e297deecece65103df8ce61f53230bda`). So
+there is **no per-backend vimcode-side fix available** here, per the
+Platform-Neutrality Rule — this is a quadraui/`portable_pty` ConPTY
+question, and confirmed to have essentially zero existing coverage there:
+`quadraui/src/terminal_engine.rs`'s own `#[cfg(test)] mod tests` is almost
+entirely `#[cfg(unix)]`-gated (grep finds dozens of hits, zero
+Windows-gated spawn/poll tests), so the exact path this bug lives in has
+never been exercised automatically on the platform it was reported on.
+
+Also confirmed, narrowly: the tick re-arm (`5401a24e`/`f321ac37`,
+`App::tick_dispatch`'s `terminal_poll_rearm_delay`) that #1668 landed for
+Win-GUI cannot be **this** TUI symptom's cause — it's explicitly a no-op on
+TUI (`src/app.rs`'s own comment: "Harmless on GTK/TUI/macOS (they already
+tick regardless, via their own `IDLE_POLL_CEILING` fallback)"), and
+`terminal_poll_rearm_delay`'s own doc already flags the one thing that fix
+could not verify (whether a real `WM_TIMER` re-fires on real Windows
+hardware). That narrow mechanical point does **not**, on its own, mean the
+issue's "likely the same root cause as #1668" premise is dead — the issue
+body notes #1668 was **reopened** the same day this session ran, i.e. the
+re-arm did not actually resolve the Win-GUI symptom on real hardware, which
+is evidence *for* a shared root cause, not against it. This session's own
+destination (quadraui's untested Windows ConPTY leg of the shared
+`terminal_engine`) is exactly the kind of shared cause the issue predicted:
+both #1668 and #1829 drive the same `quadraui::terminal_engine::
+TerminalSession` on Windows, just from different front ends (Win-GUI vs.
+Windows TUI). So: the Win-GUI tick re-arm is not the TUI bug's cause — yes;
+"the two issues share nothing but symptom + dependency" — not established,
+and arguably contradicted by #1668's reopening. Confirming this needs the
+same real-hardware check named below: once a fix lands and is verified
+against vimcode's new ConPTY test on `dell64`, re-check #1668 against it
+too, per the issue's own acceptance step 3.
+
+Added `tests/conpty_term_opens_shell_1829.rs` — a new, `#[cfg(windows)]`-
+gated real-ConPTY regression test following the exact precedent of
+`tests/conpty_idle_flicker.rs` (#1634) and
+`tests/conpty_activity_bar_click.rs` (#1636): spawns `vcd.exe` cross-
+compiled for `x86_64-pc-windows-msvc` under a real Win32 ConPTY, types the
+literal keystrokes `:term` + Enter, waits, then types the issue's own
+acceptance probe (`echo <marker> > "<path>"` + Enter) and polls the
+**filesystem** (not the screen — the whole point is proving the shell
+actually ran a command) for the marker file to appear. Verified to compile
+cleanly both ways from this Linux session (no Windows host attached here):
+`cargo xwin check --target x86_64-pc-windows-msvc --test
+conpty_term_opens_shell_1829` and plain `cargo check --test
+conpty_term_opens_shell_1829` (compiles to an empty, no-op crate on
+non-Windows via its `#![cfg(windows)]`) both succeed; `cargo fmt --check`
+and the normal host-target `cargo clippy -D warnings` lane are clean. **Not
+yet run** — that needs `cargo xwin test --target x86_64-pc-windows-msvc`
+executed on real Windows hardware (`dell64`), which this session has no
+access to. (A Windows-cross-target `cargo xwin clippy` run surfaced 4
+pre-existing lint failures in unrelated `src/core/paths.rs`/`src/core/
+swap.rs` Windows-only code — not part of this diff, not part of this
+repo's mandated host-target pre-commit gate, left alone.)
+
+Also confirmed, reading the issue body against the pinned quadraui source:
+the separately-named latent bug is real — `quadraui::terminal_engine::
+default_shell()` reads `$SHELL` **before** checking `target_os`, so a
+Windows host with `$SHELL` set (a Git Bash or WSL tab, per the issue's own
+note) hands a Unix shell path straight to `TerminalSession::spawn`'s
+`CommandBuilder`, which would plausibly also produce a dead/blank panel —
+distinct from dell64's own repro (confirmed `$SHELL` unset there) but
+explicitly in-scope per the issue body ("the fix should cover it"). This
+is quadraui code (`quadraui/src/terminal_engine.rs:2175`), not reachable
+from vimcode source — no vimcode-side fix available for this half either.
+
+**Quadraui issue drafted (review round 1):** the file-overlap fence that
+blocked this in the first pass has cleared — #1825's own branch (which was
+editing `docs/PENDING_QUADRAUI_ISSUES.md` concurrently) has since landed on
+`develop` (`58edb6d1`) — so the draft now lives in its designated home,
+`docs/PENDING_QUADRAUI_ISSUES.md`'s "`quadraui::terminal_engine`'s Windows
+ConPTY spawn/poll path has essentially no automated test coverage..."
+entry, rather than buried in this chronological log. See that file for the
+full title/body/ask/test/blocks text; filing it on `JDonaghy/quadraui` is
+still coordinator/human work per that file's own process.
+
+**CI wiring added (review round 1):** `.github/workflows/ci.yml`'s
+`build-windows-tui` job now runs `conpty_term_opens_shell_1829` as a
+`continue-on-error: true` step, same pattern #1636's step documents for a
+test "not yet promotable to a hard gate" — this was the blocking review
+finding: `windows-latest` is a real ConPTY host already building `vcd.exe`
+and already running the two sibling ConPTY tests, so it is a host capable
+of producing this test's RED/GREEN signal today, at zero added human cost,
+and leaving the new test wired into nothing meant 380 lines of this PR's
+only executable deliverable ran nowhere, ever.
+
+**What remains before #1829 can be considered resolved, let alone closed**
+(explicitly per the issue's own acceptance criteria): (1) the quadraui
+issue above needs to actually be filed (coordinator/human action) and a
+fix landed + pin bumped; (2) the new CI step needs to actually run once on
+`windows-latest` and its RED/GREEN result read, to confirm the test itself
+behaves as designed before anyone promotes it off `continue-on-error`; (3)
+a person with `dell64` access needs to actually launch `vcd.exe` from a
+PowerShell tab, run `:term`, and visually confirm whether a real prompt
+appears — the acceptance criteria's own "a person confirms on dell64's
+screen" step, which no CI run (real-ConPTY or otherwise) substitutes for.
+No `tests/smoke-spec/win-terminal.yaml` step was added for this: that
+file's own step vocabulary is interpreted by `coord`'s
+`win_native_driver.py` (a different repo this worker cannot see or edit),
+which has no filesystem-assertion step type today — the same class of
+testing-infrastructure gap `win-terminal.yaml`'s own header already
+documents for #1635/#1636 (UIA can only see Windows Terminal's single
+opaque `terminal` element, not step content). Inventing an unsupported
+YAML key here would silently no-op rather than gate anything, so none was
+added; the new Tier-1 `conpty_term_opens_shell_1829.rs` test, now actually
+wired into CI, is the closest automatable substitute, same reasoning
+`win-terminal.yaml`'s own #1751 section gives for the identical situation.
+
+ISSUE_RESOLUTION: investigation — root cause isolated to quadraui's
+Windows ConPTY leg (untested at the pinned rev) and a separate latent
+`default_shell()` ordering bug, both outside vimcode's own source per the
+Platform-Neutrality Rule. The quadraui-side issue is **drafted** in its
+designated home, `docs/PENDING_QUADRAUI_ISSUES.md` (the file-overlap fence
+with #1825 that blocked that in the first pass has cleared — see "Quadraui
+issue drafted" above), but **not yet filed** as a real GitHub issue on
+`JDonaghy/quadraui`; a drafted entry is not a filed issue. A new
+real-ConPTY regression test is added and is now wired into CI's
+`windows-latest` job, but has not yet produced a readable RED/GREEN result
+anywhere, and the issue's own acceptance step 3 — a person confirming a
+PowerShell prompt on `dell64`'s screen — is still outstanding.
+
+**Review round 1 fixes:** the quadraui draft has moved to its designated
+home (`docs/PENDING_QUADRAUI_ISSUES.md`, #1825's conflicting branch has
+since landed); `.github/workflows/ci.yml`'s `build-windows-tui` job now
+actually runs `conpty_term_opens_shell_1829` (`continue-on-error: true`,
+per #1829's own blocking review finding that the test previously executed
+nowhere); the test itself replaced its fixed `AFTER_OPEN_SETTLE` sleep and
+O(n²) re-parse with a persistent-parser `wait_for_screen_contains(...)`
+poll (mirroring `conpty_activity_bar_click.rs`'s own documented
+reasoning for why a fixed quiet-window is flaky on real hardware), gained
+an RAII `TermTestGuard` so the child/temp-home/probe-file are cleaned up on
+every exit path including a failed assertion before the old explicit
+teardown block ran (mirroring the #1822 `OrphanChildGuard` pattern already
+landed in this repo), and the PROJECT_STATE #1668 paragraph above was
+softened to stop overstating "the premise does not hold" against an issue
+the bug report itself says was reopened the same day. See this session's
+commit for the full list (probe path now single-quoted in the PowerShell
+command line, `&Path` instead of `&PathBuf`, UTF-16BE doc note).
+
+**Review round 2 fixes:** round 1's new "the panel opened" precondition
+waited on the needle `"TERMINAL"` (uppercase), which **can never paint in
+any state that test can reach** — it is the terminal toolbar tab strip's
+`if tabs.is_empty()` fallback label (`src/render.rs`), so it needs
+`TerminalPanel::tab_count == 0`, but `tab_count` is
+`engine.terminal_panes.len()` and `render::terminal_panel_desc`
+early-returns `None` (painting no panel at all) when there are no panes;
+on the `TerminalSession::spawn` failure path `terminal_new_tab_at` never
+sets `terminal_open`, so nothing paints there either. The uppercase
+assumption was carried over by false analogy from
+`conpty_activity_bar_click.rs`'s sidebar needles, which come from
+`fixed_panel_title_tooltip` (sidebar panels only, no terminal entry). As
+written it would have burned the 20 s `SETTLE_TIMEOUT` and failed
+identically on a working build and a broken one, never reaching the
+filesystem probe — i.e. it neutralised the exact CI signal round 1 added
+the step to produce, and made that step's own promotion condition
+("observed GREEN at least once") unsatisfiable. Fixed: the needle is now a
+documented `PANEL_OPEN_NEEDLE` constant = `"[1]"`, the toolbar's first
+per-tab label (`format!("[{}]", i + 1)`), which is painted exactly when a
+terminal pane exists. Title-case `"Terminal"` was rejected as a substitute
+because it is also a permanent top-level menu-bar title, so it is on
+screen before `:term` runs and the gate would be vacuous. **The needle is
+now verified on Linux with no Windows host**, which is what would have
+caught this in round 1:
+`src/tui_main/app_on_tui_tests.rs`'s
+`term_ex_command_paints_bracketed_tab_label_not_uppercase_terminal` drives
+the real `:term` ex-command through `TuiDriver` and asserts both halves —
+`"[1]"` absent before and painted after, `"TERMINAL"` absent in both — so
+"the needle is wrong" can no longer masquerade as "ConPTY is broken".
+Also: `TermTestGuard::drop` now takes every lock with
+`unwrap_or_else(|e| e.into_inner())` (a panic inside `Drop` during an
+assertion unwind aborts the process and destroys the captured-screen
+diagnostics the panic message exists to deliver); dropped the no-op
+`let _ = self.child.try_wait();` that preceded an unconditional
+sleep-then-kill; corrected `Drop`'s "graceful shutdown" comment, which
+claimed a `:qa!` that `render::route_terminal_key` actually forwards to
+the nested shell once `terminal_has_focus` is set (it only reaches
+vimcode's ex line on the early-failure paths, which is now what the
+comment says); and the test's "CI wiring" module doc now spells out what a
+red result means *today* (expected, carries no new information beyond the
+failure's shape) versus after the quadraui pin bump (a real regression
+signal, and the thing that promotes the step off `continue-on-error`). The
+contradictory `ISSUE_RESOLUTION` paragraph above — which still claimed the
+quadraui draft "could not be drafted into
+`docs/PENDING_QUADRAUI_ISSUES.md`" that the same commit had in fact landed
+there — was reconciled, and now states plainly that the draft exists but
+the GitHub issue is still unfiled.
+
+**Last updated:** October 6, 2026 (#1798 — bugbash:win-native "Tab bar label doesn't update when switching the active file via the Explorer; only one tab ever appears"). **Fixed.** Root cause was never the Explorer dispatch path — `Engine::open_file_in_tab` always appended the second tab, which is why breadcrumb, content and status bar all followed the new buffer. The second tab had nowhere to **paint**: `App::shell_config` (`src/app.rs`) set `min_sidebar_width`/`max_sidebar_width` but left `ShellConfig::default_sidebar_width` at quadraui's generic `20.0`, and `AppShell::compute_layout` multiplies that by `line_height` on *every* backend. On TUI that is 20 terminal columns (correct); on a GUI backend it is ~460 device pixels, so beside the 48px activity bar the bugbash's 800x480 window had ~290px left for the editor *and* its tab bar — room for exactly one tab, hence "only one tab ever appears". Fix is one number made per-*unit* rather than per-backend, in the sanctioned shared place: `render::UnitProfile::sidebar_width_lh` (`src/render.rs`), joining `activity_bar_width_px`/`title_bar_lh` — `ALT_SIDEBAR_WIDTH_MIN`'s 15 (~345px, in the same range as `Session::sidebar_width`'s persisted 260 default and VS Code's ~300px) on the `px` profile, 20 cells unchanged on `cell`. No per-backend code, no new quadraui knob needed — the earlier rounds' claim that this needed a pixel-valued `ShellConfig::default_sidebar_width_px` upstream was wrong, and the review that pushed back on it was right. It deliberately stops *at* the shared Alt rung's floor rather than going narrower (~10 lh / ~230px would be closer to 260): `alt_resized_sidebar_width` clamps to `ALT_SIDEBAR_WIDTH_MIN..=ALT_SIDEBAR_WIDTH_MAX` on both backends, so an opening width below that floor makes the user's first Alt+Right jump discontinuously to it with no way back (measured on GTK at 10.0: painted sidebar 230px -> 345px on Alt+Right, then stuck at 345px on Alt+Left), and `compute_layout` would clamp it back up anyway. Making that floor per-unit too is a change to the shared Alt rung's cross-backend contract (#759) and wants its own issue. Coverage, fail-first per the acceptance bar: `gtk::testing`'s `explorer_double_click_opens_second_file_in_a_second_tab_1798` now runs at the reported **800x480** (it had been widened to 1600x480 in an earlier round to dodge this very bug) and is RED against unfixed `develop` — restoring `sidebar_width_lh` to `20.0` makes `tab_center(&bar, 1)` `None` because the tab never paints — plus `render::unit_profiles_scale_the_sidebar_width_per_unit_1798` pinning the three invariants, and the `shell_config` assertions in `src/app.rs`. Tab-bar assertions are geometrically scoped via a new `painted_label_is_in_tab_slot` helper (the matched run's rect must fall inside that tab's own slot in the cached `TabBarLayout`), with a negative control asserting the helper rejects the Explorer row's bare `"main.rs"` run — a bare `screen_contains` would pass under the reported bug. The two TUI twins are green both before and after, correctly: the `cell` profile was never mis-scaled, so they cover the shared dispatch path and guard against the fix narrowing the TUI sidebar as a side effect. Full `cargo test` green (4299 passed); the narrower GUI sidebar required no fixture updates at 15 lh.
+
+**Last updated:** October 5, 2026 (#1797 — bugbash:win-native "Source Control panel CHANGES section never lists modified/untracked files"). **Fixed.** Root cause: `Engine::startup_inner`'s file-opening branch (as opposed to the folder-opening branch, which `open_folder` already repoints) never touched `cwd`/`workspace_root` at all, so `cwd` stayed whatever the process's actual working directory happened to be at `Engine::new()` time — correct by accident on a terminal launch (`cd workspace && vimcode main.rs`, since the shell already `cd`ed there first), but wrong on any native-GUI launch that hands over an absolute file path without first changing the process's directory (a desktop shortcut with no "Start in" folder, a file-association "Open with" launch). With `cwd` pointing somewhere unrelated, `git::find_repo_root(&self.cwd)` returns `None`, `sc_refresh`'s `git status` queries the wrong directory, and the CHANGES section (which only ever reads `sc_file_statuses`) stays empty no matter how many times the panel is refreshed — exactly the report. This is shared, platform-neutral `Engine`/`core` code (no backend touches `cwd` differently), so the fix lives entirely in `src/core/engine/mod.rs`: a new `adopt_cwd_for_startup_file` resolves the file's own git repo root (falling back to its immediate parent directory) and adopts it as `cwd`/`workspace_root`, but only when the file is not already reachable from the existing `cwd` — so the ordinary terminal-launch case (including a file nested several directories into the workspace) is untouched, and only the "file lives somewhere `cwd` has no path to" case is repointed. RED-verified: `src/core/engine/tests.rs`'s `startup_on_a_file_outside_cwd_still_finds_its_repo_for_source_control_1797` builds a real git repo (one modified tracked file, one untracked file) in one temp dir, points the engine's `cwd` at a second, unrelated temp dir, calls the real `Engine::startup_without_session_restore(Some(&file))`, and asserts `sc_section_file_count(SC_SECTION_CHANGES) == 2` — observed `0` before the fix (confirmed by reverting `adopt_cwd_for_startup_file`'s call site), `2` after.
+
+**Review round 1 fixes (same day):** the first version's `TuiDriver` test hand-set `engine.cwd` to the file's own repo and called `sc_refresh()` directly, bypassing `adopt_cwd_for_startup_file` entirely — it could not fail against unfixed `develop`, so it was not coverage (CLAUDE.md rule 2 / #553). Rewrote it (`src/tui_main/app_on_tui_tests.rs`'s `sc_panel_changes_section_shows_status_badges_for_modified_and_untracked_files_1797`) to start `cwd` at a second, unrelated, repo-less temp dir and drive the real `startup_without_session_restore`, then to trigger the refresh by *clicking* the sync/refresh toolbar icon (`sc:sync`) through the driver — the report's own repro gesture — rather than calling `sc_refresh()` directly; widened the sidebar via the real `Alt+Right` resize chord first, since the default ~20-column sidebar truncates the toolbar down to the Commit button alone. RED-verified by hand (stubbing `adopt_cwd_for_startup_file` to a no-op fails both this test and the `core::engine::tests` one above). Added two unit tests pinning the fix's two no-op guarantees (`adopt_cwd_for_startup_file_is_a_no_op_when_the_file_is_already_under_cwd_1797`, `..._when_cwd_already_has_its_own_repo_1797` — the latter backing a new, narrower gate: `adopt_cwd_for_startup_file` is now also a no-op when `cwd` already has *any* git repo of its own, not just when the file is reachable from it, so `cd ~/myrepo && vimcode ~/.gitconfig` no longer silently re-roots to `$HOME`). Mirrored `open_folder`'s `explorer_expanded.clear()`/`insert(canonical)` into the new code path too, closing a canonicalisation-asymmetry gap `explorer_reveal_path`'s `strip_prefix` could otherwise silently fail on (Windows short paths, symlinked launch paths, macOS `/tmp` vs `/private/tmp`). Also added a `backend_conformance!` (`gtk`+`tui`+`tui_prod`) scenario in `src/harness.rs` (`sc_panel_changes_section_shows_status_badges_after_startup_cwd_fix_1797`) so the fix has cross-backend render coverage, not just TUI — GTK paints the status badge and filename as separate coloured Pango labels, so the TUI-only idiom of `screen_has("M main.rs")` doesn't transfer; added a small `badge_precedes_file` helper built on `quadraui::testing::FrameInventory`'s relational vocabulary (`left_of`/`same_row`, quadraui#490) instead. All three arms RED-verified the same way. Satisfies the issue's "Tier-1 shared conformance scenario... that fails first" acceptance bar through the one render path GTK, TUI, and win-native all share (confirmed no `src/win/` file touches `sc_*`/`source_control` at all). No GTK- or Win-specific *production* code added, per the Platform-Neutrality Rule — only tests.
+
+**Last updated:** October 5, 2026 (#1796 — bugbash:win-native "dd leaves cursor at the previous column instead of column 0 of the line that moves up"). **Not a bug — false report, now with Tier-1 coverage closing the gap that produced it.** The issue's own oracle check placed the cursor at column 0 before `dd`, a degenerate starting point where "reset to 0" and "preserve the column, clamped" produce the same answer — it can't actually distinguish the two. Re-ran real `nvim --headless` 0.12.5 with the cursor explicitly on a non-zero column (`call cursor(2,3)` on `aaa/bbb/ccc` then `normal! dd`): buffer becomes `aaa`/`ccc`, cursor lands at `(2,2)` 0-indexed — column *preserved*, not reset. VimCode's `delete_lines` (`src/core/engine/motions.rs`) already implements this (added in #805). Real Vim 9.1 genuinely disagrees and does reset to column 0 (`'startofline'` defaults on in Vim, off in Neovim) — but this project's documented oracle is Neovim (`reference: nvim` in `tests/smoke-spec/catalogue.yaml`), so vimcode's current behaviour is correct against the oracle that matters here. Corrected the `vim-dd-deletes-line` catalogue entry, which had stated the degenerate-case result as a general rule — the likely source of the false report — and reworded the `delete_lines` comment that repeated the same conflation. Closed the mechanical gap that let this degeneracy exist in the first place: every other `op:dd` case in `tests/nvim_conformance.rs`'s oracle-backed `CASES_OP` started at column 1; added `"op:dd nonzero col 1796"` (column 3 start), oracle-verified green. Coverage, both tiers per the acceptance bar: a Tier-1 engine test (`test_nvim_dd_preserves_column_not_reset_to_zero_1796` in `src/core/engine/tests.rs`, pinning `view().cursor.{line,col}`) plus a Tier-1 `TuiDriver` test asserting the actual **painted** status bar (`dd_preserves_painted_status_bar_column_1796` in `src/tui_main/app_on_tui_tests.rs`, asserting `screen.contains("Ln 2, Col 3")`) — the issue's own evidence was a status-bar screenshot, not an engine field, so the rendered-output assertion is the one that actually answers the report. No production change in this PR; `ISSUE_RESOLUTION: investigation` — the issue stays open until a reviewer confirms the coverage closes it as "not a bug."
+
+**Last updated:** October 5, 2026 (#1783 — bugbash:mac-native "viewport scroll position incorrectly snaps to cursor's line after multi-line insert/paste"). **Already fixed by #1779 — duplicate root cause, new regression coverage only, no production change.** #1783's own two repros (`i`/`aaa`/Enter/`bbb`/Enter/`ccc`/Escape; and `dd` then `p` on `aaa/bbb/ccc`) are the exact same `run_shared_tick_chores` mechanism #1779 fixed the same day (see that entry below) via a different trigger (Insert-mode typing and delete-then-paste, instead of #1779's `o<text><Esc>`) — the mac-native bugbash lane drives the real `App`/`AppShell` the same shared `src/app.rs`/`src/render.rs` code path every backend (TUI, GTK, and `src/macos/mod.rs`'s AppKit wrapper) shares, so #1779's fix (`RenderedWindow::visible_line_capacity` instead of `rw.lines.len()`) already covers it. Verified, not assumed: added two permanent `TuiDriver`-based tests (`src/tui_main/app_on_tui_tests.rs`'s `multiline_insert_does_not_hide_earlier_lines_1783` and `dd_then_p_does_not_hide_earlier_lines_1783`), RED-verified by hand against this file's own pre-#1779 shape (temporarily reverting `run_shared_tick_chores`'s `rw.visible_line_capacity.max(1)` back to `rw.lines.len().max(1)` reproduces both repros' exact symptom — the earlier line(s) scroll out of view), GREEN again with the fix restored (`src/render.rs` is unchanged from `develop` in this commit — test-only diff). No Tier-2 `mac-native` smoke-spec step added: `tests/smoke-spec/mac-gui.yaml`'s own header notes that driver's step vocabulary (`launch`/`key`/`click`/`wait`/`capture`/`expect_a11y`/`expect_closed`) has no pixel-content or screen-text assertion primitive at all — `capture` alone can't fail (#553's "a test that cannot fail is not coverage" rule already rules it out, same reasoning that file gives for omitting the two "All GUI specs" seed checks) — so the Tier-1 `TuiDriver` route (the issue's own stated alternative) is the one that can actually assert on rendered content here.
+
+**Last updated:** October 5, 2026 (#1779 — TUI "line 1 vanishes" on `o` / yy+j+p when the edit grows the buffer's last line). **Fixed.** Root cause: `src/render.rs`'s `run_shared_tick_chores` fed `Engine::set_viewport_for_window` the *previous frame's painted line count* (`RenderedWindow.lines.len()`), not the window's actual row *capacity* — on a buffer shorter than the viewport (e.g. a freshly opened 1-line file), those two differ, so `view.viewport_lines` got pinned to the buffer's current length. The real TUI runner calls that tick between every input batch (including idle ones), so by the time the next keystroke grew the buffer, `Engine::ensure_cursor_visible` believed the viewport was exactly as tall as the old content and scrolled line 0 out of view to keep the cursor's new line "on screen". This *is* reachable in-process — `quadraui::tui::testing::TuiDriver::tick()` is public and routes straight to `App::tick` -> `run_shared_tick_chores`, so calling it between the initial render and the edit keystroke reproduces the bug with no pty at all (`src/tui_main/app_on_tui_tests.rs`'s `opening_a_line_below_the_last_line_paints_every_line_in_order_1779`, RED-verified pre-fix). `quadraui::tui::vt_testing::TuiVtDriver` has no equivalent public `tick()` at this repo's pinned quadraui rev, so its twin test genuinely can't be fixed the same way and stays as ANSI-diff-path evidence only. Also RED-verified end-to-end over a real Unix pty (`tests/pty_open_line_below_paints_all_lines.rs`, new). Fix: added `RenderedWindow::visible_line_capacity` (the window's real row count from `rect`/`line_height`, independent of how much buffer content exists) and pointed `run_shared_tick_chores` at it instead of `lines.len()`. Coverage: the new real-pty test (RED-verified pre-fix, GREEN post-fix), the `TuiDriver`-based in-process test above (also RED-verified pre-fix, GREEN post-fix), a `src/render.rs` unit test pinning the new field's value against `lines.len()` on a short buffer, and the `TuiVtDriver` twin kept as supplementary evidence the ANSI-diff/vt100 path isn't itself where the bug lives. No GTK twin: unlike `TuiDriver`, `quadraui::gtk::testing::GtkDriver` (at this repo's pinned rev) exposes neither a `tick()` nor a mutable backend accessor, so there is no way to invoke `App::tick` -> `run_shared_tick_chores` on it from outside the driver at all (confirmed while investigating, not assumed) — a real quadraui testing-API gap worth filing upstream (`GtkDriver::tick()`, mirroring `TuiDriver::tick()`), not a vimcode-side fix. The fix itself lives in shared `src/render.rs`, so GTK gets the production fix for free regardless.
+
+**Last updated:** October 5, 2026 (#1762 fix iteration 1 — activity bar got
+stuck on "Run and Debug" after visiting Extensions, and a misrouted
+right-click launched a failing debug session). **Status: partial — see
+below.** This entry was corrected in fix iteration 1 after review found two
+of its original factual claims contradicted by the code/spec they cited;
+read the "What is NOT demonstrated" bullet before treating this as closing
+#1762.
+
+- Confirmed real bug (independent of whether it explains #1762's reported
+  run): traced to the pinned quadraui rev
+  (`quadraui::dispatch::DoubleClickDetector`): `DOUBLE_CLICK_RADIUS` is 1.5
+  TUI cells and the activity bar's icon rows are exactly 1.0 cell apart, so
+  two genuinely distinct real clicks on *adjacent* activity-bar icons
+  (Source Control then Debug, Debug then Extensions, …) landing within the
+  400ms `DOUBLE_CLICK_MS` window fold into one synthesized
+  `UiEvent::DoubleClick`. `quadraui::compose::app_shell::AppShell::handle`
+  only has a hit-test arm for a plain `MouseDown` — every other event,
+  `DoubleClick` included, falls through its own `_ => Ignored` arm — so the
+  second click was silently dropped and the sidebar stayed on whatever
+  panel was already active until the next real click.
+- Fix (`src/app.rs`, `App::handle_dispatch`): the real fix belongs in
+  quadraui (`AppShell::handle` growing a `DoubleClick` arm identical to its
+  `MouseDown` one for the activity-bar band — a double-click on an
+  activity-bar icon has no distinct meaning from a single click there, for
+  every consumer, not just vimcode). That gap is now drafted in
+  `docs/PENDING_QUADRAUI_ISSUES.md` for the coordinator to file verbatim
+  (not yet filed/landed as of this commit — this repo's workers don't run
+  `gh`). Until it lands, a new rung in the shared `App` (not
+  `src/gtk/`/`src/tui_main/`, so both backends pick it up from one place)
+  catches a `DoubleClick` landing inside the activity bar's freshly
+  recomputed layout bounds, re-synthesizes it as the plain `MouseDown` it
+  was always meant to be, and feeds it back through `AppShell`'s own
+  public `handle()` — the exact dispatch a real single click takes — then
+  through the existing `ShellApp::on_shell_event_ctx` pipeline, same as a
+  real click would. This also changes same-icon double-click behaviour on
+  every backend (GTK/mac too, not just TUI) — see that comment block and
+  `src/gtk/testing.rs`'s
+  `activity_bar_double_click_on_active_icon_reopens_sidebar_via_gtk_driver`.
+- Test (Tier-1): `tui_main::app_on_tui_tests::tests::activity_bar::
+  activity_bar_adjacent_clicks_are_not_dropped_by_double_click_fold_1762`
+  — drives the same six rows `tests/smoke-spec/tui.yaml`'s activity-bar
+  section clicks, in order, but with **no simulated time between clicks**
+  (the worst case for the 400ms fold window) to isolate the adjacency-fold
+  bug on its own; it is not a timing-faithful replay of the spec (the
+  spec's own `wait_idle` pacing is ≥500ms between clicks, over the 400ms
+  fold window). RED-verified by hand with the `App::handle_dispatch` rung
+  reverted: only the *first* assertion that exercises the fold ("clicking
+  Source Control right after Debug") is ever observed to fail — `assert!`
+  panics there, so later assertions in the same test are never reached in
+  that run. It fails finding "RUN AND DEBUG" where "SOURCE CONTROL" was
+  expected, confirming the click was dropped.
+- GTK coverage (non-blocking review finding): `src/gtk/testing.rs`'s
+  `activity_bar_double_click_on_active_icon_reopens_sidebar_via_gtk_driver`
+  — the fix is shared code, so it changes behaviour on GTK too (a genuine
+  double-click on an already-active icon now re-shows the sidebar instead
+  of leaving it hidden). RED-verified by hand the same way.
+- **What is NOT demonstrated: that this fold is #1762's reported
+  mechanism.** Two claims in the original version of this entry did not
+  survive a check against the code/spec they cited: (1) the pacing claim —
+  `tui.yaml`'s own activity-bar steps pace every click with a confirmed
+  `expect_within` *and then* a 500ms `wait_idle`, comfortably over the
+  400ms fold window, so the reported lane should not hit this fold under
+  normal timing; no measurement to the contrary is offered. (2) the
+  symptom claim — the issue's own
+  `activity-bar-explorer-reselect-1636` failure is row 5 (Extensions) to
+  row 1 (Explorer), a 4.0-cell gap far outside the 1.5-cell radius, and
+  `DoubleClickDetector::process` resets `last_click_time` to `None` the
+  instant it folds a pair, so the click immediately following any fold is
+  never itself eligible to be folded — under no timing can that specific
+  re-click be dropped by this mechanism. #1762 therefore plausibly still
+  reproduces after this fix; something else is holding the sidebar on
+  Run&Debug in the reported run, not yet identified. The second half of
+  the issue title (the misrouted right-click launching a failing debug
+  session) is a pure downstream consequence of whichever cause turns out
+  to be real, so it is equally unconfirmed by this fix.
+- Filed in `docs/PENDING_QUADRAUI_ISSUES.md`, not yet filed on GitHub: the
+  quadraui-side issue (`AppShell::handle`'s missing `DoubleClick` arm) —
+  this session cannot run `gh`; the coordinator should file it against
+  `JDonaghy/quadraui` using that entry verbatim.
+
+**Last updated:** October 4, 2026 (#1761 — the automatic startup
+extension-registry refresh no longer breaks the idle-silence guarantee):
+
+- Root cause: `Engine::startup_inner`'s unconditional, ambient
+  `ext_refresh()` call at launch always surfaced a
+  `"Extension registry updated (N extensions)"` status message (and the
+  repaint that comes with it) whenever its background fetch completed —
+  and that completion time is bounded only by `registry::fetch_registry`'s
+  `curl --max-time 15`, i.e. anywhere from under a second to ~15s after
+  the first frame paints, entirely outside the user's control. #1702/
+  #1737/#1741 had already traced this exact mechanism and worked around
+  it with a wider Tier-2 YAML settle margin (`tests/smoke-spec/tui.yaml`'s
+  `settle-ext-registry-fetch-1741`), but a real-pty bugbash run still
+  caught it: a fixed settle margin cannot bound an unbounded network
+  delay.
+- Fix (`src/core/engine/lsp_ops.rs`): split `ext_refresh` into a shared
+  `ext_refresh_inner(quiet: bool)`, with the public `ext_refresh()` (every
+  explicit, user-initiated call site — Extensions panel open/refresh,
+  `:ExtRefresh`) keeping its status message, and a new `pub(crate)
+  ext_refresh_quiet()` — used only by `Engine::startup_inner`'s automatic
+  call — that never touches `self.message` on either the success or
+  failure branch, and reports "no redraw needed" to `poll_idle`. New
+  `Engine::ext_registry_quiet` field (`src/core/engine/mod.rs`) threads the
+  quiet/non-quiet flag through the async fetch's `mpsc` channel round
+  trip.
+- Test:
+  `tui_main::app_on_tui_tests::tests::quiet_startup_registry_refresh_1761::startup_registry_refresh_never_shows_a_message_or_forces_a_repaint`
+  (`src/tui_main/app_on_tui_tests.rs`) — Tier-1, drives the
+  real `Engine::ext_refresh_quiet()` production entry point (not a
+  hand-rolled channel) through a `TuiDriver`, asserts the status message
+  never paints and no repaint fires across a 2s poll window, and confirms
+  the fetch genuinely completed (not vacuously silent because it never
+  ran). RED-verified against pre-fix behavior (manually reverting
+  `ext_refresh_quiet` to the old unconditional-message path reproduces
+  the exact failure the bugbash found).
+- Manually reproduced the pre-fix bug directly against the real compiled
+  `vcd` binary under a `tmux` pty with a fresh `$HOME` (no
+  `registry_cache.json`) before writing the fix, to ground-truth the
+  mechanism rather than relying on the existing (already deeply-explored)
+  theories in #1702/#1737/#1741's own comments.
+- Not touched: `tests/smoke-spec/tui.yaml`'s existing `wait_idle`/
+  `expect_silent` settle margins from #1741/#1737 — they're now
+  redundant insurance (the message they were waiting out no longer
+  fires) rather than wrong, and removing them wasn't necessary to satisfy
+  this issue's acceptance bar (a new Tier-1 regression test).
+- Review fix-iteration 1: `ext_refresh_inner`'s "already in progress" dedupe
+  (`src/core/engine/lsp_ops.rs`) now upgrades `ext_registry_quiet` to
+  `false` when a non-quiet caller dedupes against an in-flight quiet fetch
+  — otherwise a user's explicit `r` refresh pressed during the startup
+  fetch's window silently inherited startup's silence policy and produced
+  no feedback at all. `poll_ext_registry`'s redraw verdict is now
+  `!quiet || self.active_panel_is(PANEL_EXTENSIONS)` — a quiet fetch
+  landing while the Extensions panel happens to be open still redraws, since
+  `sidebar.rs`'s panel-open handler deliberately doesn't re-arm its own
+  refresh when one is already in flight and relies on this fetch's own
+  completion to paint the list. Four new unit tests
+  (`core::engine::lsp_ops::tests`) cover both fixes directly against
+  `ext_refresh`/`ext_refresh_quiet`/`poll_ext_registry` (RED-verified
+  against the pre-fix code). A second Tier-1 test,
+  `tui_main::app_on_tui_tests::tests::quiet_startup_registry_refresh_1761::public_startup_entry_point_uses_the_quiet_refresh`,
+  drives the real public `Engine::startup()` entry point (not just
+  `ext_refresh_quiet()` directly) so a regression at `startup_inner`'s own
+  call site is caught black-box too — RED-verified the same way.
+- Review round 2: the four new unit tests drive the real
+  `poll_ext_registry()`, whose success branch calls `registry::save_cache`
+  unconditionally, so their shared `poll_with` helper now holds a
+  `core::paths::TestHomeGuard` across that call (and asserts the cache
+  landed under the temp home). Without it `cargo test` truncated the
+  developer's real `~/.config/vimcode/registry_cache.json` to `[]`, which
+  is sticky: `load_cache()` then returns `Some([])`, defeating
+  `sidebar.rs`'s `ext_registry.is_none()` guard so the Extensions panel
+  paints empty until a manual refresh. Same convention as
+  `lsp_ops.rs`'s existing guard use and the #1741 review fix.
+  The dedupe fix also gained a driver-tier guard that asserts on *painted*
+  output rather than the `ext_registry_quiet` flag:
+  `tui_main::app_on_tui_tests::tests::quiet_startup_registry_refresh_1761::explicit_refresh_during_the_quiet_startup_fetch_still_paints_its_message`
+  (RED-verified: fails with the dedupe upgrade reverted).
+
+**Last updated:** October 4, 2026 (#1760 — status bar drops the Ln/Col
+cursor-position segment once other optional segments compete for width).
+Root cause: `build_window_status_line` (`src/render.rs`, shared by both
+backends) pushed `cursor_seg` (`Ln N, Col N`) **first** into the window
+status bar's `right_segments`, to match VS Code's own left-to-right visual
+order (#1690). quadraui's `StatusBar::layout`/`fit_right_start`
+priority-drop removes `right_segments` from the *front* of the vector and
+always preserves only the *last* one — so pushing the ruler first made it
+the first segment *dropped* the moment a dirty marker (`[+]`), a git
+branch, or VS Code mode's `EDIT  F1:cmd  Alt-M:vim` hint ate into the left
+side's width budget, while lower-value segments (layout toggles, LSP
+status) survived instead.
+
+- Fix: `cursor_seg` is now pushed **last** into `right`, unconditionally
+  the bar's right-most segment, which is the only position quadraui's
+  "always keep the last right segment" rule can guarantee survives any
+  priority-drop. The rest of `right`'s push order was re-ranked
+  least-important-first (LSP status, notifications, layout toggles, then
+  VS Code's filetype/line-ending/encoding/indent cluster, then `showcmd`)
+  so something sensible is sacrificed before the ruler ever could be.
+  `sidebar_toggle_seg`'s text regained its trailing space (quadraui#1155)
+  since it's no longer the bar's default right-most segment.
+- This is a genuine quadraui `StatusBar` primitive limitation, not a
+  per-backend bug: a flat `right_segments` vector conflates visual
+  left-to-right position with drop priority, so VS Code's own visual
+  order (ruler leftmost of the right cluster) and "never disappears"
+  (ruler must be last) cannot both be satisfied with the primitive's
+  current shape — #164 had already flagged this coupling as unresolved.
+  The existing #1690 GTK test asserting the old visual order was updated
+  to assert the new order instead (language → LF → UTF-8 → Spaces →
+  Ln/Col), and two render.rs unit tests (`test_status_bar_toggle_and_
+  bell_glyphs_come_from_icons_rs_constants`, `test_window_status_line_
+  right_most_segment_has_no_trailing_space`) were updated for the same
+  reason.
+- Tests: new Tier-1 TuiDriver test `status_bar_1760_keeps_cursor_
+  position_once_other_segments_compete` (`src/tui_main/app_on_tui_tests.
+  rs`) — dirty marker + git branch + VS Code EDIT hint all competing on an
+  80-column bar, asserting `Ln 1,` still paints. Verified RED against
+  unfixed `develop` (reverting just the `cursor_seg` push-order hunk and
+  re-running prints a status row with no `Ln ` anywhere).
+
+**Last updated:** October 3, 2026 (#1719, partial — detect extension
+prerequisites before install, for LSP and DAP). Fixes the half of #1719
+that lives in this repo without touching the registry (vimcode-ext):
+
+- `src/core/engine/lsp_ops.rs`'s `ext_install_from_registry_with_runtime_
+  check` now checks `manifest.lsp.dependencies` **before** dispatching the
+  legacy terminal-install command (previously only checked at LSP
+  server-start time, well after the install pane had already failed with
+  a bare `command not found: npm`), and likewise for the new
+  `manifest.dap.dependencies` (`DapConfig`, `src/core/extensions.rs` — did
+  not exist before this issue) before the DAP leg's install.
+- `src/core/dap_manager.rs`'s new `adapter_dependencies(adapter, platform)`
+  declares the built-in codelldb/debugpy/delve/netcoredbg installers' own
+  prerequisites (curl+unzip, python3, go, curl+tar respectively — fewer on
+  Windows, which uses PowerShell's built-in `Expand-Archive` instead of
+  `unzip`/`tar`) — these ship inside vimcode itself, so nothing in the
+  registry could ever have declared them. Checked only when the manifest
+  doesn't override the install command itself (a manifest-declared
+  `dap.dependencies` always wins over the built-in guess).
+- `PREREQ_INSTALLS` (`src/core/extensions.rs`) gained `brew` (the Homebrew
+  installer one-liner — several registry manifests' `install_macos` shells
+  to `brew install …` with nothing declaring Homebrew itself), `java`
+  (JDK), `curl`, `unzip`, `tar`. `go`'s Linux hint changed from `sudo apt
+  install golang-go` (Ubuntu 24.04 ships 1.22, too old for `gopls@latest`,
+  and pins `GOTOOLCHAIN=local`) to `sudo snap install go --classic`.
+- New headless CLI entry point: `vimcode --ext-install <name> [--json]`
+  (`src/main.rs`) — runs the same prerequisite check with no GUI/TUI
+  backend, reports a JSON or plain-text verdict, exits non-zero and
+  dispatches **no** install when a prerequisite is missing. Exists so an
+  external driver (vimcode-ext#17's CI matrix) can exercise vimcode's real
+  detect/instruct logic instead of re-implementing it.
+- Tests: `every_prereq_install_entry_is_runnable_on_every_platform` +
+  `prereq_install_cmd_covers_the_1719_additions` (`extensions.rs`),
+  `adapter_dependencies_*` (`dap_manager.rs`), five new engine-level tests
+  in `lsp_ops.rs` (`lsp_legacy_install_blocked_when_declared_dependency_
+  missing` and four DAP siblings), `ext_install_flag_and_value_parse_and_
+  json_is_recognised` + `ext_install_value_is_not_mistaken_for_the_file_
+  path` (`main.rs`), and the black-box `tests/ext_install_cli.rs` (spawns
+  the real compiled binary with a throwaway `$HOME`/local extension
+  manifest and a `PATH` that can't resolve `npm`). All RED-verified against
+  the pre-fix code.
+- **Review fix (2026-10-03):** the engine-internal-state tests above were
+  flagged as necessary-but-not-sufficient per CLAUDE.md's black-box
+  coverage rule (the same gap #1346's review caught for the closely
+  analogous "missing runtime" fallback in this same function). Added
+  driver-tier coverage for both backends, asserting on rendered output
+  instead of engine state: `tui_main::app_on_tui_tests::tests::issue_1719_
+  prerequisite_detect_before_install` (`TuiDriver`, two tests — the LSP
+  legacy leg and the built-in delve DAP leg) and its GTK twin
+  `gtk::testing::issue_1719_missing_prereq_blocks_install` (`GtkDriver`,
+  same two scenarios). Both RED-verified against a reintroduced regression
+  (`if true || missing.is_empty()` in `lsp_ops.rs`'s legacy-install
+  branch) before being restored to pass against the real fix.
+
+**Not done (see `docs/PENDING_VIMCODE_ISSUES.md`'s "#1719 remainder"
+entry for the full writeup):** no minimum-version checking (a *present but
+too old* `go`/etc. still passes detection); the headless entry point
+checks prerequisites and runs the install but does not yet speak LSP/DAP
+`initialize` to confirm "working" (contract item 3) — left to
+vimcode-ext#17's own matrix, which has the per-language client fixtures
+for it. The npm-global-prefix and dotnet/csharp-ls version-pin issues the
+GitHub issue also names are explicitly vimcode-ext's own fixes (#14/#15),
+not this repo's.
+
 **Last updated:** September 24, 2026 (#523, Track A Phase 0b — wire Board
 actions to provider-declared commands, on top of #521/#522's generic Board
 host and #524's document buffers). Makes the board actionable: right-click
@@ -1861,9 +2673,10 @@ Stage 1** (the GTK-side `App` move), not a re-filing task — see `PLAN.md` and
 - **quadraui milestone #9** ("vimcode Platform-Neutral blockers") is **open** (0
   open / 7 closed issues) — it held quadraui#699 and does not need re-opening.
 - **Stale Win-GUI issues.** Roughly a dozen open `Win-GUI:` issues (#160–#178, #61,
-  #172, #176) describe a backend **deleted from this repo on 2026-05-11** (`3e4bcff`).
-  Their live counterparts are quadraui#19–#31 / quadraui#580. They should be migrated or
-  closed rather than left to imply `src/win_gui/` still exists.
+  #172, #176) describe the *old* `src/win_gui/` backend, which was deleted on 2026-05-11
+  (`3e4bcff`). The Windows GUI came back on 2026-09-11 as the `src/win/` thin wrapper
+  over `quadraui::win` (#866, `4e2883d`, `win` feature). Re-check each of those issues
+  against `src/win/` and close the ones that no longer apply.
 
 ### A note on line numbers in this file
 
@@ -1994,7 +2807,7 @@ next piece of the north star's own work.
 - ⚠️ **Hit-test glue partially shared** (#210/#344) — screen-level zone detection (tab bar, window, divider, breadcrumb) and window sub-zone detection (gutter, status bar, scrollbar, text area) now shared via `render::screen_zone_hit_test` + `window_zone_hit_test`. GTK caches ScreenLayout from paint (#344). Remaining per-backend: motion-handler → `selected_idx` wiring for primitive surfaces (#210), tab bar inner slot resolution (Pango vs char-cell).
 - ❌ No `Backend::watch_file(path) -> Stream<FileEvent>` trait method — every backend rolls its own watcher (TUI poll, GTK GIO). Suppress decision is shared (#201) but not the watcher invocation.
 - ✅ **Editor viewport lifted** (Phase C Stage 1 / #276). Both backends paint through `quadraui::{tui,gtk}::draw_editor`. The vim-motion-suite vision (PLAN.md) is now unblocked at the paint layer; engine-slice extraction (Phase 2 — `editor_core` crate carving out `keys.rs` + buffer + LSP) remains as a separate multi-month wave.
-- ⏭️ Win-GUI removed from this repo on 2026-05-11 (`3e4bcff`). Will be re-added as a thin wrapper when quadraui ships its Win backend (quadraui#19–#31, quadraui#580). The `Win-GUI:` issues still open on *this* tracker describe that deleted backend — migrate or close them (see Milestone hygiene above).
+- ✅ Win-GUI is a thin wrapper again: `src/win/` over `quadraui::win`, `win` feature (#866, 2026-09-11). The old `src/win_gui/` backend was deleted on 2026-05-11 (`3e4bcff`); open `Win-GUI:` issues filed before 2026-09-11 may describe that deleted code (see Milestone hygiene above).
 
 ---
 

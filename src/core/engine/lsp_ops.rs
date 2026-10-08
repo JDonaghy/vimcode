@@ -1,3 +1,4 @@
+use super::sidebar::PANEL_EXTENSIONS;
 use super::*;
 
 /// Which half of a manifest's install (`[lsp]` or `[dap]`) a background
@@ -128,11 +129,22 @@ impl Engine {
     pub(crate) fn lsp_did_open(&mut self, buffer_id: BufferId) {
         // Fire plugin "open" hook regardless of LSP enabled state
         if let Some(state) = self.buffer_manager.get(buffer_id) {
-            if let Some(path) = state.file_path.clone() {
+            let path = state.file_path.clone();
+            let ft = state.lsp_language_id.clone();
+            if let Some(path) = path {
                 let path_str = path.to_string_lossy().into_owned();
                 self.plugin_event("open", &path_str);
                 self.plugin_event("BufNew", &path_str);
                 self.plugin_event("BufEnter", &path_str);
+                // #1623: FileType, once the language id is known (set by
+                // `buffer_manager::open_file`'s path-based detection before
+                // this runs). Arg is the filetype name — the whole point of
+                // this event is `vimcode.on("FileType", function(ft) if ft
+                // == "rust" then ... end end)`-style per-language setup,
+                // matching vim's own `<amatch>` convention for it.
+                if let Some(ft) = ft {
+                    self.plugin_event("FileType", &ft);
+                }
             }
         }
         // Fire cursor_move so position-aware plugins (e.g. git-insights blame) annotate
@@ -248,10 +260,51 @@ impl Engine {
     }
 
     /// Spawn a background thread to fetch all configured extension registries.
-    /// Result arrives via `ext_registry_rx`.
+    /// Result arrives via `ext_registry_rx`. Explicit/user-initiated refresh
+    /// (Extensions panel open, its refresh key, `:ExtRefresh`) — surfaces a
+    /// status message when it completes. Startup's own automatic refresh
+    /// uses [`Self::ext_refresh_quiet`] instead; see that method's doc and
+    /// `ext_registry_quiet`'s doc for why the two must not share a message
+    /// policy (#1761).
     pub fn ext_refresh(&mut self) {
+        self.ext_refresh_inner(false);
+    }
+
+    /// The automatic refresh [`Engine::startup_inner`] fires unconditionally
+    /// on every launch, before anything the user did. Identical to
+    /// [`Self::ext_refresh`] except the eventual completion — consumed by
+    /// [`Self::poll_ext_registry`] — never touches `self.message` (#1761).
+    ///
+    /// That matters because this fetch's completion time is bounded only by
+    /// `registry::fetch_registry`'s `curl --max-time 15` — anywhere from
+    /// under a second (warm DNS/fast network) to ~15s (slow network, no
+    /// cached registry to fall back to while it runs), entirely outside the
+    /// user's control and uncorrelated with anything they did. A status
+    /// message for it — even a successful, correct one — is still
+    /// unsolicited output that can land several seconds after the first
+    /// frame painted, breaking the `idle-no-repaint-bytes-when-idle`
+    /// journey's contract that the terminal goes perfectly silent once
+    /// idle. An explicit, user-requested refresh keeps its message: the
+    /// user just took an action and is watching for its result, so staying
+    /// silent *there* would be the bug.
+    pub(crate) fn ext_refresh_quiet(&mut self) {
+        self.ext_refresh_inner(true);
+    }
+
+    /// Shared body of [`Self::ext_refresh`] / [`Self::ext_refresh_quiet`].
+    fn ext_refresh_inner(&mut self, quiet: bool) {
         if self.ext_registry_fetching {
-            return; // already in progress
+            // Already in progress — dedupe against it rather than spawning a
+            // second fetch. But if *this* caller is non-quiet (an explicit,
+            // user-requested refresh) and the in-flight fetch was armed
+            // quiet (startup's automatic one), upgrade the flag so the
+            // fetch-in-progress still reports its result when it lands
+            // (#1761): otherwise the user's `r` keypress produces no
+            // feedback at all, silently inheriting startup's silence policy.
+            if !quiet {
+                self.ext_registry_quiet = false;
+            }
+            return;
         }
         let urls = self.settings.extension_registries.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -279,6 +332,7 @@ impl Engine {
         });
         self.ext_registry_rx = Some(rx);
         self.ext_registry_fetching = true;
+        self.ext_registry_quiet = quiet;
     }
 
     /// Non-blocking check for a completed registry fetch.
@@ -292,28 +346,173 @@ impl Engine {
         if let Some(maybe_reg) = result {
             self.ext_registry_fetching = false;
             self.ext_registry_rx = None;
+            let quiet = self.ext_registry_quiet;
+            self.ext_registry_quiet = false;
             match maybe_reg {
                 Some(entries) => {
                     let count = entries.len();
                     registry::save_cache(&entries);
                     self.ext_registry = Some(entries);
-                    // Re-filter stored diagnostics with updated ignore_error_sources.
+                    // Re-filter stored diagnostics with updated
+                    // ignore_error_sources. Note this can change painted
+                    // output (gutter signs / Problems panel / status counts)
+                    // even on a quiet fetch, and the redraw verdict below
+                    // deliberately does not cover it: it only matters when a
+                    // registry entry's `ignore_error_sources` changed *and*
+                    // diagnostics were already on screen, and it self-heals on
+                    // the next repaint (#1761 review).
                     self.refilter_diagnostics();
-                    self.message = format!("Extension registry updated ({count} extensions)");
+                    if !quiet {
+                        self.message = format!("Extension registry updated ({count} extensions)");
+                    }
                 }
                 None => {
                     if self.ext_registry.is_some() {
                         // Cache from a previous fetch is still available —
                         // silently keep it rather than alarming the user.
-                    } else {
+                    } else if !quiet {
                         self.message = "Registry fetch failed — try again later".to_string();
                     }
                 }
             }
-            true
+            // #1761: a quiet (startup) fetch reports "no redraw needed" so a
+            // cold launch stays silent; see `Engine::ext_registry_quiet`'s doc
+            // for why. The panel check is the one case where a quiet fetch
+            // *is* visible: `sidebar.rs`'s `PANEL_EXTENSIONS` open handler
+            // deliberately does not re-arm while a fetch is in flight, so a
+            // panel opened during the fetch window relies on this completion
+            // for its first painted list.
+            !quiet || self.active_panel_is(PANEL_EXTENSIONS)
         } else {
             false
         }
+    }
+
+    /// Show the README for an extension, fetching it in the background if
+    /// it isn't already on disk (#1739). Call sites: [`Self::
+    /// ext_open_selected_readme`] (Enter / double-click on a sidebar row,
+    /// `show_missing_message: true`) and the Extensions sidebar's `i` key
+    /// handler (install-then-preview, `show_missing_message: false` — the
+    /// generic "No README available... Press i to install" wording would
+    /// be actively wrong right after an install just succeeded, so that
+    /// call site keeps its pre-#1739 behaviour of silently not opening a
+    /// preview tab when there's no README to show).
+    ///
+    /// The on-disk check is a plain `fs::read_to_string` — fast, local,
+    /// stays synchronous. Only the network fallback
+    /// (`registry::fetch_readme`, a `curl --max-time 10` subprocess) moves
+    /// to a background thread: that blocking call on the key-dispatch path
+    /// is #1739's actual root cause. A fresh install's `README.md` isn't
+    /// on disk yet (the script download that would place it is itself now
+    /// backgrounded too — see the comment in
+    /// `ext_install_from_registry_with_runtime_check`), so the install path
+    /// hits this same async fallback on every first "i" press, not just a
+    /// cache-miss edge case.
+    ///
+    /// No-op (or, if `show_missing_message`, a synchronous "no README"
+    /// message) when `base_url` is empty — matches `registry::
+    /// fetch_readme`'s own `base_url.is_empty()` early return, so there is
+    /// nothing to wait on.
+    pub(crate) fn ext_show_readme_or_fetch_async(
+        &mut self,
+        name: &str,
+        display: &str,
+        base_url: &str,
+        show_missing_message: bool,
+    ) {
+        let readme_path = paths::vimcode_config_dir()
+            .join("extensions")
+            .join(name)
+            .join("README.md");
+        if let Ok(content) = std::fs::read_to_string(&readme_path) {
+            self.open_markdown_preview_in_tab(&content, display);
+            return;
+        }
+        if base_url.is_empty() {
+            if show_missing_message {
+                self.message = format!("No README available for '{name}'. Press i to install.");
+            }
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base_url = base_url.to_string();
+        let name_bg = name.to_string();
+        std::thread::spawn(move || {
+            let content = registry::fetch_readme(&base_url, &name_bg);
+            let _ = tx.send(content);
+        });
+        self.ext_readme_rx = Some(rx);
+        self.ext_readme_pending_name = name.to_string();
+        self.ext_readme_pending_display = display.to_string();
+        self.ext_readme_show_missing_message = show_missing_message;
+    }
+
+    /// Non-blocking check for a completed README fetch started by
+    /// [`Self::ext_show_readme_or_fetch_async`]. Wired into
+    /// [`Self::poll_idle`] — same shape as [`Self::poll_ext_registry`].
+    pub fn poll_ext_readme(&mut self) -> bool {
+        let maybe_content = match &self.ext_readme_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(content) => content,
+                // #1739 review round 2 nit: a plain `.ok()` collapses this
+                // arm into the "still running" `None` below, so if the
+                // fetch thread ever died without sending, `ext_readme_rx`
+                // would stay `Some` forever and get polled every idle
+                // tick for nothing. Treat a dead sender the same as a
+                // completed-with-no-content fetch.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            },
+            None => return false,
+        };
+        self.ext_readme_rx = None;
+        let name = std::mem::take(&mut self.ext_readme_pending_name);
+        let display = std::mem::take(&mut self.ext_readme_pending_display);
+        let show_missing_message = self.ext_readme_show_missing_message;
+        match maybe_content {
+            Some(content) => {
+                self.open_markdown_preview_in_tab(&content, &display);
+            }
+            None if show_missing_message => {
+                self.message = format!("No README available for '{name}'. Press i to install.");
+            }
+            None => {}
+        }
+        true
+    }
+
+    /// Non-blocking check for completed background script downloads
+    /// started by [`Self::ext_install_from_registry_with_runtime_check`]
+    /// (#1739 review round 2). Wired into [`Self::poll_idle`] alongside
+    /// [`Self::poll_ext_readme`]. Drains every receiver that has a result
+    /// ready (not just the first) — see [`Engine::ext_scripts_fetch_rx`]'s
+    /// doc for why this is a `Vec` rather than a single slot — and
+    /// reloads plugins (`plugin_manager = None; plugin_init()`) once, if
+    /// any did, so newly-downloaded Lua for an extension installed in
+    /// *this* session becomes active without the user having to restart
+    /// vimcode. The content of the signal itself carries no information
+    /// (downloads still discard their own errors, matching the pre-#1739
+    /// inline loop) — only its arrival matters, because that's what
+    /// means the files are now actually on disk for `plugin_init()` to
+    /// find.
+    pub fn poll_ext_scripts(&mut self) -> bool {
+        if self.ext_scripts_fetch_rx.is_empty() {
+            return false;
+        }
+        let mut any_completed = false;
+        self.ext_scripts_fetch_rx.retain(|rx| match rx.try_recv() {
+            Ok(()) => {
+                any_completed = true;
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+        });
+        if any_completed {
+            self.plugin_manager = None;
+            self.plugin_init();
+        }
+        any_completed
     }
 
     /// Resolve the base URL for downloading extension files.
@@ -372,7 +571,38 @@ impl Engine {
         };
         let ext_name = manifest.name.clone();
 
-        // Download scripts from the registry (skip files already on disk for local dev)
+        // #1807: refuse to install an extension whose `requires_vimcode`
+        // constraint isn't met by the running vimcode — with a clear
+        // message, rather than a silent no-op or an install that leaves
+        // scripts erroring at load time on a `vimcode.*` API this version
+        // doesn't have yet.
+        if let Some(reason) = manifest.incompatibility_reason_for_running_vimcode() {
+            let display = manifest.display_or_name();
+            self.message = format!("Cannot install '{display}' — {reason}");
+            return;
+        }
+
+        // Download scripts from the registry (skip files already on disk
+        // for local dev). #1739: this used to run the `curl --max-time 30`
+        // download inline, per script, right here on the key-dispatch
+        // path — a second blocking leg of the same freeze the `i` key's
+        // README fetch had (see `ext_show_readme_or_fetch_async`'s doc).
+        // The download itself is still fire-and-forget (errors are
+        // discarded with `let _ =`, same as the old inline loop), but its
+        // *side effect* — the `.lua` files landing on disk — is not
+        // something downstream can ignore: `plugin_init()` a few lines
+        // below enumerates this same `ext_dir` and loads whatever `.lua`
+        // it finds there *right now*, before the background thread has
+        // had a chance to write anything. Left alone, that races the
+        // download essentially 100% of the time, so a freshly installed
+        // Lua-scripted extension would silently register none of its
+        // commands/keymaps until the next launch (#1739 review round 2).
+        // The fix mirrors `ext_show_readme_or_fetch_async`'s
+        // `ext_readme_rx`/`poll_ext_readme` pair: the thread signals
+        // completion over a channel, and `poll_ext_scripts` (wired into
+        // `poll_idle` alongside `poll_ext_readme`) reloads plugins once
+        // the files are actually on disk, so the newly installed
+        // extension's Lua becomes active in the installing session too.
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
             .join(&ext_name);
@@ -381,13 +611,24 @@ impl Engine {
             && !base_url.is_empty()
             && std::fs::create_dir_all(&ext_dir).is_ok()
         {
-            for script in &manifest.scripts {
-                let dest = ext_dir.join(script);
-                if !dest.exists() {
-                    let url = format!("{}/{}/{}", base_url, ext_name, script);
-                    let _ = registry::download_script(&url, &dest);
+            let scripts = manifest.scripts.clone();
+            let ext_name_bg = ext_name.clone();
+            // Neither `base_url` nor `ext_dir` is read again past this
+            // block, so both move into the thread outright rather than
+            // cloning (only `ext_name` is still needed below, for the
+            // LSP/DAP status messages).
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for script in &scripts {
+                    let dest = ext_dir.join(script);
+                    if !dest.exists() {
+                        let url = format!("{}/{}/{}", base_url, ext_name_bg, script);
+                        let _ = registry::download_script(&url, &dest);
+                    }
                 }
-            }
+                let _ = tx.send(());
+            });
+            self.ext_scripts_fetch_rx.push(rx);
         }
 
         let mut status_parts: Vec<String> = Vec::new();
@@ -453,18 +694,40 @@ impl Engine {
                     }
                 }
             } else if !manifest.lsp.install_cmd_for_platform().is_empty() {
-                let lsp_key = format!("ext:{ext_name}:lsp");
-                self.lsp_installing.insert(lsp_key.clone());
-                install_commands.push(manifest.lsp.install_cmd_for_platform().to_string());
-                self.pending_install_context = Some(InstallContext {
-                    ext_name: ext_name.clone(),
-                    install_key: lsp_key,
-                });
-                self.notify(
-                    NotificationKind::LspInstall,
-                    &format!("Installing {}…", manifest.lsp.binary),
-                );
-                status_parts.push(format!("LSP: installing {}…", manifest.lsp.binary));
+                // #1719: this is the legacy terminal-install leg — unlike
+                // the `[lsp.acquire]` branch above, nothing here checked
+                // `manifest.lsp.dependencies` before now. Detection only
+                // ran at server-start time (`resolve_and_start_server`),
+                // well after the install pane had already failed with a
+                // bare "command not found: npm". Check first; show the
+                // same actionable hint `missing_dependency_message`
+                // already builds for the server-start case, and never
+                // dispatch a doomed command.
+                let missing: Vec<&str> = manifest
+                    .lsp
+                    .dependencies
+                    .iter()
+                    .filter(|dep| !runtime_present(dep))
+                    .map(|s| s.as_str())
+                    .collect();
+                if missing.is_empty() {
+                    let lsp_key = format!("ext:{ext_name}:lsp");
+                    self.lsp_installing.insert(lsp_key.clone());
+                    install_commands.push(manifest.lsp.install_cmd_for_platform().to_string());
+                    self.pending_install_context = Some(InstallContext {
+                        ext_name: ext_name.clone(),
+                        install_key: lsp_key,
+                    });
+                    self.notify(
+                        NotificationKind::LspInstall,
+                        &format!("Installing {}…", manifest.lsp.binary),
+                    );
+                    status_parts.push(format!("LSP: installing {}…", manifest.lsp.binary));
+                } else {
+                    status_parts.push(crate::core::lsp_manager::missing_dependency_message(
+                        &manifest, &missing,
+                    ));
+                }
             }
         }
 
@@ -523,28 +786,63 @@ impl Engine {
                     }
                 }
             } else {
-                let adapter_install = crate::core::dap_manager::install_cmd_for_adapter(
-                    manifest.dap.adapter.as_str(),
-                    &available_manifests,
-                );
-                if let Some(cmd_str) = adapter_install {
-                    let dap_key = format!("dap:{}", manifest.dap.adapter);
-                    self.lsp_installing.insert(dap_key.clone());
-                    install_commands.push(cmd_str);
-                    // Only set install context if LSP didn't already set it.
-                    if self.pending_install_context.is_none() {
-                        self.pending_install_context = Some(InstallContext {
-                            ext_name: ext_name.clone(),
-                            install_key: dap_key,
-                        });
+                // #1719: merge manifest-declared `dap.dependencies` with
+                // the built-in adapters' hardcoded prerequisites
+                // (`dap_manager::adapter_dependencies` — delve needs `go`,
+                // debugpy needs `python3`, codelldb/netcoredbg need
+                // `curl`+`unzip`/`tar`) *before* building the install
+                // command, same treatment the LSP leg above just got.
+                // The built-in list only applies when this manifest itself
+                // has no `install_*` override — if it does, `install_cmd_
+                // for_adapter` will use that command instead, which may
+                // have entirely different prerequisites.
+                let mut missing: Vec<String> = manifest
+                    .dap
+                    .dependencies
+                    .iter()
+                    .filter(|dep| !runtime_present(dep))
+                    .cloned()
+                    .collect();
+                if manifest.dap.install_cmd_for_platform().is_empty() {
+                    for dep in crate::core::dap_manager::adapter_dependencies(
+                        &manifest.dap.adapter,
+                        extensions::Platform::host(),
+                    ) {
+                        if !runtime_present(dep) && !missing.iter().any(|m| m == dep) {
+                            missing.push(dep.to_string());
+                        }
                     }
-                    status_parts.push(format!("DAP: installing {}…", manifest.dap.adapter));
-                } else if !dap_binary.is_empty() {
-                    // Nothing knows how to install this adapter — fall back
-                    // to telling the user.
-                    status_parts.push(format!(
-                        "DAP: {dap_binary} needs manual install (no automated installer)"
+                }
+                if !missing.is_empty() {
+                    let missing_refs: Vec<&str> = missing.iter().map(String::as_str).collect();
+                    status_parts.push(crate::core::lsp_manager::missing_dependency_message(
+                        &manifest,
+                        &missing_refs,
                     ));
+                } else {
+                    let adapter_install = crate::core::dap_manager::install_cmd_for_adapter(
+                        manifest.dap.adapter.as_str(),
+                        &available_manifests,
+                    );
+                    if let Some(cmd_str) = adapter_install {
+                        let dap_key = format!("dap:{}", manifest.dap.adapter);
+                        self.lsp_installing.insert(dap_key.clone());
+                        install_commands.push(cmd_str);
+                        // Only set install context if LSP didn't already set it.
+                        if self.pending_install_context.is_none() {
+                            self.pending_install_context = Some(InstallContext {
+                                ext_name: ext_name.clone(),
+                                install_key: dap_key,
+                            });
+                        }
+                        status_parts.push(format!("DAP: installing {}…", manifest.dap.adapter));
+                    } else if !dap_binary.is_empty() {
+                        // Nothing knows how to install this adapter — fall back
+                        // to telling the user.
+                        status_parts.push(format!(
+                            "DAP: {dap_binary} needs manual install (no automated installer)"
+                        ));
+                    }
                 }
             }
         }
@@ -565,7 +863,12 @@ impl Engine {
             .mark_installed_version(&ext_name, &manifest.version);
         let _ = self.extension_state.save();
 
-        // Reload plugins so newly extracted scripts are active
+        // Reload plugins now so already-on-disk scripts (re-installs,
+        // local dev extensions, or an install with no `scripts` to fetch)
+        // are active immediately. For a *freshly* downloaded script this
+        // reload is a no-op — the background thread kicked off above
+        // hasn't written the files yet — so `poll_ext_scripts` runs this
+        // same reload again once that download actually completes.
         self.plugin_manager = None;
         self.plugin_init();
 
@@ -818,18 +1121,10 @@ impl Engine {
                 manifest.display_name.clone()
             };
             let base_url = self.resolve_registry_base_url(manifest);
-            let readme_path = paths::vimcode_config_dir()
-                .join("extensions")
-                .join(&name)
-                .join("README.md");
-            let content = std::fs::read_to_string(&readme_path)
-                .ok()
-                .or_else(|| registry::fetch_readme(&base_url, &name));
-            if let Some(content) = content {
-                self.open_markdown_preview_in_tab(&content, &display);
-            } else {
-                self.message = format!("No README available for '{name}'. Press i to install.");
-            }
+            // #1739: was a blocking `curl --max-time 10` subprocess call
+            // (`registry::fetch_readme`) right here on the key-dispatch
+            // path — see `ext_show_readme_or_fetch_async`'s doc.
+            self.ext_show_readme_or_fetch_async(&name, &display, &base_url, true);
         }
     }
 
@@ -1061,6 +1356,17 @@ impl Engine {
         let ext_name = manifest.name.clone();
         let new_version = manifest.version.clone();
 
+        // #1807: an update is the most realistic route to an incompatible
+        // installed extension — the registry bumping `requires_vimcode`
+        // in a newer manifest version is exactly the shape of change this
+        // field exists for. Refuse the same way the initial install does,
+        // leaving the already-installed (compatible) version untouched.
+        if let Some(reason) = manifest.incompatibility_reason_for_running_vimcode() {
+            let display = manifest.display_or_name();
+            self.message = format!("Cannot update '{display}' — {reason}");
+            return;
+        }
+
         // Re-download scripts (overwrite existing files)
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
@@ -1143,8 +1449,22 @@ impl Engine {
             self.message = "All extensions are up to date".to_string();
             return;
         }
-        let count = updated.len();
+        // #1807: split out any candidate whose newer manifest is
+        // incompatible with the running vimcode — same reasoning as
+        // `ext_update_one`, applied per-extension here since `:ExtUpdate`
+        // batches every installed extension with an available update.
+        let mut skipped_incompatible: Vec<String> = Vec::new();
+        let mut actually_updated = Vec::new();
         for name in &updated {
+            if let Some(manifest) = manifests.iter().find(|m| &m.name == name) {
+                if let Some(reason) = manifest.incompatibility_reason_for_running_vimcode() {
+                    skipped_incompatible.push(format!("{} ({reason})", manifest.display_or_name()));
+                    continue;
+                }
+            }
+            actually_updated.push(name.clone());
+        }
+        for name in &actually_updated {
             // Re-download scripts for each
             if let Some(manifest) = manifests.iter().find(|m| &m.name == name) {
                 let ext_dir = paths::vimcode_config_dir().join("extensions").join(name);
@@ -1166,7 +1486,19 @@ impl Engine {
         let _ = self.extension_state.save();
         self.plugin_manager = None;
         self.plugin_init();
-        self.message = format!("{count} extension(s) updated: {}", updated.join(", "));
+        let count = actually_updated.len();
+        self.message = if skipped_incompatible.is_empty() {
+            format!(
+                "{count} extension(s) updated: {}",
+                actually_updated.join(", ")
+            )
+        } else {
+            format!(
+                "{count} extension(s) updated: {}; skipped incompatible: {}",
+                actually_updated.join(", "),
+                skipped_incompatible.join(", ")
+            )
+        };
     }
 
     /// Returns true if a newer version is available for the given extension.
@@ -1809,5 +2141,451 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── #1719: detect missing prerequisites before dispatching an install ──
+
+    /// #1719 acceptance criterion: an extension whose `lsp.dependencies`
+    /// names a binary that isn't on PATH must never reach the terminal
+    /// pane at all — the pre-#1719 behaviour let the legacy `install_*`
+    /// string through unconditionally, so the failure only ever showed up
+    /// as `command not found: npm` *inside* the pane the install already
+    /// started. `missing_dependency_message`'s actionable hint must appear
+    /// in the status line instead, and no terminal command may be queued.
+    ///
+    /// Verified RED against the pre-#1719 code (the `else if !manifest.
+    /// lsp.install_cmd_for_platform().is_empty()` branch with no `missing`
+    /// check in front of it): `pending_terminal_command` becomes `Some`
+    /// and `e.message` never mentions `npm`.
+    #[test]
+    fn lsp_legacy_install_blocked_when_declared_dependency_missing() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1719-lsp-missing-dep";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 LSP missing-dep test".to_string(),
+            language_ids: vec!["vc-unit-1719-lsp-lang".to_string()],
+            lsp: LspConfig {
+                binary: "vc-unit-1719-lsp-bin".to_string(),
+                install_linux: "npm install -g vc-unit-1719-lsp-bin".to_string(),
+                install_macos: "npm install -g vc-unit-1719-lsp-bin".to_string(),
+                install_windows: "npm install -g vc-unit-1719-lsp-bin".to_string(),
+                dependencies: vec!["npm".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        e.ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+
+        assert!(
+            e.pending_terminal_command.is_none(),
+            "a missing declared dependency must never dispatch an install; got: {:?}",
+            e.pending_terminal_command
+        );
+        assert!(
+            e.message.contains("npm"),
+            "status line must name the missing dependency; got: {}",
+            e.message
+        );
+    }
+
+    /// Same contract as above, but for the DAP leg's *manifest-declared*
+    /// `install_*` command, using the new `dap.dependencies` field (#1719 —
+    /// this field didn't exist before this issue).
+    #[test]
+    fn dap_manifest_install_blocked_when_declared_dependency_missing() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest};
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1719-dap-missing-dep";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 DAP missing-dep test".to_string(),
+            dap: DapConfig {
+                adapter: "vc-unit-1719-dap-adapter".to_string(),
+                binary: "vc-unit-1719-dap-bin".to_string(),
+                install_linux: "gem install vc-unit-1719-dap-bin".to_string(),
+                install_macos: "gem install vc-unit-1719-dap-bin".to_string(),
+                install_windows: "gem install vc-unit-1719-dap-bin".to_string(),
+                dependencies: vec!["gem".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        e.ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+
+        assert!(
+            e.pending_terminal_command.is_none(),
+            "a missing declared DAP dependency must never dispatch an install; got: {:?}",
+            e.pending_terminal_command
+        );
+        assert!(
+            e.message.contains("gem"),
+            "status line must name the missing DAP dependency; got: {}",
+            e.message
+        );
+    }
+
+    /// #1719: the built-in `delve` adapter's installer runs `go install
+    /// github.com/go-delve/delve/cmd/dlv@latest` — nothing declared `go` as
+    /// a prerequisite anywhere before this issue (`dap.dependencies` did
+    /// not even exist), so a machine without `go` saw an opaque `command
+    /// not found: go` inside the install pane rather than an upfront
+    /// message. This drives the real merge of `dap_manager::adapter_
+    /// dependencies` into `ext_install_from_registry_with_runtime_check`'s
+    /// built-in-installer branch, not just the pure function on its own.
+    ///
+    /// Verified RED against the pre-#1719 code (the built-in branch calling
+    /// `install_cmd_for_adapter` unconditionally): `pending_terminal_
+    /// command` ends up `Some("... go install ...")` and `e.message` never
+    /// mentions `go` as a missing prerequisite.
+    #[test]
+    fn dap_builtin_delve_install_blocked_when_go_missing() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest};
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1719-delve-missing-go";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 delve missing-go test".to_string(),
+            dap: DapConfig {
+                adapter: "delve".to_string(),
+                // Deliberately not the literal `dlv` binary name — a dev
+                // machine that has ever run `go install .../dlv` has it
+                // sitting in `~/go/bin`, which `resolve_command` probes
+                // regardless of PATH, short-circuiting the "already
+                // resolvable" check before this test's prerequisite check
+                // ever runs. See the sibling codelldb test's comment.
+                binary: "vc-unit-1719-nonexistent-dlv".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        // Neither the adapter binary nor `go` is on PATH — the runtime
+        // predicate below always returns false, so this is deterministic
+        // regardless of what's on the machine running the suite.
+        e.ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+
+        assert!(
+            e.pending_terminal_command.is_none(),
+            "delve's install must never run without `go` present; got: {:?}",
+            e.pending_terminal_command
+        );
+        assert!(
+            e.message.contains("go"),
+            "status line must name `go` as the missing prerequisite; got: {}",
+            e.message
+        );
+    }
+
+    /// #1719: the built-in `codelldb` adapter's Unix installer needs
+    /// `curl` and `unzip`; pin that both are checked (not just the first
+    /// one found).
+    #[test]
+    fn dap_builtin_codelldb_install_blocked_when_curl_and_unzip_missing() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest};
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1719-codelldb-missing-tools";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 codelldb missing-tools test".to_string(),
+            dap: DapConfig {
+                adapter: "codelldb".to_string(),
+                // Deliberately not the literal `codelldb` binary name —
+                // this dev machine (and maybe the CI runner) may have a
+                // real one on PATH already, which would short-circuit
+                // `ext_install_from_registry_with_runtime_check`'s
+                // "already resolvable" check before the prerequisite
+                // check this test targets ever runs.
+                binary: "vc-unit-1719-nonexistent-codelldb".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        e.ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+
+        assert!(
+            e.pending_terminal_command.is_none(),
+            "codelldb's install must never run without curl/unzip present; got: {:?}",
+            e.pending_terminal_command
+        );
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(
+                e.message.contains("curl") && e.message.contains("unzip"),
+                "status line must name both missing prerequisites; got: {}",
+                e.message
+            );
+        }
+    }
+
+    /// A manifest that already declares its *own* `install_*` for a
+    /// built-in adapter name (`codelldb`) must be checked against its own
+    /// `dap.dependencies`, not the built-in curl/unzip list — the built-in
+    /// list only applies when nothing overrides the install command.
+    #[test]
+    fn dap_manifest_override_of_builtin_adapter_uses_its_own_dependencies() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest};
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1719-codelldb-override";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 codelldb override test".to_string(),
+            dap: DapConfig {
+                adapter: "codelldb".to_string(),
+                // See the sibling test above for why this isn't the
+                // literal `codelldb` binary name.
+                binary: "vc-unit-1719-nonexistent-codelldb".to_string(),
+                install_linux: "pip install codelldb-shim".to_string(),
+                install_macos: "pip install codelldb-shim".to_string(),
+                install_windows: "pip install codelldb-shim".to_string(),
+                dependencies: vec!["pip".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        // `pip` is declared missing; `curl`/`unzip` (the built-in codelldb
+        // prerequisites) are irrelevant here since this manifest overrides
+        // the install command entirely.
+        e.ext_install_from_registry_with_runtime_check(ext_name, |dep| dep != "pip");
+
+        assert!(
+            e.pending_terminal_command.is_none(),
+            "the overriding manifest's own missing dependency must still block install; got: {:?}",
+            e.pending_terminal_command
+        );
+        assert!(
+            e.message.contains("pip"),
+            "status line must name the manifest's own declared dependency, not the \
+             built-in codelldb list; got: {}",
+            e.message
+        );
+    }
+
+    // ── #1761 review: `ext_refresh_inner`'s dedupe-vs-quiet interaction ──
+
+    /// An explicit, user-requested refresh (`ext_refresh`, non-quiet) that
+    /// arrives while a quiet (startup) fetch is already in flight must
+    /// upgrade the shared flag, not silently inherit the in-flight fetch's
+    /// quiet policy — otherwise the user's `r` keypress in the Extensions
+    /// panel produces no feedback at all when the fetch eventually lands
+    /// (the exact #1761 review finding this covers).
+    #[test]
+    fn explicit_refresh_upgrades_an_in_flight_quiet_fetch() {
+        let mut e = Engine::new_for_test();
+        // Simulate a startup quiet fetch already in flight — deterministic,
+        // no real channel/thread needed to exercise the dedupe branch.
+        e.ext_registry_fetching = true;
+        e.ext_registry_quiet = true;
+
+        e.ext_refresh(); // non-quiet, explicit call
+
+        assert!(
+            e.ext_registry_fetching,
+            "dedupe must not spawn a second fetch — the in-flight one stays armed"
+        );
+        assert!(
+            !e.ext_registry_quiet,
+            "an explicit (non-quiet) refresh that dedupes against an \
+             in-flight quiet fetch must upgrade the flag so the fetch's \
+             eventual completion still reports its result (#1761)"
+        );
+    }
+
+    /// The mirror case: a *quiet* call (startup's own, or a second one
+    /// somehow fired) that dedupes against an already-in-flight *explicit*
+    /// fetch must not downgrade it back to quiet — the user who triggered
+    /// the in-flight fetch is still owed its message.
+    #[test]
+    fn quiet_refresh_does_not_downgrade_an_in_flight_explicit_fetch() {
+        let mut e = Engine::new_for_test();
+        e.ext_registry_fetching = true;
+        e.ext_registry_quiet = false;
+
+        e.ext_refresh_quiet();
+
+        assert!(
+            e.ext_registry_fetching,
+            "dedupe must not spawn a second fetch"
+        );
+        assert!(
+            !e.ext_registry_quiet,
+            "a quiet call deduping against an in-flight explicit fetch must \
+             not downgrade it back to quiet (#1761)"
+        );
+    }
+
+    // ── #1761 review: `poll_ext_registry`'s redraw verdict while the
+    //    Extensions panel is open during a quiet fetch ──
+
+    /// Drive `poll_ext_registry` directly (no real background thread) to
+    /// pin down its return value for the `(quiet, panel_open)` combinations
+    /// the #1761 review found incompletely handled: the panel being open
+    /// while a *quiet* fetch lands must still request a redraw (the panel's
+    /// list needs the fetch result just populated), even though the common
+    /// quiet/closed-panel startup case must not.
+    fn poll_with(quiet: bool, panel_open: bool) -> bool {
+        // `poll_ext_registry`'s success branch calls `registry::save_cache`
+        // unconditionally, which resolves through
+        // `paths::vimcode_config_dir()`. Without a `TestHomeGuard` held
+        // across that call, this test would write `[]` over the *real*
+        // `~/.config/vimcode/registry_cache.json` on whatever machine runs
+        // the suite — and a truncated cache is sticky, because `load_cache`
+        // then returns `Some([])`, which makes `sidebar.rs`'s
+        // `ext_registry.is_none()` guard false and leaves the developer's
+        // Extensions panel painting empty until they refresh by hand.
+        // Thread-local override, not `set_var("HOME", …)` — see
+        // `core::paths::TEST_HOME_OVERRIDE` (#1741 review, #1761 review).
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_1761_poll_home_q{quiet}_p{panel_open}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let home_guard = crate::core::paths::set_test_home(&home);
+
+        let mut e = Engine::new_for_test();
+        if panel_open {
+            e.app_shell
+                .show_panel(&quadraui::WidgetId::new(PANEL_EXTENSIONS));
+        }
+        assert_eq!(
+            e.active_panel_is(PANEL_EXTENSIONS),
+            panel_open,
+            "test setup: activating the Extensions panel must actually take \
+             (PANEL_EXTENSIONS must be registered in the test engine's \
+             app_shell panel list)"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(Vec::new())).unwrap();
+        e.ext_registry_rx = Some(rx);
+        e.ext_registry_fetching = true;
+        e.ext_registry_quiet = quiet;
+        // Bind, don't tail-return: the guard must still be alive while
+        // `poll_ext_registry` runs `save_cache` (a tail expression would
+        // also be fine today, but binding makes the ordering explicit and
+        // lets the cache assertion below run under the override).
+        let redraw = e.poll_ext_registry();
+        assert!(
+            home.join(".config/vimcode/registry_cache.json").exists(),
+            "the fetch's cache write must land under the test home override, \
+             not the real ~/.config/vimcode (#1761 review)"
+        );
+        drop(home_guard);
+        let _ = std::fs::remove_dir_all(&home);
+        redraw
+    }
+
+    #[test]
+    fn quiet_fetch_with_panel_closed_reports_no_redraw_needed() {
+        // The common cold-launch case this issue is about: nothing visible
+        // reads `ext_registry` while the panel is closed, so no redraw.
+        assert!(!poll_with(true, false));
+    }
+
+    #[test]
+    fn quiet_fetch_with_panel_open_still_requests_a_redraw() {
+        // #1761 review: opening the Extensions panel while a quiet fetch is
+        // in flight does not re-arm its own refresh (`set_panel_focus`'s
+        // `PANEL_EXTENSIONS` arm only calls `ext_refresh` when nothing is
+        // already fetching), so the panel relies entirely on *this* fetch's
+        // completion to paint anything. Suppressing the redraw here would
+        // leave the open panel showing an empty/stale list.
+        assert!(poll_with(true, true));
+    }
+
+    #[test]
+    fn explicit_fetch_always_requests_a_redraw_regardless_of_panel_state() {
+        assert!(poll_with(false, false));
+        assert!(poll_with(false, true));
+    }
+
+    /// #1807: `ext_install_from_registry` must refuse an extension whose
+    /// `requires_vimcode` constraint isn't met by the running vimcode —
+    /// engine-internal-state half of the acceptance bar; the driver-tier
+    /// black-box twin (asserting on `driver.screen()`) is
+    /// `tui_main::app_on_tui_tests::tests::issue_1807_requires_vimcode_gates_install::
+    /// far_future_requires_vimcode_blocks_install_with_clear_message`.
+    #[test]
+    fn install_refused_when_requires_vimcode_is_unmet() {
+        use crate::core::extensions::ExtensionManifest;
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1807-future-ext";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1807 Future Extension".to_string(),
+            requires_vimcode: Some(">=9999.0.0".to_string()),
+            scripts: vec!["init.lua".to_string()],
+            ..Default::default()
+        }]);
+
+        e.ext_install_from_registry(ext_name);
+
+        assert!(
+            e.message.contains("Cannot install") && e.message.contains("requires vimcode"),
+            "got: {}",
+            e.message
+        );
+        assert!(
+            !e.extension_state.is_installed(ext_name),
+            "a refused install must never mark the extension installed"
+        );
+    }
+
+    /// #1807: absent `requires_vimcode` (the pre-#1807 default) must never
+    /// trip the new gate — the "If the field is missing, behave as today"
+    /// acceptance criterion.
+    ///
+    /// This install runs to completion (`mark_installed_version` +
+    /// `.save()`, then would reach `plugin_init` in a real session), so it
+    /// uses `set_test_home` to keep that persistence under a throwaway
+    /// directory instead of the developer's real `~/.config/vimcode`
+    /// (review finding on this issue's round 1).
+    #[test]
+    fn install_not_refused_when_requires_vimcode_is_absent() {
+        use crate::core::extensions::ExtensionManifest;
+
+        let unique = format!(
+            "vimcode_test_1807_lsp_ops_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(&unique);
+        std::fs::create_dir_all(&home).unwrap();
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-1807-legacy-ext";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1807 Legacy Extension".to_string(),
+            ..Default::default()
+        }]);
+
+        e.ext_install_from_registry(ext_name);
+
+        assert!(
+            !e.message.contains("Cannot install"),
+            "an extension with no requires_vimcode field must never be \
+             refused by the new gate; got: {}",
+            e.message
+        );
+
+        drop(_home_guard);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

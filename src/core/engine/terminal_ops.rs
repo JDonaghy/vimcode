@@ -160,14 +160,31 @@ impl Engine {
         // from this attempt.
         invalidate_install_exit_code(install_key);
         let wrapped = build_terminal_install_wrapper(command, is_powershell, install_key);
+        // #1712: never type `wrapped` itself into the PTY — a tty's
+        // canonical-mode line discipline caps a single input line at 1024
+        // bytes on macOS (4096 on Linux), and `wrapped` starts with `command`
+        // verbatim, which for e.g. the combined rust/cpp install
+        // (`rustup component add rust-analyzer ; <codelldb install command>`)
+        // routinely exceeds that. Anything past the cap — including the
+        // trailing newline — is silently dropped before the shell ever sees
+        // it, leaving the pane stuck at a half-typed prompt forever. Instead,
+        // write the full script to a temp file and type only a short
+        // `sh '<path>'` / `& '<path>'` launcher line, whose length no longer
+        // depends on `command` at all.
+        let script_path = install_script_path(install_key, is_powershell);
+        if let Err(e) = std::fs::write(&script_path, &wrapped) {
+            self.message = format!("terminal: failed to write install script: {e}");
+            return;
+        }
+        let launch_line = build_terminal_install_launch_line(&script_path, is_powershell);
         match TerminalSession::spawn(cols, rows, &shell, &cwd, history_cap) {
             Ok(mut sess) => {
-                // Inject the wrapped command immediately.  The PTY master writer is
+                // Inject the short launcher line immediately.  The PTY master writer is
                 // ready as soon as `spawn` returns — the kernel PTY subsystem buffers
                 // the bytes and the shell reads them from its stdin when it starts
                 // processing input, so there is no race between this write and the
                 // shell's readiness.
-                sess.write_input(wrapped.as_bytes());
+                sess.write_input(launch_line.as_bytes());
                 self.terminal_panes.push(TerminalSlot {
                     session: sess,
                     install_ctx: ctx,
@@ -1511,6 +1528,66 @@ fn invalidate_install_exit_code(install_key: &str) {
     let _ = std::fs::remove_file(install_exit_code_path(install_key));
 }
 
+/// Path to the per-install **wrapper script** file for `install_key`
+/// (#1712), sibling to [`install_exit_code_path`]. `terminal_run_command`
+/// writes [`build_terminal_install_wrapper`]'s output here rather than
+/// typing it into the PTY directly — see that call site's doc comment for
+/// why. Sanitizes `install_key` the same way `install_exit_code_path` does
+/// (same collision caveat applies), and picks `.sh` / `.ps1` purely so a
+/// human skimming the temp dir can tell the two scratch files for one
+/// install (this one and the exit-code file) apart from unrelated ones at a
+/// glance — nothing in vimcode parses the extension back.
+pub(crate) fn install_script_path(install_key: &str, is_powershell: bool) -> PathBuf {
+    let safe: String = install_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let ext = if is_powershell { "ps1" } else { "sh" };
+    std::env::temp_dir().join(format!("vimcode-install-{safe}.{ext}"))
+}
+
+/// Build the short line actually typed into the PTY to run an extension
+/// install (#1712). `terminal_run_command` writes the full
+/// [`build_terminal_install_wrapper`] script to `script_path` first, then
+/// types only this line — its length depends solely on `script_path` (an OS
+/// temp-dir path plus a short fixed-format filename), never on the command
+/// being installed, so it can't hit a tty's canonical-mode line-length cap
+/// (1024 bytes on macOS, 4096 on Linux) the way typing the full script would.
+///
+/// `sh '<path>'` for POSIX; `& '<path>'` for PowerShell — both quoted via
+/// [`quote_shell_arg`] since a temp-dir path can itself contain spaces or
+/// other shell metacharacters on some systems.
+///
+/// **Ends with its own `; exit` / `; Exit`**, and must keep doing so: the
+/// wrapper's trailing `exit` (step 5 of [`build_terminal_install_wrapper`])
+/// was written to exit the *pane's interactive shell*, which is what makes
+/// `TerminalSession::is_exited()` fire so `poll_terminal` removes the
+/// pane's `TerminalSlot` once the user presses Enter at "Press Enter to
+/// close…". Now that the wrapper runs as a child `sh`/`&` invocation rather
+/// than being typed into that shell directly, its `exit` only ends the
+/// child — so the launcher line has to carry the interactive shell's own
+/// exit itself, or the pane would return to its PS1 prompt and stay open
+/// (and unremovable) forever. The install's *result* no longer depends on
+/// this (#1396 finalizes off the exit-code scratch file), only the pane's
+/// lifecycle does.
+pub(crate) fn build_terminal_install_launch_line(
+    script_path: &Path,
+    is_powershell: bool,
+) -> String {
+    let quoted = quote_shell_arg(&script_path.display().to_string(), is_powershell);
+    if is_powershell {
+        format!("& {quoted}; Exit\n")
+    } else {
+        format!("sh {quoted}; exit\n")
+    }
+}
+
 /// Build the PTY-injected wrapper script for `terminal_run_command`.
 ///
 /// Wraps `command` in a shell fragment that:
@@ -2007,11 +2084,18 @@ pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Ve
 mod tests {
     use super::{
         acp_terminal_command_display, build_acp_auth_wrapper, build_acp_terminal_wrapper,
-        build_terminal_install_wrapper, extract_acp_terminal_output, install_exit_code_path,
-        install_exit_code_ready, invalidate_install_exit_code, read_install_exit_code,
+        build_terminal_install_launch_line, build_terminal_install_wrapper,
+        extract_acp_terminal_output, install_exit_code_path, install_exit_code_ready,
+        install_script_path, invalidate_install_exit_code, read_install_exit_code,
         truncate_terminal_output,
     };
     use std::path::PathBuf;
+
+    /// macOS's tty line discipline caps a single canonical-mode input line at
+    /// this many bytes (`MAX_CANON`); Linux allows 4096. Anything past it,
+    /// including the trailing newline, is silently dropped before the shell
+    /// ever sees it (#1712).
+    const MACOS_MAX_CANON: usize = 1024;
 
     /// Verify that the POSIX wrapper ends with `\nexit\n` so the shell process
     /// exits after the user presses Enter, enabling `poll_terminal` to call
@@ -2036,6 +2120,38 @@ mod tests {
         );
     }
 
+    /// #1712 kept the two tests above honest: the wrapper's own trailing
+    /// `exit` now runs in a *child* `sh`/`&` invocation, so it no longer
+    /// ends the pane's interactive shell — the launcher line typed into
+    /// that shell has to carry the exit itself, or `TerminalSession::
+    /// is_exited()` never fires and `poll_terminal` never removes the
+    /// pane's `TerminalSlot` (the pane just returns to its PS1 prompt and
+    /// can't be closed). Dropping the `; exit` / `; Exit` suffix from
+    /// `build_terminal_install_launch_line` makes this test fail while
+    /// `posix_wrapper_ends_with_exit` above keeps passing, which is exactly
+    /// the gap it covers.
+    #[test]
+    fn install_launch_line_exits_the_pane_shell_after_the_script_returns() {
+        let posix = build_terminal_install_launch_line(
+            &PathBuf::from("/tmp/vimcode-install-test.sh"),
+            false,
+        );
+        assert_eq!(
+            posix, "sh '/tmp/vimcode-install-test.sh'; exit\n",
+            "POSIX launcher must run the script and then exit the pane's \
+             own interactive shell"
+        );
+        let ps = build_terminal_install_launch_line(
+            &PathBuf::from("C:\\Temp\\vimcode-install-test.ps1"),
+            true,
+        );
+        assert_eq!(
+            ps, "& \"C:\\Temp\\vimcode-install-test.ps1\"; Exit\n",
+            "PowerShell launcher must run the script and then exit the \
+             pane's own shell"
+        );
+    }
+
     /// The command appears verbatim at the start of both wrapper flavours.
     #[test]
     fn wrapper_contains_command() {
@@ -2050,6 +2166,57 @@ mod tests {
             ps.starts_with(cmd),
             "PowerShell wrapper must start with the command"
         );
+    }
+
+    /// #1712: the line actually typed into the PTY for an extension install
+    /// must stay under the tty canonical-mode cap regardless of how long the
+    /// command being installed is — reproducing the real rust/cpp DAP
+    /// install shape (`rustup component add rust-analyzer ; <codelldb
+    /// install command>`, which is itself well over 1024 bytes on macOS) and
+    /// a synthetic command several times longer still, for both shell
+    /// flavours and several `install_key` lengths. Against unfixed
+    /// `develop` — which typed `build_terminal_install_wrapper`'s full
+    /// output (starting with `command` verbatim) directly into the PTY —
+    /// this same assertion fails for the long commands below; the fix
+    /// routes the command through a temp script file instead and types only
+    /// a short `sh '<path>'` / `& '<path>'` launcher line, whose length
+    /// never depends on `command` at all.
+    #[test]
+    fn install_launch_line_stays_under_tty_canon_cap_for_every_command_length() {
+        let codelldb_macos_like = "curl -fSL 'https://github.com/vadimcn/codelldb/releases/latest/download/codelldb-darwin-arm64.vsix' -o /tmp/vimcode-codelldb.vsix && unzip -o /tmp/vimcode-codelldb.vsix 'extension/adapter/codelldb' 'extension/adapter/scripts/*' 'extension/lldb/bin/*' 'extension/lldb/lib/liblldb.dylib' 'extension/lldb/lib/libpython312.dylib' 'extension/lldb/lib/python3.12/*' 'extension/lldb/lib/lldb-python/*' -d /tmp/vimcode-codelldb && mkdir -p \"$HOME/.local/bin\" \"$HOME/.local/lldb/bin\" \"$HOME/.local/lldb/lib\" \"$HOME/.local/bin/scripts\" && cp /tmp/vimcode-codelldb/extension/adapter/codelldb \"$HOME/.local/bin/codelldb\" && cp -r /tmp/vimcode-codelldb/extension/adapter/scripts/. \"$HOME/.local/bin/scripts/\" && cp -r /tmp/vimcode-codelldb/extension/lldb/bin/. \"$HOME/.local/lldb/bin/\" && cp /tmp/vimcode-codelldb/extension/lldb/lib/liblldb.dylib \"$HOME/.local/lldb/lib/liblldb.dylib\" && cp /tmp/vimcode-codelldb/extension/lldb/lib/libpython312.dylib \"$HOME/.local/lldb/lib/libpython312.dylib\" && cp -r /tmp/vimcode-codelldb/extension/lldb/lib/python3.12 \"$HOME/.local/lldb/lib/\" && cp -r /tmp/vimcode-codelldb/extension/lldb/lib/lldb-python/lldb \"$HOME/.local/lldb/lib/python3.12/\" && chmod +x \"$HOME/.local/bin/codelldb\" \"$HOME/.local/lldb/bin/\"*";
+        let rust_combined = format!("rustup component add rust-analyzer ; {codelldb_macos_like}");
+        assert!(
+            rust_combined.len() > MACOS_MAX_CANON,
+            "test fixture should reproduce a command longer than the macOS \
+             canon cap, otherwise it isn't exercising the bug: {} bytes",
+            rust_combined.len()
+        );
+        let synthetic_huge = "x".repeat(10_000);
+
+        for (label, command) in [
+            (
+                "rust+cpp codelldb install (real shape)",
+                rust_combined.as_str(),
+            ),
+            ("synthetic 10k-byte command", synthetic_huge.as_str()),
+        ] {
+            for is_powershell in [false, true] {
+                for install_key in ["dap:codelldb", "ext:some-quite-long-extension-name:lsp"] {
+                    let _wrapped =
+                        build_terminal_install_wrapper(command, is_powershell, install_key);
+                    let script_path = install_script_path(install_key, is_powershell);
+                    let launch_line =
+                        build_terminal_install_launch_line(&script_path, is_powershell);
+                    assert!(
+                        launch_line.len() < MACOS_MAX_CANON,
+                        "{label} (is_powershell={is_powershell}, key={install_key}): \
+                         PTY-typed launch line is {} bytes, must stay under the \
+                         {MACOS_MAX_CANON}-byte macOS tty canon cap; got:\n{launch_line}",
+                        launch_line.len()
+                    );
+                }
+            }
+        }
     }
 
     /// #957 (ACP-6): unlike the install wrapper, the ACP auth-login wrapper

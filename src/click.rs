@@ -165,11 +165,14 @@ pub(crate) fn pixel_to_click_target(
     // could in principle thread a scratch `DragState`; every real call site
     // threads its own backend's live one.
     drag: &mut quadraui::DragState,
-    // #1271: Alt held at press time — threaded straight into
-    // `render::minimap_press`'s `fine` parameter (see its doc comment).
-    // Irrelevant to every other rung below the minimap one, so callers with
-    // no Alt context of their own (Ctrl+click, drag continuation, the
-    // tab-bar test helpers) pass `false`.
+    // #1271/#1828: Alt held at press time — inverted and threaded into
+    // `render::minimap_press`'s `fine` parameter below (`!alt`, see its doc
+    // comment). #1828: a plain minimap drag now maps within the minimap's
+    // own (possibly sliding, #1093) scale by default, matching VS Code —
+    // holding Alt opts into the old #1187 file-wide/scrollbar-equivalent
+    // fast-scroll mapping instead. Irrelevant to every other rung below the
+    // minimap one, so callers with no Alt context of their own (Ctrl+click,
+    // drag continuation, the tab-bar test helpers) pass `false`.
     alt: bool,
 ) -> ClickTarget {
     // #752: the separated status line's arm was here, and the per-window
@@ -190,7 +193,11 @@ pub(crate) fn pixel_to_click_target(
     // which one it hit — never assumed to be the active window, since a
     // split can have a strip on an inactive pane too.
     if mutate_focus {
-        if let Some(press) = render_mod::minimap_press(engine, cached_layout, x, y, alt) {
+        // #1828: `!alt` — a plain press/drag defaults to the minimap's own
+        // (possibly sliding, #1093) scale, matching VS Code; Alt held opts
+        // into the old #1187 file-wide mapping instead. See
+        // `render::minimap_press`'s doc comment.
+        if let Some(press) = render_mod::minimap_press(engine, cached_layout, x, y, !alt) {
             if press.jump {
                 render_mod::apply_minimap_click(engine, cached_layout, x, y);
             } else {
@@ -557,7 +564,7 @@ pub(crate) fn handle_mouse_click(
         tab_bar_zones,
         true, // real click: focus/tab/gutter side effects are intended
         drag,
-        alt, // #1271: Alt-press arms the minimap's fine-seek virtual track
+        alt, // #1271/#1828: Alt-press arms the minimap's file-wide (old #1187) track; plain press now fine-seeks by default
     ) {
         ClickTarget::BufferPos(wid, line, col) => {
             // Alt+Click in VSCode mode → add cursor at position

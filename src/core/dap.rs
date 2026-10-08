@@ -182,16 +182,21 @@ impl DapServer {
 
         // Replace the placeholder "0" that follows "--port" or "--listen" in
         // args with the actual chosen port number.
-        // codelldb uses "--port 0"; debugpy uses "--listen 0".
-        let resolved_args: Vec<&str> = {
-            let mut v: Vec<&str> = args.to_vec();
+        // codelldb uses "--port 0"; delve uses "--listen host:0" (the port
+        // is the suffix of a "host:port" value, not a standalone token).
+        let resolved_args: Vec<String> = {
+            let mut v: Vec<String> = args.iter().map(|a| a.to_string()).collect();
             let port_flag_pos = v
                 .iter()
-                .position(|a| *a == "--port")
-                .or_else(|| v.iter().position(|a| *a == "--listen"));
+                .position(|a| a == "--port")
+                .or_else(|| v.iter().position(|a| a == "--listen"));
             if let Some(pos) = port_flag_pos {
                 if pos + 1 < v.len() {
-                    v[pos + 1] = &port_str;
+                    if v[pos + 1] == "0" {
+                        v[pos + 1] = port_str.clone();
+                    } else if let Some(host) = v[pos + 1].strip_suffix(":0") {
+                        v[pos + 1] = format!("{host}:{port_str}");
+                    }
                 }
             }
             v

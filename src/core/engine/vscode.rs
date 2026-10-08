@@ -1,5 +1,28 @@
 use super::*;
 
+// #1730: this file deliberately has — and must never grow — a
+// `cfg(target_os = "macos")` or "is this a Mac terminal" branch. Every
+// binding below is stated purely in terms of `ctrl`/`shift`/the `Alt_*` key
+// names the shared decoder (`render::engine_key_from_ui`) hands it, which is
+// correct for macOS's terminal build too: Cmd is a GUI-only modifier that
+// never reaches a terminal application on any OS, so a macOS TUI's reachable
+// chord alphabet is identical to Linux's.
+//
+// #1745: the macOS *GUI* backend (`src/macos/`) does exist in this repo
+// (#1730's module doc wrongly assumed otherwise) and does need a real
+// Cmd-vs-Ctrl remap — but that remap still does not belong in this file.
+// `normalize_mac_cmd_as_ctrl` (`src/app.rs`), called once at the top of
+// the one shared `App::handle_dispatch` both GTK and the macOS GUI run
+// through, folds `Modifiers::cmd` into `ctrl` for plain substitution chords
+// and translates the handful of VS Code Mac defaults that are *not* a plain
+// substitution (Option for word-nav, Cmd for line/doc-nav) into the exact
+// `Key`/`Modifiers` shape this file already understands, before this file
+// ever sees the event — so `vscode.rs` keeps speaking only `ctrl`/`shift`/
+// `Alt_*`, unchanged. `Cmd+Option+F` for Find & Replace is not yet among
+// them: see `tests/vscode_keybinding_parity.rs`'s `REACHABILITY_TABLE` and
+// `docs/PENDING_QUADRAUI_ISSUES.md` for why that one is blocked upstream in
+// quadraui, not a vimcode-side gap.
+
 impl Engine {
     /// True when the editor is configured in VSCode editing mode.
     pub fn is_vscode_mode(&self) -> bool {
@@ -12,7 +35,7 @@ impl Engine {
             return match self.mode {
                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock => "SELECT",
                 Mode::Command => "COMMAND",
-                _ => "EDIT  F1:cmd  Alt-M:vim",
+                _ => "EDIT  F1:palette  Alt-M:vim",
             };
         }
         match self.mode {
@@ -100,6 +123,9 @@ impl Engine {
         if self.visual_anchor.is_none() {
             self.visual_anchor = Some(self.view().cursor);
             self.mode = Mode::Visual;
+            // Keyboard extension drives the ordinary insert-mode cursor, which
+            // lands one char *past* the last selected char — exclusive end.
+            self.visual_end_exclusive = true;
         }
         self.vscode_do_move(op);
         if self.visual_anchor == Some(self.view().cursor) {
@@ -109,7 +135,9 @@ impl Engine {
     }
 
     /// Delete the current visual selection and restore Insert mode.
-    /// Uses exclusive-end semantics: selection is [anchor, cursor) (cursor not included).
+    /// Selection end bound follows `visual_end_exclusive` (#1788 review) —
+    /// NOT a hardcoded exclusive-end assumption, since Ctrl+D/Ctrl+Shift+L/
+    /// mouse selections are inclusive-end even in VSCode mode.
     /// Relies on the caller to manage the undo group.
     fn vscode_delete_selection(&mut self, changed: &mut bool) {
         let Some(anchor) = self.visual_anchor else {
@@ -127,7 +155,12 @@ impl Engine {
         };
 
         let start_char = self.buffer().line_to_char(start.line) + start.col;
-        let end_char = self.buffer().line_to_char(end.line) + end.col; // exclusive
+        let mut end_char = self.buffer().line_to_char(end.line) + end.col;
+        if !self.visual_end_exclusive {
+            // Inclusive end — the cursor's own char is part of the selection too.
+            end_char += 1;
+        }
+        let end_char = end_char.min(self.buffer().len_chars());
 
         if end_char > start_char {
             self.delete_with_undo(start_char, end_char);
@@ -310,15 +343,128 @@ impl Engine {
     }
 
     /// Ctrl-A: select all text.
+    ///
+    /// #1785: select-all collapses to a single whole-buffer selection, so any
+    /// multi-cursor state left over from a prior Ctrl+D/Ctrl+Shift+L edit must
+    /// be cleared here. Otherwise the next typed character hits the inline
+    /// multi-cursor-with-selection branch in `handle_vscode_key`'s `unicode`
+    /// (catch-all `_`) arm — the sibling of the dedicated
+    /// `vscode_mc_delete_selections` method, same underflow shape, different
+    /// call site — which assumes every extra cursor carries its own
+    /// matched-length selection from Ctrl+D. After Ctrl+A the "selection" is
+    /// the whole document instead, so that branch computes a garbage
+    /// (underflowed) char index per stale extra cursor and `delete_with_undo`
+    /// panics deep inside ropey on an out-of-bounds range.
     fn vscode_select_all(&mut self) {
+        self.view_mut().extra_cursors.clear();
         self.visual_anchor = Some(Cursor { line: 0, col: 0 });
         self.mode = Mode::Visual;
+        // Cursor lands at `get_line_len_for_insert` below — one past the last
+        // char, same as `vscode_do_move`'s "DocEnd" — exclusive end.
+        self.visual_end_exclusive = true;
         let last = self.buffer().len_lines().saturating_sub(1);
         let last_col = self.get_line_len_for_insert(last);
         self.view_mut().cursor = Cursor {
             line: last,
             col: last_col,
         };
+    }
+
+    /// Alt+Shift+Up: add an extra cursor one line above the topmost existing
+    /// cursor, at the same column.
+    fn vscode_add_cursor_above(&mut self) {
+        let col = self.view().cursor.col;
+        let min_line = self
+            .view()
+            .extra_cursors
+            .iter()
+            .map(|c| c.line)
+            .min()
+            .unwrap_or(self.view().cursor.line)
+            .min(self.view().cursor.line);
+        if min_line > 0 {
+            self.add_cursor_at_pos(min_line - 1, col);
+            let n = self.view().extra_cursors.len() + 1;
+            self.message = format!("{n} cursors");
+        }
+    }
+
+    /// Alt+Shift+Down: add an extra cursor one line below the bottommost
+    /// existing cursor, at the same column.
+    fn vscode_add_cursor_below(&mut self) {
+        let col = self.view().cursor.col;
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let max_cursor_line = self
+            .view()
+            .extra_cursors
+            .iter()
+            .map(|c| c.line)
+            .max()
+            .unwrap_or(self.view().cursor.line)
+            .max(self.view().cursor.line);
+        if max_cursor_line < max_line {
+            self.add_cursor_at_pos(max_cursor_line + 1, col);
+            let n = self.view().extra_cursors.len() + 1;
+            self.message = format!("{n} cursors");
+        }
+    }
+
+    /// Dispatch one of the `Selection` menu's commands (#1697). These are
+    /// `execute_command`/menu-bar string actions ("select_all",
+    /// "MoveLineUp", "MoveLineDown", "add_cursor_above",
+    /// "add_cursor_below", "add_next_occurrence",
+    /// "select_all_occurrences") that reach the exact same per-key logic
+    /// `handle_vscode_key` already runs for the equivalent keystroke
+    /// (Ctrl+A, Alt+Up/Down, Alt+Shift+Up/Down, Ctrl+D, Ctrl+Shift+L) —
+    /// this is wiring, not new editing behaviour. Mirrors the undo-group /
+    /// dirty / syntax bookkeeping `handle_vscode_key` performs around its
+    /// own key dispatch so menu activation behaves identically to pressing
+    /// the shortcut.
+    ///
+    /// `MoveLineUp`/`MoveLineDown` are deliberately PascalCase, not
+    /// `move_line_up`/`move_line_down`: `execute_command`'s
+    /// `is_ranged_ex_name` treats any lowercase action whose
+    /// underscore-delimited first word is `move` (or `delete`/`yank`/
+    /// `join`/`copy`/`put`/`retab`/`left`/`right`/`center`/`t`) as vim's
+    /// ranged `:move` ex-command and routes it to
+    /// `try_execute_ranged_command` *before* this function's match ever
+    /// runs — `move_line_down` silently parsed as `:move` with a garbage
+    /// address and no-op'd instead of moving the line (caught by this
+    /// issue's own `test_selection_menu_move_line_down_action_moves_current_line`,
+    /// observed red with the lowercase name). PascalCase skips that path
+    /// entirely, matching the existing convention for other menu actions
+    /// that need to dodge it (`EditorGroupSplit`, `MarkdownPreview`).
+    pub(crate) fn execute_selection_menu_action(&mut self, action: &str) -> EngineAction {
+        self.vscode_break_undo_group();
+        self.start_undo_group();
+        let mut changed = false;
+        match action {
+            "select_all" => self.vscode_select_all(),
+            "MoveLineUp" => self.vscode_move_line_up(&mut changed),
+            "MoveLineDown" => self.vscode_move_line_down(&mut changed),
+            "add_cursor_above" => self.vscode_add_cursor_above(),
+            "add_cursor_below" => self.vscode_add_cursor_below(),
+            "add_next_occurrence" => self.vscode_ctrl_d(),
+            "select_all_occurrences" => self.vscode_select_all_occurrences(),
+            _ => {}
+        }
+        if changed {
+            self.finish_undo_group();
+            self.set_dirty(true);
+            self.update_syntax();
+            let active_id = self.active_buffer_id();
+            self.preview_tab_promote(active_id);
+            self.lsp_dirty_buffers.insert(active_id, true);
+            self.swap_mark_dirty();
+            if !self.search_matches.is_empty() {
+                self.run_search();
+            }
+        }
+        self.ensure_cursor_visible();
+        self.sync_scroll_binds();
+        self.update_bracket_match();
+        self.fire_cursor_move_hook();
+        EngineAction::None
     }
 
     // ── Word-level delete ────────────────────────────────────────────────────
@@ -499,6 +645,87 @@ impl Engine {
         *changed = true;
     }
 
+    /// Shift+Alt+Up: duplicate the current line (or selected lines) directly
+    /// above themselves — VS Code's `editor.action.copyLinesUpAction`. The
+    /// cursor (and visual anchor) are left at the same line index, which the
+    /// new, upper copy now occupies (the original content shifts down by the
+    /// number of duplicated lines) — matching VS Code's own "the duplicate
+    /// becomes the thing you're editing" feel, and letting repeated presses
+    /// keep stacking copies upward. #1744: this chord used to be misbound to
+    /// `vscode_add_cursor_above` (now Ctrl+Alt+Up's `insertCursorAbove`).
+    fn vscode_copy_line_up(&mut self, changed: &mut bool) {
+        let (start_line, end_line) = self.vscode_affected_lines();
+        self.start_undo_group();
+        let start = self.buffer().line_to_char(start_line);
+        let num_lines = self.buffer().len_lines();
+        let end = if end_line + 1 < num_lines {
+            self.buffer().line_to_char(end_line + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+        let mut text: String = self.buffer().content.slice(start..end).chars().collect();
+        if !text.ends_with('\n') {
+            // Only the last line of the buffer can lack a trailing newline;
+            // the duplicate still needs one to separate it from the
+            // (shifted-down) original.
+            text.push('\n');
+        }
+        self.insert_with_undo(start, &text);
+        self.finish_undo_group();
+        *changed = true;
+    }
+
+    /// Shift+Alt+Down: duplicate the current line (or selected lines)
+    /// directly below themselves — VS Code's
+    /// `editor.action.copyLinesDownAction`. The cursor (and visual anchor)
+    /// move down by the number of duplicated lines, onto the new copy,
+    /// mirroring [`Engine::vscode_copy_line_up`]'s "follow the duplicate"
+    /// behaviour.
+    fn vscode_copy_line_down(&mut self, changed: &mut bool) {
+        let (start_line, end_line) = self.vscode_affected_lines();
+        self.start_undo_group();
+        let start = self.buffer().line_to_char(start_line);
+        let num_lines = self.buffer().len_lines();
+        let end = if end_line + 1 < num_lines {
+            self.buffer().line_to_char(end_line + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+        let mut text: String = self.buffer().content.slice(start..end).chars().collect();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let insert_pos = if end_line + 1 < num_lines {
+            end
+        } else {
+            // Last line with no trailing newline: insert a separator first,
+            // mirroring `vscode_move_line_up`'s own end-of-buffer fixup, so
+            // the duplicate doesn't run on into the original line's text.
+            let pos = self.buffer().len_chars();
+            if pos > 0 {
+                let last_ch: char = self.buffer().content.char(pos - 1);
+                if last_ch != '\n' {
+                    self.insert_with_undo(pos, "\n");
+                }
+            }
+            self.buffer().len_chars()
+        };
+        self.insert_with_undo(insert_pos, &text);
+        self.finish_undo_group();
+        let shift = end_line - start_line + 1;
+        // `.min(max_line)` mirrors `vscode_move_line_down`'s own clamp —
+        // the insert above always adds exactly `shift` lines today, so this
+        // is a no-op in practice, but leaving the addition unclamped (as a
+        // prior version of this function did) would panic the moment that
+        // invariant ever changes, where its sibling would just saturate.
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        self.view_mut().cursor.line = (self.view().cursor.line + shift).min(max_line);
+        if let Some(ref mut anc) = self.visual_anchor {
+            anc.line = (anc.line + shift).min(max_line);
+        }
+        *changed = true;
+    }
+
     /// Ctrl+Shift+K: delete current line.
     fn vscode_delete_line(&mut self, changed: &mut bool) {
         let num_lines = self.buffer().len_lines();
@@ -573,6 +800,9 @@ impl Engine {
             // First press: anchor at line start, cursor at start of next line.
             self.visual_anchor = Some(Cursor { line, col: 0 });
             self.mode = Mode::Visual;
+            // Cursor lands at the start of the next line (or one past the
+            // last char on the last line) — exclusive end either way.
+            self.visual_end_exclusive = true;
             if line < max_line {
                 self.view_mut().cursor = Cursor {
                     line: line + 1,
@@ -630,6 +860,7 @@ impl Engine {
                     col: ws,
                 });
                 self.mode = Mode::Visual;
+                self.visual_end_exclusive = false;
                 // Cursor at last char of word (inclusive), not one past end
                 self.view_mut().cursor.col = we - 1;
             }
@@ -725,6 +956,8 @@ impl Engine {
             col: ws,
         });
         self.mode = Mode::Visual;
+        self.visual_end_exclusive = false;
+        // Cursor at last char of word (inclusive), matching `vscode_ctrl_d`.
         self.view_mut().cursor.col = we - 1;
 
         // Find all occurrences and place extra cursors at word END
@@ -980,41 +1213,28 @@ impl Engine {
         // ── Alt-encoded keys (sent from backends when in VSCode mode) ────
         if key_name.starts_with("Alt_") {
             match key_name {
+                // #1744: `ctrl` now flows through from `render::route_alt_key`
+                // instead of being hardcoded `false`, so Ctrl+Alt+Up/Down —
+                // VS Code's real `insertCursorAbove`/`insertCursorBelow` —
+                // can finally be told apart from plain Alt+Up/Down's
+                // move-line. These guarded arms must stay above the
+                // unguarded ones below, or the `ctrl` distinction is lost.
+                "Alt_Up" if ctrl => self.vscode_add_cursor_above(),
+                "Alt_Down" if ctrl => self.vscode_add_cursor_below(),
                 "Alt_Up" => self.vscode_move_line_up(&mut changed),
                 "Alt_Down" => self.vscode_move_line_down(&mut changed),
-                "Alt_Shift_Up" => {
-                    let col = self.view().cursor.col;
-                    let min_line = self
-                        .view()
-                        .extra_cursors
-                        .iter()
-                        .map(|c| c.line)
-                        .min()
-                        .unwrap_or(self.view().cursor.line)
-                        .min(self.view().cursor.line);
-                    if min_line > 0 {
-                        self.add_cursor_at_pos(min_line - 1, col);
-                        let n = self.view().extra_cursors.len() + 1;
-                        self.message = format!("{n} cursors");
-                    }
-                }
-                "Alt_Shift_Down" => {
-                    let col = self.view().cursor.col;
-                    let max_line = self.buffer().len_lines().saturating_sub(1);
-                    let max_cursor_line = self
-                        .view()
-                        .extra_cursors
-                        .iter()
-                        .map(|c| c.line)
-                        .max()
-                        .unwrap_or(self.view().cursor.line)
-                        .max(self.view().cursor.line);
-                    if max_cursor_line < max_line {
-                        self.add_cursor_at_pos(max_cursor_line + 1, col);
-                        let n = self.view().extra_cursors.len() + 1;
-                        self.message = format!("{n} cursors");
-                    }
-                }
+                // #1744: Shift+Alt+Up/Down is VS Code's `copyLinesUpAction`/
+                // `copyLinesDownAction` (duplicate the line), not add-cursor
+                // — that chord used to be misbound here to
+                // `vscode_add_cursor_above`/`_below`, the behaviour
+                // Ctrl+Alt+Up/Down now owns above.
+                "Alt_Shift_Up" => self.vscode_copy_line_up(&mut changed),
+                "Alt_Shift_Down" => self.vscode_copy_line_down(&mut changed),
+                // #1744: VS Code's `workbench.action.navigateBack`/
+                // `navigateForward`, the same jump-list mechanism Vim mode's
+                // Ctrl-O/Ctrl-I already use.
+                "Alt_Left" => self.jump_list_back(),
+                "Alt_Right" => self.jump_list_forward(),
                 "Alt_z" => {
                     self.settings.wrap = !self.settings.wrap;
                     self.message = format!(
@@ -1213,6 +1433,18 @@ impl Engine {
                 // presses unfold nested folds)
                 "Shift_bracketright" => {
                     self.cmd_fold_open_progressive();
+                }
+                // #1744: Ctrl+Shift+\ → jump to matching bracket (VS Code's
+                // `editor.action.jumpToBracket`), the same underlying search
+                // Vim mode's `%` already uses. `"|"` is the literal shifted
+                // glyph most surfaces deliver instead of an explicit Shift
+                // bit — `App::handle_dispatch`'s `Key::Char` arm
+                // (`src/app.rs`) forwards it unchanged via `c.to_string()`;
+                // `"Shift_backslash"` is that same match's own special case
+                // for the one shape ('\\' + an explicit Shift bit) that
+                // isn't already a distinct glyph.
+                "Shift_backslash" | "|" => {
+                    self.move_to_matching_bracket();
                 }
                 _ => {}
             }

@@ -1,5 +1,498 @@
 use super::*;
 
+// ─── Native loop API: shared process-spawning core (#1624) ─────────────────
+//
+// `vimcode.loop.spawn` and the legacy `vimcode.async_shell` (see
+// `Engine::plugin_api_spawn` / `Engine::poll_async_shells` in
+// `engine/plugins.rs`) are both built on [`spawn_piped`] so a future change
+// to argv construction, reader chunking, or exit/signal decoding has one
+// call site to fix instead of two independently-hand-rolled ones (the
+// pre-#1624 state: `async_shell`'s thread called `Command::output()`/
+// `wait_with_output()` directly and had no streaming and no exit status at
+// all).
+
+use std::io::Read;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+
+/// One streamed event from a spawned child: a chunk of stdout/stderr as it
+/// arrives, or the final exit status. `code`/`signal` on `Exit` are mutually
+/// exclusive in practice — a normal exit carries a code, a signal death
+/// (`kill()`, on unix) carries a signal number — but both are `Option` so a
+/// platform/error case that has neither still has something to send.
+pub(crate) enum PluginSpawnEvent {
+    Stdout(String),
+    Stderr(String),
+    Exit {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+}
+
+/// Live state for one `vimcode.loop.spawn` handle (#1624): the child (shared
+/// with the background exit-watcher thread so `kill()` can reach it), the
+/// writable stdin half (shared so `write`/`close_stdin` can reach it without
+/// blocking on the reader threads), and the event stream.
+pub(crate) struct PluginSpawnHandle {
+    /// Weak so an unloaded owning plugin (`Engine::set_plugin_manager`
+    /// replacing the `Rc`) is detectable without `Engine` tracking ownership
+    /// separately — see `Engine::poll_plugin_spawns`.
+    pub(crate) manager: std::rc::Weak<plugin::PluginManager>,
+    pub(crate) child: Arc<Mutex<Child>>,
+    pub(crate) stdin: Arc<Mutex<Option<ChildStdin>>>,
+    pub(crate) rx: Receiver<PluginSpawnEvent>,
+}
+
+/// Live state for one `vimcode.async_shell` task (#1624): same event stream
+/// as [`PluginSpawnHandle`], but accumulated into a single buffer rather
+/// than streamed to Lua per chunk — see `Engine::poll_async_shells`.
+pub(crate) struct AsyncShellTask {
+    pub(crate) rx: Receiver<PluginSpawnEvent>,
+    pub(crate) stdout_buf: String,
+}
+
+/// [`spawn_piped`]'s return shape: the child (shared with its exit-watcher
+/// thread), the writable stdin half, and the event stream. Named purely to
+/// satisfy `clippy::type_complexity` — see the two structs above for what
+/// each piece means.
+type SpawnPipes = (
+    Arc<Mutex<Child>>,
+    Arc<Mutex<Option<ChildStdin>>>,
+    Receiver<PluginSpawnEvent>,
+);
+
+/// Poll `child` with `try_wait()` (never a blocking `wait()`, which would
+/// hold the child's mutex indefinitely and starve a concurrent `kill()`)
+/// until it exits, then send the single `Exit` event.
+fn finish_and_send_exit(child: Arc<Mutex<Child>>, tx: Sender<PluginSpawnEvent>) {
+    loop {
+        let status = match child.lock() {
+            Ok(mut guard) => guard.try_wait(),
+            // A prior panic while the lock was held elsewhere (e.g. inside
+            // `kill()`) poisons it — recover the guard via `into_inner()`
+            // rather than giving up here, so this thread still reaps the
+            // child and sends its `Exit` event instead of leaking both
+            // silently (#1624 review, non-blocking).
+            Err(poisoned) => poisoned.into_inner().try_wait(),
+        };
+        match status {
+            Ok(Some(status)) => {
+                let code = status.code();
+                #[cfg(unix)]
+                let signal = {
+                    use std::os::unix::process::ExitStatusExt;
+                    status.signal()
+                };
+                #[cfg(not(unix))]
+                let signal = None;
+                let _ = tx.send(PluginSpawnEvent::Exit { code, signal });
+                return;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(15)),
+            Err(_) => {
+                let _ = tx.send(PluginSpawnEvent::Exit {
+                    code: None,
+                    signal: None,
+                });
+                return;
+            }
+        }
+    }
+}
+
+/// Launch `command`, piping stdin/stdout/stderr and starting the background
+/// threads that turn its output into a stream of [`PluginSpawnEvent`]s:
+/// - one thread reads stdout in up-to-4KiB chunks, sending each as it arrives;
+/// - one thread does the same for stderr;
+/// - whichever of those two reader threads hits EOF *last* then calls
+///   [`finish_and_send_exit`] and sends the single `Exit` event.
+///
+/// The last-reader-sends-`Exit` handoff (`pending_readers`) matters: a child
+/// can terminate while its pipes still hold unread, already-written bytes,
+/// so a naive third thread polling `try_wait()` independently can observe
+/// the exit and send `Exit` *before* a reader thread gets scheduled to drain
+/// the last chunk — reordering `on_exit` ahead of `on_stdout`/`on_stderr` for
+/// a fast, short-lived child. Gating `Exit` on both readers reaching EOF
+/// first makes that reordering impossible. (Found via this issue's own
+/// `concurrent_spawns_stream_independent_output_and_exit_codes` test, which
+/// flaked under parallel `cargo test` load before this fix — a `printf`
+/// child exits fast enough that the race window was real, not theoretical.)
+///
+/// `stdin_data`, when given, is written to the child's stdin and the pipe is
+/// then closed (EOF) before returning — the legacy `vimcode.async_shell`
+/// `stdin` option's shape (write-then-close, no interactive follow-up).
+/// `vimcode.loop.spawn` passes `None` and drives stdin interactively through
+/// the returned handle's `write`/`close_stdin` instead.
+pub(crate) fn spawn_piped(
+    mut command: Command,
+    stdin_data: Option<String>,
+) -> std::io::Result<SpawnPipes> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut stdin = child.stdin.take();
+    if let Some(data) = stdin_data {
+        // Write on a dedicated background thread rather than inline here
+        // (#1624 review): this runs synchronously on the caller's thread —
+        // the main/engine thread for `vimcode.async_shell`'s legacy
+        // `stdin` option — and `data` can exceed the OS pipe buffer
+        // (commonly 64KiB on Linux) or be written to a child that doesn't
+        // promptly drain stdin. Either blocks a `write_all` indefinitely,
+        // which previously stalled the whole editor; the pre-#1624 code
+        // avoided this by running spawn+write+wait inside its own
+        // `std::thread::spawn`. Taking the pipe out and moving it into a
+        // thread (rather than writing through the shared `Arc<Mutex<..>>`
+        // below) keeps that same off-thread guarantee while still handing
+        // back `None` for `stdin` here, matching this option's frozen
+        // write-then-close, no-interactive-follow-up shape.
+        if let Some(pipe) = stdin.take() {
+            std::thread::spawn(move || {
+                let mut pipe = pipe;
+                use std::io::Write;
+                let _ = pipe.write_all(data.as_bytes());
+                // `pipe` drops here, closing stdin (EOF) once the write
+                // completes — same as the previous inline `stdin = None`.
+            });
+        }
+    }
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tx, rx) = mpsc::channel();
+    let child = Arc::new(Mutex::new(child));
+    // `Stdio::piped()` is always set for both above, so both are always
+    // `Some` in practice — the count still starts from how many reader
+    // threads actually get spawned below, so this stays correct even if
+    // that ever changes.
+    let pending_readers = Arc::new(AtomicUsize::new(
+        stdout.is_some() as usize + stderr.is_some() as usize,
+    ));
+
+    if let Some(mut out) = stdout {
+        let tx = tx.clone();
+        let pending = Arc::clone(&pending_readers);
+        let child = Arc::clone(&child);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match out.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        if tx.send(PluginSpawnEvent::Stdout(chunk)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            if pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+                finish_and_send_exit(child, tx);
+            }
+        });
+    }
+    if let Some(mut err) = stderr {
+        let tx = tx.clone();
+        let pending = Arc::clone(&pending_readers);
+        let child = Arc::clone(&child);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match err.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        if tx.send(PluginSpawnEvent::Stderr(chunk)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            if pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+                finish_and_send_exit(child, tx);
+            }
+        });
+    }
+
+    Ok((child, Arc::new(Mutex::new(stdin)), rx))
+}
+
+// ─── `vimcode.http` (#1632) ─────────────────────────────────────────────────
+//
+// Runs each request as a `curl` child process on its own background thread,
+// the same "shell out, don't vendor a TLS stack" choice `tool_acquire::
+// http_get_bytes` already made for LSP/DAP acquisition downloads — curl is
+// already an assumed runtime dependency on every platform vimcode ships for
+// (including the Windows `+crt-static` and musl `vcd` builds), so reusing it
+// here adds **zero** new compiled dependency: no `ureq`/`reqwest`, no new TLS
+// backend, no `Cargo.toml`/`Cargo.lock` change, no binary-size impact. `-i`
+// asks curl to prefix the body with the response's status line and headers
+// on stdout so a single read gives us everything; `--data-raw`/`-X` cover
+// method/body; `-H` covers headers; `--max-time` covers the timeout, enforced
+// by curl itself so a slow/unresponsive server can never wedge the request
+// past its deadline.
+
+/// One `vimcode.http.request` call's parameters, already validated/defaulted
+/// on the Lua side (`method` non-empty, `url` non-empty, headers free of
+/// CR/LF — [`spawn_http_request`] re-checks the last one defensively).
+pub(crate) struct HttpRequestSpec {
+    pub(crate) method: String,
+    pub(crate) url: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Option<String>,
+    pub(crate) timeout_ms: u64,
+}
+
+/// A successfully-completed request's response, exactly the shape
+/// `vimcode.http.request`'s callback receives.
+pub(crate) struct HttpResponse {
+    pub(crate) status: u16,
+    /// Insertion order as received; a header repeated by the server keeps
+    /// only its last value (matching a plain Lua table's own "later
+    /// `t[k]=v` wins" semantics, so nothing is lost silently — it's simply
+    /// not representable as a `k -> single value` table).
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: String,
+    pub(crate) elapsed_ms: u64,
+}
+
+/// One request's outcome: a parsed response, or an error message (network
+/// failure, timeout, or a response curl could not parse) — surfaced to Lua
+/// as `{status, headers, body, elapsed_ms}` or `{error}` respectively.
+pub(crate) enum HttpResult {
+    Ok(HttpResponse),
+    Err(String),
+}
+
+/// Live state for one `vimcode.http.request` handle (#1632): the child
+/// (shared with the background thread so `cancel()` can reach it) and the
+/// one-shot result channel. Mirrors [`PluginSpawnHandle`] minus the stdin
+/// half (an HTTP request has no interactive stdin) and streams exactly one
+/// [`HttpResult`] instead of many [`PluginSpawnEvent`]s.
+pub(crate) struct PluginHttpHandle {
+    /// Weak so an unloaded owning plugin is detectable the same way
+    /// `PluginSpawnHandle::manager` is — see `Engine::poll_plugin_http`.
+    pub(crate) manager: std::rc::Weak<plugin::PluginManager>,
+    pub(crate) child: Arc<Mutex<Child>>,
+    pub(crate) rx: Receiver<HttpResult>,
+}
+
+/// Find the first occurrence of `needle` in `haystack`, or `None`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Split curl's `-i` output (status line + headers + blank line + body) into
+/// its header block and body. Looks for `\r\n\r\n` first (the wire format
+/// HTTP actually uses) and falls back to a bare `\n\n` so a test fixture that
+/// writes bare-`\n` line endings still parses.
+fn split_head_body(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    if let Some(pos) = find_subslice(bytes, b"\r\n\r\n") {
+        return Some((&bytes[..pos], &bytes[pos + 4..]));
+    }
+    if let Some(pos) = find_subslice(bytes, b"\n\n") {
+        return Some((&bytes[..pos], &bytes[pos + 2..]));
+    }
+    None
+}
+
+/// Parse curl's `-i` stdout into a structured [`HttpResponse`]. `elapsed_ms`
+/// is measured by the caller (wall-clock around the whole child lifetime),
+/// not parsed out of curl's own timing — simpler, and accurate for exactly
+/// what a plugin author means by "how long did this take".
+fn parse_curl_response(bytes: &[u8], elapsed_ms: u64) -> HttpResult {
+    let Some((head, body)) = split_head_body(bytes) else {
+        return HttpResult::Err("malformed HTTP response: no header/body boundary".to_string());
+    };
+    let head_str = String::from_utf8_lossy(head).replace("\r\n", "\n");
+    let mut lines = head_str.split('\n').filter(|l| !l.is_empty());
+    let Some(status_line) = lines.next() else {
+        return HttpResult::Err("malformed HTTP response: missing status line".to_string());
+    };
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    HttpResult::Ok(HttpResponse {
+        status,
+        headers,
+        body: String::from_utf8_lossy(body).into_owned(),
+        elapsed_ms,
+    })
+}
+
+/// [`spawn_http_request`]'s return shape: the child (shared with its
+/// background thread, for `cancel()`) and the one-shot result channel.
+/// `Engine::plugin_api_http_request` wraps this into a [`PluginHttpHandle`]
+/// once it has the owning `Rc<PluginManager>` to downgrade — mirrors
+/// `spawn_piped`/`Engine::plugin_api_spawn`'s split the same way.
+type HttpPipes = (Arc<Mutex<Child>>, Receiver<HttpResult>);
+
+/// Maximum response body [`spawn_http_request`] will buffer from curl's
+/// stdout (headers + body together — curl's `-i` combines them into one
+/// stream) before giving up and failing the request. Without this, an
+/// unbounded `read_to_end` lets a large/slow-but-"successful" response — or
+/// a malicious/misbehaving server — grow memory without bound (review
+/// finding, #1632).
+const HTTP_MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+
+/// Read at most `cap` bytes from `r`, returning `(bytes, exceeded)`.
+/// `exceeded` is true if `r` still had more data once `cap` was reached
+/// (i.e. reading stopped early rather than hitting EOF) — the caller uses
+/// this to fail the request instead of silently truncating it.
+fn read_capped(mut r: impl Read, cap: usize) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        if buf.len() >= cap {
+            return match r.read(&mut chunk) {
+                Ok(0) | Err(_) => (buf, false),
+                Ok(_) => (buf, true),
+            };
+        }
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => return (buf, false),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// A header key or value is rejected if it contains `\r` or `\n`: curl
+/// writes `-H "{k}: {v}"` verbatim onto the wire as one argument, so an
+/// embedded CR/LF would let a caller smuggle extra header lines or split the
+/// request (review finding, #1632) — e.g. a header value built from
+/// response data, a template, or other less-trusted input.
+fn header_is_safe(s: &str) -> bool {
+    !s.contains('\r') && !s.contains('\n')
+}
+
+/// Launch `spec` as a `curl` child and return the shared child handle (for
+/// `cancel()`) plus the one-shot result channel, polled by `Engine::
+/// poll_plugin_http`.
+///
+/// stdout/stderr are drained on their own reader threads (rather than one
+/// `read_to_end` after another) for the same reason [`spawn_piped`] does:
+/// reading them sequentially risks a deadlock if the child fills the *other*
+/// pipe's OS buffer while this thread is still blocked on the first one.
+pub(crate) fn spawn_http_request(spec: HttpRequestSpec) -> std::io::Result<HttpPipes> {
+    for (k, v) in &spec.headers {
+        if !header_is_safe(k) || !header_is_safe(v) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "vimcode.http.request: header name/value must not contain CR or LF",
+            ));
+        }
+    }
+    let mut command = crate::core::git::hidden_command("curl");
+    let timeout_secs = (spec.timeout_ms.max(1) as f64) / 1000.0;
+    command.args([
+        "-sS",
+        "-i",
+        "--max-time",
+        &format!("{timeout_secs:.3}"),
+        // Restrict curl to http/https regardless of what scheme the URL
+        // string carries — without this, a `file://`, `smb://`, or other
+        // scheme would be followed too (review finding, #1632), widening
+        // the blast radius of any URL an attacker can influence.
+        "--proto",
+        "-all,+http,+https",
+        "-X",
+        &spec.method,
+    ]);
+    for (k, v) in &spec.headers {
+        command.arg("-H").arg(format!("{k}: {v}"));
+    }
+    if spec.body.is_some() {
+        // Suppress curl's automatic `Expect: 100-continue` for a sizeable
+        // `--data-raw` body: an intermediate "HTTP/1.1 100 Continue" block
+        // ahead of the real response would otherwise defeat `split_head_
+        // body`'s "first blank line" framing, which assumes exactly one
+        // header block.
+        command.arg("-H").arg("Expect:");
+    }
+    if let Some(body) = &spec.body {
+        command.arg("--data-raw").arg(body);
+    }
+    // `--url` (rather than a bare positional argument) so a URL string that
+    // itself looks like a curl flag — e.g. `-o /home/user/.ssh/
+    // authorized_keys` or `-K <config>` — is always parsed as the literal
+    // URL value, never as another option (review finding, #1632: verified
+    // `curl -X GET "-o/tmp/x"` without `--url` is parsed as the `-o` flag).
+    command.arg("--url").arg(&spec.url);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let child = Arc::new(Mutex::new(child));
+    let (tx, rx) = mpsc::channel();
+    let child_thread = Arc::clone(&child);
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let out_reader =
+            stdout.map(|out| std::thread::spawn(move || read_capped(out, HTTP_MAX_RESPONSE_BYTES)));
+        let err_reader = stderr.map(|mut err| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = err.read_to_end(&mut buf);
+                buf
+            })
+        });
+        let (out_buf, out_exceeded) = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+        let err_buf = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+        if out_exceeded {
+            // The child may still be blocked writing to a stdout pipe
+            // nothing further drains — kill it before `wait()` so this
+            // thread (and the request) doesn't hang.
+            if let Ok(mut guard) = child_thread.lock() {
+                let _ = guard.kill();
+            }
+        }
+        let status = match child_thread.lock() {
+            Ok(mut guard) => guard.wait(),
+            Err(poisoned) => poisoned.into_inner().wait(),
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let result = if out_exceeded {
+            HttpResult::Err(format!(
+                "response exceeds maximum size ({} MiB)",
+                HTTP_MAX_RESPONSE_BYTES / (1024 * 1024)
+            ))
+        } else {
+            match status {
+                Ok(status) if status.success() => parse_curl_response(&out_buf, elapsed_ms),
+                Ok(_) => {
+                    let msg = String::from_utf8_lossy(&err_buf).trim().to_string();
+                    HttpResult::Err(if msg.is_empty() {
+                        "curl request failed".to_string()
+                    } else {
+                        msg
+                    })
+                }
+                Err(e) => HttpResult::Err(e.to_string()),
+            }
+        };
+        // A `cancel()` that dropped this handle (and its `Receiver`) races
+        // harmlessly with this send — `send` just returns `Err`, ignored.
+        let _ = tx.send(result);
+    });
+    Ok((child, rx))
+}
+
 impl Engine {
     pub fn execute_command(&mut self, cmd: &str) -> EngineAction {
         // Save for @: repeat (before normalization, using trimmed original).
@@ -1765,6 +2258,9 @@ impl Engine {
                 } else {
                     self.message = format!("Theme: {canonical}");
                 }
+                // #1623: ColorScheme, arg = the new scheme name (matches
+                // vim's own `<amatch>` convention for this autocmd).
+                self.plugin_event("ColorScheme", canonical);
             } else {
                 let mut available: Vec<String> = builtin.iter().map(|s| s.to_string()).collect();
                 available.extend(custom);
@@ -2607,7 +3103,15 @@ impl Engine {
         }
 
         match cmd {
-            "write" => {
+            // `:w!` force-writes — vimcode has no readonly/overwrite
+            // distinction to force past, so the bang is a no-op and `:w!`
+            // behaves exactly like plain `:w` (standard Vim compatibility,
+            // #1790). Without this arm, `normalize_ex_command` still
+            // expanded the "w!" abbreviation to "write!" (`EX_ABBREVS`
+            // preserves the bang through the rewrite), but that string
+            // fell through this match's catch-all and printed "Not an
+            // editor command: write!" instead of saving.
+            "write" | "write!" => {
                 let _ = self.save_with_format(false);
                 EngineAction::None
             }
@@ -2976,6 +3480,14 @@ impl Engine {
                 self.find_replace_show_replace = true;
                 EngineAction::None
             }
+            // ── Selection menu (#1697) ─────────────────────────────────────────
+            "select_all"
+            | "MoveLineUp"
+            | "MoveLineDown"
+            | "add_cursor_above"
+            | "add_cursor_below"
+            | "add_next_occurrence"
+            | "select_all_occurrences" => self.execute_selection_menu_action(cmd),
             "sidebar" => {
                 self.toggle_sidebar();
                 EngineAction::None

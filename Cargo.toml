@@ -1,6 +1,6 @@
 [package]
 name = "vimcode"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "Vim-like code editor with GTK4 and tree-sitter"
 license = "MIT"
@@ -268,17 +268,245 @@ win = ["quadraui/win"]
 # while `win::run`'s outer call already holds `ws.state.borrow_mut()` —
 # `wndproc`'s existing `pump_depth.is_pumping()` re-entrancy guard (#702)
 # does not cover this path, since it fires during window creation, before
-# the main message pump starts. Confirmed present starting at quadraui
-# `90e4310` (the native-menu-bar commit) through `cc2b80d` and `928f2b5`
-# (same panic site, same 100%-reproducible startup crash at each); the
-# immediately-prior pin (`db92e46`, still below) launches cleanly — real
-# window, `Get-Process` shows `Responding: True`. Full repro, isolation
-# steps and stack trace are in `docs/PENDING_QUADRAUI_ISSUES.md`'s new
-# entry — file that as a quadraui issue and get a fix merged before
-# attempting this bump again. Leave vimcode#1559/#1562/#1582 open behind
-# it; none of the three can be verified end-to-end while Win-GUI can't
-# start.
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "db92e461ca5376103d3147d5267b697cbe002063", features = ["tui", "terminal"] }
+# the main message pump starts. Filed as JDonaghy/quadraui#1213.
+#
+# #1618 (refile of #1614) bumps to `6e14d8a` (quadraui `develop` HEAD),
+# which contains the fix for #1213 on top of the three Win-GUI fixes above:
+# `ce1c763` arms a `ModalPumpGuard` around `install_menu_bar_now`'s `SetMenu`
+# call so the nested `WM_SIZE` it triggers bounces off wndproc's existing
+# `pump_depth.is_pumping()` re-entrancy guard instead of re-entering the
+# already-borrowed `ws.state`, and `6e14d8a` adds a live wndproc regression
+# test for it. No further vimcode-side change was needed to pick any of
+# #1197/#1199/#1200 up — `App::setup`'s `native_menu` arm and
+# `App::render_content`'s `backend_caps()` three-way branch (both already
+# in `src/app.rs`, unrelated to this bump) already handle whatever
+# `WinBackend::backend_caps()` reports, and picked these three flags up for
+# free purely from the pin moving.
+#
+# #1629 bumps to `d292a4c` (quadraui `develop` HEAD) to pick up
+# quadraui#1228 (`bc92d47` + its doc-only follow-up `d292a4c`), which
+# reverts the `native_menu: true` half of quadraui#1200:
+# `WinBackend::backend_caps()` now declares only `window_chrome: true`
+# (matching `GtkBackend`), and `install_menu_bar` is back to the trait's
+# no-op default on Win-GUI. #1618's #1622 real-hardware follow-up found
+# `native_menu: true` and `window_chrome: true` together meant two
+# different things per backend (macOS: a true OS-global menu bar with zero
+# in-window footprint, so the native caption should stay; Windows: a
+# per-window `SetMenu` `HMENU` sitting directly under the caption) and
+# `App::setup`'s `if native_menu {…} else if window_chrome {…}` order
+# (correct for macOS) silently starved `window_chrome`'s drawn-caption path
+# on Windows — filed as the `BackendCaps::native_menu is overloaded` entry
+# in `docs/PENDING_QUADRAUI_ISSUES.md` (now struck, see that file). Rather
+# than add the asked-for capability split, quadraui#1228 resolved the
+# conflict the other way: Win-GUI drops `native_menu` and switches to the
+# same drawn-menu-row + `window_chrome`-doubles-as-titlebar shape GTK
+# already uses (a native `HMENU` lives in the non-client area, which
+# #1199's drawn caption permanently covers, so it was unreachable anyway).
+# `App::setup`'s three-way branch needed no vimcode-side change to pick
+# this up — a Win backend now falls into the same `window_chrome` arm GTK
+# takes, `capture_window_and_apply_csd`'s `!native_menu` gate now lets
+# `set_decorated(false)` run on Windows too, and the macOS `native_menu`
+# arm is untouched (`MacBackend` still declares it, unaffected by this
+# bump). See `src/win/mod.rs`/`src/win/backend.rs` for the doc-comment
+# corrections and the `WinDriver` test replacements this bump required.
+#
+# #1647 bumps to `fc94f21` (quadraui `develop` HEAD, all CI checks green) to
+# pick up quadraui#1232: `WinBackend::draw_menu_bar`,
+# `draw_status_bar_interactive`, and `draw_command_center` now register a
+# `nc_hit_test` zone for each of their own clickable bounds right after
+# computing the real layout, mirroring how `AppShell::render` already
+# registers one per activity-bar item. Before this, every point in the
+# drawn title band (the menu row, vimcode's inline minimize/maximize/close,
+# and the command-centre search box) classified `HTCAPTION` in a live app —
+# confirmed on dell64 with real `SendInput`/`mouse_event` input, not
+# `PostMessage` (which bypasses `WM_NCHITTEST` and is how the bug went
+# unseen past #1199's original review) — swallowing the click before the
+# widget ever saw a `MouseDown`, even though the pure `nc_hit_test` unit
+# tests passed (they hand-registered the exclusion zone directly). No
+# vimcode-side change was needed to pick this up: `src/win/` never computed
+# its own hit zones, so there was nothing here to delete — the fix lives
+# entirely inside `WinBackend`'s own draw_* calls.
+#
+# Real-input re-verification (fix round, 2026-10-01): built with `cargo xwin
+# build --release --target x86_64-pc-windows-msvc --no-default-features
+# --features win` under `RUSTFLAGS="-C target-feature=+crt-static"`, ran
+# `vimcode.exe --version` (reports `quadraui fc94f2136bf6, win`, confirming
+# the resolved rev), then launched the built `.exe` on dell64's own Windows
+# 11 host with an *unlocked, active* session (no `LogonUI`, `query session`
+# shows `Active`, `GetForegroundWindow()` non-null) and drove it with
+# `SetCursorPos` + `mouse_event` (never `PostMessage`, which bypasses
+# `WM_NCHITTEST`):
+# - `WM_NCHITTEST` at the drawn menu row (File…Help, the command-centre
+#   search box) returns `HTCLIENT`; the narrow inter-widget gaps return
+#   `HTCAPTION`.
+# - A real click on File opens its dropdown (New Tab/Open File…/Quit etc.).
+# - A real click on the maximize button flips `IsZoomed` false → true.
+# - A real drag from an `HTCAPTION` point in the menu row moves the window
+#   by exactly the drag delta (`GetWindowRect` before/after confirms it).
+# - A real click on the close button (`HTCLOSE` by `WM_NCHITTEST`) ends the
+#   process (`Get-Process` confirms exit).
+# Every PID launched for this was stopped only by exact PID after
+# confirming its image path was this build's `vimcode.exe`, never by image
+# name.
+#
+# #1652 bumps to `ca7fcc8` (quadraui `develop` HEAD) to pick up quadraui#1108
+# (`TextInput`/`Toolbar`/`Editor` each gain a `new(required…)`/`with_*`/
+# `Default` constructor trio, plus the off-by-default `strict-descriptors`
+# feature that proves a consumer no longer needs an exhaustive struct
+# literal) and quadraui#1109 (removes the 54 deprecated items with zero
+# consumer uses; leaves deprecated anything either consumer still has a
+# live use of). This is the consumer-migration half quadraui#1251's
+# eventual `#[non_exhaustive]` cut needs to find already done:
+# `sc_commit_message_to_text_input`/`debug_toolbar`/`sc_button_toolbar`/
+# `app_support::scrollbar_probe_editor`/`render::to_q_editor` now build
+# their `quadraui::TextInput`/`Toolbar`/`Editor` with the new constructors
+# instead of an exhaustive literal, and `render.rs`'s `draw_toolbar`/
+# `draw_sidebar_panel` call sites and `raw_syntax_spans` field move onto
+# `draw_toolbar_interactive`/`draw_sidebar_panel_interactive`/
+# `quadraui::MinimapSpan` — the two remaining quadraui-only
+# `#[allow(deprecated)]`s #937 originally needed are gone. Verified by
+# temporarily adding `"strict-descriptors"` to this dependency's `features`
+# (not committed — quadraui#1251 removes the feature once every consumer
+# has migrated) and confirming `cargo check --all-targets` stays clean.
+# #1732 bumps to `1a87c4e` (quadraui `develop` HEAD; no `v0.1.0` tag exists
+# yet, so this is the closest available target) to pick up 39 commits
+# including the Win-GUI caption/drag/theme/quit fixes #1675/#1661/#1667 are
+# waiting on (quadraui#1259, #1260, #1261, #1278) and the Windows-TUI ConPTY
+# blink fix (quadraui#1284), plus the v0.1.0 breaking batch (`817b800`,
+# non_exhaustive descriptors + removed deprecated items), `Backend::
+# measure_text` (quadraui#1132) and the Style-tokens/unit-contract work
+# (quadraui#1133/#1098).
+#
+# #1765 bumps to `8425673` (quadraui `develop` HEAD, 11 commits ahead of
+# `1a87c4e`) for three fixes: quadraui#1282 (`8968808`, `9c9ccd6`,
+# `a48cf10` — caches Win-GUI brushes/text formats on the render target
+# instead of allocating ~647 brushes/frame) and quadraui#1101 (`7ed870e` —
+# makes `PaintSurface` a public trait; reshapes the `Backend` paint seam
+# but did not change vimcode behaviour — confirmed by a clean build on all
+# three feature sets, no call-site changes needed).
+#
+# quadraui#1295 (`3ebead9`, `b145a55`, `26ed611`) narrowed but did not
+# close vimcode#1735 (dead-pty busy-spin) for a headless, non-ctty `vcd` —
+# see `tests/pty_dead_master_exit.rs`'s module doc for the inter-slice-
+# window analysis that motivated the real fix below.
+#
+# #1775 bumps to `a536053` (quadraui `develop` HEAD, 8 commits ahead of
+# `8425673`) for quadraui#1301 (`4fda8f7`, `a536053`) — the actual fix for
+# the dead-pty busy-spin: `TuiBackend::wait_events` no longer delegates a
+# blocking wait straight to crossterm's broken `UnixInternalEventSource::
+# try_read`. It now calls this crate's own `poll(2)`-based
+# `wait_for_stdin_ready` first, for the caller's real timeout, and only
+# ever hands crossterm a guaranteed non-blocking `Duration::ZERO` call
+# once readiness with no hangup bit is already confirmed — so a hangup
+# arriving *during* what used to be the delegated blocking call is now
+# the wakeup itself (`POLLHUP`), not something a periodic re-check has to
+# race a call that never returns. This is what finally fixes vimcode#1735
+# — see `tests/pty_dead_master_exit.rs`, now un-`#[ignore]`d.
+#
+# Also carries quadraui#1099 (`c851834`, `44c95f6` — closes the
+# 14-primitive `Surface` gap, makes `FrameHitMap`/`FrameZone` serializable,
+# adds `#[non_exhaustive]` to `Surface`/`FrameZone`; `Surface<'a>`/
+# `ScreenLayout<'a>` still borrow — #1099's "owned Frame" half is
+# deliberately left open upstream, see `44c95f6`'s commit message —
+# adopted as-is, no vimcode call-site changes needed beyond what the
+# compiler required) and quadraui#1103 (`b6fd556`, `b5bf8ad` — optional
+# flex/grid layout over Taffy, feature-gated upstream and not enabled
+# here).
+#
+# Note on Cargo.lock across this bump: the only line cargo changes is
+# `quadraui`'s `source = "git+...#rev"` string. In particular the lock gains
+# no `taffy`/`slotmap` entries, even though quadraui `a536053` adds `taffy`
+# as an optional dependency behind its new `layout` feature (quadraui#1103).
+#
+# That is cargo's own output, not an inference, and it is cheap to re-check
+# in either direction with cargo 1.97.1 on this tree:
+#
+#   cargo metadata --locked        # succeeds => committed lock matches
+#   rm Cargo.lock && cargo build   # regenerated lock still has no taffy
+#   # and, flipping `rev` back to the previous pin 84256731 and rebuilding,
+#   # cargo writes a lock that differs from this one by that one source line
+#
+# Do NOT read this as a rule about cargo's resolver. It is specifically not
+# "unactivated optional deps are pruned": every *other* optional dependency
+# of quadraui (`gtk4`, `windows`, `objc2-app-kit`, `trash`, `keyring`, ...)
+# is in the lock, as are `ratatui`'s unactivated `ratatui-termwiz` /
+# `ratatui-termina`, which no vimcode feature can reach. `taffy` is the lone
+# exception and the mechanism behind that is not established here — so if a
+# future bump *does* add `taffy`/`slotmap`, that is unremarkable: commit
+# whatever lock cargo writes. The invariant worth preserving is only the one
+# the #896 note below also relies on — the committed lock must be what cargo
+# produces, verified with `--locked`, never hand-reasoned.
+#
+# #1843 bumps to `4e71a8b` (quadraui `develop` HEAD, **19 commits** ahead
+# of `a536053` — `git rev-list --count a5360532..4e71a8bb`, same by
+# `--first-parent`; 63 files changed, +5896/-160) for quadraui#1327:
+# ConPTY VT handshake answers plus the `default_shell()` `$SHELL` gate.
+# This is the fix for the Windows TUI `:term` blank-panel bug
+# (vimcode#1829) and very likely also the Win-GUI terminal (vimcode#1668)
+# — confirmed on dell64's real Windows host: the same
+# `tests/conpty_term_opens_shell_1829.rs` test against quadraui `a536053`
+# FAILED (no probe file within 20s), and against `4e71a8b` PASSED (1.9s).
+# See the comments on vimcode#1829 and quadraui#1327.
+#
+# Also carries quadraui#1325 (macOS GTK foreground activation, vimcode
+# #1825) — unconfirmed by a person on real macOS hardware yet, but that's
+# fine since the macOS GUI build is marked not-ready regardless.
+#
+# The rest of the 19-commit range this bump drags in, for anyone bisecting
+# a future regression:
+#   - `be97a62e` adds a `DoubleClick` arm for the activity bar to
+#     `AppShell::handle`. vimcode's own `App::handle_dispatch` carries a
+#     rescue rung (search "#1762 rescue" in `src/app.rs`) that exists
+#     specifically because this arm was missing upstream; traced after
+#     this bump and confirmed there is no double-handling — the rung
+#     intercepts `UiEvent::DoubleClick` first, re-synthesizes a
+#     `MouseDown`, and returns before the new upstream arm is ever
+#     reached. The rung itself is now redundant and should be removed as
+#     separate platform-neutrality follow-up work (GOALS.md milestone #7),
+#     not in this PR.
+#   - `18eda743`/`a1898415` add
+#     `Backend::draw_rich_text_popup_with_font_role`, closing the
+#     quadraui#220 gap (`RichTextPopup` previously hardcoded its chrome
+#     font).
+#   - `8b072205`/`066d5bae` add new `Canvas` and `Float` primitives, with
+#     accompanying `Surface`/`Backend`/`modal_stack` surface changes
+#     (`quadraui/src/{backend,frame,modal_stack}.rs`). No vimcode call-site
+#     changes needed beyond what the compiler required.
+#   - The `gtk` feature now pulls in `dep:objc2`/`dep:objc2-app-kit` on
+#     macOS as part of quadraui#1325's activation fix (previously those
+#     crates were only reachable via the `macos` feature); both are
+#     already present in this lockfile via that feature, so the lock gains
+#     no new entries.
+#   - The remaining commits in the range (`primitives/status_bar.rs`,
+#     `tui/braille.rs`, test/doc/refactor commits) are doc/test/refactor
+#     only — no rendering change, consistent with zero snapshot churn in
+#     this diff.
+#
+# Note on Cargo.lock across *this* bump (same invariant as the #896/#1775
+# notes above, verified the same way): the only line cargo changes is
+# `quadraui`'s `source = "git+...#rev"` string. The upstream manifest diff
+# (`quadraui/Cargo.toml`, `a536053..4e71a8b`) adds no new *external*
+# dependencies — it only adds `dep:objc2`/`dep:objc2-app-kit` to the
+# existing `gtk` feature, and both packages are already present in this
+# lockfile via the `macos` feature. Verified with `cargo metadata --locked`
+# against the committed lock.
+#
+# This PR also removes `continue-on-error: true` from the
+# `conpty_term_opens_shell_1829` step in `build-windows-tui` (ci.yml), so
+# it's a required gate like `conpty_idle_flicker` /
+# `conpty_activity_bar_click` — vimcode#1829 itself is NOT closed by this
+# bump (`Refs`, not `Fixes`); it closes only after a person sees a live
+# PowerShell prompt in `vcd.exe` on dell64.
+#
+# v0.15.0 release prep bumps to `80b96f5` (quadraui `develop` HEAD, 5 commits
+# ahead of `4e71a8b`) for quadraui#1334: the Linux TUI under Windows Terminal
+# (WSL, `WT_SESSION` set) now strips SGR 58 underline colours. ConPTY
+# misparsed the semicolon form as SGR 2 (faint), so C# files showed runs of
+# faded text and line numbers after every LSP-hint underline (confirmed on
+# real Windows Terminal -> WSL Ubuntu). Also carries quadraui#1328 (macOS
+# native `NSApplication::activate()`, confirmed by a person on macOS 26) and
+# the #1329 Core Text fallback investigation hook (no behaviour change).
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "80b96f550650816ea267427af85b641e1f573107", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
@@ -332,6 +560,11 @@ fancy-regex = "0.11"
 lsp-types = "0.97"
 mlua = { version = "0.9", features = ["lua54", "vendored"] }
 toml = "0.8"
+# #1807: extension manifests declare `requires_vimcode` as a semver
+# requirement string (e.g. ">=0.15.0"); already resolvable transitively
+# (cargo itself depends on it, see Cargo.lock) — pinned here as a direct
+# dependency since `extensions.rs` parses/compares with it directly.
+semver = "1.0"
 libc = "0.2"
 pulldown-cmark = { version = "0.13", default-features = false }
 streaming-iterator = "0.1.9"
@@ -392,6 +625,59 @@ rmpv = "1.3"
 # graph) — narrowing here is correct today and free if `arboard` ever
 # narrows its own request first.
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+# #1729: parses `tests/smoke-spec/catalogue.yaml` (the bugbash behaviour
+# catalogue, claude-coordinator#3580) in `tests/smoke_catalogue.rs`'s schema
+# test. Dev-only — nothing vimcode ships reads this file; `coord`'s own
+# bugbash tooling reads it directly as YAML in a separate (Python) process.
+serde_yaml = "0.9"
+
+# #1634: `tests/conpty_idle_flicker.rs` — the raw-output ConPTY idle
+# regression test for the Windows TUI fg-colour flicker. Target-gated (not
+# plain `[dev-dependencies]`) because this crate is only meaningful as a real
+# Win32 ConPTY host, i.e. only when *this test binary itself* is compiled for
+# `x86_64-pc-windows-msvc` and executed on real Windows (`dell64`'s WSL2
+# interop, or CI's `windows-latest`) — see that file's module doc. Gating
+# here, not just `#[cfg(target_os = "windows")]` inside the test file, keeps
+# a plain Linux `cargo test` (which never touches this target) from resolving
+# or building the crate at all.
+#
+# Pinned to `0.9.0`, the exact version already resolved in `Cargo.lock` —
+# `portable-pty` is already a transitive dependency (quadraui's `terminal`
+# feature, vimcode's own embedded terminal panel) whose Windows backend
+# (`portable_pty::win::conpty`) already wraps `CreatePseudoConsole` et al.,
+# so this adds no new crate version to the graph, just a direct name this
+# test can reach it by instead of hand-rolling the same Win32 FFI a second
+# time.
+[target.'cfg(windows)'.dev-dependencies]
+portable-pty = "=0.9.0"
+# #1636: `tests/conpty_activity_bar_click.rs` — the real-ConPTY activity-bar
+# click regression test. Same target-gating rationale as `portable-pty`
+# above (only meaningful as a real Win32 ConPTY host). `vt100` parses the
+# raw ANSI byte stream that test captures back into a screen model (cell
+# contents + position) so it can locate each activity-bar icon's actual
+# rendered column/row and send a real SGR mouse click at that exact spot,
+# rather than hand-rolling a second ANSI parser — quadraui's own
+# `tui::vt_testing`/`TuiVtDriver` already depends on this exact crate for
+# the same reason (see that module's doc). Pinned to `=0.16.2`, the version
+# already resolved in `Cargo.lock` via quadraui's `terminal` feature (always
+# enabled — see the `quadraui = {...}` dependency line above), so this adds
+# no new crate version to the graph.
+vt100 = "=0.16.2"
+
+# #1701: `tests/pty_settings_header_delay.rs` — the real-pty regression test
+# for the "Settings sidebar header shows the previous panel's name for
+# ~0.4-0.9s after the click" bugbash report. Unix twin of the
+# `[target.'cfg(windows)'.dev-dependencies]` block above: a real pty (not
+# `quadraui::tui::testing::TuiDriver`'s synthetic-event dispatch, which
+# can't observe wall-clock repaint timing at all) is the only way to see
+# whether the *live* terminal byte stream lags behind the click the way the
+# bugbash explorer's timestamped reads did. Same versions, same
+# already-resolved-via-quadraui's-`terminal`-feature rationale as above —
+# this adds no new crate version to `Cargo.lock`, just a direct name this
+# platform's test code can reach them by.
+[target.'cfg(unix)'.dev-dependencies]
+portable-pty = "=0.9.0"
+vt100 = "=0.16.2"
 
 [build-dependencies]
 cc = "1.0"

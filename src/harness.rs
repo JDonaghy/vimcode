@@ -139,6 +139,20 @@
 #[cfg(test)]
 pub mod plugin_panel;
 
+/// #146: the plugin-declared **view** (`vimcode.ui.register_view`) fixture +
+/// scenarios. Sibling of [`plugin_panel`], which covers the older
+/// `vimcode.panel.register` tree panels.
+#[cfg(test)]
+pub mod plugin_view;
+
+/// #147: driver-tier black-box tests for the bundled
+/// `contrib/extensions/rest-client` extension — loads the real on-disk
+/// Lua (not a synthetic fixture) via the same `PluginManager` harvest
+/// [`plugin_view`] uses. See that module's own doc for why `#[cfg(test)]`
+/// is the right (narrower) gate here too.
+#[cfg(test)]
+pub mod rest_client;
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -182,6 +196,51 @@ pub fn screen_row_has<D: ConformanceDriver>(driver: &D, needle: &str) -> bool {
             .collect::<String>()
             .contains(needle)
     })
+}
+
+/// Paint one frame *without* dispatching an input event — the harness
+/// stand-in for the runner's "the idle tick reported a redraw, so paint".
+///
+/// Every `ConformanceDriver` in quadraui repaints only when the app's own
+/// dispatch returns [`quadraui::Reaction::Redraw`], and none of them expose
+/// a tick on the shared trait (`TuiDriver::tick` exists; `GtkDriver` /
+/// `MacDriver` have no equivalent). So a backend-neutral scenario that
+/// advances *time-driven* engine state by hand — calling
+/// `Engine::poll_panel_hover` instead of sleeping out a real hover dwell —
+/// has no way to get that state onto the screen.
+///
+/// Before #1722 such scenarios got their frame by accident: a `MouseMoved`
+/// anywhere in the sidebar's X range forced a repaint whether or not any
+/// hover target changed (see [`crate::render::route_sidebar_hover`]'s own
+/// doc). That spurious repaint *was* the bug #1722 fixed, so the scenarios
+/// now ask for the frame explicitly, which is also what the real runner
+/// does — `Engine::poll_idle` returns `true` and the runner paints.
+///
+/// Implemented here rather than upstream because the trait is local; each
+/// driver already has a public, inherent `render()`.
+pub trait DriverRepaint {
+    /// Re-render the current app state into this driver's frame buffer.
+    fn repaint(&mut self);
+}
+
+impl<A: quadraui::AppLogic> DriverRepaint for quadraui::tui::testing::TuiDriver<A> {
+    fn repaint(&mut self) {
+        self.render();
+    }
+}
+
+#[cfg(feature = "gui")]
+impl<A: quadraui::AppLogic> DriverRepaint for quadraui::gtk::testing::GtkDriver<A> {
+    fn repaint(&mut self) {
+        self.render();
+    }
+}
+
+#[cfg(all(feature = "macos", target_os = "macos"))]
+impl<A: quadraui::AppLogic> DriverRepaint for quadraui::macos::testing::MacDriver<A> {
+    fn repaint(&mut self) {
+        self.render();
+    }
 }
 
 /// A backend-neutral [`ConformanceDriver`] plus the `Rc` handle to the
@@ -1080,11 +1139,16 @@ pub fn sidebar_ctrl_w_l_returns_focus_to_the_editor<D: ConformanceDriver + Drive
 /// something else entirely (panel-local navigation / a plain editor motion +
 /// line-join respectively), never switches the sidebar to a different
 /// panel. So Search -> `Ctrl-W h` (arm+toolbar-focus) -> `j` (select the
-/// next toolbar item, Debug) -> `l` (activate it) landing on the Debug
-/// panel's own painted content (case-insensitive `"debug"` — GTK's shared
-/// `App` titles this panel "RUN AND DEBUG", the pre-#1434 TUI shell's own independent
-/// `shell_config` titles it "Debug"; `"debug"` is a substring of both)
-/// proves the chord actually moved focus to the toolbar.
+/// next toolbar item, Source Control — #1698 reordered `FIXED_ACTIVITY_
+/// PANEL_IDS` so Source Control, not Debug, now immediately follows Search,
+/// matching VS Code's Explorer/Search/Source Control/Run and Debug
+/// sequence) -> `l` (activate it) landing on the Source Control panel's own
+/// painted content (case-insensitive `"control"` — both
+/// `sidebar::fixed_panel_title_tooltip`'s shared title table and the
+/// pre-#1434 TUI shell's own independent `shell_config` title this panel
+/// "SOURCE CONTROL"/"Source Control", painted as two separate text runs on
+/// `tui_prod`, hence the single-word needle) proves the chord actually
+/// moved focus to the toolbar.
 ///
 /// Deliberately not `q` (`ActivityBarKeyAction::Collapse`): that hits an
 /// unrelated, pre-existing gap confirmed by hand while developing this
@@ -1134,12 +1198,19 @@ pub fn sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar<
     ConformanceDriver::type_char(driver, 'h');
     ConformanceDriver::type_char(driver, 'j');
     ConformanceDriver::type_char(driver, 'l');
+    // "control", not "source control": the header paints as two separate
+    // text runs ("SOURCE", "CONTROL" — one per styled span, same reason
+    // `GtkDriver::find`'s own doc warns against a needle that straddles a
+    // style change), so a two-word needle never matches a single run even
+    // though both words are on screen. "control" alone is still unique to
+    // this panel's header on this fixture.
     assert!(
-        screen_has_ci(driver, "debug"),
+        screen_has_ci(driver, "control"),
         "Ctrl-W h must move keyboard focus to the activity bar toolbar -- \
-         'j' then 'l' from there must move the toolbar cursor onto Debug \
-         (the next fixed panel after Search) and activate it, which a \
-         still-panel-focused or still-editor-focused 'j'/'l' would not do"
+         'j' then 'l' from there must move the toolbar cursor onto Source \
+         Control (the next fixed panel after Search) and activate it, \
+         which a still-panel-focused or still-editor-focused 'j'/'l' would \
+         not do"
     );
 }
 
@@ -2254,6 +2325,163 @@ mod tests {
                 !driver.screen_has("Press '?' for help"),
                 "the SC panel lost keyboard focus, so the hint row must no \
                  longer be reserved/painted"
+            );
+        },
+    }
+
+    // ── #1797 review (non-blocking finding): GTK twin for the CHANGES
+    // badges scenario ──
+    //
+    // The first version of this PR only covered the fix with a
+    // `TuiDriver` scenario (`src/tui_main/app_on_tui_tests.rs`'s
+    // `sc_panel_changes_section_shows_status_badges_for_modified_and_
+    // untracked_files_1797`), even though the fix itself
+    // (`Engine::adopt_cwd_for_startup_file`) is shared, platform-neutral
+    // `core` code that both backends' `sc_refresh`/paint paths read
+    // identically. This fixture mirrors `engine_with_sc_panel` above but
+    // drives the actual fixed code path (`startup_without_session_
+    // restore`, not a hand-set `engine.cwd`) from a launch `cwd` that is
+    // deliberately unrelated to (and has no git repo of its own, same as)
+    // the file's real workspace — exactly the #1797 bug-bash shape — so
+    // the `gtk`/`tui_prod` arms below give GTK and the pre-#1434 TUI shell
+    // the same fail-first coverage the `TuiDriver` scenario already has.
+    fn engine_outside_cwd_with_sc_panel_1797(tag: &str) -> crate::core::Engine {
+        let workspace = scratch_dir(&format!("vimcode_test_1797_sc_panel_ws_{tag}"));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "t@t.com"]);
+        run_git(&["config", "user.name", "T"]);
+
+        let tracked = workspace.join("main.rs");
+        std::fs::write(&tracked, "fn main() {}\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+        std::fs::write(&tracked, "fn main() { /* changed */ }\n").unwrap();
+
+        let untracked = workspace.join("extra.rs");
+        std::fs::write(&untracked, "// new file\n").unwrap();
+
+        // Deliberately not `workspace`: an unrelated, repo-less directory
+        // standing in for "wherever the process's cwd happened to be at
+        // launch" -- only the fixed `adopt_cwd_for_startup_file` can make
+        // `cwd` land on the file's real repo from here.
+        let launch_cwd = scratch_dir(&format!("vimcode_test_1797_sc_panel_launch_{tag}"));
+        let _ = std::fs::remove_dir_all(&launch_cwd);
+        std::fs::create_dir_all(&launch_cwd).unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.swap_file = false;
+        engine.cwd = launch_cwd;
+        engine.startup_without_session_restore(Some(&tracked));
+        engine.git_branch = Some("main".to_string());
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_GIT,
+        ));
+        // The manual refresh the report's repro step triggers via the
+        // sync/refresh icon -- see the `TuiDriver`-level scenario for the
+        // click-driven version of this same gesture. Calling `sc_refresh`
+        // directly here keeps this fixture backend-neutral (an icon-only
+        // toolbar button's painted bounds differ enough between GTK's
+        // pixel layout and TUI's cell layout that locating it generically
+        // across both backends is its own, separate concern from what
+        // this scenario is pinning: that the fix makes `sc_refresh`
+        // itself resolve the right repo, and that both backends paint the
+        // result identically once it does).
+        engine.sc_refresh();
+        engine
+    }
+
+    /// Whether a painted text run reading exactly `badge` sits on the
+    /// same row as, and strictly left of, the first painted run
+    /// containing `filename` -- i.e. the status badge is painted
+    /// immediately before the file's name, the same relationship
+    /// `screen_has("M main.rs")` checks on a single joined-row backend
+    /// like TUI.
+    ///
+    /// Not just `inv.screen_has("M main.rs")` (#1797 review): GTK paints
+    /// the status char and the filename as two *separate* coloured Pango
+    /// labels (`render::populate_sc_sidebar_system`'s `StyledSpan::
+    /// with_fg(ch.to_string(), color)` + a second `StyledSpan::plain`),
+    /// so `screen_has`/`painted_text`'s per-label `contains` check never
+    /// sees the combined substring on that backend -- only TUI's
+    /// `screen_has` incidentally works, because its `screen()` joins an
+    /// entire row into one string before searching it. This instead uses
+    /// [`quadraui::testing::FrameInventory`]'s own relational vocabulary
+    /// (quadraui#490: `left_of`/`same_row`, built exactly for "two
+    /// painted things, however many labels either backend split them
+    /// into"), with an *exact* match on `badge` rather than `contains`
+    /// so a status bar mode indicator like "NORMAL" (which `contains`
+    /// would match against a bare "M" needle) can't false-positive.
+    fn badge_precedes_file(
+        inv: &quadraui::testing::FrameInventory,
+        badge: char,
+        filename: &str,
+    ) -> bool {
+        let badge = badge.to_string();
+        // `filename` can legitimately paint more than once a frame (the
+        // tab bar's own title, the breadcrumb, *and* its CHANGES-section
+        // row all read "main.rs") -- checking only the first match in
+        // paint order found the tab title instead of the CHANGES row and
+        // never saw a badge next to it. Check every occurrence instead;
+        // only one needs a badge immediately to its left.
+        inv.text_runs()
+            .iter()
+            .filter(|r| r.text.contains(filename))
+            .any(|file_run| {
+                inv.text_runs().iter().any(|r| {
+                    r.text == badge
+                        && r.bounds.x + r.bounds.width <= file_run.bounds.x
+                        && r.bounds.y < file_run.bounds.y + file_run.bounds.height
+                        && file_run.bounds.y < r.bounds.y + r.bounds.height
+                })
+            })
+    }
+
+    crate::backend_conformance! {
+        label: sc_panel_changes_section_shows_status_badges_after_startup_cwd_fix_1797,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_outside_cwd_with_sc_panel_1797("badges"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("SOURCE CONTROL"),
+                "precondition: the SC panel must be showing"
+            );
+            assert!(
+                driver.screen_has("CHANGES"),
+                "precondition: the CHANGES section header must be painted"
+            );
+            assert!(
+                driver.screen_has("main.rs"),
+                "the modified tracked file's name must be painted in the \
+                 CHANGES list"
+            );
+            assert!(
+                driver.screen_has("extra.rs"),
+                "the untracked file's name must be painted in the CHANGES \
+                 list"
+            );
+            let inv = driver.inventory();
+            assert!(
+                badge_precedes_file(&inv, 'M', "main.rs"),
+                "the modified tracked file must carry an 'M' status badge"
+            );
+            assert!(
+                badge_precedes_file(&inv, 'U', "extra.rs"),
+                "the untracked file must carry a 'U' status badge (VS \
+                 Code's untracked glyph -- see `StatusKind::label`'s own \
+                 doc for why this is 'U', not git's raw '?')"
             );
         },
     }
@@ -5503,14 +5731,24 @@ mod issue_1256_sidebar_chrome {
 /// gap inventory re-checked that claim by actually running the `tui` arm
 /// (rather than trusting the comment) and it no longer reproduces — the
 /// precondition (`screen_has("Ln 1,")`) and the rest of
-/// [`activity_bar_click_focuses_search_panel`]'s body all pass cleanly at
-/// this scenario's `(800, 480)` size. Whatever regressed the by-hand
-/// observation has since been fixed elsewhere (most likely #700's move to
-/// fixed-pixel `TAB_ROW_HEIGHT_PX`/`BREADCRUMB_ROW_HEIGHT_PX` no longer
-/// scaling with `line_height`, so the huge `lh` a `TuiBackend` used to
-/// report no longer inflates the reserved chrome past the viewport) —
-/// registering the `tui` arm plain (no `KNOWN_BUGS` gate) is itself the
-/// record that this gap has closed.
+/// [`activity_bar_click_focuses_search_panel`]'s body all pass cleanly.
+/// Whatever regressed the by-hand observation has since been fixed
+/// elsewhere (most likely #700's move to fixed-pixel
+/// `TAB_ROW_HEIGHT_PX`/`BREADCRUMB_ROW_HEIGHT_PX` no longer scaling with
+/// `line_height`, so the huge `lh` a `TuiBackend` used to report no longer
+/// inflates the reserved chrome past the viewport) — registering the `tui`
+/// arm plain (no `KNOWN_BUGS` gate) is itself the record that this gap has
+/// closed.
+///
+/// Width bumped `800` -> `1600` (#1690): the ruler (`Ln N, Col N`) this
+/// scenario's precondition and both post-click assertions all read moved
+/// to the front of the right-side priority-drop order (VS Code parity —
+/// it is now the *leftmost* segment of the right group, not the protected
+/// right-most one), so the `gtk` arm's real pixel geometry — sidebar +
+/// activity bar default-visible chrome subtracted from `800`px — no
+/// longer leaves it room. `1600` is shared with `tui`/`tui_prod` too (one
+/// `size` for all three arms), but a wider cell-grid terminal changes
+/// nothing either of those already-passing arms assert on.
 #[cfg(test)]
 mod issue_1360_activity_bar_click_focuses_panel {
     fn engine_fixture() -> crate::core::Engine {
@@ -5528,7 +5766,7 @@ mod issue_1360_activity_bar_click_focuses_panel {
         label: activity_bar_click_focuses_search_panel_proof,
         backends: [gtk, tui, tui_prod],
         engine: engine_fixture(),
-        size: (800, 480),
+        size: (1600, 480),
         body: |driver| {
             crate::harness::activity_bar_click_focuses_search_panel(driver);
         },
@@ -5680,6 +5918,12 @@ mod issue_1426_app_on_tui_rows_match_shipped_tui {
 /// `activity_bar_click_focuses_search_panel` above running clean there in
 /// spirit) but is still pinned to `[gtk, tui_prod]` for symmetry with its
 /// sibling.
+///
+/// The `l` proof's width is bumped `800` -> `1600` (#1690), same
+/// `Ln N, Col N`-priority-drop rationale as
+/// `issue_1360_activity_bar_click_focuses_panel`'s own note — the `h`
+/// proof below does not read that segment, so its `(800, 480)` is
+/// untouched.
 #[cfg(test)]
 mod issue_406_sidebar_ctrl_w_navigates {
     fn engine_fixture() -> crate::core::Engine {
@@ -5697,7 +5941,7 @@ mod issue_406_sidebar_ctrl_w_navigates {
         label: sidebar_ctrl_w_l_returns_focus_to_the_editor_proof,
         backends: [gtk, tui, tui_prod],
         engine: engine_fixture(),
-        size: (800, 480),
+        size: (1600, 480),
         body: |driver| {
             crate::harness::sidebar_ctrl_w_l_returns_focus_to_the_editor(driver);
         },
@@ -6098,12 +6342,26 @@ mod issue_1427_menu_bar_reveal_shared {
     /// Alt+F must reveal the (hidden by default) menu bar *and* hand the
     /// same keystroke to the `MenuSystem` intercept, which activates the
     /// File menu — both of which redraw, and the reveal reserves one more
-    /// row above the editor content, shifting a marker at buffer offset 0
-    /// down by exactly one line.
+    /// row above the editor content, shifting a marker down by exactly
+    /// one line.
+    ///
+    /// #1732: the File dropdown's width used to be a flat `20.0 * lh`
+    /// guess; quadraui#1132 (`dropdown_width`, measured from the real
+    /// item labels via `Backend::measure_text`) widened it to fit its
+    /// longest item ("Open Workspace From File…"), which now bleeds past
+    /// the Explorer sidebar's own width into the editor's first ~10
+    /// columns. A marker at buffer offset 0 would sit inside that
+    /// dropdown's footprint and get column-clipped instead of testing the
+    /// row shift this scenario is actually about, so the marker lives 15
+    /// blank lines down — below the File dropdown's current 14-row
+    /// height (1 header + 12 items/separators + 1 border), comfortably
+    /// inside this 24-row viewport either side of the Alt-reveal.
     #[test]
     fn alt_letter_reveals_menu_bar_via_app_on_tui() {
         let mut engine = engine_with_sidebar_open();
-        engine.buffer_mut().insert(0, "ZQXW_ALT_MARKER");
+        engine
+            .buffer_mut()
+            .insert(0, &format!("{}ZQXW_ALT_MARKER", "\n".repeat(15)));
         let mut h = crate::tui_main::testing::conformance_harness(engine, 80, 24);
 
         let before = h.driver.screen();
@@ -6324,5 +6582,75 @@ mod issue_1427_menu_bar_reveal_shared {
              (the #988 symptom); screen:\n{}",
             h.driver.screen()
         );
+    }
+}
+
+// #1789: bugbash finding — the Command Palette's "File: New Tab" row
+// advertises `Ctrl+T` as its shortcut hint, but the chord's real, live
+// binding is `panel_keys.open_terminal` (README § "Integrated Terminal":
+// "`Ctrl-T` (Normal mode) — toggle the integrated terminal panel";
+// `PanelKeys::open_terminal`'s own `#[serde(default = "pk_open_terminal")]`
+// → `"<C-t>"`, registered globally by `render::register_panel_accelerators`
+// regardless of Vim/VSCode mode). Pressing Ctrl+T opens/focuses the
+// terminal panel, never creates a second tab — exactly the mismatch
+// vimcode#1789 reports, reproduced here as a cross-backend conformance
+// scenario rather than fixed by changing the live keybinding: the terminal
+// toggle is the one README documents as intentional, so the bug is the
+// palette's own stale label, not the chord's behaviour. (The chord's own
+// live behaviour already has coverage elsewhere — e.g.
+// `menu_terminal_activation_opens_terminal_pane` below — this scenario
+// only needs to pin the label.)
+#[cfg(test)]
+mod issue_1789_command_palette_new_tab_shortcut_lies {
+    use super::*;
+
+    fn engine_vscode_fixture() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine
+    }
+
+    /// The Command Palette's own displayed shortcut hint for "File: New
+    /// Tab" must not claim `Ctrl+T` — that chord is live-bound to the
+    /// integrated terminal toggle (`panel_keys.open_terminal`), never to
+    /// `tabnew`.
+    ///
+    /// RED against unfixed `develop`: `PALETTE_COMMANDS`'s `"File: New
+    /// Tab"` entry hard-codes `shortcut: "Ctrl+T"` with an empty
+    /// `vscode_shortcut` (falls back to `shortcut`), so the palette row
+    /// paints "Ctrl+T" right next to "File: New Tab" in every mode.
+    crate::backend_conformance! {
+        label: command_palette_new_tab_shortcut_matches_live_binding,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_vscode_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            // Opened via F1 (`PALETTE_COMMANDS`'s own "View: Command
+            // Palette" entry, `vscode_shortcut: "F1"`, handled directly in
+            // both modes by `Engine::handle_key`/`vscode.rs`) rather than
+            // `:CommandPalette` — VSCode mode has no Normal-mode ':'
+            // gesture, so typing ':' there inserts a literal colon into
+            // the buffer instead of opening the command line.
+            driver.press_named(NamedKey::F(1));
+            driver.type_text("New Tab");
+            // "File:" alone, not the full "File: New Tab" phrase — TUI
+            // paints each word of a palette row as its own text run with
+            // no joining space (`command_palette_filters_and_escape_
+            // dismisses`'s own doc spells this out), so a needle spanning
+            // the "New"/"Tab" word boundary never matches there even
+            // though the phrase is plainly on screen.
+            assert!(
+                screen_row_has(driver, "File:"),
+                "typing 'New Tab' must keep the 'File: New Tab' entry visible"
+            );
+            assert!(
+                !screen_row_has(driver, "Ctrl+T"),
+                "#1789: the palette must not advertise Ctrl+T as 'File: \
+                 New Tab's shortcut — that chord is live-bound to the \
+                 integrated terminal toggle (panel_keys.open_terminal), \
+                 never to tabnew"
+            );
+        },
     }
 }

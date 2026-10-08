@@ -1,0 +1,2549 @@
+# vimcode#1729 -- behaviour catalogue for the cross-platform bug-bash.
+#
+# This file is the shared contract between `claude-coordinator`'s
+# `coord bugbash vimcode` (claude-coordinator#3580) and this repo: a list of
+# concrete user journeys with an observable expected outcome, so bugbash can
+# drive the real app and judge pass/fail without inventing behaviour or
+# needing prior vimcode context. It supplements (does not replace) the
+# Tier-2 smoke specs in this same directory (`tui.yaml`, `gtk-gui.yaml`,
+# `mac-gui.yaml`, `win-gui.yaml`, `win-terminal.yaml`), which pin exact
+# driver steps/coordinates for a handful of previously-reported bugs; this
+# file is broader and shallower -- one line of steps, one line of expected
+# outcome, no driver-specific coordinates.
+#
+# `reference` says where `expected` comes from, not the author's opinion:
+#   - nvim:     whatever real Neovim does for the same keystrokes on the
+#               same buffer (buffer text, cursor, registers). Only features
+#               VIM_COMPATIBILITY.md marks (tick) are catalogued here --
+#               never a known-unsupported (cross) one.
+#   - vscode:   VS Code's own default keybindings (per-OS: Ctrl on
+#               Linux/Windows, Cmd on macOS, with documented exceptions
+#               called out explicitly in `reference_detail`).
+#   - spec:     this repo's own README/docs describing intended behaviour
+#               (mode switching, chrome, VSCode-mode specifics without a
+#               1:1 VS Code command).
+#   - platform: a checkable terminal/OS/rendering fact (Option-as-Meta,
+#               ConPTY vs a Unix pty, Nerd Font fallback, truecolor vs
+#               256-color, IME positioning, etc.) rather than an app
+#               behaviour.
+#
+# `lanes` are the coordinator's driver kinds (`scripts/validate_smoke_specs.py`
+# is the other place these four strings are enumerated): `tui-pty`,
+# `win-native`, `mac-native`, `gtk-native`.
+#
+# Extensions are out of scope for this version (per the issue) -- no
+# extension-install or extension-API journeys appear below.
+#
+# Schema is checked by `tests/smoke_catalogue.rs`: unique `id`s, every
+# enum-valued field drawn from a known set, non-empty `steps`/`expected`.
+# **Do not run these journeys or fix anything here** -- this file is the
+# catalogue only; findings come from an actual bug-bash run afterward.
+version: 1
+journeys:
+- id: vscode-type-inserts-at-cursor
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: Default text-entry behaviour of any VS Code text editor
+  steps: Empty buffer, cursor at 0,0; type 'hello'
+  expected: Buffer contains 'hello'; cursor sits right after the final 'o'
+  priority: 1
+- id: vscode-backspace-deletes-prev-char
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'VS Code default: Backspace deletes the character before the cursor'
+  steps: Buffer 'hello', cursor at end of line; press Backspace
+  expected: Buffer becomes 'hell'; cursor after the final 'l'
+  priority: 1
+- id: vscode-delete-key-deletes-next-char
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'VS Code default: Delete removes the character under/after the cursor'
+  steps: Buffer 'hello', cursor at column 0; press Delete
+  expected: Buffer becomes 'ello'; cursor stays at column 0
+  priority: 2
+- id: vscode-enter-splits-line
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'VS Code default: Enter inserts a newline, splitting the current line'
+  steps: Buffer 'foobar', cursor between 'foo' and 'bar'; press Enter
+  expected: 'Buffer becomes two lines: ''foo'' and ''bar''; cursor at start of second line'
+  priority: 1
+- id: vscode-tab-inserts-indent
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'VS Code default: Tab at line start inserts one indent level'
+  steps: Empty line, cursor at column 0; press Tab
+  expected: Line now starts with one indent level (spaces per 'tabSize'/'insertSpaces', or a literal tab);
+    cursor moves past it
+  priority: 1
+- id: vscode-shift-tab-outdents
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.outdentLines (Shift+Tab)
+  steps: Line indented one level, cursor anywhere on it; press Shift+Tab
+  expected: Line's leading indent is reduced by one level
+  priority: 2
+- id: vscode-arrow-keys-move-cursor
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: Default arrow-key cursor movement
+  steps: Buffer 'abc\ndef', cursor at 0,0; press Right, Right, Down
+  expected: Cursor ends at line 1 ('def'), column 2
+  priority: 1
+- id: vscode-ctrl-right-word-jump
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding cursorWordRight (Ctrl+Right; Option+Right on macOS)
+  steps: Buffer 'foo bar baz', cursor at column 0; press Ctrl+Right twice
+  expected: Cursor lands at the start of 'baz' (column 8)
+  priority: 2
+- id: vscode-ctrl-left-word-jump
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding cursorWordLeft (Ctrl+Left; Option+Left on macOS)
+  steps: Buffer 'foo bar baz', cursor at end of line; press Ctrl+Left twice
+  expected: Cursor lands at the start of 'bar' (column 4)
+  priority: 2
+- id: vscode-ctrl-home-buffer-start
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding cursorTop (Ctrl+Home; Cmd+Up on macOS)
+  steps: Buffer with 5 lines, cursor on last line; press Ctrl+Home
+  expected: Cursor moves to line 0, column 0
+  priority: 2
+- id: vscode-ctrl-end-buffer-end
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding cursorBottom (Ctrl+End; Cmd+Down on macOS)
+  steps: Buffer with 5 lines, cursor on first line; press Ctrl+End
+  expected: Cursor moves to the last line, at its last column
+  priority: 2
+- id: vscode-home-smart-home-toggle
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'VS Code default: Home goes to first non-whitespace, pressing again goes to column
+    0'
+  steps: Line '    foo', cursor at column 7 (end); press Home, then Home again
+  expected: First Home moves cursor to column 4 (the 'f'); second Home moves it to column 0
+  priority: 2
+- id: vscode-shift-right-extends-selection-one-char
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding cursorRightSelect (Shift+Right)
+  steps: Buffer 'hello', cursor at column 0; press Shift+Right three times
+  expected: Selection spans columns 0-3 ('hel'); status bar/selection indicator shows a 3-character selection
+  priority: 1
+- id: vscode-shift-down-extends-selection-one-line
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding cursorDownSelect (Shift+Down)
+  steps: Buffer 'aaa\nbbb\nccc', cursor at 0,0; press Shift+Down
+  expected: Selection spans from 0,0 to 1,0 (the whole first line plus the newline)
+  priority: 2
+- id: vscode-shift-home-extends-to-line-start
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding cursorHomeSelect (Shift+Home)
+  steps: Line 'hello world', cursor at end of line; press Shift+Home
+  expected: Selection spans from column 0 to the cursor's original position
+  priority: 1
+- id: vscode-shift-end-extends-to-line-end
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding cursorEndSelect (Shift+End)
+  steps: Line 'hello world', cursor at column 0; press Shift+End
+  expected: Selection spans the whole line, from column 0 to column 11
+  priority: 1
+- id: vscode-ctrl-shift-right-extends-by-word
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding cursorWordRightSelect (Ctrl+Shift+Right)
+  steps: Buffer 'foo bar baz', cursor at column 0; press Ctrl+Shift+Right
+  expected: Selection spans columns 0-3 ('foo')
+  priority: 2
+- id: vscode-ctrl-a-select-all
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.selectAll (Ctrl+A; Cmd+A on macOS)
+  steps: Buffer 'line1\nline2\nline3'; press Ctrl+A
+  expected: Entire buffer is selected, from 0,0 to the end of the last line
+  priority: 1
+- id: vscode-typing-replaces-selection
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'Default VS Code behaviour: typing while text is selected replaces it'
+  steps: Buffer 'hello world', select 'hello' (columns 0-5); type 'goodbye'
+  expected: Buffer becomes 'goodbye world'; cursor right after 'goodbye'
+  priority: 1
+- id: vscode-escape-clears-selection-stays-insert
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'README ''VSCode Mode'': Escape clears selection, stays in insert state'
+  steps: Buffer 'hello', select all of it; press Escape
+  expected: Selection is cleared; status bar still reads EDIT (not a Vim mode); no text is deleted
+  priority: 1
+- id: vscode-ctrl-c-copies-selection
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.clipboardCopyAction (Ctrl+C; Cmd+C on macOS)
+  steps: Buffer 'hello world', select 'hello'; press Ctrl+C, move cursor to end of line, press Ctrl+V
+  expected: Buffer becomes 'hello worldhello'; original selection is untouched by the copy
+  priority: 1
+- id: vscode-ctrl-c-copies-selection-exact-length
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.clipboardCopyAction (Ctrl+C; Cmd+C on macOS)
+  steps: Buffer 'hello world', Ctrl+Home, Shift+Right x6 (selects 'hello ' -- 6 chars including the
+    trailing space); press Ctrl+C, Ctrl+End, Ctrl+V
+  expected: Buffer becomes 'hello worldhello '; the pasted text is exactly the 6 selected characters,
+    not 7 (copying must not include one extra trailing character past the selection)
+  priority: 1
+- id: vscode-ctrl-c-no-selection-copies-whole-line
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'VS Code default: with no selection, Copy acts on the whole current line'
+  steps: Buffer 'first\nsecond\nthird', cursor on 'second' with no selection; press Ctrl+C, then move
+    to end of 'third' and press Enter then Ctrl+V
+  expected: The pasted text is the full line 'second\n'; buffer gains a new 'second' line after 'third'
+  priority: 1
+- id: vscode-ctrl-x-cuts-selection
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.clipboardCutAction (Ctrl+X; Cmd+X on macOS)
+  steps: Buffer 'hello world', select 'hello '; press Ctrl+X
+  expected: Buffer becomes 'world'; the cut text is now on the clipboard (Ctrl+V elsewhere re-inserts
+    'hello ')
+  priority: 1
+- id: vscode-ctrl-x-no-selection-cuts-whole-line
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'VS Code default: with no selection, Cut removes and copies the whole current line'
+  steps: Buffer 'first\nsecond\nthird', cursor on 'second' with no selection; press Ctrl+X
+  expected: Buffer becomes 'first\nthird'; the removed line 'second\n' is now on the clipboard
+  priority: 1
+- id: vscode-ctrl-v-pastes
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.clipboardPasteAction (Ctrl+V; Cmd+V on macOS)
+  steps: Clipboard holds 'xyz'; buffer 'ab', cursor at column 1; press Ctrl+V
+  expected: Buffer becomes 'axyzb'; cursor right after the pasted text
+  priority: 1
+- id: vscode-ctrl-z-undo
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding undo (Ctrl+Z; Cmd+Z on macOS)
+  steps: Buffer 'hello'; type ' world'; press Ctrl+Z
+  expected: Buffer returns to 'hello'; cursor returns to where it was before the typed text
+  priority: 1
+- id: vscode-ctrl-y-redo
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding redo (Ctrl+Y; Cmd+Shift+Z on macOS)
+  steps: Buffer 'hello'; type ' world'; press Ctrl+Z, then Ctrl+Y
+  expected: Buffer ends as 'hello world' again; the undone edit is restored
+  priority: 2
+- id: vscode-ctrl-s-save
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.files.save (Ctrl+S; Cmd+S on macOS)
+  steps: Open an existing file, make an edit (dirty indicator visible on the tab); press Ctrl+S
+  expected: File is written to disk; the tab's dirty/modified indicator disappears
+  priority: 1
+- id: vscode-ctrl-slash-toggle-line-comment
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.commentLine (Ctrl+/; Cmd+/ on macOS)
+  steps: Python buffer, line 'x = 1', cursor on it; press Ctrl+/, then press Ctrl+/ again
+  expected: First press turns the line into '# x = 1' (language-aware comment prefix); second press removes
+    it, restoring 'x = 1'
+  priority: 1
+- id: vscode-alt-up-moves-line-up
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'README ''Line Operations'': Alt+Up moves the current line up'
+  steps: Buffer 'aaa\nbbb', cursor on 'bbb'; press Alt+Up
+  expected: Buffer becomes 'bbb\naaa'; cursor stays on the moved line, now line 0
+  priority: 1
+- id: vscode-alt-down-moves-line-down
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'README ''Line Operations'': Alt+Down moves the current line down'
+  steps: Buffer 'aaa\nbbb', cursor on 'aaa'; press Alt+Down
+  expected: Buffer becomes 'bbb\naaa'; cursor stays on the moved line, now line 1
+  priority: 2
+- id: vscode-alt-shift-up-duplicates-line-up
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'README ''Line Operations'': Alt+Shift+Up duplicates the line/selection, inserting
+    the copy above'
+  steps: Buffer 'aaa\nbbb', cursor on 'bbb'; press Alt+Shift+Up
+  expected: Buffer becomes 'aaa\nbbb\nbbb'; cursor stays at the same line *index* (line 1), which the
+    new, upper copy now occupies — real VS Code's copyLinesUpAction moves the cursor with the
+    duplicate it just created, not with the original text, matching copyLinesDownAction's own
+    "cursor follows the new copy" symmetry below rather than being its mirror opposite
+  priority: 2
+- id: vscode-alt-shift-down-duplicates-line-down
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'README ''Line Operations'': Alt+Shift+Down duplicates the line/selection, inserting
+    the copy below'
+  steps: Buffer 'aaa\nbbb', cursor on 'aaa'; press Alt+Shift+Down
+  expected: Buffer becomes 'aaa\naaa\nbbb'; cursor moves to the new copy (line 1)
+  priority: 2
+- id: vscode-ctrl-shift-k-deletes-line
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.deleteLines (Ctrl+Shift+K)
+  steps: Buffer 'aaa\nbbb\nccc', cursor on 'bbb'; press Ctrl+Shift+K
+  expected: Buffer becomes 'aaa\nccc'; cursor lands on what is now line 1 ('ccc')
+  priority: 2
+- id: vscode-ctrl-enter-inserts-line-below
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.insertLineAfter (Ctrl+Enter)
+  steps: Buffer 'foo', cursor in the middle of the word; press Ctrl+Enter
+  expected: A new empty line is inserted below the current line; cursor moves to it; 'foo' is left intact
+    on its own line
+  priority: 2
+- id: vscode-ctrl-shift-enter-inserts-line-above
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.insertLineBefore (Ctrl+Shift+Enter)
+  steps: Buffer 'foo', cursor in the middle of the word; press Ctrl+Shift+Enter
+  expected: A new empty line is inserted above the current line; cursor moves to it; 'foo' is left intact,
+    now one line further down
+  priority: 2
+- id: vscode-ctrl-l-selects-line-then-extends
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding expandLineSelection (Ctrl+L)
+  steps: Buffer 'aaa\nbbb\nccc', cursor on 'aaa'; press Ctrl+L, then Ctrl+L again
+  expected: First press selects all of line 'aaa' (cursor moves to start of 'bbb'); second press extends
+    the selection to also cover 'bbb'
+  priority: 2
+- id: vscode-ctrl-d-adds-next-occurrence
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.addSelectionToNextFindMatch (Ctrl+D; Cmd+D
+    on macOS)
+  steps: Buffer 'foo bar foo', cursor on the first foo; press Ctrl+D twice
+  expected: Two selections, one on each 'foo'; typing replaces both
+  priority: 1
+- id: vscode-ctrl-shift-l-selects-all-occurrences
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.selectHighlights (Ctrl+Shift+L; Cmd+Shift+L
+    on macOS)
+  steps: Buffer 'foo bar foo baz foo', cursor on any 'foo'; press Ctrl+Shift+L
+  expected: Three selections, one on every occurrence of 'foo' in the buffer; typing replaces all three
+    simultaneously
+  priority: 2
+- id: vscode-ctrl-bracket-right-indents
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.indentLines (Ctrl+])
+  steps: Buffer line 'foo' with no leading indent, cursor on it; press Ctrl+]
+  expected: 'Line gains one indent level: ''    foo'' (or a literal tab, per settings)'
+  priority: 2
+- id: vscode-ctrl-bracket-left-outdents
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.outdentLines (Ctrl+[)
+  steps: Buffer line '    foo' (one indent level), cursor on it; press Ctrl+[
+  expected: Line loses one indent level, becoming 'foo'
+  priority: 2
+- id: vscode-ctrl-g-goto-line
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.gotoLine (Ctrl+G on every platform, including
+    macOS)
+  steps: 10-line buffer, cursor on line 0; press Ctrl+G, type '7', press Enter
+  expected: Cursor moves to line 7 (1-indexed as typed), first non-blank column
+  priority: 1
+- id: vscode-ctrl-p-quick-open
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.quickOpen (Ctrl+P; Cmd+P on macOS)
+  steps: Workspace with files 'main.rs' and 'lib.rs' open; press Ctrl+P, type 'lib'
+  expected: A fuzzy-filtered file list appears showing 'lib.rs'; pressing Enter opens it in the editor
+  priority: 1
+- id: vscode-ctrl-shift-p-command-palette
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.showCommands (Ctrl+Shift+P or F1; Cmd+Shift+P
+    on macOS)
+  steps: Press Ctrl+Shift+P, type 'Toggle Sidebar', press Enter
+  expected: Command palette opens showing a filtered, fuzzy-matched command list; selecting the entry
+    toggles the sidebar's visibility
+  priority: 1
+- id: vscode-f1-opens-command-palette
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'VS Code default: F1 is an alias for the command palette; README notes it also works
+    in Vim mode'
+  steps: Press F1
+  expected: Command palette opens, identical to Ctrl+Shift+P
+  priority: 2
+- id: vscode-ctrl-shift-o-goto-symbol
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.gotoSymbol (Ctrl+Shift+O; Cmd+Shift+O
+    on macOS)
+  steps: Open a source file with several functions; press Ctrl+Shift+O, type part of a function name
+  expected: A symbol list for the current file appears, filtered by the typed text; selecting an entry
+    jumps the cursor to that symbol's definition
+  priority: 2
+- id: vscode-f12-goto-definition
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.revealDefinition (F12)
+  steps: Cursor on a call to a function defined elsewhere in the file/project (LSP running); press F12
+  expected: Cursor jumps to the function's definition site (same file, or a new/focused tab if defined
+    in another file)
+  priority: 1
+- id: vscode-ctrl-b-toggles-sidebar
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.toggleSidebarVisibility (Ctrl+B; Cmd+B
+    on macOS)
+  steps: Sidebar visible; press Ctrl+B, then press Ctrl+B again
+  expected: First press hides the sidebar (editor area widens to fill the space); second press shows it
+    again at its previous width
+  priority: 1
+- id: vscode-ctrl-j-toggles-panel
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.togglePanel (Ctrl+J; Cmd+J on macOS)
+  steps: Terminal/panel area hidden; press Ctrl+J
+  expected: The bottom panel area opens, showing its last-active tab (e.g. terminal)
+  priority: 1
+- id: vscode-ctrl-backtick-toggles-terminal
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.terminal.toggleTerminal (Ctrl+`, same
+    on macOS -- Cmd+` is reserved by the OS for window switching)
+  steps: No terminal panel open; press Ctrl+` (Ctrl+backtick)
+  expected: An integrated terminal pane opens and receives keyboard focus
+  priority: 1
+- id: vscode-ctrl-t-opens-terminal-not-new-tab
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: 'README ''Integrated Terminal'': Ctrl+T (default panel_keys.open_terminal) toggles
+    the integrated terminal panel; it is NOT bound to File: New Tab, despite vimcode#1789''s Command
+    Palette row having claimed otherwise before the fix'
+  steps: Single tab open, no terminal panel open; press Ctrl+T
+  expected: The integrated terminal panel opens and receives keyboard focus; the tab bar still shows
+    only the one editor tab (Ctrl+T does not create a second tab)
+  priority: 1
+- id: vscode-ctrl-comma-opens-settings
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.openSettings (Ctrl+,; Cmd+, on macOS)
+  steps: Press Ctrl+,
+  expected: The Settings UI opens and gains input focus
+  priority: 2
+- id: vscode-ctrl-k-ctrl-c-adds-comment
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default chord editor.action.addCommentLine (Ctrl+K, Ctrl+C)
+  steps: Line 'x = 1' with no existing comment, cursor on it; press Ctrl+K, release, then Ctrl+C
+  expected: Line becomes a commented line (language-aware prefix, e.g. '# x = 1'); pressing the chord
+    again on an already-commented line is a no-op (this chord only adds, never toggles off)
+  priority: 2
+- id: vscode-ctrl-k-ctrl-u-removes-comment
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default chord editor.action.removeCommentLine (Ctrl+K, Ctrl+U)
+  steps: Line '# x = 1' (already commented), cursor on it; press Ctrl+K, release, then Ctrl+U
+  expected: Line's comment prefix is removed, leaving 'x = 1'
+  priority: 2
+- id: vscode-ctrl-k-ctrl-w-closes-group-editors
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default chord workbench.action.closeEditorsInGroup (Ctrl+K, Ctrl+W)
+  steps: Three tabs open in the active editor group; press Ctrl+K, release, then Ctrl+W
+  expected: All three tabs in that group close; if any had unsaved changes, a save/discard prompt appears
+    before closing
+  priority: 3
+- id: vscode-ctrl-k-ctrl-f-formats-document
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default chord editor.action.formatDocument (Ctrl+K, Ctrl+F)
+  steps: A file with inconsistent indentation and a formatter available; press Ctrl+K, release, then Ctrl+F
+  expected: The whole document is reformatted in place (consistent indentation/spacing per the language
+    formatter)
+  priority: 2
+- id: vscode-ctrl-shift-bracket-left-folds
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.fold (Ctrl+Shift+[)
+  steps: Cursor on a foldable block header (e.g. 'fn main() {'); press Ctrl+Shift+[
+  expected: The block collapses to a single line with a fold indicator; the body lines are hidden
+  priority: 3
+- id: vscode-ctrl-shift-bracket-right-unfolds
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.unfold (Ctrl+Shift+])
+  steps: A folded block, cursor on its header line; press Ctrl+Shift+]
+  expected: The block expands again; its body lines reappear
+  priority: 3
+- id: vscode-alt-z-toggles-word-wrap
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.toggleWordWrap (Alt+Z)
+  steps: A long line wider than the viewport, wrap off; press Alt+Z
+  expected: The long line now visually wraps onto multiple screen rows with no buffer-content change;
+    pressing Alt+Z again restores the unwrapped view
+  priority: 3
+- id: vscode-ctrl-w-closes-tab
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.closeActiveEditor (Ctrl+W; Cmd+W on macOS)
+  steps: Two tabs open, second one active and unmodified; press Ctrl+W
+  expected: The active tab closes; the first tab becomes active
+  priority: 1
+- id: vscode-ctrl-tab-cycles-tabs
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.quickOpenNavigateNext/nextEditor (Ctrl+Tab,
+    held to cycle; same on macOS)
+  steps: Three tabs open (A, B, C active); press Ctrl+Tab
+  expected: Focus switches to the most-recently-used tab other than C (typically B); releasing Ctrl commits
+    the switch
+  priority: 2
+- id: vscode-ctrl-backslash-splits-editor
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.splitEditor (Ctrl+\; Cmd+\ on macOS)
+  steps: One editor group with a file open; press Ctrl+\
+  expected: A second editor group appears side-by-side (or stacked, per layout), showing the same file;
+    the original group's content is unaffected
+  priority: 2
+- id: vscode-ctrl-1-focuses-group-1
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.focusFirstEditorGroup (Ctrl+1; Cmd+1 on
+    macOS)
+  steps: Two editor groups side by side, group 2 focused; press Ctrl+1
+  expected: Keyboard focus and the active-group highlight move to editor group 1
+  priority: 2
+- id: vscode-ctrl-2-focuses-group-2
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.focusSecondEditorGroup (Ctrl+2; Cmd+2
+    on macOS)
+  steps: Two editor groups side by side, group 1 focused; press Ctrl+2
+  expected: Keyboard focus and the active-group highlight move to editor group 2
+  priority: 2
+- id: vscode-ctrl-3-focuses-group-3
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding workbench.action.focusThirdEditorGroup (Ctrl+3; Cmd+3 on
+    macOS)
+  steps: Three editor groups open, group 1 focused; press Ctrl+3
+  expected: Keyboard focus and the active-group highlight move to editor group 3
+  priority: 3
+- id: vscode-ctrl-f-opens-find
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding actions.find (Ctrl+F; Cmd+F on macOS)
+  steps: Buffer 'foo bar foo'; press Ctrl+F, type 'foo'
+  expected: Find widget opens at the top of the editor; both occurrences of 'foo' are highlighted, with
+    a '1 of 2' (or similar) match counter
+  priority: 1
+- id: vscode-f3-finds-next-match
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.nextMatchFindAction (F3; Cmd+G on macOS)
+  steps: Find widget open and searching 'foo' in 'foo bar foo', cursor/selection on the first match; press
+    F3
+  expected: Selection moves to the second occurrence of 'foo'; the match counter advances
+  priority: 2
+- id: vscode-shift-f3-finds-previous-match
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.previousMatchFindAction (Shift+F3; Cmd+Shift+G
+    on macOS)
+  steps: Find widget open and searching 'foo', selection on the second occurrence; press Shift+F3
+  expected: Selection moves back to the first occurrence of 'foo'
+  priority: 2
+- id: vscode-ctrl-h-opens-replace
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.startFindReplaceAction (Ctrl+H; Cmd+Option+F
+    on macOS)
+  steps: Buffer 'foo bar foo'; press Ctrl+H, type 'foo' in find and 'baz' in replace, click/trigger 'Replace
+    All'
+  expected: Buffer becomes 'baz bar baz'; both occurrences are replaced
+  priority: 1
+- id: vscode-alt-enter-selects-all-matches-in-find
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: VS Code default keybinding editor.action.selectAllMatches inside the Find widget (Alt+Enter)
+  steps: Find widget open searching 'foo' in 'foo bar foo baz foo'; with focus in the find input, press
+    Alt+Enter
+  expected: All three occurrences of 'foo' become live selections in the editor (multi-cursor); typing
+    replaces all three
+  priority: 2
+- id: vscode-ctrl-g-mac-stays-ctrl
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - mac-native
+  reference: vscode
+  reference_detail: VS Code keeps Go to Line on Ctrl+G even on macOS (Cmd+G is reserved for 'Find Next'
+    in many macOS apps) -- a deliberate non-Cmd exception worth checking explicitly
+  steps: On macOS, 10-line buffer; press Ctrl+G (not Cmd+G), type '5', press Enter
+  expected: Cursor moves to line 5; Cmd+G alone does nothing to navigation (it is not bound to Go to Line)
+  priority: 2
+- id: vscode-macos-ctrl-c-is-cmd-c
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - mac-native
+  reference: vscode
+  reference_detail: 'VS Code macOS default: the Ctrl-based clipboard/undo/select-all family maps to Cmd'
+  steps: On macOS, buffer 'hello world', select 'hello'; press Cmd+C, move to end of line, press Cmd+V
+  expected: Buffer becomes 'hello worldhello', exactly as Ctrl+C/Ctrl+V behave on Linux/Windows
+  priority: 2
+- id: vscode-macos-cmd-w-closes-tab
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - mac-native
+  reference: vscode
+  reference_detail: VS Code macOS default keybinding workbench.action.closeActiveEditor is Cmd+W, not
+    Ctrl+W
+  steps: On macOS, two tabs open, second active; press Cmd+W
+  expected: The active tab closes, same result as Ctrl+W on Linux/Windows
+  priority: 2
+- id: vscode-macos-cmd-p-quick-open
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - mac-native
+  reference: vscode
+  reference_detail: VS Code macOS default keybinding workbench.action.quickOpen is Cmd+P
+  steps: On macOS, press Cmd+P, type part of a filename
+  expected: Quick-open file list appears, filtered by the typed text, identical in behaviour to Ctrl+P
+    elsewhere
+  priority: 2
+- id: vscode-macos-cmd-shift-p-command-palette
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - mac-native
+  reference: vscode
+  reference_detail: VS Code macOS default keybinding workbench.action.showCommands is Cmd+Shift+P
+  steps: On macOS, press Cmd+Shift+P, type 'Toggle Sidebar'
+  expected: Command palette opens with the same fuzzy filtering as Ctrl+Shift+P elsewhere
+  priority: 2
+- id: vscode-macos-cmd-backtick-is-not-terminal-toggle
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - mac-native
+  reference: vscode
+  reference_detail: VS Code deliberately keeps the terminal toggle on Ctrl+` on macOS because Cmd+` is
+    the OS-level 'cycle windows of this app' shortcut
+  steps: On macOS, no terminal panel open; press Cmd+` (Cmd+backtick)
+  expected: vimcode does not toggle the terminal panel (the OS or window manager may act on Cmd+` instead);
+    Ctrl+` is the one that opens it, same as every other platform
+  priority: 2
+- id: vscode-macos-cmd-bracket-indent-outdent
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - mac-native
+  reference: vscode
+  reference_detail: VS Code macOS default keybindings editor.action.indentLines/outdentLines stay on Cmd+]/Cmd+[
+  steps: On macOS, unindented line, cursor on it; press Cmd+]
+  expected: Line gains one indent level, same result as Ctrl+] elsewhere
+  priority: 3
+- id: vscode-macos-cmd-d-adds-next-occurrence
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - mac-native
+  reference: vscode
+  reference_detail: VS Code macOS default keybinding editor.action.addSelectionToNextFindMatch is Cmd+D
+  steps: On macOS, buffer 'foo bar foo', cursor on the first foo; press Cmd+D twice
+  expected: Two selections, one on each 'foo', identical result to Ctrl+D on Linux/Windows
+  priority: 2
+- id: vscode-macos-cmd-backslash-splits-editor
+  area: vscode-mode
+  mode: vscode
+  lanes:
+  - mac-native
+  reference: vscode
+  reference_detail: VS Code macOS default keybinding workbench.action.splitEditor is Cmd+\
+  steps: On macOS, one editor group open; press Cmd+\
+  expected: A second editor group appears side-by-side, same result as Ctrl+\ elsewhere
+  priority: 3
+- id: vim-w-moves-word-forward
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'w' motion
+  steps: Buffer 'foo bar baz', cursor at col 0, Normal mode; press w
+  expected: Cursor moves to column 4 (start of 'bar'), matching Neovim exactly
+  priority: 1
+- id: vim-b-moves-word-backward
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'b' motion
+  steps: Buffer 'foo bar baz', cursor at col 8 (start of 'baz'), Normal mode; press b
+  expected: Cursor moves to column 4 (start of 'bar')
+  priority: 2
+- id: vim-e-moves-to-word-end
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'e' motion
+  steps: Buffer 'foo bar', cursor at col 0, Normal mode; press e
+  expected: Cursor moves to column 2 (the 'o' ending 'foo')
+  priority: 2
+- id: vim-0-and-dollar-line-boundaries
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim '0' and '$' motions
+  steps: Buffer 'hello world', cursor in the middle, Normal mode; press $, then 0
+  expected: $ moves cursor to column 10 (the 'd'); 0 moves it back to column 0
+  priority: 1
+- id: vim-gg-and-g-goto-buffer-ends
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'gg' and 'G' motions
+  steps: 10-line buffer, cursor on line 5; press gg, then G
+  expected: gg moves cursor to line 0 (first non-blank); G moves it to line 9 (last line)
+  priority: 1
+- id: vim-count-g-goes-to-line-n
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim '{count}G' motion
+  steps: 10-line buffer, cursor on line 0; type 5G
+  expected: Cursor moves to line 4 (0-indexed internally, '5' as the user-facing line number), first non-blank
+    column
+  priority: 2
+- id: vim-f-char-finds-forward
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'f{char}' motion
+  steps: Line 'foo(bar)', cursor at col 0, Normal mode; press f(
+  expected: Cursor moves to the '(' character, column 3
+  priority: 2
+- id: vim-percent-matches-bracket
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim '%' motion
+  steps: Line 'foo(bar)', cursor on the '(' at column 3; press %
+  expected: Cursor jumps to the matching ')' at column 7
+  priority: 2
+- id: vim-dw-deletes-word
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'dw' operator+motion
+  steps: Buffer 'foo bar baz', cursor at col 0, Normal mode; press dw
+  expected: Buffer becomes 'bar baz'; cursor stays at column 0
+  priority: 1
+- id: vim-dd-deletes-line
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'dd'
+  steps: Buffer 'aaa\nbbb\nccc', cursor on 'bbb' at its last column (column 3); press dd
+  expected: Buffer becomes 'aaa\nccc'; cursor stays at column 3 on 'ccc' (Neovim's 'dd'
+    preserves the column, clamped to the new line's length -- it does NOT reset to column
+    0; verified via nvim --headless with the cursor explicitly placed at column 3 before
+    'dd', see issue 1796); 'bbb\n' is now in the unnamed register
+  priority: 1
+- id: vim-count-dd-deletes-n-lines
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim '{count}dd'
+  steps: Buffer 'aaa\nbbb\nccc\nddd', cursor on 'aaa'; type 3dd
+  expected: Buffer becomes 'ddd'; the first three lines are deleted as one unit into the unnamed register
+  priority: 2
+- id: vim-yy-and-p-yank-and-paste-line
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'yy' + 'p'
+  steps: Buffer 'aaa\nbbb', cursor on 'aaa'; press yy, move to 'bbb', press p
+  expected: Buffer becomes 'aaa\nbbb\naaa'; the yanked line is pasted below 'bbb' (linewise paste-after
+    semantics)
+  priority: 1
+- id: vim-shift-p-pastes-before
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'P'
+  steps: Buffer 'aaa\nbbb', yank 'aaa' with yy, move to 'bbb', press P
+  expected: Buffer becomes 'aaa\naaa\nbbb'; the yanked line is pasted above 'bbb'
+  priority: 2
+- id: vim-cc-changes-line
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'cc'
+  steps: Buffer '    foo', cursor on it, Normal mode; press cc, then type 'bar'
+  expected: Line becomes '    bar' (original indent preserved); editor is left in Insert mode after cc,
+    so typing inserts directly
+  priority: 1
+- id: vim-ciw-changes-inner-word
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'ciw' text object
+  steps: Line 'foo bar baz', cursor on 'bar'; press ciw, type 'qux'
+  expected: Line becomes 'foo qux baz'
+  priority: 1
+- id: vim-daw-deletes-a-word-with-trailing-space
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'daw' text object
+  steps: Line 'foo bar baz', cursor on 'bar'; press daw
+  expected: Line becomes 'foo baz' (the word plus one trailing space is removed)
+  priority: 2
+- id: vim-ci-quote-changes-inside-quotes
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'ci"' text object
+  steps: Line 'say "hello" now', cursor anywhere inside the quotes; press ci", type 'bye'
+  expected: Line becomes 'say "bye" now'
+  priority: 2
+- id: vim-di-paren-deletes-inside-parens
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'di(' text object
+  steps: Line 'foo(bar, baz)', cursor inside the parens; press di(
+  expected: Line becomes 'foo()'
+  priority: 2
+- id: vim-dit-deletes-inside-tag
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'dit' text object
+  steps: Line '<b>hello</b>', cursor inside the tag content; press dit
+  expected: Line becomes '<b></b>'
+  priority: 3
+- id: vim-dot-repeats-last-change
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim '.' repeat
+  steps: Line 'foo foo foo', cursor on first 'foo'; press x (delete one char), move to the second 'foo',
+    press .
+  expected: Both the first and second 'foo' lose their first character ('oo foo foo' then 'oo oo foo');
+    '.' repeats exactly the 'x' change
+  priority: 1
+- id: vim-undo-and-redo
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'u' and Ctrl-R
+  steps: Line 'hello'; delete it with dd, press u, then press Ctrl-R
+  expected: u restores 'hello'; Ctrl-R re-deletes it, leaving an empty buffer
+  priority: 1
+- id: vim-visual-v-selects-and-d-deletes
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim Visual mode 'v' + 'd'
+  steps: Line 'hello world', cursor at col 0; press v, move right 4 times (lLlL -> selecting 'hello'),
+    press d
+  expected: Selected text 'hello' is deleted, leaving ' world'; mode returns to Normal
+  priority: 1
+- id: vim-visual-line-mode-selects-whole-lines
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim Visual Line mode 'V'
+  steps: Buffer 'aaa\nbbb\nccc', cursor on 'aaa'; press V, press j, press d
+  expected: Both 'aaa' and 'bbb' (whole lines) are deleted; buffer becomes 'ccc'
+  priority: 2
+- id: vim-visual-block-ctrl-v-selects-rectangle
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim Visual Block mode Ctrl-V
+  steps: Buffer 'abc\ndef\nghi', cursor at 0,0; press Ctrl-V, press j j, press l, press x
+  expected: 'A 2-column-wide, 3-row-tall rectangle is deleted: buffer becomes ''c\nf\ni'''
+  priority: 3
+- id: vim-register-named-yank-and-paste
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim named registers
+  steps: Line 'hello'; press "ayy to yank the line into register a, move elsewhere, press "ap
+  expected: The line 'hello' is pasted from register a at the new cursor location, independent of the
+    unnamed register
+  priority: 2
+- id: vim-macro-record-and-play
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim macro recording/playback (qa ... q, @a)
+  steps: Buffer 'a\nb\nc'; press qa, press A (append), type ';', press Escape, press j, press q to stop
+    recording, then press @a
+  expected: Macro appends ';' to the current line and moves down one line each time it runs; after recording
+    once and playing once, two lines ('a' and 'b') end with ';'
+  priority: 2
+- id: vim-at-at-repeats-last-macro
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim '@@' repeat-last-macro
+  steps: After running @a once (appending ';' and moving down), press @@
+  expected: The same macro runs again on the next line, appending ';' there too
+  priority: 3
+- id: vim-count-at-a-plays-macro-n-times
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim '{count}@{register}'
+  steps: Buffer with 5 short lines, macro recorded in register a that appends ';' and moves down one line;
+    cursor on line 0; type 3@a
+  expected: 'The macro runs three times in sequence: lines 0, 1 and 2 each gain a trailing '';'''
+  priority: 3
+- id: vim-ex-substitute-current-line
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim ':s/pat/rep/'
+  steps: Line 'foo foo foo'; run :s/foo/bar/
+  expected: 'Only the first occurrence on the line changes: ''bar foo foo'''
+  priority: 1
+- id: vim-ex-substitute-global-flag
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim ':s/pat/rep/g'
+  steps: Line 'foo foo foo'; run :s/foo/bar/g
+  expected: 'Every occurrence on the line changes: ''bar bar bar'''
+  priority: 1
+- id: vim-ex-substitute-whole-buffer
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim ':%s/pat/rep/g'
+  steps: Buffer 'foo\nfoo\nfoo'; run :%s/foo/bar/g
+  expected: Every line becomes 'bar'
+  priority: 2
+- id: vim-ex-global-delete-matching-lines
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim ':g/pat/d'
+  steps: Buffer 'keep\ndrop\nkeep\ndrop'; run :g/drop/d
+  expected: Buffer becomes 'keep\nkeep'; every line matching 'drop' is deleted
+  priority: 2
+- id: vim-join-lines-with-space
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'J'
+  steps: Buffer 'foo\nbar', cursor on 'foo'; press J
+  expected: 'Buffer becomes one line: ''foo bar'' (a single space is inserted at the join point)'
+  priority: 2
+- id: vim-gj-joins-lines-without-space
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'gJ'
+  steps: Buffer 'foo\nbar', cursor on 'foo'; press gJ
+  expected: 'Buffer becomes one line: ''foobar'' (no space inserted)'
+  priority: 2
+- id: vim-ctrl-a-increments-number
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim Ctrl-A
+  steps: 'Line ''count: 41'', cursor anywhere on the line; press Ctrl-A'
+  expected: 'The number nearest/under the cursor becomes 42: ''count: 42'''
+  priority: 2
+- id: vim-ctrl-x-decrements-number
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim Ctrl-X
+  steps: 'Line ''count: 42'', cursor anywhere on the line; press Ctrl-X'
+  expected: 'The number becomes 41: ''count: 41'''
+  priority: 3
+- id: vim-tilde-toggles-case
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim '~'
+  steps: Line 'abc', cursor at column 0; press ~ three times
+  expected: 'Each press toggles one character''s case and advances the cursor: line becomes ''ABC'', cursor
+    ends at column 3'
+  priority: 2
+- id: vim-greater-greater-indents-line
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim '>>'
+  steps: Line 'foo' with no indent, 'shiftwidth' = 4; press >>
+  expected: Line becomes '    foo'
+  priority: 2
+- id: vim-less-less-dedents-line
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim '<<'
+  steps: Line '    foo' (one indent level); press <<
+  expected: Line becomes 'foo'
+  priority: 3
+- id: vim-m-sets-mark-and-backtick-jumps
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'm{a-z}' + '`{a-z}'
+  steps: Line 5 of a buffer, cursor at column 3; press ma, move elsewhere, press `a
+  expected: Cursor returns to exactly line 5, column 3 (the marked position, not just the line)
+  priority: 2
+- id: vim-search-next-prev-match
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim '/pattern', 'n', 'N'
+  steps: Buffer 'foo bar foo baz foo'; run /foo<CR>, then press n, then press N
+  expected: First search lands on the second 'foo'; n advances to the third 'foo'; N moves back to the
+    second
+  priority: 2
+- id: vim-star-searches-word-under-cursor
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim '*'
+  steps: Buffer 'foo bar foo', cursor on the first 'foo'; press *
+  expected: Cursor jumps to the next whole-word match of 'foo' (the second occurrence), with the search
+    pattern set to \<foo\>
+  priority: 2
+- id: vim-insert-i-a-o-variants
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'i', 'a', 'o' entering Insert mode
+  steps: Line 'foo', cursor at column 1; press a, type 'X', Escape; then press o, type 'bar', Escape
+  expected: 'After ''a'' + ''X'': line is ''fXoo'' (inserted after cursor). After ''o'': a new line ''bar''
+    is added below'
+  priority: 1
+- id: vim-visual-indent-reselects-with-gv
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'gv' reselect-last-visual
+  steps: Select 'hello' with v + motion, press Escape to leave Visual mode, then press gv
+  expected: The exact same selection ('hello') is restored
+  priority: 3
+- id: vim-ctrl-o-ctrl-i-jumplist
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim Ctrl-O / Ctrl-I jumplist navigation
+  steps: Cursor on line 0; press G to jump to the last line (a jump), then press Ctrl-O, then press Ctrl-I
+  expected: Ctrl-O returns the cursor to line 0 (the pre-jump position); Ctrl-I moves forward again to
+    the last line
+  priority: 2
+- id: vim-gq-formats-paragraph
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'gqip' (format the inner paragraph to 'textwidth')
+  steps: A long unwrapped paragraph line, 'textwidth' set to 40, cursor in it; press gqip
+  expected: The paragraph is reflowed into multiple lines, each no wider than 40 columns (except where
+    a single word exceeds it)
+  priority: 3
+- id: vim-r-replaces-single-char
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'r{char}'
+  steps: Line 'cat', cursor on 'c'; press rb
+  expected: Line becomes 'bat'; cursor stays on the replaced character
+  priority: 2
+- id: vim-shift-r-enters-replace-mode
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'R' replace mode
+  steps: Line 'hello', cursor at column 0; press R, type 'HI', press Escape
+  expected: Line becomes 'HIllo' (typed characters overwrite in place instead of inserting)
+  priority: 2
+- id: vim-count-prefixes-a-motion
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim count-prefixed motion, e.g. '3w'
+  steps: Buffer 'one two three four', cursor at col 0; type 3w
+  expected: Cursor lands at the start of 'four' (three word-forward motions applied at once)
+  priority: 2
+- id: vim-x-and-shift-x-delete-chars
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'x' and 'X'
+  steps: Line 'hello', cursor at column 2 (the first 'l'); press x, then press X
+  expected: x deletes the character under the cursor, giving 'helo' with the cursor still at column 2
+    (now the second 'l'); X then deletes the character before the cursor, giving 'hlo' with the cursor
+    at column 1
+  priority: 2
+- id: vim-shift-a-appends-at-end-of-line
+  area: vim-mode
+  mode: vim
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: nvim
+  reference_detail: Real Neovim 'A'
+  steps: Line 'foo', cursor at column 0; press A, type 'bar', Escape
+  expected: Line becomes 'foobar'; cursor ends on the last typed character
+  priority: 2
+- id: modeswitch-alt-m-from-normal
+  area: mode-switch
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: 'README ''VSCode Mode'': Alt-M toggles between Vim mode and VSCode mode at any time'
+  steps: Start in Vim Normal mode; press Alt-M
+  expected: Editor switches to VSCode mode; status bar changes from a Vim mode indicator (e.g. NORMAL)
+    to 'EDIT  F1:palette  Alt-M:vim'
+  priority: 1
+- id: modeswitch-alt-m-from-insert
+  area: mode-switch
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: 'README ''VSCode Mode'': Alt-M toggles at any time, including mid-Insert-mode'
+  steps: Start in Vim Insert mode, cursor mid-line; press Alt-M
+  expected: Editor switches to VSCode mode without losing the cursor position or any already-typed text;
+    VSCode mode is always-insert, so typing continues to work immediately
+  priority: 1
+- id: modeswitch-alt-m-from-visual
+  area: mode-switch
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: 'README ''VSCode Mode'': Alt-M toggles at any time, including from Visual mode'
+  steps: Start in Vim Visual mode with an active selection; press Alt-M
+  expected: Editor switches to VSCode mode; the selection is preserved as a VSCode-mode selection (status
+    bar reads SELECT)
+  priority: 2
+- id: modeswitch-alt-m-back-to-vim
+  area: mode-switch
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: 'README ''VSCode Mode'': Alt-M toggles back to Vim mode'
+  steps: In VSCode mode; press Alt-M
+  expected: Editor switches back to Vim mode, landing in Normal mode; status bar shows a Vim mode indicator
+    again. On tui-pty (a toggleable, runner-drawn menu bar), the menu-bar row the earlier Vim->VSCode
+    toggle revealed is removed too, with no left-over row shifting the sidebar/editor content down. On
+    gtk-native/win-native/mac-native the drawn menu bar doubles as the window's titlebar and stays visible
+    the whole time, in both modes -- this toggle does not hide it.
+  priority: 1
+- id: modeswitch-ex-set-mode-vscode
+  area: mode-switch
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: 'README ''VSCode Mode'': '':set mode=vscode'' activates VSCode mode from Vim Normal
+    mode'
+  steps: In Vim Normal mode; run :set mode=vscode
+  expected: Editor switches to VSCode mode, identical result to pressing Alt-M
+  priority: 2
+- id: modeswitch-ex-set-mode-vim
+  area: mode-switch
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: 'README ''VSCode Mode'': '':set mode=vim'' returns to Vim mode'
+  steps: In VSCode mode; run :set mode=vim
+  expected: Editor switches back to Vim mode (Normal), identical result to pressing Alt-M from VSCode
+    mode
+  priority: 3
+- id: modeswitch-buffer-state-preserved-across-toggle
+  area: mode-switch
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: 'README ''VSCode Mode'': toggling modes is a UI-layer switch, not a buffer reset'
+  steps: Buffer 'hello world', cursor at column 6; press Alt-M, then press Alt-M again
+  expected: Buffer text and cursor position are unchanged after the round trip; no edit, undo-tree entry,
+    or scroll-position change results purely from toggling
+  priority: 1
+# vimcode#1795 investigation note: this journey's "quit, inspect
+# settings.json, relaunch" shape cannot currently be pinned as an exact
+# Tier-2 driver step (`tests/smoke-spec/tui.yaml`/`win-terminal.yaml`/
+# `win-gui.yaml`/`mac-gui.yaml`/`gtk-gui.yaml`) the way this catalogue's
+# own doc comment (above) says those files do for other journeys.
+# Confirmed by inspecting the real, installed `code-coordinator` package
+# (`coord.tui_pty_driver.parse_smoke_spec`, `coord.win_native_driver`/
+# `coord.mac_native_driver`/`coord.gtk_native_driver.parse_native_spec`):
+# every driver's `launch` step takes no settings/env fields at all (the
+# settings.json each spec file assumes is fixed per-file, supplied
+# entirely outside the YAML by whatever calls `run_smoke_spec`/
+# `run_native_spec`), and no driver has a second "relaunch" or "read a
+# file back" step type — only one `launch` per spec, matching every
+# existing file in this directory. Pinning this exact journey at Tier-2
+# therefore needs new coordinator-side driver support (a per-spec
+# settings-seed field, and a relaunch-or-inspect-file step type) before a
+# YAML-only change in *this* repo can express it — filing that gap as a
+# `claude-coordinator` issue is coordinator-side follow-up, not something
+# a vimcode worktree commit can do. Until that lands, the closest
+# available black-box coverage is `tests/editor_mode_startup_persistence.rs`
+# (real `vcd` binary, real pty, asserts on the painted screen) — it is not
+# a drop-in substitute for a cross-platform Tier-2 step (it only runs on
+# `#[cfg(unix)]` hosts) but it is strictly more than the zero coverage this
+# journey had before.
+- id: modeswitch-persisted-in-settings-json
+  area: mode-switch
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: 'README ''VSCode Mode'': the ''editor_mode'' setting is persisted in settings.json'
+  steps: Switch to VSCode mode via Alt-M, quit vimcode, inspect settings.json, then relaunch vimcode
+  expected: 'settings.json contains ''editor_mode'': ''vscode'' (or equivalent) after quitting; relaunching
+    starts directly in VSCode mode'
+  priority: 1
+- id: modeswitch-status-bar-indicates-current-mode
+  area: mode-switch
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: 'README: VSCode mode''s status bar reads ''EDIT ... Alt-M:vim'' (or SELECT/COMMAND);
+    Vim mode''s status bar shows the active Vim mode name'
+  steps: Cycle through Vim Normal, Vim Insert, Vim Visual, and VSCode mode (via Alt-M and normal mode-entry
+    keys)
+  expected: 'Each state has a visibly distinct, correctly-labelled status bar indicator: NORMAL, INSERT,
+    VISUAL, and EDIT/SELECT respectively'
+  priority: 2
+- id: chrome-activity-bar-switches-panels
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - win-native
+  - mac-native
+  - tui-pty
+  reference: vscode
+  reference_detail: 'VS Code layout: activity bar icons switch the sidebar''s active panel'
+  steps: Click/activate the Source Control icon in the activity bar, then the Explorer icon
+  expected: The sidebar content switches to show Source Control (branch + changed files), then back to
+    the Explorer file tree, each time the corresponding icon is activated
+  priority: 1
+- id: chrome-explorer-context-menu-on-right-click
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - win-native
+  - tui-pty
+  reference: vscode
+  reference_detail: 'VS Code layout: right-clicking a file-tree row opens a context menu'
+  steps: Right-click a folder row in the Explorer sidebar
+  expected: A context menu appears offering at least 'New File...' and 'New Folder...'; selecting Escape
+    or clicking elsewhere dismisses it with no change
+  priority: 1
+- id: chrome-tab-click-switches-active-buffer
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - win-native
+  - mac-native
+  - tui-pty
+  reference: vscode
+  reference_detail: 'VS Code layout: clicking a tab in the tab bar makes it the active editor'
+  steps: Two tabs open (A, B), A active; click tab B
+  expected: Tab B becomes active and highlighted; its buffer content is now shown in the editor area
+  priority: 1
+- id: chrome-tab-close-button-closes-tab
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - win-native
+  - mac-native
+  reference: vscode
+  reference_detail: 'VS Code layout: each tab has a close (''x'') affordance'
+  steps: A tab with no unsaved changes; click its close button
+  expected: The tab closes; if it was the only tab, the editor area shows an empty/welcome state; if others
+    remain, one becomes active
+  priority: 2
+- id: chrome-tab-drag-reorders
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - tui-pty
+  reference: vscode
+  reference_detail: 'VS Code layout: tabs can be dragged to reorder them within the tab bar'
+  steps: Three tabs in order A, B, C; drag tab C to the position before A
+  expected: Tab order becomes C, A, B; no buffer content changes, only the visual tab order
+  priority: 3
+- id: chrome-status-bar-branch-name-opens-picker
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - win-native
+  - mac-native
+  - tui-pty
+  reference: vscode
+  reference_detail: 'VS Code layout: the status bar''s branch segment opens a branch picker on click'
+  steps: Open a git-tracked workspace; click the branch name segment in the status bar
+  expected: A branch picker opens listing local branches, fuzzy-filterable by typing; selecting one switches
+    the checked-out branch
+  priority: 2
+- id: chrome-status-bar-language-indicator-opens-picker
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - win-native
+  - tui-pty
+  reference: vscode
+  reference_detail: 'VS Code layout: the status bar''s filetype/language segment opens a language picker
+    on click'
+  steps: A '.rs' file open; click the language segment of the status bar
+  expected: A language picker opens; selecting a different language re-highlights the buffer under that
+    language's grammar
+  priority: 3
+- id: chrome-menu-bar-file-menu-opens
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - win-native
+  - mac-native
+  reference: vscode
+  reference_detail: 'VS Code layout: a File menu with Open/Save/etc entries'
+  steps: Click (or Alt+F / native-menu-click) the File menu
+  expected: A dropdown opens listing file-related commands (e.g. Open File, Save, Save As); selecting
+    one runs it and closes the menu
+  priority: 1
+- id: chrome-settings-gear-opens-settings-sidebar
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - win-native
+  - tui-pty
+  reference: vscode
+  reference_detail: 'README ''(Settings sidebar)'': click the gear icon for a VSCode-style interactive
+    settings form'
+  steps: Click the gear/settings icon in the activity bar
+  expected: A Settings sidebar/panel opens showing an interactive form of editable settings (not just
+    raw JSON)
+  priority: 2
+- id: chrome-colorscheme-command-changes-theme
+  area: chrome
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: README ':colorscheme <name>' switches theme, affecting all chrome
+  steps: Run :colorscheme gruvbox-dark, observe editor and chrome colors, then run :colorscheme onedark
+  expected: All UI surfaces -- editor background/foreground, status bar, sidebar, tab bar -- repaint in
+    the new theme's palette immediately on each command
+  priority: 1
+- id: chrome-command-palette-runs-toggle-sidebar
+  area: chrome
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'VS Code layout: the command palette can run any registered command by name'
+  steps: Open the command palette (F1), type 'Toggle Sidebar', press Enter
+  expected: The sidebar's visibility toggles, exactly as if Ctrl+B had been pressed directly
+  priority: 1
+- id: chrome-terminal-panel-toggle-opens-pane
+  area: chrome
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: vscode
+  reference_detail: 'VS Code layout: the integrated terminal lives in the bottom panel area'
+  steps: No terminal open; toggle it open (Ctrl+` or activity bar / panel icon)
+  expected: A terminal pane opens at the bottom of the window with a live shell prompt and keyboard focus
+  priority: 2
+- id: chrome-search-panel-project-search-updates-results
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - win-native
+  - tui-pty
+  reference: vscode
+  reference_detail: 'VS Code layout: the Search sidebar panel performs a live project-wide search'
+  steps: Open the Search panel (activity bar icon or Ctrl+Shift+F), type a query that matches text in
+    multiple files
+  expected: A results list appears grouped by file, each entry showing the matching line with the query
+    highlighted; clicking a result opens that file at that line
+  priority: 2
+- id: chrome-source-control-panel-shows-status-badges
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - win-native
+  - tui-pty
+  reference: vscode
+  reference_detail: 'VS Code layout: the Source Control panel shows per-file git status letters'
+  steps: In a git-tracked workspace with a modified file and a new untracked file, open the Source Control
+    panel
+  expected: The modified file shows an 'M' badge and the untracked file shows a '?' (or 'U') badge, each
+    color-coded per the active theme
+  priority: 2
+- id: chrome-breadcrumbs-show-file-and-symbol-path
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - win-native
+  reference: vscode
+  reference_detail: 'VS Code layout: a breadcrumbs bar above the editor shows the open file''s path and,
+    with LSP symbols available, the enclosing symbol'
+  steps: Open a source file with a function, place cursor inside the function body
+  expected: The breadcrumb bar shows the file's folder path and filename, and (when symbol information
+    is available) the enclosing function name as the last segment
+  priority: 3
+- id: chrome-quickfix-window-lists-results
+  area: chrome
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  - mac-native
+  - gtk-native
+  reference: spec
+  reference_detail: 'README quickfix window: '':copen'' opens a list of locations (e.g. from :grep or
+    build errors)'
+  steps: Run a project search that populates the quickfix list (:vimgrep or :grep), then run :copen
+  expected: A quickfix window opens listing every match with file:line:column and the matching text; pressing
+    Enter on an entry jumps to that location
+  priority: 2
+- id: chrome-extensions-panel-lists-available-extensions
+  area: chrome
+  mode: any
+  lanes:
+  - gtk-native
+  - win-native
+  - tui-pty
+  reference: vscode
+  reference_detail: 'VS Code layout: an Extensions panel for browsing/installing extensions'
+  steps: Open the Extensions panel from the activity bar
+  expected: A list of available/installed extensions appears, each showing a name and install/enable state
+  priority: 3
+- id: platform-macos-option-m-sends-mu-without-meta
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  reference: platform
+  reference_detail: 'Checkable terminal fact: on macOS Terminal.app/iTerm2, Option+M sends the composed
+    character ''µ'' unless ''Option as Meta'' is explicitly enabled'
+  steps: On macOS, in a terminal with 'Option as Meta' NOT enabled, press Option+M (Alt-M)
+  expected: The terminal sends the literal character 'µ' as text input, not an Alt/Meta-modified 'm';
+    vimcode therefore does not toggle Vim/VSCode mode from this keystroke in this terminal configuration
+    -- it should either insert 'µ' as typed text (Insert mode) or be a no-op recognised key in Normal
+    mode, never a silent crash or mode flip
+  priority: 1
+- id: platform-macos-option-m-toggles-mode-with-meta-enabled
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  reference: platform
+  reference_detail: 'Checkable terminal fact: once ''Option as Meta'' is enabled (iTerm2: Profiles ->
+    Keys -> Left Option key: Esc+; Terminal.app: ''Use Option as Meta key''), Option+M sends a real Alt-modified
+    ''m'''
+  steps: On macOS, in a terminal with 'Option as Meta' enabled, press Option+M
+  expected: vimcode receives an Alt-M keypress and toggles between Vim mode and VSCode mode, identical
+    to Linux/Windows Alt-M
+  priority: 1
+- id: platform-windows-conpty-ctrl-shift-sends-correct-codes
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  reference: platform
+  reference_detail: 'Checkable fact: ConPTY/Windows Terminal forwards Ctrl+Shift+<key> as distinct VT
+    sequences from Ctrl+<key> alone'
+  steps: On Windows, under ConPTY/Windows Terminal, press Ctrl+Shift+Right in a line with multiple words
+  expected: The selection extends by one word (Ctrl+Shift+Right's VSCode-mode binding), not the plain
+    Ctrl+Right word-jump behaviour -- the Shift modifier must survive the ConPTY round trip
+  priority: 1
+- id: platform-windows-function-keys-through-conpty
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  reference: platform
+  reference_detail: 'Checkable fact: F1-F12 must arrive as distinct keys through ConPTY, not collide with
+    other sequences'
+  steps: On Windows, under ConPTY/Windows Terminal, press F1, then F12
+  expected: F1 opens the command palette; F12 goes to definition (with LSP/a definition available); the
+    two keys are never confused with each other or with arrow/navigation keys
+  priority: 2
+- id: platform-linux-xterm-ctrl-shift-arrow-word-select
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  reference: platform
+  reference_detail: 'Checkable fact: xterm-compatible terminals on Linux send distinct CSI sequences for
+    Ctrl+Shift+Arrow vs plain Ctrl+Arrow'
+  steps: On Linux, in a standard xterm-compatible terminal, press Ctrl+Shift+Right twice on a multi-word
+    line
+  expected: Selection extends by two words; releasing and pressing plain Ctrl+Right afterward moves the
+    cursor without selecting
+  priority: 2
+- id: platform-nerd-font-glyphs-render-in-sidebar
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  - gtk-native
+  reference: platform
+  reference_detail: 'Checkable fact: with a Nerd Font installed and ''use_nerd_fonts'' true, file-type
+    icons render as Nerd Font glyphs instead of ASCII'
+  steps: With use_nerd_fonts enabled and a Nerd Font set as the terminal/UI font, open the Explorer sidebar
+    on a mixed-type folder (e.g. a .rs file and a folder)
+  expected: Each row shows a distinct Nerd Font glyph appropriate to its file type/folder state, not a
+    generic ASCII fallback character
+  priority: 2
+- id: platform-ascii-fallback-glyphs-without-nerd-font
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  - gtk-native
+  reference: platform
+  reference_detail: 'Checkable fact: with ''use_nerd_fonts'' false, chrome icons must fall back to plain
+    ASCII, never render a tofu/missing-glyph box'
+  steps: With use_nerd_fonts disabled, open the Explorer sidebar and look at the status bar's layout-toggle
+    icons
+  expected: Icons render as the documented ASCII fallbacks (e.g. '[S]'/'[T]'/'[M]' for sidebar/terminal/menu-bar
+    toggles); no blank box or '?' placeholder glyph appears anywhere in the chrome
+  priority: 2
+- id: platform-wide-cjk-glyph-does-not-corrupt-line
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  - gtk-native
+  reference: platform
+  reference_detail: 'Checkable fact: CJK characters occupy two terminal/cell columns; cursor and line-wrap
+    math must account for that width'
+  steps: Buffer containing a line with CJK text, e.g. '你好 world'; move the cursor across the CJK characters
+    with Right/Left and check column reporting
+  expected: Each CJK character's cursor step and the status bar's column indicator both account for its
+    double-cell width; no half-character cursor position, no screen corruption of subsequent columns on
+    the same row
+  priority: 2
+- id: platform-resize-reflows-layout
+  area: render
+  mode: any
+  lanes:
+  - tui-pty
+  - gtk-native
+  reference: platform
+  reference_detail: 'Checkable fact: resizing the terminal/window must reflow sidebar, editor and status
+    bar to the new dimensions'
+  steps: With the sidebar open, resize the terminal from 100x30 to 60x20 columns/rows
+  expected: The editor viewport, sidebar width and status/command-line rows all re-fit the new size with
+    no leftover content from the old size and no crash
+  priority: 1
+- id: platform-truecolor-vs-256color-theme-fallback
+  area: render
+  mode: any
+  lanes:
+  - tui-pty
+  reference: platform
+  reference_detail: 'Checkable fact: a terminal advertising only 256-color support ($TERM without truecolor,
+    no COLORTERM=truecolor) must still render a readable, distinguishable theme'
+  steps: Launch vcd in a terminal/TERM setting that only supports 256 colors (not 24-bit truecolor)
+  expected: Theme colors are quantized to the nearest 256-color palette entries; text remains readable
+    and syntax-highlight categories remain visually distinct from each other (no two unrelated token types
+    collapsing to the identical quantized color)
+  priority: 2
+- id: platform-mouse-click-positions-cursor
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  - gtk-native
+  - win-native
+  reference: platform
+  reference_detail: 'Checkable fact: a single left click in the editor area must position the cursor at
+    the clicked cell'
+  steps: Buffer 'hello world' on line 0; click on the 'w' of 'world'
+  expected: Cursor moves exactly to the column of the clicked character
+  priority: 1
+- id: platform-mouse-drag-selects-text
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  - gtk-native
+  - win-native
+  reference: platform
+  reference_detail: 'Checkable fact: pressing and dragging the left mouse button selects the dragged-over
+    text'
+  steps: Buffer 'hello world'; press the mouse button down on 'h' and drag to 'o' of 'world', then release
+  expected: A selection spans from 'h' to 'o' of 'world' when the button is released
+  priority: 1
+- id: platform-scroll-wheel-scrolls-hovered-pane
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  - gtk-native
+  - win-native
+  reference: platform
+  reference_detail: 'README: TUI/GTK mouse wheel targets the pane under the cursor, not necessarily the
+    focused one'
+  steps: Two split panes, left one focused, mouse hovering over the right pane; scroll the wheel down
+  expected: The right (hovered) pane scrolls, while the left (focused) pane's viewport is unaffected
+  priority: 2
+- id: platform-bracketed-paste-inserts-literal-text
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  reference: platform
+  reference_detail: 'README: TUI backend supports bracketed paste'
+  steps: Insert mode; paste (via terminal paste, which sends a bracketed-paste sequence) a multi-line
+    block of text containing characters like '<' or leading whitespace
+  expected: The pasted text is inserted literally as buffer content, not reinterpreted as individual keystrokes
+    (no auto-indent re-triggering per line, no characters misinterpreted as commands)
+  priority: 2
+- id: platform-osc52-copies-to-system-clipboard
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  reference: platform
+  reference_detail: 'Checkable fact: a TUI running over SSH/tmux with no X11/Wayland access can still
+    reach the local system clipboard via the OSC 52 escape sequence, when the terminal supports it'
+  steps: In a terminal that supports OSC 52 (e.g. a modern terminal emulator, possibly over SSH), yank
+    text with yy in Vim mode
+  expected: The yanked text becomes available on the local system clipboard (paste-able into another application
+    outside the terminal), via an OSC 52 sequence emitted by vimcode
+  priority: 3
+- id: platform-ctrl-s-xon-xoff-flow-control
+  area: terminal
+  mode: any
+  lanes:
+  - tui-pty
+  reference: platform
+  reference_detail: 'README ''macOS terminal notes'': Ctrl+S can be the terminal''s XON/XOFF flow-control
+    key in some shell configs and appears to freeze the terminal'
+  steps: In a shell with XON/XOFF flow control enabled (stty ixon), press Ctrl+S inside vimcode's VSCode-mode
+    save binding
+  expected: If the terminal driver intercepts Ctrl+S for flow control before it reaches vimcode, output
+    visibly freezes until Ctrl+Q is pressed to resume -- this is documented, expected terminal behaviour,
+    not a vimcode hang; running 'stty -ixon' first (or using Alt+Enter for AI-send / a menu action for
+    Save) avoids it entirely
+  priority: 2
+- id: idle-no-repaint-bytes-when-idle
+  area: idle
+  mode: any
+  lanes:
+  - tui-pty
+  reference: platform
+  reference_detail: 'Checkable fact: an idle TUI process must emit zero output bytes while nothing changes
+    (precondition for diagnosing any apparent flicker)'
+  steps: Launch vcd, wait for the first frame to finish painting, then leave the terminal completely untouched
+    for 3 seconds
+  expected: No further bytes are written to the terminal during that idle window -- screen output is perfectly
+    silent
+  priority: 1
+- id: platform-windows-conpty-resize-signal
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  reference: platform
+  reference_detail: 'Checkable fact: ConPTY delivers window-resize notifications differently from a Unix
+    pty''s SIGWINCH, but the end result -- the app learning its new size -- must be the same'
+  steps: On Windows, under ConPTY/Windows Terminal, resize the terminal window while vcd is running
+  expected: vcd's rendered layout updates to the new terminal dimensions within one frame, with no stale-size
+    content left over from before the resize
+  priority: 2
+- id: platform-x11-vs-wayland-clipboard-parity
+  area: platform-input
+  mode: any
+  lanes:
+  - gtk-native
+  reference: platform
+  reference_detail: 'Checkable fact: GTK4''s clipboard API behaves identically whether the session is
+    X11 or Wayland, but the two sessions use different underlying mechanisms and are worth checking separately'
+  steps: On Linux under both an X11 session and a Wayland session, copy text with Ctrl+C in VSCode mode,
+    then paste it into another application (e.g. a terminal or text field outside vimcode)
+  expected: The copied text is available to paste into the external application on both session types,
+    with identical content and no mangled encoding
+  priority: 2
+- id: platform-win-native-ime-composition-positions-at-cursor
+  area: platform-input
+  mode: any
+  lanes:
+  - win-native
+  reference: platform
+  reference_detail: 'Checkable fact: IME composition windows (for CJK/other composed input) must appear
+    anchored at the text cursor''s screen position, not at a fixed window corner'
+  steps: On Windows, with an IME enabled (e.g. a Japanese or Chinese input method), place the cursor mid-buffer
+    and begin composing text
+  expected: The IME candidate window appears directly below/near the text cursor's actual screen position,
+    following the cursor if it has moved since the IME was last used
+  priority: 2
+- id: platform-mac-native-cmd-not-ctrl-for-shortcuts
+  area: platform-input
+  mode: any
+  lanes:
+  - mac-native
+  reference: platform
+  reference_detail: 'Checkable fact: on macOS, the OS convention is Cmd for app shortcuts; Ctrl is a distinct,
+    rarely-remapped modifier'
+  steps: On macOS native build, in VSCode mode, press Ctrl+C (not Cmd+C) with text selected
+  expected: vimcode does not treat bare Ctrl+C on macOS as the copy shortcut (Cmd+C is the bound key per
+    the mac keybinding variants); behaviour should match whatever vimcode documents for Ctrl+C on mac
+    specifically -- the point of this check is confirming it is NOT silently treated as copy by Ctrl alone
+    when Cmd is the documented macOS binding
+  priority: 3
+- id: render-scrollbar-thumb-tracks-viewport
+  area: render
+  mode: any
+  lanes:
+  - tui-pty
+  - gtk-native
+  - win-native
+  reference: platform
+  reference_detail: 'Checkable fact: the scrollbar thumb''s position and size must reflect the current
+    viewport''s position and proportion within the buffer'
+  steps: A 200-line buffer in a ~30-row viewport; scroll to roughly the middle of the buffer
+  expected: The scrollbar thumb is positioned roughly in the middle of the scrollbar track, and its length
+    is roughly proportional to (viewport rows / total lines)
+  priority: 2
+- id: render-status-bar-mode-color-changes-per-theme
+  area: render
+  mode: any
+  lanes:
+  - tui-pty
+  - gtk-native
+  reference: platform
+  reference_detail: 'Checkable fact: the status bar''s mode-indicator background color is theme-driven
+    and must repaint when the theme changes'
+  steps: Enter Vim Insert mode (status bar shows INSERT with its mode color), then run :colorscheme to
+    switch themes
+  expected: The INSERT indicator's background color updates to the new theme's insert-mode color immediately,
+    without needing to leave and re-enter Insert mode
+  priority: 3
+- id: platform-double-click-selects-word
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  - gtk-native
+  - win-native
+  reference: platform
+  reference_detail: 'Checkable fact: double-clicking a word selects the whole word, a cross-platform convention
+    this app documents for both backends'
+  steps: Line 'hello world'; double-click on 'world'
+  expected: The whole word 'world' becomes selected (both ends snap to word boundaries), not just the
+    clicked character
+  priority: 2
+- id: platform-sgr-right-click-opens-context-menu
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  reference: platform
+  reference_detail: 'Checkable fact: real SGR mouse right-click sequences (button 2) must reach vimcode''s
+    context-menu dispatch, not just a simulated in-process click'
+  steps: In a real terminal with SGR mouse mode, right-click a folder row in the Explorer sidebar
+  expected: A context menu opens within about a second, offering file/folder actions ('New File...', 'New
+    Folder...', etc.)
+  priority: 2
+- id: platform-win-terminal-vs-legacy-conhost-rendering
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  - win-native
+  reference: platform
+  reference_detail: 'Checkable fact: Windows Terminal (VT-aware) and legacy conhost.exe (more limited
+    VT support) can render the same byte stream differently'
+  steps: On Windows, run vcd once in Windows Terminal and once in legacy cmd.exe/conhost (not Windows
+    Terminal), using the same file and terminal size
+  expected: Both terminals show a readable, correctly laid-out editor; any feature that legacy conhost
+    cannot support (e.g. certain colors or glyphs) degrades gracefully rather than corrupting the screen
+  priority: 2
+- id: render-gtk-pixel-divider-visible
+  area: render
+  mode: any
+  lanes:
+  - gtk-native
+  reference: platform
+  reference_detail: 'Checkable fact: the GTK sidebar/editor divider must be visibly painted at the expected
+    pixel column, confirmed by sampling actual pixels rather than trusting layout state'
+  steps: With the sidebar open at its default width on the GTK backend, sample pixel colors along the
+    expected divider column
+  expected: A visually distinct divider color is present at that column, different from both the sidebar
+    and editor background colors on either side of it
+  priority: 3
+- id: platform-kitty-protocol-ctrl-enter-sends-ai-message
+  area: platform-input
+  mode: any
+  lanes:
+  - tui-pty
+  reference: platform
+  reference_detail: 'README AI panel: Ctrl+Enter sends the AI chat message, but only under the Kitty keyboard
+    protocol (kitty, Alacritty >= 0.12, WezTerm, foot) -- not most other terminals'
+  steps: In a terminal that implements the Kitty keyboard protocol, open the AI panel, type a message,
+    press Ctrl+Enter
+  expected: The message sends immediately, identical to pressing Alt+Enter or Ctrl+S; in a terminal that
+    does NOT implement the Kitty protocol, Ctrl+Enter instead behaves like a plain Enter (newline in the
+    input) since the terminal cannot distinguish the two
+  priority: 2

@@ -114,22 +114,36 @@ impl Engine {
                 Some((text, RegType::Linewise))
             }
             Mode::Visual => {
-                // Character mode: extract from start to end (inclusive)
+                // Character mode. Some selections (VSCode's Shift+arrow/Ctrl+A/
+                // Ctrl+L keyboard extension) leave the cursor *after* the last
+                // selected character (exclusive end); others (plain Vim visual
+                // mode, and — even in VSCode mode — mouse selection and Ctrl+D/
+                // Ctrl+Shift+L) put the cursor *on* the last selected character
+                // (inclusive end). This is NOT a function of editor mode — see
+                // `visual_end_exclusive`'s doc comment (#1788 review). Mixing the
+                // two conventions up here under-copies by one char for inclusive
+                // selections and over-copies by one char for exclusive
+                // selections: a 6-char Shift+Right selection of "hello " used to
+                // copy "hello w".
                 let start_char = self.buffer().line_to_char(start.line) + start.col;
-                let mut end_char_inclusive = self.buffer().line_to_char(end.line) + end.col + 1;
+                let mut end_char = self.buffer().line_to_char(end.line) + end.col;
+                if !self.visual_end_exclusive {
+                    // Inclusive end — the cursor's own char is selected too.
+                    end_char += 1;
+                }
 
                 // When $ was used, extend through the newline (Vim curswant=MAXCOL)
                 if self.visual_dollar {
                     let line_len = self.buffer().line_len_chars(end.line);
-                    end_char_inclusive = self.buffer().line_to_char(end.line) + line_len;
+                    end_char = self.buffer().line_to_char(end.line) + line_len;
                 }
 
-                let end_char_inclusive = end_char_inclusive.min(self.buffer().len_chars());
+                let end_char = end_char.min(self.buffer().len_chars());
 
                 let text = self
                     .buffer()
                     .content
-                    .slice(start_char..end_char_inclusive)
+                    .slice(start_char..end_char)
                     .to_string();
 
                 Some((text, RegType::Charwise))

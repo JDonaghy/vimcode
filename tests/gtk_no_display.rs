@@ -20,6 +20,24 @@
 //! reliably return quickly (a bad guessed `DISPLAY` can leave GTK to spend
 //! real time probing before giving up, unlike this fix's immediate check
 //! before anything is touched).
+//!
+//! X11/Wayland platforms only. `gtk::run`'s guard is deliberately gated to
+//! the platforms where GTK actually talks to a display server
+//! (`no_display_configured` in `src/gtk/mod.rs` is a no-op on macOS/quartz
+//! and Windows/win32, where there is no display variable to set and
+//! refusing to start would break a perfectly good GUI build). So on macOS
+//! this test's child process does *not* exit early — it goes on to call
+//! `gtk4::init()`, succeeds, opens a real window and runs the GTK main
+//! loop, and `Command::output()` blocks on it forever. That hung the whole
+//! `cargo test` run for >25 minutes with no failure output, which reads as
+//! "the suite is slow", not "this test can never pass here".
+//!
+//! The guard's platform split is already covered without spawning anything
+//! by the `no_display_guard_tests` module beside it in `src/gtk/mod.rs`,
+//! including the macOS/Windows "never trips" direction, so nothing is lost
+//! by not spawning the binary off-Linux.
+
+#![cfg(not(any(target_os = "macos", target_os = "windows")))]
 
 use std::process::Command;
 

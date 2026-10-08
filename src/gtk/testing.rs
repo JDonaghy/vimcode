@@ -660,6 +660,64 @@ mod tests {
         quadraui::WidgetId::new(crate::render::EDITOR_TAB_BAR_WIDGET_ID)
     }
 
+    /// True if a painted text run containing `needle` lands **inside tab
+    /// `idx`'s own slot** on tab bar `bar` — the tab-bar-scoped replacement
+    /// for a bare `screen_contains(label)` (#1798 review).
+    ///
+    /// `GtkDriver::screen_contains`/`find_bounds` match any painted run
+    /// anywhere on screen, and a filename is painted by the explorer tree
+    /// row, the breadcrumb bar and the window title on the very same frame
+    /// — so a needle-only assertion about a *tab* label passes even when the
+    /// tab never painted. (The same trap `tab_zero_left_half` below
+    /// documents from the other direction: a needle-anchored probe silently
+    /// measured the breadcrumb's geometry instead of the tab's.)
+    ///
+    /// Scoping is geometric, which is what makes it robust to a future
+    /// painted run that merely *contains* the needle (`"main.rs > main"`,
+    /// say): the slot comes from the [`quadraui::TabBarLayout`] the
+    /// rasteriser cached while actually painting `bar`, its width recovered
+    /// from the centre-to-centre distance of tabs 0 and 1 (equal-width slots
+    /// ⇒ one slot, the same derivation `tab_zero_left_half` uses), and the
+    /// matched run's rect must sit within it on both axes. Needs at least
+    /// two painted tabs to measure a slot width, which every caller has.
+    ///
+    /// Still worth passing a needle that only a tab bar can paint
+    /// (`TabInfo::name`'s trailing space — `name + " "`), so a failure
+    /// reports "the tab didn't paint" rather than "some other widget's run
+    /// matched first": `find_bounds` returns the *first* matching run, and
+    /// this helper can only reject that one, not search past it.
+    fn painted_label_is_in_tab_slot(
+        h: &mut Harness<impl AppLogic>,
+        bar: &quadraui::WidgetId,
+        idx: usize,
+        needle: &str,
+    ) -> bool {
+        let (Some(c0), Some(c1)) = (h.driver.tab_center(bar, 0), h.driver.tab_center(bar, 1))
+        else {
+            return false;
+        };
+        let Some(centre) = h.driver.tab_center(bar, idx) else {
+            return false;
+        };
+        let Some(label) = h.driver.find_bounds(needle) else {
+            return false;
+        };
+        // Horizontal: the run must lie within this slot's own half-open
+        // span. Equal-width slots ⇒ centre-to-centre is one slot wide.
+        let slot_w = (c1.0 - c0.0).abs();
+        let (slot_left, slot_right) = (centre.0 - slot_w / 2.0, centre.0 + slot_w / 2.0);
+        // Vertical: a label painted *in* the tab row straddles that row's
+        // own centre line, which `tab_center` reports. Checking containment
+        // of the centre (rather than deriving a row height the layout does
+        // not expose) is what rejects a same-needle run on another row — a
+        // breadcrumb or window-title run sits entirely below or above it.
+        const EPS: f32 = 0.5;
+        label.x + EPS >= slot_left
+            && label.x + label.width <= slot_right + EPS
+            && label.y <= centre.1
+            && label.y + label.height >= centre.1
+    }
+
     // ── #753 (mouse ladder slice 3): dividers + drag ────────────────────
     //
     // The GTK half of the rung this slice lifted into `render.rs`
@@ -937,7 +995,8 @@ mod tests {
     #[test]
     fn tab_drag_past_a_neighbour_reorders_the_painted_tab_bar() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_753_gtk_tab_drag_{:?}",
+            "vimcode_test_753_gtk_tab_drag_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1043,7 +1102,8 @@ mod tests {
     #[test]
     fn tab_drag_into_another_group_merges_and_collapses_the_source_on_gtk() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1370_gtk_merge_{:?}",
+            "vimcode_test_1370_gtk_merge_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1139,7 +1199,8 @@ mod tests {
     #[test]
     fn tab_drag_to_the_left_edge_splits_into_a_new_group_on_gtk() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1370_gtk_split_{:?}",
+            "vimcode_test_1370_gtk_split_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1579,7 +1640,16 @@ mod tests {
     /// `StatusAction::GoToLine`.
     #[test]
     fn status_bar_segment_click_opens_go_to_line_picker() {
-        let mut h = harness(engine_with_long_buffer(), 1400, 900);
+        // 2200px, not 1400 (#1690): the ruler (`Ln N, Col N`) moved from the
+        // bar's protected right-most slot to the **front** of the
+        // right-side priority-drop order (VS Code parity — it is now the
+        // *leftmost* segment of the right group, matching VS Code's own
+        // layout), so it is now among the first things a narrow bar drops,
+        // not the last. 1400px (this test's original width) no longer
+        // fits it — see `status_bar_1548_polish_paints_and_problems_
+        // counter_click_opens_workspace_quickfix`'s identical 2200px
+        // rationale for the measured drop-off point.
+        let mut h = harness(engine_with_long_buffer(), 2200, 900);
         let win = h.engine.borrow().active_window_id();
         assert!(
             h.engine.borrow().settings.window_status_line,
@@ -1645,7 +1715,11 @@ mod tests {
         engine.settings.status_line_above_terminal = false;
         engine.terminal_open = true;
         engine.session.terminal_panel_rows = 10;
-        let mut h = harness(engine, 1400, 900);
+        // 2200px, not 1400 (#1690) — same priority-drop rationale as
+        // `status_bar_segment_click_opens_go_to_line_picker`'s sibling
+        // comment: the ruler moved to the front of the right-side drop
+        // order, so it no longer survives this bar's original width.
+        let mut h = harness(engine, 2200, 900);
         let win = h.engine.borrow().active_window_id();
 
         assert!(
@@ -1818,6 +1892,146 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1690 acceptance: VS Code parity for the status bar — (1) it is a
+    /// window-width band that caps the activity bar and sidebar instead of
+    /// letting them run past its bottom edge, with a fill colour sourced
+    /// from `theme.status_bg` rather than a computed-lighter-than-
+    /// everything-else offset, and (2) its segments are grouped the way VS
+    /// Code's own bar is: far-left `NORMAL`/filename/problems counter,
+    /// far-right the `language` / `LF` / `UTF-8` / `Spaces: N` / `Ln N,
+    /// Col N` cluster.
+    ///
+    /// RED against unfixed `develop` (confirmed by reverting this issue's
+    /// `render.rs`/`app.rs` hunks and re-running): the fill sampled at
+    /// `x = 0` on the bar's row was the activity bar's own colour (the
+    /// activity bar/sidebar ran straight through the row instead of being
+    /// capped by it), and `ShowDiagnostics` painted to the *right* of
+    /// `ChangeLanguage` instead of to the left of every right-side
+    /// segment — the exact reversal this issue reports.
+    ///
+    /// #1760 updated this test's right-side ordering assertion: `Ln N, Col
+    /// N` is no longer the leftmost of the right cluster (VS Code's own
+    /// visual order) — it is now unconditionally the right-most segment of
+    /// the whole bar, because that is the only position
+    /// `StatusBar::layout`'s priority-drop treats as undroppable. See
+    /// `build_window_status_line`'s `right` push-order comment in
+    /// `render.rs` for why visual VS Code parity and "never disappears"
+    /// could not both be had from the leftmost position with quadraui's
+    /// current `StatusBar` primitive.
+    #[test]
+    fn status_bar_1690_spans_full_window_width_and_orders_segments_vs_code_style() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.lsp_enabled = false;
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        // A real-looking path (no file touched on disk — `file_path` is
+        // only ever read for its extension here, mirroring
+        // `test_window_status_line_problems_counter_reflects_diagnostic_
+        // counts`'s identical no-disk-IO pattern) so the language segment
+        // has something to paint.
+        engine.active_buffer_state_mut().file_path =
+            Some(std::path::PathBuf::from("/tmp/probe_1690.rs"));
+        let text: String = (0..50).map(|i| format!("line {i}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+        engine.lsp_diagnostics.insert(
+            std::path::PathBuf::from("/tmp/probe_1690.rs"),
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange::default(),
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: "probe".to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+        let win = engine.active_window_id();
+        // 1400px, not narrower (same #1548/#1690 rationale elsewhere in
+        // this file): wide enough that every segment this test reads
+        // survives the bar's priority-drop regardless of font metrics.
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        // ---- (1) full-width fill, capping the activity bar/sidebar ----
+        let mode_bounds = h
+            .driver
+            .find_bounds("NORMAL")
+            .expect("the mode badge must paint on the status bar's row");
+        let bar_y = (mode_bounds.y + mode_bounds.height / 2.0) as i32;
+        let (r, g, b) = h.driver.pixel(0, bar_y);
+        let theme = crate::render::Theme::onedark();
+        assert_eq!(
+            (r, g, b),
+            (theme.status_bg.r, theme.status_bg.g, theme.status_bg.b),
+            "the status bar's fill must reach the window's left edge \
+             (x=0) — capping the activity bar and sidebar instead of \
+             letting them run through its row — and come from \
+             theme.status_bg, not whatever colour the activity bar/\
+             sidebar/background paint; sampled {:?} at y={bar_y}",
+            (r, g, b)
+        );
+        // Sanity: this is a real colour switch, not a coincidence — the
+        // activity bar's own fill (`theme.tab_bar_bg` on this backend) is
+        // a distinctly different value.
+        assert_ne!(
+            (r, g, b),
+            (theme.tab_bar_bg.r, theme.tab_bar_bg.g, theme.tab_bar_bg.b),
+            "the x=0 sample must not still be the activity bar's own fill"
+        );
+
+        // ---- (2) segment order: VS Code's left/right split ----
+        // Left group: NORMAL, then the problems counter (ShowDiagnostics)
+        // — both ahead of the right group entirely.
+        let diag_x = h
+            .status_segment_center(win, crate::core::engine::StatusAction::ShowDiagnostics)
+            .expect("the problems counter must paint into status_segment_map")
+            .0;
+        assert!(
+            (mode_bounds.x as f32) < diag_x,
+            "NORMAL ({}) must sit left of the problems counter ({diag_x}) \
+             — both are the bar's far-left group",
+            mode_bounds.x
+        );
+
+        // Right group, left to right: language -> LF -> UTF-8 -> Spaces ->
+        // Ln/Col (#1760: Ln/Col is now the bar's unconditional right-most
+        // segment — see the test's own doc comment above).
+        let cursor_x = h
+            .status_segment_center(win, crate::core::engine::StatusAction::GoToLine)
+            .expect("the ruler must paint into status_segment_map")
+            .0;
+        let indent_x = h
+            .status_segment_center(win, crate::core::engine::StatusAction::ChangeIndentation)
+            .expect("the indent segment must paint into status_segment_map")
+            .0;
+        let encoding_x = h
+            .status_segment_center(win, crate::core::engine::StatusAction::ChangeEncoding)
+            .expect("the encoding segment must paint into status_segment_map")
+            .0;
+        let eol_x = h
+            .status_segment_center(win, crate::core::engine::StatusAction::ChangeLineEnding)
+            .expect("the line-ending segment must paint into status_segment_map")
+            .0;
+        let lang_x = h
+            .status_segment_center(win, crate::core::engine::StatusAction::ChangeLanguage)
+            .expect("the language segment must paint into status_segment_map")
+            .0;
+
+        assert!(
+            diag_x < lang_x
+                && lang_x < eol_x
+                && eol_x < encoding_x
+                && encoding_x < indent_x
+                && indent_x < cursor_x,
+            "right-side segments must paint in the order language -> LF -> \
+             UTF-8 -> Spaces -> Ln/Col, with Ln/Col unconditionally last \
+             (#1760), got x positions diag={diag_x} lang={lang_x} \
+             eol={eol_x} encoding={encoding_x} indent={indent_x} \
+             cursor={cursor_x}"
+        );
     }
 
     /// Three tabs in the default **single** editor group — the exact shape
@@ -2459,7 +2673,8 @@ mod tests {
         tag: &str,
     ) -> (Engine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_992_gtk_explorer_{tag}_{:?}",
+            "vimcode_test_992_gtk_explorer_{tag}_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2564,7 +2779,8 @@ mod tests {
     #[test]
     fn explorer_tree_shows_dotfiles_but_hides_git_by_default_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1545_gtk_explorer_{:?}",
+            "vimcode_test_1545_gtk_explorer_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2626,7 +2842,8 @@ mod tests {
         crate::icons::set_nerd_fonts(true);
 
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1381_gtk_explorer_icon_color_{:?}",
+            "vimcode_test_1381_gtk_explorer_icon_color_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2713,7 +2930,8 @@ mod tests {
         kind: crate::core::git::StatusKind,
     ) -> (Engine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "vc1051_gtk_explorer_{tag}_{:?}",
+            "vc1051_gtk_explorer_{tag}_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3740,6 +3958,133 @@ mod tests {
         );
     }
 
+    /// #1698: VS Code's activity bar paints, top to bottom, Explorer ·
+    /// Search · Source Control · Run and Debug · Extensions — vimcode had
+    /// Source Control and Run and Debug swapped (debug third, git fourth)
+    /// and the wrong glyphs for three of the five (an open-folder icon for
+    /// Explorer, the plain `fa-bug` glyph for Run and Debug, and the
+    /// diamond-shaped `nf-dev-git`/`e702` glyph for Source Control).
+    ///
+    /// Reads real painted output, not `PanelDefinition` state (#555): each
+    /// assertion locates a glyph via `GtkDriver::find`, which only reports
+    /// positions `GtkBackend::record_painted_text` recorded while actually
+    /// rasterising a Pango layout this frame, then checks the Y-coordinates
+    /// come back in top-to-bottom order. The icon glyphs doubling as search
+    /// needles (`icons::SOURCE_CONTROL`/`icons::RUN_AND_DEBUG`, nf-cod
+    /// `\u{ea68}`/`\u{eb91}`) are themselves new in this issue — on
+    /// unfixed `develop`, `App::resolve_builtin_panel_icon` never emits
+    /// either codepoint at all (`"panel:git"` painted the old `GIT_BRANCH`
+    /// diamond glyph, `"panel:debug"` painted the plain bug glyph), so
+    /// `find` returns `None` and the `expect` below panics before the
+    /// ordering check is even reached — verified by reverting
+    /// `src/app.rs`'s two changed match arms locally and re-running this
+    /// test, which failed exactly that way.
+    #[test]
+    fn activity_bar_paints_vscode_order_and_glyphs() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(true);
+        let mut h = harness(engine, 1400, 900);
+
+        let y = |needle: &str| -> f32 {
+            h.driver
+                .find(needle)
+                .unwrap_or_else(|| panic!("activity bar glyph {needle:?} not painted"))
+                .1
+        };
+
+        let explorer_y = y(crate::icons::EXPLORER.s());
+        let search_y = y(crate::icons::SEARCH.s());
+        let source_control_y = y(crate::icons::SOURCE_CONTROL.s());
+        let run_and_debug_y = y(crate::icons::RUN_AND_DEBUG.s());
+        let extensions_y = y(crate::icons::EXTENSIONS.s());
+
+        assert!(
+            explorer_y < search_y,
+            "Explorer ({explorer_y}) must paint above Search ({search_y})"
+        );
+        assert!(
+            search_y < source_control_y,
+            "Search ({search_y}) must paint above Source Control ({source_control_y})"
+        );
+        assert!(
+            source_control_y < run_and_debug_y,
+            "Source Control ({source_control_y}) must paint above Run and \
+             Debug ({run_and_debug_y}) — VS Code order, vimcode used to \
+             have these two swapped"
+        );
+        assert!(
+            run_and_debug_y < extensions_y,
+            "Run and Debug ({run_and_debug_y}) must paint above Extensions \
+             ({extensions_y})"
+        );
+    }
+
+    /// #1762 (non-blocking review finding): `App::handle_dispatch`'s
+    /// "rescue a double-click that folded away an activity-bar panel
+    /// switch" rung (`src/app.rs`) is shared by every backend, not just
+    /// TUI — GTK's `DoubleClickDetector` uses a 4.0px radius
+    /// (`gtk/backend.rs`), too wide for adjacent activity-bar rows to be
+    /// the failure mode there, but a genuine fast double-click on an
+    /// icon that is *already active* still reaches this rung: before
+    /// #1762's fix, click 1 toggled the sidebar hidden
+    /// (`AppShell::handle_activity_click`'s toggle branch) and click 2
+    /// folded into a `DoubleClick` that `AppShell::handle` has no arm
+    /// for, so it stayed hidden. After the fix, click 2 is replayed as a
+    /// plain `MouseDown` on the same (already-active, but now
+    /// sidebar-hidden) icon, which re-shows it. Dispatches the raw
+    /// `UiEvent`s directly (`h.driver.click` then `h.driver.dispatch`
+    /// with a literal `DoubleClick`), bypassing `GtkDriver`'s own
+    /// double-click folding so the two clicks are independently
+    /// controllable, and asserts on *painted* output
+    /// (`screen_contains("EXPLORER")`), never on `app_shell` state
+    /// (#587/#592's lesson).
+    #[test]
+    fn activity_bar_double_click_on_active_icon_reopens_sidebar_via_gtk_driver() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(true);
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        let mut h = harness(engine, 1400, 900);
+
+        assert!(
+            h.driver.screen_contains("EXPLORER"),
+            "precondition: Explorer must be the active, visible panel; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let (ex, ey) = h
+            .driver
+            .find(crate::icons::EXPLORER.s())
+            .expect("Explorer activity-bar icon must paint");
+
+        // Click 1 on the already-active icon: toggles the sidebar hidden.
+        h.driver.click(ex, ey);
+        assert!(
+            !h.driver.screen_contains("EXPLORER"),
+            "sanity: a single click on the already-active Explorer icon \
+             must hide the sidebar; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Click 2, as a real double-click (not two singles — the folding
+        // path this rung exists for): must re-show the sidebar, not leave
+        // it hidden.
+        h.driver.dispatch(quadraui::UiEvent::DoubleClick {
+            widget: None,
+            position: Point::new(ex, ey),
+        });
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("EXPLORER"),
+            "a double-click on the already-active Explorer icon must \
+             re-show the sidebar (the fold-rescue rung replays it as a \
+             plain MouseDown toggle), not leave it hidden; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     /// #727: a natively-expressible dialog (no `DialogTable`, no text
     /// input — `quit_unsaved`, the "Unsaved Changes" confirm, is exactly
     /// this shape) must be presented via a real `PlatformServices::
@@ -4077,6 +4422,171 @@ mod tests {
              tab, raising the painted \"Terminal\" occurrence count above \
              the menu-bar-only baseline ({before}); got {after}"
         );
+    }
+
+    /// #1798 (bugbash:win-native): double-clicking a *second* file in the
+    /// Explorer sidebar, while a first file is already open in a real
+    /// (non-preview) tab, must paint a **second** tab — label and all —
+    /// beside the first, in an **800x480** window.
+    ///
+    /// The GTK half of the shared-engine coverage; `tui_main::
+    /// app_on_tui_tests`'s `explorer_double_click_opens_second_file_in_a_
+    /// second_tab_1798` is the TUI half. Both drive the identical
+    /// `App::explorer_ui_event` → `Engine::dispatch_explorer_tree_event` →
+    /// `Engine::open_file_in_tab` path (shared by every backend — there is
+    /// no GTK-specific explorer click handler, `src/gtk/explorer.rs` is a
+    /// type-re-export stub), which is also the path the real Win-GUI
+    /// backend takes: quadraui's `src/win/events.rs` sets no `CS_DBLCLKS`
+    /// and handles no `WM_LBUTTONDBLCLK`, so Windows delivers two plain
+    /// `WM_LBUTTONDOWN`s folded by the same shared `DoubleClickDetector`.
+    ///
+    /// `sample.txt` is opened the way the bugbash report's "Open
+    /// sample.txt" step did — `Engine::startup_without_session_restore`,
+    /// the CLI-argument path — rather than `open_file_in_tab` directly, so
+    /// this reproduces the pristine-scratch-buffer-reuse precondition the
+    /// report started from.
+    ///
+    /// # Why 800x480, and why this fails against unfixed `develop`
+    ///
+    /// 800x480 is the evidence screenshot's own size, and the dispatch path
+    /// above was never the defect — the engine always opened a second tab.
+    /// The tab had nowhere to *paint*. `App::shell_config` left
+    /// `ShellConfig::default_sidebar_width` at quadraui's generic `20.0`,
+    /// which `AppShell::compute_layout` multiplies by `line_height` on
+    /// *every* backend: 20 terminal rows on TUI, but ~460 device pixels on a
+    /// GUI one. Beside the 48px activity bar that left ~290px of an 800px
+    /// window for the editor and its tab bar — room for exactly one tab.
+    /// Hence the report: breadcrumb, content and status bar all followed the
+    /// new buffer, but the tab strip kept reading only `sample.txt x`.
+    ///
+    /// The fix makes that one number per-*unit* rather than per-backend, via
+    /// `render::UnitProfile::sidebar_width_lh` (`ALT_SIDEBAR_WIDTH_MIN`'s 15
+    /// ≈ 345px on a GUI, in the same range as `Session::sidebar_width`'s
+    /// persisted 260 default and VS Code's ~300px; 20 cells on TUI, i.e.
+    /// unchanged). See that field's doc for why it stops at the shared Alt
+    /// rung's floor rather than going narrower.
+    ///
+    /// RED-verified: restoring the px profile's `sidebar_width_lh` to `20.0`
+    /// makes the `tab_center(&bar, 1)` assertion below fail at this window
+    /// size — the second tab's hit region is never cached because the tab
+    /// never paints — while the whole rest of the suite, the TUI twin
+    /// included, stays green.
+    ///
+    /// # Why the assertions are scoped to the tab bar
+    ///
+    /// A bare `screen_contains("main.rs")` is satisfied regardless by the
+    /// Explorer sidebar row, the breadcrumb segment and the window-title
+    /// path segments this same frame also paints — so it would pass even
+    /// under the reported bug. Two things keep these assertions honest:
+    ///
+    /// * the needle carries the trailing space `TabInfo::name` appends
+    ///   (`name + " "`, so the close glyph doesn't sit flush against the
+    ///   label) — breadcrumb and status-bar text is painted one run *per
+    ///   segment*, so those runs are bare `"main.rs"` with no trailing
+    ///   space and cannot match;
+    /// * [`painted_label_is_in_tab_slot`] then checks the matched run's
+    ///   pixel rect actually lands inside that tab's own slot on the bar,
+    ///   derived from the `TabBarLayout` the rasteriser cached while
+    ///   painting. That is what makes the check robust to a *future*
+    ///   painted run of the form `"main.rs > main"` (a breadcrumb joined
+    ///   before paint), which would contain the needle but sit on a
+    ///   different row.
+    #[test]
+    fn explorer_double_click_opens_second_file_in_a_second_tab_1798() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1798_gtk_explorer_dblclick_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sample = dir.join("sample.txt");
+        let main_rs = dir.join("main.rs");
+        std::fs::write(&sample, "sample contents\n").unwrap();
+        std::fs::write(&main_rs, "fn main() {}\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.startup_without_session_restore(Some(&sample));
+        engine.explorer_expanded.insert(dir.clone());
+        engine.explorer_rebuild_rows();
+        // `app_shell.show_panel(...)` is not called here — confirmed a
+        // no-op in this harness (the runner-side `AppShell` the driver
+        // actually paints from is never synced from this *shadow* copy at
+        // startup; `collapse_sidebar`'s TUI-side doc traces the same gap).
+        // `session.explorer_visible` alone drives the painted sidebar.
+        engine.session.explorer_visible = true;
+
+        let mut h = harness(engine, 800, 480);
+        h.driver.render();
+
+        // Scoped to `"sample.txt "` (with the tab-bar-only trailing space
+        // `TabInfo::name` appends) rather than a bare `screen_contains`,
+        // same reasoning as the main assertions below (#1798 review): a
+        // bare `screen_contains("sample.txt")` is also satisfied by the
+        // Explorer sidebar row, so it would pass even if the tab itself
+        // never painted.
+        assert!(
+            h.driver.find_bounds("sample.txt ").is_some(),
+            "precondition: sample.txt's tab must already be painted on the \
+             tab bar itself; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let (x, y) = h
+            .driver
+            .find("main.rs")
+            .expect("the populated explorer row must paint main.rs's file name");
+        h.driver.dispatch(quadraui::UiEvent::DoubleClick {
+            widget: None,
+            position: quadraui::Point::new(x, y),
+        });
+        h.driver.render();
+
+        assert_eq!(
+            h.engine.borrow().active_group().tabs.len(),
+            2,
+            "double-clicking a second file in the Explorer must open a \
+             second tab, not replace the first one in place"
+        );
+
+        let bar = editor_tab_bar_id();
+        assert!(
+            h.driver.tab_center(&bar, 0).is_some() && h.driver.tab_center(&bar, 1).is_some(),
+            "the tab bar must have actually painted (and cached a hit \
+             region for) two tabs, not just hold two entries in the \
+             pre-paint `TabBar` primitive"
+        );
+        assert!(
+            painted_label_is_in_tab_slot(&mut h, &bar, 0, "sample.txt ")
+                && painted_label_is_in_tab_slot(&mut h, &bar, 1, "main.rs "),
+            "both the originally-open sample.txt tab and the newly \
+             double-clicked main.rs tab must have their own label painted \
+             inside their own slot on the editor tab bar — not just the \
+             sidebar row, breadcrumb segment or window title painting the \
+             same filename elsewhere on screen; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Negative control: the assertion above has teeth only if
+        // `painted_label_is_in_tab_slot` can actually *reject* a run. Drop
+        // the trailing space and `find_bounds` matches the explorer tree row
+        // first — same needle, same frame, same already-correct tab bar — and
+        // the geometric check must say no. Without this, a future change that
+        // made the helper trivially true (or a `find_bounds` that started
+        // matching a joined `"main.rs > main"` breadcrumb run) would silently
+        // re-vacuate the assertion above rather than fail here.
+        assert!(
+            !painted_label_is_in_tab_slot(&mut h, &bar, 1, "main.rs"),
+            "the tab-slot scoping must reject the explorer row's bare \
+             \"main.rs\" run, which `find_bounds` matches before the tab's \
+             own \"main.rs \" — otherwise the assertion above proves nothing \
+             about the tab bar; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #1038 (GTK half of the shared-engine fix): `handle_mouse_click`
@@ -5698,6 +6208,134 @@ mod sidebar_panel_clicks {
              Engine::handle_dap_sidebar_action_click, which stops the \
              (faked) active session and repaints \"Start Debugging\" in \
              its place"
+        );
+    }
+
+    /// #1693 acceptance item 3: the Explorer header must expose an
+    /// overflow-menu widget id, not just a bare "EXPLORER" title bar with
+    /// no actions. This is the "fails first against unfixed `develop`"
+    /// black-box test the issue asks for — before this PR there was no
+    /// `SidebarPanelChrome` row at all over the Explorer tree, so neither
+    /// the "..." glyph nor `explorer:overflow` painted/hit-tested, and
+    /// this assertion was RED against unfixed `develop` (confirmed by
+    /// temporarily reverting the `PANEL_EXPLORER` chrome arm back to
+    /// `SidebarPanelChrome::None` while writing this test).
+    #[test]
+    fn explorer_header_view_actions_row_exposes_an_overflow_menu_widget_id() {
+        let h = panel_harness(PANEL_EXPLORER);
+
+        assert!(
+            h.driver.screen_contains("\u{2026}"),
+            "the Explorer header's \"...\" overflow button must actually be \
+             painted, not just recorded in a layout cache; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        let overflow_id = quadraui::WidgetId::new("explorer:overflow");
+        let hits = h.engine.borrow().explorer_toolbar_hits.borrow().clone();
+        assert!(
+            hits.iter().any(|(_, hit)| matches!(
+                hit,
+                quadraui::StatusBarHit::Segment(id) if *id == overflow_id
+            )),
+            "the toolbar's painted hit regions (captured straight from \
+             SidebarPanelBodyLayout::status_bar_hit_regions, not re-derived) \
+             must include a segment whose widget id is \"explorer:overflow\": {hits:?}"
+        );
+    }
+
+    /// Clicking the Explorer header's "..." button must open a real popup
+    /// menu offering the same four operations as the toolbar's own
+    /// buttons (#1693) — `Engine::open_explorer_overflow_menu` through the
+    /// generic `engine.context_menu` paint path every other context menu
+    /// (editor / tab bar / explorer row) already uses.
+    #[test]
+    fn clicking_the_explorer_overflow_button_opens_a_menu_with_new_file_and_collapse_all() {
+        let mut h = panel_harness(PANEL_EXPLORER);
+        h.driver.render();
+        let (x, y) = h.driver.find("\u{2026}").unwrap_or_else(|| {
+            panic!(
+                "could not find the overflow button's \"...\" glyph; painted texts: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+
+        h.driver.click(x, y);
+
+        assert!(
+            h.driver.screen_contains("New File..."),
+            "the overflow menu must offer \"New File...\"; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("Collapse Folders in Explorer"),
+            "the overflow menu must offer \"Collapse Folders in Explorer\"; \
+             painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// Clicking the Explorer header's "Collapse All" toolbar button must
+    /// collapse every expanded directory except the workspace root (#1693)
+    /// — asserted on painted content (a deeply nested file's row vanishes
+    /// from the screen), not on `explorer_expanded`'s size alone, per
+    /// `CLAUDE.md`'s "assert on rendered output" testing rule.
+    #[test]
+    fn clicking_explorer_collapse_all_collapses_nested_directories_but_keeps_the_root_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1693_collapse_all_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("sub").join("deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        let deep_file = nested.join("deepfile.txt");
+        std::fs::write(&deep_file, "marker\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+        engine.explorer_reveal_path(&deep_file);
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("deepfile.txt"),
+            "precondition: revealing the deep file must expand every \
+             ancestor so its row is actually painted; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // `explorer_toolbar_status_bar` pads every fallback glyph with a
+        // leading/trailing space (`" c "`), so searching for that padded
+        // form (rather than a bare `"c"`) can't accidentally match a `c`
+        // inside a painted file/directory name.
+        let (x, y) = h.driver.find(" c ").unwrap_or_else(|| {
+            panic!(
+                "could not find Collapse All's \" c \" fallback glyph; \
+                 painted texts: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+
+        h.driver.click(x, y);
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !h.driver.screen_contains("deepfile.txt"),
+            "Collapse All must collapse the nested directories so the deep \
+             file's row is no longer painted; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("sub"),
+            "Collapse All must keep the workspace root expanded, so its \
+             immediate child \"sub\" stays visible; painted texts: {:?}",
+            h.driver.painted_texts()
         );
     }
 
@@ -7988,7 +8626,8 @@ second line here
     #[test]
     fn change_review_close_restores_chrome_clicks_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_955_gtk_review_modal_pop_{:?}",
+            "vimcode_test_955_gtk_review_modal_pop_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -8262,6 +8901,14 @@ second line here
             let mut engine = h.engine.borrow_mut();
             engine.settings.acp_follow_agent = true;
             engine.workspace_root = Some(dir.clone());
+            // Pinned short (#1690): `panel_harness` builds on `Engine::new()`,
+            // which auto-detects this worktree's real (long) git branch
+            // name, and this test's final assertion depends on the
+            // `Ln N` segment surviving the bar's priority-drop — see
+            // `status_bar_1548_polish_paints_and_problems_counter_click_
+            // opens_workspace_quickfix`'s own comment for the established
+            // precedent.
+            engine.git_branch = Some("main".to_string());
             let fixture = concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/fake_acp_agent.sh"
@@ -9309,11 +9956,10 @@ mod editor_popups {
     fn completion_popup_paints_and_caches_a_hit_testable_layout() {
         let without = popup_region_pixels(|_| {});
         let with = popup_region_pixels(|e| {
-            e.completion_candidates = vec![
-                "println".to_string(),
-                "print".to_string(),
-                "process".to_string(),
-            ];
+            e.completion_candidates = ["println", "print", "process"]
+                .into_iter()
+                .map(|s| crate::core::completion::CompletionCandidate::plain(s.to_string()))
+                .collect();
             e.completion_idx = Some(0);
             e.completion_start_col = 0;
         });
@@ -9322,11 +9968,10 @@ mod editor_popups {
         // Also verify the layout is cached for the click handler's
         // hit-testing (B.5b Stage 5), separately from the paint proof above.
         let mut engine = small_engine();
-        engine.completion_candidates = vec![
-            "println".to_string(),
-            "print".to_string(),
-            "process".to_string(),
-        ];
+        engine.completion_candidates = ["println", "print", "process"]
+            .into_iter()
+            .map(|s| crate::core::completion::CompletionCandidate::plain(s.to_string()))
+            .collect();
         engine.completion_idx = Some(0);
         engine.completion_start_col = 0;
         let h = harness(engine, 1400, 900);
@@ -9355,7 +10000,9 @@ mod editor_popups {
         let mut engine = Engine::new();
         engine.buffer_mut().insert(0, "\t\tfoo\n");
         engine.view_mut().cursor.col = 5;
-        engine.completion_candidates = vec!["foobar".to_string()];
+        engine.completion_candidates = vec![crate::core::completion::CompletionCandidate::plain(
+            "foobar".to_string(),
+        )];
         engine.completion_idx = Some(0);
         engine.completion_start_col = 2;
 
@@ -9888,6 +10535,298 @@ mod editor_popups {
                 .iter()
                 .any(|(_, uri)| uri == "https://example.com/docs821"),
             "the bare URL must be linkified into a real clickable link rect; got {link_rects:?}"
+        );
+    }
+
+    /// #504: a hover popup with several bare URLs used to register a click
+    /// region for only the first one — the rest painted in link color but
+    /// did nothing when clicked. Coverage here spans the two things the
+    /// coordinator triage flagged as the remaining suspects: two URLs
+    /// landing on the very same line (so any per-line "stop after first
+    /// match" bug in the scanner would show up), and a URL that comes after
+    /// a run of **bold** text, so a char-count hit-region computed from the
+    /// *wrong* preceding width would drift.
+    ///
+    /// Clicks are aimed at the *painted* link-coloured pixels — located by
+    /// scanning for `theme.md_link`-coloured columns inside the popup
+    /// line's own painted bounds — not at the centre of the registered
+    /// hit rect read straight out of `editor_hover_link_rects`. Clicking
+    /// the registered rect's own centre would be tautologically green no
+    /// matter how far that rect has drifted from where GTK's Pango layout
+    /// actually painted the glyphs, and that drift was the remaining #504
+    /// GTK suspect this test exists to catch: `editor_hover_popup_paint`
+    /// (`src/render.rs`) used to derive the link hit region from a
+    /// char-count estimate (`chars().count() * unit_w`) while the
+    /// rasteriser painted with real, proportional glyph widths. That
+    /// estimate has since been replaced with `Backend::measure_text`
+    /// (same fix), so this test now also pins that fix against a
+    /// regression.
+    ///
+    /// `h.driver.find_bounds`/`find` can't locate an individual URL here:
+    /// quadraui's `draw_rich_text_popup` renders a whole popup *line* as a
+    /// single `pango::Layout`/`show_layout` call — per-span colour comes
+    /// from a `pango::AttrList` inside that one call, not a separate call
+    /// per span (confirmed by reading `rich_text_popup.rs`'s draw loop) —
+    /// and `GtkDriver`'s paint-time text recording captures one run per
+    /// `show_layout` call. So `find_bounds(first_url)` resolves to the
+    /// *whole line's* bounds (it contains both URLs plus the plain text
+    /// around them), confirmed by hand while writing this test: it
+    /// returned the full-line width, and clicking its centre landed in
+    /// the plain-text gap between the two links and queued nothing.
+    /// Pixel-colour scanning is this file's own prior art for exactly
+    /// this situation (CLAUDE.md: "probe pixels when the content is icon
+    /// glyphs") and, unlike `find_bounds` here, it is driven by what the
+    /// rasteriser actually drew rather than by a logical span registered
+    /// elsewhere — so it stays independent of this test's own production
+    /// fix.
+    ///
+    /// Each case gets its own fresh harness/popup — a `Link` click
+    /// dismisses the popup (see `apply_editor_hover_popup_route`), so
+    /// clicking the second link in the same popup instance the first click
+    /// already closed would trivially prove nothing.
+    ///
+    /// **RED against the bug this issue describes:** with only the first
+    /// match per line registered, `second_rect` below would not exist (or
+    /// would alias `first_rect`), and clicking it would queue no
+    /// `OpenUrl` at all. Reverting the `measure_text` fix in
+    /// `editor_hover_popup_paint` back to the char-count estimate also
+    /// turns this red: the second URL's painted pixels then sit outside
+    /// its (now too-narrow) registered hit rect, so `click_and_collect`
+    /// finds no `OpenUrl` in `pending_platform_actions`.
+    #[test]
+    fn editor_hover_popup_registers_every_bare_url_as_its_own_click_region_on_gtk() {
+        let markdown =
+            "**Bold504** then https://example.com/first504 and https://example.com/second504 end504";
+        let first_url = "https://example.com/first504";
+        let second_url = "https://example.com/second504";
+
+        fn fresh_popup(markdown: &str) -> Harness<impl AppLogic> {
+            let mut engine = small_engine();
+            engine.show_editor_hover(
+                1,
+                4,
+                markdown,
+                crate::core::engine::EditorHoverSource::Lsp,
+                false,
+                false,
+            );
+            let mut h = harness(engine, 1400, 900);
+            h.driver.render();
+            h
+        }
+
+        /// True if `px` is close enough to `target` to count as "painted
+        /// in that colour" — glyph edges anti-alias towards the
+        /// background, so only pixels deep inside a stroke match exactly;
+        /// ±24 per channel is generous enough to still catch those while
+        /// staying well clear of this popup's `hover_fg`/`hover_bg` (the
+        /// two colours a link pixel could otherwise be mistaken for).
+        fn color_near((r, g, b): (u8, u8, u8), target: (u8, u8, u8)) -> bool {
+            let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 24;
+            near(r, target.0) && near(g, target.1) && near(b, target.2)
+        }
+
+        /// Contiguous x-ranges, within `line_bounds`, of columns that
+        /// contain at least one `target`-coloured pixel somewhere in the
+        /// line's vertical extent. One range per run of link-coloured
+        /// glyphs — i.e. one per bare URL, since the plain text around
+        /// each link (several glyphs *and a 5-character " and "* wide)
+        /// never matches `target` and so always breaks the run. A
+        /// same-link gap between two adjacent glyphs' own ink (the hole
+        /// inside an "o", the gap either side of a thin "l"/"i" stroke,
+        /// kerning — not whitespace) measured by hand against this
+        /// fixture's actual chrome font tops out under 10px, so
+        /// `GAP_TOLERANCE` bridges those while staying well under the
+        /// 40+px a single plain-text word between two links leaves.
+        fn link_colored_x_spans<A: AppLogic>(
+            h: &mut Harness<A>,
+            line_bounds: quadraui::Rect,
+            target: (u8, u8, u8),
+        ) -> Vec<(f32, f32)> {
+            const GAP_TOLERANCE: i32 = 20;
+            let x0 = line_bounds.x.floor() as i32;
+            let x1 = (line_bounds.x + line_bounds.width).ceil() as i32;
+            let y0 = line_bounds.y.floor() as i32;
+            let y1 = (line_bounds.y + line_bounds.height).ceil() as i32;
+
+            let mut spans = Vec::new();
+            let mut run_start: Option<i32> = None;
+            let mut run_last_hit: Option<i32> = None;
+            for x in x0..x1 {
+                let hit = (y0..y1).any(|y| color_near(h.driver.pixel(x, y), target));
+                if hit {
+                    run_start.get_or_insert(x);
+                    run_last_hit = Some(x);
+                } else if let (Some(start), Some(last)) = (run_start, run_last_hit) {
+                    if x - last > GAP_TOLERANCE {
+                        spans.push((start as f32, last as f32 + 1.0));
+                        run_start = None;
+                        run_last_hit = None;
+                    }
+                }
+            }
+            if let (Some(start), Some(last)) = (run_start, run_last_hit) {
+                spans.push((start as f32, last as f32 + 1.0));
+            }
+            spans
+        }
+
+        // Sanity, checked once up front: both URLs must have painted, as
+        // *distinct* (non-aliased) registered hit rects, on the very same
+        // popup line — the #504 symptom was per-*line*, so pin both URLs
+        // there rather than letting a future fixture edit silently
+        // relocate one onto line 2 while this test keeps passing for the
+        // wrong reason. Also pins exactly two link-coloured pixel runs on
+        // that line, which the click loop below relies on to tell "first"
+        // from "second" apart.
+        let line_bounds = {
+            let mut h = fresh_popup(markdown);
+            assert!(
+                h.driver.screen_contains(first_url),
+                "the first bare URL must paint; painted texts: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                h.driver.screen_contains(second_url),
+                "the second bare URL must paint — if this fails, the \
+                 renderer stopped drawing it even though {first_url} \
+                 still did; painted texts: {:?}",
+                h.driver.painted_texts()
+            );
+
+            let link_rects = h.editor_hover_link_rects.borrow().clone();
+            let first_rect = link_rects
+                .iter()
+                .find(|(_, uri)| uri == first_url)
+                .map(|(r, _)| *r)
+                .unwrap_or_else(|| panic!("missing rect for {first_url}; got {link_rects:?}"));
+            let second_rect = link_rects
+                .iter()
+                .find(|(_, uri)| uri == second_url)
+                .map(|(r, _)| *r)
+                .unwrap_or_else(|| panic!("missing rect for {second_url}; got {link_rects:?}"));
+            assert_ne!(
+                first_rect, second_rect,
+                "the first and second bare URL must paint distinct hit \
+                 regions, not alias the same rect"
+            );
+            assert_eq!(
+                first_rect.y, second_rect.y,
+                "this fixture only exercises the per-line scanner bug if \
+                 both URLs land on the same popup line; got {first_rect:?} \
+                 vs {second_rect:?}"
+            );
+
+            let line_bounds = h
+                .driver
+                .find_bounds(first_url)
+                .expect("the popup line containing both URLs must paint");
+            let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+            let md_link = (theme.md_link.r, theme.md_link.g, theme.md_link.b);
+            let spans = link_colored_x_spans(&mut h, line_bounds, md_link);
+            assert_eq!(
+                spans.len(),
+                2,
+                "expected exactly two link-coloured pixel runs on the \
+                 popup line (one per bare URL); got {spans:?} within \
+                 {line_bounds:?}"
+            );
+
+            // The direct geometric check #504's drift is about: the
+            // *registered* hit rect for each URL must track where its
+            // glyphs were *actually painted* (the pixel-coloured span),
+            // not just "close enough that a click happens to land in the
+            // overlap by luck". Caught the char-count-estimate bug this
+            // test guards against with a wide margin while writing it:
+            // reverting `editor_hover_popup_paint` to the old
+            // `chars().count() * unit_w` estimate put the second URL's
+            // registered rect ~120px right of its real span (992 vs a
+            // real span starting at 870) — one order of magnitude past
+            // this ±10px tolerance — while leaving the *click-routing*
+            // assertions below passing, because the oversized registered
+            // rect still happened to overlap the real click point. A
+            // tight bound here is what actually rejects that drift.
+            const EDGE_TOLERANCE: f32 = 10.0;
+            let assert_rect_tracks_span =
+                |label: &str, rect: quadraui::Rect, (sx0, sx1): (f32, f32)| {
+                    assert!(
+                        (rect.x - sx0).abs() <= EDGE_TOLERANCE
+                            && (rect.x + rect.width - sx1).abs() <= EDGE_TOLERANCE,
+                        "{label}'s registered hit rect {rect:?} must track \
+                         its actually-painted pixel span ({sx0}, {sx1}) \
+                         within {EDGE_TOLERANCE}px"
+                    );
+                };
+            assert_rect_tracks_span("the first bare URL", first_rect, spans[0]);
+            assert_rect_tracks_span("the second bare URL", second_rect, spans[1]);
+
+            line_bounds
+        };
+
+        // Click the *painted* link-coloured pixels for each URL in turn,
+        // in its own fresh popup, and confirm each queues its own
+        // `OpenUrl`. Re-locates the spans every time (a fresh popup is a
+        // fresh paint) rather than reusing the sanity block's own
+        // harness — only `span_idx` (first span ⇒ first URL, second span
+        // ⇒ second URL, since the markdown places them in that
+        // left-to-right order) carries over.
+        let click_and_collect = |url_to_click: &str,
+                                 span_idx: usize|
+         -> Vec<crate::core::engine::PendingPlatformAction> {
+            let mut h = fresh_popup(markdown);
+
+            // Precondition: a hit region really was registered for this
+            // URL (distinct from whether the click below lands on it —
+            // that's the drift this test is about).
+            let link_rects = h.editor_hover_link_rects.borrow().clone();
+            assert!(
+                link_rects.iter().any(|(_, uri)| uri == url_to_click),
+                "expected a click region for {url_to_click}; got {link_rects:?}"
+            );
+
+            let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+            let md_link = (theme.md_link.r, theme.md_link.g, theme.md_link.b);
+            let spans = link_colored_x_spans(&mut h, line_bounds, md_link);
+            let (sx0, sx1) = *spans.get(span_idx).unwrap_or_else(|| {
+                panic!(
+                    "expected a link-coloured pixel run at index {span_idx} \
+                     for {url_to_click}; got {spans:?}"
+                )
+            });
+            let (cx, cy) = ((sx0 + sx1) / 2.0, line_bounds.y + line_bounds.height / 2.0);
+            h.driver.click(cx, cy);
+            h.driver.render();
+
+            // Not a redundant binding: as a bare tail expression this
+            // fails to compile (E0597) — the `Ref` guard `.borrow()`
+            // returns is part of the tail-expression's temporary scope,
+            // which isn't dropped until after `h` itself is dropped at
+            // the closing brace; naming the clone forces the `Ref` to
+            // drop first.
+            let actions = h.engine.borrow().pending_platform_actions.clone();
+            actions
+        };
+
+        let actions_from_first = click_and_collect(first_url, 0);
+        assert!(
+            actions_from_first.iter().any(|a| matches!(
+                a,
+                crate::core::engine::PendingPlatformAction::OpenUrl(u) if u == first_url
+            )),
+            "clicking the first bare URL's painted location must queue \
+             OpenUrl({first_url}); got {actions_from_first:?}"
+        );
+
+        let actions_from_second = click_and_collect(second_url, 1);
+        assert!(
+            actions_from_second.iter().any(|a| matches!(
+                a,
+                crate::core::engine::PendingPlatformAction::OpenUrl(u) if u == second_url
+            )),
+            "clicking the second bare URL's painted location must queue \
+             OpenUrl({second_url}) — this is the #504 regression: only the \
+             first bare URL was clickable, the rest painted in link color but \
+             did nothing; got {actions_from_second:?}"
         );
     }
 }
@@ -10768,8 +11707,20 @@ mod chrome_surfaces {
     #[test]
     fn context_menu_key_is_consumed_instead_of_leaking_to_the_editor() {
         let mut engine = small_engine();
+        // Pinned short (#1690, mirrors the established fix in
+        // `status_bar_1548_polish_paints_and_problems_counter_click_opens_
+        // workspace_quickfix`'s own comment): `small_engine()` is built on
+        // `Engine::new()`, which auto-detects this worktree's real (long)
+        // git branch name, and this test's final assertion now depends on
+        // the `Ln N, Col N` segment surviving the bar's priority-drop.
+        engine.git_branch = Some("main".to_string());
         engine.open_editor_context_menu(700, 400);
-        let mut h = harness(engine, 1400, 900);
+        // 2200px, not 1400 (#1690): the ruler moved to the front of the
+        // right-side priority-drop order (VS Code parity — it is now the
+        // *leftmost* segment of the right group, not the protected
+        // right-most one), so it no longer reliably survives this bar's
+        // original width.
+        let mut h = harness(engine, 2200, 900);
         assert!(
             h.driver.screen_contains("Paste"),
             "precondition: the context menu paints its always-enabled Paste item"
@@ -11234,6 +12185,64 @@ mod sticky_scroll {
             "clicking the pinned inner-scope header must move the cursor \
              to its real buffer line (1)"
         );
+    }
+}
+
+/// #1697: VS Code's menu bar is `File · Edit · Selection · View · Go · Run ·
+/// Terminal · Help` — vimcode's dropped `Selection` entirely, the only
+/// mismatch against an otherwise label-for-label identical bar (see the
+/// issue's side-by-side capture). `MENU_STRUCTURE` (`render.rs`) is the one
+/// shared static both backends paint their top-level row from, so this is a
+/// pure menu-definition fix with no backend-specific code; this GTK-side
+/// proof is paired with a TUI-side mirror driving the real `App` through
+/// `quadraui::tui::testing::TuiDriver` —
+/// `tui_main::app_on_tui_tests::tests::selection_menu::
+/// menu_bar_has_selection_between_edit_and_view_in_order` — so both
+/// renderers are proven off the same data rather than assumed from this
+/// test alone (the #587/#592 "state populated, only one backend painted it"
+/// class of gap this file's module docs already warn about).
+///
+/// Verified RED against the pre-fix tree: with `Selection` absent from
+/// `MENU_STRUCTURE`, `find_bounds("Selection")` returns `None` and the
+/// `expect` below panics.
+#[cfg(test)]
+mod selection_menu {
+    use super::*;
+
+    #[test]
+    fn menu_bar_has_selection_between_edit_and_view_in_order() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        let labels = [
+            "File",
+            "Edit",
+            "Selection",
+            "View",
+            "Go",
+            "Run",
+            "Terminal",
+            "Help",
+        ];
+        let mut xs = Vec::with_capacity(labels.len());
+        for label in labels {
+            let bounds = h
+                .driver
+                .find_bounds(label)
+                .unwrap_or_else(|| panic!("top-level menu label {label:?} must paint"));
+            xs.push((label, bounds.x));
+        }
+        for i in 1..xs.len() {
+            let (prev_label, prev_x) = xs[i - 1];
+            let (label, x) = xs[i];
+            assert!(
+                x > prev_x,
+                "menu bar labels must paint left-to-right in VS Code's order \
+                 (File, Edit, Selection, View, Go, Run, Terminal, Help); \
+                 {label:?} at x={x} did not paint after {prev_label:?} at x={prev_x}"
+            );
+        }
     }
 }
 
@@ -11868,6 +12877,255 @@ mod command_center {
             PickerSource::CommandCenter,
             "the search box must still open the picker with the \
              CommandCenter source while the drawn menu row is hidden"
+        );
+    }
+
+    /// #1657: `tests/smoke-spec/win-gui.yaml`'s hit-test pixel coordinates
+    /// were derived from a naive "7 menu items evenly spaced, caption
+    /// buttons flush right, with a big empty band in between" model that
+    /// never accounted for the Command Center (back/forward nav arrows +
+    /// search box, #676/#939) now painting between the menu row and the
+    /// caption buttons on a `window_chrome` backend. `WinBackend` and
+    /// `GtkBackend` both declare `BackendCaps::window_chrome` and run
+    /// through the *exact same* platform-neutral title-band composition
+    /// (`App::render_content`'s `presence.command_center` block,
+    /// `render::measure_title_bar_bands`, `render::
+    /// paint_command_center_rung`) — so this `GtkDriver` paint at the
+    /// smoke-spec's own `1024x768` window size is a faithful, headlessly
+    /// runnable stand-in for what a real Win32 `WM_NCHITTEST` round trip
+    /// sees, with only glyph metrics differing (Pango here vs DirectWrite
+    /// on real Win-GUI) — the Tier-1 shared conformance scenario #1657's
+    /// acceptance bar asks for, so a future title-band layout change
+    /// invalidates the smoke-spec's assumptions the same day a `cargo
+    /// test` run would catch it, not only at the next real-hardware
+    /// bugbash pass.
+    ///
+    /// Three assertions, matching the issue's own three findings exactly:
+    ///
+    /// 1. The stale `x=24` assumption for the File menu item lands left of
+    ///    the real item's hit region — in #720's app-icon slot / blank
+    ///    menu-row padding — so it does not hit-test to File at all.
+    /// 2. The stale `x=886/932/978` assumptions for the three caption
+    ///    buttons come from a "flush right, uniform 46px pitch" model that
+    ///    does not describe the real right-aligned controls bar, and all
+    ///    three land left of their real painted centres.
+    /// 3. The stale `x=620` "empty band, must stay HTCAPTION" assumption
+    ///    now lands *inside* the Command Center's search box — a real,
+    ///    registered `HTCLIENT` widget, not blank drag space.
+    ///
+    /// RED-verification: each of the three findings below was checked by
+    /// hand against this exact frame's real numbers (`File` item hit region
+    /// `x=46..90`; caption-button centres `≈893.5/940/989.5`; search box
+    /// `x=517..797`) before this test was written — every one of the old
+    /// smoke-spec assumptions genuinely misses, confirming this is real
+    /// staleness and not a tautology that would pass against any layout.
+    /// Each finding also carries a positive control (the *real* coordinate
+    /// resolving to the thing the stale one misses), so none of them can
+    /// pass by the lookup silently resolving to nothing.
+    ///
+    /// Host-font independence (the CI red on the first cut): every number
+    /// this test compares is read back from the frame's own published
+    /// layout, and the only *constants* it asserts against are the four
+    /// stale smoke-spec coordinates themselves. Finding 1 deliberately
+    /// hit-tests the menu-bar layout instead of measuring the File label's
+    /// glyph ink — see the comment at that assertion for why the ink-extent
+    /// form passed locally and failed on CI's font set.
+    #[test]
+    fn win_gui_smoke_spec_title_band_coordinates_are_stale_1657() {
+        let mut h = harness(engine_with_tab_history(), 1024, 768);
+        h.driver.render();
+
+        // Finding 1: File menu item.
+        //
+        // Asserted through `MenuBarLayout::hit_test` -- the *same* call the
+        // running app routes a menu-row click through -- rather than through
+        // the File label's painted glyph ink (`GtkDriver::find_bounds`). The
+        // smoke-spec question is "does a click at x=24 land on the File menu
+        // item?", and the hit region is what answers it; the label's ink is
+        // only a proxy for it. The proxy is also a *fragile* one: the ink's
+        // left edge sits at `app-icon slot + item padding`, the slot width is
+        // derived from the band height, and the band height is derived from
+        // the host's UI font metrics -- so a comparison with a few px of
+        // slack swings with whichever font set the machine happens to have
+        // (this assertion's first cut compared `file.x` against
+        // `24.0 + file.width`, a ~2px margin here, and went red on CI's font
+        // set while staying green locally). The item's hit region clears x=24
+        // by the whole app-icon slot, tens of px, so this form says the same
+        // thing without depending on glyph widths at all.
+        let menu_row = h.menu_row_rect.get();
+        assert!(
+            menu_row.width > 0.0 && menu_row.height > 0.0,
+            "the menu row band must have painted a non-degenerate rect"
+        );
+        // Mirrors `App::render_content`'s own split: GTK's
+        // `titlebar_control_inset()` is the trait default (zero), so the
+        // leading inset is `0.0` and the menu items start after #720's
+        // app-icon slot.
+        let (_app_icon, items_rect) = crate::render::split_menu_row_for_app_icon(menu_row, 0.0);
+        let menu_bar = h.engine.borrow().menu_system.borrow().menu_bar();
+        let file_idx = menu_bar
+            .items
+            .iter()
+            .position(|i| i.label.replace('&', "") == "File")
+            .expect("the menu bar must carry a File item");
+        let mb_layout = {
+            use quadraui::Backend as _;
+            h.driver.backend().menu_bar_layout(items_rect, &menu_bar)
+        };
+        let file = mb_layout
+            .visible_items
+            .iter()
+            .find(|vi| vi.item_idx == file_idx)
+            .expect("the File menu item must be visible in the laid-out bar")
+            .bounds;
+        let band_y = menu_row.y + menu_row.height / 2.0;
+
+        // Positive control: the *real* centre of the File item does resolve
+        // to it, so a failure below is "x=24 is stale", never "this hit-test
+        // never resolves to anything".
+        assert_eq!(
+            mb_layout.hit_test(file.x + file.width / 2.0, band_y),
+            quadraui::MenuBarHit::Item(file_idx),
+            "the File item's own painted centre ({}) must hit-test to File",
+            file.x + file.width / 2.0
+        );
+        assert_ne!(
+            mb_layout.hit_test(24.0, band_y),
+            quadraui::MenuBarHit::Item(file_idx),
+            "the smoke-spec's stale x=24 assumption must NOT hit-test to the \
+             File menu item -- it lands in the app-icon slot / blank padding \
+             left of the real item (which spans {}..{}); if this ever fires, \
+             the layout has moved again and the smoke-spec coordinates need \
+             re-deriving",
+            file.x,
+            file.x + file.width
+        );
+        assert!(
+            24.0 < file.x,
+            "x=24 must fall left of the real File item's leading edge \
+             (got {file:?})"
+        );
+
+        // Finding 2: the three caption buttons.
+        let controls_rect = h.title_bar_rect.get();
+        assert!(
+            controls_rect.width > 0.0,
+            "window controls must have painted a non-degenerate rect"
+        );
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let controls_bar = crate::render::window_controls_status_bar(&theme, false);
+        let status_layout = {
+            use quadraui::Backend as _;
+            h.driver
+                .backend()
+                .status_bar_layout(controls_rect, &controls_bar)
+        };
+        let button_rect = |action: &str| -> quadraui::Rect {
+            status_layout
+                .hit_regions
+                .iter()
+                .find_map(|(r, hit)| match hit {
+                    quadraui::StatusBarHit::Segment(id) if id.as_str() == action => Some(
+                        quadraui::Rect::new(controls_rect.x + r.x, r.y, r.width, r.height),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{action} must have a registered hit region"))
+        };
+        let button_center_x = |action: &str| -> f32 {
+            let r = button_rect(action);
+            r.x + r.width / 2.0
+        };
+
+        // The structural half of this finding, and the one that carries the
+        // weight. The stale triple was derived from a "caption buttons flush
+        // right, uniform 46px pitch" model: close's centre `SPEC_PITCH_PX` in
+        // from the window's right edge, the other two at that same pitch. The
+        // real layout right-aligns the controls `StatusBar` with only
+        // `PIXEL_EDGE_INSET` of trailing slack, so for the spec's model to be
+        // right the close button would have to be
+        // `2 * (SPEC_PITCH_PX - PIXEL_EDGE_INSET)` wide. It is nowhere near
+        // that -- and *that* comparison has a ~30% margin, where comparing the
+        // centres directly turns on ~8px of glyph advance. The per-button
+        // check below keeps the issue's own wording, but this is the claim
+        // that holds whatever font set the host has; tuning the per-button
+        // tolerance against one machine's fonts is exactly how the first cut
+        // of this test passed locally and went red on CI.
+        const SPEC_PITCH_PX: f32 = 46.0;
+        // The band runs to the window's right edge, so this is the `1024` the
+        // smoke spec's own coordinates are expressed against — asserted, not
+        // assumed, because every stale constant here is only meaningful at
+        // that window size.
+        // Tolerance, not `assert_eq!`: the band's right edge is reconstructed
+        // as `x + (1024 - x)` in f32, which only round-trips exactly when `x`
+        // happens to be integral.
+        let window_right = controls_rect.x + controls_rect.width;
+        assert!(
+            (window_right - 1024.0).abs() < 1.0,
+            "the smoke-spec coordinates are derived for a 1024x768 window; \
+             this harness must paint the controls band flush to x=1024 (got \
+             {window_right})"
+        );
+        let spec_implied_button_width =
+            2.0 * (SPEC_PITCH_PX - quadraui::primitives::status_bar::PIXEL_EDGE_INSET);
+        let real_close = button_rect(crate::render::WINDOW_CLOSE_ACTION);
+        assert!(
+            real_close.width < spec_implied_button_width * 0.85,
+            "the smoke-spec's \"caption buttons flush right at {SPEC_PITCH_PX}px \
+             pitch\" model must not describe the real layout: it implies a close \
+             button {spec_implied_button_width}px wide, the real one is \
+             {}px (spanning {}..{} against a window right edge of {window_right})",
+            real_close.width,
+            real_close.x,
+            real_close.x + real_close.width
+        );
+
+        // Per-button detail, matching the issue's own wording ("land in blank
+        // space between them"). The tolerance only has to exclude float
+        // noise and sub-pixel rounding -- how *far* each stale x misses is a
+        // function of the host's glyph advances, so a large threshold here
+        // would be asserting this machine's font set, not the layout. The
+        // claim that cannot drift is the one above.
+        for (stale_x, action, name) in [
+            (886.0_f32, crate::render::WINDOW_MINIMIZE_ACTION, "minimize"),
+            (932.0_f32, crate::render::WINDOW_MAXIMIZE_ACTION, "maximize"),
+            (978.0_f32, crate::render::WINDOW_CLOSE_ACTION, "close"),
+        ] {
+            let real_x = button_center_x(action);
+            assert!(
+                (stale_x - real_x).abs() > 2.0,
+                "the smoke-spec's stale x={stale_x} assumption for the \
+                 {name} button must miss its real painted centre \
+                 ({real_x}) by a meaningful margin"
+            );
+            // Direction, not just distance: every stale coordinate sits
+            // *left* of its real centre, because the spec's pitch model
+            // under-measures the buttons' real width. A future layout change
+            // that flipped this would invalidate the spec just as surely.
+            assert!(
+                stale_x < real_x,
+                "the smoke-spec's stale x={stale_x} for the {name} button \
+                 must sit left of its real painted centre ({real_x})"
+            );
+        }
+
+        // Finding 3: the "empty band" at x=620 is no longer empty.
+        let cc = h
+            .engine
+            .borrow()
+            .command_center_layout
+            .borrow()
+            .clone()
+            .expect("the Command Center must paint on a window_chrome backend");
+        let search = cc
+            .search_bounds
+            .expect("the search box must have a painted bounds");
+        assert!(
+            search.x <= 620.0 && 620.0 < search.x + search.width,
+            "x=620 must now land inside the real search box ({search:?}) \
+             -- the same shift the issue reports from a real Win-GUI \
+             PrintWindow capture; the smoke-spec's old \"must stay \
+             HTCAPTION\" expectation at this x is therefore itself stale"
         );
     }
 }
@@ -12829,14 +14087,16 @@ mod minimap {
         );
     }
 
-    /// #1187 acceptance (black-box, driver tier, GTK): dragging the
-    /// minimap's own viewport-highlight thumb from the top of the strip to
-    /// the bottom must scroll through virtually the whole file in one
-    /// gesture — exactly like dragging the real vertical scrollbar handle
-    /// the same distance — not crawl within roughly one strip-window's
-    /// worth of lines. GTK counterpart of the TUI acceptance test
-    /// `tui_main::shell_app::tests::
-    /// dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_not_a_crawl`.
+    /// #1187/#1828 acceptance (black-box, driver tier, GTK): **holding
+    /// Alt** while dragging the minimap's own viewport-highlight thumb from
+    /// the top of the strip to the bottom must scroll through virtually the
+    /// whole file in one gesture — exactly like dragging the real vertical
+    /// scrollbar handle the same distance — not crawl within roughly one
+    /// strip-window's worth of lines. This is #1187's original file-wide
+    /// drag mapping, which #1828 moved behind the Alt modifier (the plain,
+    /// no-modifier drag now maps within the minimap's own scale instead —
+    /// see
+    /// [`dragging_the_minimap_viewport_highlight_scrolls_within_its_own_scale_by_default_on_gtk`]).
     ///
     /// With the file scrolled to the top, the highlight band's own top edge
     /// coincides with the strip's top row (#1093: the highlight always
@@ -12897,8 +14157,21 @@ mod minimap {
         let x = strip.x + strip.width / 2.0;
         // Press on the strip's very top row — with the file scrolled to the
         // top, that coincides with the viewport-highlight band's own top
-        // edge — then drag to the strip's bottom row.
-        h.driver.mouse_down(x, strip.y + 1.0);
+        // edge — then drag to the strip's bottom row. #1828: Alt held at
+        // press time is what now reaches the old #1187 file-wide mapping —
+        // dispatched directly as a `UiEvent::MouseDown` (rather than
+        // `h.driver.mouse_down`, which always sends `Modifiers::default()`)
+        // since that's the only way to hold a modifier through this
+        // driver's click helpers.
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(x as f32, (strip.y + 1.0) as f32),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        });
         h.driver.mouse_move(x, strip.y + strip.height - 1.0);
         h.driver.mouse_up(x, strip.y + strip.height - 1.0);
         h.driver.render();
@@ -12925,10 +14198,99 @@ mod minimap {
 
         assert!(
             top > TOTAL_LINES * 9 / 10,
-            "dragging from the highlight's top edge to the strip's bottom \
-             row must scroll through virtually the whole file in one \
-             gesture, not crawl within one strip window — landed on line \
-             {top} of {TOTAL_LINES}"
+            "an Alt-held drag from the highlight's top edge to the strip's \
+             bottom row must scroll through virtually the whole file in \
+             one gesture, not crawl within one strip window — landed on \
+             line {top} of {TOTAL_LINES}"
+        );
+    }
+
+    /// #1828 acceptance (black-box, driver tier, GTK): the **plain**
+    /// (no-modifier) minimap thumb drag must map within the minimap's own
+    /// scale — the same sliding window #1093 paints — not jump
+    /// proportionally across the whole file like the real scrollbar handle
+    /// does. This is the VS Code mapping the bug report asks for: "a
+    /// minimap drag moves the viewport slider within the minimap's own
+    /// scale ... A scrollbar drag maps the whole file's length." #1828
+    /// moved the old (#1187) file-wide mapping behind Alt (see the sibling
+    /// test immediately above) and made this one the default.
+    ///
+    /// Same gesture, fixture and geometry as the sibling Alt-held test
+    /// above (full top-to-bottom drag on a 200,000-line buffer) — only the
+    /// modifier differs — so a regression that left the Alt-gating dead
+    /// (e.g. always taking the file-wide branch) would fail *this* test
+    /// while the sibling kept passing.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — this is
+    /// exactly the plain drag unfixed `develop` already ran through
+    /// `#1187`'s file-wide mapping unconditionally, landing past 90% of
+    /// the file (the sibling test's own assertion); the `top <
+    /// TOTAL_LINES / 10` bound below fails there.
+    #[test]
+    fn dragging_the_minimap_viewport_highlight_scrolls_within_its_own_scale_by_default_on_gtk() {
+        const TOTAL_LINES: usize = 200_000;
+        fn engine_with_very_long_buffer() -> Engine {
+            let mut engine = Engine::new();
+            let text: String = (0..TOTAL_LINES)
+                .map(|i| format!("line {i} content\n"))
+                .collect();
+            engine.buffer_mut().insert(0, &text);
+            engine
+        }
+
+        let mut h = harness(engine_with_very_long_buffer(), 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.driver.render();
+
+        assert_eq!(
+            h.engine.borrow().windows.get(&win).unwrap().view.scroll_top,
+            0,
+            "fixture must start at the top of the file"
+        );
+
+        let strip = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("a 200,000-line buffer must publish a minimap strip");
+            crate::render::minimap_strip_rect(mm)
+        };
+
+        let x = strip.x + strip.width / 2.0;
+        // Plain press/drag — no modifier — must now stay scoped to the
+        // minimap's own scale rather than traversing the whole file.
+        h.driver.mouse_down(x, strip.y + 1.0);
+        h.driver.mouse_move(x, strip.y + strip.height - 1.0);
+        h.driver.mouse_up(x, strip.y + strip.height - 1.0);
+        h.driver.render();
+
+        fn top_line(texts: &[&str]) -> Option<usize> {
+            texts
+                .iter()
+                .filter_map(|t| {
+                    t.strip_prefix("line ")?
+                        .split_whitespace()
+                        .next()?
+                        .parse()
+                        .ok()
+                })
+                .min()
+        }
+        let texts = h.driver.painted_texts();
+        let top = top_line(&texts).unwrap_or_else(|| {
+            panic!("the editor must still paint line numbers; painted: {texts:?}")
+        });
+
+        assert!(
+            top < TOTAL_LINES / 10,
+            "a plain (no-modifier) drag from the highlight's top edge to \
+             the strip's bottom row must stay within roughly the minimap's \
+             own painted window, not traverse virtually the whole file — \
+             landed on line {top} of {TOTAL_LINES}"
         );
     }
 
@@ -13200,6 +14562,15 @@ mod minimap {
     /// Acceptance (#35): pressing and holding on the minimap and dragging
     /// keeps seeking — not just the pixel under the initial mouse-down.
     ///
+    /// Presses with **Alt held** (#1828: the plain, no-modifier press now
+    /// maps within the minimap's own scale instead — see
+    /// `dragging_the_minimap_viewport_highlight_scrolls_within_its_own_scale_by_default_on_gtk`
+    /// — so this test's own "~50% of the *whole file*" assertion, which
+    /// only the old #1187 file-wide mapping satisfies, needs the modifier
+    /// to keep testing that mapping specifically; its actual point — that
+    /// a held-button drag keeps re-seeking, not just the initial
+    /// mouse-down — is orthogonal to which of the two mappings is active).
+    ///
     /// RED-first regression: before this fix, `pixel_to_click_target`'s
     /// minimap hit-test only ran when `mutate_focus` was true, and
     /// `handle_mouse_drag` (the drag-continuation path) always called it
@@ -13232,12 +14603,20 @@ mod minimap {
             "fixture must start at the top of the file"
         );
 
-        // Press down near the top of the strip — mouse-down alone already
-        // seeks there (covered by the click test above).
-        h.driver.mouse_down(
-            (strip.x + strip.width / 2.0) as f32,
-            (strip.y + strip.height * 0.1) as f32,
-        );
+        // Press down near the top of the strip, Alt held (#1828) — mouse-down
+        // alone already seeks there (covered by the click test above).
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(
+                (strip.x + strip.width / 2.0) as f32,
+                (strip.y + strip.height * 0.1) as f32,
+            ),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        });
         let after_down = h.engine.borrow().scroll_top();
 
         // Continue the SAME held-button gesture down to the vertical
@@ -14486,6 +15865,204 @@ mod app_icon {
             h.driver.painted_texts()
         );
     }
+
+    /// #1763 (review round 1): the fix lives in **shared**
+    /// `App::handle_dispatch` (the `MenuEvent::Ignored` arm just above the
+    /// Command Center block), not TUI-side wiring, so a GTK user gets the
+    /// identical dismiss-on-unrecognised-key behaviour. On GTK/macOS
+    /// `menu_bar_visible` is always `true` (`ShellApp::setup`'s three-way
+    /// branch) and a dropdown opens from a plain click on a bar label — no
+    /// Alt-chord stand-in needed the way the TUI regression test
+    /// (`app_on_tui_tests.rs`'s `alt_g_dropdown_does_not_survive_a_vim_
+    /// dw_1763`) requires, since `TuiDriver::type_char` can't carry `alt:
+    /// true`. This exercises the real GTK trigger end to end: click
+    /// "File" to open the dropdown (same gesture
+    /// `clicking_file_after_the_app_icon_still_opens_the_file_menu` above
+    /// proves opens it), then send one plain, unrecognised `KeyPressed`
+    /// (`'q'` — not Escape/an arrow/Enter/a matching Alt+<letter>, so it
+    /// falls through `MenuSystem::handle` to `MenuEvent::Ignored` exactly
+    /// like the TUI scenario's stray `0`/`w`/`d`/`w`), and asserts the
+    /// dropdown's "New Tab" entry stops painting.
+    ///
+    /// RED-verified the same way the TUI test was: reverting the
+    /// `MenuEvent::Ignored` arm to `{}` leaves "New Tab" painted after the
+    /// `'9'` keystroke on this exact path.
+    #[test]
+    fn unrecognised_key_closes_a_stale_open_dropdown_on_gtk_1763() {
+        let mut h = harness(Engine::new_for_test(), 1200, 800);
+        h.driver.render();
+
+        let file = h
+            .driver
+            .find_bounds("File")
+            .expect("the File menu-bar header must paint");
+        h.driver
+            .click(file.x + file.width / 2.0, file.y + file.height / 2.0);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("New Tab"),
+            "precondition: clicking File must open its dropdown; painted \
+             texts were {:?}",
+            h.driver.painted_texts()
+        );
+
+        // A plain, unrecognised key — not Escape/an arrow/Enter/a matching
+        // Alt+<letter> mnemonic — must fall through `MenuSystem::handle` to
+        // `MenuEvent::Ignored` and, via the shared `App::handle_dispatch`
+        // fix, close the stale dropdown. `'9'` (a digit — just starts a
+        // harmless, inert Vim count-prefix accumulation underneath, unlike
+        // a letter such as `'q'` which would start macro recording) is
+        // chosen so the keystroke that falls through to the editor can't
+        // produce any visible side effect that would confuse the
+        // assertion below.
+        h.driver.type_char('9');
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("New Tab"),
+            "the stale File dropdown must not survive a key it doesn't \
+             recognise on GTK, same as on TUI; painted texts were {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #1764 (follow-up to #1763, revised in review round 1): the fix for
+    /// #1763/#1764's pty-fusion bug (a real macOS pty can collapse a fast
+    /// Escape-then-letter into one `Alt+<letter>` chord — see
+    /// `render::alt_mnemonic_open_allowed`'s own doc) is gated on
+    /// `engine.menu_bar_toggleable`, the existing discriminator for "this is
+    /// the raw-terminal profile a pty can even fuse bytes for"
+    /// (`App::setup`'s own doc — only ever `true` on the `cell`/TUI
+    /// profile). GTK's menu bar is always visible and a `Modifiers { alt:
+    /// true }` `KeyPressed` there is a real, unambiguous keystroke from a
+    /// real keyboard — there is no pty to fuse anything — so the standard
+    /// Alt+<mnemonic> menu gesture must keep working in every mode on GTK,
+    /// including mid-text-entry, exactly as it did before #1764.
+    ///
+    /// An earlier version of this test (round 1 of this issue) asserted the
+    /// opposite — that Alt+g must *not* open the dropdown and must instead
+    /// be swallowed as an implicit Escape — which was itself the regression
+    /// a review caught: it cemented the loss of ordinary mnemonic menu
+    /// access on a backend where the ambiguity #1764 exists for cannot
+    /// occur. This version pins the restored, correct behaviour instead.
+    ///
+    /// **Verified RED against the round-1 fix (`menu_bar_toggleable` not yet
+    /// threaded through `alt_mnemonic_open_allowed`):** before this round,
+    /// `alt_mnemonic_open_allowed` ignored the backend shape entirely, so
+    /// GTK's Alt+g in Insert mode was blocked exactly like TUI's — "Go to
+    /// File" never painted and the status bar stayed on `INSERT` — failing
+    /// the assertions below.
+    #[test]
+    fn alt_mnemonic_still_opens_the_menu_from_insert_mode_on_gtk_1764() {
+        let mut engine = Engine::new_for_test();
+        engine.buffer_mut().insert(0, "foo bar baz\n");
+        engine.handle_key("i", Some('i'), false);
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("INSERT"),
+            "precondition: the engine must start in Insert mode; painted \
+             texts were {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Hand-rolled rather than the `alt_rung`/`alt_rung_1744` modules' own
+        // private `alt_press` helper (out of scope here — this test lives in
+        // the outer `mod tests`, not either of those nested modules).
+        h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('g'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("Go to File"),
+            "Alt+g must still open the \"Go\" dropdown from Insert mode on \
+             GTK — there is no pty to fuse an Escape into this chord on \
+             this backend, so the #1764 workaround must not apply here; \
+             painted texts were {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// vimcode#1673 (bugbash finding): a real Win-GUI click at x=24, y=16
+    /// — the title band's historical menu-row-item coordinate, the exact
+    /// stale value `tests/smoke-spec/win-gui.yaml`'s original
+    /// `click-file-menu-item-1232` step still carries, and the exact
+    /// value vimcode#1673's own reproduction used — opens no dropdown.
+    /// vimcode#1657 already found the same gap from a different angle (a
+    /// stale `expect_hit` sweep): at this window's width, x=24 lands in
+    /// the blank padding left of "File"'s real painted bounds (the
+    /// app-icon slot, #720), not on the label itself. This test proves
+    /// the *consequence* of that finding end-to-end, through the real
+    /// click-to-dropdown path (`MenuSystem::handle`), on the one backend
+    /// (GTK) that can run it headlessly here — both backends share the
+    /// identical `window_chrome` title-band composition
+    /// (`App::render_content`'s `presence.command_center`/`menu_row`
+    /// blocks, and the shared `quadraui::MenuBar` layout algorithm), so
+    /// this is the same faithful platform-neutral stand-in #1657's own
+    /// Tier-1 pair already relies on. See `src/win/mod.rs`'s new `#1673`
+    /// doc section for the full write-up and why no new quadraui issue is
+    /// filed.
+    ///
+    /// Both assertions below were run against today's `develop` with no
+    /// code change on either side of them: clicking the stale x=24 opens
+    /// nothing (matching vimcode#1673's report exactly), while clicking
+    /// the *real* painted "File" bounds at the same window size opens it
+    /// fine (the same shape `clicking_file_after_the_app_icon_still_
+    /// opens_the_file_menu` above already proves GREEN) — together ruling
+    /// out a functional regression in the shared click-routing path and
+    /// pinning vimcode#1673's symptom entirely on the stale coordinate
+    /// vimcode#1657 already tracks, not a new defect.
+    #[test]
+    fn clicking_the_stale_1232_file_x_opens_nothing_but_the_real_bounds_do_1673() {
+        let mut h = harness(Engine::new_for_test(), 1024, 768);
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("New Tab"),
+            "sanity: the File dropdown must be closed before either click"
+        );
+
+        // vimcode#1673's own reproduction coordinate — the stale,
+        // pre-#1657 value.
+        h.driver.click(24.0, 16.0);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("New Tab"),
+            "x=24 is blank padding left of the real \"File\" label at \
+             this window width (vimcode#1657) — it must NOT open the File \
+             dropdown, reproducing vimcode#1673's report exactly; painted \
+             texts were {:?}",
+            h.driver.painted_texts()
+        );
+
+        let file = h
+            .driver
+            .find_bounds("File")
+            .expect("the File menu-bar header must paint");
+        assert!(
+            file.x > 24.0,
+            "fixture assumption: the real \"File\" label must paint \
+             strictly right of x=24 at this window width, or this test's \
+             own premise (x=24 misses it) doesn't hold; got {file:?}"
+        );
+        h.driver
+            .click(file.x + file.width / 2.0, file.y + file.height / 2.0);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("New Tab"),
+            "clicking the real, painted \"File\" label must open its \
+             dropdown — proving vimcode#1673's reported symptom is the \
+             stale x=24 coordinate alone, not a regression in the shared \
+             click-routing path; painted texts were {:?}",
+            h.driver.painted_texts()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -15288,6 +16865,161 @@ mod scrollbar_paint {
             cols_without_reserve - viewport_cols
         );
     }
+
+    // ── #1695: Explorer sidebar scrollbar — upstream quadraui bug ──────────
+    //
+    // Not a vimcode-side fix (Platform-Neutrality Rule): see
+    // `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry and `src/win/mod.rs`'s
+    // `#1695` doc section for the full root-cause write-up. The two tests
+    // below are executable, GREEN evidence of *current* upstream behaviour,
+    // driven through vimcode's real Explorer paint path — tripwires, not
+    // locks: both are expected to start failing the day quadraui's fix
+    // lands and the pin is bumped, at which point they (and this comment)
+    // should be deleted, not patched to match.
+
+    /// A directory listing with far more rows than any plausible viewport,
+    /// so the Explorer's `TreeController` always needs a scrollbar.
+    fn engine_with_overflowing_explorer() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine.explorer_rows = (0..200)
+            .map(|i| crate::core::engine::ExplorerRow {
+                depth: 0,
+                name: format!("file_{i:03}.rs"),
+                path: std::path::PathBuf::from(format!("file_{i:03}.rs")),
+                is_dir: false,
+                is_expanded: false,
+            })
+            .collect();
+        engine
+    }
+
+    /// #1695's first complaint: the sidebar scrollbar is painted even when
+    /// the tree is scrollable but **not hovered** — VS Code's overlay stays
+    /// fully transparent at rest. `TreeController::build_scrollbar` never
+    /// sets `Scrollbar::hovered`, and `primitives::scrollbar::native_
+    /// surface_paint::paint`'s track alpha floor is 0.20 regardless of
+    /// hover state (both read directly off the pinned quadraui rev — see
+    /// the doc section cited above), so there is no event this test could
+    /// synthesize that would make the column read as empty today.
+    #[test]
+    fn explorer_sidebar_scrollbar_paints_unconditionally_at_rest_1695() {
+        let mut h = harness(engine_with_overflowing_explorer(), 1400, 900);
+        h.driver.render();
+
+        let body_rect = h.engine.borrow().explorer_tree_rect.get();
+        assert!(
+            body_rect.width > 0.0 && body_rect.height > 0.0,
+            "the Explorer panel must have painted a non-empty body rect \
+             before this test's probe means anything"
+        );
+
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let bg = {
+            let c = theme.tab_bar_bg;
+            (c.r, c.g, c.b)
+        };
+
+        // A thin strip hugging the panel's right edge — inside the
+        // scrollbar column under *any* width this bug could produce
+        // (today's wide one or VS Code's thin ~10px target alike).
+        const PROBE_W: f32 = 6.0;
+        let strip = quadraui::Rect::new(
+            body_rect.x + body_rect.width - PROBE_W,
+            body_rect.y + 2.0,
+            PROBE_W,
+            (body_rect.height - 4.0).max(0.0),
+        );
+        assert!(
+            region_has_non_background_pixel(&mut h.driver, strip, bg),
+            "the Explorer sidebar's scrollbar must paint something at its \
+             right edge while the tree overflows its viewport (200 \
+             synthetic rows) -- this assertion documents today's bug \
+             (#1695: a VS-Code-style overlay would paint nothing here at \
+             rest) and must flip to the opposite assertion once quadraui's \
+             fix lands, not be deleted silently"
+        );
+    }
+
+    /// #1695's "two differently-lit segments" observation, root-caused:
+    /// `TreeController::render` narrows `rect` into `(tree_rect, sb_rect)`
+    /// via `split_rect`, then paints the real scrollbar explicitly into
+    /// `sb_rect` (width = `backend.line_height()`, `TreeController::
+    /// scrollbar_track_width`'s fallback since vimcode never calls
+    /// `set_scrollbar_width`) — but it ALSO calls
+    /// `backend.draw_tree(tree_rect, &tree)` first, and `tree`
+    /// (`build_tree_view`) still carries every row, untruncated. The shared
+    /// rasteriser underneath `draw_tree` (`primitives::tree::native_
+    /// surface_paint::paint`) *unconditionally* re-derives and paints its
+    /// OWN vertical scrollbar whenever the (untruncated) row count
+    /// overflows the rect it was handed — even though that rect
+    /// (`tree_rect`) already excludes the column `TreeController` itself
+    /// reserved and is about to paint a second time. The two scrollbars use
+    /// different width formulas (the real one: `backend.line_height()`; the
+    /// phantom inner one: `layout_metrics::tree_row_pitch`, ~1.4x that), so
+    /// they paint as two adjacent, differently-sized bands immediately next
+    /// to each other — not one double-wide thumb, and not a rendering
+    /// artifact of this test.
+    ///
+    /// Proven here by probing the band the phantom inner scrollbar alone
+    /// would occupy (to the *left* of the real, explicit one) and showing
+    /// it also paints — which a single, correctly-suppressed scrollbar
+    /// could never do.
+    #[test]
+    fn explorer_sidebar_scrollbar_double_paints_an_adjacent_phantom_band_1695() {
+        let mut h = harness(engine_with_overflowing_explorer(), 1400, 900);
+        h.driver.render();
+
+        let body_rect = h.engine.borrow().explorer_tree_rect.get();
+        let lh = h
+            .painted_line_height()
+            .expect("render_content must publish the painted line height");
+        // Mirrors `quadraui::primitives::layout_metrics::tree_row_pitch`'s
+        // formula for a default `TreeStyle` (`row_height: None`, true for
+        // every synthetic row this fixture builds): `(line_height *
+        // 1.4).round()`.
+        let item_h = (lh * 1.4).round();
+        let outer_w = lh; // `TreeController::scrollbar_track_width`'s fallback
+
+        assert!(
+            body_rect.width as f64 > outer_w + item_h + 20.0,
+            "setup sanity: the sidebar must be far wider than both \
+             scrollbar bands combined, or this probe can't tell them apart \
+             from the tree content itself (body_width={}, outer_w={outer_w}, \
+             item_h={item_h})",
+            body_rect.width
+        );
+
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let bg = {
+            let c = theme.tab_bar_bg;
+            (c.r, c.g, c.b)
+        };
+
+        let right = (body_rect.x + body_rect.width) as f64;
+        // The phantom inner band: `tree_rect`'s own right-edge column,
+        // immediately left of the real, explicit scrollbar.
+        const MARGIN: f64 = 2.0;
+        let phantom = quadraui::Rect::new(
+            (right - outer_w - item_h + MARGIN) as f32,
+            body_rect.y + 2.0,
+            (item_h - 2.0 * MARGIN).max(1.0) as f32,
+            (body_rect.height - 4.0).max(0.0),
+        );
+        assert!(
+            region_has_non_background_pixel(&mut h.driver, phantom, bg),
+            "a second, phantom scrollbar-shaped band must paint immediately \
+             left of the real one (#1695's 'two differently-lit segments') \
+             -- `TreeController::render`'s own `backend.draw_tree(tree_rect, \
+             &tree)` call re-paints a scrollbar `TreeController` already \
+             owns explicitly, because `tree` still carries every \
+             untruncated row and the shared rasteriser never checks for a \
+             caller-owned column to suppress itself against"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -16019,7 +17751,8 @@ mod editor_band_order {
     #[test]
     fn live_tab_drag_composes_the_ghost_rung_inside_the_band_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_764_gtk_tab_drag_{:?}",
+            "vimcode_test_764_gtk_tab_drag_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -16588,7 +18321,8 @@ mod modal_rung {
     #[test]
     fn quick_open_hides_git_internals_but_shows_dotfiles_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1545_gtk_picker_{:?}",
+            "vimcode_test_1545_gtk_picker_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -17478,7 +19212,20 @@ mod editor_mouse_rungs {
         // doc comment for why a fixed-visible-sidebar 900px window no
         // longer clears `MINIMAP_MIN_TEXT_COLS`'s suppression threshold now
         // that the real default `settings.font_size` (14pt) reaches paint.
-        let mut h = harness(long_engine(), 1050, 600);
+        //
+        // 1300, not 1050 (#1690): the ruler (`Ln N, Col N`) this test's
+        // final assertion reads moved to the front of the right-side
+        // priority-drop order (VS Code parity — it is now the *leftmost*
+        // segment of the right group), so it is now among the first
+        // things a narrow bar drops, not the last; 1050px no longer
+        // leaves it (and `indent_seg`) room once the default-visible
+        // sidebar/activity-bar chrome is subtracted. This test isn't the
+        // narrow-vs-wide minimap-width comparison (that's the sibling
+        // `minimap_strip_is_narrower_on_a_narrow_pane_than_on_a_wide_one`,
+        // deliberately still at 1050) — it only reads the strip's actual
+        // painted geometry and clicks its vertical middle, so a wider
+        // window changes nothing this test asserts on.
+        let mut h = harness(long_engine(), 1300, 600);
         h.driver.render();
 
         assert!(
@@ -18144,6 +19891,205 @@ mod editor_mouse_rungs {
     }
 }
 
+/// #1750 — editor hover dwell: `MouseMoved` must arm `Engine::editor_hover_
+/// mouse_move` on GTK too, through the exact same shared `App::handle_
+/// dispatch` arm `tui_main::app_on_tui_tests::tests::editor_hover_dwell_
+/// 1750`'s two TUI tests cover — see that module's doc for the full root
+/// cause (#731 deleted the only, GTK-only, caller; #1434 deleted TUI's own
+/// copy the same way; this fix adds one shared caller both backends reach).
+/// One scenario here (an LSP-sourced diagnostic, mirroring the TUI twin
+/// `lsp_diagnostic_hover_dwell_paints_popup_via_mouse_move_1750`) is enough
+/// to prove GTK reaches the same fixed code path as TUI — the fix itself
+/// has no backend-specific line in it to duplicate coverage for. Dwelling
+/// over a real word (not the annotation ghost-text region the TUI plugin-
+/// hover twin uses) is deliberate here: GTK's `editor_col_at_x` resolves a
+/// pixel past the end of the real text against the *editable* text's own
+/// Pango layout, which doesn't model the separately-painted annotation run
+/// at all, so it does not reliably clamp to (or past) `line_char_len` the
+/// way a monospace-cell TUI column does — confirmed while writing this
+/// test: hovering at the GTK-painted pixel position of an annotation string
+/// resolved to a column still inside the real text, not past it, so the
+/// `on_annotation` gate in `Engine::editor_hover_mouse_move` never armed.
+///
+/// Root cause pinned down (not just observed) by reading the quadraui
+/// source at this repo's pinned rev
+/// (`quadraui::gtk::editor::editor_col_at_x`, `src/gtk/editor.rs`): it
+/// calls `pango_layout.xy_to_index(x_pango, 0)`, which returns an `inside:
+/// bool` flag that is `false` exactly when `x` falls outside the laid-out
+/// text's extent — i.e. the unambiguous "you're past the real text, in
+/// annotation territory" signal — but `editor_col_at_x` discards that flag
+/// (`let (_inside, byte_index, _trailing) = ...`) and returns only a
+/// `usize` column clamped into the real text. Fixing this needs either
+/// that flag surfaced through `Backend::editor_col_at_x`'s return type (a
+/// quadraui API change) or `EditorLine` modelling the annotation run so
+/// the laid-out text extends past it — both are quadraui-side changes
+/// under this repo's Platform-Neutrality Rule (`GOALS.md`), not something
+/// a vimcode-side `src/gtk/` workaround should paper over by re-deriving
+/// pixel geometry the backend already owns.
+///
+/// **TODO(quadraui issue — COORDINATOR ACTION, #1750 follow-up): no
+/// quadraui issue has been filed for this yet** — this worker's own
+/// assignment forbids running `gh` (the coordinator owns GitHub
+/// interactions), so this can only be reported, not filed, from here. Per
+/// CLAUDE.md's testing rule, a `KNOWN_BUGS`-style gap like this one is not
+/// supposed to ship without the fix issue's number cited beside it; until
+/// the coordinator files `JDonaghy/quadraui` issue describing the above
+/// and that number lands in this comment, GTK plugin/extension hover
+/// (`vimcode.editor.set_hover`, git-insights' blame hover) past the end of
+/// a line should be treated as **known-broken on GTK only**, independent
+/// of and not reintroduced by this PR's #1750 fix (TUI and the LSP/
+/// diagnostic path on both backends are unaffected — see the test below).
+#[cfg(test)]
+mod issue_1750_editor_hover_dwell {
+    use super::*;
+
+    /// GTK twin of `tui_main::app_on_tui_tests::tests::editor_hover_dwell_
+    /// 1750::lsp_diagnostic_hover_dwell_paints_popup_via_mouse_move_1750` —
+    /// see that test's doc for why the content source is a diagnostic
+    /// rather than a live `rust-analyzer` round-trip or a direct `Engine::
+    /// lsp_hover_text` pre-seed (the latter paints through a second,
+    /// independent, cursor-anchored widget regardless of mouse/dwell
+    /// state, so it can't RED-verify this fix).
+    ///
+    /// `GtkDriver` has no `tick()` (quadraui, confirmed absent at this
+    /// repo's pinned rev — see the #1779 note on
+    /// `opening_a_line_below_the_last_line_paints_every_line_in_order_1779`'s
+    /// doc comment for the same gap), so this drives `Engine::poll_idle()`
+    /// directly instead, the established idiom this file already uses
+    /// elsewhere (e.g. `busy_status_shows_running_tool_call_and_elapsed_
+    /// time_via_gtk_driver`) to advance time-driven engine state with no
+    /// backend tick seam.
+    ///
+    /// **RED-verified** the same way as the TUI twin: reverting the new
+    /// `MouseMoved` arm in `App::handle_dispatch` (wrapping its `if
+    /// gate_open` in `if false && gate_open`) makes the final assertion
+    /// below fail — the dwell timer never arms, so `poll_idle`'s
+    /// `poll_editor_hover` has nothing to act on.
+    #[test]
+    fn lsp_diagnostic_hover_dwell_paints_popup_via_gtk_driver_1750() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1750_gtk_hover_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let path = dir.join("fixture.rs");
+        std::fs::write(&path, "let needle = 1;\n").expect("write fixture file");
+
+        let mut engine = Engine::new_for_test();
+        // See the TUI twin's identical comment: keeps `lsp_request_hover_at`
+        // (fired alongside the diagnostic section) a no-op, so this test
+        // cannot accidentally spawn a real LSP server process.
+        engine.settings.lsp_enabled = false;
+        engine.new_tab(Some(&path));
+        let diag_key = engine
+            .active_buffer_diagnostics_key()
+            .expect("the just-opened fixture file must have a diagnostics key");
+        engine.lsp_diagnostics.insert(
+            diag_key,
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange {
+                    start: crate::core::lsp::LspPosition {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: crate::core::lsp::LspPosition {
+                        line: 0,
+                        character: 15,
+                    },
+                },
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: "ZQXW_1750_GTK_LSP_DIAG_MARKER".to_string(),
+                source: Some("rust-analyzer".to_string()),
+                code: None,
+            }],
+        );
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        // Unlike the TUI twin, `GtkDriver` never drives the App-side
+        // settings-file reload (`check_settings_reload` lives in
+        // `src/app.rs`, not `Engine::poll_idle` — confirmed by reading
+        // `poll_idle`'s own body, which has no settings-file access at
+        // all — and this module's own doc states "No main loop", so
+        // nothing here ever calls into `App` to trigger it). So this
+        // first `poll_idle()` is not load-bearing for `hover_delay` the
+        // way the TUI twin's first `driver.tick()` is; it's kept only to
+        // mirror that twin's shape and flush any other one-shot idle
+        // work before the fixture is configured.
+        h.engine.borrow_mut().poll_idle();
+        h.engine.borrow_mut().settings.hover_delay = 1;
+        h.driver.render();
+
+        // `find()`'s reported `y` lands exactly on the row-0/row-1 boundary
+        // for this fixture's line height (confirmed by hand: the hit-test
+        // below resolved to `buf_line: 1`, the buffer's blank trailing
+        // line, not `0` where "needle" actually is) — a `GtkDriver::find`
+        // sampling quirk unrelated to #1750, not something to special-case
+        // here. Using the window's own painted top edge
+        // (`rw.rect.y`) plus a few px, comfortably inside row 0, avoids it;
+        // `x` from `find()` is unaffected (no horizontal boundary to hit).
+        let (x, _) = h
+            .driver
+            .find("needle")
+            .expect("the word to hover over must be painted");
+        let y = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .and_then(|l| l.windows.first())
+                .map(|rw| (rw.rect.y + 5.0) as f32)
+                .expect("a window must have painted")
+        };
+
+        h.driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(x, y),
+            buttons: quadraui::ButtonMask::default(),
+        });
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("ZQXW_1750_GTK_LSP_DIAG_MARKER"),
+            "precondition: the popup must not appear before the dwell \
+             delay elapses and a tick polls it"
+        );
+
+        // No key press, no click — only time passing and the idle poll the
+        // real GTK runner drives on its own timer.
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        h.engine.borrow_mut().poll_idle();
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("ZQXW_1750_GTK_LSP_DIAG_MARKER"),
+            "dwelling over a word with an LSP-sourced diagnostic must, with \
+             no intervening key press or click, paint the hover popup once \
+             the dwell timer elapses (#1750); painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Enforces (rather than merely documenting) the `lsp_enabled = false`
+        // guard above: `Engine::lsp_manager` starts `None` and is only ever
+        // populated by `ensure_lsp_manager()`, which every spawn path —
+        // `new_tab`'s own `lsp_did_open` and `poll_idle`'s
+        // `lsp_request_hover_at` alike — must pass through before it can
+        // start the registry's real `rust-analyzer` off `PATH`. A review
+        // round of #1750 found the TUI twin's equivalent prose guard silently
+        // defeated by a reordering, so both twins now assert it. See
+        // `tui_main::app_on_tui_tests::tests::editor_hover_dwell_1750::
+        // assert_no_lsp_server_was_spawned` for the full reasoning.
+        assert!(
+            h.engine.borrow().lsp_manager.is_none(),
+            "this test must never start a real language server: \
+             `Engine::lsp_manager` is `Some`, so some path reached \
+             `ensure_lsp_manager()` with `settings.lsp_enabled` still true \
+             and may have spawned (and leaked) a real `rust-analyzer` \
+             indexing this whole workspace (#1750 review)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod alt_rung {
     //! #759 / #734 slice 4 — the shared Alt-modifier / VSCode-mode rung.
@@ -18287,6 +20233,431 @@ mod alt_rung {
                 h.driver.painted_texts()
             );
         }
+    }
+
+    /// #1744: driver-tier black-box coverage for the five VS Code-mode
+    /// chords `route_alt_key`/`handle_vscode_key` were fixed to decode
+    /// correctly (#1730's `KNOWN_GAPS`). Each test here drives a real
+    /// `UiEvent::KeyPressed` through the production `App::handle_dispatch`
+    /// → `route_alt_key`/`Engine::handle_key` path (not a direct
+    /// `route_alt_key`/`handle_key` call, unlike `render::
+    /// alt_key_router_tests` and `tests/vscode_keybinding_parity.rs`) and
+    /// asserts on what GTK actually *paints*, per CLAUDE.md's rendered-
+    /// output rule. The TUI mirror of each test lives in
+    /// `src/tui_main/app_on_tui_tests.rs`'s `mod vscode_mode_alt_rung_1744`.
+    ///
+    /// GTK's driver has no character grid and does not
+    /// `record_painted_text` editor glyphs (this module's own header doc),
+    /// so none of these assert on duplicated/typed buffer text directly —
+    /// each instead finds an observable that *is* painted as text and that
+    /// only the fixed behaviour (not the old, broken one) produces: the
+    /// "N cursors" command-line message, the global status bar's
+    /// "(N lines)" segment, the per-window status bar's "Ln N, Col N"
+    /// segment, or the painted sidebar rect.
+    mod alt_rung_1744 {
+        use super::*;
+
+        /// Press `key` with exactly `modifiers` held — like [`alt_press`]
+        /// above, but for chords (Ctrl+Alt+_, Ctrl+Shift+Alt+_, Ctrl+Shift+_)
+        /// that need more than Alt (+ optionally Shift) alone.
+        fn press<A: AppLogic>(driver: &mut GtkDriver<A>, key: Key, modifiers: Modifiers) {
+            driver.dispatch(UiEvent::KeyPressed {
+                key,
+                modifiers,
+                repeat: false,
+            });
+        }
+
+        fn vscode_engine(buffer: &str) -> Engine {
+            let mut engine = Engine::new_for_test();
+            engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+            engine.mode = crate::core::Mode::Insert;
+            engine.buffer_mut().insert(0, buffer);
+            engine.view_mut().cursor = crate::core::Cursor { line: 0, col: 0 };
+            engine
+        }
+
+        /// Ctrl+Alt+Down is VS Code's real `insertCursorBelow` — it must add
+        /// a cursor, not move the line. `Engine::vscode_add_cursor_below`
+        /// sets `self.message = "{n} cursors"`, which GTK paints on the
+        /// command line (unlike editor buffer text, this *is* recorded —
+        /// see `alt_z_toggles_word_wrap_only_in_vscode_mode_on_gtk` above for
+        /// the same command-line pattern).
+        ///
+        /// **Verified RED against unfixed `develop`:** before #1744,
+        /// `route_alt_key` had no `ctrl` parameter, so Ctrl+Alt+Down decoded
+        /// identically to plain Alt+Down (move-line) and never reached
+        /// `vscode_add_cursor_below` — no "cursors" message is ever painted.
+        #[test]
+        fn ctrl_alt_down_adds_a_cursor_below_in_vscode_mode_on_gtk() {
+            let engine = vscode_engine("aaa\nbbb\nccc\n");
+            let mut h = harness(engine, 1200, 800);
+            h.driver.render();
+
+            press(
+                &mut h.driver,
+                Key::Named(quadraui::NamedKey::Down),
+                Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Default::default()
+                },
+            );
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("2 cursors"),
+                "Ctrl+Alt+Down (insertCursorBelow) must add a second cursor; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+        }
+
+        /// Shift+Alt+Down is VS Code's real `copyLinesDownAction` — it must
+        /// duplicate the line (growing the buffer by one), not add a
+        /// cursor. The buffer's line count is painted in the *global*
+        /// status bar's "(N lines)" ruler segment (`render::
+        /// build_status_line`) when `window_status_line` is off — on by
+        /// default, the per-window bar's own cursor segment carries no line
+        /// count, so this test turns it off to get the observable that
+        /// actually distinguishes "duplicated" from "moved" (both move the
+        /// cursor from line 0 to line 1; only duplication changes the line
+        /// count).
+        ///
+        /// **Verified RED against unfixed `develop`:** before #1744,
+        /// `handle_vscode_key`'s `"Alt_Shift_Down"` arm called
+        /// `vscode_add_cursor_below` instead of `vscode_copy_line_down`, so
+        /// the line count never grows and this assertion fires.
+        #[test]
+        fn shift_alt_down_duplicates_the_line_in_vscode_mode_on_gtk() {
+            let mut engine = vscode_engine("aaa\nbbb\n");
+            engine.settings.window_status_line = false;
+            let lines_before = engine.buffer().len_lines();
+
+            let mut h = harness(engine, 1200, 800);
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains(&format!("({lines_before} lines)")),
+                "precondition: the global ruler must paint the starting \
+                 line count; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            press(
+                &mut h.driver,
+                Key::Named(quadraui::NamedKey::Down),
+                Modifiers {
+                    alt: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            );
+            h.driver.render();
+
+            let lines_after = lines_before + 1;
+            assert!(
+                h.driver.screen_contains(&format!("({lines_after} lines)")),
+                "Shift+Alt+Down (copyLinesDownAction) must grow the buffer \
+                 by one line, not merely move the cursor; painted: {:?}",
+                h.driver.painted_texts()
+            );
+        }
+
+        /// Plain Alt+Left is VS Code's `navigateBack` — it must return the
+        /// cursor to the last jump-list entry, not resize the sidebar (the
+        /// mode-independent meaning this chord used to have unconditionally).
+        /// Asserted through the per-window status bar's "Ln N, Col N"
+        /// segment, the same painted observable
+        /// `status_bar_segment_click_opens_go_to_line_picker` (above)
+        /// already proves reaches the screen for this exact fixture shape.
+        ///
+        /// **Verified RED against unfixed `develop`:** before #1744, the
+        /// mode-independent tier's unconditional `AltBase::Left =>
+        /// ResizeSidebar(-1)` ran before the VSCode-mode tier ever saw the
+        /// chord, so the painted cursor position never changes and widens
+        /// the sidebar instead — this assertion fires and the (absent)
+        /// sidebar-width assertion would have passed instead.
+        #[test]
+        fn alt_left_navigates_the_jump_list_in_vscode_mode_on_gtk() {
+            let mut engine = vscode_engine(&"line\n".repeat(10));
+            engine.push_jump_location();
+            engine.view_mut().cursor = crate::core::Cursor { line: 9, col: 0 };
+
+            let mut h = harness(engine, 2200, 800);
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("Ln 10, Col 1"),
+                "precondition: the painted cursor must start on line 10; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            press(
+                &mut h.driver,
+                Key::Named(quadraui::NamedKey::Left),
+                Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+            );
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("Ln 1, Col 1"),
+                "Alt+Left (navigateBack) must return the painted cursor to \
+                 the jump-list entry at line 1, not resize the sidebar; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+        }
+
+        /// VSCode mode's own alternate home for keyboard sidebar resize is
+        /// Ctrl+**Shift**+Alt+Right — not plain Ctrl+Alt+Right, which is
+        /// already the shipped `panel_keys.nav_forward` global accelerator
+        /// and would never reach `route_alt_key` at all in the live app
+        /// (see that function's own doc). Mirrors
+        /// `alt_right_widens_the_painted_sidebar_on_gtk` above, in VSCode
+        /// mode with the alternate chord.
+        ///
+        /// **Verified RED against unfixed `develop`:** before this fix
+        /// iteration, this rung's alternate-resize arms matched on `ctrl`
+        /// alone (plain Ctrl+Alt+Right), a chord the live accelerator tier
+        /// claims first and this rung never actually sees — dispatching
+        /// Ctrl+Shift+Alt+Right here found no matching arm at all and fell
+        /// through to `vscode_alt_key_name`'s plain-`Alt_Right` lookup
+        /// (navigate-forward), so the sidebar rect never widened.
+        #[test]
+        fn ctrl_shift_alt_right_resizes_the_sidebar_in_vscode_mode_on_gtk() {
+            let mut engine = vscode_engine("fn main() {}\n");
+            engine.cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            engine.explorer_rebuild_rows();
+            engine.session.explorer_visible = true;
+
+            let mut h = harness(engine, 1400, 900);
+            h.driver.render();
+            let before = h
+                .painted_sidebar_bounds
+                .get()
+                .expect("precondition: the sidebar must be painted to be resized");
+            assert!(before.width > 0.0, "degenerate sidebar rect {before:?}");
+
+            press(
+                &mut h.driver,
+                Key::Named(quadraui::NamedKey::Right),
+                Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    alt: true,
+                    ..Default::default()
+                },
+            );
+            h.driver.render();
+            let wider = h
+                .painted_sidebar_bounds
+                .get()
+                .expect("the sidebar must still paint after the resize");
+            assert!(
+                wider.width > before.width,
+                "Ctrl+Shift+Alt+Right must widen the painted sidebar in \
+                 VSCode mode: {} -> {}",
+                before.width,
+                wider.width
+            );
+        }
+
+        /// Ctrl+Shift+\ is VS Code's `editor.action.jumpToBracket` — it
+        /// must move the cursor onto the matching bracket. Covers both
+        /// input shapes `App::handle_dispatch`'s `Key::Char` arm resolves
+        /// to `"Shift_backslash"`/`"|"`: the literal already-shifted glyph
+        /// `'|'` (what GDK delivers), and the base key `'\\'` plus an
+        /// explicit Shift bit (the kitty/CSI-u shape the #1744 fix-iteration
+        /// review found unreachable in production — see `render::
+        /// engine_key_from_ui`'s module doc and `App::handle_dispatch`'s own
+        /// `Key::Char('\\') if modifiers.ctrl && modifiers.shift` arm).
+        /// Asserted through the painted "Ln N, Col N" segment.
+        #[test]
+        fn ctrl_shift_backslash_jumps_to_the_matching_bracket_in_vscode_mode_on_gtk() {
+            for (key, label) in [
+                (Key::Char('|'), "literal '|' glyph (GDK)"),
+                (
+                    Key::Char('\\'),
+                    "base '\\' + explicit Shift bit (kitty/CSI-u)",
+                ),
+            ] {
+                let mut engine = vscode_engine("(abc)\n");
+                engine.view_mut().cursor = crate::core::Cursor { line: 0, col: 0 };
+
+                let mut h = harness(engine, 2200, 800);
+                h.driver.render();
+                assert!(
+                    h.driver.screen_contains("Ln 1, Col 1"),
+                    "[{label}] precondition: painted cursor must start on \
+                     the opening '('; painted: {:?}",
+                    h.driver.painted_texts()
+                );
+
+                press(
+                    &mut h.driver,
+                    key,
+                    Modifiers {
+                        ctrl: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                );
+                h.driver.render();
+
+                assert!(
+                    h.driver.screen_contains("Ln 1, Col 5"),
+                    "[{label}] Ctrl+Shift+\\ must move the painted cursor \
+                     onto the matching ')' (col 5); painted: {:?}",
+                    h.driver.painted_texts()
+                );
+            }
+        }
+
+        fn plain_engine() -> Engine {
+            let mut engine = Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            engine
+        }
+
+        /// GTK mirror of `app_on_tui_tests.rs`'s
+        /// `alt_m_round_trip_hides_the_menu_bar_row_again_via_shell_app_1780`
+        /// — but pinning the *opposite* outcome. On GTK the drawn menu row
+        /// doubles as the client-side titlebar and `setup()` pins
+        /// `menu_bar_visible = true` for the engine's whole lifetime
+        /// (`menu_bar_toggleable` stays `false` — see the module doc on
+        /// `overlay_band_holds_only_the_title_bar_when_no_overlay_is_open_via_gtk_driver`).
+        /// `Engine::toggle_editor_mode`'s VSCode -> Vim arm is now gated on
+        /// `menu_bar_toggleable` (#1780 review) specifically so this round
+        /// trip leaves the titlebar/menu row alone on GTK, rather than
+        /// clearing `menu_bar_visible` and stranding GTK with a
+        /// reserved-but-blank titlebar strip with no in-app way back.
+        ///
+        /// **Verified RED against the naive #1780 fix (unconditional
+        /// `self.menu_bar_visible = false` in the Vim-mode arm, no
+        /// `menu_bar_toggleable` gate):** the second Alt-M would have
+        /// cleared `menu_bar_visible` on GTK too, so `screen_contains("File")`
+        /// below would fail.
+        #[test]
+        fn alt_m_round_trip_leaves_the_pinned_menu_bar_row_alone_on_gtk() {
+            let engine = plain_engine();
+            let mut h = harness(engine, 1400, 900);
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("File"),
+                "precondition: GTK's titlebar-doubling menu row is pinned \
+                 visible from `setup()`; painted: {:?}",
+                h.driver.painted_texts()
+            );
+            let row_before = h.menu_row_rect.get();
+            assert!(
+                row_before.height > 0.0,
+                "precondition: the menu row must have real painted height \
+                 before any Alt-M; rect: {row_before:?}"
+            );
+
+            let alt_m = Modifiers {
+                alt: true,
+                ..Default::default()
+            };
+
+            // First Alt-M: Vim -> VSCode.
+            press(&mut h.driver, Key::Char('m'), alt_m);
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("EDIT"),
+                "first Alt-M must switch to VSCode mode; painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                h.driver.screen_contains("File"),
+                "menu row must still paint in VSCode mode on GTK; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            // Second Alt-M: VSCode -> Vim. Status flips back, but — unlike
+            // TUI — the pinned titlebar/menu row must NOT disappear.
+            press(&mut h.driver, Key::Char('m'), alt_m);
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("NORMAL"),
+                "second Alt-M must switch back to Vim Normal mode; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                h.driver.screen_contains("File"),
+                "second Alt-M (VSCode -> Vim) must leave GTK's pinned \
+                 titlebar/menu row painted — clearing it would strand GTK \
+                 with a reserved-but-blank titlebar strip; painted: {:?}",
+                h.driver.painted_texts()
+            );
+            let row_after = h.menu_row_rect.get();
+            assert_eq!(
+                (row_after.y, row_after.height),
+                (row_before.y, row_before.height),
+                "the menu row's painted geometry must be unchanged by the \
+                 Alt-M round trip on GTK: before {row_before:?}, after \
+                 {row_after:?}"
+            );
+        }
+    }
+
+    /// #1745 review: the only thing standing between GTK and the whole
+    /// Cmd-to-Ctrl fold is `normalize_mac_cmd_as_ctrl`'s own
+    /// `backend.services().platform_name() != "macos"` early return — pin
+    /// that directly, on the live GTK backend, rather than trusting the
+    /// module doc's "GTK's own Cmd-reporting convention (Super/Meta ->
+    /// `cmd`) is untouched" claim by inspection alone.
+    ///
+    /// `quadraui::Modifiers::cmd` is what GTK reports for a held Super/Meta
+    /// key (same field #1745 reads on macOS for a held Cmd key — see
+    /// `normalize_mac_cmd_as_ctrl`'s own doc in `src/app.rs`), so this
+    /// drives the exact same `UiEvent::KeyPressed { Key::Char('/'), cmd:
+    /// true, .. }` `src/macos/mod.rs`'s `cmd_slash_toggles_line_comment`
+    /// drives, through this crate's `App::handle_dispatch`, and expects the
+    /// *opposite* painted outcome: a literal `/` character inserted, not a
+    /// toggled line comment — because on GTK this is Super+/, not a VS Code
+    /// Ctrl+/ substitute, and nothing about this issue should change that.
+    ///
+    /// RED would look like: if the early return above were gated wrong (or
+    /// missing), this `/` would instead comment the line, exactly as
+    /// `cmd_slash_toggles_line_comment` asserts on macOS.
+    #[test]
+    fn cmd_slash_is_not_folded_to_ctrl_slash_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.mode = crate::core::Mode::Insert;
+        engine.buffer_mut().insert(0, "print(1)\n");
+        engine.view_mut().cursor = crate::core::Cursor { line: 0, col: 0 };
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        h.driver.dispatch(UiEvent::KeyPressed {
+            key: Key::Char('/'),
+            modifiers: Modifiers {
+                cmd: true,
+                ..Default::default()
+            },
+            repeat: false,
+        });
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("/print(1)"),
+            "Cmd(Super)+/ must be a plain '/' keystroke on GTK, not VS \
+             Code's Mac `commentLine` substitute — painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("# print(1)"),
+            "Cmd(Super)+/ must not toggle the line comment on GTK; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
     }
 }
 
@@ -19121,8 +21492,9 @@ mod engine_key_from_ui_gtk_tests {
     /// `vscode_copy`'s `visual_anchor.is_some()` branch was never taken;
     /// `Ctrl+C` then fell to the "copy current line" branch instead, so the
     /// clipboard hook would have captured `"hello world\n"` (the whole
-    /// line), not `"hello"` (the shift-selected span) — this assertion
-    /// fails against that.
+    /// line) — not the `"hell"` this assertion actually expects post-fix
+    /// (the 4-char shift-selected span). This assertion fails against that
+    /// pre-fix behavior.
     #[test]
     fn shift_right_extends_selection_and_ctrl_c_copies_it_on_gtk() {
         let mut engine = Engine::new_for_test();
@@ -19140,10 +21512,9 @@ mod engine_key_from_ui_gtk_tests {
         let mut h = harness(engine, 1200, 800);
         h.driver.render();
 
-        // Four Shift+Right presses move the cursor to col 4 ('o'); copying a
-        // `Mode::Visual` selection reuses Vim's own inclusive-of-cursor
-        // range (`get_visual_selection_text`), so [anchor=0, cursor=4]
-        // copies chars 0..=4 — "hello".
+        // Four Shift+Right presses move the cursor to col 4 ('o'); VSCode
+        // mode's selection is exclusive of the cursor (#1788), so
+        // [anchor=0, cursor=4] copies chars 0..4 — "hell".
         for _ in 0..4 {
             press(
                 &mut h,
@@ -19172,9 +21543,10 @@ mod engine_key_from_ui_gtk_tests {
 
         assert_eq!(
             copied.borrow().as_deref(),
-            Some("hello"),
-            "Ctrl+C after Shift+Right x5 must copy exactly the shift-selected \
-             span, proving the selection (not the whole line) was captured"
+            Some("hell"),
+            "Ctrl+C after Shift+Right x4 must copy exactly the shift-selected \
+             span, proving the selection (not the whole line, and not one \
+             extra trailing char per #1788) was captured"
         );
     }
 
@@ -19675,7 +22047,8 @@ mod conformance_proof_slice {
 
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_928_gtk_conformance_{tag}_{:?}",
+            "vimcode_test_928_gtk_conformance_{tag}_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -20564,6 +22937,105 @@ mod acquire_status_paint_1345 {
     }
 }
 
+/// #1719 review: GTK twin of `tui_main::app_on_tui_tests::tests::
+/// issue_1719_prerequisite_detect_before_install` — the multi-backend rule
+/// asks for both backends' black-box coverage, not just TUI's, for a
+/// change that repaints `engine.message` (rendered by both). Same
+/// `pub(crate) Engine::ext_install_from_registry_with_runtime_check` seam,
+/// stubbed `runtime_present`, asserting on `driver.screen_contains`
+/// instead of engine-internal state — see that module's own doc for why.
+#[cfg(test)]
+mod issue_1719_missing_prereq_blocks_install {
+    use super::*;
+
+    /// #1719 acceptance: a manifest's legacy `[lsp]` `install_*` string,
+    /// gated by the new `lsp.dependencies` field, must paint the
+    /// actionable "requires npm — ..." status line instead of silently
+    /// queuing a doomed terminal command — the GTK twin of
+    /// `lsp_legacy_install_blocked_when_dependency_missing_paints_status`.
+    #[test]
+    fn lsp_legacy_install_blocked_when_dependency_missing_paints_status_via_gtk() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+
+        let mut engine = Engine::new();
+        let ext_name = "vc-gtk-1719-lsp-missing-dep";
+        engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 gtk lsp dep".to_string(),
+            language_ids: vec!["vc-gtk-1719-lsp-lang".to_string()],
+            lsp: LspConfig {
+                binary: "vc-gtk-1719-lsp-bin".to_string(),
+                install_linux: "npm install -g vc-gtk-1719-lsp-bin".to_string(),
+                install_macos: "npm install -g vc-gtk-1719-lsp-bin".to_string(),
+                install_windows: "npm install -g vc-gtk-1719-lsp-bin".to_string(),
+                dependencies: vec!["npm".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        let mut h = harness(engine, 1000, 640);
+        h.engine
+            .borrow_mut()
+            .ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("requires npm"),
+            "a missing declared LSP dependency must paint a visible \
+             'requires npm' instruction on GTK too; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.engine.borrow().pending_terminal_command.is_none(),
+            "a missing declared dependency must never dispatch an install"
+        );
+    }
+
+    /// #1719 acceptance: the built-in `delve` DAP adapter's hardcoded `go
+    /// install ...` installer, gated by the new `dap_manager::
+    /// adapter_dependencies` merge, must also paint a "requires go" status
+    /// line rather than queuing the install — the GTK twin of
+    /// `dap_builtin_delve_install_blocked_when_go_missing_paints_status`.
+    #[test]
+    fn dap_builtin_delve_install_blocked_when_go_missing_paints_status_via_gtk() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest};
+
+        let mut engine = Engine::new();
+        let ext_name = "vc-gtk-1719-delve-missing-go";
+        engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "1719 gtk delve dep".to_string(),
+            dap: DapConfig {
+                adapter: "delve".to_string(),
+                // Deliberately not the literal `dlv` binary name — see
+                // `lsp_ops::tests::dap_builtin_delve_install_blocked_when_
+                // go_missing`'s comment for why.
+                binary: "vc-gtk-1719-nonexistent-dlv".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        let mut h = harness(engine, 1000, 640);
+        h.engine
+            .borrow_mut()
+            .ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("requires go"),
+            "delve's missing `go` prerequisite must paint a visible \
+             'requires go' instruction on GTK too; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.engine.borrow().pending_terminal_command.is_none(),
+            "delve's install must never run without `go` present"
+        );
+    }
+}
+
 /// #1397/#1577: the recommended-extension install offer, rebuilt on
 /// quadraui#1185's multi-action toast — a non-modal notification with real
 /// "Install"/"Don't ask again" buttons (not printed-as-body-text shortcuts)
@@ -20999,7 +23471,8 @@ mod issue_1460_acp_turn_review_and_checkpoints {
     #[test]
     fn acp_turn_review_lists_all_three_files_and_revert_restores_one_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1460_gtk_turn_review_{:?}",
+            "vimcode_test_1460_gtk_turn_review_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -21089,7 +23562,8 @@ mod issue_1460_acp_turn_review_and_checkpoints {
     #[test]
     fn acp_restore_checkpoint_keeps_a_user_edit_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1460_gtk_restore_{:?}",
+            "vimcode_test_1460_gtk_restore_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -21210,7 +23684,8 @@ mod issue_1460_acp_turn_review_and_checkpoints {
         /// reachable from the steps below).
         fn open_comment_heavy_buffer() -> (std::path::PathBuf, Engine) {
             let path = std::env::temp_dir().join(format!(
-                "vimcode_test_1583_gtk_{:?}.rs",
+                "vimcode_test_1583_gtk_{}_{:?}.rs",
+                std::process::id(),
                 std::thread::current().id()
             ));
             let mut text = String::new();
@@ -21373,7 +23848,8 @@ mod issue_1515_acp_review_badge {
     #[test]
     fn badge_mode_suppresses_auto_open_and_shows_edited_summary_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1515_gtk_badge_{:?}",
+            "vimcode_test_1515_gtk_badge_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -21447,7 +23923,8 @@ mod issue_1515_acp_review_badge {
     #[test]
     fn badge_mode_paints_gutter_markers_on_agent_changed_lines_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1515_gtk_gutter_{:?}",
+            "vimcode_test_1515_gtk_gutter_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -21494,7 +23971,8 @@ mod issue_1515_acp_review_badge {
     #[test]
     fn off_mode_paints_no_gutter_markers_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1515_gtk_off_gutter_{:?}",
+            "vimcode_test_1515_gtk_off_gutter_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -21572,7 +24050,8 @@ mod issue_1517_acp_inline_review {
     #[test]
     fn virtual_action_row_paints_in_the_normal_buffer_view_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1517_gtk_row_{:?}",
+            "vimcode_test_1517_gtk_row_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -21616,7 +24095,8 @@ mod issue_1517_acp_inline_review {
     #[test]
     fn leader_ar_reverts_the_hunk_under_the_cursor_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1517_gtk_ar_{:?}",
+            "vimcode_test_1517_gtk_ar_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -21665,7 +24145,8 @@ mod issue_1517_acp_inline_review {
     #[test]
     fn leader_ak_keeps_the_hunk_under_the_cursor_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1517_gtk_ak_{:?}",
+            "vimcode_test_1517_gtk_ak_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -21714,7 +24195,8 @@ mod issue_1517_acp_inline_review {
     #[test]
     fn editing_a_hunk_before_keep_labels_it_edited_and_keeps_the_edit_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1517_gtk_edit_{:?}",
+            "vimcode_test_1517_gtk_edit_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -21798,7 +24280,8 @@ mod issue_1517_acp_inline_review {
     #[test]
     fn jump_next_hunk_prefers_the_outstanding_review_hunk_over_raw_git_diff_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1517_gtk_git_precedence_{:?}",
+            "vimcode_test_1517_gtk_git_precedence_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -21895,7 +24378,8 @@ mod issue_1516_hunk_level_review {
     #[test]
     fn keep_one_hunk_reject_the_other_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1516_gtk_hunks_{:?}",
+            "vimcode_test_1516_gtk_hunks_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22596,5 +25080,491 @@ mod issue_1513_at_dir_and_at_symbol_mentions {
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// #1653 review: the GTK twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1653_decor_api` — the issue's own acceptance list names both
+    /// `TuiDriver` *and* `GtkDriver` black-box coverage explicitly, and
+    /// CLAUDE.md's multi-backend rule requires both backends be covered
+    /// for any surface both backends render. The decoration *data* is
+    /// built once in `render.rs` (shared), but whether GTK's own
+    /// `to_q_editor_line`/quadraui-paint path actually turns that data
+    /// into pixels is exactly the class of bug #587/#592 found
+    /// (`ScreenLayout.picker` populated on GTK for months while nothing
+    /// painted it) — a TUI-only test cannot catch a GTK-only regression
+    /// here, so this module exists alongside it rather than instead of
+    /// it.
+    ///
+    /// Every editor text line paints through exactly one
+    /// `pangocairo::show_layout(cr, layout)` call with `layout`'s text
+    /// set to the *whole* `rl.raw_text` (`quadraui::gtk::editor::
+    /// paint_line_text_ghost_and_annotation`), so `GtkDriver::find_bounds`
+    /// on any substring of a line returns that *whole line's* painted
+    /// bounds, not a sub-rect around the match — unlike `TuiDriver`'s
+    /// character grid. Every test below accounts for this by computing a
+    /// column's pixel center as `bounds.x + (col as f32 + 0.5) *
+    /// char_width` off the line's own bounds, the same technique
+    /// `command_line_selection::col_center` (above) already uses for the
+    /// command line.
+    mod issue_1653_decor_api_gtk {
+        use super::*;
+        use crate::core::buffer::{DecorOpts, HlGroupDef, VirtTextChunk, VirtTextPos};
+        use quadraui::Backend as _;
+
+        /// The plainest possible fixture — mirrors `app_on_tui_tests`'
+        /// `plain_engine` (nerd fonts off: icon glyphs are irrelevant to
+        /// what these tests assert on), plus `hide_sidebar()`/
+        /// `explorer_visible = false` (the established pattern elsewhere
+        /// in this file, e.g. the font-size-settle test above) — the
+        /// Explorer sidebar is visible by default and, confirmed by hand
+        /// while writing this module, its ~440px column shifts where
+        /// every subsequent `find_bounds` lands, which is exactly the
+        /// kind of hardcoded-position assumption CLAUDE.md's "locate
+        /// targets, never hardcode coordinates" rule exists to avoid.
+        fn plain_engine() -> Engine {
+            let mut engine = Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            engine.app_shell.hide_sidebar();
+            engine.session.explorer_visible = false;
+            engine
+        }
+
+        /// [`harness`] plus the two extra settle frames `hide_sidebar()`'s
+        /// own doc elsewhere in this file calls for (its flip "takes a
+        /// frame to reach the painted layout") — every test below needs
+        /// `find_bounds`/`col_strip` to see the *settled* (sidebar-hidden)
+        /// layout, not the first, still-transitioning frame.
+        fn settled_harness(engine: Engine) -> Harness<impl AppLogic> {
+            let mut h = harness(engine, 1200, 800);
+            h.driver.render();
+            h.driver.render();
+            h
+        }
+
+        /// True for a pixel within ±10 per channel of `target` — same
+        /// tolerance (and same AA rationale) as `mod tests`'s own
+        /// `pixel_near` helper, redefined locally here since that one is
+        /// private to its own (sibling, not ancestor) module.
+        fn pixel_near((r, g, b): (u8, u8, u8), target: (u8, u8, u8)) -> bool {
+            let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 10;
+            near(r, target.0) && near(g, target.1) && near(b, target.2)
+        }
+
+        /// Every pixel inside character column `col` (0-based) on the
+        /// line whose painted bounds are `line_bounds` — a full vertical
+        /// strip rather than one coordinate, because `line_bounds`'s
+        /// `height` (from `pango::Layout::pixel_size`, the *logical*
+        /// extent, confirmed by hand to run noticeably taller than the
+        /// glyphs' own ink) is not vertically centred on the glyphs
+        /// themselves, so a single `height / 2.0` midpoint sample can
+        /// land in the leading/trailing blank padding rather than on ink.
+        /// Scanning the whole column (same "scan every pixel inside the
+        /// bounds" approach `explorer_file_icon_paints_in_the_tab_bar_s_
+        /// filetype_colour` above uses for a glyph) sidesteps needing to
+        /// know exactly where the ink sits within the logical box.
+        fn col_strip<A: AppLogic>(
+            h: &mut Harness<A>,
+            line_bounds: quadraui::Rect,
+            col: usize,
+        ) -> Vec<(u8, u8, u8)> {
+            let char_w = h.driver.backend().char_width();
+            let x0 = (line_bounds.x + col as f32 * char_w).round() as i32;
+            let x1 = (line_bounds.x + (col as f32 + 1.0) * char_w).round() as i32;
+            let mut px = Vec::new();
+            for x in x0..x1 {
+                for y in (line_bounds.y as i32)..((line_bounds.y + line_bounds.height) as i32) {
+                    px.push(h.driver.pixel(x, y));
+                }
+            }
+            px
+        }
+
+        /// A highlighted range (`hl_group`) must paint in the resolved
+        /// group's colour, not the theme default foreground.
+        #[test]
+        fn decor_highlight_range_paints_in_group_color_via_gtk_driver() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQHIGHLIGHTME\n");
+            engine.decor.set_hl(
+                "ZqTestHl",
+                HlGroupDef {
+                    fg: Some("#ff00ff".to_string()),
+                    ..Default::default()
+                },
+            );
+            let ns = engine.decor.namespace("zq_hl_test");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                Some("ZQHIGHLIGHTME".chars().count()),
+                DecorOpts {
+                    hl_group: Some("ZqTestHl".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let mut h = settled_harness(engine);
+            let bounds = h
+                .driver
+                .find_bounds("HIGHLIGHTME")
+                .expect("the marked line must paint");
+            // Column 5 ("I" of "HIGHLIGHTME", i.e. char index 2 + 3 into
+            // "ZQHIGHLIGHTME") — inside the highlighted range, clear of
+            // the Normal-mode block cursor's default column 0.
+            let strip = col_strip(&mut h, bounds, 5);
+            assert!(
+                strip.iter().copied().any(|p| pixel_near(p, (255, 0, 255))),
+                "a pixel inside the highlighted range must paint in the \
+                 resolved group colour #ff00ff; sampled column: {strip:?}"
+            );
+        }
+
+        /// Overlay virtual text replaces the glyphs already at its
+        /// column, same width — the original text underneath must not
+        /// still show.
+        #[test]
+        fn decor_overlay_virt_text_paints_over_existing_text_via_gtk_driver() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQBEFOREXXXAFTERZQ\n");
+            let ns = engine.decor.namespace("zq_overlay");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                8, // the first "X" of "XXX"
+                None,
+                None,
+                DecorOpts {
+                    virt_text: vec![VirtTextChunk {
+                        text: "JJJ".to_string(),
+                        hl_group: None,
+                    }],
+                    virt_text_pos: Some(VirtTextPos::Overlay),
+                    ..Default::default()
+                },
+            );
+
+            let h = settled_harness(engine);
+            assert!(
+                h.driver.screen_contains("ZQBEFOREJJJAFTERZQ"),
+                "overlay virt text must replace the XXX span with JJJ; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                !h.driver.screen_contains("XXX"),
+                "the original text under an overlay must not still show; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+        }
+
+        /// Inline virtual text inserts at its column, shifting later text
+        /// on the same line right — and the painted cursor column must
+        /// follow, even though the engine's own (buffer-coordinate)
+        /// cursor column never changes.
+        ///
+        /// The cursor check compares, within a *single* painted frame
+        /// (no mode switch, no second render — dispatching any event here
+        /// turned out to have its own confounds, e.g. the first-ever key
+        /// event settling the sidebar's default-open state, confirmed by
+        /// hand while writing this test), two renderings of the exact
+        /// same glyph: the leading "Z" of "ZQHEAD" (column 0 — the cursor
+        /// can only ever land on column 6, buggy/unshifted, or column 8,
+        /// correct/shifted, so column 0 is cursor-free in *either* case,
+        /// a clean reference) against the "Z" of "ZQTAIL" (column 8,
+        /// cursor-free only if the shift is missing). Both are the same
+        /// character in the same plain foreground colour with no
+        /// highlighting on this line, so any pixel difference between
+        /// the two strips can only be the cursor overlay — proving it
+        /// landed on column 8, not column 6.
+        #[test]
+        fn decor_inline_virt_text_shifts_text_and_cursor_col_via_gtk_driver() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQHEADZQTAIL\n");
+            let ns = engine.decor.namespace("zq_inline");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                6, // right after "ZQHEAD", right before "ZQTAIL"
+                None,
+                None,
+                DecorOpts {
+                    virt_text: vec![VirtTextChunk {
+                        text: ">>".to_string(),
+                        hl_group: None,
+                    }],
+                    virt_text_pos: Some(VirtTextPos::Inline),
+                    ..Default::default()
+                },
+            );
+            // Cursor sits in buffer coordinates at column 6 — the "Z" of
+            // "ZQTAIL" before any inline text exists.
+            engine.view_mut().cursor.col = 6;
+
+            let mut h = settled_harness(engine);
+            assert!(
+                h.driver.screen_contains("ZQHEAD>>ZQTAIL"),
+                "inline virt text must be inserted, shifting the following \
+                 text right; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            let bounds = h.driver.find_bounds("ZQHEAD").expect("the line must paint");
+            // "ZQHEAD>>ZQTAIL": Z0 Q1 H2 E3 A4 D5 >6 >7 Z8 — column 0 is
+            // the leading "Z" of "ZQHEAD" (always cursor-free, the
+            // reference); column 8 is the shifted "Z" of "ZQTAIL", where
+            // the cursor must now sit.
+            let reference_z = col_strip(&mut h, bounds, 0);
+            let shifted_z = col_strip(&mut h, bounds, 8);
+            assert_ne!(
+                reference_z, shifted_z,
+                "the \"Z\" at column 8 (ZQTAIL's, post-shift) must paint \
+                 differently from the cursor-free \"Z\" at column 0 \
+                 (ZQHEAD's) — proving the cursor followed the inline \
+                 shift to column 8 rather than staying on column 6's \
+                 original (now \">\") position"
+            );
+        }
+
+        /// A `sign_text` mark paints its glyph in the gutter, left of the
+        /// line's own text.
+        #[test]
+        fn decor_sign_appears_in_gutter_via_gtk_driver() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQLINEMARKER\n");
+            let ns = engine.decor.namespace("zq_sign");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                None,
+                DecorOpts {
+                    sign_text: Some("@".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let h = settled_harness(engine);
+            let sign_bounds = h
+                .driver
+                .find_bounds("@")
+                .expect("the decor sign glyph must paint in the gutter");
+            let line_bounds = h
+                .driver
+                .find_bounds("ZQLINEMARKER")
+                .expect("the signed line's text must paint");
+            assert!(
+                sign_bounds.x < line_bounds.x,
+                "the decor sign must paint left of the line's own text \
+                 (in the gutter), not inside it; sign_bounds={sign_bounds:?} \
+                 line_bounds={line_bounds:?}"
+            );
+        }
+
+        /// A mark-anchored highlight follows an insert *above* it: once a
+        /// new line is spliced in before the marked line (`O` + Escape),
+        /// the highlight must paint on the mark's *new* row, not its
+        /// original one.
+        #[test]
+        fn decor_mark_anchored_highlight_follows_insert_above_via_gtk_driver() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQKEEPCOLOR\nZQOTHERLINE\n");
+            engine.decor.set_hl(
+                "ZqFollowHl",
+                HlGroupDef {
+                    fg: Some("#00ffff".to_string()),
+                    ..Default::default()
+                },
+            );
+            let ns = engine.decor.namespace("zq_follow");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                Some("ZQKEEPCOLOR".chars().count()),
+                DecorOpts {
+                    hl_group: Some("ZqFollowHl".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let mut h = settled_harness(engine);
+            // Column 4 — inside "KEEPCOLOR", clear of the Normal-mode
+            // block cursor's default column 0.
+            let bounds0 = h
+                .driver
+                .find_bounds("ZQKEEPCOLOR")
+                .expect("precondition: the marked line must paint before the edit");
+            let strip0 = col_strip(&mut h, bounds0, 4);
+            assert!(
+                strip0.iter().copied().any(|p| pixel_near(p, (0, 255, 255))),
+                "precondition: the highlight must paint before the edit; \
+                 sampled column: {strip0:?}"
+            );
+
+            // `O` + Escape splices a new line in above row 0.
+            h.driver.type_char('O');
+            for c in "NEWTOPLINE".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Escape);
+
+            assert!(
+                h.driver.screen_contains("NEWTOPLINE") && h.driver.screen_contains("ZQKEEPCOLOR"),
+                "precondition: the insert must have landed; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            let bounds1 = h
+                .driver
+                .find_bounds("ZQKEEPCOLOR")
+                .expect("the marked line must still paint after the edit");
+            assert!(
+                bounds1.y > bounds0.y,
+                "precondition: ZQKEEPCOLOR must have moved down a row"
+            );
+            let strip1 = col_strip(&mut h, bounds1, 4);
+            assert!(
+                strip1.iter().copied().any(|p| pixel_near(p, (0, 255, 255))),
+                "the highlight must have followed the mark to its new row, \
+                 not stayed pinned to the row it started on; sampled \
+                 column: {strip1:?}"
+            );
+        }
+
+        // #1810 (not #1653 — this test lands in this module only for its
+        // imports/fixtures; see that issue's own comment if this module
+        // ever gets split).
+        /// #1810, GTK twin of `app_on_tui_tests`'
+        /// `decor_eol_virt_text_paints_after_line_and_follows_insert_above_
+        /// via_app_on_tui`: end-of-line virtual text (`virt_text_pos =
+        /// "eol"`) must actually reach pixels on GTK too, not just be
+        /// stored. It converges on `RenderedLine::annotation`, which GTK
+        /// paints in its *own* `pango::Layout` (quadraui's
+        /// `gtk::editor::paint_line_text_ghost_and_annotation`) separate
+        /// from the line body's layout — so unlike the body-text
+        /// assertions above, `find_bounds` here returns a rect around the
+        /// annotation run itself, which is what lets this test check it
+        /// lands on the marked line's row and to the right of its content.
+        ///
+        /// Also covers two eol marks on one line drawing in creation
+        /// order, space-separated, and the fact that eol text (unlike the
+        /// blame annotation sharing the field) survives Insert mode — a
+        /// `ZQBLAMETEXT` control annotation is asserted present in Normal
+        /// mode and absent in Insert mode, so the Insert-mode assertions
+        /// are provably checking a fresh frame rather than a stale one
+        /// `GtkDriver` simply never repainted.
+        ///
+        /// RED against unfixed `develop`: `render.rs`'s `Eol | None` arm
+        /// was a deliberate no-op there, so "ZQEOLA" is painted nowhere
+        /// and the first `screen_contains` assertion fails.
+        #[test]
+        fn decor_eol_virt_text_paints_after_line_content_via_gtk_driver() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQBEFORE\nZQOTHERLINE\n");
+            // The blame-sourced annotation this field normally carries — the
+            // control for the Insert-mode assertion below. `GtkDriver` only
+            // repaints on an app-requested redraw, so `painted_texts()` can
+            // be a stale Normal-mode frame if nothing changed; asserting
+            // this control annotation *disappears* (it IS muted in Insert
+            // mode) proves the frame checked below is actually fresh, not
+            // just the same one still sitting there.
+            engine.line_annotations.insert(0, "ZQBLAMETEXT".to_string());
+            let ns = engine.decor.namespace("zq_eol_gtk");
+            let buf_id = engine.active_buffer_id();
+            for text in ["ZQEOLA", "ZQEOLB"] {
+                engine.decor.set_mark(
+                    buf_id,
+                    ns,
+                    0,
+                    0,
+                    None,
+                    None,
+                    DecorOpts {
+                        virt_text: vec![VirtTextChunk {
+                            text: text.to_string(),
+                            hl_group: None,
+                        }],
+                        virt_text_pos: Some(VirtTextPos::Eol),
+                        ..Default::default()
+                    },
+                );
+            }
+
+            let mut h = settled_harness(engine);
+            assert!(
+                h.driver.screen_contains("ZQEOLA ZQEOLB"),
+                "eol virtual text must paint on GTK, with two marks on one \
+                 line drawn in creation order and space-separated; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                h.driver.screen_contains("ZQBLAMETEXT"),
+                "precondition: the blame annotation control must paint in \
+                 Normal mode; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            let line = h
+                .driver
+                .find_bounds("ZQBEFORE")
+                .expect("the marked line's own text must paint");
+            let eol = h
+                .driver
+                .find_bounds("ZQEOLA")
+                .expect("the eol virtual text must paint");
+            // Same row (the annotation layout is baselined on the line it
+            // annotates), and to the right of where the line's own content
+            // starts — i.e. trailing the content, not replacing it.
+            assert!(
+                (eol.y - line.y).abs() < h.driver.backend().char_width(),
+                "the eol text must paint on the marked line's own row \
+                 (line {line:?} vs eol {eol:?})"
+            );
+            assert!(
+                eol.x > line.x,
+                "the eol text must paint after the line's content, not \
+                 before/over it (line {line:?} vs eol {eol:?})"
+            );
+            assert!(
+                h.driver.screen_contains("ZQOTHERLINE"),
+                "the unmarked line must be untouched; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            // Entering Insert mode must not mute it (the blame annotation
+            // sharing this field *is* muted there — see the TUI twin). The
+            // control (`ZQBLAMETEXT` disappearing) proves this is a fresh
+            // Insert-mode frame, not a stale repaint-skipped Normal-mode one.
+            h.driver.type_char('i');
+            assert!(
+                h.driver.screen_contains("ZQEOLA ZQEOLB"),
+                "eol virtual text must stay painted in Insert mode; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                !h.driver.screen_contains("ZQBLAMETEXT"),
+                "the blame annotation control must have muted in Insert \
+                 mode, proving this frame is actually fresh and not a \
+                 stale Normal-mode repaint; painted: {:?}",
+                h.driver.painted_texts()
+            );
+        }
     }
 }

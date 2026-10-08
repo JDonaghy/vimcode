@@ -70,35 +70,34 @@ fn test_vscode_move_line_up_with_selection() {
     assert_eq!(buf(&e), "bbb\nccc\naaa\nddd\n");
 }
 
+// #1744: Shift+Alt+Up/Down is VS Code's `copyLinesUpAction`/
+// `copyLinesDownAction` (duplicate the line) — it used to be misbound to
+// add-a-cursor, which is Ctrl+Alt+Up/Down's real chord (`insertCursorAbove`/
+// `insertCursorBelow`, see the "Multi-cursor" section below).
+//
+// Verified RED against unfixed `develop` for both tests below: reverting
+// `handle_vscode_key`'s `"Alt_Shift_Up"`/`"Alt_Shift_Down"` arms to call
+// `vscode_add_cursor_above`/`_below` instead reproduces both assertion
+// failures (buffer unchanged, `extra_cursors` gains an entry).
+
 #[test]
-fn test_vscode_alt_shift_down_adds_cursor_below() {
+fn test_vscode_alt_shift_down_duplicates_line_down() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 0, col: 1 };
     e.handle_key("Alt_Shift_Down", None, false);
-    assert_eq!(e.view().extra_cursors.len(), 1);
-    assert_eq!(e.view().extra_cursors[0], Cursor { line: 1, col: 1 });
+    assert_eq!(buf(&e), "aaa\naaa\nbbb\nccc\n");
+    assert!(e.view().extra_cursors.is_empty());
 }
 
 #[test]
-fn test_vscode_alt_shift_up_adds_cursor_above() {
+fn test_vscode_alt_shift_up_duplicates_line_up() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 2, col: 0 };
     e.handle_key("Alt_Shift_Up", None, false);
-    assert_eq!(e.view().extra_cursors.len(), 1);
-    assert_eq!(e.view().extra_cursors[0], Cursor { line: 1, col: 0 });
-}
-
-#[test]
-fn test_vscode_alt_shift_down_multiple() {
-    let mut e = engine_with("aaa\nbbb\nccc\nddd\n");
-    vscode_mode(&mut e);
-    e.view_mut().cursor = Cursor { line: 0, col: 0 };
-    e.handle_key("Alt_Shift_Down", None, false);
-    e.handle_key("Alt_Shift_Down", None, false);
-    // Should have 2 extra cursors (lines 1 and 2)
-    assert_eq!(e.view().extra_cursors.len(), 2);
+    assert_eq!(buf(&e), "aaa\nbbb\nccc\nccc\n");
+    assert!(e.view().extra_cursors.is_empty());
 }
 
 #[test]
@@ -180,6 +179,59 @@ fn test_vscode_select_line_extends() {
 // Phase 2: Multi-Cursor + Indentation
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// #1744: Ctrl+Alt+Up/Down (`"Alt_Up"`/`"Alt_Down"` with `ctrl: true` — the
+// exact spelling `render::route_alt_key` now forwards) is VS Code's real
+// `insertCursorAbove`/`insertCursorBelow`. Plain Alt+Up/Down (no ctrl) still
+// moves the line (see Phase 1 above); Alt+Shift+Up/Down duplicates it.
+//
+// Verified RED against unfixed `develop` for the three tests below:
+// `handle_vscode_key` used to have no `"Alt_Up"/"Alt_Down" if ctrl` arm at
+// all (and `route_alt_key` had no `ctrl` parameter to forward one with), so
+// Ctrl+Alt+Up/Down ran the move-line arm instead — these assertions'
+// `extra_cursors` checks fail and the buffer-unchanged checks fail against
+// that code.
+
+#[test]
+fn test_vscode_ctrl_alt_down_adds_cursor_below() {
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 1 };
+    e.handle_key("Alt_Down", None, true);
+    assert_eq!(e.view().extra_cursors.len(), 1);
+    assert_eq!(e.view().extra_cursors[0], Cursor { line: 1, col: 1 });
+    assert_eq!(
+        buf(&e),
+        "aaa\nbbb\nccc\n",
+        "insertCursorBelow must not move any line"
+    );
+}
+
+#[test]
+fn test_vscode_ctrl_alt_up_adds_cursor_above() {
+    let mut e = engine_with("aaa\nbbb\nccc\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 2, col: 0 };
+    e.handle_key("Alt_Up", None, true);
+    assert_eq!(e.view().extra_cursors.len(), 1);
+    assert_eq!(e.view().extra_cursors[0], Cursor { line: 1, col: 0 });
+    assert_eq!(
+        buf(&e),
+        "aaa\nbbb\nccc\n",
+        "insertCursorAbove must not move any line"
+    );
+}
+
+#[test]
+fn test_vscode_ctrl_alt_down_multiple() {
+    let mut e = engine_with("aaa\nbbb\nccc\nddd\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    e.handle_key("Alt_Down", None, true);
+    e.handle_key("Alt_Down", None, true);
+    // Should have 2 extra cursors (lines 1 and 2)
+    assert_eq!(e.view().extra_cursors.len(), 2);
+}
+
 #[test]
 fn test_vscode_ctrl_d_selects_word() {
     let mut e = engine_with("hello world hello\n");
@@ -191,6 +243,36 @@ fn test_vscode_ctrl_d_selects_word() {
     assert_eq!(e.mode, Mode::Visual);
     assert_eq!(e.visual_anchor.unwrap().col, 0); // anchor at word start
     assert_eq!(e.cursor().col, 4); // cursor at last char of "hello" (inclusive)
+}
+
+/// #1788 review regression guard: `vscode_ctrl_d`'s word selection is
+/// inclusive-end (cursor lands *on* the last char of the word, see
+/// `test_vscode_ctrl_d_selects_word` above) — unlike the Shift+arrow
+/// keyboard-extended selection, which is exclusive-end. A fix for #1788 that
+/// discriminates on `is_vscode_mode()` instead of the selection's own
+/// end-bound convention (`visual_end_exclusive`) regresses exactly this
+/// case: Ctrl+D then Ctrl+C would copy "hell" (4 chars) instead of "hello"
+/// (5 chars).
+///
+/// **Verified RED without the `visual_end_exclusive` fix** (i.e. against a
+/// version of the #1788 fix that branches on `is_vscode_mode()` alone): the
+/// final assertion fails with `"hell"` instead of `"hello"`.
+#[test]
+fn test_vscode_ctrl_d_then_ctrl_c_copies_whole_word() {
+    let mut e = engine_with("hello world\n");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    e.handle_key("d", Some('d'), true); // Ctrl+D: select "hello"
+    assert_eq!(e.cursor().col, 4); // inclusive-end, per test above
+
+    e.handle_key("c", Some('c'), true); // Ctrl+C
+    let (text, _) = e
+        .get_register_content('+')
+        .expect("Ctrl+C must populate the clipboard register");
+    assert_eq!(
+        text, "hello",
+        "Ctrl+D then Ctrl+C must copy the whole 5-char word, not 4"
+    );
 }
 
 #[test]
@@ -469,11 +551,11 @@ fn test_vscode_move_line_preserves_content() {
 }
 
 #[test]
-fn test_vscode_alt_shift_preserves_cursor_col() {
+fn test_vscode_ctrl_alt_down_preserves_cursor_col() {
     let mut e = engine_with("hello world\nsecond\n");
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 0, col: 5 };
-    e.handle_key("Alt_Shift_Down", None, false);
+    e.handle_key("Alt_Down", None, true);
     // Primary cursor stays at col 5, extra cursor added at (1, 5)
     assert_eq!(e.cursor().col, 5);
     assert_eq!(e.view().extra_cursors[0].col, 5);
@@ -555,7 +637,10 @@ fn test_vscode_escape_dismisses_completion() {
     let mut e = engine_with("hello\n");
     vscode_mode(&mut e);
     // Simulate completion popup being open
-    e.completion_candidates = vec!["hello".to_string(), "help".to_string()];
+    e.completion_candidates = vec!["hello", "help"]
+        .into_iter()
+        .map(|s| vimcode_core::core::completion::CompletionCandidate::plain(s.to_string()))
+        .collect();
     e.completion_idx = Some(0);
     e.completion_display_only = true;
     // Press Escape
@@ -579,7 +664,9 @@ fn test_vscode_escape_priority_completion_then_cursors_then_selection() {
     let mut e = engine_with("hello\nworld\n");
     vscode_mode(&mut e);
     // Set up: completion + extra cursors + selection
-    e.completion_candidates = vec!["test".to_string()];
+    e.completion_candidates = vec![vimcode_core::core::completion::CompletionCandidate::plain(
+        "test".to_string(),
+    )];
     e.completion_idx = Some(0);
     e.add_cursor_at_pos(1, 0);
     e.visual_anchor = Some(Cursor { line: 0, col: 0 });
@@ -634,8 +721,8 @@ fn test_vscode_multi_cursor_type_char() {
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 0, col: 0 };
     // Add cursors on lines 1 and 2
-    e.handle_key("Alt_Shift_Down", None, false);
-    e.handle_key("Alt_Shift_Down", None, false);
+    e.handle_key("Alt_Down", None, true);
+    e.handle_key("Alt_Down", None, true);
     assert_eq!(e.view().extra_cursors.len(), 2);
     // Type 'X' — should insert at all 3 cursor positions
     e.handle_key("X", Some('X'), false);
@@ -650,8 +737,8 @@ fn test_vscode_multi_cursor_backspace() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 0, col: 1 };
-    e.handle_key("Alt_Shift_Down", None, false);
-    e.handle_key("Alt_Shift_Down", None, false);
+    e.handle_key("Alt_Down", None, true);
+    e.handle_key("Alt_Down", None, true);
     // Backspace — should delete first char on all 3 lines
     e.handle_key("BackSpace", None, false);
     let lines = get_lines(&e);
@@ -700,11 +787,42 @@ fn test_vscode_ctrl_d_then_backspace_deletes_all() {
 }
 
 #[test]
+fn test_vscode_select_all_after_multicursor_edit_then_type_replaces_buffer() {
+    // #1785: regression for a crash where typing after Ctrl+A, following a
+    // multi-cursor Ctrl+D edit, panicked inside ropey instead of replacing
+    // the whole buffer. Exact repro from the bug report: "foo bar foo",
+    // cursor at start, Ctrl+D Ctrl+D (selects both "foo"s), type "X" (->
+    // "X bar X", two cursors remain), Ctrl+A (select all), type "Y".
+    let mut e = engine_with("foo bar foo");
+    vscode_mode(&mut e);
+    e.view_mut().cursor = Cursor { line: 0, col: 0 };
+    e.handle_key("d", Some('d'), true); // select first "foo"
+    e.handle_key("d", Some('d'), true); // add cursor at second "foo"
+
+    // Precondition: Ctrl+D Ctrl+D added exactly one extra cursor.
+    assert_eq!(e.view().extra_cursors.len(), 1);
+    e.handle_key("X", Some('X'), false);
+    assert_eq!(buf(&e), "X bar X");
+    // Load-bearing: the extra cursor survives the multi-cursor edit itself
+    // (this is the bug's actual precondition — Ctrl+A only crashes if a
+    // stale extra cursor is still here afterwards).
+    assert_eq!(e.view().extra_cursors.len(), 1);
+    // Ctrl+A: select all. This used to leave the stale extra cursor in
+    // place, which crashed the very next keystroke.
+    e.handle_key("a", Some('a'), true);
+    // Typing now must not panic, and must replace the *entire* buffer
+    // (rendered content), same as the single-cursor case.
+    e.handle_key("Y", Some('Y'), false);
+    assert_eq!(buf(&e), "Y");
+    assert!(e.view().extra_cursors.is_empty());
+}
+
+#[test]
 fn test_vscode_multi_cursor_escape_clears() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
     vscode_mode(&mut e);
     e.view_mut().cursor = Cursor { line: 0, col: 0 };
-    e.handle_key("Alt_Shift_Down", None, false);
+    e.handle_key("Alt_Down", None, true);
     assert_eq!(e.view().extra_cursors.len(), 1);
     e.handle_key("Escape", None, false);
     assert_eq!(e.view().extra_cursors.len(), 0);

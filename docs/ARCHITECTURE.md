@@ -133,13 +133,17 @@ names.
 > raw-`ratatui::Frame` path, along with its three test-only helpers.
 > `build_screen_for_tui()` survives only under `#[cfg(test)]`.
 
-### Win-GUI
+### Win-GUI directory (`src/win/`)
 
-**There is no `src/win_gui/` directory.** The Direct2D/Win32 backend was removed
-from this repo on 2026-05-11 (`3e4bcff`). It will be re-added as a thin wrapper
-once quadraui ships its Windows backend (quadraui#19–#31, quadraui#580). Open
-`Win-GUI:` issues on *this* tracker describe the deleted backend and belong
-upstream — see `PROJECT_STATE.md`, "Milestone hygiene".
+The Windows GUI is a **thin wrapper** over quadraui's Direct2D/DirectWrite backend
+(`quadraui::win`). It lives in `src/win/` (`mod.rs`, `backend.rs`) behind the `win`
+feature and was added by #866 (2026-09-11, `4e2883d`). Feature logic stays in the
+shared engine and in quadraui, per the Platform-Neutrality Rule. Build it from Linux/WSL
+with `cargo xwin build --release --target x86_64-pc-windows-msvc --no-default-features --features win --bin vimcode`.
+
+The *older* Direct2D/Win32 backend (`src/win_gui/`) was deleted on 2026-05-11
+(`3e4bcff`). `Win-GUI:` issues filed before 2026-09-11 describe that deleted code:
+check each against `src/win/` before working it.
 
 ### Engine directory (`src/core/engine/`)
 
@@ -162,7 +166,7 @@ The Engine is split into focused submodules. Each file adds `impl Engine` blocks
 | `lsp_ops.rs` | All `lsp_*` methods, code actions, diagnostics, hover, completion |
 | `ext_panel.rs` | `ext_*` methods, `handle_ext_*`, extension + settings panel |
 | `panels.rs` | AI (`ai_*`), dialog system, swap files |
-| `plugins.rs` | Plugin init, event dispatch, command/keymap hooks |
+| `plugins.rs` | Plugin init, event dispatch, command/keymap hooks, plugin-declared UI views (`refresh_plugin_view`, `dispatch_plugin_view_event`, `handle_plugin_view_key` — #146) |
 | `dap_ops.rs` | DAP/debug: poll_dap, breakpoints, sidebar, stepping |
 | `vscode.rs` | VSCode mode, menu bar methods |
 | `picker.rs` | Fuzzy score, unified picker, quickfix |

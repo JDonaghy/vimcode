@@ -20,14 +20,22 @@ impl Engine {
     ///    documents these as curswant-preserving alongside `j`/`k`, and
     ///    `scroll_and_move_by`/`page_down`/`page_up` read/reapply `curswant`
     ///    just like a plain vertical motion does.
+    ///  - `G` / `H` / `M` / `L` — the other single-key `'startofline'`
+    ///    commands (#1772).
+    ///  - the bare, not-yet-resolved `g` keystroke that *starts* a `g`-
+    ///    sequence, and `gg`'s own second keystroke — `gg` is the fifth
+    ///    `'startofline'` command (#1772). This is safe even though most
+    ///    `g`-sequences (`ge`, `g_`, `gJ`, `gv`, …) don't want `curswant`
+    ///    preserved at all: the first `g` keystroke is a pure "arm
+    ///    `pending_key`" no-op that never moves the cursor, so preserving
+    ///    across it changes nothing by itself — and every *other* second
+    ///    keystroke besides `g` still falls through to the unconditional
+    ///    reset below (`pending_key.is_some()` is true for it, and the
+    ///    `gg`-specific escape above only matches `unicode == Some('g')`).
     ///
     /// Reset to `None` for everything else, including `$` (its own handler
     /// sets `Some(CURSWANT_EOL)` immediately afterward, so the reset here
-    /// just guarantees a clean slate for keys that don't) and `g` — even
-    /// when `g` is about to resolve to `gj`/`gk`: those dispatch to
-    /// `move_visual_down`/`move_visual_up` (`src/core/engine/search.rs`),
-    /// which never read or write `curswant`, so there is no downstream
-    /// motion for a preserved value to feed.
+    /// just guarantees a clean slate for keys that don't).
     fn update_curswant_for_key(&mut self, unicode: Option<char>, ctrl: bool) {
         if !matches!(
             self.mode,
@@ -35,6 +43,18 @@ impl Engine {
         ) {
             self.latch_visual_block_want();
             self.curswant = None;
+            return;
+        }
+        // #1772: `gg`'s second keystroke must escape the generic
+        // "any pending multi-key sequence resets curswant" rule below —
+        // `gg` is one of Vim's documented `'startofline'` commands
+        // (alongside `G`/`H`/`M`/`L`/the `<C-d>` family), so with the
+        // default `'nostartofline'` it has to honor the *remembered*
+        // column exactly like `j`/`k`, not whatever the first `g`
+        // keystroke's dispatch already clamped the actual column to.
+        // Every other two-key `g`-sequence (`ge`, `g_`, `gJ`, …) still
+        // falls through to the reset below, unaffected.
+        if self.pending_key == Some('g') && unicode == Some('g') && !ctrl {
             return;
         }
         if self.pending_operator.is_some()
@@ -51,7 +71,11 @@ impl Engine {
                 if matches!(ch, 'd' | 'u' | 'f' | 'b' | 'e' | 'y') {
                     return;
                 }
-            } else if matches!(ch, 'j' | 'k') {
+            } else if matches!(ch, 'j' | 'k' | 'G' | 'H' | 'M' | 'L' | 'g') {
+                // #1772: `G`/`H`/`M`/`L` are the other single-key
+                // `'startofline'` commands, and `g` here is the bare
+                // first keystroke arming `pending_key` for a `g`-sequence
+                // (including `gg` itself) — see the doc comment above.
                 return;
             } else if ch.is_ascii_digit() && (ch != '0' || self.count.is_some()) {
                 return; // count digit in progress; cursor hasn't moved
@@ -410,6 +434,50 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // #1627: the active window may be hosting a `vimcode.ui.register_view`
+        // view as an editor-area tab (`Engine::open_plugin_view_tab`) rather
+        // than a text buffer — route keys through the same
+        // `handle_plugin_view_key` the sidebar uses (with its own selection/
+        // scroll state, `PluginViewHost::Tab`) instead of falling into
+        // Insert/Normal/Visual-mode buffer editing below. Gated on
+        // `!self.ext_panel_has_focus`: the sidebar already claimed every key
+        // above when it has focus, and only one of the two surfaces can hold
+        // keyboard focus at a time.
+        //
+        // Only a key the view actually claims is consumed here (mirrors
+        // `handle_ext_panel_key`'s own fallthrough for the sidebar) — while a
+        // `Text`/`Password`/`TextArea` field is focused that is *every* key
+        // (typing must never leak into buffer editing, #1627's own
+        // requirement), but with a `Button`/`Toggle`/no field focused, an
+        // unrecognised key (`:`, `gt`, `<C-w>`, …) falls through to ordinary
+        // vim dispatch below — the scratch buffer backing the tab is
+        // `read_only`, so nothing there can be corrupted, and this is what
+        // lets `:tabclose` (or any other window-management command) close a
+        // plugin-view tab exactly like any other tab.
+        //
+        // Gated on `Mode::Normal` too, not just `!ext_panel_has_focus`: once a
+        // fallthrough `:` above has switched into `Mode::Command` (or a
+        // fallthrough `/` into `Mode::Search`, or `i`/`a`/… into
+        // `Mode::Insert`), every subsequent keystroke belongs to *that*
+        // mode's own editor, not the view — without this a command like
+        // `:g/pat/d` would have its leading `g` swallowed as "jump to first
+        // field" instead of reaching the command line, since the active
+        // window is still the same plugin-view tab for the whole time the
+        // user is typing it.
+        if !self.ext_panel_has_focus && self.mode == Mode::Normal {
+            if let Some(view_name) = self.active_plugin_view_tab() {
+                if self.handle_plugin_view_key(
+                    &view_name,
+                    key_name,
+                    ctrl,
+                    unicode,
+                    PluginViewHost::Tab,
+                ) {
+                    return EngineAction::None;
+                }
+            }
+        }
+
         // Ctrl-S: save in any mode (does not change mode) — except right
         // after `<C-x>` in Insert mode, where `<C-x><C-s>` is the
         // spelling-suggestion completion sub-mode (`:h i_CTRL-X_CTRL-S`,
@@ -711,6 +779,20 @@ impl Engine {
             }
             self.set_dirty(true);
 
+            // #1623: TextChanged (any mode but Insert/Replace) or
+            // TextChangedI (while typing). `plugin_event` itself is the cheap
+            // gate — it bails out before building any context when no hook
+            // is registered for the event name, so this costs one HashMap
+            // lookup on every keystroke that changes the buffer when no
+            // plugin subscribes.
+            let text_changed_event = if matches!(self.mode, Mode::Insert | Mode::Replace) {
+                "TextChangedI"
+            } else {
+                "TextChanged"
+            };
+            let text_changed_buf = self.active_buffer_id().0.to_string();
+            self.plugin_event(text_changed_event, &text_changed_buf);
+
             let t1 = std::time::Instant::now();
             // Always do a full re-parse + highlight extraction so byte
             // offsets stay correct.  Tree-sitter incremental parsing is fast
@@ -768,6 +850,18 @@ impl Engine {
             };
             if cur_line != pre_cursor_line || cur_col != pre_cursor_col {
                 self.cursor_move_pending = Some(std::time::Instant::now());
+            }
+        }
+
+        // #1623: CursorMoved/CursorMovedI debounce — independent of the
+        // legacy Normal-mode-only tracking just above, which must keep its
+        // exact firing scope. Covers every mode a cursor motion makes sense
+        // in, including Insert (typing moves the cursor every keystroke,
+        // hence CursorMovedI).
+        if !matches!(self.mode, Mode::Command | Mode::Search) {
+            let cur = self.cursor();
+            if cur.line != pre_cursor_line || cur.col != pre_cursor_col {
+                self.cursor_moved_event_pending = Some(std::time::Instant::now());
             }
         }
 
@@ -2234,18 +2328,19 @@ impl Engine {
                         } else {
                             0
                         };
-                        // `gg`, like `G`/`H`/`M`/`L`, doesn't use `curswant` at
-                        // all — there's no remembered column to fall back on
-                        // (see `land_line_jump_cursor`'s own doc comment).
-                        // `'startofline'` (`Settings::startofline`, #876) is
-                        // OFF by default (Neovim's default; Vim's is ON), so
-                        // out of the box `gg` never jumps to column
-                        // 0/first-non-blank; it keeps the column the cursor
-                        // already had, clamped to the target line's length
-                        // (verified against `nvim --headless`, the conformance
-                        // oracle this repo's tests run against; see #806 review —
-                        // a real `vim` binary's `col('.')` after `gg` is not a
-                        // substitute for the actual nvim oracle used by
+                        // `gg`, like `G`/`H`/`M`/`L`, is `curswant`-preserving
+                        // (see `land_line_jump_cursor`'s own doc comment,
+                        // #1772). `'startofline'` (`Settings::startofline`,
+                        // #876) is OFF by default (Neovim's default; Vim's is
+                        // ON), so out of the box `gg` never jumps to column
+                        // 0/first-non-blank; it keeps the remembered desired
+                        // column (clamped to the target line's length), and
+                        // that column survives even an intervening jump
+                        // through a shorter line (verified against `nvim
+                        // --headless`, the conformance oracle this repo's
+                        // tests run against; see #806 review — a real `vim`
+                        // binary's `col('.')` after `gg` is not a substitute
+                        // for the actual nvim oracle used by
                         // `tests/nvim_conformance.rs`).
                         self.land_line_jump_cursor(target_line);
                     }
@@ -4893,10 +4988,34 @@ impl Engine {
                 self.command_cursor = self.command_buffer.chars().count();
             }
             '@' => {
-                // g@: call user-defined operatorfunc (charwise)
+                // g@: call user-defined operatorfunc (charwise). #1623: set
+                // '[ / '] to the motion's span first, so the callback can
+                // query it via `vimcode.state.mark("[")` / `("]")` (matching
+                // Neovim's own `operatorfunc` contract) instead of having to
+                // re-derive the range from the cursor and motion type alone.
                 let start_line = self.buffer().content.char_to_line(start);
+                let start_col = start - self.buffer().line_to_char(start_line);
+                let end_pos = end.saturating_sub(1).max(start);
+                let end_line = self.buffer().content.char_to_line(end_pos);
+                let end_col = end_pos - self.buffer().line_to_char(end_line);
+                let buf_id = self.active_buffer_id();
+                let marks = self.marks.entry(buf_id).or_default();
+                marks.insert(
+                    '[',
+                    Cursor {
+                        line: start_line,
+                        col: start_col,
+                    },
+                );
+                marks.insert(
+                    ']',
+                    Cursor {
+                        line: end_line,
+                        col: end_col,
+                    },
+                );
                 self.view_mut().cursor.line = start_line;
-                self.view_mut().cursor.col = start - self.buffer().line_to_char(start_line);
+                self.view_mut().cursor.col = start_col;
                 self.plugin_run_operatorfunc("char");
             }
             _ => {}
@@ -5058,8 +5177,27 @@ impl Engine {
                 self.command_cursor = self.command_buffer.chars().count();
             }
             '@' => {
-                // g@: call user-defined operatorfunc (linewise)
-                // Set '[ and '] marks for the range, then call the plugin
+                // g@: call user-defined operatorfunc (linewise). #1623:
+                // set '[ / '] to the motion's range first (see the charwise
+                // '@' arm in `apply_charwise_operator` for why) — '[ at the
+                // first line's start, '] at the last line's last column.
+                let buf_id = self.active_buffer_id();
+                let end_col = self.buffer().line_len_chars(end_line).saturating_sub(1);
+                let marks = self.marks.entry(buf_id).or_default();
+                marks.insert(
+                    '[',
+                    Cursor {
+                        line: start_line,
+                        col: 0,
+                    },
+                );
+                marks.insert(
+                    ']',
+                    Cursor {
+                        line: end_line,
+                        col: end_col,
+                    },
+                );
                 self.view_mut().cursor.line = start_line;
                 self.view_mut().cursor.col = 0;
                 self.plugin_run_operatorfunc("line");
@@ -6366,7 +6504,10 @@ impl Engine {
                     return;
                 }
                 self.completion_start_col = start_col;
-                self.completion_candidates = candidates;
+                self.completion_candidates = candidates
+                    .into_iter()
+                    .map(CompletionCandidate::plain)
+                    .collect();
                 let idx = if next {
                     0
                 } else {
@@ -9903,6 +10044,18 @@ impl Engine {
     /// both the lhs and any key-to-keys rhs (#1151).
     pub fn rebuild_user_keymaps(&mut self) {
         let leader = self.settings.leader.to_string();
+        // #1623: a `vimcode.keymap.set` entry isn't derived from
+        // `settings.keymaps` at all (load-time ones are merged in by
+        // `Engine::set_plugin_manager`; runtime ones are pushed directly by
+        // the immediate API) — rebuilding from settings alone would silently
+        // drop every Lua keymap the moment anything calls this (`:nnoremap`,
+        // `:unmap`, saving the Keymaps editor buffer, …). Carry them across.
+        let lua_keymaps: Vec<UserKeymap> = self
+            .user_keymaps
+            .iter()
+            .filter(|km| matches!(km.action, UserKeymapAction::Lua(_)))
+            .cloned()
+            .collect();
         self.user_keymaps = self
             .settings
             .keymaps
@@ -9915,6 +10068,7 @@ impl Engine {
                 }
                 km
             })
+            .chain(lua_keymaps)
             .collect();
     }
 
@@ -10064,8 +10218,14 @@ impl Engine {
         let mut exact_match: Option<(UserKeymapAction, bool)> = None;
         let mut has_prefix = false;
 
+        let active_buffer = self.active_buffer_id();
         for km in &self.user_keymaps {
             if !active_modes.contains(&km.mode.as_str()) {
+                continue;
+            }
+            // #1623: a buffer-local Lua keymap (`vimcode.keymap.set(..., {buffer
+            // = handle})`) only matches while that buffer is active.
+            if km.buffer.is_some_and(|b| b != active_buffer) {
                 continue;
             }
             if km.keys == self.keymap_buf {
@@ -10108,6 +10268,7 @@ impl Engine {
                     feed.extend(rhs);
                     self.feed_keymap_rhs(&feed, noremap)
                 }
+                UserKeymapAction::Lua(id) => self.dispatch_lua_keymap(id),
             });
         }
 
@@ -10224,10 +10385,14 @@ impl Engine {
 
         while let Some(first) = queue.front().cloned() {
             let active_modes = self.active_keymap_modes();
+            let active_buffer = self.active_buffer_id();
             let mut best: Option<(usize, UserKeymapAction, bool)> = None;
             if !active_modes.is_empty() {
                 for km in &self.user_keymaps {
                     if !active_modes.contains(&km.mode.as_str()) {
+                        continue;
+                    }
+                    if km.buffer.is_some_and(|b| b != active_buffer) {
                         continue;
                     }
                     if km.keys.is_empty() || km.keys.len() > queue.len() {
@@ -10274,9 +10439,37 @@ impl Engine {
                         }
                     }
                 }
+                UserKeymapAction::Lua(id) => {
+                    last = self.dispatch_lua_keymap(id);
+                }
             }
         }
         last
+    }
+
+    /// Invoke a Lua keymap registered via `vimcode.keymap.set` (#1623),
+    /// identified by its `UserKeymapAction::Lua` id. Applies whatever the
+    /// callback did through the queued/immediate plugin APIs, then — for an
+    /// `expr` map whose callback returned a string — feeds that string back
+    /// through the normal key path (literally, like a `noremap` `Keys` rhs;
+    /// an expr map has no notion of "recursive" expansion).
+    fn dispatch_lua_keymap(&mut self, id: u64) -> EngineAction {
+        if !self.can_dispatch_to_plugins() {
+            return EngineAction::None;
+        }
+        let ctx = self.make_plugin_ctx(false);
+        let Some((expr_result, ctx)) = self.with_plugin_dispatch(|pm| pm.call_lua_keymap(id, ctx))
+        else {
+            return EngineAction::None;
+        };
+        self.apply_plugin_ctx(ctx);
+        match expr_result {
+            Some(feed) if !feed.is_empty() => {
+                let toks = parse_key_sequence(&feed);
+                self.replay_keys_literal(&toks)
+            }
+            _ => EngineAction::None,
+        }
     }
 
     /// Replay a fixed list of already-resolved keys through `handle_key` with
@@ -10299,47 +10492,58 @@ impl Engine {
     }
 
     /// Try to run a named plugin command. Returns `true` if the command was found.
+    ///
+    /// Returns `false` when called from inside a plugin callback — unlike an
+    /// event (which `Engine::plugin_event` defers), a command dispatch has to
+    /// answer "was it found?" synchronously, and Lua cannot be re-entered while
+    /// the engine is loaned to it (#1214, see `Engine::with_plugin_dispatch`).
     pub fn plugin_run_command(&mut self, name: &str, args: &str) -> bool {
-        if !self.settings.plugins_enabled {
+        if !self.can_dispatch_to_plugins() {
             return false;
         }
-        let pm = match self.plugin_manager.take() {
-            Some(p) => p,
-            None => return false,
-        };
         let ctx = self.make_plugin_ctx(false);
-        let (found, ctx) = pm.call_command(name, args, ctx);
-        self.plugin_manager = Some(pm);
+        let Some((found, ctx)) = self.with_plugin_dispatch(|pm| pm.call_command(name, args, ctx))
+        else {
+            return false;
+        };
         self.apply_plugin_ctx(ctx);
         found
     }
 
     /// Try to run a plugin keymap. Returns `true` if a mapping was found and executed.
+    ///
+    /// Also `false` from inside a plugin callback — see
+    /// [`Engine::plugin_run_command`].
     pub fn plugin_run_keymap(&mut self, mode: &str, key: &str) -> bool {
-        if !self.settings.plugins_enabled {
+        // Cheap bail-out before the (snapshot-building) context construction:
+        // this runs as the fallback for *every* unhandled normal-mode key.
+        if !self.can_dispatch_to_plugins() {
             return false;
         }
-        let pm = match self.plugin_manager.take() {
-            Some(p) => p,
-            None => return false,
-        };
         let ctx = self.make_plugin_ctx(false);
-        let (found, ctx) = pm.call_keymap(mode, key, ctx);
-        self.plugin_manager = Some(pm);
+        let Some((found, ctx)) = self.with_plugin_dispatch(|pm| pm.call_keymap(mode, key, ctx))
+        else {
+            return false;
+        };
         self.apply_plugin_ctx(ctx);
         found
     }
 
     /// Run the user-defined operatorfunc (g@) with the given motion type.
     /// Returns `true` if an operatorfunc was registered and executed.
+    ///
+    /// Also `false` from inside a plugin callback — see
+    /// [`Engine::plugin_run_command`].
     pub(crate) fn plugin_run_operatorfunc(&mut self, motion_type: &str) -> bool {
-        let pm = match self.plugin_manager.take() {
-            Some(p) => p,
-            None => return false,
-        };
+        if !self.can_dispatch_to_plugins() {
+            return false;
+        }
         let ctx = self.make_plugin_ctx(false);
-        let (found, ctx) = pm.call_operatorfunc(motion_type, ctx);
-        self.plugin_manager = Some(pm);
+        let Some((found, ctx)) =
+            self.with_plugin_dispatch(|pm| pm.call_operatorfunc(motion_type, ctx))
+        else {
+            return false;
+        };
         self.apply_plugin_ctx(ctx);
         found
     }
@@ -10413,6 +10617,10 @@ impl Engine {
             ) {
                 self.visual_anchor = Some(cursor);
                 self.mode = Mode::Visual;
+                // Mouse selection is inclusive-end (cursor lands on the
+                // hovered cell) in both Vim and VSCode mode — this helper
+                // has no VSCode-mode variant (#1788 review).
+                self.visual_end_exclusive = false;
             }
             self.mouse_drag_active = true;
             self.mouse_drag_origin_window = Some(window_id);
@@ -10426,7 +10634,9 @@ impl Engine {
         let clamped_col = col.min(max_col);
 
         if self.mouse_drag_word_mode {
-            // Word-wise drag: snap to word boundaries
+            // Word-wise drag: snap to word boundaries. Inclusive-end, like
+            // double-click below — no VSCode-mode variant (#1788 review).
+            self.visual_end_exclusive = false;
             if let Some((orig_start, orig_end, orig_line)) = self.mouse_drag_word_origin {
                 let line_text: Vec<char> =
                     self.buffer().content.line(clamped_line).chars().collect();
@@ -10515,6 +10725,8 @@ impl Engine {
         }
 
         // Enter visual mode with anchor at word start, cursor at word end
+        // (inclusive) — no VSCode-mode variant (#1788 review).
+        self.visual_end_exclusive = false;
         self.visual_anchor = Some(Cursor {
             line: cursor_line,
             col: word_start,
