@@ -3852,6 +3852,164 @@ mod tests {
         );
     }
 
+    /// #1853: an extension-registered panel icon outside vimcode's own
+    /// `src/icons.rs` codepoint set must still resolve to the bundled Nerd
+    /// Font itself when painted — not fall through to tofu, and not get
+    /// "accidentally" covered by some unrelated system font that happens to
+    /// share the same Private-Use-Area codepoint (several dev machines have
+    /// one: `fonts-font-awesome` assigns real glyphs at a number of the
+    /// same codepoints Nerd Fonts patches FontAwesome from, since Nerd
+    /// Fonts *is* FontAwesome at those codepoints).
+    ///
+    /// The Git Insights extension's `git_log_panel.lua` declares
+    /// `icon = "\u{f1d3}"` (`nf-fa-git`) for its sidebar panel, plus several
+    /// more codepoints (U+E74E among them) for the file-type glyphs it
+    /// draws in the log view. Before #1853, `data/fonts/vimcode-icons.ttf`
+    /// only bundled the 114 codepoints `Icon::new(...)` calls in
+    /// `src/icons.rs` reference — none of the Git Insights codepoints were
+    /// among them, so they rendered as tofu wherever the host has no
+    /// system-wide Nerd Font (native macOS/Windows, GTK without one
+    /// installed). `tests/icon_font_coverage.rs`'s
+    /// `bundled_font_covers_the_git_insights_extension_panel_icon` already
+    /// guards the font asset's `cmap`, but per #555/#557's own lesson
+    /// (`PROJECT_STATE.md`'s `ScreenLayout.picker` history: a field can be
+    /// populated, or a codepoint can be "covered" by cmap, for months while
+    /// nothing actually paints it) a cmap assertion cannot by itself prove
+    /// the glyph paints.
+    ///
+    /// # Why this isn't a raw pixel diff
+    ///
+    /// An earlier draft of this test rendered the full activity bar twice
+    /// (real codepoint vs. an "unassigned PUA baseline") and diffed sampled
+    /// pixels, mirroring `extension_panel_contributes_an_activity_bar_icon`
+    /// above. That approach turned out to be unreliable on a real dev
+    /// machine: Pango's font-substitution cascade falls through to *every*
+    /// installed font once the requested family doesn't cover a character,
+    /// and this box happens to have `fonts-font-awesome` installed, which
+    /// covers U+F1D3 (and several other nerd codepoints) independently of
+    /// whatever `data/fonts/vimcode-icons.ttf` bundles — so the "real" and
+    /// "baseline" renders differed by comparable pixel counts *even with
+    /// the pre-#1853 114-codepoint font restored*, giving a false green.
+    ///
+    /// A follow-up draft tried comparing which *font* Pango's itemizer
+    /// tagged the shaped run with (`Analysis::font().describe().family()`)
+    /// instead of pixels, on the theory that Pango always prefers an
+    /// earlier family in the list when it covers the character. That also
+    /// turned out to be unreliable in the other direction: Pango's
+    /// itemizer tags a run with the *first requested* family regardless of
+    /// whether anything in the whole fallback chain actually had the
+    /// glyph — it reports `Some("Symbols Nerd Font")` for both a real
+    /// covered codepoint and a confirmed-unassigned one. What actually
+    /// flags "nothing anywhere had this glyph" is a bit on the *shaped
+    /// glyph itself*, not the run's nominal font: `pango_shape()` sets
+    /// `PANGO_GLYPH_UNKNOWN_FLAG` on exactly the glyphs no font in the
+    /// search — including a full Fontconfig fallback scan — actually
+    /// covered, which is what `glyph_is_known` below checks instead.
+    #[test]
+    fn extension_panel_file_type_glyph_outside_the_old_subset_resolves_through_the_bundled_font() {
+        use gtk4::pango;
+        use pangocairo::cairo::{Context, Format, ImageSurface};
+
+        // Ensures `App::setup` has run at least once on this thread, which
+        // is what calls `render::register_nerd_font_fallback` — the call
+        // that both (a) hands `ICON_FONT_BYTES` to FreeType/Fontconfig as
+        // an in-process memory font and (b) points
+        // `quadraui::gtk::NERD_FONT_FALLBACK_FAMILY` at whatever family
+        // name it actually registered under (see that function's doc for
+        // why those are two different steps). Without this, the
+        // `FontDescription` below would still name the right family
+        // *string*, but no font claiming that family would actually be
+        // loaded into Fontconfig yet.
+        let _h = harness(Engine::new(), 10, 10);
+
+        /// Builds the exact family list
+        /// `quadraui::gtk::activity_bar::activity_bar_icon_font` paints
+        /// activity-bar icon glyphs with (`"{family}, monospace"`), shapes
+        /// `ch` through it, and reports whether Pango's shaper actually
+        /// found a glyph for it anywhere in that family list.
+        ///
+        /// Checks the `PANGO_GLYPH_UNKNOWN_FLAG` bit on the shaped
+        /// `GlyphInfo` rather than which `Font`/family the run ended up
+        /// tagged with: an earlier draft of this test compared resolved
+        /// family names instead and got `Some("Symbols Nerd Font")` back
+        /// for *both* a real covered codepoint and a confirmed-unassigned
+        /// one — Pango's itemizer still tags a run with the first
+        /// requested family even when nothing in the whole fallback chain
+        /// actually covers the character, and relies on this flag (not a
+        /// different font/glyph) to mark the shaped glyph itself as
+        /// "unknown" so the renderer draws the hex-coded tofu box instead
+        /// of a real outline. The flag is the authoritative signal either
+        /// way: GNOME's own `pango_shape()` sets it exactly when no font it
+        /// tried — including whatever a full Fontconfig fallback search
+        /// turns up — had the glyph, so a glyph with the flag clear must
+        /// have come from a font that really does contain it.
+        fn glyph_is_known(ch: char) -> bool {
+            let surface = ImageSurface::create(Format::ARgb32, 40, 40).expect("surface");
+            let cr = Context::new(&surface).expect("context");
+            let layout = pangocairo::functions::create_layout(&cr);
+            layout.set_font_description(Some(&pango::FontDescription::from_string(&format!(
+                "{}, monospace 18",
+                quadraui::gtk::NERD_FONT_FALLBACK_FAMILY
+            ))));
+            layout.set_text(&ch.to_string());
+            let run = layout
+                .line(0)
+                .expect("single-character layout must have one line")
+                .runs()
+                .into_iter()
+                .next()
+                .expect("single-character layout must itemize to exactly one run");
+            let glyphs = run.glyph_string();
+            let info = glyphs.glyph_info();
+            !info.is_empty()
+                && info
+                    .iter()
+                    .all(|g| g.glyph() & pango::GLYPH_UNKNOWN_FLAG == 0)
+        }
+
+        /// nf-dev-javascript_alt — one of `git_log_panel.lua`'s file-type
+        /// glyphs. Deliberately *not* U+F1D3 (the extension's main
+        /// `nf-fa-git` panel icon, also named in this issue): U+F1D3 is a
+        /// codepoint nerd-fonts patches straight from the original
+        /// FontAwesome icon set, and this dev machine happens to have
+        /// `fonts-font-awesome` installed system-wide, which covers it
+        /// independently of anything `data/fonts/vimcode-icons.ttf`
+        /// bundles — confirmed by hand (`fc-list` + a per-codepoint
+        /// `cmap` scan of every installed font) to make U+F1D3 resolve to
+        /// a known glyph *even with the pre-#1853 114-codepoint font
+        /// restored*, which would make this test pass unconditionally and
+        /// prove nothing. U+E74E has no such collision: scanning every
+        /// font `fc-list` reports on this machine turns up no other
+        /// coverage for it at all, so it only resolves if
+        /// `data/fonts/vimcode-icons.ttf` itself covers it.
+        const GIT_INSIGHTS_FILE_TYPE_GLYPH: char = '\u{e74e}';
+        /// BMP PUA, last codepoint in the range. Confirmed absent from
+        /// every font `fc-list` reports on this machine (including
+        /// `data/fonts/vimcode-icons.ttf` itself) — used only as a sanity
+        /// check that this test's own machinery can tell "a real glyph
+        /// was shaped" apart from "nothing was shaped" at all.
+        const UNASSIGNED_PUA_BASELINE: char = '\u{f8ff}';
+
+        assert!(
+            glyph_is_known(GIT_INSIGHTS_FILE_TYPE_GLYPH),
+            "the Git Insights extension's U+E74E (nf-dev-javascript_alt) \
+             file-type glyph (`git_log_panel.lua`) must shape to a real \
+             glyph through the bundled Nerd Font family (#1853) — Pango's \
+             shaper marked it PANGO_GLYPH_UNKNOWN_FLAG instead, which means \
+             data/fonts/vimcode-icons.ttf no longer covers U+E74E (or the \
+             family it registers under no longer matches \
+             quadraui::gtk::NERD_FONT_FALLBACK_FAMILY, see that issue's \
+             review for the family-name-mismatch failure mode)"
+        );
+        assert!(
+            !glyph_is_known(UNASSIGNED_PUA_BASELINE),
+            "sanity check: U+F8FF is a confirmed-unassigned PUA codepoint, \
+             so Pango must mark it PANGO_GLYPH_UNKNOWN_FLAG — if it \
+             doesn't, this test's own baseline is broken and the assertion \
+             above proves nothing"
+        );
+    }
+
     /// #950 review: `App::shell_config()`'s `"panel:search"` arm used to
     /// build its own GTK-only `SEARCH_COD` (nf-cod-search, `\u{ea6d}`)
     /// instead of the shared `crate::icons::SEARCH` (nf-fa-search,

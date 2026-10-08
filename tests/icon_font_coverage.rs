@@ -29,9 +29,12 @@
 //! Insights extension's `git_log_panel.lua`, which declares U+F1D3
 //! (`nf-fa-git`) as its panel icon and U+F15B/U+E7A8/U+F81F/U+E74E/U+E628/
 //! U+E620/U+E626 for file-type glyphs, none of which `src/icons.rs`
-//! referenced. The font now bundles nerd-fonts' entire Symbols Nerd Font
-//! Mono cmap (~10,600 codepoints), so this class of bug can't recur for any
-//! codepoint a Nerd Font actually assigns.
+//! referenced. The font now bundles nerd-fonts' entire (proportional)
+//! Symbols Nerd Font cmap (10,627 codepoints as of nerd-fonts v3.5.1) --
+//! not the Mono variant, which registers under a different family name
+//! (`Symbols Nerd Font Mono`) and would have rescaled every pre-#1853
+//! glyph's metrics, see `scripts/gen_icon_font.py`'s module doc -- so this
+//! class of bug can't recur for any codepoint a Nerd Font actually assigns.
 //! `bundled_font_covers_the_git_insights_extension_panel_icon` below is a
 //! named regression anchor for exactly the codepoints that motivated it;
 //! `bundled_font_covers_every_icon_codepoint` above keeps covering
@@ -324,13 +327,19 @@ fn bundled_font_covers_the_git_insights_extension_panel_icon() {
     let covered = font_covered_codepoints(FONT_BYTES);
     for (cp, what) in [
         (0xF1D3, "Git Insights panel icon (nf-fa-git)"),
-        (0xF15B, "git_log_panel.lua file-type glyph"),
-        (0xE7A8, "git_log_panel.lua file-type glyph"),
+        (0xF15B, "git_log_panel.lua file-type glyph (nf-fa-file)"),
+        (0xE7A8, "git_log_panel.lua file-type glyph (nf-dev-rust)"),
         (0xF81F, "git_log_panel.lua file-type glyph (nf-dev-python)"),
-        (0xE74E, "git_log_panel.lua file-type glyph"),
-        (0xE628, "git_log_panel.lua file-type glyph"),
-        (0xE620, "git_log_panel.lua file-type glyph"),
-        (0xE626, "git_log_panel.lua file-type glyph"),
+        (
+            0xE74E,
+            "git_log_panel.lua file-type glyph (nf-dev-javascript_alt)",
+        ),
+        (
+            0xE628,
+            "git_log_panel.lua file-type glyph (nf-seti-typescript)",
+        ),
+        (0xE620, "git_log_panel.lua file-type glyph (nf-seti-lua)"),
+        (0xE626, "git_log_panel.lua file-type glyph (nf-custom-go)"),
     ] {
         assert!(
             covered.contains(&cp),
