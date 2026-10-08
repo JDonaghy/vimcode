@@ -1,5 +1,16 @@
 # Nerd Fonts Licensing
 
+This license covers `data/fonts/vimcode-icons.ttf`, bundled as the **full**
+Symbols Nerd Font Mono (nerd-fonts v3.5.1 release,
+`SymbolsNerdFontMono-Regular.ttf`) rather than a per-codepoint subset as of
+#1853 -- see `scripts/gen_icon_font.py`'s module docstring for why bundling
+the whole font (rather than only the codepoints vimcode's own `src/icons.rs`
+references) is necessary for registry extensions that pick their own Nerd
+Font codepoints. Three codepoints upstream nerd-fonts dropped after v3.0.0
+(U+F6A9, U+F81D, U+F81F) are merged back in from a v2.1.0-era build; see
+`LEGACY_DROPPED_CODEPOINTS` in that same script. Both the v3.5.1 release and
+the v2.1.0-era glyphs these three came from are licensed identically below.
+
 There are various sources used under various licenses:
 
 * Nerd Fonts source fonts, patched fonts, and folders with explict OFL SIL files are licensed under SIL OPEN FONT LICENSE Version 1.1 (see below).
