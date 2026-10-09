@@ -4740,6 +4740,18 @@ impl App {
         // platform-native convention every frame, not just at startup.
         let (editor_family, editor_size_pt) = resolve_editor_font(&engine.settings, backend);
         backend.set_editor_font(&editor_family, editor_size_pt);
+        // #1864: on the native macOS GUI, override `set_editor_font`'s own
+        // natural (Core Text ascent+descent+leading, ~1.17x) line height
+        // with VS Code's row pitch (`round(font_px * 1.5)` by default, or
+        // `settings.line_height`'s explicit multiplier) — see
+        // `resolve_editor_line_height_px`'s doc for why this is scoped to
+        // macOS only and re-applied every frame, same reasoning as
+        // `set_editor_font` immediately above (`zoomin`/`zoomout`/`:set
+        // line_height=N` must reach the painted row pitch next frame, not
+        // just at startup).
+        if let Some(lh) = resolve_editor_line_height_px(&engine.settings, backend, editor_size_pt) {
+            quadraui::Backend::set_current_line_height(backend, lh);
+        }
 
         // #672: scroll surfaces are re-registered from scratch every frame
         // (mirrors TUI's `render_impl.rs` `scroll_surfaces.borrow_mut().clear()`)
@@ -10045,6 +10057,26 @@ impl quadraui::ShellApp for App {
         // instead of the pre-#1434 TUI shell — `backend.backend_caps()` reads the same
         // `TuiBackend` state either way.
         self.keyboard_enhanced = backend.backend_caps().kitty_keyboard;
+        // #1864: `shell_config`'s `with_editor_font` seed only covers
+        // family/size — the runner's own `set_editor_font` call (made from
+        // that stored value, just before `setup()` runs) resets
+        // `current_line_height` to this backend's *natural* font-metric
+        // value every time, same as every other `set_editor_font` call
+        // (`set_current_font`'s doc). Without re-applying the VS Code
+        // override here too, frame 1's shell-level layout (sidebar width,
+        // computed by the runner *before* `render_content`'s own per-frame
+        // override ever runs) would see the natural line height while
+        // frame 2+ (after `sync_per_frame_backend_state` has run once) sees
+        // the override — a one-frame geometry snap that (#967-style) throws
+        // off any hit-test computed against frame 1's painted rects. Same
+        // call `sync_per_frame_backend_state` makes every frame; see
+        // `resolve_editor_line_height_px`'s doc for the macOS-only scoping.
+        let (_, editor_size_pt) = resolve_editor_font(&self.engine.borrow().settings, backend);
+        if let Some(lh) =
+            resolve_editor_line_height_px(&self.engine.borrow().settings, backend, editor_size_pt)
+        {
+            quadraui::Backend::set_current_line_height(backend, lh);
+        }
         // Seed cached metrics from runner defaults.
         self.cached_line_height = backend.line_height() as f64;
         self.cached_char_width = backend.char_width() as f64;

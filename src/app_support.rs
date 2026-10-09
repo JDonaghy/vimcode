@@ -155,6 +155,35 @@ pub(crate) fn resolve_ui_font_size(
     settings.effective_ui_font_size(backend.default_fonts().ui_size_pt)
 }
 
+/// Effective editor row pitch in pixels for this frame, given the point
+/// size [`resolve_editor_font`] just resolved — [`resolve_editor_font`]'s
+/// line-height twin (issue #1864, VS Code `editor.lineHeight` parity).
+///
+/// `None` means "leave `backend`'s own natural font-metric line height
+/// (Core Text's `ascent + descent + leading`, ~1.17x) alone" — every
+/// backend this issue doesn't touch; see
+/// [`core::settings::Settings::effective_line_height_multiplier`]'s doc for
+/// why that's a runtime `backend.services().platform_name()` check, not a
+/// `cfg!(target_os = "macos")` guess, and why non-macOS backends are
+/// unconditionally `None` for now (GTK/Win-GUI parity at VS Code's non-mac
+/// ratio, 1.35, is a follow-up).
+///
+/// `Some(px)` callers overwrite the live backend's current line height with
+/// [`quadraui::Backend::set_current_line_height`] — mirrors
+/// [`resolve_editor_font`]'s own caller pushing its result through
+/// `Backend::set_editor_font`, so a runtime `:set line_height=N`/`zoomin`/
+/// `zoomout` reaches the painted row pitch on the very next frame the same
+/// way those already reach the painted font.
+pub(crate) fn resolve_editor_line_height_px(
+    settings: &core::settings::Settings,
+    backend: &dyn quadraui::Backend,
+    editor_size_pt: f32,
+) -> Option<f32> {
+    let multiplier =
+        settings.effective_line_height_multiplier(backend.services().platform_name())?;
+    Some((editor_size_pt as f64 * multiplier).round() as f32)
+}
+
 /// Pango font description string for UI chrome at the currently
 /// configured size. Call sites do `FontDescription::from_string(&UI_FONT())`.
 #[allow(non_snake_case)]
