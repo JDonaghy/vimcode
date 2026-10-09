@@ -29508,6 +29508,31 @@ impl UnitProfile {
     }
 }
 
+/// #1877: undo `AppShellLayout::main_content_bounds`'s shrink from
+/// `App::shell_config`'s `with_command_line()`/`with_status_bar()`
+/// reservation, recovering the full content height `render_content`'s own
+/// `compute_editor_layout`/status-bar/command-line math was already
+/// written against (that math independently — and correctly — subtracts
+/// vimcode's own *dynamic* bottom-chrome height from whatever `h` it is
+/// given; it must not also inherit a second, *static* subtraction the
+/// shell performed first, or every bottom row ends up reserved twice,
+/// leaving a blank gap between the command line and the window's true
+/// bottom edge).
+///
+/// `shell_config`'s reservation exists purely so
+/// `AppShellLayout::activity_bar_bounds` (and
+/// `sidebar_header_bounds`/`sidebar_content_bounds`) stop short of the
+/// window's bottom edge — see that call site's doc. Everything
+/// `render_content` paints into `main_content_bounds` keeps using this
+/// recovered height instead, so the one reservation shrinks only the
+/// activity bar/sidebar's painted height, never where the editor, status
+/// line or command line actually paint.
+pub fn main_content_true_height(layout: &quadraui::AppShellLayout) -> f32 {
+    layout.main_content_bounds.height
+        + layout.command_line_bounds.map(|r| r.height).unwrap_or(0.0)
+        + layout.status_bar_bounds.map(|r| r.height).unwrap_or(0.0)
+}
+
 /// Compute the height of the bottom chrome (status bar + wildmenu) in pixels.
 ///
 /// `show_global_status` is [`global_status_bar_visible`]'s value, **not**
@@ -33003,6 +33028,33 @@ mod tests {
         let large_bc = tab_bar_height_px(40.0, true);
         assert_eq!(small_bc, large_bc);
         assert_eq!(small_bc, TAB_ROW_HEIGHT_PX + BREADCRUMB_ROW_HEIGHT_PX);
+    }
+
+    /// #1877: `main_content_true_height` adds the shell's own
+    /// `command_line_bounds`/`status_bar_bounds` heights back onto
+    /// `main_content_bounds.height`, recovering the pre-reservation value
+    /// — and is `0.0`-safe (treats either/both as absent) for callers that
+    /// never opted into one or either band.
+    #[test]
+    fn main_content_true_height_adds_back_the_shells_bottom_chrome_reservation() {
+        let mut layout = quadraui::AppShellLayout {
+            window_bounds: quadraui::Rect::new(0.0, 0.0, 1400.0, 900.0),
+            title_bar_bounds: None,
+            activity_bar_bounds: quadraui::Rect::default(),
+            sidebar_header_bounds: None,
+            sidebar_content_bounds: None,
+            divider_bounds: None,
+            main_content_bounds: quadraui::Rect::new(0.0, 36.0, 1000.0, 828.0),
+            bottom_panel_bounds: None,
+            command_line_bounds: Some(quadraui::Rect::new(0.0, 864.0, 1000.0, 18.0)),
+            status_bar_bounds: Some(quadraui::Rect::new(0.0, 882.0, 1000.0, 18.0)),
+        };
+        assert_eq!(main_content_true_height(&layout), 828.0 + 18.0 + 18.0);
+
+        // Neither band reserved — the common, pre-#1877 shape — is a no-op.
+        layout.command_line_bounds = None;
+        layout.status_bar_bounds = None;
+        assert_eq!(main_content_true_height(&layout), 828.0);
     }
 
     #[test]
