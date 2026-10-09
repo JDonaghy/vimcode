@@ -1,5 +1,45 @@
 # VimCode Project State
 
+**Last updated:** October 9, 2026 (#1831 review round 2 — untagged the one
+expected-GREEN `known_bug` step). One blocking finding fixed in
+`tests/smoke-spec/mac-gtk.yaml`:
+
+- **Removed `known_bug: vimcode#1825` from `no-tofu-terminal-panel-1831`.**
+  Round 1 applied the tag to every step from `launch-is-frontmost-1831`
+  onward, but `expect_no_tofu` is a NEGATIVE assertion:
+  `coord.native_pixels.looks_like_tofu` returns `(False, …)` — i.e. the step
+  PASSES — unless it finds a near-uniform interior *plus* a high-contrast
+  border, and its docstring says a fully-uniform region is explicitly not
+  tofu. Under #1825 no input reaches the app, the terminal panel never
+  opens, the mac-native runner's `run()` keeps iterating past failing steps,
+  so this step executed over a blank editor band and *passed*.
+  `classify_step` maps pass+`known_bug` to `GREEN_KNOWN_BUG_FIXED`, and
+  `process_nightly_step` acts on that with `issue comment … "appears fixed.
+  Closing."` + `issue close` — i.e. the first live nightly run of this lane
+  would have auto-closed #1825 while it is still broken (CLAUDE.md
+  "Testing (CRITICAL)" rules 3/4). No pixel-geometry change fixes it;
+  untagged, a pass is `GREEN_CLEAN`/silent and a real tofu box still files.
+
+Also, from the same review's non-blocking notes: added an explicit
+first-real-run operator check to `terminal-panel-not-uniform-1831` (its tag
+is only correct if its unconfirmed 1x band really is uniform in the unfixed
+state — otherwise it hits the same false-close path); documented that the
+trailing cleanup is skipped on the driver-level-timeout path (`run()` marks
+remaining steps failed without executing them), leaving the probe file on
+disk for the next run to pass against, with the manual `rm -f` an operator
+should do after seeing that abort message; documented the ~35 duplicate
+"appears fixed. Closing." comments the blanket tagging will produce the day
+#1825 is fixed, and why that is still the lesser evil; re-worded the
+`docs/PENDING_QUADRAUI_ISSUES.md` quotation in the spec header as explicitly
+historical, since this same PR rewrote that sentence out of the repo; and
+re-wrapped `tests/smoke-spec/catalogue.yaml`'s Tier-2 spec list to the
+block's own width. The header's tagging rationale now states the rule
+(`known_bug` only on steps expected RED) and lists all three classes of
+exception, instead of claiming blanket coverage. **Still UNRUN ON REAL
+HARDWARE.**
+
+---
+
 **Last updated:** October 9, 2026 (#1831 review round 1 — close-terminal
 bug fix, cross-run cleanup, `known_bug` gating). Fixed three blocking
 findings in `tests/smoke-spec/mac-gtk.yaml`:

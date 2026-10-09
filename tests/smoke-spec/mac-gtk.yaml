@@ -16,12 +16,16 @@
 # at the macOS OS level.
 #
 # `docs/PENDING_QUADRAUI_ISSUES.md`'s struck "`quadraui::gtk::run` never
-# activates the process as the foreground app on macOS" entry names this
-# exact gap explicitly in its own "Test" section: "What is actually missing
-# is a macOS-GTK smoke lane: nothing in `tests/smoke-spec/` targets the GTK
-# build running on macOS today... Filing/adding that lane is
-# coordinator/human work (a new `tests/smoke-spec/*.yaml` file...)". This
-# file is that lane.
+# activates the process as the foreground app on macOS" entry named this
+# exact gap explicitly in its own "Test" section. BEFORE THIS FILE LANDED
+# that section read: "What is actually missing is a macOS-GTK smoke lane:
+# nothing in `tests/smoke-spec/` targets the GTK build running on macOS
+# today... Filing/adding that lane is coordinator/human work (a new
+# `tests/smoke-spec/*.yaml` file...)". This file is that lane, and the same
+# commit that added it rewrote that sentence in
+# `docs/PENDING_QUADRAUI_ISSUES.md` to point here instead — so the wording
+# quoted above is deliberately historical and is no longer grep-able
+# anywhere in the repo; see that entry's current text for the live state.
 #
 # Driver: **`mac-native`** (`coord/mac_native_driver.py`), the SAME driver
 # `mac-gui.yaml` uses — not a new "macOS-GTK" driver. `mac-native` launches
@@ -133,11 +137,44 @@
 # `launch-is-frontmost-1831` and every `key`/`click`/`type_text` step in
 # this file after it is unreachable — not just that one check. An operator
 # reading this file should expect the ENTIRE spec red under #1825, not a
-# single failing step, and every step from `launch-is-frontmost-1831`
-# onward below is marked `known_bug: vimcode#1825` for exactly that reason
-# (so a red run here files under the known bug instead of a fresh issue
-# per step, and the day #1825 is actually fixed, each of those steps
-# turning green is the signal that flags it).
+# single failing step. 35 of this file's 37 steps therefore carry
+# `known_bug: vimcode#1825` for exactly that reason (so a red run here
+# files under the known bug instead of a fresh issue per step, and the day
+# #1825 is actually fixed, each of those steps turning green is the signal
+# that flags it).
+#
+# The tagging is NOT blanket, though, and the exceptions are the part worth
+# reading. A `known_bug:` tag is only correct on a step that is EXPECTED RED
+# while the bug is open, because `coord.nightly_smoke.classify_step` maps
+# pass+`known_bug` to `GREEN_KNOWN_BUG_FIXED`, and
+# `process_nightly_step` acts on that by posting "this known bug appears
+# fixed. Closing." and CLOSING the referenced issue. So any step that PASSES
+# under #1825 must stay untagged or it auto-closes a live bug. Three notes:
+#
+#   * The `wait` steps (`type-probe-settle-1831`, `bare-w-probe-settle-1831`,
+#     `term-probe-open-settle-1831`, `cleanup-probe-settle-1831`) and
+#     `launch`/`startup-settle` are untagged because they cannot fail --
+#     `wait` always passes, and #1825 does not stop the window opening, it
+#     only leaves Terminal.app frontmost. Tagged, each of those unavoidable
+#     passes would be a "bug fixed, closing" signal.
+#   * `no-tofu-terminal-panel-1831` is untagged for the same reason, less
+#     obviously: `expect_no_tofu` is a NEGATIVE assertion that passes in
+#     nearly every state, including over the blank editor band this spec
+#     leaves behind under #1825. See that step's own comment for the full
+#     derivation.
+#   * `terminal-panel-not-uniform-1831` DOES keep its tag, on the
+#     expectation that its band is genuinely uniform in the unfixed state --
+#     but that band is an unconfirmed 1x guess, so it needs an explicit
+#     operator check on the first real macmini run before this lane is
+#     enabled in non-dry-run mode. Written up at that step.
+#
+# One accepted cost of the 35 tags: the day #1825 IS fixed they all go
+# green at once and `process_nightly_step` fires one `issue comment` + one
+# `issue close` per green step -- ~35 duplicate "appears fixed. Closing."
+# comments on #1825. It converges to the right state (closed), just
+# noisily; that is accepted here because the alternative (leaving the
+# mechanical `key`/`type_text` steps untagged) would file ~35 FRESH issues
+# on every red run while #1825 is open, which is strictly worse.
 name: vimcode-mac-gtk
 width: 1024
 height: 768
@@ -155,8 +192,10 @@ steps:
   # step that silently lands on the launching Terminal.app instead (the
   # vimcode#1825 symptom) must not be able to masquerade as a pass by this
   # check running after the fact. `known_bug: vimcode#1825` below (and on
-  # every input/assertion step after it — see this file's header) marks
-  # this expected-red while #1825 is open on this host, so a red run here
+  # every input/assertion step after it EXCEPT `no-tofu-terminal-panel-1831`
+  # and the `wait`s, which pass under #1825 and so must stay untagged — see
+  # this file's header) marks this expected-red while #1825 is open on this
+  # host, so a red run here
   # is filed/tracked against the known bug rather than as a fresh
   # regression, and the day it starts passing is the signal that #1825 is
   # actually fixed.
@@ -326,6 +365,22 @@ steps:
   # proves it painted real cell content, not a blank panel (vimcode#1828's
   # bug class). First-approximation band, unconfirmed on real hardware --
   # see this file's header (including the Retina 2x-doubling caveat).
+  #
+  # OPERATOR CHECK REQUIRED ON THE FIRST REAL macmini RUN, before this lane
+  # is pointed at the nightly in non-dry-run mode: this step keeps its
+  # `known_bug: vimcode#1825` tag on the expectation that under #1825 (no
+  # input reaches the app, so the terminal panel never opens) this band
+  # covers an empty editor and is genuinely UNIFORM, i.e. the step fails and
+  # classifies as `RED_EXPECTED_KNOWN_BUG`. That holds only if the band
+  # really is blank in the unfixed state. If this unconfirmed 1x guess
+  # happens to straddle painted chrome (a status row, a tab strip, a
+  # gutter), the step passes while #1825 is still open, and pass+known_bug
+  # is `GREEN_KNOWN_BUG_FIXED` -- which comment-and-closes #1825 for the
+  # wrong reason, the same hazard the untagged `expect_no_tofu` step
+  # immediately below spells out in full. So on the first real run: capture
+  # the window with #1825 still open, confirm this band is uniform (step
+  # red), and if it is NOT, move the band onto genuinely panel-only pixels
+  # or drop its `known_bug:` tag before enabling the nightly.
   - type: expect_region_not_uniform
     id: terminal-panel-not-uniform-1831
     x: 300
@@ -339,13 +394,36 @@ steps:
   # fleet for a missing-glyph ("tofu") box, and this is a "first five
   # minutes" spec, so it is worth one cheap check here even though nothing
   # in this section specifically targets Unicode/icon-glyph content.
+  #
+  # DELIBERATELY the ONE step in this file with NO `known_bug:` tag, and the
+  # reason is structural, not stylistic. `expect_no_tofu` is a NEGATIVE
+  # assertion: `coord.native_pixels.looks_like_tofu` returns `(False, ...)`
+  # -- i.e. this step PASSES -- unless it finds a near-uniform interior AND
+  # a high-contrast border around it, and its own docstring says so
+  # explicitly ("including a region that is itself fully uniform -- a tofu
+  # box is a BORDER around something, not a flat fill; a flat fill is
+  # `expect_region_not_uniform`'s own concern, not this one's"). So under
+  # vimcode#1825 -- where no input reaches the app, the terminal panel never
+  # opens, and this band is a blank editor instead -- this step still
+  # EXECUTES (the driver's `run()` does not abort the remaining steps after
+  # a failing one; it keeps iterating) and still PASSES. Tagged
+  # `known_bug: vimcode#1825` it would therefore be pass+known_bug, which
+  # `coord.nightly_smoke.classify_step` maps to `GREEN_KNOWN_BUG_FIXED`,
+  # whose `process_nightly_step` posts "this known bug appears fixed.
+  # Closing." and CLOSES vimcode#1825 on the first live nightly run of this
+  # lane -- auto-closing a bug that is still broken, the exact failure mode
+  # CLAUDE.md "Testing (CRITICAL)" rules 3/4 exist to prevent. Note no
+  # pixel-geometry correction fixes that: this assertion passes in
+  # essentially every state except an actual tofu box, so there is no band
+  # on this window for which it is "expected red" under #1825. Untagged, a
+  # pass is `GREEN_CLEAN` (silent) and a real tofu box files as a fresh
+  # finding, which is the behaviour this check was added for.
   - type: expect_no_tofu
     id: no-tofu-terminal-panel-1831
     x: 300
     y: 520
     width: 300
     height: 90
-    known_bug: vimcode#1825
 
   # Trailing cleanup -- removes every file this file created (both
   # `/tmp/vimcode-smoke-1831-macgtk.txt` from section 2 and
@@ -357,6 +435,23 @@ steps:
   # fail is not coverage", #553) -- see this file's section-2c comment.
   # Reuses the already-open terminal pane from section 3 above, so this
   # needs no extra `:term` toggle of its own.
+  #
+  # KNOWN HOLE, shared with `gtk-gui.yaml`'s identical fixed-string +
+  # trailing-cleanup shape: this cleanup is SKIPPED on the driver-level
+  # timeout path. The mac-native runner's `run()` marks every remaining step
+  # failed WITHOUT executing it once its own deadline passes, so a run that
+  # times out somewhere between 2b and here leaves
+  # `/tmp/vimcode-smoke-1831-macgtk.txt` on disk with both markers in it,
+  # and the NEXT run's `type-probe-file-appears-1831`/
+  # `bare-w-probe-file-appears-1831` would pass off that leftover -- while
+  # tagged `known_bug`, so a false "fixed, closing" signal on vimcode#1825.
+  # Closing this off properly needs run-unique markers (a timestamp or sha
+  # interpolated into the typed text), which this spec format has no
+  # substitution syntax for today. Until it does, an operator who sees
+  # "aborted: mac-native driver-level timeout exceeded" in a run's results
+  # should `rm -f /tmp/vimcode-smoke-1831-macgtk.txt
+  # /tmp/vimcode-smoke-term-probe-1831-macgtk.txt` by hand before the next
+  # run, and treat that run's two `expect_file` passes as unproven.
   - type: type_text
     id: cleanup-probe-1831
     text: "rm -f /tmp/vimcode-smoke-1831-macgtk.txt /tmp/vimcode-smoke-term-probe-1831-macgtk.txt"

@@ -6,10 +6,10 @@
 # drive the real app and judge pass/fail without inventing behaviour or
 # needing prior vimcode context. It supplements (does not replace) the
 # Tier-2 smoke specs in this same directory (`tui.yaml`, `gtk-gui.yaml`,
-# `mac-gui.yaml`, `mac-gtk.yaml`, `win-gui.yaml`, `win-terminal.yaml`), which pin exact
-# driver steps/coordinates for a handful of previously-reported bugs; this
-# file is broader and shallower -- one line of steps, one line of expected
-# outcome, no driver-specific coordinates.
+# `mac-gui.yaml`, `mac-gtk.yaml`, `win-gui.yaml`, `win-terminal.yaml`),
+# which pin exact driver steps/coordinates for a handful of
+# previously-reported bugs; this file is broader and shallower -- one line
+# of steps, one line of expected outcome, no driver-specific coordinates.
 #
 # `reference` says where `expected` comes from, not the author's opinion:
 #   - nvim:     whatever real Neovim does for the same keystrokes on the
