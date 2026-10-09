@@ -1011,6 +1011,200 @@ mod win_gutter_contract_1691 {
     }
 }
 
+// ── #1869: GUI minimap and scrollbar widths don't match VS Code ──────────
+//
+// Driver-tier coverage for the Win-GUI half of #1869's acceptance bullet
+// ("a black-box test drives a GUI backend ... at a fixed pane width"),
+// alongside `gtk::testing::minimap`'s own two tests. Unlike `src/macos/`
+// (whole-module `target_os = "macos"`-gated, so nothing in it can be typed
+// or run off a Mach-O host — see that module's own "Verifying this file
+// without a Mac" section), this module compiles and **runs** on an ordinary
+// Linux host: `win` is gated on the Cargo feature alone (see `src/lib.rs`'s
+// doc comment on `pub mod win`), the same reason
+// `win_gutter_contract_1691` above can.
+#[cfg(all(test, feature = "win"))]
+mod win_minimap_scrollbar_1869 {
+    use crate::core::{Engine, WindowRect};
+    use crate::render;
+
+    /// Geometry read back from a real `build_screen_layout` call plus the
+    /// same `Editor::layout` call `quadraui::win::editor::draw_editor`
+    /// makes — no arithmetic recomputed by the probe itself, only read.
+    struct MinimapProbe {
+        strip_width: f64,
+        v_scrollbar_width_px: Option<f64>,
+        char_width: f64,
+        pane_width: f64,
+        gutter_cells: usize,
+    }
+
+    /// `width_px` is the pane's own full width (there is no sidebar/
+    /// activity-bar chrome in this single-window fixture, unlike
+    /// `gtk::testing::harness`, so the `WindowRect` passed in *is* the
+    /// pane's rect `build_screen_layout` sees). A 2000-line buffer and a
+    /// 900px-tall window keep the vertical scrollbar reserved
+    /// (`quadraui::primitives::editor::Editor::layout`'s `has_v_scrollbar`
+    /// needs `total_lines > visible_lines`), so `v_scrollbar_width_px` is
+    /// never vacuously `None`.
+    fn minimap_probe(width_px: f64) -> MinimapProbe {
+        use quadraui::Backend as _;
+
+        let backend = super::backend::WinBackend::new();
+        let char_width = backend.char_width() as f64;
+        let line_height = backend.line_height() as f64;
+        let scrollbar_reserve = backend.scrollbar_reserve() as f64;
+        assert!(
+            char_width > 0.0 && line_height > 0.0,
+            "WinBackend must report real text metrics before any minimap \
+             arithmetic means anything (got char_width={char_width}, \
+             line_height={line_height})"
+        );
+
+        let mut engine = Engine::new_for_test();
+        // #1858: the minimap defaults off on every backend — explicitly on
+        // here, since reaching it at all is the whole point of this probe.
+        engine.settings.minimap = true;
+        let text: String = (0..2000).map(|i| format!("vimcodeline{i}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+
+        let theme = render::Theme::vscode_dark();
+        let bounds = WindowRect::new(0.0, 0.0, width_px, 900.0);
+        let tab_bar_h = render::tab_row_height_px(line_height);
+        let (rects, _) = engine.calculate_group_window_rects(bounds, tab_bar_h);
+        let layout = render::build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            true,
+            scrollbar_reserve,
+            render::gtk_minimap_sizing(),
+        );
+        let rw = layout
+            .windows
+            .first()
+            .expect("a single-group layout must paint exactly one window");
+        let mm = layout.minimap.first().expect(
+            "a pane this wide with the minimap explicitly on must paint a \
+             strip — if this fails, the fixture's own width is too narrow \
+             for MINIMAP_MIN_TEXT_COLS's self-suppression check",
+        );
+
+        let editor = render::to_q_editor(rw);
+        let el = editor.layout(editor.rect, char_width as f32, line_height as f32);
+
+        MinimapProbe {
+            strip_width: mm.rect.width,
+            v_scrollbar_width_px: el.v_scrollbar_bounds.map(|r| r.width as f64),
+            char_width,
+            pane_width: rw.rect.width,
+            gutter_cells: rw.gutter_char_width,
+        }
+    }
+
+    /// #1869 acceptance: "the minimap width equals the VS Code formula's
+    /// result, which is less than 120 at a pane narrow enough to be under
+    /// the cap." Hand-computed independently of
+    /// `minimap_reserved_width`/`vs_code_minimap_width_px` (reverting
+    /// either back to the pre-#1869 fraction formula must make this fail,
+    /// which calling them to compute "expected" cannot do — the same
+    /// tautology the #1869 review round 1 finding flagged in
+    /// `gtk::testing::minimap`).
+    ///
+    /// RED against the pre-#1869-round-1 shape, which fed
+    /// `vs_code_minimap_width_px` the pane's raw width instead of
+    /// `remainingWidth = pane width - gutter`: at this fixture's geometry
+    /// (`char_width=8`, 2000 lines → a 7-cell gutter, `gutter_px=56`) that
+    /// shape would have resolved `floor((700 - 14 - 2) / 9) + 8 = 84`
+    /// instead of this test's own hand-computed, gutter-subtracted value.
+    /// Confirmed by temporarily reverting
+    /// `window_minimap_gutter_width_px`'s call site in
+    /// `build_screen_layout_with_breadcrumb_row` to pass `0.0` and
+    /// re-running this test: it fails with `left: 84.0, right: 77.0` (the
+    /// un-gutter-subtracted production value against this test's own
+    /// hand-computed, gutter-subtracted `expected`) before being reverted
+    /// back.
+    #[test]
+    fn minimap_width_matches_vs_code_formula_on_a_narrow_pane_1869() {
+        let p = minimap_probe(700.0);
+        let gutter_px = p.gutter_cells as f64 * p.char_width;
+        let remaining = p.pane_width - gutter_px;
+        let inner = ((remaining - 14.0 - 2.0) / (p.char_width + 1.0))
+            .floor()
+            .max(0.0);
+        let expected = (inner + 8.0).min(120.0);
+
+        assert_eq!(
+            p.strip_width, expected,
+            "the real paint path must reserve exactly what VS Code's own \
+             minimap formula (floor((remainingWidth - 14 - 2) / (char_width \
+             + 1)) + 8, capped at 120) computes by hand (pane_width={}, \
+             gutter_cells={}, char_width={})",
+            p.pane_width, p.gutter_cells, p.char_width
+        );
+        assert!(
+            expected < 120.0,
+            "test setup sanity: a 700px pane must stay under the 120px \
+             cap, or this isn't exercising the formula at all (got \
+             {expected})"
+        );
+    }
+
+    /// #1869 acceptance: "... and exactly 120 on a wide pane."
+    #[test]
+    fn minimap_width_caps_at_exactly_120_on_a_wide_pane_1869() {
+        let p = minimap_probe(1400.0);
+        let gutter_px = p.gutter_cells as f64 * p.char_width;
+        let remaining = p.pane_width - gutter_px;
+        let inner = ((remaining - 14.0 - 2.0) / (p.char_width + 1.0))
+            .floor()
+            .max(0.0);
+        let expected = (inner + 8.0).min(120.0);
+        assert_eq!(
+            expected, 120.0,
+            "test setup sanity: this fixture's own hand-computed formula \
+             must actually hit the cap, or this isn't a wide-pane test"
+        );
+
+        assert_eq!(
+            p.strip_width, 120.0,
+            "a 1400px Win-GUI pane must cap at *exactly* VS Code's 120px \
+             minimap width (got {})",
+            p.strip_width
+        );
+    }
+
+    /// #1869's still-open half: the vertical scrollbar gutter. VS Code's
+    /// own default (`editor.scrollbar.verticalScrollbarSize`) is a fixed
+    /// 14px regardless of font; quadraui's `Editor::layout` instead sizes
+    /// it at `cell_width` (`quadraui-0.1.2/src/primitives/editor.rs`,
+    /// `v_scrollbar_w = if has_v_scrollbar { cell_width } else { 0.0 }`),
+    /// with no way for a host to override it. This is the drafted,
+    /// not-yet-filed gap in `docs/PENDING_QUADRAUI_ISSUES.md` — pinning the
+    /// *current*, still-wrong width here (rather than leaving it
+    /// unasserted) means this test goes red the day quadraui ships a fix,
+    /// which is the trigger to update this assertion and close that entry,
+    /// not a silent drift.
+    #[test]
+    fn vertical_scrollbar_is_still_cell_width_not_vs_codes_14px_1869() {
+        let p = minimap_probe(1400.0);
+        let got = p
+            .v_scrollbar_width_px
+            .expect("a 2000-line buffer in a 900px-tall window must overflow and reserve a vertical scrollbar");
+        assert_eq!(
+            got, p.char_width,
+            "quadraui still sizes the vertical scrollbar at the editor's \
+             own cell width, not VS Code's fixed 14px — if this now fails, \
+             quadraui shipped the host-settable scrollbar width \
+             docs/PENDING_QUADRAUI_ISSUES.md's #1869 entry asks for; update \
+             this test to assert exactly 14.0 and close that entry instead \
+             of re-tuning the fixture (got {got}, char_width={})",
+            p.char_width
+        );
+    }
+}
+
 // ── #1696: editor text not inset by the minimap strip; tab-strip
 // overflow-action toolbar clipped off the window's right edge ───────────
 //

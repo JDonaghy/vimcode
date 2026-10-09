@@ -14194,6 +14194,18 @@ mod minimap {
     /// sizing table clamps to a 30-*column* ceiling, which at this pane's
     /// real pixel width would produce a strip an order of magnitude
     /// narrower than GTK's own pixel-denominated formula computes below.
+    ///
+    /// #1869 review round 1: `expected` below is hand-computed, not routed
+    /// through `minimap_reserved_width`/`vs_code_minimap_width_px` — the
+    /// prior shape called the very function under test to produce
+    /// "expected", which cannot fail against a regression in that
+    /// function. RED-verified against the #1869-round-1 shape (which fed
+    /// the formula the pane's raw width, skipping the gutter subtraction):
+    /// temporarily reverting that subtraction to `0.0` takes this test red
+    /// (`left: 61.0, right: 55.0`, confirmed, then reverted back) while the
+    /// sibling wide-pane test below stays green at this harness's scale
+    /// (the 120-cap binds either way there) — this narrow-pane test is the
+    /// one that actually exercises the gutter term.
     #[test]
     fn minimap_strip_is_narrower_on_a_narrow_pane_than_on_a_wide_one() {
         // #947: was `900` — wide enough for `MINIMAP_MIN_TEXT_COLS`'s
@@ -14211,7 +14223,7 @@ mod minimap {
         h.window_center(win)
             .expect("editor pane must paint with the minimap explicitly enabled");
 
-        let (strip_width, pane_width) = {
+        let (strip_width, pane_width, gutter_cols) = {
             let layout = h.screen_layout.borrow();
             let l = layout.as_ref().unwrap();
             let mm = l.minimap.iter().find(|m| m.window_id == win).expect(
@@ -14226,20 +14238,30 @@ mod minimap {
             // `RenderedWindow.rect` by the strip's width (that used to make
             // `rw.rect.width + mm.rect.width` the way to recover the pane's
             // full width; doing that today double-counts the strip).
-            (mm.rect.width, rw.rect.width)
+            (mm.rect.width, rw.rect.width, rw.gutter_char_width)
         };
         let char_width = h.painted_char_width();
-        let expected = crate::render::minimap_reserved_width(
-            &h.engine.borrow(),
-            pane_width,
-            char_width,
-            crate::render::gtk_minimap_sizing(),
-        );
+        // #1869 review round 1: hand-computed VS Code formula, independent
+        // of both `minimap_reserved_width` and `vs_code_minimap_width_px` —
+        // calling either of those for "expected" is exactly the tautology
+        // the review flagged (revert the production formula to the pre-
+        // #1869 fraction shape and a call to the *same* function would have
+        // stayed green). `gutter_cols` is read back from the real painted
+        // `RenderedWindow` (`calculate_gutter_cols`'s own output, not
+        // recomputed), so `remaining` here is VS Code's own `remainingWidth
+        // = editor outer width - gutter`, matching the formula this probes.
+        let gutter_px = gutter_cols as f64 * char_width;
+        let remaining = pane_width - gutter_px;
+        let inner = ((remaining - 14.0 - 2.0) / (char_width + 1.0))
+            .floor()
+            .max(0.0);
+        let expected = (inner + 8.0).min(120.0);
 
         assert_eq!(
             strip_width, expected,
-            "the real paint path must reserve exactly what \
-             minimap_reserved_width computes"
+            "the real paint path must reserve exactly what VS Code's own \
+             minimap formula (floor((remainingWidth - 14 - 2) / (char_width \
+             + 1)) + 8, capped at 120) computes by hand"
         );
         assert!(
             strip_width < 100.0,
@@ -14248,28 +14270,41 @@ mod minimap {
         );
         assert!(
             strip_width > 48.0,
-            "a 900px pane should still be comfortably clear of the \
-             absolute pixel floor (48px) — this test is about the ordinary \
-             fraction-scaled case, not the floor clamp itself (that's \
-             `minimap_reserved_width_uses_the_explicit_sizing_not_char_width` \
-             in render.rs); got {strip_width}px"
+            "a 900px pane should still be comfortably clear of zero — this \
+             test is about the ordinary division-term case, not \
+             `vs_code_minimap_width_px`'s own gutter-width floor (that's \
+             `vs_code_minimap_width_px_floors_at_the_gutter_width_regardless_of_font` \
+             in render.rs, a pane far narrower than this one); got \
+             {strip_width}px"
         );
     }
 
-    /// #728 acceptance: on an ordinary wide pane the minimap strip settles
-    /// at VS Code's own ~120px width instead of scaling up with the pane —
-    /// the pre-fix `rect_width * MINIMAP_WIDTH_FRACTION` formula reached
-    /// ~240px on a pane this wide, roughly twice VS Code's. Driven through
-    /// the real paint path (`ScreenLayout` from an actual `window_center`
-    /// call), not just `minimap_reserved_width` in isolation.
+    /// #728/#1869 acceptance: on an ordinary wide pane the minimap strip
+    /// caps at VS Code's own *exactly* 120px width instead of scaling up
+    /// with the pane — the pre-#728 `rect_width * MINIMAP_WIDTH_FRACTION`
+    /// formula reached ~240px on a pane this wide, roughly twice VS Code's.
+    /// Driven through the real paint path (`ScreenLayout` from an actual
+    /// `window_center` call), and the expectation below is hand-computed
+    /// rather than routed through `minimap_reserved_width`/
+    /// `vs_code_minimap_width_px` (#1869 review round 1: reverting either of
+    /// those to the pre-#1869 formula must make this fail, which calling
+    /// them to compute "expected" cannot do).
+    ///
+    /// `2200` (not `1600`): #1869's gutter subtraction (`remainingWidth =
+    /// editor outer width - gutter`) pulls the division term's input down
+    /// by the gutter's own width, so the harness needs real margin past the
+    /// point the *uncapped* formula would cross 120 for the cap to bind
+    /// *exactly* rather than merely approach it — at `1600` this pane
+    /// resolves to 101px, well under the cap, which would make the "exactly
+    /// 120" assertion below fail honestly rather than vacuously pass.
     #[test]
     fn minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane() {
-        let h = harness(engine_with_shaped_buffer(), 1600, 900);
+        let h = harness(engine_with_shaped_buffer(), 2200, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win)
             .expect("editor pane must paint with the minimap explicitly enabled");
 
-        let (strip_width, pane_width) = {
+        let (strip_width, pane_width, gutter_cols) = {
             let layout = h.screen_layout.borrow();
             let l = layout.as_ref().unwrap();
             let mm = l
@@ -14280,25 +14315,33 @@ mod minimap {
             let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
             // #1094: see the sibling narrow-pane test's comment — `rw.rect.
             // width` is the pane's own un-narrowed width directly now.
-            (mm.rect.width, rw.rect.width)
+            (mm.rect.width, rw.rect.width, rw.gutter_char_width)
         };
         let char_width = h.painted_char_width();
-        let expected = crate::render::minimap_reserved_width(
-            &h.engine.borrow(),
-            pane_width,
-            char_width,
-            crate::render::gtk_minimap_sizing(),
-        );
+        // #1869 review round 1: hand-computed, independent of
+        // `minimap_reserved_width`/`vs_code_minimap_width_px` — see the
+        // sibling narrow-pane test's comment for why calling either of
+        // those for "expected" would be tautological.
+        let gutter_px = gutter_cols as f64 * char_width;
+        let remaining = pane_width - gutter_px;
+        let inner = ((remaining - 14.0 - 2.0) / (char_width + 1.0))
+            .floor()
+            .max(0.0);
+        let expected = (inner + 8.0).min(120.0);
 
         assert_eq!(
             strip_width, expected,
-            "the real paint path must reserve exactly what \
-             minimap_reserved_width computes"
+            "the real paint path must reserve exactly what VS Code's own \
+             minimap formula computes by hand"
         );
-        assert!(
-            strip_width < 150.0,
-            "a 1600px pane must not blow past VS Code's ~120px minimap \
-             width (got {strip_width}px — the pre-#728 formula would have \
+        // #1869 acceptance: "exactly 120 on a wide pane" — this harness is
+        // wide enough that the formula's own cap, not just a loose upper
+        // bound, must bind.
+        assert_eq!(
+            strip_width, 120.0,
+            "a 1600px pane must cap at *exactly* VS Code's 120px minimap \
+             width, not merely stay below some looser bound (got \
+             {strip_width}px — the pre-#728 fraction formula would have \
              hit ~240px here)"
         );
     }
