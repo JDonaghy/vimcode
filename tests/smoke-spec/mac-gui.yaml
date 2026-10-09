@@ -406,6 +406,49 @@ steps:
     width: 40
     height: 40
 
+  # vimcode#1877 — "status bar covers activity bar (settings unclickable)".
+  # `App::shell_config` now reserves one line-height each for the status
+  # bar/command line at the shell level (`with_command_line()`/
+  # `with_status_bar()`), so the activity bar's bottom-pinned Settings
+  # item should stop above those two rows instead of running flush to the
+  # window's bottom edge the way it did pre-fix. Locks in the
+  # activity-bar half of this issue on the real-hardware lane: a click at
+  # the Settings item's approximate position must open the Settings
+  # panel, which paints a real AX element the fix's headless `MacDriver`
+  # coverage (`settings_button_click_opens_settings_panel_via_mac_driver`
+  # in `src/macos/mod.rs`) cannot observe at all (it only asserts on
+  # painted glyph text, there being no AX-tree equivalent in that
+  # harness).
+  #
+  # `x`/`y` are a first-approximation guess, same caveat as this file's
+  # `click-file-menu-item` coordinates above: this window is 1024x768
+  # (see header), the activity bar is a fixed 48px-wide column with
+  # ~44px icon slots (confirmed real-measured for the three fixed icons
+  # right above), and the bottom-chrome reservation this issue adds is
+  # two rows at roughly a default line height each (~18-20px apiece on
+  # this backend's default font metrics) — so the Settings item's icon
+  # slot should sit a little above `768 - 2*20 = 728`. NOT yet confirmed
+  # against a real running `vimcode` process's actual Settings-item
+  # position on real macOS hardware (macmini); update this comment with
+  # the real measured box once someone with macmini access runs this
+  # spec, the same way `click-file-menu-item`'s own first-run note asks.
+  # The traffic-light-strip half of #1877 is deliberately NOT added here:
+  # this driver's `expect_*` vocabulary (`expect_a11y`/`expect_no_tofu`/
+  # `region_not_uniform`) cannot express "this pixel equals
+  # theme.tab_bar_bg", only structural/AX/tofu checks, so there is
+  # nothing this file can assert for that half beyond what
+  # `title_row_leading_edge_matches_theme_tab_bar_bg_for_two_colorschemes_
+  # via_mac_driver` already covers headlessly (with its own documented
+  # RED-verification gap — see that test's doc).
+  - type: click
+    id: click-settings-gear-1877
+    x: 24
+    y: 684
+  - type: expect_a11y
+    id: settings-panel-opens-1877
+    role: AXStaticText
+    name: "Color Scheme"
+
   # vimcode#1646's two "All GUI specs" seed checks ("minimap shows content
   # for a non-empty file" / "extension-install reaches a completed state")
   # are DELIBERATELY OMITTED from this file, same as `win-gui.yaml` (see

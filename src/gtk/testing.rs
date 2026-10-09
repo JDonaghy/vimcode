@@ -13157,6 +13157,49 @@ mod command_center {
             .search_bounds
             .expect("the search box must still have a painted bounds");
 
+        // #1877 review round 1 (non-blocking finding 6): pins that the
+        // title-bar band's own leading edge (left of the Command Center's
+        // `back` arrow) still paints `theme.tab_bar_bg`, not the bare
+        // frame-clear background colour, once the drawn menu row is
+        // hidden (`FrameOp::MenuDropdown`'s own title-band fill is gated
+        // on `presence.menu_row`/`menu_bar_visible`, which is exactly what
+        // this test just set `false`).
+        //
+        // Honesty note on what this does and does not RED-verify (the
+        // same "cannot RED here" category `title_row_leading_edge_matches_
+        // theme_tab_bar_bg_for_two_colorschemes_via_mac_driver` in
+        // `src/macos/mod.rs` documents for the same underlying fill).
+        // `App::render_content`'s `FrameOp::CommandCenter` arm's new
+        // unconditional-on-`!presence.menu_row` row fill does execute on
+        // this exact path — but on GTK, `Backend::titlebar_control_inset()`
+        // is always `Rect::default()` (zero; only `MacBackend` overrides
+        // it), so with the drawn menu row hidden, `command_center_rect`
+        // is *already* measured to span the entire row from x=0 (see that
+        // arm's own comment for why), and `paint_command_center_rung`
+        // paints `theme.tab_bar_bg` across that same pixel regardless of
+        // the new fill. Verified directly: commenting out the new fill
+        // call and re-running this test leaves it GREEN — the assertion
+        // below cannot distinguish the two. What it genuinely guards is a
+        // regression in the *combination* (either the Command Center's
+        // own background or this fill ceasing to cover x=2 on this row),
+        // which is real coverage, just not a pin on this specific diff's
+        // new code. The fill's own distinguishing effect — the strip
+        // behind a *non-zero* `titlebar_control_inset()` (macOS's real
+        // traffic lights) — needs a live `NSWindow`, same real-Mac gap the
+        // mac-driver test above documents.
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let row_y = (back.y + back.height / 2.0) as i32;
+        let (r, g, b) = h.driver.pixel(2, row_y);
+        assert_eq!(
+            (r, g, b),
+            (theme.tab_bar_bg.r, theme.tab_bar_bg.g, theme.tab_bar_bg.b),
+            "the title-bar row's leading edge (left of the Command \
+             Center's back arrow) must paint theme.tab_bar_bg once the \
+             drawn menu row is hidden, not the bare background colour; \
+             sampled {:?} at (2, {row_y})",
+            (r, g, b)
+        );
+
         // And it must still be *clickable*, not just present in the cache --
         // the #587 class of bug is state populated with nothing wired to it.
         h.driver

@@ -2445,6 +2445,20 @@ mod mac_driver_tests {
     /// Asserts on *painted* Settings-panel content (`"Color Scheme"`, a
     /// settings-form field label — CLAUDE.md's "rendered output, not
     /// state" rule), not on `engine.app_shell.active_panel_id()`.
+    ///
+    /// **What this does and does not pin (review round 1, non-blocking
+    /// finding 4).** The Settings button's registered zone sat inside
+    /// `activity_bar_bounds` both before and after this issue's fix —
+    /// `AppShell::handle`'s `contains(activity_bar_bounds, p)` hit-test
+    /// resolved a click there either way, reservation or not, so this
+    /// test would also have passed on the pre-fix tree. It pins the
+    /// issue's acceptance text ("a click on it opens settings") as a
+    /// regression guard going forward, but it does **not** cover the
+    /// reported "cannot be clicked" symptom itself — that symptom was a
+    /// *visual/geometric* overlap (the status/command-line rows painting
+    /// on top of the button, not the hit-test rect moving), which
+    /// `settings_activity_bar_zone_ends_above_the_status_bar_via_mac_driver`
+    /// right above is the one that actually RED-verifies.
     #[test]
     fn settings_button_click_opens_settings_panel_via_mac_driver() {
         let (_guards, mut driver) = driver(plain_engine());
