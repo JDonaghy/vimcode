@@ -1,5 +1,70 @@
 # VimCode Project State
 
+**Last updated:** October 9, 2026 (#1832 — `tests/smoke-spec/mac-gui.yaml`'s
+first real run, on macmini, against a real `cargo build --no-default-features
+--features macos --bin vimcode` driven by `coord app-drive run-spec mac-native`
+(`code-coordinator` 0.5.620 — note `~/.coord-venv.blue` on this same host is a
+stale 0.5.617 that lacks every `#3650` step type this file now uses; `which
+coord` must resolve to the green venv). Added the five `#3650` driver steps
+this issue asked for (`expect_dock_icon`, `expect_frontmost`, the typing/
+`:w`/`expect_file` section, three `expect_no_tofu` checks on the activity
+bar) and ran the whole 29-step spec end to end once, clean, no manual
+intervention — full per-step pass/fail recorded in the file's own header
+(not duplicated here). Three findings worth a look from someone other than
+this worker:
+
+1. **#1824 reproduces exactly as documented Oct 6** — `expect_frontmost`
+   fails immediately after launch (actual frontmost stays the launching
+   terminal), and that one failure cascades through `_require_frontmost`
+   to block every later `click`/`key`/`type_text` step in the spec — not
+   independent bugs, one root cause. No new finding here, just a second,
+   independent real-hardware confirmation.
+2. **#1824 finding 2 ("Explorer/Source Control/Run&Debug show a generic
+   `?`-box placeholder") did NOT reproduce today** — all three
+   `expect_no_tofu` checks pass, confirmed via `coord.native_pixels.
+   looks_like_tofu`/`region_not_uniform` (the real heuristic, not eyeballed)
+   against two separate fresh launches. Do not read this as "#1824 is
+   fixed" — only this one sub-finding failed to reproduce; window
+   activation (finding 1) is still fully red. Keep #1824 open, but
+   whoever next touches it should re-confirm finding 2 before continuing
+   to treat it as live.
+3. **New, unfiled finding: `coord`'s `send_click` (`CGEventPostToPid`)
+   does not register against vimcode's window at all, even once the app
+   is made genuinely frontmost by hand** — confirmed by forcing frontmost
+   via `osascript ... set frontmost ... to true`, then clicking a
+   precisely-calibrated activity-bar icon coordinate: zero visible effect,
+   twice, across two different window positions. The identical coordinate
+   posted instead via a raw global `Quartz.CGEventPost(kCGHIDEventTap,
+   ...)` (bypassing `coord` entirely) opened the panel immediately.
+   `send_key`'s own `CGEventPostToPid` calls work reliably by contrast
+   (`i` flips the status bar to `INSERT` every time) — this is specific to
+   *mouse* event delivery via pid-addressed posting. Reproduces
+   independently of #1824's frontmost gate, so fixing #1824 alone will
+   NOT by itself unblock this spec's `click` steps. This is plausibly a
+   `coord`-side driver gap (`mac_native_driver.py` lives in the
+   `code-coordinator` package, not this repo — this worker cannot file
+   against it or fix it), not confirmed to be a vimcode/quadraui bug;
+   flagged here for whoever next touches that driver or re-runs this spec.
+   Also observed, separately: `move_window`'s requested `(0,0)` placement
+   was honored once (landed at `(0,30)`, Y clamped below the real menu
+   bar — expected) and not honored once (landed at `(332,677)`, no
+   interaction preceded either launch) across two consecutive fresh
+   launches — noted in the spec file's own header as a placement-
+   instability caveat on this file's window-relative click coordinates,
+   not independently investigated further here.
+
+No vimcode-repo production code changed — #1832 is a test/spec-only issue;
+the real bug most of this run's steps reproduce is already #1824 (open,
+separate, unaffected by this PR). #1832's own acceptance bar ("the spec
+has actually run on the real host, with the result — pass, or
+expected-red with its issue — recorded in the file header") is fully met:
+this is a real, clean, one-shot `coord app-drive run-spec` run with every
+step's real pass/fail recorded, every red step tagged `known_bug:
+vimcode#1824` and genuinely explained by that one root cause. Closing
+#1832 does not mean #1824 is fixed — #1824 stays open on its own, per the
+findings above (notably: its finding 2 did not reproduce today, worth a
+re-check, but finding 1 still fully does).
+
 **Last updated:** October 9, 2026 (#1833 review round 2 — restore the one
 pre-existing line review round 1 rewrote in `tests/smoke-spec/win-terminal.yaml`,
 per #3509's additive-only policy). Round 1's fix #4 below corrected the
