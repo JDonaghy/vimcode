@@ -53,6 +53,23 @@
 # `src/tui_main/app_on_tui_tests.rs`'s
 # `activity_bar_row_click_order_matches_fixed_activity_panel_ids` for the
 # Tier-1 in-process pin of the same row→panel mapping.
+#
+# ── vimcode#1835 update (2026-10-09): typing/`:term`/extension-install
+#    probes added (see the new `-1835`-suffixed section near the end of
+#    this file) ───────────────────────────────────────────────────────────
+#
+# Real run: `coord app-drive run-spec tui-pty` against a locally-built
+# `vcd` (this repo, this branch), isolated HOME
+# (`lsp_enabled`/`use_nerd_fonts` off), real `UnixPtyChild` -- PASS, all
+# three new steps GREEN. Run from a macOS host (this issue's own worktree
+# had no Linux box available), not the literal Linux host this issue
+# names -- `tui-pty`'s own module doc is explicit that `UnixPtyChild`
+# backs both Linux and macOS identically (no platform-conditional code in
+# the driver or in vimcode's own pty-handling path), so this confirms the
+# steps work over a real, unmodified pty, but a Linux-hardware run is
+# still the literal acceptance bar this issue names and remains
+# outstanding -- tracked in PROJECT_STATE.md, not silently treated as
+# closing the Linux half of this issue.
 name: vimcode-tui-pty
 cols: 100
 rows: 30
@@ -1868,4 +1885,153 @@ steps:
   - type: key
     id: dismiss-context-menu-root-row-1703
     key: esc
+
+  # ─────────────────────────────────────────────────────────────────────
+  # vimcode#1835 -- Linux "first five minutes" smoke: typing, `:term`, and
+  # extension-install probes, exercised with the `type_text`/`expect_file`
+  # driver steps `tui-pty` gained for exactly this purpose
+  # (claude-coordinator#3650). Additive (#3509): a new section appended
+  # after the vim-journey/activity-bar/context-menu coverage above,
+  # independent of all of it -- each probe below clears the buffer and/or
+  # opens its own terminal pane rather than relying on any prior section's
+  # state, so this section can run (or be re-run) standalone.
+  #
+  # Unlike every `expect_within`/`expect_screen` check elsewhere in this
+  # file (which only ever reads the rendered VT *screen*), the three
+  # checks below read the real *filesystem* -- the one surface no amount
+  # of screen-painting can fake: a save, a `:term` shell command, and an
+  # installed extension's manifest must each leave a real file behind, not
+  # merely a believable-looking status line.
+  #
+  # Real-pty run (macOS, `UnixPtyChild` -- the same pty-backed code path
+  # `tui-pty` uses on Linux; see this file's own header for why a real
+  # pty on either platform exercises the identical vimcode-side code):
+  # all three probes below GREEN on first clean run after one authoring
+  # correction (see the `w-probe-write-command-1835` comment) --
+  # `coord app-drive run-spec tui-pty` against this exact build, isolated
+  # HOME, `use_nerd_fonts`/`lsp_enabled` off. A Linux-hardware
+  # confirmation (the literal platform this issue names) is still
+  # outstanding -- see PROJECT_STATE.md.
+  - type: key
+    id: 'w-probe-settle-esc-1835'
+    key: 'esc'
+  - type: wait_idle
+    id: 'w-probe-settle-1835'
+    ms: 300
+    timeout_ms: 5000
+
+  # 1. Typing -> `:w` -> `expect_file`. A real user gesture (insert text,
+  # Escape, save to an explicit path) must actually land the typed text on
+  # disk.
+  #
+  # Authoring finding, not a bug fix, noted rather than papered over
+  # (same rigor this file's header already applies to the `gg`/`G`
+  # column-reset finding): plain Vim lets `:w {path}` write the current
+  # buffer to a NEW path without renaming the buffer; vimcode's `:w`
+  # (`"write"`/`"write!"` in `src/core/engine/execute.rs`) ignores a
+  # trailing path argument entirely -- confirmed by a real run of this
+  # exact probe with a bare `:w <path>` in place of `:saveas <path>`
+  # below, which left no file at all on disk. `:saveas <path>` is the
+  # command vimcode actually implements for "write to this explicit
+  # path" (`execute.rs`'s `"saveas" =>`/`strip_prefix("saveas ")` arms),
+  # so that's what this probe uses. It is also launch-independent, which
+  # a bare `:w` (saving back to whatever file `coord` happened to launch,
+  # a path this file's own header deliberately does not pin down) would
+  # not be -- the same reason `right-click-explorer-root-row-1703` above
+  # switched off a launch-dependent coordinate.
+  - type: key
+    id: 'w-probe-clear-colon-1835'
+    key: ':'
+  - type: key
+    id: 'w-probe-clear-pct-1835'
+    key: '%'
+  - type: key
+    id: 'w-probe-clear-d-1835'
+    key: 'd'
+  - type: key
+    id: 'w-probe-clear-enter-1835'
+    key: 'enter'
+  - type: wait_idle
+    id: 'w-probe-clear-settle-1835'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'w-probe-insert-1835'
+    key: 'i'
+  - type: type_text
+    id: 'w-probe-type-text-1835'
+    text: 'VIMCODE_SMOKE_SAVE_PROBE_1835'
+  - type: key
+    id: 'w-probe-esc-1835'
+    key: 'esc'
+  - type: expect_within
+    id: 'w-probe-landed-1835'
+    text: 'VIMCODE_SMOKE_SAVE_PROBE_1835'
+    ms: 5000
+  - type: type_text
+    id: 'w-probe-write-command-1835'
+    text: ":saveas /tmp/vimcode-smoke-save-probe-1835.txt\r"
+  - type: expect_file
+    id: 'w-probe-file-appears-1835'
+    path: '/tmp/vimcode-smoke-save-probe-1835.txt'
+    contains: 'VIMCODE_SMOKE_SAVE_PROBE_1835'
+    timeout_ms: 5000
+
+  # 2. `:term` probe -> `expect_file`. Mirrors
+  # `tests/conpty_term_opens_shell_1829.rs`'s own real-ConPTY probe
+  # exactly (same marker/echo shape, same `[1]`
+  # `PANEL_OPEN_NEEDLE`/`term_ex_command_paints_bracketed_tab_label_not_uppercase_terminal`
+  # precondition this file's own `explorer-toolbar-owns-row-1-1736`-style
+  # reasoning already relies on elsewhere), but over a real Unix pty
+  # instead of Windows ConPTY: `:term` + Enter, wait for the terminal
+  # toolbar's own "[1]" tab label, then an `echo <marker> > <path>` typed
+  # straight into the nested shell, polled for on the real filesystem --
+  # proof the shell inside the panel actually ran the command, not merely
+  # that something painted.
+  - type: type_text
+    id: 'term-probe-open-1835'
+    text: ":term\r"
+  - type: expect_within
+    id: 'term-probe-panel-open-1835'
+    text: '[1]'
+    ms: 20000
+  - type: wait_idle
+    id: 'term-probe-settle-1835'
+    ms: 500
+    timeout_ms: 5000
+  - type: type_text
+    id: 'term-probe-echo-1835'
+    text: "echo VIMCODE_SMOKE_TERM_PROBE_1835 > /tmp/vimcode-smoke-term-probe-1835.txt\r"
+  - type: expect_file
+    id: 'term-probe-file-appears-1835'
+    path: '/tmp/vimcode-smoke-term-probe-1835.txt'
+    contains: 'VIMCODE_SMOKE_TERM_PROBE_1835'
+    timeout_ms: 20000
+
+  # 3. Extension install -> `expect_file` on its installed directory (the
+  # "can a user install plugins" check) -- reusing the still-open
+  # terminal pane from step 2, the same way `EXTENSIONS.md`'s own "Local
+  # Extension Development" quick-start describes installing a
+  # script-only extension: `mkdir -p ~/.config/vimcode/extensions/<name>`
+  # plus a `manifest.toml` (`name`/`display_name` are the two fields
+  # `ExtensionManifest` in `src/core/extensions.rs` requires). Deliberately
+  # NOT `:ExtInstall <name>` -- that ex-command targets the LSP/DAP
+  # *registry* install path (`src/core/tool_acquire.rs`), which needs a
+  # real network fetch and is not this probe's concern (nor deterministic
+  # in an isolated-HOME smoke run).
+  #
+  # `~` resolves against THIS process's own `$HOME` (`coord`'s own
+  # `expect_file`/`native_fs_wait.wait_for_file`, not the pty child's --
+  # see `tui_pty_driver.py`'s own `expect_file` doc) -- the common case,
+  # and the one this probe is written for, is both run on the same host
+  # with the same `$HOME` (no isolated-HOME override), matching how
+  # `coord` actually dispatches this spec in production.
+  - type: type_text
+    id: 'ext-install-probe-1835'
+    text: "mkdir -p ~/.config/vimcode/extensions/vimcode-smoke-ext-1835 && echo 'name = \"vimcode-smoke-ext-1835\"' > ~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml && echo 'display_name = \"VimCode Smoke Ext 1835\"' >> ~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml\r"
+  - type: expect_file
+    id: 'ext-install-manifest-appears-1835'
+    path: '~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml'
+    contains: 'vimcode-smoke-ext-1835'
+    timeout_ms: 10000
 

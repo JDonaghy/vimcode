@@ -1,5 +1,58 @@
 # VimCode Project State
 
+**Last updated:** October 9, 2026 (#1835 — Linux "first five minutes"
+smoke: typing/`:term`/extension-install probes). Added a new
+`-1835`-suffixed section to both `tests/smoke-spec/tui.yaml` (`tui-pty`)
+and `tests/smoke-spec/gtk-gui.yaml` (`gtk-native`), using the
+`type_text`/`expect_file`/`expect_frontmost`/`expect_region_not_uniform`
+driver steps `claude-coordinator#3650` shipped for exactly this purpose —
+every step type the issue asked for was already available, so none needed
+to be marked pending. Each section covers: typing text, saving it to an
+explicit path (`:saveas <path>`, not a bare `:w <path>` — see below), a
+`:term` probe that echoes a marker into a file from inside the real nested
+shell (mirrors `tests/conpty_term_opens_shell_1829.rs`'s own ConPTY probe),
+and a local extension install (drop a `manifest.toml` under
+`~/.config/vimcode/extensions/<name>/`, the "can a user install plugins"
+check) — plus, GTK-only, `expect_frontmost` right after launch and
+`expect_region_not_uniform` on the terminal panel and minimap bands.
+**TUI: real-pty run, GREEN.** `coord app-drive run-spec tui-pty` against a
+locally-built `vcd` (isolated HOME, `lsp_enabled`/`use_nerd_fonts` off) —
+all three new probes passed, both standalone and appended to the full
+1800+-line file. Run from a macOS host (`UnixPtyChild` backs both Linux and
+macOS identically, per `tui_pty_driver.py`'s own module doc — no
+platform-conditional code in the driver or in vimcode's pty-handling path),
+not literally Linux; a Linux-hardware confirmation of this exact section is
+still outstanding. One real authoring finding, not a bug fix: vimcode's
+`:w`/`"write"` (`src/core/engine/execute.rs`) ignores a trailing path
+argument — unlike real Vim's `:w {path}`, it does not write to a new path.
+`:saveas <path>` is the command vimcode actually implements for that, and
+is what both new sections use; not filed as a bug since no documentation
+claims `:w {path}` is supported and fixing engine behavior is out of this
+issue's own scope (smoke-spec authoring only). The full-file run also
+surfaced ~45 pre-existing `FAIL`s scattered through the unrelated
+vim-journey section added by an earlier issue — none touch anything this
+PR changed (confirmed: every `-1835` step passed), and the file's own
+existing comments already document exactly this class of flakiness (mode-
+transition timing racing a just-passed `expect_within`); not investigated
+further here as out of this issue's scope, but worth a follow-up look if
+seen again on a real Linux run. **GTK: UNCONFIRMED — no real run.** This
+issue's worktree is a macOS host with no Linux box, container runtime, or
+fleet SSH access reachable from it, and `gtk_native_driver.py`'s own
+`LinuxGtkCalls` construction-time-raises `GtkNativeRuntimeError` on any
+non-Linux platform by design, so `coord app-drive run-spec gtk-native`
+cannot even start here. The new section's `type_text`/`key`/`expect_file`
+steps reuse the exact marker/echo/`:saveas` shapes the TUI section already
+ran clean (strong, not equivalent, evidence they're correct); the two
+`expect_region_not_uniform` pixel bands are first-approximation guesses
+derived from `src/render.rs`'s own layout constants, with no cross-check
+available at all. Per this issue's own bar ("the spec has actually run on
+the real host"), the GTK half is not done — needs a Linux/GTK operator (the
+fleet's `precision`/`dellserver`/`dell64` hosts per `coordinator.yml` are
+plausible candidates) to run `tests/smoke-spec/gtk-gui.yaml` and record
+pass/fail (and corrected pixel geometry if the two `-1835` uniform-region
+bands miss) back into that file's own header. `ISSUE_RESOLUTION: partial`
+— TUI half run and green; GTK half authored but unrun, tracked above.
+
 **Last updated:** October 8, 2026 (#1853 CI fix round 1 — register the
 bundled icon font **once per process**, and stop the new GTK glyph test
 measuring the host's font set). **Fix, not reimplementation.** Round 2's
