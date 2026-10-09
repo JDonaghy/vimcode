@@ -1,5 +1,61 @@
 # VimCode Project State
 
+**Last updated:** October 9, 2026 (#1833 — Windows TUI "first five minutes"
+smoke spec: `:term` probe, minimap thumb, typing round trip, all added to
+`tests/smoke-spec/win-terminal.yaml` and RUN FOR REAL on dell64). **New
+steps added and run on real hardware, not just parsed.** `coord app-drive
+run-spec`/`open` could not drive the actual run end to end: three real,
+reproducible `claude-coordinator`-side `win_native_driver.py` bugs block
+every `mode: terminal, terminal_app: windows-terminal` launch on this host
+(not vimcode bugs — flagged for a coordinator-repo issue, filing is outside
+a vimcode worker's reach): (1) `find_top_window`'s process-descendant walk
+can never find a `wt.exe`-hosted window, since `wt.exe` hands off to the
+real `WindowsTerminal.exe` via COM activation whose OS parent is a
+short-lived broker, never a true descendant; (2) `subprocess.Popen(...,
+shell=True)` unconditionally sets `wShowWindow=SW_HIDE` (CPython's own
+behaviour), so even a `conhost`-mode launch (a genuine descendant) produces
+a window `IsWindowVisible` can never confirm; (3) `launch_in_terminal`
+passes a bare relative `vcd.exe` token with no `-d <dir>`, which Windows
+Terminal cannot resolve against the launching process's own cwd (`[error
+2147942402 (0x80070002)] ... The system cannot find the file specified.`,
+confirmed on screen). Worked around with a direct Win32/`SendInput` harness
+reusing `coord.win_native_driver`'s own `Win32Calls`/`NativeRunner`/
+`parse_native_spec` (same "drive the real primitives by hand" methodology
+this file's own win-terminal.yaml header already used for the original
+#1634/#1635/#1636 confirmation) — every new step in the YAML file was then
+run twice, end to end, through the REAL `NativeRunner._run_step` dispatch
+(not a reimplementation) against a real, visible, foreground `vcd.exe`
+window built from this branch (`cargo xwin build --release --target
+x86_64-pc-windows-msvc --no-default-features --bin vcd`, quadraui 0.1.2).
+Both runs: all twelve new steps green. Headline results: **#1828** (minimap
+thumb) — `expect_region_not_uniform` over the strip's top band passed for
+real (max channel delta 57), the real-hardware confirmation
+PROJECT_STATE's own #1842 entry below named as the one thing a headless
+`TestBackend` run could not do. **#1829** (`:term` blank panel) — the
+terminal panel opened with a real, live `Windows PowerShell` prompt
+(screenshotted) and a typed `echo MARKER > ...` command actually ran;
+#1829's own symptom did NOT reproduce on this real host with this branch's
+quadraui pin, consistent with the #1843 entry below tracing the fix to
+quadraui#1327 and leaving only this real-hardware confirmation open. #1829
+is left OPEN on GitHub (closing it is a review decision, not this worker's
+call) and its spec step keeps `known_bug: vimcode#1829` — the bidirectional
+half of the known-bug gate is exactly "alert that a parked bug is now
+passing", not "silently declare it fixed". One probe-mechanism-only
+finding, NOT a vimcode defect: Windows PowerShell's `>` redirection writes
+UTF-16LE by default, so a literal `contains: MARKER` check (which decodes
+as UTF-8) against the issue's own literal `echo MARKER > ...` probe command
+reads a byte-correct file as not containing `MARKER` — confirmed by hand
+against the identical file (plain existence: passes; `contains: MARKER`:
+fails). The `:term` probe step therefore checks existence only; a second,
+unrelated probe (typing + `:w` + a `Get-Content | Set-Content -Encoding
+utf8` copy-out, since vimcode's `:w` has no save-as/filename-argument form)
+uses `contains:` safely. Also found and worked around (not a bug, a step-
+ordering gap in this new YAML): plain `Esc` alone does not return focus to
+the editor from a terminal panel the #1829 steps leave open — an explicit
+`click` into the editor's own text area is now step `click-back-into-
+editor` before the typing round trip. See `tests/smoke-spec/win-
+terminal.yaml`'s own header for the full, step-by-step record.
+
 **Last updated:** October 9, 2026 (#1835 — Linux "first five minutes"
 smoke: typing/`:term`/extension-install probes, through review round 2).
 Added a new
