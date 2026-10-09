@@ -215,7 +215,7 @@ win = ["quadraui/win"]
 # the git dependency, redirecting the build to the local checkout by package
 # name, as long as the local checkout's own `Cargo.toml` version satisfies
 # `^0.1`.
-quadraui = { version = "0.1", features = ["tui", "terminal"] }
+quadraui = { version = "0.1.2", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
