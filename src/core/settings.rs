@@ -233,7 +233,7 @@ pub struct Settings {
     /// Win-GUI parity at VS Code's non-mac ratio, 1.35, is a follow-up).
     /// Any other positive value is taken as an explicit multiplier on every
     /// backend `effective_line_height_multiplier` recognises.
-    #[serde(default)]
+    #[serde(default = "default_line_height")]
     pub line_height: f64,
 
     /// Show file explorer sidebar on startup
@@ -1841,6 +1841,13 @@ fn default_ui_font_size() -> u8 {
     10
 }
 
+/// #1864: `0.0` is [`Settings::effective_line_height_multiplier`]'s "auto"
+/// sentinel — the same "never customized" convention
+/// [`default_ui_font_size`]'s doc describes for `ui_font_size`.
+fn default_line_height() -> f64 {
+    0.0
+}
+
 fn default_listchars() -> String {
     "tab:> ,trail:-,nbsp:+".to_string()
 }
@@ -1876,7 +1883,7 @@ impl Default for Settings {
             font_family: default_font_family(),
             font_size: default_font_size(),
             ui_font_size: default_ui_font_size(),
-            line_height: 0.0,
+            line_height: default_line_height(),
             explorer_visible_on_startup: default_explorer_visible(),
             incremental_search: default_incremental_search(),
             auto_indent: default_auto_indent(),
@@ -3411,6 +3418,10 @@ impl Settings {
             "laststatus" | "ls" => Some(self.laststatus as i64),
             "sidescrolloff" | "siso" => Some(self.sidescrolloff as i64),
             "scrolljump" | "sj" => Some(self.scrolljump as i64),
+            // #1864: `line_height`/`lh` deliberately has no arm here — this
+            // helper is `i64`-only (see its own doc) and `line_height` is an
+            // `f64` multiplier (`1.25`, not `1`), so `:set lh+=0.5` can't go
+            // through the same add/subtract path `font_size+=1` does.
             _ => None,
         }
     }
@@ -4414,6 +4425,19 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Integer { min: 6, max: 32 },
     },
     SettingDef {
+        key: "line_height",
+        label: "Line Height",
+        description: "Editor row-pitch multiplier of font_size, VS Code's \
+                       editor.lineHeight convention (0 = auto: this \
+                       platform's own native ratio)",
+        category: "Appearance",
+        // #1864: no `SettingType` variant takes a float (`Integer`'s
+        // `min`/`max` are `i32`) — `StringVal` round-trips through
+        // `get_value_str`/`set_value_str` exactly like `font_family` above,
+        // just parsed as `f64` rather than taken verbatim.
+        setting_type: SettingType::StringVal,
+    },
+    SettingDef {
         key: "use_nerd_fonts",
         label: "Nerd Font Icons",
         description: "Use Nerd Font glyphs for UI icons (disable for ASCII fallbacks)",
@@ -5196,6 +5220,22 @@ mod tests {
         assert_eq!(settings.line_height, 5.0);
         settings.parse_set_option("lh=-3").unwrap();
         assert_eq!(settings.line_height, 0.0);
+    }
+
+    /// `docs/PATTERNS.md`'s "Adding a setting" step 5, same precedent as
+    /// `minimap_appears_in_the_settings_registry` — without an entry here
+    /// `line_height` is wired through `:set`/`settings.json` (the tests
+    /// above) but invisible and uneditable in the Settings sidebar form.
+    #[test]
+    fn line_height_appears_in_the_settings_registry() {
+        let def = SETTING_DEFS
+            .iter()
+            .find(|d| d.key == "line_height")
+            .expect("`line_height` must appear in SETTING_DEFS so the settings UI lists it");
+        assert_eq!(def.category, "Appearance");
+        assert!(matches!(def.setting_type, SettingType::StringVal));
+        assert!(!def.label.is_empty());
+        assert!(!def.description.is_empty());
     }
 
     // ── `minimap` option (#35) ───────────────────────────────────────────

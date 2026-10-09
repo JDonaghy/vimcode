@@ -4749,6 +4749,19 @@ impl App {
         // `set_editor_font` immediately above (`zoomin`/`zoomout`/`:set
         // line_height=N` must reach the painted row pitch next frame, not
         // just at startup).
+        //
+        // Review round 1: this override is deliberately global for the
+        // whole frame, not scoped to only the `Surface::Editor` paint call
+        // — everything downstream of it (tab bars, scrollbars, completion/
+        // hover/dialog/picker popups) is anchored and hit-tested in the
+        // *same* `lh` units (`App::painted_line_height`), so suspending the
+        // override partway through the frame would desync paint from
+        // click/hover for all of those, not just the editor. The one place
+        // that must NOT see this value — sidebar panel content
+        // (`tree_layout`/`list_layout`/`form_layout`/`msv_layout` all read
+        // `current_line_height` directly) — gets it suspended narrowly,
+        // around that one call; see `render_content`'s `FrameOp::
+        // SidebarPanel` arm.
         if let Some(lh) = resolve_editor_line_height_px(&engine.settings, backend, editor_size_pt) {
             quadraui::Backend::set_current_line_height(backend, lh);
         }
@@ -8844,7 +8857,21 @@ impl App {
                     layout,
                     position.x as f64,
                     position.y as f64,
-                    backend.line_height() as f64,
+                    // #1864 review round 1: the gutter is part of the
+                    // *editor* row grid — `painted_line_height()` (#555) is
+                    // the cached, published-at-paint-time row pitch every
+                    // other editor-row hit-test in this file already reads
+                    // (`self.handle`/`apply_picker_route`/etc.), rather than
+                    // `backend.line_height()`'s live, mutable field — which
+                    // `render_content`'s `FrameOp::SidebarPanel` arm now
+                    // transiently overwrites mid-frame for sidebar content
+                    // (tree/list/form rows). A raw `backend.line_height()`
+                    // read from a click/hover handler, outside any paint
+                    // call, happens to still agree today (the override is
+                    // restored before `render_content` returns), but
+                    // `painted_line_height()` is the documented contract for
+                    // this and does not depend on that ordering.
+                    self.painted_line_height(),
                     backend.char_width() as f64,
                 );
                 if engine.gutter_hover_window != was {
@@ -10219,6 +10246,13 @@ impl quadraui::ShellApp for App {
         let theme = Theme::from_name(&engine.settings.colorscheme);
         self.sync_per_frame_backend_state(backend, &engine, &theme);
 
+        // #1864 review round 1: resolved again here (cheap — `resolve_editor_font`
+        // is a pure lookup over `settings`/`backend.default_fonts()`), so the
+        // `FrameOp::SidebarPanel` arm below can briefly reset `backend` to
+        // this font's *natural* line height for sidebar content, then
+        // restore the editor's row-pitch override afterward — see that
+        // arm's own comment.
+        let (editor_family, editor_size_pt) = resolve_editor_font(&engine.settings, backend);
         let lh = self.cached_line_height.max(backend.line_height() as f64);
         let cw = self.cached_char_width.max(backend.char_width() as f64);
         // Publish the value this frame paints with so click-time hit-tests can
@@ -10659,11 +10693,38 @@ impl quadraui::ShellApp for App {
                 // The quadraui AppShell chrome (activity bar, sidebar header,
                 // separator) is painted by the runner before `render_content`
                 // is entered; this fills only the content area it exposes.
+                //
+                // #1864 review round 1: `backend.current_line_height` holds
+                // the editor's VS Code row-pitch override for the rest of
+                // this frame (`sync_per_frame_backend_state` applied it at
+                // the top, every frame) — correct for the editor band,
+                // popups, dialogs and pickers above/below this arm, which
+                // all paint and hit-test in those same `lh` units, but wrong
+                // for sidebar content: `tree_layout`/`list_layout`/
+                // `form_layout`/`msv_layout` (the file explorer, search,
+                // Source Control, extensions, settings and debug panels, all
+                // routed through `paint_sidebar_panel_rung` below) read that
+                // field directly, so the override inflated every one of them
+                // by the same multiplier — untested, unmeasured sidebar
+                // growth. Bracket just this one call: reset to this font's
+                // natural metric (`set_editor_font`'s own doc — it always
+                // re-derives `current_line_height` from the font, the same
+                // mechanism `sync_per_frame_backend_state` itself uses to
+                // seed the override), paint, then restore the override so
+                // every rung after this one keeps agreeing with `lh`/
+                // `painted_line_height()`.
                 render::FrameOp::SidebarPanel => {
                     if let Some(q_sb) = layout.sidebar_content_bounds {
+                        backend.set_editor_font(&editor_family, editor_size_pt);
+                        let natural_lh = backend.line_height() as f64;
                         self.paint_sidebar_panel_rung(
-                            backend, &engine, screen, &theme, q_sb, lh, cw,
+                            backend, &engine, screen, &theme, q_sb, natural_lh, cw,
                         );
+                        if let Some(px) =
+                            resolve_editor_line_height_px(&engine.settings, backend, editor_size_pt)
+                        {
+                            quadraui::Backend::set_current_line_height(backend, px);
+                        }
                         composed.push(render::FrameOp::SidebarPanel);
                     }
                 }
