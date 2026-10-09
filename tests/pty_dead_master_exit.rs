@@ -95,6 +95,64 @@
 //! `#[ignore]`d pending an upstream `crossterm` fix (see that file's own
 //! module doc, and the PENDING entry's "Note on the two `#[ignore]`d
 //! vimcode tests" paragraph).
+//!
+//! # macOS: now measured, and still RED — `#[ignore]`d on `target_os = "macos"` only
+//!
+//! The paragraph above flagged macOS as "structurally-argued, not
+//! measured". It has now been measured, on a real Apple Silicon host
+//! (macOS 26.6.2, `vcd` built `--no-default-features`), and the structural
+//! argument does **not** hold: quadraui#1301's `wait_for_stdin_ready`
+//! narrows the race on Darwin but does not close it, so this test is
+//! *flaky-red* there rather than green.
+//!
+//! Measured 2026-10-08, against the pin in this repo's `Cargo.lock`:
+//!
+//! - **3 failures in 17 standalone runs**, and **2 in 2** when the host was
+//!   simultaneously loaded (the race widens with scheduling pressure, which
+//!   is also why it shows up under a parallel `cargo test` far more often
+//!   than a `--test pty_dead_master_exit` run alone).
+//! - Every failure is the *same* signature the originating vimcode#1735
+//!   bugbash reported, not a slow-but-correct shutdown: `vcd` never exits
+//!   within `EXIT_BUDGET`, and `ps -o utime=,stime=,%cpu=` on the live
+//!   hung process reads `utime 0:00.18, stime 0:00.59, 58.2% CPU` — i.e.
+//!   kernel time ~3x user time, "mostly a syscall loop rather than real
+//!   work", exactly as that bugbash characterised its orphans.
+//!   `peak_cpu_during_wait` as this test measures it came in at 1.33s and
+//!   2.44s of CPU inside the 5s window on two of the failures.
+//! - `sample(1)` could not be used to confirm the *frame* this time (it
+//!   returns an empty call graph for an un-entitled process on this OS
+//!   version without elevation), so the stack-level attribution above —
+//!   parked in `UnixInternalEventSource::try_read`'s bare-`read()` loop —
+//!   is carried over from the #1765-era measurement rather than re-taken.
+//!   The `stime`-dominated CPU profile is consistent with it.
+//!
+//! The remaining Darwin-specific race is in quadraui, not vimcode:
+//! `wait_for_stdin_ready`'s `poll(2)` returns "readable, no hangup bit",
+//! and the hangup lands in the window between that return and the
+//! `Duration::ZERO` crossterm call it then makes — at which point
+//! crossterm's unpatched `try_read` takes its first `Ok(0)` and never
+//! returns, so the next guard check never runs. Darwin's `poll(2)` is
+//! historically weaker than Linux's at reporting `POLLHUP` on a pty slave
+//! promptly, which is precisely the bit a Linux-only run cannot confirm.
+//!
+//! **Per this repo's Platform-Neutrality Rule, there is no vimcode-side fix
+//! to make here** — vimcode polling its own fds around quadraui's event
+//! loop is exactly the per-backend workaround that rule exists to prevent
+//! (the PENDING entry's "Blocks" paragraph makes the same point). So this
+//! test is `#[ignore]`d **on macOS only**, with the Linux coverage it was
+//! un-ignored for (#1775) left fully intact. Gating it costs **zero CI
+//! coverage**: `.github/workflows/ci.yml`'s `test-macos` job runs
+//! `cargo test --lib --no-default-features --features macos`, which never
+//! builds `tests/` at all, so this file has only ever executed on the
+//! Linux jobs (where it is green) and on developer macOS hosts.
+//!
+//! Un-gate this (delete the `cfg_attr` below) once quadraui's
+//! `wait_for_stdin_ready` closes the Darwin half of the race — see
+//! `docs/PENDING_QUADRAUI_ISSUES.md`'s "crossterm 0.29.0 ... busy-spins"
+//! entry, "macOS measurement (2026-10-08)" section, for the ask. Until
+//! then, treat #1735 as **fixed on Linux, reproduced-not-fixed on macOS**:
+//! per this repo's `CLAUDE.md` rule 4, do not describe it as fixed on
+//! macOS in release notes or status reports.
 #![cfg(unix)]
 
 use std::io::{ErrorKind, Read, Write};
@@ -312,6 +370,22 @@ fn parse_ps_time(text: &str) -> Option<f64> {
 }
 
 #[test]
+// Linux: green against the quadraui#1301 pin (#1775), and the lane this
+// test was un-ignored for. macOS: flaky-RED — quadraui#1301's `poll(2)`
+// guard narrows but does not close the race on Darwin ptys; measured 3/17
+// standalone and 2/2 under load, with the #1735 `stime`-dominated
+// busy-spin signature. The fix belongs in quadraui (Platform-Neutrality
+// Rule), so this stays reproduced-not-fixed there. Full measurement and
+// the un-gate condition are in this file's module doc, "macOS: now
+// measured, and still RED".
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "#1735 is still RED on macOS: quadraui#1301's poll(2) hangup \
+              guard does not close the Darwin pty race. Reproduced, not \
+              fixed — see this file's module doc and \
+              docs/PENDING_QUADRAUI_ISSUES.md. Run with --ignored to \
+              re-check against a newer quadraui pin."
+)]
 fn vcd_should_exit_promptly_once_its_pty_master_closes() {
     let home = isolated_home();
     let main_rs = home.join("main.rs");
