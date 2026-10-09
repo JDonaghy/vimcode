@@ -1,5 +1,29 @@
 # VimCode Project State
 
+**Last updated:** October 9, 2026 (#1832 review round 1 — fix the "additive-
+only" violation in `tests/smoke-spec/mac-gui.yaml`). The original #1832 fix
+below (its own entry, unedited) rewrote several pre-existing comment
+paragraphs in place (the "menu-bar/close-button checks are expected GREEN"
+tail, the `move_window` paragraph, the entire "UNLIKE win-gui.yaml... has
+NOT had a real run" paragraph, the "DELIBERATELY OMITTED" paragraph's tail,
+the "Real native traffic-light close button." line) and rewrote one step
+field (`click-file-menu-item`'s `x: 95` → `x: 150`), which review correctly
+flagged against #3509's additive-only policy for this file — the exact
+same class of finding #1833 review round 2 already fixed once in
+`win-terminal.yaml` (see that entry below). Fixed the same way: every
+pre-existing line (including the `x: 95` step field — the real-measured
+`x≈150` is recorded as new, additive commentary instead, with a note that
+updating the field itself is a separate, narrowly-scoped follow-up once
+#1824 clears) is restored to its exact original text/value, and every
+correction/new finding is appended as new, additive paragraphs and comment
+lines instead of edits in place. Confirmed via `git diff
+<merge-base>..HEAD -- tests/smoke-spec/mac-gui.yaml`: every line that diff
+shows as removed is present verbatim elsewhere in the new file (pure
+reordering around newly-inserted additive content, not a content change);
+zero step fields differ from before this issue's first commit. The 29-step
+spec, its real-run results, and `ISSUE_RESOLUTION` are otherwise unchanged
+from the entry below.
+
 **Last updated:** October 9, 2026 (#1832 — `tests/smoke-spec/mac-gui.yaml`'s
 first real run, on macmini, against a real `cargo build --no-default-features
 --features macos --bin vimcode` driven by `coord app-drive run-spec mac-native`

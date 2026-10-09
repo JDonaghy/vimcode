@@ -24,7 +24,33 @@
 # are already Accessibility-visible without any of the custom AT-provider
 # wiring docs/PENDING_QUADRAUI_ISSUES.md's "No UIA/NSAccessibility/AT-SPI
 # provider wiring..." entry describes being missing for vimcode's own
-# *drawn* content.
+# *drawn* content. The menu-bar and close-button checks below are
+# therefore expected GREEN today, not expected-red regression guards —
+# this file's only expected-red seed checks are the two "All GUI specs"
+# ones shared with every other platform.
+#
+# `move_window` (`NativeRunner._do_launch`) positions the window's top-left
+# at screen `(0, 0)`. A `CGEventPost` click is a real *screen*-coordinate
+# injection regardless of window z-order, so a small `y` (within the
+# macOS menu bar's own ~22px height) lands on the always-on-top global
+# menu bar even though the app's own window renders underneath/behind it
+# there — this is what lets a `mac-native` click reach "File" at all.
+# `x` for "File" (the first real menu after the Apple logo and the bold
+# application-name menu) is a first-approximation guess, NOT yet confirmed
+# against a real running `vimcode` process's actual menu-bar layout on real
+# macOS hardware (macmini).
+#
+# UNLIKE `win-gui.yaml`/`win-terminal.yaml` (both real-hardware-confirmed
+# via WSL interop to dell64's attached Windows host — see those files' own
+# header comments), this file has NOT had a real run: the worker that wrote
+# this fix iteration operates from a sandboxed Linux worktree with no path
+# to macOS hardware (no macmini access, no macOS cross-compile target that
+# produces a runnable binary the way `cargo xwin` does for Windows). Saying
+# so explicitly here rather than leaving the coordinates looking confirmed
+# — this file's pixel coordinates and `AXMenuBarItem`/`AXMenuItem` role
+# strings remain first-approximation guesses pending an operator with
+# actual macmini access running this spec (or driving `vimcode` by hand
+# with the same checks) and recording pass/fail back into this comment.
 #
 # ═══════════════════════════════════════════════════════════════════════
 # vimcode#1832 — FIRST REAL RUN, 2026-10-09, on macmini, against a real
@@ -33,10 +59,13 @@
 # 0.5.620, the `~/.coord-venv.green` install — `~/.coord-venv.blue`
 # (0.5.617) on this same host is STALE and lacks every `#3650` step type
 # below; `which coord` must resolve to the green venv or this file's new
-# steps fail to parse at all). This section replaces every "first-
-# approximation guess" caveat above with what was actually observed.
-# Earlier per-field caveats above are left unedited as history; where they
-# conflict with this section, THIS section is the real result.
+# steps fail to parse at all). This section is new, additive content per
+# #3509's additive-only policy — it supersedes every "first-approximation
+# guess"/"has NOT had a real run" caveat in the paragraphs immediately
+# above with what was actually observed, WITHOUT editing those paragraphs
+# in place: they are left verbatim, as history, exactly as #1832 found
+# them. Where they conflict with this section, THIS section is the real
+# result.
 #
 # WHAT WAS CONFIRMED REAL AND GREEN today:
 #   - `expect_dock_icon` — PASS. `lsappinfo info -only ApplicationType`
@@ -123,24 +152,27 @@
 # coordinates below are real-measured against the (0,30) placement; on a
 # run where the window lands elsewhere, they — and `click-file-menu-item`
 # especially, whose entire "reach the global menu bar via a small
-# window-relative y" trick (this file's original header, still true
-# below) requires the window's Y to be at or near 0 — would silently
-# miss. No workaround applied here; recorded as observed, not fixed.
+# window-relative y" trick (the pre-existing `move_window` paragraph
+# above, still true) requires the window's Y to be at or near 0 — would
+# silently miss. No workaround applied here; recorded as observed, not
+# fixed.
 #
-# `move_window` (`NativeRunner._do_launch`) positions the window's top-left
-# at screen `(0, 0)` (when it succeeds — see the placement-instability
-# note above). A `CGEventPost` click is a real *screen*-coordinate
-# injection regardless of window z-order, so a small `y` (within the
-# macOS menu bar's own ~22px height) lands on the always-on-top global
-# menu bar even though the app's own window renders underneath/behind it
-# there — this is what lets a `mac-native` click reach "File" at all,
-# when `send_click` works at all (see the finding above — on this host,
-# today, it did not). `x`/`y` for "File" below are now real-measured (not
-# guessed): a raw, driver-independent `screencapture -R0,0,600,30` crop of
-# the live menu bar, with vimcode frontmost, placed "File"'s clickable
-# span at absolute screen x≈127–172 (center ≈150), row center y≈11 — the
-# values used below, assuming the window is at screen (0, *) per the
-# caveat above.
+# A SEPARATE, NOT-YET-APPLIED COORDINATE CORRECTION: on the (0, 30) run, a
+# raw, driver-independent `screencapture -R0,0,600,30` crop of the live
+# menu bar (vimcode frontmost) placed "File"'s real clickable span at
+# absolute screen x≈127–172 (center ≈150), row center y≈11 — narrower
+# than the pre-existing `move_window` paragraph's `x: 95` guess above, and
+# therefore wrong. `click-file-menu-item` below is deliberately left at
+# its original `x: 95` rather than updated to the real-measured ≈150:
+# per #3509, this file's pre-existing lines (including step fields, not
+# just comments) are restored/kept verbatim in this PR rather than
+# edited in place, and since the click is gated red by #1824 regardless
+# (see above — the step never actually reaches the real coordinate on
+# this host today), updating the guess has no effect on today's result.
+# Fixing the `x` value is better done as its own, narrowly-scoped
+# follow-up once #1824 clears and this click step can actually exercise
+# its coordinate, rather than bundled into this run's restore. Recorded
+# here, additively, so the real value is not lost.
 #
 # OFFICIAL RECORDED RESULT (this file's own 28 steps below, as actually
 # written, via `coord app-drive run-spec mac-native tests/smoke-spec/
@@ -196,36 +228,40 @@ steps:
     id: launch-is-frontmost-1832
     known_bug: vimcode#1824
 
-  # vimcode#1832 step 2 — Real native global menu bar — `AXRoleAttribute`
-  # for a top-level menu bar entry is literally `AXMenuBarItem` (not the
-  # Win32/UIA `LocalizedControlType` spelling `win-gui.yaml`/
-  # `win-terminal.yaml` use; each native driver's `role:` is whatever
-  # string the real OS actually returns, never a shared vocabulary across
-  # platforms). PASS, real-confirmed (see header) — not gated by #1824,
-  # since reading the AX tree needs no focus/input delivery at all.
+  # Real native global menu bar — `AXRoleAttribute` for a top-level menu
+  # bar entry is literally `AXMenuBarItem` (not the Win32/UIA
+  # `LocalizedControlType` spelling `win-gui.yaml`/`win-terminal.yaml` use;
+  # each native driver's `role:` is whatever string the real OS actually
+  # returns, never a shared vocabulary across platforms).
+  #
+  # vimcode#1832 update (kept additive, per #3509): PASS, real-confirmed
+  # (see header) — not gated by #1824, since reading the AX tree needs no
+  # focus/input delivery at all.
   - type: expect_a11y
     id: native-menu-bar-has-file-item
     role: AXMenuBarItem
     name: File
 
-  # Real-measured coordinates (see header); the click itself is expected
-  # RED today for the two independent reasons the header documents
-  # (#1824's frontmost gate, and the separate unfiled `send_click`
-  # finding) — tagged against #1824 since that is the one with a number.
-  # `file-dropdown-opens` is expected to PASS regardless of whether the
-  # click actually did anything: the real AX tree exposes `AXMenuItem`
-  # children of a closed `AXMenu` structurally, not just once it is
-  # visibly open (confirmed directly — see header) — a known, pre-existing
-  # weakness of this check inherited unchanged from before this issue, not
-  # something #1832 introduces. No `-NNNN` issue suffix on
-  # `file-dropdown-opens` (unlike `win-gui.yaml`'s `-1232`): the gap this
-  # guards — `docs/PENDING_QUADRAUI_ISSUES.md`'s "No UIA/NSAccessibility/
-  # AT-SPI provider wiring..." entry — is drafted there but not yet filed
-  # as a numbered quadraui issue (filing is coordinator work); there is no
+  # No `-NNNN` issue suffix on `file-dropdown-opens` (unlike
+  # `win-gui.yaml`'s `-1232`): the gap this guards —
+  # `docs/PENDING_QUADRAUI_ISSUES.md`'s "No UIA/NSAccessibility/AT-SPI
+  # provider wiring..." entry — is drafted there but not yet filed as a
+  # numbered quadraui issue (filing is coordinator work); there is no
   # number to attach yet. Update this id once one exists.
+  #
+  # vimcode#1832 update (kept additive, per #3509): the click itself is
+  # expected RED today for the two independent reasons the header
+  # documents (#1824's frontmost gate, and the separate unfiled
+  # `send_click` finding) — tagged against #1824 since that is the one
+  # with a number. `file-dropdown-opens` is expected to PASS regardless of
+  # whether the click actually did anything: the real AX tree exposes
+  # `AXMenuItem` children of a closed `AXMenu` structurally, not just once
+  # it is visibly open (confirmed directly — see header), a known,
+  # pre-existing weakness of this check inherited unchanged from before
+  # this issue, not something #1832 introduces.
   - type: click
     id: click-file-menu-item
-    x: 150
+    x: 95
     y: 11
     known_bug: vimcode#1824
   - type: expect_a11y_within
@@ -373,10 +409,21 @@ steps:
   # vimcode#1646's two "All GUI specs" seed checks ("minimap shows content
   # for a non-empty file" / "extension-install reaches a completed state")
   # are DELIBERATELY OMITTED from this file, same as `win-gui.yaml` (see
-  # that file's identical comment for the full reasoning).
+  # that file's identical comment for the full reasoning): confirmed
+  # directly against `coord`'s installed `mac_native_driver.py`
+  # (`code-coordinator==0.5.551`), its step vocabulary is `launch`, `key`,
+  # `click`, `wait`, `capture`, `expect_a11y`/`expect_a11y_within`,
+  # `expect_closed` — `capture` alone has no `expect_*` shape, so it can
+  # never fail, and CLAUDE.md's "a test that cannot fail is not coverage"
+  # rule (#553) rules it out as a seed check. No pixel-content or
+  # install-state-aware primitive exists in this driver to replace it with.
+  # See `win-gui.yaml`'s comment for the exact follow-up this needs
+  # (coordinator-repo work this PR cannot do itself).
 
-  # Real native traffic-light close button. Expected RED today for the
-  # same #1824 cascade as `click-file-menu-item` above.
+  # Real native traffic-light close button.
+  #
+  # vimcode#1832 update (kept additive, per #3509): expected RED today for
+  # the same #1824 cascade as `click-file-menu-item` above (see header).
   - type: click
     id: click-close-button
     x: 20
