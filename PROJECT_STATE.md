@@ -1,56 +1,8 @@
 # VimCode Project State
 
-**Last updated:** October 9, 2026 (#1835 review round 1 — self-invalidation
-fix). Fixed every blocking/non-blocking finding from the first review of
-the `-1835` smoke sections below that this worker could fix without a real
-Linux/GTK host (still doesn't have one — see the still-open item at the
-end of this entry). **Blocking fix:** all three filesystem probes in both
-`tests/smoke-spec/tui.yaml` and `tests/smoke-spec/gtk-gui.yaml` were
-permanent one-shot tests — a stale `/tmp` file or extension directory from
-a PRIOR successful run would satisfy `expect_file` even if `:term` never
-opened or the typed command was swallowed entirely THIS run. Fixed three
-ways: (a) the `:term`/extension-install shell commands now `rm` their own
-target before recreating it; (b) a new bare-`:w` probe pair (appends a
-fresh marker suffix, saves with plain `:w`, checks for the suffix) covers
-the issue's literal step-1 gesture in a way that's inherently
-self-invalidating; (c) a trailing cleanup block at the end of each
-`-1835` section removes every file/directory the section created, both so
-the next run starts clean and so the spec stops permanently installing a
-bogus extension into the operator's real `~/.config/vimcode/extensions/`.
-**Re-verified on the real pty** (same macOS-not-Linux caveat as the
-original run below): `coord app-drive run-spec tui-pty` against this
-worktree's locally-built `vcd`, both the `-1835` section standalone and
-appended to the full 1800+-line file — every `-1835` step GREEN on run 1,
-and a manual sanity check confirmed the `rm -f X && echo … > X` compound
-commands and the trailing cleanup actually clear `/tmp` and the extension
-directory afterward (`ls` showed both gone). The pre-existing ~45
-`vim-journey`-section `FAIL`s are still present and still untouched by
-this change — **flagging explicitly per the review's own note that a
-paragraph isn't enough**: this needs a real tracked follow-up issue, which
-the coordinator should file (this worker cannot run `gh`); until then this
-paragraph is the only record. Likewise the `:w {path}` divergence is a
-real, reproduced vimcode bug (confirmed from `execute.rs`: `cmd` is
-matched *exactly* against the literal `"write"`/`"write!"`, so a trailing
-path makes the whole command fall through to "Not an editor command" —
-corrected from this entry's own prior, less precise wording, "ignores a
-trailing path argument", which wrongly implied the current file still
-gets saved) and should also be filed as its own tracked issue by the
-coordinator, with the number then dropped into both spec files' comments.
-**GTK band repositioning (non-blocking, done to the extent possible
-without hardware):** both `expect_region_not_uniform` bands moved from
-deep inside their painted regions toward the top edge (terminal panel:
-its own tab-bar/toolbar row, which paints immediately on open; minimap:
-the first rows of the scaled buffer, which paint regardless of file
-length) — still first-approximation guesses, **still not run on real GTK
-hardware**, exactly as before this round. **Still outstanding, unchanged
-from before this round:** a Linux-hardware run of the TUI section, and any
-run at all of the GTK section — this worker's worktree is still a macOS
-host with no Linux box/container/fleet-SSH access and no `xdotool`/`Xvfb`.
-`ISSUE_RESOLUTION: partial` — same as before this round; nothing in this
-fix pass changes the real-host-run status the issue's own bar requires.
-
 **Last updated:** October 9, 2026 (#1835 — Linux "first five minutes"
-smoke: typing/`:term`/extension-install probes). Added a new
+smoke: typing/`:term`/extension-install probes, through review round 2).
+Added a new
 `-1835`-suffixed section to both `tests/smoke-spec/tui.yaml` (`tui-pty`)
 and `tests/smoke-spec/gtk-gui.yaml` (`gtk-native`), using the
 `type_text`/`expect_file`/`expect_frontmost`/`expect_region_not_uniform`
@@ -72,9 +24,14 @@ macOS identically, per `tui_pty_driver.py`'s own module doc — no
 platform-conditional code in the driver or in vimcode's pty-handling path),
 not literally Linux; a Linux-hardware confirmation of this exact section is
 still outstanding. One real authoring finding, not a bug fix: vimcode's
-`:w`/`"write"` (`src/core/engine/execute.rs`) ignores a trailing path
-argument — unlike real Vim's `:w {path}`, it does not write to a new path.
-`:saveas <path>` is the command vimcode actually implements for that, and
+`:w`/`"write"` (`src/core/engine/execute.rs`) matches `cmd` *exactly*
+against the literal strings `"write"`/`"write!"`, so a trailing path
+argument makes the WHOLE command fall through to the catch-all "Not an
+editor command" arm — unlike real Vim's `:w {path}`, it is an
+unrecognized command and does not even save the current file (corrected
+from an earlier, less precise draft of this paragraph that said `:w`
+"ignores" the path, which wrongly implied the current file still gets
+saved). `:saveas <path>` is the command vimcode actually implements for that, and
 is what both new sections use; not filed as a bug since no documentation
 claims `:w {path}` is supported and fixing engine behavior is out of this
 issue's own scope (smoke-spec authoring only). The full-file run also
@@ -99,8 +56,71 @@ the real host"), the GTK half is not done — needs a Linux/GTK operator (the
 fleet's `precision`/`dellserver`/`dell64` hosts per `coordinator.yml` are
 plausible candidates) to run `tests/smoke-spec/gtk-gui.yaml` and record
 pass/fail (and corrected pixel geometry if the two `-1835` uniform-region
-bands miss) back into that file's own header. `ISSUE_RESOLUTION: partial`
-— TUI half run and green; GTK half authored but unrun, tracked above.
+bands miss) back into that file's own header.
+
+**Review round 1 (self-invalidation fix).** All three filesystem probes
+in both files were permanent one-shot tests — a stale `/tmp` file or
+extension directory from a PRIOR successful run would satisfy
+`expect_file` even if `:term` never opened or the typed command was
+swallowed entirely THIS run. Fixed three ways: (a) the
+`:term`/extension-install shell commands now `rm` their own target
+before recreating it; (b) a new bare-`:w` probe pair (appends a fresh
+marker suffix, saves with plain `:w`, checks for the suffix) covers the
+issue's literal step-1 gesture in a way that's inherently
+self-invalidating; (c) a trailing cleanup block at the end of each
+`-1835` section removes every file/directory the section created, both
+so the next run starts clean and so the spec stops permanently
+installing a bogus extension into the operator's real
+`~/.config/vimcode/extensions/`. Re-verified on the real pty (same
+macOS-not-Linux caveat as above): `coord app-drive run-spec tui-pty`
+against this worktree's locally-built `vcd`, both the `-1835` section
+standalone and appended to the full 1800+-line file — every `-1835` step
+GREEN, and a manual sanity check confirmed the `rm -f X && echo … > X`
+compound commands and the trailing cleanup actually clear `/tmp` and the
+extension directory afterward (`ls` showed both gone).
+
+**Review round 2 (bare-`:w` adjacency bug + hardening).** Round 1's GTK
+bare-`:w` probe asserted `contains` on the two markers being *adjacent*
+in the saved file, but the GTK section (unlike its TUI twin) never
+clears the buffer first, so `A` (append-at-end-of-line) lands the
+`_WBARE` suffix after the launch file's own original line-1 text, not
+after the first marker — the assertion could never match on a real host.
+Fixed by typing the FULL second marker
+(`VIMCODE_SMOKE_SAVE_PROBE_1835_GTK_WBARE`) as one contiguous
+`type_text` instead of appending a bare `_WBARE` suffix, so the asserted
+string is exactly what was just typed in one shot and does not depend on
+what precedes it on the line — adjacency to the first marker is no
+longer required. Also, per review: (1) corrected the `1b.` comments in
+both files to stop claiming the suffix check is self-invalidating
+*across* runs — it is only self-invalidating *within* a run (vs. the
+`:saveas` probe above it); cross-run invalidation for the save probe
+rests entirely on the trailing cleanup block, and that limitation (the
+cleanup itself doesn't run, and can't be verified to have run, if an
+earlier step in the same section fails first) is now stated explicitly
+in both files' section headers instead of being implied away; (2) split
+the extension-install probe's destructive `rm -rf <extdir>` onto its own
+typed line/Enter, separate from the `mkdir -p`/`echo` that recreates it,
+in both files — a dropped character in the single long compound command
+could previously have let a truncated `rm -rf` resolve to a shorter real
+path (`~/.config/vimcode/extensions` or `~/.config/vimcode`) on the
+operator's own machine; isolating it to its own line makes that failure
+mode visibly wrong (nothing to recreate afterward) rather than silently
+destructive. Not changed, flagged instead: a per-run unique token (vs.
+reusing the same fixed `/tmp`/extension-dir names every run) would close
+the cleanup-didn't-run residual gap for good, but the spec format has no
+run-id primitive to build one from; the GTK `type_text`-lands-in-the-
+wrong-window false-pass vector (a vimcode#1825-class misrouting bug
+could let the `:term` probe's shell command execute in the launching
+terminal instead of the panel, same effect, same file, still a pass) has
+no cheap structural fix beyond the `expect_frontmost` gate already in
+place before any typed input; and the two `expect_region_not_uniform`
+bands remain unvalidated guesses pending a real GTK/Linux run, unchanged
+from round 1.
+
+`ISSUE_RESOLUTION: partial` — TUI half run (green, on a macOS pty, not
+the Linux host the issue names) and GTK half authored but still never
+run on a real GTK/Linux host; neither half meets the issue's own bar
+("the spec has actually run on the real host") yet.
 
 **Last updated:** October 8, 2026 (#1853 CI fix round 1 — register the
 bundled icon font **once per process**, and stop the new GTK glyph test

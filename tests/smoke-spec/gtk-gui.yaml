@@ -182,9 +182,27 @@ steps:
   # Unlike the TUI section's `:%d` buffer-clear, this GTK section never
   # clears the launched buffer before typing, so `:saveas`/`:w` below
   # write the launch file's ORIGINAL content plus the typed markers, not
-  # just the markers alone -- harmless for a `contains` assertion (the one
-  # thing every probe here checks), just noted so it doesn't read as an
-  # oversight beside its TUI twin.
+  # just the markers alone. Round 1 claimed this was harmless for every
+  # `contains` assertion here; round 2's review found that claim false
+  # for the bare-`:w` probe specifically -- `A` (append-at-end-of-line)
+  # landed its suffix after the launch file's own original text, not
+  # adjacent to the first marker, so the OLD suffix-only assertion could
+  # never match on a real host. Fixed by typing the full second marker in
+  # one contiguous `type_text` instead of a bare suffix (see the
+  # `w-bare-probe-*-1835` steps' own comment below) -- with that fix the
+  # not-clearing-the-buffer choice really is harmless again, for the
+  # reason originally claimed.
+  #
+  # Review round 2 also notes a residual limitation of the trailing
+  # cleanup block this section relies on for cross-run self-invalidation
+  # (see PROJECT_STATE.md for the full writeup): the cleanup is typed
+  # into the terminal pane opened by step 2, so if ANY earlier step in
+  # this section fails first, the cleanup never runs and the `/tmp`
+  # files / extension directory survive for the NEXT run to stale-pass
+  # against. A per-run-unique path/suffix would close this for good; the
+  # spec format has no run-id primitive to build one from, so this is a
+  # known, accepted residual gap, not something the probes below claim to
+  # solve.
 
   # 0. `expect_frontmost` -- the vimcode#1824 "app never becomes
   # frontmost" class of bug, checked before any typed input below so a
@@ -241,17 +259,35 @@ steps:
     contains: "VIMCODE_SMOKE_SAVE_PROBE_1835_GTK"
     timeout_ms: 5000
 
-  # 1b. Bare `:w` -> `expect_file`. Appends a NEW marker suffix before
-  # saving so this check is self-invalidating: a leftover file (from an
-  # earlier run, or from the `:saveas` probe just above) would be missing
-  # the `_WBARE` suffix and fail `contains` -- it can only pass if this
-  # `:w` actually just wrote the buffer.
+  # 1b. Bare `:w` -> `expect_file`. Appends a NEW, FULL marker (not just a
+  # suffix -- review round 2) before saving so this check is
+  # self-invalidating WITHIN this run: a leftover file from the
+  # `:saveas` probe just above would be missing this marker and fail
+  # `contains` -- it can only pass if this `:w` actually just wrote the
+  # buffer. (It is NOT self-invalidating ACROSS runs -- a leftover file
+  # from any PAST successful run already contains this exact marker too;
+  # cross-run invalidation for this probe rests entirely on the trailing
+  # cleanup block at the end of this section, which does not run, and
+  # cannot be verified to have run, if an earlier step in this section
+  # fails first.)
+  #
+  # Round-2 fix: `key: A` is Vim append-AT-END-OF-LINE
+  # (`src/core/engine/keys.rs`), and unlike the TUI twin's section this
+  # GTK section never clears the buffer first (see this section's header
+  # comment), so line 1 at this point reads `<first marker><launch
+  # file's own original line-1 text>` -- appending just a `_WBARE` SUFFIX
+  # would land it after that original text, not adjacent to the first
+  # marker, and the `contains` assertion below could never match on a
+  # real host. Typing the FULL second marker in one `type_text` call
+  # fixes this: the asserted string is exactly what was just typed in a
+  # single contiguous block, so it does not depend on what precedes it
+  # on the line.
   - type: key
     id: w-bare-probe-append-key-1835
     key: A
   - type: type_text
     id: w-bare-probe-append-text-1835
-    text: "_WBARE"
+    text: "VIMCODE_SMOKE_SAVE_PROBE_1835_GTK_WBARE"
   - type: key
     id: w-bare-probe-esc-1835
     key: esc
@@ -290,6 +326,17 @@ steps:
   # header, "AT-provider-wiring" gap), and `expect_region_not_uniform`
   # itself is a single immediate check with no retry/timeout, so using it
   # here would just race the same paint instead of waiting for it.
+  #
+  # False-pass vector this probe's `rm -f && echo` prefix does NOT close
+  # (review round 2): `type_text` on this driver is real X11 input, so
+  # under a vimcode#1825-class misrouting bug (keys land on the
+  # LAUNCHING terminal instead of the panel) this exact `rm -f … && echo
+  # MARKER > …` line would execute in that launching shell and create
+  # the file anyway, making this probe green with a dead `:term`.
+  # `launch-is-frontmost-1835` at the top of this section is a PARTIAL
+  # guard against exactly this (focus is checked once, right after
+  # launch, before any typed input) -- it does not re-check focus here,
+  # immediately before this command, so it cannot fully close the gap.
   - type: key
     id: term-probe-colon-1835
     key: ':'
@@ -339,9 +386,26 @@ steps:
   # install path and needs a real network fetch). The command now `rm
   # -rf`s its own target directory before recreating it (review round 1),
   # for the same self-invalidation reason as the `:term` probe above.
+  #
+  # The destructive `rm -rf` is its OWN typed line/Enter, separate from
+  # the `mkdir -p`/`echo` that recreates the directory (review round 2):
+  # `type_text` on this driver is real X11 input (`xdotool type`), and a
+  # dropped character anywhere in one long compound command could have
+  # let a truncated `rm -rf` resolve to a SHORTER real path
+  # (`~/.config/vimcode/extensions` or `~/.config/vimcode`) on the
+  # operator's own machine. Splitting it out doesn't make dropped
+  # characters impossible, but it makes that failure mode visibly wrong
+  # (the extension directory is simply gone, with nothing recreated
+  # afterward) instead of silently destructive.
+  - type: type_text
+    id: ext-install-probe-rm-1835
+    text: "rm -rf ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk"
+  - type: key
+    id: ext-install-probe-rm-enter-1835
+    key: enter
   - type: type_text
     id: ext-install-probe-1835
-    text: "rm -rf ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk && mkdir -p ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk && echo 'name = \"vimcode-smoke-ext-1835-gtk\"' > ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk/manifest.toml && echo 'display_name = \"VimCode Smoke Ext 1835 GTK\"' >> ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk/manifest.toml"
+    text: "mkdir -p ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk && echo 'name = \"vimcode-smoke-ext-1835-gtk\"' > ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk/manifest.toml && echo 'display_name = \"VimCode Smoke Ext 1835 GTK\"' >> ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk/manifest.toml"
   - type: key
     id: ext-install-probe-enter-1835
     key: enter
