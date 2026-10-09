@@ -1,5 +1,23 @@
 # VimCode Project State
 
+**Last updated:** October 9, 2026 (#1833 review round 2 — restore the one
+pre-existing line review round 1 rewrote in `tests/smoke-spec/win-terminal.yaml`,
+per #3509's additive-only policy). Round 1's fix #4 below corrected the
+`open-second-tab` step's stale comment ("Ctrl+T opens a second editor tab" —
+it doesn't) by rewriting it in place, which review round 2 flagged as
+weakening/rewriting an existing line in this file's Tier-2 smoke-spec entry
+point, even though the rewrite was comment-only and changed no check. Fixed
+by reverting that paragraph to its exact original wording and appending the
+correction as new, additive lines immediately after it (the same "kept
+verbatim, corrected in a new paragraph" pattern this file's own header
+already uses for its #1829 update section) rather than editing text in
+place. No other line in this PR's diff pre-dates #1833 (confirmed via `git
+diff <merge-base>..HEAD -- tests/smoke-spec/win-terminal.yaml PROJECT_STATE.md`
+showing zero `-` lines against lines that existed before this issue's first
+commit); round 1's three other fixes and the minimap/stale-probe/`:term`-focus
+corrections they made are unchanged. `ISSUE_RESOLUTION: partial` still stands,
+for the same reasons round 1 recorded below.
+
 **Last updated:** October 9, 2026 (#1833 review round 1 — fix four blocking
 findings in `tests/smoke-spec/win-terminal.yaml`'s new step groups). **Fix,
 not reimplementation; no re-verification on real hardware was possible from

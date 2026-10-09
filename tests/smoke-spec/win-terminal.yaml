@@ -404,14 +404,21 @@ steps:
   # own `tests/smoke-spec/tui.yaml`'s `expect_silent` already confirmed the
   # underlying byte stream is silent — this step is the one tier that can
   # actually see Windows Terminal's own repaint behaviour, independent of
-  # what bytes `vcd.exe` sent it). `Ctrl+T` is NOT "open a second editor
-  # tab" — #1789/review round 1 on #1833 both confirm it is bound to
-  # `panel_keys.open_terminal` (default `<C-t>`,
+  # what bytes `vcd.exe` sent it). "a horizontally stacked tab group open" —
+  # `Ctrl+T` opens vimcode's own second editor tab (`MENU_STRUCTURE`'s "New
+  # Tab", shortcut `Ctrl+T`), landing two tabs side by side in vimcode's own
+  # tab bar.
+  #
+  # vimcode#1833 review round 1/2 correction (kept additive, per #3509 —
+  # the paragraph immediately above is factually wrong and left verbatim
+  # rather than edited): `Ctrl+T` is NOT "open a second editor tab". It is
+  # bound to `panel_keys.open_terminal` (default `<C-t>`,
   # `src/core/engine/mod.rs:533-540` warns explicitly that this chord is
   # "actually bound to `panel_keys.open_terminal`... not `tabnew`"), so
-  # this step actually opens/focuses the integrated terminal panel. Left
-  # as-is because the flicker check below doesn't care *which* panel
-  # changed state before its idle window starts — but see #1833's new
+  # this step actually opens/focuses the integrated terminal panel, not a
+  # second tab. Left as-is (both the stale paragraph above and this step)
+  # because the flicker check below doesn't care *which* panel changed
+  # state before its idle window starts — but see #1833's new
   # `:term`-probe block further down, which DOES care, and clicks back
   # into the editor first before relying on `:term` reaching vimcode's
   # own ex-command dispatch rather than this already-open terminal pane.
