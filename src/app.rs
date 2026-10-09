@@ -1747,6 +1747,39 @@ impl App {
         );
         cfg.min_sidebar_width = render::ALT_SIDEBAR_WIDTH_MIN as f32;
         cfg.max_sidebar_width = render::ALT_SIDEBAR_WIDTH_MAX as f32;
+        // #1877: reserve one line-height each for the always-present
+        // command line and the (near-always-present) status line at the
+        // *shell* level, so `AppShellLayout::activity_bar_bounds` — and
+        // `sidebar_header_bounds`/`sidebar_content_bounds` — stop one-plus
+        // rows above the window's bottom edge instead of running the full
+        // window height. Without this, `AppShell::compute_layout` has no
+        // idea vimcode paints its own bottom chrome underneath
+        // `main_content_bounds`, so the activity bar's bottom-pinned
+        // Settings button ends up pinned to the *window's* bottom edge —
+        // the exact same y-range vimcode's own status/command-line rows
+        // occupy — instead of ending above them the way VS Code's does.
+        //
+        // `with_status_bar()`/`with_command_line()` each reserve a static
+        // `line_height.round()` row — not vimcode's own dynamic
+        // `render::status_bar_height_px`/wildmenu/quickfix bottom-chrome
+        // total, which quadraui's `ShellConfig` has no knob for (`#[cfg]`-
+        // gating a dynamic per-frame height onto `AppShellLayout` would be
+        // new backend-shaped decision logic, not thin wiring — see
+        // `CLAUDE.md`'s Platform-Neutrality Rule). Two static rows exactly
+        // matches the common case (one status row + the always-present
+        // command line) that this issue reports; a frame with wildmenu or
+        // quickfix *also* open still has a few extra rows of bottom chrome
+        // this reservation doesn't know about, a strictly smaller residual
+        // gap than today's "reserves nothing at all". Neither band is
+        // painted by quadraui itself — `render_content` keeps painting
+        // vimcode's own status/command-line rows into
+        // `main_content_bounds` exactly as before; see
+        // `render::main_content_true_height`'s doc for how `render_content`
+        // un-does this reservation's shrink of `main_content_bounds`
+        // before computing editor/status/command-line geometry, so this
+        // reservation affects only the activity bar/sidebar's painted
+        // height, never where the editor or its chrome actually paint.
+        cfg = cfg.with_command_line().with_status_bar();
         cfg
     }
 
@@ -9558,12 +9591,18 @@ impl App {
                 }
                 if buttons.left {
                     let main = ctx.layout.main_content_bounds;
+                    // #1877: the recovered (un-shrunk) height — see
+                    // `render::main_content_true_height`'s doc — so a drag
+                    // that clamps against the content height (e.g. the
+                    // picker popup bounds `handle_mouse_drag_msg` computes)
+                    // still clamps against the window's true bottom edge,
+                    // not `shell_config`'s static bottom-chrome reservation.
                     self.handle_mouse_drag_msg(
                         &*backend,
                         position.x as f64,
                         position.y as f64,
                         main.width as f64,
-                        main.height as f64,
+                        render::main_content_true_height(ctx.layout) as f64,
                     );
                 }
             }
@@ -9983,11 +10022,15 @@ impl App {
 /// This should hold on *every* backend by construction: quadraui's
 /// `compose::app_shell::compute_layout` derives `AppShellLayout::
 /// main_content_bounds` from this exact `viewport` (title bar carved off
-/// the top; nothing reserved below, since vimcode never opts into
-/// quadraui's own status-bar/command-line bands — `render_content`'s own
-/// `status_bar_h`/`cmd_y` locals lay both rows out entirely inside
-/// `main_content_bounds` instead), and `cmd_y + lh` always resolves to
-/// `main.y + main.height` (see the `FrameOp::CommandLine` arm below). A
+/// the top). #1877: `shell_config` now also opts into quadraui's own
+/// `with_command_line()`/`with_status_bar()` bands — but only so
+/// `activity_bar_bounds`/`sidebar_*_bounds` stop above them; `h` here is
+/// `render::main_content_true_height(layout)`, which adds that
+/// reservation straight back, so `render_content`'s own `status_bar_h`/
+/// `cmd_y` locals still lay both rows out as if nothing were reserved
+/// below `main_content_bounds`, and `cmd_y + lh` always resolves to
+/// `main.y + h`, i.e. `viewport.height` (see the `FrameOp::CommandLine`
+/// arm below). A
 /// live macOS run is the one environment this fleet cannot check that
 /// construction against directly — no macOS cross-toolchain is
 /// installed (`src/macos/mod.rs`'s "Verifying this file without a Mac").
@@ -10276,11 +10319,20 @@ impl quadraui::ShellApp for App {
         let layout = &corrected_layout;
 
         let main = layout.main_content_bounds;
+        // #1877: `h` is the *recovered* content height, not
+        // `main.height` directly — `shell_config`'s
+        // `with_command_line()`/`with_status_bar()` reservation already
+        // shrank `main_content_bounds` by one static row each so the
+        // activity bar/sidebar stop above them; every line below this one
+        // keeps assuming `h` reaches the window's true bottom edge (it
+        // subtracts vimcode's own *dynamic* bottom-chrome height itself),
+        // so `h` has to be un-shrunk back to that same true height here —
+        // see `render::main_content_true_height`'s doc.
         let (x, y, w, h) = (
             main.x as f64,
             main.y as f64,
             main.width as f64,
-            main.height as f64,
+            render::main_content_true_height(layout) as f64,
         );
         if w < 1.0 || h < 1.0 {
             return;
@@ -10854,6 +10906,46 @@ impl quadraui::ShellApp for App {
                 // A) and `mouse.rs`'s "Menu bar row click — command center
                 // only".
                 render::FrameOp::CommandCenter => {
+                    // #1877: on a native-menu backend (macOS) `presence.
+                    // menu_row` is `false` (#901 suppresses the drawn
+                    // `File Edit View` row under AppKit's real menu bar),
+                    // so `FrameOp::MenuDropdown`'s own arm — the one that
+                    // paints `paint_title_bar_band`'s themed background
+                    // fill across `menu_row_rect` — never composes this
+                    // frame (`presence.menu_dropdown` stays coupled to
+                    // `presence.menu_row`, pinned by
+                    // `command_center_liveness_is_split_from_menu_bar_visible`
+                    // in `render.rs`). The Command Center rung below is
+                    // then the *only* thing painting into this band, and
+                    // its own rect starts at `menu_end` — one
+                    // `titlebar_control_inset()`-wide step clear of the
+                    // leading edge (#940), so vimcode never draws under
+                    // the real traffic lights — leaving that leading
+                    // strip with no vimcode paint call touching it at
+                    // all. A plain CG/Cairo/Direct2D surface shows
+                    // whatever the OS filled the view with there (macOS:
+                    // the window's own background colour, not the theme),
+                    // which is this issue's "traffic-light strip isn't
+                    // themed" report. Fill the *entire* row — inset
+                    // included — with the theme's title-bar colour first,
+                    // the same empty-`MenuBar` background-only trick the
+                    // app-icon slot filler above uses, mirroring VS Code's
+                    // own macOS title bar (which paints the full row
+                    // including behind the traffic lights). A no-op
+                    // repaint on every other backend: there,
+                    // `presence.menu_row` is `true` whenever this rung is
+                    // live, so `FrameOp::MenuDropdown` already painted
+                    // this exact fill across this exact rect immediately
+                    // beforehand.
+                    if !presence.menu_row {
+                        let filler = quadraui::MenuBar {
+                            id: quadraui::WidgetId::new("title_row_background_fill"),
+                            items: Vec::new(),
+                            open_item: None,
+                            focused_item: None,
+                        };
+                        let _ = backend.draw_menu_bar(menu_row_rect, &filler);
+                    }
                     if let Some(cc_rect) = command_center_rect.filter(|r| r.width >= 1.0) {
                         let title = engine
                             .cwd
