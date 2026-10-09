@@ -14141,15 +14141,18 @@ pub const TUI_MINIMAP_SIZING: quadraui::MinimapSizing = quadraui::MinimapSizing:
 /// see `minimap_reserved_width`'s doc comment.
 ///
 /// A single column-based `MinimapSizing` (`resolve_width(pane_width,
-/// real_char_width)`) using `resolve_width`'s own `target_cols.min(pane_width_cols
-/// * fraction).clamp(min, max)` arithmetic was tried first and reverted:
+/// real_char_width)`) using `resolve_width`'s own
+/// `target_cols.min(pane_width_cols * fraction).clamp(min, max)` arithmetic
+/// was tried first and reverted:
 /// `resolve_width` normalises `pane_width` into columns via the *editor's*
 /// `char_width` before applying `fraction`/`min`/`max`, then converts back —
 /// correct when the bounds genuinely mean "columns of the editor's own
 /// font", but VS Code's minimap renders in its *own*, much smaller font,
 /// decoupled from the editor's for that formula's purposes. Feeding a real
 /// editor `char_width` (7-9px) through that *linear-fraction* formula moved
-/// an ordinary wide GTK pane's strip from VS Code's ~120px to ~180-240px — caught by a driver test (`gtk::testing::minimap`) exercising the real paint path.
+/// an ordinary wide GTK pane's strip from VS Code's ~120px to ~180-240px —
+/// caught by a driver test (`gtk::testing::minimap`) exercising the real
+/// paint path.
 ///
 /// #1869: VS Code's *real* width formula (`EditorLayoutInfoComputer` in
 /// `editorOptions.ts`) is not that linear-fraction shape at all — it is
@@ -14191,8 +14194,15 @@ pub fn gtk_minimap_sizing() -> quadraui::MinimapSizing {
 ///                         + MINIMAP_GUTTER_WIDTH(8))
 /// ```
 ///
-/// `remaining_width` is the caller's own pane width, in the same raw-pixel
-/// unit [`minimap_reserved_width`] already receives as `rect_width`.
+/// `remaining_width` is **already gutter-subtracted** by the caller
+/// ([`minimap_reserved_width`]) — matching the formula block quoted above,
+/// where `remainingWidth = editor outer width - gutter (glyph margin + line
+/// numbers + folding)`, never the pane's raw rect width. A pre-#1869-fix-
+/// round-1 version of this function was fed the full, un-subtracted pane
+/// width here and this doc comment claimed that was correct ("the caller's
+/// own pane width") — it was not: at the issue's measured case (editor area
+/// ≈872px, Menlo 12, `cw≈7.22`) that shape gave 112px against VS Code's own
+/// ≈97–104px, off by roughly the gutter term it was skipping.
 /// `typical_char_width` is the *real* editor font's cell width — unlike the
 /// linear-fraction formula this replaces (see `gtk_minimap_sizing`'s doc
 /// comment), this one is explicitly a function of it, so the minimap
@@ -14228,13 +14238,14 @@ const MINIMAP_GUTTER_WIDTH_PX: f64 = 8.0;
 /// **not** the width any backend's own vertical scrollbar actually paints
 /// at today. That gutter is quadraui's `EditorLayout::layout_with_options`
 /// (`v_scrollbar_w = cell_width`, a font-sized ~7-9px column, not a fixed
-/// 14px one) — a quadraui-side gap #1869's final report files separately,
-/// since vimcode must not work around it locally (Platform-Neutrality
-/// Rule). VS Code itself computes the minimap's width against its
-/// *configured* scrollbar width regardless of what ends up painted, so
-/// this constant is correct for the minimap formula even while that
-/// scrollbar gap is still open.
-pub(crate) const MINIMAP_VERTICAL_SCROLLBAR_WIDTH_PX: f64 = 14.0;
+/// 14px one) — a quadraui-side gap drafted in
+/// `docs/PENDING_QUADRAUI_ISSUES.md` (not yet filed as a real GitHub issue:
+/// #1869 cannot close until it is and quadraui ships a fix), since vimcode
+/// must not work around it locally (Platform-Neutrality Rule). VS Code
+/// itself computes the minimap's width against its *configured* scrollbar
+/// width regardless of what ends up painted, so this constant is correct
+/// for the minimap formula even while that scrollbar gap is still open.
+const MINIMAP_VERTICAL_SCROLLBAR_WIDTH_PX: f64 = 14.0;
 
 /// Buffer lines sampled per *display* row of minimap height.
 ///
@@ -14490,23 +14501,87 @@ pub struct RenderedMinimap {
 /// backends (and `build_screen_layout`, which shrinks each window rect by
 /// exactly this much) reclaim identical geometry when `:set nominimap`
 /// turns the strip off.
+///
+/// `gutter_width` (#1869 review round 1) is the pane's own line-number/fold
+/// gutter, in the same unit as `rect_width` — subtracted *only* on the
+/// [`vs_code_minimap_width_px`] path, matching VS Code's own
+/// `remainingWidth = editor outer width - gutter` (see that function's doc
+/// comment). TUI's `sizing.resolve_width()` path ignores it: TUI sizing is
+/// out of #1869's scope and its callers (and every unit test below except
+/// the real `build_screen_layout` call site) pass `0.0`, i.e. "rect_width is
+/// already the remaining width" — the function's pre-#1869-round-1 contract,
+/// preserved for every caller that isn't the real per-window production path.
 pub fn minimap_reserved_width(
     engine: &Engine,
     rect_width: f64,
     char_width: f64,
     sizing: quadraui::MinimapSizing,
+    gutter_width: f64,
 ) -> f64 {
     let want = match sizing {
         quadraui::MinimapSizing::VsCodeParity { target_cols, .. }
             if target_cols == MINIMAP_TARGET_COLS as f32 =>
         {
-            vs_code_minimap_width_px(rect_width, char_width)
+            vs_code_minimap_width_px((rect_width - gutter_width).max(0.0), char_width)
         }
         _ => sizing.resolve_width(rect_width as f32, 1.0).unwrap_or(0.0) as f64,
     };
     let cw = if char_width > 0.0 { char_width } else { 1.0 };
     let has = engine.settings.minimap && rect_width >= want + MINIMAP_MIN_TEXT_COLS * cw;
     quadraui::reserved_width(want as f32, has) as f64
+}
+
+/// This window's own line-number/fold gutter width, in the caller's pixel
+/// unit — the `remaining_width = editor outer width - gutter` term
+/// [`vs_code_minimap_width_px`]'s formula needs and the pre-#1869-round-1
+/// shape silently skipped (2026-review finding: "remaining_width is wrong").
+///
+/// Computed from [`calculate_gutter_cols`] — the same function
+/// `build_rendered_window` uses for the real painted gutter — fed this
+/// window's own buffer/settings state directly, since this runs *before*
+/// `build_rendered_window` (the `minimap_widths` map in
+/// `build_screen_layout_with_breadcrumb_row` has to know the strip's width
+/// before it can compute each window's rect). Two inputs
+/// `build_rendered_window`'s own `has_git`/`has_bp` fold in are deliberately
+/// **not** replicated here, both documented, bounded deviations:
+///
+/// - `has_git` there also covers the in-flight ACP-turn-checkpoint overlay
+///   (`acp_turn_status`) — here it is just `!git_diff.is_empty()`, since the
+///   checkpoint lookup needs a `pre_turn_content` fetch this sizing pass has
+///   no reason to pay for on every frame.
+/// - `has_bp` there also covers an in-viewport decor sign (`has_decor_sign`)
+///   — here it is just "a real breakpoint is set, or a DAP session is
+///   live", since the decor check needs a resolved scroll/visible-lines
+///   window this sizing pass doesn't have yet.
+///
+/// Both gaps can only make the *real* painted gutter one column wider than
+/// this estimate, and only while a checkpoint/decor sign is actually
+/// outstanding — a transient, bounded case where the minimap strip comes
+/// out fractionally wider than VS Code's formula predicts, not a silent
+/// misrepresentation of the formula's own `remainingWidth` term.
+fn window_minimap_gutter_width_px(engine: &Engine, window_id: WindowId, char_width: f64) -> f64 {
+    let Some(window) = engine.windows.get(&window_id) else {
+        return 0.0;
+    };
+    let Some(buffer_state) = engine.buffer_manager.get(window.buffer_id) else {
+        return 0.0;
+    };
+    let total_lines = buffer_state.buffer.len_lines();
+    let line_number_mode = if buffer_state.md_rendered.is_some() {
+        LineNumberMode::None
+    } else {
+        engine.settings.line_numbers
+    };
+    let has_git = !buffer_state.git_diff.is_empty();
+    let has_bp = buffer_state
+        .file_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .and_then(|key| engine.dap_breakpoints.get(&key).map(|v| !v.is_empty()))
+        .unwrap_or(false)
+        || engine.dap_session_active;
+    let cols = calculate_gutter_cols(line_number_mode, total_lines, char_width, has_git, has_bp);
+    cols as f64 * char_width
 }
 
 /// Width of the scroll-affordance gutter a pane's rightmost edge must keep
@@ -17885,7 +17960,9 @@ pub fn build_screen_layout_with_breadcrumb_row(
     let minimap_widths: std::collections::HashMap<WindowId, f64> = window_rects
         .iter()
         .map(|(id, r)| {
-            let raw = minimap_reserved_width(engine, r.width, char_width, minimap_sizing);
+            let gutter_px = window_minimap_gutter_width_px(engine, *id, char_width);
+            let raw =
+                minimap_reserved_width(engine, r.width, char_width, minimap_sizing, gutter_px);
             let w = if raw > 0.0 {
                 let cw = if char_width > 0.0 { char_width } else { 1.0 };
                 let gutter = scroll_gutter_width(scrollbar_reserve, char_width);
@@ -33583,7 +33660,7 @@ mod tests {
         // isn't already a whole number, not `floor(minimap_w)`. See the
         // split-pane test below, whose 79-column pane is the first fixture
         // in this file to actually exercise a fractional `minimap_w`.
-        let expected_cols = (minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING)
+        let expected_cols = (minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING, 0.0)
             + scroll_gutter_width(0.0, 1.0))
         .ceil() as usize;
 
@@ -33656,7 +33733,7 @@ mod tests {
             // `build_screen_layout`'s real reclaimed width by exactly one
             // column.
             let expected_cols =
-                (minimap_reserved_width(&e, w_without.rect.width, 1.0, TUI_MINIMAP_SIZING)
+                (minimap_reserved_width(&e, w_without.rect.width, 1.0, TUI_MINIMAP_SIZING, 0.0)
                     + scroll_gutter_width(0.0, 1.0))
                 .ceil() as usize;
             assert_eq!(
@@ -33772,15 +33849,15 @@ mod tests {
     fn minimap_reserved_width_is_zero_when_the_setting_is_off() {
         let mut e = minimap_engine();
         e.settings.minimap = true;
-        assert!(minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING) > 0.0);
-        assert!(minimap_reserved_width(&e, 1200.0, 8.0, gtk_minimap_sizing()) > 0.0);
+        assert!(minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING, 0.0) > 0.0);
+        assert!(minimap_reserved_width(&e, 1200.0, 8.0, gtk_minimap_sizing(), 0.0) > 0.0);
         e.settings.minimap = false;
         assert_eq!(
-            minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING),
+            minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING, 0.0),
             0.0
         );
         assert_eq!(
-            minimap_reserved_width(&e, 1200.0, 8.0, gtk_minimap_sizing()),
+            minimap_reserved_width(&e, 1200.0, 8.0, gtk_minimap_sizing(), 0.0),
             0.0
         );
     }
@@ -33808,7 +33885,7 @@ mod tests {
         // itself suppress the strip.
         let pane_width = 100.0;
         let char_width = 1.0;
-        let got = minimap_reserved_width(&e, pane_width, char_width, gtk_minimap_sizing());
+        let got = minimap_reserved_width(&e, pane_width, char_width, gtk_minimap_sizing(), 0.0);
         // Hand-computed VS Code formula, independent of
         // `vs_code_minimap_width_px`'s own implementation: floor((100 - 14
         // - 2) / (1.0 + 1.0)) + 8 = floor(84 / 2) + 8 = 42 + 8 = 50.
@@ -33828,7 +33905,7 @@ mod tests {
     fn minimap_suppresses_itself_in_a_narrow_window() {
         let e = minimap_engine();
         assert_eq!(
-            minimap_reserved_width(&e, 20.0, 1.0, TUI_MINIMAP_SIZING),
+            minimap_reserved_width(&e, 20.0, 1.0, TUI_MINIMAP_SIZING, 0.0),
             0.0,
             "a 20-column window cannot spare the minimap's floor width plus \
              MINIMAP_MIN_TEXT_COLS of surviving text"
@@ -34128,8 +34205,8 @@ mod tests {
     #[test]
     fn minimap_reserved_width_scales_with_a_narrow_pane_width() {
         let e = minimap_engine();
-        let narrow = minimap_reserved_width(&e, 40.0, 1.0, TUI_MINIMAP_SIZING);
-        let wide = minimap_reserved_width(&e, 70.0, 1.0, TUI_MINIMAP_SIZING);
+        let narrow = minimap_reserved_width(&e, 40.0, 1.0, TUI_MINIMAP_SIZING, 0.0);
+        let wide = minimap_reserved_width(&e, 70.0, 1.0, TUI_MINIMAP_SIZING, 0.0);
         assert_eq!(narrow, 40.0 * MINIMAP_WIDTH_FRACTION);
         assert_eq!(wide, 70.0 * MINIMAP_WIDTH_FRACTION);
         assert!(
@@ -34150,9 +34227,9 @@ mod tests {
     #[test]
     fn minimap_reserved_width_holds_steady_across_ordinary_pane_widths() {
         let e = minimap_engine();
-        let at_100 = minimap_reserved_width(&e, 100.0, 1.0, TUI_MINIMAP_SIZING);
-        let at_150 = minimap_reserved_width(&e, 150.0, 1.0, TUI_MINIMAP_SIZING);
-        let at_200 = minimap_reserved_width(&e, 200.0, 1.0, TUI_MINIMAP_SIZING);
+        let at_100 = minimap_reserved_width(&e, 100.0, 1.0, TUI_MINIMAP_SIZING, 0.0);
+        let at_150 = minimap_reserved_width(&e, 150.0, 1.0, TUI_MINIMAP_SIZING, 0.0);
+        let at_200 = minimap_reserved_width(&e, 200.0, 1.0, TUI_MINIMAP_SIZING, 0.0);
         assert_eq!(
             (at_100, at_150, at_200),
             (
@@ -34182,8 +34259,8 @@ mod tests {
     fn minimap_reserved_width_scales_with_char_width_per_vs_code_formula() {
         let e = minimap_engine();
         let pane_width = 900.0;
-        let small_font = minimap_reserved_width(&e, pane_width, 8.0, gtk_minimap_sizing());
-        let large_font = minimap_reserved_width(&e, pane_width, 16.0, gtk_minimap_sizing());
+        let small_font = minimap_reserved_width(&e, pane_width, 8.0, gtk_minimap_sizing(), 0.0);
+        let large_font = minimap_reserved_width(&e, pane_width, 16.0, gtk_minimap_sizing(), 0.0);
         // Hand-computed VS Code formula, independent of
         // `vs_code_minimap_width_px`'s own implementation:
         // floor((900 - 14 - 2) / (cw + 1)) + 8, capped at 120.
@@ -34255,8 +34332,8 @@ mod tests {
     fn minimap_reserved_width_caps_at_exactly_120_on_a_wide_pane_across_font_sizes() {
         let e = minimap_engine();
         let pane_width = 3000.0;
-        let small_font = minimap_reserved_width(&e, pane_width, 8.0, gtk_minimap_sizing());
-        let large_font = minimap_reserved_width(&e, pane_width, 16.0, gtk_minimap_sizing());
+        let small_font = minimap_reserved_width(&e, pane_width, 8.0, gtk_minimap_sizing(), 0.0);
+        let large_font = minimap_reserved_width(&e, pane_width, 16.0, gtk_minimap_sizing(), 0.0);
         assert_eq!(
             (small_font, large_font),
             (MINIMAP_TARGET_COLS, MINIMAP_TARGET_COLS),
@@ -34275,7 +34352,7 @@ mod tests {
     #[test]
     fn minimap_reserved_width_matches_vs_code_parity_on_a_wide_pane() {
         let e = minimap_engine();
-        let want = minimap_reserved_width(&e, 1600.0, 8.0, gtk_minimap_sizing());
+        let want = minimap_reserved_width(&e, 1600.0, 8.0, gtk_minimap_sizing(), 0.0);
         assert_eq!(
             want, MINIMAP_TARGET_COLS,
             "an ordinary wide GTK pane must settle at VS Code's ~120px \

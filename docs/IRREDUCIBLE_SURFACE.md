@@ -326,15 +326,19 @@ of a forced `1.0`; TUI's own `sizing.resolve_width()` path — and its forced
 *argument-forked* verdict above still holds — GTK/macOS/Win and TUI still use two
 distinct policies — only the GTK/macOS/Win side's own math changed.
 
-#1869 also found a second, genuine quadraui-gap: the editor's vertical scrollbar
-*itself* paints at `cell_width` (quadraui's `EditorLayout::layout_with_options`,
-`v_scrollbar_w = cell_width` — a font-sized ~7-9px column, not VS Code's fixed 14px
-`editor.scrollbar.verticalScrollbarSize`). `vs_code_minimap_width_px` subtracts the
-*VS-Code-configured* 14px (`MINIMAP_VERTICAL_SCROLLBAR_WIDTH_PX`) regardless, since
-that is what VS Code's own formula does — matching the real painted scrollbar's width
-to 14px as well is a quadraui-side change vimcode cannot make locally
-(Platform-Neutrality Rule); tracked as a follow-up quadraui issue, not worked around
-here.
+**#1869 review round 1 follow-up:** `remaining_width` is now genuinely VS Code's own
+`remainingWidth = editor outer width - gutter`, not the pane's raw rect width —
+`render::window_minimap_gutter_width_px` computes each window's own line-number/fold
+gutter (via `calculate_gutter_cols`) and `minimap_reserved_width` subtracts it before
+calling `vs_code_minimap_width_px`. `vs_code_minimap_width_px` itself still subtracts
+the *VS-Code-configured* 14px scrollbar width (`MINIMAP_VERTICAL_SCROLLBAR_WIDTH_PX`)
+regardless of what any backend's vertical scrollbar actually paints at — that is what
+VS Code's own formula does. Matching the *real painted* scrollbar to 14px is a genuine
+quadraui-gap (`quadraui::EditorLayout::layout_with_options`'s `v_scrollbar_w =
+cell_width`, no host override point) that vimcode cannot fix locally
+(Platform-Neutrality Rule); drafted as a fileable quadraui issue in
+`docs/PENDING_QUADRAUI_ISSUES.md` rather than only named here, so the gap survives
+past this file's own prose.
 
 ## 7. #1044: the full `ShellApp`/`mouse.rs` rung audit — irreducible residue
 
