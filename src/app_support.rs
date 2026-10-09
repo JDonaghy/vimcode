@@ -174,6 +174,21 @@ pub(crate) fn resolve_ui_font_size(
 /// `Backend::set_editor_font`, so a runtime `:set line_height=N`/`zoomin`/
 /// `zoomout` reaches the painted row pitch on the very next frame the same
 /// way those already reach the painted font.
+///
+/// Despite the name, this multiplies a *point* size (`editor_size_pt`) with
+/// no pt→px conversion — true today because every call site resolves to
+/// `None` (a no-op) on every backend except the native macOS GUI
+/// (`effective_line_height_multiplier`'s own doc), and `MacBackend`/Core
+/// Text treat 1pt == 1px (no independent DPI scale this function needs to
+/// account for). A future GTK/Win-GUI caller (the ×1.35 parity follow-up)
+/// would need to revisit this if either backend's pt/px ratio ever differs
+/// from 1:1.
+///
+/// The result is floored at 1px: `settings.line_height`'s own clamp
+/// (`0.0..=5.0`) lets `0.03` resolve to `round(12 * 0.03) == 0`, and a
+/// `0.0` row pitch would feed every `*_layout` divisor on `MacBackend`
+/// (`cached_line_height` included) — VS Code's own `editor.lineHeight`
+/// has an equivalent floor.
 pub(crate) fn resolve_editor_line_height_px(
     settings: &core::settings::Settings,
     backend: &dyn quadraui::Backend,
@@ -181,7 +196,7 @@ pub(crate) fn resolve_editor_line_height_px(
 ) -> Option<f32> {
     let multiplier =
         settings.effective_line_height_multiplier(backend.services().platform_name())?;
-    Some((editor_size_pt as f64 * multiplier).round() as f32)
+    Some(((editor_size_pt as f64 * multiplier).round() as f32).max(1.0))
 }
 
 /// Pango font description string for UI chrome at the currently

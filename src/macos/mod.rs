@@ -677,11 +677,10 @@ mod mac_driver_tests {
     /// the same monitor, issue #1864's own side-by-side screenshot.
     ///
     /// RED-verified against unfixed `develop`: with the
-    /// `resolve_editor_line_height_px` call in
-    /// `App::sync_per_frame_backend_state` deleted (so nothing ever
-    /// overrides `MacBackend`'s natural `current_line_height`), this test's
-    /// row-pitch assertions fail — consecutive rows land ~14px apart
-    /// instead of 18px.
+    /// `resolve_editor_line_height_px` call around `App::render_content`'s
+    /// `compose_editor_band_rungs` deleted (so nothing ever overrides
+    /// `MacBackend`'s natural `current_line_height`), this test's row-pitch
+    /// assertions fail — consecutive rows land ~14px apart instead of 18px.
     #[test]
     fn macos_default_font_rows_are_18px_apart_matching_vs_code() {
         // #1745-review's `TestSettingsPathGuard` dance (see
@@ -726,6 +725,39 @@ mod mac_driver_tests {
             (pitch_2 - 18.0).abs() < 0.5,
             "row pitch {pitch_2}px between 'bravo'/'charlie', want 18px \
              (VS Code's round(12 * 1.5) for Menlo 12)"
+        );
+    }
+
+    /// Non-blocking concern from review round 1: the sibling test above
+    /// only exercises the *auto* (0.0 → macOS's 1.5x) path through
+    /// `effective_line_height_multiplier` — `:set line_height=N`'s explicit
+    /// branch had unit coverage (`src/core/settings.rs`) but no driver-tier
+    /// assertion that the explicit multiplier actually reaches the painted
+    /// row pitch, the same way `zoomin`/`zoomout` below are driver-tested
+    /// rather than left to the unit layer alone.
+    #[test]
+    fn explicit_line_height_setting_reaches_the_painted_row_pitch() {
+        use crate::core::settings::TestSettingsPathGuard;
+        let tmp = std::env::temp_dir().join(format!(
+            "vimcode_test_1864_explicit_row_pitch_{:?}.json",
+            std::thread::current().id()
+        ));
+        let _settings_guard = TestSettingsPathGuard::install(tmp);
+
+        let mut engine = plain_engine();
+        engine.buffer_mut().insert(0, "alpha\nbravo\n");
+        engine.settings.line_height = 2.0;
+        let (_guards, mut driver) = driver(engine);
+        driver.render();
+
+        let alpha = driver.find_bounds("alpha").expect("'alpha' must paint");
+        let bravo = driver.find_bounds("bravo").expect("'bravo' must paint");
+        let pitch = bravo.y - alpha.y;
+
+        assert!(
+            (pitch - 24.0).abs() < 0.5,
+            "row pitch {pitch}px between 'alpha'/'bravo', want 24px \
+             (an explicit `line_height=2.0` on Menlo 12: round(12 * 2.0))"
         );
     }
 
@@ -803,6 +835,67 @@ mod mac_driver_tests {
             pitch_4 < pitch_3,
             "a second zoomout must shrink the row pitch further: {pitch_3} -> {pitch_4}"
         );
+    }
+
+    /// #1864 review round 1: the VS Code editor row-pitch override must
+    /// never move the file-explorer tree's own row pitch. An earlier
+    /// version of this fix applied the override to `MacBackend`'s single,
+    /// shared `current_line_height` field for the *entire* frame — which
+    /// `tree_layout` (file-explorer rows) also reads directly, inflating
+    /// the sidebar by the same multiplier (plus `tree_layout`'s own `*
+    /// 1.4` on top): ~28%, untested and unmeasured.
+    ///
+    /// Renders the same expanded-explorer scenario at two very different
+    /// `settings.line_height` values (the default "auto", VS Code's 1.5x,
+    /// and an explicit 3.0x — double that) and asserts the tree's painted
+    /// row pitch is identical either way. If the editor override still
+    /// leaked into `backend.current_line_height` during this paint, the
+    /// second render's rows would land roughly twice as far apart as the
+    /// first's.
+    ///
+    /// RED-verified against the global-override version of this fix (the
+    /// one `sync_per_frame_backend_state` applied for the whole frame):
+    /// `pitch_default` was ~25px and `pitch_explicit` (`line_height=3.0`,
+    /// i.e. 36px editor rows) was ~50px — the assertion below failed.
+    #[test]
+    fn explorer_row_pitch_is_unaffected_by_the_editor_line_height_setting() {
+        use crate::core::settings::TestSettingsPathGuard;
+        let tmp = std::env::temp_dir().join(format!(
+            "vimcode_test_1864_explorer_row_pitch_{:?}.json",
+            std::thread::current().id()
+        ));
+        let _settings_guard = TestSettingsPathGuard::install(tmp);
+
+        let dir = scratch_explorer_dir("row_pitch_1864", 2);
+        let (_guards, engine, mut driver) = driver_with_engine(engine_with_expanded_explorer(&dir));
+
+        let mut row_pitch = |when: &str| -> f32 {
+            driver.render();
+            let src = driver
+                .find_bounds("src")
+                .unwrap_or_else(|| panic!("'src' must paint {when}"));
+            let core = driver
+                .find_bounds("core")
+                .unwrap_or_else(|| panic!("'core' must paint {when}"));
+            core.y - src.y
+        };
+
+        let pitch_default = row_pitch("at the default (auto, 1.5x) line_height");
+
+        engine.borrow_mut().settings.line_height = 3.0;
+        let pitch_explicit = row_pitch("with an explicit 3.0x line_height");
+
+        assert!(
+            (pitch_default - pitch_explicit).abs() < 0.5,
+            "the file-explorer's own row pitch must not move when the \
+             *editor's* line_height setting changes: {pitch_default}px \
+             (line_height=0, auto) vs {pitch_explicit}px (line_height=3.0) \
+             — the VS Code row-pitch override must be scoped to the \
+             editor's own rows, never bleeding into `MacBackend::\
+             tree_layout`'s unrelated row-height convention"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── #901: native menu bar adoption ──────────────────────────────────
