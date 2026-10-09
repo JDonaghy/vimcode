@@ -1,5 +1,54 @@
 # VimCode Project State
 
+**Last updated:** October 9, 2026 (#1833 review round 1 — fix four blocking
+findings in `tests/smoke-spec/win-terminal.yaml`'s new step groups). **Fix,
+not reimplementation; no re-verification on real hardware was possible from
+this environment.** (1) The minimap is off by default (#1858) and the
+file's shared settings precondition never promised `minimap: true`, so
+`minimap-thumb-visible-1828` was not self-sufficient — it now enables the
+minimap itself via `:set minimap` immediately before the capture. (2) That
+same step's region sits entirely inside the viewport band on a short file
+(the whole strip IS the band), so it was measuring the strip's per-line
+marks, not band-vs-strip CONTRAST — the actual open half of #1828/#1842;
+`win_native_driver.py` has no two-point pixel-colour-comparison primitive
+to build a true contrast check, so the step is now tagged `known_bug:
+vimcode#1828` with a comment stating plainly it is a "strip paints
+something" proxy only, not a thumb-visibility confirmation. (3) Both
+`expect_file` probes, and the `sample.txt` write round trip, could be
+satisfied by a PREVIOUS run's leftover state (neither probe file is ever
+deleted; `sample.txt` accumulates a `from_1833` line every successful run
+and is never reverted) — fixed with `Remove-Item -ErrorAction
+SilentlyContinue` before each probe file write, plus a `Get-Content |
+Where-Object -notmatch | Set-Content` filter and a forced `:e!` buffer
+reload for `sample.txt` (the reload matters because vimcode's own
+in-memory buffer, loaded at `launch` time, can itself still carry a stale
+`from_1833` line that cleaning only the disk file wouldn't undo). This
+closes the common regression case but still can't distinguish "never
+executed" from "ran a no-op delete" on a host with zero prior runs and an
+unrelated stale file already at that exact path — a residual gap inherent
+to having no delete-file step, flagged in the YAML's own comment rather
+than silently left. (4) The `:term` probe steps were not actually
+exercising `:term`: the pre-existing `open-second-tab` step's `Ctrl+T` is
+`panel_keys.open_terminal` (same panel `:term` opens), so by the time the
+probe ran, a pre-existing terminal pane already held focus and the typed
+`":term\r"` went to that shell as a literal command, bypassing vimcode's
+own ex-command dispatch entirely — fixed with an explicit `click` into the
+editor's text area immediately before the probe, same pattern already used
+later in the file. Also applied the non-blocking review notes: restored
+`contains: MARKER` on the `:term` probe (via `Set-Content -Encoding utf8`,
+sidestepping the UTF-16LE `>`-default trap rather than dropping the
+content check), corrected the `open-second-tab` step's stale comment
+("Ctrl+T opens a second editor tab" — it doesn't; it's the terminal-panel
+toggle), and noted beside `copy-saved-file-to-probe-path` that it cannot
+pass through `coord app-drive run-spec` until the `_plan_staging` gap is
+fixed too. None of these four fixes has been re-verified on a real Windows
+host — this review round had no access to dell64 or any other Windows
+machine, so the corrected step shapes are reviewed-for-correctness only.
+`ISSUE_RESOLUTION: partial` stands — unchanged from before this round —
+pending both a real re-run and the still-unfiled coordinator-repo issues
+for the three `win_native_driver.py` launch bugs and the `_plan_staging`
+gap.
+
 **Last updated:** October 9, 2026 (#1833 — Windows TUI "first five minutes"
 smoke spec: `:term` probe, minimap thumb, typing round trip, all added to
 `tests/smoke-spec/win-terminal.yaml` and RUN FOR REAL on dell64). **New

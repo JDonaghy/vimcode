@@ -301,6 +301,89 @@
 # venv on dell64) against a real, visible, foreground `vcd.exe` window —
 # not just the hand-rolled approximation the paragraphs above describe
 # finding the workarounds with. Both runs: all twelve new steps GREEN.
+#
+# ── vimcode#1833 review round 1 (2026-10-09): correctness fixes to the
+#    three new step groups above, per blocking review findings — kept as
+#    a new section rather than editing the paragraphs above, per #3509's
+#    additive-only policy ─────────────────────────────────────────────────
+#
+# Four blocking findings from review, all fixed in the `steps:` list
+# itself below (these are correctness bugs in what the steps actually
+# check, not just prose):
+#
+#   1. Minimap default-off (#1858: `default_minimap() -> false`): the
+#      shared settings precondition this file's own header states
+#      (paragraph above beginning "`coord` supplies...") never promises
+#      `minimap: true`, so `minimap-thumb-visible-1828` was not
+#      self-sufficient through the real `coord`-staged lane. Fixed by
+#      having the spec enable the minimap itself (`:set minimap`,
+#      documented at `src/core/settings.rs:940`) immediately before the
+#      capture, rather than depending on a precondition it doesn't
+#      control.
+#   2. `minimap-thumb-visible-1828`'s region sits entirely inside the
+#      viewport-highlight band on a freshly opened short file (the whole
+#      strip IS the band on a file that short), so the non-uniformity it
+#      measures is the strip's own per-line marks, not band-vs-strip
+#      CONTRAST — the actual still-open half of #1828/#1842
+#      (`docs/PENDING_QUADRAUI_ISSUES.md`'s entry: band `rgb(44,63,79)`
+#      vs strip bg `rgb(26,26,26)`, invisible on Windows Terminal's
+#      palette). `win_native_driver.py` has no pixel-colour-sampling
+#      primitive to compare two specific points' colours (only
+#      whole-region uniformity), so this step cannot be turned into a
+#      true contrast check without new coordinator-repo infrastructure.
+#      Re-tagged `known_bug: vimcode#1828` and reworded its comment to
+#      say plainly this is a "the strip paints *something*, not a flat
+#      empty bar" proxy only — NOT a thumb-visibility/contrast check — so
+#      a green run here is no longer presented as confirming #1828's
+#      contrast complaint either way.
+#   3. Both `expect_file` probes, and the `sample.txt` write round trip,
+#      could be satisfied by state a PREVIOUS green run left behind (the
+#      probe files are never deleted; `sample.txt` accumulates a new
+#      `from_1833` line every successful run and is never reverted) — a
+#      real regression in THIS run's `:term`/focus/typing could still
+#      read green off stale leftovers. `win_native_driver.py` has no
+#      delete-file step, and this spec format has no per-run templating
+#      (no way to mint a genuinely unique marker/filename per run), so
+#      the fix resets to a known-clean state immediately before each
+#      check, using the existing `type_text` vocabulary: `Remove-Item
+#      -ErrorAction SilentlyContinue` for the two probe files, and a
+#      `Get-Content | Where-Object -notmatch | Set-Content` filter plus a
+#      forced `:e!` buffer reload for `sample.txt` (the reload matters
+#      because vimcode's own in-memory buffer, loaded at `launch` time,
+#      may itself already carry an old `from_1833` line that cleaning
+#      only the *disk* file would not undo). This closes the common
+#      regression case (any run after the first) but still can't tell
+#      "the shell never executed anything, ever" apart from "the shell
+#      correctly ran a no-op delete" on a host that has never run this
+#      spec before and already has an unrelated stale file at this exact
+#      path — that residual case needs a real delete-file primitive
+#      upstream, not a YAML-only fix.
+#   4. The `:term` probe steps were not actually exercising `:term` at
+#      all in the original step order: `open-second-tab`'s pre-existing
+#      `Ctrl+T` is `panel_keys.open_terminal` (see that step's own,
+#      now-corrected comment below), which opens/focuses the SAME
+#      integrated-terminal panel `:term` opens — so by the time
+#      `open-term-panel-1829` ran, a live terminal pane already held
+#      keyboard focus, and the typed `":term\r"` went to that
+#      pre-existing shell as a literal (erroring) command, never through
+#      vimcode's own ex-command dispatch. Fixed with an explicit `click`
+#      into the editor's own text area immediately before
+#      `open-term-panel-1829` (the same fix already correctly applied to
+#      the later typing block, via `click-back-into-editor`) — `:term`
+#      now always goes through vimcode's real ex-command path
+#      (`toggle_terminal`, `src/core/engine/terminal_ops.rs`), whether
+#      that creates a fresh pane or refocuses one `Ctrl+T` already
+#      opened earlier in the same run.
+#
+# None of these four fixes has been re-verified on real Windows hardware
+# — this round was done with no access to dell64 or any other real
+# Windows host, so unlike the paragraphs above (which record an actual
+# dell64 run), the corrected step shapes below are REVIEWED-FOR-
+# CORRECTNESS ONLY, not RE-CONFIRMED-ON-REAL-HARDWARE. A fresh real run
+# (through `coord app-drive run-spec` once the driver bugs/staging gap
+# above are fixed, or the same hand-driven harness methodology) is still
+# needed before this issue's resolution can move from `partial` to
+# `resolved`.
 name: vimcode-win-terminal
 mode: terminal
 terminal_app: windows-terminal
@@ -321,10 +404,17 @@ steps:
   # own `tests/smoke-spec/tui.yaml`'s `expect_silent` already confirmed the
   # underlying byte stream is silent — this step is the one tier that can
   # actually see Windows Terminal's own repaint behaviour, independent of
-  # what bytes `vcd.exe` sent it). "a horizontally stacked tab group open" —
-  # `Ctrl+T` opens vimcode's own second editor tab (`MENU_STRUCTURE`'s "New
-  # Tab", shortcut `Ctrl+T`), landing two tabs side by side in vimcode's own
-  # tab bar.
+  # what bytes `vcd.exe` sent it). `Ctrl+T` is NOT "open a second editor
+  # tab" — #1789/review round 1 on #1833 both confirm it is bound to
+  # `panel_keys.open_terminal` (default `<C-t>`,
+  # `src/core/engine/mod.rs:533-540` warns explicitly that this chord is
+  # "actually bound to `panel_keys.open_terminal`... not `tabnew`"), so
+  # this step actually opens/focuses the integrated terminal panel. Left
+  # as-is because the flicker check below doesn't care *which* panel
+  # changed state before its idle window starts — but see #1833's new
+  # `:term`-probe block further down, which DOES care, and clicks back
+  # into the editor first before relying on `:term` reaching vimcode's
+  # own ex-command dispatch rather than this already-open terminal pane.
   - type: key
     id: open-second-tab
     key: "ctrl+t"
@@ -407,19 +497,60 @@ steps:
     name: EXTENSIONS
     timeout_ms: 5000
 
-  # vimcode#1833: "first five minutes" checks added for the minimap thumb
+  # vimcode#1833: "first five minutes" checks for the minimap thumb
   # (#1828), the `:term` probe (#1829), and a plain typing -> `:w` round
-  # trip — see this file's own header, "vimcode#1833 update" section, for
-  # the real dell64 run these were verified against (including the two
-  # `coord`-side infra workarounds that run needed) and why the `:term`
-  # probe step below checks existence only, not `contains:`.
+  # trip — see this file's own header, "vimcode#1833 update" AND
+  # "vimcode#1833 review round 1" sections, for the real dell64 run these
+  # were originally verified against, the infra workarounds that run
+  # needed (driver bugs + a staging gap, enumerated in the header — not
+  # repeated here by count since that count has already drifted once),
+  # and the four correctness fixes review round 1 made to the step shapes
+  # below (none of which has been re-verified on real hardware yet).
 
-  # #1828: the minimap viewport-highlight band/strip must paint real,
-  # non-flat content near the top of the strip (cursor starts at the top
-  # of a freshly opened file) -- vimcode#1676/#1828's own defect class is
-  # a strip that renders as one uniform flat colour instead. Region
-  # chosen and REAL-RUN-CONFIRMED against this exact launch command/
-  # window size (1024x768) -- see the header update above.
+  # Review round 1: establish a known focus baseline (the editor, not
+  # whatever sidebar panel the preceding activity-bar steps left focused)
+  # before any of the new #1833 checks below.
+  - type: click
+    id: click-focus-editor-before-1833-checks
+    x: 500
+    y: 300
+    button: left
+
+  # #1828: the minimap is OFF by default (#1858,
+  # `src/core/settings.rs:1216-1220`) and this file's own shared settings
+  # precondition (header, "`coord` supplies...") never promises `minimap:
+  # true`, so this step was not self-sufficient through the real
+  # `coord`-staged lane. Review round 1: the spec now enables the minimap
+  # itself (`:set minimap`, documented at `src/core/settings.rs:940`)
+  # immediately before the capture, rather than depending on a
+  # precondition it doesn't control.
+  - type: type_text
+    id: enable-minimap-1828
+    text: ":set minimap\r"
+  - type: wait
+    id: settle-after-minimap-enable
+    ms: 500
+
+  # The minimap viewport-highlight band/strip must paint real, non-flat
+  # content near the top of the strip (cursor starts at the top of a
+  # freshly opened file) -- vimcode#1676/#1828's own defect class is a
+  # strip that renders as one uniform flat colour instead. Region chosen
+  # and REAL-RUN-CONFIRMED against this exact launch command/window size
+  # (1024x768) when the minimap was staged on via settings.json -- see
+  # the header's "vimcode#1833 update" section (NOT yet re-confirmed with
+  # the minimap enabled via `:set minimap` instead -- see "review round
+  # 1" immediately below it).
+  #
+  # `known_bug: vimcode#1828` (review round 1): this region sits entirely
+  # INSIDE the viewport band on a short, freshly opened file (the whole
+  # strip IS the band), so a PASS here is a "the minimap strip paints
+  # *something*, not a flat empty bar" proxy ONLY -- it does NOT, and
+  # structurally cannot with this driver's region-uniformity-only
+  # vocabulary (no two-point pixel-colour comparison exists), assert the
+  # actual still-open half of #1828/#1842: band-vs-strip CONTRAST on
+  # Windows Terminal's palette (`docs/PENDING_QUADRAUI_ISSUES.md`). Do
+  # NOT read a green run here as confirming the thumb is visibly distinct
+  # from the strip.
   - type: expect_region_not_uniform
     id: minimap-thumb-visible-1828
     x: 860
@@ -427,34 +558,81 @@ steps:
     width: 90
     height: 40
     tolerance: 24
+    known_bug: vimcode#1828
 
   # #1829: `:term` must open a panel with an actually-working shell, not
-  # a permanently blank one -- typed via `type_text` (real OS input, see
-  # this file's header for why), then a real PowerShell command (the
-  # issue's own literal probe) must actually execute and write the file.
-  # `contains: MARKER` is deliberately NOT set here -- see the header's
-  # "term-probe-content (encoding note)" paragraph for why a byte-correct
-  # UTF-16LE `"MARKER\r\n"` (Windows PowerShell's `>` operator default
-  # encoding) fails a UTF-8 `contains:` substring check for reasons
-  # unrelated to #1829 itself. `known_bug: vimcode#1829` stays on this
-  # step because the issue is still open on GitHub; this run observed it
-  # PASSING for real (a working PowerShell prompt, real command
-  # execution) -- the bidirectional half of the known-bug gate, not a
-  # claim that this file is closing #1829.
+  # a permanently blank one. Review round 1: the ORIGINAL step order here
+  # typed `:term` while the terminal pane `open-second-tab`'s `Ctrl+T`
+  # had already opened was still focused, so the keystrokes went to that
+  # PRE-EXISTING shell as a literal (erroring) command, never through
+  # vimcode's own `:term` ex-command dispatch (`toggle_terminal`,
+  # `src/core/engine/terminal_ops.rs`) at all. The explicit `click` below
+  # fixes that -- same pattern the later typing block already uses via
+  # `click-back-into-editor`.
+  - type: click
+    id: click-back-into-editor-before-term
+    x: 500
+    y: 300
+    button: left
   - type: type_text
     id: open-term-panel-1829
     text: ":term\r"
   - type: wait
     id: term-panel-settle-1829
     ms: 2500
+
+  # Review round 1: delete any probe file a PREVIOUS green run left
+  # behind before writing a new one -- `win_native_driver.py` has no
+  # delete-file step and nothing isolates `$env:TEMP` across runs (#3637
+  # isolates `%APPDATA%` only), so without this, `term-probe-file-
+  # exists-1829` below could read a stale leftover as evidence THIS run's
+  # `:term` worked even if it didn't. Cannot fully close the gap on a
+  # host that has literally never run this spec before and already has
+  # an unrelated stale file at this exact path -- that residual case
+  # needs a real delete-file primitive upstream, not a YAML-only fix.
+  - type: type_text
+    id: clean-stale-term-probe-1829
+    text: "Remove-Item $env:TEMP\\vc_term_probe_1833.txt -ErrorAction SilentlyContinue\r"
+  - type: wait
+    id: settle-after-term-probe-cleanup
+    ms: 500
+
+  # The issue's own literal probe, now piped through `Set-Content
+  # -Encoding utf8` instead of `echo ... >` -- same workaround the
+  # typing-round-trip block below already uses -- so `contains: MARKER`
+  # below is safe. (Review round 1: a plain `echo MARKER > ...` writes
+  # UTF-16LE on Windows PowerShell, which a UTF-8 `contains:` check reads
+  # as not containing `MARKER` even though the bytes are byte-correct --
+  # see the header's "term-probe-content" note for the original,
+  # now-superseded encoding trap this avoids altogether, rather than
+  # dropping the content check entirely as the original step did.)
   - type: type_text
     id: term-echo-probe-1829
-    text: "echo MARKER > $env:TEMP\\vc_term_probe_1833.txt\r"
+    text: "echo MARKER | Set-Content -Encoding utf8 $env:TEMP\\vc_term_probe_1833.txt\r"
   - type: expect_file
     id: term-probe-file-exists-1829
     path: "$env:TEMP\\vc_term_probe_1833.txt"
+    contains: "MARKER"
     timeout_ms: 5000
     known_bug: vimcode#1829
+
+  # Review round 1: clean up the SECOND probe file's stale leftover too,
+  # and reset `sample.txt` to a baseline with no pre-existing `from_1833`
+  # line -- both while the SAME terminal the #1829 probe above opened is
+  # still open and focused, before clicking back into the editor below.
+  # Without this, `sample.txt` accumulates a new `from_1833` line every
+  # successful run and is never reverted, so `type-and-save-expect-file`
+  # further down could read an OLD run's line as evidence THIS run's
+  # typing + `:w` actually landed, even if a regression meant it didn't.
+  - type: type_text
+    id: clean-stale-write-probe-1833
+    text: "Remove-Item $env:TEMP\\vc_write_probe_1833.txt -ErrorAction SilentlyContinue\r"
+  - type: type_text
+    id: reset-sample-txt-baseline
+    text: "(Get-Content sample.txt) | Where-Object { $_ -notmatch 'from_1833' } | Set-Content -Encoding utf8 sample.txt\r"
+  - type: wait
+    id: settle-after-sample-reset
+    ms: 500
 
   # Plain typing -> `:w` -> `expect_file` round trip, no known bug: `G`
   # (last line) `o` (open a line below) + text + `Esc`, then `:w`, saves
@@ -469,25 +647,40 @@ steps:
   # steps already proved works: open `:term` again and have the real
   # shell copy the just-saved file's content out to a known, absolute
   # `$env:TEMP` path, which IS something this step can `expect_file`
-  # against. REAL-RUN-CONFIRMED end to end (see header) -- `Set-Content
-  # -Encoding utf8` sidesteps the SAME PowerShell `>`-defaults-to-
-  # UTF-16LE trap the #1829 probe above hit, so `contains:` is safe to
-  # use here.
+  # against.
+  #
+  # Review round 1: `:e!` (`src/core/engine/execute.rs`'s `edit!` ex
+  # command, reachable via the `edit` abbreviation,
+  # `src/core/engine/mod.rs`'s `EX_ABBREVS`) forces vimcode to discard
+  # its own in-memory buffer -- loaded at `launch` time, and so possibly
+  # still carrying an old `from_1833` line from a PREVIOUS run even after
+  # the `reset-sample-txt-baseline` step above cleaned the file ON DISK
+  # -- and re-read the now-clean file. Without this, the in-memory
+  # buffer (not the disk file) would still be the stale one, and `:w`
+  # below would just write that stale content straight back out.
   #
   # A real run found plain `Esc` alone does NOT move focus back to the
-  # editor from the terminal panel the earlier #1829 steps just opened
-  # (the saved file came back missing `from_1833` entirely -- `Esc` was
+  # editor from the terminal panel the #1829 steps above leave open (the
+  # saved file came back missing `from_1833` entirely -- `Esc` was
   # consumed by the live shell/terminal pane, not routed to vimcode's own
   # focus-switch handling). An explicit `click` into the editor's own
   # text area (well clear of the activity bar/sidebar on the left and the
   # minimap strip on the right) is what real `tui.yaml`-style mouse-driven
   # focus already does elsewhere in this file; added here too, and
-  # REAL-RUN-CONFIRMED to fix it.
+  # REAL-RUN-CONFIRMED to fix it (the `:e!` reload immediately below is
+  # new in review round 1 and has NOT been separately re-verified on real
+  # hardware).
   - type: click
     id: click-back-into-editor
     x: 500
     y: 300
     button: left
+  - type: type_text
+    id: reload-buffer-from-disk-1833
+    text: ":e!\r"
+  - type: wait
+    id: settle-after-reload
+    ms: 500
   - type: key
     id: dismiss-any-mode-before-edit
     key: esc
@@ -503,6 +696,15 @@ steps:
   - type: wait
     id: term-panel-settle-for-write-check
     ms: 2500
+  # Review round 1 note: this runs `Get-Content sample.txt` relative to
+  # the shell's own cwd, which matches the editor's cwd at `launch` time
+  # -- but `_plan_staging` (header's "two coord-side infra" paragraph)
+  # never stages a bare command-line *argument* naming a working file, so
+  # this step cannot pass through `coord app-drive run-spec` even once
+  # the three `win_native_driver.py` launch bugs are fixed, until that
+  # staging gap is fixed too (same gap the header's infra paragraph
+  # already names; called out here as well since this is the step that
+  # actually trips over it).
   - type: type_text
     id: copy-saved-file-to-probe-path
     text: "Get-Content sample.txt | Set-Content -Encoding utf8 $env:TEMP\\vc_write_probe_1833.txt\r"
