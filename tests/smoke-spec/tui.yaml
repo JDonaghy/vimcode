@@ -1931,6 +1931,21 @@ steps:
   # installing a bogus extension into the operator's real
   # `~/.config/vimcode/extensions/` (which every later `vimcode`/`vcd`
   # launch on the host would otherwise load, forever).
+  #
+  # Residual limit on (a)/(c) above, noted but not fixed (review round
+  # 2): the trailing cleanup block is typed into the terminal pane opened
+  # by step 2, so if an EARLIER step in this section fails first, the
+  # cleanup never runs and the `/tmp` files / extension directory survive
+  # for the next run to stale-pass against. The `_WBARE` suffix the
+  # bare-`:w` probe checks for is a FIXED string, not a per-run token, so
+  # it is only self-invalidating WITHIN a run against the `:saveas` probe
+  # above it, not across runs -- a leftover file from any past successful
+  # run already contains that suffix too. A per-run-unique path/suffix
+  # would close this gap for good; the spec format has no run-id
+  # primitive to build one from, so this is a known, accepted residual,
+  # not something the probes above claim to solve. (Same note applies to
+  # `tests/smoke-spec/gtk-gui.yaml`'s twin section; see PROJECT_STATE.md
+  # for the full writeup.)
   - type: key
     id: 'w-probe-settle-esc-1835'
     key: 'esc'
@@ -2016,10 +2031,15 @@ steps:
   # disk" gesture a user performs after `:saveas` has already named the
   # buffer (a bare `:w` with no prior `:saveas` would be launch-dependent;
   # see the comment above). Appends a NEW marker suffix before saving so
-  # this check is self-invalidating: a leftover file from an earlier run
-  # (or from the `:saveas` probe just above, within this same run) would
-  # be missing the `_WBARE` suffix and fail `contains` -- it can only pass
-  # if this `:w` actually just wrote the buffer.
+  # this check is self-invalidating WITHIN this run: a leftover file from
+  # the `:saveas` probe just above (same run) would be missing the
+  # `_WBARE` suffix and fail `contains` -- it can only pass if this `:w`
+  # actually just wrote the buffer. (It is NOT self-invalidating ACROSS
+  # runs -- a leftover file from any PAST successful run already contains
+  # this exact `_WBARE` suffix too; cross-run invalidation for this probe
+  # rests entirely on the trailing cleanup block at the end of this
+  # section, which does not run, and cannot be verified to have run, if
+  # an earlier step in this section fails first -- round 2 review.)
   - type: key
     id: 'w-bare-probe-append-key-1835'
     key: 'A'
@@ -2091,9 +2111,20 @@ steps:
   # and the one this probe is written for, is both run on the same host
   # with the same `$HOME` (no isolated-HOME override), matching how
   # `coord` actually dispatches this spec in production.
+  #
+  # The destructive `rm -rf` is its own typed line, separate from the
+  # `mkdir -p`/`echo` that recreates the directory (review round 2, same
+  # hardening as the GTK twin's section): this driver's `type_text`
+  # writes straight to the pty rather than through real X11 input, so
+  # the dropped-keystroke risk the GTK side guards against is much lower
+  # here, but isolating the destructive command still costs nothing and
+  # keeps both sections' shapes identical.
+  - type: type_text
+    id: 'ext-install-probe-rm-1835'
+    text: "rm -rf ~/.config/vimcode/extensions/vimcode-smoke-ext-1835\r"
   - type: type_text
     id: 'ext-install-probe-1835'
-    text: "rm -rf ~/.config/vimcode/extensions/vimcode-smoke-ext-1835 && mkdir -p ~/.config/vimcode/extensions/vimcode-smoke-ext-1835 && echo 'name = \"vimcode-smoke-ext-1835\"' > ~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml && echo 'display_name = \"VimCode Smoke Ext 1835\"' >> ~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml\r"
+    text: "mkdir -p ~/.config/vimcode/extensions/vimcode-smoke-ext-1835 && echo 'name = \"vimcode-smoke-ext-1835\"' > ~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml && echo 'display_name = \"VimCode Smoke Ext 1835\"' >> ~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml\r"
   - type: expect_file
     id: 'ext-install-manifest-appears-1835'
     path: '~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml'
