@@ -2563,6 +2563,70 @@ mod tests {
             );
         }
 
+        /// #1877 review round 1 (blocking finding 1): the bottom-left
+        /// strip `shell_config`'s reservation vacates from `activity_bar_
+        /// bounds` (two rows tall, as wide as the activity bar/sidebar
+        /// column) must paint a themed chrome colour, not whatever the
+        /// frame clear left there — the "same class of bug as the
+        /// traffic-light strip this issue's other half fixes".
+        ///
+        /// `status_bar_1690_spans_full_window_width_and_orders_segments_
+        /// vs_code_style` (`src/gtk/testing.rs`) already pins that the
+        /// *status* row of the two reserved rows gets a full-width
+        /// backdrop from `App::render_content`'s pre-existing (#1690)
+        /// `paint_status_backdrop` call, independent of this issue —
+        /// that mechanism caps the activity bar at the status row with
+        /// `theme.status_bg` on every build, before or after #1877.
+        /// Nothing plays that role for the *command-line* row below it:
+        /// `FrameOp::CommandLine` paints only `x = main_content_bounds.x`
+        /// onward, never reaching the activity-bar/sidebar column. Before
+        /// `render::bottom_chrome_reservation_fill_rect`'s fill, that
+        /// column at the very last row showed `theme.background` — the
+        /// bug. This test targets exactly that row/column, where #1690's
+        /// backdrop cannot be the one making it pass.
+        ///
+        /// RED-verified against the unfixed tree (temporarily removing
+        /// the `bottom_chrome_reservation_fill_rect` fill call in
+        /// `render_content`): the sampled style at `(0, ROWS - 1)` comes
+        /// back as `theme.background` (`#1a1a1a` on onedark), not
+        /// `theme.tab_bar_bg` (`#262633`) — this assertion fails.
+        #[test]
+        fn bottom_left_reclaimed_strip_paints_tab_bar_bg_not_background_via_shell_app() {
+            let mut h = harness(plain_engine());
+            let driver = &mut h.driver;
+            driver.render();
+
+            const ROWS: u16 = 24;
+            let theme = crate::render::Theme::from_name("onedark");
+            let expected_bg = quadraui::tui::ratatui_color(theme.tab_bar_bg);
+            let background = quadraui::tui::ratatui_color(theme.background);
+
+            let style = driver.style_at(0, ROWS - 1).unwrap_or_else(|| {
+                panic!(
+                    "the command-line row's leading column must paint a \
+                     styled cell; screen:\n{}",
+                    driver.screen()
+                )
+            });
+            assert_ne!(
+                style.bg,
+                background,
+                "the bottom-left reclaimed strip (0, {}) must not show \
+                 the bare frame-clear background colour; screen:\n{}",
+                ROWS - 1,
+                driver.screen()
+            );
+            assert_eq!(
+                style.bg,
+                expected_bg,
+                "the bottom-left reclaimed strip (0, {}) must paint \
+                 theme.tab_bar_bg, matching the activity bar's own fill \
+                 colour just above it; screen:\n{}",
+                ROWS - 1,
+                driver.screen()
+            );
+        }
+
         /// The Extensions activity-bar icon must paint a header naming the
         /// panel — same assertion `crate::harness`'s
         /// `issue_1256_sidebar_chrome::extensions_header_is_painted` uses for
