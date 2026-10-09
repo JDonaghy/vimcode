@@ -2485,6 +2485,84 @@ mod tests {
             );
         }
 
+        /// #1877 (the TUI half of a cross-backend fix): the activity bar's
+        /// bottom-pinned Settings icon must paint **above** vimcode's own
+        /// status and command-line rows, not on top of them.
+        ///
+        /// The issue reports it on native macOS ("status bar covers
+        /// activity bar, Settings unclickable"), but the cause and the fix
+        /// are platform-neutral — `App::shell_config`'s
+        /// `with_command_line()`/`with_status_bar()` reservation, which
+        /// makes `AppShell::compute_layout` carve those two rows out of
+        /// `activity_bar_bounds` on *every* backend. The macOS half is
+        /// pinned by `settings_activity_bar_zone_ends_above_the_status_bar_
+        /// via_mac_driver` in `src/macos/mod.rs`; this is the TUI twin, as
+        /// CLAUDE.md's multi-backend rule requires.
+        ///
+        /// Reads the **painted** screen, not an `AppShellLayout` field:
+        /// `find_bounds` reports where the glyph's text run actually
+        /// landed, and the two "the bottom rows really are vimcode's own
+        /// chrome" assertions below (the status row's `NORMAL` indicator,
+        /// and a `:` prompt echoed onto the very last row) keep the
+        /// comparison from being vacuously true against a window whose
+        /// bottom chrome isn't there at all.
+        ///
+        /// RED-verified against the unfixed tree (temporarily dropping
+        /// `shell_config`'s `.with_command_line().with_status_bar()`
+        /// call): the glyph paints at row 23 of this 80x24 harness — the
+        /// command-line row itself, two rows lower than the fixed tree's
+        /// 21 — and the `<= 22` assertion fails.
+        #[test]
+        fn settings_icon_paints_above_the_status_and_command_rows() {
+            let mut h = harness(plain_engine());
+            let driver = &mut h.driver;
+            driver.render();
+
+            // This module's standard harness size (see `harness`).
+            const ROWS: usize = 24;
+            let screen = driver.screen();
+            let rows: Vec<&str> = screen.lines().collect();
+            assert_eq!(rows.len(), ROWS, "harness geometry; screen:\n{screen}");
+
+            let gear = driver
+                .find_bounds(crate::icons::SETTINGS.s())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the Settings activity-bar glyph must paint; \
+                         screen:\n{screen}"
+                    )
+                });
+
+            // The second-to-last row is the status line…
+            assert!(
+                rows[ROWS - 2].contains("NORMAL"),
+                "fixture: the status row must paint on row {}; screen:\n{screen}",
+                ROWS - 2
+            );
+            // …and the Settings glyph must end at or above its top edge,
+            // i.e. never be painted into either bottom-chrome row.
+            assert!(
+                gear.y + gear.height <= (ROWS - 2) as f32,
+                "the Settings activity-bar glyph must paint above the \
+                 status/command-line rows, but its bounds are {gear:?} in \
+                 a {ROWS}-row window; screen:\n{screen}"
+            );
+
+            // …and the last row really is the command line: a `:` there
+            // is what would have been drawn over the Settings glyph.
+            driver.type_char(':');
+            let screen = driver.screen();
+            let rows: Vec<&str> = screen.lines().collect();
+            // `trim_start`: the command line paints at
+            // `main_content_bounds.x`, i.e. indented past the activity
+            // bar/sidebar columns, not at column 0.
+            assert!(
+                rows[ROWS - 1].trim_start().starts_with(':'),
+                "fixture: the command line must paint on the last row; \
+                 screen:\n{screen}"
+            );
+        }
+
         /// The Extensions activity-bar icon must paint a header naming the
         /// panel — same assertion `crate::harness`'s
         /// `issue_1256_sidebar_chrome::extensions_header_is_painted` uses for
@@ -14270,7 +14348,7 @@ mod tests {
         use super::*;
         use std::time::{Duration, Instant};
 
-        /// A wide (220x30, `Alt+Right` x40 — same widening
+        /// A wide (220x32, `Alt+Right` x40 — same widening
         /// `issue_1510_ai_panel_markdown_rendering`'s harnesses use, so a
         /// card's title/location text never word-wraps and confuses a
         /// `screen.contains`/ordering check) harness with a fixture agent
@@ -14279,6 +14357,22 @@ mod tests {
         /// sequence (a `tool_call` carrying `rawInput`, a `tool_call_update`
         /// adding `rawOutput`, then a SECOND thought+message pair emitted
         /// afterward).
+        ///
+        /// #1877: 32 rows, not the 30 these tests were written against.
+        /// `App::shell_config` now opts into quadraui's
+        /// `with_command_line()`/`with_status_bar()` bands so the activity
+        /// bar's bottom-pinned Settings button stops above vimcode's own
+        /// status/command-line rows instead of being painted underneath
+        /// them — and `AppShell::compute_layout` carves those same two
+        /// rows out of `sidebar_content_bounds` too, which is where the AI
+        /// panel (and so the tool-call card) paints. Two extra terminal
+        /// rows give the panel back the exact viewport height it had
+        /// before that reservation, so
+        /// `tool_call_card_collapses_by_default_and_toggles_via_click_via_shell_app`
+        /// can still see the expanded card's title line (the click target
+        /// for the collapse half) rather than having it scrolled off the
+        /// panel's top edge. Nothing about what these three tests assert
+        /// changes with the taller terminal.
         fn widened_tool_call_card_harness() -> crate::harness::ConformanceHarness<
             quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
         > {
@@ -14299,7 +14393,8 @@ mod tests {
                 mcp_servers: Vec::new(),
             }];
             engine.settings.acp_active_agent = "alpha".to_string();
-            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            // 32, not 30 — see this fixture's doc (#1877).
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 32);
             h.driver.press_named(quadraui::NamedKey::Escape);
             for _ in 0..40 {
                 h.driver.dispatch(quadraui::UiEvent::KeyPressed {
