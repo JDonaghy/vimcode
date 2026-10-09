@@ -6660,3 +6660,154 @@ mod issue_1789_command_palette_new_tab_shortcut_lies {
         },
     }
 }
+
+/// #1266: the scroll-routing cascade `mouse.rs:964-1270` used to
+/// hand-roll (a TUI-private `matches!(ev.kind, ScrollUp)` cascade
+/// resolving the target surface once per surface, duplicated against
+/// `app.rs`'s GTK-only equivalent) no longer exists to converge —
+/// `mouse.rs` itself was deleted whole by #1434, and since #1433 every
+/// backend (`gtk`, `tui`, `macos`, `win`) drives the *same*
+/// `App::handle_dispatch`'s `UiEvent::Scroll` arm, which resolves the
+/// target surface once via `quadraui::dispatch_scroll` against
+/// `Engine::scroll_surfaces` (registered by the shared `render.rs`
+/// paint path, not per backend) before falling back to the generic
+/// active/hovered-window viewport scroll. There is exactly one scroll
+/// router left; this module is the `::tui_prod` proof #1266 asked for
+/// that it behaves identically (both direction and magnitude) on every
+/// backend, not just that the two code paths look the same size.
+///
+/// #554's polarity convention, restated here since this is the scenario
+/// that exercises it end to end: `UiEvent::Scroll.delta.y` is
+/// **quadraui's** convention (positive y = up, toward the top of the
+/// content) — the opposite of GTK's raw `GdkEventScroll` polarity
+/// (positive dy = wheel down). `App::handle_dispatch` negates `delta.y`
+/// back to GTK-raw once, at the single shared call site
+/// (`self.handle_mouse_scroll_msg(&*backend, delta.x as f64,
+/// -(delta.y as f64))`), so every surface-specific consumer downstream
+/// (`scroll_viewport_with_cursor`, `handle_debug_output_scroll`,
+/// `handle_terminal_scroll`, `picker_scroll`) is written against
+/// GTK-raw polarity and never needs to know quadraui's convention
+/// exists. `ConformanceDriver::scroll_at(needle, lines)` dispatches in
+/// quadraui's convention directly (its own doc: "positive = scroll
+/// up"), so a *negative* `lines` here is a wheel-down notch.
+///
+/// Magnitude is asserted relatively (farther scroll ⇒ a strictly larger
+/// topmost-visible line number), not against a hardcoded row count —
+/// `scroll_at`'s `lines` are scaled by each backend's own
+/// `conformance_line_height()` (TUI: 1 cell; GTK: a real painted pixel
+/// line height), so one notch moves the GTK viewport roughly 20x as far
+/// as one TUI "line" even though both are converted through the
+/// identical `handle_mouse_scroll_msg` notch-to-row formula
+/// (`(delta_y * 3.0).round()`) — confirmed empirically while writing
+/// this test (GTK: ~69 rows per notch at 800x480; TUI: ~3 rows per
+/// notch at 80x24). A cross-backend scenario has to tolerate that or it
+/// isn't testing the shared router, it's testing one backend's pixel
+/// geometry.
+#[cfg(test)]
+mod issue_1266_scroll_router_convergence {
+    use quadraui::testing::ConformanceDriver;
+
+    /// A long, single-token-per-line buffer (`L0000`, `L0001`, …) — single
+    /// tokens rather than `"line 0"`-style phrases because `TuiDriver`'s
+    /// `inventory()` splits painted text into runs at every space
+    /// character (see its own doc), so a multi-word phrase can straddle
+    /// two runs on TUI while GTK paints it as one Pango run. A single
+    /// token is exactly one run on every backend, so `screen_has` reads
+    /// identically everywhere.
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let text: String = (0..500).map(|i| format!("L{i:04}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+        engine
+    }
+
+    /// The smallest `L%04d` line number currently painted anywhere on
+    /// screen — a backend-neutral, rendered-output measure of "how far
+    /// down the viewport has scrolled". Reads `FrameInventory` text runs
+    /// (the same inventory `screen_has`/`screen_row_has` read), never
+    /// engine state.
+    fn topmost_visible_line<D: ConformanceDriver>(driver: &D) -> u32 {
+        driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .filter_map(|run| run.text.strip_prefix('L'))
+            // GTK paints a text-display run as the raw buffer slice,
+            // trailing `\n` included; TUI's cell grid has no such
+            // character. `take_while(ascii_digit)` reads "the digits at
+            // the front" on both, ignoring whichever backend's trailing
+            // byte this run happens to carry.
+            .map(|digits| {
+                digits
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .filter_map(|digits| digits.parse::<u32>().ok())
+            .min()
+            .expect(
+                "at least one L%04d marker line must be painted — the \
+                 fixture's 500-line buffer should always leave some in \
+                 view",
+            )
+    }
+
+    crate::backend_conformance! {
+        label: wheel_scroll_direction_and_magnitude,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("L0000"),
+                "precondition: a fresh buffer must open scrolled to the top"
+            );
+
+            // Direction: a wheel-down notch (negative `lines`, quadraui's
+            // convention per `scroll_at`'s own doc) must move the viewport
+            // DOWN — later lines come into view, `L0000` scrolls out.
+            //
+            // Each step re-locates its needle off the *previous* step's
+            // own `topmost_visible_line` reading rather than reusing
+            // `"L0000"` — once the viewport has scrolled a wheel-notch's
+            // worth, `L0000` itself is no longer painted, and `scroll_at`
+            // panics if its needle isn't on screen (it has to find a
+            // pixel/cell position to dispatch the event at).
+            driver.scroll_at("L0000", -2);
+            let after_small_down = topmost_visible_line(driver);
+            assert!(
+                after_small_down > 0,
+                "wheel down must move the viewport down (topmost visible \
+                 line 0 -> >0), got {after_small_down} — direction is \
+                 inverted (#554)"
+            );
+
+            // Magnitude: a bigger notch count must move the viewport
+            // farther, not just further-than-zero — a consumer that
+            // clamps every nonzero delta to the same single-row step
+            // would pass the direction check above but fail this one.
+            driver.scroll_at(&format!("L{after_small_down:04}"), -10);
+            let after_bigger_down = topmost_visible_line(driver);
+            assert!(
+                after_bigger_down > after_small_down,
+                "a larger wheel-down notch (-10 vs -2) must scroll \
+                 farther (topmost visible line {after_small_down} -> \
+                 strictly more), got {after_bigger_down} — magnitude is \
+                 not respected"
+            );
+
+            // Direction, the other way: a wheel-up notch (positive
+            // `lines`) must walk the viewport back up — this is the half
+            // that catches a consumer which ignores the sign entirely
+            // and always scrolls the same direction regardless of it.
+            driver.scroll_at(&format!("L{after_bigger_down:04}"), 3);
+            let after_up = topmost_visible_line(driver);
+            assert!(
+                after_up < after_bigger_down,
+                "wheel up must move the viewport back up ({after_bigger_down} \
+                 -> {after_up})"
+            );
+        },
+    }
+}
