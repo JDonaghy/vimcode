@@ -1,5 +1,46 @@
 # VimCode Project State
 
+**Last updated:** October 9, 2026 (#1831 review round 1 — close-terminal
+bug fix, cross-run cleanup, `known_bug` gating). Fixed three blocking
+findings in `tests/smoke-spec/mac-gtk.yaml`:
+1. Dropped the "close the terminal panel" block before step 4 — it typed
+   `:term` a second time, which does not toggle (a typed `:term` always
+   normalizes to `EngineAction::OpenTerminal`; `toggle_terminal()` is only
+   reached when `is_macro` is true, which a driver-typed ex command is
+   not), so it typed `:term` into the live shell instead (keyboard focus
+   is inside the terminal pane) and left the panel open regardless. Step
+   4's clicks are all at y=16/46 — well above the panel's `y: 520` band —
+   so closing it first was never necessary; the comment now says so.
+2. Added a trailing `rm -f` cleanup (reusing the already-open terminal
+   pane) removing both `/tmp/vimcode-smoke-1831-macgtk.txt` and
+   `/tmp/vimcode-smoke-term-probe-1831-macgtk.txt`, so the two `expect_file`
+   probes in section 2 are genuinely cross-run self-invalidating instead of
+   passing against a leftover from a prior green run (CLAUDE.md /
+   #553) — same pattern as `gtk-gui.yaml`'s `cleanup-probe-1835`.
+3. Added `known_bug: vimcode#1825` to every step from
+   `launch-is-frontmost-1831` onward (confirmed, with `code-coordinator`
+   actually installed in this session, that `parse_native_spec` tolerates
+   the extra field and the whole file still parses clean — 37 steps).
+   `NativeRunner._require_frontmost` refuses all `key`/`click`/`type_text`
+   input while the pid isn't frontmost, so under #1825 the ENTIRE file is
+   red, not just the one check — the header now says this explicitly.
+
+Also: split the `:term` probe's `rm -f`/`echo` back onto separate
+`type_text` lines (consistency with `gtk-gui.yaml`'s own destructive-command
+split), added an `expect_no_tofu` check over the terminal panel band, fixed
+the "cross-compiled" claim (the macOS build is native, not cross-compiled),
+added the Retina 2x backing-scale-factor caveat to the header, spelled out
+the literal `coord app-drive run-spec` invocation, updated
+`tests/smoke-spec/catalogue.yaml` and `docs/PENDING_QUADRAUI_ISSUES.md`'s
+stale "nothing targets macOS-GTK" claim, and restored this file's own
+`**Last updated:**` heading convention on the #1835 entry below (a
+previous pass had renamed it to `(previous)`, breaking the file's one
+grep-able convention). **Still UNRUN ON REAL HARDWARE** — same
+environment constraint as before, unchanged by this fix round; see the
+spec file's own header.
+
+---
+
 **Last updated:** October 9, 2026 (#1831 — "first five minutes" smoke spec
 for the **shipped macOS GTK artifact** (`vimcode-macos-arm64.tar.gz`), run
 on `macmini`). New file `tests/smoke-spec/mac-gtk.yaml`, driven by the
