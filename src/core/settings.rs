@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
@@ -1182,6 +1183,28 @@ pub struct Settings {
     /// needs a thread-safe cache", not as a mystery.
     #[serde(skip)]
     iskeyword_cache: RefCell<Option<(String, IskeywordParsed)>>,
+
+    /// The resolved (DPI-corrected) editor font default size in points, as
+    /// of the last call to [`crate::app_support::resolve_editor_font`] —
+    /// `app_support::resolve_editor_font`'s own doc has the full writeup of
+    /// why this cache exists (#1860 review round 1). `0.0` (the
+    /// `Default`/never-resolved value) means "unknown" and is treated
+    /// exactly like `effective_editor_font`'s own TUI all-sentinel bypass:
+    /// [`Self::zoom_font_size`] falls back to the raw stored `font_size`
+    /// field, i.e. today's pre-#1860 behaviour, on any backend/test harness
+    /// that never calls `resolve_editor_font` at all.
+    ///
+    /// Not real settings state — derived from `dyn quadraui::Backend`, the
+    /// same reason [`Self::iskeyword_cache`] right above is `#[serde(skip)]`
+    /// and a `Cell`/`RefCell` rather than a plain field: it must never
+    /// round-trip through `settings.json`, and every writer/reader runs on
+    /// the one GTK/macOS/Win-GUI main thread `Settings` already assumes
+    /// (see `iskeyword_cache`'s doc for the "single thread" invariant this
+    /// relies on too). `Cell<f32>`, not `RefCell`, because `f32` is `Copy`
+    /// and there is never a borrow to hold across a mutation — `Cell::set`/
+    /// `get` is strictly simpler for that shape.
+    #[serde(skip)]
+    resolved_editor_default_size_pt: Cell<f32>,
 }
 
 /// Mode-derived default for `ctrl_f_action` — see the field doc comment on
@@ -1976,6 +1999,7 @@ impl Default for Settings {
             sidescrolloff: 0,
             scrolljump: default_scrolljump(),
             iskeyword_cache: RefCell::new(None),
+            resolved_editor_default_size_pt: Cell::new(0.0),
         }
     }
 }
@@ -3869,6 +3893,65 @@ impl Settings {
         }
     }
 
+    /// Records this frame's resolved (DPI-corrected, per
+    /// `app_support::dpi_correct_platform_default_size`) editor font default
+    /// size in points — [`Self::zoom_font_size`]'s write side; see that
+    /// method's doc for why it exists (#1860 review round 1). Called once
+    /// per frame from [`crate::app_support::resolve_editor_font`], the one
+    /// place in the call graph that actually has a `dyn quadraui::Backend`
+    /// to resolve it from.
+    pub(crate) fn note_resolved_editor_default_size_pt(&self, size_pt: f32) {
+        self.resolved_editor_default_size_pt.set(size_pt);
+    }
+
+    /// What `effective_editor_font` is *currently painting* as the editor
+    /// font size, in points — the un-rounded answer
+    /// [`Self::zoom_font_size`] seeds its `+1`/`-1` step from. Same
+    /// "still at the sentinel means un-customized" test
+    /// [`Self::effective_editor_font`] itself uses, but against the cached
+    /// *resolved* default ([`Self::note_resolved_editor_default_size_pt`])
+    /// rather than a `default_size_pt` the caller would otherwise have to
+    /// pass in — `font_size` alone (never `font_family`) is what
+    /// `zoomin`/`zoomout` touch, so only the size half of that method's
+    /// logic is needed here.
+    fn current_effective_font_size_pt(&self) -> f32 {
+        let resolved_default = self.resolved_editor_default_size_pt.get();
+        if resolved_default > 0.0 && self.font_size == default_font_size() {
+            resolved_default
+        } else {
+            self.font_size as f32
+        }
+    }
+
+    /// Step `font_size` by `delta` (`+1`/`-1`, `zoomin`/`zoomout`'s only two
+    /// callers in `core::engine::execute::Engine::execute_command`),
+    /// clamped to the same `6..=72` range those two call sites already
+    /// enforced by hand before this method existed.
+    ///
+    /// #1860 review round 1: seeds the step from
+    /// [`Self::current_effective_font_size_pt`] — the size actually being
+    /// painted right now — rather than the raw `font_size` field directly.
+    /// Before this fix, `zoomin` always computed `self.font_size + 1`
+    /// against the *raw* field: on an un-customized 1x Mac buffer, that
+    /// field sits at the sentinel `14` while the screen is actually
+    /// painting the DPI-corrected `16` (`app_support::
+    /// dpi_correct_platform_default_size`'s whole point). The very first
+    /// `zoomin` keystroke then stored `15` — smaller than the `16` already
+    /// on screen, i.e. "zoom in" visibly shrank the text — and `zoomout`
+    /// from there dropped a further 3pt in one keystroke (`16 -> 13`).
+    /// Seeding from the effective size instead makes the first `zoomin`
+    /// store `17` (`16` rounded, `+1`), so the text only ever grows.
+    ///
+    /// RED-verified against the pre-fix body: reverting this method to
+    /// `self.font_size = (self.font_size + delta).clamp(6, 72)` and
+    /// re-running `zoom_font_size_steps_from_the_resolved_size_not_the_raw_sentinel`
+    /// below fails — the post-zoomin size comes back `15.0`, less than the
+    /// `16.0` pre-zoom effective size the test asserts against.
+    pub fn zoom_font_size(&mut self, delta: i32) {
+        let current = self.current_effective_font_size_pt();
+        self.font_size = (current.round() as i32 + delta).clamp(6, 72);
+    }
+
     /// Where `settings.json` lives — `~/.config/vimcode/settings.json`
     /// (or the platform equivalent, see [`super::paths::vimcode_config_dir`]).
     ///
@@ -5055,6 +5138,80 @@ mod tests {
             "an untouched font_size must still resolve to the backend default \
              even when font_family alone has been customized"
         );
+    }
+
+    /// #1860 review round 1: `zoom_font_size` must seed its `+1` step from
+    /// the resolved (DPI-corrected) default, not the raw sentinel
+    /// `font_size` field — the macOS "first zoomin shrinks the text" bug.
+    ///
+    /// RED-verified: see [`Settings::zoom_font_size`]'s own doc for the
+    /// exact pre-fix body and the `15.0` it produces instead of this test's
+    /// `17`.
+    #[test]
+    fn zoom_font_size_steps_from_the_resolved_size_not_the_raw_sentinel() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.font_size, default_font_size());
+
+        // Simulate a 1x macOS frame having already resolved+cached the
+        // DPI-corrected default (Menlo 12 -> 16) via
+        // `app_support::resolve_editor_font`.
+        settings.note_resolved_editor_default_size_pt(16.0);
+
+        settings.zoom_font_size(1);
+        assert_eq!(
+            settings.font_size, 17,
+            "zoomin from an un-customized 1x-Mac buffer must grow the \
+             *painted* size (16 -> 17), not the raw sentinel (14 -> 15), \
+             which would be a visible shrink"
+        );
+
+        // A second zoomin now customizes further from 17, same as always.
+        settings.zoom_font_size(1);
+        assert_eq!(settings.font_size, 18);
+
+        settings.zoom_font_size(-1);
+        settings.zoom_font_size(-1);
+        assert_eq!(
+            settings.font_size, 16,
+            "zoomout must retrace the same ladder, 1pt at a time, once \
+             font_size is no longer at the sentinel"
+        );
+    }
+
+    /// Mirror image of the test above: zoomout from the un-customized
+    /// sentinel must also seed from the resolved size, so the very first
+    /// `zoomout` doesn't jump down further than one point at a time (the
+    /// pre-fix `16 -> 13` 3pt drop the review flagged).
+    #[test]
+    fn zoom_font_size_zoomout_from_sentinel_also_uses_resolved_size() {
+        let mut settings = Settings::default();
+        settings.note_resolved_editor_default_size_pt(16.0);
+
+        settings.zoom_font_size(-1);
+        assert_eq!(
+            settings.font_size, 15,
+            "zoomout from the un-customized 1x-Mac default (painting at 16) \
+             must land one point below it (15), not three (13 = 14 - 1 off \
+             the raw sentinel then re-resolved)"
+        );
+    }
+
+    /// Without ever calling `note_resolved_editor_default_size_pt` — the
+    /// shape every pre-existing GTK/Win-GUI test and any backend that never
+    /// hits the macOS DPI-bump path exercises — `zoom_font_size` must fall
+    /// back to stepping the raw `font_size` field directly, i.e. today's
+    /// pre-#1860 behaviour is unchanged when there is no resolved-default
+    /// cache to seed from.
+    #[test]
+    fn zoom_font_size_falls_back_to_raw_field_when_no_resolved_default_cached() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.font_size, 14);
+
+        settings.zoom_font_size(1);
+        assert_eq!(settings.font_size, 15);
+
+        settings.zoom_font_size(1);
+        assert_eq!(settings.font_size, 16);
     }
 
     /// A fixed-cell backend (TUI) reports [`quadraui::PlatformFontDefaults`]'s

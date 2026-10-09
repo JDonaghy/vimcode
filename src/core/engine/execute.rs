@@ -3493,12 +3493,16 @@ impl Engine {
                 EngineAction::None
             }
             "zoomin" => {
-                self.settings.font_size = (self.settings.font_size + 1).min(72);
+                // #1860 review round 1: `Settings::zoom_font_size` seeds its
+                // `+1` step from the *resolved* (DPI-corrected) size that is
+                // actually painted, not the raw `font_size` field — see its
+                // doc for the macOS zoomin-shrinks-text bug this replaced.
+                self.settings.zoom_font_size(1);
                 let _ = self.settings.save();
                 EngineAction::None
             }
             "zoomout" => {
-                self.settings.font_size = (self.settings.font_size - 1).max(6);
+                self.settings.zoom_font_size(-1);
                 let _ = self.settings.save();
                 EngineAction::None
             }

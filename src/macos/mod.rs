@@ -665,17 +665,18 @@ mod mac_driver_tests {
     }
 
     /// #1860: an un-customized `font_size` must resolve to the DPI-corrected
-    /// `Menlo 16` [`crate::app_support::macos_1x_dpi_bump`] computes — not
-    /// `MacBackend::default_fonts()`'s raw `Menlo 12` — when running at 1x
-    /// scale, which [`MacDriver`](quadraui::macos::testing::MacDriver) always
-    /// does (it hard-codes `scale: 1.0` into every `begin_frame`/`render`
-    /// call it makes — see `quadraui::macos::testing`'s own source). That
-    /// makes this driver permanently exercise exactly the "35% too small"
-    /// scenario real-hardware testing reported on a 1x macmini monitor: the
-    /// production-shaped path (`App::shell_config`'s pre-seed, then
-    /// `App::sync_per_frame_backend_state`'s per-frame sync, both reached
-    /// through the same `impl ShellApp for App` the live `macos::run` hands
-    /// `run_with_shell`) rather than a bare call into `app_support`'s helper.
+    /// `Menlo 16` [`crate::app_support::dpi_correct_platform_default_size`]
+    /// computes — not `MacBackend::default_fonts()`'s raw `Menlo 12` — when
+    /// running at 1x scale, which [`MacDriver`](quadraui::macos::testing::MacDriver)
+    /// always does (it hard-codes `scale: 1.0` into every `begin_frame`/
+    /// `render` call it makes — see `quadraui::macos::testing`'s own
+    /// source). That makes this driver permanently exercise exactly the
+    /// "35% too small" scenario real-hardware testing reported on a 1x
+    /// macmini monitor: the production-shaped path (`App::shell_config`'s
+    /// pre-seed, then `App::sync_per_frame_backend_state`'s per-frame sync,
+    /// both reached through the same `impl ShellApp for App` the live
+    /// `macos::run` hands `run_with_shell`) rather than a bare call into
+    /// `app_support`'s helper.
     ///
     /// Reads `backend.char_width()`/`line_height()` — CoreText's own measured
     /// metrics for whatever font `Backend::set_editor_font` actually
@@ -685,42 +686,212 @@ mod mac_driver_tests {
     /// `set_editor_font` changes what CoreText measures, so this fails if the
     /// correction silently stopped firing.
     ///
+    /// No explicit `driver.render()` here (review nit on #1860's first
+    /// round): `driver()` already paints a first frame inside
+    /// `driver_with_shell` — see that helper's own doc.
+    ///
+    /// The expected sizes are derived from `MacBackend::new().default_fonts()`
+    /// and [`crate::app_support::CORE_TEXT_POINTS_PER_PX_96DPI`] (review nit
+    /// on #1860's first round) rather than the literals `16.0`/`12.0`, so a
+    /// future change to either upstream default moves this test's
+    /// expectation instead of requiring a manual edit.
+    ///
     /// RED-verified against unfixed `develop`: with `app_support::
-    /// macos_1x_dpi_bump`'s `if` short-circuited to never fire, this test
-    /// fails with `char_width 7.2246094 does not match the DPI-corrected
-    /// Menlo 16 metrics 9.6328125 — still resolving the raw Menlo 12
-    /// default (7.224609375)?` — i.e. the measured metrics are exactly
-    /// `Menlo 12`'s, not `Menlo 16`'s.
+    /// dpi_correct_platform_default_size`'s `if` short-circuited to never
+    /// fire, this test fails with `char_width 7.2246094 does not match the
+    /// DPI-corrected Menlo 16 metrics 9.6328125 — still resolving the raw
+    /// Menlo 12 default (7.224609375)?` — i.e. the measured metrics are
+    /// exactly `Menlo 12`'s, not `Menlo 16`'s.
     #[test]
     fn editor_font_bumped_for_1x_scale_via_shell_app() {
         use quadraui::Backend;
 
-        let (_guards, mut driver) = driver(plain_engine());
-        driver.render();
+        let (_guards, driver) = driver(plain_engine());
 
-        let expected_font = quadraui::macos::text::make_font_exact("Menlo", 16.0)
+        let unbumped_size_pt = MacBackend::new().default_fonts().editor_size_pt as f64;
+        let bumped_size_pt =
+            unbumped_size_pt * crate::app_support::CORE_TEXT_POINTS_PER_PX_96DPI as f64;
+
+        let expected_font = quadraui::macos::text::make_font_exact("Menlo", bumped_size_pt)
             .expect("Menlo must resolve on any Mac this test runs on");
         let expected = quadraui::macos::text::font_metrics(&expected_font);
-        let unbumped_font = quadraui::macos::text::make_font_exact("Menlo", 12.0)
+        let unbumped_font = quadraui::macos::text::make_font_exact("Menlo", unbumped_size_pt)
             .expect("Menlo must resolve on any Mac this test runs on");
         let unbumped = quadraui::macos::text::font_metrics(&unbumped_font);
 
         let backend = driver.backend();
         assert!(
             (backend.char_width() as f64 - expected.char_width).abs() < 0.01,
-            "char_width {} does not match the DPI-corrected Menlo 16 metrics \
-             {} — still resolving the raw Menlo 12 default ({})?",
+            "char_width {} does not match the DPI-corrected Menlo {bumped_size_pt} \
+             metrics {} — still resolving the raw Menlo {unbumped_size_pt} \
+             default ({})?",
             backend.char_width(),
             expected.char_width,
             unbumped.char_width
         );
         assert!(
             (backend.line_height() as f64 - expected.line_height).abs() < 0.01,
-            "line_height {} does not match the DPI-corrected Menlo 16 metrics \
-             {} — still resolving the raw Menlo 12 default ({})?",
+            "line_height {} does not match the DPI-corrected Menlo \
+             {bumped_size_pt} metrics {} — still resolving the raw Menlo \
+             {unbumped_size_pt} default ({})?",
             backend.line_height(),
             expected.line_height,
             unbumped.line_height
+        );
+    }
+
+    /// #1860 non-blocking review note: the `scale < 2.0` guard's *false*
+    /// arm had zero coverage — nothing proved a Retina Mac is left alone.
+    /// Mirrors `editor_font_family_default_resolves_a_real_font_on_macos`'s
+    /// bare-backend shape (no `App`/driver needed, this is purely about
+    /// `dpi_correct_platform_default_size`'s own branch) but seeds
+    /// `begin_frame` with `scale: 2.0` instead of `MacBackend::new`'s
+    /// default `1.0`.
+    ///
+    /// RED-verified: temporarily dropping the `&& backend.viewport().scale
+    /// < 2.0` half of `dpi_correct_platform_default_size`'s condition makes
+    /// this fail — the resolved size becomes the bumped `Menlo 16`/`21.33`
+    /// instead of the untouched platform default this test asserts.
+    #[test]
+    fn dpi_correct_platform_default_size_leaves_retina_untouched() {
+        use quadraui::Backend;
+
+        let mut backend = MacBackend::new();
+        backend.begin_frame(quadraui::Viewport::new(W as f32, H as f32, 2.0));
+
+        let defaults = backend.default_fonts();
+        let editor_size = crate::app_support::dpi_correct_platform_default_size(
+            &backend,
+            defaults.editor_size_pt,
+        );
+        assert_eq!(
+            editor_size, defaults.editor_size_pt,
+            "a Retina (2x) Mac must not have its platform-default editor \
+             size corrected — CoreText's raw point size already lands on \
+             twice the physical pixels of its 1x equivalent there"
+        );
+
+        let ui_size =
+            crate::app_support::dpi_correct_platform_default_size(&backend, defaults.ui_size_pt);
+        assert_eq!(
+            ui_size, defaults.ui_size_pt,
+            "a Retina (2x) Mac must not have its platform-default UI-chrome \
+             size corrected either"
+        );
+    }
+
+    /// #1860 review round 1, blocking finding 2: the macOS twin of
+    /// `crate::gtk::testing::ui_font_size_default_resolves_to_gtk_backend_convention_not_hardcoded_10pt` —
+    /// same shape (an un-customized `ui_font_size` must resolve to the
+    /// backend's own convention, DPI-corrected on macOS at 1x), same
+    /// "painted breadcrumb glyph width" assertion, just driven through
+    /// `MacDriver` instead of `GtkDriver`.
+    ///
+    /// This is the chrome half of #1860 the editor-metrics test above
+    /// doesn't cover: `src/app_support.rs`'s `dpi_correct_platform_default_size`
+    /// bump reaches `ui_font_size` too (macOS `ui_size_pt: 13.0 -> 17.0` at
+    /// 1x), every menu bar/tab bar/status bar/tree/breadcrumb glyph on a 1x
+    /// Mac, not just the editor buffer — and nothing in the suite asserted
+    /// it before this test.
+    ///
+    /// RED-verified against unfixed `develop`: before this PR's round 1,
+    /// `resolve_ui_font_size` never called `dpi_correct_platform_default_size`
+    /// at all (`macos_1x_dpi_bump` — the pre-round-1 name — existed only for
+    /// `resolve_editor_font`), so `ui_font_size` resolved straight to the
+    /// raw `13.0` default everywhere; temporarily hardcoding
+    /// `resolve_ui_font_size` to `settings.effective_ui_font_size(defaults.ui_size_pt)`
+    /// (skipping the DPI correction) reproduces that and makes the first
+    /// assertion below fail (`default_bounds` comes back the width of an
+    /// explicit `ui_font_size = 13` buffer, not `17`).
+    #[test]
+    fn ui_font_size_default_resolves_to_mac_backend_convention_not_raw_13pt() {
+        let engine_default = engine_with_breadcrumb_path();
+        let (_guards_default, driver_default) = driver(engine_default);
+        let default_bounds = driver_default
+            .find_bounds("src")
+            .expect("breadcrumb 'src' segment must paint at Settings::default()");
+
+        let mut engine_explicit_17 = engine_with_breadcrumb_path();
+        engine_explicit_17.settings.ui_font_size = 17;
+        let (_guards_17, driver_17) = driver(engine_explicit_17);
+        let explicit_17_bounds = driver_17
+            .find_bounds("src")
+            .expect("breadcrumb 'src' segment must paint at ui_font_size=17");
+
+        let mut engine_explicit_13 = engine_with_breadcrumb_path();
+        engine_explicit_13.settings.ui_font_size = 13;
+        let (_guards_13, driver_13) = driver(engine_explicit_13);
+        let explicit_13_bounds = driver_13
+            .find_bounds("src")
+            .expect("breadcrumb 'src' segment must paint at ui_font_size=13");
+
+        assert!(
+            (default_bounds.width - explicit_17_bounds.width).abs() < 0.5,
+            "Settings::default()'s un-customized ui_font_size must resolve \
+             to MacBackend::default_fonts()'s 13pt convention, DPI-corrected \
+             to 17pt at the 1x scale MacDriver always runs at: got \
+             default={default_bounds:?} explicit_17={explicit_17_bounds:?}"
+        );
+        assert!(
+            (default_bounds.width - explicit_13_bounds.width).abs() > 3.0,
+            "sanity: an explicit (un-corrected) ui_font_size=13 must paint \
+             visibly narrower than the DPI-corrected default, or this test \
+             can't tell point sizes apart: got default={default_bounds:?} \
+             explicit_13={explicit_13_bounds:?}"
+        );
+    }
+
+    /// #1860 review round 1, blocking finding 1: `zoomin`/`zoomout`
+    /// (`core::engine::execute::Engine::execute_command`) must grow/shrink
+    /// the *painted* editor text monotonically — never the "first zoomin
+    /// shrinks the text" inversion the review caught on an un-customized 1x
+    /// Mac buffer (`font_size` sentinel `14` paints at the DPI-corrected
+    /// `16`; the pre-fix `zoomin` stored the raw `14 + 1 = 15`, smaller than
+    /// what was already on screen).
+    ///
+    /// Drives the real ex-command path (`Engine::execute_command`, the same
+    /// call a `Ctrl++`/`Ctrl+-` keystroke or the command palette makes) —
+    /// not `Settings::zoom_font_size` directly, which
+    /// `core::settings::tests::zoom_font_size_*` already covers in
+    /// isolation — through a full `App`/`MacDriver` frame at `MacDriver`'s
+    /// permanent 1x scale, and asserts on CoreText's own measured
+    /// `char_width`, the same black-box shape
+    /// `editor_font_bumped_for_1x_scale_via_shell_app` above uses.
+    ///
+    /// RED-verified against the pre-fix `zoomin`/`zoomout`
+    /// (`self.settings.font_size = (self.settings.font_size + 1).min(72)`):
+    /// re-running this test against that body fails on the first
+    /// assertion — the post-zoomin `char_width` comes back *smaller* than
+    /// the pre-zoom one, because `15 < 16`.
+    #[test]
+    fn zoomin_from_uncustomized_1x_default_grows_text_not_shrinks_it() {
+        use quadraui::Backend;
+
+        let (_guards, engine, mut driver) = driver_with_engine(plain_engine());
+        let char_width_before_zoom = driver.backend().char_width();
+
+        engine.borrow_mut().execute_command("zoomin");
+        driver.render();
+        let char_width_after_zoomin = driver.backend().char_width();
+
+        assert!(
+            char_width_after_zoomin > char_width_before_zoom,
+            "the first `zoomin` from an un-customized 1x-Mac buffer must \
+             grow the painted text, not shrink it: before={char_width_before_zoom} \
+             after={char_width_after_zoomin}"
+        );
+
+        engine.borrow_mut().execute_command("zoomout");
+        driver.render();
+        engine.borrow_mut().execute_command("zoomout");
+        driver.render();
+        let char_width_after_zoomout = driver.backend().char_width();
+
+        assert!(
+            char_width_after_zoomout < char_width_after_zoomin,
+            "`zoomout` must shrink the painted text back down: \
+             after_zoomin={char_width_after_zoomin} \
+             after_zoomout={char_width_after_zoomout}"
         );
     }
 
@@ -733,6 +904,22 @@ mod mac_driver_tests {
     fn plain_engine() -> Engine {
         let mut engine = Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    /// An engine with an open buffer whose breadcrumb path paints a `"src"`
+    /// segment — mirrors `crate::gtk::testing::engine_with_breadcrumb_path`
+    /// exactly, for the #1860 `ui_font_size` chrome test above, which needs
+    /// a UI-font-painted glyph run to measure.
+    fn engine_with_breadcrumb_path() -> Engine {
+        let mut engine = plain_engine();
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        let buf = engine.active_buffer_id();
+        if let Some(state) = engine.buffer_manager.get_mut(buf) {
+            state.file_path = Some(cwd.join("src").join("main.rs"));
+        }
+        engine.buffer_mut().insert(0, "fn main() {}\n");
         engine
     }
 

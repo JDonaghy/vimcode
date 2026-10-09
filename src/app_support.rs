@@ -142,44 +142,71 @@ pub(crate) fn sync_ui_font_size(
 /// about 35% smaller under Core Text than it does under Pango (issue
 /// #1860's macmini report: `MacBackend::default_fonts()`'s `Menlo 12` is
 /// 12 device px at 1x; GTK's own `Monospace 14` default is ~18.7px at 96
-/// dpi). [`macos_1x_dpi_bump`] applies this exact ratio back onto macOS's
-/// *un-customized* platform-default sizes at 1x only, closing that gap
-/// without touching `quadraui` (off-limits per this repo's
-/// Platform-Neutrality Rule — `~/src/quadraui` is a published crate
+/// dpi). [`dpi_correct_platform_default_size`] applies this exact ratio
+/// back onto macOS's *un-customized* platform-default sizes at 1x only,
+/// closing that gap without touching `quadraui` (off-limits per this
+/// repo's Platform-Neutrality Rule — `~/src/quadraui` is a published crate
 /// dependency here, not a sibling checkout to edit) or adding a
 /// `cfg!(target_os = "macos")` branch to this file: the correction is
 /// driven entirely by data every backend's `dyn quadraui::Backend` already
 /// answers (`default_fonts()`, `viewport()`), the same shape
 /// `UI_FONT_FAMILY`'s history above already settled on.
-const MACOS_DPI_SCALE: f32 = 96.0 / 72.0;
+///
+/// Named for the conversion it performs, not the platform it happens to
+/// fire on today (review nit on #1860's first round) — this module's own
+/// header doc says none of its items name a per-platform type, and
+/// `"macos"` in a constant name reads like an exception to that rule.
+pub(crate) const CORE_TEXT_POINTS_PER_PX_96DPI: f32 = 96.0 / 72.0;
 
-/// Applies [`MACOS_DPI_SCALE`] to `native_size_pt` when, and only when,
-/// `defaults` is unmistakably macOS's own [`quadraui::PlatformFontDefaults`]
-/// — its `editor_family` is the literal `"Menlo"` no other in-tree backend
-/// returns (`MacBackend::default_fonts()` is the one call site that sets
-/// it; GTK/Win-GUI/TUI each return `"Monospace"`/`"Consolas"`/`""`) — *and*
-/// `backend`'s current viewport is still at 1x scale. At 2x+ (Retina), Core
-/// Text's raw point size already renders at twice the physical pixels of
-/// its 1x equivalent, so the platform default is left untouched; see
-/// [`MACOS_DPI_SCALE`]'s doc for the full issue #1860 writeup.
+/// Applies [`CORE_TEXT_POINTS_PER_PX_96DPI`] to `native_size_pt` when, and
+/// only when, `backend.default_fonts().editor_family` is unmistakably
+/// macOS's own convention — the literal `"Menlo"` no other in-tree backend
+/// returns (`MacBackend::default_fonts()`, quadraui 0.1.1
+/// `src/macos/backend.rs:1398`, is the one call site that sets it;
+/// GTK/Win-GUI/TUI each return `"Monospace"`/`"Consolas"`/`""` — see this
+/// function's own "no quadraui issue filed yet" paragraph below for why
+/// this string match, not a `cfg!`, is the discriminator) — *and*
+/// `backend`'s current viewport is still at 1x scale. At 2x+ (Retina),
+/// Core Text's raw point size already
+/// renders at twice the physical pixels of its 1x equivalent, so the
+/// platform default is left untouched; see
+/// [`CORE_TEXT_POINTS_PER_PX_96DPI`]'s doc for the full issue #1860
+/// writeup.
+///
+/// Takes `backend` alone, not a separately-passed `PlatformFontDefaults`
+/// (review feedback on #1860's first round) — both call sites below always
+/// pass `backend.default_fonts()` back in verbatim, so a second parameter
+/// only created room for a caller to pass a mismatched pair; resolving it
+/// internally removes that possibility entirely at the cost of one extra
+/// (cheap, struct-literal) `default_fonts()` call.
+///
+/// **No quadraui issue filed yet for the underlying gap** (review
+/// non-blocking note): [`quadraui::PlatformFontDefaults`] has no DPI
+/// semantic at all — `editor_size_pt` means device px on Core Text and
+/// 96dpi points on Pango/DirectWrite — so this function is a vimcode-side
+/// workaround with no exit path until that's filed against
+/// `JDonaghy/quadraui` and referenced here. Left for the coordinator: this
+/// worker cannot file GitHub issues (see this repo's worker protocol).
 ///
 /// `backend.viewport().scale` reads whatever the last `Backend::begin_frame`
 /// call set it to; before the very first frame (one of this function's two
 /// callers, the `ShellConfig`-construction pre-seed in `App::shell_config`,
 /// runs before any window exists) it is still `MacBackend::new`'s `1.0`
-/// seed regardless of the real display, so a Retina Mac's very first frame
-/// is briefly laid out against the bumped size — the same one-frame
-/// placeholder gap `resolve_editor_font`'s own doc already describes for
-/// `current_char_width`/`current_line_height` — before the per-frame call
-/// in `App::sync_per_frame_backend_state` (reading the real post-
-/// `begin_frame` scale) corrects it back down for frame 1 itself.
-pub(crate) fn macos_1x_dpi_bump(
-    defaults: &quadraui::PlatformFontDefaults,
+/// seed regardless of the real display. That pre-window pre-seed is the
+/// only place the un-corrected (pending real scale) bump can be measured
+/// against — `quadraui::macos::run::render_frame` calls `begin_frame` with
+/// the real `backingScaleFactor` *before* `App::render` runs
+/// (`run.rs:408`), so no actually painted frame, Retina or not, is ever
+/// laid out against the bumped size; `App::sync_per_frame_backend_state`'s
+/// per-frame call (reading the real post-`begin_frame` scale) is what every
+/// painted frame, including the first, sees.
+pub(crate) fn dpi_correct_platform_default_size(
     backend: &dyn quadraui::Backend,
     native_size_pt: f32,
 ) -> f32 {
+    let defaults = backend.default_fonts();
     if defaults.editor_family == "Menlo" && backend.viewport().scale < 2.0 {
-        native_size_pt * MACOS_DPI_SCALE
+        native_size_pt * CORE_TEXT_POINTS_PER_PX_96DPI
     } else {
         native_size_pt
     }
@@ -188,35 +215,52 @@ pub(crate) fn macos_1x_dpi_bump(
 /// Resolve this session's editor font `(family, size_pt)` — the user's
 /// explicit `settings.font_family`/`font_size` if they have ever set one,
 /// else `backend`'s own platform-native convention (issue #1156/#1542),
-/// DPI-corrected on macOS at 1x scale per [`macos_1x_dpi_bump`] (#1860).
-/// Thin wrapper over [`core::settings::Settings::effective_editor_font`];
-/// exists so every call site (the `ShellConfig`-construction pre-seed in
-/// `App::shell_config` and the per-frame sync in
-/// `App::sync_per_frame_backend_state`) asks `backend` for its defaults
-/// the same way, rather than each inlining its own `backend.default_fonts()`
-/// call.
+/// DPI-corrected on macOS at 1x scale per [`dpi_correct_platform_default_size`]
+/// (#1860). Thin wrapper over
+/// [`core::settings::Settings::effective_editor_font`]; exists so every
+/// call site (the `ShellConfig`-construction pre-seed in `App::shell_config`
+/// and the per-frame sync in `App::sync_per_frame_backend_state`) asks
+/// `backend` for its defaults the same way, rather than each inlining its
+/// own `backend.default_fonts()` call.
+///
+/// Also caches the resolved (DPI-corrected) default size onto `settings`
+/// via [`core::settings::Settings::note_resolved_editor_default_size_pt`]
+/// (#1860 review round 1) — `zoomin`/`zoomout`
+/// (`core::engine::execute::Engine::execute_command`) need to seed their
+/// `+1`/`-1` step from the size that is *actually currently painted*, not
+/// the raw sentinel `font_size` field, or the first zoom keystroke on an
+/// un-customized 1x Mac buffer silently shrinks the text (14 -> 15 is less
+/// than the DPI-corrected 16 it replaces) instead of growing it. `execute.rs`
+/// is core and has no `dyn quadraui::Backend` of its own to resolve this
+/// with directly, so this is the one place in the whole call graph that
+/// *does* have one and can leave the answer behind for it to read later —
+/// see that method's own doc for the full read side of this.
 pub(crate) fn resolve_editor_font(
     settings: &core::settings::Settings,
     backend: &dyn quadraui::Backend,
 ) -> (String, f32) {
     let defaults = backend.default_fonts();
-    let size_pt = macos_1x_dpi_bump(&defaults, backend, defaults.editor_size_pt);
+    let size_pt = dpi_correct_platform_default_size(backend, defaults.editor_size_pt);
+    settings.note_resolved_editor_default_size_pt(size_pt);
     settings.effective_editor_font(&defaults.editor_family, size_pt)
 }
 
 /// Resolve this session's UI/chrome font size in points — [`resolve_editor_font`]'s
 /// twin for `settings.ui_font_size` (#1542), carrying the same
-/// [`macos_1x_dpi_bump`] correction (#1860's "also worth checking:
-/// `ui_font_size` follows the same rule" note — macOS's `ui_size_pt: 13.0`
-/// is just as subject to the 96/72 dpi gap as `editor_size_pt`, it's only
-/// the editor metric real-hardware testing happened to report). Thin
-/// wrapper over [`core::settings::Settings::effective_ui_font_size`].
+/// [`dpi_correct_platform_default_size`] correction (#1860's "also worth
+/// checking: `ui_font_size` follows the same rule" note — macOS's
+/// `ui_size_pt: 13.0` is just as subject to the 96/72 dpi gap as
+/// `editor_size_pt`, it's only the editor metric real-hardware testing
+/// happened to report). Thin wrapper over
+/// [`core::settings::Settings::effective_ui_font_size`]. No zoom command
+/// touches `ui_font_size`, so unlike [`resolve_editor_font`] this has no
+/// zoom-seed cache to maintain.
 pub(crate) fn resolve_ui_font_size(
     settings: &core::settings::Settings,
     backend: &dyn quadraui::Backend,
 ) -> u8 {
     let defaults = backend.default_fonts();
-    let size_pt = macos_1x_dpi_bump(&defaults, backend, defaults.ui_size_pt);
+    let size_pt = dpi_correct_platform_default_size(backend, defaults.ui_size_pt);
     settings.effective_ui_font_size(size_pt)
 }
 
