@@ -1912,6 +1912,25 @@ steps:
   # HOME, `use_nerd_fonts`/`lsp_enabled` off. A Linux-hardware
   # confirmation (the literal platform this issue names) is still
   # outstanding -- see PROJECT_STATE.md.
+  #
+  # Review round 1 (self-invalidation fix): a fixed `/tmp`/extensions-dir
+  # path with nothing that ever deletes it means every probe below is a
+  # one-shot test -- from the second run onward it passes even if `:term`
+  # never opens or the shell swallows the typed command, because a PRIOR
+  # run's leftover file on disk still satisfies `expect_file`. Three
+  # changes fix that: (a) the `:term`/extension-install shell commands now
+  # `rm` their own target before (re)creating it, so each run's pass
+  # depends on that run's own command actually executing in a live shell,
+  # not a stale file from a previous pass; (b) the `w-bare-probe-*-1835`
+  # steps right after the `:saveas` probe append a NEW marker suffix and
+  # re-save with a bare `:w`, so that check can only pass if `:w` itself
+  # just ran -- a leftover file from an earlier run would be missing the
+  # suffix and fail `contains`; (c) a trailing cleanup block at the end of
+  # this section removes every file/directory this section created, both
+  # so the NEXT run starts clean and so this probe stops permanently
+  # installing a bogus extension into the operator's real
+  # `~/.config/vimcode/extensions/` (which every later `vimcode`/`vcd`
+  # launch on the host would otherwise load, forever).
   - type: key
     id: 'w-probe-settle-esc-1835'
     key: 'esc'
@@ -1928,17 +1947,32 @@ steps:
   # (same rigor this file's header already applies to the `gg`/`G`
   # column-reset finding): plain Vim lets `:w {path}` write the current
   # buffer to a NEW path without renaming the buffer; vimcode's `:w`
-  # (`"write"`/`"write!"` in `src/core/engine/execute.rs`) ignores a
-  # trailing path argument entirely -- confirmed by a real run of this
-  # exact probe with a bare `:w <path>` in place of `:saveas <path>`
+  # (`"write"`/`"write!"` in `src/core/engine/execute.rs`) matches `cmd`
+  # *exactly* against the literal strings `"write"`/`"write!"` -- a
+  # trailing path argument makes the whole command fall through to the
+  # catch-all arm, so `:w {path}` is not a silent no-op, it is an
+  # UNRECOGNIZED command (`"Not an editor command: write {path}"`) that
+  # does not even save the CURRENT file -- confirmed by a real run of
+  # this exact probe with a bare `:w <path>` in place of `:saveas <path>`
   # below, which left no file at all on disk. `:saveas <path>` is the
   # command vimcode actually implements for "write to this explicit
   # path" (`execute.rs`'s `"saveas" =>`/`strip_prefix("saveas ")` arms),
-  # so that's what this probe uses. It is also launch-independent, which
-  # a bare `:w` (saving back to whatever file `coord` happened to launch,
-  # a path this file's own header deliberately does not pin down) would
-  # not be -- the same reason `right-click-explorer-root-row-1703` above
-  # switched off a launch-dependent coordinate.
+  # so that's what this probe uses for the new-path half of the check. It
+  # is also launch-independent, which a bare `:w` (saving back to
+  # whatever file `coord` happened to launch, a path this file's own
+  # header deliberately does not pin down) would not be -- the same
+  # reason `right-click-explorer-root-row-1703` above switched off a
+  # launch-dependent coordinate. The literal bare-`:w` gesture the issue
+  # names is still covered, just deferred until AFTER `:saveas` has named
+  # the buffer (see the `w-bare-probe-*-1835` steps below) so it stays
+  # launch-independent too, re-saving to the SAME now-explicit path.
+  #
+  # NOT filed as a vimcode bug: no documentation claims `:w {path}` is
+  # supported, and fixing engine behavior is out of this smoke-spec-
+  # authoring issue's scope -- flagged here, and in PROJECT_STATE.md, for
+  # the coordinator to file as a real tracked issue (this worker cannot
+  # run `gh`); until that issue number exists there is nothing to put in
+  # this comment beyond this description.
   - type: key
     id: 'w-probe-clear-colon-1835'
     key: ':'
@@ -1977,6 +2011,37 @@ steps:
     contains: 'VIMCODE_SMOKE_SAVE_PROBE_1835'
     timeout_ms: 5000
 
+  # 1b. Bare `:w` -> `expect_file`. The issue's step 1 literally names
+  # `:w`, not `:saveas` -- this covers the real "typing -> `:w` -> file on
+  # disk" gesture a user performs after `:saveas` has already named the
+  # buffer (a bare `:w` with no prior `:saveas` would be launch-dependent;
+  # see the comment above). Appends a NEW marker suffix before saving so
+  # this check is self-invalidating: a leftover file from an earlier run
+  # (or from the `:saveas` probe just above, within this same run) would
+  # be missing the `_WBARE` suffix and fail `contains` -- it can only pass
+  # if this `:w` actually just wrote the buffer.
+  - type: key
+    id: 'w-bare-probe-append-key-1835'
+    key: 'A'
+  - type: type_text
+    id: 'w-bare-probe-append-text-1835'
+    text: '_WBARE'
+  - type: key
+    id: 'w-bare-probe-esc-1835'
+    key: 'esc'
+  - type: expect_within
+    id: 'w-bare-probe-landed-1835'
+    text: 'VIMCODE_SMOKE_SAVE_PROBE_1835_WBARE'
+    ms: 5000
+  - type: type_text
+    id: 'w-bare-probe-write-command-1835'
+    text: ":w\r"
+  - type: expect_file
+    id: 'w-bare-probe-file-appears-1835'
+    path: '/tmp/vimcode-smoke-save-probe-1835.txt'
+    contains: 'VIMCODE_SMOKE_SAVE_PROBE_1835_WBARE'
+    timeout_ms: 5000
+
   # 2. `:term` probe -> `expect_file`. Mirrors
   # `tests/conpty_term_opens_shell_1829.rs`'s own real-ConPTY probe
   # exactly (same marker/echo shape, same `[1]`
@@ -2001,7 +2066,7 @@ steps:
     timeout_ms: 5000
   - type: type_text
     id: 'term-probe-echo-1835'
-    text: "echo VIMCODE_SMOKE_TERM_PROBE_1835 > /tmp/vimcode-smoke-term-probe-1835.txt\r"
+    text: "rm -f /tmp/vimcode-smoke-term-probe-1835.txt && echo VIMCODE_SMOKE_TERM_PROBE_1835 > /tmp/vimcode-smoke-term-probe-1835.txt\r"
   - type: expect_file
     id: 'term-probe-file-appears-1835'
     path: '/tmp/vimcode-smoke-term-probe-1835.txt'
@@ -2028,10 +2093,26 @@ steps:
   # `coord` actually dispatches this spec in production.
   - type: type_text
     id: 'ext-install-probe-1835'
-    text: "mkdir -p ~/.config/vimcode/extensions/vimcode-smoke-ext-1835 && echo 'name = \"vimcode-smoke-ext-1835\"' > ~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml && echo 'display_name = \"VimCode Smoke Ext 1835\"' >> ~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml\r"
+    text: "rm -rf ~/.config/vimcode/extensions/vimcode-smoke-ext-1835 && mkdir -p ~/.config/vimcode/extensions/vimcode-smoke-ext-1835 && echo 'name = \"vimcode-smoke-ext-1835\"' > ~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml && echo 'display_name = \"VimCode Smoke Ext 1835\"' >> ~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml\r"
   - type: expect_file
     id: 'ext-install-manifest-appears-1835'
     path: '~/.config/vimcode/extensions/vimcode-smoke-ext-1835/manifest.toml'
     contains: 'vimcode-smoke-ext-1835'
     timeout_ms: 10000
+
+  # Trailing cleanup -- removes every file/directory this section
+  # created, both so the NEXT run of this spec starts clean (no stale
+  # `/tmp` file or extension directory to mask a future regression as a
+  # pass) and so this probe stops permanently installing a bogus
+  # extension into the operator's REAL `~/.config/vimcode/extensions/`,
+  # which every later `vimcode`/`vcd` launch on this host (including
+  # other smoke specs) would otherwise load. Reuses the already-open
+  # terminal pane from step 2/3 above -- no new `:term` needed.
+  - type: type_text
+    id: 'cleanup-probe-1835'
+    text: "rm -f /tmp/vimcode-smoke-save-probe-1835.txt /tmp/vimcode-smoke-term-probe-1835.txt && rm -rf ~/.config/vimcode/extensions/vimcode-smoke-ext-1835\r"
+  - type: wait_idle
+    id: 'cleanup-probe-settle-1835'
+    ms: 300
+    timeout_ms: 4000
 
