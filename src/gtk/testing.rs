@@ -15405,7 +15405,12 @@ mod minimap {
              fixture, or the colour assertions below are vacuous"
         );
 
-        let mut h = harness(engine, 1400, 900);
+        // #1869: widened from the pre-#1869 1400px — under the real VS Code
+        // minimap width formula (which, unlike the pre-#1869 fraction-based
+        // one, genuinely narrows as a function of the pane's own remaining
+        // width) a 1400px harness no longer reaches the ≥96-column budget
+        // deliverable 2's indent-80 probe below needs.
+        let mut h = harness(engine, 1600, 900);
         h.window_center(win_id)
             .expect("editor pane must paint with the minimap on");
 
