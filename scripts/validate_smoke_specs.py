@@ -47,6 +47,7 @@ SPECS = [
     ("win-gui.yaml", parse_win_native_spec, "win-native"),
     ("win-terminal.yaml", parse_win_native_spec, "win-native"),
     ("mac-gui.yaml", parse_mac_native_spec, "mac-native"),
+    ("mac-gtk.yaml", parse_mac_native_spec, "mac-native"),
     ("gtk-gui.yaml", parse_gtk_native_spec, "gtk-native"),
 ]
 

@@ -1,5 +1,46 @@
 # VimCode Project State
 
+**Last updated:** October 9, 2026 (#1831 — "first five minutes" smoke spec
+for the **shipped macOS GTK artifact** (`vimcode-macos-arm64.tar.gz`), run
+on `macmini`). New file `tests/smoke-spec/mac-gtk.yaml`, driven by the
+existing `mac-native` driver (`coord/mac_native_driver.py` — the same one
+`mac-gui.yaml` uses; its `CGEvent`/AX/`screencapture` calls are OS-level,
+not toolkit-specific, so no new coordinator-side driver was needed, just a
+new spec file pointed at the GTK tarball binary instead of the native
+`--features macos` one). Covers the issue's four steps: `expect_frontmost`
++ a typing/`:saveas`/bare-`:w` probe (gated on vimcode#1825 — expected RED
+until a person confirms the quadraui `activateIgnoringOtherApps`/
+`setActivationPolicy` fix from #1843 on real macOS hardware, per
+`docs/PENDING_QUADRAUI_ISSUES.md`'s struck "`quadraui::gtk::run` never
+activates..." entry, which explicitly named this exact missing lane in its
+own "Test" section), a `:term` probe + `expect_region_not_uniform` on the
+panel, and a `File → New Tab` click sequence + close-button
+`expect_closed`. Also added `mac-gtk.yaml` to
+`scripts/validate_smoke_specs.py`'s `SPECS` table.
+**UNRUN ON REAL HARDWARE — not done per this issue's own bar** ("the spec
+has actually run on the real host"). This worker's environment is a
+sandboxed Linux worktree with no macmini access and no Darwin host of any
+kind reachable from it; `coord.mac_native_driver`'s `MacOSCalls`
+construction requires real AppKit/Quartz (`pyobjc`) and is macOS-only by
+design, so `coord app-drive run-spec mac-native` cannot even start here.
+What WAS verified from this worktree: the file parses cleanly against the
+real, installed `coord.mac_native_driver.parse_native_spec` (confirmed via
+`python3 scripts/validate_smoke_specs.py` against `code-coordinator`
+0.5.620, above CI's `>=0.5.551` floor) — every step type the issue asked
+for (`type_text`/`expect_file`/`expect_frontmost`/
+`expect_region_not_uniform`) already exists in that driver, so none needed
+to be marked pending. Every pixel coordinate (the File-menu click, the
+dropdown's first-item position, the close button, the terminal-panel band)
+is a first-approximation guess derived from `src/render.rs`'s drawn-chrome
+constants, not a real `screencapture` capture — needs an operator with
+real macmini access to run this file for real, record pass/fail (including
+whether vimcode#1825 is still red), and correct any pixel geometry that
+misses, back into the file's own header. See that file's header for the
+full reasoning, including why no `expect_a11y` check was added for the
+File/New-Tab click (a GTK-via-quartz window's AX-tree shape on macOS is
+itself unconfirmed, so a role-string guess on top of that would compound
+two guesses rather than add real coverage).
+
 **Last updated:** October 9, 2026 (#1832 review round 1 — fix the "additive-
 only" violation in `tests/smoke-spec/mac-gui.yaml`). The original #1832 fix
 below (its own entry, unedited) rewrote several pre-existing comment
