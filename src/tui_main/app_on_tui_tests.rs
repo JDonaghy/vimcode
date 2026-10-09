@@ -2524,12 +2524,28 @@ mod tests {
             let rows: Vec<&str> = screen.lines().collect();
             assert_eq!(rows.len(), ROWS, "harness geometry; screen:\n{screen}");
 
+            // #1877 review round 1 (nit): locate the gear via its own
+            // registered chrome zone (`PANEL_SETTINGS`, "bottom:settings"
+            // — the same zone id `src/macos/mod.rs`'s
+            // `settings_activity_bar_zone_ends_above_the_status_bar_via_
+            // mac_driver` uses), not by searching the whole screen for its
+            // glyph text. With nerd fonts off (`plain_engine()` forces
+            // this), `SETTINGS.s()` resolves to the single character `"*"`
+            // (`icons.rs`) — a collision-prone locator that could match
+            // elsewhere on the 80x24 screen and either spuriously fail (if
+            // matched on the status row) or vacuously pass (if matched
+            // inside the editor area). The zone is unambiguous: one
+            // registered id, one rect.
             let gear = driver
-                .find_bounds(crate::icons::SETTINGS.s())
+                .inventory()
+                .zones()
+                .iter()
+                .find(|z| z.id.as_str() == crate::core::engine::sidebar::PANEL_SETTINGS)
+                .map(|z| z.bounds)
                 .unwrap_or_else(|| {
                     panic!(
-                        "the Settings activity-bar glyph must paint; \
-                         screen:\n{screen}"
+                        "the Settings activity-bar item must register its \
+                         chrome zone; screen:\n{screen}"
                     )
                 });
 

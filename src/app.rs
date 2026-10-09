@@ -1770,7 +1770,16 @@ impl App {
         // command line) that this issue reports; a frame with wildmenu or
         // quickfix *also* open still has a few extra rows of bottom chrome
         // this reservation doesn't know about, a strictly smaller residual
-        // gap than today's "reserves nothing at all". Neither band is
+        // gap than today's "reserves nothing at all". The inverse also
+        // exists and is worth naming rather than leaving implicit: with
+        // `laststatus=0` (or `1` with a single window, `global_status_bar`
+        // stays `None`) vimcode's actual bottom chrome is one row, not
+        // two, so this static reservation over-reserves by a row — the
+        // activity bar/sidebar stop one row higher than strictly
+        // necessary. Harmless on its own (an extra row of the activity
+        // bar's own `theme.tab_bar_bg` fill, not a gap), but it widens
+        // the same reclaimed-strip accounting `bottom_chrome_reservation_
+        // fill_rect` below has to get right either way. Neither band is
         // painted by quadraui itself — `render_content` keeps painting
         // vimcode's own status/command-line rows into
         // `main_content_bounds` exactly as before; see
@@ -10949,12 +10958,53 @@ impl quadraui::ShellApp for App {
                     // the same empty-`MenuBar` background-only trick the
                     // app-icon slot filler above uses, mirroring VS Code's
                     // own macOS title bar (which paints the full row
-                    // including behind the traffic lights). A no-op
-                    // repaint on every other backend: there,
-                    // `presence.menu_row` is `true` whenever this rung is
-                    // live, so `FrameOp::MenuDropdown` already painted
-                    // this exact fill across this exact rect immediately
-                    // beforehand.
+                    // including behind the traffic lights).
+                    //
+                    // Review round 1 (#1877) caught an earlier draft of
+                    // this comment claiming this is "a no-op repaint on
+                    // every other backend" because `presence.menu_row` is
+                    // supposedly `true` whenever this rung is live. That
+                    // reasoning was wrong as *stated*: `presence.menu_row
+                    // == screen.menu_bar_visible && title_bar_band_live`
+                    // while `presence.command_center == title_bar_band_live`
+                    // alone (`FramePresence::from_screen`, #939) — the two
+                    // are deliberately *not* coupled, so `menu_bar_visible`
+                    // can be `false` while this rung is still live on
+                    // GTK/Win too (`Engine::toggle_menu_bar` at runtime, or
+                    // TUI's `cell` profile booting with the menu bar
+                    // hidden), independent of `presence.menu_row`.
+                    //
+                    // It is, however, still a no-op in *every case this
+                    // codebase can currently reach* — for a more precise
+                    // reason than the coupling claim above, not because of
+                    // it. `command_center_rect` (below) is measured with
+                    // `leading_inset = control_inset.width.max(0.0)`, and
+                    // `Backend::titlebar_control_inset()` is provably
+                    // `Rect::default()` (zero) on every backend except
+                    // `MacBackend` (see `control_inset_is_default_because_
+                    // mac_driver_never_sets_a_window`'s doc in
+                    // `src/macos/mod.rs`). With a zero inset and
+                    // `presence.menu_row == false`, `items_for_measure`
+                    // collapses to zero width and `draw_controls` is also
+                    // `false` (`should_draw_window_controls`), so
+                    // `command_center_rect` already spans the *entire*
+                    // row, x=0 included — this fill then paints the exact
+                    // same rect the same colour immediately before
+                    // `paint_command_center_rung` does, a real but
+                    // invisible duplicate draw call. The one case where it
+                    // is NOT redundant is a native-menu backend with a
+                    // non-zero inset (macOS, #940's `leading_inset`): there
+                    // `command_center_rect` starts *after* the inset, so
+                    // this fill is the only thing painting the strip
+                    // behind the traffic lights — this issue's actual
+                    // fix. GTK's `command_center_stays_live_when_menu_bar_
+                    // is_hidden` test pins the GTK-reachable case (row
+                    // still paints `theme.tab_bar_bg`) but, per its own
+                    // doc, cannot RED-verify this fill specifically —
+                    // `paint_command_center_rung`'s own background already
+                    // covers the same pixel there, same as this comment
+                    // just explained.
+                    let mut row_filled = false;
                     if !presence.menu_row {
                         let filler = quadraui::MenuBar {
                             id: quadraui::WidgetId::new("title_row_background_fill"),
@@ -10963,7 +11013,9 @@ impl quadraui::ShellApp for App {
                             focused_item: None,
                         };
                         let _ = backend.draw_menu_bar(menu_row_rect, &filler);
+                        row_filled = true;
                     }
+                    let mut cc_painted = false;
                     if let Some(cc_rect) = command_center_rect.filter(|r| r.width >= 1.0) {
                         let title = engine
                             .cwd
@@ -10977,6 +11029,16 @@ impl quadraui::ShellApp for App {
                             &title,
                         );
                         render::paint_command_center_rung(backend, &engine, cc_rect, &cc);
+                        cc_painted = true;
+                    }
+                    // `composed` records exactly what reached the canvas
+                    // this frame (this file's own contract elsewhere) —
+                    // push it whenever *either* paint call above actually
+                    // ran, not only when the Command Center's own rect
+                    // painted, so a degenerate/`None` `command_center_rect`
+                    // with the row-fill still active isn't silently
+                    // dropped from the recorded sequence.
+                    if row_filled || cc_painted {
                         composed.push(render::FrameOp::CommandCenter);
                     }
                 }
