@@ -9,8 +9,11 @@
 # NOT the Linux GTK build (`tests/smoke-spec/gtk-gui.yaml`, which needs
 # `xdotool`/AT-SPI/a live X11 `$DISPLAY` and construction-time-raises on any
 # non-Linux host by design) — it is the same `quadraui::GtkBackend` Rust
-# code as the Linux build, cross-compiled for `aarch64-apple-darwin` and
-# linked against Homebrew's GTK4, launched and driven at the macOS OS level.
+# code as the Linux build, but built NATIVELY on `macos-latest` runners by
+# `release.yml`'s `build-macos` job (plain `cargo build --release --bin
+# vimcode`, no `--target`/cross-compile — see this file's own opening
+# citation above) and linked against Homebrew's GTK4, launched and driven
+# at the macOS OS level.
 #
 # `docs/PENDING_QUADRAUI_ISSUES.md`'s struck "`quadraui::gtk::run` never
 # activates the process as the foreground app on macOS" entry names this
@@ -84,21 +87,57 @@
 # `coord app-drive run-spec mac-native` cannot even start here. What WAS
 # verified from this worktree: this file parses cleanly against the real,
 # installed `coord.mac_native_driver.parse_native_spec` (added to
-# `scripts/validate_smoke_specs.py`'s own `SPECS` table — run that script to
-# reproduce), which confirms every step type/field below is one this
-# driver's current build actually accepts (`type_text`/`expect_file`/
-# `expect_frontmost`/`expect_region_not_uniform` all exist in the installed
-# `coord` package as of this commit — none needed to be marked pending).
+# `scripts/validate_smoke_specs.py`'s own `SPECS` table — run that script
+# with `code-coordinator` installed to reproduce), which confirms every
+# step type/field below is one this driver's current build actually
+# accepts — `type_text`/`expect_file`/`expect_frontmost`/
+# `expect_region_not_uniform`/`expect_no_tofu` (fields `x`/`y`/`width`/
+# `height`, confirmed against that driver's own `_REQUIRED_FIELDS` table)
+# all exist in the installed `coord` package (`code-coordinator==0.5.621`)
+# as of this commit — none needed to be marked pending. The per-step
+# `known_bug: vimcode#1825` field (see below) is NOT read by
+# `parse_native_spec`/`NativeStep` itself — confirmed directly: it is an
+# unrecognized key that the parser simply ignores, same as any other extra
+# field — it is read by whatever builds `coord.nightly_smoke`'s
+# `known_bugs: dict[(spec, step), ref]` mapping from the raw YAML before
+# handing observations to `classify_step`/`classify_nightly_run`. Adding it
+# does not change what this file parses as.
 # Every pixel coordinate below is a first-approximation guess derived from
 # `src/render.rs`'s drawn-chrome constants (same ones `gtk-gui.yaml` cites:
 # `TAB_ROW_HEIGHT_PX = 35.0`, item height `(line_height * 1.4).round()`),
-# not a real `screencapture` capture. Per this issue's own bar ("the spec
-# has actually run on the real host"), this file is NOT done — it needs an
-# operator with real macmini access to run `coord app-drive run-spec
-# mac-native` against this file (pointed at a real, extracted
-# `vimcode-macos-arm64.tar.gz`), record pass/fail (including whether
-# vimcode#1825 is still red), and correct any pixel geometry that misses,
-# back into this header. Tracked in PROJECT_STATE.md.
+# not a real `screencapture` capture — and ASSUMES A BACKING SCALE FACTOR OF
+# 1x (a non-Retina display, or a Retina display driven at its "Looks like"
+# logical resolution). `mac_native_driver.py`'s own docstring is explicit
+# that `screencapture` emits DEVICE pixels, so on a genuinely 2x Retina
+# `macmini` display a 1024x768 logical window captures as 2048x1536, and
+# every `expect_region_not_uniform`/`click` coordinate below must be
+# DOUBLED (x, y, width, height alike) before this spec will hit the right
+# pixels — this driver does not normalize that for the spec author. Per
+# this issue's own bar ("the spec has actually run on the real host"), this
+# file is NOT done — it needs an operator with real macmini access to run:
+#
+#   coord app-drive run-spec mac-native tests/smoke-spec/mac-gtk.yaml \
+#     --launch ./vimcode --cwd /path/to/extracted/vimcode-macos-arm64
+#
+# (after `tar xzf vimcode-macos-arm64.tar.gz` into that directory), record
+# pass/fail (including whether vimcode#1825 is still red and whether the
+# display's backing scale factor required doubling the pixel bands above),
+# and correct any pixel geometry that misses, back into this header.
+# Tracked in PROJECT_STATE.md.
+#
+# One more consequence of vimcode#1825 worth stating plainly: this driver's
+# `NativeRunner._require_frontmost` refuses to send ANY `key`/`click`/
+# `type_text` input while the launched pid is not the frontmost app. While
+# #1825 is open, launch leaves Terminal.app (not vimcode) frontmost, so
+# `_require_frontmost` raises on the very first input step after
+# `launch-is-frontmost-1831` and every `key`/`click`/`type_text` step in
+# this file after it is unreachable — not just that one check. An operator
+# reading this file should expect the ENTIRE spec red under #1825, not a
+# single failing step, and every step from `launch-is-frontmost-1831`
+# onward below is marked `known_bug: vimcode#1825` for exactly that reason
+# (so a red run here files under the known bug instead of a fresh issue
+# per step, and the day #1825 is actually fixed, each of those steps
+# turning green is the signal that flags it).
 name: vimcode-mac-gtk
 width: 1024
 height: 768
@@ -115,11 +154,15 @@ steps:
   # `gtk-gui.yaml`'s `launch-is-frontmost-1835` step gives: a `type_text`
   # step that silently lands on the launching Terminal.app instead (the
   # vimcode#1825 symptom) must not be able to masquerade as a pass by this
-  # check running after the fact. Expected RED while vimcode#1825 is open
-  # on this host — see this file's header; a red here is the issue's own
-  # bar for the bug, not a new regression.
+  # check running after the fact. `known_bug: vimcode#1825` below (and on
+  # every input/assertion step after it — see this file's header) marks
+  # this expected-red while #1825 is open on this host, so a red run here
+  # is filed/tracked against the known bug rather than as a fresh
+  # regression, and the day it starts passing is the signal that #1825 is
+  # actually fixed.
   - type: expect_frontmost
     id: launch-is-frontmost-1831
+    known_bug: vimcode#1825
 
   # 2b. Typing -> `:w` -> `expect_file`: vimcode#1831's own step 2 gesture
   # ("ihello<Esc>:w $TMP/probe.txt<CR>"). Uses `:saveas <path>`, not a bare
@@ -137,21 +180,27 @@ steps:
   - type: key
     id: type-probe-insert-1831
     key: i
+    known_bug: vimcode#1825
   - type: type_text
     id: type-probe-text-1831
     text: "VIMCODE_SMOKE_1831_MACGTK_HELLO"
+    known_bug: vimcode#1825
   - type: key
     id: type-probe-esc-1831
     key: esc
+    known_bug: vimcode#1825
   - type: key
     id: type-probe-colon-1831
     key: ':'
+    known_bug: vimcode#1825
   - type: type_text
     id: type-probe-saveas-1831
     text: "saveas /tmp/vimcode-smoke-1831-macgtk.txt"
+    known_bug: vimcode#1825
   - type: key
     id: type-probe-enter-1831
     key: enter
+    known_bug: vimcode#1825
   - type: wait
     id: type-probe-settle-1831
     ms: 500
@@ -160,6 +209,7 @@ steps:
     path: "/tmp/vimcode-smoke-1831-macgtk.txt"
     contains: "VIMCODE_SMOKE_1831_MACGTK_HELLO"
     timeout_ms: 5000
+    known_bug: vimcode#1825
 
   # 2c. Literal bare `:w` -> `expect_file`, the issue's own exact gesture,
   # now that the buffer has a name from 2b's `:saveas`. Appends a NEW, FULL
@@ -167,26 +217,42 @@ steps:
   # comment for why a suffix-only append is unsafe here: this section never
   # clears the buffer first, so `A` lands after whatever text already sits
   # on that line) so this check can only pass if this bare `:w` actually
-  # just wrote the buffer, and is self-invalidating within this run against
-  # a leftover file from 2b alone.
+  # just wrote the buffer — WITHIN this run, against the file 2b's own
+  # `:saveas` created a moment earlier in the same run. That is NOT the
+  # same thing as cross-run self-invalidation: nothing in this file deletes
+  # `/tmp/vimcode-smoke-1831-macgtk.txt` between runs, so once this lane
+  # has gone green once on a host, both the `..._HELLO` and
+  # `..._HELLO_WBARE` markers persist there indefinitely and would satisfy
+  # these two `expect_file` checks on every later run even if this run's
+  # own `:saveas`/`:w` never actually fired (CLAUDE.md "a test that cannot
+  # fail is not coverage", #553). The trailing cleanup block after the
+  # terminal section below removes this file, same as `gtk-gui.yaml`'s own
+  # `cleanup-probe-1835` — that cleanup is what makes 2b/2c's cross-run
+  # invalidation real rather than assumed.
   - type: key
     id: bare-w-probe-append-key-1831
     key: A
+    known_bug: vimcode#1825
   - type: type_text
     id: bare-w-probe-append-text-1831
     text: "VIMCODE_SMOKE_1831_MACGTK_HELLO_WBARE"
+    known_bug: vimcode#1825
   - type: key
     id: bare-w-probe-esc-1831
     key: esc
+    known_bug: vimcode#1825
   - type: key
     id: bare-w-probe-colon-1831
     key: ':'
+    known_bug: vimcode#1825
   - type: type_text
     id: bare-w-probe-write-command-1831
     text: "w"
+    known_bug: vimcode#1825
   - type: key
     id: bare-w-probe-enter-1831
     key: enter
+    known_bug: vimcode#1825
   - type: wait
     id: bare-w-probe-settle-1831
     ms: 500
@@ -195,14 +261,20 @@ steps:
     path: "/tmp/vimcode-smoke-1831-macgtk.txt"
     contains: "VIMCODE_SMOKE_1831_MACGTK_HELLO_WBARE"
     timeout_ms: 5000
+    known_bug: vimcode#1825
 
   # 3. `:term` probe -> `expect_file`: vimcode#1831's own step 3. Same
   # marker/echo shape as `gtk-gui.yaml`'s/`tui.yaml`'s own `-1835` sections
   # — proof the shell inside the panel actually ran the command, not merely
-  # that something painted. `rm -f` first so a stale file from a prior run
-  # cannot satisfy `expect_file` without this run's own command actually
-  # executing in a live shell (same self-invalidation `gtk-gui.yaml`'s
-  # review round 1 added).
+  # that something painted. The `rm -f` that clears any stale file from a
+  # prior run is its OWN typed line/Enter, separate from the `echo` that
+  # recreates it (same reasoning `gtk-gui.yaml`'s own
+  # `ext-install-probe-rm-1835`/`ext-install-probe-1835` split gives,
+  # review round 2 there: `type_text` is real OS-level input, and keeping a
+  # destructive command on its own line means a dropped character makes
+  # that line visibly wrong instead of silently resolving to a shorter real
+  # path) -- so this `expect_file` cannot pass off a leftover from a prior
+  # run without this run's own command actually executing in a live shell.
   #
   # The fixed `wait` below (not a poll) is this driver's only option, same
   # reasoning `gtk-gui.yaml`'s own `term-probe-open-settle-1835` comment
@@ -211,26 +283,40 @@ steps:
   - type: key
     id: term-probe-colon-1831
     key: ':'
+    known_bug: vimcode#1825
   - type: type_text
     id: term-probe-command-1831
     text: "term"
+    known_bug: vimcode#1825
   - type: key
     id: term-probe-enter-1831
     key: enter
+    known_bug: vimcode#1825
   - type: wait
     id: term-probe-open-settle-1831
     ms: 2000
   - type: type_text
+    id: term-probe-rm-1831
+    text: "rm -f /tmp/vimcode-smoke-term-probe-1831-macgtk.txt"
+    known_bug: vimcode#1825
+  - type: key
+    id: term-probe-rm-enter-1831
+    key: enter
+    known_bug: vimcode#1825
+  - type: type_text
     id: term-probe-echo-1831
-    text: "rm -f /tmp/vimcode-smoke-term-probe-1831-macgtk.txt && echo VIMCODE_SMOKE_TERM_PROBE_1831_MACGTK > /tmp/vimcode-smoke-term-probe-1831-macgtk.txt"
+    text: "echo VIMCODE_SMOKE_TERM_PROBE_1831_MACGTK > /tmp/vimcode-smoke-term-probe-1831-macgtk.txt"
+    known_bug: vimcode#1825
   - type: key
     id: term-probe-echo-enter-1831
     key: enter
+    known_bug: vimcode#1825
   - type: expect_file
     id: term-probe-file-appears-1831
     path: "/tmp/vimcode-smoke-term-probe-1831-macgtk.txt"
     contains: "VIMCODE_SMOKE_TERM_PROBE_1831_MACGTK"
     timeout_ms: 20000
+    known_bug: vimcode#1825
 
   # The terminal panel is now open and has really run a shell command --
   # `expect_region_not_uniform` on its drawn tab-bar/toolbar row (anchored
@@ -239,40 +325,74 @@ steps:
   # `gtk-gui.yaml`'s own `terminal-panel-not-uniform-1835` comment gives)
   # proves it painted real cell content, not a blank panel (vimcode#1828's
   # bug class). First-approximation band, unconfirmed on real hardware --
-  # see this file's header.
+  # see this file's header (including the Retina 2x-doubling caveat).
   - type: expect_region_not_uniform
     id: terminal-panel-not-uniform-1831
     x: 300
     y: 520
     width: 300
     height: 90
+    known_bug: vimcode#1825
 
-  # Close the terminal panel before step 4 below, same `:term` toggle used
-  # to open it, so step 4's close-button click targets the plain editor
-  # chrome this file's coordinates assume rather than a layout with the
-  # panel still occupying the bottom of the window.
-  - type: key
-    id: term-probe-close-colon-1831
-    key: ':'
+  # `expect_no_tofu` over the same drawn chrome/status row area -- a
+  # Homebrew-GTK4 font stack on macOS is about the most likely place in the
+  # fleet for a missing-glyph ("tofu") box, and this is a "first five
+  # minutes" spec, so it is worth one cheap check here even though nothing
+  # in this section specifically targets Unicode/icon-glyph content.
+  - type: expect_no_tofu
+    id: no-tofu-terminal-panel-1831
+    x: 300
+    y: 520
+    width: 300
+    height: 90
+    known_bug: vimcode#1825
+
+  # Trailing cleanup -- removes every file this file created (both
+  # `/tmp/vimcode-smoke-1831-macgtk.txt` from section 2 and
+  # `/tmp/vimcode-smoke-term-probe-1831-macgtk.txt` from section 3 above),
+  # same reasoning `gtk-gui.yaml`'s own `cleanup-probe-1835` gives: without
+  # this, both `expect_file` checks in section 2 (2b/2c) would be satisfied
+  # by a leftover from a PRIOR green run regardless of whether THIS run's
+  # `:saveas`/`:w` actually wrote anything (CLAUDE.md "a test that cannot
+  # fail is not coverage", #553) -- see this file's section-2c comment.
+  # Reuses the already-open terminal pane from section 3 above, so this
+  # needs no extra `:term` toggle of its own.
   - type: type_text
-    id: term-probe-close-command-1831
-    text: "term"
+    id: cleanup-probe-1831
+    text: "rm -f /tmp/vimcode-smoke-1831-macgtk.txt /tmp/vimcode-smoke-term-probe-1831-macgtk.txt"
+    known_bug: vimcode#1825
   - type: key
-    id: term-probe-close-enter-1831
+    id: cleanup-probe-enter-1831
     key: enter
+    known_bug: vimcode#1825
   - type: wait
-    id: term-probe-close-settle-1831
+    id: cleanup-probe-settle-1831
     ms: 500
 
   # 4. `File → New Tab`, then the close button. vimcode#1831's own step 4.
-  # `click-file-menu-item-1831`'s coordinates reuse `gtk-gui.yaml`'s exact
-  # (x=24, y=16) -- the identical drawn-chrome row, same render.rs layout
-  # constants, independent of OS. `click-new-tab-item-1831`'s coordinates
-  # are a first-approximation guess at the dropdown's first item ("New Tab"
-  # is literally the first entry in `src/render.rs`'s `MENU_STRUCTURE` File
-  # menu) sitting just below the ~32px drawn menu/title row, at roughly one
-  # `(line_height * 1.4)`-tall item down -- UNCONFIRMED, see this file's
-  # header.
+  # This section deliberately does NOT close the terminal panel opened in
+  # section 3 first -- unlike `gtk-gui.yaml`, which never attempts to close
+  # the panel it opens either. A typed `:term` is NOT a toggle (it always
+  # normalizes to `EngineAction::OpenTerminal`, which only *opens*/creates
+  # a tab -- `toggle_terminal()` is reached only when `is_macro` is true in
+  # `App::dispatch_engine_action`, which a driver-typed ex command is not),
+  # so a second `:term` here would not close anything; it would type
+  # `:term` into the shell itself (keyboard focus is inside the terminal
+  # pane at this point, which is what makes section 3's echo probe above
+  # work without a click) and get `command not found: :term` in the pane.
+  # It is also unnecessary: `click-file-menu-item-1831`/
+  # `click-new-tab-item-1831`/`click-close-button-1831` below all target
+  # the drawn menu/title row at y=16/46, well above where the terminal
+  # panel occupies the BOTTOM of the window (the `y: 520` band above), so
+  # the panel being open does not affect any of this section's coordinates
+  # either way. `click-file-menu-item-1831`'s coordinates reuse
+  # `gtk-gui.yaml`'s exact (x=24, y=16) -- the identical drawn-chrome row,
+  # same render.rs layout constants, independent of OS. `click-new-tab-item
+  # -1831`'s coordinates are a first-approximation guess at the dropdown's
+  # first item ("New Tab" is literally the first entry in `src/render.rs`'s
+  # `MENU_STRUCTURE` File menu) sitting just below the ~32px drawn
+  # menu/title row, at roughly one `(line_height * 1.4)`-tall item down --
+  # UNCONFIRMED, see this file's header.
   #
   # No `expect_a11y`/`expect_a11y_within` check brackets this click (see
   # this file's header for why a role-string guess on top of an
@@ -291,15 +411,19 @@ steps:
     id: click-file-menu-item-1831
     x: 24
     y: 16
+    known_bug: vimcode#1825
   - type: click
     id: click-new-tab-item-1831
     x: 60
     y: 46
+    known_bug: vimcode#1825
 
   - type: click
     id: click-close-button-1831
     x: 978
     y: 16
+    known_bug: vimcode#1825
   - type: expect_closed
     id: close-button-actually-closes-window-1831
     timeout_ms: 5000
+    known_bug: vimcode#1825
