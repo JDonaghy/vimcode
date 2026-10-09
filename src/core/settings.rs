@@ -225,6 +225,17 @@ pub struct Settings {
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: u8,
 
+    /// Editor row pitch, as a multiplier of `font_size` — VS Code's
+    /// `editor.lineHeight` convention (issue #1864). `0.0` (the default)
+    /// means "auto": resolve to this backend's own platform-native ratio via
+    /// [`Self::effective_line_height_multiplier`] (VS Code's macOS
+    /// `GOLDEN_LINE_HEIGHT_RATIO`, 1.5, for the native macOS GUI today — GTK/
+    /// Win-GUI parity at VS Code's non-mac ratio, 1.35, is a follow-up).
+    /// Any other positive value is taken as an explicit multiplier on every
+    /// backend `effective_line_height_multiplier` recognises.
+    #[serde(default)]
+    pub line_height: f64,
+
     /// Show file explorer sidebar on startup
     #[serde(default = "default_explorer_visible")]
     pub explorer_visible_on_startup: bool,
@@ -1865,6 +1876,7 @@ impl Default for Settings {
             font_family: default_font_family(),
             font_size: default_font_size(),
             ui_font_size: default_ui_font_size(),
+            line_height: 0.0,
             explorer_visible_on_startup: default_explorer_visible(),
             incremental_search: default_incremental_search(),
             auto_indent: default_auto_indent(),
@@ -3163,6 +3175,12 @@ impl Settings {
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.ui_font_size = n.clamp(6, 32) as u8;
             }
+            "line_height" | "lh" => {
+                let n: f64 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.line_height = n.clamp(0.0, 5.0);
+            }
             "minimapscale" => {
                 let n: u32 = value
                     .parse()
@@ -3869,6 +3887,37 @@ impl Settings {
         }
     }
 
+    /// Effective editor row-pitch multiplier for the live backend named
+    /// `backend_platform_name` (issue #1864 — VS Code's `editor.lineHeight`
+    /// parity, resolved by [`crate::app_support::resolve_editor_line_height_px`]).
+    ///
+    /// `None` means "leave this backend's own natural font-metric line
+    /// height (ascent + descent + leading) alone" — every backend except the
+    /// native macOS GUI (`"macos"`, matching
+    /// [`quadraui::PlatformServices::platform_name`]'s convention) until GTK/
+    /// Win-GUI parity at VS Code's non-mac ratio (1.35) lands as a follow-up;
+    /// see this issue's own PR notes. A runtime `platform_name()` check
+    /// rather than `cfg!(target_os = "macos")` for the same reason
+    /// `normalize_mac_cmd_as_ctrl` (`src/app.rs`, #1745) uses one: GTK can
+    /// run on a Mac host too (no `macos` feature), and must not pick up a
+    /// macOS-only override by virtue of the build machine's OS.
+    ///
+    /// `0.0` (`self.line_height`'s default — "auto") resolves to VS Code's
+    /// own macOS default, `GOLDEN_LINE_HEIGHT_RATIO` = 1.5 (18px for Menlo
+    /// 12). Any other positive value is taken as an explicit multiplier of
+    /// the font's point size, mirroring VS Code's own `editor.lineHeight`
+    /// setting (0 = automatic, a number = an explicit ratio).
+    pub fn effective_line_height_multiplier(&self, backend_platform_name: &str) -> Option<f64> {
+        if backend_platform_name != "macos" {
+            return None;
+        }
+        if self.line_height <= 0.0 {
+            Some(1.5)
+        } else {
+            Some(self.line_height)
+        }
+    }
+
     /// Where `settings.json` lives — `~/.config/vimcode/settings.json`
     /// (or the platform equivalent, see [`super::paths::vimcode_config_dir`]).
     ///
@@ -3903,6 +3952,7 @@ impl Settings {
             "font_family" => self.font_family.clone(),
             "font_size" => self.font_size.to_string(),
             "ui_font_size" => self.ui_font_size.to_string(),
+            "line_height" => self.line_height.to_string(),
             "line_numbers" => match self.line_numbers {
                 LineNumberMode::None => "none".to_string(),
                 LineNumberMode::Absolute => "absolute".to_string(),
@@ -4035,6 +4085,12 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid ui_font_size: {value}"))?;
                 self.ui_font_size = n;
+            }
+            "line_height" => {
+                let n: f64 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid line_height: {value}"))?;
+                self.line_height = n.clamp(0.0, 5.0);
             }
             "line_numbers" => {
                 self.line_numbers = match value {
@@ -5088,6 +5144,58 @@ mod tests {
     fn effective_ui_font_size_ignores_tui_all_sentinel_defaults() {
         let settings = Settings::default();
         assert_eq!(settings.effective_ui_font_size(0.0), settings.ui_font_size);
+    }
+
+    // ── `line_height` option (#1864) ──────────────────────────────────────
+
+    #[test]
+    fn effective_line_height_multiplier_defaults_to_vs_code_macos_ratio() {
+        let settings = Settings::default();
+        assert_eq!(
+            settings.effective_line_height_multiplier("macos"),
+            Some(1.5)
+        );
+    }
+
+    #[test]
+    fn effective_line_height_multiplier_honours_an_explicit_override() {
+        let mut settings = Settings::default();
+        settings.line_height = 1.2;
+        assert_eq!(
+            settings.effective_line_height_multiplier("macos"),
+            Some(1.2)
+        );
+    }
+
+    /// Scoped to macOS for this issue (GTK/Win-GUI parity is a follow-up) —
+    /// a non-macOS `platform_name()` must get no override at all, even with
+    /// an explicit `line_height` set, so `resolve_editor_line_height_px`'s
+    /// caller leaves that backend's natural font metrics untouched.
+    #[test]
+    fn effective_line_height_multiplier_is_none_on_non_macos_backends() {
+        let mut settings = Settings::default();
+        settings.line_height = 1.2;
+        assert_eq!(settings.effective_line_height_multiplier("gtk"), None);
+        assert_eq!(settings.effective_line_height_multiplier("win-gui"), None);
+        assert_eq!(settings.effective_line_height_multiplier("tui"), None);
+    }
+
+    #[test]
+    fn line_height_round_trips_through_set_value_str_and_get_value_str() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.get_value_str("line_height"), "0");
+        settings.set_value_str("line_height", "1.25").unwrap();
+        assert_eq!(settings.line_height, 1.25);
+        assert_eq!(settings.get_value_str("line_height"), "1.25");
+    }
+
+    #[test]
+    fn parse_set_option_line_height_clamps_to_a_sane_range() {
+        let mut settings = Settings::default();
+        settings.parse_set_option("line_height=100").unwrap();
+        assert_eq!(settings.line_height, 5.0);
+        settings.parse_set_option("lh=-3").unwrap();
+        assert_eq!(settings.line_height, 0.0);
     }
 
     // ── `minimap` option (#35) ───────────────────────────────────────────
