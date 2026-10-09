@@ -114,7 +114,7 @@ jobs:
           - **GUI builds (`vimcode`) are not ready for use on any platform.** GUI artifacts are attached **for testing only**: GTK4 on Linux and macOS, and (new) the native Windows and native macOS GUIs.
 
           <!-- Update this section every release: highlights since the previous tag. -->
-          **Since v0.15.0:** **The minimap is now off by default and marked experimental** (#1858) — enable it with `:set minimap` or `"minimap": true` in `settings.json`. Also: VimCode now builds against [quadraui](https://crates.io/crates/quadraui) from crates.io (0.1.1); the bundled icon font is the full Symbols Nerd Font, so extension panel icons (e.g. Git Insights) no longer render as `?` in the GUIs (#1853); the native Windows GUI minimap now shows a real miniature instead of a dark strip (quadraui#1354), and the Windows GUI is attached as a testing-only download.
+          **Since v0.15.0:** **The minimap is now off by default and marked experimental** (#1858) — enable it with `:set minimap` or `"minimap": true` in `settings.json`. Also: VimCode now builds against [quadraui](https://crates.io/crates/quadraui) from crates.io (0.1.2); the TUI in macOS Terminal.app no longer shows runs of dimmed text (quadraui#1366); the GTK GUI on macOS now shows its icons instead of tofu boxes (quadraui#1367); the bundled icon font is the full Symbols Nerd Font, so extension panel icons (e.g. Git Insights) no longer render as `?` in the GUIs (#1853); the native Windows GUI minimap now shows a real miniature instead of a dark strip (quadraui#1354), and the native Windows and native macOS GUIs are attached as testing-only downloads.
 
           ## Installation
 
