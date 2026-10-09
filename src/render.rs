@@ -29527,10 +29527,91 @@ impl UnitProfile {
 /// recovered height instead, so the one reservation shrinks only the
 /// activity bar/sidebar's painted height, never where the editor, status
 /// line or command line actually paint.
+///
+/// Only valid for an `AppShellLayout` produced by the one `ShellConfig`
+/// that actually opted into both bands — `App::shell_config`, today the
+/// sole legitimate producer. A layout built from a `ShellConfig` that
+/// skipped `with_command_line()`/`with_status_bar()` just adds back
+/// `0.0` for the missing band(s) (see the second half of this function's
+/// own test), so a mismatched layout is silently off by nothing, not
+/// silently off by two rows — there is nothing here for a mismatch to
+/// get wrong.
+///
+/// Review round 1 (#1877): clamped to `window_bounds`'s own true bottom
+/// edge, not just `main_content_bounds.height` plus both bands' heights
+/// unconditionally. `AppShell::compute_layout` clamps `band_h` with
+/// `.max(0.0)` *after* subtracting both rows from the viewport (quadraui
+/// `app_shell.rs:1253`), but still *returns* full-height
+/// `command_line_bounds`/`status_bar_bounds` rects even when the window is
+/// too short to hold them — so on, say, a 3-row terminal,
+/// `main_content_bounds.height` floors at `0.0` while the two bands still
+/// report `lh.round()` each, and this function would hand back `2 *
+/// lh.round()` for a window that cannot fit even one full row below the
+/// title bar. That slipped past `render_content`'s `w < 1.0 || h < 1.0`
+/// guard (previously the only thing standing between a too-short window
+/// and a negative/degenerate paint) and tripped
+/// `debug_assert_command_line_fits_viewport` instead — a debug-build panic
+/// where the pre-#1877 code silently bailed. Clamping to the window's own
+/// bottom edge restores that bail-out: a too-short window now reports a
+/// true height of `0.0` (or less, if `main_content_bounds.y` already
+/// exceeds the window), so the `h < 1.0` guard catches it exactly as
+/// before.
 pub fn main_content_true_height(layout: &quadraui::AppShellLayout) -> f32 {
-    layout.main_content_bounds.height
+    let reserved = layout.main_content_bounds.height
         + layout.command_line_bounds.map(|r| r.height).unwrap_or(0.0)
-        + layout.status_bar_bounds.map(|r| r.height).unwrap_or(0.0)
+        + layout.status_bar_bounds.map(|r| r.height).unwrap_or(0.0);
+    let window_bottom = layout.window_bounds.y + layout.window_bounds.height;
+    reserved.min(window_bottom - layout.main_content_bounds.y)
+}
+
+/// #1877 review round 1 (blocking finding 1): the rect `shell_config`'s
+/// bottom-chrome reservation reclaims from `activity_bar_bounds`/
+/// `sidebar_header_bounds`/`sidebar_content_bounds`/`divider_bounds` but
+/// that nothing else paints — the bottom-left strip, `two rows tall ×
+/// (main_content_bounds.x - window_bounds.x)` wide, that used to be
+/// covered by the activity bar/sidebar/divider chrome quadraui's own
+/// `AppShell::render` paints (fully, edge to edge, before #1877) and now
+/// isn't, because that chrome is painted *into* the now-shrunk bounds
+/// only. Nothing downstream repaints the vacated strip: vimcode's own
+/// status-bar/command-line rows are anchored at `main_content_bounds.x`
+/// (`render_content`'s own `x`/`w` locals), not at the window's left
+/// edge, so they never reach left of the activity bar/sidebar column
+/// either. Left unpainted, a plain Cairo/CG/ratatui surface shows
+/// whatever the frame clear left there — `theme.background` on every
+/// backend — a visible notch against `theme.tab_bar_bg`'s activity-bar
+/// color on any theme where the two differ (onedark: `#1a1a1a` vs
+/// `#262633`).
+///
+/// Returns the reclaimed rect — `window_bounds.x` to `main_content_bounds
+/// .x`, from the bottom of `activity_bar_bounds` (the shrunk edge every
+/// one of the four reclaimed rects shares, by construction: `band_h` feeds
+/// all four at once, quadraui `app_shell.rs:1296-1349`) to
+/// `window_bounds`'s own true bottom edge — or `None` when there is
+/// nothing to reclaim (no reservation active, so `activity_bar_bounds`
+/// already runs flush to the window's bottom edge, or the window is too
+/// short for either dimension to be positive). The caller fills this with
+/// `theme.tab_bar_bg` — the same colour `AppShell::render` already uses
+/// for `activity_bar_bounds` itself (quadraui `primitives/activity_bar.rs
+/// :644-645`) and for `divider_bounds` (`theme.separator`, blended in by
+/// eye at this width) — so the strip reads as a continuation of the
+/// existing chrome instead of a second, differently-themed notch.
+pub fn bottom_chrome_reservation_fill_rect(
+    layout: &quadraui::AppShellLayout,
+) -> Option<quadraui::Rect> {
+    let ab = layout.activity_bar_bounds;
+    let reclaimed_y = ab.y + ab.height;
+    let window_bottom = layout.window_bounds.y + layout.window_bounds.height;
+    let height = window_bottom - reclaimed_y;
+    let width = layout.main_content_bounds.x - layout.window_bounds.x;
+    if height < 1.0 || width < 1.0 {
+        return None;
+    }
+    Some(quadraui::Rect::new(
+        layout.window_bounds.x,
+        reclaimed_y,
+        width,
+        height,
+    ))
 }
 
 /// Compute the height of the bottom chrome (status bar + wildmenu) in pixels.
@@ -33055,6 +33136,83 @@ mod tests {
         layout.command_line_bounds = None;
         layout.status_bar_bounds = None;
         assert_eq!(main_content_true_height(&layout), 828.0);
+    }
+
+    /// #1877 review round 1 (non-blocking finding 1): a window too short
+    /// to hold the reservation must clamp to the window's own true bottom
+    /// edge, not blindly add both bands' full (un-`.max(0.0)`-clamped-at-
+    /// this-layer) heights back onto a `main_content_bounds.height` that
+    /// `AppShell::compute_layout` already floored at `0.0`. Pre-fix this
+    /// returned `2 * lh.round()` for a window with zero rows available
+    /// below the title bar — enough to slip past `render_content`'s own
+    /// `h < 1.0` bail-out and reach `debug_assert_command_line_fits_
+    /// viewport` instead, a debug-build panic where the pre-#1877 code
+    /// silently returned with nothing painted.
+    #[test]
+    fn main_content_true_height_clamps_to_the_window_when_too_short_to_reserve() {
+        let layout = quadraui::AppShellLayout {
+            window_bounds: quadraui::Rect::new(0.0, 0.0, 400.0, 40.0),
+            title_bar_bounds: None,
+            activity_bar_bounds: quadraui::Rect::default(),
+            sidebar_header_bounds: None,
+            sidebar_content_bounds: None,
+            divider_bounds: None,
+            // `AppShell::compute_layout` floored this at `0.0` already —
+            // the window is too short to fit anything below the title bar.
+            main_content_bounds: quadraui::Rect::new(0.0, 40.0, 400.0, 0.0),
+            bottom_panel_bounds: None,
+            // ...but it still *returns* two full-height bands.
+            command_line_bounds: Some(quadraui::Rect::new(0.0, 40.0, 400.0, 18.0)),
+            status_bar_bounds: Some(quadraui::Rect::new(0.0, 40.0, 400.0, 18.0)),
+        };
+        // Un-clamped this would be `0.0 + 18.0 + 18.0 = 36.0` — more rows
+        // than the 0-tall window has left below `main_content_bounds.y`
+        // (`window_bounds.y + window_bounds.height - main_content_bounds.y
+        // == 40.0 - 40.0 == 0.0`). Clamped, it is `0.0`, which
+        // `render_content`'s `h < 1.0` guard correctly bails out on.
+        assert_eq!(main_content_true_height(&layout), 0.0);
+    }
+
+    /// #1877 review round 1 (blocking finding 1): the rect `shell_config`'s
+    /// reservation vacates from `activity_bar_bounds` (and `sidebar_*_
+    /// bounds`/`divider_bounds`) — nothing else in `render_content` paints
+    /// it, so it must be reported precisely: from `activity_bar_bounds`'s
+    /// (shrunk) bottom edge down to the window's true bottom edge, as wide
+    /// as everything left of `main_content_bounds.x`.
+    #[test]
+    fn bottom_chrome_reservation_fill_rect_reports_the_vacated_strip() {
+        let layout = quadraui::AppShellLayout {
+            window_bounds: quadraui::Rect::new(0.0, 0.0, 1400.0, 900.0),
+            title_bar_bounds: None,
+            // Shrunk by the two-row (18.0px each) reservation, same as
+            // `sidebar_header_bounds`/`sidebar_content_bounds`/
+            // `divider_bounds` would be.
+            activity_bar_bounds: quadraui::Rect::new(0.0, 36.0, 48.0, 828.0),
+            sidebar_header_bounds: None,
+            sidebar_content_bounds: None,
+            divider_bounds: None,
+            main_content_bounds: quadraui::Rect::new(48.0, 36.0, 1352.0, 828.0),
+            bottom_panel_bounds: None,
+            command_line_bounds: Some(quadraui::Rect::new(48.0, 864.0, 1352.0, 18.0)),
+            status_bar_bounds: Some(quadraui::Rect::new(48.0, 882.0, 1352.0, 18.0)),
+        };
+        let rect = bottom_chrome_reservation_fill_rect(&layout)
+            .expect("a reservation is active and the window has room for it");
+        assert_eq!(rect, quadraui::Rect::new(0.0, 864.0, 48.0, 36.0));
+
+        // No reservation active (`activity_bar_bounds` already flush with
+        // the window's bottom edge) — nothing to reclaim.
+        let mut no_reservation = layout.clone();
+        no_reservation.activity_bar_bounds = quadraui::Rect::new(0.0, 36.0, 48.0, 864.0);
+        no_reservation.command_line_bounds = None;
+        no_reservation.status_bar_bounds = None;
+        assert_eq!(bottom_chrome_reservation_fill_rect(&no_reservation), None);
+
+        // No activity bar/sidebar column to reclaim either (`main_content_
+        // bounds.x == window_bounds.x`) — zero-width, so `None`.
+        let mut no_column = layout.clone();
+        no_column.main_content_bounds.x = 0.0;
+        assert_eq!(bottom_chrome_reservation_fill_rect(&no_column), None);
     }
 
     #[test]

@@ -10030,9 +10030,8 @@ impl App {
 /// `cmd_y` locals still lay both rows out as if nothing were reserved
 /// below `main_content_bounds`, and `cmd_y + lh` always resolves to
 /// `main.y + h`, i.e. `viewport.height` (see the `FrameOp::CommandLine`
-/// arm below). A
-/// live macOS run is the one environment this fleet cannot check that
-/// construction against directly — no macOS cross-toolchain is
+/// arm below). A live macOS run is the one environment this fleet cannot
+/// check that construction against directly — no macOS cross-toolchain is
 /// installed (`src/macos/mod.rs`'s "Verifying this file without a Mac").
 /// `debug_assert!` (not a hard `assert!`) so a violation surfaces loudly
 /// in a debug build's log/console — exactly the signal a future live-
@@ -10336,6 +10335,25 @@ impl quadraui::ShellApp for App {
         );
         if w < 1.0 || h < 1.0 {
             return;
+        }
+
+        // #1877 review round 1 (blocking finding 1): `shell_config`'s
+        // bottom-chrome reservation above vacates a strip left of
+        // `main_content_bounds` — below the now-shrunk
+        // `activity_bar_bounds`/`sidebar_header_bounds`/
+        // `sidebar_content_bounds`/`divider_bounds` — that nothing else
+        // paints (quadraui's own `AppShell::render` only fills those four
+        // rects *as shrunk*; vimcode's own status-bar/command-line rows
+        // below are anchored at `main_content_bounds.x`, never reaching
+        // left of them either). Fill it explicitly with the same chrome
+        // colour the activity bar itself paints, every frame, on every
+        // backend — see `render::bottom_chrome_reservation_fill_rect`'s
+        // own doc for exactly which rect and why `theme.tab_bar_bg`. A
+        // no-op (`None`) once there is nothing left to reclaim — no
+        // reservation active, or a window too short for either dimension
+        // to be positive.
+        if let Some(fill_rect) = render::bottom_chrome_reservation_fill_rect(layout) {
+            backend.draw_solid_fill(fill_rect, theme.tab_bar_bg);
         }
 
         // ── Layout ────────────────────────────────────────────────────────────
