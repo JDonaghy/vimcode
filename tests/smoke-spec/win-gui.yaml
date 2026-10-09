@@ -401,11 +401,18 @@
 #      `win-terminal.yaml`'s own `-1829` steps already proved works, here
 #      run against the real Win-GUI window directly (`mode: window`, no
 #      Windows-Terminal host in between) rather than through a
-#      terminal-emulator's own opaque UIA `terminal` element. Tagged
-#      `known_bug: vimcode#1668` -- PROJECT_STATE.md records #1668 was
-#      **reopened** after its tick-rearm fix landed (a real-hardware check
-#      found the panel still blank), so today's expected state is RED, not
-#      GREEN.
+#      terminal-emulator's own opaque UIA `terminal` element.
+#
+#      NOT tagged `known_bug: vimcode#1668`, deliberately (review round 1):
+#      the caveat right below explains why this step cannot observe #1668's
+#      own symptom at all, in either direction, so a PASS here is neither a
+#      real fix confirmation nor a false "started passing" alert — it is
+#      just "the terminal panel's shell is alive and runs commands", with no
+#      known bug attached. Tagging it `known_bug: vimcode#1668` anyway would
+#      make a PASS fire `coord.nightly_smoke`'s
+#      `NightlyStepKind.GREEN_KNOWN_BUG_FIXED` alert — a false close signal
+#      for an issue `PROJECT_STATE.md` already records was **reopened** once
+#      after a premature fix claim.
 #
 #      Caveat, stated plainly rather than papered over: `expect_file` reads
 #      the filesystem, not the screen, and the keystroke-forwarding path
@@ -501,6 +508,50 @@
 #      return there on its own from the terminal panel the probe above
 #      leaves open).
 #
+# Review round 1 fix: every `type_text` below that needs to submit an ex
+# command or leave insert mode now does so with a separate `- type: key`
+# step (`key: enter` / `key: esc`), never by embedding `\r`/`\x1b` inside
+# the `text:` string. The win-native driver types `text:` one UTF-16 code
+# unit at a time via `SendInput`/`KEYEVENTF_UNICODE`
+# (`Win32Calls.type_text`, `coord/win_native_driver.py`), which Windows
+# delivers as `WM_KEYDOWN` with `wVk = VK_PACKET` (no
+# `events::vk_to_named_key` entry) plus a `WM_CHAR` that
+# `events::wm_char_to_uievent` drops for every control character including
+# `\r`/`\x1B` (quadraui 0.1.2, `src/win/run.rs`) — so an embedded `\r` or
+# `\x1b` is silently swallowed on a real Win-GUI window; it only works on
+# `win-terminal.yaml`'s `mode: terminal` lane, where the same bytes go
+# straight into ConPTY's raw stream instead. A standalone `key:` step
+# instead encodes `enter`/`esc` as real `VK_RETURN`/`VK_ESCAPE`
+# (`_NAMED_VKEYS`), which both `wm_keydown_to_uievent` arms handle —
+# confirmed by reading `_vkey_for`/`_NAMED_VKEYS` directly in the installed
+# driver, and the same split `mac-gui.yaml`'s own GUI steps already use.
+#
+# Review round 1 fix: the end-of-block cleanup step that used to retype
+# `:term\r` while the terminal panel was still open and focused has been
+# removed rather than fixed. `toggle_terminal`'s state machine
+# (`src/core/engine/terminal_ops.rs`) only takes the "open AND focused" ->
+# close branch when an `EngineAction::OpenTerminal` actually reaches
+# `dispatch_engine_action` — and it never can while the panel holds focus,
+# because `render::route_terminal_key` (`src/render.rs`) sits in a rung
+# above ex-command dispatch in `App::handle_key_press` and consumes every
+# key while `engine.terminal_has_focus`, forwarding it straight to the PTY
+# (`TerminalKeyAction::SendToPty`). So typing `:term` into a focused
+# terminal panel runs it as a literal (erroring) PowerShell command, not an
+# ex command, and the panel stays open — "close the panel by typing
+# `:term`" is unreachable via `type_text`/`key` in general, not just a
+# step-ordering mistake. Nothing below this point in the file depends on
+# the terminal panel being closed (no `expect_idle_stable` step exists in
+# this `mode: window` spec), so the cleanup step is dropped rather than
+# replaced; the terminal panel is left open (and focused) once this
+# section's steps finish, same as `win-terminal.yaml`'s equivalent block
+# after its own #1833 review fix.
+#
+# Review round 1 fix: `#178`'s `expect_no_tofu` region, the minimap-enable
+# block's missing mode reset, the minimap-strip-width discrepancy with
+# `docs/PENDING_QUADRAUI_ISSUES.md`, and the Win-GUI device-pixel/DIP
+# coordinate-space caveat are all addressed inline next to the steps/region
+# values they affect, below.
+#
 # IMPORTANT -- NOT YET RUN ON REAL HARDWARE. Unlike every other dated
 # update in this file, this section's four steps were written and
 # reviewed for correctness against the real source (citations above) but
@@ -547,6 +598,27 @@ steps:
   # icon's real painted bounds at this exact 1024x768 window size
   # (GTK-harness stand-in measurement, nerd fonts off: `Rect { x: 17.0,
   # y: 55.5, width: 14.0, height: 29.0 }`).
+  #
+  # Review round 1 caveat: `coord.native_pixels.looks_like_tofu` compares a
+  # 1px *outer ring* against the region's interior, so a margin this size
+  # around the glyph's real box means the ring samples activity-bar
+  # background (not the glyph's own border) and the interior mixes the
+  # glyph edges with its hollow centre — the same shape as `mac-gui.yaml`'s
+  # 40x40 icon-slot regions, which came back PASS on real hardware despite
+  # that file's own header flagging the result as contradicting #1824. A
+  # GREEN result here should likewise NOT be read as disproving #178 —
+  # treat it the same way the #1676 step's own "GREEN does not yet disprove
+  # it" framing already does — pending a tighter, glyph-box-sized
+  # real-hardware remeasurement in a future bugbash pass.
+  #
+  # Review round 1 note: both this region and the minimap region below are
+  # device pixels for `PrintWindow`/`expect_no_tofu`/
+  # `expect_region_not_uniform`, but were derived from a GTK *logical*-pixel
+  # measurement; quadraui's Win-GUI backend lays out in DIPs (device pixels
+  # ÷ `scale` — `quadraui/src/win/events.rs`'s "Coordinate convention"). At
+  # anything other than 100% display scaling on the real host both regions
+  # land in the wrong place — worth confirming `dell64`'s scale factor
+  # before trusting a real run's result either way.
   - type: expect_no_tofu
     id: activity-bar-explorer-icon-no-tofu-178
     x: 14
@@ -559,18 +631,38 @@ steps:
   # (see header section). Region sits inside the GTK-stand-in-measured
   # strip rect `(958.0, 103.0, 55.0x619.0)`, near its top (a freshly
   # opened file's cursor starts there). Enabling the minimap first —
-  # `:set minimap` (`src/core/settings.rs:940`), same approach
+  # `:set minimap` (the `minimap:` field's own doc comment,
+  # `src/core/settings.rs`'s `default_minimap`), same approach
   # `win-terminal.yaml`'s `-1828` block already uses — since this file's
   # own shared-settings precondition (this file's header, "`coord`
   # supplies...") never promises `minimap: true` (#1858: off by default).
+  #
+  # Review round 1 note: `docs/PENDING_QUADRAUI_ISSUES.md`'s #1676 entry
+  # describes "the editor minimap's ~96px-wide strip", but the GTK stand-in
+  # measured 55.0px wide at this file's window size — the sampled
+  # sub-rectangle below sits inside either width, but the discrepancy means
+  # the stand-in may not be a fully faithful Win-GUI *shape*, only a
+  # same-sizing-code approximation; worth a real-hardware remeasurement in
+  # a future bugbash pass rather than trusting either number blindly.
+  #
+  # `key: esc` first makes this block's mode precondition self-sufficient
+  # (mirrors `click-focus-editor-before-term-1834` below, which exists for
+  # the identical reason) rather than relying on whatever mode the previous
+  # section left the editor in.
   - type: click
     id: click-focus-editor-before-1834-checks
     x: 500
     y: 300
     button: left
+  - type: key
+    id: dismiss-any-mode-before-minimap-enable-1834
+    key: esc
   - type: type_text
     id: enable-minimap-1834
-    text: ":set minimap\r"
+    text: ":set minimap"
+  - type: key
+    id: submit-enable-minimap-1834
+    key: enter
   - type: wait
     id: settle-after-minimap-enable-1834
     ms: 500
@@ -580,15 +672,15 @@ steps:
     y: 108
     width: 48
     height: 30
-    tolerance: 24
     known_bug: vimcode#1676
 
   # #1668: the terminal panel's real shell must actually receive and run a
   # typed command (see header section for exactly what this does and does
-  # not prove about #1668's own "paints completely blank" symptom).
-  # Click back into the editor first — `:set minimap` above already
-  # returned focus there, but this makes the precondition explicit and
-  # self-sufficient rather than relying on step-ordering memory.
+  # not prove about #1668's own "paints completely blank" symptom, and for
+  # why this step carries no `known_bug` tag). Click back into the editor
+  # first — `:set minimap` above already returned focus there, but this
+  # makes the precondition explicit and self-sufficient rather than relying
+  # on step-ordering memory.
   - type: click
     id: click-focus-editor-before-term-1834
     x: 500
@@ -596,25 +688,33 @@ steps:
     button: left
   - type: type_text
     id: open-term-panel-1834
-    text: ":term\r"
+    text: ":term"
+  - type: key
+    id: submit-open-term-panel-1834
+    key: enter
   - type: wait
     id: term-panel-settle-1834
     ms: 2500
   - type: type_text
     id: clean-stale-term-probe-1834
-    text: "Remove-Item $env:TEMP\\vc_win_gui_term_probe_1834.txt -ErrorAction SilentlyContinue\r"
+    text: "Remove-Item $env:TEMP\\vc_win_gui_term_probe_1834.txt -ErrorAction SilentlyContinue"
+  - type: key
+    id: submit-clean-stale-term-probe-1834
+    key: enter
   - type: wait
     id: settle-after-term-probe-cleanup-1834
     ms: 500
   - type: type_text
     id: term-echo-probe-1834
-    text: "echo MARKER | Set-Content -Encoding utf8 $env:TEMP\\vc_win_gui_term_probe_1834.txt\r"
+    text: "echo MARKER | Set-Content -Encoding utf8 $env:TEMP\\vc_win_gui_term_probe_1834.txt"
+  - type: key
+    id: submit-term-echo-probe-1834
+    key: enter
   - type: expect_file
     id: term-probe-file-exists-1834
     path: "$env:TEMP\\vc_win_gui_term_probe_1834.txt"
     contains: "MARKER"
     timeout_ms: 5000
-    known_bug: vimcode#1668
 
   # Plain typing -> `:w` -> `expect_file` round trip, no known bug — same
   # shape as `win-terminal.yaml`'s `type-and-save-expect-file` block (see
@@ -625,12 +725,24 @@ steps:
   # abbreviation) forces a fresh read from disk first, so a previous run's
   # own `from_1834` line already in vimcode's in-memory buffer can't be
   # mistaken for this run's write.
+  #
+  # Review round 1 note (inherited from `win-terminal.yaml`'s own #1833
+  # precedent, not new here): `Set-Content -Encoding utf8` under Windows
+  # PowerShell 5.1 writes a UTF-8 BOM, so each run of this baseline-reset
+  # line prepends a BOM to `sample.txt` that then shows up in the buffer —
+  # it mutates a shared fixture rather than restoring it byte-for-byte.
   - type: type_text
     id: clean-stale-write-probe-1834
-    text: "Remove-Item $env:TEMP\\vc_win_gui_write_probe_1834.txt -ErrorAction SilentlyContinue\r"
+    text: "Remove-Item $env:TEMP\\vc_win_gui_write_probe_1834.txt -ErrorAction SilentlyContinue"
+  - type: key
+    id: submit-clean-stale-write-probe-1834
+    key: enter
   - type: type_text
     id: reset-sample-baseline-1834
-    text: "(Get-Content sample.txt) | Where-Object { $_ -notmatch 'from_1834' } | Set-Content -Encoding utf8 sample.txt\r"
+    text: "(Get-Content sample.txt) | Where-Object { $_ -notmatch 'from_1834' } | Set-Content -Encoding utf8 sample.txt"
+  - type: key
+    id: submit-reset-sample-baseline-1834
+    key: enter
   - type: wait
     id: settle-after-sample-reset-1834
     ms: 500
@@ -641,7 +753,10 @@ steps:
     button: left
   - type: type_text
     id: reload-buffer-from-disk-1834
-    text: ":e!\r"
+    text: ":e!"
+  - type: key
+    id: submit-reload-buffer-from-disk-1834
+    key: enter
   - type: wait
     id: settle-after-reload-1834
     ms: 500
@@ -650,41 +765,51 @@ steps:
     key: esc
   - type: type_text
     id: type-and-save-probe-1834
-    text: "Gofrom_1834\x1b:w\r"
+    text: "Gofrom_1834"
+  - type: key
+    id: exit-insert-after-typing-1834
+    key: esc
+  - type: type_text
+    id: enter-save-command-1834
+    text: ":w"
+  - type: key
+    id: submit-save-command-1834
+    key: enter
   - type: wait
     id: save-settle-1834
     ms: 1000
   - type: type_text
     id: open-term-panel-for-write-check-1834
-    text: ":term\r"
+    text: ":term"
+  - type: key
+    id: submit-open-term-panel-for-write-check-1834
+    key: enter
   - type: wait
     id: term-panel-settle-for-write-check-1834
     ms: 2500
   - type: type_text
     id: copy-saved-file-to-probe-path-1834
-    text: "Get-Content sample.txt | Set-Content -Encoding utf8 $env:TEMP\\vc_win_gui_write_probe_1834.txt\r"
+    text: "Get-Content sample.txt | Set-Content -Encoding utf8 $env:TEMP\\vc_win_gui_write_probe_1834.txt"
+  - type: key
+    id: submit-copy-saved-file-to-probe-path-1834
+    key: enter
   - type: expect_file
     id: type-and-save-expect-file-1834
     path: "$env:TEMP\\vc_win_gui_write_probe_1834.txt"
     contains: "from_1834"
     timeout_ms: 5000
 
-  # Leave the window in the same state the pre-existing steps below
-  # expect (editor focused, terminal panel closed): `toggle_terminal`
-  # (`src/core/engine/terminal_ops.rs`) only closes on "open AND
-  # focused", so `:term` is typed here FIRST, while the terminal pane the
-  # write-check above left open and focused still is both — only after
-  # that does the `click` below move focus to the editor, mirroring the
-  # exact open/focus state machine this whole block's earlier
-  # `click`-then-`:term` pairs already rely on (see this file's own
-  # "#1834" header section's point 1 and `win-terminal.yaml`'s matching
-  # precedent).
-  - type: type_text
-    id: close-term-panel-after-1834-checks
-    text: ":term\r"
-  - type: wait
-    id: settle-after-term-close-1834
-    ms: 500
+  # Review round 1 fix: the step that used to retype `:term` here to close
+  # the terminal panel is REMOVED, not fixed in place — see this file's
+  # "#1834" header section's "Review round 1 fix" paragraph on the removed
+  # cleanup step for the full reasoning (typing `:term` into a focused
+  # terminal panel runs it as a literal PowerShell command, not an ex
+  # command; the panel cannot be closed this way at all). The terminal
+  # panel is left open and focused once the write-check above finishes.
+  # This `click` still moves focus back onto the editor's own text area —
+  # harmless and self-sufficient precondition cleanup for whatever a future
+  # bugbash pass adds after this section, independent of the terminal
+  # panel's own open/closed state.
   - type: click
     id: click-back-into-editor-after-1834-checks
     x: 500
