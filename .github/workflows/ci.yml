@@ -145,6 +145,11 @@ jobs:
     - name: Run validator unit tests
       run: python3 -m pytest tests/test_validate_smoke_specs.py -v
 
+    # Ratchet: fails when any group's count of history-narrating comment
+    # lines rises above scripts/comment_history_thresholds.json.
+    - name: Comment-history lint (ratchet)
+      run: python3 scripts/comment_history_lint.py
+
   # #645: the job above compiles GTK OUT (`--no-default-features`), so a green
   # run there carries zero information about `src/gtk/`. This job is the lane
   # that actually compiles and tests the GTK backend. It runs headlessly — no

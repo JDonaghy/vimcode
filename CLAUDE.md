@@ -112,6 +112,14 @@ the Test stage's job.
 - `rustfmt` defaults; `PascalCase` types, `snake_case` functions/vars.
 - Core: return `Result<T, E>` for I/O, silent no-ops for bounds.
 - Tests in `#[cfg(test)] mod tests` at file bottom.
+- **Comments describe the code as it is, never its history.** Say *why* the
+  code is this way now, in a few lines. No issue numbers (`#123`) and no history
+  phrases ("used to", "no longer", "before #", "this PR", "the reviewer") —
+  history goes in the commit message. CI's ratchet
+  (`scripts/comment_history_lint.py`) fails a PR that raises any group's count;
+  a PR that cleans comments up lowers its group's number in
+  `scripts/comment_history_thresholds.json`. Only exception: a workaround
+  reference whose removal is gated on that issue closing.
 
 ## Testing — black-box coverage is the acceptance bar (MANDATORY)
 

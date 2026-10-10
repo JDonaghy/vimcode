@@ -1,0 +1,10 @@
+{
+  "core": 3197,
+  "gtk": 1079,
+  "harness": 115,
+  "macos": 142,
+  "src": 3074,
+  "tests": 1090,
+  "tui_main": 578,
+  "win": 288
+}
