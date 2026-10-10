@@ -1,12 +1,13 @@
-## Current Goal — read first
+# CLAUDE.md — vimcode
 
-**[`GOALS.md`](GOALS.md) holds the current north-star objective:** *eliminate all
-platform-specific code from vimcode and lift it into quadraui.* It is meta-level
-(above any single issue or session) and sequences the work — read it first, plan
-against it, and keep it current. The **Platform-Neutrality Rule** below is the
-operational rule that stops *new* per-backend code; `GOALS.md` tracks *deleting the
-existing* per-backend code via milestone **#7 Platform-Neutral** (the vimcode-side
-adoption of shipped quadraui APIs; #5 is the quadraui-build supply side).
+Agent-facing rules for **vimcode**. Re-read on every turn, so it holds only what a
+diff can violate. Rationale, history and longer procedures live in
+[`docs/AGENT_REFERENCE.md`](docs/AGENT_REFERENCE.md) — read a section only when your
+task touches it.
+
+**North star:** eliminate platform-specific code from vimcode and lift it into
+quadraui ([`GOALS.md`](GOALS.md) — background for planning/triage; a single-issue
+worker does not need to read it). The rule below stops *new* per-backend code.
 
 ## Platform-Neutrality Rule (MANDATORY — overrides all other guidance)
 
@@ -20,6 +21,7 @@ adoption of shipped quadraui APIs; #5 is the quadraui-build supply side).
 **Issues and acceptance are platform-neutral too.** If quadraui works as advertised, every vimcode behaviour is the same on every backend, so:
 
 - A vimcode issue's acceptance is a backend-neutral test (engine/`render.rs` unit test, or the TUI/headless driver), never "on macOS", "on Windows" or "verify on real hardware". Per-platform rendering and input are proven by quadraui's own conformance tests.
+- **Test on one platform: `vcd` (TUI) on Linux.** Assume a change that passes there works on every backend. Your verify loop and the Test stage run `cargo test --no-default-features` (plus a narrow filter while iterating); the GTK lane is GitHub CI's job, not yours.
 - A bug that shows up on only one backend is a quadraui gap or bug: the fix is a quadraui issue, and the vimcode side is at most a version bump. If your issue asks you to fix a single-backend symptom inside vimcode, say so in your final message and stop rather than adding backend code.
 - Allowed per-platform differences are data, not code: e.g. default font per platform as a table the engine reads, and packaging/release plumbing.
 
@@ -33,223 +35,127 @@ adoption of shipped quadraui APIs; #5 is the quadraui-build supply side).
 
 ## Codebase navigation — query the graph first
 
-This repo ships a **graphify** knowledge graph in `graphify-out/` (`graph.json`,
-`GRAPH_REPORT.md`), kept current automatically by `post-commit` / `post-checkout`
-git hooks. For any architecture / "where is this handled" / "what calls this" /
-file-relationship question, **query the graph first** (the `graphify` skill, or the
-graphify CLI) before reaching for grep/Read. Grep/Read are for exact-string or
-line-level confirmation — not the first move.
+`graphify-out/` holds a knowledge graph of this repo. For "where is this handled /
+what calls this" questions, query it (the `graphify` skill or CLI) before grep/Read.
 
-## Session Start Protocol
-1. Read `PROJECT_STATE.md` for current progress
-2. Read `PLAN.md` if present — pickup doc for in-flight multi-stage features
-3. **If the work touches `quadraui/`** — read `docs/QUADRAUI_GUIDE.md` and quadraui repo's `DECISIONS.md` + `BACKEND_TRAIT_PROPOSAL.md` §9
-4. **If navigating unfamiliar code** — read `docs/ARCHITECTURE.md` for directory layout, engine submodule map, and data model
-5. Check `.opencode/specs/` for detailed feature specs before starting
-6. Run `gh issue list --state open` to see active work and priorities
-7. Prompt user to update `PROJECT_STATE.md` and `PLAN.md` after significant tasks
+## Background docs — on demand only
 
-### quadraui is a crates.io dependency, not a sibling checkout (#1848)
+No reading chain is required at session start. `PROJECT_STATE.md`, `PLAN.md` and
+`GOALS.md` are large (≈400 KB together) — do not read them unless the task needs
+them. Load a reference doc only when its trigger applies: `docs/ARCHITECTURE.md`
+(layout, engine submodule map), `docs/PATTERNS.md` (adding keys, commands,
+settings, theme colors, clickable UI), `docs/QUADRAUI_GUIDE.md` (quadraui
+migrations, paint↔click), `docs/IRREDUCIBLE_SURFACE.md` (platform-neutrality
+planning). Full index: `docs/AGENT_REFERENCE.md`.
 
-Vimcode depends on the **published `quadraui` crate** — `quadraui = { version = "0.1", features = [...] }` in `Cargo.toml`, locked to an exact version in `Cargo.lock` (`source = "registry+https://github.com/rust-lang/crates.io-index"`). **`~/src/quadraui` is not consulted by a normal build at all**, so a plain `cargo build` is reproducible regardless of what's checked out there.
+## quadraui is a crates.io dependency, not a sibling checkout (#1848)
 
-```bash
-# Build against the locked crate (the normal case):
-cargo build
+vimcode depends on the **published `quadraui` crate** (`quadraui = { version =
+"0.1.x", … }` in `Cargo.toml`, exact version locked in `Cargo.lock`).
+`~/src/quadraui` is not consulted by a normal build, and a worktree contains no
+quadraui source. **To read quadraui's code, use the registry copy of the locked
+version: `~/.cargo/registry/src/*/quadraui-<version>/` (version from `Cargo.lock`)
+— read-only; don't `find /` for it.**
 
-# Pick up a new quadraui patch release (0.1.x): just
-cargo update -p quadraui && cargo test
-# A breaking release (0.2) is a `version = "0.2"` edit in Cargo.toml.
+- Patch release (0.1.x): `cargo update -p quadraui && cargo test`. Breaking release
+  (0.2): a `version = "0.2"` edit in `Cargo.toml`.
+- A quadraui fix vimcode needs must be **published** before vimcode depends on it.
+  Co-develop with the git-ignored local override
+  (`cp cargo-config-local-quadraui.toml.example .cargo/config.toml`, remove after) —
+  **never a git or path dep in a committed `Cargo.toml`**.
+- Don't "fix" vimcode to match a stale local quadraui checkout; if a build sees one,
+  look for a stray `.cargo/config.toml`. `vimcode --version` prints the resolved
+  quadraui version.
 
-# Co-developing quadraui on a local branch? Opt in per-checkout:
-cp cargo-config-local-quadraui.toml.example .cargo/config.toml   # git-ignored, `paths` override
-# ... edit ~/src/quadraui, rebuild ...
-rm .cargo/config.toml   # back to the crates.io version
-```
+## Development workflow
 
-A quadraui fix vimcode needs has to be **published** (a quadraui release + `cargo publish`) before vimcode can depend on it; until then use the local override, never a git dep in a committed `Cargo.toml`.
-
-`vimcode --version` / `vcd --version` print the resolved quadraui version (e.g. `quadraui 0.1.0`), so "which quadraui?" is answerable from any binary.
-
-Do not "fix" vimcode to match a stale local quadraui checkout — it can't affect a normal build; if you see it, check for a stray `.cargo/config.toml`.
-
-## Conditional Reference Files
-
-| File | Load when |
-|------|-----------|
-| `docs/ARCHITECTURE.md` | Working on code structure, adding files, navigating unfamiliar modules |
-| `docs/QUADRAUI_GUIDE.md` | Quadraui migrations, cross-backend rendering, paint↔click integration |
-| `docs/PATTERNS.md` | Adding new keys, commands, settings, theme colors, or clickable UI |
-| `docs/IRREDUCIBLE_SURFACE.md` | Planning platform-neutrality work — what genuinely stays per-backend, and why the rest is duplication not porting |
-| `docs/DOC_MAINTENANCE.md` | After completing any feature — lists all files to update |
-| `docs/COORDINATOR.md` | Designated as coordinator for multi-machine parallel work |
-
-## Agent Roles
-
-The default role is **developer** — read issues, write code, run tests, open PRs.
-
-If the user designates you as **coordinator**, switch to planning mode: read `docs/COORDINATOR.md` and follow that protocol. Coordinators don't write code — they track work across machines, prevent file conflicts, and assign the next issue when an agent finishes.
-
-## Development Workflow
-
-All non-trivial work should be tracked via GitHub Issues.
-
-**Documentation-only changes** (pure `.md` edits) may be committed directly to `develop` and pushed. No branch, no smoke test. If any code changes accompany the doc edit, use the full branch workflow.
-
-**For all other changes:**
-
-1. **Claim the issue before starting work.** Multiple agents may be active concurrently — claim publicly so nobody picks up the same issue. Run `gh issue edit <N> --add-assignee @me`, create the feature branch from `develop` (`issue-{number}-{short-description}`), and push it empty so it appears on the remote as the claim signal. Pushing an empty branch is NOT opening a PR.
-2. **Work on that branch**, committing as you go. Never commit code directly to `develop`. For non-issue work, use `{kind}-{short-description}` naming and you may skip the claim step.
-3. **Do NOT open a PR yet.** Keep the branch in "commits pushed, no PR" state until the user has run smoke tests or explicitly agreed testing is not needed. Subsequent pushes to the claim branch are fine.
-4. **Once approved, ask the user which landing path:**
-   - **Path A — merge locally + push.** For small/trivial changes: `git merge --ff-only <branch>`, push `develop`, delete the branch.
-   - **Path B — open PR.** For normal feature/bugfix work: open a PR to `develop` against the already-pushed branch. Reference "Closes #{number}" if it closes an issue.
-5. **When the user confirms a merge that closes an issue**, immediately `gh issue close <number>` and unassign yourself.
-
-**Creating issues:** Include full design context in the body — file paths, API details, expected behavior. Issues should be self-contained so a new session can pick one up.
+- Work on a branch off `develop` (`issue-{number}-{short-description}`, or
+  `{kind}-{short-description}` for non-issue work). Never commit code directly to
+  `develop`; never push to `main`. PRs target `develop` ("Closes #N").
+- Interactive (non-fleet) sessions: claim the issue, don't open a PR until the user
+  has smoke-tested or waived it, then ask Path A (ff-merge + push) vs Path B (PR) —
+  details in `docs/AGENT_REFERENCE.md`.
+- Issues you file must be self-contained: file paths, API details, expected
+  behaviour — and platform-neutral (see the rule above).
 
 ## Architecture
 
-**VimCode**: Vim-like code editor in Rust. Clean separation: `src/core/` (platform-agnostic logic) vs `src/gtk/` (GTK UI) vs `src/tui_main/` (TUI). `src/main.rs` is a thin CLI dispatcher. A native Windows backend will be re-added as a thin wrapper when the quadraui Win backend ships (quadraui#19–#31).
+Vim-like code editor in Rust (GTK4, quadraui, Ropey, Tree-sitter, Pango+Cairo,
+ratatui+crossterm). `src/core/` is platform-agnostic logic; `src/gtk/`,
+`src/tui_main/`, `src/macos/`, `src/win/` are backends (thin wiring only — see the
+Platform-Neutrality Rule); `src/main.rs` is a thin CLI dispatcher.
 
-**Tech Stack:** Rust 2021, GTK4 (Relm4 removed in #540), quadraui, Ropey, Tree-sitter, Pango+Cairo, ratatui+crossterm
+- **`src/core/` must NEVER depend on `gtk4`, `relm4` or `pangocairo`** — it must be
+  testable in isolation.
+- A change to a surface the backends render (mouse, drag, layout, click detection,
+  rendering) must keep **every** backend working, and its tests cover them.
 
-**Critical Rule:** `src/core/` must NEVER depend on `gtk4`, `relm4`, or `pangocairo`. Must be testable in isolation.
+## Commands & quality checks
 
-**Multi-backend rule:** TWO UI backends (GTK, TUI). When fixing bugs or adding features that touch mouse handling, drag, layout, click detection, or rendering — check and update BOTH backends. See `docs/ARCHITECTURE.md` for directory layout and engine submodule map.
+**Workers: run narrow, relevant tests — not the whole suite.** Before committing:
+`cargo fmt`, `cargo clippy -- -D warnings`, and the tests for what you touched
+(`cargo test <filter>` or `cargo test --test <file>`). The full suite is CI's and
+the Test stage's job.
 
-## Commands & Quality Checks
-
-```bash
-cargo build                       # Compile (GUI on — needs GTK4 dev libs)
-cargo test                        # Run all tests, BOTH backends (see Testing)
-cargo clippy -- -D warnings       # Lint (must pass)
-cargo fmt                         # Format
-```
-
-**MANDATORY before commits:** Run all four commands above. If any fails, fix and re-run. `cargo test --no-default-features --lib` is faster for dev loops, but plain `cargo test` (GUI-on) is the pre-commit gate — the `--no-default-features` variant never compiles `src/gtk/` and cannot catch a GTK regression (#645).
-
-### "CI's `Test (Linux, headless)` is red but everything passes locally"
-
-That job is the **only** one that runs `cargo fmt -- --check` and
-`cargo clippy --no-default-features -- -D warnings` (the GUI job runs `cargo test`
-alone), so a *lint or formatting* failure shows up as exactly one red check and
-zero red tests. Before hunting for a phantom test regression, check the
-toolchain: CI uses `dtolnay/rust-toolchain@stable`, i.e. **whatever stable is
-newest on the day the job runs**, while your machine is on whatever you last
-installed. Every six weeks a new clippy adds lints that turn pre-existing,
-previously-clean code into `-D warnings` errors.
-
-```bash
-rustup check                                    # is CI's stable newer than yours?
-rustup toolchain install <newer> --component clippy,rustfmt --profile minimal
-cargo +<newer> fmt -- --check
-cargo +<newer> clippy --no-default-features -- -D warnings
-```
-
-Fix the lints (they are real, just newly reported) — do **not** pin the workflow
-to an old toolchain to make the check go green. Verify the fix still compiles on
-the older stable too, so you don't accidentally raise the MSRV.
+- Plain `cargo` (default features = `gui` on) compiles `src/gtk/`;
+  `--no-default-features` never does, so **a green `--no-default-features` run says
+  nothing about GTK code** — use the default features if you touched GTK/`render`.
+- CI also runs `cargo fmt -- --check` and `cargo clippy --no-default-features --
+  -D warnings` on the newest stable; a red lint-only CI check is usually a newer
+  clippy — fix the lints, never pin the workflow to an older toolchain.
+- Every test must pass with no `DISPLAY` set (GTK tests paint into in-memory Cairo
+  surfaces). A test that genuinely needs a live display is `#[ignore]`d with a
+  comment saying why.
 
 ## Code Style
-- `rustfmt` defaults (4-space indent)
-- `PascalCase` types, `snake_case` functions/vars
-- Core: Return `Result<T, E>` for I/O, silent no-ops for bounds
-- Tests in `#[cfg(test)] mod tests` at file bottom
 
-## Testing (CRITICAL)
+- `rustfmt` defaults; `PascalCase` types, `snake_case` functions/vars.
+- Core: return `Result<T, E>` for I/O, silent no-ops for bounds.
+- Tests in `#[cfg(test)] mod tests` at file bottom.
 
-### Black-box coverage is the acceptance bar (MANDATORY)
+## Testing — black-box coverage is the acceptance bar (MANDATORY)
 
-**Every PR that changes user-visible behaviour must ship a black-box test that drives the
-running app and asserts on its rendered output.** Both backends have a driver — there is no
-"no harness here" excuse:
+**Every PR that changes user-visible behaviour must ship a black-box test that drives
+the running app and asserts on its rendered output.** Pure refactors and
+internal-only changes are exempt — **say so in the PR**. The adversarial reviewer
+**rejects** behaviour-changing PRs without one.
 
 | Backend | Driver | Where the test goes |
 |---|---|---|
-| TUI | quadraui `TuiDriver` via `quadraui::tui::testing::driver_with_shell(TuiShellApp, ...)` | **in-crate** in `src/tui_main/shell_app.rs`, `#[cfg(test)]` — reuse the local fixtures there (`app_with_sidebar_open`, `app_with_ext_panel`, …) and follow the existing `render_content_paints_*_via_shell_app` tests |
-| GTK | `GtkDriver` (`src/gtk/testing.rs`, harness from #646) | in-crate; paints into in-memory Cairo `ImageSurface`s, headless |
+| TUI | quadraui `TuiDriver` via `quadraui::tui::testing::driver_with_shell(TuiShellApp, ...)` | in-crate in `src/tui_main/shell_app.rs`, `#[cfg(test)]` — reuse its fixtures (`app_with_sidebar_open`, …), follow the `render_content_paints_*_via_shell_app` tests |
+| GTK | `GtkDriver` (`src/gtk/testing.rs`) | in-crate; paints into in-memory Cairo `ImageSurface`s, headless |
 
-Pure refactors and internal-only changes are exempt — **say so in the PR** if that applies.
-The adversarial reviewer reads this file and **rejects** behaviour-changing PRs that lack one.
+1. **Assert on rendered output — never on state being populated.** Locate targets
+   with `find` / `screen_contains`, or probe pixels for icon glyphs — never hardcode
+   coordinates.
+2. **State in the PR that the new test fails against unfixed `develop`.** Remove the
+   fix, re-run, confirm red, restore — a test that cannot fail is not coverage.
+3. **A reproduction is not a fix.** A test-only issue (a red, `KNOWN_BUGS`-gated
+   scenario, no code change) may not be closed until its follow-up fix issue
+   exists, and that issue's number goes in the `KNOWN_BUGS` comment beside the label
+   it gates.
+4. **Never describe a `KNOWN_BUGS`-gated issue as fixed** — not in a PR body,
+   release notes or status report. Release notes list every still-gated issue under
+   **"Reproduced, not yet fixed"**.
 
-**Two rules that exist because they were learned the expensive way:**
+**Sealed acceptance suite:** slices under `tests/acceptance/**` (driven via
+`tests/acceptance.rs`) are authored by the test-author agent. Workers may *run*
+them (`coord acceptance run --issue N`) but must never create, edit or delete them.
 
-1. **Assert on rendered output — never on state being populated.** `ScreenLayout.picker` was
-   populated on GTK for months while nothing painted it; the symptom read as an input bug and
-   burned ~5 sessions before #587 found it was paint, and #592 then found 13 more fields in the
-   same state. A test asserting the field is `Some` passes against the bug. Locate targets with
-   `find` / `screen_contains`, or probe pixels when the content is icon glyphs (#555) — never
-   hardcode coordinates.
-2. **State in the PR that the new test fails against unfixed `develop`.** #553 shipped
-   black-box tests that stayed green with the bug reinstated. A test that cannot fail is not
-   coverage. Remove the fix, re-run, confirm red, restore — then say so in the PR.
-3. **A reproduction is not a fix, and a `KNOWN_BUGS` entry is not a closed bug.** A
-   test-only issue (one that ships a red, `KNOWN_BUGS`-gated scenario and no code change)
-   **may not be closed until its follow-up fix issue exists**, and that fix issue's number
-   goes in the `KNOWN_BUGS` comment beside the label it gates. The bidirectional gate makes
-   a still-broken bug report a *green* CI run, so without this rule a reproduced bug
-   silently disappears: the v0.11.0 suite (#983, #984, #986, #987, #988, #990) shipped 15
-   gated labels in v0.12.0, all six issues closed, zero fix issues filed, and the bugs went
-   out to a user who believed they were fixed.
-4. **Never describe a `KNOWN_BUGS`-gated issue as fixed** — not in a PR body, not in
-   release notes, not in a status report. Before writing release notes, read `KNOWN_BUGS`
-   and list every issue it still gates under an explicit **"Reproduced, not yet fixed"**
-   heading. "Closed" describes the issue; only a green, un-gated test describes the bug.
+### Test-stage agents
 
-If the change touches a surface both backends render, the multi-backend rule above applies to
-the tests too: cover both.
+The Test stage is black-box validation, not a redo of the Work stage: run the
+routed command / pulled artifact (`coord pull-artifact <work_aid>`) you are given,
+don't rebuild or run the full suite. A bug-fix branch fails Test unless it names
+the black-box test covering the bug and states it was seen red on unfixed
+`develop`; a `KNOWN_BUGS`-gated scenario is reproduced, not fixed. Record the verdict
+with `coord test --passed <work_aid>` or `coord test --fail <work_aid> --reason
+"<expected vs actual, steps, suspected files>"`. Full procedure:
+`docs/AGENT_REFERENCE.md`.
 
-- **Full test suite:** `cargo test` (default features, GUI on) — lib + integration tests + the `vimcode` bin's GTK/render unit tests
-- **Fast dev iteration:** `cargo test --no-default-features --lib` — lib tests only
+## Branching & releases
 
-### Test lanes: which command covers which backend (#645)
-
-| Command | Compiles | Covers |
-|---------|----------|--------|
-| `cargo test` (default = `gui` on) | everything: lib, `vcd`, all integration tests, **plus** the `vimcode` bin (`src/gtk/`, bin-side `render`) | **both backends** — strict superset of the TUI lane |
-| `cargo test --no-default-features` | lib, `vcd`, integration tests only — `src/gtk/` is **never compiled** | TUI/core only |
-
-- The two lanes compile *identical* code for every shared target — no
-  `cfg(feature = "gui")` exists outside the `vimcode` bin target — so the GUI
-  lane is a strict superset of the TUI lane's test coverage. The TUI lane's
-  only unique value is compile-hygiene: proving vimcode still builds on a
-  machine without GTK dev libs (CI keeps a `--no-default-features` job for
-  exactly that).
-- **A green `--no-default-features` run says NOTHING about GTK code.** Reading
-  it as cross-backend coverage is the misread #645 exists to prevent: the Test
-  stage reported `passed` on GTK bug fixes whose GTK code it never compiled.
-- The GUI lane runs **headlessly** — no `DISPLAY` or `WAYLAND_DISPLAY` needed.
-  The GTK tests paint into in-memory Cairo `ImageSurface`s (the quadraui#301
-  `GtkDriver` pattern); nothing calls `gtk::init`.
-- **Display policy:** every test must pass with no `DISPLAY` set. Any future
-  test that genuinely needs a live display must be `#[ignore]`-gated with a
-  comment saying why. As of #645 there are none.
-- Coordinator Test-stage recommendation (measured on a 20-core machine, warm
-  shared dependency cache): fresh-worktree `cargo test` ≈ 50s vs 34s for the
-  TUI lane; incremental after a core edit ≈ 19s vs 15s. The GUI lane's extra
-  cost is small and it subsumes the TUI lane's tests, so the recommended
-  `test_command` is **`cargo test`** (one lane; CI covers no-GTK build
-  hygiene).
-
-### Coordinator pipeline: the **Test stage** (read this if you are a smoke / test-stage agent)
-The coordinator drives issues through `Work → Test → Review → Merge`. The **Test stage is a separate step from the work that built the branch — do NOT redo the worker's job:**
-- **ALWAYS pull the prebuilt artifact** with `coord pull-artifact <work_aid>`. Do **NOT** run `cargo build` / `cargo test` yourself — the work-stage worker already compiled the binary and ran the full suite before finishing. Rebuilding or re-testing here **pins the CPU for zero new signal**.
-- **Do NOT run the full test suite** (`cargo test`) at the Test stage. It already ran at the Work stage. The Test stage is **black-box behavior validation + user smoke**: drive the *pulled* binary, exercise the changed behavior end-to-end, and confirm it does what the issue asks.
-- The "**MANDATORY before commits: run all four commands**" rule above is for the **work-stage worker authoring the change**, NOT for the test-stage agent.
-- **For a bug-fix issue, the branch does not pass the Test stage without a named black-box test and a RED verification.** Check that the PR/branch names the test that covers the reported bug, and that it states the test was observed failing against unfixed `develop` (rule 2 above). If the branch ships a `KNOWN_BUGS`-gated scenario instead of a green one, the bug is **reproduced, not fixed** — `coord test --fail` it unless the issue was explicitly scoped test-only, and in that case confirm its follow-up fix issue exists before passing (rule 3 above).
-- Record the verdict with `coord test --passed <work_aid>` or `coord test --fail <work_aid> --reason "<full repro: expected vs actual, steps, suspected files>"`.
-
-## Branching & Releases
-
-> **Cutting a release: [`docs/RELEASING.md`](docs/RELEASING.md).** It holds the
-> pre-release architecture gate — the per-backend test lanes, which machine can run
-> each one, and which failures are expected-red on which platform — plus what the
-> release artifacts actually are. Operator-facing; workers don't need it.
-
-- All work happens on `develop`; `main` is the release branch
-- Merge `develop` → `main` via GitHub PR (CI runs on the PR before release)
-- Before creating the PR: bump version in `Cargo.toml`
-- If `Cargo.lock` changed: regenerate `flatpak/cargo-sources.json` with `python3 flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json`
-- Merging the PR to `main` triggers `release.yml` which creates a GitHub Release tagged `v$VERSION`
-- Never push directly to `main`
+`develop` is the integration branch; `main` is the release branch, updated only by
+a `develop` → `main` PR. Never push directly to `main`. Release procedure
+(version bump, flatpak `cargo-sources.json`, tagging): `docs/RELEASING.md` —
+operator-facing; workers don't need it.
