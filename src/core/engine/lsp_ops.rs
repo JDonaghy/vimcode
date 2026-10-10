@@ -3,7 +3,7 @@ use super::*;
 
 /// Which half of a manifest's install (`[lsp]` or `[dap]`) a background
 /// `tool_acquire` task is acquiring — carries what `finalize_tool_acquire`
-/// needs to register the result (#1345).
+/// needs to register the result.
 pub(crate) enum ToolAcquireLeg {
     Lsp {
         lang_ids: Vec<String>,
@@ -20,18 +20,14 @@ pub(crate) struct ToolAcquireOutcome {
     pub leg: ToolAcquireLeg,
     pub tool_name: String,
     pub result: Result<std::path::PathBuf, String>,
-    /// The specific notification this outcome must resolve — never marked
-    /// done "by kind" (review finding on #1345): a manifest with both
-    /// `[lsp.acquire]` and `[dap.acquire]` spawns two concurrent native
-    /// acquisitions, both using `NotificationKind::LspInstall`, so
-    /// `notify_done_by_kind` would mark *both* notifications done the moment
-    /// either leg finishes — a still-downloading DAP adapter would flip to
-    /// "done" in the UI the instant the LSP leg completes (or vice versa).
+    /// The specific notification this outcome must resolve — each
+    /// concurrent acquisition (LSP and DAP) gets its own notification ID
+    /// so they can be marked done independently.
     pub notification_id: u64,
 }
 
 /// What `ext_install_from_registry` should do with a manifest's
-/// `[lsp.acquire]`/`[dap.acquire]` table (#1346): kick off a native
+/// `[lsp.acquire]`/`[dap.acquire]` table: kick off a native
 /// background acquisition, or — for one of the five package-manager kinds
 /// whose runtime isn't on PATH — fall through to the visible-terminal tier
 /// instead of failing silently.
@@ -69,20 +65,14 @@ pub(crate) fn resolve_acquire_action(
     }
 }
 
-/// Per-extension aggregation state for the native acquisitions one
-/// `:ExtInstall` kicked off (#1345 review follow-up).
+/// Per-extension aggregation state for concurrent native acquisitions.
 ///
-/// A manifest with both `[lsp.acquire]` and `[dap.acquire]` spawns two
-/// background threads that finish **whenever they finish** — the same
-/// `poll_tool_acquire` tick if both are fast, different ticks otherwise
-/// (a big download next to a small one, or just scheduler luck). Joining
-/// only the outcomes that happen to land in the *same* tick therefore
-/// fixes nothing on its own: the later tick's `self.message = …` still
-/// erases the earlier tick's text, which is exactly the "DAP outcome
-/// clobbering LSP success" bug (#1344) in slow motion. Carrying the
-/// finished legs' text here, across ticks, until the last leg of that
-/// extension reports, makes the final status line contain every leg's
-/// outcome regardless of completion order or tick boundaries.
+/// When a manifest has both `[lsp.acquire]` and `[dap.acquire]`, the
+/// two background threads finish independently — possibly in different
+/// `poll_tool_acquire` ticks. Collecting finished legs' text here,
+/// across ticks, until the last leg of that extension reports ensures
+/// the final status line contains every leg's outcome regardless of
+/// completion order or tick boundaries.
 #[derive(Default)]
 pub(crate) struct ToolAcquireGroup {
     /// Legs spawned for this extension that have not reported yet.
@@ -136,7 +126,7 @@ impl Engine {
                 self.plugin_event("open", &path_str);
                 self.plugin_event("BufNew", &path_str);
                 self.plugin_event("BufEnter", &path_str);
-                // #1623: FileType, once the language id is known (set by
+                // FileType, once the language id is known (set by
                 // `buffer_manager::open_file`'s path-based detection before
                 // this runs). Arg is the filetype name — the whole point of
                 // this event is `vimcode.on("FileType", function(ft) if ft
@@ -191,21 +181,13 @@ impl Engine {
                 && !self.prompted_extensions.contains(name.as_str())
             {
                 self.prompted_extensions.insert(name.to_string());
-                // #1397/#1577: the offer is a non-modal, actionable toast
-                // (never auto-expires — see `EngineToast::sticky`'s doc)
-                // with real "Install"/"Don't ask again" buttons, not a
-                // missable status-line hint or shortcuts printed as body
-                // text. `:ExtInstall <name>` keeps working as the
-                // command-line equivalent; keyboard-only users reach the
-                // buttons through `:Notifications` /
-                // `panel_keys.focus_notifications`
-                // (`Engine::focus_toast_stack`) instead of a hijacked vim
-                // key — the pre-#1577 `N` shortcut silently and
-                // permanently dismissed the offer if the user pressed vim's
-                // own `N` (search-previous) while it happened to be up.
+                // The offer is a non-modal, actionable toast with real
+                // "Install"/"Don't ask again" buttons. Command-line users
+                // can run `:ExtInstall <name>` directly; keyboard-only users
+                // reach the buttons through `:Notifications` instead.
                 self.push_extension_recommendation_toast(name, &manifest.display_name);
             } else if let Some(err) = no_server {
-                // #436: extension is installed but the LSP didn't start
+                // Extension is installed but the LSP didn't start
                 // (binary missing, install crashed, etc.).  Surface the
                 // hint from `ensure_server_for_language` instead of
                 // silently failing.
@@ -265,7 +247,7 @@ impl Engine {
     /// status message when it completes. Startup's own automatic refresh
     /// uses [`Self::ext_refresh_quiet`] instead; see that method's doc and
     /// `ext_registry_quiet`'s doc for why the two must not share a message
-    /// policy (#1761).
+    /// policy.
     pub fn ext_refresh(&mut self) {
         self.ext_refresh_inner(false);
     }
@@ -273,7 +255,7 @@ impl Engine {
     /// The automatic refresh [`Engine::startup_inner`] fires unconditionally
     /// on every launch, before anything the user did. Identical to
     /// [`Self::ext_refresh`] except the eventual completion — consumed by
-    /// [`Self::poll_ext_registry`] — never touches `self.message` (#1761).
+    /// [`Self::poll_ext_registry`] — never touches `self.message`.
     ///
     /// That matters because this fetch's completion time is bounded only by
     /// `registry::fetch_registry`'s `curl --max-time 15` — anywhere from
@@ -299,7 +281,7 @@ impl Engine {
             // user-requested refresh) and the in-flight fetch was armed
             // quiet (startup's automatic one), upgrade the flag so the
             // fetch-in-progress still reports its result when it lands
-            // (#1761): otherwise the user's `r` keypress produces no
+            //: otherwise the user's `r` keypress produces no
             // feedback at all, silently inheriting startup's silence policy.
             if !quiet {
                 self.ext_registry_quiet = false;
@@ -360,7 +342,7 @@ impl Engine {
                     // deliberately does not cover it: it only matters when a
                     // registry entry's `ignore_error_sources` changed *and*
                     // diagnostics were already on screen, and it self-heals on
-                    // the next repaint (#1761 review).
+                    // the next repaint.
                     self.refilter_diagnostics();
                     if !quiet {
                         self.message = format!("Extension registry updated ({count} extensions)");
@@ -375,7 +357,7 @@ impl Engine {
                     }
                 }
             }
-            // #1761: a quiet (startup) fetch reports "no redraw needed" so a
+            // A quiet (startup) fetch reports "no redraw needed" so a
             // cold launch stays silent; see `Engine::ext_registry_quiet`'s doc
             // for why. The panel check is the one case where a quiet fetch
             // *is* visible: `sidebar.rs`'s `PANEL_EXTENSIONS` open handler
@@ -389,30 +371,16 @@ impl Engine {
     }
 
     /// Show the README for an extension, fetching it in the background if
-    /// it isn't already on disk (#1739). Call sites: [`Self::
-    /// ext_open_selected_readme`] (Enter / double-click on a sidebar row,
-    /// `show_missing_message: true`) and the Extensions sidebar's `i` key
-    /// handler (install-then-preview, `show_missing_message: false` — the
-    /// generic "No README available... Press i to install" wording would
-    /// be actively wrong right after an install just succeeded, so that
-    /// call site keeps its pre-#1739 behaviour of silently not opening a
-    /// preview tab when there's no README to show).
-    ///
-    /// The on-disk check is a plain `fs::read_to_string` — fast, local,
-    /// stays synchronous. Only the network fallback
-    /// (`registry::fetch_readme`, a `curl --max-time 10` subprocess) moves
-    /// to a background thread: that blocking call on the key-dispatch path
-    /// is #1739's actual root cause. A fresh install's `README.md` isn't
-    /// on disk yet (the script download that would place it is itself now
-    /// backgrounded too — see the comment in
-    /// `ext_install_from_registry_with_runtime_check`), so the install path
-    /// hits this same async fallback on every first "i" press, not just a
-    /// cache-miss edge case.
+    /// it isn't already on disk. The on-disk check is a plain `fs::
+    /// read_to_string` — fast and local. Only the network fallback
+    /// (`registry::fetch_readme`, a `curl --max-time 10` subprocess)
+    /// moves to a background thread, unblocking the key-dispatch path.
+    /// A fresh install's `README.md` isn't on disk yet, so the install
+    /// path hits this same async fallback on every first "i" press.
     ///
     /// No-op (or, if `show_missing_message`, a synchronous "no README"
     /// message) when `base_url` is empty — matches `registry::
-    /// fetch_readme`'s own `base_url.is_empty()` early return, so there is
-    /// nothing to wait on.
+    /// fetch_readme`'s own `base_url.is_empty()` early return.
     pub(crate) fn ext_show_readme_or_fetch_async(
         &mut self,
         name: &str,
@@ -454,12 +422,9 @@ impl Engine {
         let maybe_content = match &self.ext_readme_rx {
             Some(rx) => match rx.try_recv() {
                 Ok(content) => content,
-                // #1739 review round 2 nit: a plain `.ok()` collapses this
-                // arm into the "still running" `None` below, so if the
-                // fetch thread ever died without sending, `ext_readme_rx`
-                // would stay `Some` forever and get polled every idle
-                // tick for nothing. Treat a dead sender the same as a
-                // completed-with-no-content fetch.
+                // Treat a dead sender (disconnected channel) the same as a
+                // completed-with-no-content fetch, preventing the receiver
+                // from being polled forever.
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return false,
             },
@@ -481,20 +446,13 @@ impl Engine {
         true
     }
 
-    /// Non-blocking check for completed background script downloads
-    /// started by [`Self::ext_install_from_registry_with_runtime_check`]
-    /// (#1739 review round 2). Wired into [`Self::poll_idle`] alongside
-    /// [`Self::poll_ext_readme`]. Drains every receiver that has a result
-    /// ready (not just the first) — see [`Engine::ext_scripts_fetch_rx`]'s
-    /// doc for why this is a `Vec` rather than a single slot — and
-    /// reloads plugins (`plugin_manager = None; plugin_init()`) once, if
-    /// any did, so newly-downloaded Lua for an extension installed in
-    /// *this* session becomes active without the user having to restart
-    /// vimcode. The content of the signal itself carries no information
-    /// (downloads still discard their own errors, matching the pre-#1739
-    /// inline loop) — only its arrival matters, because that's what
-    /// means the files are now actually on disk for `plugin_init()` to
-    /// find.
+    /// Non-blocking check for completed background script downloads.
+    /// Drains every receiver that has a result ready (not just the first)
+    /// and reloads plugins once, if any did, so newly-downloaded Lua for
+    /// an extension installed in *this* session becomes active without
+    /// requiring a restart. Errors are discarded — only the arrival of
+    /// the signal matters, indicating the files are now on disk for
+    /// `plugin_init()` to find.
     pub fn poll_ext_scripts(&mut self) -> bool {
         if self.ext_scripts_fetch_rx.is_empty() {
             return false;
@@ -539,7 +497,7 @@ impl Engine {
     }
 
     /// The real body of `ext_install_from_registry`, parameterised over the
-    /// "is this package-manager kind's runtime on PATH?" predicate (#1346).
+    /// "is this package-manager kind's runtime on PATH?" predicate.
     /// `ext_install_from_registry` calls this with the real `binary_on_path`
     /// — split out so a test can call this directly with a stub predicate
     /// and deterministically exercise the "runtime missing → terminal
@@ -551,7 +509,7 @@ impl Engine {
     /// deterministic seam through a real `TuiDriver` and assert on
     /// `driver.screen()` — the engine-internal-state test right below this
     /// one is necessary but not sufficient per CLAUDE.md's black-box
-    /// coverage rule (#1346 review).
+    /// coverage rule.
     pub(crate) fn ext_install_from_registry_with_runtime_check(
         &mut self,
         name: &str,
@@ -571,7 +529,7 @@ impl Engine {
         };
         let ext_name = manifest.name.clone();
 
-        // #1807: refuse to install an extension whose `requires_vimcode`
+        // Refuse to install an extension whose `requires_vimcode`
         // constraint isn't met by the running vimcode — with a clear
         // message, rather than a silent no-op or an install that leaves
         // scripts erroring at load time on a `vimcode.*` API this version
@@ -583,26 +541,14 @@ impl Engine {
         }
 
         // Download scripts from the registry (skip files already on disk
-        // for local dev). #1739: this used to run the `curl --max-time 30`
-        // download inline, per script, right here on the key-dispatch
-        // path — a second blocking leg of the same freeze the `i` key's
-        // README fetch had (see `ext_show_readme_or_fetch_async`'s doc).
-        // The download itself is still fire-and-forget (errors are
-        // discarded with `let _ =`, same as the old inline loop), but its
-        // *side effect* — the `.lua` files landing on disk — is not
-        // something downstream can ignore: `plugin_init()` a few lines
-        // below enumerates this same `ext_dir` and loads whatever `.lua`
-        // it finds there *right now*, before the background thread has
-        // had a chance to write anything. Left alone, that races the
-        // download essentially 100% of the time, so a freshly installed
-        // Lua-scripted extension would silently register none of its
-        // commands/keymaps until the next launch (#1739 review round 2).
-        // The fix mirrors `ext_show_readme_or_fetch_async`'s
-        // `ext_readme_rx`/`poll_ext_readme` pair: the thread signals
-        // completion over a channel, and `poll_ext_scripts` (wired into
-        // `poll_idle` alongside `poll_ext_readme`) reloads plugins once
-        // the files are actually on disk, so the newly installed
-        // extension's Lua becomes active in the installing session too.
+        // for local dev). This used to run inline on the key-dispatch path,
+        // blocking both the README fetch and the script download. The
+        // download itself is still fire-and-forget, but backgrounding it
+        // prevents a race where `plugin_init()` a few lines below enumerates
+        // `ext_dir` and loads whatever `.lua` it finds *before* the
+        // background thread has written anything. The thread signals
+        // completion over a channel, and `poll_ext_scripts` reloads plugins
+        // once the files are actually on disk.
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
             .join(&ext_name);
@@ -633,7 +579,7 @@ impl Engine {
 
         let mut status_parts: Vec<String> = Vec::new();
         let mut install_commands: Vec<String> = Vec::new();
-        // #1345: true once any leg has kicked off a native acquisition
+        // True once any leg has kicked off a native acquisition
         // (download/verify/unpack, no terminal). Tracked separately from
         // `has_install` below because both can never involve the same leg —
         // a leg does the shared-resolver check, then EITHER native
@@ -643,7 +589,7 @@ impl Engine {
         let mut has_native_acquire = false;
 
         // ── LSP ──────────────────────────────────────────────────────────────
-        // Resolution order (#1345): (1) already resolvable via the shared
+        // Resolution order: (1) already resolvable via the shared
         // tool lookup (`binary_on_path`, which now probes the vimcode-managed
         // tools dir first) → done; (2) manifest declares `[lsp.acquire]` →
         // native acquisition, no terminal, no shell; (3) else the legacy
@@ -694,7 +640,7 @@ impl Engine {
                     }
                 }
             } else if !manifest.lsp.install_cmd_for_platform().is_empty() {
-                // #1719: this is the legacy terminal-install leg — unlike
+                // This is the legacy terminal-install leg — unlike
                 // the `[lsp.acquire]` branch above, nothing here checked
                 // `manifest.lsp.dependencies` before now. Detection only
                 // ran at server-start time (`resolve_and_start_server`),
@@ -736,14 +682,10 @@ impl Engine {
         let available_manifests = self.ext_available_manifests();
 
         // ── DAP ──────────────────────────────────────────────────────────────
-        // Check PATH first (idempotent), then prefer native acquisition
-        // (#1345) when the manifest declares `[dap.acquire]`, then fall back
-        // to the unified resolver that knows about both manifest-declared
-        // installs AND the built-in multi-step installers (codelldb, debugpy
-        // venv, netcoredbg archive unpack). Previously this branch read
-        // `manifest.dap.install` only, which is empty for adapters with
-        // hardcoded installers — sending the user into a `:DapInstall <lang>`
-        // loop that resolved back here.
+        // Check PATH first, then prefer native acquisition when the manifest
+        // declares `[dap.acquire]`, then fall back to the unified resolver
+        // that knows about both manifest-declared installs and built-in
+        // installers (codelldb, debugpy venv, netcoredbg archive unpack).
         if !manifest.dap.adapter.is_empty() {
             let dap_binary = manifest.dap.binary.as_str();
             let already_on_path = !dap_binary.is_empty() && binary_on_path(dap_binary);
@@ -786,7 +728,7 @@ impl Engine {
                     }
                 }
             } else {
-                // #1719: merge manifest-declared `dap.dependencies` with
+                // Merge manifest-declared `dap.dependencies` with
                 // the built-in adapters' hardcoded prerequisites
                 // (`dap_manager::adapter_dependencies` — delve needs `go`,
                 // debugpy needs `python3`, codelldb/netcoredbg need
@@ -872,11 +814,10 @@ impl Engine {
         self.plugin_manager = None;
         self.plugin_init();
 
-        // Kick-start LSP for the current buffer if it matches this extension's languages.
-        // Without this, the user would have to re-open the file to get LSP support.
-        // Skip if an install/acquisition is pending — the binary isn't available yet;
-        // LSP will be started when the install terminal (or `finalize_tool_acquire`,
-        // #1345) completes.
+        // Kick-start LSP for the current buffer if it matches this extension's
+        // languages. Without this, the user would have to re-open the file to
+        // get LSP support. Skip if an install or acquisition is pending —
+        // the binary isn't available yet and will be started later.
         if !has_install && !has_native_acquire {
             let active_bid = self.active_buffer_id();
             if let Some(state) = self.buffer_manager.get(active_bid) {
@@ -906,7 +847,7 @@ impl Engine {
     }
 
     /// Spawn a background thread that downloads, verifies and unpacks
-    /// `tool_name` per `acquire` (#1345), off the UI thread. The result
+    /// `tool_name` per `acquire`, off the UI thread. The result
     /// arrives via `tool_acquire_tasks`, drained by `poll_tool_acquire` —
     /// same shape as `Engine::ext_refresh`'s background registry fetch and
     /// `plugins.rs`'s `async_shell_tasks`.
@@ -960,21 +901,14 @@ impl Engine {
             self.tool_acquire_tasks.remove(key);
         }
 
-        // Group by extension (review finding on #1345): a manifest with
-        // both `[lsp.acquire]` and `[dap.acquire]` spawns two concurrent
-        // background acquisitions, and if both land in the same poll tick,
-        // finalizing them one at a time straight into `self.message` would
-        // let the second overwrite the first's success/failure text —
-        // exactly the "DAP outcome clobbering LSP success" class fixed for
-        // the terminal-install path in `finalize_install_from_terminal`
-        // (#1344). Outcomes for the same extension are collected and joined
-        // into one status line instead — and, because two legs need not
-        // land in the same tick at all, that join is carried across ticks
-        // in `Engine::tool_acquire_groups` (see `ToolAcquireGroup`);
-        // outcomes for different extensions
-        // still each get their own call (and so the last one to finalize
-        // wins `self.message` — a pre-existing, unrelated property of a
-        // single-line status bar shared across all engine operations).
+        // Group by extension: a manifest with both `[lsp.acquire]` and
+        // `[dap.acquire]` spawns two concurrent background acquisitions.
+        // If both land in the same poll tick, finalizing them one at a time
+        // straight into `self.message` lets the second overwrite the first's
+        // text. Collecting outcomes for the same extension and joining them
+        // into one status line prevents this. Because two legs need not land
+        // in the same tick at all, that join is carried across ticks in
+        // `Engine::tool_acquire_groups` (see `ToolAcquireGroup`).
         let mut order: Vec<String> = Vec::new();
         let mut by_ext: std::collections::HashMap<String, Vec<ToolAcquireOutcome>> =
             std::collections::HashMap::new();
@@ -1121,7 +1055,7 @@ impl Engine {
                 manifest.display_name.clone()
             };
             let base_url = self.resolve_registry_base_url(manifest);
-            // #1739: was a blocking `curl --max-time 10` subprocess call
+            // Was a blocking `curl --max-time 10` subprocess call
             // (`registry::fetch_readme`) right here on the key-dispatch
             // path — see `ext_show_readme_or_fetch_async`'s doc.
             self.ext_show_readme_or_fetch_async(&name, &display, &base_url, true);
@@ -1267,7 +1201,7 @@ impl Engine {
         }
 
         for bin_name in &bins {
-            // #1345 (review): every path below is built by joining this
+            // Every path below is built by joining this
             // manifest-supplied name onto a directory vimcode then *deletes
             // from* (`remove_dir_all` for the managed tool dir and the
             // `~/.local/share/<name>` data dir, `remove_file` in the safe
@@ -1287,7 +1221,7 @@ impl Engine {
                 ));
                 continue;
             }
-            // #1345: delete the vimcode-managed acquisition dir outright —
+            // Delete the vimcode-managed acquisition dir outright —
             // unlike the shared `safe_dirs` above (system directories other
             // tools might also use), `tools/<bin_name>/` is exclusively
             // populated by `tool_acquire::acquire_and_install`, so removing
@@ -1303,7 +1237,7 @@ impl Engine {
                 if !path.exists() {
                     continue;
                 }
-                // #436: ~/.cargo/bin/<binary> may be a symlink to `rustup`
+                // ~/.cargo/bin/<binary> may be a symlink to `rustup`
                 // (rustup creates these proxies for every component binary,
                 // including rust-analyzer).  Removing the proxy strands the
                 // rustup-managed binary — `rustup component add` won't
@@ -1356,7 +1290,7 @@ impl Engine {
         let ext_name = manifest.name.clone();
         let new_version = manifest.version.clone();
 
-        // #1807: an update is the most realistic route to an incompatible
+        // An update is the most realistic route to an incompatible
         // installed extension — the registry bumping `requires_vimcode`
         // in a newer manifest version is exactly the shape of change this
         // field exists for. Refuse the same way the initial install does,
@@ -1449,7 +1383,7 @@ impl Engine {
             self.message = "All extensions are up to date".to_string();
             return;
         }
-        // #1807: split out any candidate whose newer manifest is
+        // Split out any candidate whose newer manifest is
         // incompatible with the running vimcode — same reasoning as
         // `ext_update_one`, applied per-extension here since `:ExtUpdate`
         // batches every installed extension with an available update.
@@ -1541,18 +1475,10 @@ impl Engine {
             None => return LspStatus::None,
         };
         let status = mgr.lsp_status_for_language(lang);
-        // #450: keep the indicator dimmed (`name…`) while the server has
-        // any open `$/progress` work item. This is the LSP-protocol signal
-        // for "still indexing the workspace" — rust-analyzer / gopls /
-        // pyright all emit it. Previously we tried two semantic-tokens
-        // heuristics:
-        //   - `semantic_tokens.is_empty()` (Session 243) — pinned forever
-        //     for files with no tokens (#230).
-        //   - `!semantic_tokens_received` (#230 fix) — went bright on the
-        //     first empty response, well before indexing actually finished.
-        // The progress-notification gate is both. Servers that don't emit
-        // progress notifications (marksman, simple servers) brighten on
-        // handshake — same as before.
+        // Keep the indicator dimmed (`name…`) while the server has any open
+        // `$/progress` work item, the LSP-protocol signal for workspace
+        // indexing. Servers that don't emit progress notifications brighten
+        // on handshake.
         if let LspStatus::Running(name) = &status {
             if let Some(server_id) = mgr.server_id_for_language(lang) {
                 if mgr.is_indexing(server_id) {
@@ -1564,7 +1490,7 @@ impl Engine {
     }
 
     /// Return the active `$/progress` snapshot for the buffer's server
-    /// (#221). Used by the status bar to format
+    ///. Used by the status bar to format
     /// `name • Indexing: 319/320` segments. Returns None when no
     /// progress is open or the manager/language isn't set up.
     pub fn lsp_progress_for_buffer(
@@ -1580,9 +1506,8 @@ impl Engine {
 }
 
 /// Returns true if `path` is a symlink pointing to `rustup` (the rustup
-/// proxy used to dispatch component binaries like `rust-analyzer`,
-/// `rustc`, `rustfmt`).  These proxies are created by rustup and cannot
-/// be restored by `rustup component add` once removed.
+/// proxy used to dispatch component binaries). These proxies cannot be
+/// restored by `rustup component add` once removed.
 #[cfg(not(target_os = "windows"))]
 fn is_rustup_proxy(path: &Path) -> bool {
     match std::fs::read_link(path) {
@@ -1612,7 +1537,7 @@ mod rustup_proxy_tests {
 
     #[test]
     fn symlink_to_relative_rustup_is_proxy() {
-        // #436: rustup creates `~/.cargo/bin/rust-analyzer -> rustup`
+        // Rustup creates `~/.cargo/bin/rust-analyzer -> rustup`
         // (relative symlink).  ext_remove_tools must skip these.
         let dir = scratch_dir("relative");
         let link = dir.join("rust-analyzer");
@@ -1694,7 +1619,7 @@ mod tests {
         }
     }
 
-    // ── #1346: package-manager runtime dependency → terminal fallback ────
+    // ── package-manager runtime dependency → terminal fallback ────
 
     /// Pure decision-table test for `resolve_acquire_action` — the seam
     /// `ext_install_from_registry_with_runtime_check` drives for every
@@ -1767,25 +1692,14 @@ mod tests {
         }
     }
 
-    /// #1346 acceptance criterion: a manifest whose `[lsp.acquire]` names a
-    /// package-manager kind whose runtime isn't on PATH must fall through
-    /// to the visible-terminal tier with a dependency hint — never spawn a
-    /// native acquisition (which would just fail silently, or worse, spawn
-    /// a process that doesn't exist) and never leave the user with no
-    /// feedback at all.
+    /// A manifest whose `[lsp.acquire]` names a package-manager kind
+    /// whose runtime isn't on PATH must fall through to the visible-
+    /// terminal tier with a dependency hint — never spawn a native
+    /// acquisition and never leave the user with no feedback.
     ///
-    /// `runtime_present` is stubbed to always return `false` — deterministic
-    /// regardless of whether the machine running this suite happens to have
-    /// npm on PATH — so this drives the real engine method
-    /// (`ext_install_from_registry_with_runtime_check`, the seam
-    /// `ext_install_from_registry` itself calls with the real
-    /// `binary_on_path`), not just the pure decision function above.
-    ///
-    /// Verified RED against a version of `ext_install_from_registry` that
-    /// unconditionally spawns `spawn_tool_acquire` for any `[lsp.acquire]`
-    /// table (the pre-#1346 behaviour, still correct for the three
-    /// archive-download kinds): `tool_acquire_groups` gains an entry and
-    /// `pending_terminal_command` stays `None`.
+    /// `runtime_present` is stubbed to always return `false` for
+    /// determinism, driving the real engine method that checks the
+    /// actual binary on PATH.
     #[test]
     fn missing_package_manager_runtime_falls_through_to_terminal_tier() {
         use crate::core::extensions::{ExtensionManifest, LspConfig};
@@ -1832,25 +1746,11 @@ mod tests {
         );
     }
 
-    /// #1345 review follow-up, deterministic half: two legs of the same
-    /// `:ExtInstall` that report in **different** `poll_tool_acquire`
-    /// ticks must both survive in the status line. The driver-tier test
-    /// `tui_main::shell_app::tests::extension_install_lsp_acquire_success_
-    /// survives_dap_acquire_failure_via_shell_app` covers the same rule on
-    /// painted output, but it cannot *force* the two-tick ordering — the
-    /// background threads decide that — so it reproduced the bug only
-    /// intermittently (2 of 4 full `--lib` runs). Calling finalize twice
-    /// here pins it.
-    ///
-    /// Verified RED against the same-tick-only join (`let mut messages`
-    /// local to `finalize_tool_acquire_group`, assigned straight into
-    /// `self.message`): the second call overwrites the first's text and
-    /// the DAP assertion below fails.
-    ///
-    /// The DAP leg succeeds and the LSP leg fails (rather than the other
-    /// way round) purely so neither call reaches `ensure_lsp_manager` /
-    /// `ensure_server_for_language` — no process spawn, no PATH probing,
-    /// nothing environment-dependent in a unit test.
+    /// Two legs of the same `:ExtInstall` that report in **different**
+    /// `poll_tool_acquire` ticks must both survive in the status line.
+    /// Calling finalize twice here ensures outcomes for the same
+    /// extension are collected and joined across ticks, so the second
+    /// call's text doesn't overwrite the first's.
     #[test]
     fn tool_acquire_outcomes_in_separate_ticks_keep_both_messages() {
         let mut e = Engine::new();
@@ -1913,33 +1813,15 @@ mod tests {
         );
     }
 
-    /// #1345 blocking review finding: `ext_remove_tools` joins
-    /// `manifest.lsp.binary` / `manifest.dap.binary` — free-form text from a
-    /// community-submitted registry manifest — straight onto directories it
-    /// then `remove_dir_all`s. `PathBuf::join` resolves nothing, so a
-    /// manifest declaring `binary = "../.."` used to turn ":ExtUninstall,
-    /// remove tools" into a recursive delete of an *ancestor* of
+    /// `ext_remove_tools` joins `manifest.lsp.binary` / `manifest.dap.
+    /// binary` — free-form text from community-submitted manifests —
+    /// straight onto directories. `PathBuf::join` resolves nothing, so a
+    /// manifest declaring `binary = "../.."` would turn ":ExtUninstall,
+    /// remove tools" into a recursive delete of an ancestor of
     /// `~/.local/share/vimcode/tools`.
     ///
-    /// The sentinel here sits two levels above the managed tools dir — i.e.
-    /// exactly where `managed_tool_dir("../../<sentinel>")` lands once the
-    /// OS resolves the join — and must survive the removal. The traversal
-    /// deliberately cannot reach anything real through the `$HOME`-based
-    /// legs of that same loop either: `~/.local/bin/../../<sentinel>` and
-    /// `~/.local/share/../../<sentinel>` resolve to a pid-unique name
-    /// directly under `$HOME`'s parent that no machine has, so an unguarded
-    /// (RED) run of this test deletes the throwaway sentinel and nothing
-    /// else.
-    ///
-    /// **Verified RED without the guard:** removing the
-    /// `is_safe_single_segment_name` check from `ext_remove_tools` makes the
-    /// sentinel directory (and the file inside it) gone by the time the
-    /// assertions run.
-    ///
-    /// Unit- rather than driver-tier on purpose: the guard changes no
-    /// painted output at all — `ext_remove` reports the same "Extension 'x'
-    /// and its tools removed" message either way — so what has to be
-    /// asserted is the filesystem effect, which no screen can show.
+    /// This test verifies the path-traversal guard: the sentinel sits
+    /// two levels above the managed tools dir and must survive removal.
     #[test]
     fn ext_remove_tools_refuses_path_traversal_binary_names() {
         use crate::core::extensions::{DapConfig, ExtensionManifest, LspConfig};
@@ -2042,24 +1924,14 @@ mod tests {
         }
     }
 
-    /// #1386 core acceptance: opening several files of a language whose
-    /// server resolves to a broken proxy (present on disk, fails its
-    /// `--version` probe — the rustup-uninstalled-component shape) must not
-    /// re-run that probe for every open. `Engine::open_file_with_mode`
-    /// calls `lsp_did_open`, which calls `ensure_server_for_language`
-    /// *twice* per open (did-open + `lsp_request_semantic_tokens`), so
-    /// without the negative cache this reads N×2 (or N×4, counting
-    /// `resolve_command`'s own internal duplicate probe) instead of 1.
+    /// Opening several files of a language whose server resolves to a
+    /// broken proxy (present on disk but fails its `--version` probe)
+    /// must not re-run that probe for every open. The negative cache
+    /// prevents multiple probes for the same unresolvable server.
     ///
-    /// Also proves the file still opens successfully (buffer content
-    /// present, no error `Result`) despite the unresolvable server — the
-    /// bug this issue reports was a UI-thread stall on open, not a hard
-    /// failure, so a passing `open_file_with_mode` call on its own wouldn't
-    /// be new coverage; the probe count is the actual regression guard.
-    ///
-    /// **Verified RED against unfixed `develop`:** reverting the
-    /// `failed_language_resolutions` cache (`lsp_manager.rs`) makes
-    /// `probe_count` below grow with each open instead of staying at 1.
+    /// Also verifies the file still opens successfully despite the
+    /// unresolvable server — this issue's bug was a UI-thread stall,
+    /// not a hard failure.
     #[test]
     #[cfg(unix)]
     fn opening_multiple_files_with_unresolvable_lsp_server_probes_only_once() {
@@ -2094,9 +1966,7 @@ mod tests {
             std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        // Thread-local, not `set_var("HOME", …)` — see
-        // `core::paths::TEST_HOME_OVERRIDE` for why the process-global
-        // version corrupts concurrently-running tests (#957 smoke).
+        // Use thread-local HOME override to avoid corrupting concurrent tests.
         let _home_guard = crate::core::paths::set_test_home(&home);
 
         let ext_name = "vc-test-1386-engine-ext";
@@ -2143,20 +2013,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // ── #1719: detect missing prerequisites before dispatching an install ──
-
-    /// #1719 acceptance criterion: an extension whose `lsp.dependencies`
-    /// names a binary that isn't on PATH must never reach the terminal
-    /// pane at all — the pre-#1719 behaviour let the legacy `install_*`
-    /// string through unconditionally, so the failure only ever showed up
-    /// as `command not found: npm` *inside* the pane the install already
-    /// started. `missing_dependency_message`'s actionable hint must appear
-    /// in the status line instead, and no terminal command may be queued.
-    ///
-    /// Verified RED against the pre-#1719 code (the `else if !manifest.
-    /// lsp.install_cmd_for_platform().is_empty()` branch with no `missing`
-    /// check in front of it): `pending_terminal_command` becomes `Some`
-    /// and `e.message` never mentions `npm`.
+    /// An extension whose `lsp.dependencies` names a binary that isn't
+    /// on PATH must never reach the terminal pane — the failure hint
+    /// must appear in the status line instead, and no terminal command
+    /// may be queued.
     #[test]
     fn lsp_legacy_install_blocked_when_declared_dependency_missing() {
         use crate::core::extensions::{ExtensionManifest, LspConfig};
@@ -2192,9 +2052,8 @@ mod tests {
         );
     }
 
-    /// Same contract as above, but for the DAP leg's *manifest-declared*
-    /// `install_*` command, using the new `dap.dependencies` field (#1719 —
-    /// this field didn't exist before this issue).
+    /// Same contract as above, but for the DAP leg's manifest-declared
+    /// `install_*` command using the `dap.dependencies` field.
     #[test]
     fn dap_manifest_install_blocked_when_declared_dependency_missing() {
         use crate::core::extensions::{DapConfig, ExtensionManifest};
@@ -2230,19 +2089,10 @@ mod tests {
         );
     }
 
-    /// #1719: the built-in `delve` adapter's installer runs `go install
-    /// github.com/go-delve/delve/cmd/dlv@latest` — nothing declared `go` as
-    /// a prerequisite anywhere before this issue (`dap.dependencies` did
-    /// not even exist), so a machine without `go` saw an opaque `command
-    /// not found: go` inside the install pane rather than an upfront
-    /// message. This drives the real merge of `dap_manager::adapter_
-    /// dependencies` into `ext_install_from_registry_with_runtime_check`'s
-    /// built-in-installer branch, not just the pure function on its own.
-    ///
-    /// Verified RED against the pre-#1719 code (the built-in branch calling
-    /// `install_cmd_for_adapter` unconditionally): `pending_terminal_
-    /// command` ends up `Some("... go install ...")` and `e.message` never
-    /// mentions `go` as a missing prerequisite.
+    /// The built-in `delve` adapter's installer runs `go install ...`.
+    /// This drives the real merge of `dap_manager::adapter_dependencies`
+    /// into the built-in-installer branch, ensuring missing `go` is
+    /// reported upfront rather than as an opaque error inside the pane.
     #[test]
     fn dap_builtin_delve_install_blocked_when_go_missing() {
         use crate::core::extensions::{DapConfig, ExtensionManifest};
@@ -2283,7 +2133,7 @@ mod tests {
         );
     }
 
-    /// #1719: the built-in `codelldb` adapter's Unix installer needs
+    /// The built-in `codelldb` adapter's Unix installer needs
     /// `curl` and `unzip`; pin that both are checked (not just the first
     /// one found).
     #[test]
@@ -2371,14 +2221,10 @@ mod tests {
         );
     }
 
-    // ── #1761 review: `ext_refresh_inner`'s dedupe-vs-quiet interaction ──
-
-    /// An explicit, user-requested refresh (`ext_refresh`, non-quiet) that
-    /// arrives while a quiet (startup) fetch is already in flight must
-    /// upgrade the shared flag, not silently inherit the in-flight fetch's
-    /// quiet policy — otherwise the user's `r` keypress in the Extensions
-    /// panel produces no feedback at all when the fetch eventually lands
-    /// (the exact #1761 review finding this covers).
+    /// An explicit, user-requested refresh that arrives while a quiet
+    /// (startup) fetch is already in flight must upgrade the shared flag,
+    /// not inherit the in-flight fetch's quiet policy — otherwise the
+    /// user's `r` keypress in the Extensions panel produces no feedback.
     #[test]
     fn explicit_refresh_upgrades_an_in_flight_quiet_fetch() {
         let mut e = Engine::new_for_test();
@@ -2424,27 +2270,13 @@ mod tests {
         );
     }
 
-    // ── #1761 review: `poll_ext_registry`'s redraw verdict while the
-    //    Extensions panel is open during a quiet fetch ──
-
-    /// Drive `poll_ext_registry` directly (no real background thread) to
-    /// pin down its return value for the `(quiet, panel_open)` combinations
-    /// the #1761 review found incompletely handled: the panel being open
-    /// while a *quiet* fetch lands must still request a redraw (the panel's
-    /// list needs the fetch result just populated), even though the common
+    /// Check the return value of `poll_ext_registry` for the `(quiet,
+    /// panel_open)` combinations. The panel being open while a quiet
+    /// fetch lands must still request a redraw, even though the common
     /// quiet/closed-panel startup case must not.
     fn poll_with(quiet: bool, panel_open: bool) -> bool {
-        // `poll_ext_registry`'s success branch calls `registry::save_cache`
-        // unconditionally, which resolves through
-        // `paths::vimcode_config_dir()`. Without a `TestHomeGuard` held
-        // across that call, this test would write `[]` over the *real*
-        // `~/.config/vimcode/registry_cache.json` on whatever machine runs
-        // the suite — and a truncated cache is sticky, because `load_cache`
-        // then returns `Some([])`, which makes `sidebar.rs`'s
-        // `ext_registry.is_none()` guard false and leaves the developer's
-        // Extensions panel painting empty until they refresh by hand.
-        // Thread-local override, not `set_var("HOME", …)` — see
-        // `core::paths::TEST_HOME_OVERRIDE` (#1741 review, #1761 review).
+        // Use thread-local HOME override to prevent writing over the real
+        // registry cache during tests.
         let home = std::env::temp_dir().join(format!(
             "vimcode_test_1761_poll_home_q{quiet}_p{panel_open}_{}_{:?}",
             std::process::id(),
@@ -2495,7 +2327,7 @@ mod tests {
 
     #[test]
     fn quiet_fetch_with_panel_open_still_requests_a_redraw() {
-        // #1761 review: opening the Extensions panel while a quiet fetch is
+        // Opening the Extensions panel while a quiet fetch is
         // in flight does not re-arm its own refresh (`set_panel_focus`'s
         // `PANEL_EXTENSIONS` arm only calls `ext_refresh` when nothing is
         // already fetching), so the panel relies entirely on *this* fetch's
@@ -2510,7 +2342,7 @@ mod tests {
         assert!(poll_with(false, true));
     }
 
-    /// #1807: `ext_install_from_registry` must refuse an extension whose
+    /// `ext_install_from_registry` must refuse an extension whose
     /// `requires_vimcode` constraint isn't met by the running vimcode —
     /// engine-internal-state half of the acceptance bar; the driver-tier
     /// black-box twin (asserting on `driver.screen()`) is
@@ -2543,15 +2375,10 @@ mod tests {
         );
     }
 
-    /// #1807: absent `requires_vimcode` (the pre-#1807 default) must never
-    /// trip the new gate — the "If the field is missing, behave as today"
-    /// acceptance criterion.
-    ///
-    /// This install runs to completion (`mark_installed_version` +
-    /// `.save()`, then would reach `plugin_init` in a real session), so it
-    /// uses `set_test_home` to keep that persistence under a throwaway
-    /// directory instead of the developer's real `~/.config/vimcode`
-    /// (review finding on this issue's round 1).
+    /// Absent `requires_vimcode` must never trip the gate — the field's
+    /// absence should behave as today's behavior. This install runs to
+    /// completion, so it uses `set_test_home` to keep persistence under
+    /// a throwaway directory.
     #[test]
     fn install_not_refused_when_requires_vimcode_is_absent() {
         use crate::core::extensions::ExtensionManifest;

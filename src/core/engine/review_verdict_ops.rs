@@ -1,40 +1,39 @@
-//! Review verdict reporting (#526, Track A Phase 2): close the loop on the
-//! change-review surface (#525/#955) by approving or requesting changes,
-//! routed to a provider-declared command through a temp file (never
-//! inline — see `crate::core::tool_client::write_review_body_temp_file`'s
-//! doc for why).
+//! Review verdict reporting: close the loop on the change-review
+//! surface by approving or requesting changes, routed to a
+//! provider-declared command through a temp file (never inline — see
+//! `crate::core::tool_client::write_review_body_temp_file`'s doc for
+//! why).
 //!
 //! This is the generic host's `core` half, same placement rule as
 //! `board_ops.rs`/`document_ops.rs`: it knows how to find a configured
-//! provider (an installed extension whose manifest declares `[board]` with
-//! `verdict_commands`, #522), compose a review body as a real markdown
-//! scratch buffer (mirroring `document_ops.rs`'s provider-document buffer
-//! exactly — same "capture the provider's argv at open time, push on `:w`"
-//! shape), and run its verdict command through the same `board_client`
-//! seam `board_ops.rs` already uses. It names **no specific external
-//! provider or verdict vocabulary beyond `crate::core::review::
-//! ReviewVerdict`'s own generic approve/request-changes/comment terms** —
-//! a dedicated repo-root test enforces this mechanically.
+//! provider (an installed extension whose manifest declares `[board]`
+//! with `verdict_commands`), compose a review body as a real markdown
+//! scratch buffer (mirroring `document_ops.rs`'s provider-document
+//! buffer exactly — same "capture the provider's argv at open time,
+//! push on `:w`" shape), and run its verdict command through the same
+//! `board_client` seam `board_ops.rs` already uses. It names **no
+//! specific external provider or verdict vocabulary beyond
+//! `crate::core::review::ReviewVerdict`'s own generic approve/
+//! request-changes/comment terms** — a dedicated repo-root test
+//! enforces this mechanically.
 //!
 //! ## Why a scratch buffer, not an inline prompt
 //!
-//! A review body is prose (and, once #527 lands, collected inline
-//! comments) — multi-line, possibly containing code fences. `document_ops.
-//! rs` already proved the "open a real markdown buffer, `:w` pushes it
-//! through a provider command" shape works well for exactly this kind of
-//! payload; reusing it here means the same vim editing (undo, search,
-//! paste from other buffers) is available for composing a review as it is
-//! for authoring an issue.
+//! A review body is prose (and once inline comments are collected,
+//! multi-line text possibly containing code fences). `document_ops.rs`
+//! already proved the "open a real markdown buffer, `:w` pushes it
+//! through a provider command" shape works well for exactly this kind
+//! of payload; reusing it here means the same vim editing (undo,
+//! search, paste from other buffers) is available for composing a
+//! review as it is for authoring an issue.
 //!
-//! ## A failed verdict command preserves the composed body (#526's own
-//! acceptance bar)
+//! ## A failed verdict command preserves the composed body
 //!
-//! [`Engine::save_review_verdict_buffer`] never clears the buffer or its
-//! `dirty` flag on failure — the composed text stays exactly where the
-//! user left it (still in the buffer, still on disk in the temp file the
-//! failed attempt wrote), so a rejected/erroring provider command never
-//! costs a retype-from-scratch — a real failure mode a pipeline-management
-//! bundle's own verdict-reporting channel has been bitten by before.
+//! [`Engine::save_review_verdict_buffer`] never clears the buffer or
+//! its `dirty` flag on failure — the composed text stays exactly where
+//! the user left it (still in the buffer, still on disk in the temp
+//! file the failed attempt wrote), so a rejected/erroring provider
+//! command never costs a retype-from-scratch.
 
 use super::*;
 use crate::core::buffer_manager::ReviewVerdictBinding;
@@ -71,7 +70,7 @@ impl Engine {
             return;
         }
         // Captured *before* `close_change_review` clears `self.change_review`
-        // — the pinned comments (#527) collected while the diff surface was
+        // — the pinned comments collected while the diff surface was
         // open are the findings list this verdict's body gets prefilled
         // with.
         let comments = self
@@ -91,7 +90,7 @@ impl Engine {
         comments: Vec<crate::core::review::ReviewComment>,
     ) {
         let buf_id = self.buffer_manager.create();
-        // #527: fold the pinned line comments into the composed body via
+        // Fold the pinned line comments into the composed body via
         // whichever `FindingsSerializer` is installed — pluggable, not a
         // hardcoded format inline here (see `crate::core::review::
         // FindingsSerializer`'s own doc for why).
@@ -126,9 +125,8 @@ impl Engine {
         };
     }
 
-    /// Swap in a different [`crate::core::review::FindingsSerializer`] for
-    /// tests — proves the findings layout is genuinely pluggable, not
-    /// hardcoded, per #527's own acceptance bar.
+    /// Swap in a different [`crate::core::review::FindingsSerializer`] —
+    /// proves the findings layout is genuinely pluggable, not hardcoded.
     #[cfg(test)]
     pub fn set_review_findings_serializer(
         &mut self,
@@ -137,8 +135,8 @@ impl Engine {
         self.review_findings_serializer = serializer;
     }
 
-    /// Save a review-verdict buffer: write the composed body to a temp file
-    /// and run the bound provider's verdict command with `{id}`/
+    /// Save a review-verdict buffer: write the composed body to a temp
+    /// file and run the bound provider's verdict command with `{id}`/
     /// `{body_file}` substituted. **Blocking**, the same deliberate
     /// tradeoff `save_tool_document_buffer` already made.
     ///
@@ -146,8 +144,7 @@ impl Engine {
     /// failure never loses the body: it is still on disk at the path just
     /// written, and — since this function returns an `Err` without
     /// touching the buffer's content or `dirty` flag — still exactly as
-    /// the user left it in the open buffer too (#526's "preserve the
-    /// composed body on failure" acceptance bar).
+    /// the user left it in the open buffer too.
     pub(crate) fn save_review_verdict_buffer(&mut self) -> Result<(), String> {
         let binding = self
             .active_buffer_state()
@@ -276,10 +273,10 @@ mod tests {
         assert_eq!(binding.verdict_command[3], "--ok");
     }
 
-    /// #527 acceptance: pinned comments collected on the change-review
-    /// surface "appear in the submitted body" — asserted on the actual
-    /// composed buffer content, the same text `save_review_verdict_buffer`
-    /// would push through `{body_file}`.
+    /// Pinned comments collected on the change-review surface appear in
+    /// the submitted body — asserted on the actual composed buffer
+    /// content, the same text `save_review_verdict_buffer` would push
+    /// through `{body_file}`.
     #[test]
     fn start_review_verdict_prefills_the_body_with_pinned_findings() {
         let mut engine = Engine::new_for_test();
@@ -317,10 +314,9 @@ mod tests {
         assert!(engine.message.contains("1 pinned comment(s) included"));
     }
 
-    /// #527's own acceptance bar: "the findings serializer is pluggable,
-    /// not hardcoded to one provider's format" — swapping
-    /// `review_findings_serializer` changes what the composed body looks
-    /// like, with no other code path touched.
+    /// The findings serializer is pluggable, not hardcoded to one
+    /// provider's format — swapping `review_findings_serializer` changes
+    /// what the composed body looks like, with no other code path touched.
     #[test]
     fn start_review_verdict_uses_the_installed_findings_serializer() {
         fn shouty(comments: &[crate::core::review::ReviewComment]) -> String {
@@ -359,9 +355,8 @@ mod tests {
         assert_eq!(body, "!!! QUIET DOWN !!!");
     }
 
-    /// A review with no pinned comments composes exactly the blank body it
-    /// did before #527 — no stray "## Findings" heading with nothing under
-    /// it.
+    /// A review with no pinned comments composes exactly the blank body
+    /// — no stray "## Findings" heading with nothing under it.
     #[test]
     fn start_review_verdict_with_no_comments_leaves_the_body_blank() {
         let mut engine = Engine::new_for_test();
@@ -385,7 +380,7 @@ mod tests {
     }
 
     /// Acceptance: "Approve / request-changes records a verdict through a
-    /// mock provider, with no coordinator present" (#526) — and the body,
+    /// mock provider, with no coordinator present" — and the body,
     /// including newlines, arrives intact via `{body_file}`.
     #[test]
     fn save_review_verdict_buffer_reports_through_the_provider_with_the_body_file() {
@@ -429,9 +424,9 @@ mod tests {
         assert!(!engine.active_buffer_state().dirty);
     }
 
-    /// #526's own acceptance bar: "a failed verdict command preserves the
-    /// composed body." The buffer's content and dirty flag are untouched
-    /// on failure — no retype-from-scratch.
+    /// A failed verdict command preserves the composed body: the buffer's
+    /// content and dirty flag are untouched on failure — no
+    /// retype-from-scratch.
     #[test]
     fn save_review_verdict_buffer_preserves_the_body_on_a_failing_provider() {
         let mut engine = Engine::new_for_test();

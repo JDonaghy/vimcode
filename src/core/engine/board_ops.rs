@@ -1,49 +1,36 @@
-//! Board panel engine plumbing (#521 Phase 0 read-only + #523
-//! provider-dispatch actions).
+//! Board panel engine: finds a configured provider (an installed extension
+//! whose manifest declares `[board]`), runs it through the
+//! [`crate::core::tool_client`] seam, and translates `quadraui::BoardAction`s
+//! into mutations on the cached `quadraui::BoardModel`. Names no specific
+//! external provider — see `tool_client`'s module doc for the placement rule
+//! this satisfies.
 //!
-//! This module is the generic host's `core` half: it knows how to find a
-//! configured provider (an installed extension whose manifest declares
-//! `[board]`, #522), run it through the [`crate::core::tool_client`] seam,
-//! and translate `quadraui::BoardAction`s into mutations on the cached
-//! `quadraui::BoardModel`. It names **no specific external provider** — see
-//! `tool_client`'s module doc for the placement rule this satisfies, which a
-//! dedicated repo-root test enforces mechanically.
-//!
-//! ## #523: provider-declared named actions
-//!
-//! Beyond the read-only navigation `quadraui::BoardAction` already covers
-//! (`SelectCard`, `MoveSelection`, `JumpToTop`/`JumpToBottom`, `OpenIssue`),
-//! a provider can declare arbitrary named actions
-//! (`extensions::BoardActionDef` — e.g. "dispatch this card's work",
-//! "record a Test verdict") scoped to specific stages (columns), with an
-//! optional keybinding and a confirmation requirement. Three entry points
-//! run them:
+//! A provider can declare arbitrary named actions (`extensions::BoardActionDef`
+//! — e.g. "dispatch this card's work", "record a Test verdict") scoped to
+//! specific stages (columns), with an optional keybinding and a confirmation
+//! requirement. Three entry points run them:
 //!
 //! - [`Engine::open_board_context_menu`] — right-click a card, lists every
 //!   action valid for its current stage; confirming an item runs
-//!   [`Engine::run_board_action_by_name`] (`windows.rs`'s
-//!   `context_menu_confirm`, `ContextMenuTarget::Board` arm).
+//!   [`Engine::run_board_action_by_name`].
 //! - [`Engine::dispatch_board_key_unified`] — a single key matching a
 //!   provider-declared stage keybinding for the selected card (e.g. a
 //!   `P`/`S`/`F` style single-key verdict) runs it directly.
-//! - `Engine::open_issue_card` — `OpenIssue` falls back to a provider
-//!   action of the same name when no more specific handling applies (a
-//!   `[document]` provider, #524). `OpenReview` is the one exception: its
-//!   provider action resolves a review *target* rather than being
-//!   fire-and-forget, so `Engine::open_review_card` reads the declared argv
-//!   itself and feeds the result to `Engine::open_branch_review` (#525)
-//!   instead of going through the generic dispatch below.
+//! - `Engine::open_issue_card` — `OpenIssue` falls back to a provider action
+//!   of the same name when no more specific handling applies. `OpenReview` is
+//!   the exception: its provider action resolves a review *target* rather
+//!   than being fire-and-forget, so `Engine::open_review_card` reads the
+//!   declared argv itself and feeds the result to `Engine::open_branch_review`
+//!   instead of going through the generic dispatch.
 //!
-//! [`Engine::run_board_action_by_name`] resolves the action's argv
-//! (`{id}` substituted) and either dispatches it immediately or — when the
-//! provider marked it `confirm` — opens a Yes/No dialog first
-//! (`panels.rs`'s `"confirm_board_action"` `process_dialog_result` arm).
-//! Dispatch itself is a background subprocess via the same `ToolClient`
-//! seam `board_refresh` uses ([`Engine::dispatch_board_action_command`] /
-//! [`Engine::poll_board_action`]); its exit status/stdout land in
-//! `Engine::message`, and a successful run triggers a fresh
-//! [`Engine::board_refresh`] so the panel reflects the provider's new state
-//! on the next poll.
+//! [`Engine::run_board_action_by_name`] resolves the action's argv (`{id}`
+//! substituted) and either dispatches it immediately or — when the provider
+//! marked it `confirm` — opens a Yes/No dialog first. Dispatch itself is a
+//! background subprocess via the same `ToolClient` seam `board_refresh` uses
+//! ([`Engine::dispatch_board_action_command`] / [`Engine::poll_board_action`]);
+//! its exit status/stdout land in `Engine::message`, and a successful run
+//! triggers a fresh [`Engine::board_refresh`] so the panel reflects the
+//! provider's new state on the next poll.
 
 use super::*;
 use crate::core::extensions::BoardProviderConfig;
@@ -59,16 +46,12 @@ pub type BoardActionResult = (String, Result<Vec<u8>, ToolError>);
 /// Block until `ready()` observes the result of a backgrounded provider
 /// command, or fail the test after a generous wall-clock deadline.
 ///
-/// Every board command (`board_refresh`, action dispatch, freshness tick)
-/// runs on a real `std::thread`, so a test that wants to see its result has
-/// to wait for the OS to schedule that thread. A bounded spin on
-/// `yield_now()` — what these tests used to do — is **not** a wait: with
-/// nothing else runnable on this core, 1000 yields retire in microseconds
-/// and the loop gives up long before the spawned thread has run at all.
-/// That made the suite pass on an idle machine and fail under the
-/// coordinator's parallel load, which is exactly how these tests were
-/// reported broken. Sleep between attempts and bound by *time*, not by
-/// iteration count, so the wait scales with how busy the box is.
+/// Every board command runs on a real `std::thread`, so a test that wants to
+/// see its result has to wait for the OS to schedule that thread. Failure is
+/// a race condition: with nothing else runnable on this core, a bounded spin
+/// on `yield_now()` retires in microseconds before the spawned thread has run.
+/// Sleep between attempts and bound by *time*, not by iteration count, so the
+/// wait scales with how busy the box is.
 #[cfg(test)]
 pub(crate) fn wait_for_provider_command(what: &str, mut ready: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -176,7 +159,7 @@ impl Engine {
         }
     }
 
-    /// Opt-in freshness (#523): periodically run the provider's declared
+    /// Opt-in freshness: periodically run the provider's declared
     /// `tick_command`, independent of whether the Board panel is currently
     /// visible — unlike [`Self::tick_board`], which only refreshes reads
     /// while the panel is active, the whole point of a tick is nudging a
@@ -266,8 +249,8 @@ impl Engine {
     }
 
     /// `OpenIssue`'s handling, in priority order: a `[document]` provider
-    /// (#524) opens the card as an editable markdown buffer; otherwise a
-    /// provider-declared `"OpenIssue"` named action (#523) dispatches it;
+    /// opens the card as an editable markdown buffer; otherwise a
+    /// provider-declared `"OpenIssue"` named action dispatches it;
     /// otherwise fall back to Phase 0's acknowledgement — echo the cached
     /// card's title to the status line — so a board with neither still
     /// gives feedback on open.
@@ -295,23 +278,22 @@ impl Engine {
         }
     }
 
-    /// `OpenReview`'s handling (#525): run the configured board provider's
-    /// `"OpenReview"` action ([`crate::core::extensions::BoardProviderConfig::
-    /// action_by_name`]) to resolve this card to a
-    /// [`crate::core::tool_client::BranchReviewTarget`], then hand that
-    /// off to `Engine::open_branch_review`, which turns it into a local
-    /// git diff and opens the shared change-review surface (#955). This
-    /// function is the only place that knows the review comes from a board
-    /// card — `open_branch_review` itself has no idea.
+    /// `OpenReview`'s handling: run the configured board provider's
+    /// `"OpenReview"` action to resolve this card to a
+    /// [`crate::core::tool_client::BranchReviewTarget`], then hand that off to
+    /// `Engine::open_branch_review`, which turns it into a local git diff and
+    /// opens the shared change-review surface. This function is the only place
+    /// that knows the review comes from a board card — `open_branch_review` itself
+    /// has no idea.
     ///
-    /// Note this is the one named action that is **not** dispatched through
-    /// [`Self::run_board_action_by_name`] (#523's generic path): its
-    /// command's stdout is a review *target* to resolve into a diff, not a
-    /// fire-and-forget side effect whose stdout belongs on the status line.
+    /// This is the one named action **not** dispatched through
+    /// [`Self::run_board_action_by_name`]: its command's stdout is a review
+    /// *target* to resolve into a diff, not a fire-and-forget side effect whose
+    /// stdout belongs on the status line.
     ///
     /// **Blocking**, the same one-shot tradeoff `open_issue_card`'s
-    /// document-provider path already made: opening a review is a
-    /// deliberate user action with no cached state to show while waiting.
+    /// document-provider path already made: opening a review is a deliberate user
+    /// action with no cached state to show while waiting.
     fn open_review_card(&mut self, id: quadraui::WidgetId) {
         let Some(provider) = self.board_provider() else {
             self.message = "Board: no provider configured".to_string();
@@ -339,9 +321,8 @@ impl Engine {
         }
         // `open_branch_review` -> `open_change_review` already reset
         // `review_card_id` to `None`; set it back now that the surface it
-        // opened really is for this card, so a later verdict
-        // (`Engine::start_review_verdict`, #526) knows which one to report
-        // against.
+        // opened really is for this card, so later verdict handling knows which
+        // one to report against.
         self.review_card_id = Some(id.as_str().to_string());
     }
 
@@ -359,16 +340,15 @@ impl Engine {
     }
 
     /// Open a context menu listing the provider-declared actions valid for
-    /// `card_id`'s current stage (#523: "listing the actions the provider
-    /// declares as valid for that card's stage"). `x`/`y` are cell
-    /// coordinates — the same convention `Engine::open_editor_context_menu`
-    /// uses; callers convert a pixel click themselves (GTK) or pass the
-    /// cell position straight through (TUI).
+    /// `card_id`'s current stage. `x`/`y` are cell coordinates — the same
+    /// convention `Engine::open_editor_context_menu` uses; callers convert a
+    /// pixel click themselves (GTK) or pass the cell position straight through
+    /// (TUI).
     ///
     /// A no-op — no menu opened — when there's no provider configured, the
-    /// card isn't on the current model, or the provider declared no
-    /// actions valid for that card's stage; the panel stays perfectly
-    /// usable read-only in that case.
+    /// card isn't on the current model, or the provider declared no actions
+    /// valid for that card's stage; the panel stays perfectly usable read-only
+    /// in that case.
     pub fn open_board_context_menu(&mut self, card_id: quadraui::WidgetId, x: u16, y: u16) {
         let Some(provider) = self.board_provider() else {
             return;
@@ -400,16 +380,14 @@ impl Engine {
         });
     }
 
-    /// Run a provider-declared named action (#523) against `card_id` — from
-    /// the context menu, a stage keybinding, or an `OpenIssue`/`OpenReview`
-    /// fallback. Returns whether an action was actually found and started
-    /// (dispatched immediately, or a confirmation dialog opened) — `false`
-    /// means "no provider", "no action by that name", or "declared with an
-    /// empty command" (not runnable), so callers can fall back to their own
-    /// default behaviour.
+    /// Run a provider-declared named action against `card_id` — from the
+    /// context menu, a stage keybinding, or an `OpenIssue`/`OpenReview` fallback.
+    /// Returns whether an action was actually found and started (dispatched
+    /// immediately, or a confirmation dialog opened) — `false` means "no
+    /// provider", "no action by that name", or "declared with an empty command",
+    /// so callers can fall back to their own default behaviour.
     ///
-    /// An action marked `confirm` opens a Yes/No dialog first (#523's
-    /// "irreversible or metered actions" requirement) instead of
+    /// An action marked `confirm` opens a Yes/No dialog first instead of
     /// dispatching right away — the actual dispatch happens from
     /// `process_dialog_result`'s `"confirm_board_action"` arm on "yes".
     pub fn run_board_action_by_name(
@@ -457,10 +435,9 @@ impl Engine {
     }
 
     /// Run `argv` on a background thread via the configured
-    /// [`crate::core::tool_client::ToolClient`] — the same "spawn +
-    /// mpsc, poll from `poll_idle`" pattern [`Self::board_refresh`] uses.
-    /// Refuses to start a second action while one is already running
-    /// (#523: metered actions shouldn't stack); the result lands via
+    /// [`crate::core::tool_client::ToolClient`] — the same "spawn + mpsc, poll
+    /// from `poll_idle`" pattern [`Self::board_refresh`] uses. Refuses to start
+    /// a second action while one is already running; the result lands via
     /// [`Self::poll_board_action`].
     pub fn dispatch_board_action_command(&mut self, argv: Vec<String>, label: String) {
         if self.board_action_running {
@@ -479,12 +456,11 @@ impl Engine {
         self.message = format!("Running '{label}'…");
     }
 
-    /// Non-blocking check for a completed board action. Call from
-    /// `poll_idle`. Surfaces the exit outcome (trimmed stdout on success,
-    /// the typed error's message on failure) in `Engine::message` (#523's
-    /// "exit status and stdout surfaced to the user"), then triggers a
-    /// fresh [`Self::board_refresh`] so the panel reflects the provider's
-    /// new state on the next poll (#523's "board refreshed on next poll").
+    /// Non-blocking check for a completed board action. Call from `poll_idle`.
+    /// Surfaces the exit outcome (trimmed stdout on success, the typed error's
+    /// message on failure) in `Engine::message`, then triggers a fresh
+    /// [`Self::board_refresh`] so the panel reflects the provider's new state
+    /// on the next poll.
     pub fn poll_board_action(&mut self) -> bool {
         let result: Option<(String, Result<Vec<u8>, ToolError>)> = self
             .board_action_rx
@@ -513,11 +489,11 @@ impl Engine {
         true
     }
 
-    /// The provider-declared action bound to `key` for the currently
-    /// selected card's stage, if any — `Engine::dispatch_board_key_
-    /// unified`'s lookup for #523's single-key verdict-style keybindings
-    /// (e.g. `P`/`S`/`F`). `None` when there's no provider, no selected
-    /// card, or no action bound to that key for the card's current stage.
+    /// The provider-declared action bound to `key` for the currently selected
+    /// card's stage, if any — `Engine::dispatch_board_key_unified`'s lookup for
+    /// single-key verdict-style keybindings (e.g. `P`/`S`/`F`). `None` when
+    /// there's no provider, no selected card, or no action bound to that key for
+    /// the card's current stage.
     fn board_key_action(&self, key: &str) -> Option<(String, quadraui::WidgetId)> {
         let provider = self.board_provider()?;
         let card_id = self.board_model.as_ref()?.selected_card_id.clone()?;
@@ -539,7 +515,7 @@ impl Engine {
     /// Two host-level keymaps sit in front of that generic one, in this
     /// precedence order:
     ///
-    /// 1. `R` (#525) opens the review for the selected card —
+    /// 1. `R` opens the review for the selected card —
     ///    `handle_key`'s own doc explicitly calls "review" out as a
     ///    workflow-specific verb hosts should handle themselves, so it's
     ///    dispatched here rather than added to quadraui's generic keymap.
@@ -550,7 +526,7 @@ impl Engine {
     ///    claim `R` would silently downgrade opening a review to printing
     ///    that JSON to the status line.
     /// 2. A key matching a provider-declared stage keybinding for the
-    ///    selected card (#523) is checked *before* falling to
+    ///    selected card is checked *before* falling to
     ///    `BoardModel::handle_key`'s generic navigation, so a provider is
     ///    free to bind e.g. `P`/`S`/`F` without them ever reaching the
     ///    primitive's own keymap.
@@ -736,7 +712,7 @@ mod tests {
         assert!(engine.message.contains("Another"));
     }
 
-    /// #524: when a document provider is configured, `OpenIssue` opens the
+    /// When a document provider is configured, `OpenIssue` opens the
     /// card as an editable markdown buffer instead of just echoing its
     /// title — "from a board card" in the issue's scope.
     #[test]
@@ -811,14 +787,14 @@ mod tests {
         assert!(engine.board_fetching, "first focus should kick off a fetch");
     }
 
-    // ── OpenReview (#525) ────────────────────────────────────────────────
+    // ── OpenReview ───────────────────────────────────────────────────────
 
     /// Builds on [`install_mock_provider`] (manifest/`extension_state`/
-    /// `ext_registry` wiring) rather than duplicating it (review nit,
-    /// #525), layering on the one thing `OpenReview` needs that a plain
-    /// board provider doesn't: an `"OpenReview"` [`BoardActionDef`], plus
-    /// swapping the mock client's response from "board refresh" JSON to
-    /// "review-action" JSON for the `OpenReview` tests that follow.
+    /// `ext_registry` wiring) rather than duplicating it, layering on the one
+    /// thing `OpenReview` needs that a plain board provider doesn't: an
+    /// `"OpenReview"` [`BoardActionDef`], plus swapping the mock client's
+    /// response from "board refresh" JSON to "review-action" JSON for the
+    /// `OpenReview` tests that follow.
     fn install_mock_provider_with_review_action(
         engine: &mut Engine,
         model: BoardModel,
@@ -980,16 +956,15 @@ mod tests {
         assert!(engine.change_review.is_none());
     }
 
-    // ─── #523: provider-declared named actions ─────────────────────────────
+    // ─── provider-declared named actions ──────────────────────────────────
 
     use crate::core::extensions::BoardActionDef;
     use crate::core::tool_client::RecordingToolClient;
 
     /// Install a mock `[board]` provider (like `install_mock_provider`) that
-    /// additionally declares `actions`. No coordinator (or any other
-    /// specific provider) vocabulary anywhere in this test, per #522/#523's
-    /// "generic host" scope. Also sets `engine.board_model` directly
-    /// (synchronously) — #523's tests exercise action dispatch against an
+    /// additionally declares `actions`. No coordinator (or any other specific
+    /// provider) vocabulary in this test. Also sets `engine.board_model`
+    /// directly (synchronously) — tests exercise action dispatch against an
     /// already-loaded model, not the async refresh flow
     /// `board_refresh_with_mock_provider_populates_model` covers.
     fn install_mock_provider_with_actions(
@@ -1031,12 +1006,11 @@ mod tests {
     /// `refresh_command`.
     ///
     /// [`Engine::poll_board_action`] deliberately kicks off a follow-up
-    /// [`Engine::board_refresh`] once an action's result lands (#523's
-    /// "board refreshed on next poll"), and that refresh runs on its own
-    /// background thread through this same client. Whether it has reached
-    /// the recorder by the time the test reads the log is a race against
-    /// the OS scheduler — `recorder.calls().len()` is legitimately 1 *or*
-    /// 2 — so an assertion about *the action* must not count it.
+    /// [`Engine::board_refresh`] once an action's result lands, and that refresh
+    /// runs on its own background thread through this same client. Whether it
+    /// has reached the recorder by the time the test reads the log is a race
+    /// against the OS scheduler — `recorder.calls().len()` is legitimately 1
+    /// *or* 2 — so an assertion about *the action* must not count it.
     /// `poll_board_action_triggers_a_follow_up_provider_refresh` covers the
     /// refresh itself, deterministically, by waiting for it.
     fn action_argvs(recorder: &RecordingToolClient) -> Vec<Vec<String>> {
@@ -1161,11 +1135,10 @@ mod tests {
         );
     }
 
-    /// The other half of [`Engine::poll_board_action`] (#523's "board
-    /// refreshed on next poll"): once the action's result lands, the
-    /// provider's `refresh_command` must be dispatched too, so the panel
-    /// reflects whatever the action changed. Waited on explicitly rather
-    /// than asserted as a call count — the refresh runs on its own thread,
+    /// The other half of [`Engine::poll_board_action`]: once the action's
+    /// result lands, the provider's `refresh_command` must be dispatched too,
+    /// so the panel reflects whatever the action changed. Waited on explicitly
+    /// rather than asserted as a call count — the refresh runs on its own thread,
     /// which is exactly why `action_argvs` filters it out elsewhere.
     #[test]
     fn poll_board_action_triggers_a_follow_up_provider_refresh() {
@@ -1351,14 +1324,11 @@ mod tests {
     }
 
     /// `"OpenReview"` is the one provider-declared action name that must
-    /// **not** flow through #523's generic fire-and-forget dispatch: #525
-    /// resolves its stdout into a
-    /// [`crate::core::tool_client::BranchReviewTarget`] and opens the
-    /// change-review surface instead (see `Engine::open_review_card`).
-    /// Pinning the precedence here because the two features were developed
-    /// in parallel and both claim the same action name — a regression would
-    /// silently turn "open the review" back into "print the review JSON to
-    /// the status line".
+    /// **not** flow through the generic fire-and-forget dispatch: it resolves
+    /// its stdout into a [`crate::core::tool_client::BranchReviewTarget`] and
+    /// opens the change-review surface instead (see `Engine::open_review_card`).
+    /// A regression would silently turn "open the review" back into "print the
+    /// review JSON to the status line".
     #[test]
     fn apply_open_review_resolves_a_target_instead_of_dispatching_the_action() {
         let (dir, base) = init_review_repo("precedence-over-dispatch");
@@ -1395,8 +1365,8 @@ mod tests {
     #[test]
     fn apply_open_issue_falls_back_to_provider_action_when_no_document_provider() {
         // No `[document]` provider configured, but the board provider does
-        // declare an "OpenIssue" action — #523's dispatch should be tried
-        // before falling all the way back to the plain title-echo message.
+        // declare an "OpenIssue" action — dispatch should be tried before
+        // falling all the way back to the plain title-echo message.
         let mut engine = Engine::new_for_test();
         install_mock_provider_with_actions(
             &mut engine,
@@ -1415,7 +1385,7 @@ mod tests {
         );
     }
 
-    // ─── #523: opt-in freshness (`tick_command`) ───────────────────────────
+    // ─── opt-in freshness (`tick_command`) ────────────────────────────────
 
     fn install_mock_provider_with_tick(engine: &mut Engine, tick_interval_secs: u64) {
         let mut manifest = ExtensionManifest {

@@ -78,7 +78,7 @@ impl Engine {
 
     /// Ensure the cursor is visible within the viewport, adjusting scroll_top.
     ///
-    /// #185: `view.viewport_lines` is updated by the backends on the next
+    /// `view.viewport_lines` is updated by the backends on the next
     /// draw pass, but engine-side operations (e.g. `qf_jump`)
     /// may call this synchronously BEFORE the next draw — at which
     /// point the cached `viewport_lines` reflects the previous chrome
@@ -140,15 +140,14 @@ impl Engine {
             let viewport_lines = self.effective_viewport_lines();
             let cursor_line = self.view().cursor.line;
             let scroll_top = self.view().scroll_top;
-            // `:h 'scrolljump'` (#1206): the minimum number of lines to
-            // scroll when the cursor moves off the top/bottom edge. `sj`'s
-            // formula collapses to the pre-#1206 "jump exactly the minimal
-            // amount" behavior when `scrolljump` is `1` (its default) —
-            // `jumped` and `minimal` are then never more than one line
-            // apart in the direction that matters, so `min`/`max` always
-            // pick `minimal`. `.max(1)` treats a stored `0` (Neovim accepts
-            // it) the same as `1`, since a zero-line "minimum jump" isn't a
-            // real constraint.
+            // `:h 'scrolljump'`: the minimum number of lines to
+            // scroll when the cursor moves off the top/bottom edge.
+            // When `scrolljump` is `1` (its default), this collapses to
+            // jumping exactly the minimal amount — `jumped` and `minimal`
+            // are then never more than one line apart in the direction
+            // that matters, so `min`/`max` always pick `minimal`. `.max(1)`
+            // treats a stored `0` (Neovim accepts it) the same as `1`,
+            // since a zero-line "minimum jump" is not a real constraint.
             let sj = self.settings.scrolljump.max(1);
             if cursor_line < scroll_top + scrolloff {
                 let minimal = cursor_line.saturating_sub(scrolloff);
@@ -163,10 +162,9 @@ impl Engine {
             }
 
             // Horizontal: keep cursor within the visible column range,
-            // respecting 'sidescrolloff' (#1206, `:h 'sidescrolloff'`) —
-            // the horizontal counterpart of 'scrolloff' above. Prefer
-            // paint-time viewport_cols (exact) over the resize handler's
-            // approximate value.
+            // respecting 'sidescrolloff' (the horizontal counterpart of
+            // 'scrolloff' above). Prefer paint-time viewport_cols (exact)
+            // over the resize handler's approximate value.
             let wid = self.active_window_id();
             let viewport_cols = self
                 .paint_viewport_cols
@@ -188,11 +186,8 @@ impl Engine {
     }
 
     /// Buffer line `line`'s text with its trailing newline stripped — the
-    /// input `engine_visual_rows_for_line` expects. Small private helper
-    /// factoring out a `.chars().collect()` + drop-last-char that was
-    /// duplicated across `ensure_cursor_visible_wrap`'s margin/top/bottom
-    /// walks (#1293 review nit). Kept as text rather than just a length
-    /// (as it was pre-#1496) so `engine_visual_rows_for_line` can honour
+    /// input `engine_visual_rows_for_line` expects. Kept as text rather
+    /// than just a length so `engine_visual_rows_for_line` can honour
     /// `'linebreak'`, which needs the actual characters to find a word
     /// boundary, not just a char count.
     fn wrap_line_text(&self, line: usize) -> String {
@@ -206,7 +201,7 @@ impl Engine {
 
     /// Sum of visual rows occupied by buffer lines `[start, end)`. Used by
     /// `ensure_cursor_visible_wrap` to measure `'scrolloff'` margins in
-    /// visual rows rather than buffer lines (#1293).
+    /// visual rows rather than buffer lines.
     fn visual_rows_for_range(&self, start: usize, end: usize, viewport_cols: usize) -> usize {
         if start >= end {
             return 0;
@@ -219,7 +214,7 @@ impl Engine {
 
     /// Wrap-aware scroll-to-cursor. Counts visual rows (accounting for
     /// soft-wrapped buffer lines) to determine when to adjust `scroll_top`,
-    /// honoring `'scrolloff'` (#1293) — the `'wrap'`-off counterpart above
+    /// honoring `'scrolloff'` — the `'wrap'`-off counterpart above
     /// (`ensure_cursor_visible`) does this in buffer lines; here the margin
     /// has to be counted in *visual* rows instead, since a single wrapped
     /// buffer line can span more than one screen row.
@@ -230,7 +225,7 @@ impl Engine {
         // `ensure_cursor_visible` above. Counting visual rows at a width even
         // one column off the painted one miscounts every line whose wrap
         // point lands near the edge, drifting the scroll so the cursor's
-        // line can end up below the viewport (#1496).
+        // line can end up below the viewport.
         let wid = self.active_window_id();
         let viewport_cols = self
             .paint_viewport_cols
@@ -239,7 +234,7 @@ impl Engine {
             .copied()
             .filter(|&c| c > 0)
             .unwrap_or(self.view().viewport_cols);
-        // #185: use effective viewport (accounts for bottom chrome like
+        // Use effective viewport (accounts for bottom chrome like
         // the quickfix panel that may have opened in the current tick).
         let viewport_lines = self.effective_viewport_lines();
         let cursor_line = self.view().cursor.line;
@@ -453,7 +448,7 @@ impl Engine {
     /// When wrap is off, equivalent to `$`.
     pub(crate) fn move_screen_line_end(&mut self) {
         let line = self.view().cursor.line;
-        // #1280: `get_max_cursor_col` (what plain `$` uses) is the
+        // `get_max_cursor_col` (what plain `$` uses) is the
         // newline-safe way to find the line's last real column — a raw
         // `.len_chars().saturating_sub(1)` assumes every line ends with
         // `\n`, which the buffer's last line does not when the source file
@@ -483,7 +478,7 @@ impl Engine {
     /// panes at exactly the same row. Without this, scrolling past a
     /// hunk drifts the panes by `(adds − removes)` rows of every prior
     /// hunk because `scroll_top` (a buffer line) cannot identify a
-    /// padding row uniquely (#166).
+    /// padding row uniquely.
     pub fn sync_scroll_binds(&mut self) {
         if self.scroll_bind_pairs.is_empty() {
             return;
@@ -748,9 +743,8 @@ impl Engine {
                 self.search_input_move_caret(is_replace, key);
                 SearchInputAction::Consumed
             }
-            // "ISO_Left_Tab" is TUI's (and, since #1060, GTK's own)
-            // `render::engine_key_from_ui` spelling for Shift+Tab;
-            // "BackTab" is kept for any caller still on the pre-#1060 name.
+            // "ISO_Left_Tab" is TUI's (and GTK's) `render::engine_key_from_ui`
+            // spelling for Shift+Tab; "BackTab" is kept for compatibility.
             "Tab" | "BackTab" | "ISO_Left_Tab" => {
                 if is_query {
                     self.search_panel_form_focus
@@ -1605,7 +1599,7 @@ impl Engine {
                 let end_line_start = self.buffer().line_to_char(end.line);
                 // Match `sel_text` above: the end bound follows
                 // `visual_end_exclusive`, not a hardcoded inclusive `+1`
-                // (#1788 review) — otherwise replace-in-selection ranges
+                // — otherwise replace-in-selection ranges
                 // disagree with the text that was actually captured.
                 let end_char = if self.visual_end_exclusive {
                     end_line_start + end.col
@@ -1962,16 +1956,7 @@ impl Engine {
     ///
     /// Shared by [`handle_find_replace_key`]'s own Ctrl+V arm (which reads
     /// `self.clipboard_read` itself) and [`Engine::route_paste`] (`keys.rs`)
-    /// — the latter is the one real backends actually reach for Ctrl+V today
-    /// (#946): quadraui#813 intercepts Ctrl+V/Ctrl+Shift+V ahead of
-    /// `AppLogic::handle` on every backend and delivers the resolved text as
-    /// `UiEvent::ClipboardPaste` → `route_paste`, so a raw `KeyPressed`
-    /// Ctrl+V never reaches [`handle_find_replace_key`]'s own arm in
-    /// practice. Before this method existed, `route_paste` had no branch for
-    /// `find_replace_open` at all, so Ctrl+V while the find/replace overlay
-    /// was focused fell through to `route_paste`'s `Mode::Normal` arm and
-    /// pasted into the *editor buffer* instead of the overlay field — a
-    /// live, user-visible bug on both GTK and TUI, not a dead-code gap.
+    /// — the latter is the one real backends actually reach for Ctrl+V.
     ///
     /// [`handle_find_replace_key`]: Self::handle_find_replace_key
     pub(crate) fn find_replace_paste(&mut self, clip: &str) {

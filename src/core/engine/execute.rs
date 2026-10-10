@@ -1,15 +1,11 @@
 use super::*;
 
-// ─── Native loop API: shared process-spawning core (#1624) ─────────────────
+// ─── Native loop API: shared process-spawning core ─────────────────────────
 //
-// `vimcode.loop.spawn` and the legacy `vimcode.async_shell` (see
-// `Engine::plugin_api_spawn` / `Engine::poll_async_shells` in
-// `engine/plugins.rs`) are both built on [`spawn_piped`] so a future change
-// to argv construction, reader chunking, or exit/signal decoding has one
-// call site to fix instead of two independently-hand-rolled ones (the
-// pre-#1624 state: `async_shell`'s thread called `Command::output()`/
-// `wait_with_output()` directly and had no streaming and no exit status at
-// all).
+// `vimcode.loop.spawn` and the legacy `vimcode.async_shell` are both
+// built on [`spawn_piped`] so a future change to argv construction, reader
+// chunking, or exit/signal decoding has one call site to fix instead of two
+// independently hand-rolled implementations.
 
 use std::io::Read;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -31,7 +27,7 @@ pub(crate) enum PluginSpawnEvent {
     },
 }
 
-/// Live state for one `vimcode.loop.spawn` handle (#1624): the child (shared
+/// Live state for one `vimcode.loop.spawn` handle: the child (shared
 /// with the background exit-watcher thread so `kill()` can reach it), the
 /// writable stdin half (shared so `write`/`close_stdin` can reach it without
 /// blocking on the reader threads), and the event stream.
@@ -45,7 +41,7 @@ pub(crate) struct PluginSpawnHandle {
     pub(crate) rx: Receiver<PluginSpawnEvent>,
 }
 
-/// Live state for one `vimcode.async_shell` task (#1624): same event stream
+/// Live state for one `vimcode.async_shell` task: same event stream
 /// as [`PluginSpawnHandle`], but accumulated into a single buffer rather
 /// than streamed to Lua per chunk — see `Engine::poll_async_shells`.
 pub(crate) struct AsyncShellTask {
@@ -70,11 +66,10 @@ fn finish_and_send_exit(child: Arc<Mutex<Child>>, tx: Sender<PluginSpawnEvent>) 
     loop {
         let status = match child.lock() {
             Ok(mut guard) => guard.try_wait(),
-            // A prior panic while the lock was held elsewhere (e.g. inside
-            // `kill()`) poisons it — recover the guard via `into_inner()`
-            // rather than giving up here, so this thread still reaps the
-            // child and sends its `Exit` event instead of leaking both
-            // silently (#1624 review, non-blocking).
+            // A prior panic while the lock was held elsewhere (e.g. inside `kill()`)
+            // poisons it — recover the guard via `into_inner()` rather than giving up
+            // here, so this thread still reaps the child and sends its `Exit` event
+            // instead of leaking both silently.
             Err(poisoned) => poisoned.into_inner().try_wait(),
         };
         match status {
@@ -136,19 +131,13 @@ pub(crate) fn spawn_piped(
     let mut child = command.spawn()?;
     let mut stdin = child.stdin.take();
     if let Some(data) = stdin_data {
-        // Write on a dedicated background thread rather than inline here
-        // (#1624 review): this runs synchronously on the caller's thread —
-        // the main/engine thread for `vimcode.async_shell`'s legacy
-        // `stdin` option — and `data` can exceed the OS pipe buffer
-        // (commonly 64KiB on Linux) or be written to a child that doesn't
-        // promptly drain stdin. Either blocks a `write_all` indefinitely,
-        // which previously stalled the whole editor; the pre-#1624 code
-        // avoided this by running spawn+write+wait inside its own
-        // `std::thread::spawn`. Taking the pipe out and moving it into a
-        // thread (rather than writing through the shared `Arc<Mutex<..>>`
-        // below) keeps that same off-thread guarantee while still handing
-        // back `None` for `stdin` here, matching this option's frozen
-        // write-then-close, no-interactive-follow-up shape.
+        // Write on a dedicated background thread rather than inline here: the
+        // caller's thread is the main/engine thread, and `data` can exceed the OS
+        // pipe buffer (commonly 64KiB on Linux) or be written to a child that
+        // doesn't promptly drain stdin. Either blocks a `write_all` indefinitely,
+        // stalling the whole editor. Taking the pipe out and moving it into a thread
+        // keeps the off-thread guarantee while still handing back `None` for `stdin`
+        // here, matching this option's frozen write-then-close, no-interactive shape.
         if let Some(pipe) = stdin.take() {
             std::thread::spawn(move || {
                 let mut pipe = pipe;
@@ -219,7 +208,7 @@ pub(crate) fn spawn_piped(
     Ok((child, Arc::new(Mutex::new(stdin)), rx))
 }
 
-// ─── `vimcode.http` (#1632) ─────────────────────────────────────────────────
+// ─── `vimcode.http` ─────────────────────────────────────────────────────────
 //
 // Runs each request as a `curl` child process on its own background thread,
 // the same "shell out, don't vendor a TLS stack" choice `tool_acquire::
@@ -266,7 +255,7 @@ pub(crate) enum HttpResult {
     Err(String),
 }
 
-/// Live state for one `vimcode.http.request` handle (#1632): the child
+/// Live state for one `vimcode.http.request` handle: the child
 /// (shared with the background thread so `cancel()` can reach it) and the
 /// one-shot result channel. Mirrors [`PluginSpawnHandle`] minus the stdin
 /// half (an HTTP request has no interactive stdin) and streams exactly one
@@ -344,8 +333,7 @@ type HttpPipes = (Arc<Mutex<Child>>, Receiver<HttpResult>);
 /// stdout (headers + body together — curl's `-i` combines them into one
 /// stream) before giving up and failing the request. Without this, an
 /// unbounded `read_to_end` lets a large/slow-but-"successful" response — or
-/// a malicious/misbehaving server — grow memory without bound (review
-/// finding, #1632).
+/// a malicious/misbehaving server — grow memory without bound.
 const HTTP_MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// Read at most `cap` bytes from `r`, returning `(bytes, exceeded)`.
@@ -370,10 +358,10 @@ fn read_capped(mut r: impl Read, cap: usize) -> (Vec<u8>, bool) {
 }
 
 /// A header key or value is rejected if it contains `\r` or `\n`: curl
-/// writes `-H "{k}: {v}"` verbatim onto the wire as one argument, so an
-/// embedded CR/LF would let a caller smuggle extra header lines or split the
-/// request (review finding, #1632) — e.g. a header value built from
-/// response data, a template, or other less-trusted input.
+/// writes `-H "{k}: {v}"` verbatim onto the wire, so an embedded CR/LF
+/// would let a caller smuggle extra header lines or split the request — e.g.
+/// a header value built from response data, a template, or other less-trusted
+/// input.
 fn header_is_safe(s: &str) -> bool {
     !s.contains('\r') && !s.contains('\n')
 }
@@ -402,10 +390,10 @@ pub(crate) fn spawn_http_request(spec: HttpRequestSpec) -> std::io::Result<HttpP
         "-i",
         "--max-time",
         &format!("{timeout_secs:.3}"),
-        // Restrict curl to http/https regardless of what scheme the URL
-        // string carries — without this, a `file://`, `smb://`, or other
-        // scheme would be followed too (review finding, #1632), widening
-        // the blast radius of any URL an attacker can influence.
+        // Restrict curl to http/https regardless of what scheme the URL string
+        // carries — without this, a `file://`, `smb://`, or other scheme would be
+        // followed too, widening the blast radius of any URL an attacker can
+        // influence.
         "--proto",
         "-all,+http,+https",
         "-X",
@@ -426,10 +414,9 @@ pub(crate) fn spawn_http_request(spec: HttpRequestSpec) -> std::io::Result<HttpP
         command.arg("--data-raw").arg(body);
     }
     // `--url` (rather than a bare positional argument) so a URL string that
-    // itself looks like a curl flag — e.g. `-o /home/user/.ssh/
-    // authorized_keys` or `-K <config>` — is always parsed as the literal
-    // URL value, never as another option (review finding, #1632: verified
-    // `curl -X GET "-o/tmp/x"` without `--url` is parsed as the `-o` flag).
+    // itself looks like a curl flag — e.g. `-o /home/user/.ssh/authorized_keys`
+    // or `-K <config>` — is always parsed as the literal URL value, never as
+    // another option.
     command.arg("--url").arg(&spec.url);
     command
         .stdin(Stdio::null())
@@ -584,7 +571,7 @@ impl Engine {
             return EngineAction::ToggleTerminalMaximize;
         }
 
-        // Handle :CheckNerdFonts (issue #999) — TUI-discoverability command:
+        // Handle :CheckNerdFonts — TUI-discoverability command:
         // paint a sample row of nerd-font glyphs next to their ASCII
         // fallbacks and let the user say which one actually rendered,
         // persisting the answer as an explicit `use_nerd_fonts` override.
@@ -828,8 +815,8 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // :Toast <text> — push a test toast. Diagnostic for #450 toast
-        // wiring; verifies the render path independent of LSP events.
+        // :Toast <text> — push a test toast. Diagnostic; verifies the render path
+        // independent of LSP events.
         if let Some(body) = cmd.strip_prefix("Toast ").map(|s| s.trim()) {
             self.push_toast("Test toast", body, quadraui::ToastSeverity::Info);
             return EngineAction::None;
@@ -1025,12 +1012,10 @@ impl Engine {
             return self.cmd_git_push();
         }
 
-        // Handle :GFinalize [message] — #528 Track A Phase 3: commit any
-        // working-tree edits made while reviewing a branch and push them,
-        // the "finalize review edits" action. See `Engine::
-        // finalize_review_edits` for the safety semantics (no-force push,
-        // refuses to run if the worktree has moved off the reviewed
-        // branch).
+        // Handle :GFinalize [message] — commit any working-tree edits made while
+        // reviewing a branch and push them, the "finalize review edits" action.
+        // See `Engine::finalize_review_edits` for the safety semantics (no-force
+        // push, refuses to run if the worktree has moved off the reviewed branch).
         if cmd == "GFinalize" {
             return self.cmd_git_finalize_review(None);
         }
@@ -1232,20 +1217,16 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // ── :map family — vim's per-mode key mapping commands (#1151) ─────────────
-        // Before #1151, vimcode's only mapping command was its own invention,
-        // `:map <mode> <keys> :<excmd>` — mode as a positional argument, target
-        // always an ex command. Neither matches vim: vim selects the mode from
-        // the *command name* (`:nnoremap`, `:imap`, …) and `{rhs}` can be a raw
-        // key sequence, not just `:excmd`. This table drives that per-mode
-        // dispatch; `build_keymap_entries` materializes it into the same
-        // persisted-string format `settings.json` already used (so existing
-        // `keymaps` entries, and code that reads them, keep working unmigrated).
+        // ── :map family — vim's per-mode key mapping commands ─────────────────────
+        // Vim selects the mode from the *command name* (`:nnoremap`, `:imap`, …)
+        // and `{rhs}` can be a raw key sequence, not just `:excmd`. This table
+        // drives that per-mode dispatch; `build_keymap_entries` materializes it into
+        // the persisted-string format `settings.json` already used.
         //
         // "x"/"s" are vim's Visual-only / Select-only letters. vimcode has no
-        // separate Select mode, so `x` matches during `try_user_keymap`
-        // alongside `v` and `s` is accepted here (parses, lists, unmaps) but
-        // never active — see `Engine::active_keymap_modes`.
+        // separate Select mode, so `x` matches during `try_user_keymap` alongside
+        // `v` and `s` is accepted here (parses, lists, unmaps) but never active —
+        // see `Engine::active_keymap_modes`.
         const MAP_DEFINE_CMDS: &[(&str, &[&str], bool)] = &[
             ("nnoremap", &["n"], true),
             ("nmap", &["n"], false),
@@ -1303,8 +1284,8 @@ impl Engine {
         {
             match map_rest {
                 None | Some("") => {
-                    // Bare command (any of the family) — list all user keymaps,
-                    // same as pre-#1151 bare `:map`.
+                    // Bare command (any of the family) — list all user keymaps, same as bare
+                    // `:map`.
                     if self.settings.keymaps.is_empty() {
                         self.message = "No user keymaps defined".to_string();
                     } else {
@@ -1325,7 +1306,7 @@ impl Engine {
                             // `:nnoremap jk <C-c>` left both entries in
                             // `settings.keymaps` forever, with `:nmap`'s
                             // lister showing the stale one alongside the
-                            // current one (#1151 review).
+                            // current one.
                             let leader = self.settings.leader.to_string();
                             let target_keys =
                                 expand_leader_tokens(parse_key_sequence(lhs), &leader);
@@ -1399,7 +1380,7 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // ── :abbreviate / :iabbrev / :cabbrev family (#1152) ──────────────────────
+        // ── :abbreviate / :iabbrev / :cabbrev family ──────────────────────────────
         // A Vim abbreviation is a key-to-keys substitution like `:map`, but
         // triggered by typing a non-keyword character (or leaving Insert /
         // running the command line) right after the `lhs`, instead of typing
@@ -1470,7 +1451,7 @@ impl Engine {
         }
 
         // ── :Notifications / :NotifyFocus — give the toast/notification
-        //    stack keyboard focus (#1577) ─────────────────────────────────
+        //    stack keyboard focus ─────────────────────────────────────────
         // Same effect as `panel_keys.focus_notifications` (default
         // `<C-S-n>`) — see `Engine::focus_toast_stack`'s doc. Two spellings
         // so both a VS Code habit ("Notifications") and a shorter one work.
@@ -1597,19 +1578,14 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // :AI <message> — send a message to the AI assistant. #1453: the
-        // reply streams into the AI panel, so the panel must actually be
-        // revealed (`focus_sidebar_panel`, which expands the sidebar and
-        // switches it to PANEL_AI) rather than just flipping the
-        // `ai_has_focus` flag — that flag alone routes *keyboard* focus but
-        // does nothing to `app_shell`'s active panel, which is what
-        // `render::sidebar_owner` actually paints. Deliberately does not
-        // also raise `sidebar_focus_requested` (contrast
-        // `Engine::ai_attach_range`'s empty-message arm): the user handed
-        // over a complete ex command and should stay where they were, per
-        // the #958 regression this mirrors — pulling the keyboard into the
-        // chat input would turn the next `:` typed after `:AI hi` into chat
-        // text instead of opening the command line.
+        // :AI <message> — send a message to the AI assistant. The reply streams
+        // into the AI panel, so the panel must be revealed (`focus_sidebar_panel`,
+        // which expands the sidebar and switches it to PANEL_AI) rather than just
+        // flipping the `ai_has_focus` flag. Deliberately does not also raise
+        // `sidebar_focus_requested`: the user handed over a complete ex command and
+        // should stay where they were — pulling the keyboard into the chat input
+        // would turn the next `:` typed after `:AI hi` into chat text instead of
+        // opening the command line.
         if let Some(msg) = cmd.strip_prefix("AI ").map(|s| s.trim()) {
             if !msg.is_empty() {
                 self.ai_send_message(msg.to_string());
@@ -1622,22 +1598,19 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // :AiReview — open the combined review of everything the most
-        // recently completed ACP turn wrote (#1460), the same surface
-        // `PromptStopped` -> `Engine::acp_end_turn` auto-opens under the
-        // `acp_review_on_turn_end = auto` setting — this is the manual
-        // "look at it again" path always available regardless of that
-        // setting: under the default `badge` (or `off`), this is the only
-        // way the modal opens at all (#1515) — the status-strip badge
-        // segment (`render::populate_ai_chat_controller`) is a summary
-        // only, not (yet) itself clickable; see #1515's PR notes. A status
-        // message, not an error, when there's nothing to review yet.
+        // :AiReview — open the combined review of everything the most recently
+        // completed ACP turn wrote, the same surface `PromptStopped` ->
+        // `Engine::acp_end_turn` auto-opens under the `acp_review_on_turn_end = auto`
+        // setting — this is the manual "look at it again" path always available
+        // regardless of that setting. Under the default `badge` (or `off`), this is
+        // the only way the modal opens at all. A status message, not an error, when
+        // there's nothing to review yet.
         if cmd == "AiReview" {
             self.cmd_ai_review();
             return EngineAction::None;
         }
 
-        // :AiRestore [id] — revert to a past ACP turn's checkpoint (#1460):
+        // :AiRestore [id] — revert to a past ACP turn's checkpoint:
         // every file that checkpoint (or a later one) touched reverts to
         // its pre-turn content, except one a human has since hand-edited
         // (refused, never clobbered — see `Engine::acp_restore_checkpoint`).
@@ -1671,7 +1644,7 @@ impl Engine {
 
         // :AiMode          — show the agent's declared modes + which is current
         // :AiMode <target> — switch mode (matched by id or name) via
-        //                    `session/set_mode` (#956, ACP-5)
+        //                    `session/set_mode`
         if cmd == "AiMode" {
             self.message = self.acp_mode_status_line();
             return EngineAction::None;
@@ -1688,10 +1661,8 @@ impl Engine {
         // :AiConfig <id>          — show one option's declared values and
         //                           which is current
         // :AiConfig <id> <value>  — switch it (matched by id or name) via
-        //                           `session/set_config_option` (#1520 —
-        //                           ACP v1's generic session-config knob,
-        //                           the mechanism `:AiModel` below is sugar
-        //                           over)
+        //                           `session/set_config_option` — the mechanism
+        //                           `:AiModel` below is sugar over
         if cmd == "AiConfig" {
             self.message = self.acp_config_status_line();
             return EngineAction::None;
@@ -1716,7 +1687,7 @@ impl Engine {
         //                     has no dedicated `session/set_model`, so this
         //                     is the only model picker the spec offers)
         // :AiModel <name>   — switch model, matched by id or name, via
-        //                     `session/set_config_option` (#1520)
+        //                     `session/set_config_option`
         if cmd == "AiModel" {
             self.message = self.acp_model_status_line();
             return EngineAction::None;
@@ -1728,12 +1699,11 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // :AiFollow — toggle "follow the agent" (#1514, Zed-style):
-        // `settings.acp_follow_agent`. While on, every file the ACP agent
-        // touches (a served `fs/read_text_file`/`fs/write_text_file`, or a
-        // `tool_call`/`tool_call_update`'s `locations`) is revealed at its
-        // line in the last-used editor window without stealing keyboard
-        // focus from the chat input — see `Engine::acp_follow_reveal`'s doc.
+        // :AiFollow — toggle "follow the agent": `settings.acp_follow_agent`. While
+        // on, every file the ACP agent touches (a served `fs/read_text_file`/
+        // `fs/write_text_file`, or a `tool_call`/`tool_call_update`'s `locations`)
+        // is revealed at its line in the last-used editor window without stealing
+        // keyboard focus from the chat input — see `Engine::acp_follow_reveal`'s doc.
         if cmd == "AiFollow" {
             self.settings.acp_follow_agent = !self.settings.acp_follow_agent;
             self.message = format!(
@@ -1748,7 +1718,7 @@ impl Engine {
         }
 
         // :AiAgent          — list configured agents (settings.acp_agents)
-        //                     and which is active (#958, ACP-7)
+        //                     and which is active
         // :AiAgent <name>   — switch the active agent; takes effect on the
         //                     next message, without restarting vimcode
         if cmd == "AiAgent" {
@@ -1764,7 +1734,7 @@ impl Engine {
 
         // :AiSessions — open the `:AiSessions` picker of past sessions for
         // the active agent + workspace, or resume one via `session/load`
-        // (#1459). See `Engine::acp_open_sessions_picker`'s doc for the
+        //. See `Engine::acp_open_sessions_picker`'s doc for the
         // "agent doesn't support resume" refusal.
         if cmd == "AiSessions" {
             self.acp_open_sessions_picker();
@@ -1772,7 +1742,7 @@ impl Engine {
         }
 
         // :AiNew [agent] / :AiNext / :AiPrev / :AiClose — multiple
-        // concurrent ACP session tabs (#1463). See `Engine::acp_new_
+        // concurrent ACP session tabs. See `Engine::acp_new_
         // session`'s doc for the "reuse a still-blank tab" policy and
         // `Engine::acp_close_session`'s for what closing the last tab does.
         if cmd == "AiNew" {
@@ -1797,7 +1767,7 @@ impl Engine {
         }
 
         // :AiAttach <path> — stage a file or image at `path` as the next
-        // prompt's attachment (#1464). See `Engine::acp_attach_file`'s doc
+        // prompt's attachment. See `Engine::acp_attach_file`'s doc
         // for the workspace-resolution, `promptCapabilities.image` gate and
         // size-limit refusals.
         if cmd == "AiAttach" {
@@ -1810,7 +1780,7 @@ impl Engine {
         }
 
         // :AiPasteImage — attach whatever image is currently on the system
-        // clipboard as the next prompt's attachment (#1464): the ex-command
+        // clipboard as the next prompt's attachment: the ex-command
         // "paste an image" entry point, since a raw Ctrl+V that finds no
         // *text* on the clipboard never reaches the app at all (quadraui's
         // Ctrl+V interception swallows the keypress rather than forwarding
@@ -1830,7 +1800,7 @@ impl Engine {
                 Ok(()) => {
                     let name = state.display_name();
                     self.message = format!("\"{}\" reloaded", name);
-                    // #222: re-sync the buffer with the LSP server so
+                    // Re-sync the buffer with the LSP server so
                     // semantic_tokens (which override tree-sitter for
                     // Rust) are refreshed against the new content.
                     self.lsp_dirty_buffers.insert(buf_id, true);
@@ -1851,7 +1821,7 @@ impl Engine {
             return EngineAction::OpenFile(PathBuf::from(filename));
         }
 
-        // Handle :e[dit] <filename> — 'hidden' guard (#1190): unlike
+        // Handle :e[dit] <filename> — 'hidden' guard: unlike
         // `:edit!` above, a plain `:edit` abandons the current buffer, so
         // it must refuse when the buffer is dirty, no other window shows
         // it, and 'hidden' isn't set (`:h 'hidden'`, `:h E37`).
@@ -1869,7 +1839,7 @@ impl Engine {
         }
 
         // Handle :b[uffer][!] <buffer> — same 'hidden' guard as `:edit`,
-        // bypassed by a trailing `!` (#1190).
+        // bypassed by a trailing `!`.
         if cmd.starts_with("buffer ") || cmd.starts_with("buffer! ") {
             let force = cmd.starts_with("buffer! ");
             let arg = cmd
@@ -1898,7 +1868,7 @@ impl Engine {
         // separate "unloaded but still listed" buffer state (`delete_buffer`
         // always fully removes the buffer), so `:bwipeout` shares `:bdelete`'s
         // implementation; only the reported message differs, matching Vim's
-        // own wording for each command (#1154).
+        // own wording for each command.
         if cmd == "bdelete"
             || cmd.starts_with("bdelete ")
             || cmd == "bdelete!"
@@ -1972,14 +1942,13 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :hid[e] — close the current window without touching the
-        // buffer (it stays loaded, just no longer shown here). `close_window`
-        // already never checks the dirty flag itself — that guard lives in
-        // the `:quit` handler above, which calls it after its own dirty
-        // check — so plain `close_window` already has exactly `:hide`'s
-        // "never complain about unsaved changes" semantics, including its
-        // refusal (with the same message Vim-adjacent "Cannot close last
-        // window" case) to close the very last window (#1154).
+        // Handle :hid[e] — close the current window without touching the buffer
+        // (it stays loaded, just no longer shown here). `close_window` already never
+        // checks the dirty flag itself — that guard lives in the `:quit` handler
+        // above, which calls it after its own dirty check — so plain `close_window`
+        // already has exactly `:hide`'s "never complain about unsaved changes"
+        // semantics, including its refusal (with the same message) to close the very
+        // last window.
         if cmd == "hide" {
             self.close_window();
             return EngineAction::None;
@@ -2053,7 +2022,7 @@ impl Engine {
 
         // Handle :tabo[nly] — close every tab except the active one.
         // Identical to Vim's `:tabonly`; `close_other_tabs` already implements
-        // exactly this (#1154).
+        // exactly this.
         if cmd == "tabonly" {
             self.close_other_tabs();
             return EngineAction::None;
@@ -2142,7 +2111,7 @@ impl Engine {
                     self.ensure_spell_checker();
                 }
                 self.update_syntax();
-                // `foldmethod=indent|marker`/`foldlevel=N` (#1153, #1159) —
+                // `foldmethod=indent|marker`/`foldlevel=N` —
                 // recompute the fold hierarchy against the new level
                 // immediately, mirroring `apply_foldlevel`'s own doc
                 // ("processing deepest-first") rather than waiting for the
@@ -2151,7 +2120,7 @@ impl Engine {
                 // actually touched on this `:set` line — gated on that
                 // (rather than unconditionally on every `:set`) so an
                 // unrelated option like `:set ic` doesn't pay to recompute
-                // fold state on large files (#1153 review).
+                // fold state on large files.
                 if self.folds_are_computed()
                     && split_set_args(trimmed)
                         .iter()
@@ -2206,7 +2175,6 @@ impl Engine {
                 self.update_syntax();
             }
             // See the matching comment in the multi-option branch above
-            // (#1153, #1159).
             if self.folds_are_computed() && set_arg_touches_folding(trimmed) {
                 self.apply_foldlevel(self.settings.foldlevel);
             }
@@ -2258,7 +2226,7 @@ impl Engine {
                 } else {
                     self.message = format!("Theme: {canonical}");
                 }
-                // #1623: ColorScheme, arg = the new scheme name (matches
+                // ColorScheme, arg = the new scheme name (matches
                 // vim's own `<amatch>` convention for this autocmd).
                 self.plugin_event("ColorScheme", canonical);
             } else {
@@ -2326,7 +2294,7 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :bn[ext][!] — 'hidden' guard (#1190): each of these
+        // Handle :bn[ext][!] — 'hidden' guard: each of these
         // switches the active buffer, so all share `check_buffer_abandon`,
         // bypassed by a trailing `!`.
         if cmd == "bnext" || cmd == "bnext!" {
@@ -2380,7 +2348,7 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Quickfix / location-list commands (#1155). `:l*` is a thin mirror
+        // Quickfix / location-list commands. `:l*` is a thin mirror
         // of `:c*` over the active window's location list — same `qf_*`
         // methods (`src/core/engine/picker.rs`), just `Some(window)` instead
         // of `None` as the target.
@@ -2430,13 +2398,9 @@ impl Engine {
                 return self.qf_go(Some(win), n - 1);
             }
         }
-        // Handle bare :cc / :ll — (re-)jump to the current entry.
-        //
-        // #1283: these used to hardcode "E42: No errors" (lowercase
-        // "errors") — real Neovim's message is "E42: No Errors" (confirmed
-        // against a live oracle). Routing through `Engine::qf_empty_msg`
-        // fixes the casing once instead of three times and keeps it from
-        // drifting again.
+        // Handle bare :cc / :ll — (re-)jump to the current entry. Routing through
+        // `Engine::qf_empty_msg` provides the correct casing (Neovim's "E42: No
+        // Errors") in one place instead of three.
         if cmd == "cc" {
             if self.quickfix.items.is_empty() {
                 self.message = Self::qf_empty_msg(None);
@@ -2599,12 +2563,12 @@ impl Engine {
         }
 
         // `:fold`, `:foldopen[!]`, `:foldclose[!]`, `:folddoopen`,
-        // `:folddoclosed` (#1159).
+        // `:folddoclosed`.
         if let Some(action) = self.try_execute_fold_command(cmd) {
             return action;
         }
 
-        // `:undolist`, `:earlier`, `:later`, `:undojoin` (#1156).
+        // `:undolist`, `:earlier`, `:later`, `:undojoin`.
         if let Some(action) = self.try_execute_undo_command(cmd) {
             return action;
         }
@@ -2614,12 +2578,10 @@ impl Engine {
             return action;
         }
 
-        // :sort [flags] — sort lines in buffer.
-        // Accept both ":sort" with space-separated flags and the Vim ":sort!" bang.
-        // `!` reverses the sort direction; it is a separate axis from the `r`
-        // letter flag (which selects the pattern *match* as the sort key
-        // instead of the text after it) — the two used to be conflated here,
-        // which broke `:sort /pat/ r` (#879).
+        // :sort [flags] — sort lines in buffer. Accept both ":sort" with
+        // space-separated flags and the Vim ":sort!" bang. `!` reverses the sort
+        // direction; it is a separate axis from the `r` letter flag (which selects
+        // the pattern *match* as the sort key instead of the text after it).
         if cmd == "sort" || cmd == "sort!" || cmd.starts_with("sort ") || cmd.starts_with("sort!") {
             // Normalize: strip "sort" and an optional '!'.
             let after = cmd.strip_prefix("sort").unwrap_or("");
@@ -2684,7 +2646,7 @@ impl Engine {
         }
 
         // Handle :r[ead] {file} / :r[ead] !{cmd} — read a file, or the stdout
-        // of a shell command, and insert it after the cursor line (#879).
+        // of a shell command, and insert it after the cursor line.
         if let Some(arg) = cmd.strip_prefix("read ").map(|s| s.trim()) {
             if let Some(shell_cmd_raw) = arg.strip_prefix('!') {
                 let shell_cmd_str = shell_cmd_raw.trim();
@@ -2731,34 +2693,17 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :tabmove [N] — `:h :tabmove`: "Move the current tab page
-        // to after tab page N. Use 0 to make the current tab page the
-        // first one. Without N the current tab page is made the last one."
-        // #1281 finding: `:tabmove 0` used to be treated the same as bare
-        // `:tabmove` (both landed at the end) — Vim's own wording makes `0`
-        // and "no argument" opposite ends, not synonyms.
-        //
-        // #1281 review: the *previous* fix's formula (`dest = n.min(num_tabs
-        // - 1)`, treating `N` as a direct 0-based destination index) is
-        // wrong in general. Verified against the live oracle
-        // (`nvim v0.12.5 --headless -u NONE -i NONE`) with 5 tabs and every
-        // starting position: `N` is a 1-based reference to a tab in the
-        // *original* (pre-move) ordering — "after tab page N" — so where the
-        // current tab lands depends on whether N falls before, at, or after
-        // the current tab's own original position:
+        // Handle :tabmove [N] — move the current tab page to after tab page N.
+        // Use 0 to make the current tab page the first one. Without N the current
+        // tab page is made the last one. `N` is a 1-based reference to a tab in the
+        // *original* (pre-move) ordering — "after tab page N" — so where the current
+        // tab lands depends on whether N falls before, at, or after the current
+        // tab's original position:
         //   - N <= current's original 0-based index: dest = N
-        //     (the target tab N hasn't shifted yet, so N is already the
-        //     right 0-based slot to land in)
+        //     (the target tab N hasn't shifted yet)
         //   - N >  current's original 0-based index: dest = N - 1
-        //     (removing the current tab from earlier in the list shifts
-        //     every later tab back by one, so tab N's new index is N - 1)
-        //   - N == current's original 0-based index, or N == that + 1: both
-        //     resolve to the current tab's own original slot, i.e. a no-op
-        //     — confirmed against the oracle (5 tabs, current at index 2:
-        //     both `:tabmove 2` and `:tabmove 3` leave the order unchanged).
-        // Example: 5 tabs `a,b,c,d,e`, current = `a` (original index 0),
-        // `:tabmove 3` → oracle result `b,c,a,d,e` (a lands at index 2 =
-        // N - 1, since N(3) > current's original index(0)).
+        //     (removing the current tab shifts every later tab back by one)
+        //   - N == current's original index or index + 1: both are a no-op.
         if cmd == "tabmove" || cmd.starts_with("tabmove ") {
             let arg = cmd.strip_prefix("tabmove").unwrap_or("").trim();
             let num_tabs = self.active_group().tabs.len();
@@ -2795,16 +2740,10 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :sav[eas][!] {file} — save buffer to a new file. `!` is
-        // required by Neovim whenever `{file}` already exists (confirmed
-        // against a live `nvim --headless -u NONE`: `E13: File exists (add
-        // ! to override)` without it) — vimcode doesn't refuse an existing
-        // target either way (#1282 found this while adding the on-disk
-        // probe; a bare `:saveas` clobbering silently is a separate,
-        // narrower gap than the one being fixed here, which is just that
-        // `:saveas!` used to normalize to a string this `strip_prefix`
-        // could never match — `cmd` is `"saveas!" + rest`, not
-        // `"saveas" + rest`, per `split_ex_command`).
+        // Handle :sav[eas][!] {file} — save buffer to a new file. `!` is required
+        // by Neovim whenever `{file}` already exists — vimcode doesn't refuse an
+        // existing target either way. Without the proper parsing, `:saveas!` (with
+        // `cmd` = "saveas!" + rest) couldn't be matched correctly.
         if let Some(path_str) = cmd
             .strip_prefix("saveas! ")
             .or_else(|| cmd.strip_prefix("saveas "))
@@ -2876,15 +2815,10 @@ impl Engine {
             return self.execute_command("number");
         }
 
-        // Handle :windo {cmd} — #1281 finding: this used to iterate
-        // `self.windows.keys()`, which is (a) every window in the *whole
-        // engine*, not just the current tabpage (`:h :windo` is explicitly
-        // tab-scoped), and (b) `HashMap` order, so which window is left
-        // active when the loop ends was nondeterministic across runs, not
-        // just wrong. `Tab::layout.window_ids()` is deterministic
-        // left-to-right/top-to-bottom layout order, matching Neovim's own
-        // window-number order — and lands on the same "last one wins"
-        // window Neovim does.
+        // Handle :windo {cmd} — iterate over windows in the current tabpage in
+        // deterministic left-to-right/top-to-bottom layout order, matching Neovim's
+        // own window-number order, and leave active the same "last one wins" window
+        // Neovim does.
         if let Some(subcmd) = cmd.strip_prefix("windo ") {
             let subcmd = subcmd.trim().to_string();
             let win_ids: Vec<WindowId> = self.active_tab().layout.window_ids();
@@ -2954,7 +2888,7 @@ impl Engine {
         // Handle :delm[arks] {marks} / :delmarks! — delete the named marks
         // (space-separated chars and `a-c` ranges), or with `!` clear every
         // lowercase mark in the current buffer (Vim never lets `!` touch
-        // uppercase/numbered marks — those are global, not per-buffer) (#1154).
+        // uppercase/numbered marks — those are global, not per-buffer).
         if cmd == "delmarks" {
             self.message = "E471: Argument required".to_string();
             return EngineAction::Error;
@@ -2972,15 +2906,12 @@ impl Engine {
             for token in arg.split_whitespace() {
                 let bytes: Vec<char> = token.chars().collect();
                 if bytes.len() == 3 && bytes[1] == '-' {
-                    // Range, e.g. "a-c" — real Vim only accepts a range
-                    // between two marks of the *same* category (both
-                    // lowercase, both uppercase, or both digits) with the
-                    // low end sorting before the high end; anything else
-                    // (an inverted range like "c-a", or a mixed-case range
-                    // like "a-C") is `E475: Invalid argument` and aborts the
-                    // whole command rather than being silently reinterpreted
-                    // as three individual one-character mark names (#1154
-                    // review nit).
+                    // Range, e.g. "a-c" — real Vim only accepts a range between two marks of
+                    // the *same* category (both lowercase, both uppercase, or both digits) with
+                    // the low end sorting before the high end; anything else (an inverted range
+                    // like "c-a", or a mixed-case range like "a-C") is `E475: Invalid argument`
+                    // and aborts the whole command rather than being silently reinterpreted as
+                    // three individual one-character mark names.
                     let (lo, hi) = (bytes[0], bytes[2]);
                     let same_category = (lo.is_ascii_lowercase() && hi.is_ascii_lowercase())
                         || (lo.is_ascii_uppercase() && hi.is_ascii_uppercase())
@@ -3019,15 +2950,11 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :star[tinsert][!] — enter Insert mode as if `i` (or, with
-        // `!`, `A`) had been pressed. Reuses the exact same field bookkeeping
-        // those normal-mode keys use rather than reimplementing entry here
-        // (#1154), including `start_undo_group`'s call order relative to the
-        // cursor adjustment: `A` starts its undo group *after* moving the
-        // cursor to end-of-line so `u` restores to the append position, not
-        // the pre-`A` cursor (#886), while plain `i` starts its undo group
-        // *before* `clamp_cursor_col` so `u` restores to the pre-clamp
-        // position exactly as pressing `i` would (#1003, keys.rs).
+        // Handle :star[tinsert][!] — enter Insert mode as if `i` (or, with `!`,
+        // `A`) had been pressed. Reuses the exact same field bookkeeping those
+        // normal-mode keys use: `A` starts its undo group *after* moving the cursor
+        // to end-of-line so `u` restores to the append position, while plain `i`
+        // starts its undo group *before* `clamp_cursor_col`.
         if cmd == "startinsert" || cmd == "startinsert!" {
             if self.mode == Mode::Insert {
                 return EngineAction::None;
@@ -3052,7 +2979,7 @@ impl Engine {
         // Handle :stopi[nsert] — leave Insert mode as if <Esc> had been
         // pressed. Delegates to the real Escape handler so undo-group
         // closing, dot-register recording, and cursor-left-on-exit all match
-        // pressing <Esc> exactly (#1154).
+        // pressing <Esc> exactly.
         if cmd == "stopinsert" {
             if self.mode == Mode::Insert {
                 let mut changed = false;
@@ -3061,23 +2988,20 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle `:digraphs` (`:h :digraphs`, #1160): with no arguments,
-        // lists the digraph table; with `{char1}{char2} {number} ...`
-        // arguments, defines a user digraph (`:h :dig`/`:h digraph-usage`).
-        // `:digraph` is the same command — both spellings normalize to
-        // "digraphs" via `EX_ABBREVS`.
+        // Handle `:digraphs` (`:h :digraphs`): with no arguments, lists the digraph
+        // table; with `{char1}{char2} {number} ...` arguments, defines a user
+        // digraph. Both `:digraph` and `:digraphs` spellings normalize to "digraphs"
+        // via `EX_ABBREVS`.
         if cmd == "digraphs" || cmd.starts_with("digraphs ") {
             let args = cmd.strip_prefix("digraphs").unwrap_or("").trim();
             return self.ex_digraphs(args);
         }
 
-        // Handle `:registers`/`:display` (`:h :registers`, #1299): with no
-        // arguments, lists every non-empty register in Neovim's canonical
-        // order; with a `{register-name}...` argument, restricts the listing
-        // to just those registers (`:reg a`, `:reg ab`, `:reg a b` all mean
-        // "show a and b" — each non-space character of the argument is its
-        // own register name, `:h :registers`). Both spellings normalize to
-        // "registers" via `EX_ABBREVS`.
+        // Handle `:registers`/`:display` (`:h :registers`): with no arguments,
+        // lists every non-empty register in Neovim's canonical order; with a
+        // `{register-name}...` argument, restricts the listing to just those
+        // registers (`:reg a`, `:reg ab`, `:reg a b` all mean "show a and b").
+        // Both spellings normalize to "registers" via `EX_ABBREVS`.
         if cmd == "registers"
             || cmd.starts_with("registers ")
             || cmd == "display"
@@ -3090,27 +3014,20 @@ impl Engine {
             return self.ex_registers(args, prev_ex_command.as_deref());
         }
 
-        // Handle `:history`/`:his` (`:h :history`, #1327): with no
-        // arguments, lists the `:` command history (Neovim's own default —
-        // confirmed against a live oracle); with a `{name}` and/or
-        // `{first}[,{last}]` index-range argument, restricts which history
-        // and which entries are listed (`:h :history-indexing`). Both are
-        // plain keyword/integer arguments, not Vim expressions, so no
-        // expression evaluator is needed to cover them.
+        // Handle `:history`/`:his` (`:h :history`): with no arguments, lists the
+        // `:` command history (Neovim's own default); with a `{name}` and/or
+        // `{first}[,{last}]` index-range argument, restricts which history and
+        // which entries are listed.
         if cmd == "history" || cmd.starts_with("history ") {
             let args = cmd.strip_prefix("history").unwrap_or("").trim();
             return self.ex_history(args);
         }
 
         match cmd {
-            // `:w!` force-writes — vimcode has no readonly/overwrite
-            // distinction to force past, so the bang is a no-op and `:w!`
-            // behaves exactly like plain `:w` (standard Vim compatibility,
-            // #1790). Without this arm, `normalize_ex_command` still
-            // expanded the "w!" abbreviation to "write!" (`EX_ABBREVS`
-            // preserves the bang through the rewrite), but that string
-            // fell through this match's catch-all and printed "Not an
-            // editor command: write!" instead of saving.
+            // `:w!` force-writes — vimcode has no readonly/overwrite distinction to
+            // force past, so the bang is a no-op and `:w!` behaves exactly like plain
+            // `:w`. Without this arm, the "write!" abbreviation expansion falls through
+            // and prints "Not an editor command: write!" instead of saving.
             "write" | "write!" => {
                 let _ = self.save_with_format(false);
                 EngineAction::None
@@ -3201,7 +3118,7 @@ impl Engine {
                 lines.push("mark line  col file/text".to_string());
 
                 // Neovim's `:marks` always lists the three automatic marks
-                // alongside any user-set ones (#1300): `'` (previous
+                // alongside any user-set ones: `'` (previous
                 // context — the pcmark set by the last jump), the user marks
                 // themselves, `"` (cursor position before last leaving this
                 // buffer), and `.` (position of the last change).
@@ -3243,10 +3160,8 @@ impl Engine {
             // Display jump list
             "jumps" => {
                 let mut lines: Vec<String> = Vec::new();
-                // Neovim's `:jumps` header has no `tab` column — vimcode
-                // invented one — and *does* carry a `file/text` preview of
-                // the target line, which the old header omitted entirely
-                // (confirmed against a live oracle, #1301).
+                // Neovim's `:jumps` header has no `tab` column and *does* carry a
+                // `file/text` preview of the target line.
                 lines.push(" jump line  col file/text".to_string());
                 let current_file = self.file_path().cloned();
                 let idx = self.jump_list_pos;
@@ -3259,10 +3174,9 @@ impl Engine {
                     // `w_jumplistidx`-relative numbering, confirmed against
                     // a live oracle).
                     let jump_num = i.abs_diff(idx);
-                    // `file/text`: Neovim previews the target line's text
-                    // when the jump is within the *current* buffer, and
-                    // falls back to the file path when it's a different
-                    // buffer (confirmed against a live oracle, #1301).
+                    // `file/text`: Neovim previews the target line's text when the jump is
+                    // within the *current* buffer, and falls back to the file path when it's a
+                    // different buffer.
                     let text = if entry.file == current_file {
                         self.preview_line_text(entry.line)
                     } else {
@@ -3294,19 +3208,15 @@ impl Engine {
             // Display change list
             "changes" => {
                 let mut lines: Vec<String> = Vec::new();
-                // Neovim's `:changes` header carries a `text` column (a
-                // preview of the changed line, same idea as `:jumps`'
-                // `file/text`), which the old header omitted entirely
-                // (confirmed against a live oracle, #1303).
+                // Neovim's `:changes` header carries a `text` column (a preview of the
+                // changed line), which the old header omitted entirely.
                 lines.push("change line  col text".to_string());
                 let idx = self.change_list_pos;
                 for (i, (line, col)) in self.change_list.iter().enumerate() {
                     let marker = if i == idx { ">" } else { " " };
-                    // Change number counts *distance from the current
-                    // position* in the list, not the raw index — same
-                    // `w_changelistidx`-relative numbering `:jumps` uses for
-                    // `w_jumplistidx` (confirmed against a live oracle,
-                    // #1303; the old code printed the raw 0-based index).
+                    // Change number counts *distance from the current position* in the list,
+                    // not the raw index — same `w_changelistidx`-relative numbering `:jumps`
+                    // uses for `w_jumplistidx`.
                     let change_num = i.abs_diff(idx);
                     let text = self.preview_line_text(*line);
                     lines.push(format!(
@@ -3318,11 +3228,9 @@ impl Engine {
                         text
                     ));
                 }
-                // When the current position is past the end of the recorded
-                // list (no `g;` has been done since the last change),
-                // Neovim prints a bare trailing `>` line with no entry data
-                // — same shape as `:jumps` (confirmed against a live
-                // oracle, #1303).
+                // When the current position is past the end of the recorded list (no `g;`
+                // has been done since the last change), Neovim prints a bare trailing `>`
+                // line with no entry data — same shape as `:jumps`.
                 if idx == self.change_list.len() {
                     lines.push(">".to_string());
                 }
@@ -3480,7 +3388,7 @@ impl Engine {
                 self.find_replace_show_replace = true;
                 EngineAction::None
             }
-            // ── Selection menu (#1697) ─────────────────────────────────────────
+            // ── Selection menu ─────────────────────────────────────────────────
             "select_all"
             | "MoveLineUp"
             | "MoveLineDown"
@@ -3568,7 +3476,7 @@ impl Engine {
                 // than a per-backend native dialog, pre-fill the command
                 // line with the current path for interactive editing, same
                 // platform-neutral pattern as `:Rename` with no argument
-                // above (#585).
+                // above.
                 let current = self
                     .file_path()
                     .map(|p| p.display().to_string())
@@ -3656,7 +3564,7 @@ impl Engine {
                 self.message = format!("\"{name}\"{modified} {total} lines --{pct}%--");
                 EngineAction::None
             }
-            // 'hidden' guard (#1190): `:enew` abandons the current buffer
+            // 'hidden' guard: `:enew` abandons the current buffer
             // for a fresh unnamed one, same rule as `:edit`/`:bnext`.
             "enew" | "enew!" => {
                 if let Err(msg) = self.check_buffer_abandon(cmd == "enew!") {
@@ -3687,11 +3595,9 @@ impl Engine {
                 EngineAction::None
             }
             "number" => {
-                // #1282: verified against a live `nvim --headless -u NONE`
-                // `msg_show` event — a single space after a **minimum**
-                // 3-wide right-justified line number (it grows past 3 for a
-                // 4+-digit line, never shrinks below it), not the 6-wide/
-                // double-space field this used to print.
+                // A single space after a **minimum** 3-wide right-justified line number
+                // (it grows past 3 for a 4+-digit line, never shrinks below it), not the
+                // 6-wide/double-space field this used to print.
                 let line = self.view().cursor.line;
                 let text = self.buffer().content.line(line).chars().collect::<String>();
                 self.message = format!("{:>3} {}", line + 1, text.trim_end_matches('\n'));
@@ -3753,9 +3659,9 @@ impl Engine {
         }
     }
 
-    /// Preview text for a `file/text`-column target line (`:marks`, `:jumps`):
-    /// leading whitespace trimmed, no trailing newline — matches Neovim's
-    /// listing commands (confirmed against a live oracle, #1300, #1301).
+    /// Preview text for a `file/text`-column target line (`:marks`, `:jumps`,
+    /// `:changes`): leading whitespace trimmed, no trailing newline — matches
+    /// Neovim's listing commands.
     fn preview_line_text(&self, line_idx: usize) -> String {
         let clamped = line_idx.min(self.buffer().content.len_lines().saturating_sub(1));
         self.buffer()
@@ -3804,9 +3710,8 @@ impl Engine {
 
         let keys_chars: Vec<char> = keys.chars().collect();
 
-        // Save the undo-tree position so all the per-line commands below can
-        // be merged into one undoable step (#1156: was a saved undo-stack
-        // *length*, since replaced with a tree `seq` mark).
+        // Save the undo-tree position so all the per-line commands below can be
+        // merged into one undoable step.
         let saved_undo_seq = self.active_buffer_state_mut().undo_seq();
 
         for line_num in start_line..=end_line {
@@ -4001,7 +3906,7 @@ impl Engine {
         let mut idx = 0usize;
         // `:g` is one undoable step in Vim, however many lines it touches —
         // save the undo depth so the per-line sub-command entries below can
-        // be merged into a single one (#886). A bare `start_undo_group()`
+        // be merged into a single one. A bare `start_undo_group()`
         // here doesn't work: the first sub-command that itself calls
         // `start_undo_group()` (nearly all of them — `d`, `s`, `normal`, …)
         // immediately finishes this outer group (empty, so it's discarded)
@@ -4038,7 +3943,7 @@ impl Engine {
 
         // Merge every undo step created by the sub-commands above into a
         // single step, so `u` reverts all of `:g`'s edits at once and lands
-        // on the position of the *first* one (#886).
+        // on the position of the *first* one.
         self.active_buffer_state_mut()
             .merge_undo_since(saved_undo_seq);
 
@@ -4057,7 +3962,7 @@ impl Engine {
     }
 
     /// `:undolist`, `:earlier {count}`/`:earlier {N}[smhd]`, `:later
-    /// {count}`/`:later {N}[smhd]`, `:undojoin` (#1156). Returns `None` when
+    /// {count}`/`:later {N}[smhd]`, `:undojoin`. Returns `None` when
     /// `cmd` doesn't name one of these, so the caller falls through to the
     /// rest of `execute_command`'s dispatch.
     pub(crate) fn try_execute_undo_command(&mut self, cmd: &str) -> Option<EngineAction> {
@@ -4083,7 +3988,7 @@ impl Engine {
         }
     }
 
-    /// `:undolist` (#1156): list every live undo-tree node in chronological
+    /// `:undolist`: list every live undo-tree node in chronological
     /// (`seq`) order — the same order `g-`/`g+`/`:earlier`/`:later` walk —
     /// marking the buffer's current position with `>`, like Vim's `:h
     /// :undolist` (columns simplified: Vim's `changes` count is the number
@@ -4112,7 +4017,7 @@ impl Engine {
         EngineAction::None
     }
 
-    /// `:undojoin` (#1156): fold the *next* committed undo group back into
+    /// `:undojoin`: fold the *next* committed undo group back into
     /// whatever undo step precedes it, so undoing after that next change
     /// reverts both together as one `u`. Errors like Vim's `E790` if
     /// there's no previous change to join with (a fresh buffer, or already
@@ -4131,16 +4036,12 @@ impl Engine {
     }
 
     /// `:[range]fold`, `:foldo[pen][!] [range]`, `:foldc[lose][!] [range]`,
-    /// `:[range]foldd[oopen] {cmd}`, `:[range]folddoc[losed] {cmd}` (#1159)
-    /// — the ex-command surface for folding, previously only reachable
-    /// through the `z` normal-mode commands (0 hits in `src/core/engine/`
-    /// before this). `:foldnew`, mentioned in the issue, does not exist in
-    /// Neovim (`E492: Not an editor command`, checked against `nvim
-    /// --headless -u NONE`) so isn't implemented — there is no oracle to
-    /// verify it against and no such command to be compatible with.
+    /// `:[range]foldd[oopen] {cmd}`, `:[range]folddoc[losed] {cmd}`
+    /// — the ex-command surface for folding, previously only reachable through
+    /// the `z` normal-mode commands.
     ///
-    /// Returns `None` when `cmd` doesn't name one of these, so the caller
-    /// falls through to the rest of `execute_command`'s dispatch.
+    /// Returns `None` when `cmd` doesn't name one of these, so the caller falls
+    /// through to the rest of `execute_command`'s dispatch.
     pub(crate) fn try_execute_fold_command(&mut self, cmd: &str) -> Option<EngineAction> {
         let chars: Vec<char> = cmd.chars().collect();
         let (range, consumed) = self.parse_ex_range(&chars);
@@ -4175,7 +4076,7 @@ impl Engine {
         None
     }
 
-    /// `:[range]foldd[oopen] {cmd}` / `:[range]folddoc[losed] {cmd}` (#1159)
+    /// `:[range]foldd[oopen] {cmd}` / `:[range]folddoc[losed] {cmd}`
     /// — run `{cmd}` on every line in `[range]` (default: the whole buffer,
     /// unlike most other `[range]` ex commands — verified against `nvim
     /// --headless`) that is/isn't inside a closed fold. `closed` selects
@@ -4206,7 +4107,7 @@ impl Engine {
 
         let mut executed = 0usize;
         let mut idx = 0usize;
-        // See `execute_global_command`'s matching comment (#886): `:folddo*`
+        // See `execute_global_command`'s matching comment: `:folddo*`
         // is one undoable step however many lines it touches.
         let saved_undo_seq = self.active_buffer_state_mut().undo_seq();
         while idx < pending.len() {
@@ -4258,7 +4159,7 @@ impl Engine {
     /// it is a separate axis from the `r` letter flag inside `spec`, which
     /// (only meaningful together with a `/pattern/`) selects the *matched*
     /// text as the sort key instead of the text following the match — mixing
-    /// the two up is what made `:sort /pat/ r` sort on whole lines (#879).
+    /// the two up is what made `:sort /pat/ r` sort on whole lines.
     pub(crate) fn execute_sort_command(
         &mut self,
         range: Option<(usize, usize)>,
@@ -4407,7 +4308,7 @@ impl Engine {
         self.start_undo_group();
         let first_new_line = if line + 1 < num_lines {
             let insert_pos = self.buffer().line_to_char(line + 1);
-            // #1282: `content` is the on-disk file verbatim, which has no
+            // `content` is the on-disk file verbatim, which has no
             // trailing newline whenever the source file itself doesn't end
             // with one (`std::fs::read_to_string` doesn't add one) — insert
             // it as-is here and it silently merges into the following
@@ -4992,7 +4893,7 @@ impl Engine {
                 }
             }
         }
-        // #1031 (#801 Phase 2): the confirm loop is entered further down,
+        // The confirm loop is entered further down,
         // once the pattern/replacement/range are all resolved — see
         // `confirm && !report_only` below.
         let confirm = flags.contains('c');
@@ -5070,12 +4971,12 @@ impl Engine {
         first_line = first_line.min(n_lines.saturating_sub(1));
         last_line = last_line.min(n_lines.saturating_sub(1));
 
-        // --- `:s///c` confirm loop (#1031, #801 Phase 2) ---
+        // --- `:s///c` confirm loop ---
         //
-        // `n` ("report only, don't substitute") wins over `c` if both are
-        // given — there is nothing to confirm if nothing is ever applied —
-        // so that combination falls through to the ordinary scan below
-        // exactly like a plain `:s///n` would.
+        // `n` ("report only, don't substitute") wins over `c` if both are given —
+        // nothing is confirmed if nothing is ever applied — so that combination
+        // falls through to the ordinary scan below exactly like a plain `:s///n`
+        // would.
         if confirm && !report_only {
             let candidates = collect_confirm_candidates(
                 body,
@@ -5126,7 +5027,7 @@ impl Engine {
         let mut last_was_multiline = false;
         // Byte offset (into `body`, i.e. pre-substitution) of the very first
         // match — Vim's `u` restores the cursor here, not to the cursor
-        // position when `:s` was invoked (#886).
+        // position when `:s` was invoked.
         let mut first_change_pos: Option<usize> = None;
 
         while at <= body.len() {
@@ -5252,7 +5153,7 @@ impl Engine {
         };
 
         // `u` restores the cursor here — Vim uses the position of the first
-        // substitution, not wherever the cursor was when `:s` ran (#886).
+        // substitution, not wherever the cursor was when `:s` ran.
         let first_change_cursor = first_change_pos
             .map(|pos| {
                 let line = line_of(pos);
@@ -5293,7 +5194,7 @@ impl Engine {
     ///
     /// `cursor_before` is what `u` restores the cursor to; Vim uses the
     /// position of the *first* change, which is not always wherever the
-    /// (real) cursor happens to be at the time of the call (#886).
+    /// (real) cursor happens to be at the time of the call.
     pub(crate) fn splice_buffer_text_at(&mut self, new_text: &str, cursor_before: Cursor) {
         let old: Vec<char> = self.buffer().to_string().chars().collect();
         let new: Vec<char> = new_text.chars().collect();
@@ -5329,34 +5230,23 @@ impl Engine {
         self.splice_buffer_text_at(new_text, cursor_before);
     }
 
-    // --- `:s///c` confirm loop (#1031, #801 Phase 2) ---
+    // --- `:s///c` confirm loop ---
     //
-    // `run_substitute` precomputes every candidate match up front (see
-    // `collect_confirm_candidates`) using the *original*, unmodified buffer
-    // text — the same one-pass scan the non-confirm path already used,
-    // just not applied yet. The interactive loop below only ever decides,
-    // per candidate in order, whether to fold its rendered replacement into
-    // an `out` string being built incrementally; the real buffer is left
-    // untouched (`self.confirm_sub` holds all of this state) until the loop
-    // ends, at which point one `splice_buffer_text_at` applies the result —
-    // exactly mirroring what a single non-interactive `:s///g` would have
-    // spliced, just gated per-match by the user's answer. This keeps
-    // candidate positions stable across answers (no later match ever shifts
-    // because an earlier one was replaced), which is safe because, like the
-    // non-confirm path, no candidate's rendered text is re-scanned for
-    // further matches.
+    // `run_substitute` precomputes every candidate match up front using the
+    // *original*, unmodified buffer text — the same one-pass scan the non-confirm
+    // path already used, just not applied yet. The interactive loop only decides,
+    // per candidate in order, whether to fold its rendered replacement into an
+    // `out` string being built incrementally; the real buffer is left untouched
+    // (`self.confirm_sub` holds this state) until the loop ends, at which point
+    // one `splice_buffer_text_at` applies the result — exactly mirroring what a
+    // single non-interactive `:s///g` would splice, just gated per-match by the
+    // user's answer. Candidate positions remain stable across answers.
     //
-    // Verified against a real `nvim --headless --listen` session (v0.12.5,
-    // driven interactively over its msgpack `--remote-send`, not the
-    // non-interactive `-es` batch mode, which short-circuits `:s///c`
-    // entirely): the pending match's *start* (not its line's first
-    // non-blank) is where the cursor sits while a prompt is up; quitting
-    // (`q`/`<Esc>`) or `l` ("last") freezes the cursor there and prints no
-    // report line even if earlier answers replaced something; only running
-    // off the end of the candidate list (individually or via `a`) both
-    // reports and re-lands the cursor the same place the non-confirm path
-    // would (last substitution's line, first non-blank unless the last
-    // substitution was multiline).
+    // The pending match's *start* (not its line's first non-blank) is where the
+    // cursor sits while a prompt is up; quitting or `l` ("last") freezes the
+    // cursor there and prints no report line even if earlier answers replaced
+    // something; only running off the end of the candidate list reports and
+    // re-lands the cursor the same place the non-confirm path would.
 
     /// Show the prompt for the confirm loop's current candidate, or finish
     /// the loop (as a "ran off the end" completion) if there isn't one.
@@ -5399,7 +5289,7 @@ impl Engine {
     ) -> EngineAction {
         // `<C-c>`/`<C-[>` aren't in `:h :s_c`'s documented answer set, but
         // they're the same "get me out of here" aliases for `<Esc>` that
-        // `handle_insert_key` already recognizes (#804) -- without this a
+        // `handle_insert_key` already recognizes -- without this a
         // user's habitual escape hatch would silently re-prompt instead of
         // quitting the loop like every other Escape-shaped key in this
         // codebase does.
@@ -5453,22 +5343,11 @@ impl Engine {
     }
 
     /// Fold the current candidate's rendered replacement into the
-    /// in-progress `out` string (mirroring exactly what the non-confirm
-    /// scan does per match -- `run_substitute`'s own comment on the
-    /// equivalent code explains the bookkeeping) *and* splice that same
-    /// change into the real, live buffer right now.
-    ///
-    /// #1031 review: the confirm loop used to only ever touch `state.out`,
-    /// leaving the visible buffer frozen until the whole loop ended (`a`,
-    /// `q`/`<Esc>`, or running off the end) at which point `finish_confirm_sub`
-    /// applied every decided candidate in one shot. That's backwards from
-    /// the entire point of an interactive confirm prompt -- a user answering
-    /// `y` should watch that match change in place before deciding on the
-    /// next one. This now performs the live edit immediately, as part of a
-    /// single undo group spanning the whole loop (opened here, lazily, on
-    /// the first applied answer; closed once in `finish_confirm_sub`) so `u`
-    /// still undoes the entire `:s///c` invocation in one step rather than
-    /// one keystroke at a time.
+    /// in-progress `out` string and splice that same change into the real,
+    /// live buffer right now. The live edit is performed immediately as part
+    /// of a single undo group spanning the whole confirm loop (opened here,
+    /// lazily, on the first applied answer; closed once in `finish_confirm_sub`)
+    /// so `u` still undoes the entire `:s///c` invocation in one step.
     fn confirm_sub_apply_current(&mut self) {
         let Some(mut state) = self.confirm_sub.take() else {
             return;
@@ -5615,7 +5494,7 @@ impl Engine {
     /// Compile a Vim pattern against the current `'ignorecase'` / `'smartcase'`
     /// settings, or return the Vim-style error message.
     ///
-    /// #801: a pattern that fails to translate is **rejected**, never silently
+    /// A pattern that fails to translate is **rejected**, never silently
     /// downgraded to a literal substring match.
     pub(crate) fn compile_vim_pattern(
         &self,
@@ -5636,7 +5515,7 @@ impl Engine {
     }
 
     /// The last Visual selection's byte range within `self.buffer().to_string()`
-    /// — what `\%V` (#1157) restricts a match to. `None` when there has never
+    /// — what `\%V` restricts a match to. `None` when there has never
     /// been one, *or* when the last selection was Visual-Block.
     ///
     /// Charwise (`v`) and linewise (`V`) selections are both a single
@@ -5644,19 +5523,9 @@ impl Engine {
     /// byte span `Compiled::pos_ok` filters against. Visual-Block (`CTRL-V`)
     /// is *not* contiguous — it's a per-line column range (e.g. columns 3..6
     /// on every selected line) — and `pos_ok`'s single-span representation
-    /// cannot express that shape at all.
-    ///
-    /// This used to (incorrectly) run the charwise column formula for every
-    /// Visual kind, which for linewise/blockwise produced a range that looked
-    /// plausible but was arithmetically nonsense (silently wrong matches,
-    /// not a "no selection" no-op). Since there is no faithful contiguous
-    /// approximation for Visual-Block, this refuses instead: no range means
-    /// `\%V` never matches, the same safe behaviour already covered by
-    /// `percent_v_with_no_visual_range_never_matches` for "no selection yet".
-    /// Rejection, never fallback — the same doctrine `vim_regex`'s module doc
-    /// states for the untranslatable-pattern case. Proper Visual-Block
-    /// support needs a per-line-range `\%V` representation and is a
-    /// follow-up, not a fix folded into this pass.
+    /// cannot express that shape at all. This refuses Visual-Block selections:
+    /// no range means `\%V` never matches. Proper Visual-Block support needs
+    /// a per-line-range `\%V` representation.
     fn last_visual_byte_range(&self) -> Option<(usize, usize)> {
         let anchor = self.last_visual_anchor?;
         let cursor = self.last_visual_cursor?;
@@ -5763,7 +5632,7 @@ impl Engine {
             }
             None => {
                 // `:h 'wrapscan'`: off, and no match after the cursor —
-                // stay put rather than wrapping (#1153).
+                // stay put rather than wrapping.
                 self.message = format!(
                     "E385: search hit BOTTOM without match for: {}",
                     self.search_query
@@ -5805,7 +5674,7 @@ impl Engine {
                 self.search_matches.len() - 1
             }
             None => {
-                // See `search_next`'s matching `'wrapscan'` comment (#1153).
+                // See `search_next`'s matching `'wrapscan'` comment.
                 self.message = format!(
                     "E384: search hit TOP without match for: {}",
                     self.search_query
@@ -5821,9 +5690,6 @@ impl Engine {
     /// Is the active search offset a *line* offset (`/pat/+1`, `/pat/-1`,
     /// `/pat/0`)? Those make the search linewise for an operator (`:h
     /// search-offset`).
-    /// (Seam for the operator-pending `d/pat` work in the next issue of the
-    /// #801 chain — an operator over a search motion is linewise exactly when
-    /// the offset is a line offset.)
     pub fn search_offset_is_linewise(&self) -> bool {
         let off = self.search_offset.trim();
         !off.is_empty() && !off.starts_with(['e', 's', 'b'])
@@ -5990,11 +5856,9 @@ impl Engine {
             let start_cursor = self.search_start_cursor.unwrap_or(self.view().cursor);
             let start_char = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
 
-            // Find the appropriate match based on search direction. `:h
-            // 'wrapscan'`: off, and no match in the requested direction from
-            // the start position — the live preview stays put rather than
-            // previewing a wrapped-around match (#1153 review; mirrors
-            // `search_next`/`search_prev`).
+            // Find the appropriate match based on search direction. When
+            // 'wrapscan' is off and there is no match in the requested direction
+            // from the start position, the live preview stays put.
             let idx = match self.search_direction {
                 SearchDirection::Forward => {
                     // Find first match at or after start position
@@ -6282,12 +6146,10 @@ impl Engine {
             name.len() >= min && name.len() <= canonical.len() && canonical.starts_with(name)
         };
 
-        // `:[range]AI [message]` (#1450 point 1) — attach `[range]`'s lines
-        // of the current buffer as context, then send `message` (or, given
-        // none, just focus the panel so it can be typed in — see
-        // `Engine::ai_attach_range`'s doc). Case-sensitive `"AI"`, no
-        // abbreviation — matches the existing plain `:AI <message>` in this
-        // function's fallback dispatch further down in `execute_command`.
+        // `:[range]AI [message]` — attach `[range]`'s lines of the current
+        // buffer as context, then send `message` (or, given none, just focus
+        // the panel so it can be typed in). Case-sensitive `"AI"`, no
+        // abbreviation.
         if name == "AI" {
             let (start, end) = self.range_with_count(range, None, last_line);
             self.ai_attach_range(start, end, args);
@@ -6307,11 +6169,9 @@ impl Engine {
             self.view_mut().cursor.line = start;
             self.view_mut().cursor.col = 0;
             let mut changed = false;
-            // Route the register through `delete_lines`'s own
-            // `set_delete_register` (via `active_register`) instead of
-            // deleting into the unnamed register and copying afterward —
-            // the copy step can't express "don't write anywhere", so `:d _`
-            // was clobbering "" like a plain `:d` (#806, "ex:d _").
+            // Route the register through `delete_lines`'s own `set_delete_register`
+            // (via `active_register`) instead of deleting into the unnamed register
+            // and copying afterward, which would clobber "" like a plain `:d`.
             if let Some(r) = reg {
                 self.selected_register = Some(r);
             }
@@ -6712,7 +6572,7 @@ impl Engine {
         self.clamp_cursor_col();
     }
 
-    // ─── User abbreviations (#1152) ─────────────────────────────────────────
+    // ─── User abbreviations ─────────────────────────────────────────────────
 
     /// Parse `"{lhs} {rhs...}"` (the argument tail of `:abbreviate`/
     /// `:iabbrev`/`:cabbrev` and their `nore` variants) and define or replace
@@ -6748,9 +6608,8 @@ impl Engine {
     }
 
     /// Remove every abbreviation (in any mode) whose `lhs` matches exactly.
-    /// Returns `true` if anything was removed. Vim distinguishes
-    /// `:unabbreviate`/`:iunabbreviate`/`:cunabbreviate` by mode; this engine
-    /// only exposes the mode-agnostic form (#1152's requested deliverable).
+    /// Returns `true` if anything was removed. This engine only exposes the
+    /// mode-agnostic form.
     fn remove_abbrev(&mut self, lhs: &str) -> bool {
         let before = self.settings.abbreviations.len();
         self.settings
@@ -6783,19 +6642,15 @@ impl Engine {
         }
     }
 
-    /// `:registers`/`:display` (`:h :registers`, #1299). With `args` empty,
+    /// `:registers`/`:display` (`:h :registers`). With `args` empty,
     /// lists every non-empty register; otherwise each non-space character of
     /// `args` is one requested register name and only those are listed
-    /// (still in canonical order, not argument order — confirmed against a
-    /// live oracle: `:reg b a` lists `a` before `b`).
+    /// (still in canonical order, not argument order).
     ///
     /// `prev_ex_command` is `self.last_ex_command` from *before*
     /// [`Engine::execute_command`] overwrote it for this very invocation —
     /// needed because the `":"` register must show the previous command
-    /// while `:registers`/`:reg` itself is running, never itself (confirmed
-    /// against a live oracle: back-to-back `:registers` calls show the
-    /// *first* one's `":"` row empty, and the *second* one's `":"` row is
-    /// `registers`, the first call — not the second call self-referencing).
+    /// while `:registers`/`:reg` itself is running, never itself.
     pub(crate) fn ex_registers(
         &mut self,
         args: &str,
@@ -6877,7 +6732,7 @@ impl Engine {
         }
     }
 
-    /// `:history`/`:his` (`:h :history`, #1327). `args` is everything after
+    /// `:history`/`:his` (`:h :history`). `args` is everything after
     /// the command word, e.g. `""`, `"/"`, `"all"`, `"cmd 2,5"`.
     ///
     /// The leading token, if present, selects a [`HistoryKind`] (`:`/`cmd`,
@@ -6885,16 +6740,12 @@ impl Engine {
     /// vimcode tracks none of the latter three, see [`HistoryKind::entries`]).
     /// When the leading token doesn't name a kind (e.g. it's a bare number),
     /// it is instead the index-range argument and the kind defaults to
-    /// `Cmd` — Neovim's own default (confirmed against a live oracle: typing
-    /// two prior commands then bare `:history` lists the `:` history, not
-    /// `all`).
+    /// `Cmd`.
     ///
-    /// A trailing `{first}[,{last}]` restricts *which entries* of the
+    /// A trailing `{first}[,{last}]` restricts which entries of the
     /// selected kind(s) are printed (`:h :history-indexing`): a bare number
     /// means `first == last`; a negative number counts back from the newest
-    /// entry (`-1` is the newest). All confirmed against a live oracle,
-    /// including that `:history {kind} 0` / `... 99` (out of range) print
-    /// just the header with no rows rather than erroring.
+    /// entry (`-1` is the newest).
     pub(crate) fn ex_history(&mut self, args: &str) -> EngineAction {
         let args = args.trim();
         let mut tokens = args.split_whitespace();
@@ -7135,9 +6986,8 @@ pub(crate) struct ConfirmSubState {
     /// The substitution result being built incrementally as candidates are
     /// decided — mirrors the non-confirm scan's `out`.
     out: String,
-    /// Count of candidates actually replaced (`y`/`a`/`l`) — *not* the
-    /// number of candidates offered; a `n`-answered candidate must not
-    /// count toward the post-loop report (#1031 deliverable 2).
+    /// Count of candidates actually replaced (`y`/`a`/`l`) — not the
+    /// number of candidates offered.
     n_subs: usize,
     /// Distinct 0-indexed lines an actual replacement landed on, in the
     /// order they were applied — feeds "N substitutions on M lines".
@@ -7719,15 +7569,11 @@ pub(crate) fn split_set_args(args: &str) -> Vec<String> {
     out
 }
 
-/// Does a single `:set` argument (one entry from [`split_set_args`], or a
-/// whole single-option `:set` line) name `'foldmethod'`/`'foldlevel'`/
-/// `'foldmarker'`/`'foldnestmax'` (either full name or abbreviation)? Used
-/// to skip the `apply_foldlevel` recompute on `:set` lines that have
-/// nothing to do with folding — see the two call sites in
-/// `handle_ex_command` (#1153 review: re-running the indent-fold pass on
-/// every `:set ic` etc. was a needless cost on large files). `'foldmarker'`/
-/// `'foldnestmax'` joined the list in #1159 — changing either one also
-/// needs a recompute, for the same reason as `'foldmethod'`/`'foldlevel'`.
+/// Does a single `:set` argument name `'foldmethod'`/`'foldlevel'`/
+/// `'foldmarker'`/`'foldnestmax'` (either full name or abbreviation)?
+/// Used to skip the `apply_foldlevel` recompute on `:set` lines that have
+/// nothing to do with folding. Changing `'foldmarker'` or `'foldnestmax'`
+/// also needs a recompute.
 fn set_arg_touches_folding(arg: &str) -> bool {
     let arg = arg.trim();
     let arg = arg.strip_suffix('?').unwrap_or(arg);
@@ -7846,7 +7692,6 @@ fn reg_type_letter(ty: RegType) -> &'static str {
 /// `{rhs}` that fails key-notation parsing). Reuses [`parse_keymap_def`] as
 /// the single source of truth for validity, so a `:nnoremap` definition and a
 /// hand-edited `settings.json` line can never disagree about what's valid
-/// (#1151).
 fn build_keymap_entries(
     lhs: &str,
     rhs: &str,

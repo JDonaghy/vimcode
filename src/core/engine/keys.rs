@@ -5,7 +5,7 @@ impl Engine {
     // Key handling
     // =======================================================================
 
-    /// #805: decide whether `curswant` (the Normal-mode vertical-motion
+    /// Decide whether `curswant` (the Normal-mode vertical-motion
     /// desired column tracked in `self.curswant`) survives this keystroke.
     ///
     /// Must run before `self.pending_key` / `self.pending_operator` /
@@ -21,10 +21,10 @@ impl Engine {
     ///    `scroll_and_move_by`/`page_down`/`page_up` read/reapply `curswant`
     ///    just like a plain vertical motion does.
     ///  - `G` / `H` / `M` / `L` — the other single-key `'startofline'`
-    ///    commands (#1772).
+    ///    commands.
     ///  - the bare, not-yet-resolved `g` keystroke that *starts* a `g`-
     ///    sequence, and `gg`'s own second keystroke — `gg` is the fifth
-    ///    `'startofline'` command (#1772). This is safe even though most
+    ///    `'startofline'` command. This is safe even though most
     ///    `g`-sequences (`ge`, `g_`, `gJ`, `gv`, …) don't want `curswant`
     ///    preserved at all: the first `g` keystroke is a pure "arm
     ///    `pending_key`" no-op that never moves the cursor, so preserving
@@ -45,7 +45,7 @@ impl Engine {
             self.curswant = None;
             return;
         }
-        // #1772: `gg`'s second keystroke must escape the generic
+        // `gg`'s second keystroke must escape the generic
         // "any pending multi-key sequence resets curswant" rule below —
         // `gg` is one of Vim's documented `'startofline'` commands
         // (alongside `G`/`H`/`M`/`L`/the `<C-d>` family), so with the
@@ -72,7 +72,7 @@ impl Engine {
                     return;
                 }
             } else if matches!(ch, 'j' | 'k' | 'G' | 'H' | 'M' | 'L' | 'g') {
-                // #1772: `G`/`H`/`M`/`L` are the other single-key
+                // `G`/`H`/`M`/`L` are the other single-key
                 // `'startofline'` commands, and `g` here is the bare
                 // first keystroke arming `pending_key` for a `g`-sequence
                 // (including `gg` itself) — see the doc comment above.
@@ -85,7 +85,7 @@ impl Engine {
         self.curswant = None;
     }
 
-    /// #807: copy the current wanted column into `visual_block_want` before
+    /// Copy the current wanted column into `visual_block_want` before
     /// `curswant` is dropped, so a Visual-Block operator keystroke (`y`, `d`,
     /// `I`, …) still knows which column the block's moving edge is on after
     /// `j`/`k` clamped the cursor onto a shorter line.
@@ -105,20 +105,20 @@ impl Engine {
         unicode: Option<char>,
         ctrl: bool,
     ) -> EngineAction {
-        // #805: decide whether this keystroke should drop the remembered
+        // Decide whether this keystroke should drop the remembered
         // `curswant` (Normal-mode vertical-motion desired column) before any
         // of the pending-state fields it inspects get consumed below.
         self.update_curswant_for_key(unicode, ctrl);
 
-        // Reset the per-keystroke failure flag (#806) — set by a Normal-mode
+        // Reset the per-keystroke failure flag — set by a Normal-mode
         // command below that couldn't complete, and read once, right after
         // this call returns, by `advance_macro_playback`.
         self.command_failed = false;
 
         // `:s///c` confirm-loop prompt intercepts all keys while a match is
-        // pending an answer (#1031, #801 Phase 2) — highest priority, same
-        // as the other modal-input interceptions below, since none of
-        // Normal/Insert/Command-mode dispatch makes sense mid-prompt.
+        // pending an answer — highest priority, same as the other modal-input
+        // interceptions below, since none of Normal/Insert/Command-mode dispatch
+        // makes sense mid-prompt.
         if self.confirm_sub.is_some() {
             return self.handle_confirm_sub_key(key_name, unicode, ctrl);
         }
@@ -133,7 +133,7 @@ impl Engine {
         // intercepts all keys until the terminating `<CR>`/`<Esc>` — it's a
         // mini command-line, entered from (and returning to) whichever mode
         // triggered it, so it can't be handled as part of the mode-specific
-        // dispatch below (#806, `reg:"= expr`, `reg:C-r = in insert`).
+        // dispatch below.
         if self.expr_register_pending.is_some() {
             return self.handle_expr_register_key(key_name, unicode);
         }
@@ -283,9 +283,8 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Change-review surface (#955, ACP-4/#525) intercepts all keys
-        // while open — same "modal overlay owns the keyboard" policy as
-        // diff peek above.
+        // Change-review surface intercepts all keys while open — same "modal
+        // overlay owns the keyboard" policy as diff peek above.
         if self.change_review.is_some() && self.handle_change_review_key(key_name, unicode) {
             return EngineAction::None;
         }
@@ -304,10 +303,9 @@ impl Engine {
 
         // Quickfix / active window's location-list panel intercepts all keys
         // while it has focus. Two ways that can be true: the legacy
-        // `has_focus` flag (#1155; still how any caller that flips
-        // `open`/`has_focus` directly without a real window signals it —
-        // see `Engine::qf_open`'s #1307 doc comment), or — since #1307 —
-        // the active window simply *being* the panel's own real
+        // `has_focus` flag (still how any caller that flips `open`/`has_focus`
+        // directly without a real window signals it — see `Engine::qf_open`),
+        // or the active window simply *being* the panel's own real
         // `WindowLayout` leaf, the same way any other Neovim window has
         // focus by being current, with no separate flag at all.
         // `qf_panel_target` resolves that second case; at most one of the
@@ -320,7 +318,7 @@ impl Engine {
             .get(&self.active_window_id())
             .is_some_and(|l| l.has_focus);
 
-        // #1307 review: when the active window *is* a quickfix/location-list
+        // When the active window *is* a quickfix/location-list
         // panel's own real `WindowLayout` leaf, `CTRL-W` must be able to
         // leave it exactly the way it can enter it — a real Neovim quickfix
         // window is an ordinary window as far as `CTRL-W` navigation is
@@ -347,7 +345,7 @@ impl Engine {
                 // otherwise the only two places that clear it — which is
                 // exactly what left it stale and swallowing every
                 // subsequent keystroke system-wide even after focus had
-                // genuinely moved elsewhere (#1307 review). Harmless when
+                // genuinely moved elsewhere. Harmless when
                 // the sub-command keeps focus in the panel (e.g. a resize):
                 // the intercept check below re-derives from `panel_target`
                 // independently, using whichever window ends up active.
@@ -434,7 +432,7 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // #1627: the active window may be hosting a `vimcode.ui.register_view`
+        // The active window may be hosting a `vimcode.ui.register_view`
         // view as an editor-area tab (`Engine::open_plugin_view_tab`) rather
         // than a text buffer — route keys through the same
         // `handle_plugin_view_key` the sidebar uses (with its own selection/
@@ -447,13 +445,13 @@ impl Engine {
         // Only a key the view actually claims is consumed here (mirrors
         // `handle_ext_panel_key`'s own fallthrough for the sidebar) — while a
         // `Text`/`Password`/`TextArea` field is focused that is *every* key
-        // (typing must never leak into buffer editing, #1627's own
-        // requirement), but with a `Button`/`Toggle`/no field focused, an
-        // unrecognised key (`:`, `gt`, `<C-w>`, …) falls through to ordinary
-        // vim dispatch below — the scratch buffer backing the tab is
-        // `read_only`, so nothing there can be corrupted, and this is what
-        // lets `:tabclose` (or any other window-management command) close a
-        // plugin-view tab exactly like any other tab.
+        // (typing must never leak into buffer editing), but with a
+        // `Button`/`Toggle`/no field focused, an unrecognised key (`:`, `gt`,
+        // `<C-w>`, …) falls through to ordinary vim dispatch below — the
+        // scratch buffer backing the tab is `read_only`, so nothing there can
+        // be corrupted, and this is what lets `:tabclose` (or any other
+        // window-management command) close a plugin-view tab exactly like any
+        // other tab.
         //
         // Gated on `Mode::Normal` too, not just `!ext_panel_has_focus`: once a
         // fallthrough `:` above has switched into `Mode::Command` (or a
@@ -480,8 +478,8 @@ impl Engine {
 
         // Ctrl-S: save in any mode (does not change mode) — except right
         // after `<C-x>` in Insert mode, where `<C-x><C-s>` is the
-        // spelling-suggestion completion sub-mode (`:h i_CTRL-X_CTRL-S`,
-        // #1160), not save.
+        // spelling-suggestion completion sub-mode (`:h i_CTRL-X_CTRL-S`),
+        // not save.
         if ctrl && key_name == "s" && !(self.mode == Mode::Insert && self.insert_ctrl_x_pending) {
             if let Err(e) = self.save_with_format(false) {
                 self.message = format!("Save failed: {}", e);
@@ -512,17 +510,6 @@ impl Engine {
             }
         }
 
-        // #1577: the pre-#1397/#1577 "N-to-dismiss" hijack of vim's own `N`
-        // (search-previous) used to live here — removed. It silently and
-        // permanently dismissed the extension recommendation if the user
-        // pressed `N` to search backward while the (sticky, never-expiring)
-        // toast happened to be up. Keyboard access to the toast's buttons
-        // now goes through `Engine::focus_toast_stack`
-        // (`:Notifications`/`panel_keys.focus_notifications`) and
-        // quadraui's `ToastStackController`, wired in `app.rs`'s shared
-        // `handle_key_press` — a real focus cursor, not a mode-specific key
-        // steal, so `N` always means "previous search match" in Normal mode.
-
         // Safety: dismiss completion popup if it's visible outside Insert mode.
         // This can happen if a late-arriving LSP response set it after mode change.
         if self.completion_idx.is_some() && self.mode != Mode::Insert && !self.is_vscode_mode() {
@@ -533,7 +520,7 @@ impl Engine {
         // Insert session, so any key handled outside Insert mode — including the
         // `i`/`a`/`A`/`o` that enters it, and the Normal-mode command run by
         // `<C-o>` — clears it. Without this, `A<C-d>` on a line that already
-        // ends in a literal '0' would be mistaken for `:h i_0_CTRL-D` (#804).
+        // ends in a literal '0' would be mistaken for `:h i_0_CTRL-D`.
         if self.mode != Mode::Insert {
             self.insert_last_key_char = None;
         }
@@ -573,7 +560,7 @@ impl Engine {
 
         // Ctrl+F: open find/replace from any mode (Visual captures the selection)
         // — except right after `<C-x>` in Insert mode, where `<C-x><C-f>` is
-        // filename completion (`:h i_CTRL-X_CTRL-F`, #1160), not find/replace.
+        // filename completion (`:h i_CTRL-X_CTRL-F`), not find/replace.
         if ctrl
             && key_name == "f"
             && self.settings.ctrl_f_action() == "find"
@@ -612,11 +599,10 @@ impl Engine {
         // below), that stale prefix would otherwise survive untouched and
         // get folded into the *nested* `handle_key` calls that
         // `repeat_last_change`'s replay performs (`replay_dot_keys`),
-        // corrupting `last_dot_count` for every later bare `.` (#803 review:
-        // `3x` `2.` would leave `last_dot_count = Some(22)` instead of
-        // `Some(2)`). Discard it here: a `.` keystroke never itself
-        // contributes to a new dot-repeat candidate, so whatever was pending
-        // before it is fully spent once `.` has consumed it as an override.
+        // corrupting `last_dot_count` for every later bare `.`. Discard it
+        // here: a `.` keystroke never itself contributes to a new dot-repeat
+        // candidate, so whatever was pending before it is fully spent once
+        // `.` has consumed it as an override.
         if dot_is_repeat_trigger {
             self.dot_scratch.clear();
             self.dot_scratch_any_change = false;
@@ -630,7 +616,7 @@ impl Engine {
                 // below to tell a genuinely bare `$`/`p` apart from one that
                 // merely happens to be the *last* keystroke of a longer
                 // command (`y$`, `r p`, `"ap`) — those must not trigger the
-                // bare-`$`/bare-`p` cursor special-casing (#804 review).
+                // bare-`$`/bare-`p` cursor special-casing.
                 let ctrl_o_key_starts_new_command = self.pending_key.is_none()
                     && self.pending_operator.is_none()
                     && self.selected_register.is_none();
@@ -643,10 +629,9 @@ impl Engine {
                         && self.pending_key.is_none()
                         && self.pending_operator.is_none()
                         // A count digit alone (`2` of `2w`) isn't a complete
-                        // command yet — without this a lone digit already
-                        // satisfies the two checks above and returns to
-                        // Insert before the motion it prefixes ever runs
-                        // (#804, "C-o with count").
+                        // command yet — without this a lone digit already satisfies the two
+                        // checks above and returns to Insert before the motion it prefixes
+                        // ever runs.
                         && self.count.is_none()
                     {
                         self.mode = Mode::Insert;
@@ -655,7 +640,7 @@ impl Engine {
                         // `:h i_CTRL-O`: a bare `$` sets Vim's sticky
                         // "end of line" want-column, so resuming Insert
                         // afterwards appends past the last character
-                        // instead of inserting before it (#804). Gated on
+                        // instead of inserting before it. Gated on
                         // `ctrl_o_key_starts_new_command` so a `$` that's
                         // merely the *motion half* of a longer command
                         // (`y$`) doesn't also get this cursor shift.
@@ -663,23 +648,20 @@ impl Engine {
                             let line = self.view().cursor.line;
                             self.view_mut().cursor.col = self.get_line_len_for_insert(line);
                         } else if ctrl_o_key_starts_new_command && !ctrl && unicode == Some('p') {
-                            // `p` leaves the cursor ON the last pasted
-                            // character in Normal mode; resuming Insert via
-                            // <C-o> continues typing *after* it instead
-                            // (#804, "C-o p"). Same gate: a `p` that's the
-                            // replacement char of `r` or the command after a
-                            // `"a`-style register prefix isn't the bare `p`
-                            // command and must not shift the cursor.
+                            // `p` leaves the cursor ON the last pasted character in Normal mode;
+                            // resuming Insert via <C-o> continues typing *after* it instead.
+                            // Same gate: a `p` that's the replacement char of `r` or the command
+                            // after a `"a`-style register prefix isn't the bare `p` command and
+                            // must not shift the cursor.
                             let line = self.view().cursor.line;
                             let max_col = self.get_line_len_for_insert(line);
                             self.view_mut().cursor.col = (self.view().cursor.col + 1).min(max_col);
                         }
                     } else if self.mode != Mode::Normal && self.mode != Mode::Command {
                         // Command changed mode (e.g. entered Insert via i/a/o) — clear flag.
-                        // Mode::Command is exempt: `<C-o>:s/a/b/<CR>` is still
-                        // "one command" spanning several keystrokes — see the
-                        // `Mode::Command` arm below, which resumes Insert once
-                        // the ex-command actually runs (#804, "C-o :s").
+                        // Mode::Command is exempt: `<C-o>:s/a/b/<CR>` is still one command
+                        // spanning several keystrokes — see the `Mode::Command` arm below,
+                        // which resumes Insert once the ex-command actually runs.
                         self.insert_ctrl_o_active = false;
                     }
                     // If pending_key/operator is set, keep flag active for next iteration
@@ -696,7 +678,7 @@ impl Engine {
                 // Ctrl-O auto-return, continued: an ex-command entered via
                 // `<C-o>:` counts as the one command <C-o> promised, so
                 // resume Insert once it has run (mode is back to Normal) —
-                // see the `Mode::Normal` arm above for the common case (#804).
+                // see the `Mode::Normal` arm above for the common case.
                 if self.insert_ctrl_o_active && self.mode == Mode::Normal {
                     self.mode = Mode::Insert;
                     self.start_undo_group();
@@ -758,7 +740,7 @@ impl Engine {
         }
 
         // Track where insert mode was entered (for Ctrl-U boundary, and
-        // 'backspace''s "start" token, #1206)
+        // 'backspace''s "start" token)
         if !matches!(pre_mode, Mode::Insert) && self.mode == Mode::Insert {
             self.insert_enter_col = self.view().cursor.col;
             self.insert_enter_line = self.view().cursor.line;
@@ -779,7 +761,7 @@ impl Engine {
             }
             self.set_dirty(true);
 
-            // #1623: TextChanged (any mode but Insert/Replace) or
+            // TextChanged (any mode but Insert/Replace) or
             // TextChangedI (while typing). `plugin_event` itself is the cheap
             // gate — it bails out before building any context when no hook
             // is registered for the event name, so this costs one HashMap
@@ -853,7 +835,7 @@ impl Engine {
             }
         }
 
-        // #1623: CursorMoved/CursorMovedI debounce — independent of the
+        // CursorMoved/CursorMovedI debounce — independent of the
         // legacy Normal-mode-only tracking just above, which must keep its
         // exact firing scope. Covers every mode a cursor motion makes sense
         // in, including Insert (typing moves the cursor every keystroke,
@@ -874,7 +856,7 @@ impl Engine {
     /// Insert-mode variant (`from_insert`) also inserts it at the cursor,
     /// "as if typed" like any other `<C-r>` register paste. `<Esc>` cancels
     /// without touching the `=` register, matching `i_CTRL-R_CTRL-R`'s
-    /// abort behavior (#806).
+    /// abort behavior.
     fn handle_expr_register_key(&mut self, key_name: &str, unicode: Option<char>) -> EngineAction {
         let Some((from_insert, mut buf)) = self.expr_register_pending.take() else {
             return EngineAction::None;
@@ -1017,13 +999,12 @@ impl Engine {
 
             // A command inside the macro failed (`f{char}` not found, `j`/`k`
             // already at a buffer edge, …): real Vim aborts the rest of this
-            // macro invocation *and* any outstanding repeat count right here
-            // (#806, "mac:10@a stops at failure"). This is also what makes a
-            // self-referential recursive macro terminate at EOF instead of
-            // spinning to `MAX_MACRO_RECURSION` — the trailing `@a` that
-            // would re-queue another pass is still sitting unexpanded at the
-            // front of the queue when the failure happens, so clearing here
-            // discards it before it ever runs (#806, "mac:recursive").
+            // macro invocation *and* any outstanding repeat count right here.
+            // This is also what makes a self-referential recursive macro
+            // terminate at EOF instead of spinning to `MAX_MACRO_RECURSION` — the
+            // trailing `@a` that would re-queue another pass is still sitting
+            // unexpanded at the front of the queue when the failure happens, so
+            // clearing here discards it before it ever runs.
             if self.command_failed {
                 self.macro_playback_queue.clear();
             }
@@ -1070,7 +1051,7 @@ impl Engine {
                 return self.cmdline_window_execute();
             }
             if unicode == Some('q') && self.pending_key.is_none() {
-                // #1297: the cmdline window is a split in the current tab,
+                // The cmdline window is a split in the current tab,
                 // not a whole tab — close just the window.
                 self.close_window();
                 return EngineAction::None;
@@ -1100,7 +1081,7 @@ impl Engine {
                 "d" => {
                     // <C-d>: half-page down. An explicit count SETS the
                     // sticky 'scroll' value (replacing, not multiplying, any
-                    // previous one); a bare <C-d> reuses it (#805).
+                    // previous one); a bare <C-d> reuses it.
                     let explicit = self.count.take();
                     if let Some(n) = explicit {
                         self.scroll_value = Some(n.max(1));
@@ -1131,7 +1112,7 @@ impl Engine {
                         self.open_find_replace();
                         return EngineAction::None;
                     }
-                    // <C-f>: full page(s) forward, 2-line overlap (#805).
+                    // <C-f>: full page(s) forward, 2-line overlap.
                     let count = self.take_count();
                     for _ in 0..count {
                         self.page_down();
@@ -1163,8 +1144,7 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "o" => {
-                    // Ctrl-O: jump list back, `N<C-o>` repeats N times
-                    // (#806, "jump:3<C-o>" — this previously ignored its count).
+                    // Ctrl-O: jump list back, `N<C-o>` repeats N times.
                     let count = self.take_count().max(1);
                     for _ in 0..count {
                         self.jump_list_back();
@@ -1192,7 +1172,7 @@ impl Engine {
                 "g" => {
                     // Ctrl-G: show file info (Vim compat).
                     //
-                    // #1282: verified against a live `nvim --headless -u
+                    // Verified against a live `nvim --headless -u
                     // NONE` `msg_show` event that Neovim's default
                     // `'ruler'` — on, unlike classic Vim's `'noruler'`
                     // default (`settings.ruler`'s own doc comment) — makes
@@ -1224,7 +1204,7 @@ impl Engine {
                 "e" => {
                     // Ctrl-E: scroll down one line (fold-aware). The cursor
                     // only moves if the scroll pushed it out of view — and
-                    // then only as far as 'scrolloff' requires (#805).
+                    // then only as far as 'scrolloff' requires.
                     let count = self.take_count();
                     self.scroll_viewport_with_cursor(1, count);
                     return EngineAction::None;
@@ -1248,14 +1228,12 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "6" | "^" => {
-                    // Ctrl-^ (Ctrl-6): edit alternate file. #1281: some
-                    // backends report this combo as the base key ("6",
-                    // physical Ctrl+6) and some as the shifted glyph
-                    // Ctrl+Shift+6 actually types ("^") — Neovim's own
-                    // `<C-^>` termcode decodes to the same control byte
-                    // either way (`:h CTRL-^`), so both spellings dispatch
-                    // here rather than only one silently doing nothing.
-                    // Takes priority over Ctrl+6 focus group
+                    // Ctrl-^ (Ctrl-6): edit alternate file. Some backends report this
+                    // combo as the base key ("6", physical Ctrl+6) and some as the shifted
+                    // glyph Ctrl+Shift+6 actually types ("^") — Neovim's own `<C-^>`
+                    // termcode decodes to the same control byte either way (`:h CTRL-^`),
+                    // so both spellings dispatch here rather than only one silently doing
+                    // nothing. Takes priority over Ctrl+6 focus group.
                     self.alternate_buffer();
                     return EngineAction::None;
                 }
@@ -1275,7 +1253,7 @@ impl Engine {
                     // TUI maps the raw '\' to "backslash"; the GTK ShellApp key
                     // path forwards the raw char "\\". Accept both so the split
                     // fires on every backend (mirrors the "bracketright" | "]"
-                    // dual-match above). (#515)
+                    // dual-match above).
                     self.open_editor_group(SplitDirection::Vertical);
                     return EngineAction::None;
                 }
@@ -1355,10 +1333,9 @@ impl Engine {
                 let count = self.take_count();
                 for _ in 0..count {
                     if !self.move_down() {
-                        // Already at the last line: a macro/`:normal` playing
-                        // this back must stop here (#806, "mac:recursive" —
-                        // this is what makes a self-referential macro
-                        // terminate at EOF instead of spinning forever).
+                        // Already at the last line: a macro/`:normal` playing this back must
+                        // stop here. This is what makes a self-referential macro terminate at
+                        // EOF instead of spinning forever.
                         self.command_failed = true;
                         break;
                     }
@@ -1383,20 +1360,17 @@ impl Engine {
                 self.insert_repeat_count = self.take_count();
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
-                // Unlike `a`/`A`/`I` (which all recompute the target column
-                // from the line's content), plain single-cursor `i` inserts
-                // at whatever column the cursor already holds. Real Vim's
-                // main loop revalidates the cursor against the Normal-mode
-                // end-of-line column before dispatching every command;
-                // vimcode has no equivalent per-keystroke revalidation, so
-                // if the cursor is ever sitting one column past the last
-                // char while still nominally in Normal mode, `i` would
-                // insert there instead of at the last valid column -- which
-                // then lets `<C-w>` delete one word too many (confirmed
-                // against Neovim, #1003 "dot:i<C-w> ."). Gated on
-                // `extra_cursors.is_empty()`: vimcode's VSCode-style
-                // multi-cursor mode has no Vim oracle and deliberately
-                // allows a cursor to sit at end-of-line (see
+                // Unlike `a`/`A`/`I` (which all recompute the target column from the
+                // line's content), plain single-cursor `i` inserts at whatever column
+                // the cursor already holds. Real Vim's main loop revalidates the cursor
+                // against the Normal-mode end-of-line column before dispatching every
+                // command; vimcode has no equivalent per-keystroke revalidation, so
+                // if the cursor is ever sitting one column past the last char while
+                // still nominally in Normal mode, `i` would insert there instead of at
+                // the last valid column — which then lets `<C-w>` delete one word too
+                // many. Gated on `extra_cursors.is_empty()`: vimcode's VSCode-style
+                // multi-cursor mode has no Vim oracle and deliberately allows a cursor
+                // to sit at end-of-line (see
                 // `test_multi_cursor_tab_advances_to_each_cursors_own_next_tabstop`),
                 // so this clamp must not touch that path.
                 if self.view().extra_cursors.is_empty() {
@@ -1426,7 +1400,7 @@ impl Engine {
                 // Undo group must start AFTER the cursor moves to the append
                 // position: `cursor_before` is what `u` restores to (clamped
                 // back into the line), and Vim restores to where the insert
-                // began, not to the pre-`A` cursor position (#886).
+                // began, not to the pre-`A` cursor position.
                 self.start_undo_group();
                 self.set_mode(Mode::Insert);
             }
@@ -1484,11 +1458,10 @@ impl Engine {
                 self.insert_text_buffer.clear();
                 self.view_mut().cursor.line += 1;
                 self.view_mut().cursor.col = indent_len;
-                // `o` opens a brand-new line containing nothing but the
-                // auto-indent, so it's always "untouched" at this point —
-                // mirrors the `<CR>` path's tracking so a bare `<Esc>`
-                // removes the indent again instead of leaving a
-                // whitespace-only line (`:h 'autoindent'`, #883).
+                // `o` opens a brand-new line containing nothing but the auto-indent,
+                // so it's always "untouched" at this point — mirrors the `<CR>` path's
+                // tracking so a bare `<Esc>` removes the indent again instead of
+                // leaving a whitespace-only line (`:h 'autoindent'`).
                 self.insert_indent_only_line = if !indent.is_empty() {
                     Some(self.view().cursor.line)
                 } else {
@@ -1584,7 +1557,7 @@ impl Engine {
                 // `'virtualedit'` "all"/"onemore" (verified against `nvim
                 // --headless`: `$` alone stays put, only a *subsequent*
                 // motion like `l` goes past it) — the bonus column belongs
-                // to `move_right`, not here (#1153).
+                // to `move_right`, not here.
                 self.view_mut().cursor.col = self.get_max_cursor_col(line);
                 self.curswant = Some(CURSWANT_EOL);
             }
@@ -1608,7 +1581,7 @@ impl Engine {
                     let char_idx = self.buffer().line_to_char(line) + col;
                     // Calculate how many chars we can actually delete
                     let line_end = self.buffer().line_to_char(line) + content_len;
-                    // Counted in cursor cells, not raw codepoints (#1005):
+                    // Counted in cursor cells, not raw codepoints:
                     // `x` on a combining-mark cluster deletes the whole
                     // cluster as one cell, matching `nvim`.
                     let to_delete = self.cluster_chars_len(char_idx, count, line_end);
@@ -1697,7 +1670,7 @@ impl Engine {
             }
             Some('H') => {
                 // H: jump to line [count] from top of visible screen, kept
-                // at least 'scrolloff' lines from the top (#805).
+                // at least 'scrolloff' lines from the top.
                 let count = self.take_count().max(1);
                 let target = self.screen_top_target(count);
                 self.push_jump_location();
@@ -1705,9 +1678,9 @@ impl Engine {
             }
             Some('M') => {
                 // M: jump to the middle of the lines actually visible.
-                // Unlike H/L, M ignores 'scrolloff' (#805) — and its count
+                // Unlike H/L, M ignores 'scrolloff' — and its count
                 // (`:h M`), but the count must still be consumed or it leaks
-                // into the next command (#807).
+                // into the next command.
                 let _ = self.take_count();
                 let mid = self.middle_visible_line();
                 self.push_jump_location();
@@ -1715,7 +1688,7 @@ impl Engine {
             }
             Some('L') => {
                 // L: jump to line [count] from bottom of visible screen,
-                // kept at least 'scrolloff' lines from the bottom (#805).
+                // kept at least 'scrolloff' lines from the bottom.
                 let count = self.take_count().max(1);
                 let target = self.screen_bottom_target(count);
                 self.push_jump_location();
@@ -1731,12 +1704,9 @@ impl Engine {
                 self.count = None;
             }
             Some('(') => {
-                // (: backward sentence. Only pushes a jump when the sentence
-                // start lands on a different line — verified against real
-                // Neovim, same rule as `%` (#806, "jump:C-o after (": pushing
-                // unconditionally here made `<C-o>` snap straight back to
-                // the pre-`(` column instead of leaving a same-line move
-                // alone).
+                // (: backward sentence. Only pushes a jump when the sentence start
+                // lands on a different line — verified against real Neovim, same rule
+                // as `%`.
                 let count = self.take_count();
                 let pre_cursor = self.view().cursor;
                 for _ in 0..count {
@@ -1904,12 +1874,10 @@ impl Engine {
                             .slice(line_start..delete_end)
                             .chars()
                             .collect();
-                        // `S` register content is linewise (`:h registers`) —
-                        // same as `cc` (#806, "reg:\"1 after cc"): even though
-                        // the buffer edit only clears the line's content and
-                        // leaves the newline in place, a subsequent `P` must
-                        // paste the yanked text back as a whole line above
-                        // the cursor, not inline.
+                        // `S` register content is linewise (`:h registers`) — same as `cc`:
+                        // even though the buffer edit only clears the line's content and
+                        // leaves the newline in place, a subsequent `P` must paste the yanked
+                        // text back as a whole line above the cursor, not inline.
                         let reg = self.active_register();
                         self.set_delete_register(reg, format!("{}\n", deleted), true);
                         self.clear_selected_register();
@@ -2135,18 +2103,15 @@ impl Engine {
                     let fnb = self.first_non_blank_col(target);
                     self.view_mut().cursor.col = fnb;
                     // `N%` scrolls like any other jump — minimally, via the
-                    // `ensure_cursor_visible()` call `handle_key` already
-                    // makes after dispatch (#805: verified against real
-                    // interactive Neovim — a 50%-of-60-lines jump lands the
-                    // target line at the *bottom* of the window, not
-                    // centered; see scripts/nvim_headless_vs_interactive_repro.sh).
+                    // `ensure_cursor_visible()` call `handle_key` already makes after
+                    // dispatch: verified against real interactive Neovim — a 50%-of-60-lines
+                    // jump lands the target line at the *bottom* of the window, not
+                    // centered.
                 } else {
-                    // `%` always moves the `` ` `` pcmark, but only appends
-                    // to the persistent jumplist when the matched bracket is
-                    // on a DIFFERENT line — verified against real Neovim:
-                    // `getjumplist()` stays empty for a same-line match, yet
-                    // `` `` `` still returns to the pre-`%` column (#806,
-                    // "jump:% C-o" vs "mark:`` after %").
+                    // `%` always moves the `` ` `` pcmark, but only appends to the
+                    // persistent jumplist when the matched bracket is on a DIFFERENT line
+                    // — verified against real Neovim: `getjumplist()` stays empty for a
+                    // same-line match, yet `` `` `` still returns to the pre-`%` column.
                     let pre_cursor = self.view().cursor;
                     self.move_to_matching_bracket();
                     self.record_jump_from(pre_cursor);
@@ -2244,10 +2209,8 @@ impl Engine {
                     }
                 }
                 // `:h 'whichwrap'`: `<BS>`/`<Space>` as Normal-mode motions
-                // (`b`/`s` tokens — the *default* `'whichwrap'` value, so
-                // these wrap into the previous/next line out of the box).
-                // There was no Normal-mode handling for either key at all
-                // before #1206 — both silently no-op'd.
+                // (`b`/`s` tokens — the *default* `'whichwrap'` value, so these wrap
+                // into the previous/next line out of the box).
                 "BackSpace" => {
                     let count = self.take_count();
                     for _ in 0..count {
@@ -2257,7 +2220,7 @@ impl Engine {
                 // Both spellings: real key events use "Space" (see
                 // `tui_main::shell_app`'s `Key::Char(' ')` mapping) but
                 // `encode_keypress`/`decode_keypress` and existing tests
-                // also use lowercase "space" interchangeably (#1206).
+                // also use lowercase "space" interchangeably.
                 "space" | "Space" => {
                     let count = self.take_count();
                     for _ in 0..count {
@@ -2328,20 +2291,13 @@ impl Engine {
                         } else {
                             0
                         };
-                        // `gg`, like `G`/`H`/`M`/`L`, is `curswant`-preserving
-                        // (see `land_line_jump_cursor`'s own doc comment,
-                        // #1772). `'startofline'` (`Settings::startofline`,
-                        // #876) is OFF by default (Neovim's default; Vim's is
-                        // ON), so out of the box `gg` never jumps to column
-                        // 0/first-non-blank; it keeps the remembered desired
-                        // column (clamped to the target line's length), and
-                        // that column survives even an intervening jump
-                        // through a shorter line (verified against `nvim
-                        // --headless`, the conformance oracle this repo's
-                        // tests run against; see #806 review — a real `vim`
-                        // binary's `col('.')` after `gg` is not a substitute
-                        // for the actual nvim oracle used by
-                        // `tests/nvim_conformance.rs`).
+                        // `gg`, like `G`/`H`/`M`/`L`, is `curswant`-preserving (see
+                        // `land_line_jump_cursor`'s own doc comment). `'startofline'`
+                        // (`Settings::startofline`) is OFF by default (Neovim's default; Vim's
+                        // is ON), so out of the box `gg` never jumps to column 0/first-non-blank;
+                        // it keeps the remembered desired column (clamped to the target line's
+                        // length), and that column survives even an intervening jump through a
+                        // shorter line.
                         self.land_line_jump_cursor(target_line);
                     }
                 }
@@ -2360,7 +2316,6 @@ impl Engine {
                             // Include the character at end_pos: ge is naturally
                             // inclusive of its landing character (:help ge), so
                             // `v`-forcing must shrink this range, not grow it
-                            // (#881 review).
                             self.apply_charwise_operator_inclusive(
                                 op,
                                 end_pos,
@@ -2406,10 +2361,8 @@ impl Engine {
                 Some('_') => {
                     // g_: last non-blank character of line (count: Nth line below)
                     if let Some(op) = self.pending_operator.take() {
-                        // dg_: delete to the last non-blank character (#1279 —
-                        // this arm used to ignore `pending_operator` entirely,
-                        // so `dg_` moved the cursor and left the buffer
-                        // untouched instead of deleting).
+                        // dg_: delete to the last non-blank character. This arm now handles
+                        // `pending_operator`.
                         let count = self.take_count();
                         let start_cursor = self.view().cursor;
                         let start_pos =
@@ -2426,7 +2379,7 @@ impl Engine {
                         // `start_pos` — the cursor must land on `lo`, not
                         // unconditionally back on `start_cursor`, or a `dg_`
                         // from mid-trailing-whitespace leaves the cursor one
-                        // column right of where Neovim puts it (#1279).
+                        // column right of where Neovim puts it.
                         let (lo, hi) = if end_pos >= start_pos {
                             (start_pos, end_pos)
                         } else {
@@ -2708,11 +2661,10 @@ impl Engine {
                     }
                 }
                 Some(',') => {
-                    // g,: jump to next (newer) change position. Symmetric with
-                    // g; above: g; decrements-then-looks-up, so g, must
-                    // increment-then-look-up too, or it just re-visits the
-                    // entry the last g; already landed on instead of
-                    // advancing past it (#891, "jump:g; g; g,").
+                    // g,: jump to next (newer) change position. Symmetric with g; above:
+                    // g; decrements-then-looks-up, so g, must increment-then-look-up too,
+                    // or it just re-visits the entry the last g; already landed on instead
+                    // of advancing past it.
                     if self.change_list.is_empty() {
                         self.message = "Change list is empty".to_string();
                     } else if self.change_list_pos + 1 >= self.change_list.len() {
@@ -2729,7 +2681,7 @@ impl Engine {
                 Some('m') => {
                     // gm: go to middle of screen line. The count is ignored,
                     // but it must still be CONSUMED or it leaks into the next
-                    // command (#807).
+                    // command.
                     self.take_count();
                     let vp_cols = self.view().viewport_cols;
                     let mid = vp_cols / 2;
@@ -2737,9 +2689,8 @@ impl Engine {
                     self.clamp_cursor_col();
                 }
                 Some('M') => {
-                    // gM: go to the character `count` percent into the line,
-                    // defaulting to 50 — i.e. the middle (`:h gM`). Before
-                    // #807 the count was ignored *and* leaked.
+                    // gM: go to the character `count` percent into the line, defaulting to
+                    // 50 — i.e. the middle (`:h gM`). The count is no longer ignored.
                     let pct = self.peek_count().filter(|n| *n <= 100).unwrap_or(50);
                     self.take_count();
                     let line = self.view().cursor.line;
@@ -2755,7 +2706,7 @@ impl Engine {
                     if char_idx < self.buffer().content.len_chars() {
                         let ch = self.buffer().content.char(char_idx);
                         let code = ch as u32;
-                        // #1282: Neovim spells this "Octal", not "Oct" —
+                        // Neovim spells this "Octal", not "Oct" —
                         // verified against a live `nvim --headless -u NONE`
                         // `msg_show` event for `ga`.
                         self.message = format!(
@@ -2826,27 +2777,12 @@ impl Engine {
                     self.clamp_cursor_col();
                 }
                 Some('x') => {
-                    // gx: open the word/URL under cursor externally. #1134:
-                    // this used to shell out to a bare call to the Linux
-                    // freedesktop.org opener with no `target_os` guard at
-                    // all — the most severe of the four hand-rolled per-OS
-                    // openers this issue removed, since it ran that Linux
-                    // opener even on macOS and Windows.
-                    //
-                    // No `is_safe_url` gate here, deliberately, unlike
-                    // `Engine::open_url`'s markdown-link callers: this was
-                    // never gated before (any word went straight to the
-                    // opener) and `word_under_cursor` only ever returns a
-                    // run of `'iskeyword'` characters (`Engine::is_word_char`,
-                    // #1191) — with the default `'iskeyword'`, `:` and `/`
-                    // are never keyword characters, so a scheme like
-                    // `https://…` can never survive that tokenizer intact,
-                    // and an `is_safe_url` check here would reject every
-                    // input and make `gx` permanently inert. Queuing
-                    // unconditionally preserves the exact pre-#1134
-                    // behavior; only the opener mechanism changed, from a
-                    // raw per-OS `Command::new` to
-                    // `PlatformServices::open_url_result` via the queue.
+                    // gx: open the word/URL under cursor externally. No `is_safe_url`
+                    // gate here, deliberately: `word_under_cursor` only ever returns a run
+                    // of `'iskeyword'` characters — with the default `'iskeyword'`, `:` and
+                    // `/` are never keyword characters, so a scheme like `https://…` can
+                    // never survive that tokenizer intact, and an `is_safe_url` check here
+                    // would reject every input and make `gx` permanently inert.
                     if let Some(word) = self.word_under_cursor() {
                         self.message = format!("Opening: {}", word);
                         self.pending_platform_actions
@@ -2863,7 +2799,7 @@ impl Engine {
                 }
                 Some('q') => {
                     if self.pending_operator == Some('q') {
-                        // gqgq: doubled operator — same as gqq (#807).
+                        // gqgq: doubled operator — same as gqq.
                         self.pending_operator = None;
                         let count = self.take_count().max(1);
                         let line = self.view().cursor.line;
@@ -2877,7 +2813,7 @@ impl Engine {
                 Some('w') => {
                     if self.pending_operator == Some('Q') {
                         // gwgw: doubled operator — same as gww; `gw` keeps the
-                        // cursor where it was (#807).
+                        // cursor where it was.
                         self.pending_operator = None;
                         let count = self.take_count().max(1);
                         let line = self.view().cursor.line;
@@ -2903,7 +2839,7 @@ impl Engine {
                 }
                 Some('?') => {
                     if self.pending_operator == Some('R') {
-                        // g?g?: doubled operator — same as g?? (#807).
+                        // g?g?: doubled operator — same as g??.
                         self.pending_operator = None;
                         let count = self.take_count().max(1);
                         let line = self.view().cursor.line;
@@ -2996,12 +2932,10 @@ impl Engine {
                     }
                 }
                 Some('z') => {
-                    // ]z: move to end of current open fold. Uses the
-                    // *defined* fold hierarchy (open or closed), not just
-                    // `folds` (closed only, #1006) — otherwise this never
-                    // finds the open fold it's specifically documented to
-                    // move within (`:h ]z`, verified against `nvim
-                    // --headless`).
+                    // ]z: move to end of current open fold. Uses the *defined* fold
+                    // hierarchy (open or closed), not just closed folds — otherwise this
+                    // never finds the open fold it's specifically documented to move within
+                    // (`:h ]z`).
                     let line = self.view().cursor.line;
                     if let Some(end) = self.view().enclosing_fold_def(line).map(|f| f.end) {
                         self.view_mut().cursor.line = end;
@@ -3081,7 +3015,7 @@ impl Engine {
                 Some('z') => {
                     // [z: move to start of current open fold — see the `]z`
                     // comment above for why this uses `enclosing_fold_def`
-                    // rather than `folds` (#1006).
+                    // rather than `folds`.
                     let line = self.view().cursor.line;
                     if let Some(start) = self.view().enclosing_fold_def(line).map(|f| f.start) {
                         self.view_mut().cursor.line = start;
@@ -3119,7 +3053,7 @@ impl Engine {
                 // Uppercase A-Z appends to lowercase register. `_` is the black
                 // hole (reads/writes go nowhere — `:h quote_`); `.`, `/`, `%`,
                 // `#`, `:`, `-` are the read-mostly special registers (`:h
-                // registers`); `=` opens the expression-register prompt (#806).
+                // registers`); `=` opens the expression-register prompt.
                 if let Some(ch) = unicode {
                     if ch == '=' {
                         self.selected_register = Some('=');
@@ -3152,8 +3086,7 @@ impl Engine {
                     } else if ch.is_ascii_lowercase() {
                         self.start_macro_recording(ch);
                     } else if ch.is_ascii_uppercase() {
-                        // qA: append to register "a" instead of overwriting
-                        // it (`:h q`, #806 "mac:qA append").
+                        // qA: append to register "a" instead of overwriting it (`:h q`).
                         self.start_macro_recording_append(ch.to_ascii_lowercase());
                     } else {
                         self.message = "Invalid register for macro".to_string();
@@ -3188,7 +3121,7 @@ impl Engine {
                         // @Q plays the same register as @q: register names
                         // read case-insensitively (`:h quote_alpha`) — only
                         // *writing* (`qA`, `"Ayy`) distinguishes upper from
-                        // lower as overwrite-vs-append (#890).
+                        // lower as overwrite-vs-append.
                         let count = self.take_count();
                         let _ = self.play_macro_with_count(ch.to_ascii_lowercase(), count);
                     } else {
@@ -3209,9 +3142,8 @@ impl Engine {
                     }
                     // Remember this find for ; and , repeat
                     self.last_find = Some((pending, target));
-                    // Target not found on the line: a macro/`:normal` playing
-                    // this back must stop here rather than continue on as if
-                    // it succeeded (#806, "mac:10@a stops at failure").
+                    // Target not found on the line: a macro/`:normal` playing this back
+                    // must stop here rather than continue on as if it succeeded.
                     if !found {
                         self.command_failed = true;
                     }
@@ -3300,11 +3232,9 @@ impl Engine {
                 if let Some(ch) = unicode {
                     match ch {
                         '\'' => {
-                            // '' jumps to the position before the last jump —
-                            // and IS ITSELF a jump, so it toggles: read the
-                            // target before `push_jump_location` overwrites
-                            // `last_jump_pos` with where we're jumping FROM
-                            // (#806, "mark:'' toggles").
+                            // '' jumps to the position before the last jump — and IS ITSELF a
+                            // jump, so it toggles: read the target before `push_jump_location`
+                            // overwrites `last_jump_pos` with where we're jumping FROM.
                             if let Some((line, _)) = self.last_jump_pos {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
                                 let target = line.min(max_line);
@@ -3342,7 +3272,7 @@ impl Engine {
                             }
                         }
                         '[' => {
-                            // '[ jump to start of last change (#806, "mark:'[ after >>")
+                            // '[ jump to start of last change
                             if let Some((line, _)) = self.last_change_start {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
                                 let target = line.min(max_line);
@@ -3481,9 +3411,8 @@ impl Engine {
                 if let Some(ch) = unicode {
                     match ch {
                         '`' => {
-                            // `` jumps to the exact position before the last
-                            // jump — and toggles, same as '' (#806, "mark:``
-                            // after ''").
+                            // `` jumps to the exact position before the last jump — and toggles,
+                            // same as ''.
                             if let Some((line, col)) = self.last_jump_pos {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
                                 let target_line = line.min(max_line);
@@ -3536,9 +3465,8 @@ impl Engine {
                             }
                         }
                         '[' => {
-                            // `` `[ ``: jump to the exact start of the last
-                            // change/yank (#891, sibling of `'[` above, which
-                            // lands on first-non-blank instead of the exact
+                            // `` `[ ``: jump to the exact start of the last change/yank (sibling
+                            // of `'[` above, which lands on first-non-blank instead of the exact
                             // column — `:h '[`).
                             if let Some((line, col)) = self.last_change_start {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
@@ -3551,7 +3479,7 @@ impl Engine {
                         }
                         ']' => {
                             // `` `] ``: jump to the exact end of the last
-                            // change/yank (#891).
+                            // change/yank.
                             if let Some((line, col)) = self.last_change_end {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
                                 self.view_mut().cursor.line = line.min(max_line);
@@ -3574,11 +3502,8 @@ impl Engine {
                             }
                         }
                         _ if ch.is_ascii_uppercase() => {
-                            // `` `A ``: exact position, across files if the
-                            // mark was set in a different one (#1281 —
-                            // `resolve_global_mark`'s own doc comment has the
-                            // full history of why this used to be a same-
-                            // buffer-only no-op for a cross-file mark).
+                            // `` `A ``: exact position, across files if the mark was set in a
+                            // different one.
                             let pre_cursor = self.view().cursor;
                             if let Some(((target_line, target_col), switched)) =
                                 self.resolve_global_mark(ch, true)
@@ -3600,10 +3525,8 @@ impl Engine {
                 }
             }
             '\x07' => {
-                // g': jump to mark line WITHOUT adding to jump list. Like
-                // `'{mark}`, lands on the first non-blank — #1281 fixed this
-                // from a hardcoded column 0 (already documented as a
-                // `Partial` row in REGMARK_AUDIT's `g'{mark}` entry).
+                // g': jump to mark line WITHOUT adding to jump list. Like `'{mark}`,
+                // lands on the first non-blank.
                 if let Some(ch) = unicode {
                     if ch.is_ascii_lowercase() {
                         let buffer_id = self.active_window().buffer_id;
@@ -3622,7 +3545,7 @@ impl Engine {
                     } else if ch.is_ascii_uppercase() {
                         // g'A: across files if the mark was set in a
                         // different one, same fix as `` `A `` above but
-                        // never recording a jump (#1281).
+                        // never recording a jump.
                         if let Some(((target_line, _), _)) = self.resolve_global_mark(ch, false) {
                             self.view_mut().cursor.line = target_line;
                             self.view_mut().cursor.col = self.first_non_blank_col(target_line);
@@ -3650,7 +3573,7 @@ impl Engine {
                         }
                     } else if ch.is_ascii_uppercase() {
                         // g`A: across files if the mark was set in a
-                        // different one, never recording a jump (#1281).
+                        // different one, never recording a jump.
                         if let Some(((target_line, target_col), _)) =
                             self.resolve_global_mark(ch, false)
                         {
@@ -3719,12 +3642,9 @@ impl Engine {
                         self.pending_operator = Some('Z');
                     }
                     Some('F') => {
-                        // zF: create fold covering `count` lines total from
-                        // the cursor (default 1, i.e. no-op — there is
-                        // nothing to hide). #1280: this used to fold
-                        // `count + 1` lines (`line + count`, not
-                        // `line + count - 1`), off by one against Neovim —
-                        // `3zF` folded 4 lines instead of 3.
+                        // zF: create fold covering `count` lines total from the cursor
+                        // (default 1, i.e. no-op — there is nothing to hide). Folds `count`
+                        // lines, not `count + 1` (off-by-one fixed from earlier behavior).
                         let count = self.take_count();
                         let line = self.view().cursor.line;
                         let total = self.buffer().len_lines();
@@ -3768,7 +3688,7 @@ impl Engine {
         // Handle 'Z' sentinel for zf{motion} — fold creation operator.
         if operator == 'Z' {
             // zf{a/i}{object} (e.g. `zfap`) — same `i`/`a` text-object
-            // grammar as any other operator (#1006). This branch always
+            // grammar as any other operator. This branch always
             // returns before reaching the shared `pending_text_object`
             // dispatch further down in this function, so both halves of
             // that grammar (setting it, then consuming it on the next key)
@@ -4293,8 +4213,7 @@ impl Engine {
                 self.view_mut().cursor = start_cursor;
                 if end_pos >= start_pos {
                     let end = (end_pos + 1).min(self.buffer().len_chars());
-                    // E is naturally inclusive of its landing character, same
-                    // as e (:help E, #881 review).
+                    // E is naturally inclusive of its landing character, same as e (`:help E`).
                     self.apply_charwise_operator_inclusive(operator, start_pos, end, changed);
                 }
             }
@@ -4547,7 +4466,7 @@ impl Engine {
             Some('H') => {
                 // dH: delete from the current line to the [count]'th line from
                 // the top of the screen (linewise). The count used to be
-                // thrown away, making `d3H` behave as `dH` (#807).
+                // thrown away, making `d3H` behave as `dH`.
                 let count = self.take_count().max(1);
                 let current_line = self.view().cursor.line;
                 let top = self.screen_top_target(count);
@@ -4573,7 +4492,7 @@ impl Engine {
             }
             Some('L') => {
                 // dL: delete from the current line to the [count]'th line from
-                // the bottom of the screen (linewise) — see `dH` (#807).
+                // the bottom of the screen (linewise) — see `dH`.
                 let count = self.take_count().max(1);
                 let current_line = self.view().cursor.line;
                 let bot = self.screen_bottom_target(count);
@@ -4814,7 +4733,7 @@ impl Engine {
     /// `apply_charwise_operator_inclusive` goes through this, so `v`-forcing
     /// applies uniformly — each call site must pick the flag that matches
     /// how its own range was built, or `v`-forcing will grow/shrink the
-    /// range in the wrong direction (#881 review). It exists so `v` forcing
+    /// range in the wrong direction. It exists so `v` forcing
     /// (`:help o_v`) has something to toggle: forcing a charwise motion with
     /// `v` flips inclusive <-> exclusive in place, without touching which
     /// characters were selected in the first place.
@@ -4938,7 +4857,7 @@ impl Engine {
             '~' | 'u' | 'U' => {
                 self.apply_case_range(start, end, operator, changed);
                 // Like every other operator, `g~`/`gu`/`gU` leave the cursor
-                // at the start of the region they changed (#807).
+                // at the start of the region they changed.
                 self.move_cursor_to_range_start(start);
             }
             'R' => {
@@ -5041,7 +4960,7 @@ impl Engine {
         // A linewise command that touches any part of a closed fold applies
         // to the fold's entire range (`:h fold-behavior`) — verified
         // against `nvim --headless`: `dd`/`yy` on a closed fold's header
-        // remove/yank every line inside it, not just the header (#1006).
+        // remove/yank every line inside it, not just the header.
         let start_line = self
             .view()
             .enclosing_closed_fold(start_line)
@@ -5072,15 +4991,10 @@ impl Engine {
         self.force_motion_mode = None;
         let count = end_line - start_line + 1;
         self.view_mut().cursor.line = start_line;
-        // #1279: this used to also force `cursor.col = 0` here, but real Vim
-        // leaves the cursor on its original column for `d`/`y` through this
-        // path (verified against `nvim --headless`: `dj`/`y}` from col 2
-        // land back on col 2, matching plain `dd`'s own `delete_lines` —
-        // see that function's doc comment, which this preamble was
-        // silently overriding for every *other* linewise motion routed
-        // through here). The operator arms below that need a specific
-        // column (`c`, `~`/`u`/`U`/`R`, `@`) already set one explicitly, so
-        // they are unaffected.
+        // Real Vim leaves the cursor on its original column for `d`/`y` through this path
+        // (verified against `nvim --headless`: `dj`/`y}` from col 2 land back on col 2, matching
+        // plain `dd`'s own `delete_lines`). The operator arms below that need a specific column
+        // (`c`, `~`/`u`/`U`/`R`, `@`) already set one explicitly, so they are unaffected.
         match operator {
             'y' => {
                 self.yank_lines(count);
@@ -5255,7 +5169,7 @@ impl Engine {
         // above already accounts for that with `+1`); F/T are naturally
         // exclusive of the cursor's original position (:help f, :help F).
         // This only matters when `v` forces the motion charwise-toggled
-        // (#881 review) — otherwise it's a no-op.
+        // — otherwise it's a no-op.
         if find_type == 'f' || find_type == 't' {
             self.apply_charwise_operator_inclusive(operator, range_start, range_end, changed);
         } else {
@@ -5274,12 +5188,9 @@ impl Engine {
         let col = self.view().cursor.col;
         let cursor_char = self.buffer().line_to_char(line) + col;
 
-        // `:h gn` / `:h gN` — "If the cursor is on the match, visually
-        // selects it." This applies regardless of direction, and takes
-        // priority over searching forward/backward: a strict `<`/`>=`
-        // comparison against the cursor would otherwise skip straight past
-        // the match the cursor is already sitting in (wrapping `gN` to the
-        // *last* match instead of reselecting the current one, #889).
+        // `:h gn` / `:h gN` — "If the cursor is on the match, visually selects it." This applies
+        // regardless of direction: a strict `<`/`>=` comparison against the cursor would otherwise
+        // skip straight past the match the cursor is already sitting in.
         let on_match = self
             .search_matches
             .iter()
@@ -5288,7 +5199,7 @@ impl Engine {
         // `:h gn`: "like the `n` command" — so it honours `'wrapscan'` the
         // same way `search_next`/`search_prev` do: off, and no match in the
         // requested direction, stay put with the matching E384/E385 message
-        // instead of wrapping (#1153 review).
+        // instead of wrapping.
         let idx = if let Some(i) = on_match {
             i
         } else if backward {
@@ -5434,7 +5345,7 @@ impl Engine {
                 // this just focuses the panel — the same fallback the
                 // palette's plain `chat_open` action already has.
                 //
-                // #1507: this arm only ever runs to *enter* the panel — once
+                // This arm only ever runs to *enter* the panel — once
                 // `ai_has_focus` is true, every keystroke (including this
                 // same leader sequence typed again) routes straight to
                 // `render::route_ai_chat_event` instead of reaching
@@ -5451,7 +5362,7 @@ impl Engine {
                     self.acp_attach_visual_selection_and_focus();
                 } else {
                     self.ai_has_focus = true;
-                    // #1507 review: this is a fresh entry into the panel, so
+                    // This is a fresh entry into the panel, so
                     // any `<leader>ai` partial match left buffered from a
                     // previous session (this arm bypasses
                     // `clear_sidebar_focus`, unlike `focus_sidebar_panel`)
@@ -5495,14 +5406,14 @@ impl Engine {
                 self.toggle_inline_blame();
             }
             "ak" => {
-                // #1517: in-buffer inline review — keep the agent hunk
+                // In-buffer inline review — keep the agent hunk
                 // under the cursor. Deliberately not bare `a`/`r` (those
                 // are vim's own append/replace-char) — see `acp_turn_ops.
                 // rs`'s "in-buffer inline review" section doc.
                 self.acp_inline_review_keep_at_cursor();
             }
             "ar" => {
-                // #1517: in-buffer inline review — revert the agent hunk
+                // In-buffer inline review — revert the agent hunk
                 // under the cursor to its pre-turn content.
                 self.acp_inline_review_reject_at_cursor();
             }
@@ -5698,18 +5609,15 @@ impl Engine {
         self.apply_charwise_operator('c', start_pos, end, changed);
     }
 
-    /// Shared body for the `j`/`k` operator-pending handlers (`dj`/`dk` and
-    /// their `v`-forced charwise variants `dvj`/`dvk`).
+    /// Shared body for the `j`/`k` operator-pending handlers (`dj`/`dk` and their `v`-forced
+    /// charwise variants `dvj`/`dvk`).
     ///
-    /// `j`/`k` are ordinarily linewise, so the un-forced case just uses the
-    /// caller-computed whole-line `line_range`. But `:help o_v` says
-    /// forcing a linewise motion charwise takes "the cursor position" as
-    /// one end and "the position the motion would move the cursor to" as
-    /// the other — i.e. the *exact* landing column, not the whole target
-    /// line. Rather than reimplementing that column (curswant, folds via
-    /// `is_line_hidden`, …), this runs the real `move_down`/`move_up` to
-    /// find it, then rewinds the cursor before either operator applies
-    /// (#881, `op:dvj charwise force`).
+    /// `j`/`k` are ordinarily linewise, so the un-forced case just uses the caller-computed
+    /// whole-line `line_range`. But `:help o_v` says forcing a linewise motion charwise takes
+    /// "the cursor position" as one end and "the position the motion would move the cursor to"
+    /// as the other — the *exact* landing column, not the whole target line. Rather than
+    /// reimplementing that column (curswant, folds via `is_line_hidden`, …), this runs the real
+    /// `move_down`/`move_up` to find it, then rewinds the cursor before either operator applies.
     fn apply_vertical_operator_motion(
         &mut self,
         operator: char,
@@ -5888,10 +5796,9 @@ impl Engine {
             self.view_mut().cursor = end_cursor;
         }
 
-        // `e` is naturally inclusive of its last character (`delete_end`
-        // above already accounts for that with `+1`); `w`/`b` are
-        // naturally exclusive. This only matters when `v` forces the
-        // motion charwise-toggled (#881, `dve`); otherwise it's a no-op.
+        // `e` is naturally inclusive of its last character (`delete_end` above already accounts
+        // for that with `+1`); `w`/`b` are naturally exclusive. This only matters when `v`
+        // forces the motion charwise-toggled; otherwise it's a no-op.
         if motion == 'e' {
             self.apply_charwise_operator_inclusive(operator, delete_start, delete_end, changed);
         } else {
@@ -6096,8 +6003,7 @@ impl Engine {
             if operator == 'y' {
                 self.set_yank_register(reg, text, false);
             } else {
-                // `%` always goes to "1 even though the matched region is
-                // often less than a line (#806, "d% goes to \"1").
+                // `%` always goes to "1 even though the matched region is often less than a line.
                 self.set_delete_register_special_motion(reg, text, false);
             }
             self.clear_selected_register();
@@ -6175,25 +6081,20 @@ impl Engine {
         self.insert_repeat_count = 0;
     }
 
-    /// Splits the undo group: moving the cursor with an arrow key during
-    /// Insert mode starts a new change, so `u` after `ifoo<Left>bar<Esc>`
-    /// undoes only "bar", not the whole insert (#804, "undo:arrow breaks
-    /// undo"). Must run *after* the cursor has moved, so the new group's
-    /// saved cursor is the position the next edit will actually start from.
-    /// `finish_undo_group`/`start_undo_group` are no-ops on an empty group,
-    /// so this is free when nothing was typed yet.
+    /// Splits the undo group: moving the cursor with an arrow key during Insert mode starts a
+    /// new change, so `u` after `ifoo<Left>bar<Esc>` undoes only "bar", not the whole insert.
+    /// Must run *after* the cursor has moved, so the new group's saved cursor is the position
+    /// the next edit will actually start from. `finish_undo_group`/`start_undo_group` are no-ops
+    /// on an empty group, so this is free when nothing was typed yet.
     ///
-    /// Also re-anchors the `'backspace'` `"start"` / Ctrl-U boundary
-    /// (`insert_enter_line`/`insert_enter_col`) to the cursor's post-move
-    /// position. This mirrors real Vim's `stop_arrow()` (`edit.c`), which
-    /// resets `Insstart` on exactly these cursor-movement keys — confirmed
-    /// against real Neovim 0.12.5: `:set backspace=indent,eol` (no
-    /// `start`), enter Insert, type multi-line text, arrow onto a
-    /// pre-existing line and BackSpace is refused outright even though
-    /// that line is nowhere near the line Insert was originally entered on
-    /// (#1206 review). Without this, `line != insert_enter_line` alone
-    /// would wrongly treat *any* non-entry line — including one the user
-    /// merely arrow-navigated to — as "typed this session".
+    /// Also re-anchors the `'backspace'` `"start"` / Ctrl-U boundary (`insert_enter_line`/
+    /// `insert_enter_col`) to the cursor's post-move position. This mirrors real Vim's
+    /// `stop_arrow()` (`edit.c`), which resets `Insstart` on exactly these cursor-movement keys
+    /// — confirmed against real Neovim 0.12.5: `:set backspace=indent,eol` (no `start`), enter
+    /// Insert, type multi-line text, arrow onto a pre-existing line and BackSpace is refused
+    /// outright even though that line is nowhere near the line Insert was originally entered on.
+    /// Without this, `line != insert_enter_line` alone would wrongly treat *any* non-entry line
+    /// — including one the user merely arrow-navigated to — as "typed this session".
     fn split_insert_undo_group(&mut self) {
         self.finish_undo_group();
         self.start_undo_group();
@@ -6207,7 +6108,7 @@ impl Engine {
     /// `insert_indent_only_line` points at (set when `<CR>` last created an
     /// indent-only line and nothing but `<BS>`/`<C-d>` has touched it since —
     /// a plain "is this line blank" check would also strip a line the user
-    /// deliberately emptied with `<C-u>`, which Vim does not do (#804).
+    /// deliberately emptied with `<C-u>`, which Vim does not do.
     /// Moves the cursor to column 0 when it strips.
     fn strip_blank_current_line_indent(&mut self, changed: &mut bool) {
         let line = self.view().cursor.line;
@@ -6240,7 +6141,7 @@ impl Engine {
     /// Expand any literal tabs in text about to be bulk-inserted (`<C-r>`
     /// register insertion), the same way a real `<Tab>` keypress would be
     /// expanded — `:h i_CTRL-R` inserts the register "as if typed", and that
-    /// includes 'expandtab' (#804). `start_col` is the column the first
+    /// includes 'expandtab'. `start_col` is the column the first
     /// character lands at; each embedded `\n` resets the column to 0 for the
     /// next line.
     fn expand_tabs_for_insert(&self, content: &str, start_col: usize) -> String {
@@ -6272,7 +6173,7 @@ impl Engine {
 
     /// Insert register/expression content at the cursor "as if typed"
     /// (`:h i_CTRL-R`) — shared by plain `<C-r>{reg}` and the result of
-    /// `<C-r>=expr<CR>` (#806). Expands embedded tabs per 'expandtab' and
+    /// `<C-r>=expr<CR>`. Expands embedded tabs per 'expandtab' and
     /// advances the cursor line-by-line for a linewise (or otherwise
     /// multi-line) register instead of just adding the raw character count.
     fn insert_register_content_at_cursor(&mut self, content: &str) {
@@ -6312,7 +6213,7 @@ impl Engine {
         ctrl: bool,
         changed: &mut bool,
     ) {
-        // `'showmatch'` (#1207): the flash from a previous key (if any) ends
+        // `'showmatch'`: the flash from a previous key (if any) ends
         // as soon as another key arrives — matching real Vim, where the
         // momentary jump to the matching bracket lasts only until the next
         // key or `'matchtime'` elapses (`'matchtime'` itself is out of
@@ -6320,7 +6221,7 @@ impl Engine {
         // if *this* key is a closing bracket with a match.
         self.showmatch_flash = None;
 
-        // ── Terminal ctrl-key aliases (#804) ──────────────────────────────────
+        // ── Terminal ctrl-key aliases ─────────────────────────────────────────
         // In a real terminal, crossterm delivers `<C-h>` as ctrl+'h' (byte
         // 0x08), `<C-j>`/`<C-m>` as ctrl+'j'/'m' (bytes 0x0A/0x0D), and
         // `<C-c>`/`<C-[>` as ctrl+'c'/'bracketleft' — none of those are the
@@ -6369,7 +6270,7 @@ impl Engine {
         {
             self.insert_indent_only_line = None;
         }
-        // A run of <Down>/<Up> remembers its want-column (#804); any other
+        // A run of <Down>/<Up> remembers its want-column; any other
         // key ends the run.
         if key_name != "Down" && key_name != "Up" {
             self.insert_vertical_want_col = None;
@@ -6437,12 +6338,10 @@ impl Engine {
             return;
         }
 
-        // ── Ctrl-K: digraph entry (`:h i_CTRL-K`, #1160) ──────────────────────
-        // Checked after the Ctrl-X block above (see its comment) so
-        // `<C-x><C-k>` reaches dictionary completion rather than digraph
-        // entry. Otherwise takes priority over everything else so the two
-        // characters typed after `<C-k>` (often themselves punctuation like
-        // `:`, `'`, `>`) aren't intercepted by an unrelated binding below.
+        // Ctrl-K: digraph entry (`:h i_CTRL-K`). Checked after the Ctrl-X block above so
+        // `<C-x><C-k>` reaches dictionary completion rather than digraph entry. Otherwise takes
+        // priority over everything else so the two characters typed after `<C-k>` (often themselves
+        // punctuation like `:`, `'`, `>`) aren't intercepted by an unrelated binding below.
         if ctrl && key_name == "k" && self.insert_ctrl_k_pending.is_none() {
             self.insert_ctrl_k_pending = Some(None);
             return;
@@ -6632,9 +6531,8 @@ impl Engine {
             self.insert_ctrl_r_pending = true;
             return;
         }
-        // When Ctrl+R pending, next char selects the register to insert.
-        // `=` doesn't paste directly — it opens the expression prompt (#806,
-        // "reg:C-r = in insert"), same as `"=` in Normal mode.
+        // When Ctrl+R pending, next char selects the register to insert. `=` doesn't paste
+        // directly — it opens the expression prompt, same as `"=` in Normal mode.
         if self.insert_ctrl_r_pending {
             self.insert_ctrl_r_pending = false;
             if unicode == Some('=') {
@@ -6656,7 +6554,7 @@ impl Engine {
         // Vim ignores the insert-start column entirely and deletes back to
         // the first non-blank instead — leaving autoindent alone unless the
         // indent is all there is before the cursor, in which case that goes
-        // too (#804).
+        // too.
         if ctrl && key_name == "u" {
             let line = self.view().cursor.line;
             let col = self.view().cursor.col;
@@ -6676,12 +6574,9 @@ impl Engine {
             return;
         }
 
-        // Ctrl+O: execute one normal-mode command then return to insert
-        // (`:h i_CTRL-O`). "If the cursor was beyond the end of the line, it
-        // will be put on the last character" — clamp now, before the one
-        // command runs, exactly like leaving insert mode via <Esc> does
-        // (#804, "A C-o h": without this, `h` from insert's one-past-eol
-        // column lands one column too far right).
+        // Ctrl+O: execute one normal-mode command then return to insert (`:h i_CTRL-O`). "If the
+        // cursor was beyond the end of the line, it will be put on the last character" — clamp now,
+        // before the one command runs, exactly like leaving insert mode via <Esc> does.
         if ctrl && key_name == "o" {
             self.finish_undo_group();
             self.mode = Mode::Normal;
@@ -6690,10 +6585,9 @@ impl Engine {
             return;
         }
 
-        // Ctrl+V: insert next character literally, or — when it's a digit,
-        // or one of o/O (octal), x/X (hex), u (hex4), U (hex8) — accumulate
-        // the decimal/octal/hex/unicode value of a character to insert
-        // instead (`:h i_CTRL-V_digit`, #804).
+        // Ctrl+V: insert next character literally, or — when it's a digit, or one of o/O (octal),
+        // x/X (hex), u (hex4), U (hex8) — accumulate the decimal/octal/hex/unicode value of a
+        // character to insert instead (`:h i_CTRL-V_digit`).
         if ctrl && key_name == "v" {
             self.insert_ctrl_v_pending = true;
             return;
@@ -6771,8 +6665,8 @@ impl Engine {
         // Ctrl+W: delete word backward from cursor (`:h i_CTRL-W`). Respects
         // Vim's three word classes (blank / keyword / punctuation) so
         // "foo.bar" only loses "bar", not the whole run of non-blank chars
-        // (#804) — and at column 1, joins with the previous line exactly
-        // like BackSpace does, then keeps the joined cursor position (#804).
+        // — and at column 1, joins with the previous line exactly
+        // like BackSpace does, then keeps the joined cursor position.
         if ctrl && key_name == "w" {
             let line = self.view().cursor.line;
             let col = self.view().cursor.col;
@@ -6811,7 +6705,7 @@ impl Engine {
                 }
             } else if line > 0 && self.settings.backspace_allows("eol") {
                 // At column 1: join with the previous line, same as BackSpace
-                // — including the `'backspace'` `"eol"` gate (#1206).
+                // — including the `'backspace'` `"eol"` gate.
                 let prev_line_len = self.buffer().line_len_chars(line - 1);
                 let new_col = prev_line_len.saturating_sub(1);
                 let char_idx = self.buffer().line_to_char(line);
@@ -7024,7 +6918,7 @@ impl Engine {
 
         match key_name {
             "Escape" => {
-                // Vim abbreviation expansion (#1152): <Esc> is one of the
+                // Vim abbreviation expansion: <Esc> is one of the
                 // trigger events, and must run before the autoindent-strip
                 // below — it operates on the same "text before cursor" that
                 // an abbreviation match consumes.
@@ -7032,7 +6926,7 @@ impl Engine {
                     *changed = true;
                 }
                 // `:h 'autoindent'` — leaving a line that's still nothing but
-                // the auto-inserted indent removes that indent (#804).
+                // the auto-inserted indent removes that indent.
                 self.strip_blank_current_line_indent(changed);
                 // Apply visual block insert/append to the remaining lines.
                 //
@@ -7111,7 +7005,7 @@ impl Engine {
                         let insert_pos = if has_nl { insert_pos - 1 } else { insert_pos };
                         // Repeat the *indented* line, not just the typed
                         // text — `2ox<Esc>` on an indented line repeats
-                        // "  x", not "x" (#804).
+                        // "  x", not "x".
                         let new_line = format!("\n{}{}", self.insert_open_indent, text);
                         self.insert_with_undo(insert_pos, &new_line);
                         self.view_mut().cursor.line += 1;
@@ -7213,7 +7107,7 @@ impl Engine {
                     // 'softtabstop' (clamped to the start of the contiguous
                     // blank run so it never eats non-blank text), wherever
                     // the run is on the line (not just at the front of it)
-                    // — verified against `nvim --headless` (#1153). Distinct
+                    // — verified against `nvim --headless`. Distinct
                     // from the 'smarttab'-driven `leading_blanks` rule
                     // above: that one always uses 'shiftwidth' and only
                     // fires when *every* character before the cursor is
@@ -7246,9 +7140,9 @@ impl Engine {
                         // `:h smarttab`: with 'smarttab' on (checked above),
                         // backspacing within leading indentation removes a
                         // whole 'shiftwidth' worth of blanks (rounded to the
-                        // previous stop), not one space at a time (#804).
+                        // previous stop), not one space at a time.
                         // Off, a plain one-character BackSpace applies here
-                        // too, via the `col > 0` branch below (#1001).
+                        // too, via the `col > 0` branch below.
                         let sw = self.effective_shift_width().max(1);
                         let new_col = ((col - 1) / sw) * sw;
                         self.delete_with_undo(line_start + new_col, char_idx);
@@ -7263,7 +7157,7 @@ impl Engine {
                         // `:h 'backspace'`: without the `"start"` token,
                         // BackSpace refuses to delete at or before the
                         // position where the current Insert session began
-                        // (#1206). This has to be its own `col > 0` arm
+                        //. This has to be its own `col > 0` arm
                         // rather than folded into the condition — falling
                         // through to `else if` here would hit the
                         // `line > 0` line-join branch below even though
@@ -7295,7 +7189,7 @@ impl Engine {
                         // token — gated here rather than earlier so every
                         // other BackSpace behavior (auto-pair, softtabstop,
                         // smarttab) stays available up to the true start of
-                        // the line regardless of `'backspace'` (#1206).
+                        // the line regardless of `'backspace'`.
                         let prev_line_len = self.buffer().line_len_chars(line - 1);
                         let new_col = if prev_line_len > 0 {
                             prev_line_len - 1
@@ -7333,7 +7227,7 @@ impl Engine {
                     self.insert_text_buffer.push('\n');
                     *changed = true;
                 } else {
-                    // Vim abbreviation expansion (#1152): <CR> is a trigger
+                    // Vim abbreviation expansion: <CR> is a trigger
                     // event, run before the newline split below so the split
                     // sees the expanded text (matches Vim, and lines up with
                     // the same ordering used for the <Esc> trigger above).
@@ -7343,12 +7237,12 @@ impl Engine {
                     // content before any stripping below touches it — the
                     // second <CR> in `A<CR><CR>x` must still copy the first
                     // line's indent even though the (untouched, blank)
-                    // intermediate line is about to be emptied out (#804).
+                    // intermediate line is about to be emptied out.
                     let indent = self.smart_indent_for_newline(line);
                     let indent_len = indent.len();
                     // `:h 'autoindent'`: pressing <CR> on a line that's
                     // nothing but the not-yet-typed-on autoindent removes
-                    // that indent first (#804).
+                    // that indent first.
                     self.strip_blank_current_line_indent(changed);
                     let line = self.view().cursor.line;
                     let col = self.view().cursor.col;
@@ -7401,7 +7295,7 @@ impl Engine {
             }
             "Tab" => {
                 if !self.view().extra_cursors.is_empty() {
-                    // #804 review: use the same next-tabstop/smarttab-aware
+                    // Use the same next-tabstop/smarttab-aware
                     // calculation as the single-cursor path below, per
                     // cursor, instead of always inserting a fixed
                     // `tabstop`-width block of spaces.
@@ -7420,9 +7314,9 @@ impl Engine {
                         // `:h smarttab`: with 'smarttab' on, in front of a
                         // line (nothing but blanks before the cursor) Tab
                         // advances using 'shiftwidth'; everywhere else — and
-                        // always, with 'smarttab' off (#1001) — it uses
+                        // always, with 'smarttab' off — it uses
                         // 'tabstop'. In both cases it advances to the *next*
-                        // stop, not a fixed count of spaces (#804).
+                        // stop, not a fixed count of spaces.
                         let line_start = self.buffer().line_to_char(line);
                         let front_of_line = self.settings.smarttab
                             && (0..col).all(|i| {
@@ -7431,7 +7325,7 @@ impl Engine {
                         // `:h 'softtabstop'`: when set (and not overridden by
                         // 'smarttab' at the front of the line, which always
                         // uses 'shiftwidth'), Tab advances to the next
-                        // 'softtabstop' stop instead of 'tabstop' (#1153).
+                        // 'softtabstop' stop instead of 'tabstop'.
                         let sts = self.effective_softtabstop();
                         let stop = if front_of_line {
                             self.effective_shift_width().max(1)
@@ -7468,7 +7362,7 @@ impl Engine {
                 self.cancel_insert_repeat_count();
                 if self.view().cursor.line > 0 {
                     // Remember the column this vertical run started at
-                    // (#804) — clamping to each intermediate line's length
+                    // — clamping to each intermediate line's length
                     // would otherwise lose it permanently, not just while
                     // passing through a short line.
                     let want = self
@@ -7511,7 +7405,7 @@ impl Engine {
                 if unicode.is_none() && self.plugin_run_keymap("i", key_name) {
                     // keymap handled it — skip default character insertion
                 } else if ctrl {
-                    // Catch-all (#804): every ctrl combo this function knows
+                    // Catch-all: every ctrl combo this function knows
                     // how to handle has already matched an explicit arm above
                     // and returned. Anything reaching here is an unrecognised
                     // ctrl combo — Vim either ignores it or binds it to
@@ -7603,7 +7497,7 @@ impl Engine {
                             }
                         }
                     }
-                    // `'smartindent'`/`'cindent'` (#1207): typing '#' as the
+                    // `'smartindent'`/`'cindent'`: typing '#' as the
                     // first non-blank character on a line moves it to
                     // column 0.
                     if ch == '#' {
@@ -7623,7 +7517,7 @@ impl Engine {
                             }
                         }
                     }
-                    // `'showmatch'` (#1207): briefly flag the matching
+                    // `'showmatch'`: briefly flag the matching
                     // opening bracket after typing a closer, reusing `%`'s
                     // own `find_matching_bracket` rather than reimplementing
                     // bracket search. This deliberately does not move
@@ -7657,7 +7551,7 @@ impl Engine {
                         self.ensure_lsp_manager();
                         self.lsp_request_signature_help();
                     }
-                    // Vim abbreviation expansion (#1152): any typed
+                    // Vim abbreviation expansion: any typed
                     // non-keyword character is a trigger — the character
                     // itself was already inserted above and stays put
                     // (`trailing = 1`), only the word/sequence before it may
@@ -7702,7 +7596,7 @@ impl Engine {
         // Build the final string to insert.
         // Replace \r\n and \r with \n. Do NOT auto-indent — pasted text
         // already carries its own whitespace; adding indent causes a
-        // cumulative staircase effect (see #65).
+        // cumulative staircase effect.
         let to_insert = text.replace("\r\n", "\n").replace('\r', "\n");
 
         self.insert_with_undo(char_idx, &to_insert);
@@ -7759,7 +7653,7 @@ impl Engine {
     /// `handle_command_key`'s `"Tab"` arm unchanged — see
     /// `Settings::wildmode_is_plain_full`). Builds the candidate list on
     /// the first press of a round, then applies the flags active for each
-    /// press per `Settings::wildmode_stage_at` (#1206).
+    /// press per `Settings::wildmode_stage_at`.
     fn wildmode_tab_press(&mut self, is_backtab: bool) {
         if is_backtab {
             // `:h 'wildmode'` doesn't special-case Shift-Tab per stage —
@@ -7808,7 +7702,7 @@ impl Engine {
     }
 
     /// Apply one `'wildmode'` stage's flags to the already-populated
-    /// `wildmenu_items` (#1206). `longest` takes priority over a
+    /// `wildmenu_items`. `longest` takes priority over a
     /// co-occurring `full` on the same stage (`:h 'wildmode'`:
     /// `"longest:full"` "does not cycle through full matches").
     fn apply_wildmode_stage(&mut self, stage: crate::core::settings::WildmodeStage) {
@@ -7945,7 +7839,7 @@ impl Engine {
                 EngineAction::None
             }
             "Return" => {
-                // Vim abbreviation expansion (#1152): <CR> is a trigger event
+                // Vim abbreviation expansion: <CR> is a trigger event
                 // for `:cabbrev`/`:abbreviate` on the command line, run
                 // before the buffer is captured so the expanded text is what
                 // actually executes (`:cabbrev W w` then typing `:W<CR>`
@@ -8079,7 +7973,7 @@ impl Engine {
 
                 // `'wildmode'` != the bare default "full" drives a
                 // genuinely different, stage-based completion sequence
-                // (#1206) — see `wildmode_tab_press` and
+                // — see `wildmode_tab_press` and
                 // `Settings::wildmode_is_plain_full`'s doc comment for why
                 // the default itself keeps this legacy path unchanged.
                 if !self.settings.wildmode_is_plain_full() {
@@ -8194,7 +8088,7 @@ impl Engine {
                                 cmd_char_to_byte(&self.command_buffer, self.command_cursor);
                             self.command_buffer.insert(byte_off, ch);
                             self.command_cursor += 1;
-                            // Vim abbreviation expansion (#1152): any typed
+                            // Vim abbreviation expansion: any typed
                             // non-keyword character on the command line is a
                             // trigger for `:cabbrev`/`:abbreviate`, same rule
                             // as Insert mode.
@@ -8544,7 +8438,7 @@ impl Engine {
 
         // Handle mode switching: v toggles to Visual, V toggles to VisualLine.
         // Skipped while a prefix key is pending, or the `v` of `gv` would
-        // toggle Visual off instead of completing the command (#807).
+        // toggle Visual off instead of completing the command.
         if let Some(ch) = unicode.filter(|_| self.pending_key.is_none()) {
             match ch {
                 'v' => {
@@ -8599,7 +8493,7 @@ impl Engine {
         // Normal mode's backtick handling (the `pending == '`'` arm further
         // up in `handle_key`) only ever runs there; Visual mode fell through
         // to the catch-all and treated `` ` `` as a no-op, so `v\`ad` never
-        // extended the selection (#887).
+        // extended the selection.
         if !ctrl && self.pending_key.is_none() && unicode == Some('`') {
             self.pending_key = Some('`');
             return EngineAction::None;
@@ -8633,7 +8527,7 @@ impl Engine {
                 // Uppercase operators (`:h v_D`, `v_X`, `v_Y`, `v_C`, `v_S`,
                 // `v_R`) act LINEWISE on the selected lines whatever the
                 // current Visual mode is — except in Visual-Block, where `D`
-                // and `C` instead extend the block to end-of-line (#807).
+                // and `C` instead extend the block to end-of-line.
                 'D' | 'X' | 'Y' | 'C' | 'S' | 'R' if self.pending_key.is_none() => {
                     self.count = None;
                     if self.mode == Mode::VisualBlock && matches!(ch, 'D' | 'C' | 'X') {
@@ -8715,8 +8609,6 @@ impl Engine {
                 }
                 '=' if self.pending_key.is_none() => {
                     // Visual `=`: re-indent the selected lines (`:h v_=`).
-                    // VIM_COMPATIBILITY.md claimed this worked long before it
-                    // did — #807 makes the claim true.
                     self.count = None;
                     if let Some((start, end)) = self.get_visual_selection_range() {
                         let start_line = start.line;
@@ -8938,7 +8830,7 @@ impl Engine {
             if pending == '"' {
                 // Register selection: "x (uppercase A-Z appends to lowercase).
                 // See the Normal-mode `'"'` arm for the full register-name
-                // rationale (#806); `=` opens the expression-register prompt
+                // rationale; `=` opens the expression-register prompt
                 // the same way there, rather than silently leaving
                 // `selected_register` set with no prompt ever shown (#806
                 // review).
@@ -8984,7 +8876,7 @@ impl Engine {
                     // or paragraph), same as `find_paragraph_object`'s
                     // count>1 path already does for an explicit `2ip`/`2ap`.
                     // Detect that by walking `try_count` up while it keeps
-                    // reproducing the current selection (#887).
+                    // reproducing the current selection.
                     if obj_type == 'p' && count == 1 {
                         if let Some(anchor) = self.visual_anchor {
                             let anchor_pos = self.buffer().line_to_char(anchor.line) + anchor.col;
@@ -9152,7 +9044,7 @@ impl Engine {
             } else if pending == 'g' && unicode == Some('J') {
                 // Visual `gJ`: join the selected lines without inserting or
                 // collapsing white space (`:h v_gJ`) — another row
-                // VIM_COMPATIBILITY.md marked ✅ before it existed (#807).
+                // VIM_COMPATIBILITY.md marked ✅ before it existed.
                 self.count = None;
                 if let Some((start, end)) = self.get_visual_selection_range() {
                     let line_count = end.line - start.line + 1;
@@ -9284,8 +9176,7 @@ impl Engine {
                 self.visual_dollar = false;
             }
             Some('^') => {
-                // `^` in Visual mode — was unbound before #807, so `v^d`
-                // deleted only the character under the cursor.
+                // `^` in Visual mode — moves to the first non-blank character of the line.
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.first_non_blank_col(line);
                 self.visual_dollar = false;
@@ -9492,7 +9383,7 @@ impl Engine {
         // `handle_key` has already appended it to `recording_buffer` by the
         // time we get here — so the keys this replay synthesizes must not be
         // appended as well, or `qax.jq` records `x.xj` instead of `x.j` and
-        // `@a` then performs one edit too many (#803).
+        // `@a` then performs one edit too many.
         let saved_recording = self.macro_recording.take();
         let mut queue: VecDeque<char> = keys.chars().collect();
         while let Some((key_name, unicode, ctrl, consume)) = self.decode_key_from_queue(&queue) {
@@ -9558,7 +9449,7 @@ impl Engine {
         // keys, which are recorded when `macro_playback_queue` is later pumped
         // through `handle_key`), but `@:` re-runs the ex command inline — and
         // an ex command is not dot-repeatable at all — so `.` after `:d<CR>@:`
-        // must not delete a third line (#803). Drop the whole `@…` span.
+        // must not delete a third line. Drop the whole `@…` span.
         if self.pending_key == Some('@') {
             self.dot_skip_command = true;
         }
@@ -9774,7 +9665,7 @@ impl Engine {
             "ExtDisable",
             "ExtRemove",
             "ExtRefresh",
-            // Notifications (#1577)
+            // Notifications
             "Notifications",
             "NotifyFocus",
             // AI
@@ -9922,7 +9813,7 @@ impl Engine {
                     .filter(|m| m.starts_with(arg_partial))
                     .map(|m| format!("Keybindings {m}"))
                     .collect(),
-                // #1520: `:AiConfig <id> <value>` — complete the id
+                // `:AiConfig <id> <value>` — complete the id
                 // against declared config option ids/names first; once a
                 // second space starts the value half, complete against
                 // that specific option's declared values instead.
@@ -9957,7 +9848,7 @@ impl Engine {
                             .collect()
                     }
                 }
-                // #1520: `:AiModel <name>` completes against the
+                // `:AiModel <name>` completes against the
                 // `category: "model"` config option's declared values —
                 // there is only ever one positional argument, unlike
                 // `:AiConfig`.
@@ -10041,10 +9932,10 @@ impl Engine {
     /// Call after loading or changing settings. Expands the `<leader>`
     /// notation marker against `Settings::leader` here (rather than in the
     /// free-standing `parse_keymap_def`, which has no settings access), on
-    /// both the lhs and any key-to-keys rhs (#1151).
+    /// both the lhs and any key-to-keys rhs.
     pub fn rebuild_user_keymaps(&mut self) {
         let leader = self.settings.leader.to_string();
-        // #1623: a `vimcode.keymap.set` entry isn't derived from
+        // A `vimcode.keymap.set` entry isn't derived from
         // `settings.keymaps` at all (load-time ones are merged in by
         // `Engine::set_plugin_manager`; runtime ones are pushed directly by
         // the immediate API) — rebuilding from settings alone would silently
@@ -10078,7 +9969,7 @@ impl Engine {
     /// since vimcode has no separate Select mode to tell them apart. `o`
     /// (operator-pending) replaces `n` while an operator awaits its motion,
     /// matching vim: only o-mode maps (and built-in motions) apply then, not
-    /// plain Normal-mode maps (#1151).
+    /// plain Normal-mode maps.
     fn active_keymap_modes(&self) -> &'static [&'static str] {
         if self.is_vscode_mode() {
             // VSCode mode has no modal distinction; "n" keymaps apply.
@@ -10102,7 +9993,7 @@ impl Engine {
         }
     }
 
-    // ─── User abbreviations (#1152) ─────────────────────────────────────────
+    // ─── User abbreviations ─────────────────────────────────────────────────
 
     /// Rebuild the parsed user_abbrevs cache from settings.abbreviations.
     /// Call after loading or changing settings (mirrors `rebuild_user_keymaps`).
@@ -10223,7 +10114,7 @@ impl Engine {
             if !active_modes.contains(&km.mode.as_str()) {
                 continue;
             }
-            // #1623: a buffer-local Lua keymap (`vimcode.keymap.set(..., {buffer
+            // A buffer-local Lua keymap (`vimcode.keymap.set(..., {buffer
             // = handle})`) only matches while that buffer is active.
             if km.buffer.is_some_and(|b| b != active_buffer) {
                 continue;
@@ -10256,11 +10147,10 @@ impl Engine {
                     self.execute_command(&cmd)
                 }
                 UserKeymapAction::Keys(rhs) => {
-                    // Vim: a count typed before a key-to-keys mapping is
-                    // inserted before the rhs's own keys, not used to repeat
-                    // the whole rhs — `nnoremap X dw` + `3X` types "3dw", so
-                    // the built-in count+operator handling (not this code)
-                    // consumes it.
+                    // A count typed before a key-to-keys mapping is inserted before
+                    // the rhs's own keys, not used to repeat the whole rhs — `nnoremap X dw`
+                    // + `3X` types "3dw", so the built-in count+operator handling
+                    // (not this code) consumes it.
                     let mut feed: Vec<String> = Vec::new();
                     if let Some(n) = explicit_count {
                         feed.extend(n.to_string().chars().map(|c| c.to_string()));
@@ -10274,13 +10164,11 @@ impl Engine {
 
         if has_prefix {
             // More keys needed — consume this keypress. Arm/refresh the
-            // 'timeoutlen' deadline (#1206): each keystroke that extends an
+            // 'timeoutlen' deadline: each keystroke that extends an
             // still-ambiguous buffer gets its own full 'timeoutlen' window,
-            // matching Vim's "waited... for a key code or mapped key
-            // sequence to complete" (`:h 'timeoutlen'`). `0` means "no
-            // timed wait" — leave `keymap_buf_deadline` unset so
-            // `tick_keymap_timeout` never fires and the buffer only
-            // resolves on the next keystroke, exactly like before #1206.
+            // matching Vim's behavior. `0` means "no timed wait" — leave
+            // `keymap_buf_deadline` unset so `tick_keymap_timeout` never fires
+            // and the buffer only resolves on the next keystroke.
             self.keymap_buf_deadline = (self.settings.timeoutlen > 0).then(|| {
                 std::time::Instant::now()
                     + std::time::Duration::from_millis(self.settings.timeoutlen as u64)
@@ -10317,20 +10205,18 @@ impl Engine {
         Some(last_action)
     }
 
-    /// Idle-tick companion to [`Self::try_user_keymap`] (`poll_idle`,
-    /// #1206): if a keypress buffer has been sitting as an unresolved
-    /// mapping prefix for `'timeoutlen'` ms with no further keystroke, give
-    /// up waiting and dispatch it as the individual keys it contains.
+    /// Idle-tick companion to [`Self::try_user_keymap`]: if a keypress
+    /// buffer has been sitting as an unresolved mapping prefix for
+    /// `'timeoutlen'` ms with no further keystroke, give up waiting and
+    /// dispatch it as the individual keys it contains.
     ///
     /// Unlike [`Self::replay_keymap_buf`] (used when a *keystroke* proves
-    /// the buffer has no match — that keystroke's own `handle_key` call is
-    /// still on the stack and falls through to built-in handling for a
-    /// lone buffered key itself), a 1-key buffer here gets dispatched too:
+    /// the buffer has no match), a 1-key buffer here gets dispatched too:
     /// there is no live keystroke left to fall through on, and a 1-key
     /// buffer is the *common* case (typing the first key of a 2-key mapping
     /// and then pausing) — dropping it would silently eat that keystroke
-    /// instead of letting it act as the plain key it is (`:h 'timeoutlen'`).
-    /// Returns `true` if a redraw is needed (the replay changed something).
+    /// instead of letting it act as the plain key it is.
+    /// Returns `true` if a redraw is needed.
     pub fn tick_keymap_timeout(&mut self) -> bool {
         let Some(deadline) = self.keymap_buf_deadline else {
             return false;
@@ -10373,7 +10259,7 @@ impl Engine {
     /// a cyclic map (`handle_key` is a large function) *before* any depth
     /// counter got a chance to fire. This instead resolves the whole chain
     /// with an explicit work queue in a loop, so [`MAXMAPDEPTH`] expansions
-    /// cost one stack frame total, not 1000 (#1151 review).
+    /// cost one stack frame total, not 1000.
     fn feed_keymap_rhs(&mut self, rhs: &[String], top_noremap: bool) -> EngineAction {
         if top_noremap {
             return self.replay_keys_literal(rhs);
@@ -10447,7 +10333,7 @@ impl Engine {
         last
     }
 
-    /// Invoke a Lua keymap registered via `vimcode.keymap.set` (#1623),
+    /// Invoke a Lua keymap registered via `vimcode.keymap.set`,
     /// identified by its `UserKeymapAction::Lua` id. Applies whatever the
     /// callback did through the queued/immediate plugin APIs, then — for an
     /// `expr` map whose callback returned a string — feeds that string back
@@ -10493,10 +10379,9 @@ impl Engine {
 
     /// Try to run a named plugin command. Returns `true` if the command was found.
     ///
-    /// Returns `false` when called from inside a plugin callback — unlike an
-    /// event (which `Engine::plugin_event` defers), a command dispatch has to
-    /// answer "was it found?" synchronously, and Lua cannot be re-entered while
-    /// the engine is loaned to it (#1214, see `Engine::with_plugin_dispatch`).
+    /// Returns `false` when called from inside a plugin callback — a command
+    /// dispatch must answer synchronously, and Lua cannot be re-entered while
+    /// the engine is loaned to it.
     pub fn plugin_run_command(&mut self, name: &str, args: &str) -> bool {
         if !self.can_dispatch_to_plugins() {
             return false;
@@ -10570,7 +10455,7 @@ impl Engine {
         // Clicking into the editor returns keyboard focus to the buffer, so
         // any bottom-panel focus (quickfix, or this window's location list)
         // must be released — otherwise the panel keeps the `[FOCUS]` marker
-        // and j/k keep routing to the panel until Esc is pressed (#1155).
+        // and j/k keep routing to the panel until Esc is pressed.
         self.quickfix.has_focus = false;
         if let Some(list) = self.location_lists.get_mut(&window_id) {
             list.has_focus = false;
@@ -10619,7 +10504,7 @@ impl Engine {
                 self.mode = Mode::Visual;
                 // Mouse selection is inclusive-end (cursor lands on the
                 // hovered cell) in both Vim and VSCode mode — this helper
-                // has no VSCode-mode variant (#1788 review).
+                // has no VSCode-mode variant.
                 self.visual_end_exclusive = false;
             }
             self.mouse_drag_active = true;
@@ -10635,7 +10520,7 @@ impl Engine {
 
         if self.mouse_drag_word_mode {
             // Word-wise drag: snap to word boundaries. Inclusive-end, like
-            // double-click below — no VSCode-mode variant (#1788 review).
+            // double-click below — no VSCode-mode variant.
             self.visual_end_exclusive = false;
             if let Some((orig_start, orig_end, orig_line)) = self.mouse_drag_word_origin {
                 let line_text: Vec<char> =
@@ -10725,7 +10610,7 @@ impl Engine {
         }
 
         // Enter visual mode with anchor at word start, cursor at word end
-        // (inclusive) — no VSCode-mode variant (#1788 review).
+        // (inclusive) — no VSCode-mode variant.
         self.visual_end_exclusive = false;
         self.visual_anchor = Some(Cursor {
             line: cursor_line,
@@ -10799,13 +10684,8 @@ impl Engine {
             return;
         }
 
-        // Find/replace overlay. Checked ahead of `picker_open` — same
-        // relative priority `Engine::handle_key` gives the two overlays
-        // (`find_replace_open` is tested before `picker_open` there too;
-        // #946 discovery: this branch used to be entirely missing, so
-        // Ctrl+V while the overlay was open fell through to the
-        // `Mode::Normal` arm below and pasted into the editor buffer
-        // instead of the focused query/replacement field).
+        // Find/replace overlay. Checked ahead of `picker_open` — same relative
+        // priority `Engine::handle_key` gives the two overlays.
         if self.find_replace_open {
             self.find_replace_paste(text);
             return;
@@ -10825,11 +10705,8 @@ impl Engine {
         }
 
         // Tree inline-edit (explorer rename). Mirrors the selection-replace
-        // + insert behaviour `handle_explorer_rename_key`'s own `ctrl+v`
-        // branch already has — that branch reads `self.clipboard_read`
-        // directly and only ever fired from a raw `KeyPressed("v", ctrl)`,
-        // which quadraui's GTK runner no longer delivers (#593: Ctrl+V is
-        // intercepted and turned into this fn's `text` argument instead).
+        // + insert behaviour `handle_explorer_rename_key` already has for
+        // Ctrl+V — that branch reads `self.clipboard_read` directly.
         if let Some(state) = self.explorer_rename.as_mut() {
             if !first_line.is_empty() {
                 if let Some(anchor) = state.selection_anchor.take() {
@@ -10880,23 +10757,11 @@ impl Engine {
             return;
         }
 
-        // Settings panel search/edit input (#937 discovery, quadraui pin bump
-        // to 68f0ef9). Before that bump, TUI's own dispatch caught the raw
-        // `Ctrl+V` `KeyPressed` ahead of this function
-        // (`shell_app.rs::handle_key_pressed`'s `FocusKeyRoute::Settings`
-        // arm) and called `settings_paste` directly — this function never
-        // saw a settings-panel paste at all, so it never needed this branch.
-        // quadraui#813 moved Ctrl-V/Ctrl-Shift-V interception into the
-        // shared `runtime::preprocess_event` every backend's
-        // `dispatch_event` (TUI included, for the first time) now runs
-        // *before* `AppLogic::handle`, so the raw keypress no longer reaches
-        // that TUI-only arm — every Ctrl-V now arrives here as `route_paste`'s
-        // `text` argument instead, on every backend uniformly. Without this
-        // branch, a Settings-panel paste would fall through to the
-        // mode-based match below (whatever `self.mode` happens to be behind
-        // the panel) instead of the settings input the user is looking at.
-        // `settings_paste` already no-ops if neither settings state is
-        // active, so this mirrors `ai_has_focus` above exactly.
+        // Settings panel search/edit input. Ctrl+V is preprocessed by the
+        // runtime before reaching `AppLogic::handle`, so it arrives here as
+        // `route_paste`'s `text` argument on all backends uniformly. Without
+        // this branch, a Settings-panel paste would fall through to the
+        // mode-based match below (whatever `self.mode` is behind the panel).
         if self.settings_input_active || self.settings_editing.is_some() {
             self.settings_paste(text);
             return;

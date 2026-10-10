@@ -3,10 +3,9 @@ use super::*;
 /// Extract the first non-empty line of LSP server stderr (trimmed) and cap
 /// it at 100 display columns for the status-bar failure message.
 ///
-/// `stderr` is arbitrary, uncontrolled subprocess output — a byte-indexed
-/// slice (`&s[..100]`) can land mid-codepoint and panic if a multibyte
-/// character straddles byte offset 100. `quadraui::truncate_to_width`
-/// always cuts on a char boundary. See vimcode#620 / quadraui#472.
+/// `stderr` is arbitrary, uncontrolled subprocess output. Byte-indexed
+/// slicing can land mid-codepoint in multibyte UTF-8 characters and panic.
+/// `quadraui::truncate_to_width` always cuts on a char boundary.
 fn lsp_stderr_snippet(stderr: &str) -> &str {
     let snippet = stderr
         .lines()
@@ -27,7 +26,7 @@ impl Engine {
         body: Vec<String>,
         buttons: Vec<DialogButton>,
     ) {
-        // #953 (ACP-2): a still-open `session/request_permission` dialog
+        // A still-open `session/request_permission` dialog
         // getting replaced by an unrelated one must still produce exactly
         // one reply — a parked ACP request must never silently hang just
         // because some other event (e.g. a file-changed-on-disk prompt)
@@ -39,7 +38,7 @@ impl Engine {
 
         // Opening a dialog is a "user is now focused on this modal"
         // event — dismiss any passive overlays (LSP hover) so they
-        // don't render behind the dialog (#247).
+        // don't render behind the dialog.
         self.dismiss_editor_hover();
 
         self.dialog = Some(Dialog {
@@ -107,7 +106,7 @@ impl Engine {
         );
     }
 
-    /// `:CheckNerdFonts` (issue #999) — paint a sample row of a few
+    /// `:CheckNerdFonts` — paint a sample row of a few
     /// file-type glyphs next to their ASCII fallbacks and let the user say
     /// which one actually rendered.
     ///
@@ -211,7 +210,7 @@ impl Engine {
     /// `process_dialog_result(tag, "cancel", ..)`, the single function that
     /// owns what "cancel" means for a given dialog tag.
     ///
-    /// Used by the GTK native-message-dialog path (#727) when
+    /// Used by the GTK native-message-dialog path when
     /// `PlatformServices::show_message_dialog` returns `None` — the native
     /// alert was dismissed (Escape, close box) without a button choice, the
     /// same event the in-canvas dialog's Escape key produces. Returns
@@ -264,11 +263,8 @@ impl Engine {
                 }
                 None
             }
-            // "Shift_Tab" is sent by the TUI backend explicitly.
-            // "ISO_Left_Tab" is `render::engine_key_from_ui`'s spelling for
-            // `NamedKey::BackTab` (both backends, since #1060); "BackTab" is
-            // kept for any caller still on the pre-#1060 name. Accept all
-            // three so backward button cycling works on both backends.
+            // Accept "Tab", "Shift_Tab", "ISO_Left_Tab", and "BackTab" for
+            // backward button cycling across TUI backends.
             "Tab" | "Shift_Tab" | "ISO_Left_Tab" | "BackTab" => {
                 let len = dialog.buttons.len();
                 if len > 0 {
@@ -353,7 +349,7 @@ impl Engine {
         match tag {
             "swap_recovery" => self.process_swap_dialog_action(action),
             "confirm_board_action" => {
-                // #523: a provider-declared action the provider marked
+                // A provider-declared action the provider marked
                 // `confirm` — `Engine::run_board_action_by_name` stashed
                 // the already-resolved argv/label here rather than
                 // dispatching immediately.
@@ -531,7 +527,7 @@ impl Engine {
                 EngineAction::None
             }
             "review_comment" => {
-                // #527: `Engine::change_review_start_comment` opened this
+                // `Engine::change_review_start_comment` opened this
                 // dialog and recorded which comment it's for in
                 // `self.review_comment_target`; the resolution logic all
                 // lives on that method's sibling so it can be unit-tested
@@ -599,7 +595,7 @@ impl Engine {
                 EngineAction::None
             }
             "acp_permission" => {
-                // #953 (ACP-2): the one function that turns a dialog
+                // The one function that turns a dialog
                 // dismissal into the ACP reply. `dialog_click_button`/
                 // `handle_dialog_key`/`dialog_cancel` have already cleared
                 // `self.dialog` by the time this runs — only
@@ -632,7 +628,7 @@ impl Engine {
                 // rather than holding one `client` reference across the
                 // `remembered_decisions` mutation in between — the two now
                 // live in the same `AcpSession` behind `Engine::acp_sessions`
-                // (#1463), and unlike separate top-level `Engine` fields, a
+                //, and unlike separate top-level `Engine` fields, a
                 // `Vec` index can't be borrow-split field-by-field, so an
                 // in-flight `&AcpClient` borrowed via `self.acp()` would
                 // conflict with the `self.acp_mut()` mutation.
@@ -671,7 +667,7 @@ impl Engine {
                 EngineAction::None
             }
             "acp_auth_choice" => {
-                // #957 (ACP-6): "cancel" (Escape) and the "Continue without
+                // "cancel" (Escape) and the "Continue without
                 // auth" button both mean the same thing — the human
                 // declined to pick a method, so proceed to `session/new`
                 // unauthenticated and let the agent itself accept or
@@ -989,7 +985,7 @@ impl Engine {
                     Some(p) => p.clone(),
                     None => return,
                 };
-                // #208: lsp_diagnostics is keyed by the URI-derived canonical
+                // Lsp_diagnostics is keyed by the URI-derived canonical
                 // path (insertions in the Diagnostics handler use uri_to_path).
                 // Removing by the buffer's original `file_path` is a no-op
                 // when that path was relative, leaving stale diagnostics in
@@ -1025,14 +1021,12 @@ impl Engine {
         let dirty: Vec<BufferId> = self.lsp_dirty_buffers.keys().copied().collect();
         for buffer_id in dirty {
             self.lsp_dirty_buffers.remove(&buffer_id);
-            // `notify_path` is what we pass to LSP calls (path_to_uri
-            // canonicalizes internally). `key_path` is the canonical path
-            // used to key our own HashMaps (lsp_diagnostics,
-            // lsp_code_actions) — they're populated by handlers that
-            // decode the URI back via uri_to_path, which always yields the
-            // canonical absolute path. Removing by a relative `file_path`
-            // was silently a no-op (#208) — stale gutter markers persisted
-            // after git discard / revert until the server re-published.
+            // `notify_path` is what we pass to LSP calls (path_to_uri canonicalizes
+            // internally). `key_path` is the canonical path used to key our own
+            // HashMaps (lsp_diagnostics, lsp_code_actions) — they're populated by
+            // handlers that decode the URI back via uri_to_path, which always yields
+            // the canonical absolute path. Removing by a relative `file_path` is a
+            // no-op, so stale gutter markers persist after git discard / revert.
             let (notify_path, key_path, text) = {
                 let state = match self.buffer_manager.get(buffer_id) {
                     Some(s) => s,
@@ -1054,7 +1048,7 @@ impl Engine {
             // Clear stale position-based data immediately — line numbers from
             // the previous buffer state would highlight/annotate wrong lines.
             // Also reset the received flag so the indicator briefly returns
-            // to `Initializing` until the re-requested tokens arrive (#230).
+            // to `Initializing` until the re-requested tokens arrive.
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.semantic_tokens.clear();
                 state.semantic_tokens_received = false;
@@ -1072,11 +1066,9 @@ impl Engine {
     }
 
     /// Install `diagnostics` for `path`, replacing whatever was there, and
-    /// fire `DiagnosticChanged` (#1654 P6) with the path so a plugin
-    /// watching diagnostics (`vimcode.diagnostics.get`) can react without
-    /// polling. The single seam `poll_lsp`'s `LspEvent::Diagnostics` arm
-    /// goes through — kept as its own method (rather than inlined there) so
-    /// a test can inject a diagnostic set and observe the event fire
+    /// fire `DiagnosticChanged` with the path so a plugin watching diagnostics
+    /// (`vimcode.diagnostics.get`) can react without polling. Kept as its own
+    /// method so a test can inject a diagnostic set and observe the event fire
     /// without needing a live `lsp_manager`.
     pub fn set_diagnostics_for_path(&mut self, path: PathBuf, diagnostics: Vec<Diagnostic>) {
         let path_str = path.to_string_lossy().to_string();
@@ -1202,7 +1194,7 @@ impl Engine {
                             if !lsp_cands.is_empty() {
                                 self.completion_start_col =
                                     self.view().cursor.col - cur_prefix.chars().count();
-                                // #467: merge into existing candidates instead
+                                // Merge into existing candidates instead
                                 // of replacing — fresh LSP fetches at narrower
                                 // prefixes can return a smaller set than the
                                 // previous response, and items the user already
@@ -1471,7 +1463,7 @@ impl Engine {
                         // Multiple results — populate the quickfix window.
                         // `qf_set_list` also snapshots whatever quickfix list
                         // was there before onto the `:colder`/`:cnewer` stack
-                        // (#1155), same as `:grep`.
+                        //, same as `:grep`.
                         let n = locations.len();
                         let items = locations
                             .into_iter()
@@ -1482,13 +1474,10 @@ impl Engine {
                                 line_text: String::new(),
                             })
                             .collect();
-                        // Focus the panel — Neovim convention for `gr`
-                        // (Find References) is to land the user in the
-                        // quickfix so j/k/Enter drive the result list
-                        // without a follow-up `:copen`. Closes #150.
-                        // `qf_set_list` already focuses whenever the new
-                        // list is non-empty, which always holds here (this
-                        // branch is only reached for `locations.len() > 1`).
+                        // Focus the panel — Neovim convention for `gr` (Find References) is to
+                        // land the user in the quickfix so j/k/Enter drive the result list
+                        // without a follow-up `:copen`. `qf_set_list` already focuses whenever
+                        // the new list is non-empty, which always holds here.
                         self.qf_set_list(None, items);
                         self.message = format!("{n} references found");
                     }
@@ -1635,7 +1624,7 @@ impl Engine {
                                 if let Some(state) = self.buffer_manager.get_mut(bid) {
                                     if state.file_path.as_deref() == Some(path.as_path()) {
                                         state.semantic_tokens = decoded;
-                                        // #230: record receipt even when the
+                                        // Record receipt even when the
                                         // server returns zero tokens. The
                                         // LSP status indicator uses this to
                                         // distinguish "haven't responded
@@ -1699,7 +1688,7 @@ impl Engine {
                             redraw = true;
                         }
                     } else if self.lsp_pending_ai_mention_symbols == Some(request_id) {
-                        // #1513: `@symbol` mention completion's own
+                        // `@symbol` mention completion's own
                         // request — distinct pending-id field from the
                         // Command Center picker's above, so the two can
                         // never steal each other's response.
@@ -1715,7 +1704,7 @@ impl Engine {
                     message,
                     percentage,
                 } => {
-                    // #1583: only request a redraw if the snapshot this
+                    // Only request a redraw if the snapshot this
                     // feeds (the status-bar segment) actually changed — a
                     // server that repeats an identical begin payload for a
                     // token it already reported must not force a full
@@ -1733,7 +1722,7 @@ impl Engine {
                     message,
                     percentage,
                 } => {
-                    // #1583: ditto — only the message/percentage actually
+                    // Ditto — only the message/percentage actually
                     // changing warrants a redraw of the status segment.
                     if let Some(mgr) = self.lsp_manager.as_mut() {
                         if mgr.work_progress_report(server_id, &token, message, percentage) {
@@ -1742,7 +1731,7 @@ impl Engine {
                     }
                 }
                 LspEvent::WorkProgressEnd { server_id, token } => {
-                    // #1583: ditto — a stray `end` for a token already gone
+                    // Ditto — a stray `end` for a token already gone
                     // (or already ended) changes nothing on screen.
                     if let Some(mgr) = self.lsp_manager.as_mut() {
                         if mgr.work_progress_end(server_id, &token) {
@@ -1824,10 +1813,9 @@ impl Engine {
         result
     }
 
-    // Link extraction from hover markdown moved to
-    // `core::markdown::hover_markdown_structure` (#821 — hover popups adopt
-    // quadraui's `render_markdown_to_styled`, which resolves link ranges
-    // itself instead of vimcode re-pairing `Link`/`LinkUrl` spans).
+    // Link extraction from hover markdown is now in
+    // `core::markdown::hover_markdown_structure` — hover popups use
+    // quadraui's `render_markdown_to_styled`, which resolves link ranges itself.
 
     /// Execute an LSP navigation command from a hover popup link.
     /// Moves the cursor to the given position before invoking the LSP request.
@@ -1953,11 +1941,8 @@ impl Engine {
 
     /// Build a JSON array of diagnostics touching a specific line (for code action context).
     ///
-    /// `_path` is the raw path used to identify the file in the LSP request
-    /// itself (kept for API symmetry with the caller); the diagnostics
-    /// lookup must use the canonical key `Engine::lsp_diagnostics` is
-    /// actually stored under (#1373), or it silently misses whenever the
-    /// buffer was opened through a non-canonical path.
+    /// Uses the canonical key `Engine::lsp_diagnostics` is stored under;
+    /// a raw path lookup would miss when the buffer was opened through a non-canonical path.
     pub(crate) fn diagnostics_json_for_line(&self, _path: &Path, line: usize) -> serde_json::Value {
         let diags = match self
             .active_buffer_diagnostics_key()
@@ -2251,27 +2236,14 @@ impl Engine {
     }
 
     /// Apply a workspace-wide rename edit. Returns one error message per
-    /// file this couldn't be applied to (empty on full success) — never
-    /// swallows a failure the way the old closed-file branch did (#954
-    /// review of #1897-1964/#1967-2016).
+    /// file this couldn't be applied to (empty on full success).
     ///
-    /// For a file that's already open, this delegates straight to
-    /// [`Self::apply_lsp_edits`] (undo-grouped, UTF-16-aware). For a
-    /// **closed** file, this used to fall through to a raw `fs::write` with
-    /// no undo group, no path canonicalisation (so an already-open buffer
-    /// under a differently-spelled-but-equal path could silently diverge
-    /// from what just got written to disk), and a swallowed `Result` (a
-    /// failed write — read-only file, missing parent directory, whatever —
-    /// looked identical to a no-op success). That made LSP rename-across-
-    /// files unsafe, and would have made ACP's `fs/write_text_file`
-    /// (#954) unsafe by construction had it reused this path unfixed. The
-    /// fix: open the closed file into a buffer first (`BufferManager::
-    /// open_file`, which already canonicalizes for its own dedup), then
-    /// apply through the exact same undo-grouped path an already-open file
-    /// gets — deliberately **not** an immediate disk write. This matches
-    /// how an already-open buffer behaves (dirty, undoable, saved
-    /// whenever the user next saves) instead of re-introducing a silent
-    /// background write behind the user's back.
+    /// For an already-open file, this delegates to [`Self::apply_lsp_edits`]
+    /// (undo-grouped, UTF-16-aware). For a closed file, this first opens it
+    /// into a buffer (which canonicalizes the path), then applies edits through
+    /// the same undo-grouped path an already-open file gets, rather than a raw
+    /// disk write. This ensures consistency when a buffer is open under a
+    /// differently-spelled but equal path.
     pub(crate) fn apply_workspace_edit(&mut self, we: WorkspaceEdit) -> Vec<String> {
         let mut errors = Vec::new();
         for file_edit in we.changes {
@@ -2417,7 +2389,7 @@ impl Engine {
     }
 
     /// Flatten every diagnostic currently known across *all* buffers into
-    /// quickfix items, for the status bar's "Problems" counter (#1548) —
+    /// quickfix items, for the status bar's "Problems" counter —
     /// clicking it opens this workspace-wide list, matching VS Code's
     /// Problems panel (which is workspace-wide even though the status bar
     /// counter itself, [`Self::diagnostic_counts`], stays scoped to the
@@ -2456,11 +2428,10 @@ impl Engine {
 mod lsp_stderr_snippet_tests {
     use super::lsp_stderr_snippet;
 
-    /// A stderr line where a two-byte UTF-8 character straddles byte
-    /// offset 100 must not panic when truncated for the status message.
-    /// Regression test for vimcode#620 / quadraui#472: the old code did
-    /// `&snippet[..100]`, a byte-indexed slice with no char-boundary
-    /// check, on arbitrary LSP subprocess stderr.
+    /// Truncating a line where a two-byte UTF-8 character straddles byte
+    /// offset 100 must not panic when creating the status message.
+    /// Regression test: byte-indexed slicing on arbitrary LSP subprocess
+    /// stderr can land mid-codepoint and panic.
     #[test]
     fn multibyte_char_straddling_byte_100_does_not_panic() {
         // 99 ASCII bytes, then 'é' (2 UTF-8 bytes) spanning bytes 99..101,
@@ -2499,8 +2470,8 @@ mod lsp_stderr_snippet_tests {
 mod diagnostics_json_for_line_tests {
     use super::*;
 
-    /// #1373: `Engine::lsp_diagnostics` is keyed by the canonical absolute
-    /// path (#208), so `diagnostics_json_for_line` — which fed diagnostic
+    /// `Engine::lsp_diagnostics` is keyed by the canonical absolute
+    /// path, so `diagnostics_json_for_line` — which fed diagnostic
     /// context to LSP code-action requests — must look diagnostics up
     /// through `active_buffer_diagnostics_key()`, the same key the gutter
     /// and hover lookups use, not through the raw `file_path` a buffer was

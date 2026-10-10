@@ -273,7 +273,7 @@ impl Engine {
         };
 
         // For debugpy: tell the adapter which Python to use for running the
-        // user's script.  The adapter itself runs from the debugpy-venv, but
+        // user's script. The adapter itself runs from the debugpy-venv, but
         // the user's project venv (if active) must be used to find installed
         // packages (e.g. fastapi, django, etc.).
         // Respects any `python`/`pythonPath` already set in launch.json.
@@ -974,7 +974,7 @@ impl Engine {
                         .push(format!("[dap] event: Stopped reason={reason}"));
                     self.dap_stopped_thread = Some(thread_id);
                     self.message = format!("DAP: stopped ({reason})");
-                    // #212: var_refs are server-assigned per-stop; many
+                    // Var_refs are server-assigned per-stop; many
                     // adapters (lldb-dap, codelldb) recycle them between
                     // stops. Without clearing the expand state + child
                     // cache here, a recycled var_ref makes a NEW variable
@@ -1435,7 +1435,7 @@ impl Engine {
             EditorMode::Vim => EditorMode::Vscode,
             EditorMode::Vscode => EditorMode::Vim,
         };
-        // Clear any selection. Also reset the end-bound convention (#1788) —
+        // Clear any selection. Also reset the end-bound convention —
         // otherwise a lingering `true` from a VSCode-mode keyboard-extended
         // selection would silently apply to the next Vim-mode `v`/`V`
         // selection, which is always inclusive-end.
@@ -1447,12 +1447,12 @@ impl Engine {
             self.menu_bar_visible = true;
         } else {
             self.mode = Mode::Normal;
-            // #1780: VSCode mode's own entry above unconditionally reveals
+            // VSCode mode's own entry above unconditionally reveals
             // the menu-bar row (`menu_bar_visible = true`); without a
             // mirror-image clear here, toggling straight back to Vim mode
-            // left that row permanently on screen (shifting the activity
-            // bar/sidebar/editor content down by one row forever), since
-            // nothing else in the Vim-mode arm ever flips it back off.
+            // leaves that row permanently on screen (shifting the activity
+            // bar/sidebar/editor content down by one row), since nothing else
+            // in the Vim-mode arm ever flips it back off.
             //
             // Gated on `menu_bar_toggleable` (true only on backends with a
             // runner-drawn, hideable menu bar — i.e. TUI): on a
@@ -1462,7 +1462,7 @@ impl Engine {
             // there). Clearing `menu_bar_visible` unconditionally would
             // leave those backends with a reserved-but-blank titlebar strip
             // after a VSCode->Vim round trip, with no in-app way back short
-            // of `:set menu` (see review discussion on #1780).
+            // of `:set menu`.
             if self.menu_bar_toggleable {
                 self.menu_bar_visible = false;
             }
@@ -1495,7 +1495,7 @@ impl Engine {
 /// inserted between indices 3 and 4 in the built `Toolbar`, so
 /// `DEBUG_BUTTON_IDS` has exactly 7 entries (one per action, not counting
 /// the separator). Shared by `render::debug_toolbar` and the click/hover
-/// hit-test so the id↔index mapping has a single source of truth (#510).
+/// hit-test so the id↔index mapping has a single source of truth.
 pub const DEBUG_BUTTON_IDS: [&str; 7] = [
     "dbg:continue",
     "dbg:pause",
@@ -1524,7 +1524,7 @@ impl Engine {
     }
 
     /// Resolve which debug button (if any) sits under absolute point `(x, y)`,
-    /// using the `quadraui::Toolbar` layout cached at paint time (#510).
+    /// using the `quadraui::Toolbar` layout cached at paint time.
     /// Returns `None` for clicks in the bar's empty gutter, off the bar,
     /// or over a disabled button.
     pub fn debug_button_hit(&self, x: f32, y: f32) -> Option<usize> {

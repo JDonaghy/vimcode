@@ -83,11 +83,8 @@ impl Engine {
         provider: &DocumentProviderConfig,
     ) {
         // If this document (by id) is already open in a buffer, switch to
-        // it rather than opening a second tab bound to the same id — two
-        // buffers racing to `:w` the same document would be "last save
-        // wins, first buffer's edits silently lost" (review follow-up,
-        // #524). Same precedent as `open_keymaps_editor`. Only applies to a
-        // real id: `new_tool_document`'s blank buffer (`id: None`) has
+        // it rather than opening a second tab bound to the same id. Only applies
+        // to a real id: `new_tool_document`'s blank buffer (`id: None`) has
         // nothing yet to deduplicate against — every blank buffer is
         // legitimately a fresh, not-yet-created document.
         if let Some(id) = &id {
@@ -205,12 +202,10 @@ impl Engine {
             }
         }
 
-        // Create path (`binding.id` was `None`): if the provider echoed an
-        // id back on stdout, bind this buffer to it now, so a *second* `:w`
-        // on the still-open buffer updates the just-created document
-        // instead of silently re-running "create" with an empty id again
-        // (review follow-up, #524). A provider that echoed nothing leaves
-        // the buffer unbound, exactly as before this existed.
+        // Create path: if the provider echoed an id back on stdout, bind this
+        // buffer to it now, so a subsequent `:w` on the still-open buffer updates
+        // the just-created document instead of running "create" again with an
+        // empty id. A provider that echoed nothing leaves the buffer unbound.
         if binding.id.is_none() {
             if let Some(id) = assigned_id {
                 let scratch_name = format!("[Document {id}]");
@@ -379,8 +374,7 @@ mod tests {
         assert_eq!(text, "# T\n\nB\n");
     }
 
-    /// Acceptance: "Open → edit → :w round-trips a document through a mock
-    /// provider, with no coordinator present." #524.
+    /// Open → edit → :w round-trips a document through a mock provider.
     #[test]
     fn open_edit_save_round_trips_through_mock_provider() {
         let mut engine = Engine::new_for_test();
@@ -486,7 +480,7 @@ mod tests {
         assert_eq!(sent["body"], "Brand new body.\n");
     }
 
-    /// Review follow-up (#524): if the write command echoes a
+    /// Review follow-up: if the write command echoes a
     /// provider-assigned id back on stdout, the create path binds the
     /// still-open buffer to it — so a *second* `:w` updates the
     /// now-existing document (a real write-command argv, not the create
@@ -569,7 +563,7 @@ mod tests {
         assert_eq!(err, "No file name");
     }
 
-    /// Review follow-up (#524): opening the same document id a second time
+    /// Review follow-up: opening the same document id a second time
     /// must switch to the already-open buffer/tab, not open a duplicate —
     /// mirrors `open_keymaps_editor`'s precedent. Otherwise two buffers
     /// bound to the same id could race on `:w` (last save wins, first

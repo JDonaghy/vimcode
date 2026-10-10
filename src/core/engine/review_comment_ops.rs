@@ -1,9 +1,9 @@
-//! Pinned review comments (#527, Track A Phase 3): anchor a short note to
-//! whichever line the open change-review surface's `DiffView` is
-//! currently scrolled to (the same row `Return`/`change_review_jump_to_hit`
-//! resolves — see `crate::core::review::row_to_location`'s doc), edit or
-//! delete it before a verdict is reported, and fold the collected list
-//! into the verdict body #526 composes.
+//! Pinned review comments: anchor a short note to whichever line the
+//! open change-review surface's `DiffView` is currently scrolled to
+//! (the same row `Return`/`change_review_jump_to_hit` resolves — see
+//! `crate::core::review::row_to_location`'s doc), edit or delete it
+//! before a verdict is reported, and fold the collected list into the
+//! verdict body.
 //!
 //! ## Why a `Dialog`, not a new overlay
 //!

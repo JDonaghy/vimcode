@@ -65,8 +65,7 @@ impl Engine {
     // =======================================================================
 
     /// Repair inconsistent state where `active_tab().active_window` points
-    /// to a WindowId that no longer exists in `self.windows`.  This can
-    /// happen after certain tab/group close sequences.  The method finds
+    /// to a WindowId that no longer exists in `self.windows`. The method finds
     /// a valid window from the current tab's layout, or creates a fresh
     /// scratch window as a last resort.
     pub(crate) fn repair_active_window(&mut self) {
@@ -98,10 +97,10 @@ impl Engine {
     /// Which (group, tab index) currently has `window_id` somewhere in its
     /// layout — searched across *every* editor group/tab, not just the
     /// active one. Needed by any window-removal path that can be driven from
-    /// a tab other than the currently active one (`qf_close_panel_window`,
-    /// #1307 review): `qf_panel_windows` is a single engine-wide map with no
-    /// per-tab scoping, so the panel window named by a `:cclose`/`:copen`
-    /// call may live in a tab the user isn't currently looking at.
+    /// a tab other than the currently active one: `qf_panel_windows` is a
+    /// single engine-wide map with no per-tab scoping, so the panel window
+    /// named by a `:cclose`/`:copen` call may live in a tab the user isn't
+    /// currently looking at.
     pub(crate) fn find_window_tab(&self, window_id: WindowId) -> Option<(GroupId, usize)> {
         for (&group_id, group) in self.editor_groups.iter() {
             for (tab_idx, tab) in group.tabs.iter().enumerate() {
@@ -115,12 +114,10 @@ impl Engine {
 
     /// Like [`Self::repair_active_window`], but for an arbitrary `(group,
     /// tab_idx)` pair rather than always the currently active one. Every
-    /// other window-removal path in this codebase derives the tab to repair
-    /// from `active_tab_mut()`, which silently does nothing for a *different*
-    /// tab's now-dangling `active_window` — leaving it to panic the next time
-    /// that tab becomes active and [`Self::active_window`] is called
-    /// (#1307 review: `:copen` in tab 1, `:tabnew`, `:cclose` from tab 2).
-    /// A no-op if `(group_id, tab_idx)` no longer exists.
+    /// other window-removal path derives the tab to repair from
+    /// `active_tab_mut()`, which silently does nothing for a *different*
+    /// tab's now-dangling `active_window`. A no-op if `(group_id, tab_idx)`
+    /// no longer exists.
     pub(crate) fn repair_window_in_tab(&mut self, group_id: GroupId, tab_idx: usize) {
         let Some(wid) = self
             .editor_groups
@@ -257,7 +254,7 @@ impl Engine {
         self.active_buffer_state().dirty
     }
 
-    /// Text for Vim's `'showcmd'` (#1190): the partially-typed Normal-mode
+    /// Text for Vim's `'showcmd'`: the partially-typed Normal-mode
     /// command so far — register prefix, counts, pending operator/
     /// find-operator/text-object modifier, and the single pending key for
     /// two-key sequences like `gg`/`dd` (`:h 'showcmd'`). Reconstructed
@@ -309,13 +306,8 @@ impl Engine {
     /// *last* window showing `buf_id` is closing it a real "discard my only
     /// copy" decision that deserves a confirmation prompt.
     ///
-    /// This predicate used to be duplicated: the `:q` path
-    /// (`execute.rs`) got it right, but the tab-bar close path
-    /// (`handle_tab_bar_click`'s `CloseTab` arm) never applied it and
-    /// prompted on every view of a dirty buffer, not just the last one
-    /// (#1038). `:q` only ever closes a single window, so a single
-    /// `except_win` is enough for it; see `buffer_has_views_outside` for
-    /// the multi-window case (closing a whole tab).
+    /// See `buffer_has_views_outside` for the multi-window case (closing
+    /// a whole tab).
     pub fn buffer_has_other_views(&self, buf_id: BufferId, except_win: WindowId) -> bool {
         self.buffer_has_views_outside(buf_id, std::slice::from_ref(&except_win))
     }
@@ -330,7 +322,7 @@ impl Engine {
     /// active window (as `buffer_has_other_views` does) would find that
     /// sibling split and wrongly conclude another view survives, even
     /// though it's being destroyed in the very same operation — silently
-    /// discarding the only copy of the dirty buffer (#1038). Callers that
+    /// discarding the only copy of the dirty buffer. Callers that
     /// close more than one window at a time must exclude the *whole* set of
     /// windows about to disappear.
     pub fn buffer_has_views_outside(&self, buf_id: BufferId, excluded: &[WindowId]) -> bool {
@@ -339,7 +331,7 @@ impl Engine {
             .any(|w| w.buffer_id == buf_id && !excluded.contains(&w.id))
     }
 
-    /// Vim's `'hidden'` gate (#1190) for abandoning the active buffer via
+    /// Vim's `'hidden'` gate for abandoning the active buffer via
     /// `:edit`, `:bnext`/`:bprevious`/`:bfirst`/`:blast`, `:buffer` and
     /// `:enew`. Mirrors the `:quit` guard (`execute.rs`'s `"quit"` arm):
     /// a dirty buffer may always be abandoned when another window still
@@ -371,7 +363,6 @@ impl Engine {
     /// every file-status path (a syscall each) and scans every
     /// diagnostic — on a workspace with thousands of untracked files
     /// the uncached version was costing seconds per explorer draw
-    /// (see #153).
     pub fn explorer_indicators(
         &self,
     ) -> (HashMap<PathBuf, char>, HashMap<PathBuf, (usize, usize)>) {
@@ -401,7 +392,7 @@ impl Engine {
         let repo_root = git::find_repo_root(&self.cwd);
         if let Some(ref root) = repo_root {
             for fs in &self.sc_file_statuses {
-                // #991: a conflicted path carries neither side, so without
+                // A conflicted path carries neither side, so without
                 // the `unmerged` arm it got no explorer badge at all.
                 let kind = fs
                     .unmerged
@@ -460,7 +451,7 @@ impl Engine {
         // shows modified/added color when any descendant file has that status.
         // Priority: M > D > R > A > U
         //
-        // #1051: this reads `StatusKind::label()`'s own output (populated
+        // This reads `StatusKind::label()`'s own output (populated
         // into `git_statuses` above), so it must track that mapping — 'U'
         // is the display label for `StatusKind::Untracked`, not git's `?`
         // porcelain notation.
@@ -598,7 +589,7 @@ impl Engine {
             None
         };
         if let Some(line) = forced_line {
-            // #805 review: this is a *vertical* cursor move (scrolloff pushed
+            // This is a *vertical* cursor move (scrolloff pushed
             // the cursor onto a different line), so it must land on the
             // remembered `curswant` column exactly like `j`/`k`/`<C-d>`/
             // `<C-f>` do — a bare `clamp_cursor_col()` here would drop a
@@ -729,7 +720,7 @@ impl Engine {
 
     /// If `line` falls inside a fold body, snap to the fold header (start).
     pub(crate) fn snap_scroll_top(folds: &[FoldRegion], line: usize) -> usize {
-        // Nested closed folds can both contain `line` (#1006) — snap to the
+        // Nested closed folds can both contain `line` — snap to the
         // outermost (smallest `start`), the one actually visible at the top
         // of the viewport, not just whichever entry comes first.
         folds
@@ -768,20 +759,12 @@ impl Engine {
     pub fn clear_sidebar_focus(&mut self) {
         self.explorer_has_focus = false;
         self.search_has_focus = false;
-        // #823 item 8: was a direct `self.sc_has_focus = false`, which
-        // skipped `sc_set_focus`'s other two effects — clearing
-        // `sc_button_focused` and syncing `sc_sidebar_system`'s own
-        // focus flag. TUI's mouse.rs open-coded this same 9-flag clear
-        // and, unlike this method, already called `sc_set_focus(false)`
-        // here — so GTK's two call sites (both "clicking the editor clears
-        // every sidebar's focus") were the ones carrying the bug: an SC
-        // action button could stay visually focused after focus moved to
-        // the editor.
+        // Clears `sc_button_focused` and syncs `sc_sidebar_system`'s own focus flag,
         self.sc_set_focus(false);
         self.dap_sidebar_has_focus = false;
         self.ext_sidebar_has_focus = false;
         self.ai_has_focus = false;
-        // #1507 review: this is also the chokepoint every focus *grant*
+        // This is also the chokepoint every focus *grant*
         // (`focus_sidebar_panel`/`toggle_sidebar_panel`) calls immediately
         // before `set_panel_focus`, so clearing here discards a
         // `<leader>ai` partial match abandoned on both the way out (losing
@@ -798,13 +781,11 @@ impl Engine {
     /// sidebar panel's keyboard focus, mark the explorer no longer visible
     /// in session state, and persist the session.
     ///
-    /// Shared by both backends (#823 item 8) — this exact 4-statement
-    /// sequence (`app_shell.hide_sidebar()`, `clear_sidebar_focus()`,
-    /// `session.explorer_visible = false`, `session.save()`) was pasted at
-    /// five call sites in `tui_main/shell_app.rs` and once in `app.rs`.
-    /// TUI additionally resets its own `TuiSidebar::has_focus` around each
-    /// call — that's TUI-local UI state, not `Engine`'s, so it stays at the
-    /// call site rather than becoming a parameter here.
+    /// Shared by both backends — this exact 4-statement sequence is called
+    /// from multiple places. TUI additionally resets its own
+    /// `TuiSidebar::has_focus` around each call — that's TUI-local UI state,
+    /// not `Engine`'s, so it stays at the call site rather than becoming a
+    /// parameter here.
     pub fn collapse_sidebar(&mut self) {
         self.app_shell.hide_sidebar();
         self.clear_sidebar_focus();
@@ -820,16 +801,7 @@ impl Engine {
     ///
     /// Single source of truth for backends that need to gate
     /// behaviour on modal state — e.g. GTK suppresses the LSP hover
-    /// trigger and hides native scrollbar widgets when this returns
-    /// true.
-    ///
-    /// #731 (vimcode): both GTK call sites were inside dead code deleted
-    /// by that issue (`App::tick`'s hover-polling block and the
-    /// `sync_scrollbar`/`sync_scrollbar_positions` native-widget path) —
-    /// both were already gated on Relm4-era widget handles permanently
-    /// `None` under the ShellApp runner, so this had no live caller before
-    /// the deletion either. #1750 restored the hover-polling caller (the
-    /// shared `MouseMoved` arm in `src/app.rs`), so this is no longer dead.
+    /// trigger and hides native scrollbar widgets when this returns true.
     pub fn is_blocking_modal_open(&self) -> bool {
         self.picker_open
             || self.tab_switcher_open

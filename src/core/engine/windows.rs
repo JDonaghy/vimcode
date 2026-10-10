@@ -7,16 +7,15 @@ use crate::core::settings::ExplorerAction;
 /// contrast, divides *raw* axis space — a Horizontal split's two windows'
 /// raw row counts sum to the tree's full axis size, each then losing one row
 /// to its own status line for display; a Vertical split's two windows' raw
-/// column counts sum to the tree's axis size *minus one* (`WindowLayout::
-/// layout_snapped`'s reserved divider column, #1326), not the full size.
-/// Vertical splits have no equivalent *per-window* row/column chrome column
-/// here (see `resize_window_split`'s `#1288` doc) — the divider column is a
+/// column counts sum to the tree's axis size *minus one* (the reserved
+/// divider column), not the full size. Vertical splits have no equivalent
+/// *per-window* row/column chrome column here — the divider column is a
 /// cost the *split* pays once, not each window individually — so a single
 /// window's own `raw_axis_extent` still round-trips through `viewport_cols`
 /// unchanged; only the *pair's* total is one column short of the bounds
 /// width. Used by `split_window_with_new_first` and `resize_window_split` to
 /// convert between the two spaces when recovering or redistributing a
-/// split's axis size (#1288).
+/// split's axis size.
 fn raw_axis_extent(view: &View, direction: SplitDirection) -> f64 {
     match direction {
         SplitDirection::Horizontal => view.viewport_lines as f64 + 1.0,
@@ -37,7 +36,7 @@ fn set_raw_axis_extent(view: &mut View, direction: SplitDirection, raw: f64) {
 /// The current raw axis size (see [`raw_axis_extent`]) a `WindowLayout`
 /// subtree occupies along `direction`, read straight from the leaf
 /// windows' own currently-tracked content sizes — used by
-/// `Engine::resize_window_split` (#1288) to recover a split's total axis
+/// `Engine::resize_window_split` to recover a split's total axis
 /// size without reintroducing integer-rounding error (see that function's
 /// doc for why `leaf_size / share` can't be trusted for this).
 fn subtree_raw_extent(
@@ -80,7 +79,7 @@ fn subtree_raw_extent(
 /// Compute the split's new first-child raw size after an absolute
 /// `[count]` lines/columns resize, given that split's *current* first-child
 /// raw size (see [`subtree_raw_extent`]) and whether the active window is
-/// the first or second child (#1288). Stays entirely in integer-valued raw
+/// the first or second child. Stays entirely in integer-valued raw
 /// space — see `resize_window_split`'s doc for why converting through a
 /// continuous ratio delta instead reintroduces a rounding tie.
 fn resize_new_first_raw(first_raw: f64, is_first: bool, increase: bool, count: usize) -> f64 {
@@ -102,8 +101,8 @@ fn resize_new_first_raw(first_raw: f64, is_first: bool, increase: bool, count: u
 /// Convert an absolute `[count]` lines/columns resize into the ratio delta
 /// to apply to a split, given that split's current total `axis_size` (see
 /// [`subtree_raw_extent`]) and whether the active window is the split's
-/// first child (#1288 — Neovim moves the window *boundary* by `[count]`
-/// screen lines/columns, not by some fraction of the split). Used only by
+/// first child — Neovim moves the window *boundary* by `[count]`
+/// screen lines/columns, not by some fraction of the split. Used only by
 /// the editor-group fallback in `resize_window_split`, whose `axis_size` is
 /// itself already approximate — see that function's doc.
 fn resize_delta_ratio(is_first: bool, increase: bool, count: usize, axis_size: f64) -> f64 {
@@ -123,7 +122,7 @@ fn resize_delta_ratio(is_first: bool, increase: bool, count: usize, axis_size: f
 
 /// Neovim's `'winminheight'`/`'winminwidth'` floor — the smallest raw axis
 /// size (see [`raw_axis_extent`]) a window may be shrunk to — used by
-/// `Engine::maximize_window_split` (#1289) to shrink the *other* window down
+/// `Engine::maximize_window_split` to shrink the *other* window down
 /// to its real floor instead of applying a fixed 0.9/0.1 ratio. Neither
 /// setting is wired up as a real `Settings` field yet (both are
 /// `NotImplemented` in `tests/nvim_conformance.rs`'s settings table), so this
@@ -135,8 +134,8 @@ fn min_raw_extent(direction: SplitDirection) -> f64 {
         // 1 content row, plus the 1-row status-line chrome `raw_axis_extent`
         // always adds back for Horizontal splits.
         SplitDirection::Horizontal => 2.0,
-        // 1 column; Vertical splits have no per-window chrome column here
-        // (see `resize_window_split`'s #1288 doc), so it round-trips as-is.
+        // 1 column; Vertical splits have no per-window chrome column here,
+        // so it round-trips as-is.
         SplitDirection::Vertical => 1.0,
     }
 }
@@ -201,7 +200,7 @@ impl Engine {
         };
 
         // Opening a file into a split is jump-worthy in Neovim regardless
-        // of line (#1158) -- record the pre-switch position while `self`
+        // of line -- record the pre-switch position while `self`
         // still points at the window being left. Skip when leaving a
         // still-pristine scratch buffer, which real Neovim doesn't record
         // either (`is_pristine_scratch_buffer`'s doc comment), and skip
@@ -230,7 +229,7 @@ impl Engine {
             .split_at(current_window_id, direction, new_window_id, new_first);
         tab.focus_window(new_window_id);
 
-        // #1288: `WindowLayout::split_at` always starts a fresh split at an
+        // `WindowLayout::split_at` always starts a fresh split at an
         // exact 0.5 ratio; give both new sibling windows an immediately
         // accurate viewport size for the split axis (round-tripped through
         // `raw_axis_extent`/`set_raw_axis_extent`, mirroring the rounding
@@ -246,7 +245,7 @@ impl Engine {
             .map(|w| raw_axis_extent(&w.view, direction))
             .unwrap_or(0.0);
         if total_raw > 0.0 {
-            // #1326: a fresh `Vertical` split reserves one screen column for
+            // A fresh `Vertical` split reserves one screen column for
             // the divider bar itself, matching `WindowLayout::layout_snapped`
             // (a fresh 80-column `<C-w>v` gives `40`/`39`, not `40`/`40`) —
             // `content_total` is what the 0.5 split actually divides.
@@ -309,17 +308,17 @@ impl Engine {
         // Remove window from windows map and any scroll-bind pairs that referenced it.
         let closed_buf_id = self.windows.get(&window_id).map(|w| w.buffer_id);
         self.windows.remove(&window_id);
-        // #1307: keep `QuickfixList::open`/`has_focus` honest if `window_id`
+        // Keep `QuickfixList::open`/`has_focus` honest if `window_id`
         // was itself a quickfix/location-list panel window closed via this
         // generic path (e.g. `CTRL-W q`) rather than `qf_close`.
         self.forget_closed_panel_window(window_id);
-        // #1155: CTRL-W window-close drops the window's location list — it
+        // CTRL-W window-close drops the window's location list — it
         // has no meaning once the window it was scoped to is gone.
         self.location_lists.remove(&window_id);
         self.prune_jump_list_windows(&[window_id]);
         self.scroll_bind_pairs
             .retain(|&(a, b)| a != window_id && b != window_id);
-        // #1297: closing an ordinary (non-diff) window can orphan a scratch
+        // Closing an ordinary (non-diff) window can orphan a scratch
         // buffer — e.g. the command-line window (`q:`/`q/`/`q?`) — with no
         // other window left referencing it. `close_tab()` evicts unreferenced
         // buffers via `remove_tab_raw`, but this generic single-window-removal
@@ -396,7 +395,7 @@ impl Engine {
         true
     }
 
-    // ─── Quickfix/location-list panel windows (#1307) ─────────────────────
+    // ─── Quickfix/location-list panel windows ─────────────────────────────
     //
     // `qf_open`/`qf_window` (`src/core/engine/picker.rs`) call these to make
     // the quickfix/location-list panel a real `WindowLayout` leaf instead of
@@ -417,10 +416,9 @@ impl Engine {
     /// twice in a row must not open a second window. ("In the active tab"
     /// because `qf_panel_windows` is a single engine-wide map with no
     /// per-tab awareness — a known, deliberately out-of-scope simplification
-    /// for #1307: re-running `:copen` from a *different* tab than the one
-    /// the panel was opened in opens a second, independently-tracked window
-    /// rather than reusing the first, the same way most of this codebase's
-    /// window bookkeeping doesn't attempt full cross-tab tracking.)
+    /// for re-running `:copen` from a *different* tab than the one the panel
+    /// was opened in opens a second, independently-tracked window rather than
+    /// reusing the first.)
     pub(crate) fn qf_ensure_panel_window(
         &mut self,
         target: Option<WindowId>,
@@ -447,7 +445,7 @@ impl Engine {
         self.windows.insert(win_id, Window::new(win_id, buf_id));
 
         // Real Vim's default quickfix/location-list window height (`:h
-        // copen`), confirmed against a live oracle (#1307).
+        // copen`), confirmed against a live oracle.
         const QF_DEFAULT_ROWS: f64 = 10.0;
 
         match target {
@@ -476,8 +474,8 @@ impl Engine {
             Some(owner) => {
                 // A location-list window is scoped to its owner window's
                 // own subtree — an ordinary split, same shape as the
-                // command-line window (#1297) — not a full-tab wrap.
-                // Confirmed against a live oracle (#1307).
+                // command-line window — not a full-tab wrap.
+                // Confirmed against a live oracle.
                 let total_raw = self
                     .windows
                     .get(&owner)
@@ -544,13 +542,13 @@ impl Engine {
     /// [`Self::qf_ensure_panel_window`]), restoring focus to whichever
     /// window was active *before* the panel was opened (`Tab::prev_window`)
     /// when the panel window was itself the active one — confirmed against a
-    /// live oracle (#1307): `:cclose` returns to the window that was current
+    /// live oracle: `:cclose` returns to the window that was current
     /// before `:copen`, not simply "the first window in the layout" the way
     /// the generic `close_window`'s fallback does. A no-op if `target` has
     /// no real window (the common case — most `:cclose`/`:lclose` calls
     /// target an already-closed or never-opened panel).
     ///
-    /// #1307 review: `target`'s panel window can be a different *tab* than
+    /// `target`'s panel window can be a different *tab* than
     /// whichever one is currently active — e.g. `:copen` in tab 1
     /// (auto-focusing the panel there), `:tabnew` to tab 2, then `:cclose`
     /// from tab 2. `qf_panel_windows` has no per-tab scoping, so this must
@@ -737,7 +735,7 @@ impl Engine {
     /// active), then points that group's own `active_window` at it, without
     /// touching cursor or scroll position.
     ///
-    /// #1187: the minimap's own thumb-drag press needs exactly this — a
+    /// The minimap's own thumb-drag press needs exactly this — a
     /// press on a background pane's strip must focus that pane like any
     /// other click, but a press *inside* the viewport-highlight band must
     /// not also jump/centre the view (that's `apply_minimap_click`'s job,
@@ -759,7 +757,7 @@ impl Engine {
     /// bottom-right (`last == true`) corner — the target of `CTRL-W t` /
     /// `CTRL-W b`.
     ///
-    /// #1162: vimcode's screen has *two* nested layout levels where Vim has
+    /// Vimcode's screen has *two* nested layout levels where Vim has
     /// one. The outer level is `group_layout` (VSCode-style editor groups);
     /// each group's active tab then owns its own `WindowLayout` of vim
     /// splits. "Corner window" therefore means: first/last group in
@@ -846,7 +844,7 @@ impl Engine {
         };
 
         // Opening a file into a new tab is jump-worthy in Neovim regardless
-        // of line (#1158) -- record the pre-switch position while `self`
+        // of line -- record the pre-switch position while `self`
         // still points at the tab/window being left. Skip when leaving a
         // still-pristine scratch buffer, which real Neovim doesn't record
         // either (`is_pristine_scratch_buffer`'s doc comment), and skip
@@ -953,7 +951,7 @@ impl Engine {
     /// `closed_tab_id`. Reads the MRU stack for the most recently used tab
     /// that still exists in the group (other than the one being closed) and
     /// returns `None` when the MRU has nothing usable, so the caller can
-    /// fall back to positional adjacency (#673).
+    /// fall back to positional adjacency.
     pub(crate) fn successor_tab_after_close(
         &self,
         group_id: GroupId,
@@ -1006,7 +1004,7 @@ impl Engine {
     /// on a tab bar entry.
     ///
     /// Closing a tab that is **not** the group's active tab never changes
-    /// `active_tab` or steals global focus (#673) — it just removes the tab
+    /// `active_tab` or steals global focus — it just removes the tab
     /// in place. Closing a group's own active tab picks a successor the same
     /// way `close_tab` does, but only moves global focus to `group_id` when
     /// that group was already focused.
@@ -1109,11 +1107,10 @@ impl Engine {
             // After closing, the active_tab might have shifted.
         }
         // Ensure the originally active tab (now the only one) is selected.
-        // Each `close_tab()` call above already ran the MRU-successor logic
-        // and its own `tab_mru_touch()` for the *intermediate* tabs this
-        // loop temporarily made active — those entries are transient and get
-        // overwritten below. The final `tab_mru_touch()` call MUST stay
-        // after this `active_tab = 0` assignment; reordering them would
+        // Each `close_tab()` call already ran the MRU-successor logic for
+        // the *intermediate* tabs this loop temporarily made active — those
+        // entries get overwritten below. The final `tab_mru_touch()` call MUST
+        // stay after this `active_tab = 0` assignment; reordering them would
         // leave the front of the MRU stack pointing at a tab this function
         // never intended to keep active.
         self.active_group_mut().active_tab = 0;
@@ -1215,15 +1212,10 @@ impl Engine {
     /// Open the system file manager at the given path's parent directory,
     /// with it selected. Queues a [`PendingPlatformAction::Reveal`] for the
     /// runner to carry out through `PlatformServices::reveal_in_file_manager`
-    /// (#1134) — see `Engine::pending_platform_actions`'s doc for why this
+    /// — see `Engine::pending_platform_actions`'s doc for why this
     /// can't shell out directly from here. That method takes the target
-    /// path itself (not its parent) on every backend that implements it for
-    /// real (GTK, macOS, Win-GUI all resolve the parent-and-select
-    /// themselves), so no `path.is_dir()`/`path.parent()` split is needed
-    /// here any more — that used to live in this function only because the
-    /// old macOS leg (`open -R`) and the old Linux fallback leg (the
-    /// freedesktop.org opener, given `<dir>`) disagreed about which one they
-    /// wanted.
+    /// path itself (not its parent) and resolves the parent-and-select
+    /// itself on every platform that supports it.
     pub fn reveal_in_file_manager(&mut self, path: &Path) {
         self.pending_platform_actions
             .push(PendingPlatformAction::Reveal(path.to_path_buf()));
@@ -1622,7 +1614,7 @@ impl Engine {
         });
     }
 
-    /// Open the Explorer header's "..." overflow menu (#1693) — the
+    /// Open the Explorer header's "..." overflow menu — the
     /// dropdown twin of the view-actions toolbar row's own four buttons
     /// (New File / New Folder / Refresh Explorer / Collapse Folders in
     /// Explorer), triggered from the overflow button rather than a
@@ -1928,7 +1920,7 @@ impl Engine {
                     }
                     "open_side_vsplit" => {
                         // "Open to the Side" always places the target on the
-                        // right, regardless of splitright (#226). Split first
+                        // right, regardless of splitright. Split first
                         // with new_first=false, then load the target file into
                         // the new (right, now-active) window.
                         self.split_window_with_new_first(SplitDirection::Vertical, None, false);
@@ -1939,7 +1931,7 @@ impl Engine {
                     _ => {}
                 }
             }
-            // #1693: unlike the per-row menu above, every action here is
+            // Unlike the per-row menu above, every action here is
             // fully resolved in-engine — there is no right-clicked row to
             // set as the selection first, so `dispatch_explorer_crud`'s own
             // "fall back to the current selection, or `cwd`" behaviour is
@@ -2075,7 +2067,7 @@ impl Engine {
                 self.plugin_event("panel_context_menu", &arg);
             }
             ContextMenuTarget::Board { card_id } => {
-                // #523: `action` is one of the provider-declared action
+                // `action` is one of the provider-declared action
                 // names `open_board_context_menu` populated the menu from
                 // for this exact card/stage, so it's already known-valid —
                 // `run_board_action_by_name` re-resolving it (rather than
@@ -2240,7 +2232,7 @@ impl Engine {
     }
 
     // =======================================================================
-    // Jump list pane lookup (#674)
+    // Jump list pane lookup
     // =======================================================================
 
     /// Find where a jump-list entry's pane now lives. Returns the
@@ -2248,10 +2240,7 @@ impl Engine {
     /// no longer exists (its tab or split was closed).
     ///
     /// Tolerates a tab that moved to a different editor group since the
-    /// jump was recorded (`move_tab_to_other_group`) by falling back to a
-    /// search across all groups — mirrors the reasoning in that function's
-    /// doc comment about `tab_mru`/`tab_nav_history` entries simply not
-    /// matching after a move rather than being misread.
+    /// jump was recorded by falling back to a search across all groups.
     pub(crate) fn locate_jump_pane(
         &self,
         group_id: GroupId,
@@ -2292,7 +2281,7 @@ impl Engine {
     /// remembers — most commonly the single-window, no-splits-no-tabs case:
     /// jump inside file A, open file B into that same pane, then `Ctrl-O`.
     /// Without this check the entry would silently apply file A's
-    /// remembered line/col onto file B's buffer (#674 review).
+    /// remembered line/col onto file B's buffer.
     pub(crate) fn jump_pane_buffer_matches(
         &self,
         window_id: WindowId,
@@ -2332,7 +2321,7 @@ impl Engine {
     /// retain-and-clamp pattern used for tab close. Called from every path
     /// that removes windows from `self.windows` (split close, tab close,
     /// group close) so `Ctrl-O`/`Ctrl-I` skip dead entries instead of
-    /// reopening a closed file or panicking (#674).
+    /// reopening a closed file or panicking.
     pub(crate) fn prune_jump_list_windows(&mut self, removed: &[WindowId]) {
         if removed.is_empty() || self.jump_list.is_empty() {
             return;
@@ -2434,7 +2423,7 @@ impl Engine {
     /// Open the tab switcher popup, pre-selecting the second MRU entry.
     pub fn open_tab_switcher(&mut self) {
         // Opening a modal dismisses passive overlays (LSP hover) so
-        // they don't render behind it (#247).
+        // they don't render behind it.
         self.dismiss_editor_hover();
 
         // Build a clean MRU list: only include entries that still exist
@@ -2467,7 +2456,6 @@ impl Engine {
 
     /// Open the tab switcher if not already open, then cycle the selection.
     /// `forward`: true = next (Alt+t, Ctrl+Tab), false = previous (Shift+Tab).
-    /// Dead in ShellApp mode until tab-switcher key handling is re-wired (#448-C follow-on).
     #[allow(dead_code)]
     pub fn tab_switcher_cycle(&mut self, forward: bool) {
         if !self.tab_switcher_open {
@@ -2551,7 +2539,7 @@ impl Engine {
                 self.line_annotations.clear();
                 // Only prompt when closing this tab would remove the last
                 // view of the buffer — another view can still save it, so
-                // silently closing this one loses nothing (#1038). A tab can
+                // silently closing this one loses nothing. A tab can
                 // own more than one window (an in-tab split on the same
                 // buffer), and `close_tab` destroys all of them together, so
                 // the whole set of the tab's windows — not just the
@@ -2647,7 +2635,7 @@ impl Engine {
                 // leading space + digits + ": " + name + trailing space
                 // Uses cell width, not `.chars().count()`, so double-width
                 // glyphs (CJK, many emoji) in the buffer name are accounted
-                // for correctly — see vimcode#620 / quadraui#472.
+                // for correctly.
                 1 + (i + 1).to_string().len() + 2 + quadraui::tui::display_width(&dn) + 1
             } else {
                 // " N: [No Name] "
@@ -2667,11 +2655,10 @@ impl Engine {
     /// `quadraui::TabBar::fit_active_scroll_offset` — this is the
     /// char-cell-measured, backend-agnostic caller of it that keeps engine
     /// state internally consistent even before any backend has painted a
-    /// frame (see vimcode#660: the engine used to carry its own copy of
-    /// this exact algorithm, hardcoded to `tab_display_width`'s char-cell
-    /// estimate; GTK/Win-GUI compute their own pixel-accurate offset via
-    /// the same quadraui helper and write it back through
-    /// `set_tab_scroll_offset` instead of relying on this method).
+    /// frame — the engine carries its own copy of this algorithm, hardcoded to
+    /// `tab_display_width`'s char-cell estimate; GTK/Win-GUI compute their own
+    /// pixel-accurate offset via the same quadraui helper and write it back
+    /// through `set_tab_scroll_offset` instead of relying on this method.
     pub(crate) fn ensure_active_tab_visible(&mut self) {
         let group = match self.editor_groups.get(&self.active_group) {
             Some(g) => g,
@@ -2724,7 +2711,6 @@ impl Engine {
     /// GTK / Win-GUI / macOS have pixel-based padding that doesn't map to
     /// char units, so they compute their own offset via
     /// `quadraui::TabBar::fit_active_scroll_offset` and write it here.
-    /// Dead in ShellApp mode until tab scroll offset is re-wired (#448-C follow-on).
     #[allow(dead_code)]
     pub fn set_tab_scroll_offset(&mut self, group_id: GroupId, offset: usize) -> bool {
         if let Some(g) = self.editor_groups.get_mut(&group_id) {
@@ -2748,43 +2734,22 @@ impl Engine {
     /// after layout changes (window resize, sidebar toggle, new file open)
     /// and stay there until something else triggers a draw.
     ///
-    /// Where each backend calls it (both post-#540 ShellApp migration —
-    /// `tui_main/mod.rs`'s pre-migration `event_loop`/`win_gui/mod.rs` this
-    /// doc used to cite are both gone):
-    /// - **TUI** (the pre-#1434 TUI shell's `tick`, `tui_main/shell_app.rs`): drains
+    /// Where each backend calls it:
+    /// - **TUI** (`tui_main/shell_app.rs`'s `tick`): drains
     ///   `tab_visible_counts`, populated by the same frame's `TabBars` rung
     ///   in `render_content`. Setting `Reaction::Redraw` is the async
     ///   twin of the "schedule one more draw" GTK does below — quadraui's
     ///   TUI runner is a synchronous per-frame loop, so there is no separate
     ///   idle handle to defer through.
     /// - **GTK** (`App::handle_poll_tick`, `src/app.rs`): drains the GTK
-    ///   twin, `App::tab_visible_counts`, same cadence (#1165 — this call
-    ///   was missing entirely before, the exact gap this doc's own
-    ///   "skipping it after a draw is a bug" warns about). If the call
+    ///   twin, `App::tab_visible_counts`, same cadence. If the call
     ///   returns true, `self.draw_needed.set(true)` schedules the next
     ///   `tick_dispatch` to return `Reaction::Redraw`.
     ///
-    /// #1722: the return value used to be `width_bookkeeping_changed ||
-    /// scroll_changed` — i.e. it also forced a redraw whenever the raw
-    /// `tab_bar_width` value this call just stored differed from what was
-    /// stored before, even if that difference never moved
-    /// `tab_scroll_offset` (same tabs visible, same offset, same pixels on
-    /// screen either way). That raw value is *itself* derived from the
-    /// paint that already happened this frame, so a bare change in it has
-    /// nothing left to correct — unlike a `tab_scroll_offset` correction,
-    /// which does change what the next paint draws. On a pixel-measuring
-    /// backend (GTK/Win-GUI/macOS) the per-frame width can wobble by a
-    /// sub-pixel-rounding unit with several tabs open — each wobble is a
-    /// legitimate "the width changed" but a no-op "did anything paint
-    /// differently", and the old contract turned every one of those into
-    /// a forced repaint, which re-measured a slightly different width and
-    /// forced another, indefinitely. Basing the signal purely on
-    /// `tab_scroll_offset` (the one piece of state a width correction can
-    /// actually move) keeps the real "active tab was scrolled out of view"
-    /// case working (covered by
-    /// `test_post_draw_apply_widths_detects_scroll_change`, `tests.rs`) while
-    /// making the cosmetic-only case report no change
-    /// (`test_post_draw_apply_widths_reports_changes`, same file).
+    /// The return value is based purely on `tab_scroll_offset` changes
+    /// (the one piece of state a width correction can actually move) rather
+    /// than raw `tab_bar_width` changes, which may wobble by a sub-pixel
+    /// rounding unit without affecting what the next paint draws.
     pub fn post_draw_apply_widths(&mut self, widths: &[(GroupId, usize)]) -> bool {
         for &(gid, width) in widths {
             self.set_tab_visible_count(gid, width);
@@ -2860,7 +2825,7 @@ impl Engine {
     /// Move the current tab from the active group to the next group.
     ///
     /// Any `tab_mru`/`tab_nav_history` entry for this tab still names the
-    /// old group; since both stacks are keyed by `(GroupId, TabId)` (#673),
+    /// old group; since both stacks are keyed by `(GroupId, TabId)`,
     /// such an entry simply stops matching anything (the tab isn't in that
     /// group anymore) rather than being misread as pointing at whatever tab
     /// now occupies its old slot. No explicit fixup is required.
@@ -2920,7 +2885,7 @@ impl Engine {
     /// Move a tab from one group to another at a specific insertion index.
     ///
     /// See `move_tab_to_other_group` re: `tab_mru` — stale cross-group
-    /// entries harmlessly stop matching rather than repointing (#673).
+    /// entries harmlessly stop matching rather than repointing.
     pub fn move_tab_to_target_group_at(
         &mut self,
         src_group: GroupId,
@@ -2961,7 +2926,7 @@ impl Engine {
     /// Move a tab out of its group into a new split adjacent to `target_group`.
     ///
     /// See `move_tab_to_other_group` re: `tab_mru` — stale cross-group
-    /// entries harmlessly stop matching rather than repointing (#673).
+    /// entries harmlessly stop matching rather than repointing.
     pub fn move_tab_to_new_split(
         &mut self,
         src_group: GroupId,
@@ -3002,8 +2967,8 @@ impl Engine {
     ///
     /// This is the single, backend-agnostic entry point for committing a tab
     /// drag-and-drop. Both the GTK and TUI backends resolve the drop zone via
-    /// `quadraui::compose::resolve_tab_drop` (through `render::resolve_tab_drop_zone`,
-    /// #1370) and then call this method, so the mutation semantics live in
+    /// `quadraui::compose::resolve_tab_drop` (through `render::resolve_tab_drop_zone`)
+    /// and then call this method, so the mutation semantics live in
     /// exactly one place. `source_gid` / `source_tab_idx` identify the dragged
     /// tab, captured when the drag started.
     pub fn apply_tab_drop_zone(
@@ -3042,7 +3007,7 @@ impl Engine {
     /// Reorder a tab within its group.
     ///
     /// No `tab_mru` fixup is needed here: the MRU stack is keyed by `TabId`
-    /// (#673), and reordering never changes a tab's id — only its position
+    ///, and reordering never changes a tab's id — only its position
     /// in `tabs`, which the MRU doesn't track.
     pub fn reorder_tab_in_group(&mut self, group_id: GroupId, from_idx: usize, to_idx: usize) {
         if let Some(g) = self.editor_groups.get_mut(&group_id) {
@@ -3111,7 +3076,7 @@ impl Engine {
     /// in `window_rects` (rather than re-deriving them from
     /// `group_layout.calculate_group_rects` with a fresh tab-bar-height
     /// guess) so divider positions always agree exactly with whatever
-    /// `window_rects` the caller is already using/rendering — see #582.
+    /// `window_rects` the caller is already using/rendering.
     pub fn calculate_window_dividers(
         &self,
         window_rects: &[(WindowId, WindowRect)],
@@ -3160,7 +3125,7 @@ impl Engine {
     /// window. Used by location-list jumps (`qf_jump` in
     /// `src/core/engine/picker.rs`), which must stay in the window that owns
     /// the list rather than scattering each entry across new tabs the way
-    /// the window-agnostic global quickfix list does (#1155).
+    /// the window-agnostic global quickfix list does.
     pub fn open_file_in_window(&mut self, window_id: WindowId, path: &Path) {
         let buffer_id = match self.buffer_manager.open_file(path) {
             Ok(id) => id,
@@ -3306,7 +3271,7 @@ impl Engine {
             return;
         }
 
-        // Ask the shared preview tier (quadraui#597) whether this reuses the
+        // Ask the shared preview tier whether this reuses the
         // existing preview slot or needs a new one; it hands back the old
         // preview's id (if any) via a `Closed` event so we can unload it.
         let label = path
@@ -3532,15 +3497,10 @@ impl Engine {
     /// list, save the per-workspace session (if any), then persist the
     /// global session file.
     ///
-    /// Shared by both backends (#823 item 5) — `App::save_session_and_exit`
-    /// (`app.rs`) and `tui_main`'s `save_session` free function were the
-    /// same ~20 lines restated twice, GTK's copy with its own window
-    /// width/height capture spliced in before `collect_session_open_files`
-    /// and its own swap-cleanup/LSP-shutdown/exit-request epilogue spliced
-    /// after `session.save()` — both are genuinely backend-specific (GTK
-    /// has a live window handle to read geometry from; TUI's own quit path
-    /// runs cleanup/shutdown around this call too, just at a different
-    /// call site, `handle_action`'s `Quit`/`SaveQuit` arm) so they stay at
+    /// Shared by both backends — `App::save_session_and_exit` (`app.rs`) and
+    /// `tui_main`'s `save_session` free function have backend-specific
+    /// geometry capture and cleanup epilogues (GTK has a live window handle;
+    /// TUI's quit path runs cleanup/shutdown separately) so they remain at
     /// each call site rather than becoming parameters here.
     pub fn save_session_state(&mut self) {
         let buffer_id = self.active_buffer_id();
@@ -3625,7 +3585,7 @@ impl Engine {
         let mut first = true;
         // `open_file_with_mode` may itself reuse `initial_id` in place for
         // the first file if it's still the pristine startup scratch buffer
-        // (#1298) -- in which case it's no longer an empty scratch buffer to
+        // — in which case it's no longer an empty scratch buffer to
         // clean up below, it *is* one of the restored file buffers.
         let mut initial_id_reused = false;
 
@@ -3659,7 +3619,7 @@ impl Engine {
 
         // Remove the initial empty scratch buffer now that real files are
         // open -- unless `open_file_with_mode` already renamed it in place
-        // for the first file (#1298), in which case deleting it here would
+        // for the first file, in which case deleting it here would
         // delete that file's buffer too.
         if !initial_id_reused {
             let _ = self.delete_buffer(initial_id, true);
@@ -3845,7 +3805,7 @@ impl Engine {
             let dirty_flag = if state.dirty { "+" } else { " " };
             let name = state.display_name();
             let preview_flag = if state.preview { " [Preview]" } else { "" };
-            // #1282: Neovim's `:ls`/`:buffers` appends `line N` (the cursor
+            // Neovim's `:ls`/`:buffers` appends `line N` (the cursor
             // line of whichever window is showing this buffer) for every
             // buffer that's currently in a window — verified against a live
             // `nvim --headless -u NONE` `msg_show` event. Not shown for a
@@ -3894,62 +3854,28 @@ impl Engine {
     /// `direction`: which split direction to look for (Horizontal for +/-, Vertical for </>).
     /// `increase`: true = make active window/group bigger, false = smaller.
     ///
-    /// #1288: vimcode used to move the split *ratio* by a fixed 5% per
-    /// count step (`delta_per_step = 0.05`) — the two only ever agreed by
-    /// accident (`CTRL-W +`/`_` happen to land on the same cell as
-    /// Neovim's absolute-count resize for `[count]=5` on a fixed 80x24
-    /// two-window 50/50 split; `-`/`<`/`>` do not).
+    /// Works in the same *integer* raw-line/column space Neovim uses: reads
+    /// both child subtrees' current sizes (`subtree_raw_extent`), adds or
+    /// subtracts `count` from whichever side the active window is on, and
+    /// converts back to a ratio at the very end. This avoids rounding ties:
+    /// `WindowLayout`'s `ratio` field is a continuous ideal fraction, but
+    /// the two windows' *actual* rendered sizes are already integers rounded
+    /// away from that ideal. Anchoring the arithmetic on the already-integer
+    /// current sizes means the result is only ever `count` away from an
+    /// already-resolved integer, never a fresh tie.
     ///
-    /// The window-split branch below instead works entirely in the same
-    /// *integer* raw-line/column space Neovim's own window-frame model
-    /// uses: it reads both child subtrees' current sizes
-    /// (`subtree_raw_extent`), adds or subtracts `count` from whichever
-    /// side the active window is on, and only converts back to a ratio at
-    /// the very end. This — not `ratio + count / axis_size`, which looked
-    /// algebraically equivalent — is required to avoid landing back on a
-    /// fresh `.5`-line rounding tie: `WindowLayout`'s `ratio` field is a
-    /// continuous ideal fraction (a fresh 50/50 split is `ratio = 0.5`
-    /// exactly), but the two windows' *actual* rendered sizes are already
-    /// integers rounded away from that ideal (an odd 23-row split's two
-    /// sides are 12/11 raw, not 11.5/11.5). Computing the delta against the
-    /// idealized `ratio` and only rounding at render time re-derives a new
-    /// idealized ratio that, for plenty of `[count]`s, is *itself* exactly
-    /// on a `.5` tie (verified against #1290's independent-per-side
-    /// rounding for this exact fixture) — reproducing #1290's bug on a
-    /// resize it was never filed against. Anchoring the arithmetic on the
-    /// already-integer current sizes instead means the result is only ever
-    /// `count` away from an already-resolved integer, never a fresh tie.
-    ///
-    /// #1326: `[count]` converts against `axis_size = first_raw + second_raw`
+    /// `[count]` converts against `axis_size = first_raw + second_raw`
     /// (`subtree_raw_extent`'s own doc), the sum of both children's *actual*
-    /// current content widths — which, thanks to `split_window_with_new_
-    /// first` and `WindowLayout::layout_snapped` both reserving `Vertical`'s
-    /// one-column divider consistently, already equals the split's content
-    /// width (raw axis size minus one), never the raw bounds width. No
-    /// separate divider-column subtraction is needed here: `new_ratio =
-    /// new_first_raw / axis_size`, and `layout_snapped` multiplies that same
-    /// ratio back by the identical content width, so the two cancel back out
-    /// to exactly `new_first_raw` — the same invariant a `Horizontal` split
-    /// (zero divider thickness, `axis_size` and content width always equal)
-    /// has always relied on.
+    /// current content widths — which, thanks to the divider column being
+    /// reserved consistently, already equals the split's content width (raw
+    /// axis size minus one for Vertical), never the raw bounds width.
     ///
-    /// #582: tries the active *window*'s split within its tab's
-    /// `WindowLayout` first (vim `:split`/`:vsplit` panes) — this was
-    /// entirely unwired before (Ctrl-W resize only ever touched
-    /// `self.group_layout`, so it was a no-op for vim window splits, whose
-    /// active window is never a `GroupId`). Falls back to the active
+    /// Tries the active *window*'s split within its tab's `WindowLayout`
+    /// first (vim `:split`/`:vsplit` panes). Falls back to the active
     /// editor-group's parent split (`Ctrl-W e`/`E` layouts, a separate,
-    /// pre-existing, already-tested feature — see
-    /// `tests/vim_compat_batch.rs::test_ctrl_w_plus_resize`) when the active
-    /// tab has no window split in the requested direction, matching vim's
-    /// "operate on the current window, or whatever's locally splittable"
-    /// convention. The group-layout fallback keeps the simpler (and, for
-    /// the reason above, occasionally imprecise) continuous `ratio +
-    /// count / axis_size` conversion — no test pins its exact resulting
-    /// numbers (only that the ratio changes at all), and giving it the
-    /// same integer-anchored treatment would need walking `GroupLayout`
-    /// subtrees down into each group's *own* `WindowLayout`, a bigger
-    /// change than this fallback's existing test coverage asks for.
+    /// pre-existing, already-tested feature) when the active tab has no
+    /// window split in the requested direction, matching vim's "operate on
+    /// the current window, or whatever's locally splittable" convention.
     pub(crate) fn resize_window_split(
         &mut self,
         direction: SplitDirection,
@@ -4005,7 +3931,7 @@ impl Engine {
 
     /// Equalize split ratios to 0.5. Prefers the active tab's window splits
     /// (vim `:split`/`:vsplit`) when any exist, falling back to editor-group
-    /// splits otherwise — see `resize_window_split`'s doc for why (#582).
+    /// splits otherwise — see `resize_window_split`'s doc for why.
     pub(crate) fn equalize_splits(&mut self) {
         if self.active_tab().layout.is_single_window() {
             self.group_layout.set_all_ratios(0.5);
@@ -4016,19 +3942,14 @@ impl Engine {
 
     /// Maximize window in a given direction (CTRL-W _ for height, CTRL-W | for width).
     /// Same window-split-first, group-split-fallback preference as
-    /// `resize_window_split` (#582).
+    /// `resize_window_split`.
     ///
-    /// #1289: used to set a fixed 0.9/0.1 ratio regardless of split size —
-    /// Neovim instead shrinks the *other* window down to its
-    /// `'winminheight'`/`'winminwidth'` floor ([`min_raw_extent`]) and gives
-    /// everything else to the active window. The two only ever agreed for
-    /// height (`CTRL-W _`), and only by accident: 10% of this harness's
-    /// fixed 23-row budget happens to round down to the same 1-content-row
-    /// floor Neovim uses. Works in the same integer raw-line/column space as
-    /// `resize_window_split` (#1288) for the same reason — see that
-    /// function's doc, including #1326's note on why `axis_size` here is
-    /// already the divider-reserved content width for `Vertical` splits and
-    /// needs no separate adjustment.
+    /// Shrinks the *other* window down to its `'winminheight'`/`'winminwidth'`
+    /// floor ([`min_raw_extent`]) and gives everything else to the active
+    /// window, matching Neovim. Works in the same integer raw-line/column
+    /// space as `resize_window_split` for the same reason — see that
+    /// function's doc for why `axis_size` here is already the divider-reserved
+    /// content width for `Vertical` splits and needs no separate adjustment.
     pub(crate) fn maximize_window_split(&mut self, direction: SplitDirection) {
         let active_window = self.active_window_id();
         if let Some((split_idx, split_dir, is_first)) =
@@ -4055,7 +3976,7 @@ impl Engine {
                             other_min_raw
                         };
                         let new_ratio = (new_first_raw / axis_size).clamp(0.0, 1.0);
-                        // #1289: use the size-derived bound, not the generic
+                        // Use the size-derived bound, not the generic
                         // 0.1..0.9 per-step-resize clamp `set_ratio_at_index`
                         // applies by default — that clamp would silently
                         // re-widen the other window straight back out past
@@ -4103,22 +4024,17 @@ impl Engine {
             'j' => self.focus_window_direction(SplitDirection::Horizontal, true),
             'k' => self.focus_window_direction(SplitDirection::Horizontal, false),
             'l' => self.focus_window_direction(SplitDirection::Vertical, true),
-            // #1162: `w` and `W` used to both call `focus_next_window` — `W`
-            // (cycle *backward*, per `:h CTRL-W_W` and this repo's own
-            // VIM_COMPATIBILITY.md row) was silently aliased to `w`. Caught by
-            // the oracle-backed `win:CTRL-W W` case.
+            // `w` and `W` — `w` calls `focus_next_window`, `W` calls
             'w' => self.focus_next_window(),
             'W' => self.focus_prev_window(),
-            // #1292: real Vim's "previously active window" is tab/split
+            // Real Vim's "previously active window" is tab/split
             // scoped — `Tab::prev_window`, updated at every focus-changing
             // call site (see `Tab::focus_window`). Prefer that; a window
             // that's since been closed or moved out of this tab reads back
             // as `None`/stale, so re-validate against the *current* tab
             // layout rather than reviving a dead id. Only when there's no
             // usable window-level target (single-window tab) does `p` fall
-            // back to the pre-existing VSCode-style editor-group toggle —
-            // this repo's own layer beneath real Vim, which has no such
-            // concept and so cannot arbitrate it.
+            // back to the pre-existing VSCode-style editor-group toggle.
             'p' => {
                 let win_target = self.active_tab().prev_window.filter(|&w| {
                     w != self.active_tab().active_window
@@ -4135,15 +4051,10 @@ impl Engine {
                     }
                 }
             }
-            // #1162: `t`/`b` ("go to top-left"/"bottom-right window", `:h
-            // CTRL-W_t`/`:h CTRL-W_b`) used to walk *only* `self.group_layout`
-            // — the VSCode-style editor-group tree — which is a no-op whenever
-            // there is exactly one editor group, the common case a plain
-            // `<C-w>s`/`<C-w>v` split lives in. Real Vim has no editor groups:
-            // its `t`/`b` name the corner *window* of the whole screen, which
-            // here means descending both levels of the layout — outer group
-            // tree first, then that group's own window tree. See
-            // [`Self::corner_window`].
+            // `t`/`b` ("go to top-left"/"bottom-right window") walk
+            // both levels of the layout — outer group tree first, then
+            // that group's own window tree, naming the corner *window* of
+            // the whole screen. See [`Self::corner_window`].
             't' => {
                 if let Some(first) = self.corner_window(false) {
                     self.activate_window(first);
@@ -4348,7 +4259,7 @@ impl Engine {
     /// Ctrl-W r/R: rotate windows in the current tab.
     /// `forward=true` rotates downward/rightward, `forward=false` rotates upward/leftward.
     ///
-    /// Rotates window *identity* through the fixed tree slots (#1291), not
+    /// Rotates window *identity* through the fixed tree slots, not
     /// each slot's content: Neovim's CTRL-W r/R moves which window (buffer +
     /// view + `winid`) occupies each screen position, so a window that was
     /// focused before the rotate stays focused after it, just in its new
@@ -4387,9 +4298,7 @@ impl Engine {
                 self.view_mut().cursor.line = line_idx;
                 // Position cursor on the '/' of '*/' — Neovim lands on the
                 // *last* character of the closing marker, the mirror image
-                // of `[*`/`[/` landing on the first character of `/*`
-                // (#1280: this used to point at the '*' instead, one column
-                // short of Neovim).
+                // of `[*`/`[/` landing on the first character of `/*`.
                 if let Some(pos) = line.find("*/") {
                     let col = line[..pos].chars().count() + 1;
                     self.view_mut().cursor.col = col;
@@ -4755,16 +4664,6 @@ impl Engine {
             lines_text.push_str(&line);
         }
         // Pipe through the command
-        // #948 review (non-blocking): this real-spawn branch is
-        // `#[cfg(not(test))]`, with the `#[cfg(test)]` no-op stub below
-        // standing in under `cargo test` — pre-existing (not introduced by
-        // #948), but it means `shell_cmd()`'s use here has zero automated
-        // coverage under either the engine-level or driver-tier test
-        // styles: `cargo test` never compiles this arm at all, and a
-        // driver test couldn't close the gap either since it hits the exact
-        // same `cfg(test)` stub. Manually verified: `:1,3!sort` on a real
-        // (non-test) build honours `$SHELL` the same way `:!` does, via the
-        // identical `shell_cmd()` call (#1492).
         #[cfg(not(test))]
         let result = {
             use std::io::Write;
