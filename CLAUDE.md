@@ -21,6 +21,7 @@ worker does not need to read it). The rule below stops *new* per-backend code.
 **Issues and acceptance are platform-neutral too.** If quadraui works as advertised, every vimcode behaviour is the same on every backend, so:
 
 - A vimcode issue's acceptance is a backend-neutral test (engine/`render.rs` unit test, or the TUI/headless driver), never "on macOS", "on Windows" or "verify on real hardware". Per-platform rendering and input are proven by quadraui's own conformance tests.
+- **Test on one platform: `vcd` (TUI) on Linux.** Assume a change that passes there works on every backend. Your verify loop and the Test stage run `cargo test --no-default-features` (plus a narrow filter while iterating); the GTK lane is GitHub CI's job, not yours.
 - A bug that shows up on only one backend is a quadraui gap or bug: the fix is a quadraui issue, and the vimcode side is at most a version bump. If your issue asks you to fix a single-backend symptom inside vimcode, say so in your final message and stop rather than adding backend code.
 - Allowed per-platform differences are data, not code: e.g. default font per platform as a table the engine reads, and packaging/release plumbing.
 
