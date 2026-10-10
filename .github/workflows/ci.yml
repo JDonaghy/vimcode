@@ -102,12 +102,26 @@ jobs:
   # caught here instead of only discovered the next time someone runs a real
   # acceptance pass. `scripts/validate_smoke_specs.py` does the importing;
   # this step only installs its one dependency and runs it.
+  #
+  # #1884: the same script also runs static checks (unique `expect_file`
+  # markers, `known_bug` polarity, no raw control chars in a native-GUI
+  # `type_text`, additive-only edits to a sealed spec) that need no `coord`
+  # import at all — a cost analysis of vimcode#1831/#1833/#1834/#1835's
+  # review rounds found a reviewer re-deriving these same three mistakes by
+  # hand, at review prices, every time. `fetch-depth: 0` (not the default
+  # shallow checkout) is required so `git merge-base HEAD origin/develop`
+  # inside the additive-only check can actually resolve a base commit on a
+  # PR run; without it that one check silently skips (logged as a NOTE, not
+  # a failure) rather than reddening the job over missing history it has no
+  # control over.
   test-smoke-specs:
     name: Validate Tier-2 smoke specs
     runs-on: ubuntu-24.04
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
     # Floor, not an exact pin: the four `parse_*_spec` entry points this job
     # imports first shipped together in 0.5.551, and tracking the latest
@@ -120,6 +134,16 @@ jobs:
 
     - name: Validate tests/smoke-spec/*.yaml against coord's real spec loaders
       run: python3 scripts/validate_smoke_specs.py
+
+    # #1884: the validator's own static-check logic (no `coord` import) gets
+    # unit tests, one passing + one failing fixture per rule — run them here
+    # too so a regression in the checker itself (not just in a spec file) is
+    # caught before it ships a silently-weaker gate.
+    - name: Install pytest
+      run: pip install --quiet pytest pyyaml
+
+    - name: Run validator unit tests
+      run: python3 -m pytest tests/test_validate_smoke_specs.py -v
 
   # #645: the job above compiles GTK OUT (`--no-default-features`), so a green
   # run there carries zero information about `src/gtk/`. This job is the lane
