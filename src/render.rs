@@ -14234,17 +14234,17 @@ const MINIMAP_SCALE_CHAR_WIDTH_PX: f64 = 1.0;
 const MINIMAP_GUTTER_WIDTH_PX: f64 = 8.0;
 
 /// VS Code's own default `editor.scrollbar.verticalScrollbarSize` (14 CSS
-/// px), consulted only by [`vs_code_minimap_width_px`]'s ported formula —
-/// **not** the width any backend's own vertical scrollbar actually paints
-/// at today. That gutter is quadraui's `EditorLayout::layout_with_options`
-/// (`v_scrollbar_w = cell_width`, a font-sized ~7-9px column, not a fixed
-/// 14px one) — a quadraui-side gap drafted in
-/// `docs/PENDING_QUADRAUI_ISSUES.md` (not yet filed as a real GitHub issue:
-/// #1869 cannot close until it is and quadraui ships a fix), since vimcode
-/// must not work around it locally (Platform-Neutrality Rule). VS Code
-/// itself computes the minimap's width against its *configured* scrollbar
-/// width regardless of what ends up painted, so this constant is correct
-/// for the minimap formula even while that scrollbar gap is still open.
+/// px), consulted only by [`vs_code_minimap_width_px`]'s ported formula.
+/// quadraui 0.1.3 shipped the host-settable
+/// `Backend::set_editor_v_scrollbar_width`/`Editor::layout_with_options_and_v_scrollbar_w`
+/// quadraui#1869 asked for, and `App::setup` now calls
+/// `backend.set_editor_v_scrollbar_width(Some(14.0))` so GTK/macOS/Win
+/// actually paint (and, via `app_support::editor_scrollbar_layout`,
+/// hit-test) a 14px vertical scrollbar matching this constant — see
+/// `docs/PENDING_QUADRAUI_ISSUES.md`'s #1869 entry for the closed-out
+/// history. VS Code itself computes the minimap's width against its
+/// *configured* scrollbar width regardless of what ends up painted, so this
+/// constant remains correct for the minimap formula independent of that.
 const MINIMAP_VERTICAL_SCROLLBAR_WIDTH_PX: f64 = 14.0;
 
 /// Buffer lines sampled per *display* row of minimap height.

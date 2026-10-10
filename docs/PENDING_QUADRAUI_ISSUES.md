@@ -3187,6 +3187,22 @@ The fix landed entirely on the vimcode side (`Engine::ext_sidebar_navigate`/`ext
 
 **Blocks:** `JDonaghy/vimcode#1869` (the scrollbar half only — the minimap half shipped in this PR as a vimcode-side fix). Per `GOALS.md`'s milestone-discipline rule, #1869 should stay open behind this entry once filed, since there is no vimcode-repo fix available for the scrollbar gutter width.
 
+**Resolved (vimcode#1891):** quadraui 0.1.3 shipped exactly the ask above —
+`Backend::set_editor_v_scrollbar_width`/`editor_v_scrollbar_width` plus
+`Editor::layout_with_options_and_v_scrollbar_w` (an `Option<f32>` override,
+`None` preserving the old `cell_width` default). vimcode#1891 bumped to
+0.1.3 and wired `App::setup` to call
+`backend.set_editor_v_scrollbar_width(Some(14.0))` on GTK/macOS/Win, and
+`app_support::editor_scrollbar_layout` (vimcode's own hit-test/geometry
+chokepoint) now threads `backend.editor_v_scrollbar_width()` through to
+`layout_with_options_and_v_scrollbar_w` as well, so paint and hit-test agree
+on the 14px column rather than paint alone drifting ahead of it. The test
+named above was renamed and its assertion flipped to pin the fixed width
+going forward: `win::win_minimap_scrollbar_1869::
+vertical_scrollbar_is_exactly_vs_codes_14px_1869` now asserts `14.0`. This
+entry's gap is closed; the `## ... sizes the vertical scrollbar at
+cell_width ...` title above describes the pre-0.1.3 state only.
+
 ## `MinimapSizing::VsCodeParity`'s `fraction`/`min`/`max` fields cannot express a real division-based width formula — vimcode routes around it with a `target_cols` sentinel (found while fixing vimcode#1869)
 
 **Title:** `quadraui::MinimapSizing::VsCodeParity { target_cols, fraction, min, max }`'s `resolve_width` (a `target_cols.min(pane_width_cols * fraction).clamp(min, max)` linear-fraction shape) cannot express VS Code's actual minimap width formula, which divides by the editor's real character width rather than scaling linearly — so vimcode's `src/render.rs::minimap_reserved_width` detects its own GTK/macOS/Win policy by a magic `target_cols == 120.0` sentinel and bypasses `resolve_width` entirely, calling a vimcode-local `vs_code_minimap_width_px` instead. `gtk_minimap_sizing()`'s returned value then carries `fraction: 0.0, min: 0.0` — inert placeholders that lie about what the value does if any future caller calls `resolve_width` on it directly instead of routing through `minimap_reserved_width`.
