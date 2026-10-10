@@ -292,27 +292,43 @@ fn scrollbar_probe_editor(engine: &Engine, window_id: core::WindowId) -> Option<
 
 /// This window's [`quadraui::Editor`] + [`quadraui::EditorLayout`], laid
 /// out against `rect` at `char_width`/`line_height` — the same
-/// [`quadraui::Editor::layout`] call paint makes, so
+/// [`quadraui::Editor::layout_with_options_and_v_scrollbar_w`] call paint
+/// makes (via `backend.set_editor_v_scrollbar_width`/
+/// `backend.editor_v_scrollbar_width`, #1891), so
 /// `.h_scrollbar_bounds`/`.v_scrollbar_bounds` are never independently
 /// re-derived (#1128).
 ///
-/// `rect` is handed to `.layout()` unmodified, exactly as
-/// `quadraui::gtk::editor::draw_editor_with_options` hands it `editor.rect`
-/// unmodified — including for a window with its own per-window status
-/// line, which current paint does **not** shrink `rect` for before laying
-/// out scrollbars (see `quadraui::gtk::editor`'s module doc, "Scrollbars"
-/// section). That means the painted scrollbar can currently run under
-/// where the status line paints afterward; that overlap is real, but
-/// pre-existing and out of this issue's scope — #723/#1094 are the
-/// scrollbar-*placement* follow-ups this issue's ordering note defers it
-/// to. Reintroducing a status-row offset here — as the pre-#1128 code did —
-/// would just make hit-testing disagree with paint in the other direction.
+/// `v_scrollbar_w` must be the same value the backend painted with —
+/// callers with a `&dyn quadraui::Backend` in scope pass
+/// `backend.editor_v_scrollbar_width()` through unchanged. Passing `None`
+/// here when the real backend has an override set (e.g. GTK/macOS/Win's
+/// 14px vertical scrollbar) would reintroduce the paint↔hit-test
+/// divergence #1891 fixed: quadraui defaults an unset `v_scrollbar_w` to
+/// `cell_width` (~7-9px), narrower than the 14px column paint actually
+/// draws, so hit-testing would miss clicks on the outer few pixels of a
+/// real scrollbar and the horizontal scrollbar's track width (which also
+/// depends on `v_scrollbar_w`, since it eats into `text_w`) would disagree
+/// too.
+///
+/// `rect` is handed to `.layout_with_options_and_v_scrollbar_w()`
+/// unmodified, exactly as `quadraui::gtk::editor::draw_editor_with_options`
+/// hands it `editor.rect` unmodified — including for a window with its own
+/// per-window status line, which current paint does **not** shrink `rect`
+/// for before laying out scrollbars (see `quadraui::gtk::editor`'s module
+/// doc, "Scrollbars" section). That means the painted scrollbar can
+/// currently run under where the status line paints afterward; that
+/// overlap is real, but pre-existing and out of this issue's scope —
+/// #723/#1094 are the scrollbar-*placement* follow-ups this issue's
+/// ordering note defers it to. Reintroducing a status-row offset here — as
+/// the pre-#1128 code did — would just make hit-testing disagree with
+/// paint in the other direction.
 pub(crate) fn editor_scrollbar_layout(
     engine: &Engine,
     window_id: core::WindowId,
     rect: &core::WindowRect,
     char_width: f64,
     line_height: f64,
+    v_scrollbar_w: Option<f32>,
 ) -> Option<(quadraui::Editor, quadraui::EditorLayout)> {
     let editor = scrollbar_probe_editor(engine, window_id)?;
     let viewport = quadraui::Rect::new(
@@ -321,7 +337,13 @@ pub(crate) fn editor_scrollbar_layout(
         rect.width as f32,
         rect.height as f32,
     );
-    let layout = editor.layout(viewport, char_width as f32, line_height as f32);
+    let layout = editor.layout_with_options_and_v_scrollbar_w(
+        viewport,
+        char_width as f32,
+        line_height as f32,
+        quadraui::EditorPaintOptions::default(),
+        v_scrollbar_w,
+    );
     Some((editor, layout))
 }
 
@@ -369,10 +391,17 @@ pub(crate) fn scrollbar_thumb_geometry(
     rect: &core::WindowRect,
     char_width: f64,
     line_height: f64,
+    v_scrollbar_w: Option<f32>,
     axis: ScrollbarAxis,
 ) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
-    let (editor, layout) =
-        editor_scrollbar_layout(engine, window_id, rect, char_width, line_height)?;
+    let (editor, layout) = editor_scrollbar_layout(
+        engine,
+        window_id,
+        rect,
+        char_width,
+        line_height,
+        v_scrollbar_w,
+    )?;
     let (track, scroll_pos, extent, visible, track_len) = match axis {
         ScrollbarAxis::Horizontal => {
             let track = layout.h_scrollbar_bounds?;
@@ -436,6 +465,13 @@ pub(crate) fn scrollbar_thumb_geometry(
 /// scrollbar (#987's `drag_group_divider_resizes` regression). Reading
 /// both axes through the same `hit_test` call means they can never
 /// re-diverge on that convention again.
+// #1891 added `v_scrollbar_w` to thread the backend's scrollbar-width
+// override through hit-testing so it agrees with paint, pushing this
+// shared horizontal/vertical helper from 7 to 8 parameters. Splitting
+// it back into two per-axis copies to dodge the lint would reintroduce
+// exactly the duplication the doc comment above explains this function
+// exists to avoid, so the extra argument is accepted deliberately.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scrollbar_hit_test(
     engine: &Engine,
     x: f64,
@@ -443,6 +479,7 @@ pub(crate) fn scrollbar_hit_test(
     window_rects: &[(core::WindowId, core::WindowRect)],
     char_width: f64,
     line_height: f64,
+    v_scrollbar_w: Option<f32>,
     axis: ScrollbarAxis,
 ) -> Option<(core::WindowId, usize)> {
     let want = match axis {
@@ -450,9 +487,14 @@ pub(crate) fn scrollbar_hit_test(
         ScrollbarAxis::Vertical => quadraui::EditorHit::VScrollbar,
     };
     for (window_id, rect) in window_rects {
-        let Some((_, layout)) =
-            editor_scrollbar_layout(engine, *window_id, rect, char_width, line_height)
-        else {
+        let Some((_, layout)) = editor_scrollbar_layout(
+            engine,
+            *window_id,
+            rect,
+            char_width,
+            line_height,
+            v_scrollbar_w,
+        ) else {
             continue;
         };
         if layout.hit_test(x as f32, y as f32) == want {

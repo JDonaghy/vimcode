@@ -250,8 +250,9 @@ mod editor_scrollbar_geometry_tests {
         let char_width = 20.0;
         let line_height = 20.0;
 
-        let (editor, layout) = editor_scrollbar_layout(&e, wid, &rect, char_width, line_height)
-            .expect("window and buffer must resolve");
+        let (editor, layout) =
+            editor_scrollbar_layout(&e, wid, &rect, char_width, line_height, None)
+                .expect("window and buffer must resolve");
         let h_track = layout
             .h_scrollbar_bounds
             .expect("a 500-char line must overflow a 1000px-wide pane");
@@ -292,6 +293,7 @@ mod editor_scrollbar_geometry_tests {
             &rect,
             char_width,
             line_height,
+            None,
             ScrollbarAxis::Horizontal,
         )
         .expect("thumb geometry must resolve alongside the track");
@@ -331,8 +333,9 @@ mod editor_scrollbar_geometry_tests {
         let baseline_y = {
             let e = engine_needing_h_scrollbar_with_wide_gutter();
             let wid = e.active_window_id();
-            let (_, layout) = editor_scrollbar_layout(&e, wid, &rect, char_width, line_height)
-                .expect("an overflowing line needs an h-scrollbar");
+            let (_, layout) =
+                editor_scrollbar_layout(&e, wid, &rect, char_width, line_height, None)
+                    .expect("an overflowing line needs an h-scrollbar");
             layout.h_scrollbar_bounds.unwrap().y
         };
 
@@ -344,8 +347,9 @@ mod editor_scrollbar_geometry_tests {
             let mut e = engine_needing_h_scrollbar_with_wide_gutter();
             configure(&mut e);
             let wid = e.active_window_id();
-            let (_, layout) = editor_scrollbar_layout(&e, wid, &rect, char_width, line_height)
-                .expect("still overflowing under this configuration");
+            let (_, layout) =
+                editor_scrollbar_layout(&e, wid, &rect, char_width, line_height, None)
+                    .expect("still overflowing under this configuration");
             assert_eq!(
                 layout.h_scrollbar_bounds.unwrap().y,
                 baseline_y,

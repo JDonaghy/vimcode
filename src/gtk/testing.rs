@@ -17159,6 +17159,199 @@ mod scrollbar_paint {
         );
     }
 
+    /// #1891 black-box regression: dragging a point that falls **only**
+    /// inside the real 14px-wide v-scrollbar column — strictly left of
+    /// where the pre-#1891 `cell_width`-based column would have started —
+    /// must still grab and drag the v-scrollbar thumb, landing on the same
+    /// [`quadraui::fit_thumb`]-predicted row the plain-thumb drag test
+    /// above pins. This is the driver-tier proof that paint and hit-test
+    /// now agree on the *same* 14px backend override end to end
+    /// (`App::setup`'s `backend.set_editor_v_scrollbar_width(Some(14.0))`
+    /// -> `quadraui::gtk::editor::draw_editor_with_options_and_v_scrollbar_w`
+    /// for paint; `App::editor_scrollbar_press`'s
+    /// `backend.editor_v_scrollbar_width()` ->
+    /// `editor_scrollbar_layout`/`scrollbar_thumb_geometry` for hit-test) —
+    /// not only that each half independently compiles.
+    ///
+    /// Before #1891, `editor_scrollbar_layout` called the bare
+    /// `quadraui::Editor::layout`, which always passes `v_scrollbar_w =
+    /// None` through to `layout_with_options_and_v_scrollbar_w` —
+    /// defaulting the *hit-tested* column to `char_width` (~7-9px) even
+    /// though GTK/macOS/Win's real backend override made quadraui *paint*
+    /// a 14px column. A point in the gap between those two widths would
+    /// paint as scrollbar but hit-test as ordinary editor text.
+    ///
+    /// This test never calls `editor_scrollbar_layout` /
+    /// `scrollbar_thumb_geometry` itself (the code under test) — it
+    /// predicts both the old and new track geometry directly from
+    /// quadraui's own public `quadraui::Editor::layout_with_options_and_v_scrollbar_w`,
+    /// exactly mirroring what `editor_scrollbar_layout` does internally,
+    /// so a regression in that wiring (e.g. reverting to the bare
+    /// `.layout()`) changes what this test predicts, not just what
+    /// production code computes.
+    ///
+    /// **Verified RED against the pre-#1891 fix**: temporarily hardcoding
+    /// `App::editor_scrollbar_press`'s `v_scrollbar_w` to `None` instead of
+    /// reading `backend.editor_v_scrollbar_width()` — reproducing the
+    /// pre-#1891 behavior, where hit-testing never saw the backend's 14px
+    /// override — this test failed: `gap_x` fell outside the production
+    /// hit-test's (narrower) `cell_width`-based track, so the "drag"
+    /// (mouse_down/move/up at `gap_x`) fell through to ordinary editor
+    /// click/drag handling instead of grabbing the scrollbar thumb;
+    /// `scroll_top` stayed at 0 instead of matching this test's
+    /// `fit_thumb` prediction, failing the final assertion. Restoring the
+    /// real `backend.editor_v_scrollbar_width()` read makes it pass again.
+    #[test]
+    fn dragging_the_14px_only_gap_still_hits_the_v_scrollbar_on_gtk() {
+        let mut h = harness(engine_with_long_buffer(), 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+
+        let rect = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win)
+                .expect("the active window must have painted")
+                .rect
+        };
+        let char_width = h.painted_char_width() as f32;
+        let line_height =
+            h.painted_line_height()
+                .expect("render_content must publish the painted line height") as f32;
+        assert!(
+            char_width < 14.0,
+            "fixture sanity: the default font's cell width ({char_width}) \
+             must be narrower than the 14px override this test proves \
+             paint and hit-test now both use — otherwise there is no gap \
+             between the old and new track to click into"
+        );
+
+        let total_lines = {
+            let engine = h.engine.borrow();
+            let window = engine.windows.get(&win).unwrap();
+            let buffer_state = engine.buffer_manager.get(window.buffer_id).unwrap();
+            buffer_state.buffer.len_lines()
+        };
+
+        // Independently lay out the editor twice with quadraui's own
+        // public API — once exactly as the real 14px backend override
+        // does, once exactly as the pre-#1891 bare `.layout()` (`None`)
+        // did — to find a point that is on the new track but was never on
+        // the old one.
+        let viewport = quadraui::Rect::new(
+            rect.x as f32,
+            rect.y as f32,
+            rect.width as f32,
+            rect.height as f32,
+        );
+        let mk_editor = || {
+            quadraui::Editor::new(
+                quadraui::WidgetId::new("v_scrollbar_gap_probe"),
+                quadraui::Rect::new(0.0, 0.0, 0.0, 0.0),
+            )
+            .with_scroll_top(0)
+            .with_total_lines(total_lines)
+            .with_max_col(0)
+        };
+        let layout_14px = mk_editor().layout_with_options_and_v_scrollbar_w(
+            viewport,
+            char_width,
+            line_height,
+            quadraui::EditorPaintOptions::default(),
+            Some(14.0),
+        );
+        let layout_cell_width = mk_editor().layout_with_options_and_v_scrollbar_w(
+            viewport,
+            char_width,
+            line_height,
+            quadraui::EditorPaintOptions::default(),
+            None,
+        );
+        let track_14px = layout_14px
+            .v_scrollbar_bounds
+            .expect("fixture sanity: a 500-line buffer must paint a v-scrollbar");
+        let track_cell_width = layout_cell_width
+            .v_scrollbar_bounds
+            .expect("fixture sanity: a 500-line buffer must paint a v-scrollbar");
+        assert!(
+            track_14px.x < track_cell_width.x,
+            "the 14px-override track ({}) must start further left (be \
+             wider) than the cell_width-default track ({}) — if this now \
+             fails, quadraui no longer widens the painted/hit-tested \
+             column with an explicit override and this test (and #1891)\
+             need updating",
+            track_14px.x,
+            track_cell_width.x
+        );
+        let gap = track_cell_width.x - track_14px.x;
+        assert!(
+            gap >= 2.0,
+            "fixture sanity: the gap between the two tracks ({gap}px) must \
+             be wide enough to place a click strictly inside it"
+        );
+
+        // A point 1px right of the 14px track's own left edge — inside the
+        // new (correct) track, strictly left of where the old
+        // `cell_width`-based track would have started.
+        let gap_x = track_14px.x + 1.0;
+        assert!(
+            gap_x < track_cell_width.x,
+            "fixture sanity: gap_x ({gap_x}) must fall strictly outside \
+             the old cell_width-based track ({})",
+            track_cell_width.x
+        );
+
+        // Predict the expected drag landing spot exactly as the plain-
+        // thumb drag test above does, from the real 14px track's own
+        // height and `quadraui::fit_thumb` — never this issue's own
+        // `scrollbar_thumb_geometry`.
+        let track_h = track_14px.height;
+        let visible_lines = (track_h / line_height).floor();
+        let max_scroll = ((total_lines as f64) - (visible_lines as f64))
+            .max(1.0)
+            .round() as usize;
+        let (thumb_start0, thumb_len) =
+            quadraui::fit_thumb(0.0, total_lines as f32, visible_lines, track_h, line_height);
+        assert!(
+            thumb_len > 8.0,
+            "fixture sanity: the thumb must be comfortably grabbable a few \
+             pixels from its own top edge (thumb_len={thumb_len})"
+        );
+
+        const GRAB_OFFSET: f32 = 2.0;
+        let grab_y = rect.y as f32 + thumb_start0 + GRAB_OFFSET;
+        let target_y = rect.y as f32 + 0.5 * track_h;
+        let effective_track = (track_h - thumb_len).max(1.0);
+        let rel = ((target_y - rect.y as f32) - GRAB_OFFSET) / effective_track;
+        let expected = (rel.clamp(0.0, 1.0) * max_scroll as f32).round() as i64;
+
+        let before = h.engine.borrow().windows.get(&win).unwrap().view.scroll_top;
+        assert_eq!(before, 0, "fixture sanity: must start unscrolled");
+
+        // A real drag through the real `App` dispatch, grabbing the thumb
+        // at `gap_x` — a point that is on-track only because paint and
+        // hit-test now agree on the 14px override.
+        h.driver.mouse_down(gap_x, grab_y);
+        h.driver.mouse_move(gap_x, target_y);
+        h.driver.mouse_up(gap_x, target_y);
+        h.driver.render();
+
+        let after = h.engine.borrow().windows.get(&win).unwrap().view.scroll_top as i64;
+        assert!(
+            (after - expected).abs() <= 1,
+            "dragging from gap_x={gap_x} (inside the 14px track, outside \
+             the old cell_width track) must land scroll_top within 1 of \
+             this test's independent `fit_thumb`-based prediction \
+             ({expected}); got {after} instead — if this fails, hit-test \
+             and paint have gone back out of sync on the v-scrollbar's \
+             real width (max_scroll={max_scroll}, \
+             visible_lines={visible_lines}, thumb_len={thumb_len})"
+        );
+    }
+
     /// #828 acceptance (driver tier): "editor viewport width with the
     /// scrollbar present". GTK does not clip painted *text* glyphs to
     /// `text_viewport_cols` at the pixel level — a long line's characters

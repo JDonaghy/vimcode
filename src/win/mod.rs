@@ -1049,7 +1049,13 @@ mod win_minimap_scrollbar_1869 {
     fn minimap_probe(width_px: f64) -> MinimapProbe {
         use quadraui::Backend as _;
 
-        let backend = super::backend::WinBackend::new();
+        let mut backend = super::backend::WinBackend::new();
+        // #1891: mirror `App::setup`'s real production wiring
+        // (`backend.set_editor_v_scrollbar_width(Some(14.0))`) rather than
+        // leaving this probe's backend at the trait's own `None` default —
+        // otherwise this probe would keep exercising a code path paint no
+        // longer takes.
+        backend.set_editor_v_scrollbar_width(Some(14.0));
         let char_width = backend.char_width() as f64;
         let line_height = backend.line_height() as f64;
         let scrollbar_reserve = backend.scrollbar_reserve() as f64;
@@ -1092,7 +1098,19 @@ mod win_minimap_scrollbar_1869 {
         );
 
         let editor = render::to_q_editor(rw);
-        let el = editor.layout(editor.rect, char_width as f32, line_height as f32);
+        // #1891: honour the override just set above, the same way
+        // `app_support::editor_scrollbar_layout` does for hit-testing and
+        // `quadraui::win::editor::draw_editor` does for paint — the bare
+        // `.layout()` call this replaced always passed `v_scrollbar_w =
+        // None`, which silently reverted to `cell_width` regardless of the
+        // backend's own override.
+        let el = editor.layout_with_options_and_v_scrollbar_w(
+            editor.rect,
+            char_width as f32,
+            line_height as f32,
+            quadraui::EditorPaintOptions::default(),
+            backend.editor_v_scrollbar_width(),
+        );
 
         MinimapProbe {
             strip_width: mm.rect.width,
@@ -1175,31 +1193,32 @@ mod win_minimap_scrollbar_1869 {
         );
     }
 
-    /// #1869's still-open half: the vertical scrollbar gutter. VS Code's
-    /// own default (`editor.scrollbar.verticalScrollbarSize`) is a fixed
-    /// 14px regardless of font; quadraui's `Editor::layout` instead sizes
-    /// it at `cell_width` (`quadraui-0.1.2/src/primitives/editor.rs`,
-    /// `v_scrollbar_w = if has_v_scrollbar { cell_width } else { 0.0 }`),
-    /// with no way for a host to override it. This is the drafted,
-    /// not-yet-filed gap in `docs/PENDING_QUADRAUI_ISSUES.md` — pinning the
-    /// *current*, still-wrong width here (rather than leaving it
-    /// unasserted) means this test goes red the day quadraui ships a fix,
-    /// which is the trigger to update this assertion and close that entry,
-    /// not a silent drift.
+    /// #1869's formerly-open half, now closed: the vertical scrollbar
+    /// gutter. VS Code's own default
+    /// (`editor.scrollbar.verticalScrollbarSize`) is a fixed 14px regardless
+    /// of font; quadraui 0.1.2's `Editor::layout` used to size it at
+    /// `cell_width` instead with no way for a host to override it. quadraui
+    /// 0.1.3 shipped the host-settable
+    /// `Backend::set_editor_v_scrollbar_width`/
+    /// `Editor::layout_with_options_and_v_scrollbar_w` the drafted
+    /// `docs/PENDING_QUADRAUI_ISSUES.md` entry asked for, and #1891 wired
+    /// `App::setup` to call `backend.set_editor_v_scrollbar_width(Some(14.0))`
+    /// on GTK/macOS/Win — `minimap_probe` above now mirrors that same call
+    /// rather than bypassing it, so this pins the *fixed* width going
+    /// forward instead of the old, VS-Code-mismatched one.
     #[test]
-    fn vertical_scrollbar_is_still_cell_width_not_vs_codes_14px_1869() {
+    fn vertical_scrollbar_is_exactly_vs_codes_14px_1869() {
         let p = minimap_probe(1400.0);
         let got = p
             .v_scrollbar_width_px
             .expect("a 2000-line buffer in a 900px-tall window must overflow and reserve a vertical scrollbar");
         assert_eq!(
-            got, p.char_width,
-            "quadraui still sizes the vertical scrollbar at the editor's \
-             own cell width, not VS Code's fixed 14px — if this now fails, \
-             quadraui shipped the host-settable scrollbar width \
-             docs/PENDING_QUADRAUI_ISSUES.md's #1869 entry asks for; update \
-             this test to assert exactly 14.0 and close that entry instead \
-             of re-tuning the fixture (got {got}, char_width={})",
+            got, 14.0,
+            "WinBackend's `set_editor_v_scrollbar_width(Some(14.0))` override \
+             (wired by `App::setup`, #1891) must make the vertical scrollbar \
+             paint — and, via `editor_v_scrollbar_width()`, hit-test — at \
+             exactly VS Code's fixed 14px rather than the editor's own font- \
+             sized cell width (got {got}, char_width={})",
             p.char_width
         );
     }
