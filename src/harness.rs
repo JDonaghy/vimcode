@@ -1331,7 +1331,10 @@ pub fn explorer_chevron_click_toggles_dir_with_same_arity_as_label_click<
         .inventory()
         .text_runs()
         .iter()
-        .find(|r| r.text == "▸" || r.text == "\u{eab6}")
+        .find(|r| {
+            r.text == crate::icons::TREE_CHEVRON_RIGHT.fallback
+                || r.text == crate::icons::TREE_CHEVRON_RIGHT.nerd
+        })
         .unwrap_or_else(|| {
             panic!(
                 "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click: \
@@ -4852,7 +4855,8 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
                         // the plain `×` (U+00D7) character; accept either
                         // so this disambiguation (same row, to the
                         // label's right) still finds it on both.
-                        (r.text.contains('\u{00d7}') || r.text.contains('\u{ea76}'))
+                        (r.text.contains(crate::icons::TAB_CLOSE.fallback)
+                            || r.text.contains(crate::icons::TAB_CLOSE.nerd))
                             && r.bounds.y == label.bounds.y
                             && r.bounds.x > label.bounds.x
                     })

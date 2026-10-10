@@ -273,6 +273,13 @@ pub const FIND_REPLACE_ALL: Icon = Icon::new("\u{eb3d}", "R*"); // nf-cod-replac
 pub const FIND_IN_SEL: Icon = Icon::new("\u{eb54}", "\u{2261}"); // ≡ nf-cod-selection
 pub const FIND_CLOSE: Icon = Icon::new("\u{ea76}", "\u{00d7}"); // × nf-cod-close
 
+// ─── quadraui-painted glyphs (quadraui#1377) ────────────────────────────────
+// Glyphs quadraui itself paints (not vimcode); the test harness matches on
+// `.nerd` / `.fallback` to accept both pre- and post-#1377 quadraui.
+
+pub const TREE_CHEVRON_RIGHT: Icon = Icon::new("\u{eab6}", "\u{25b8}"); // ▸ nf-cod-chevron_right
+pub const TAB_CLOSE: Icon = Icon::new("\u{ea76}", "\u{00d7}"); // × nf-cod-close
+
 // ─── Window Controls (GTK client-side titlebar, #552) ───────────────────────
 // Plain Unicode glyphs — deliberately no nerd-font-only variant since these
 // draw at the very top of the window before any font capability probing is
