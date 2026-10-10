@@ -45,6 +45,47 @@
 # first-approximation guesses pending an operator with a real (or
 # `Xvfb`-provisioned, package-installable) Linux desktop running this spec
 # and recording pass/fail back into this comment.
+#
+# ── vimcode#1835 update (2026-10-09): typing/`:term`/extension-install/
+#    `expect_frontmost`/`expect_region_not_uniform` probes added (see the
+#    new `-1835`-suffixed section before the `click-close-button` pair
+#    below) ───────────────────────────────────────────────────────────────
+#
+# This update inherits the paragraph above's own "has NOT had a real run"
+# status, unchanged: this issue's worktree is a macOS host with no Linux
+# box, container runtime, or fleet SSH access reachable from it, and
+# `gtk_native_driver.py`'s own `LinuxGtkCalls` construction-time-raises on
+# any non-Linux platform (`GtkNativeRuntimeError`, by design — see that
+# module's docstring), so `coord app-drive run-spec gtk-native` cannot even
+# start here to attempt validation. Every step in the new `-1835` section
+# was instead validated the way this repo's own convention requires for a
+# step that genuinely cannot be exercised locally: cross-checked against
+# the exact same marker/echo/`:saveas` shapes this issue's companion
+# `tests/smoke-spec/tui.yaml` `-1835` section already ran clean, real, over
+# a real pty (see that file's own header) — the `type_text`/`key`/
+# `expect_file` semantics are the one piece shared verbatim across every
+# Tier-2 native driver (`coord.native_fs_wait`, #2096 "one question, one
+# answer"), so a real pass there is strong (not equivalent-to-a-real-run)
+# evidence this section's own non-pixel steps are correct. The two
+# `expect_region_not_uniform` pixel bands remain first-approximation
+# guesses with no cross-check available at all. None of this section is
+# "done" by this issue's own bar ("the spec has actually run on the real
+# host") until a Linux/GTK operator runs it (review round 1 below, same
+# status: still unrun) — tracked in PROJECT_STATE.md.
+#
+# -- review round 1 (2026-10-09): self-invalidation + band placement --
+#
+# Same worktree, same "cannot even start `gtk-native` here" constraint as
+# the paragraph above -- still unrun. Fixes applied without a real run,
+# cross-checked the same way as the original authoring (against the TUI
+# section's own real-pty-verified equivalents, now updated with the same
+# fixes -- see `tests/smoke-spec/tui.yaml`'s own round-1 header): the
+# `:term`/extension-install shell commands now `rm` their own target
+# before recreating it, a bare-`:w` pair covers the issue's literal step 1
+# gesture, a trailing cleanup block removes everything this section
+# created, and both `expect_region_not_uniform` bands moved toward the top
+# of their respective painted regions. See the per-step comments in the
+# `-1835` section below for the specifics of each.
 name: vimcode-gtk-gui
 width: 1024
 height: 768
@@ -77,6 +118,337 @@ steps:
   - type: key
     id: dismiss-dropdown
     key: esc
+
+  # ─────────────────────────────────────────────────────────────────────
+  # vimcode#1835 -- Linux "first five minutes" smoke: typing, `:term`, and
+  # extension-install probes, plus `expect_frontmost`/
+  # `expect_region_not_uniform` -- the driver steps `gtk-native` gained for
+  # exactly this purpose (claude-coordinator#3650). Additive (#3509): every
+  # existing step above is unchanged. Placed here (before the pre-existing
+  # `click-close-button`/`close-button-actually-closes-window` pair below,
+  # not appended after it) because that pair's own job is closing the
+  # window — this section needs it still open, and #3509's "don't rewrite
+  # an existing step" bar does not require literally moving to the very
+  # end of the file when the existing last step is itself a teardown
+  # action.
+  #
+  # UNCONFIRMED pixel geometry (same caveat this file's own header already
+  # states for every `click`/`expect_a11y` step above): no real Linux/X11
+  # host was available to run this section from this issue's worktree.
+  # The `terminal-panel-not-uniform-1835`/`minimap-not-uniform-1835` bands
+  # below are derived from `src/render.rs`'s own layout constants
+  # (`activity_bar_width_px = 48.0`, `TAB_ROW_HEIGHT_PX = 35.0`,
+  # `BREADCRUMB_ROW_HEIGHT_PX = 22.0`, `MINIMAP_WIDTH_FRACTION = 0.15` of
+  # the editor pane, clamped to `[MINIMAP_MIN_PX, MINIMAP_MAX_PX] = [48,
+  # 240]` px), not a real `xwd` capture — first-approximation guesses,
+  # same status this file's header already gives the `click-file-menu-item`
+  # coordinates. Needs an operator with a real (or Xvfb-provisioned) Linux
+  # desktop to run this section and record pass/fail back into this
+  # comment — see PROJECT_STATE.md. The `expect_file`/`expect_frontmost`
+  # steps below have no pixel-geometry guesswork in them and are expected
+  # to be reliable on a real run; only the two `expect_region_not_uniform`
+  # bands are first-approximation.
+  #
+  # Review round 1 (self-invalidation + band placement): same three
+  # changes made to this issue's TUI section (see
+  # `tests/smoke-spec/tui.yaml`'s own `-1835` header for the full
+  # reasoning, cross-checked real on a pty), applied here too: (a) the
+  # `:term`/extension-install shell commands now `rm` their own target
+  # before (re)creating it, so a stale `/tmp` file or extension directory
+  # from a PRIOR run cannot masquerade as proof this run's shell command
+  # actually ran; (b) a `w-bare-probe-*-1835` pair right after the
+  # `:saveas` probe appends a NEW marker suffix and re-saves with a bare
+  # `:w` -- the literal gesture this issue's step 1 names, not covered by
+  # `:saveas` alone, and self-invalidating the same way; (c) a trailing
+  # cleanup block removes every file/directory this section created, so
+  # the next run starts clean and this probe stops permanently installing
+  # a bogus extension into the operator's REAL
+  # `~/.config/vimcode/extensions/`. Also repositioned both
+  # `expect_region_not_uniform` bands toward the TOP of their respective
+  # painted regions (panel tab-bar/toolbar row; first rows of the
+  # minimap's scaled content) instead of deep into them, since a short
+  # "small, real, non-empty text file" (this file's own header) or a
+  # terminal panel that has only echoed one or two lines so far may well
+  # leave the LOWER portion of either region genuinely blank -- still a
+  # first-approximation guess, not a real-host confirmation.
+  #
+  # `~` in `expect_file` below resolves against the DRIVER process's own
+  # `$HOME` (`coord`'s own `expect_file`/`native_fs_wait.wait_for_file`,
+  # not the launched app's) -- same note `tests/smoke-spec/tui.yaml`'s own
+  # `-1835` section makes; an operator who launches this spec's app under
+  # an isolated `HOME` override must run `coord` itself with that same
+  # `HOME` or point this probe at an absolute path instead.
+  #
+  # Unlike the TUI section's `:%d` buffer-clear, this GTK section never
+  # clears the launched buffer before typing, so `:saveas`/`:w` below
+  # write the launch file's ORIGINAL content plus the typed markers, not
+  # just the markers alone. Round 1 claimed this was harmless for every
+  # `contains` assertion here; round 2's review found that claim false
+  # for the bare-`:w` probe specifically -- `A` (append-at-end-of-line)
+  # landed its suffix after the launch file's own original text, not
+  # adjacent to the first marker, so the OLD suffix-only assertion could
+  # never match on a real host. Fixed by typing the full second marker in
+  # one contiguous `type_text` instead of a bare suffix (see the
+  # `w-bare-probe-*-1835` steps' own comment below) -- with that fix the
+  # not-clearing-the-buffer choice really is harmless again, for the
+  # reason originally claimed.
+  #
+  # Review round 2 also notes a residual limitation of the trailing
+  # cleanup block this section relies on for cross-run self-invalidation
+  # (see PROJECT_STATE.md for the full writeup): the cleanup is typed
+  # into the terminal pane opened by step 2, so if ANY earlier step in
+  # this section fails first, the cleanup never runs and the `/tmp`
+  # files / extension directory survive for the NEXT run to stale-pass
+  # against. A per-run-unique path/suffix would close this for good; the
+  # spec format has no run-id primitive to build one from, so this is a
+  # known, accepted residual gap, not something the probes below claim to
+  # solve.
+
+  # 0. `expect_frontmost` -- the vimcode#1824 "app never becomes
+  # frontmost" class of bug, checked before any typed input below so a
+  # `type_text` step that silently lands on the launching terminal instead
+  # (vimcode#1825-class) cannot masquerade as a pass. Expected RED while
+  # EITHER #1824 (reported on macOS; Linux status unconfirmed, no `-NNNN`
+  # per-platform split filed) or #1825 (reported cross-platform, still
+  # open pending human confirmation of quadraui#1325 per
+  # PROJECT_STATE.md) is open on this host -- a red here is not
+  # necessarily a NEW regression, check those issues first.
+  - type: expect_frontmost
+    id: launch-is-frontmost-1835
+
+  # 1. Typing -> `:w` -> `expect_file`: a real user gesture (insert text,
+  # Escape, save to an explicit path) must actually land the typed text on
+  # disk. Uses `:saveas <path>`, not a bare `:w <path>` — see
+  # `tests/smoke-spec/tui.yaml`'s own `-1835` section for why: a real-pty
+  # run found vimcode's `:w` matches `cmd` *exactly* against the literal
+  # strings `"write"`/`"write!"` (`src/core/engine/execute.rs`), so a
+  # trailing path argument makes the WHOLE command fall through to the
+  # catch-all "Not an editor command" arm -- it is an unrecognized
+  # command, not a silent no-op, and it does not even save the current
+  # file. `:saveas <path>` is the command vimcode actually implements for
+  # "write to this explicit new path". The literal bare-`:w` gesture this
+  # issue's step 1 names is still covered below (`w-bare-probe-*-1835`),
+  # deferred until after `:saveas` has named the buffer so it stays
+  # launch-independent. NOT filed as a vimcode bug -- flagged here and in
+  # PROJECT_STATE.md for the coordinator to file (this worker cannot run
+  # `gh`).
+  - type: key
+    id: w-probe-insert-1835
+    key: i
+  - type: type_text
+    id: w-probe-type-text-1835
+    text: "VIMCODE_SMOKE_SAVE_PROBE_1835_GTK"
+  - type: key
+    id: w-probe-esc-1835
+    key: esc
+  - type: key
+    id: w-probe-colon-1835
+    key: ':'
+  - type: type_text
+    id: w-probe-write-command-1835
+    text: "saveas /tmp/vimcode-smoke-save-probe-1835-gtk.txt"
+  - type: key
+    id: w-probe-enter-1835
+    key: enter
+  - type: wait
+    id: w-probe-settle-1835
+    ms: 500
+  - type: expect_file
+    id: w-probe-file-appears-1835
+    path: "/tmp/vimcode-smoke-save-probe-1835-gtk.txt"
+    contains: "VIMCODE_SMOKE_SAVE_PROBE_1835_GTK"
+    timeout_ms: 5000
+
+  # 1b. Bare `:w` -> `expect_file`. Appends a NEW, FULL marker (not just a
+  # suffix -- review round 2) before saving so this check is
+  # self-invalidating WITHIN this run: a leftover file from the
+  # `:saveas` probe just above would be missing this marker and fail
+  # `contains` -- it can only pass if this `:w` actually just wrote the
+  # buffer. (It is NOT self-invalidating ACROSS runs -- a leftover file
+  # from any PAST successful run already contains this exact marker too;
+  # cross-run invalidation for this probe rests entirely on the trailing
+  # cleanup block at the end of this section, which does not run, and
+  # cannot be verified to have run, if an earlier step in this section
+  # fails first.)
+  #
+  # Round-2 fix: `key: A` is Vim append-AT-END-OF-LINE
+  # (`src/core/engine/keys.rs`), and unlike the TUI twin's section this
+  # GTK section never clears the buffer first (see this section's header
+  # comment), so line 1 at this point reads `<first marker><launch
+  # file's own original line-1 text>` -- appending just a `_WBARE` SUFFIX
+  # would land it after that original text, not adjacent to the first
+  # marker, and the `contains` assertion below could never match on a
+  # real host. Typing the FULL second marker in one `type_text` call
+  # fixes this: the asserted string is exactly what was just typed in a
+  # single contiguous block, so it does not depend on what precedes it
+  # on the line.
+  - type: key
+    id: w-bare-probe-append-key-1835
+    key: A
+  - type: type_text
+    id: w-bare-probe-append-text-1835
+    text: "VIMCODE_SMOKE_SAVE_PROBE_1835_GTK_WBARE"
+  - type: key
+    id: w-bare-probe-esc-1835
+    key: esc
+  - type: key
+    id: w-bare-probe-colon-1835
+    key: ':'
+  - type: type_text
+    id: w-bare-probe-write-command-1835
+    text: "w"
+  - type: key
+    id: w-bare-probe-enter-1835
+    key: enter
+  - type: wait
+    id: w-bare-probe-settle-1835
+    ms: 500
+  - type: expect_file
+    id: w-bare-probe-file-appears-1835
+    path: "/tmp/vimcode-smoke-save-probe-1835-gtk.txt"
+    contains: "VIMCODE_SMOKE_SAVE_PROBE_1835_GTK_WBARE"
+    timeout_ms: 5000
+
+  # 2. `:term` probe -> `expect_file`: same marker/echo shape as
+  # `tests/smoke-spec/tui.yaml`'s own `-1835` section and
+  # `tests/conpty_term_opens_shell_1829.rs` — proof the shell inside the
+  # panel actually ran the command, not merely that something painted.
+  # The echoed command now `rm`s its own target first (review round 1),
+  # so a stale file from a prior run cannot satisfy `expect_file` below
+  # without this run's own command actually executing in a live shell.
+  #
+  # `term-probe-open-settle-1835`'s fixed `wait` (not a poll) is this
+  # driver's only option here: unlike `tui-pty`'s `expect_within '[1]'`
+  # gate (a real poll on rendered VT text), `gtk-native` has no polling
+  # equivalent to wait for the panel to actually paint before typing into
+  # it -- `expect_a11y_within` can't substitute, because nothing registers
+  # an AT-SPI provider for vimcode's own drawn content (this file's own
+  # header, "AT-provider-wiring" gap), and `expect_region_not_uniform`
+  # itself is a single immediate check with no retry/timeout, so using it
+  # here would just race the same paint instead of waiting for it.
+  #
+  # False-pass vector this probe's `rm -f && echo` prefix does NOT close
+  # (review round 2): `type_text` on this driver is real X11 input, so
+  # under a vimcode#1825-class misrouting bug (keys land on the
+  # LAUNCHING terminal instead of the panel) this exact `rm -f … && echo
+  # MARKER > …` line would execute in that launching shell and create
+  # the file anyway, making this probe green with a dead `:term`.
+  # `launch-is-frontmost-1835` at the top of this section is a PARTIAL
+  # guard against exactly this (focus is checked once, right after
+  # launch, before any typed input) -- it does not re-check focus here,
+  # immediately before this command, so it cannot fully close the gap.
+  - type: key
+    id: term-probe-colon-1835
+    key: ':'
+  - type: type_text
+    id: term-probe-command-1835
+    text: "term"
+  - type: key
+    id: term-probe-enter-1835
+    key: enter
+  - type: wait
+    id: term-probe-open-settle-1835
+    ms: 2000
+  - type: type_text
+    id: term-probe-echo-1835
+    text: "rm -f /tmp/vimcode-smoke-term-probe-1835-gtk.txt && echo VIMCODE_SMOKE_TERM_PROBE_1835_GTK > /tmp/vimcode-smoke-term-probe-1835-gtk.txt"
+  - type: key
+    id: term-probe-echo-enter-1835
+    key: enter
+  - type: expect_file
+    id: term-probe-file-appears-1835
+    path: "/tmp/vimcode-smoke-term-probe-1835-gtk.txt"
+    contains: "VIMCODE_SMOKE_TERM_PROBE_1835_GTK"
+    timeout_ms: 20000
+
+  # The terminal panel is now open and has really run a shell command --
+  # `expect_region_not_uniform` on its own drawn band proves it painted
+  # real cell content (prompt/echoed text/cursor), not vimcode#1828's
+  # blank panel. Band anchored near the TOP of the panel (its tab-bar +
+  # toolbar row, which paint immediately on open regardless of how much
+  # shell output has scrolled in) rather than deep into the content area,
+  # where a panel that has only echoed one or two lines so far may still
+  # be genuinely blank (review round 1) -- still a first-approximation
+  # guess, see this section's header for the "UNCONFIRMED pixel geometry"
+  # caveat.
+  - type: expect_region_not_uniform
+    id: terminal-panel-not-uniform-1835
+    x: 300
+    y: 520
+    width: 300
+    height: 90
+
+  # 3. Extension install -> `expect_file` on its installed directory (the
+  # "can a user install plugins" check) -- reuses the still-open terminal
+  # pane from step 2, same local-extension-directory flow as
+  # `tests/smoke-spec/tui.yaml`'s own `-1835` section (see that file's
+  # comment for why not `:ExtInstall`, which targets the LSP/DAP registry
+  # install path and needs a real network fetch). The command now `rm
+  # -rf`s its own target directory before recreating it (review round 1),
+  # for the same self-invalidation reason as the `:term` probe above.
+  #
+  # The destructive `rm -rf` is its OWN typed line/Enter, separate from
+  # the `mkdir -p`/`echo` that recreates the directory (review round 2):
+  # `type_text` on this driver is real X11 input (`xdotool type`), and a
+  # dropped character anywhere in one long compound command could have
+  # let a truncated `rm -rf` resolve to a SHORTER real path
+  # (`~/.config/vimcode/extensions` or `~/.config/vimcode`) on the
+  # operator's own machine. Splitting it out doesn't make dropped
+  # characters impossible, but it makes that failure mode visibly wrong
+  # (the extension directory is simply gone, with nothing recreated
+  # afterward) instead of silently destructive.
+  - type: type_text
+    id: ext-install-probe-rm-1835
+    text: "rm -rf ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk"
+  - type: key
+    id: ext-install-probe-rm-enter-1835
+    key: enter
+  - type: type_text
+    id: ext-install-probe-1835
+    text: "mkdir -p ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk && echo 'name = \"vimcode-smoke-ext-1835-gtk\"' > ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk/manifest.toml && echo 'display_name = \"VimCode Smoke Ext 1835 GTK\"' >> ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk/manifest.toml"
+  - type: key
+    id: ext-install-probe-enter-1835
+    key: enter
+  - type: expect_file
+    id: ext-install-manifest-appears-1835
+    path: "~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk/manifest.toml"
+    contains: "vimcode-smoke-ext-1835-gtk"
+    timeout_ms: 10000
+
+  # 4. Minimap `expect_region_not_uniform` -- vimcode#1676's "uniform
+  # black-bar minimap" regression class, the exact bug the driver's own
+  # module doc names this primitive for. Band moved to the TOP of the
+  # minimap strip (review round 1): the minimap renders the whole buffer
+  # scaled, and this file's own header deliberately does not pin down the
+  # launch file's length, so a band deep into the strip (the original
+  # `y: 300`) risks landing below a short file's last scaled line, which
+  # would be genuinely uniform background through no fault of vimcode's.
+  # The first rows of ANY non-empty buffer paint at the top of the strip,
+  # just below the tab-bar/breadcrumb rows -- still a first-approximation
+  # guess, see this section's header for the "UNCONFIRMED pixel geometry"
+  # caveat.
+  - type: expect_region_not_uniform
+    id: minimap-not-uniform-1835
+    x: 950
+    y: 100
+    width: 60
+    height: 80
+
+  # Trailing cleanup -- removes every file/directory this section
+  # created, both so the NEXT run starts clean and so this probe stops
+  # permanently installing a bogus extension into the operator's real
+  # `~/.config/vimcode/extensions/`, which every later `vimcode`/`vcd`
+  # launch on this host (including other smoke specs) would otherwise
+  # load. Reuses the already-open terminal pane from step 2/3 above.
+  - type: type_text
+    id: cleanup-probe-1835
+    text: "rm -f /tmp/vimcode-smoke-save-probe-1835-gtk.txt /tmp/vimcode-smoke-term-probe-1835-gtk.txt && rm -rf ~/.config/vimcode/extensions/vimcode-smoke-ext-1835-gtk"
+  - type: key
+    id: cleanup-probe-enter-1835
+    key: enter
+  - type: wait
+    id: cleanup-probe-settle-1835
+    ms: 500
 
   # vimcode#1646's two "All GUI specs" seed checks are DELIBERATELY OMITTED
   # from this file, same as `win-gui.yaml`/`mac-gui.yaml` (see

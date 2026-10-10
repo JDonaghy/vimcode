@@ -1747,6 +1747,48 @@ impl App {
         );
         cfg.min_sidebar_width = render::ALT_SIDEBAR_WIDTH_MIN as f32;
         cfg.max_sidebar_width = render::ALT_SIDEBAR_WIDTH_MAX as f32;
+        // #1877: reserve one line-height each for the always-present
+        // command line and the (near-always-present) status line at the
+        // *shell* level, so `AppShellLayout::activity_bar_bounds` — and
+        // `sidebar_header_bounds`/`sidebar_content_bounds` — stop one-plus
+        // rows above the window's bottom edge instead of running the full
+        // window height. Without this, `AppShell::compute_layout` has no
+        // idea vimcode paints its own bottom chrome underneath
+        // `main_content_bounds`, so the activity bar's bottom-pinned
+        // Settings button ends up pinned to the *window's* bottom edge —
+        // the exact same y-range vimcode's own status/command-line rows
+        // occupy — instead of ending above them the way VS Code's does.
+        //
+        // `with_status_bar()`/`with_command_line()` each reserve a static
+        // `line_height.round()` row — not vimcode's own dynamic
+        // `render::status_bar_height_px`/wildmenu/quickfix bottom-chrome
+        // total, which quadraui's `ShellConfig` has no knob for (`#[cfg]`-
+        // gating a dynamic per-frame height onto `AppShellLayout` would be
+        // new backend-shaped decision logic, not thin wiring — see
+        // `CLAUDE.md`'s Platform-Neutrality Rule). Two static rows exactly
+        // matches the common case (one status row + the always-present
+        // command line) that this issue reports; a frame with wildmenu or
+        // quickfix *also* open still has a few extra rows of bottom chrome
+        // this reservation doesn't know about, a strictly smaller residual
+        // gap than today's "reserves nothing at all". The inverse also
+        // exists and is worth naming rather than leaving implicit: with
+        // `laststatus=0` (or `1` with a single window, `global_status_bar`
+        // stays `None`) vimcode's actual bottom chrome is one row, not
+        // two, so this static reservation over-reserves by a row — the
+        // activity bar/sidebar stop one row higher than strictly
+        // necessary. Harmless on its own (an extra row of the activity
+        // bar's own `theme.tab_bar_bg` fill, not a gap), but it widens
+        // the same reclaimed-strip accounting `bottom_chrome_reservation_
+        // fill_rect` below has to get right either way. Neither band is
+        // painted by quadraui itself — `render_content` keeps painting
+        // vimcode's own status/command-line rows into
+        // `main_content_bounds` exactly as before; see
+        // `render::main_content_true_height`'s doc for how `render_content`
+        // un-does this reservation's shrink of `main_content_bounds`
+        // before computing editor/status/command-line geometry, so this
+        // reservation affects only the activity bar/sidebar's painted
+        // height, never where the editor or its chrome actually paint.
+        cfg = cfg.with_command_line().with_status_bar();
         cfg
     }
 
@@ -4740,6 +4782,31 @@ impl App {
         // platform-native convention every frame, not just at startup.
         let (editor_family, editor_size_pt) = resolve_editor_font(&engine.settings, backend);
         backend.set_editor_font(&editor_family, editor_size_pt);
+        // #1864: on the native macOS GUI, override `set_editor_font`'s own
+        // natural (Core Text ascent+descent+leading, ~1.17x) line height
+        // with VS Code's row pitch (`round(font_px * 1.5)` by default, or
+        // `settings.line_height`'s explicit multiplier) — see
+        // `resolve_editor_line_height_px`'s doc for why this is scoped to
+        // macOS only and re-applied every frame, same reasoning as
+        // `set_editor_font` immediately above (`zoomin`/`zoomout`/`:set
+        // line_height=N` must reach the painted row pitch next frame, not
+        // just at startup).
+        //
+        // Review round 1: this override is deliberately global for the
+        // whole frame, not scoped to only the `Surface::Editor` paint call
+        // — everything downstream of it (tab bars, scrollbars, completion/
+        // hover/dialog/picker popups) is anchored and hit-tested in the
+        // *same* `lh` units (`App::painted_line_height`), so suspending the
+        // override partway through the frame would desync paint from
+        // click/hover for all of those, not just the editor. The one place
+        // that must NOT see this value — sidebar panel content
+        // (`tree_layout`/`list_layout`/`form_layout`/`msv_layout` all read
+        // `current_line_height` directly) — gets it suspended narrowly,
+        // around that one call; see `render_content`'s `FrameOp::
+        // SidebarPanel` arm.
+        if let Some(lh) = resolve_editor_line_height_px(&engine.settings, backend, editor_size_pt) {
+            quadraui::Backend::set_current_line_height(backend, lh);
+        }
 
         // #672: scroll surfaces are re-registered from scratch every frame
         // (mirrors TUI's `render_impl.rs` `scroll_surfaces.borrow_mut().clear()`)
@@ -8832,7 +8899,21 @@ impl App {
                     layout,
                     position.x as f64,
                     position.y as f64,
-                    backend.line_height() as f64,
+                    // #1864 review round 1: the gutter is part of the
+                    // *editor* row grid — `painted_line_height()` (#555) is
+                    // the cached, published-at-paint-time row pitch every
+                    // other editor-row hit-test in this file already reads
+                    // (`self.handle`/`apply_picker_route`/etc.), rather than
+                    // `backend.line_height()`'s live, mutable field — which
+                    // `render_content`'s `FrameOp::SidebarPanel` arm now
+                    // transiently overwrites mid-frame for sidebar content
+                    // (tree/list/form rows). A raw `backend.line_height()`
+                    // read from a click/hover handler, outside any paint
+                    // call, happens to still agree today (the override is
+                    // restored before `render_content` returns), but
+                    // `painted_line_height()` is the documented contract for
+                    // this and does not depend on that ordering.
+                    self.painted_line_height(),
                     backend.char_width() as f64,
                 );
                 if engine.gutter_hover_window != was {
@@ -9519,12 +9600,18 @@ impl App {
                 }
                 if buttons.left {
                     let main = ctx.layout.main_content_bounds;
+                    // #1877: the recovered (un-shrunk) height — see
+                    // `render::main_content_true_height`'s doc — so a drag
+                    // that clamps against the content height (e.g. the
+                    // picker popup bounds `handle_mouse_drag_msg` computes)
+                    // still clamps against the window's true bottom edge,
+                    // not `shell_config`'s static bottom-chrome reservation.
                     self.handle_mouse_drag_msg(
                         &*backend,
                         position.x as f64,
                         position.y as f64,
                         main.width as f64,
-                        main.height as f64,
+                        render::main_content_true_height(ctx.layout) as f64,
                     );
                 }
             }
@@ -9944,13 +10031,16 @@ impl App {
 /// This should hold on *every* backend by construction: quadraui's
 /// `compose::app_shell::compute_layout` derives `AppShellLayout::
 /// main_content_bounds` from this exact `viewport` (title bar carved off
-/// the top; nothing reserved below, since vimcode never opts into
-/// quadraui's own status-bar/command-line bands — `render_content`'s own
-/// `status_bar_h`/`cmd_y` locals lay both rows out entirely inside
-/// `main_content_bounds` instead), and `cmd_y + lh` always resolves to
-/// `main.y + main.height` (see the `FrameOp::CommandLine` arm below). A
-/// live macOS run is the one environment this fleet cannot check that
-/// construction against directly — no macOS cross-toolchain is
+/// the top). #1877: `shell_config` now also opts into quadraui's own
+/// `with_command_line()`/`with_status_bar()` bands — but only so
+/// `activity_bar_bounds`/`sidebar_*_bounds` stop above them; `h` here is
+/// `render::main_content_true_height(layout)`, which adds that
+/// reservation straight back, so `render_content`'s own `status_bar_h`/
+/// `cmd_y` locals still lay both rows out as if nothing were reserved
+/// below `main_content_bounds`, and `cmd_y + lh` always resolves to
+/// `main.y + h`, i.e. `viewport.height` (see the `FrameOp::CommandLine`
+/// arm below). A live macOS run is the one environment this fleet cannot
+/// check that construction against directly — no macOS cross-toolchain is
 /// installed (`src/macos/mod.rs`'s "Verifying this file without a Mac").
 /// `debug_assert!` (not a hard `assert!`) so a violation surfaces loudly
 /// in a debug build's log/console — exactly the signal a future live-
@@ -10045,6 +10135,26 @@ impl quadraui::ShellApp for App {
         // instead of the pre-#1434 TUI shell — `backend.backend_caps()` reads the same
         // `TuiBackend` state either way.
         self.keyboard_enhanced = backend.backend_caps().kitty_keyboard;
+        // #1864: `shell_config`'s `with_editor_font` seed only covers
+        // family/size — the runner's own `set_editor_font` call (made from
+        // that stored value, just before `setup()` runs) resets
+        // `current_line_height` to this backend's *natural* font-metric
+        // value every time, same as every other `set_editor_font` call
+        // (`set_current_font`'s doc). Without re-applying the VS Code
+        // override here too, frame 1's shell-level layout (sidebar width,
+        // computed by the runner *before* `render_content`'s own per-frame
+        // override ever runs) would see the natural line height while
+        // frame 2+ (after `sync_per_frame_backend_state` has run once) sees
+        // the override — a one-frame geometry snap that (#967-style) throws
+        // off any hit-test computed against frame 1's painted rects. Same
+        // call `sync_per_frame_backend_state` makes every frame; see
+        // `resolve_editor_line_height_px`'s doc for the macOS-only scoping.
+        let (_, editor_size_pt) = resolve_editor_font(&self.engine.borrow().settings, backend);
+        if let Some(lh) =
+            resolve_editor_line_height_px(&self.engine.borrow().settings, backend, editor_size_pt)
+        {
+            quadraui::Backend::set_current_line_height(backend, lh);
+        }
         // Seed cached metrics from runner defaults.
         self.cached_line_height = backend.line_height() as f64;
         self.cached_char_width = backend.char_width() as f64;
@@ -10187,6 +10297,13 @@ impl quadraui::ShellApp for App {
         let theme = Theme::from_name(&engine.settings.colorscheme);
         self.sync_per_frame_backend_state(backend, &engine, &theme);
 
+        // #1864 review round 1: resolved again here (cheap — `resolve_editor_font`
+        // is a pure lookup over `settings`/`backend.default_fonts()`), so the
+        // `FrameOp::SidebarPanel` arm below can briefly reset `backend` to
+        // this font's *natural* line height for sidebar content, then
+        // restore the editor's row-pitch override afterward — see that
+        // arm's own comment.
+        let (editor_family, editor_size_pt) = resolve_editor_font(&engine.settings, backend);
         let lh = self.cached_line_height.max(backend.line_height() as f64);
         let cw = self.cached_char_width.max(backend.char_width() as f64);
         // Publish the value this frame paints with so click-time hit-tests can
@@ -10210,14 +10327,42 @@ impl quadraui::ShellApp for App {
         let layout = &corrected_layout;
 
         let main = layout.main_content_bounds;
+        // #1877: `h` is the *recovered* content height, not
+        // `main.height` directly — `shell_config`'s
+        // `with_command_line()`/`with_status_bar()` reservation already
+        // shrank `main_content_bounds` by one static row each so the
+        // activity bar/sidebar stop above them; every line below this one
+        // keeps assuming `h` reaches the window's true bottom edge (it
+        // subtracts vimcode's own *dynamic* bottom-chrome height itself),
+        // so `h` has to be un-shrunk back to that same true height here —
+        // see `render::main_content_true_height`'s doc.
         let (x, y, w, h) = (
             main.x as f64,
             main.y as f64,
             main.width as f64,
-            main.height as f64,
+            render::main_content_true_height(layout) as f64,
         );
         if w < 1.0 || h < 1.0 {
             return;
+        }
+
+        // #1877 review round 1 (blocking finding 1): `shell_config`'s
+        // bottom-chrome reservation above vacates a strip left of
+        // `main_content_bounds` — below the now-shrunk
+        // `activity_bar_bounds`/`sidebar_header_bounds`/
+        // `sidebar_content_bounds`/`divider_bounds` — that nothing else
+        // paints (quadraui's own `AppShell::render` only fills those four
+        // rects *as shrunk*; vimcode's own status-bar/command-line rows
+        // below are anchored at `main_content_bounds.x`, never reaching
+        // left of them either). Fill it explicitly with the same chrome
+        // colour the activity bar itself paints, every frame, on every
+        // backend — see `render::bottom_chrome_reservation_fill_rect`'s
+        // own doc for exactly which rect and why `theme.tab_bar_bg`. A
+        // no-op (`None`) once there is nothing left to reclaim — no
+        // reservation active, or a window too short for either dimension
+        // to be positive.
+        if let Some(fill_rect) = render::bottom_chrome_reservation_fill_rect(layout) {
+            backend.draw_solid_fill(fill_rect, theme.tab_bar_bg);
         }
 
         // ── Layout ────────────────────────────────────────────────────────────
@@ -10627,11 +10772,38 @@ impl quadraui::ShellApp for App {
                 // The quadraui AppShell chrome (activity bar, sidebar header,
                 // separator) is painted by the runner before `render_content`
                 // is entered; this fills only the content area it exposes.
+                //
+                // #1864 review round 1: `backend.current_line_height` holds
+                // the editor's VS Code row-pitch override for the rest of
+                // this frame (`sync_per_frame_backend_state` applied it at
+                // the top, every frame) — correct for the editor band,
+                // popups, dialogs and pickers above/below this arm, which
+                // all paint and hit-test in those same `lh` units, but wrong
+                // for sidebar content: `tree_layout`/`list_layout`/
+                // `form_layout`/`msv_layout` (the file explorer, search,
+                // Source Control, extensions, settings and debug panels, all
+                // routed through `paint_sidebar_panel_rung` below) read that
+                // field directly, so the override inflated every one of them
+                // by the same multiplier — untested, unmeasured sidebar
+                // growth. Bracket just this one call: reset to this font's
+                // natural metric (`set_editor_font`'s own doc — it always
+                // re-derives `current_line_height` from the font, the same
+                // mechanism `sync_per_frame_backend_state` itself uses to
+                // seed the override), paint, then restore the override so
+                // every rung after this one keeps agreeing with `lh`/
+                // `painted_line_height()`.
                 render::FrameOp::SidebarPanel => {
                     if let Some(q_sb) = layout.sidebar_content_bounds {
+                        backend.set_editor_font(&editor_family, editor_size_pt);
+                        let natural_lh = backend.line_height() as f64;
                         self.paint_sidebar_panel_rung(
-                            backend, &engine, screen, &theme, q_sb, lh, cw,
+                            backend, &engine, screen, &theme, q_sb, natural_lh, cw,
                         );
+                        if let Some(px) =
+                            resolve_editor_line_height_px(&engine.settings, backend, editor_size_pt)
+                        {
+                            quadraui::Backend::set_current_line_height(backend, px);
+                        }
                         composed.push(render::FrameOp::SidebarPanel);
                     }
                 }
@@ -10761,6 +10933,89 @@ impl quadraui::ShellApp for App {
                 // A) and `mouse.rs`'s "Menu bar row click — command center
                 // only".
                 render::FrameOp::CommandCenter => {
+                    // #1877: on a native-menu backend (macOS) `presence.
+                    // menu_row` is `false` (#901 suppresses the drawn
+                    // `File Edit View` row under AppKit's real menu bar),
+                    // so `FrameOp::MenuDropdown`'s own arm — the one that
+                    // paints `paint_title_bar_band`'s themed background
+                    // fill across `menu_row_rect` — never composes this
+                    // frame (`presence.menu_dropdown` stays coupled to
+                    // `presence.menu_row`, pinned by
+                    // `command_center_liveness_is_split_from_menu_bar_visible`
+                    // in `render.rs`). The Command Center rung below is
+                    // then the *only* thing painting into this band, and
+                    // its own rect starts at `menu_end` — one
+                    // `titlebar_control_inset()`-wide step clear of the
+                    // leading edge (#940), so vimcode never draws under
+                    // the real traffic lights — leaving that leading
+                    // strip with no vimcode paint call touching it at
+                    // all. A plain CG/Cairo/Direct2D surface shows
+                    // whatever the OS filled the view with there (macOS:
+                    // the window's own background colour, not the theme),
+                    // which is this issue's "traffic-light strip isn't
+                    // themed" report. Fill the *entire* row — inset
+                    // included — with the theme's title-bar colour first,
+                    // the same empty-`MenuBar` background-only trick the
+                    // app-icon slot filler above uses, mirroring VS Code's
+                    // own macOS title bar (which paints the full row
+                    // including behind the traffic lights).
+                    //
+                    // Review round 1 (#1877) caught an earlier draft of
+                    // this comment claiming this is "a no-op repaint on
+                    // every other backend" because `presence.menu_row` is
+                    // supposedly `true` whenever this rung is live. That
+                    // reasoning was wrong as *stated*: `presence.menu_row
+                    // == screen.menu_bar_visible && title_bar_band_live`
+                    // while `presence.command_center == title_bar_band_live`
+                    // alone (`FramePresence::from_screen`, #939) — the two
+                    // are deliberately *not* coupled, so `menu_bar_visible`
+                    // can be `false` while this rung is still live on
+                    // GTK/Win too (`Engine::toggle_menu_bar` at runtime, or
+                    // TUI's `cell` profile booting with the menu bar
+                    // hidden), independent of `presence.menu_row`.
+                    //
+                    // It is, however, still a no-op in *every case this
+                    // codebase can currently reach* — for a more precise
+                    // reason than the coupling claim above, not because of
+                    // it. `command_center_rect` (below) is measured with
+                    // `leading_inset = control_inset.width.max(0.0)`, and
+                    // `Backend::titlebar_control_inset()` is provably
+                    // `Rect::default()` (zero) on every backend except
+                    // `MacBackend` (see `control_inset_is_default_because_
+                    // mac_driver_never_sets_a_window`'s doc in
+                    // `src/macos/mod.rs`). With a zero inset and
+                    // `presence.menu_row == false`, `items_for_measure`
+                    // collapses to zero width and `draw_controls` is also
+                    // `false` (`should_draw_window_controls`), so
+                    // `command_center_rect` already spans the *entire*
+                    // row, x=0 included — this fill then paints the exact
+                    // same rect the same colour immediately before
+                    // `paint_command_center_rung` does, a real but
+                    // invisible duplicate draw call. The one case where it
+                    // is NOT redundant is a native-menu backend with a
+                    // non-zero inset (macOS, #940's `leading_inset`): there
+                    // `command_center_rect` starts *after* the inset, so
+                    // this fill is the only thing painting the strip
+                    // behind the traffic lights — this issue's actual
+                    // fix. GTK's `command_center_stays_live_when_menu_bar_
+                    // is_hidden` test pins the GTK-reachable case (row
+                    // still paints `theme.tab_bar_bg`) but, per its own
+                    // doc, cannot RED-verify this fill specifically —
+                    // `paint_command_center_rung`'s own background already
+                    // covers the same pixel there, same as this comment
+                    // just explained.
+                    let mut row_filled = false;
+                    if !presence.menu_row {
+                        let filler = quadraui::MenuBar {
+                            id: quadraui::WidgetId::new("title_row_background_fill"),
+                            items: Vec::new(),
+                            open_item: None,
+                            focused_item: None,
+                        };
+                        let _ = backend.draw_menu_bar(menu_row_rect, &filler);
+                        row_filled = true;
+                    }
+                    let mut cc_painted = false;
                     if let Some(cc_rect) = command_center_rect.filter(|r| r.width >= 1.0) {
                         let title = engine
                             .cwd
@@ -10774,6 +11029,16 @@ impl quadraui::ShellApp for App {
                             &title,
                         );
                         render::paint_command_center_rung(backend, &engine, cc_rect, &cc);
+                        cc_painted = true;
+                    }
+                    // `composed` records exactly what reached the canvas
+                    // this frame (this file's own contract elsewhere) —
+                    // push it whenever *either* paint call above actually
+                    // ran, not only when the Command Center's own rect
+                    // painted, so a degenerate/`None` `command_center_rect`
+                    // with the row-fill still active isn't silently
+                    // dropped from the recorded sequence.
+                    if row_filled || cc_painted {
                         composed.push(render::FrameOp::CommandCenter);
                     }
                 }

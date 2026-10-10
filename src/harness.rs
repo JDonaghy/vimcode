@@ -3310,11 +3310,14 @@ mod issue_984_explorer_chevron_needs_a_double_click {
 // `cell_width` before that window's edge -- which, for any window sitting
 // immediately left of a group divider (the reported "left group"), is
 // within `GTK_DIVIDER_METRICS`'s 6-unit grab band around the divider's own
-// `position` (confirmed: with the default minimap painting a wide strip
-// between a window's own rect and the next group's divider, the two don't
-// overlap and the resize half does not fire -- every fixture below
-// explicitly disables the minimap, `engine.settings.minimap = false`, to
-// reproduce the adjacency the report describes). A window with no divider
+// `position` (confirmed: with the minimap turned on and painting a wide
+// strip between a window's own rect and the next group's divider, the two
+// don't overlap and the resize half does not fire -- every fixture below
+// explicitly disables the minimap, `engine.settings.minimap = false` (#1858:
+// now also this repo's own default everywhere, but pinned explicitly here
+// regardless, since this module's whole point is the *adjacency* the
+// minimap being off produces), to reproduce the adjacency the report
+// describes). A window with no divider
 // on its scrollbar-adjacent side (the **right** group in a two-group
 // layout) is simply inert, with no resize side effect -- deliverable 3
 // below pins exactly that distinction.
@@ -3368,10 +3371,13 @@ mod issue_987_group_scrollbar_inert_and_click_resizes {
     /// share this one fixture rather than two near-identical copies.
     ///
     /// `engine.settings.minimap = false` reproduces the adjacency the
-    /// report describes -- see this module's own top doc for why a
-    /// default-on minimap would put ~50 columns of unrelated space between
-    /// a window's own scrollbar and the group divider, hiding the "click
-    /// resizes" half entirely.
+    /// report describes -- see this module's own top doc for why turning
+    /// the minimap on would put ~50 columns of unrelated space between a
+    /// window's own scrollbar and the group divider, hiding the "click
+    /// resizes" half entirely. (#1858: the minimap now also defaults off
+    /// everywhere, but this is pinned explicitly regardless — this
+    /// fixture's whole point is the adjacency the setting being off
+    /// produces, not whatever the default happens to be.)
     fn engine_two_groups(tag: &str, focus_left: bool) -> (Engine, WindowId, WindowId) {
         let mut engine = Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);
@@ -6652,5 +6658,456 @@ mod issue_1789_command_palette_new_tab_shortcut_lies {
                  never to tabnew"
             );
         },
+    }
+}
+
+/// #1266: the scroll-routing cascade `mouse.rs:964-1270` used to
+/// hand-roll (a TUI-private `matches!(ev.kind, ScrollUp)` cascade
+/// resolving the target surface once per surface, duplicated against
+/// `app.rs`'s GTK-only equivalent) no longer exists to converge —
+/// `mouse.rs` itself was deleted whole by #1434, and since #1433 every
+/// backend (`gtk`, `tui`, `macos`, `win`) drives the *same*
+/// `App::handle_dispatch`'s `UiEvent::Scroll` arm, which resolves the
+/// target surface once via `quadraui::dispatch_scroll` against
+/// `Engine::scroll_surfaces` (registered by the shared `render.rs`
+/// paint path, not per backend) before falling back to the generic
+/// active/hovered-window viewport scroll. There is exactly one scroll
+/// router left; this module is the `::tui_prod` proof #1266 asked for
+/// that it behaves identically (both direction and magnitude) on every
+/// backend, not just that the two code paths look the same size.
+///
+/// #554's polarity convention, restated here since this is the scenario
+/// that exercises it end to end: `UiEvent::Scroll.delta.y` is
+/// **quadraui's** convention (positive y = up, toward the top of the
+/// content) — the opposite of GTK's raw `GdkEventScroll` polarity
+/// (positive dy = wheel down). `App::handle_dispatch` negates `delta.y`
+/// back to GTK-raw once, at the single shared call site
+/// (`self.handle_mouse_scroll_msg(&*backend, delta.x as f64,
+/// -(delta.y as f64))`), so every surface-specific consumer downstream
+/// (`scroll_viewport_with_cursor`, `handle_debug_output_scroll`,
+/// `handle_terminal_scroll`, `picker_scroll`) is written against
+/// GTK-raw polarity and never needs to know quadraui's convention
+/// exists. `ConformanceDriver::scroll_at(needle, lines)` dispatches in
+/// quadraui's convention directly (its own doc: "positive = scroll
+/// up"), so a *negative* `lines` here is a wheel-down notch.
+///
+/// Magnitude is asserted relatively (farther scroll ⇒ a strictly larger
+/// topmost-visible line number), not against a hardcoded row count —
+/// `scroll_at`'s `lines` are scaled by each backend's own
+/// `conformance_line_height()` (TUI: 1 cell; GTK: a real painted pixel
+/// line height), so one notch moves the GTK viewport roughly 20x as far
+/// as one TUI "line" even though both are converted through the
+/// identical `handle_mouse_scroll_msg` notch-to-row formula
+/// (`(delta_y * 3.0).round()`) — confirmed empirically while writing
+/// this test (GTK: ~69 rows per notch at 800x480; TUI: ~3 rows per
+/// notch at 80x24). A cross-backend scenario has to tolerate that or it
+/// isn't testing the shared router, it's testing one backend's pixel
+/// geometry.
+#[cfg(test)]
+mod issue_1266_scroll_router_convergence {
+    use quadraui::testing::ConformanceDriver;
+
+    /// A long, single-token-per-line buffer (`L0000`, `L0001`, …) — single
+    /// tokens rather than `"line 0"`-style phrases because `TuiDriver`'s
+    /// `inventory()` splits painted text into runs at every space
+    /// character (see its own doc), so a multi-word phrase can straddle
+    /// two runs on TUI while GTK paints it as one Pango run. A single
+    /// token is exactly one run on every backend, so `screen_has` reads
+    /// identically everywhere.
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let text: String = (0..500).map(|i| format!("L{i:04}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+        engine
+    }
+
+    /// The smallest `L%04d` line number currently painted anywhere on
+    /// screen — a backend-neutral, rendered-output measure of "how far
+    /// down the viewport has scrolled". Reads `FrameInventory` text runs
+    /// (the same inventory `screen_has`/`screen_row_has` read), never
+    /// engine state.
+    fn topmost_visible_line<D: ConformanceDriver>(driver: &D) -> u32 {
+        driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .filter_map(|run| run.text.strip_prefix('L'))
+            // GTK paints a text-display run as the raw buffer slice,
+            // trailing `\n` included; TUI's cell grid has no such
+            // character. `take_while(ascii_digit)` reads "the digits at
+            // the front" on both, ignoring whichever backend's trailing
+            // byte this run happens to carry.
+            .map(|digits| {
+                digits
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .filter_map(|digits| digits.parse::<u32>().ok())
+            .min()
+            .expect(
+                "at least one L%04d marker line must be painted — the \
+                 fixture's 500-line buffer should always leave some in \
+                 view",
+            )
+    }
+
+    crate::backend_conformance! {
+        label: wheel_scroll_direction_and_magnitude,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("L0000"),
+                "precondition: a fresh buffer must open scrolled to the top"
+            );
+
+            // Direction: a wheel-down notch (negative `lines`, quadraui's
+            // convention per `scroll_at`'s own doc) must move the viewport
+            // DOWN — later lines come into view, `L0000` scrolls out.
+            //
+            // Each step re-locates its needle off the *previous* step's
+            // own `topmost_visible_line` reading rather than reusing
+            // `"L0000"` — once the viewport has scrolled a wheel-notch's
+            // worth, `L0000` itself is no longer painted, and `scroll_at`
+            // panics if its needle isn't on screen (it has to find a
+            // pixel/cell position to dispatch the event at).
+            driver.scroll_at("L0000", -2);
+            let after_small_down = topmost_visible_line(driver);
+            assert!(
+                after_small_down > 0,
+                "wheel down must move the viewport down (topmost visible \
+                 line 0 -> >0), got {after_small_down} — direction is \
+                 inverted (#554)"
+            );
+
+            // Magnitude: a bigger notch count must move the viewport
+            // farther, not just further-than-zero — a consumer that
+            // clamps every nonzero delta to the same single-row step
+            // would pass the direction check above but fail this one.
+            driver.scroll_at(&format!("L{after_small_down:04}"), -10);
+            let after_bigger_down = topmost_visible_line(driver);
+            assert!(
+                after_bigger_down > after_small_down,
+                "a larger wheel-down notch (-10 vs -2) must scroll \
+                 farther (topmost visible line {after_small_down} -> \
+                 strictly more), got {after_bigger_down} — magnitude is \
+                 not respected"
+            );
+
+            // Direction, the other way: a wheel-up notch (positive
+            // `lines`) must walk the viewport back up — this is the half
+            // that catches a consumer which ignores the sign entirely
+            // and always scrolls the same direction regardless of it.
+            driver.scroll_at(&format!("L{after_bigger_down:04}"), 3);
+            let after_up = topmost_visible_line(driver);
+            assert!(
+                after_up < after_bigger_down,
+                "wheel up must move the viewport back up ({after_bigger_down} \
+                 -> {after_up})"
+            );
+        },
+    }
+
+    /// A second surface in the same shared cascade, chosen for being fully
+    /// deterministic without a real git repo or a live PTY (unlike the
+    /// sidebar's git/search panels or the terminal's scrollback, both of
+    /// which depend on ambient process state this suite doesn't control) —
+    /// the debug-output bottom panel's content is seeded directly onto
+    /// `Engine::dap_output_lines`.
+    ///
+    /// This is the `"debug_output"` arm of `handle_mouse_scroll_msg`'s
+    /// `quadraui::dispatch_scroll` match (`app.rs`) — the exact other
+    /// branch, besides the generic window-viewport fallback the scenario
+    /// above exercises, that the old per-backend `mouse.rs` cascade used
+    /// to hand-roll a second time (`"debug_output" =>
+    /// engine.handle_debug_output_scroll(delta.y)`, identical body, see
+    /// this module's git-blame history). Proving *this* arm converges too
+    /// is what makes "one shared router" true of the cascade as a whole,
+    /// not just of the one arm the first scenario happens to hit.
+    ///
+    /// Direction here is `auto_scroll` (pinned-to-tail vs not), not a line
+    /// number — `Engine::handle_debug_output_scroll`'s `delta_y > 0.0`
+    /// branch only *sets* `auto_scroll = true` (never clears it), so
+    /// scrolling down from an already-pinned view is a no-op by design;
+    /// the observable, direction-sensitive half is scrolling *up* (which
+    /// unconditionally clears `auto_scroll`, unpinning the view) and then
+    /// *back down enough rows* to re-pin it — both direction and magnitude
+    /// have to be right for that round trip to land exactly on repinning.
+    mod issue_1266_debug_output_scroll_router_convergence {
+        use quadraui::testing::ConformanceDriver;
+
+        /// 200 single-token lines so each one is exactly one painted text
+        /// run on every backend — same rationale as the editor scenario's
+        /// `engine_fixture`.
+        fn engine_fixture() -> crate::core::Engine {
+            let mut engine = crate::core::Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            engine.bottom_panel_open = true;
+            engine.bottom_panel_kind = crate::core::engine::BottomPanelKind::DebugOutput;
+            engine.dap_output_lines = (0..200).map(|i| format!("D{i:04}")).collect();
+            engine
+        }
+
+        crate::backend_conformance! {
+            label: debug_output_wheel_scroll_direction_and_magnitude,
+            backends: [gtk, tui, tui_prod],
+            engine: engine_fixture(),
+            size: (800, 480),
+            body: |driver| {
+                assert!(
+                    !driver.exited(),
+                    "precondition: the app must still be running"
+                );
+                assert!(
+                    driver.screen_has("D0199"),
+                    "precondition: a fresh `auto_scroll: true` panel must open \
+                     pinned to the tail (D0199, the last seeded line)"
+                );
+
+                // Wheel up (positive `lines`, quadraui's convention) over the
+                // panel: must unpin it from the tail. A pinned-to-tail panel
+                // keeps painting the same last lines no matter how far
+                // `debug_output_scroll` moves internally, so "the tail is
+                // still visible" would pass even with the router firing the
+                // wrong arm (or no arm at all) — checking the now-*visible*
+                // top-of-buffer line is the rendered-output signal that the
+                // view really moved.
+                driver.scroll_at("D0199", 30);
+                assert!(
+                    driver.screen_has("D0000"),
+                    "a big-enough wheel-up notch over the debug-output panel \
+                     must unpin it from the tail and scroll far enough to \
+                     bring the first seeded line (D0000) into view — the \
+                     view is still pinned, or the router's \"debug_output\" \
+                     arm never fired (#1266)"
+                );
+
+                // Magnitude, the other direction: scroll back down by much
+                // less than a full re-pin's worth and the tail must still be
+                // absent — a consumer that always jumps straight back to the
+                // tail regardless of the notch size would pass the direction
+                // check above but fail this one.
+                driver.scroll_at("D0000", -2);
+                assert!(
+                    !driver.screen_has("D0199"),
+                    "a small wheel-down notch must not snap all the way back \
+                     to the tail — magnitude is not respected"
+                );
+            },
+        }
+    }
+
+    /// A third surface: the sidebar. Chosen over the explorer/search/
+    /// settings/AI panels that shared this same cascade (`mouse.rs`'s old
+    /// `active_panel_is(PANEL_*)` arms, one per panel, all now collapsed
+    /// onto the single `try_route_sidebar_mouse_event` call in
+    /// `App::handle_dispatch` — see that method's own doc) because the
+    /// Git panel's `build_source_control_data` builds straight off
+    /// `Engine::sc_file_statuses`, with no dependency on this process's
+    /// real `cwd` being a git repository (unlike the explorer, which
+    /// walks the real filesystem) — deterministic without a fixture
+    /// beyond the engine itself.
+    ///
+    /// Unlike the editor/debug-output scenarios above, the sidebar's wheel
+    /// path never reaches `handle_mouse_scroll_msg`'s `dispatch_scroll` at
+    /// all: `try_route_sidebar_mouse_event` claims every `UiEvent::Scroll`
+    /// whose position falls inside the painted sidebar bounds *earlier* in
+    /// the same `handle_dispatch`, and hands it to
+    /// `Engine::handle_sc_sidebar_ui_event`. That earlier call is still
+    /// the *one* shared call site both backends execute — this scenario
+    /// is the proof that the convergence covers it too, not just the
+    /// `scroll_surfaces`-registered arms the other two scenarios hit.
+    ///
+    /// Also unlike the other two scenarios, quadraui's own
+    /// `SidebarSystem::handle_inner`'s `UiEvent::Scroll` arm (the shared
+    /// widget the git panel is built on) scrolls by a **fixed one row per
+    /// event, regardless of the delta's magnitude** (`rows = if delta.y >
+    /// 0.0 { -1 } else { 1 }` — ignores `delta.y`'s size entirely, only
+    /// its sign). So "magnitude" for *this* surface is tested by
+    /// dispatching a wheel event more than once, not by one bigger-delta
+    /// event — a single `scroll_at` call, however large its `lines`
+    /// argument, moves exactly one row.
+    ///
+    /// And, load-bearing for #554's convention specifically:
+    /// `try_route_sidebar_mouse_event` is called *before* the
+    /// `UiEvent::Scroll` match arm that negates `delta.y` back to GTK-raw
+    /// (see that arm's own doc) — so unlike `handle_mouse_scroll_msg`'s
+    /// three consumers (editor/debug-output/terminal, all written against
+    /// GTK-raw polarity), `SidebarSystem` receives the **un-negated,
+    /// quadraui-native** delta straight off the `UiEvent`, matching
+    /// `ScrollDelta`'s own documented convention ("positive y = up")
+    /// directly. Confirmed empirically while writing this scenario:
+    /// negating the shared call site's `-(delta.y)` (the #554 fix itself)
+    /// flips the editor/debug-output scenarios red but leaves this one
+    /// green, since it never passes through that call site at all. Two
+    /// genuinely different polarity contracts converge on the *same*
+    /// shared `handle_dispatch`, each correct for its own consumer — this
+    /// scenario is the regression guard for the sidebar's half, proven
+    /// red by disabling `try_route_sidebar_mouse_event`'s `UiEvent::Scroll`
+    /// arm (restores the pre-#1433 "wrong panel / no panel" cascade
+    /// failure mode) rather than by the negation flip.
+    mod issue_1266_sidebar_scroll_router_convergence {
+        use quadraui::testing::ConformanceDriver;
+
+        /// 80 synthetic unstaged files so the panel body overflows one
+        /// screen — single-token paths (`gitf0000` .. `gitf0079`, no `/`
+        /// or extra punctuation) for the same reason `engine_fixture`'s
+        /// `L%04d` lines are single tokens in the sibling scenario above.
+        fn engine_fixture() -> crate::core::Engine {
+            let mut engine = crate::core::Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_GIT,
+            ));
+            engine.sc_file_statuses = (0..80)
+                .map(|i| crate::core::git::FileStatus {
+                    path: format!("gitf{i:04}"),
+                    unstaged: Some(crate::core::git::StatusKind::Modified),
+                    ..Default::default()
+                })
+                .collect();
+            engine
+        }
+
+        /// The seeded row whose painted y is closest to `anchor_y`, as
+        /// `(index, trimmed text)`.
+        ///
+        /// Every seeded row stays present in `inventory()` even once it
+        /// has scrolled off the visible band — this harness's text-run
+        /// recorder captures paint calls ahead of whatever clip region a
+        /// real display would apply, so "is a given row still reported at
+        /// all" can't distinguish a scrolled-away row from one that never
+        /// scrolled, and a fixed needle (e.g. always re-scrolling at
+        /// `"gitf0000"`) eventually dispatches the wheel event at a
+        /// `position` outside the painted sidebar bounds once that row
+        /// scrolls out of it — `try_route_sidebar_mouse_event` requires
+        /// `position` to land inside `sidebar_content_bounds` to route the
+        /// event at all, so that reads as a silent, misleading "scroll
+        /// stopped working" rather than the test-anchoring bug it is.
+        ///
+        /// Anchoring on "whichever row now sits near this fixed *screen*
+        /// position" instead mirrors what a real mouse wheel does — the
+        /// pointer doesn't move, the content slides under it — and keeps
+        /// every dispatch inside the panel. The row's parsed index is a
+        /// direct, monotonic proxy for scroll position, since the fixture
+        /// seeds `gitf%04d` in ascending order. Panel rows render with a
+        /// one-column status-marker gutter ahead of the filename, so each
+        /// row is its own run with a leading space (`" gitf0000"`) rather
+        /// than starting with `"gitf"` — hence `trim()` before parsing.
+        fn nearest_row<D: ConformanceDriver>(driver: &D, anchor_y: f32) -> (u32, String) {
+            driver
+                .inventory()
+                .text_runs()
+                .iter()
+                .filter_map(|run| {
+                    let trimmed = run.text.trim();
+                    trimmed
+                        .strip_prefix("gitf")
+                        .and_then(|digits| digits.parse::<u32>().ok())
+                        .map(|idx| (idx, trimmed.to_string(), (run.bounds.y - anchor_y).abs()))
+                })
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+                .map(|(idx, text, _)| (idx, text))
+                .expect(
+                    "at least one gitf%04d row must be painted somewhere — \
+                     the fixture seeded 80 of them",
+                )
+        }
+
+        /// The shared scenario body, generic over the driver — see the
+        /// three `#[test]` functions below for why this isn't a
+        /// `crate::backend_conformance!` invocation like its siblings
+        /// above: that macro's single `size: (w, h)` is handed to every
+        /// backend arm as both GTK's pixels *and* TUI's cells, which this
+        /// scenario can't tolerate — a 480-*cell*-tall terminal (fine as
+        /// 480 *pixels* for GTK) pushes the git panel's layout far enough
+        /// past realistic terminal geometry that `try_route_sidebar_mouse_
+        /// event`'s bounds check and this scenario's own wheel-position
+        /// anchoring stopped agreeing in practice (confirmed empirically:
+        /// identical logic, identical dispatch, real row movement on GTK,
+        /// zero movement on TUI at that size; a realistic terminal size
+        /// fixed it). Each backend below sizes its own harness instead.
+        fn run_scenario<D: ConformanceDriver>(driver: &mut D) {
+            // The screen point every wheel event in this scenario
+            // dispatches at: `gitf0000`'s initial painted position — the
+            // panel's top content row, which stays well inside
+            // `sidebar_content_bounds` for every step below.
+            let anchor_y = driver
+                .inventory()
+                .text_runs()
+                .iter()
+                .find(|run| run.text.trim() == "gitf0000")
+                .map(|run| run.bounds.y)
+                .expect(
+                    "precondition: the git panel must open scrolled to the \
+                     first (alphabetically-first) file, gitf0000",
+                );
+
+            // Direction: one wheel-down notch must advance which row sits
+            // at the anchor screen point.
+            let (idx0, needle0) = (0u32, "gitf0000".to_string());
+            driver.scroll_at(&needle0, -1);
+            let (idx1, needle1) = nearest_row(driver, anchor_y);
+            assert!(
+                idx1 > idx0,
+                "one wheel-down notch over the git sidebar must bring a \
+                 later row to this screen point (row index {idx0} -> \
+                 greater), got {idx1} — direction is inverted, or the \
+                 event never reached the sidebar's shared routing call \
+                 site at all"
+            );
+
+            // Magnitude: four more notches (five total) must advance it
+            // further still — SidebarSystem's own `UiEvent::Scroll` arm
+            // moves exactly one row per *event* (ignoring delta magnitude,
+            // see this module's doc), so magnitude here means "more events
+            // moved it further", not "one bigger event moved it further".
+            let mut needle = needle1;
+            for _ in 0..4 {
+                driver.scroll_at(&needle, -1);
+                needle = nearest_row(driver, anchor_y).1;
+            }
+            let (idx5, needle5) = nearest_row(driver, anchor_y);
+            assert!(
+                idx5 > idx1,
+                "five wheel-down notches must advance the row at this \
+                 screen point further than one notch did (idx1={idx1}, \
+                 idx5={idx5}) — repeat wheel events are being dropped or \
+                 clamped"
+            );
+
+            // Direction, the other way: a wheel-up notch must bring an
+            // earlier row back to the anchor point.
+            driver.scroll_at(&needle5, 1);
+            let (idx_up, _) = nearest_row(driver, anchor_y);
+            assert!(
+                idx_up < idx5,
+                "wheel up over the git sidebar must bring an earlier row \
+                 back to this screen point ({idx5} -> less), got {idx_up}"
+            );
+        }
+
+        #[test]
+        #[cfg(feature = "gui")]
+        fn sidebar_wheel_scroll_direction_and_magnitude_gtk() {
+            let mut h = crate::gtk::testing::conformance_harness(engine_fixture(), 800, 480);
+            run_scenario(&mut h.driver);
+        }
+
+        #[test]
+        fn sidebar_wheel_scroll_direction_and_magnitude_tui() {
+            let mut h = crate::tui_main::testing::conformance_harness(engine_fixture(), 120, 40);
+            run_scenario(&mut h.driver);
+        }
+
+        #[test]
+        fn sidebar_wheel_scroll_direction_and_magnitude_tui_prod() {
+            let mut h =
+                crate::tui_main::testing::conformance_harness_prod(engine_fixture(), 120, 40);
+            run_scenario(&mut h.driver);
+        }
     }
 }

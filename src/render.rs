@@ -931,11 +931,66 @@ const NERD_FONT_FALLBACK_FAMILY: &str = "Symbols Nerd Font";
 /// `None` falls back to [`NERD_FONT_FALLBACK_FAMILY`], the literal name the
 /// font is known to register under, so `set_nerd_font_fallback` still gets
 /// a usable family either way.
+///
+/// # Why it registers at most once per process (#1853)
+///
+/// "Call once" is the contract, but a *process* can legitimately build many
+/// `App`s/backends — every `GtkDriver`/`TuiDriver` harness in the test suite
+/// does, several hundred times per `cargo test` run — and each one used to
+/// hand the whole font to its backend again. Registration is **not** free
+/// and **not** idempotent on the platform side:
+///
+/// - GTK registers via Fontconfig's `FcConfigAppFontAddFile`, which has no
+///   in-memory entry point, so quadraui writes the bytes to a fresh temp
+///   file per call and deliberately never deletes it (Fontconfig/FreeType
+///   may re-open it lazily at shape time). Each call also appends another
+///   `FcPattern` — with its full charset — to the process's application
+///   font set, which every subsequent font match then has to sort.
+/// - macOS fails outright on the second call (duplicate PostScript name).
+///
+/// With the pre-#1853 114-glyph subset (29 KB) the per-harness copies were
+/// invisible. With the full Symbols Nerd Font (2.5 MB) the same suite wrote
+/// ~1.5 GB of temp files and grew the application font set by ~600 copies of
+/// a 10,627-codepoint font in a single `cargo test` run — enough to redden a
+/// CI runner that has far less headroom (disk and RAM) than a dev box.
+///
+/// So the first backend that *accepts* the font wins: its resolved family is
+/// remembered for the process, and later backends are only handed the font
+/// again if they cannot already see that family themselves
+/// ([`quadraui::Backend::has_font_family`]). That keeps the semantics each
+/// platform actually needs rather than assuming process-global registration:
+/// GTK/Fontconfig and Core Text both register process-wide, so a later
+/// backend answers `Some(true)` and skips; Win-GUI's DirectWrite custom
+/// collection is per-backend, so a fresh `WinBackend` answers `Some(false)`
+/// and does register; the TUI backend answers `None` ("can't know") and
+/// takes the no-op default exactly as before.
 pub fn register_nerd_font_fallback(b: &mut dyn quadraui::Backend) {
-    let family = b
+    /// The family the bundled icon font actually registered under, the
+    /// first time any backend in this process accepted it.
+    static REGISTERED_FAMILY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    if let Some(family) = REGISTERED_FAMILY.get() {
+        // Already registered in this process *and* this backend can
+        // resolve it — handing it the same 2.5 MB again would only leak
+        // another copy. `Some(false)`/`None` both fall through to a real
+        // registration attempt: the font must be registered per backend
+        // (Win-GUI), or the backend cannot answer at all (TUI).
+        if b.has_font_family(family) == Some(true) {
+            b.set_nerd_font_fallback(family);
+            return;
+        }
+    }
+
+    let registered = b
         .register_font_from_memory(crate::app_support::ICON_FONT_BYTES)
-        .and_then(|families| families.into_iter().next())
-        .unwrap_or_else(|| NERD_FONT_FALLBACK_FAMILY.to_string());
+        .and_then(|families| families.into_iter().next());
+    if let Some(family) = &registered {
+        // Only a *successful* registration may be remembered: a `None`
+        // (TUI's no-op default, or macOS's duplicate-name rejection) must
+        // not stop a later, more capable backend from registering for real.
+        let _ = REGISTERED_FAMILY.set(family.clone());
+    }
+    let family = registered.unwrap_or_else(|| NERD_FONT_FALLBACK_FAMILY.to_string());
     b.set_nerd_font_fallback(&family);
 }
 
@@ -14002,19 +14057,29 @@ pub struct ScreenLayout {
 // ─── Minimap (#35) ────────────────────────────────────────────────────────────
 
 /// Fraction of a pane's own width the minimap strip may reserve, as an
-/// *upper bound* only (#728) — shared by both backends' `MinimapSizing`
-/// below. VS Code does not scale its minimap with window width at all: it
-/// derives a *fixed* width from `minimap.maxColumn` (`MINIMAP_TARGET_COLS`),
-/// and this fraction only matters as a cap for a pane too narrow to afford
-/// the full target (so the strip still shrinks smoothly with the pane
-/// rather than snapping straight from the target to suppressed at
-/// `MINIMAP_MIN_TEXT_COLS`).
+/// *upper bound* — **TUI-only** since #1869 (`TUI_MINIMAP_SIZING`'s own
+/// `fraction` field; TUI sizing is explicitly out of #1869's scope).
+///
+/// Before #1869 this doc comment claimed "VS Code does not scale its
+/// minimap with window width at all: it derives a *fixed* width from
+/// `minimap.maxColumn`" and this fraction/`gtk_minimap_sizing` shared it as
+/// a narrow-pane cap on top of that fixed width. That claim was wrong —
+/// confirmed against `EditorLayoutInfoComputer` in VS Code's own
+/// `src/vs/editor/common/config/editorOptions.ts`: `minimap.maxColumn`
+/// (120, [`MINIMAP_TARGET_COLS`]) is a *cap*, not the width. Below the cap
+/// VS Code sizes the strip from the pane's remaining width, the editor's
+/// real character width and its vertical scrollbar's width — see
+/// [`vs_code_minimap_width_px`], which ports that real formula for
+/// GTK/macOS/Win. This fraction survives only as TUI's own, deliberately
+/// much cruder, column-based approximation.
 pub const MINIMAP_WIDTH_FRACTION: f64 = 0.15;
 
-/// Target minimap width for **GTK**, in raw pixels — VS Code's
+/// Target minimap width for **GTK/macOS/Win**, in raw pixels — VS Code's
 /// `minimap.maxColumn` default (#728): VS Code renders its minimap at one
 /// pixel per assumed source column, so at 120px this is "precisely 1px per
-/// column".
+/// column". #1869: this is the *cap* [`vs_code_minimap_width_px`]'s ported
+/// formula clamps to — not, as a pre-#1869 version of this doc comment
+/// claimed, the width itself.
 ///
 /// #989: despite the name, this is GTK-only — it used to be reused for TUI's
 /// `TUI_MINIMAP_SIZING` too on the theory that "columns for TUI" made the
@@ -14054,15 +14119,6 @@ const MINIMAP_MIN_COLS: f64 = 6.0;
 /// `MINIMAP_MIN_COLS`.
 const MINIMAP_MAX_COLS: f64 = 30.0;
 
-/// Floor on the reserved width for GTK, in **raw pixels** — deliberately
-/// *not* `MINIMAP_MIN_COLS * char_width`; see `gtk_minimap_sizing`'s doc
-/// comment.
-const MINIMAP_MIN_PX: f64 = 48.0;
-
-/// Ceiling on the reserved width for GTK, same units/rationale as
-/// `MINIMAP_MIN_PX`.
-const MINIMAP_MAX_PX: f64 = 240.0;
-
 /// Text columns that must survive after reserving the strip. Below this the
 /// minimap suppresses itself rather than squeezing the editor into a sliver.
 const MINIMAP_MIN_TEXT_COLS: f64 = 30.0;
@@ -14081,31 +14137,115 @@ pub const TUI_MINIMAP_SIZING: quadraui::MinimapSizing = quadraui::MinimapSizing:
     max: MINIMAP_MAX_COLS as f32,
 };
 
-/// GTK's VS-Code-parity minimap width policy, in raw pixels — see
-/// `minimap_reserved_width`'s doc comment.
+/// GTK/macOS/Win's VS-Code-parity minimap width policy, in raw pixels —
+/// see `minimap_reserved_width`'s doc comment.
 ///
 /// A single column-based `MinimapSizing` (`resolve_width(pane_width,
-/// real_char_width)`) was tried first and reverted: `resolve_width`
-/// normalises `pane_width` into columns via the *editor's* `char_width`
-/// before applying `fraction`/`min`/`max`, then converts back — correct
-/// when the bounds genuinely mean "columns of the editor's own font", but
-/// VS Code's minimap renders in its *own*, much smaller font, decoupled
-/// from the editor's. Feeding a real editor `char_width` (7-9px) through
-/// that formula moved an ordinary wide GTK pane's strip from VS Code's
-/// ~120px to ~180-240px —
-/// `gtk::testing::minimap::minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane`
-/// (driven through the real paint path) caught it. So GTK's bounds stay
-/// stated directly in raw pixels, and `minimap_reserved_width` resolves
-/// them with a forced `char_width` of `1.0` (native-unit-in, native-unit
-/// out) rather than the real one — see docs/IRREDUCIBLE_SURFACE.md.
+/// real_char_width)`) using `resolve_width`'s own
+/// `target_cols.min(pane_width_cols * fraction).clamp(min, max)` arithmetic
+/// was tried first and reverted:
+/// `resolve_width` normalises `pane_width` into columns via the *editor's*
+/// `char_width` before applying `fraction`/`min`/`max`, then converts back —
+/// correct when the bounds genuinely mean "columns of the editor's own
+/// font", but VS Code's minimap renders in its *own*, much smaller font,
+/// decoupled from the editor's for that formula's purposes. Feeding a real
+/// editor `char_width` (7-9px) through that *linear-fraction* formula moved
+/// an ordinary wide GTK pane's strip from VS Code's ~120px to ~180-240px —
+/// caught by a driver test (`gtk::testing::minimap`) exercising the real
+/// paint path.
+///
+/// #1869: VS Code's *real* width formula (`EditorLayoutInfoComputer` in
+/// `editorOptions.ts`) is not that linear-fraction shape at all — it is
+/// [`vs_code_minimap_width_px`], which genuinely does divide by the
+/// editor's real character width (that's how VS Code arrives at ~100px for
+/// Menlo 12 instead of a flat 120px). `resolve_width` has no way to express
+/// that division, so `minimap_reserved_width` recognizes this policy by its
+/// `target_cols` (120, [`MINIMAP_TARGET_COLS`] — never collides with TUI's
+/// `target_cols` of 12, [`MINIMAP_TARGET_COLS_TUI`]) and calls
+/// `vs_code_minimap_width_px` directly instead of `sizing.resolve_width()`.
+/// `fraction`/`min`/`max` below are therefore inert placeholders, kept only
+/// so this still type-checks as a `quadraui::MinimapSizing::VsCodeParity` —
+/// see docs/IRREDUCIBLE_SURFACE.md.
 pub fn gtk_minimap_sizing() -> quadraui::MinimapSizing {
     quadraui::MinimapSizing::VsCodeParity {
         target_cols: MINIMAP_TARGET_COLS as f32,
-        fraction: MINIMAP_WIDTH_FRACTION as f32,
-        min: MINIMAP_MIN_PX as f32,
-        max: MINIMAP_MAX_PX as f32,
+        fraction: 0.0,
+        min: 0.0,
+        max: MINIMAP_TARGET_COLS as f32,
     }
 }
+
+/// VS Code's own minimap width formula (#1869), ported from
+/// `EditorLayoutInfoComputer` in
+/// `src/vs/editor/common/config/editorOptions.ts`. [`MINIMAP_TARGET_COLS`]
+/// (120, `minimap.maxColumn`) is a *cap* — below it, the strip is sized
+/// from the pane's own remaining width, the editor's real character width
+/// (`typical_char_width`, VS Code's `typicalHalfwidthCharacterWidth`) and
+/// VS Code's configured vertical scrollbar width
+/// ([`MINIMAP_VERTICAL_SCROLLBAR_WIDTH_PX`]).
+///
+/// ```text
+/// minimapCharWidth  = 1                    // minimap.scale 1
+/// minimapMaxWidth   = floor(120 * minimapCharWidth)
+/// minimapWidth      = min(minimapMaxWidth,
+///                         max(0, floor((remainingWidth - verticalScrollbarWidth - 2)
+///                                       * minimapCharWidth
+///                                       / (typicalHalfwidthCharacterWidth + minimapCharWidth)))
+///                         + MINIMAP_GUTTER_WIDTH(8))
+/// ```
+///
+/// `remaining_width` is **already gutter-subtracted** by the caller
+/// ([`minimap_reserved_width`]) — matching the formula block quoted above,
+/// where `remainingWidth = editor outer width - gutter (glyph margin + line
+/// numbers + folding)`, never the pane's raw rect width. A pre-#1869-fix-
+/// round-1 version of this function was fed the full, un-subtracted pane
+/// width here and this doc comment claimed that was correct ("the caller's
+/// own pane width") — it was not: at the issue's measured case (editor area
+/// ≈872px, Menlo 12, `cw≈7.22`) that shape gave 112px against VS Code's own
+/// ≈97–104px, off by roughly the gutter term it was skipping.
+/// `typical_char_width` is the *real* editor font's cell width — unlike the
+/// linear-fraction formula this replaces (see `gtk_minimap_sizing`'s doc
+/// comment), this one is explicitly a function of it, so the minimap
+/// genuinely narrows on a wider editor font, matching VS Code.
+fn vs_code_minimap_width_px(remaining_width: f64, typical_char_width: f64) -> f64 {
+    let cw = if typical_char_width > 0.0 {
+        typical_char_width
+    } else {
+        1.0
+    };
+    let minimap_max_width = (MINIMAP_TARGET_COLS * MINIMAP_SCALE_CHAR_WIDTH_PX).floor();
+    let inner = ((remaining_width - MINIMAP_VERTICAL_SCROLLBAR_WIDTH_PX - 2.0)
+        * MINIMAP_SCALE_CHAR_WIDTH_PX
+        / (cw + MINIMAP_SCALE_CHAR_WIDTH_PX))
+        .floor()
+        .max(0.0);
+    (inner + MINIMAP_GUTTER_WIDTH_PX).min(minimap_max_width)
+}
+
+/// The minimap's own per-source-column pixel width (VS Code's
+/// `minimapCharWidth`, `minimap.scale` 1) — distinct from
+/// [`vs_code_minimap_width_px`]'s `typical_char_width` argument, which is
+/// the *editor's* character width and only determines how many source
+/// columns fit in the pane's remaining width.
+const MINIMAP_SCALE_CHAR_WIDTH_PX: f64 = 1.0;
+
+/// Padding VS Code reserves between the minimap strip and the content it
+/// summarises (`MINIMAP_GUTTER_WIDTH` in `editorOptions.ts`).
+const MINIMAP_GUTTER_WIDTH_PX: f64 = 8.0;
+
+/// VS Code's own default `editor.scrollbar.verticalScrollbarSize` (14 CSS
+/// px), consulted only by [`vs_code_minimap_width_px`]'s ported formula —
+/// **not** the width any backend's own vertical scrollbar actually paints
+/// at today. That gutter is quadraui's `EditorLayout::layout_with_options`
+/// (`v_scrollbar_w = cell_width`, a font-sized ~7-9px column, not a fixed
+/// 14px one) — a quadraui-side gap drafted in
+/// `docs/PENDING_QUADRAUI_ISSUES.md` (not yet filed as a real GitHub issue:
+/// #1869 cannot close until it is and quadraui ships a fix), since vimcode
+/// must not work around it locally (Platform-Neutrality Rule). VS Code
+/// itself computes the minimap's width against its *configured* scrollbar
+/// width regardless of what ends up painted, so this constant is correct
+/// for the minimap formula even while that scrollbar gap is still open.
+const MINIMAP_VERTICAL_SCROLLBAR_WIDTH_PX: f64 = 14.0;
 
 /// Buffer lines sampled per *display* row of minimap height.
 ///
@@ -14339,37 +14479,109 @@ pub struct RenderedMinimap {
 /// #828/quadraui#776: `sizing` — [`TUI_MINIMAP_SIZING`] or
 /// [`gtk_minimap_sizing`] — is supplied by the caller, who already knows its
 /// own backend by construction, instead of being selected here from a
-/// `char_width > 1.0` runtime check. This function itself no longer
-/// branches on backend identity at all; it only asks `sizing` to resolve a
-/// width and applies the on/off decision.
+/// `char_width > 1.0` runtime check. This function still never branches on
+/// backend identity — only on which `sizing` *value* the caller explicitly
+/// handed it, via the match below — and it only asks that value to resolve
+/// a width before applying the on/off decision.
 ///
-/// `sizing`'s `min`/`max`/`target_cols` are already stated in the caller's
-/// own native unit (columns for TUI, raw pixels for GTK — see
-/// `gtk_minimap_sizing`'s doc comment for why GTK needs pixels, not a real
-/// `char_width` conversion), so `resolve_width` is called with a forced
-/// `char_width` of `1.0` rather than the real one: a real `char_width`
-/// would convert `sizing`'s bounds a *second* time, which is only correct
-/// when they're stated in columns of the *caller's* font — true for TUI
-/// (whose real `char_width` is `1.0` anyway) but not for GTK's minimap,
-/// which VS Code parity keeps decoupled from the editor's own font size.
-/// The real `char_width` (`cw` below) is still used for the
-/// `MINIMAP_MIN_TEXT_COLS` suppression check, which genuinely does want the
-/// editor's own font metric.
+/// #1869: TUI's column-based `sizing.resolve_width()` path (unchanged,
+/// still forced to `char_width == 1.0` — out of #1869's scope) cannot
+/// express VS Code's real width formula, which divides by the editor's
+/// character width rather than scaling linearly by a fraction. So
+/// `gtk_minimap_sizing`'s `target_cols` (120, [`MINIMAP_TARGET_COLS`]) is
+/// used as that value's own marker — still never colliding with TUI's
+/// `target_cols` of 12 ([`MINIMAP_TARGET_COLS_TUI`]) — to route GTK/macOS/
+/// Win to [`vs_code_minimap_width_px`] instead, fed the *real* `char_width`
+/// rather than a forced `1.0`. The real `char_width` (`cw` below) is always
+/// used for the `MINIMAP_MIN_TEXT_COLS` suppression check, which genuinely
+/// wants the editor's own font metric regardless of which width formula
+/// ran.
 ///
 /// Delegates the on/off decision to `quadraui::reserved_width` so both
 /// backends (and `build_screen_layout`, which shrinks each window rect by
 /// exactly this much) reclaim identical geometry when `:set nominimap`
 /// turns the strip off.
+///
+/// `gutter_width` (#1869 review round 1) is the pane's own line-number/fold
+/// gutter, in the same unit as `rect_width` — subtracted *only* on the
+/// [`vs_code_minimap_width_px`] path, matching VS Code's own
+/// `remainingWidth = editor outer width - gutter` (see that function's doc
+/// comment). TUI's `sizing.resolve_width()` path ignores it: TUI sizing is
+/// out of #1869's scope and its callers (and every unit test below except
+/// the real `build_screen_layout` call site) pass `0.0`, i.e. "rect_width is
+/// already the remaining width" — the function's pre-#1869-round-1 contract,
+/// preserved for every caller that isn't the real per-window production path.
 pub fn minimap_reserved_width(
     engine: &Engine,
     rect_width: f64,
     char_width: f64,
     sizing: quadraui::MinimapSizing,
+    gutter_width: f64,
 ) -> f64 {
-    let want = sizing.resolve_width(rect_width as f32, 1.0).unwrap_or(0.0) as f64;
+    let want = match sizing {
+        quadraui::MinimapSizing::VsCodeParity { target_cols, .. }
+            if target_cols == MINIMAP_TARGET_COLS as f32 =>
+        {
+            vs_code_minimap_width_px((rect_width - gutter_width).max(0.0), char_width)
+        }
+        _ => sizing.resolve_width(rect_width as f32, 1.0).unwrap_or(0.0) as f64,
+    };
     let cw = if char_width > 0.0 { char_width } else { 1.0 };
     let has = engine.settings.minimap && rect_width >= want + MINIMAP_MIN_TEXT_COLS * cw;
     quadraui::reserved_width(want as f32, has) as f64
+}
+
+/// This window's own line-number/fold gutter width, in the caller's pixel
+/// unit — the `remaining_width = editor outer width - gutter` term
+/// [`vs_code_minimap_width_px`]'s formula needs and the pre-#1869-round-1
+/// shape silently skipped (2026-review finding: "remaining_width is wrong").
+///
+/// Computed from [`calculate_gutter_cols`] — the same function
+/// `build_rendered_window` uses for the real painted gutter — fed this
+/// window's own buffer/settings state directly, since this runs *before*
+/// `build_rendered_window` (the `minimap_widths` map in
+/// `build_screen_layout_with_breadcrumb_row` has to know the strip's width
+/// before it can compute each window's rect). Two inputs
+/// `build_rendered_window`'s own `has_git`/`has_bp` fold in are deliberately
+/// **not** replicated here, both documented, bounded deviations:
+///
+/// - `has_git` there also covers the in-flight ACP-turn-checkpoint overlay
+///   (`acp_turn_status`) — here it is just `!git_diff.is_empty()`, since the
+///   checkpoint lookup needs a `pre_turn_content` fetch this sizing pass has
+///   no reason to pay for on every frame.
+/// - `has_bp` there also covers an in-viewport decor sign (`has_decor_sign`)
+///   — here it is just "a real breakpoint is set, or a DAP session is
+///   live", since the decor check needs a resolved scroll/visible-lines
+///   window this sizing pass doesn't have yet.
+///
+/// Both gaps can only make the *real* painted gutter one column wider than
+/// this estimate, and only while a checkpoint/decor sign is actually
+/// outstanding — a transient, bounded case where the minimap strip comes
+/// out fractionally wider than VS Code's formula predicts, not a silent
+/// misrepresentation of the formula's own `remainingWidth` term.
+fn window_minimap_gutter_width_px(engine: &Engine, window_id: WindowId, char_width: f64) -> f64 {
+    let Some(window) = engine.windows.get(&window_id) else {
+        return 0.0;
+    };
+    let Some(buffer_state) = engine.buffer_manager.get(window.buffer_id) else {
+        return 0.0;
+    };
+    let total_lines = buffer_state.buffer.len_lines();
+    let line_number_mode = if buffer_state.md_rendered.is_some() {
+        LineNumberMode::None
+    } else {
+        engine.settings.line_numbers
+    };
+    let has_git = !buffer_state.git_diff.is_empty();
+    let has_bp = buffer_state
+        .file_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .and_then(|key| engine.dap_breakpoints.get(&key).map(|v| !v.is_empty()))
+        .unwrap_or(false)
+        || engine.dap_session_active;
+    let cols = calculate_gutter_cols(line_number_mode, total_lines, char_width, has_git, has_bp);
+    cols as f64 * char_width
 }
 
 /// Width of the scroll-affordance gutter a pane's rightmost edge must keep
@@ -14935,8 +15147,9 @@ pub fn draw_minimap_strip(backend: &mut dyn quadraui::Backend, screen: &ScreenLa
 ///   constant's doc comment upstream), and its own `cols_per_cell` is
 ///   always `1` (`MinimapLayout`'s `Default`, and what
 ///   `Minimap::layout_with_sizing` always sets), so `rect_width * 1` (a
-///   pixel count, at GTK's `MINIMAP_MIN_PX`..`MINIMAP_MAX_PX` range of
-///   48..240) is not dimensionally a column count at all.
+///   pixel count, in the `0..=MINIMAP_TARGET_COLS` (0..=120) range
+///   [`vs_code_minimap_width_px`] resolves to) is not dimensionally a
+///   column count at all.
 ///
 /// Rather than branch on backend identity here (Platform-Neutrality Rule
 /// — this is shared code, not per-backend wiring), take the max of both
@@ -17747,7 +17960,9 @@ pub fn build_screen_layout_with_breadcrumb_row(
     let minimap_widths: std::collections::HashMap<WindowId, f64> = window_rects
         .iter()
         .map(|(id, r)| {
-            let raw = minimap_reserved_width(engine, r.width, char_width, minimap_sizing);
+            let gutter_px = window_minimap_gutter_width_px(engine, *id, char_width);
+            let raw =
+                minimap_reserved_width(engine, r.width, char_width, minimap_sizing, gutter_px);
             let w = if raw > 0.0 {
                 let cw = if char_width > 0.0 { char_width } else { 1.0 };
                 let gutter = scroll_gutter_width(scrollbar_reserve, char_width);
@@ -29293,6 +29508,112 @@ impl UnitProfile {
     }
 }
 
+/// #1877: undo `AppShellLayout::main_content_bounds`'s shrink from
+/// `App::shell_config`'s `with_command_line()`/`with_status_bar()`
+/// reservation, recovering the full content height `render_content`'s own
+/// `compute_editor_layout`/status-bar/command-line math was already
+/// written against (that math independently — and correctly — subtracts
+/// vimcode's own *dynamic* bottom-chrome height from whatever `h` it is
+/// given; it must not also inherit a second, *static* subtraction the
+/// shell performed first, or every bottom row ends up reserved twice,
+/// leaving a blank gap between the command line and the window's true
+/// bottom edge).
+///
+/// `shell_config`'s reservation exists purely so
+/// `AppShellLayout::activity_bar_bounds` (and
+/// `sidebar_header_bounds`/`sidebar_content_bounds`) stop short of the
+/// window's bottom edge — see that call site's doc. Everything
+/// `render_content` paints into `main_content_bounds` keeps using this
+/// recovered height instead, so the one reservation shrinks only the
+/// activity bar/sidebar's painted height, never where the editor, status
+/// line or command line actually paint.
+///
+/// Only valid for an `AppShellLayout` produced by the one `ShellConfig`
+/// that actually opted into both bands — `App::shell_config`, today the
+/// sole legitimate producer. A layout built from a `ShellConfig` that
+/// skipped `with_command_line()`/`with_status_bar()` just adds back
+/// `0.0` for the missing band(s) (see the second half of this function's
+/// own test), so a mismatched layout is silently off by nothing, not
+/// silently off by two rows — there is nothing here for a mismatch to
+/// get wrong.
+///
+/// Review round 1 (#1877): clamped to `window_bounds`'s own true bottom
+/// edge, not just `main_content_bounds.height` plus both bands' heights
+/// unconditionally. `AppShell::compute_layout` clamps `band_h` with
+/// `.max(0.0)` *after* subtracting both rows from the viewport (quadraui
+/// `app_shell.rs:1253`), but still *returns* full-height
+/// `command_line_bounds`/`status_bar_bounds` rects even when the window is
+/// too short to hold them — so on, say, a 3-row terminal,
+/// `main_content_bounds.height` floors at `0.0` while the two bands still
+/// report `lh.round()` each, and this function would hand back `2 *
+/// lh.round()` for a window that cannot fit even one full row below the
+/// title bar. That slipped past `render_content`'s `w < 1.0 || h < 1.0`
+/// guard (previously the only thing standing between a too-short window
+/// and a negative/degenerate paint) and tripped
+/// `debug_assert_command_line_fits_viewport` instead — a debug-build panic
+/// where the pre-#1877 code silently bailed. Clamping to the window's own
+/// bottom edge restores that bail-out: a too-short window now reports a
+/// true height of `0.0` (or less, if `main_content_bounds.y` already
+/// exceeds the window), so the `h < 1.0` guard catches it exactly as
+/// before.
+pub fn main_content_true_height(layout: &quadraui::AppShellLayout) -> f32 {
+    let reserved = layout.main_content_bounds.height
+        + layout.command_line_bounds.map(|r| r.height).unwrap_or(0.0)
+        + layout.status_bar_bounds.map(|r| r.height).unwrap_or(0.0);
+    let window_bottom = layout.window_bounds.y + layout.window_bounds.height;
+    reserved.min(window_bottom - layout.main_content_bounds.y)
+}
+
+/// #1877 review round 1 (blocking finding 1): the rect `shell_config`'s
+/// bottom-chrome reservation reclaims from `activity_bar_bounds`/
+/// `sidebar_header_bounds`/`sidebar_content_bounds`/`divider_bounds` but
+/// that nothing else paints — the bottom-left strip, `two rows tall ×
+/// (main_content_bounds.x - window_bounds.x)` wide, that used to be
+/// covered by the activity bar/sidebar/divider chrome quadraui's own
+/// `AppShell::render` paints (fully, edge to edge, before #1877) and now
+/// isn't, because that chrome is painted *into* the now-shrunk bounds
+/// only. Nothing downstream repaints the vacated strip: vimcode's own
+/// status-bar/command-line rows are anchored at `main_content_bounds.x`
+/// (`render_content`'s own `x`/`w` locals), not at the window's left
+/// edge, so they never reach left of the activity bar/sidebar column
+/// either. Left unpainted, a plain Cairo/CG/ratatui surface shows
+/// whatever the frame clear left there — `theme.background` on every
+/// backend — a visible notch against `theme.tab_bar_bg`'s activity-bar
+/// color on any theme where the two differ (onedark: `#1a1a1a` vs
+/// `#262633`).
+///
+/// Returns the reclaimed rect — `window_bounds.x` to `main_content_bounds
+/// .x`, from the bottom of `activity_bar_bounds` (the shrunk edge every
+/// one of the four reclaimed rects shares, by construction: `band_h` feeds
+/// all four at once, quadraui `app_shell.rs:1296-1349`) to
+/// `window_bounds`'s own true bottom edge — or `None` when there is
+/// nothing to reclaim (no reservation active, so `activity_bar_bounds`
+/// already runs flush to the window's bottom edge, or the window is too
+/// short for either dimension to be positive). The caller fills this with
+/// `theme.tab_bar_bg` — the same colour `AppShell::render` already uses
+/// for `activity_bar_bounds` itself (quadraui `primitives/activity_bar.rs
+/// :644-645`) and for `divider_bounds` (`theme.separator`, blended in by
+/// eye at this width) — so the strip reads as a continuation of the
+/// existing chrome instead of a second, differently-themed notch.
+pub fn bottom_chrome_reservation_fill_rect(
+    layout: &quadraui::AppShellLayout,
+) -> Option<quadraui::Rect> {
+    let ab = layout.activity_bar_bounds;
+    let reclaimed_y = ab.y + ab.height;
+    let window_bottom = layout.window_bounds.y + layout.window_bounds.height;
+    let height = window_bottom - reclaimed_y;
+    let width = layout.main_content_bounds.x - layout.window_bounds.x;
+    if height < 1.0 || width < 1.0 {
+        return None;
+    }
+    Some(quadraui::Rect::new(
+        layout.window_bounds.x,
+        reclaimed_y,
+        width,
+        height,
+    ))
+}
+
 /// Compute the height of the bottom chrome (status bar + wildmenu) in pixels.
 ///
 /// `show_global_status` is [`global_status_bar_visible`]'s value, **not**
@@ -32790,6 +33111,110 @@ mod tests {
         assert_eq!(small_bc, TAB_ROW_HEIGHT_PX + BREADCRUMB_ROW_HEIGHT_PX);
     }
 
+    /// #1877: `main_content_true_height` adds the shell's own
+    /// `command_line_bounds`/`status_bar_bounds` heights back onto
+    /// `main_content_bounds.height`, recovering the pre-reservation value
+    /// — and is `0.0`-safe (treats either/both as absent) for callers that
+    /// never opted into one or either band.
+    #[test]
+    fn main_content_true_height_adds_back_the_shells_bottom_chrome_reservation() {
+        let mut layout = quadraui::AppShellLayout {
+            window_bounds: quadraui::Rect::new(0.0, 0.0, 1400.0, 900.0),
+            title_bar_bounds: None,
+            activity_bar_bounds: quadraui::Rect::default(),
+            sidebar_header_bounds: None,
+            sidebar_content_bounds: None,
+            divider_bounds: None,
+            main_content_bounds: quadraui::Rect::new(0.0, 36.0, 1000.0, 828.0),
+            bottom_panel_bounds: None,
+            command_line_bounds: Some(quadraui::Rect::new(0.0, 864.0, 1000.0, 18.0)),
+            status_bar_bounds: Some(quadraui::Rect::new(0.0, 882.0, 1000.0, 18.0)),
+        };
+        assert_eq!(main_content_true_height(&layout), 828.0 + 18.0 + 18.0);
+
+        // Neither band reserved — the common, pre-#1877 shape — is a no-op.
+        layout.command_line_bounds = None;
+        layout.status_bar_bounds = None;
+        assert_eq!(main_content_true_height(&layout), 828.0);
+    }
+
+    /// #1877 review round 1 (non-blocking finding 1): a window too short
+    /// to hold the reservation must clamp to the window's own true bottom
+    /// edge, not blindly add both bands' full (un-`.max(0.0)`-clamped-at-
+    /// this-layer) heights back onto a `main_content_bounds.height` that
+    /// `AppShell::compute_layout` already floored at `0.0`. Pre-fix this
+    /// returned `2 * lh.round()` for a window with zero rows available
+    /// below the title bar — enough to slip past `render_content`'s own
+    /// `h < 1.0` bail-out and reach `debug_assert_command_line_fits_
+    /// viewport` instead, a debug-build panic where the pre-#1877 code
+    /// silently returned with nothing painted.
+    #[test]
+    fn main_content_true_height_clamps_to_the_window_when_too_short_to_reserve() {
+        let layout = quadraui::AppShellLayout {
+            window_bounds: quadraui::Rect::new(0.0, 0.0, 400.0, 40.0),
+            title_bar_bounds: None,
+            activity_bar_bounds: quadraui::Rect::default(),
+            sidebar_header_bounds: None,
+            sidebar_content_bounds: None,
+            divider_bounds: None,
+            // `AppShell::compute_layout` floored this at `0.0` already —
+            // the window is too short to fit anything below the title bar.
+            main_content_bounds: quadraui::Rect::new(0.0, 40.0, 400.0, 0.0),
+            bottom_panel_bounds: None,
+            // ...but it still *returns* two full-height bands.
+            command_line_bounds: Some(quadraui::Rect::new(0.0, 40.0, 400.0, 18.0)),
+            status_bar_bounds: Some(quadraui::Rect::new(0.0, 40.0, 400.0, 18.0)),
+        };
+        // Un-clamped this would be `0.0 + 18.0 + 18.0 = 36.0` — more rows
+        // than the 0-tall window has left below `main_content_bounds.y`
+        // (`window_bounds.y + window_bounds.height - main_content_bounds.y
+        // == 40.0 - 40.0 == 0.0`). Clamped, it is `0.0`, which
+        // `render_content`'s `h < 1.0` guard correctly bails out on.
+        assert_eq!(main_content_true_height(&layout), 0.0);
+    }
+
+    /// #1877 review round 1 (blocking finding 1): the rect `shell_config`'s
+    /// reservation vacates from `activity_bar_bounds` (and `sidebar_*_
+    /// bounds`/`divider_bounds`) — nothing else in `render_content` paints
+    /// it, so it must be reported precisely: from `activity_bar_bounds`'s
+    /// (shrunk) bottom edge down to the window's true bottom edge, as wide
+    /// as everything left of `main_content_bounds.x`.
+    #[test]
+    fn bottom_chrome_reservation_fill_rect_reports_the_vacated_strip() {
+        let layout = quadraui::AppShellLayout {
+            window_bounds: quadraui::Rect::new(0.0, 0.0, 1400.0, 900.0),
+            title_bar_bounds: None,
+            // Shrunk by the two-row (18.0px each) reservation, same as
+            // `sidebar_header_bounds`/`sidebar_content_bounds`/
+            // `divider_bounds` would be.
+            activity_bar_bounds: quadraui::Rect::new(0.0, 36.0, 48.0, 828.0),
+            sidebar_header_bounds: None,
+            sidebar_content_bounds: None,
+            divider_bounds: None,
+            main_content_bounds: quadraui::Rect::new(48.0, 36.0, 1352.0, 828.0),
+            bottom_panel_bounds: None,
+            command_line_bounds: Some(quadraui::Rect::new(48.0, 864.0, 1352.0, 18.0)),
+            status_bar_bounds: Some(quadraui::Rect::new(48.0, 882.0, 1352.0, 18.0)),
+        };
+        let rect = bottom_chrome_reservation_fill_rect(&layout)
+            .expect("a reservation is active and the window has room for it");
+        assert_eq!(rect, quadraui::Rect::new(0.0, 864.0, 48.0, 36.0));
+
+        // No reservation active (`activity_bar_bounds` already flush with
+        // the window's bottom edge) — nothing to reclaim.
+        let mut no_reservation = layout.clone();
+        no_reservation.activity_bar_bounds = quadraui::Rect::new(0.0, 36.0, 48.0, 864.0);
+        no_reservation.command_line_bounds = None;
+        no_reservation.status_bar_bounds = None;
+        assert_eq!(bottom_chrome_reservation_fill_rect(&no_reservation), None);
+
+        // No activity bar/sidebar column to reclaim either (`main_content_
+        // bounds.x == window_bounds.x`) — zero-width, so `None`.
+        let mut no_column = layout.clone();
+        no_column.main_content_bounds.x = 0.0;
+        assert_eq!(bottom_chrome_reservation_fill_rect(&no_column), None);
+    }
+
     #[test]
     fn test_status_bar_height_px() {
         let lh = 16.0;
@@ -33133,7 +33558,12 @@ mod tests {
             text.push_str(&"    ".repeat(depth));
             text.push_str(&format!("line {i} content\n"));
         }
-        test_engine(&text)
+        let mut e = test_engine(&text);
+        // #1858: the minimap is experimental and off by default on every
+        // backend now — this fixture exists specifically to exercise it, so
+        // turn it on explicitly rather than lean on the (now-off) default.
+        e.settings.minimap = true;
+        e
     }
 
     /// A large, syntax-free buffer used to force the strip into #1093's
@@ -33151,7 +33581,12 @@ mod tests {
         for i in 0..n {
             text.push_str(&format!("line {i} content\n"));
         }
-        test_engine(&text)
+        let mut e = test_engine(&text);
+        // #1858: the minimap is experimental and off by default on every
+        // backend now — this fixture exists specifically to exercise it, so
+        // turn it on explicitly rather than lean on the (now-off) default.
+        e.settings.minimap = true;
+        e
     }
 
     /// A synthetic file large enough to make an O(buffer) per-frame cost
@@ -33435,7 +33870,7 @@ mod tests {
         // isn't already a whole number, not `floor(minimap_w)`. See the
         // split-pane test below, whose 79-column pane is the first fixture
         // in this file to actually exercise a fractional `minimap_w`.
-        let expected_cols = (minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING)
+        let expected_cols = (minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING, 0.0)
             + scroll_gutter_width(0.0, 1.0))
         .ceil() as usize;
 
@@ -33508,7 +33943,7 @@ mod tests {
             // `build_screen_layout`'s real reclaimed width by exactly one
             // column.
             let expected_cols =
-                (minimap_reserved_width(&e, w_without.rect.width, 1.0, TUI_MINIMAP_SIZING)
+                (minimap_reserved_width(&e, w_without.rect.width, 1.0, TUI_MINIMAP_SIZING, 0.0)
                     + scroll_gutter_width(0.0, 1.0))
                 .ceil() as usize;
             assert_eq!(
@@ -33624,51 +34059,53 @@ mod tests {
     fn minimap_reserved_width_is_zero_when_the_setting_is_off() {
         let mut e = minimap_engine();
         e.settings.minimap = true;
-        assert!(minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING) > 0.0);
-        assert!(minimap_reserved_width(&e, 1200.0, 8.0, gtk_minimap_sizing()) > 0.0);
+        assert!(minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING, 0.0) > 0.0);
+        assert!(minimap_reserved_width(&e, 1200.0, 8.0, gtk_minimap_sizing(), 0.0) > 0.0);
         e.settings.minimap = false;
         assert_eq!(
-            minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING),
+            minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING, 0.0),
             0.0
         );
         assert_eq!(
-            minimap_reserved_width(&e, 1200.0, 8.0, gtk_minimap_sizing()),
+            minimap_reserved_width(&e, 1200.0, 8.0, gtk_minimap_sizing(), 0.0),
             0.0
         );
     }
 
-    /// #828 acceptance: `sizing` is an explicit parameter now, honored
-    /// exactly as given — not re-derived from `char_width` via the old
-    /// `if char_width > 1.0 { MINIMAP_MIN_PX/MAX_PX } else {
-    /// MINIMAP_MIN_COLS/MAX_COLS }` convention this file used to hardcode
-    /// inside `minimap_reserved_width` itself.
+    /// #828 acceptance (updated for #1869's real formula, not deleted):
+    /// `sizing` is an explicit parameter, honored exactly as given — not
+    /// re-derived from `char_width` via the old `if char_width > 1.0 { ... }
+    /// else { ... }` convention this file used to hardcode inside
+    /// `minimap_reserved_width` itself.
     ///
     /// RED against that pre-#828 shape: there was no `sizing` parameter to
     /// pass at all — the function *always* picked its constant set from
-    /// `char_width`, so a caller could never say "use GTK's pixel bounds"
+    /// `char_width`, so a caller could never say "use GTK's own policy"
     /// while passing a TUI-shaped `char_width`. This pins that passing
-    /// `gtk_minimap_sizing()` alongside `char_width == 1.0` (TUI's own
-    /// signal under the old convention) still resolves against GTK's
-    /// pixel-denominated floor (`MINIMAP_MIN_PX`), not TUI's much smaller
-    /// column-denominated one (`MINIMAP_MIN_COLS`) — proving the sizing
-    /// comes from the explicit argument, never from `char_width`.
+    /// `gtk_minimap_sizing()` alongside `char_width == 1.0` (TUI's own real
+    /// metric) still resolves via [`vs_code_minimap_width_px`] — the real
+    /// VS Code pixel formula — rather than TUI's `resolve_width`-based
+    /// column policy, by checking the result against the formula computed
+    /// by hand, not merely against *some* non-TUI-shaped number.
     #[test]
     fn minimap_reserved_width_uses_the_explicit_sizing_not_char_width() {
         let e = minimap_engine();
-        // Narrow enough that TUI's own sizing would clamp to
-        // MINIMAP_MIN_COLS (6.0), but GTK's pixel floor (48.0) is what a
-        // sniff-free implementation must produce here instead, since
-        // `gtk_minimap_sizing()` is what's explicitly passed. Wide enough
-        // that the `char_width == 1.0` passed alongside it (TUI's own
-        // MINIMAP_MIN_TEXT_COLS suppression check) doesn't itself suppress
-        // the strip.
+        // Wide enough that the `char_width == 1.0` passed alongside it
+        // (TUI's own MINIMAP_MIN_TEXT_COLS suppression check) doesn't
+        // itself suppress the strip.
         let pane_width = 100.0;
-        let got = minimap_reserved_width(&e, pane_width, 1.0, gtk_minimap_sizing());
+        let char_width = 1.0;
+        let got = minimap_reserved_width(&e, pane_width, char_width, gtk_minimap_sizing(), 0.0);
+        // Hand-computed VS Code formula, independent of
+        // `vs_code_minimap_width_px`'s own implementation: floor((100 - 14
+        // - 2) / (1.0 + 1.0)) + 8 = floor(84 / 2) + 8 = 42 + 8 = 50.
+        let expected = 50.0;
         assert_eq!(
-            got, MINIMAP_MIN_PX,
-            "an explicit gtk_minimap_sizing() must clamp to GTK's own \
-             pixel floor even at char_width == 1.0, not TUI's column floor \
-             (MINIMAP_MIN_COLS = {MINIMAP_MIN_COLS}): got {got}"
+            got, expected,
+            "an explicit gtk_minimap_sizing() must resolve via the real VS \
+             Code pixel formula even at char_width == 1.0 (TUI's own \
+             metric), not TUI's column-based resolve_width: got {got}, \
+             expected {expected}"
         );
     }
 
@@ -33678,7 +34115,7 @@ mod tests {
     fn minimap_suppresses_itself_in_a_narrow_window() {
         let e = minimap_engine();
         assert_eq!(
-            minimap_reserved_width(&e, 20.0, 1.0, TUI_MINIMAP_SIZING),
+            minimap_reserved_width(&e, 20.0, 1.0, TUI_MINIMAP_SIZING, 0.0),
             0.0,
             "a 20-column window cannot spare the minimap's floor width plus \
              MINIMAP_MIN_TEXT_COLS of surviving text"
@@ -33707,9 +34144,13 @@ mod tests {
     #[test]
     fn minimap_suppresses_itself_when_the_pane_cannot_afford_both_the_strip_and_the_scroll_gutter()
     {
-        let engine = test_engine(
+        let mut engine = test_engine(
             "a line of text long enough to fill the whole pane width and then some more text",
         );
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about the minimap's self-suppression, so turn it on
+        // explicitly.
+        engine.settings.minimap = true;
         let theme = Theme::onedark();
         // Same 40-column pane `build_screen_layout_honors_an_explicit_
         // scrollbar_reserve_even_at_char_width_one` uses: wide enough to
@@ -33974,8 +34415,8 @@ mod tests {
     #[test]
     fn minimap_reserved_width_scales_with_a_narrow_pane_width() {
         let e = minimap_engine();
-        let narrow = minimap_reserved_width(&e, 40.0, 1.0, TUI_MINIMAP_SIZING);
-        let wide = minimap_reserved_width(&e, 70.0, 1.0, TUI_MINIMAP_SIZING);
+        let narrow = minimap_reserved_width(&e, 40.0, 1.0, TUI_MINIMAP_SIZING, 0.0);
+        let wide = minimap_reserved_width(&e, 70.0, 1.0, TUI_MINIMAP_SIZING, 0.0);
         assert_eq!(narrow, 40.0 * MINIMAP_WIDTH_FRACTION);
         assert_eq!(wide, 70.0 * MINIMAP_WIDTH_FRACTION);
         assert!(
@@ -33996,9 +34437,9 @@ mod tests {
     #[test]
     fn minimap_reserved_width_holds_steady_across_ordinary_pane_widths() {
         let e = minimap_engine();
-        let at_100 = minimap_reserved_width(&e, 100.0, 1.0, TUI_MINIMAP_SIZING);
-        let at_150 = minimap_reserved_width(&e, 150.0, 1.0, TUI_MINIMAP_SIZING);
-        let at_200 = minimap_reserved_width(&e, 200.0, 1.0, TUI_MINIMAP_SIZING);
+        let at_100 = minimap_reserved_width(&e, 100.0, 1.0, TUI_MINIMAP_SIZING, 0.0);
+        let at_150 = minimap_reserved_width(&e, 150.0, 1.0, TUI_MINIMAP_SIZING, 0.0);
+        let at_200 = minimap_reserved_width(&e, 200.0, 1.0, TUI_MINIMAP_SIZING, 0.0);
         assert_eq!(
             (at_100, at_150, at_200),
             (
@@ -34012,112 +34453,116 @@ mod tests {
         );
     }
 
-    /// #722 acceptance, unchanged in shape by #828: bumping the editor font
-    /// (`char_width`) must NOT change the reserved width at a fixed pane
-    /// width — VS Code's minimap width is independent of the editor font.
-    /// `gtk_minimap_sizing`'s bounds are stated in raw pixels and resolved
-    /// with a *forced* `char_width` of `1.0` (see `minimap_reserved_width`'s
-    /// doc comment), so the real `char_width` argument here only feeds the
-    /// `MINIMAP_MIN_TEXT_COLS` suppression check, never `want` itself — this
-    /// pins that font-invariance survives #828's move from an internal
-    /// `char_width > 1.0` branch to a caller-supplied `MinimapSizing`. Pane
-    /// wide enough that `want` is driven by `MINIMAP_TARGET_COLS` rather
-    /// than the fraction, for every `char_width` tested, so the
-    /// clamp/fraction can't be the reason the widths happen to match.
-    #[test]
-    fn minimap_reserved_width_is_unchanged_by_font_size() {
-        let e = minimap_engine();
-        let pane_width = 1200.0;
-        let small_font = minimap_reserved_width(&e, pane_width, 8.0, gtk_minimap_sizing());
-        let large_font = minimap_reserved_width(&e, pane_width, 16.0, gtk_minimap_sizing());
-        assert_eq!(
-            small_font, large_font,
-            "reserved width must not depend on char_width: \
-             8px/char={small_font}, 16px/char={large_font}"
-        );
-        assert_eq!(small_font, MINIMAP_TARGET_COLS);
-    }
-
-    /// #722 review regression, unchanged in shape by #828:
-    /// `minimap_reserved_width_is_unchanged_by_font_size` above deliberately
-    /// keeps `want` inside the clamp band, so it cannot catch font-dependence
-    /// in the clamp *bounds* themselves. This pins the fixed scenario from
-    /// the original review finding: a ~300px pane, at two GTK font sizes
-    /// close enough together that neither hits `MINIMAP_MIN_TEXT_COLS`'s
-    /// separate (and correct) suppression floor, so any difference in the
-    /// result can only be the clamp bound moving with the font.
+    /// #1869 acceptance (updated from the pre-#1869
+    /// `minimap_reserved_width_is_unchanged_by_font_size`, which pinned the
+    /// *opposite* of VS Code's real behaviour — see `MINIMAP_WIDTH_FRACTION`'s
+    /// doc comment for why that premise was wrong): below the 120-column
+    /// cap, VS Code's own minimap width formula genuinely divides by the
+    /// editor's real character width, so a wider editor font must narrow
+    /// the strip at the same pane width, not leave it unchanged.
     ///
-    /// RED against a `resolve_width(pane_width, real_char_width)` formula
-    /// fed `gtk_minimap_sizing`'s pixel-denominated bounds directly as
-    /// columns (the version tried and reverted — see
-    /// `gtk_minimap_sizing`'s doc comment): at `rect_width = 300.0`,
-    /// `char_width = 6.0` gives a floor of `36.0` (want=45, not clamped →
-    /// 45), while `char_width = 8.0` gives a floor of `48.0` (want=45,
-    /// clamped → 48) — two different widths for the same pane at two font
-    /// sizes. Forcing `resolve_width`'s own `char_width` to `1.0` (this
-    /// function's actual behaviour) keeps the floor at the fixed
-    /// `MINIMAP_MIN_PX` regardless.
+    /// RED against the pre-#1869 shape (`resolve_width` with a forced
+    /// `char_width` of `1.0`): both font sizes would have resolved to the
+    /// same `pane_width * MINIMAP_WIDTH_FRACTION`-derived number regardless
+    /// of the `8.0`/`16.0` passed here.
     #[test]
-    fn minimap_reserved_width_clamp_floor_is_font_invariant() {
+    fn minimap_reserved_width_scales_with_char_width_per_vs_code_formula() {
         let e = minimap_engine();
-        let pane_width = 300.0; // want = 300 * 0.15 = 45px, below the 48px floor
-        let small_font = minimap_reserved_width(&e, pane_width, 6.0, gtk_minimap_sizing());
-        let large_font = minimap_reserved_width(&e, pane_width, 8.0, gtk_minimap_sizing());
+        let pane_width = 900.0;
+        let small_font = minimap_reserved_width(&e, pane_width, 8.0, gtk_minimap_sizing(), 0.0);
+        let large_font = minimap_reserved_width(&e, pane_width, 16.0, gtk_minimap_sizing(), 0.0);
+        // Hand-computed VS Code formula, independent of
+        // `vs_code_minimap_width_px`'s own implementation:
+        // floor((900 - 14 - 2) / (cw + 1)) + 8, capped at 120.
+        // cw=8:  floor(884 / 9)  + 8 = 98 + 8 = 106
+        // cw=16: floor(884 / 17) + 8 = 52 + 8 = 60
+        assert_eq!(
+            (small_font, large_font),
+            (106.0, 60.0),
+            "a wider editor font must narrow the minimap at a fixed pane \
+             width, matching VS Code's own division by the character \
+             width: 8px/char={small_font}, 16px/char={large_font}"
+        );
         assert!(
-            small_font > 0.0 && large_font > 0.0,
-            "test setup sanity: neither font size may trip \
-             MINIMAP_MIN_TEXT_COLS's suppression floor, or this isn't \
-             exercising the clamp bound at all: small={small_font}, \
-             large={large_font}"
-        );
-        assert_eq!(
-            small_font, large_font,
-            "the clamped (floor-hitting) reserved width must not depend on \
-             char_width either: 6px/char={small_font}, 8px/char={large_font}"
-        );
-        assert_eq!(
-            small_font, MINIMAP_MIN_PX,
-            "a pane this narrow must clamp to the fixed pixel floor, not a \
-             char_width-scaled one"
+            small_font < MINIMAP_TARGET_COLS && large_font < MINIMAP_TARGET_COLS,
+            "test setup sanity: both results must be strictly below the \
+             120-column cap, or this isn't exercising the formula at all \
+             (it would be exercising the cap instead): \
+             small={small_font}, large={large_font}"
         );
     }
 
-    /// Same regression, at the ceiling — see
-    /// `minimap_reserved_width_clamp_floor_is_font_invariant`'s doc comment.
-    /// Pane wide enough that the pane-fraction cap alone would exceed
-    /// `MINIMAP_TARGET_COLS` at every font size tested, so `want` settles at
-    /// the fixed target rather than either the fraction or `MINIMAP_MAX_PX`.
+    /// Direct unit coverage of [`vs_code_minimap_width_px`] itself (#1869),
+    /// below the cap — the acceptance bullet "the minimap width equals the
+    /// VS Code formula's result, which is less than 120 at a pane narrow
+    /// enough to be under the cap". Hand-computed independently of the
+    /// function under test: `floor((400 - 14 - 2) / (7.0 + 1.0)) + 8 =
+    /// floor(384 / 8) + 8 = 48 + 8 = 56`.
     #[test]
-    fn minimap_reserved_width_clamp_ceiling_is_font_invariant() {
-        let e = minimap_engine();
-        let pane_width = 2000.0; // fraction = 2000 * 0.15 = 300px, above the 120px target
-        let small_font = minimap_reserved_width(&e, pane_width, 8.0, gtk_minimap_sizing());
-        let large_font = minimap_reserved_width(&e, pane_width, 16.0, gtk_minimap_sizing());
-        assert_eq!(
-            small_font, large_font,
-            "the clamped (ceiling-hitting) reserved width must not depend \
-             on char_width: 8px/char={small_font}, 16px/char={large_font}"
-        );
-        assert_eq!(
-            small_font, MINIMAP_TARGET_COLS,
-            "a pane this wide must settle at the fixed VS Code-parity \
-             target, not a char_width-scaled one"
+    fn vs_code_minimap_width_px_matches_the_formula_below_the_cap() {
+        let got = vs_code_minimap_width_px(400.0, 7.0);
+        assert_eq!(got, 56.0);
+        assert!(
+            got < MINIMAP_TARGET_COLS,
+            "this case must stay below the 120 cap, or it isn't testing \
+             the below-cap branch: got {got}"
         );
     }
 
-    /// #728 acceptance: an ordinary wide GTK pane must settle at VS Code's
-    /// ~120px minimap width, not scale up with the pane — the whole reason
-    /// `gtk_minimap_sizing` keeps GTK's bounds in raw pixels, resolved with
-    /// a forced `char_width` of `1.0`, rather than routing a real editor
-    /// `char_width` through `resolve_width`'s column normalisation (see its
-    /// doc comment: that version moved this exact scenario from ~120px to
-    /// ~178px, caught by
-    /// `gtk::testing::minimap::minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane`
+    /// [`vs_code_minimap_width_px`]'s true floor (#1869): once the pane is
+    /// narrow enough that the division term itself would go negative, the
+    /// formula clamps it to `0` before adding the gutter — so the result
+    /// bottoms out at exactly [`MINIMAP_GUTTER_WIDTH_PX`] (8px), regardless
+    /// of the editor's character width. (`minimap_reserved_width`'s own
+    /// `MINIMAP_MIN_TEXT_COLS` suppression hides the strip entirely before
+    /// a real pane ever reaches this narrow — this is `vs_code_minimap_
+    /// width_px` in isolation, the formula's own floor, not the suppressed
+    /// width a caller actually sees.)
+    #[test]
+    fn vs_code_minimap_width_px_floors_at_the_gutter_width_regardless_of_font() {
+        let narrow_font = vs_code_minimap_width_px(10.0, 6.0);
+        let wide_font = vs_code_minimap_width_px(10.0, 20.0);
+        assert_eq!(
+            (narrow_font, wide_font),
+            (MINIMAP_GUTTER_WIDTH_PX, MINIMAP_GUTTER_WIDTH_PX),
+            "a pane too narrow for the division term to go positive must \
+             floor at the gutter width alone, independent of character \
+             width: 6px/char={narrow_font}, 20px/char={wide_font}"
+        );
+    }
+
+    /// #728/#1869 acceptance: an ordinary wide GTK/macOS/Win pane must cap
+    /// at VS Code's 120-column minimap width — exactly, not approximately —
+    /// across more than one editor font size, rather than scaling up with
+    /// the pane the way the pre-#728 `rect_width * MINIMAP_WIDTH_FRACTION`
+    /// formula did (caught at ~240px by
+    /// `gtk::testing::minimap::minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane`,
     /// driven through the real paint path).
+    #[test]
+    fn minimap_reserved_width_caps_at_exactly_120_on_a_wide_pane_across_font_sizes() {
+        let e = minimap_engine();
+        let pane_width = 3000.0;
+        let small_font = minimap_reserved_width(&e, pane_width, 8.0, gtk_minimap_sizing(), 0.0);
+        let large_font = minimap_reserved_width(&e, pane_width, 16.0, gtk_minimap_sizing(), 0.0);
+        assert_eq!(
+            (small_font, large_font),
+            (MINIMAP_TARGET_COLS, MINIMAP_TARGET_COLS),
+            "a pane this wide must cap at exactly VS Code's 120-column \
+             minimap width at every ordinary font size, not scale up with \
+             the pane: 8px/char={small_font}, 16px/char={large_font}"
+        );
+    }
+
+    /// #728 acceptance, still pinned at the exact scenario #728 originally
+    /// caught (a 1600px pane at an 8px character width): under #1869's real
+    /// formula this also happens to land exactly on the 120-column cap
+    /// (`floor((1600 - 16) / 9) + 8 == 184`, `min(120, 184) == 120`), so
+    /// the historical regression scenario stays covered without this test
+    /// needing to change at all.
     #[test]
     fn minimap_reserved_width_matches_vs_code_parity_on_a_wide_pane() {
         let e = minimap_engine();
-        let want = minimap_reserved_width(&e, 1600.0, 8.0, gtk_minimap_sizing());
+        let want = minimap_reserved_width(&e, 1600.0, 8.0, gtk_minimap_sizing(), 0.0);
         assert_eq!(
             want, MINIMAP_TARGET_COLS,
             "an ordinary wide GTK pane must settle at VS Code's ~120px \
@@ -35215,6 +35660,9 @@ mod tests {
     #[test]
     fn split_gives_every_pane_its_own_minimap_over_its_own_buffer() {
         let mut e = test_engine("");
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about the minimap, so turn it on explicitly.
+        e.settings.minimap = true;
         e.buffer_mut().insert(0, &"left\n".repeat(50));
         e.split_window(SplitDirection::Vertical, None);
         // The split's new window starts on the same buffer; give it its own
@@ -38313,7 +38761,18 @@ mod mouse_drag_router_tests {
     /// independently-ordered ladders kept producing.
     #[test]
     fn both_backends_resolve_the_same_layout_and_point_to_the_same_rung() {
-        const GTK_CELL: (f64, f64) = (9.0, 18.0);
+        // #1869: the GTK char width here is chosen so the real VS Code
+        // minimap width formula ([`vs_code_minimap_width_px`]) happens to
+        // land its strip's left edge at the same *logical* column (68 of
+        // 80) as TUI's independent, deliberately much cruder
+        // `MINIMAP_TARGET_COLS_TUI` (12) policy — before #1869, GTK's
+        // fraction-based formula made that coincidence hold at (9.0, 18.0)
+        // instead. The two policies are not required to agree at every
+        // char width (TUI sizing is out of #1869's scope and stays a crude
+        // approximation), only at the one this test picks, so the shared
+        // router can be exercised across both a minimap and a non-minimap
+        // rung at the same logical point.
+        const GTK_CELL: (f64, f64) = (6.2, 18.0);
         let engine = drag_engine();
         let tui = frame(&engine, (1.0, 1.0), 0.0, TUI_MINIMAP_SIZING);
         let gtk = frame(&engine, GTK_CELL, 8.0, gtk_minimap_sizing());

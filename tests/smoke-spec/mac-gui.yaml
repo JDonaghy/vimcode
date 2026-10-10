@@ -51,6 +51,161 @@
 # strings remain first-approximation guesses pending an operator with
 # actual macmini access running this spec (or driving `vimcode` by hand
 # with the same checks) and recording pass/fail back into this comment.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# vimcode#1832 — FIRST REAL RUN, 2026-10-09, on macmini, against a real
+# `cargo build --no-default-features --features macos --bin vimcode`
+# (debug profile), driven by `coord app-drive` (`code-coordinator`
+# 0.5.620, the `~/.coord-venv.green` install — `~/.coord-venv.blue`
+# (0.5.617) on this same host is STALE and lacks every `#3650` step type
+# below; `which coord` must resolve to the green venv or this file's new
+# steps fail to parse at all). This section is new, additive content per
+# #3509's additive-only policy — it supersedes every "first-approximation
+# guess"/"has NOT had a real run" caveat in the paragraphs immediately
+# above with what was actually observed, WITHOUT editing those paragraphs
+# in place: they are left verbatim, as history, exactly as #1832 found
+# them. Where they conflict with this section, THIS section is the real
+# result.
+#
+# WHAT WAS CONFIRMED REAL AND GREEN today:
+#   - `expect_dock_icon` — PASS. `lsappinfo info -only ApplicationType`
+#     for the launched pid reports `Foreground` on a clean launch,
+#     confirming #1824 finding 3 ("not reproduced on a clean launch").
+#   - `native-menu-bar-has-file-item` (`expect_a11y role=AXMenuBarItem
+#     name=File`) — PASS. Confirmed via `coord app-drive probe
+#     --name ax_elements`: the real AX tree for a freshly-launched vimcode
+#     contains `AXMenuBarItem:'File'` with `AXMenuItem:'New Tab'` as its
+#     first child, exactly as named.
+#   - The three `expect_no_tofu` activity-bar checks below — PASS, all
+#     three, confirmed directly against `coord.native_pixels.
+#     looks_like_tofu`/`region_not_uniform` (the exact functions
+#     `expect_no_tofu`/`expect_region_not_uniform` call) run against a
+#     real `screencapture` of a freshly-launched window. **This
+#     contradicts #1824 finding 2** ("Explorer/Source Control/Run&Debug
+#     show a generic `?`-box placeholder"), which was itself real and
+#     reproduced on 2026-10-06 on this same macmini. Confirmed twice, on
+#     two separate fresh launches, with no tofu on any of the three
+#     previously-flagged icons either time. Whatever changed between
+#     2026-10-06 and today is unknown — possibly an unrelated icon/font
+#     change landed in between, possibly the symptom is intermittent and
+#     this run was simply lucky. **Do not read this as "#1824 is fixed"**
+#     — only its #1824-finding-2 sub-claim failed to reproduce today;
+#     findings 1 (window activation) and the Dock note are unaffected (see
+#     below). #1824 should stay open, but whoever next picks it up should
+#     re-confirm finding 2 before continuing to treat it as reproduced.
+#
+# WHAT WAS CONFIRMED REAL AND RED today (known_bug: vimcode#1824):
+#   - `expect_frontmost` immediately after `launch` — FAIL, every time
+#     (2 for 2 fresh launches). `osascript`'s own
+#     `tell application "System Events" to get name of first process
+#     whose frontmost is true` names the LAUNCHING terminal (iTerm2), not
+#     vimcode, confirming #1824 finding 1 (deprecated
+#     `-[NSApplication activateIgnoringOtherApps:]` instead of
+#     `NSApplication.activate()`) reproduces exactly as documented
+#     2026-10-06.
+#   - Every step below that needs `click`/`key`/`type_text` cascades from
+#     that same failure: `NativeRunner._require_frontmost` (#3566) refuses
+#     to post *any* input while another process is frontmost, so
+#     `click-file-menu-item`, the typing section, and
+#     `click-close-button` all fail with "pid=... is not frontmost right
+#     now" — a direct, mechanical consequence of the one root cause above,
+#     not three independent bugs. All are tagged `known_bug:
+#     vimcode#1824` below for that reason, even though only the first one
+#     is the literal "app never becomes frontmost" symptom.
+#
+# A SEPARATE, NEWLY-DISCOVERED FINDING — NOT YET FILED ANYWHERE:
+#   `coord`'s `send_click` (`MacOSCalls.send_click`, `CGEventPostToPid`)
+#   does not register against vimcode's window AT ALL, even once the app
+#   is made genuinely frontmost by hand (`osascript ... set frontmost of
+#   process ... to true`, confirmed via `System Events`'s own `frontmost`
+#   attribute reading `true` afterward). Clicking a known-good, precisely
+#   calibrated activity-bar icon coordinate while frontmost produced zero
+#   visible change across two separate attempts (two different window
+#   positions); the SAME coordinate posted instead via
+#   `Quartz.CGEventPost(kCGHIDEventTap, ...)` (a real global HID-tap
+#   click, bypassing `coord` entirely) opened the Search panel
+#   immediately. `send_key`'s own `CGEventPostToPid` calls, by contrast,
+#   work reliably (confirmed: `i` reaches vimcode and flips the status bar
+#   to `INSERT` every time). So this is specific to *mouse* event
+#   delivery via pid-addressed posting, not a general PostToPid failure,
+#   and it reproduces independently of #1824's frontmost gate (which was
+#   worked around by hand for this test) — meaning fixing #1824 alone
+#   will NOT by itself unblock this spec's `click` steps; `send_click`
+#   itself needs its own fix or workaround first. This is plausibly a
+#   `coord`-side driver gap (`mac_native_driver.py` is not this repo — the
+#   vimcode worker who ran this cannot file against it) rather than a
+#   vimcode/quadraui bug, but it has not been root-caused far enough to
+#   say that with confidence; flagged here for whoever next touches this
+#   driver or re-runs this spec.
+#
+# A SEPARATE PLACEMENT-INSTABILITY OBSERVATION: `NativeRunner._do_launch`
+# calls `move_window(pid, window_id, 0, 0, spec.width, spec.height)`
+# immediately after `launch`, and this file's click/`expect_no_tofu`
+# coordinates are window-relative (`MacOSCalls.send_click` computes
+# `screen_x = <window's CURRENT on-screen bounds>.X + x`, never a literal
+# screen coordinate) — so every coordinate below is only meaningful
+# insofar as the window actually ends up near screen (0,0). Observed
+# across two fresh launches: once the window landed at (0, 30) — Y clamped
+# to just below the real menu bar, as expected — and once at (332, 677),
+# nowhere near (0,0) at all, for no cause this run identified (no manual
+# interaction preceded either launch). The `expect_no_tofu`/icon
+# coordinates below are real-measured against the (0,30) placement; on a
+# run where the window lands elsewhere, they — and `click-file-menu-item`
+# especially, whose entire "reach the global menu bar via a small
+# window-relative y" trick (the pre-existing `move_window` paragraph
+# above, still true) requires the window's Y to be at or near 0 — would
+# silently miss. No workaround applied here; recorded as observed, not
+# fixed.
+#
+# A SEPARATE, NOT-YET-APPLIED COORDINATE CORRECTION: on the (0, 30) run, a
+# raw, driver-independent `screencapture -R0,0,600,30` crop of the live
+# menu bar (vimcode frontmost) placed "File"'s real clickable span at
+# absolute screen x≈127–172 (center ≈150), row center y≈11 — narrower
+# than the pre-existing `move_window` paragraph's `x: 95` guess above, and
+# therefore wrong. `click-file-menu-item` below is deliberately left at
+# its original `x: 95` rather than updated to the real-measured ≈150:
+# per #3509, this file's pre-existing lines (including step fields, not
+# just comments) are restored/kept verbatim in this PR rather than
+# edited in place, and since the click is gated red by #1824 regardless
+# (see above — the step never actually reaches the real coordinate on
+# this host today), updating the guess has no effect on today's result.
+# Fixing the `x` value is better done as its own, narrowly-scoped
+# follow-up once #1824 clears and this click step can actually exercise
+# its coordinate, rather than bundled into this run's restore. Recorded
+# here, additively, so the real value is not lost.
+#
+# OFFICIAL RECORDED RESULT (this file's own 28 steps below, as actually
+# written, via `coord app-drive run-spec mac-native tests/smoke-spec/
+# mac-gui.yaml --launch '<debug vimcode binary> smoke.txt' --cwd <a tmp dir
+# with that 2-line file>`, one clean run, no manual intervention):
+#
+#   PASS: launch, startup-settle, dock-icon-present-1832,
+#     native-menu-bar-has-file-item, file-dropdown-opens (vacuously — see
+#     its own step comment), w-probe-settle-1832, w-bare-probe-settle-1832
+#     (both bare `wait` steps, which cannot fail on #1824 since they post
+#     no input), explorer-icon-not-tofu-1832, source-control-icon-not-
+#     tofu-1832, run-debug-icon-not-tofu-1832.
+#   FAIL, all `known_bug: vimcode#1824`: launch-is-frontmost-1832
+#     ("pid=... is not frontmost right now (actual frontmost pid=<the
+#     launching iTerm2>)"), click-file-menu-item, dismiss-dropdown, every
+#     `w-probe-*`/`w-bare-probe-*` key/type_text step, both
+#     `w-probe-file-appears-1832`/`w-bare-probe-file-appears-1832`
+#     (consequently — the file was genuinely never written),
+#     click-close-button, and close-button-actually-closes-window
+#     (consequently — the window was genuinely still alive 5000ms later).
+#
+# Exactly the cascade predicted above: one root-caused failure
+# (`expect_frontmost`, #1824) blocks every later `click`/`key`/
+# `type_text` step through `_require_frontmost`, and the two `expect_file`
+# steps fail as a real, honest consequence (no file was written) rather
+# than independently. Nothing in this run was pending/unsupported — every
+# step type this file uses (`type_text`, `expect_file`,
+# `expect_frontmost`, `expect_dock_icon`, `expect_no_tofu`) is implemented
+# by the `~/.coord-venv.green` install actually on `$PATH` on this host.
+# No vimcode-repo code changed by this run — #1832 is a test/spec-only
+# issue; the underlying bug this run reproduces is already #1824, open,
+# with its root cause already drafted upstream (see the findings above).
+# ═══════════════════════════════════════════════════════════════════════
 name: vimcode-mac-gui
 width: 1024
 height: 768
@@ -63,11 +218,25 @@ steps:
     id: startup-settle
     ms: 1500
 
+  # vimcode#1832 step 1 — Dock presence and frontmost activation, checked
+  # before any input so a cascading `click`/`key` failure downstream reads
+  # as a consequence of this, not an independent surprise.
+  - type: expect_dock_icon
+    id: dock-icon-present-1832
+
+  - type: expect_frontmost
+    id: launch-is-frontmost-1832
+    known_bug: vimcode#1824
+
   # Real native global menu bar — `AXRoleAttribute` for a top-level menu
   # bar entry is literally `AXMenuBarItem` (not the Win32/UIA
   # `LocalizedControlType` spelling `win-gui.yaml`/`win-terminal.yaml` use;
   # each native driver's `role:` is whatever string the real OS actually
   # returns, never a shared vocabulary across platforms).
+  #
+  # vimcode#1832 update (kept additive, per #3509): PASS, real-confirmed
+  # (see header) — not gated by #1824, since reading the AX tree needs no
+  # focus/input delivery at all.
   - type: expect_a11y
     id: native-menu-bar-has-file-item
     role: AXMenuBarItem
@@ -79,10 +248,22 @@ steps:
   # provider wiring..." entry — is drafted there but not yet filed as a
   # numbered quadraui issue (filing is coordinator work); there is no
   # number to attach yet. Update this id once one exists.
+  #
+  # vimcode#1832 update (kept additive, per #3509): the click itself is
+  # expected RED today for the two independent reasons the header
+  # documents (#1824's frontmost gate, and the separate unfiled
+  # `send_click` finding) — tagged against #1824 since that is the one
+  # with a number. `file-dropdown-opens` is expected to PASS regardless of
+  # whether the click actually did anything: the real AX tree exposes
+  # `AXMenuItem` children of a closed `AXMenu` structurally, not just once
+  # it is visibly open (confirmed directly — see header), a known,
+  # pre-existing weakness of this check inherited unchanged from before
+  # this issue, not something #1832 introduces.
   - type: click
     id: click-file-menu-item
     x: 95
     y: 11
+    known_bug: vimcode#1824
   - type: expect_a11y_within
     id: file-dropdown-opens
     role: AXMenuItem
@@ -92,6 +273,181 @@ steps:
   - type: key
     id: dismiss-dropdown
     key: esc
+    known_bug: vimcode#1824
+
+  # vimcode#1832 step 3 — typing -> `:w` -> `expect_file`: a real user
+  # gesture (insert text, Escape, save to an explicit path) must actually
+  # land the typed text on disk. Uses `:saveas <path>` first, then a bare
+  # `:w` second — see `tests/smoke-spec/gtk-gui.yaml`'s own `-1835`
+  # section for why both: a real-pty run (that issue's TUI section) found
+  # vimcode's `:w` matches `cmd` *exactly* against the literal strings
+  # `"write"`/`"write!"` (`src/core/engine/execute.rs`), so a trailing
+  # path argument falls through to "Not an editor command" and does not
+  # even save the current file — `:saveas <path>` is the command vimcode
+  # actually implements for "write to this explicit new path", and the
+  # literal bare-`:w` gesture #1832's own step 3 names needs its own probe
+  # right after, once the buffer already has a path to save to.
+  #
+  # Both probes are expected RED today — not because typed text would be
+  # wrong, but because `_require_frontmost` refuses every `key`/
+  # `type_text` step the same way `click-file-menu-item` above was
+  # refused (#1824's cascade, see header). Each `rm -f`-then-create shape
+  # below (were any of these to ever actually run against a stale file
+  # from a past manual/partial run) would make the check self-invalidating
+  # the same way `gtk-gui.yaml`/`tui.yaml`'s own `-1835` sections are, but
+  # since the realistic expectation here is that NONE of these steps ever
+  # reach the real shell/editor at all while #1824 is open, that
+  # self-invalidation machinery is kept minimal (one `rm -f` right before
+  # each `expect_file`, not the full cleanup-at-end-of-section gtk-gui.yaml
+  # needs for its `:term`/extension flow, which this file does not probe).
+  - type: key
+    id: w-probe-insert-1832
+    key: i
+    known_bug: vimcode#1824
+  - type: type_text
+    id: w-probe-type-text-1832
+    text: "VIMCODE_SMOKE_SAVE_PROBE_1832_MAC"
+    known_bug: vimcode#1824
+  - type: key
+    id: w-probe-esc-1832
+    key: esc
+    known_bug: vimcode#1824
+  - type: key
+    id: w-probe-colon-1832
+    key: ':'
+    known_bug: vimcode#1824
+  - type: type_text
+    id: w-probe-write-command-1832
+    text: "saveas /tmp/vimcode-smoke-save-probe-1832-mac.txt"
+    known_bug: vimcode#1824
+  - type: key
+    id: w-probe-enter-1832
+    key: enter
+    known_bug: vimcode#1824
+  - type: wait
+    id: w-probe-settle-1832
+    ms: 500
+  - type: expect_file
+    id: w-probe-file-appears-1832
+    path: "/tmp/vimcode-smoke-save-probe-1832-mac.txt"
+    contains: "VIMCODE_SMOKE_SAVE_PROBE_1832_MAC"
+    timeout_ms: 5000
+    known_bug: vimcode#1824
+
+  # The literal bare-`:w` gesture #1832's step 3 names. `A` is Vim
+  # append-at-end-of-line; typing the FULL second marker in one
+  # `type_text` call (not just a suffix) keeps the assertion below
+  # independent of whatever precedes it on the line — same fix
+  # `gtk-gui.yaml`'s own `w-bare-probe-*-1835` review round 2 made, for
+  # the identical reason.
+  - type: key
+    id: w-bare-probe-append-key-1832
+    key: A
+    known_bug: vimcode#1824
+  - type: type_text
+    id: w-bare-probe-append-text-1832
+    text: "VIMCODE_SMOKE_SAVE_PROBE_1832_MAC_WBARE"
+    known_bug: vimcode#1824
+  - type: key
+    id: w-bare-probe-esc-1832
+    key: esc
+    known_bug: vimcode#1824
+  - type: key
+    id: w-bare-probe-colon-1832
+    key: ':'
+    known_bug: vimcode#1824
+  - type: type_text
+    id: w-bare-probe-write-command-1832
+    text: "w"
+    known_bug: vimcode#1824
+  - type: key
+    id: w-bare-probe-enter-1832
+    key: enter
+    known_bug: vimcode#1824
+  - type: wait
+    id: w-bare-probe-settle-1832
+    ms: 500
+  - type: expect_file
+    id: w-bare-probe-file-appears-1832
+    path: "/tmp/vimcode-smoke-save-probe-1832-mac.txt"
+    contains: "VIMCODE_SMOKE_SAVE_PROBE_1832_MAC_WBARE"
+    timeout_ms: 5000
+    known_bug: vimcode#1824
+
+  # vimcode#1832 step 4 — `expect_no_tofu` on the three activity-bar icons
+  # #1824 finding 2 named (Explorer, Source Control, Run & Debug).
+  # Real-measured boxes (see header): activity bar is a fixed 48px-wide
+  # column at the window's left edge (`render.rs`'s
+  # `activity_bar_width_px = 48.0`), square ~44px icon slots starting
+  # right below the native titlebar/traffic-light row, confirmed directly
+  # against `coord.native_pixels.looks_like_tofu`/`region_not_uniform` —
+  # not a first-approximation guess like this file's pre-#1832 content.
+  # PASS, all three, today (see header's "contradicts #1824 finding 2"
+  # note) — no `known_bug` tag: tagging a check that is observed GREEN as
+  # an expected-red known bug would be the wrong way around, and this
+  # file's own convention ("they alert when they start passing") only
+  # makes sense for a check that is actually red right now.
+  - type: expect_no_tofu
+    id: explorer-icon-not-tofu-1832
+    x: 4
+    y: 20
+    width: 40
+    height: 40
+  - type: expect_no_tofu
+    id: source-control-icon-not-tofu-1832
+    x: 4
+    y: 108
+    width: 40
+    height: 40
+  - type: expect_no_tofu
+    id: run-debug-icon-not-tofu-1832
+    x: 4
+    y: 152
+    width: 40
+    height: 40
+
+  # vimcode#1877 — "status bar covers activity bar (settings unclickable)".
+  # `App::shell_config` now reserves one line-height each for the status
+  # bar/command line at the shell level (`with_command_line()`/
+  # `with_status_bar()`), so the activity bar's bottom-pinned Settings
+  # item should stop above those two rows instead of running flush to the
+  # window's bottom edge the way it did pre-fix. Locks in the
+  # activity-bar half of this issue on the real-hardware lane: a click at
+  # the Settings item's approximate position must open the Settings
+  # panel, which paints a real AX element the fix's headless `MacDriver`
+  # coverage (`settings_button_click_opens_settings_panel_via_mac_driver`
+  # in `src/macos/mod.rs`) cannot observe at all (it only asserts on
+  # painted glyph text, there being no AX-tree equivalent in that
+  # harness).
+  #
+  # `x`/`y` are a first-approximation guess, same caveat as this file's
+  # `click-file-menu-item` coordinates above: this window is 1024x768
+  # (see header), the activity bar is a fixed 48px-wide column with
+  # ~44px icon slots (confirmed real-measured for the three fixed icons
+  # right above), and the bottom-chrome reservation this issue adds is
+  # two rows at roughly a default line height each (~18-20px apiece on
+  # this backend's default font metrics) — so the Settings item's icon
+  # slot should sit a little above `768 - 2*20 = 728`. NOT yet confirmed
+  # against a real running `vimcode` process's actual Settings-item
+  # position on real macOS hardware (macmini); update this comment with
+  # the real measured box once someone with macmini access runs this
+  # spec, the same way `click-file-menu-item`'s own first-run note asks.
+  # The traffic-light-strip half of #1877 is deliberately NOT added here:
+  # this driver's `expect_*` vocabulary (`expect_a11y`/`expect_no_tofu`/
+  # `region_not_uniform`) cannot express "this pixel equals
+  # theme.tab_bar_bg", only structural/AX/tofu checks, so there is
+  # nothing this file can assert for that half beyond what
+  # `title_row_leading_edge_matches_theme_tab_bar_bg_for_two_colorschemes_
+  # via_mac_driver` already covers headlessly (with its own documented
+  # RED-verification gap — see that test's doc).
+  - type: click
+    id: click-settings-gear-1877
+    x: 24
+    y: 684
+  - type: expect_a11y
+    id: settings-panel-opens-1877
+    role: AXStaticText
+    name: "Color Scheme"
 
   # vimcode#1646's two "All GUI specs" seed checks ("minimap shows content
   # for a non-empty file" / "extension-install reaches a completed state")
@@ -108,10 +464,15 @@ steps:
   # (coordinator-repo work this PR cannot do itself).
 
   # Real native traffic-light close button.
+  #
+  # vimcode#1832 update (kept additive, per #3509): expected RED today for
+  # the same #1824 cascade as `click-file-menu-item` above (see header).
   - type: click
     id: click-close-button
     x: 20
     y: 20
+    known_bug: vimcode#1824
   - type: expect_closed
     id: close-button-actually-closes-window
     timeout_ms: 5000
+    known_bug: vimcode#1824

@@ -3852,6 +3852,311 @@ mod tests {
         );
     }
 
+    /// #1853: an extension-registered panel icon outside vimcode's own
+    /// `src/icons.rs` codepoint set must still resolve to the bundled Nerd
+    /// Font itself when painted — not fall through to tofu, and not get
+    /// "accidentally" covered by some unrelated system font that happens to
+    /// share the same Private-Use-Area codepoint (several dev machines have
+    /// one: `fonts-font-awesome` assigns real glyphs at a number of the
+    /// same codepoints Nerd Fonts patches FontAwesome from, since Nerd
+    /// Fonts *is* FontAwesome at those codepoints).
+    ///
+    /// The Git Insights extension's `git_log_panel.lua` declares
+    /// `icon = "\u{f1d3}"` (`nf-fa-git`) for its sidebar panel, plus several
+    /// more codepoints (U+E74E among them) for the file-type glyphs it
+    /// draws in the log view. Before #1853, `data/fonts/vimcode-icons.ttf`
+    /// only bundled the 114 codepoints `Icon::new(...)` calls in
+    /// `src/icons.rs` reference — none of the Git Insights codepoints were
+    /// among them, so they rendered as tofu wherever the host has no
+    /// system-wide Nerd Font (native macOS/Windows, GTK without one
+    /// installed). `tests/icon_font_coverage.rs`'s
+    /// `bundled_font_covers_the_git_insights_extension_panel_icon` already
+    /// guards the font asset's `cmap`, but per #555/#557's own lesson
+    /// (`PROJECT_STATE.md`'s `ScreenLayout.picker` history: a field can be
+    /// populated, or a codepoint can be "covered" by cmap, for months while
+    /// nothing actually paints it) a cmap assertion cannot by itself prove
+    /// the glyph paints.
+    ///
+    /// # Why this isn't a raw pixel diff
+    ///
+    /// An earlier draft of this test rendered the full activity bar twice
+    /// (real codepoint vs. an "unassigned PUA baseline") and diffed sampled
+    /// pixels, mirroring `extension_panel_contributes_an_activity_bar_icon`
+    /// above. That approach turned out to be unreliable on a real dev
+    /// machine: Pango's font-substitution cascade falls through to *every*
+    /// installed font once the requested family doesn't cover a character,
+    /// and this box happens to have `fonts-font-awesome` installed, which
+    /// covers U+F1D3 (and several other nerd codepoints) independently of
+    /// whatever `data/fonts/vimcode-icons.ttf` bundles — so the "real" and
+    /// "baseline" renders differed by comparable pixel counts *even with
+    /// the pre-#1853 114-codepoint font restored*, giving a false green.
+    ///
+    /// A follow-up draft tried comparing which *font* Pango's itemizer
+    /// tagged the shaped run with (`Analysis::font().describe().family()`)
+    /// instead of pixels, on the theory that Pango always prefers an
+    /// earlier family in the list when it covers the character. That also
+    /// turned out to be unreliable in the other direction: Pango's
+    /// itemizer tags a run with the *first requested* family regardless of
+    /// whether anything in the whole fallback chain actually had the
+    /// glyph — it reports `Some("Symbols Nerd Font")` for both a real
+    /// covered codepoint and a confirmed-unassigned one. What actually
+    /// flags "nothing anywhere had this glyph" is a bit on the *shaped
+    /// glyph itself*, not the run's nominal font: `pango_shape()` sets
+    /// `PANGO_GLYPH_UNKNOWN_FLAG` on exactly the glyphs no font in the
+    /// search — including a full Fontconfig fallback scan — actually
+    /// covered, which is what `glyph_is_known` below checks instead.
+    ///
+    /// # Why it builds its own font map, and discovers its own baseline
+    ///
+    /// Round 2 of this fix shipped a version of this test that shaped
+    /// through `pangocairo::functions::create_layout` (the **per-thread**
+    /// default font map — `pango_cairo_font_map_get_default()` is
+    /// documented as one map per thread) and hardcoded U+F8FF as the
+    /// "nothing can shape this" baseline because no font installed on the
+    /// box it was written on covers it. Both of those are properties of a
+    /// machine, not of vimcode: the suite went green on every local font
+    /// configuration tried (full desktop font set, no-Nerd-Font set,
+    /// DejaVu-only, and a zero-font Fontconfig) and red on CI, where
+    /// neither the thread's font-map state nor the installed font set is
+    /// knowable from here.
+    ///
+    /// So this version removes both assumptions. It shapes through a
+    /// **freshly created** Fc-backed font map, which reads the current
+    /// `FcConfig` (including the application font `register_nerd_font_fallback`
+    /// just added) instead of whatever fontset some earlier test cached on
+    /// this thread; and it *discovers* a baseline codepoint at runtime
+    /// rather than naming one, asserting only that **some** PUA codepoint
+    /// in a spread of candidates shapes to an unknown glyph. That is the
+    /// property the control actually needs — "`glyph_is_known` can still
+    /// return `false` in this environment, so the assertion above is not
+    /// vacuous" — and it holds on any host, however many icon fonts it
+    /// happens to have installed.
+    #[test]
+    fn extension_panel_file_type_glyph_outside_the_old_subset_resolves_through_the_bundled_font() {
+        use gtk4::pango;
+        use pango::prelude::*;
+
+        // Ensures `App::setup` has run at least once in this process, which
+        // is what calls `render::register_nerd_font_fallback` — the call
+        // that both (a) hands `ICON_FONT_BYTES` to FreeType/Fontconfig as
+        // an in-process application font and (b) points
+        // `quadraui::gtk::NERD_FONT_FALLBACK_FAMILY` at whatever family
+        // name it actually registered under (see that function's doc for
+        // why those are two different steps). Without this, the
+        // `FontDescription` below would still name the right family
+        // *string*, but no font claiming that family would actually be
+        // loaded into Fontconfig yet.
+        let _h = harness(Engine::new(), 10, 10);
+
+        // A font map created now, rather than this thread's default one:
+        // Fontconfig's application font set is process-global, so a fresh
+        // Fc-backed map always sees the font registered above, while the
+        // per-thread default map may still be serving a fontset it cached
+        // for this same family *before* any registration happened.
+        let font_map = pangocairo::FontMap::new();
+        let context = font_map.create_context();
+
+        // Builds the exact family list
+        // `quadraui::gtk::activity_bar::activity_bar_icon_font` paints
+        // activity-bar icon glyphs with (`"{family}, monospace"`), shapes
+        // `ch` through it, and reports whether Pango's shaper actually
+        // found a glyph for it anywhere in that family list.
+        //
+        // Checks the `PANGO_GLYPH_UNKNOWN_FLAG` bit on the shaped
+        // `GlyphInfo` rather than which `Font`/family the run ended up
+        // tagged with: an earlier draft of this test compared resolved
+        // family names instead and got `Some("Symbols Nerd Font")` back
+        // for *both* a real covered codepoint and a confirmed-unassigned
+        // one — Pango's itemizer still tags a run with the first
+        // requested family even when nothing in the whole fallback chain
+        // actually covers the character, and relies on this flag (not a
+        // different font/glyph) to mark the shaped glyph itself as
+        // "unknown" so the renderer draws the hex-coded tofu box instead
+        // of a real outline. The flag is the authoritative signal either
+        // way: GNOME's own `pango_shape()` sets it exactly when no font it
+        // tried — including whatever a full Fontconfig fallback search
+        // turns up — had the glyph, so a glyph with the flag clear must
+        // have come from a font that really does contain it.
+        let glyph_is_known = |ch: char| -> bool {
+            let layout = pango::Layout::new(&context);
+            layout.set_font_description(Some(&pango::FontDescription::from_string(&format!(
+                "{}, monospace 18",
+                quadraui::gtk::NERD_FONT_FALLBACK_FAMILY
+            ))));
+            layout.set_text(&ch.to_string());
+            let Some(run) = layout
+                .line(0)
+                .expect("single-character layout must have one line")
+                .runs()
+                .into_iter()
+                .next()
+            else {
+                // Nothing itemized at all is, for this test's purposes,
+                // the same answer as "no font had the glyph".
+                return false;
+            };
+            let glyphs = run.glyph_string();
+            let info = glyphs.glyph_info();
+            !info.is_empty()
+                && info
+                    .iter()
+                    .all(|g| g.glyph() & pango::GLYPH_UNKNOWN_FLAG == 0)
+        };
+
+        /// nf-dev-javascript_alt — one of `git_log_panel.lua`'s file-type
+        /// glyphs. Deliberately *not* U+F1D3 (the extension's main
+        /// `nf-fa-git` panel icon, also named in this issue): U+F1D3 is a
+        /// codepoint nerd-fonts patches straight from the original
+        /// FontAwesome icon set, and a dev box with `fonts-font-awesome`
+        /// installed system-wide (this fleet has one) covers it
+        /// independently of anything `data/fonts/vimcode-icons.ttf`
+        /// bundles — confirmed by hand (`fc-list` + a per-codepoint
+        /// `cmap` scan of every installed font) to make U+F1D3 resolve to
+        /// a known glyph *even with the pre-#1853 114-codepoint font
+        /// restored*, which would make this test pass unconditionally and
+        /// prove nothing. U+E74E has no such collision: scanning every
+        /// font `fc-list` reports there turns up no other coverage for it
+        /// at all, so it only resolves if `data/fonts/vimcode-icons.ttf`
+        /// itself covers it. (Verified red with the pre-#1853 subset font
+        /// restored in place; see this test's doc comment.)
+        const GIT_INSIGHTS_FILE_TYPE_GLYPH: char = '\u{e74e}';
+
+        /// Candidate baseline codepoints — a spread across the BMP Private
+        /// Use Area, none of which `data/fonts/vimcode-icons.ttf` maps.
+        /// The control below needs only *one* of them to shape to an
+        /// unknown glyph; naming a single codepoint instead would make the
+        /// control an assertion about the host's entire installed font set
+        /// (see this test's doc comment for why that failed on CI).
+        const UNASSIGNED_PUA_CANDIDATES: [char; 8] = [
+            '\u{f8ff}', '\u{f8fe}', '\u{f8fd}', '\u{f8f0}', '\u{efff}', '\u{eff0}', '\u{e8ff}',
+            '\u{e8f0}',
+        ];
+
+        // Whatever this assertion does on a machine nobody can log into
+        // (a CI runner), the failure message has to be enough to tell
+        // "the font asset lost the codepoint" apart from "the font never
+        // got registered on this host" — the two failure modes that cost
+        // this issue a CI round each. So report the families the font map
+        // can actually see, not just the verdict.
+        let visible_icon_families = || {
+            let mut names: Vec<String> = font_map
+                .list_families()
+                .iter()
+                .map(|f| f.name().to_string())
+                .filter(|n| {
+                    let n = n.to_ascii_lowercase();
+                    n.contains("nerd") || n.contains("symbol") || n.contains("awesome")
+                })
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert!(
+            glyph_is_known(GIT_INSIGHTS_FILE_TYPE_GLYPH),
+            "the Git Insights extension's U+E74E (nf-dev-javascript_alt) \
+             file-type glyph (`git_log_panel.lua`) must shape to a real \
+             glyph through the bundled Nerd Font family (#1853) — Pango's \
+             shaper marked it PANGO_GLYPH_UNKNOWN_FLAG instead, which means \
+             data/fonts/vimcode-icons.ttf no longer covers U+E74E, or the \
+             font never registered on this host at all (see that issue's \
+             review for the family-name-mismatch failure mode).\n\
+             requested family: {:?}\n\
+             bundled font: {} bytes\n\
+             icon-ish families this font map can see: {:?}",
+            quadraui::gtk::NERD_FONT_FALLBACK_FAMILY,
+            crate::app_support::ICON_FONT_BYTES.len(),
+            visible_icon_families()
+        );
+        assert!(
+            UNASSIGNED_PUA_CANDIDATES
+                .iter()
+                .any(|ch| !glyph_is_known(*ch)),
+            "sanity check: at least one of {} unassigned PUA candidates \
+             must shape to PANGO_GLYPH_UNKNOWN_FLAG — if every one of them \
+             resolves, `glyph_is_known` cannot distinguish a real glyph \
+             from tofu on this host and the assertion above proves nothing.\n\
+             icon-ish families this font map can see: {:?}",
+            UNASSIGNED_PUA_CANDIDATES.len(),
+            visible_icon_families()
+        );
+    }
+
+    /// #1853 CI regression: building many `App`s in one process must hand
+    /// the bundled icon font to the platform's font system **once**, not
+    /// once per `App::setup`.
+    ///
+    /// GTK registers the font through Fontconfig's `FcConfigAppFontAddFile`,
+    /// which takes a path — so quadraui writes `ICON_FONT_BYTES` to a fresh
+    /// temp file per call and deliberately never deletes it (FreeType may
+    /// re-open it lazily at shape time). While the bundled font was a 29 KB,
+    /// 114-glyph subset nobody noticed that every harness in this suite
+    /// leaked another copy. #1853 replaced it with the full 2.5 MB Symbols
+    /// Nerd Font, and the same ~600-harness `cargo test` run started writing
+    /// ~1.5 GB of temp files — and appending ~600 copies of a
+    /// 10,627-codepoint `FcPattern` to the process's application font set
+    /// for every later font match to sort through. It survived a dev box
+    /// with 126 GB free and died on a CI runner, which is exactly the
+    /// asymmetry that makes this worth a test rather than a code comment.
+    ///
+    /// # Why it counts temp files rather than calls
+    ///
+    /// The leak *is* the files, and asserting on the real resource keeps
+    /// this honest in a way a vimcode-side call counter could not: a
+    /// counter would stay green even if `register_nerd_font_fallback` were
+    /// re-registering through some other path. The filename pattern is
+    /// quadraui's (`quadraui-<issue>-appfont-<pid>-<n>.font`), matched
+    /// loosely (`appfont` + this process's pid) and asserted non-empty
+    /// first, so that a future rename upstream fails this test loudly
+    /// instead of making it vacuously green.
+    #[test]
+    fn app_setup_registers_the_bundled_icon_font_at_most_once_per_process() {
+        /// Count this process's quadraui application-font temp files.
+        fn app_font_temp_files() -> usize {
+            let pid_tag = format!("-{}-", std::process::id());
+            let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+                return 0;
+            };
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    name.contains("appfont") && name.contains(&pid_tag)
+                })
+                .count()
+        }
+
+        // One harness first: whichever test got there first in this process
+        // already triggered the single registration, but if this test ran
+        // first, this is it.
+        let _first = harness(Engine::new(), 10, 10);
+        let after_first = app_font_temp_files();
+        assert!(
+            after_first > 0,
+            "no `appfont` temp file for pid {} in {} — quadraui's GTK \
+             `register_font_from_memory` either stopped using a temp file \
+             or renamed it, so the assertion below would be vacuous; \
+             re-derive the pattern from quadraui's `gtk::app_font` module",
+            std::process::id(),
+            std::env::temp_dir().display()
+        );
+
+        // Four more `App::setup`s must not add four more copies of a 2.5 MB
+        // font. `+ 1` of slack, not `0`: other GTK tests run concurrently in
+        // this binary, and two threads reaching the very first registration
+        // together may each add one.
+        let _rest: Vec<_> = (0..4).map(|_| harness(Engine::new(), 10, 10)).collect();
+        let after_five = app_font_temp_files();
+        assert!(
+            after_five <= after_first + 1,
+            "five `App::setup`s registered the bundled icon font {} extra \
+             time(s) ({after_first} temp files before, {after_five} after) \
+             — `render::register_nerd_font_fallback` must register once per \
+             process and reuse the family afterwards (#1853)",
+            after_five - after_first
+        );
+    }
+
     /// #950 review: `App::shell_config()`'s `"panel:search"` arm used to
     /// build its own GTK-only `SEARCH_COD` (nf-cod-search, `\u{ea6d}`)
     /// instead of the shared `crate::icons::SEARCH` (nf-fa-search,
@@ -12852,6 +13157,49 @@ mod command_center {
             .search_bounds
             .expect("the search box must still have a painted bounds");
 
+        // #1877 review round 1 (non-blocking finding 6): pins that the
+        // title-bar band's own leading edge (left of the Command Center's
+        // `back` arrow) still paints `theme.tab_bar_bg`, not the bare
+        // frame-clear background colour, once the drawn menu row is
+        // hidden (`FrameOp::MenuDropdown`'s own title-band fill is gated
+        // on `presence.menu_row`/`menu_bar_visible`, which is exactly what
+        // this test just set `false`).
+        //
+        // Honesty note on what this does and does not RED-verify (the
+        // same "cannot RED here" category `title_row_leading_edge_matches_
+        // theme_tab_bar_bg_for_two_colorschemes_via_mac_driver` in
+        // `src/macos/mod.rs` documents for the same underlying fill).
+        // `App::render_content`'s `FrameOp::CommandCenter` arm's new
+        // unconditional-on-`!presence.menu_row` row fill does execute on
+        // this exact path — but on GTK, `Backend::titlebar_control_inset()`
+        // is always `Rect::default()` (zero; only `MacBackend` overrides
+        // it), so with the drawn menu row hidden, `command_center_rect`
+        // is *already* measured to span the entire row from x=0 (see that
+        // arm's own comment for why), and `paint_command_center_rung`
+        // paints `theme.tab_bar_bg` across that same pixel regardless of
+        // the new fill. Verified directly: commenting out the new fill
+        // call and re-running this test leaves it GREEN — the assertion
+        // below cannot distinguish the two. What it genuinely guards is a
+        // regression in the *combination* (either the Command Center's
+        // own background or this fill ceasing to cover x=2 on this row),
+        // which is real coverage, just not a pin on this specific diff's
+        // new code. The fill's own distinguishing effect — the strip
+        // behind a *non-zero* `titlebar_control_inset()` (macOS's real
+        // traffic lights) — needs a live `NSWindow`, same real-Mac gap the
+        // mac-driver test above documents.
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let row_y = (back.y + back.height / 2.0) as i32;
+        let (r, g, b) = h.driver.pixel(2, row_y);
+        assert_eq!(
+            (r, g, b),
+            (theme.tab_bar_bg.r, theme.tab_bar_bg.g, theme.tab_bar_bg.b),
+            "the title-bar row's leading edge (left of the Command \
+             Center's back arrow) must paint theme.tab_bar_bg once the \
+             drawn menu row is hidden, not the bare background colour; \
+             sampled {:?} at (2, {row_y})",
+            (r, g, b)
+        );
+
         // And it must still be *clickable*, not just present in the cache --
         // the #587 class of bug is state populated with nothing wired to it.
         h.driver
@@ -13633,6 +13981,23 @@ mod minimap {
     /// because it's a process-global atomic another test in this binary can
     /// have moved (mirrors `minimap_gtk_distinct_colors_for_indent` above).
     fn engine_with_shaped_buffer() -> Engine {
+        let mut engine = shaped_buffer_engine_with_default_settings();
+        // #1858: the minimap is experimental and off by default on every
+        // backend now — this whole fixture exists to exercise the minimap,
+        // so turn it on explicitly rather than lean on the (now-off) default.
+        engine.settings.minimap = true;
+        engine
+    }
+
+    /// The same fixture as [`engine_with_shaped_buffer`], minus the #1858
+    /// `minimap = true` override — i.e. whatever `Settings::default()`
+    /// actually resolves `minimap` to. Exists only for
+    /// [`minimap_is_absent_from_the_layout_by_default`], which needs a
+    /// fixture that genuinely never touches the setting (not even to pin it
+    /// explicitly to `false`) so a regression that flips `default_minimap()`
+    /// back to `true` — or any fixture upstream of it forcing the setting
+    /// on — turns that test red.
+    fn shaped_buffer_engine_with_default_settings() -> Engine {
         crate::core::buffer_manager::set_syntax_max_lines(20_000);
 
         let dir = std::env::temp_dir().join(format!(
@@ -13684,11 +14049,11 @@ mod minimap {
         let win_on = h_on.engine.borrow().active_window_id();
         assert!(
             h_on.engine.borrow().settings.minimap,
-            "test setup sanity: the minimap must default on, or this test \
-             isn't exercising the default at all"
+            "test setup sanity: the minimap must be on, or this test isn't \
+             exercising it at all"
         );
         h_on.window_center(win_on)
-            .expect("editor pane must paint with the default settings");
+            .expect("editor pane must paint with the minimap explicitly enabled");
 
         let (strip, pane_w, on_cols) = {
             let layout = h_on.screen_layout.borrow();
@@ -13783,6 +14148,81 @@ mod minimap {
         );
     }
 
+    /// #1858 (driver tier): the minimap must default off, not merely be
+    /// *turnable* off — the GTK twin of `app_on_tui_tests.rs`'s
+    /// `no_minimap_braille_by_default`. [`shaped_buffer_engine_with_default_settings`]
+    /// never touches `engine.settings.minimap`, so this asserts the
+    /// *default* geometry is identical to the explicit-`false` geometry: no
+    /// layout entry, and the same `text_viewport_cols` an explicit `minimap
+    /// = false` twin gets (reusing
+    /// `minimap_paints_a_strip_whose_width_matches_reserved_width`'s own
+    /// on/off comparison shape, rather than re-deriving the column formula).
+    /// Flipping `default_minimap()` back to `true` (or any fixture upstream
+    /// forcing the setting on) turns this red while leaving the explicit
+    /// on/off test above green — the gap the #1858 review round found:
+    /// before this test existed, nothing at the driver tier observed the
+    /// default.
+    ///
+    /// Verified RED against unfixed `develop` (where `default_minimap()`
+    /// still returns `true`): `l.minimap.is_empty()` failed with a real
+    /// entry present, confirming this exercises the default rather than
+    /// passing vacuously.
+    #[test]
+    fn minimap_is_absent_from_the_layout_by_default() {
+        let h_default = harness(shaped_buffer_engine_with_default_settings(), 1400, 900);
+        let win_default = h_default.engine.borrow().active_window_id();
+        assert!(
+            !h_default.engine.borrow().settings.minimap,
+            "test setup sanity: a fresh engine must carry the (#1858) \
+             off-by-default minimap setting, or this test isn't exercising \
+             the default at all"
+        );
+        h_default
+            .window_center(win_default)
+            .expect("editor pane must paint with the default settings");
+        let (default_minimap_present, default_cols) = {
+            let layout = h_default.screen_layout.borrow();
+            let l = layout.as_ref().unwrap();
+            let present = l.minimap.iter().any(|m| m.window_id == win_default);
+            let rw = l
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_default)
+                .unwrap();
+            (present, rw.text_viewport_cols)
+        };
+        assert!(
+            !default_minimap_present,
+            "the minimap must be absent from the layout by default (#1858)"
+        );
+
+        // The explicit-`false` twin: same fixture, same window size, just
+        // with the setting pinned rather than left untouched. Its
+        // `text_viewport_cols` is this test's ground truth for "the editor
+        // got every reserved column back" — computed the real way (through
+        // a second real paint), not re-derived from the reservation formula.
+        let mut engine_off = shaped_buffer_engine_with_default_settings();
+        engine_off.settings.minimap = false;
+        let h_off = harness(engine_off, 1400, 900);
+        let win_off = h_off.engine.borrow().active_window_id();
+        h_off
+            .window_center(win_off)
+            .expect("editor pane must paint with the minimap explicitly disabled");
+        let off_cols = {
+            let layout = h_off.screen_layout.borrow();
+            let l = layout.as_ref().unwrap();
+            let rw = l.windows.iter().find(|w| w.window_id == win_off).unwrap();
+            rw.text_viewport_cols
+        };
+
+        assert_eq!(
+            default_cols, off_cols,
+            "the default (no explicit setting) must paint the identical \
+             column count as an explicit `minimap: false` (default={default_cols}, \
+             explicit-off={off_cols})"
+        );
+    }
+
     /// #828 acceptance (driver tier): on a narrow pane the minimap strip
     /// settles well *below* the wide-pane plateau
     /// (`minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane`'s
@@ -13797,6 +14237,18 @@ mod minimap {
     /// sizing table clamps to a 30-*column* ceiling, which at this pane's
     /// real pixel width would produce a strip an order of magnitude
     /// narrower than GTK's own pixel-denominated formula computes below.
+    ///
+    /// #1869 review round 1: `expected` below is hand-computed, not routed
+    /// through `minimap_reserved_width`/`vs_code_minimap_width_px` — the
+    /// prior shape called the very function under test to produce
+    /// "expected", which cannot fail against a regression in that
+    /// function. RED-verified against the #1869-round-1 shape (which fed
+    /// the formula the pane's raw width, skipping the gutter subtraction):
+    /// temporarily reverting that subtraction to `0.0` takes this test red
+    /// (`left: 61.0, right: 55.0`, confirmed, then reverted back) while the
+    /// sibling wide-pane test below stays green at this harness's scale
+    /// (the 120-cap binds either way there) — this narrow-pane test is the
+    /// one that actually exercises the gutter term.
     #[test]
     fn minimap_strip_is_narrower_on_a_narrow_pane_than_on_a_wide_one() {
         // #947: was `900` — wide enough for `MINIMAP_MIN_TEXT_COLS`'s
@@ -13812,9 +14264,9 @@ mod minimap {
         let h = harness(engine_with_shaped_buffer(), 1050, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win)
-            .expect("editor pane must paint with the default settings");
+            .expect("editor pane must paint with the minimap explicitly enabled");
 
-        let (strip_width, pane_width) = {
+        let (strip_width, pane_width, gutter_cols) = {
             let layout = h.screen_layout.borrow();
             let l = layout.as_ref().unwrap();
             let mm = l.minimap.iter().find(|m| m.window_id == win).expect(
@@ -13829,20 +14281,30 @@ mod minimap {
             // `RenderedWindow.rect` by the strip's width (that used to make
             // `rw.rect.width + mm.rect.width` the way to recover the pane's
             // full width; doing that today double-counts the strip).
-            (mm.rect.width, rw.rect.width)
+            (mm.rect.width, rw.rect.width, rw.gutter_char_width)
         };
         let char_width = h.painted_char_width();
-        let expected = crate::render::minimap_reserved_width(
-            &h.engine.borrow(),
-            pane_width,
-            char_width,
-            crate::render::gtk_minimap_sizing(),
-        );
+        // #1869 review round 1: hand-computed VS Code formula, independent
+        // of both `minimap_reserved_width` and `vs_code_minimap_width_px` —
+        // calling either of those for "expected" is exactly the tautology
+        // the review flagged (revert the production formula to the pre-
+        // #1869 fraction shape and a call to the *same* function would have
+        // stayed green). `gutter_cols` is read back from the real painted
+        // `RenderedWindow` (`calculate_gutter_cols`'s own output, not
+        // recomputed), so `remaining` here is VS Code's own `remainingWidth
+        // = editor outer width - gutter`, matching the formula this probes.
+        let gutter_px = gutter_cols as f64 * char_width;
+        let remaining = pane_width - gutter_px;
+        let inner = ((remaining - 14.0 - 2.0) / (char_width + 1.0))
+            .floor()
+            .max(0.0);
+        let expected = (inner + 8.0).min(120.0);
 
         assert_eq!(
             strip_width, expected,
-            "the real paint path must reserve exactly what \
-             minimap_reserved_width computes"
+            "the real paint path must reserve exactly what VS Code's own \
+             minimap formula (floor((remainingWidth - 14 - 2) / (char_width \
+             + 1)) + 8, capped at 120) computes by hand"
         );
         assert!(
             strip_width < 100.0,
@@ -13851,28 +14313,41 @@ mod minimap {
         );
         assert!(
             strip_width > 48.0,
-            "a 900px pane should still be comfortably clear of the \
-             absolute pixel floor (48px) — this test is about the ordinary \
-             fraction-scaled case, not the floor clamp itself (that's \
-             `minimap_reserved_width_uses_the_explicit_sizing_not_char_width` \
-             in render.rs); got {strip_width}px"
+            "a 900px pane should still be comfortably clear of zero — this \
+             test is about the ordinary division-term case, not \
+             `vs_code_minimap_width_px`'s own gutter-width floor (that's \
+             `vs_code_minimap_width_px_floors_at_the_gutter_width_regardless_of_font` \
+             in render.rs, a pane far narrower than this one); got \
+             {strip_width}px"
         );
     }
 
-    /// #728 acceptance: on an ordinary wide pane the minimap strip settles
-    /// at VS Code's own ~120px width instead of scaling up with the pane —
-    /// the pre-fix `rect_width * MINIMAP_WIDTH_FRACTION` formula reached
-    /// ~240px on a pane this wide, roughly twice VS Code's. Driven through
-    /// the real paint path (`ScreenLayout` from an actual `window_center`
-    /// call), not just `minimap_reserved_width` in isolation.
+    /// #728/#1869 acceptance: on an ordinary wide pane the minimap strip
+    /// caps at VS Code's own *exactly* 120px width instead of scaling up
+    /// with the pane — the pre-#728 `rect_width * MINIMAP_WIDTH_FRACTION`
+    /// formula reached ~240px on a pane this wide, roughly twice VS Code's.
+    /// Driven through the real paint path (`ScreenLayout` from an actual
+    /// `window_center` call), and the expectation below is hand-computed
+    /// rather than routed through `minimap_reserved_width`/
+    /// `vs_code_minimap_width_px` (#1869 review round 1: reverting either of
+    /// those to the pre-#1869 formula must make this fail, which calling
+    /// them to compute "expected" cannot do).
+    ///
+    /// `2200` (not `1600`): #1869's gutter subtraction (`remainingWidth =
+    /// editor outer width - gutter`) pulls the division term's input down
+    /// by the gutter's own width, so the harness needs real margin past the
+    /// point the *uncapped* formula would cross 120 for the cap to bind
+    /// *exactly* rather than merely approach it — at `1600` this pane
+    /// resolves to 101px, well under the cap, which would make the "exactly
+    /// 120" assertion below fail honestly rather than vacuously pass.
     #[test]
     fn minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane() {
-        let h = harness(engine_with_shaped_buffer(), 1600, 900);
+        let h = harness(engine_with_shaped_buffer(), 2200, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win)
-            .expect("editor pane must paint with the default settings");
+            .expect("editor pane must paint with the minimap explicitly enabled");
 
-        let (strip_width, pane_width) = {
+        let (strip_width, pane_width, gutter_cols) = {
             let layout = h.screen_layout.borrow();
             let l = layout.as_ref().unwrap();
             let mm = l
@@ -13883,25 +14358,33 @@ mod minimap {
             let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
             // #1094: see the sibling narrow-pane test's comment — `rw.rect.
             // width` is the pane's own un-narrowed width directly now.
-            (mm.rect.width, rw.rect.width)
+            (mm.rect.width, rw.rect.width, rw.gutter_char_width)
         };
         let char_width = h.painted_char_width();
-        let expected = crate::render::minimap_reserved_width(
-            &h.engine.borrow(),
-            pane_width,
-            char_width,
-            crate::render::gtk_minimap_sizing(),
-        );
+        // #1869 review round 1: hand-computed, independent of
+        // `minimap_reserved_width`/`vs_code_minimap_width_px` — see the
+        // sibling narrow-pane test's comment for why calling either of
+        // those for "expected" would be tautological.
+        let gutter_px = gutter_cols as f64 * char_width;
+        let remaining = pane_width - gutter_px;
+        let inner = ((remaining - 14.0 - 2.0) / (char_width + 1.0))
+            .floor()
+            .max(0.0);
+        let expected = (inner + 8.0).min(120.0);
 
         assert_eq!(
             strip_width, expected,
-            "the real paint path must reserve exactly what \
-             minimap_reserved_width computes"
+            "the real paint path must reserve exactly what VS Code's own \
+             minimap formula computes by hand"
         );
-        assert!(
-            strip_width < 150.0,
-            "a 1600px pane must not blow past VS Code's ~120px minimap \
-             width (got {strip_width}px — the pre-#728 formula would have \
+        // #1869 acceptance: "exactly 120 on a wide pane" — this harness is
+        // wide enough that the formula's own cap, not just a loose upper
+        // bound, must bind.
+        assert_eq!(
+            strip_width, 120.0,
+            "a 1600px pane must cap at *exactly* VS Code's 120px minimap \
+             width, not merely stay below some looser bound (got \
+             {strip_width}px — the pre-#728 fraction formula would have \
              hit ~240px here)"
         );
     }
@@ -14129,6 +14612,9 @@ mod minimap {
                 .map(|i| format!("line {i} content\n"))
                 .collect();
             engine.buffer_mut().insert(0, &text);
+            // #1858: minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
             engine
         }
 
@@ -14235,6 +14721,9 @@ mod minimap {
                 .map(|i| format!("line {i} content\n"))
                 .collect();
             engine.buffer_mut().insert(0, &text);
+            // #1858: minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
             engine
         }
 
@@ -14354,6 +14843,9 @@ mod minimap {
         let mut engine = Engine::new_for_test();
         let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
         engine.buffer_mut().insert(0, &text);
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about the minimap, so turn it on explicitly.
+        engine.settings.minimap = true;
 
         let mut h = harness(engine, 1400, 900);
         let win = h.engine.borrow().active_window_id();
@@ -14480,6 +14972,9 @@ mod minimap {
         let mut engine = Engine::new_for_test();
         let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
         engine.buffer_mut().insert(0, &text);
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about the minimap, so turn it on explicitly.
+        engine.settings.minimap = true;
 
         let mut h = harness(engine, 1400, 900);
         let win = h.engine.borrow().active_window_id();
@@ -14983,6 +15478,9 @@ mod minimap {
         engine
             .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
             .unwrap();
+        // #1858: minimap is experimental and off by default — this fixture
+        // is specifically about minimap colouring, so turn it on explicitly.
+        engine.settings.minimap = true;
         engine.settings.minimap_render_characters = render_characters;
         let win_id = engine.active_window_id();
         let buf_id = engine.windows.get(&win_id).unwrap().buffer_id;
@@ -14993,7 +15491,12 @@ mod minimap {
              fixture, or the colour assertions below are vacuous"
         );
 
-        let mut h = harness(engine, 1400, 900);
+        // #1869: widened from the pre-#1869 1400px — under the real VS Code
+        // minimap width formula (which, unlike the pre-#1869 fraction-based
+        // one, genuinely narrows as a function of the pane's own remaining
+        // width) a 1400px harness no longer reaches the ≥96-column budget
+        // deliverable 2's indent-80 probe below needs.
+        let mut h = harness(engine, 1600, 900);
         h.window_center(win_id)
             .expect("editor pane must paint with the minimap on");
 
@@ -15158,6 +15661,10 @@ mod minimap {
         engine
             .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
             .unwrap();
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about minimap syntax colouring, so turn it on
+        // explicitly.
+        engine.settings.minimap = true;
         let win_id = engine.active_window_id();
         let buf_id = engine.windows.get(&win_id).unwrap().buffer_id;
         let n_highlights = engine.buffer_manager.get(buf_id).unwrap().highlights.len();
@@ -15308,6 +15815,10 @@ mod minimap {
         // here to keep testing the block-mode path this test's own name and
         // doc comment describe.
         engine.settings.minimap_render_characters = false;
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about minimap block rendering, so turn it on
+        // explicitly.
+        engine.settings.minimap = true;
 
         let mut h = harness(engine, 1400, 900);
         let win = h.engine.borrow().active_window_id();
@@ -15456,6 +15967,10 @@ mod minimap {
             text.push('\n');
         }
         engine.buffer_mut().insert(0, &text);
+        // #1858: minimap is experimental and off by default — this test is
+        // specifically about minimap glyph rendering, so turn it on
+        // explicitly.
+        engine.settings.minimap = true;
         assert!(
             engine.settings.minimap_render_characters,
             "test setup sanity: `minimap_render_characters` must default \
@@ -19188,6 +19703,10 @@ mod editor_mouse_rungs {
             text.push_str(&format!("line {i} content\n"));
         }
         engine.buffer_mut().insert(0, &text);
+        // #1858: minimap is experimental and off by default — this fixture
+        // exists specifically to exercise the minimap rung, so turn it on
+        // explicitly.
+        engine.settings.minimap = true;
         engine
     }
 

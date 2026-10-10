@@ -2680,8 +2680,9 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "quadraui"
-version = "0.1.0"
-source = "git+https://github.com/JDonaghy/quadraui.git?rev=80b96f550650816ea267427af85b641e1f573107#80b96f550650816ea267427af85b641e1f573107"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "916e893f949253b5d73aa4a032513d33587935a70e8b35197cb690cb77d69ff8"
 dependencies = [
  "arboard",
  "core-foundation 0.9.4",
@@ -3955,7 +3956,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vimcode"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "base64",
  "cc",

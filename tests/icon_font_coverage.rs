@@ -1,9 +1,9 @@
 //! CI gate for issue #197: every Nerd Font codepoint referenced by
 //! `Icon::new(...)` in `src/icons.rs` must actually be present in the
-//! bundled `data/fonts/vimcode-icons.ttf` subset, or the GTK explorer tree
-//! (and anywhere else that glyph is drawn) silently falls back to whatever
-//! the system font substitutes for the PUA codepoint -- tofu or a
-//! wrong-looking glyph, with no build-time signal.
+//! bundled `data/fonts/vimcode-icons.ttf`, or the GTK explorer tree (and
+//! anywhere else that glyph is drawn) silently falls back to whatever the
+//! system font substitutes for the PUA codepoint -- tofu or a wrong-looking
+//! glyph, with no build-time signal.
 //!
 //! This test parses the codepoint list straight out of `src/icons.rs`'s
 //! source text (so it can never drift from the actual `Icon::new` calls)
@@ -12,10 +12,33 @@
 //! every "nerd" codepoint (>= U+E000; see `scripts/gen_icon_font.py`'s
 //! module doc for why that threshold is the right split) is covered.
 //!
-//! Regenerate the subset with `scripts/gen_icon_font.py` if this fails after
+//! Regenerate the font with `scripts/gen_icon_font.py` if this fails after
 //! a new `Icon::new` call is added -- see that script's docstring for the
 //! source fonts it needs and why two are needed (upstream nerd-fonts >=
 //! v3.1.0 dropped three codepoints vimcode still uses).
+//!
+//! ## #1853: the bundled font is the *entire* Symbols Nerd Font, not a subset
+//!
+//! Before #1853, `data/fonts/vimcode-icons.ttf` was subset down to exactly
+//! the 114 codepoints `src/icons.rs` referenced. That covered every icon
+//! vimcode itself draws but nothing else: a `vimcode-ext` registry
+//! extension's panel icon is an arbitrary Nerd Font codepoint the extension
+//! author picked, not one `scripts/gen_icon_font.py` ever knew about, so it
+//! rendered as tofu on any platform without a system-wide Nerd Font (native
+//! macOS/Windows, or GTK without one installed) -- caught via the Git
+//! Insights extension's `git_log_panel.lua`, which declares U+F1D3
+//! (`nf-fa-git`) as its panel icon and U+F15B/U+E7A8/U+F81F/U+E74E/U+E628/
+//! U+E620/U+E626 for file-type glyphs, none of which `src/icons.rs`
+//! referenced. The font now bundles nerd-fonts' entire (proportional)
+//! Symbols Nerd Font cmap (10,627 codepoints as of nerd-fonts v3.5.1) --
+//! not the Mono variant, which registers under a different family name
+//! (`Symbols Nerd Font Mono`) and would have rescaled every pre-#1853
+//! glyph's metrics, see `scripts/gen_icon_font.py`'s module doc -- so this
+//! class of bug can't recur for any codepoint a Nerd Font actually assigns.
+//! `bundled_font_covers_the_git_insights_extension_panel_icon` below is a
+//! named regression anchor for exactly the codepoints that motivated it;
+//! `bundled_font_covers_every_icon_codepoint` above keeps covering
+//! vimcode's own icons specifically.
 //!
 //! No `#[cfg(feature = ...)]` gate: this doesn't touch GTK, TUI, or any
 //! optional dependency, so it runs in both the `--no-default-features` and
@@ -281,6 +304,49 @@ fn bundled_font_covers_the_explorer_view_actions_glyphs() {
             covered.contains(&cp),
             "data/fonts/vimcode-icons.ttf is missing U+{cp:04X}, used by \
              {what} -- regenerate the subset with scripts/gen_icon_font.py"
+        );
+    }
+}
+
+#[test]
+fn bundled_font_covers_the_git_insights_extension_panel_icon() {
+    // #1853 named-regression anchor: the Git Insights extension
+    // (`vimcode-ext`'s `git_log_panel.lua`) declares `icon = "\u{f1d3}"`
+    // (nf-fa-git) for its sidebar panel, plus U+F15B/U+E7A8/U+F81F/U+E74E/
+    // U+E628/U+E620/U+E626 for file-type glyphs it draws in the log view --
+    // none of which `src/icons.rs` references, so none were covered by the
+    // pre-#1853 114-codepoint subset and all rendered as tofu on any
+    // platform without a system-wide Nerd Font (native macOS/Windows, GTK
+    // without one installed). `bundled_font_covers_every_icon_codepoint`
+    // above only ever checks codepoints `src/icons.rs` itself references,
+    // so it could not have caught this -- these codepoints are a registry
+    // extension's own choice, invisible to that regex. This test names them
+    // directly against the bundled font's cmap so a future shrink back to a
+    // vimcode-only subset fails loudly here instead of shipping silent tofu
+    // to extension authors again.
+    let covered = font_covered_codepoints(FONT_BYTES);
+    for (cp, what) in [
+        (0xF1D3, "Git Insights panel icon (nf-fa-git)"),
+        (0xF15B, "git_log_panel.lua file-type glyph (nf-fa-file)"),
+        (0xE7A8, "git_log_panel.lua file-type glyph (nf-dev-rust)"),
+        (0xF81F, "git_log_panel.lua file-type glyph (nf-dev-python)"),
+        (
+            0xE74E,
+            "git_log_panel.lua file-type glyph (nf-dev-javascript_alt)",
+        ),
+        (
+            0xE628,
+            "git_log_panel.lua file-type glyph (nf-seti-typescript)",
+        ),
+        (0xE620, "git_log_panel.lua file-type glyph (nf-seti-lua)"),
+        (0xE626, "git_log_panel.lua file-type glyph (nf-custom-go)"),
+    ] {
+        assert!(
+            covered.contains(&cp),
+            "data/fonts/vimcode-icons.ttf is missing U+{cp:04X}, used by \
+             the Git Insights extension's {what} -- the bundled font must \
+             be the full Symbols Nerd Font (see scripts/gen_icon_font.py), \
+             not a vimcode-icons.rs-only subset"
         );
     }
 }

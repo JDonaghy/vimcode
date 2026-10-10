@@ -236,9 +236,10 @@ mod mac_driver_tests {
     const H: u32 = 900;
 
     /// An in-memory engine with enough lines for the minimap to have
-    /// something to draw, and the minimap explicitly **on** — the default is
-    /// not this test's business to depend on, since the whole point is to
-    /// reach `draw_minimap`.
+    /// something to draw, and the minimap explicitly **on** — (#1858: the
+    /// minimap now defaults *off* everywhere) pinned explicitly here
+    /// regardless of which way the default points, since the whole point of
+    /// this fixture is to reach `draw_minimap`.
     fn engine_with_minimap() -> Engine {
         let mut engine = Engine::new_for_test();
         let text: String = (0..500).map(|i| format!("line {i}\n")).collect();
@@ -661,6 +662,240 @@ mod mac_driver_tests {
             backend.line_height(),
             expected.line_height
         );
+    }
+
+    // ── #1864: VS Code line-height parity (native macOS GUI only) ───────
+
+    /// VS Code's `editor.lineHeight` resolves to `round(fontSize × 1.5)` on
+    /// macOS (its `GOLDEN_LINE_HEIGHT_RATIO`) — 18px for Menlo 12, the
+    /// native macOS GUI's own default font (`MacBackend::default_fonts`,
+    /// `Settings::effective_editor_font`'s "never customized" resolution —
+    /// `plain_engine()` below never touches `font_family`/`font_size`, so
+    /// this exercises that exact default path). Before this fix the editor
+    /// used Core Text's natural `ascent + descent + leading` line height
+    /// instead (~1.17x, ~14px for Menlo 12) — cramped next to VS Code on
+    /// the same monitor, issue #1864's own side-by-side screenshot.
+    ///
+    /// RED-verified against unfixed `develop`: with the
+    /// `resolve_editor_line_height_px` call around `App::render_content`'s
+    /// `compose_editor_band_rungs` deleted (so nothing ever overrides
+    /// `MacBackend`'s natural `current_line_height`), this test's row-pitch
+    /// assertions fail — consecutive rows land ~14px apart instead of 18px.
+    #[test]
+    fn macos_default_font_rows_are_18px_apart_matching_vs_code() {
+        // #1745-review's `TestSettingsPathGuard` dance (see
+        // `cmd_b_does_not_toggle_sidebar_dead_panel_accelerator`'s doc, same
+        // module): `render()` runs `Engine::check_settings_reload`, and a
+        // real on-disk `settings.json` (the local developer's own) would
+        // silently overwrite `font_family`/`font_size`/`line_height` here.
+        // Point it at a path that cannot exist instead.
+        use crate::core::settings::TestSettingsPathGuard;
+        let tmp = std::env::temp_dir().join(format!(
+            "vimcode_test_1864_row_pitch_{:?}.json",
+            std::thread::current().id()
+        ));
+        let _settings_guard = TestSettingsPathGuard::install(tmp);
+
+        let mut engine = plain_engine();
+        engine.buffer_mut().insert(0, "alpha\nbravo\ncharlie\n");
+        let (_guards, mut driver) = driver(engine);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("alpha")
+                && driver.screen_contains("bravo")
+                && driver.screen_contains("charlie"),
+            "precondition: all three lines must paint; painted text was {:?}",
+            driver.painted_texts()
+        );
+
+        let alpha = driver.find_bounds("alpha").expect("'alpha' must paint");
+        let bravo = driver.find_bounds("bravo").expect("'bravo' must paint");
+        let charlie = driver.find_bounds("charlie").expect("'charlie' must paint");
+
+        let pitch_1 = bravo.y - alpha.y;
+        let pitch_2 = charlie.y - bravo.y;
+
+        assert!(
+            (pitch_1 - 18.0).abs() < 0.5,
+            "row pitch {pitch_1}px between 'alpha'/'bravo', want 18px \
+             (VS Code's round(12 * 1.5) for Menlo 12)"
+        );
+        assert!(
+            (pitch_2 - 18.0).abs() < 0.5,
+            "row pitch {pitch_2}px between 'bravo'/'charlie', want 18px \
+             (VS Code's round(12 * 1.5) for Menlo 12)"
+        );
+    }
+
+    /// Non-blocking concern from review round 1: the sibling test above
+    /// only exercises the *auto* (0.0 → macOS's 1.5x) path through
+    /// `effective_line_height_multiplier` — `:set line_height=N`'s explicit
+    /// branch had unit coverage (`src/core/settings.rs`) but no driver-tier
+    /// assertion that the explicit multiplier actually reaches the painted
+    /// row pitch, the same way `zoomin`/`zoomout` below are driver-tested
+    /// rather than left to the unit layer alone.
+    #[test]
+    fn explicit_line_height_setting_reaches_the_painted_row_pitch() {
+        use crate::core::settings::TestSettingsPathGuard;
+        let tmp = std::env::temp_dir().join(format!(
+            "vimcode_test_1864_explicit_row_pitch_{:?}.json",
+            std::thread::current().id()
+        ));
+        let _settings_guard = TestSettingsPathGuard::install(tmp);
+
+        let mut engine = plain_engine();
+        engine.buffer_mut().insert(0, "alpha\nbravo\n");
+        engine.settings.line_height = 2.0;
+        let (_guards, mut driver) = driver(engine);
+        driver.render();
+
+        let alpha = driver.find_bounds("alpha").expect("'alpha' must paint");
+        let bravo = driver.find_bounds("bravo").expect("'bravo' must paint");
+        let pitch = bravo.y - alpha.y;
+
+        assert!(
+            (pitch - 24.0).abs() < 0.5,
+            "row pitch {pitch}px between 'alpha'/'bravo', want 24px \
+             (an explicit `line_height=2.0` on Menlo 12: round(12 * 2.0))"
+        );
+    }
+
+    /// Acceptance criterion from #1864: `zoomin` grows both the font and
+    /// the row pitch; `zoomout` shrinks both — the per-frame override in
+    /// `App::sync_per_frame_backend_state` recomputes from the *current*
+    /// `settings.font_size` every frame, same as `set_editor_font` beside
+    /// it, so a runtime zoom reaches the painted row pitch immediately.
+    #[test]
+    fn zoomin_and_zoomout_grow_and_shrink_the_row_pitch() {
+        // Same `TestSettingsPathGuard` dance as the sibling test above —
+        // `execute_command("zoomin"/"zoomout")` below calls
+        // `Settings::save()`, so without this guard the writes would land
+        // on the real on-disk `settings.json`.
+        use crate::core::settings::TestSettingsPathGuard;
+        let tmp = std::env::temp_dir().join(format!(
+            "vimcode_test_1864_zoom_{:?}.json",
+            std::thread::current().id()
+        ));
+        let _settings_guard = TestSettingsPathGuard::install(tmp);
+
+        let mut engine = plain_engine();
+        engine.buffer_mut().insert(0, "alpha\nbravo\n");
+        let (_guards, engine, mut driver) = driver_with_engine(engine);
+
+        // #1542: `zoomin`/`zoomout` mutate the *stored* `settings.font_size`
+        // literal, not the backend-resolved effective size the baseline
+        // frame below is painted with (`Settings::effective_editor_font`'s
+        // "never customized" sentinel resolves the stored default, 14, to
+        // this backend's own default, 12pt Menlo, until the very first zoom
+        // keystroke — see that method's own doc). So the very first
+        // `zoomin` jumps the *effective* size from 12 to 15 (14 + 1), not
+        // 13 — asserting monotonic growth/shrink against each *previous*
+        // measurement (not against the very first baseline) is what
+        // actually matches the acceptance criterion ("zoomin grows ...
+        // zoomout shrinks") without being coupled to that unrelated #1542
+        // jump.
+        let mut row_pitch = |when: &str| -> f32 {
+            driver.render();
+            let alpha = driver
+                .find_bounds("alpha")
+                .unwrap_or_else(|| panic!("'alpha' must paint {when}"));
+            let bravo = driver
+                .find_bounds("bravo")
+                .unwrap_or_else(|| panic!("'bravo' must paint {when}"));
+            bravo.y - alpha.y
+        };
+
+        let pitch_0 = row_pitch("at the baseline");
+
+        engine.borrow_mut().execute_command("zoomin");
+        let pitch_1 = row_pitch("after the first zoomin");
+        assert!(
+            pitch_1 > pitch_0,
+            "zoomin must grow the row pitch: {pitch_0} -> {pitch_1}"
+        );
+
+        engine.borrow_mut().execute_command("zoomin");
+        let pitch_2 = row_pitch("after the second zoomin");
+        assert!(
+            pitch_2 > pitch_1,
+            "a second zoomin must grow the row pitch further: {pitch_1} -> {pitch_2}"
+        );
+
+        engine.borrow_mut().execute_command("zoomout");
+        let pitch_3 = row_pitch("after the first zoomout");
+        assert!(
+            pitch_3 < pitch_2,
+            "zoomout must shrink the row pitch: {pitch_2} -> {pitch_3}"
+        );
+
+        engine.borrow_mut().execute_command("zoomout");
+        let pitch_4 = row_pitch("after the second zoomout");
+        assert!(
+            pitch_4 < pitch_3,
+            "a second zoomout must shrink the row pitch further: {pitch_3} -> {pitch_4}"
+        );
+    }
+
+    /// #1864 review round 1: the VS Code editor row-pitch override must
+    /// never move the file-explorer tree's own row pitch. An earlier
+    /// version of this fix applied the override to `MacBackend`'s single,
+    /// shared `current_line_height` field for the *entire* frame — which
+    /// `tree_layout` (file-explorer rows) also reads directly, inflating
+    /// the sidebar by the same multiplier (plus `tree_layout`'s own `*
+    /// 1.4` on top): ~28%, untested and unmeasured.
+    ///
+    /// Renders the same expanded-explorer scenario at two very different
+    /// `settings.line_height` values (the default "auto", VS Code's 1.5x,
+    /// and an explicit 3.0x — double that) and asserts the tree's painted
+    /// row pitch is identical either way. If the editor override still
+    /// leaked into `backend.current_line_height` during this paint, the
+    /// second render's rows would land roughly twice as far apart as the
+    /// first's.
+    ///
+    /// RED-verified against the global-override version of this fix (the
+    /// one `sync_per_frame_backend_state` applied for the whole frame):
+    /// `pitch_default` was ~25px and `pitch_explicit` (`line_height=3.0`,
+    /// i.e. 36px editor rows) was ~50px — the assertion below failed.
+    #[test]
+    fn explorer_row_pitch_is_unaffected_by_the_editor_line_height_setting() {
+        use crate::core::settings::TestSettingsPathGuard;
+        let tmp = std::env::temp_dir().join(format!(
+            "vimcode_test_1864_explorer_row_pitch_{:?}.json",
+            std::thread::current().id()
+        ));
+        let _settings_guard = TestSettingsPathGuard::install(tmp);
+
+        let dir = scratch_explorer_dir("row_pitch_1864", 2);
+        let (_guards, engine, mut driver) = driver_with_engine(engine_with_expanded_explorer(&dir));
+
+        let mut row_pitch = |when: &str| -> f32 {
+            driver.render();
+            let src = driver
+                .find_bounds("src")
+                .unwrap_or_else(|| panic!("'src' must paint {when}"));
+            let core = driver
+                .find_bounds("core")
+                .unwrap_or_else(|| panic!("'core' must paint {when}"));
+            core.y - src.y
+        };
+
+        let pitch_default = row_pitch("at the default (auto, 1.5x) line_height");
+
+        engine.borrow_mut().settings.line_height = 3.0;
+        let pitch_explicit = row_pitch("with an explicit 3.0x line_height");
+
+        assert!(
+            (pitch_default - pitch_explicit).abs() < 0.5,
+            "the file-explorer's own row pitch must not move when the \
+             *editor's* line_height setting changes: {pitch_default}px \
+             (line_height=0, auto) vs {pitch_explicit}px (line_height=3.0) \
+             — the VS Code row-pitch override must be scoped to the \
+             editor's own rows, never bleeding into `MacBackend::\
+             tree_layout`'s unrelated row-height convention"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── #901: native menu bar adoption ──────────────────────────────────
@@ -2090,6 +2325,232 @@ mod mac_driver_tests {
                  the recorder started clearing per frame, and the sibling \
                  Cmd+B test above should be revisited to use \
                  `screen_contains` instead of `sidebar_visible()`"
+            );
+        }
+    }
+
+    // ── #1877: activity bar must end above the status/command-line chrome ──
+
+    /// Look up a `quadraui::testing::ZoneRec`'s bounds by its registered
+    /// `WidgetId` string, for the assertions below. `AppShell::render`
+    /// registers one zone per chrome region it lays out (`register_chrome_
+    /// zones`) plus one per activity-bar item (keyed by the item's own
+    /// panel id) — see `quadraui::testing::FrameInventory`'s own doc for
+    /// the full catalogue. Panics with the full zone list on a miss so a
+    /// failure names exactly what *was* registered instead of just "not
+    /// found".
+    fn zone_bounds(inv: &quadraui::testing::FrameInventory, id: &str) -> quadraui::Rect {
+        inv.zones()
+            .iter()
+            .find(|z| z.id.as_str() == id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no zone registered for {id:?} -- registered zones: {:?}",
+                    inv.zones()
+                )
+            })
+            .bounds
+    }
+
+    /// #1877: the activity bar's painted/hit-test rect must end above the
+    /// shell's reserved bottom chrome, not run all the way to the window's
+    /// bottom edge — the bug report's "status bar covers activity bar,
+    /// Settings button half hidden". `plain_engine()`'s default settings
+    /// (`laststatus=2`, `window_status_line=true`, single window) are
+    /// exactly the configuration the report describes: a per-window status
+    /// row plus the always-present command line at the bottom of the one
+    /// open window, confined to `main_content_bounds` by `render_content`'s
+    /// own `compute_editor_layout` call — `App::shell_config`'s
+    /// `with_command_line()`/`with_status_bar()` reservation (the fix) is
+    /// what makes `AppShell::compute_layout` carve the *same* two rows out
+    /// of `activity_bar_bounds`'s height too.
+    ///
+    /// Asserts on registered **zones**, not a derived/recomputed rect —
+    /// `activity-bar`/`command-line`/`status-bar`/`bottom:settings` are all
+    /// registered from the exact `AppShellLayout` `AppShell::render` used
+    /// to paint this frame (`register_chrome_zones` plus the per-item loop
+    /// right after `draw_activity_bar` returns its hits), so this reads
+    /// what was actually painted and hit-tested, not a parallel guess
+    /// (CLAUDE.md's "rendered output, not state" rule).
+    ///
+    /// RED-verified against the pre-fix tree (temporarily dropping
+    /// `shell_config`'s `.with_command_line().with_status_bar()` call):
+    /// `zone_bounds` panics outright on `"app-shell:command-line"` and
+    /// `"app-shell:status-bar"` — those two zones don't exist at all
+    /// without the reservation, because nothing ever carved them out of
+    /// the shell's layout — and `"bottom:settings"`'s own zone sits at
+    /// `y: [852.0, 900.0]`, flush against the window's `900.0`-tall bottom
+    /// edge, with no chrome zone above it to be "above" in the first
+    /// place.
+    #[test]
+    fn settings_activity_bar_zone_ends_above_the_status_bar_via_mac_driver() {
+        let (_guards, mut driver) = driver(plain_engine());
+        driver.render();
+
+        use quadraui::testing::ConformanceDriver;
+        let inv = driver.inventory();
+
+        let activity_bar = zone_bounds(&inv, "app-shell:activity-bar");
+        let settings = zone_bounds(&inv, "bottom:settings");
+        let command_line = zone_bounds(&inv, "app-shell:command-line");
+        let status_bar = zone_bounds(&inv, "app-shell:status-bar");
+        let window = zone_bounds(&inv, "app-shell:window");
+
+        let activity_bar_bottom = activity_bar.y + activity_bar.height;
+        let settings_bottom = settings.y + settings.height;
+
+        assert!(
+            activity_bar_bottom <= command_line.y + 0.5,
+            "activity bar must end at or above the command line's top: \
+             activity-bar bottom {activity_bar_bottom}, command-line top {}",
+            command_line.y
+        );
+        assert!(
+            activity_bar_bottom <= status_bar.y + 0.5,
+            "activity bar must end at or above the status bar's top: \
+             activity-bar bottom {activity_bar_bottom}, status-bar top {}",
+            status_bar.y
+        );
+        assert!(
+            settings_bottom <= command_line.y + 0.5,
+            "the Settings button's own hit rect must lie entirely above \
+             the command line: settings bottom {settings_bottom}, \
+             command-line top {}",
+            command_line.y
+        );
+        // The chrome must actually have shrunk, not merely "happen" to sit
+        // above a chrome band that itself reaches the window edge — pins
+        // the fix is doing real work, not a vacuously-true comparison.
+        assert!(
+            activity_bar_bottom + 1.0 < window.y + window.height,
+            "activity bar bottom ({activity_bar_bottom}) is suspiciously \
+             close to the window's bottom edge ({}) -- the bottom-chrome \
+             reservation may not be taking effect",
+            window.y + window.height
+        );
+    }
+
+    /// #1877 companion: a click at the Settings button's own registered
+    /// zone center must actually open the Settings panel — the other half
+    /// of the issue's "...and a click on it opens settings". Resolves the
+    /// click position from the registered zone (ground truth for both
+    /// paint and hit-test) rather than `find("*")`: that helper reports
+    /// the glyph's *bar-relative* paint position for anything painted
+    /// inside `MacBackend::draw_activity_bar`'s own `CGContextTranslateCTM`
+    /// save/restore block, not its absolute window position -- a
+    /// `MacDriver` text-run-recording quirk unrelated to this issue (the
+    /// real pixels paint at the right place; only the recorded text-run
+    /// coordinates used by `find`/`find_bounds` are pre-translate).
+    ///
+    /// Asserts on *painted* Settings-panel content (`"Color Scheme"`, a
+    /// settings-form field label — CLAUDE.md's "rendered output, not
+    /// state" rule), not on `engine.app_shell.active_panel_id()`.
+    ///
+    /// **What this does and does not pin (review round 1, non-blocking
+    /// finding 4).** The Settings button's registered zone sat inside
+    /// `activity_bar_bounds` both before and after this issue's fix —
+    /// `AppShell::handle`'s `contains(activity_bar_bounds, p)` hit-test
+    /// resolved a click there either way, reservation or not, so this
+    /// test would also have passed on the pre-fix tree. It pins the
+    /// issue's acceptance text ("a click on it opens settings") as a
+    /// regression guard going forward, but it does **not** cover the
+    /// reported "cannot be clicked" symptom itself — that symptom was a
+    /// *visual/geometric* overlap (the status/command-line rows painting
+    /// on top of the button, not the hit-test rect moving), which
+    /// `settings_activity_bar_zone_ends_above_the_status_bar_via_mac_driver`
+    /// right above is the one that actually RED-verifies.
+    #[test]
+    fn settings_button_click_opens_settings_panel_via_mac_driver() {
+        let (_guards, mut driver) = driver(plain_engine());
+        driver.render();
+        assert!(
+            !driver.screen_contains("Color Scheme"),
+            "bad fixture: the Settings panel should start closed"
+        );
+
+        let (cx, cy) = {
+            use quadraui::testing::ConformanceDriver;
+            let inv = driver.inventory();
+            let z = zone_bounds(&inv, "bottom:settings");
+            (z.x + z.width / 2.0, z.y + z.height / 2.0)
+        };
+        driver.click(cx, cy);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("Color Scheme"),
+            "clicking the Settings activity-bar button's own registered \
+             zone must open the Settings panel; painted text was {:?}",
+            driver.painted_texts()
+        );
+    }
+
+    // ── #1877: traffic-light inset themed background ───────────────────
+
+    /// #1877's second report: the strip behind the macOS traffic lights
+    /// (`render::inset_titlebar_row_leading_edge`'s `leading_inset`) must
+    /// paint the theme's title-bar colour instead of showing a bare,
+    /// unthemed surface.
+    ///
+    /// The fix (`App::render_content`'s `FrameOp::CommandCenter` arm) is
+    /// unconditional on `!presence.menu_row` — true for every `MacDriver`
+    /// fixture, real window or not, since `MacBackend::backend_caps()`
+    /// declares `native_menu: true` unconditionally (`App::setup` reads
+    /// that to suppress the drawn menu row, independent of any window) —
+    /// so it reaches `backend.draw_menu_bar(menu_row_rect, &filler)` on
+    /// every `MacDriver` run. What this test **cannot** independently
+    /// prove is that this fill is *visible* — `Backend::titlebar_control_
+    /// inset()` is provably always `Rect::default()` here (see
+    /// `control_inset_is_default_because_mac_driver_never_sets_a_window`'s
+    /// doc a few hundred lines up, and `#940`'s identical gap for the
+    /// Command Center rect itself): with a zero inset, `measure_title_bar_
+    /// bands`'s `menu_end` already sits at the row's leading edge, so the
+    /// Command Center's own background fill (`quadraui::macos::
+    /// command_center`'s `fill_rect(.., theme.tab_bar_bg)`) already paints
+    /// this pixel the *same* colour this fix's fill paints underneath it
+    /// -- the two are visually indistinguishable in this harness, pre-fix
+    /// or post. A live NSWindow is the only thing that can put a non-zero
+    /// inset there (this issue's SMOKE_TESTS item), the same gap #940
+    /// already hit and documented as a quadraui-side limitation, not a
+    /// vimcode workaround (CLAUDE.md's Platform-Neutrality Rule: file
+    /// upstream, wait, then implement).
+    ///
+    /// So this test pins the one thing it *can* prove headlessly: the
+    /// fill paints the theme's own `tab_bar_bg` colour (matching what
+    /// `quadraui::primitives::menu_bar`'s `paint` and `quadraui::macos::
+    /// command_center`'s `fill_rect` both use) at the row's leading edge,
+    /// for two different colorschemes -- so a colorscheme switch really
+    /// does reach this pixel, not a hardcoded literal.
+    ///
+    /// RED-verification note, stated plainly rather than silently omitted:
+    /// this test stays GREEN even with the `FrameOp::CommandCenter` arm's
+    /// fix commented out, because of the zero-inset reasoning right above
+    /// -- it is not RED-verified against the real bug, and cannot be with
+    /// `quadraui` 0.1.2's `MacDriver`. It is real coverage of the fill
+    /// call's own correctness (colour, reach, no panic), just not of the
+    /// visible symptom. Real verification of the symptom is this issue's
+    /// real-Mac `SMOKE_TESTS` item.
+    #[test]
+    fn title_row_leading_edge_matches_theme_tab_bar_bg_for_two_colorschemes_via_mac_driver() {
+        for colorscheme in ["onedark", "gruvbox"] {
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = colorscheme.to_string();
+            let (_guards, mut driver) = driver(engine);
+            driver.render();
+
+            let theme = crate::render::Theme::from_name(colorscheme);
+            let expected = (theme.tab_bar_bg.r, theme.tab_bar_bg.g, theme.tab_bar_bg.b);
+
+            // x=2 (just inside the left window edge, where the traffic-
+            // light inset would sit on a real window), y=4 (a few px
+            // down from the top, inside the title-bar band at any
+            // reasonable `title_bar_height_lh`).
+            let (r, g, b, _a) = driver.pixel(2, 4);
+            assert_eq!(
+                (r, g, b),
+                expected,
+                "{colorscheme}: title row leading edge (2, 4) = \
+                 ({r}, {g}, {b}), expected theme.tab_bar_bg {expected:?}"
             );
         }
     }

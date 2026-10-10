@@ -111,10 +111,10 @@ jobs:
           ## Status: use the TUI
 
           - **TUI (`vcd`) is the recommended way to use VimCode.** Usable on **Linux** and **macOS**. **Windows:** usable, with known rough edges (for example, the minimap viewport thumb is not visible in Windows Terminal, #1828).
-          - **GUI builds (`vimcode`) are not ready for use on any platform.** The native macOS and Windows GUIs are not published. GUI artifacts are attached for testing only.
+          - **GUI builds (`vimcode`) are not ready for use on any platform.** GUI artifacts are attached **for testing only**: GTK4 on Linux and macOS, and (new) the native Windows and native macOS GUIs.
 
           <!-- Update this section every release: highlights since the previous tag. -->
-          **Since v0.14.0:** the integrated terminal (`:term`) now works on Windows (#1829); installing an extension from the TUI no longer freezes the editor (#1739); the Linux TUI under Windows Terminal (WSL) no longer shows runs of faded text after LSP hint underlines; minimap drag now scrolls within the minimap's own scale like VS Code, with Alt for file-wide (#1828); native Lua API additions (completion sources, async `fs.walk`/`fs.grep`, minimum-vimcode-version declarations for extensions); end-of-line virtual text; VS Code-mode fixes; hover popups working again; git status resolved per file; Windows TUI flicker fixes.
+          **Since v0.15.0:** **The minimap is now off by default and marked experimental** (#1858) — enable it with `:set minimap` or `"minimap": true` in `settings.json`. Also: VimCode now builds against [quadraui](https://crates.io/crates/quadraui) from crates.io (0.1.2); the TUI in macOS Terminal.app no longer shows runs of dimmed text (quadraui#1366); the GTK GUI on macOS now shows its icons instead of tofu boxes (quadraui#1367); the native macOS GUI's editor rows now use VS Code's 1.5× line height (18px for Menlo 12), configurable with the new `line_height` setting (#1864); the bundled icon font is the full Symbols Nerd Font, so extension panel icons (e.g. Git Insights) no longer render as `?` in the GUIs (#1853); the native Windows GUI minimap now shows a real miniature instead of a dark strip (quadraui#1354), and the native Windows and native macOS GUIs are attached as testing-only downloads.
 
           ## Installation
 
@@ -161,7 +161,8 @@ jobs:
           ```
 
           **GUI — testing only, not ready for use**
-          `brew install vimcode` (GTK4 GUI + TUI), or download `vimcode-macos-arm64.tar.gz`. The macOS GUI binary is the GTK4 build and requires GTK4 via Homebrew: `brew install gtk4`.
+          - **Native (AppKit, no dependencies):** download `vimcode-macos-native-arm64.tar.gz`, then `tar xzf vimcode-macos-native-arm64.tar.gz && xattr -d com.apple.quarantine vimcode && ./vimcode`. Launch it from a normal Terminal window: launched from a tmux server that predates your login session, macOS won't let it come to the front.
+          - **GTK4:** `brew install vimcode` (GTK4 GUI + TUI), or download `vimcode-macos-arm64.tar.gz`; requires GTK4 via Homebrew (`brew install gtk4`).
 
           ### Windows
 
@@ -172,7 +173,8 @@ jobs:
           ```
           Or rename to `vcd.exe` for convenience. Works in Windows Terminal, PowerShell, and cmd.exe.
 
-          > No Windows GUI binary is published yet — Windows users get `vcd`, the TUI.
+          **GUI — testing only, not ready for use**
+          Download `vimcode-windows-x86_64.exe` (native Win32 + Direct2D, no installer) and run it. Known rough edges: activity-bar icons can render as letters if your settings have `"use_nerd_fonts": false` (#1855), and the tab-bar toolbar is clipped at the right edge (#1696).
 
           <!-- Flatpak install section lives in git history (pre-v0.11.0
                revisions of this file). Restore it when RELEASE_FLATPAK is
@@ -228,6 +230,9 @@ jobs:
       run: |
         cargo build --release --bin vimcode
         cargo build --release --bin vcd --no-default-features
+        # Native AppKit GUI (testing only). Separate target dir so it
+        # doesn't overwrite the GTK `vimcode` binary above.
+        cargo build --release --bin vimcode --no-default-features --features macos --target-dir target-native
 
     - name: Strip and ad-hoc codesign
       run: |
@@ -235,11 +240,14 @@ jobs:
         strip target/release/vcd
         codesign --sign - --force target/release/vimcode
         codesign --sign - --force target/release/vcd
+        strip target-native/release/vimcode
+        codesign --sign - --force target-native/release/vimcode
 
     - name: Package as tarballs
       run: |
         tar czf vimcode-macos-arm64.tar.gz -C target/release vimcode
         tar czf vcd-macos-arm64.tar.gz -C target/release vcd
+        tar czf vimcode-macos-native-arm64.tar.gz -C target-native/release vimcode
 
     - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v2
@@ -248,10 +256,11 @@ jobs:
         files: |
           vimcode-macos-arm64.tar.gz
           vcd-macos-arm64.tar.gz
+          vimcode-macos-native-arm64.tar.gz
 
   # ── Windows TUI ─────────────────────────────────────────────────────────────
   build-windows:
-    name: Build Windows TUI binary
+    name: Build Windows binaries (TUI + testing-only GUI)
     runs-on: windows-latest
     # Opt-in: set repo variable RELEASE_WINDOWS=true.
     if: ${{ vars.RELEASE_WINDOWS == 'true' }}
@@ -281,15 +290,21 @@ jobs:
     - name: Build release TUI binary (no GTK)
       run: cargo build --release --bin vcd --no-default-features
 
-    - name: Prepare artifact
+    - name: Build release GUI binary (native win backend, testing only)
+      run: cargo build --release --bin vimcode --no-default-features --features win
+
+    - name: Prepare artifacts
       run: |
         Copy-Item target\release\vcd.exe vcd-windows-x86_64.exe
+        Copy-Item target\release\vimcode.exe vimcode-windows-x86_64.exe
 
     - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v2
       with:
         tag_name: v${{ needs.build-and-release.outputs.version }}
-        files: vcd-windows-x86_64.exe
+        files: |
+          vcd-windows-x86_64.exe
+          vimcode-windows-x86_64.exe
 
   # ── Flatpak ────────────────────────────────────────────────────────────────
   flatpak:
