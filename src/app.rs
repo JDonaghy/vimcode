@@ -4895,6 +4895,13 @@ impl App {
         // rect paint didn't actually draw — #1128 deleted the pre-#968
         // h-scrollbar geometry helper that independently guessed its own
         // track width and could disagree with what was actually painted.
+        // #1891: that agreement also depends on both sides reading the same
+        // `v_scrollbar_w` — paint reads it from
+        // `backend.editor_v_scrollbar_width()` (set by `App::setup`'s
+        // `backend.set_editor_v_scrollbar_width(Some(14.0))` on GTK/macOS/
+        // Win), so `editor_scrollbar_layout`'s callers must pass that same
+        // value through rather than defaulting to `None`, which would size
+        // the hit-test column at `cell_width` instead of the painted 14px.
         let mut window_editors = Vec::with_capacity(screen.windows.len());
         let mut hit_bars = Vec::new();
         let units = render::EditorBandUnits::px(lh, cw, tab_row_h);
@@ -5529,16 +5536,23 @@ impl App {
         };
         let lh = self.cached_line_height;
         let cw = self.cached_char_width;
+        // #1891: thread the backend's own vertical-scrollbar-width override
+        // (GTK/macOS/Win's 14px, `None` on TUI) through so hit-testing
+        // agrees with whatever width paint actually drew — see
+        // `editor_scrollbar_layout`'s doc for why passing `None` here would
+        // silently reintroduce the paint↔hit-test divergence #1891 fixed.
+        let v_scrollbar_w = backend.editor_v_scrollbar_width();
         let engine = self.engine.borrow();
         let (rects, _dividers) = engine.calculate_group_window_rects(content_bounds, tab_bar_h);
         let Some((win_id, scroll_at_click)) =
-            scrollbar_hit_test(&engine, x, y, &rects, cw, lh, axis)
+            scrollbar_hit_test(&engine, x, y, &rects, cw, lh, v_scrollbar_w, axis)
         else {
             return false;
         };
         let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
-        let geom = win_rect
-            .and_then(|rect| scrollbar_thumb_geometry(&engine, win_id, &rect, cw, lh, axis));
+        let geom = win_rect.and_then(|rect| {
+            scrollbar_thumb_geometry(&engine, win_id, &rect, cw, lh, v_scrollbar_w, axis)
+        });
         drop(engine);
         let Some((track_x, track_y, track_w, track_h, thumb_pos, thumb_len, scroll_range, _)) =
             geom
@@ -10135,6 +10149,9 @@ impl quadraui::ShellApp for App {
         // instead of the pre-#1434 TUI shell — `backend.backend_caps()` reads the same
         // `TuiBackend` state either way.
         self.keyboard_enhanced = backend.backend_caps().kitty_keyboard;
+        // VS Code's editor scrollbar is 14px wide (quadraui#1411); a
+        // no-op on TUI, whose scrollbar is one cell.
+        backend.set_editor_v_scrollbar_width(Some(14.0));
         // #1864: `shell_config`'s `with_editor_font` seed only covers
         // family/size — the runner's own `set_editor_font` call (made from
         // that stored value, just before `setup()` runs) resets
