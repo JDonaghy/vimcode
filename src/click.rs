@@ -1,19 +1,14 @@
-//! Backend-neutral pixel→click-target resolution (#862).
+//! Backend-neutral pixel→click-target resolution.
 //!
-//! Moved out of `src/gtk/click.rs` (which stays behind the `gui` feature)
-//! because every function here only ever touched `quadraui::Backend`,
-//! `Engine` and pure geometry — never a `gtk4`/`pango`/`gio` type. Keeping
-//! them nested inside `crate::gtk` meant `crate::app` (and any future
-//! backend reusing it) could not resolve them without the `gui` feature,
-//! even though nothing here is GTK-specific. `src/gtk/click.rs` re-exports
-//! everything below so its own tests and the rest of `crate::gtk` keep
-//! resolving these names unchanged; the one function that genuinely needs
-//! GTK (`build_editor_click_context`, which builds a `pango::Context`)
-//! stayed behind in `src/gtk/click.rs`.
+//! These functions touch only `quadraui::Backend`, `Engine` and pure
+//! geometry — never GTK-specific types. `src/gtk/click.rs` re-exports
+//! everything below so GTK tests and code keep resolving these names
+//! unchanged; the one function that genuinely needs GTK
+//! (`build_editor_click_context`, which builds a `pango::Context`)
+//! stays in `src/gtk/click.rs`.
 //!
-//! #1491 migrated the tab-bar hit-testing this file does off the deprecated
-//! `TabBarHits` (quadraui#823) and onto its replacement,
-//! `quadraui::TabBarLayout::hit_test` — see [`GroupTabBarLayoutMap`].
+//! Tab-bar hit-testing uses `quadraui::TabBarLayout::hit_test` — see
+//! [`GroupTabBarLayoutMap`].
 
 use crate::core::engine::EngineAction;
 use crate::core::window::GroupId;
@@ -25,31 +20,19 @@ use std::collections::HashMap;
 /// Re-export the shared ClickTarget enum.
 pub(crate) use render_mod::ClickTarget;
 
-/// Per-group pixel-accurate tab-bar layout recovered from
-/// [`quadraui::Backend::draw_tab_bar_icons_layout`] during the ShellApp
-/// `render_content` pass: the exact `(Rect, TabBarLayout)` the rasteriser
-/// just painted, cached so clicks resolve against what's actually on screen
-/// instead of a second, possibly-drifted measurement (#654/#703's
-/// paint/click desync shape).
+/// Per-group pixel-accurate tab-bar layout from the most recent paint:
+/// the exact `(Rect, TabBarLayout)` the rasteriser drew, cached so clicks
+/// resolve against what's actually on screen.
 ///
-/// `Rect` is the bar's own absolute origin; `TabBarLayout`'s own geometry
-/// (`visible_tabs`/`visible_segments`/`hit_regions`) is bar-**relative** (see
-/// that type's doc) — the same space `render::screen_zone_hit_test`'s
+/// `Rect` is the bar's absolute origin; `TabBarLayout`'s own geometry
+/// (`visible_tabs`/`visible_segments`/`hit_regions`) is bar-**relative**
+/// (see that type's doc) — the same space `render::screen_zone_hit_test`'s
 /// `local_x` uses, so [`render::resolve_tab_bar_click`] can hit-test
 /// directly against it with no further shifting. The stored `Rect` is only
 /// needed to translate that bar-relative geometry back to absolute screen
 /// space for consumers outside the click path (tab-drop geometry, the
 /// engine's visible-tab-count feedback — see
 /// [`abs_slot_positions_from_layout`] / [`tab_bar_available_cols`]).
-///
-/// Replaces the pre-#1491 `TabBarPixelHits`/`TabPixelHitMap` shape, which
-/// hand-rolled this same close-button/segment/slot geometry on top of the
-/// now-deprecated [`quadraui::TabBarHits`] — including a GTK-padding-constant
-/// close-zone trim (`tighten_close_bounds`) that quadraui#1080's
-/// `pixel_tab_bar_layout` now does once, upstream, for every backend
-/// (`TabMeasure::trailing_width`), so every consumer of `TabBarLayout`'s own
-/// `close_bounds` already gets the tight glyph box with no vimcode-side trim
-/// at all.
 ///
 /// Key = `group_id.0` (single-group mode keys under the active group's id,
 /// which is what `screen_zone_hit_test` reports for it).
@@ -79,22 +62,15 @@ pub(crate) fn abs_slot_positions_from_layout(
     slots
 }
 
-/// Tab-bar content width in character columns, estimated from this frame's
-/// own painted geometry — the engine-feedback number `Engine::
-/// set_tab_visible_count` budgets tab visibility in, even on a
-/// proportional-font backend.
+/// Tab-bar content width in character columns, derived from this frame's
+/// painted geometry — the budget `Engine::set_tab_visible_count` uses for
+/// tab visibility, even on a proportional-font backend.
 ///
-/// `quadraui::TabBarHits::available_cols` used to carry this (a
-/// backend-internal 15-char-sample Pango estimate, quadraui#1080); no
-/// `TabBarLayout`-based equivalent exists upstream (`TabBarLayout` carries no
-/// `available_cols` field), so this derives the same *budget*, not the same
-/// bit-for-bit pixel sample, from what's already cached: the bar's own
-/// painted width minus whatever right-aligned segments the paint actually
-/// drew (`0` if they overflowed and were dropped — see the "all or nothing"
-/// policy on `TabBar::layout`'s own doc), divided by `char_width` (`1.0` on
-/// TUI, so this reduces to the exact pre-existing cell count there;
-/// `Backend::char_width()`'s Pango `approximate_char_width` on GTK, close
-/// enough for a scroll-visibility budget that was always an estimate).
+/// Computed from the bar's painted width minus whatever right-aligned
+/// segments the paint actually drew, divided by `char_width` (`1.0` on
+/// TUI, so this reduces to the exact cell count; `Backend::char_width()`'s
+/// Pango `approximate_char_width` on GTK, close enough for a visibility
+/// budget that was always an estimate).
 pub(crate) fn tab_bar_available_cols(
     rect: quadraui::Rect,
     layout: &quadraui::TabBarLayout,
@@ -105,31 +81,24 @@ pub(crate) fn tab_bar_available_cols(
     (effective / char_width.max(1.0)).floor().max(0.0) as usize
 }
 
-/// Convert pixel (x, y) to a click target using the cached ScreenLayout from
-/// the last paint pass (#344). Zone detection delegates to the shared
+/// Convert pixel (x, y) to a click target using the cached ScreenLayout
+/// from the last paint pass. Zone detection delegates to the shared
 /// `screen_zone_hit_test` / `window_zone_hit_test` / `resolve_gutter_action`
 /// functions in render.rs so both backends use one source of truth.
 ///
-/// Tab bar inner hit-testing (which specific tab/button) stays here because it
-/// uses Pango-measured pixel slot positions from `draw_tab_bar`.
+/// Tab bar inner hit-testing (which specific tab/button) stays here because
+/// it uses the pixel slot positions from `draw_tab_bar`.
 ///
-/// The text-area column is resolved via `backend.editor_col_at_x` (quadraui,
-/// #420/#560) — the same Pango layout + attributes `draw_editor` painted
-/// with — instead of a bespoke `xy_to_index` reconstruction, so paint and
-/// click can never drift apart again.
+/// The text-area column is resolved via `backend.editor_col_at_x` (quadraui)
+/// — the same Pango layout + attributes `draw_editor` painted with — so
+/// paint and click never drift.
 ///
-/// `mutate_focus` gates every side effect this function performs purely as a
-/// byproduct of resolving a pixel position — flipping `active_group`/the
-/// active tab, and executing a gutter action (e.g. toggling a breakpoint).
-/// Real clicks (`handle_mouse_click`, `handle_mouse_double_click`, Ctrl+click,
-/// tab-drag-start detection) pass `true`, since landing on a pane or tab
-/// should focus it. `handle_mouse_drag` passes `false`: while a text-selection
-/// drag is held down, the mouse sweeping over a *different* split's tab bar or
-/// gutter must not steal focus or fire actions there — `Engine::mouse_drag`'s
-/// origin-window lock already keeps the selection pinned to the split the
-/// drag started in (#568), but only if this hit-test stays a pure query
-/// during a drag, matching how TUI's drag path (`src/tui_main/mouse.rs`)
-/// never mutates engine focus state either.
+/// `mutate_focus` gates every side effect this function performs: flipping
+/// `active_group`/the active tab, and executing a gutter action (e.g.
+/// toggling a breakpoint). Real clicks pass `true`, since landing on a pane
+/// or tab should focus it. `handle_mouse_drag` passes `false`: while a
+/// text-selection drag is held down, the mouse sweeping over a *different*
+/// split's tab bar or gutter must not steal focus or fire actions there.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pixel_to_click_target(
     engine: &mut Engine,
@@ -143,10 +112,10 @@ pub(crate) fn pixel_to_click_target(
     // during `render_content` (via `Backend::draw_tab_bar_icons_layout`).
     // GTK draws tabs with proportional-font Pango widths, so the char-cell
     // `hit_regions` on `cached_layout` do NOT match the drawn geometry — clicks
-    // must resolve against this actual painted geometry instead. (#515)
+    // must resolve against this actual painted geometry instead.
     group_tab_bar_layouts: &GroupTabBarLayoutMap,
     // Cached `quadraui::FrameHitMap` covering the Editor/TabBar surfaces
-    // painted this frame (#449), plus a `FrameZone::TabBar { idx } -> (GroupId,
+    // painted this frame, plus a `FrameZone::TabBar { idx } -> (GroupId,
     // rect)` table keyed by the tab bar's *global* surface index (editors are
     // pushed into the same `ScreenLayout` before any tab bar, so a tab bar's
     // `idx` is offset by however many editor surfaces preceded it — a plain
@@ -156,7 +125,7 @@ pub(crate) fn pixel_to_click_target(
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
     mutate_focus: bool,
-    // #1187: the shared `quadraui::DragState` a real press arms so a
+    // The shared `quadraui::DragState` a real press arms so a
     // following drag-move traverses the whole file instead of re-seeking
     // per move — see `render::minimap_press`'s doc comment. Only ever
     // touched under `mutate_focus` (a hover/drag-continuation query must
@@ -165,43 +134,36 @@ pub(crate) fn pixel_to_click_target(
     // could in principle thread a scratch `DragState`; every real call site
     // threads its own backend's live one.
     drag: &mut quadraui::DragState,
-    // #1271/#1828: Alt held at press time — inverted and threaded into
-    // `render::minimap_press`'s `fine` parameter below (`!alt`, see its doc
-    // comment). #1828: a plain minimap drag now maps within the minimap's
-    // own (possibly sliding, #1093) scale by default, matching VS Code —
-    // holding Alt opts into the old #1187 file-wide/scrollbar-equivalent
-    // fast-scroll mapping instead. Irrelevant to every other rung below the
-    // minimap one, so callers with no Alt context of their own (Ctrl+click,
-    // drag continuation, the tab-bar test helpers) pass `false`.
+    // Alt held at press time — inverted and threaded into
+    // `render::minimap_press`'s `fine` parameter below (`!alt`, see its
+    // doc). A plain minimap drag maps within the minimap's own scale by
+    // default, matching VS Code — holding Alt opts into the file-wide fast-scroll
+    // mapping instead. Irrelevant to every other rung below the minimap, so
+    // callers with no Alt context pass `false`.
     alt: bool,
 ) -> ClickTarget {
-    // #752: the separated status line's arm was here, and the per-window
-    // status line's arm was in the `WindowZone::StatusBar` match below. Both
-    // are now status bands walked by `render::route_chrome_click`, which
-    // `App::handle_mouse_click_msg` runs *before* it ever reaches this
-    // function — so a status click can no longer arrive here at all, and the
-    // shared router (not this backend) decides the order the three bars are
-    // arbitrated in.
+    // The separated status line and per-window status line are now walked by
+    // `render::route_chrome_click`, which `App::handle_mouse_click_msg` runs
+    // before this function — so a status click cannot arrive here, and the
+    // shared router decides the order the bars are arbitrated in.
 
-    // ── Minimap press (#35, #722, #1187) ────────────────────────────────────
-    // Pure rect plumbing: the shared resolver owns the hit-test, the
-    // #1093 jump-to-position, and the drag geometry. Checked before the zone
-    // walk because every window's strip is carved out of that window's own
-    // rect, so a `ScreenZone::Window` hit would otherwise swallow it. Gated
-    // on `mutate_focus` so a hover query never scrolls or arms a drag.
-    // `minimap_press` resolves against *every* pane's strip and reports
-    // which one it hit — never assumed to be the active window, since a
-    // split can have a strip on an inactive pane too.
+    // ── Minimap press ───────────────────────────────────────────────────────
+    // Pure rect plumbing: the shared resolver owns the hit-test and the
+    // jump-to-position. Checked before the zone walk because every window's
+    // strip is carved out of that window's own rect, so a `ScreenZone::Window`
+    // hit would otherwise swallow it. Gated on `mutate_focus` so a hover
+    // query never scrolls or arms a drag. `minimap_press` resolves against
+    // *every* pane's strip and reports which one it hit — never assumed to be
+    // the active window, since a split can have a strip on an inactive pane too.
     if mutate_focus {
-        // #1828: `!alt` — a plain press/drag defaults to the minimap's own
-        // (possibly sliding, #1093) scale, matching VS Code; Alt held opts
-        // into the old #1187 file-wide mapping instead. See
-        // `render::minimap_press`'s doc comment.
+        // A plain press/drag defaults to the minimap's own scale, matching
+        // VS Code; Alt held opts into the file-wide mapping instead. See
+        // `render::minimap_press`'s doc.
         if let Some(press) = render_mod::minimap_press(engine, cached_layout, x, y, !alt) {
             if press.jump {
                 render_mod::apply_minimap_click(engine, cached_layout, x, y);
             } else {
-                // #722: a press directly on the highlight band skips
+                // A press directly on the highlight band skips
                 // `apply_minimap_click`'s centring (nothing should scroll
                 // yet — that's the whole point of preserving the grab
                 // offset), but a click on a *background* pane's strip must
@@ -249,7 +211,7 @@ pub(crate) fn pixel_to_click_target(
         } => {
             if !mutate_focus {
                 // A drag sweeping over another split's tab bar must not
-                // switch tabs/focus there (#568) — treat it as a miss.
+                // switch tabs/focus there — treat it as a miss.
                 return ClickTarget::None;
             }
             engine.active_group = group_id;
@@ -284,7 +246,7 @@ pub(crate) fn pixel_to_click_target(
                     if !mutate_focus {
                         // A drag sweeping over another split's gutter must
                         // not fire gutter actions (e.g. toggle a breakpoint)
-                        // there (#568).
+                        // there.
                         return ClickTarget::None;
                     }
                     execute_gutter_action(engine, rw, window_id, view_row, line_idx, gutter_col);
@@ -293,7 +255,7 @@ pub(crate) fn pixel_to_click_target(
                 WindowZone::TextArea {
                     view_row, buf_line, ..
                 } => {
-                    // #560: resolve the exact column via the shared
+                    // Resolve the exact column via the shared
                     // quadraui text-layout inverse instead of a
                     // separately-built, attribute-less Pango layout —
                     // `editor_col_at_x` re-runs `xy_to_index` against the
@@ -318,9 +280,9 @@ pub(crate) fn pixel_to_click_target(
 }
 
 /// Resolve the top-level `ScreenZone` using the cached `quadraui::FrameHitMap`
-/// (#449), which covers exactly the `Editor`/`TabBar` surfaces painted in
+///, which covers exactly the `Editor`/`TabBar` surfaces painted in
 /// `App::render_content` via `quadraui::ScreenLayout::hit_map()`
-/// (quadraui#425) — pushed from the SAME objects/rects already painted, so
+/// — pushed from the SAME objects/rects already painted, so
 /// this can never drift from what's on screen. Returns `ScreenZone::None`
 /// when the point isn't in an Editor/TabBar zone (including breadcrumb/
 /// divider pixels, which have no `FrameZone` equivalent — the caller falls
@@ -361,19 +323,17 @@ pub(crate) fn frame_zone_to_screen_zone(
     ScreenZone::None
 }
 
-/// Tab bar inner hit-test.
+/// Tab bar inner hit-test: resolve which tab/button a click hit.
 ///
-/// `local_x` is in the tab bar's own unit, relative to its left edge — pixels
-/// for GTK, char cells for TUI. For GTK we resolve against the pixel-accurate
-/// `TabBarLayout` the rasteriser actually painted this frame
+/// `local_x` is in the tab bar's own unit, relative to its left edge —
+/// pixels for GTK, char cells for TUI. For GTK we resolve against the
+/// pixel-accurate `TabBarLayout` the rasteriser painted this frame
 /// (`group_tab_bar_layouts`, captured in `render_content` via
 /// `Backend::draw_tab_bar_icons_layout`). GTK tabs are laid out with
 /// proportional-font Pango widths + fixed pixel padding, so the char-cell
-/// `hit_regions` (correct for the monospace TUI) badly mis-measure them —
-/// clicks in a tab's middle landed on the close button and clicks near its
-/// right edge landed on the next tab (#515 regression). Falls back to the
-/// char-cell path only if no pixel geometry was cached (e.g. a click arriving
-/// before the first paint populated the map).
+/// `hit_regions` (correct for TUI) badly mis-measure them. Falls back to
+/// the char-cell path only if no pixel geometry was cached (e.g. a click
+/// before the first paint).
 fn tab_bar_inner_hit_test(
     engine: &mut Engine,
     group_id: GroupId,
@@ -412,16 +372,10 @@ fn resolve_charcell_tab_click(
 }
 
 /// Resolve which tab (if any) a right-click landed on, without any of the
-/// left-click side effects `tab_bar_inner_hit_test`/`dispatch_tab_bar_target`
-/// apply (selecting the tab, closing it, opening a split, ...).
-///
-/// Right-clicks reach `ShellApp::handle` via a dedicated `MouseButton::Right`
-/// branch that historically only ever opened the *editor* context menu — there
-/// was no tab-bar-aware routing at all, so right-clicking a tab always opened
-/// the *editor's* context menu instead of a tab-specific one (#546 FAILED-1).
-/// This mirrors `pixel_to_click_target`'s zone resolution (read-only) so the
-/// caller can tell a tab-bar right-click apart from an editor right-click
-/// before deciding which `Msg` to dispatch.
+/// side effects `tab_bar_inner_hit_test` applies (selecting the tab,
+/// closing it, ...). This mirrors `pixel_to_click_target`'s zone resolution
+/// (read-only) so the caller can tell a tab-bar right-click apart from an
+/// editor right-click and decide which message to dispatch.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_tab_right_click(
     engine: &Engine,
@@ -469,29 +423,19 @@ pub(crate) fn resolve_tab_right_click(
     }
 }
 
-/// Resolve a tab-bar click target and, for everything except the two targets
-/// that must defer to the caller, apply it through `Engine::handle_tab_bar_click`
-/// — the single dispatch the engine, the TUI and (as of #814) GTK all share.
-///
-/// GTK used to re-implement this arm by arm (goto_tab / open_editor_group /
-/// jump_prev_hunk / ... called directly), which is exactly how the TUI's own
-/// duplicate copy silently dropped `lsp_ensure_active_buffer()` (#752) before
-/// this file did the same. Routing through the engine's own function means a
-/// future fix to any arm lands on both backends for free.
+/// Resolve a tab-bar click target and apply it through
+/// `Engine::handle_tab_bar_click` — the single dispatch the engine, TUI
+/// and GTK all share.
 ///
 /// The two exceptions:
 /// - `ActionMenu` needs the click's screen coordinates to place the popup,
-///   which the engine doesn't have — its own arm for this target is a
-///   deliberate no-op, so `handle_mouse_click`'s `ActionMenuButton` arm opens
-///   the menu directly instead.
-/// - `CloseTab` on a dirty buffer must defer to a confirmation dialog before
-///   anything closes, so resolution only identifies *which* tab was
-///   targeted — `handle_mouse_click`'s `CloseTab` arm makes the one call into
-///   `Engine::handle_tab_bar_click` that decides confirm-vs-close.
+///   which the engine doesn't have — so `handle_mouse_click`'s
+///   `ActionMenuButton` arm opens the menu directly instead.
+/// - `CloseTab` on a dirty buffer must defer to a confirmation dialog
+///   before closing — so resolution only identifies *which* tab was
+///   targeted.
 ///
-/// `pub(crate)` (not just `fn`, #1059) so `tui_main/mouse.rs` can call it
-/// directly — it hand-rolled this exact arm-by-arm match twice, the same
-/// shape as the GTK duplicate #814 deleted, free to drift the same way.
+/// `pub(crate)` so `tui_main/mouse.rs` can call it directly.
 pub(crate) fn dispatch_tab_bar_target(
     engine: &mut Engine,
     group_id: GroupId,
@@ -511,11 +455,7 @@ pub(crate) fn dispatch_tab_bar_target(
 }
 
 /// Execute the engine-side action for a gutter click using shared
-/// resolution. The match itself moved to [`render::apply_gutter_action`]
-/// in #823 item 3 — it was an identical 5-arm match on
-/// [`render_mod::resolve_gutter_action`]'s result to TUI's copy
-/// (`tui_main/mouse.rs`), modulo TUI's `ToggleFold` fold-indicator guard
-/// (folded into the shared function too — see its doc comment).
+/// resolution via [`render::apply_gutter_action`].
 fn execute_gutter_action(
     engine: &mut Engine,
     rw: &render::RenderedWindow,
@@ -564,7 +504,7 @@ pub(crate) fn handle_mouse_click(
         tab_bar_zones,
         true, // real click: focus/tab/gutter side effects are intended
         drag,
-        alt, // #1271/#1828: Alt-press arms the minimap's file-wide (old #1187) track; plain press now fine-seeks by default
+        alt, // Alt-press arms the minimap's file-wide (old #1187) track; plain press now fine-seeks by default
     ) {
         ClickTarget::BufferPos(wid, line, col) => {
             // Alt+Click in VSCode mode → add cursor at position
@@ -589,7 +529,7 @@ pub(crate) fn handle_mouse_click(
         ClickTarget::ActionMenuButton(group_id) => {
             let col = (x / char_width.max(1.0)) as u16;
             let row = (y / line_height.max(1.0)) as u16;
-            // #434: pass the trigger's exact height in line_height units so
+            // Pass the trigger's exact height in line_height units so
             // the menu sits flush against the button's bottom (no sub-cell
             // gap). GTK's tab row is ceil(1.6 * line_height).
             let trigger_h =
@@ -601,14 +541,10 @@ pub(crate) fn handle_mouse_click(
     }
 }
 
-// Tab-drag drop-zone geometry is now computed in `App::render_content` from the
-// shared `render::screen_to_drop_group_bounds` pipeline and cached on the App for
-// the drag hit-test to reuse — see `cached_drop_ctx`. The former GTK-specific
-// `build_gtk_tab_slots` / `compute_tab_drop_zone` helpers (which depended on the
-// legacy per-backend pixel maps) were removed in #515; `compute_tab_drop_zone`
-// itself (vimcode's own geometry adapter over quadraui's `compute_drop_zone`)
-// was later replaced by `render::resolve_tab_drop_zone`, which resolves through
-// quadraui's host-owned-model `resolve_tab_drop` instead (#1370).
+// Tab-drag drop-zone geometry is computed in `App::render_content` from
+// `render::screen_to_drop_group_bounds` and cached for the drag hit-test.
+// `render::resolve_tab_drop_zone` resolves through quadraui's
+// `resolve_tab_drop`.
 
 /// Handle mouse double-click — select word at position.
 #[allow(clippy::too_many_arguments)]
@@ -647,18 +583,10 @@ pub(crate) fn handle_mouse_double_click(
 /// Apply a [`render::MouseDragRoute::EditorText`] drag — extend the visual
 /// selection to the glyph under the cursor.
 ///
-/// #568: this only ever fires while a mouse button is held (drag
-/// continuation), so text-selection resolution goes through
-/// `pixel_to_click_target` as a pure query (`mutate_focus: false`) — the
-/// mouse sweeping over a different split's tab bar/gutter while the drag is
-/// held must not steal focus or fire actions there. `Engine::mouse_drag`'s
-/// origin-window lock then keeps the selection itself pinned to the split
-/// the drag started in.
-///
-/// #756: the minimap check that used to open this function is gone — the
-/// strip is now [`render::MouseDragRoute::Minimap`], arbitrated above the
-/// editor text area by the shared drag router, so this function is only
-/// reached once that router has already ruled the point out.
+/// This fires while a mouse button is held, so text-selection resolution
+/// goes through `pixel_to_click_target` as a pure query (`mutate_focus:
+/// false`) — the mouse sweeping over a different split's tab bar/gutter
+/// must not steal focus or fire actions there.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_mouse_drag(
     engine: &mut Engine,
