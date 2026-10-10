@@ -112,6 +112,12 @@ the Test stage's job.
 - `rustfmt` defaults; `PascalCase` types, `snake_case` functions/vars.
 - Core: return `Result<T, E>` for I/O, silent no-ops for bounds.
 - Tests in `#[cfg(test)] mod tests` at file bottom.
+- **Comments describe the code as it is, never its history.** No issue numbers (`#123`) and no
+  "used to" / "previously" / "the reviewer found" / "this fix" in `//` comments. The *why* of a
+  fix goes in the commit message and your final message, which is where reviewers read it. When
+  you edit next to such a comment, rewrite it in the present tense or delete it. The only exception
+  is a workaround to remove when an issue closes: `// TODO(#N): <what to remove>`. Enforcement is
+  the comment-history lint (#1896) once it lands.
 
 ## Testing — black-box coverage is the acceptance bar (MANDATORY)
 
