@@ -10,12 +10,18 @@ adoption of shipped quadraui APIs; #5 is the quadraui-build supply side).
 
 ## Platform-Neutrality Rule (MANDATORY — overrides all other guidance)
 
-**NEVER add per-backend code to vimcode to fix a problem.** If a feature requires new code in `src/gtk/` or `src/tui_main/` beyond thin event-to-engine wiring, STOP. Do not attempt the fix. Instead:
+**NEVER add per-backend code to vimcode to fix a problem.** If a feature requires new code in `src/gtk/`, `src/macos/`, `src/win/` or `src/tui_main/` beyond thin event-to-engine wiring, STOP. Do not attempt the fix. Instead:
 
 1. Identify what quadraui infrastructure is missing.
 2. File a quadraui issue describing the gap.
 3. Build the infrastructure in quadraui first.
 4. Only then implement the vimcode side through the shared API.
+
+**Issues and acceptance are platform-neutral too.** If quadraui works as advertised, every vimcode behaviour is the same on every backend, so:
+
+- A vimcode issue's acceptance is a backend-neutral test (engine/`render.rs` unit test, or the TUI/headless driver), never "on macOS", "on Windows" or "verify on real hardware". Per-platform rendering and input are proven by quadraui's own conformance tests.
+- A bug that shows up on only one backend is a quadraui gap or bug: the fix is a quadraui issue, and the vimcode side is at most a version bump. If your issue asks you to fix a single-backend symptom inside vimcode, say so in your final message and stop rather than adding backend code.
+- Allowed per-platform differences are data, not code: e.g. default font per platform as a table the engine reads, and packaging/release plumbing.
 
 **Push back actively.** If the user asks to implement something that would require per-backend code, say so upfront and propose the quadraui-first alternative.
 
