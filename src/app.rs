@@ -10135,6 +10135,9 @@ impl quadraui::ShellApp for App {
         // instead of the pre-#1434 TUI shell — `backend.backend_caps()` reads the same
         // `TuiBackend` state either way.
         self.keyboard_enhanced = backend.backend_caps().kitty_keyboard;
+        // VS Code's editor scrollbar is 14px wide (quadraui#1411); a
+        // no-op on TUI, whose scrollbar is one cell.
+        backend.set_editor_v_scrollbar_width(Some(14.0));
         // #1864: `shell_config`'s `with_editor_font` seed only covers
         // family/size — the runner's own `set_editor_font` call (made from
         // that stored value, just before `setup()` runs) resets

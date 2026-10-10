@@ -1320,7 +1320,27 @@ pub fn explorer_chevron_click_toggles_dir_with_same_arity_as_label_click<
          (one of its children) must not be painted yet"
     );
 
-    let chevron_bounds = locate(driver, "▸");
+    // quadraui#1377: GTK's shared tree paint path substitutes the sharper
+    // codicon `CHEVRON_RIGHT` (U+EAB6) glyph for the literal `▸` whenever
+    // `TreeStyle::chevron_collapsed` is left at its `TreeStyle::default()`
+    // value (which vimcode does not override), so the collapsed chevron's
+    // painted text is backend/nerd-fonts-dependent now, not always
+    // literally "▸". Accept either so this scenario still finds the same
+    // row's chevron on pre-#1377 and current quadraui alike.
+    let chevron_bounds = driver
+        .inventory()
+        .text_runs()
+        .iter()
+        .find(|r| r.text == "▸" || r.text == "\u{eab6}")
+        .unwrap_or_else(|| {
+            panic!(
+                "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click: \
+                 collapsed chevron (\"▸\" or codicon CHEVRON_RIGHT) not painted; \
+                 painted: {:?}",
+                driver.inventory().text_runs()
+            )
+        })
+        .bounds;
     let (cx, cy) = (
         chevron_bounds.x + chevron_bounds.width / 2.0,
         chevron_bounds.y + chevron_bounds.height / 2.0,
@@ -4827,7 +4847,12 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
             .find_map(|label| {
                 runs.iter()
                     .find(|r| {
-                        r.text.contains('\u{00d7}')
+                        // quadraui#1377: GTK now paints the tab close mark
+                        // as the codicon `CLOSE` glyph (U+EA76) instead of
+                        // the plain `×` (U+00D7) character; accept either
+                        // so this disambiguation (same row, to the
+                        // label's right) still finds it on both.
+                        (r.text.contains('\u{00d7}') || r.text.contains('\u{ea76}'))
                             && r.bounds.y == label.bounds.y
                             && r.bounds.x > label.bounds.x
                     })
