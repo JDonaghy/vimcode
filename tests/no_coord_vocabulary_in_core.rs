@@ -1,10 +1,11 @@
-//! #522: `src/core/` and `src/render.rs` must carry no coordinator
-//! vocabulary. vimcode is an editor that can *host* a coordinator client
-//! (through the generic, coord-agnostic seam in `src/core/tool_client.rs`)
-//! — it is not a coordinator client itself. Everything coord-specific
-//! belongs in the coordinator extension bundle, never here.
+//! #522: `src/core/` and `src/render/` (formerly the single `src/render.rs`)
+//! must carry no coordinator vocabulary. vimcode is an editor that can
+//! *host* a coordinator client (through the generic, coord-agnostic seam in
+//! `src/core/tool_client.rs`) — it is not a coordinator client itself.
+//! Everything coord-specific belongs in the coordinator extension bundle,
+//! never here.
 //!
-//! A plain `grep -ri "coord" src/core/ src/render.rs` legitimately turns up
+//! A plain `grep -ri "coord" src/core/ src/render/` legitimately turns up
 //! matches today — "coordinate"/"coordinates" (screen/pixel geometry
 //! terms) and "coordinator" used as a plain English noun (e.g. "Multi-
 //! server LSP coordinator"). Those are incidental, per #522's acceptance
@@ -130,9 +131,24 @@ fn core_and_render_have_no_coordinator_vocabulary() {
         scan_file(file, &tokens, &mut hits);
     }
 
-    let render_rs = Path::new("src/render.rs");
-    assert!(render_rs.is_file(), "expected src/render.rs to exist");
-    scan_file(render_rs, &tokens, &mut hits);
+    // #3xxx (render.rs split into src/render/*.rs): the single-file check
+    // below became a directory walk, same as `src/core` above — the file
+    // no longer exists as one file, but every line that used to live in it
+    // still needs this same scan.
+    let render_dir = Path::new("src/render");
+    assert!(
+        render_dir.is_dir(),
+        "expected src/render/ to exist (render.rs was split into src/render/*.rs)"
+    );
+    let mut render_files = Vec::new();
+    collect_rs_files(render_dir, &mut render_files);
+    assert!(
+        !render_files.is_empty(),
+        "expected to find .rs files under src/render"
+    );
+    for file in &render_files {
+        scan_file(file, &tokens, &mut hits);
+    }
 
     assert!(
         hits.is_empty(),
