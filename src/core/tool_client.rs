@@ -1,26 +1,23 @@
-//! Generic external-tool JSON seam (#522).
+//! Generic external-tool JSON seam.
 //!
 //! [`ToolClient`] knows how to run a configured external command and parse
 //! its stdout as JSON. It has **no idea what it's running** — no specific
 //! external pipeline tool's subcommand names, JSON schema, or lifecycle
 //! vocabulary baked in anywhere. An extension (e.g. a future pipeline-
 //! management bundle) supplies the argv; vimcode supplies the plumbing.
-//! See `docs/COORDINATOR_INTEGRATION.md` §6 for the placement rule this
-//! module exists to satisfy: vimcode is an editor that can *host* a
-//! pipeline-management client, not a pipeline-management client itself,
-//! so `src/core/` must build, run, and pass its suite with no such tool
-//! installed and no such tool's config present.
+//! vimcode is an editor that can *host* a pipeline-management client,
+//! not a pipeline-management client itself, so `src/core/` must build,
+//! run, and pass its suite with no such tool installed and no such tool's
+//! config present.
 //!
 //! ## The board contract
 //!
 //! vimcode's board-data contract *is* quadraui's `Board` primitive data
-//! model (`BoardModel` / `BoardColumn` / `BoardCard` / `CardBadge` /
-//! `BadgeStatus`, quadraui#638) — reused here via `quadraui`'s existing
-//! `Serialize`/`Deserialize` impls rather than duplicated. Any external
-//! tool whose stdout deserializes into a [`quadraui::BoardModel`] can
-//! drive the Board panel; see [`fetch_board_model`]. The contract is
-//! vimcode's (well, quadraui's, which vimcode renders) — not any
-//! particular provider's.
+//! model — reused here via `quadraui`'s existing `Serialize`/`Deserialize`
+//! impls rather than duplicated. Any external tool whose stdout deserializes
+//! into a [`quadraui::BoardModel`] can drive the Board panel; see
+//! [`fetch_board_model`]. The contract is vimcode's — not any particular
+//! provider's.
 //!
 //! ## Threading
 //!
@@ -108,7 +105,7 @@ pub trait ToolClient: Send + Sync {
     /// error otherwise). **Blocking**, same contract as [`Self::run_json`].
     /// Used for provider commands that *consume* a payload — the stdout is
     /// captured (not parsed as JSON here) so a caller like
-    /// [`push_tool_document`] (#524) can opportunistically read back
+    /// [`push_tool_document`] can opportunistically read back
     /// whatever the provider chose to echo (e.g. a newly-assigned document
     /// id on create), without every such command being required to emit
     /// anything at all.
@@ -207,7 +204,7 @@ impl ToolClient for MockToolClient {
 
     fn run_with_stdin(&self, _argv: &[String], _stdin: &[u8]) -> Result<Vec<u8>, ToolError> {
         // The canned value doubles as "stdout" here, JSON-encoded — lets a
-        // test exercise the create-path id-capture round trip (#524) with
+        // test exercise the create-path id-capture round trip with
         // e.g. `MockToolClient(Ok(json!({"id": "99"})))` without a second,
         // stdout-specific mock type.
         self.0
@@ -219,9 +216,7 @@ impl ToolClient for MockToolClient {
 /// Test [`ToolClient`] that records the argv (and stdin, if any) of every
 /// call it receives, in order, so a test can assert *what* was sent to a
 /// provider — not just that something succeeded. Every call succeeds
-/// (`run_json` returns `null`). Used by #524's push/follow-up tests to
-/// verify the write command gets the right title/body payload and the
-/// follow-up command gets the right id.
+/// (`run_json` returns `null`).
 #[derive(Debug, Clone, Default)]
 pub struct RecordingToolClient {
     pub calls: std::sync::Arc<std::sync::Mutex<Vec<RecordedCall>>>,
@@ -267,7 +262,7 @@ impl ToolClient for RecordingToolClient {
     }
 }
 
-// ─── The document contract (#524) ──────────────────────────────────────────
+// ─── The document contract ─────────────────────────────────────────────────
 
 /// vimcode's generic document contract: a provider's read command emits
 /// this shape on stdout to seed an editable markdown buffer; the write
@@ -289,7 +284,7 @@ pub struct ToolDocument {
 }
 
 /// Run `argv` via `client` and parse the result as a [`ToolDocument`] —
-/// the read half of #524's buffer-authoring seam.
+/// the read half of the buffer-authoring seam.
 pub fn fetch_tool_document(
     client: &dyn ToolClient,
     argv: &[String],
@@ -299,7 +294,7 @@ pub fn fetch_tool_document(
 }
 
 /// Run `argv` via `client`, feeding it `{"title": title, "body": body}` on
-/// stdin — the write half of #524's buffer-authoring seam. Success is a
+/// stdin — the write half of the buffer-authoring seam. Success is a
 /// zero exit; returns the provider-assigned id if the provider chose to
 /// echo one as `{"id": "..."}` on stdout — the create path (`{id}` was
 /// substituted empty) needs this to bind the now-existing document to its
@@ -325,9 +320,8 @@ pub fn push_tool_document(
 // ─── The board contract ─────────────────────────────────────────────────────
 
 /// Run `argv` via `client` and parse the result as vimcode's board
-/// contract (`quadraui::BoardModel`, matching quadraui's `Board`
-/// primitive — quadraui#638). Any provider that emits this shape on
-/// stdout gets a board; nothing here knows or cares which one.
+/// contract ([`quadraui::BoardModel`]). Any provider that emits this
+/// shape on stdout gets a board; nothing here knows or cares which one.
 pub fn fetch_board_model(
     client: &dyn ToolClient,
     argv: &[String],
@@ -336,33 +330,26 @@ pub fn fetch_board_model(
     serde_json::from_value(value).map_err(|e| ToolError::InvalidJson(e.to_string()))
 }
 
-// ─── The branch-review contract (#525) ─────────────────────────────────────
+// ─── The branch-review contract ────────────────────────────────────────────
 
 /// The result of resolving a board card to a reviewable change: which git
 /// revision holds the change (`branch`) and which revision to diff it
 /// against (`base`). Generic, same spirit as [`ToolDocument`]/
 /// [`quadraui::BoardModel`] — any provider whose `"OpenReview"` board
-/// action (see `crate::core::extensions::BoardProviderConfig::actions`)
-/// emits this JSON shape on stdout gets a multi-file diff review; nothing
-/// here names a specific provider or lifecycle vocabulary. Both revisions
-/// must already be resolvable in the *local* repository (already pulled/
-/// checked out) — turning this into a real diff is pure local git
+/// action emits this JSON shape on stdout gets a multi-file diff review;
+/// nothing here names a specific provider or lifecycle vocabulary. Both
+/// revisions must already be resolvable in the *local* repository (already
+/// pulled/checked out) — turning this into a real diff is pure local git
 /// (`crate::core::git::changed_files_between`), not another external-tool
 /// round trip.
 ///
-/// `host` (#530, Track A Phase 5 — the fleet review seat) is an *optional*,
-/// purely descriptive label — never resolved, dialled, or `ssh`ed into by
-/// vimcode itself. It is what makes the "review-where-the-code-is" mode
-/// distinguishable from "pull-local" (`docs/COORDINATOR_INTEGRATION.md`
-/// §9/§11): a provider whose roster spans a machine fleet fills it with
-/// which worker box this branch/base pair lives on; a provider with only
-/// one checkout (or an external "pull the branch locally first" flow)
-/// leaves it `None`. Both modes reach `Engine::open_branch_review`
-/// identically — the *moat* is that vimcode already works correctly when
-/// it is itself the process running (over ssh) on that worker box, with
-/// no vimcode-side transport code at all; `host` only has to carry the
-/// provenance a human reviewing there needs to see, not make the trip
-/// happen.
+/// `host` is an *optional*, purely descriptive label — never resolved,
+/// dialled, or `ssh`ed into by vimcode itself. It marks which worker box
+/// this branch/base pair lives on in a fleet-distributed provider; a
+/// provider with only one checkout leaves it `None`. Both modes reach
+/// `Engine::open_branch_review` identically — vimcode already works
+/// correctly when it is itself the process running (over ssh) on that
+/// worker box, with no vimcode-side transport code at all.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct BranchReviewTarget {
     /// The branch (or any git revision) containing the change to review.
@@ -372,16 +359,14 @@ pub struct BranchReviewTarget {
     /// `crate::core::git::changed_files_between`.
     pub base: String,
     /// Which fleet machine this branch/base pair's worktree lives on, if
-    /// the provider's roster spans more than one (#530). `None` when the
-    /// provider doesn't distinguish machines, or omits the field entirely
-    /// (`#[serde(default)]` — every #525-era provider response still
-    /// parses unchanged).
+    /// the provider's roster spans more than one. `None` when the provider
+    /// doesn't distinguish machines, or omits the field entirely.
     #[serde(default)]
     pub host: Option<String>,
 }
 
 /// Run `argv` via `client` and parse the result as a [`BranchReviewTarget`]
-/// — the "resolve a card to a branch" half of #525's review seam. The
+/// — the "resolve a card to a branch" half of the review seam. The
 /// "branch to changed files" half is pure local git; this is the only part
 /// that needs an external tool at all.
 pub fn fetch_branch_review_target(
@@ -392,18 +377,17 @@ pub fn fetch_branch_review_target(
     serde_json::from_value(value).map_err(|e| ToolError::InvalidJson(e.to_string()))
 }
 
-// ─── Review verdict reporting (#526) ───────────────────────────────────────
+// ─── Review verdict reporting ──────────────────────────────────────────────
 
 /// Write a composed review body to a fresh, process- and time-unique temp
-/// file and return its path. #526's stated preference: a provider's verdict
-/// command receives the body's path substituted for `{body_file}`
-/// (`crate::core::extensions::BoardProviderConfig::verdict_argv`), never the
-/// body text inline — review bodies contain newlines, code fences and
-/// quotes unsafe to splice into a single argv token, the same reasoning
-/// [`push_tool_document`] already applies by sending its payload on stdin
-/// instead. Deliberately left on disk after the caller's command runs —
-/// deleting it is the OS's/user's job (temp dir cleanup), and a provider
-/// might read it asynchronously after this process's call returns.
+/// file and return its path. A provider's verdict command receives the
+/// body's path substituted for `{body_file}`, never the body text inline —
+/// review bodies contain newlines, code fences and quotes unsafe to splice
+/// into a single argv token, the same reasoning [`push_tool_document`]
+/// already applies by sending its payload on stdin instead. Deliberately
+/// left on disk after the caller's command runs — deleting it is the OS's/
+/// user's job (temp dir cleanup), and a provider might read it
+/// asynchronously after this process's call returns.
 pub fn write_review_body_temp_file(body: &str) -> std::io::Result<std::path::PathBuf> {
     let path = std::env::temp_dir().join(format!(
         "vimcode-review-body-{}-{}.md",
@@ -542,8 +526,6 @@ mod tests {
         assert!(err.user_message().contains("boom"));
     }
 
-    // ─── #524: the document contract ───────────────────────────────────────
-
     #[test]
     fn mock_client_fetch_tool_document_parses_fixture() {
         let client = MockToolClient(Ok(serde_json::json!({
@@ -600,10 +582,8 @@ mod tests {
         assert_eq!(sent["body"], "My body");
     }
 
-    /// #524 review follow-up: a provider that echoes `{"id": "..."}` on
-    /// stdout from the write command lets the create path learn the
-    /// newly-assigned id (`document_ops.rs`'s `save_tool_document_buffer`
-    /// is the actual consumer — this covers the plumbing it depends on).
+    /// A provider that echoes `{"id": "..."}` on stdout from the write
+    /// command lets the create path learn the newly-assigned id.
     #[test]
     fn push_tool_document_returns_provider_assigned_id_from_stdout() {
         let client = MockToolClient(Ok(serde_json::json!({ "id": "99" })));
@@ -669,7 +649,7 @@ mod tests {
         assert_eq!(calls[0].stdin, Some(Vec::new()));
     }
 
-    // ── fetch_branch_review_target (#525) ───────────────────────────────
+    // ── fetch_branch_review_target ──────────────────────────────────────
 
     #[test]
     fn mock_client_fetch_branch_review_target_parses_fixture() {
@@ -681,13 +661,12 @@ mod tests {
             .expect("fixture should parse into BranchReviewTarget");
         assert_eq!(target.branch, "issue-525-review");
         assert_eq!(target.base, "develop");
-        // A provider that predates #530's `host` field must still parse —
-        // `#[serde(default)]` is what makes that true, not an accident of
-        // this particular fixture.
+        // A provider that predates the `host` field must still parse —
+        // `#[serde(default)]` is what makes that true.
         assert_eq!(target.host, None);
     }
 
-    /// #530 (Track A Phase 5): a fleet provider's roster spans more than
+    /// A fleet provider's roster spans more than
     /// one worker machine, so its `"OpenReview"` response names which one
     /// this branch/base pair's worktree lives on.
     #[test]
@@ -709,7 +688,7 @@ mod tests {
         assert!(matches!(err, ToolError::BinaryNotFound(ref b) if b == "some-provider"));
     }
 
-    // ── write_review_body_temp_file (#526) ──────────────────────────────
+    // ── write_review_body_temp_file ─────────────────────────────────────
 
     #[test]
     fn write_review_body_temp_file_round_trips_the_body_with_newlines_and_fences() {

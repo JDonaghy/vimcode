@@ -123,10 +123,10 @@ pub enum LspEvent {
     },
     /// `$/progress` begin notification — a long-running work item started
     /// on the server. Used by the indicator to track workspace indexing
-    /// (#450). `token` is the unique progress-token string (LSP allows
+    ///. `token` is the unique progress-token string (LSP allows
     /// number or string; we stringify both for HashMap keying).
     /// `message` and `percentage` are the begin payload's optional
-    /// progress fields (#221).
+    /// progress fields.
     WorkProgressBegin {
         server_id: LspServerId,
         token: String,
@@ -135,7 +135,7 @@ pub enum LspEvent {
         percentage: Option<u32>,
     },
     /// `$/progress` report notification — interim update on an open
-    /// work item (#221). Drives `Indexing: 319/320` style status bar
+    /// work item. Drives `Indexing: 319/320` style status bar
     /// segments. Carries the latest message + percentage.
     WorkProgressReport {
         server_id: LspServerId,
@@ -732,9 +732,7 @@ pub fn completion_kind_label(kind: u32) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Mason registry helpers (kept for reference; no longer actively used)
-// ---------------------------------------------------------------------------
+// Mason registry helpers
 
 /// Information parsed from a Mason package.yaml.
 #[allow(dead_code)]
@@ -765,7 +763,6 @@ impl MasonPackageInfo {
 }
 
 /// Static mapping: LSP language ID → Mason registry package name.
-/// Kept for reference; no longer actively called.
 #[allow(dead_code)]
 pub fn mason_package_for_language(lang_id: &str) -> Option<&'static str> {
     match lang_id {
@@ -1006,7 +1003,7 @@ impl LspServer {
                 // rust-analyzer / gopls / pyright gate progress emission
                 // on this capability — without it they silently never
                 // send the notifications that drive the indexing
-                // indicator (#450).
+                // indicator.
                 "window": {
                     "workDoneProgress": true
                 },
@@ -1534,7 +1531,7 @@ fn reader_thread(
                     }
                 }
             } else if method == "$/progress" {
-                // Workspace indexing / long-running work signal (#450).
+                // Workspace indexing / long-running work signal.
                 // We only act on begin/end; report (interim percent
                 // updates) doesn't change the binary "is indexing" state
                 // the indicator cares about.
@@ -1798,8 +1795,8 @@ fn parse_diagnostics(server_id: LspServerId, params: &serde_json::Value) -> Opti
 }
 
 /// Parse a `$/progress` notification's params into a begin, report, or
-/// end event (#450, extended by #221). `params` shape: `{ token, value:
-/// { kind, title?, message?, percentage? } }`.
+/// end event. `params` shape: `{ token, value: { kind, title?, message?,
+/// percentage? } }`.
 fn parse_work_progress(server_id: LspServerId, params: &serde_json::Value) -> Option<LspEvent> {
     let token = params.get("token").and_then(token_to_key)?;
     let value = params.get("value")?;
@@ -3070,7 +3067,7 @@ bin:
         assert!(symbols[1].children.is_empty());
     }
 
-    // #450: $/progress parsing
+    // $/progress parsing
     #[test]
     fn parse_work_progress_begin_string_token() {
         let params = serde_json::json!({
@@ -3131,7 +3128,7 @@ bin:
 
     #[test]
     fn parse_work_progress_report_emits_event() {
-        // #221: report notifications carry the latest message+percentage
+        // Report notifications carry the latest message+percentage
         // for the status bar segment (`Indexing: 319/320`).
         let params = serde_json::json!({
             "token": "t1",

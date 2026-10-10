@@ -6,20 +6,13 @@
 pub struct AiMessage {
     /// "user" or "assistant" for the direct-provider (curl) transport.
     ///
-    /// The ACP transport (#952, `Engine::poll_acp` in
-    /// `src/core/engine/acp_ops.rs`) also pushes `"assistant-thought"` —
-    /// reused for two different things that happen to render the same way
-    /// (quadraui's "System" role label): genuine `agent_thought_chunk`
-    /// reasoning text, *and* unrelated system/error notices (agent failed
-    /// to start, a request failed, a turn stopped early). That conflation
-    /// satisfies ACP-1's "thoughts are visually distinct from messages"
-    /// bar but is a minor design smell — a follow-up slice may want a
-    /// distinct role (e.g. `"system"`) for the notice case so it isn't
-    /// visually indistinguishable from real agent reasoning.
-    ///
-    /// Only `"user"`/`"assistant"` are ever sent to a direct-provider API
-    /// (`ai_send_message_via_curl` filters the rest) — ACP-only roles like
-    /// `"assistant-thought"` aren't recognised request shapes for
+    /// The ACP transport also pushes `"assistant-thought"` — reused for two
+    /// different things that happen to render the same way (quadraui's "System"
+    /// role label): genuine `agent_thought_chunk` reasoning text, *and* unrelated
+    /// system/error notices (agent failed to start, a request failed, a turn
+    /// stopped early). Only `"user"`/`"assistant"` are ever sent to a
+    /// direct-provider API (`ai_send_message_via_curl` filters the rest) — ACP-only
+    /// roles like `"assistant-thought"` aren't recognised request shapes for
     /// Anthropic/OpenAI/Ollama.
     pub role: String,
     pub content: String,
@@ -347,19 +340,9 @@ fn send_ollama(
         .ok_or_else(|| format!("unexpected response: {resp_body}"))
 }
 
-// ── curl error reporting (#1446) ────────────────────────────────────────────────
-//
-// `-sf` (silent + fail-on-error) was the original flag combo: `-s` suppresses
-// curl's own progress/diagnostic output and `-f` makes curl exit nonzero
-// *and discard the response body* on a non-2xx HTTP status. Combined, a
-// failed request produced an empty stderr AND an empty stdout — the only
-// signal left was curl's exit code, which the old code didn't even read.
-// That's how `:AI hello` with no key configured produced the bare
-// "AI error: curl failed:" this issue is about.
-//
-// The fix drops `-f` and instead appends the HTTP status code to stdout via
-// `-w` so a non-2xx response can be reported with its real status and body
-// instead of being swallowed.
+// `-w` write-out format appended to every curl invocation in this module:
+// a newline followed by the HTTP status code. This allows a non-2xx response
+// to be distinguished from success and reported with its real status and body.
 
 /// `-w` write-out format appended to every curl invocation in this module:
 /// a newline followed by the HTTP status code, so a non-2xx response can be
@@ -398,7 +381,7 @@ fn trim_body_for_error(body: &str) -> String {
 /// any HTTP response was even received — DNS failure, connection refused,
 /// TLS error, timeout, curl missing, etc). With `-s`, curl's own stderr is
 /// almost always empty, so the exit code is included unconditionally rather
-/// than being the thing that's silently dropped (#1446).
+/// than being the thing that's silently dropped.
 fn curl_process_failure_message(exit_code: Option<i32>, stderr: &str) -> String {
     let code = exit_code
         .map(|c| c.to_string())
@@ -449,13 +432,11 @@ fn escape_json_string(s: &str) -> String {
     out
 }
 
-/// Serializes every test *anywhere in this crate* that mutates the
-/// process-global `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env vars (read by
-/// [`resolve_api_key`]) against every other one — `std::env::set_var` is
-/// process-global and Rust's default test runner executes `#[test]`s in
-/// parallel threads within one process, so this module's own env-var tests
-/// and `engine::tests`' #1446 coverage (which needs these vars reliably
-/// unset to exercise the "no API key configured" path) would otherwise race
+/// Serializes every test in this crate that mutates the process-global
+/// `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env vars (read by [`resolve_api_key`])
+/// against every other one — `std::env::set_var` is process-global and Rust's
+/// default test runner executes `#[test]`s in parallel threads within one
+/// process, so tests that need these vars reliably unset would otherwise race
 /// each other. See `crate::core::paths::VIMCODE_TEST_DATA_HOME_LOCK`'s doc
 /// comment for the same tradeoff applied to a different env var.
 #[cfg(test)]
@@ -536,7 +517,7 @@ mod tests {
         assert_eq!(resolve_api_key("openai", "setting-key"), "env-openai-key");
     }
 
-    /// #1446 (2): a curl *process*-level failure (nonzero exit, e.g. DNS
+    /// A curl *process*-level failure (nonzero exit, e.g. DNS
     /// failure or connection refused) with `-s`'s empty stderr must still
     /// produce a non-empty, actionable message — not the bare "curl
     /// failed:" the bug reported. RED verified: reverting to

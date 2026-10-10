@@ -40,7 +40,6 @@ pub struct View {
     /// existed, `open_fold` deleted the region outright, so `zf{motion}` on
     /// text with no indent structure (nothing for `detect_fold_range` to
     /// rediscover) round-tripped `zo` into a fold `zc` could never reclose
-    /// (#1006).
     pub fold_defs: Vec<FoldRegion>,
     /// In aligned-diff view, the aligned-row index this window's render
     /// should start at. Set by `sync_scroll_binds`; cleared when the
@@ -51,7 +50,7 @@ pub struct View {
     /// the viewport — multiple aligned-row indices can map to the same
     /// buffer line via the seek-then-backup-over-padding logic. Storing
     /// the aligned index lets both panes start at exactly the same row,
-    /// eliminating the cumulative drift past hunks (#166).
+    /// eliminating the cumulative drift past hunks.
     pub aligned_top: Option<usize>,
 }
 
@@ -115,7 +114,7 @@ impl View {
     /// Vim's `foldclosed()` (which reports the outermost, not a nested
     /// one). Used to extend a linewise command's range when it touches a
     /// closed fold, e.g. `dd`/`yy` on a closed fold's header apply to every
-    /// line inside it (`:h fold-behavior`, #1006).
+    /// line inside it (`:h fold-behavior`).
     pub fn enclosing_closed_fold(&self, line_idx: usize) -> Option<&FoldRegion> {
         self.folds
             .iter()
@@ -124,7 +123,7 @@ impl View {
     }
 
     /// Close a fold spanning `start..=end`, keeping `folds` sorted by
-    /// `start`. Also records the region in `fold_defs` (#1006) so a later
+    /// `start`. Also records the region in `fold_defs` so a later
     /// `zo` then `zc` recloses exactly this region.
     ///
     /// Deliberately does **not** drop an existing closed fold that's fully
@@ -132,7 +131,7 @@ impl View {
     /// tidy) — closing a *nested* fold's parent must not silently reopen
     /// the child. Verified against `nvim --headless`: opening a closed
     /// outer fold with a closed inner fold still inside leaves the inner
-    /// one closed (#1006) — `foldclosed()` on an inner line still reports
+    /// one closed — `foldclosed()` on an inner line still reports
     /// the inner range. Losing the inner entry when the outer closed broke
     /// exactly that. Multiple overlapping closed entries are fine:
     /// `is_line_hidden` only needs *any* of them to match, and
@@ -152,13 +151,12 @@ impl View {
 
     /// Open (remove) the fold whose header is `start`. The definition is
     /// kept in `fold_defs` — only its closed/open display state changes
-    /// (#1006).
     pub fn open_fold(&mut self, start: usize) {
         self.folds.retain(|f| f.start != start);
     }
 
-    /// Remove all folds in this window. Definitions are kept (`zR` doesn't
-    /// forget folds, it just opens them — #1006).
+    /// Remove all folds in this window. Definitions are kept; opening all
+    /// folds does not forget them.
     pub fn open_all_folds(&mut self) {
         self.folds.clear();
     }
@@ -194,7 +192,7 @@ impl View {
         while remaining > 0 && line < max_line {
             line += 1;
             // If we landed inside a fold body, jump past it. Several closed
-            // folds can contain the same line when they're nested (#1006) —
+            // folds can contain the same line when they're nested —
             // take the outermost (largest `end`), not just the first match,
             // or a nested fold's own end would land the cursor back inside
             // its still-closed parent.

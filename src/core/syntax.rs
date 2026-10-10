@@ -722,7 +722,7 @@ pub struct Syntax {
     /// [`Syntax::reparse_incremental`], this tree is diffed against the
     /// incoming text (see [`compute_edit`]), `tree.edit()`-ed with the
     /// resulting [`InputEdit`], and passed back into `parser.parse()` as the
-    /// reuse baseline — real tree-sitter incremental parsing (#1721), not
+    /// reuse baseline — real tree-sitter incremental parsing, not
     /// just best-effort subtree reuse. Edits are reconstructed by diffing
     /// text rather than threaded through from the buffer's mutation call
     /// sites, so this stays correct regardless of which of the many insert/
@@ -733,10 +733,7 @@ pub struct Syntax {
     /// `None` before the first parse.
     last_text: Option<String>,
     /// Running counters of how [`Syntax::reparse_incremental`] was
-    /// satisfied — read by tests to prove a keystroke-sized edit on a large
-    /// buffer doesn't trigger a full O(file) reparse after the first one
-    /// (#1721's "no full-file work per keystroke" acceptance bar), and
-    /// available generally as instrumentation.
+    /// satisfied — read by tests as instrumentation.
     stats: SyntaxStats,
 }
 
@@ -870,24 +867,21 @@ impl Syntax {
     }
 
     /// The LSP-style language identifier (e.g. `"rust"`, `"lua"`) this
-    /// `Syntax` was built for — what `vimcode.syntax.node_at`/`query` (#1654
-    /// P6) report back to a plugin as the parsed language's name.
+    /// `Syntax` was built for.
     pub fn language_id(&self) -> &'static str {
         self.language.language_id()
     }
 
     /// The most recently produced tree-sitter parse tree, if any parse has
-    /// happened yet. Read-only access for the native plugin API (#1654 P6) —
-    /// callers must not hand out anything derived from this tree that
-    /// outlives the current call (no Lua-side tree objects).
+    /// happened yet. Callers must not hand out anything derived from this
+    /// tree that outlives the current call.
     pub fn tree(&self) -> Option<&Tree> {
         self.last_tree.as_ref()
     }
 
     /// The tree-sitter `Language` this `Syntax` parses with — needed to
-    /// compile an ad hoc plugin-supplied query (#1654 P6's
-    /// `vimcode.syntax.query`), since the built-in `self.query` only ever
-    /// covers the highlight query baked in at construction time.
+    /// compile an ad hoc plugin-supplied query, since the built-in
+    /// `self.query` only covers the highlight query baked in at construction.
     pub fn ts_language(&self) -> Language {
         self.language.language()
     }
@@ -917,7 +911,7 @@ impl Syntax {
     /// delete, replace, undo/redo, paste, multi-cursor, macros) produced
     /// the new text, at the cost of an O(file) byte comparison — orders of
     /// magnitude cheaper than the O(file) tree-sitter parse + highlight
-    /// query it replaces (#1721).
+    /// query it replaces.
     ///
     /// Falls back to a full `parser.parse(text, None)` when there's no
     /// previous tree/text to diff against (first parse for this `Syntax`).
@@ -1355,17 +1349,10 @@ pub struct BreadcrumbSymbol {
     pub col: usize,
 }
 
-// ─── Native plugin API read surface (#1654 P6) ──────────────────────────────
-//
-// Plain, owned types a `vimcode.syntax.*` call hands back to Lua — never a
-// tree-sitter `Node`/`Tree` itself, which borrows from the parse tree and
-// would have no sound way to "outlive the call" into Lua. `row`/`end_row`
+// Plain, owned types for the native plugin API — never a tree-sitter
+// `Node`/`Tree` itself, which borrows from the parse tree. `row`/`end_row`
 // are 0-indexed source lines; `col`/`end_col` are 0-indexed **byte** offsets
-// within that line (tree-sitter's native `Point` column unit) — a plugin
-// written against tree-sitter query output already thinks in those units,
-// and converting to/from UTF-8 char or UTF-16 offsets here would make
-// `node_at`/`query` disagree with the query source a plugin pastes in from
-// `nvim-treesitter`-style tooling.
+// within that line (tree-sitter's native `Point` column unit).
 
 /// A byte-column range in source text, tree-sitter's native unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1418,12 +1405,9 @@ pub struct SyntaxCaptureInfo {
 }
 
 impl Syntax {
-    /// `vimcode.syntax.node_at(buf, row, col)` (#1654 P6): the smallest
-    /// tree-sitter node spanning `(row, col)`, plus its immediate parent.
-    /// `col` is a 0-indexed byte offset within `row` — see the module note
-    /// above. `Err` (surfaced as a Lua error by the thin wrapper in
-    /// `plugin.rs`) when nothing has been parsed yet, or the position is out
-    /// of range.
+    /// The smallest tree-sitter node spanning `(row, col)`, plus its immediate
+    /// parent. `col` is a 0-indexed byte offset within `row`. Returns an error
+    /// when nothing has been parsed yet or the position is out of range.
     pub fn node_at(&self, row: usize, col: usize) -> Result<SyntaxNodeInfo, String> {
         let tree = self
             .tree()
@@ -1445,13 +1429,10 @@ impl Syntax {
         })
     }
 
-    /// `vimcode.syntax.query(buf, query_string, range?)` (#1654 P6): compile
-    /// an ad hoc query against this buffer's language and run it over the
-    /// most recent parse tree, optionally restricted to the 0-indexed,
-    /// exclusive `[start_row, end_row)` row range. `text` must be the same
-    /// text the tree was parsed from (the caller — `Engine::plugin_api_
-    /// syntax_query` — re-fetches it from the live buffer each call; there
-    /// is no cached copy on `Syntax` itself).
+    /// Compile an ad hoc query against this buffer's language and run it over
+    /// the most recent parse tree, optionally restricted to the 0-indexed,
+    /// exclusive `[start_row, end_row)` row range. `text` must be the same text
+    /// the tree was parsed from.
     pub fn query_captures(
         &self,
         text: &str,
@@ -1491,7 +1472,7 @@ impl Syntax {
 /// Compute the single [`InputEdit`] describing how `old` text became `new`
 /// text, via longest common prefix/suffix — the technique editors without
 /// an exact edit-event log use to recover an edit descriptor tree-sitter
-/// can incrementally reparse against (#1721). When several disjoint edits
+/// can incrementally reparse against. When several disjoint edits
 /// (e.g. multi-cursor inserts) happened between calls, this collapses them
 /// into one bounding region spanning the first to the last difference —
 /// still a *correct* edit descriptor (it accurately describes what the old
@@ -1612,9 +1593,8 @@ fn is_utf8_char_boundary(bytes: &[u8], i: usize) -> bool {
     i >= bytes.len() || (bytes[i] & 0xC0) != 0x80
 }
 
-/// Row/column (tree-sitter's `Point`, byte-based column per its own
-/// convention) of `byte_offset` within `text`. Used to build the
-/// [`InputEdit`] positions [`compute_edit`] needs alongside byte offsets.
+/// Row/column (tree-sitter's `Point`, byte-based column) of `byte_offset`
+/// within `text`, used to build the [`InputEdit`] positions [`compute_edit`]
 fn point_for_byte(text: &str, byte_offset: usize) -> Point {
     let bytes = &text.as_bytes()[..byte_offset];
     let row = bytes.iter().filter(|&&b| b == b'\n').count();
@@ -2350,8 +2330,6 @@ mod tests {
         assert!(!kinds.contains("keyword"));
     }
 
-    // ── #1721: real incremental parsing ─────────────────────────────────
-
     #[test]
     fn test_compute_edit_none_when_unchanged() {
         assert_eq!(compute_edit("same text", "same text"), None);
@@ -2396,7 +2374,7 @@ mod tests {
         // '字' (U+5B57) -> `E5 AD 97`, '存' (U+5B58) -> `E5 AD 98`: they
         // share their first two bytes, so a raw byte-level common-prefix
         // scan between the two strings stops 2 bytes into the 3-byte
-        // sequence. Before the char-boundary snap (#1721 review), this
+        // sequence. Before the char-boundary snap, this
         // made `start_byte`/`new_end_byte` land mid-codepoint, and any
         // `&str` slicing on those offsets (e.g.
         // `update_max_col_incremental`) panicked with "byte index N is
@@ -2416,23 +2394,12 @@ mod tests {
 
     #[test]
     fn test_compute_edit_shared_suffix_byte_differing_lengths() {
-        // #1721 review round 2: the *suffix*-side counterpart of the test
-        // above, and the case the first fix got wrong. 'җ' (U+0497) is
-        // `D2 97` (2 bytes) and '字' (U+5B57) is `E5 AD 97` (3 bytes) —
-        // they share their *trailing* byte (`0x97`) and have *different*
-        // byte lengths. Replacing one with the other at the end of the
-        // text (nothing following to force a safe ASCII boundary stop)
-        // makes the byte-level common-*suffix* scan match 1 byte, landing
-        // both end offsets mid-codepoint, each at a different depth into
-        // its own character.
-        //
-        // The first fix walked `old_end_byte` *inwards* to a boundary and
-        // transferred the same numeric delta to `new_end_byte`. That
-        // panicked in one direction (`new_end_byte` left on a
-        // continuation byte of `new`) and silently produced a zero-width
-        // no-op edit in the other (a whole character replaced, reported
-        // to tree-sitter as "nothing changed"). Both directions are
-        // checked here.
+        // 'җ' (U+0497) is `D2 97` (2 bytes) and '字' (U+5B57) is `E5 AD 97`
+        // (3 bytes) — they share their *trailing* byte (`0x97`). Replacing one
+        // with the other at the end of the text makes the byte-level
+        // common-*suffix* scan match 1 byte, landing both end offsets
+        // mid-codepoint. This tests that both directions handle the boundary
+        // correctly.
         for (old, new, old_ch, new_ch) in [("җ", "字", 'җ', '字'), ("字", "җ", '字', 'җ')] {
             let edit = compute_edit(old, new).expect("texts differ");
             // Every offset is a real char boundary in *both* texts it is
@@ -2540,19 +2507,7 @@ mod tests {
     }
 
     /// If `c` is one of the deliberately UTF-8-colliding fuzz characters,
-    /// the partner it should be substituted for to *force* the collision
-    /// (#1721 review round 2).
-    ///
-    /// Leaving the fuzz to hit these pairs by chance is not coverage:
-    /// hitting one needs the substituted position to already hold one of
-    /// the pair *and* the random replacement to be its exact partner,
-    /// which is a ~0.1%-per-step coincidence — measured, not estimated,
-    /// by re-running both fuzz oracles against the round-1-broken
-    /// `compute_edit` with purely random substitution: 300 and 400 steps
-    /// and neither failed. Biasing the substitution this way makes the
-    /// collision land every time a substitution hits one of these
-    /// characters (a few percent of steps), and both oracles then do fail
-    /// against the broken version.
+    /// the partner it should be substituted for to force the collision.
     fn colliding_partner(c: char, rng: &mut Lcg) -> Option<char> {
         match c {
             // Shares its *leading* two bytes with '存', its *trailing*
@@ -2568,7 +2523,7 @@ mod tests {
     /// character boundary, including multi-byte UTF-8 (accented Latin,
     /// CJK, emoji) and newlines.
     fn apply_random_edit(chars: &mut Vec<char>, rng: &mut Lcg) {
-        // Two deliberately-colliding pairs (#1721 review), because every
+        // Two deliberately-colliding pairs, because every
         // other char below has a distinct leading *and* trailing byte
         // from every other, which made both classes of bug invisible to
         // the fuzz corpus before they were added:
@@ -2590,17 +2545,10 @@ mod tests {
             '🙂',
         ];
         let len = chars.len();
-        // Three operations, not two (#1721 review round 2): in-place
-        // *substitution* is the one that makes the colliding pairs above
-        // actually collide. An insert or a delete shifts everything after
-        // it, so the common-prefix/suffix scan meets a differing byte at
-        // a character boundary almost every time; only replacing a
-        // character with a different one of the same-ish position pits
-        // two encodings against each other byte-for-byte. Without this
-        // branch the corpus could contain the colliding characters and
-        // still never produce a mid-codepoint `InputEdit` boundary —
-        // verified, not assumed: with substitution removed, the
-        // round-1-broken `compute_edit` survived all 400 steps.
+        // In-place substitution is the operation that makes the colliding
+        // pairs actually collide — insert or delete shifts everything after it,
+        // so the common-prefix/suffix scan meets a differing byte at a
+        // character boundary almost every time.
         let roll = rng.next_usize(100);
         if len > 0 && roll < 25 {
             let pos = rng.next_usize(len);
@@ -2619,7 +2567,7 @@ mod tests {
         }
     }
 
-    /// Correctness oracle (#1721): a long randomised sequence of inserts
+    /// Correctness oracle: a long randomised sequence of inserts
     /// and deletes (multi-byte UTF-8, newlines, random positions) plus
     /// simulated undo/redo (jumping back to an earlier snapshot — from
     /// `Syntax`'s point of view that's just another arbitrary text
@@ -2634,10 +2582,8 @@ mod tests {
     /// wrong (stale-offset) captures. Restored before committing.
     #[test]
     fn test_incremental_reparse_matches_full_reparse_fuzz() {
-        // The seed carries the UTF-8-colliding characters from the start
-        // (#1721 review round 2) so `colliding_partner` substitutions can
-        // fire in the first few steps rather than waiting for a random
-        // insert to introduce one.
+        // The seed contains UTF-8-colliding characters so `colliding_partner`
+        // substitutions can fire in the first few steps.
         let seed = "fn main() {\n    let x = 1;\n    let s = \"字存җ\";\n    if x > 0 {\n        println!(\"{}\", x);\n    }\n}\n";
         let mut chars: Vec<char> = seed.chars().collect();
         let mut incremental = Syntax::new_for_language(SyntaxLanguage::Rust);
@@ -2673,20 +2619,10 @@ mod tests {
         }
     }
 
-    /// #1721 review round 2, deterministic companion to the fuzz oracle:
-    /// substituting a character for one of a *different byte length* that
-    /// shares its *trailing* UTF-8 byte ('җ' = `D2 97` vs '字' =
-    /// `E5 AD 97`) must still produce highlights identical to a fresh full
-    /// parse, in both directions.
-    ///
-    /// RED-verified against the first fix (which walked `old_end_byte`
-    /// inwards to a boundary and transferred the same delta to
-    /// `new_end_byte`): the `字` → `җ` direction collapsed to a zero-width
-    /// no-op `InputEdit`, so `old_tree.edit()` told tree-sitter nothing
-    /// changed and it reused the stale subtree over different text — this
-    /// assertion caught that divergence. The opposite direction panicked
-    /// outright in `update_max_col_incremental` (covered by
-    /// `buffer_manager.rs`'s companion test).
+    /// Deterministic test for the case where a character is substituted for
+    /// one of a different byte length that shares its trailing UTF-8 byte
+    /// ('җ' = `D2 97` vs '字' = `E5 AD 97`) — highlights must match a fresh
+    /// full parse in both directions.
     #[test]
     fn test_incremental_reparse_shared_suffix_byte_substitution_matches_full() {
         for (first, second) in [
@@ -2714,11 +2650,9 @@ mod tests {
         }
     }
 
-    /// No full-file work per keystroke (#1721's acceptance bar): after the
-    /// unavoidable first full parse, typing into a large buffer must not
-    /// trigger any further full reparses — every subsequent keystroke
-    /// should reuse the previous tree via `tree.edit()` + incremental
-    /// `parser.parse(text, Some(&old_tree))`.
+    /// After the unavoidable first full parse, typing into a large buffer
+    /// must not trigger further full reparses — every subsequent keystroke
+    /// should reuse the previous tree via `tree.edit()` and incremental parse.
     #[test]
     fn test_reparse_incremental_no_full_parse_after_first_keystroke() {
         let mut text = "fn main() {\n".to_string();

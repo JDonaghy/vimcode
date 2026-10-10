@@ -16,7 +16,7 @@ pub struct Tab {
     /// The window that was active immediately before the current one, at
     /// the *tab* (vim-split) level — distinct from `Engine::prev_active_group`,
     /// which tracks the VSCode-style editor-group toggle. Backs `CTRL-W p`
-    /// (`:h CTRL-W_p`) within a single editor group (#1292). `None` until the
+    /// (`:h CTRL-W_p`) within a single editor group. `None` until the
     /// active window has changed at least once in this tab. The field itself
     /// is never cleared when the recorded window later leaves the tab
     /// (closed, or moved elsewhere) — instead `execute_wincmd`'s `'p'` arm
@@ -37,10 +37,7 @@ impl Tab {
     }
 
     /// Make `window_id` the active window, recording the window that *was*
-    /// active as `prev_window` so `CTRL-W p` can recall it (#1292). Every
-    /// call site that reassigns `active_window` should route through this
-    /// rather than setting the field directly — the #1292 audit is the
-    /// list of sites that used to skip it.
+    /// active as `prev_window` so `CTRL-W p` can recall it.
     pub fn focus_window(&mut self, window_id: WindowId) {
         if self.active_window != window_id {
             self.prev_window = Some(self.active_window);
