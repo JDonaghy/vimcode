@@ -574,16 +574,6 @@ impl Engine {
             .join("extensions")
             .join(&ext_name);
         let base_url = self.resolve_registry_base_url(&manifest);
-        if std::env::var("VIMCODE_DEBUG_1890").is_ok() {
-            eprintln!(
-                "[1890-debug] site=install_with_runtime_check ext_name={ext_name:?} test_home={:?} saves_suppressed={} scripts_empty={} base_url={:?} ext_dir={:?}",
-                paths::test_home_override(),
-                crate::core::session::saves_suppressed(),
-                manifest.scripts.is_empty(),
-                base_url,
-                ext_dir,
-            );
-        }
         if (paths::test_home_override().is_some() || !crate::core::session::saves_suppressed())
             && !manifest.scripts.is_empty()
             && !base_url.is_empty()
@@ -1346,16 +1336,6 @@ impl Engine {
             .join("extensions")
             .join(&ext_name);
         let base_url = self.resolve_registry_base_url(&manifest);
-        if std::env::var("VIMCODE_DEBUG_1890").is_ok() {
-            eprintln!(
-                "[1890-debug] site=update_one ext_name={ext_name:?} test_home={:?} saves_suppressed={} scripts_empty={} base_url={:?} ext_dir={:?}",
-                paths::test_home_override(),
-                crate::core::session::saves_suppressed(),
-                manifest.scripts.is_empty(),
-                base_url,
-                ext_dir,
-            );
-        }
         if (paths::test_home_override().is_some() || !crate::core::session::saves_suppressed())
             && !manifest.scripts.is_empty()
             && !base_url.is_empty()
@@ -1463,16 +1443,6 @@ impl Engine {
             if let Some(manifest) = manifests.iter().find(|m| &m.name == name) {
                 let ext_dir = paths::vimcode_config_dir().join("extensions").join(name);
                 let base_url = self.resolve_registry_base_url(manifest);
-                if std::env::var("VIMCODE_DEBUG_1890").is_ok() {
-                    eprintln!(
-                        "[1890-debug] site=update_all ext_name={name:?} test_home={:?} saves_suppressed={} scripts_empty={} base_url={:?} ext_dir={:?}",
-                        paths::test_home_override(),
-                        crate::core::session::saves_suppressed(),
-                        manifest.scripts.is_empty(),
-                        base_url,
-                        ext_dir,
-                    );
-                }
                 if (paths::test_home_override().is_some()
                     || !crate::core::session::saves_suppressed())
                     && !manifest.scripts.is_empty()

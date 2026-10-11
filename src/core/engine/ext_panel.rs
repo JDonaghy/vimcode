@@ -4954,3 +4954,48 @@ mod issue_1513_at_symbol_and_at_dir_mentions {
         let _ = std::fs::remove_dir_all(&workspace);
     }
 }
+
+#[cfg(test)]
+mod save_ext_settings_guard_tests {
+    use crate::core::{paths, Engine};
+
+    /// `set_ext_setting` must never write to disk in a `--lib` unit test
+    /// build, mirroring `Settings::save()`'s `#[cfg(test)] return;` guard.
+    ///
+    /// RED verified: temporarily deleting the `#[cfg(test)] return;` line
+    /// at the top of `save_ext_settings` (leaving the `saves_suppressed()`
+    /// check in place) makes this fail — `settings.json` shows up under
+    /// the sandboxed home because `vimcode_config_dir()` already honours
+    /// `set_test_home` even without that guard, so only the explicit
+    /// `#[cfg(test)]` early return stops a plain unit test from reaching
+    /// `std::fs::write`.
+    #[test]
+    fn set_ext_setting_does_not_write_to_disk() {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_save_ext_settings_guard_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create sandboxed home dir");
+        let _guard = paths::set_test_home(&home);
+
+        let mut engine = Engine::new_for_test();
+        engine.set_ext_setting("demo-ext", "some_key", "some_value");
+
+        let settings_path = home
+            .join(".config")
+            .join("vimcode")
+            .join("extensions")
+            .join("demo-ext")
+            .join("settings.json");
+        assert!(
+            !settings_path.exists(),
+            "save_ext_settings must be a no-op in #[cfg(test)] builds, \
+             mirroring Settings::save() — found an unexpected write at \
+             {settings_path:?}"
+        );
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}

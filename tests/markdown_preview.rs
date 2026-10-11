@@ -181,6 +181,21 @@ fn preview_link_cleaned_on_close() {
 
 #[test]
 fn extension_readme_opens_in_own_tab() {
+    // `ext_open_selected_readme` reads from `paths::vimcode_config_dir()`,
+    // which (outside `--lib` unit test builds, which this integration-test
+    // binary is not) falls back to the real `$HOME`. Point `$HOME` at a
+    // throwaway directory for the duration of this test, serialized against
+    // any other test in this binary that also mutates `$HOME`, so the
+    // README fixture below never lands in the real developer home.
+    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home_dir = std::env::temp_dir().join(format!(
+        "vc-markdown-preview-readme-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home_dir);
+    std::fs::create_dir_all(&home_dir).expect("create throwaway home dir");
+    let _home_guard = EnvVarGuard::set("HOME", home_dir.as_os_str());
+
     let mut e = engine_with("");
     // Simulate having an installed extension with a README on disk.
     e.extension_state.mark_installed("rust");
@@ -191,9 +206,9 @@ fn extension_readme_opens_in_own_tab() {
         ..Default::default()
     }]);
 
-    // Create a temporary README file so the sidebar can read it
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let ext_dir = std::path::PathBuf::from(&home).join(".config/vimcode/extensions/rust");
+    // Create a temporary README file so the sidebar can read it, under the
+    // throwaway `$HOME` set up above.
+    let ext_dir = home_dir.join(".config/vimcode/extensions/rust");
     let _ = std::fs::create_dir_all(&ext_dir);
     let readme_path = ext_dir.join("README.md");
     std::fs::write(&readme_path, "# Rust Extension\nREADME content").unwrap();
@@ -216,8 +231,9 @@ fn extension_readme_opens_in_own_tab() {
     assert!(state.read_only);
     assert!(state.md_rendered.is_some());
 
-    // Clean up
-    let _ = std::fs::remove_file(&readme_path);
+    // Clean up the throwaway home dir. `_home_guard` drops after this and
+    // restores the real `$HOME`.
+    let _ = std::fs::remove_dir_all(&home_dir);
 }
 
 // ─── Undo/redo refreshes preview ────────────────────────────────────────────
@@ -342,4 +358,34 @@ fn markdown_renderer_produces_styled_spans() {
             .any(|s| s.style == MdStyle::Italic),
         "expected Italic span"
     );
+}
+
+// ─── `$HOME` isolation helpers ───────────────────────────────────────────────
+
+/// Serializes tests in this binary that mutate the process-global `$HOME`
+/// environment variable, so they can't stomp on each other when the test
+/// runner executes them concurrently on different threads.
+static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard: snapshot + restore an environment variable across a test.
+struct EnvVarGuard {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+        let old = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, old }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.old.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }

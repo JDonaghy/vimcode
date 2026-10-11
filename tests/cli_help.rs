@@ -2,18 +2,36 @@
 //! `DISPLAY`/`WAYLAND_DISPLAY` removed and asserts it prints usage
 //! and exits 0 rather than panicking or printing GTK's generic help.
 //! The `--help` flag must be processed before any GTK initialization.
+//!
+//! `--help` itself exits before anything would read or write
+//! `$HOME/.config/vimcode`, but both tests still pin `$HOME` to a
+//! throwaway directory (mirroring `tests/ext_install_cli.rs`'s
+//! real-binary-spawn pattern) so that stays true even if `--help`
+//! handling ever moves later in startup.
 
 use std::process::Command;
 
+/// Build a throwaway, empty `$HOME` for a spawned binary and return its path.
+fn throwaway_home(label: &str) -> std::path::PathBuf {
+    let home =
+        std::env::temp_dir().join(format!("vc-cli-help-test-{}-{label}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create throwaway home dir");
+    home
+}
+
 #[test]
 fn vimcode_help_prints_usage_and_exits_0_with_no_display() {
+    let home = throwaway_home("vimcode");
     let exe = env!("CARGO_BIN_EXE_vimcode");
     let output = Command::new(exe)
         .arg("--help")
+        .env("HOME", &home)
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
         .output()
         .expect("failed to run vimcode --help");
+    let _ = std::fs::remove_dir_all(&home);
 
     assert!(
         output.status.success(),
@@ -39,13 +57,16 @@ fn vimcode_help_prints_usage_and_exits_0_with_no_display() {
 
 #[test]
 fn vcd_help_prints_usage_and_exits_0() {
+    let home = throwaway_home("vcd");
     let exe = env!("CARGO_BIN_EXE_vcd");
     let output = Command::new(exe)
         .arg("--help")
+        .env("HOME", &home)
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
         .output()
         .expect("failed to run vcd --help");
+    let _ = std::fs::remove_dir_all(&home);
 
     assert!(
         output.status.success(),
