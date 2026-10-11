@@ -26,6 +26,10 @@
     "smoke-spec lane: tests/smoke-spec/*.yaml are parsed by coord's own Tier-2",
     "driver loaders, which no cargo job imports, so an unparseable spec would",
     "otherwise only surface during a real acceptance pass on fleet hardware.",
+    "#1896 added the comment-history-lint lane: tools/comment_history_lint.py",
+    "is a standalone Python script no cargo job runs, so a regression in it (or",
+    "a PR that lets a module's fix-history-comment count climb) would otherwise",
+    "go uncaught.",
     "",
     "Apply with:  scripts/apply-branch-protection.sh",
     "Audit with:  scripts/apply-branch-protection.sh --check"
@@ -37,7 +41,8 @@
     "Test (macOS native, AppKit)",
     "Build (Windows TUI, vcd.exe)",
     "Build (Windows GUI, vimcode.exe)",
-    "Validate Tier-2 smoke specs"
+    "Validate Tier-2 smoke specs",
+    "Comment-history lint"
   ],
 
   "branches": {
