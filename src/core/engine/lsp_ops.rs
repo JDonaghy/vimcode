@@ -92,7 +92,12 @@ impl Engine {
         if !self.settings.lsp_enabled || self.lsp_manager.is_some() {
             return;
         }
-        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // `self.cwd` is the editor's own workspace root, deliberately kept in
+        // sync (see `adopt_cwd_for_startup_file`) without always matching the
+        // OS process cwd. Install hints and auto-install commands need this
+        // value, not the process cwd, so a pinned `rust-toolchain.toml` at the
+        // workspace root is actually honored (#1905).
+        let root = self.cwd.clone();
         let mut mgr = LspManager::new(root, &self.settings.lsp_servers);
         mgr.set_ext_manifests(
             self.ext_installed_manifests(),

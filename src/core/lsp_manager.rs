@@ -57,7 +57,38 @@ pub fn cargo_bin_probe_ok(path: &Path, binary: &str) -> bool {
         return true;
     }
 
-    // Quick probe: run `<binary> --version` and check for a successful exit.
+    match cargo_bin_probe_output(path) {
+        Ok(()) => true,
+        Err(ProbeFailure::BadExit(stderr_line)) => {
+            install_log(&format!(
+                "[ext-check] PROBE FAILED for {binary} at {}: {stderr_line}",
+                path.display(),
+            ));
+            false
+        }
+        Err(ProbeFailure::SpawnError(e)) => {
+            install_log(&format!(
+                "[ext-check] PROBE ERROR for {binary} at {}: {e}",
+                path.display()
+            ));
+            false
+        }
+    }
+}
+
+/// Why a `~/.cargo/bin/` probe (`<binary> --version`) failed.
+enum ProbeFailure {
+    /// The process ran but exited non-zero; carries the first line of stderr.
+    BadExit(String),
+    /// The process could not even be spawned.
+    SpawnError(std::io::Error),
+}
+
+/// Run `<path> --version` and report success/failure. Shared by
+/// `cargo_bin_probe_ok` (which only needs a bool) and
+/// `pinned_toolchain_hint_for_binary` (which needs the stderr to recover the
+/// pinned toolchain's name for a better "not found" hint).
+fn cargo_bin_probe_output(path: &Path) -> Result<(), ProbeFailure> {
     let mut cmd = crate::core::git::hidden_command(path);
     cmd.arg("--version")
         .stdin(std::process::Stdio::null())
@@ -66,25 +97,63 @@ pub fn cargo_bin_probe_ok(path: &Path, binary: &str) -> bool {
     match cmd.output() {
         Ok(output) => {
             if output.status.success() {
-                true
+                Ok(())
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                install_log(&format!(
-                    "[ext-check] PROBE FAILED for {binary} at {}: {}",
-                    path.display(),
-                    stderr.lines().next().unwrap_or("(no output)")
-                ));
-                false
+                Err(ProbeFailure::BadExit(
+                    stderr.lines().next().unwrap_or("(no output)").to_string(),
+                ))
             }
         }
-        Err(e) => {
-            install_log(&format!(
-                "[ext-check] PROBE ERROR for {binary} at {}: {e}",
-                path.display()
+        Err(e) => Err(ProbeFailure::SpawnError(e)),
+    }
+}
+
+/// Parse the pinned toolchain name out of a rustup proxy's failure stderr,
+/// e.g. `error: Unknown binary 'rust-analyzer' in official toolchain
+/// '1.97.1-aarch64-apple-darwin'` -> `Some("1.97.1-aarch64-apple-darwin")`.
+fn parse_official_toolchain_from_stderr(stderr: &str) -> Option<String> {
+    let marker = "official toolchain '";
+    let start = stderr.find(marker)? + marker.len();
+    let rest = &stderr[start..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+/// If `binary` resolves to a broken rustup proxy in `~/.cargo/bin/` whose
+/// failure message names a pinned toolchain, return that toolchain's name.
+/// Used to offer the directory-independent `rustup component add --toolchain
+/// <ver> …` form alongside the primary hint (#1905).
+fn pinned_toolchain_hint_for_binary(binary: &str) -> Option<String> {
+    let candidate = super::paths::home_dir()
+        .join(".cargo")
+        .join("bin")
+        .join(binary);
+    match cargo_bin_probe_output(&candidate) {
+        Err(ProbeFailure::BadExit(stderr_line)) => {
+            parse_official_toolchain_from_stderr(&stderr_line)
+        }
+        _ => None,
+    }
+}
+
+/// Build the "<binary> not found. Run: <install_cmd>" hint, naming the
+/// workspace root the command needs to run in (install commands like `rustup
+/// component add` are resolved against the *current directory's* pinned
+/// toolchain, not the running process's), plus — when the binary is a broken
+/// rustup proxy for a pinned toolchain — an explicit `--toolchain <ver>` form
+/// that works from any directory (#1905).
+fn not_found_hint(binary: &str, install_cmd: &str, workspace_root: &Path) -> String {
+    let root_display = workspace_root.display();
+    let mut hint = format!("{binary} not found. Run in {root_display}: {install_cmd}");
+    if install_cmd.trim_start().starts_with("rustup component add") {
+        if let Some(toolchain) = pinned_toolchain_hint_for_binary(binary) {
+            hint.push_str(&format!(
+                " (or from any directory: {install_cmd} --toolchain {toolchain})"
             ));
-            false
         }
     }
+    hint
 }
 
 // ---------------------------------------------------------------------------
@@ -968,7 +1037,7 @@ impl LspManager {
                         } else {
                             manifest.lsp.binary.as_str()
                         };
-                        format!("{binary_label} not found. Run: {install_cmd}")
+                        not_found_hint(binary_label, install_cmd, &self.root_path)
                     } else {
                         // When there is no install command, name the extension and
                         // say plainly that it has no installer on this platform.
@@ -1027,17 +1096,24 @@ impl LspManager {
         let tx = self.event_tx.clone();
         let lang_id = lang_id.to_string();
         let install_cmd = install_cmd.to_string();
+        // Run in the workspace root (not whatever directory the process
+        // happens to be in) so a command like `rustup component add
+        // rust-analyzer` picks up a pinned `rust-toolchain.toml` (#1905).
+        let workspace_root = self.root_path.clone();
         std::thread::spawn(move || {
             install_log(&format!(
-                "[{}] START lang_id={lang_id}\nCMD: {install_cmd}\nPATH: {}",
+                "[{}] START lang_id={lang_id}\nCMD: {install_cmd}\nCWD: {}\nPATH: {}",
                 timestamp(),
+                workspace_root.display(),
                 std::env::var("PATH").unwrap_or_else(|_| "(unset)".into()),
             ));
 
             // Run via shell so npm/pip/dotnet etc. resolve from user PATH.
             // `shell_cmd()` picks `sh -c` vs `cmd /C` and hides the console window
             // on Windows — the single construction point every shell spawn site goes through.
-            let result = crate::core::terminal::shell_cmd(&install_cmd).output();
+            let result = crate::core::terminal::shell_cmd(&install_cmd)
+                .current_dir(&workspace_root)
+                .output();
 
             match result {
                 Ok(out) => {
@@ -2027,5 +2103,214 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&counter_dir);
+    }
+
+    // ─── #1905: "not found" hint names the workspace root + toolchain ──
+
+    /// Build `<home>/.cargo/bin/<binary_name>` as a script that always exits
+    /// non-zero and prints `stderr_msg` to stderr — simulating a rustup
+    /// proxy for a pinned toolchain that's missing the component. Returns
+    /// the fake home directory; caller cleans up and calls
+    /// `crate::core::paths::set_test_home` with it.
+    #[cfg(unix)]
+    fn fake_cargo_bin_broken_proxy_with_stderr(
+        tag: &str,
+        binary_name: &str,
+        stderr_msg: &str,
+    ) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_1905_home_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cargo_bin = home.join(".cargo").join("bin");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let binary_path = cargo_bin.join(binary_name);
+        std::fs::write(
+            &binary_path,
+            format!("#!/bin/sh\necho \"{stderr_msg}\" >&2\nexit 1\n"),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Same executability warm-up as `fake_cargo_bin_broken_proxy` — see
+        // its comment for why this loop exists.
+        let mut execd = false;
+        for _ in 0..200 {
+            if std::process::Command::new(&binary_path)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+            {
+                execd = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            execd,
+            "fake broken proxy at {} never became executable",
+            binary_path.display()
+        );
+        home
+    }
+
+    #[test]
+    fn parse_official_toolchain_from_stderr_extracts_pinned_version() {
+        let stderr = "error: Unknown binary 'rust-analyzer' in official toolchain \
+                       '1.97.1-aarch64-apple-darwin'\n";
+        assert_eq!(
+            parse_official_toolchain_from_stderr(stderr),
+            Some("1.97.1-aarch64-apple-darwin".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_official_toolchain_from_stderr_returns_none_without_marker() {
+        assert_eq!(
+            parse_official_toolchain_from_stderr("some unrelated error\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn not_found_hint_names_workspace_root() {
+        // Sandbox `$HOME` to an empty dir with no `.cargo/bin/` at all, so
+        // this assertion can't be swayed by whatever rust-analyzer proxy (or
+        // lack thereof) happens to exist on the machine actually running the
+        // test — `pinned_toolchain_hint_for_binary` must find nothing to
+        // probe and the hint stays exactly the base form.
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_1905_nohome_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let root = Path::new("/workspace/my-project");
+        let hint = not_found_hint("rust-analyzer", "rustup component add rust-analyzer", root);
+        assert_eq!(
+            hint,
+            "rust-analyzer not found. Run in /workspace/my-project: \
+             rustup component add rust-analyzer"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// **Verified RED against unfixed `develop`:** before this fix, the hint
+    /// was just `"rust-analyzer not found. Run: rustup component add
+    /// rust-analyzer"` — correct content, but silent about *where* to run it,
+    /// which is wrong from any directory other than the pinned project's root
+    /// (#1905).
+    #[test]
+    #[cfg(unix)]
+    fn resolve_and_start_server_hint_names_root_and_toolchain() {
+        let binary_name = "vimcode-test-1905-ra-proxy";
+        let stderr_msg = "error: Unknown binary 'vimcode-test-1905-ra-proxy' in official \
+                           toolchain '1.97.1-aarch64-apple-darwin'";
+        let home = fake_cargo_bin_broken_proxy_with_stderr("hint", binary_name, stderr_msg);
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let root = std::env::temp_dir().join(format!(
+            "vimcode_test_1905_root_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut mgr = LspManager::new(root.clone(), &[]);
+        let manifest = extensions::ExtensionManifest {
+            name: "rust".to_string(),
+            display_name: "Rust Language Support".to_string(),
+            language_ids: vec!["vimcode-test-lang-1905".to_string()],
+            lsp: extensions::LspConfig {
+                binary: binary_name.to_string(),
+                install: "rustup component add rust-analyzer".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        mgr.set_ext_manifests(vec![manifest.clone()], vec![manifest]);
+
+        assert!(mgr
+            .ensure_server_for_language("vimcode-test-lang-1905")
+            .is_none());
+        let err = mgr
+            .last_start_error
+            .as_deref()
+            .expect("resolution failure must set last_start_error");
+        assert!(
+            err.contains(&format!("Run in {}: ", root.display())),
+            "hint must name the workspace root, got: {err}"
+        );
+        assert!(
+            err.contains("--toolchain 1.97.1-aarch64-apple-darwin"),
+            "hint must offer the explicit --toolchain form parsed from the \
+             proxy's stderr, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Verified RED against unfixed `develop`:** `run_install_command`
+    /// spawned the shell command with no `current_dir` at all, so it ran
+    /// wherever the process happened to be rather than the workspace root —
+    /// silently missing a pinned `rust-toolchain.toml` there (#1905).
+    #[test]
+    #[cfg(unix)]
+    fn run_install_command_runs_in_workspace_root() {
+        let root = std::env::temp_dir().join(format!(
+            "vimcode_test_1905_install_cwd_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let out_file = root.join("pwd.out");
+
+        let mgr = LspManager::new(root.clone(), &[]);
+        let install_cmd = format!("pwd > {}", out_file.display());
+        mgr.run_install_command("vimcode-test-lang-1905-cwd", &install_cmd);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = String::new();
+        while std::time::Instant::now() < deadline {
+            if let Ok(contents) = std::fs::read_to_string(&out_file) {
+                if !contents.trim().is_empty() {
+                    seen = contents;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pwd_canonical = Path::new(seen.trim()).canonicalize().unwrap_or_default();
+        assert_eq!(
+            pwd_canonical, canonical_root,
+            "run_install_command must run with current_dir set to the \
+             workspace root, got pwd={seen:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
