@@ -5344,6 +5344,158 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+        /// #1903: bringing the Explorer panel to the front is an "active
+        /// editor changed, as far as the Explorer is concerned" moment too —
+        /// VS Code reveals the active file when the Explorer view becomes
+        /// visible, not only when the editor switches while it is already
+        /// open. `explorer_expanded` is in-memory only (never persisted to
+        /// the session) and `explorer_collapse_all` wipes it, so without
+        /// that trigger a user who collapses the tree, works in another
+        /// panel and comes back finds the Explorer showing a bare root with
+        /// the active file nowhere in sight and nothing highlighted.
+        ///
+        /// Drives the real gesture: a `driver.click` on the Explorer
+        /// activity-bar icon's chrome zone (same lookup as
+        /// [`collapse_sidebar`]), through `AppShell::handle_activity_click`
+        /// and the backend-neutral `render::apply_activity_panel_switch`
+        /// rung, then reads the painted sidebar row's background back with
+        /// `style_at`.
+        #[test]
+        fn activity_bar_click_reveals_active_file_in_explorer_1903() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1903_activity_reveal_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let sub = dir.join("sub");
+            std::fs::create_dir_all(&sub).unwrap();
+            let nested = sub.join("nested.rs");
+            std::fs::write(&nested, "// nested\n").unwrap();
+
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            engine.settings.breadcrumbs = false;
+            engine.cwd = dir.clone();
+            engine.open_file_in_tab(&nested);
+            // The user collapsed the whole tree while the Explorer was
+            // hidden (or it simply never expanded in this session —
+            // `explorer_expanded` is in-memory only), so nested.rs's
+            // ancestor folder is shut and its row does not exist.
+            engine.explorer_collapse_all();
+            let mut h = harness(engine);
+
+            assert!(
+                find_below_tab_bar(&h, "nested.rs").is_none(),
+                "precondition: with the tree collapsed, nested.rs must not \
+                 paint below the tab bar yet; screen:\n{}",
+                h.driver.screen()
+            );
+
+            // One click: the runner's fresh `AppShell` starts with the
+            // hamburger panel active (see [`collapse_sidebar`]), so the
+            // first click on Explorer's icon activates + shows it.
+            let zone = h
+                .driver
+                .inventory()
+                .zones()
+                .iter()
+                .find(|z| z.id.as_str() == crate::core::engine::sidebar::PANEL_EXPLORER)
+                .map(|z| z.bounds)
+                .expect("the Explorer activity-bar icon must register a chrome zone");
+            h.driver
+                .click(zone.x + zone.width / 2.0, zone.y + zone.height / 2.0);
+            h.driver.render();
+
+            let (rx, ry) = find_below_tab_bar(&h, "nested.rs").unwrap_or_else(|| {
+                panic!(
+                    "showing the Explorer must auto-reveal the active file \
+                     (expanding `sub`); screen:\n{}",
+                    h.driver.screen()
+                )
+            });
+            let style = h
+                .driver
+                .style_at(rx, ry)
+                .expect("the revealed row must paint a styled cell");
+            // Clicking the icon focuses the panel, so the revealed row is
+            // the *focused* tree selection — quadraui's `selected_bg`, not
+            // the faint `inactive_selected_bg` an unfocused Explorer paints
+            // (see `explorer_unfocused_selected_row_paints_sidebar_sel_bg_
+            // inactive_via_shell_app`).
+            let qtheme = crate::render::to_quadraui_theme(&crate::render::Theme::vscode_light());
+            assert_eq!(
+                style.bg,
+                quadraui::tui::ratatui_color(qtheme.selected_bg),
+                "the revealed row must paint the focused selection \
+                 background; screen:\n{}",
+                h.driver.screen()
+            );
+            assert_ne!(
+                style.bg,
+                quadraui::tui::ratatui_color(qtheme.inactive_selected_bg),
+                "sanity: focused and unfocused selection backgrounds must \
+                 differ for this assertion to mean anything"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #1903: the reveal-on-panel-show in
+        /// `activity_bar_click_reveals_active_file_in_explorer_1903` obeys
+        /// `explorer_auto_reveal` like every other reveal trigger: with the
+        /// setting off, showing the Explorer must leave the collapsed tree
+        /// exactly as the user left it.
+        #[test]
+        fn activity_bar_click_does_not_reveal_when_auto_reveal_is_off_1903() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1903_activity_noreveal_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let sub = dir.join("sub");
+            std::fs::create_dir_all(&sub).unwrap();
+            let nested = sub.join("nested.rs");
+            std::fs::write(&nested, "// nested\n").unwrap();
+
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            engine.settings.breadcrumbs = false;
+            engine.cwd = dir.clone();
+            engine.open_file_in_tab(&nested);
+            engine.explorer_collapse_all();
+            engine.settings.explorer_auto_reveal = false;
+            let mut h = harness(engine);
+
+            let zone = h
+                .driver
+                .inventory()
+                .zones()
+                .iter()
+                .find(|z| z.id.as_str() == crate::core::engine::sidebar::PANEL_EXPLORER)
+                .map(|z| z.bounds)
+                .expect("the Explorer activity-bar icon must register a chrome zone");
+            h.driver
+                .click(zone.x + zone.width / 2.0, zone.y + zone.height / 2.0);
+            h.driver.render();
+
+            assert!(
+                h.driver.find("sub").is_some(),
+                "the Explorer panel must actually be showing (its root's \
+                 `sub` folder row paints); screen:\n{}",
+                h.driver.screen()
+            );
+            assert!(
+                find_below_tab_bar(&h, "nested.rs").is_none(),
+                "with `explorer_auto_reveal` off, showing the Explorer must \
+                 not expand `sub` or reveal nested.rs; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

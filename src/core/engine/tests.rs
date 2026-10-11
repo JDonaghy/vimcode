@@ -26981,6 +26981,7 @@ fn test_set_option_round_trip() {
         ("terminal_scrollback_lines", "5000"),
         ("show_hidden_files", "true"),
         ("explorer_sort_case_insensitive", "true"),
+        ("explorer_auto_reveal", "false"),
         ("autohide_panels", "true"),
     ];
 
