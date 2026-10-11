@@ -3648,21 +3648,29 @@ impl Settings {
             return Ok(());
         }
 
-        let path = Self::settings_file_path();
+        #[cfg_attr(test, allow(unreachable_code))]
+        {
+            let path = Self::settings_file_path();
+            // Structural backstop: panics loudly if this call reaches here
+            // without any test isolation in effect (see `guard_real_config_write`'s
+            // doc comment). Matches the pattern already applied to
+            // `HistoryState::save`, `ExtensionState::save` and `SessionState::save`.
+            crate::core::paths::guard_real_config_write(&path);
 
-        // Create config directory if it doesn't exist
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            // Create config directory if it doesn't exist
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let contents = serde_json::to_string_pretty(self)?;
+            fs::write(&path, contents)?;
+
+            // Bump the save revision so the TUI mtime watcher knows this write
+            // came from us and can suppress its "Settings reloaded" message.
+            SAVE_REVISION.fetch_add(1, Ordering::AcqRel);
+
+            Ok(())
         }
-
-        let contents = serde_json::to_string_pretty(self)?;
-        fs::write(&path, contents)?;
-
-        // Bump the save revision so the TUI mtime watcher knows this write
-        // came from us and can suppress its "Settings reloaded" message.
-        SAVE_REVISION.fetch_add(1, Ordering::AcqRel);
-
-        Ok(())
     }
 
     /// Effective editor font family + size in points.
@@ -4156,14 +4164,13 @@ impl Settings {
     pub fn ensure_exists() -> Result<(), std::io::Error> {
         let path = Self::settings_file_path();
 
-        // Only create if file doesn't exist
+        // Only create if file doesn't exist. Directory creation and the
+        // write itself happen inside `save()`, which runs the
+        // `guard_real_config_write` backstop before touching disk — don't
+        // duplicate `fs::create_dir_all` here, or an un-isolated test would
+        // create the real config directory before `save()` ever gets a
+        // chance to panic.
         if !path.exists() {
-            // Create parent directories
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            // Write default settings
             Self::default().save()?;
         }
 

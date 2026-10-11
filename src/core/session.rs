@@ -542,17 +542,18 @@ impl SessionState {
         }
 
         #[cfg_attr(test, allow(unreachable_code))]
-        let path = Self::session_path();
-        #[cfg_attr(test, allow(unreachable_code))]
-        super::paths::guard_real_config_write(&path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        {
+            let path = Self::session_path();
+            super::paths::guard_real_config_write(&path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let json = serde_json::to_string_pretty(self)?;
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, &json)?;
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
         }
-        let json = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
     }
 
     fn session_path() -> PathBuf {
@@ -602,17 +603,18 @@ impl SessionState {
         }
 
         #[cfg_attr(test, allow(unreachable_code))]
-        let path = Self::session_path_for_workspace(root);
-        #[cfg_attr(test, allow(unreachable_code))]
-        super::paths::guard_real_config_write(&path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        {
+            let path = Self::session_path_for_workspace(root);
+            super::paths::guard_real_config_write(&path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let json = serde_json::to_string_pretty(self)?;
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, &json)?;
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
         }
-        let json = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
     }
 
     /// Add a workspace root to `recent_workspaces` (max 10, removes duplicates).
