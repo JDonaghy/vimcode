@@ -1009,6 +1009,191 @@ fn activity_bar_zone_center<D: ConformanceDriver>(driver: &D, panel_id: &str) ->
         .unwrap_or_else(|| panic!("the {panel_id} activity-bar icon must register a chrome zone"))
 }
 
+/// A full round trip through the toolbar leg of the Ctrl-W chord — panel to
+/// toolbar (`Ctrl-W h`) and straight back (`Ctrl-W l`) — must land back in
+/// the *same* panel it started from, not switch panels or toggle the
+/// sidebar.
+///
+/// Types `"zz"` into the Search panel's query box, crosses to the toolbar
+/// and back, then types `"y"`: only landing back in the Search query box
+/// (caret still at the end of `"zz"`) paints `"zzy"` — landing in the
+/// editor, a different panel, or a reset query box would not.
+pub fn panel_toolbar_round_trip_returns_to_the_same_panel<D: ConformanceDriver + DriverInput>(
+    driver: &mut D,
+) {
+    use crate::core::engine::sidebar::PANEL_SEARCH;
+
+    let (x, y) = activity_bar_zone_center(driver, PANEL_SEARCH);
+    driver.click(x, y);
+    driver.type_text("zz");
+    assert!(
+        driver.screen_has("zz"),
+        "precondition: clicking the Search icon then typing must land in \
+         its query box"
+    );
+
+    ConformanceDriver::ctrl_char(driver, 'w');
+    ConformanceDriver::type_char(driver, 'h');
+    ConformanceDriver::ctrl_char(driver, 'w');
+    ConformanceDriver::type_char(driver, 'l');
+    driver.type_text("y");
+
+    assert!(
+        driver.screen_has("zzy"),
+        "Ctrl-W h then Ctrl-W l must return keyboard focus to the Search \
+         panel's own query box, not the editor or a different panel"
+    );
+}
+
+/// Same round trip as
+/// [`panel_toolbar_round_trip_returns_to_the_same_panel`], but with a plain
+/// `j` (no Ctrl) moving the toolbar's own selection cursor off the active
+/// row before crossing back — the toolbar->panel leg of the chord must still
+/// land on the panel that was active when the toolbar was entered, never on
+/// whatever row the cursor happens to sit on.
+pub fn panel_toolbar_round_trip_uses_the_active_panel_not_the_toolbar_cursor<
+    D: ConformanceDriver + DriverInput,
+>(
+    driver: &mut D,
+) {
+    use crate::core::engine::sidebar::PANEL_SEARCH;
+
+    let (x, y) = activity_bar_zone_center(driver, PANEL_SEARCH);
+    driver.click(x, y);
+    driver.type_text("zz");
+    assert!(
+        driver.screen_has("zz"),
+        "precondition: clicking the Search icon then typing must land in \
+         its query box"
+    );
+
+    ConformanceDriver::ctrl_char(driver, 'w');
+    ConformanceDriver::type_char(driver, 'h');
+    // Move the toolbar's own cursor off the Search row -- the chord must
+    // not use it.
+    ConformanceDriver::type_char(driver, 'j');
+    ConformanceDriver::ctrl_char(driver, 'w');
+    ConformanceDriver::type_char(driver, 'l');
+    driver.type_text("y");
+
+    assert!(
+        driver.screen_has("zzy"),
+        "Ctrl-W l from the toolbar must return focus to the panel that was \
+         active when the toolbar was entered, not the row the toolbar's own \
+         cursor was moved to with the plain 'j'"
+    );
+}
+
+/// `Ctrl-W h`/`Left` from the activity bar toolbar is a no-op (the toolbar
+/// is the leftmost stop in the window-navigation chain) -- it must be
+/// consumed without changing focus or the toolbar cursor's position.
+///
+/// Mirrors [`sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar`]
+/// exactly, with one extra, inert `Ctrl-W h` inserted while already on the
+/// toolbar: the outcome (landing on Source Control via `j`, `l`) is
+/// unchanged, which only holds if the extra chord had no effect.
+pub fn toolbar_ctrl_w_left_is_a_noop<D: ConformanceDriver + DriverInput>(driver: &mut D) {
+    use crate::core::engine::sidebar::PANEL_SEARCH;
+
+    let screen_has_ci = |driver: &D, needle: &str| {
+        let needle = needle.to_ascii_lowercase();
+        driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .any(|r| r.text.to_ascii_lowercase().contains(&needle))
+    };
+
+    let (x, y) = activity_bar_zone_center(driver, PANEL_SEARCH);
+    driver.click(x, y);
+    assert!(
+        screen_has_ci(driver, "search"),
+        "precondition: clicking the Search icon must open the panel"
+    );
+    ConformanceDriver::ctrl_char(driver, 'w');
+    ConformanceDriver::type_char(driver, 'h');
+    // Already on the toolbar -- this extra Ctrl-W h must be a no-op.
+    ConformanceDriver::ctrl_char(driver, 'w');
+    ConformanceDriver::type_char(driver, 'h');
+    ConformanceDriver::type_char(driver, 'j');
+    ConformanceDriver::type_char(driver, 'l');
+    assert!(
+        screen_has_ci(driver, "control"),
+        "an inert Ctrl-W h while already on the toolbar must not change \
+         focus or the toolbar cursor -- 'j' then 'l' must still land on \
+         Source Control exactly as without the extra chord"
+    );
+}
+
+/// Same round trip as [`panel_toolbar_round_trip_returns_to_the_same_panel`],
+/// but driven entirely through a user keymap that rebinds the chord onto
+/// single keystrokes (`nnoremap <C-h> <C-w>h`, `nnoremap <C-l> <C-w>l`) --
+/// the literal two-keystroke `Ctrl-W` chord is never pressed. Proves the
+/// toolbar/panel leg is reached through the same
+/// `Engine::resolve_wincmd_keymap_direction` rung any other rebound window
+/// command uses, not a second, toolbar-only keymap table.
+pub fn rebound_ctrl_h_ctrl_l_walk_the_same_chain<D: ConformanceDriver + DriverInput>(
+    driver: &mut D,
+) {
+    use crate::core::engine::sidebar::PANEL_SEARCH;
+
+    let (x, y) = activity_bar_zone_center(driver, PANEL_SEARCH);
+    driver.click(x, y);
+    driver.type_text("zz");
+    assert!(
+        driver.screen_has("zz"),
+        "precondition: clicking the Search icon then typing must land in \
+         its query box"
+    );
+
+    ConformanceDriver::ctrl_char(driver, 'h');
+    ConformanceDriver::ctrl_char(driver, 'l');
+    driver.type_text("y");
+
+    assert!(
+        driver.screen_has("zzy"),
+        "the rebound <C-h>/<C-l> keystrokes must walk the identical panel \
+         <-> toolbar chain the literal Ctrl-W chord does, landing back in \
+         the Search panel's own query box"
+    );
+}
+
+/// [`rebound_ctrl_h_ctrl_l_walk_the_same_chain`]'s fixture: [`engine_fixture`]
+/// plus the two user keymaps `nnoremap <C-h> <C-w>h` / `nnoremap <C-l>
+/// <C-w>l` -- same rhs encoding
+/// `Engine::resolve_wincmd_keymap_direction` matches on, mirroring
+/// `keyboard_routing`'s own
+/// `a_user_keymap_bound_to_the_chord_resolves_identically_to_the_literal_chord`
+/// unit test fixture.
+fn engine_fixture_with_rebound_wincmd_keys() -> crate::core::Engine {
+    use crate::core::engine::{UserKeymap, UserKeymapAction};
+
+    let mut engine = crate::core::Engine::new_for_test();
+    engine.settings.use_nerd_fonts = Some(false);
+    let text = (1..=30)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    engine.buffer_mut().insert(0, &text);
+    engine.user_keymaps.push(UserKeymap {
+        mode: "n".to_string(),
+        noremap: true,
+        keys: vec!["<C-h>".to_string()],
+        action: UserKeymapAction::Keys(vec!["<C-w>".to_string(), "h".to_string()]),
+        buffer: None,
+        desc: None,
+    });
+    engine.user_keymaps.push(UserKeymap {
+        mode: "n".to_string(),
+        noremap: true,
+        keys: vec!["<C-l>".to_string()],
+        action: UserKeymapAction::Keys(vec!["<C-w>".to_string(), "l".to_string()]),
+        buffer: None,
+        desc: None,
+    });
+    engine
+}
+
 /// The `h`/`Left` half of the `Ctrl-W` sidebar chord.
 ///
 /// `j` then `l` only move the toolbar's own selection cursor and activate
@@ -4452,6 +4637,46 @@ mod issue_406_sidebar_ctrl_w_navigates {
         size: (800, 480),
         body: |driver| {
             crate::harness::sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar(driver);
+        },
+    }
+
+    crate::backend_conformance! {
+        label: panel_toolbar_round_trip_returns_to_the_same_panel_proof,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (1600, 480),
+        body: |driver| {
+            crate::harness::panel_toolbar_round_trip_returns_to_the_same_panel(driver);
+        },
+    }
+
+    crate::backend_conformance! {
+        label: panel_toolbar_round_trip_uses_the_active_panel_not_the_toolbar_cursor_proof,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (1600, 480),
+        body: |driver| {
+            crate::harness::panel_toolbar_round_trip_uses_the_active_panel_not_the_toolbar_cursor(driver);
+        },
+    }
+
+    crate::backend_conformance! {
+        label: toolbar_ctrl_w_left_is_a_noop_proof,
+        backends: [gtk, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            crate::harness::toolbar_ctrl_w_left_is_a_noop(driver);
+        },
+    }
+
+    crate::backend_conformance! {
+        label: rebound_ctrl_h_ctrl_l_walk_the_same_chain_proof,
+        backends: [gtk, tui, tui_prod],
+        engine: crate::harness::engine_fixture_with_rebound_wincmd_keys(),
+        size: (1600, 480),
+        body: |driver| {
+            crate::harness::rebound_ctrl_h_ctrl_l_walk_the_same_chain(driver);
         },
     }
 }

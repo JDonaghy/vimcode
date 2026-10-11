@@ -603,12 +603,25 @@ impl App {
 
         // ── Shared Ctrl+L force-redraw rung ──────────────────────────────────
         // `insert_ctrl_x_pending` carves out `<C-x><C-l>` (whole-line completion)
-        // — see `render::is_force_redraw_key`'s doc.
-        let insert_ctrl_x_pending = {
+        // — see `render::is_force_redraw_key`'s doc. A `<C-w>` chord already in
+        // progress, or a user keymap that resolves this exact keystroke to a
+        // `<C-w>h`/`<C-w>l` window-navigation direction, takes the keystroke
+        // instead: the Ctrl-W toolbar/panel/editor chain is one binding no
+        // matter which literal key reaches it, so a user remapping `<C-l>` to
+        // that chain must not be shadowed by the hardcoded redraw shortcut.
+        let (insert_ctrl_x_pending, wincmd_chord_claims_key) = {
             let engine = self.engine.borrow();
-            engine.mode == crate::core::Mode::Insert && engine.insert_ctrl_x_pending
+            let insert_ctrl_x_pending =
+                engine.mode == crate::core::Mode::Insert && engine.insert_ctrl_x_pending;
+            let wincmd_chord_claims_key = engine.sidebar_ctrl_w_pending
+                || engine
+                    .resolve_wincmd_keymap_direction(&key_name, unicode, ctrl)
+                    .is_some();
+            (insert_ctrl_x_pending, wincmd_chord_claims_key)
         };
-        if render::is_force_redraw_key(&key_name, unicode, ctrl, insert_ctrl_x_pending) {
+        if !wincmd_chord_claims_key
+            && render::is_force_redraw_key(&key_name, unicode, ctrl, insert_ctrl_x_pending)
+        {
             // Was an ordinary redraw only — no rung called
             // `Backend::request_full_repaint` on GTK at all. Harmless
             // no-op there today (Cairo's `DrawingArea` repaints in full
@@ -640,6 +653,20 @@ impl App {
         };
 
         if focus_route == render::FocusKeyRoute::ActivityBar {
+            // The toolbar is a stop in the same Ctrl-W window-navigation
+            // chain as sidebar panels and editor windows, so the chord is
+            // checked before falling back to the toolbar's own key table.
+            if render::route_sidebar_chord_key(
+                &mut self.engine.borrow_mut(),
+                &key_name,
+                unicode,
+                ctrl,
+            )
+            .is_some()
+            {
+                self.draw_needed.set(true);
+                return;
+            }
             self.handle_activity_bar_key(&key_name, ctrl);
             self.draw_needed.set(true);
             return;
@@ -680,9 +707,11 @@ impl App {
 
         // ── Shared Ctrl-W sidebar chord rung ──────────────────────────────────
         // `Engine::sidebar_ctrl_w_pending` is the shared latch both backends
-        // read/write through `route_sidebar_chord_key`; GTK has no shadow flag
-        // to clear on `SidebarChordAction::FocusOut` (unlike TUI), so there is
-        // nothing else to do here besides redraw.
+        // read/write through `route_sidebar_chord_key`. The activity bar
+        // toolbar's own chord check above already handles
+        // `FocusKeyRoute::ActivityBar`, so this rung only ever sees sidebar
+        // panel focus routes; there is nothing else to do here besides
+        // redraw.
         if focus_route != render::FocusKeyRoute::None
             && render::route_sidebar_chord_key(
                 &mut self.engine.borrow_mut(),
