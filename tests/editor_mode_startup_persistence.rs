@@ -1,31 +1,22 @@
-//! #1795: `editor_mode: "vscode"` in `settings.json` must be honoured at
+//! `editor_mode: "vscode"` in `settings.json` must be honoured at
 //! **cold startup** (`Engine::new()`'s own `Settings::load()`), not only on
 //! the hot-reload path `check_settings_reload` already covers.
 //!
 //! # Why a real pty driving the real binary, not an in-process `Engine::new()`
 //!
-//! #1795's reported symptom is specifically that a real, running vimcode's
-//! **painted status bar** read `NORMAL` at launch despite an on-disk
-//! `settings.json` saying `"editor_mode": "vscode"`
-//! (`/tmp/j_appdata_test2.png`). `CLAUDE.md`'s "Testing (CRITICAL)" rule 1
-//! is explicit that a test must assert on rendered output, never on state
-//! being populated — a prior version of this file called `Engine::new()`
-//! in-process and asserted `engine.is_vscode_mode()`/`engine.mode_str()`,
-//! which are core getters, not painted bytes, and a review caught that gap.
-//!
-//! This file instead mirrors the two real-process pty harnesses this repo
-//! already ships for exactly this class of problem —
-//! `tests/pty_settings_header_delay.rs` (#1701, Unix pty + `vt100`) and
-//! `tests/conpty_idle_flicker.rs` (#1634, Windows ConPTY) — spawning the
-//! real `vcd` binary (`CARGO_BIN_EXE_vcd`) under a real Unix pty, with a
-//! throwaway `$HOME` set **only on the spawned child's own environment**
+//! A test must assert on rendered output, never on state being populated.
+//! This file mirrors the real-process pty harnesses this repo already ships
+//! (`tests/pty_settings_header_delay.rs`, Unix pty + `vt100` and
+//! `tests/conpty_idle_flicker.rs`, Windows ConPTY) — spawning the real `vcd`
+//! binary (`CARGO_BIN_EXE_vcd`) under a real Unix pty, with a throwaway
+//! `$HOME` set **only on the spawned child's own environment**
 //! (`CommandBuilder::env`, never `std::env::set_var` on this test process —
-//! see those two files' own module docs for why process-global env
-//! mutation in a test is a standing hazard in this crate,
-//! `src/core/paths.rs`/`src/core/settings.rs`), and asserts on the actual
-//! VT100-parsed screen content a real terminal would show. `#![cfg(unix)]`
-//! because `portable-pty`'s Unix backend (a plain pty, not ConPTY) is what
-//! this dev-dependency set provides outside Windows — see `Cargo.toml`'s
+//! see those files' own module docs for why process-global env mutation in a
+//! test is a standing hazard in this crate, `src/core/paths.rs`,
+//! `src/core/settings.rs`) — and asserts on the actual VT100-parsed screen
+//! content a real terminal would show. `#![cfg(unix)]` because
+//! `portable-pty`'s Unix backend (a plain pty, not ConPTY) is what this
+//! dev-dependency set provides outside Windows — see `Cargo.toml`'s
 //! `[target.'cfg(unix)'.dev-dependencies]` comment.
 //!
 //! `Settings::load()`'s `#[cfg(test)]` short-circuit (see
@@ -36,30 +27,6 @@
 //! `Engine::new()` -> `Settings::load()` -> `Settings::load_with_validation()`
 //! path against a literal on-disk `settings.json`, end to end through the
 //! real process launch and real paint.
-//!
-//! # Investigation result (see PR for the full writeup; durable record now
-//! also lives in `tests/smoke-spec/win-terminal.yaml`'s and
-//! `tests/smoke-spec/win-gui.yaml`'s own header comments)
-//!
-//! Reproduced on real Windows hardware (`cargo xwin build --features win`,
-//! run both directly and via a PowerShell session with `$env:APPDATA`
-//! pointed at a throwaway settings.json containing exactly #1795's
-//! reported content): `Engine::new()`/`Engine::startup()` correctly loaded
-//! `editor_mode: Vscode` and `Engine::mode_str()` read
-//! `"EDIT  F1:palette  Alt-M:vim"`, never `"NORMAL"`, in every case tried.
-//! The one case that *did* reproduce "settings edited but a different file
-//! got read" was launching the exe from a WSL shell with `APPDATA=<custom>`
-//! set only on the *parent* shell's command line (`env APPDATA=... ./a.exe`)
-//! — a WSL-interop process-creation quirk that silently drops that
-//! override, so the exe reads the real `%APPDATA%\vimcode\settings.json`
-//! instead of the one just edited for the test. That is a test-harness
-//! environment-propagation gap, not a vimcode-code bug — this test instead
-//! pins the one thing that *is* a vimcode-code question, so it cannot
-//! silently regress: does the real `vcd` binary honour `editor_mode` from a
-//! real on-disk `settings.json` at cold startup, as observed on its actual
-//! painted screen. It is green on unfixed `develop`, by design (there is no
-//! code bug here) — see the PR body for why this is coverage, not a
-//! RED-then-GREEN regression fix.
 #![cfg(unix)]
 
 use std::io::{Read, Write};
@@ -81,11 +48,9 @@ struct Captured {
     bytes: Vec<u8>,
 }
 
-/// Build an isolated `$HOME` whose `.config/vimcode/settings.json` carries
-/// the exact content #1795 reported (`lsp_enabled`/`use_nerd_fonts` are
-/// along for the ride, unused by this test's assertions, but kept to match
-/// the report's reproduction verbatim) — never the real operator's
-/// settings.json.
+/// Build an isolated `$HOME` whose `.config/vimcode/settings.json` contains
+/// the test configuration (`lsp_enabled`/`use_nerd_fonts` are kept but unused
+/// by this test's assertions) — never the real operator's settings.json.
 fn isolated_home() -> PathBuf {
     let home = std::env::temp_dir().join(format!(
         "vimcode_test_1795_home_{}_{}",
@@ -219,12 +184,10 @@ fn screen_text(parser: &vt100::Parser) -> String {
     out
 }
 
-/// Poll the real pty's parsed screen until it contains `needle`, checking
-/// on every poll that it does NOT (yet) contain `forbidden` — #1795's
-/// reported symptom verbatim is the status bar reading `NORMAL`, so this
-/// must never be true at *any* point along the way to the first `EDIT`
-/// paint, not just absent from the final frame (a flash of `NORMAL` before
-/// correcting itself would be just as real a regression).
+/// Poll the real pty's parsed screen until it contains `needle`. On every
+/// poll, verify that it does NOT contain `forbidden` — the status bar must
+/// never read `NORMAL` before the first `EDIT` paint (a flash of `NORMAL`
+/// before correcting itself would be a regression).
 fn wait_for_screen_contains_never_seeing(
     parser: &mut vt100::Parser,
     captured: &Arc<Mutex<Captured>>,

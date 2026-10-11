@@ -1,22 +1,22 @@
-//! `Engine` wiring for per-turn ACP change tracking + checkpoints (#1460),
-//! on top of #955/#1454's `crate::core::review` and #954's
-//! `Engine::acp_write_text_file`: recording every file a turn writes,
-//! opening one combined turn-review surface once the turn ends (or on
-//! `:AiReview`), and restoring a past turn's checkpoint (`:AiRestore`).
-//! `crate::core::acp_turn` itself stays free of any `Engine`/buffer/
-//! filesystem knowledge — this module is the only place that bridges the
-//! two, mirroring the `crate::core::review` / `review_ops.rs` split.
+//! `Engine` wiring for per-turn ACP change tracking + checkpoints,
+//! on top of `crate::core::review` and `Engine::acp_write_text_file`:
+//! recording every file a turn writes, opening one combined turn-review
+//! surface once the turn ends (or on `:AiReview`), and restoring a past
+//! turn's checkpoint (`:AiRestore`). `crate::core::acp_turn` itself stays
+//! free of any `Engine`/buffer/filesystem knowledge — this module is the
+//! only place that bridges the two, mirroring the `crate::core::review` /
+//! `review_ops.rs` split.
 //!
 //! ## Turn review vs proposal review: same surface, opposite `a`/`r`
 //!
 //! [`crate::core::review::ChangeReviewState`] already renders "pre vs
-//! post" for a list of files — #1460 reuses it rather than building a
+//! post" for a list of files — it reuses this rather than building a
 //! second `DiffView`-based surface. But a *turn* review's files are
 //! already written to disk (they went through `fs/write_text_file`
-//! already), unlike a *proposal* review's `diff` blocks (#955), which are
+//! already), unlike a *proposal* review's `diff` blocks, which are
 //! not yet applied — so the two need opposite `a`/`r` semantics:
 //!
-//! | Key | Proposal review (#955)              | Turn review (#1460)               |
+//! | Key | Proposal review              | Turn review               |
 //! |-----|--------------------------------------|-------------------------------------|
 //! | `a` | writes `new_text` to disk            | no-op decision — already correct    |
 //! | `r` | no buffer effect                     | reverts to the pre-turn content      |
@@ -33,7 +33,7 @@ use crate::core::review::ProposedChange;
 
 impl Engine {
     /// Record one `fs/write_text_file` write into the in-flight turn's
-    /// tracking (#1460) — called from [`Self::acp_write_text_file`] just
+    /// tracking — called from [`Self::acp_write_text_file`] just
     /// before it overwrites the buffer, `pre_content` being what the file
     /// held immediately before this write, or `None` if the path did not
     /// exist on disk yet (the agent is creating it) — see
@@ -65,14 +65,12 @@ impl Engine {
     }
 
     /// End the in-flight turn (`AcpEvent::PromptStopped`): roll whatever it
-    /// wrote into a fresh [`AcpTurnCheckpoint`] and — only when
+    /// wrote into a fresh [`AcpTurnCheckpoint`] and — when
     /// [`crate::core::settings::AcpReviewOnTurnEnd::Auto`] is configured
-    /// (`acp_review_on_turn_end` setting, #1515; `Auto` is the pre-#1515
-    /// behaviour) — open the combined turn-review surface for it
-    /// automatically. Under both the default `Badge` and `Off`, the
-    /// checkpoint is still recorded — `:AiReview`/`Self::cmd_ai_review`
-    /// still reads it under either setting, and the default `Badge` also
-    /// surfaces it via the status-strip badge
+    /// (`acp_review_on_turn_end` setting) — open the combined turn-review
+    /// surface for it automatically. Under `Badge` and `Off`, the checkpoint
+    /// is still recorded — `:AiReview`/`Self::cmd_ai_review` still reads it,
+    /// and `Badge` also surfaces it via the status-strip badge
     /// (`Self::acp_turn_review_badge`, `render::populate_ai_chat_controller`)
     /// and the gutter-marker overlay (`Self::acp_turn_pre_content_for_path`,
     /// `render::build_rendered_window`). `Off`'s contract is stricter —
@@ -93,7 +91,7 @@ impl Engine {
             .push(AcpTurnCheckpoint { id, entries });
         match self.settings.acp_review_on_turn_end {
             crate::core::settings::AcpReviewOnTurnEnd::Auto => self.acp_open_turn_review(id),
-            // #1517: `badge`'s in-buffer-review counterpart to `auto`'s
+            // `badge`'s in-buffer-review counterpart to `auto`'s
             // modal auto-open — see `Self::acp_set_inline_review_status_
             // message`'s own doc.
             crate::core::settings::AcpReviewOnTurnEnd::Badge => {
@@ -103,18 +101,16 @@ impl Engine {
         }
     }
 
-    /// #1517: a one-line status hint naming how many agent hunks are still
+    /// A one-line status hint naming how many agent hunks are still
     /// pending across every file `checkpoint_id` touched, and the two
-    /// existing affordances to act on them — `:AiReview` (still opens the
-    /// full modal, #1460/#1515) and, once there, `ga` (keep every
-    /// remaining hunk, #1516). The in-buffer `<leader>ak`/`<leader>ar`
-    /// keys act on individual hunks directly without needing either; this
-    /// message is purely informational, the same "look-around" spirit
-    /// `Self::cmd_ai_review` documents for `:AiReview` itself. A no-op
-    /// when the checkpoint turns out to have zero actual hunks (every
-    /// touched file's diff against its pre-turn content is empty —
-    /// shouldn't happen for a checkpoint that was just recorded, but stays
-    /// silent rather than announcing "0 agent hunks").
+    /// existing affordances to act on them — `:AiReview` (opens the full
+    /// modal) and, once there, `ga` (keep every remaining hunk). The
+    /// in-buffer `<leader>ak`/`<leader>ar` keys act on individual hunks
+    /// directly without needing either; this message is purely informational.
+    /// A no-op when the checkpoint has zero actual hunks (every touched
+    /// file's diff against its pre-turn content is empty — shouldn't happen
+    /// for a checkpoint that was just recorded, but stays silent rather than
+    /// announcing "0 agent hunks").
     fn acp_set_inline_review_status_message(&mut self, checkpoint_id: usize) {
         let Some(checkpoint) = self
             .acp_turn_checkpoints
@@ -139,7 +135,7 @@ impl Engine {
 
     /// The most recent still-outstanding checkpoint's summary for the
     /// `badge` mode's "Edited N files · +a -r" status-strip segment
-    /// (#1515) — `(files, added_lines, removed_lines)`, or `None` once
+    /// — `(files, added_lines, removed_lines)`, or `None` once
     /// there is no checkpoint left to summarise (nothing has ever run
     /// yet, or every checkpoint has been fully reverted via `:AiRestore` —
     /// see [`Self::acp_forget_reverted_checkpoint_paths`]). Recomputed
@@ -167,10 +163,8 @@ impl Engine {
     }
 
     /// The base text a `badge`-mode gutter-marker overlay diffs `path`'s
-    /// live buffer content against (#1515; `off` mode never calls this —
-    /// see [`crate::core::settings::AcpReviewOnTurnEnd::Off`]'s own doc) —
-    /// the most recent still-outstanding checkpoint's entry for `path`, if
-    /// any.
+    /// live buffer content against — the most recent still-outstanding
+    /// checkpoint's entry for `path`, if any.
     /// `Some(None)` distinguishes "touched, but the agent created this
     /// path" (no prior content at all — every line paints as added) from
     /// a plain `None` ("`path` isn't part of any outstanding checkpoint —
@@ -210,7 +204,7 @@ impl Engine {
                     // `None` here (a path the agent created, no prior
                     // content) makes the review render it as a pure
                     // addition, same as a `diff` block on a brand-new
-                    // path (#955) — see `AcpTurnFileEntry`'s doc.
+                    // path — see `AcpTurnFileEntry`'s doc.
                     old_text: e.pre_turn_content.clone(),
                     new_text: now,
                 }
@@ -227,20 +221,15 @@ impl Engine {
     /// turn-review branch (a single-file revert via the `r` key on an open
     /// turn review).
     ///
-    /// Two things this buys, both from the review's findings on #1460:
-    /// - **A checkpoint survives a refusal.** Only the paths that were
-    ///   actually reverted are dropped, so a checkpoint with any refused
-    ///   (human-edited-since) file keeps that file's entry and remains in
-    ///   [`Self::acp_turn_checkpoints`] for a later retry — the whole point
-    ///   of a checkpoint as a rollback point. A checkpoint disappears only
-    ///   once *every* entry it holds has been reverted.
-    /// - **No stale `agent_written_content`.** A single-file revert through
-    ///   the turn-review `r` key writes the pre-turn content back via
-    ///   [`Self::acp_write_file_untracked`], which — by design — does not
-    ///   touch this bookkeeping. Without this call, a later `:AiRestore`
-    ///   would compare the now-reverted disk content against the stale
-    ///   `agent_written_content` still on file and wrongly report the
-    ///   already-reverted path as "refused (edited since)".
+    /// Two outcomes: a checkpoint survives a refusal if only some paths
+    /// were reverted, keeping those paths' entries so a later retry still
+    /// has something to restore to. A checkpoint disappears once every
+    /// entry it holds has been reverted. Additionally, a single-file revert
+    /// through the turn-review `r` key writes the pre-turn content back via
+    /// [`Self::acp_write_file_untracked`], which does not touch this
+    /// bookkeeping; this call removes the stale `agent_written_content`
+    /// entry so a later `:AiRestore` won't wrongly report the path as
+    /// "refused (edited since)".
     pub(crate) fn acp_forget_reverted_checkpoint_paths(
         &mut self,
         target_id: usize,
@@ -260,11 +249,10 @@ impl Engine {
 
     /// Whether the hunk the turn-review surface is currently scrolled to
     /// has been edited by a human since the agent's own last write to that
-    /// file (#1516's "edited by you" label) — `false` whenever no turn
-    /// review is open, the current file isn't tracked by any outstanding
-    /// checkpoint (shouldn't happen for an entry that exists, but stays
-    /// conservative), or the hunk simply still matches the agent's own
-    /// write (the common case). See
+    /// file — `false` whenever no turn review is open, the current file
+    /// isn't tracked by any outstanding checkpoint (shouldn't happen for an
+    /// entry that exists, but stays conservative), or the hunk simply still
+    /// matches the agent's own write (the common case). See
     /// [`crate::core::acp_turn::hunk_matches_agents_last_write`] for the
     /// actual comparison.
     pub(crate) fn current_turn_hunk_edited_by_human(&self) -> bool {
@@ -301,10 +289,9 @@ impl Engine {
     }
 
     /// `:AiReview` — open the turn-review surface for the most recently
-    /// completed turn (#1460's "or on `:AiReview`" alternative to the
-    /// automatic `PromptStopped` open). A status message, not an error,
-    /// when there is nothing to review yet — this is a look-around
-    /// command, not a state-changing one.
+    /// completed turn. A status message, not an error, when there is nothing
+    /// to review yet — this is a look-around command, not a state-changing
+    /// one.
     pub(crate) fn cmd_ai_review(&mut self) {
         let Some(id) = self.acp_turn_checkpoints.last().map(|c| c.id) else {
             self.message = "No ACP turn changes to review yet".to_string();
@@ -313,7 +300,7 @@ impl Engine {
         self.acp_open_turn_review(id);
     }
 
-    // ── in-buffer inline review (#1517) ─────────────────────────────────
+    // ── in-buffer inline review ─────────────────────────────────────────
     //
     // The "Zed-style" alternative to the full-viewport modal above: hunks
     // reviewed directly in the normal buffer, gutter marks + a virtual
@@ -355,7 +342,7 @@ impl Engine {
         }
     }
 
-    /// In-buffer review hunks for `path` (#1517): the outstanding
+    /// In-buffer review hunks for `path`: the outstanding
     /// checkpoint entry's `pre_turn_content` diffed against the buffer's
     /// *live* content (buffer-first, same read every other turn-review
     /// surface in this module uses) — empty when `path` isn't part of any
@@ -503,9 +490,8 @@ impl Engine {
 
     /// `:AiRestore [id]` — revert every file touched by checkpoint `id` (or
     /// the most recent checkpoint, with no argument) and every later
-    /// checkpoint's writes to it (#1460's "reverts every later agent
-    /// write"), each through the single-undo-group buffer path
-    /// ([`Self::acp_write_file_untracked`]).
+    /// checkpoint's writes to it, each through the single-undo-group buffer
+    /// path ([`Self::acp_write_file_untracked`]).
     ///
     /// A file whose current content no longer matches what the agent last
     /// wrote it (a human edit landed on it since — see
@@ -520,8 +506,7 @@ impl Engine {
     /// edit is dealt with) still has something to restore *to*. A
     /// checkpoint only disappears once every one of its entries has been
     /// reverted; a checkpoint with any refused file remains in history,
-    /// exactly the "checkpoint as a rollback point" contract a fully
-    /// destroyed-on-refusal checkpoint would otherwise break.
+    /// exactly the "checkpoint as a rollback point" contract.
     pub fn acp_restore_checkpoint(&mut self, id: Option<usize>) -> Result<String, String> {
         let target_id = match id {
             Some(id) => id,
@@ -549,9 +534,7 @@ impl Engine {
                 } => {
                     let path = item.path().to_string();
                     // `None` means the agent created this path — "revert"
-                    // means delete it, not write an empty file (#1460
-                    // review non-blocking finding; see
-                    // `AcpTurnFileEntry`'s doc).
+                    // means delete it, not write an empty file.
                     let result = match pre_turn_content {
                         Some(content) => {
                             self.acp_write_file_untracked(std::path::Path::new(&path), content)
@@ -600,14 +583,10 @@ mod tests {
     use super::*;
 
     /// Every test in this module exercises the turn-review/checkpoint
-    /// machinery itself (opening the modal, restoring a checkpoint, ...),
-    /// which pre-#1515 always ran on `Engine::acp_end_turn`. #1515 changed
-    /// the *default* `acp_review_on_turn_end` setting to `badge` (no
-    /// auto-open) — this helper opts every test here back into `auto`
-    /// (the pre-#1515 behaviour) so the module keeps testing exactly what
-    /// it always tested, unaffected by the new default a *different* set
-    /// of tests (`Engine::acp_turn_review_badge`'s own, and the
-    /// `render`/driver-level #1515 tests) covers instead.
+    /// machinery itself (opening the modal, restoring a checkpoint, ...).
+    /// This helper opts every test back into `auto` mode so the module keeps
+    /// testing the core machinery, independent of the `acp_review_on_turn_end`
+    /// setting default.
     fn engine_for_turn_review_tests() -> Engine {
         let mut engine = Engine::new_for_test();
         engine.settings.acp_review_on_turn_end = crate::core::settings::AcpReviewOnTurnEnd::Auto;
@@ -617,7 +596,7 @@ mod tests {
     /// Unique scratch dir per test — same manual pattern `review_ops.rs`'s
     /// own `unique_temp_dir` uses.
     ///
-    /// #1504: canonicalized before returning. Production records paths via
+    /// Canonicalized before returning. Production records paths via
     /// `resolve_path_within_roots` (see `acp_ops.rs`), which canonicalizes
     /// the resolved path's existing ancestor — so every path this module's
     /// engine records (review entries, checkpoint entries) is canonical.
@@ -642,12 +621,10 @@ mod tests {
         dir.canonicalize().unwrap_or(dir)
     }
 
-    /// #1460's own words: "the turn review lists all 3" — a fake agent
-    /// (here: three direct `acp_write_text_file` calls, the exact call
-    /// `fs/write_text_file` handling makes — see `acp_ops.rs`'s own
-    /// `acp_write_text_file_*` tests for the same style) writing three
-    /// files in one turn must open a review whose entries name all three,
-    /// each with its pre-turn content as `old_text`.
+    /// A fake agent (three direct `acp_write_text_file` calls, the exact call
+    /// `fs/write_text_file` handling makes) writing three files in one turn
+    /// must open a review whose entries name all three, each with its
+    /// pre-turn content as `old_text`.
     #[test]
     fn ending_a_turn_that_wrote_three_files_lists_all_three_in_the_review() {
         let dir = unique_temp_dir("three-files");
@@ -715,7 +692,7 @@ mod tests {
         assert!(engine.change_review.is_none());
     }
 
-    /// #1460: "reverting one restores exactly its pre-turn contents" —
+    /// "reverting one restores exactly its pre-turn contents" —
     /// pressing `r` (reject, repurposed as revert in turn-review mode) on
     /// one file writes its `old_text` back to disk, leaving the other
     /// file(s) untouched.
@@ -751,7 +728,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #1460 review (non-blocking finding): reverting a file the agent
+    /// Reverting a file the agent
     /// *created* this turn (didn't exist beforehand) must delete it, not
     /// leave an empty file behind — RED against the unfixed
     /// `unwrap_or_default()` path (which wrote back `""`): this assertion
@@ -834,7 +811,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── hunk-level Keep/Reject (#1516) ──────────────────────────────────
+    // ── hunk-level Keep/Reject ──────────────────────────────────────────
 
     /// Two well-separated changes in the same file (more than twice
     /// quadraui's 3-line context radius apart, same construction
@@ -851,17 +828,10 @@ mod tests {
         engine.acp_write_text_file(path, &new).unwrap();
     }
 
-    /// The core new capability (#1516's own title: "hunk-level Keep/
-    /// Reject"): rejecting the hunk the cursor is on reverts *only* that
-    /// hunk's own lines, leaving the other hunk's agent-written content on
-    /// disk untouched and the review still open (not every hunk is
-    /// decided yet) — proving reject no longer reverts the whole file, the
-    /// exact limitation the issue reports.
-    ///
-    /// RED against the pre-#1516 whole-file `r`: that key reverted the
-    /// entire file back to its pre-turn content, so "AGENT-B" would never
-    /// have survived this call — this test would see the file back to a
-    /// plain `1..20` sequence instead.
+    /// Rejecting the hunk the cursor is on reverts *only* that hunk's own
+    /// lines, leaving the other hunk's agent-written content on disk
+    /// untouched and the review still open (not every hunk is decided yet) —
+    /// proving reject operates at hunk granularity, not whole-file.
     #[test]
     fn reject_one_hunk_leaves_the_other_hunks_agent_content_on_disk() {
         let dir = unique_temp_dir("reject-one-hunk");
@@ -903,8 +873,7 @@ mod tests {
     /// Keeping one hunk then rejecting the other fully decides the entry
     /// (auto-closing the surface) and leaves a genuinely *mixed* result on
     /// disk — half the agent's turn kept, half reverted, within the same
-    /// file. This is only possible at hunk granularity; the pre-#1516
-    /// surface could only keep or revert an entire file at once.
+    /// file. This is only possible at hunk granularity.
     #[test]
     fn keep_one_hunk_and_reject_the_other_leaves_a_mixed_result_and_auto_closes() {
         let dir = unique_temp_dir("keep-one-reject-other");
@@ -1102,7 +1071,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #1460: "restoring a checkpoint undoes the agent's later writes but
+    /// "restoring a checkpoint undoes the agent's later writes but
     /// keeps a user edit made in between." Turn 1 writes `a.txt`; the user
     /// then hand-edits `a.txt` directly (not through the agent); restoring
     /// checkpoint 1 must refuse to touch `a.txt` (leaving the user's edit
@@ -1160,7 +1129,7 @@ mod tests {
             "summary should call out the refused file: {summary}"
         );
 
-        // #1460 review (blocking finding): a refused restore must not
+        // A refused restore must not
         // destroy the checkpoint — only the *reverted* path (b.txt) is
         // forgotten; a.txt's refused entry must remain so a later retry
         // (once the human edit is dealt with) still has something to
@@ -1185,7 +1154,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #1460 review (blocking finding): once the human edit that caused a
+    /// Once the human edit that caused a
     /// refusal is discarded, a *later* `:AiRestore` retry against the same
     /// checkpoint must actually work — proving the surviving checkpoint
     /// from the test above isn't just present but inert. RED against the
@@ -1317,7 +1286,7 @@ mod tests {
         assert!(engine.message.contains("No ACP turn changes"));
     }
 
-    // ── :AiReview / :AiRestore ex commands (#1460) ──────────────────────────
+    // ── :AiReview / :AiRestore ex commands ──────────────────────────────────
 
     #[test]
     fn ai_review_ex_command_reopens_the_most_recent_checkpoint() {
@@ -1403,7 +1372,7 @@ mod tests {
         assert!(engine.message.contains("Usage: AiRestore"));
     }
 
-    // ── in-buffer inline review (#1517) ─────────────────────────────────
+    // ── in-buffer inline review ─────────────────────────────────────────
 
     /// Badge-mode engine setup shared by the tests below: a real file
     /// with one agent-written hunk on disk, the checkpoint recorded, and
@@ -1531,11 +1500,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A hunk the human edits before deciding is still resolvable — the
-    /// live diff (`pre_turn_content` vs the buffer's *current* content,
-    /// buffer-first) picks up the edit, so keeping it keeps the edited
-    /// text, not the agent's original write (#1517's "edit before
-    /// accept").
+    /// A hunk the human edits before deciding is still resolvable — the live
+    /// diff (`pre_turn_content` vs the buffer's *current* content,
+    /// buffer-first) picks up the edit, so keeping it keeps the edited text,
+    /// not the agent's original write.
     #[test]
     fn a_hunk_edited_before_keep_is_kept_as_edited_not_as_the_agents_original_write() {
         let (mut engine, dir, path) = engine_with_one_pending_inline_hunk("edit-before-keep");

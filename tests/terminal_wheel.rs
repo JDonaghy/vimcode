@@ -1,8 +1,8 @@
 mod common;
 use common::*;
 
-/// #514 stress-test regression: a mouse wheel must not leak into the shell's
-/// scrollback while an app owns the alternate screen.
+/// A mouse wheel must not leak into the shell's scrollback while an app
+/// owns the alternate screen.
 ///
 /// `terminal_forward_wheel` returns `true` when the wheel was handed to the
 /// child (so the caller skips local scrollback) and `false` for an ordinary
@@ -62,8 +62,6 @@ fn wheel_no_pane_falls_back_to_scrollback() {
     assert!(!e.terminal_forward_wheel(true));
     assert!(!e.terminal_forward_wheel(false));
 }
-
-// ── #533: unified scroll / mouse handler tests ────────────────────────────────
 
 /// `handle_terminal_scroll` with a negative delta scrolls up (into history).
 ///

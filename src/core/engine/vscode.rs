@@ -1,6 +1,6 @@
 use super::*;
 
-// #1730: this file deliberately has — and must never grow — a
+// This file deliberately has — and must never grow — a
 // `cfg(target_os = "macos")` or "is this a Mac terminal" branch. Every
 // binding below is stated purely in terms of `ctrl`/`shift`/the `Alt_*` key
 // names the shared decoder (`render::engine_key_from_ui`) hands it, which is
@@ -8,9 +8,8 @@ use super::*;
 // never reaches a terminal application on any OS, so a macOS TUI's reachable
 // chord alphabet is identical to Linux's.
 //
-// #1745: the macOS *GUI* backend (`src/macos/`) does exist in this repo
-// (#1730's module doc wrongly assumed otherwise) and does need a real
-// Cmd-vs-Ctrl remap — but that remap still does not belong in this file.
+// The macOS *GUI* backend (`src/macos/`) does need a real
+// Cmd-vs-Ctrl remap — but that remap does not belong in this file.
 // `normalize_mac_cmd_as_ctrl` (`src/app.rs`), called once at the top of
 // the one shared `App::handle_dispatch` both GTK and the macOS GUI run
 // through, folds `Modifiers::cmd` into `ctrl` for plain substitution chords
@@ -18,10 +17,7 @@ use super::*;
 // substitution (Option for word-nav, Cmd for line/doc-nav) into the exact
 // `Key`/`Modifiers` shape this file already understands, before this file
 // ever sees the event — so `vscode.rs` keeps speaking only `ctrl`/`shift`/
-// `Alt_*`, unchanged. `Cmd+Option+F` for Find & Replace is not yet among
-// them: see `tests/vscode_keybinding_parity.rs`'s `REACHABILITY_TABLE` and
-// `docs/PENDING_QUADRAUI_ISSUES.md` for why that one is blocked upstream in
-// quadraui, not a vimcode-side gap.
+// `Alt_*`, unchanged.
 
 impl Engine {
     /// True when the editor is configured in VSCode editing mode.
@@ -135,7 +131,7 @@ impl Engine {
     }
 
     /// Delete the current visual selection and restore Insert mode.
-    /// Selection end bound follows `visual_end_exclusive` (#1788 review) —
+    /// Selection end bound follows `visual_end_exclusive` —
     /// NOT a hardcoded exclusive-end assumption, since Ctrl+D/Ctrl+Shift+L/
     /// mouse selections are inclusive-end even in VSCode mode.
     /// Relies on the caller to manage the undo group.
@@ -344,7 +340,7 @@ impl Engine {
 
     /// Ctrl-A: select all text.
     ///
-    /// #1785: select-all collapses to a single whole-buffer selection, so any
+    /// Select-all collapses to a single whole-buffer selection, so any
     /// multi-cursor state left over from a prior Ctrl+D/Ctrl+Shift+L edit must
     /// be cleared here. Otherwise the next typed character hits the inline
     /// multi-cursor-with-selection branch in `handle_vscode_key`'s `unicode`
@@ -409,7 +405,7 @@ impl Engine {
         }
     }
 
-    /// Dispatch one of the `Selection` menu's commands (#1697). These are
+    /// Dispatch one of the `Selection` menu's commands. These are
     /// `execute_command`/menu-bar string actions ("select_all",
     /// "MoveLineUp", "MoveLineDown", "add_cursor_above",
     /// "add_cursor_below", "add_next_occurrence",
@@ -651,8 +647,7 @@ impl Engine {
     /// new, upper copy now occupies (the original content shifts down by the
     /// number of duplicated lines) — matching VS Code's own "the duplicate
     /// becomes the thing you're editing" feel, and letting repeated presses
-    /// keep stacking copies upward. #1744: this chord used to be misbound to
-    /// `vscode_add_cursor_above` (now Ctrl+Alt+Up's `insertCursorAbove`).
+    /// keep stacking copies upward.
     fn vscode_copy_line_up(&mut self, changed: &mut bool) {
         let (start_line, end_line) = self.vscode_affected_lines();
         self.start_undo_group();
@@ -987,7 +982,7 @@ impl Engine {
     /// the loop, and the shared helper's Vim-style cursor landing
     /// (`self.view_mut().cursor.line = start_line` on every call) would
     /// otherwise stomp every cursor but the last shifted line's onto
-    /// `start_line` (#883 review).
+    /// `start_line`.
     fn vscode_indent(&mut self, changed: &mut bool) {
         if !self.view().extra_cursors.is_empty() {
             // Collect all unique lines from primary + extra cursors
@@ -1213,7 +1208,7 @@ impl Engine {
         // ── Alt-encoded keys (sent from backends when in VSCode mode) ────
         if key_name.starts_with("Alt_") {
             match key_name {
-                // #1744: `ctrl` now flows through from `render::route_alt_key`
+                // `ctrl` now flows through from `render::route_alt_key`
                 // instead of being hardcoded `false`, so Ctrl+Alt+Up/Down —
                 // VS Code's real `insertCursorAbove`/`insertCursorBelow` —
                 // can finally be told apart from plain Alt+Up/Down's
@@ -1223,14 +1218,11 @@ impl Engine {
                 "Alt_Down" if ctrl => self.vscode_add_cursor_below(),
                 "Alt_Up" => self.vscode_move_line_up(&mut changed),
                 "Alt_Down" => self.vscode_move_line_down(&mut changed),
-                // #1744: Shift+Alt+Up/Down is VS Code's `copyLinesUpAction`/
-                // `copyLinesDownAction` (duplicate the line), not add-cursor
-                // — that chord used to be misbound here to
-                // `vscode_add_cursor_above`/`_below`, the behaviour
-                // Ctrl+Alt+Up/Down now owns above.
+                // Shift+Alt+Up/Down is VS Code's `copyLinesUpAction`/
+                // `copyLinesDownAction` (duplicate the line), not add-cursor.
                 "Alt_Shift_Up" => self.vscode_copy_line_up(&mut changed),
                 "Alt_Shift_Down" => self.vscode_copy_line_down(&mut changed),
-                // #1744: VS Code's `workbench.action.navigateBack`/
+                // VS Code's `workbench.action.navigateBack`/
                 // `navigateForward`, the same jump-list mechanism Vim mode's
                 // Ctrl-O/Ctrl-I already use.
                 "Alt_Left" => self.jump_list_back(),
@@ -1434,7 +1426,7 @@ impl Engine {
                 "Shift_bracketright" => {
                     self.cmd_fold_open_progressive();
                 }
-                // #1744: Ctrl+Shift+\ → jump to matching bracket (VS Code's
+                // Ctrl+Shift+\ → jump to matching bracket (VS Code's
                 // `editor.action.jumpToBracket`), the same underlying search
                 // Vim mode's `%` already uses. `"|"` is the literal shifted
                 // glyph most surfaces deliver instead of an explicit Shift

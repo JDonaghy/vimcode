@@ -23,10 +23,9 @@ pub(crate) fn build_tab_bar_for_group_by_id(engine: &Engine, group_id: GroupId) 
             } else {
                 ("[No Name]".to_string(), false, false)
             };
-            // #700 review nit: a single trailing space so the close glyph
-            // doesn't paint flush against the label — see `TabInfo::name`'s
-            // doc for why this has to be added here, at the source, rather
-            // than downstream where `TabInfo` becomes `quadraui::TabItem`.
+            // A single trailing space so the close glyph doesn't paint flush
+            // against the label — see `TabInfo::name`'s doc for why this has to
+            // be added here, at the source, rather than downstream.
             TabInfo {
                 name: name + " ",
                 active,
@@ -47,20 +46,16 @@ pub(crate) fn build_tab_bar(engine: &Engine) -> Vec<TabInfo> {
 }
 
 /// Offset table produced by expanding `'list'` glyphs (`\t`, plus any
-/// `'listchars'` single-character substitutions — `trail`/`nbsp`/`space`,
-/// #1206) in a line's text. Every position-based field a `RenderedLine`
+/// `'listchars'` single-character substitutions — `trail`/`nbsp`/`space`)
+/// in a line's text. Every position-based field a `RenderedLine`
 /// carries for that line — byte-offset `StyledSpan`s *and* char-index
 /// `DiagnosticMark`/`SpellMark`s — must remap through this single table
-/// rather than recomputing the expansion delta twice, which is how #1208
-/// happened: the byte-offset remap for `spans` shipped in #1190 with no
-/// equivalent for the char-index diagnostic/spell marks.
+/// rather than recomputing the expansion delta twice.
 ///
-/// Byte and char deltas are tracked *separately* (#1206): a tab expansion
+/// Byte and char deltas are tracked *separately*: a tab expansion
 /// changes both by the same amount only when the configured tab glyph is
 /// pure ASCII, and a single-character substitution (`trail:·`, say) can
-/// change the byte length while leaving the char count at exactly 1 — the
-/// pre-#1206 shared-delta design (`:h` #1208's own doc) was only ever exact
-/// for the ASCII-only `^I` fallback it was built for.
+/// change the byte length while leaving the char count at exactly 1.
 struct ListGlyphOffsets {
     /// `(old_byte_offset_just_past_this_char, old_char_offset_just_past_this_char, cumulative_byte_delta, cumulative_char_delta)`.
     breakpoints: Vec<(usize, usize, i64, i64)>,
@@ -182,25 +177,20 @@ fn compute_list_glyph_expansion(text: String, settings: &Settings) -> (String, L
     (out, ListGlyphOffsets { breakpoints })
 }
 
-/// Vim's `'list'` (#1190, `'listchars'` support #1206): apply the configured
+/// Vim's `'list'` (`'listchars'` support): apply the configured
 /// glyph set to one already-built `(raw_text, spans, diagnostics,
 /// spell_errors)` tuple. Callers must not call this for a fold-header line
 /// (`RenderedLine::is_fold_header`) — real vim's `'list'` never marks a
-/// closed fold's display text (#1208).
+/// closed fold's display text.
 ///
 /// `mark_eol` is `false` for every wrap-continuation segment except the
 /// last — an `eol` glyph belongs at the true end of the buffer line, not at
 /// each mid-line wrap point — and even on the last segment, nothing is
-/// appended unless `'listchars'` actually has an `eol:` item (Neovim's real
-/// default doesn't: `:h 'listchars'`'s default is `"tab:> ,trail:-,nbsp:+"`,
-/// no `eol`, so `'list'` shows no trailing `$` out of the box — #1190's
-/// hardcoded always-`$` only matched classic Vim's *empty*-`'listchars'`
-/// fallback, not this).
+/// appended unless `'listchars'` actually has an `eol:` item.
 ///
 /// Remaps `spans` (byte offsets), `diagnostics` and `spell_errors` (char
 /// indices) through one shared [`ListGlyphOffsets`] table computed from the
-/// expansion, rather than two parallel remap implementations that can drift
-/// out of sync (#1208).
+/// expansion, rather than separate remap implementations that can drift.
 pub(crate) fn apply_list_glyphs(
     text: String,
     spans: Vec<StyledSpan>,
@@ -322,7 +312,7 @@ pub(crate) fn build_rendered_window(
         Some(s) => s,
         None => return empty(window_id),
     };
-    // #1627: an editor-tab-hosted plugin view's window paints a `Form`
+    // An editor-tab-hosted plugin view's window paints a `Form`
     // (`App::paint_editor_windows_rung`), never buffer text — short-circuit
     // before any of the syntax/diagnostic/fold work below, all of which is
     // meaningless against the tiny scratch buffer backing it.
@@ -342,7 +332,7 @@ pub(crate) fn build_rendered_window(
     let scroll_top = view.scroll_top.min(total_lines);
     let cursor_line = view.cursor.line;
 
-    // #1515: `badge` mode's gutter-marker overlay — the lines the most
+    // `badge` mode's gutter-marker overlay — the lines the most
     // recent still-outstanding ACP turn checkpoint changed in this buffer,
     // base = that checkpoint's `pre_turn_content` (not `git diff HEAD` —
     // see `crate::core::acp_turn::line_status`'s own doc for why the two
@@ -368,11 +358,11 @@ pub(crate) fn build_rendered_window(
         Vec::new()
     };
 
-    // Whether this buffer has git diff data (or an outstanding ACP-turn
-    // overlay — #1515 — to show in the same gutter column).
+    // Whether this buffer has git diff data or an outstanding ACP-turn
+    // overlay to show in the same gutter column.
     let has_git = !buffer_state.git_diff.is_empty() || !acp_turn_status.is_empty();
 
-    // #1517: in-buffer inline review — the still-outstanding hunks between
+    // In-buffer inline review — the still-outstanding hunks between
     // this buffer's checkpoint entry and its live content, gated the same
     // `badge`-only way `acp_turn_status` immediately above is (see that
     // computation's own doc). Reused below to paint a virtual
@@ -426,7 +416,7 @@ pub(crate) fn build_rendered_window(
         .unwrap_or(&[]);
     let bp_lines: Vec<u64> = bp_infos.iter().map(|bp| bp.line).collect();
 
-    // #1653: plugin decoration marks (`vimcode.decor.*`) touching the
+    // Plugin decoration marks (`vimcode.decor.*`) touching the
     // viewport — fetched once per window per frame (not per visible line,
     // and never a full-buffer scan: `DecorState::marks_touching` only walks
     // its per-buffer `by_row` index up to `end_row`), then filtered to the
@@ -475,13 +465,13 @@ pub(crate) fn build_rendered_window(
     // so the formula reduces to rect.width - gutter_char_width, which is exact.
     //
     // `scrollbar_reserve` is the caller's own backend's
-    // `quadraui::Backend::scrollbar_reserve()` (#828/quadraui#776) — width
+    // `quadraui::Backend::scrollbar_reserve()` — width
     // reserved alongside the text for a native scrollbar overlay (GTK's
     // `ScrolledWindow`; TUI has none, so its backend returns `0.0`). This
     // function has no opinion on what that value is; it only subtracts
     // whatever the caller measured.
     //
-    // `minimap_w` (#1094): `rect` is now the *pane's* rect, unmodified by
+    // `minimap_w`: `rect` is now the *pane's* rect, unmodified by
     // the strip — see this function's caller (`build_screen_layout`'s
     // `minimap_widths`/`windows` map, where `minimap_w` is derived) for
     // the full rationale on why `rect` stopped being narrowed and what
@@ -497,7 +487,7 @@ pub(crate) fn build_rendered_window(
         view.viewport_cols.max(1)
     };
 
-    // #1094 review: `RenderedWindow.minimap_reserved_w` — the same
+    // `RenderedWindow.minimap_reserved_w` — the same
     // strip-plus-gutter width just subtracted above, but re-expressed
     // relative to `rect.width` (i.e. with `scrollbar_reserve` folded back
     // in) so `window_zone_hit_test` can find the strip's boundary directly
@@ -569,13 +559,12 @@ pub(crate) fn build_rendered_window(
         engine.diff_aligned.get(&window_id).map(|v| v.as_slice());
 
     // Whether *open*-foldable-region markers (`-`) paint in this window's
-    // gutter this frame (#1544, VS Code's `editor.showFoldingControls`).
-    // Closed-fold `+` markers are handled separately, inside
+    // gutter this frame. Closed-fold `+` markers are handled separately, inside
     // `fold_indicator_char`, and always paint under `Mouseover` — a fold you
     // can't see is a fold you can't discover how to reopen. `Never` hides
-    // both. `engine.gutter_hover_window` is updated by
-    // `route_gutter_hover`, called from the same shared `MouseMoved` path on
-    // both backends (`App::handle_dispatch`) — no per-backend hover logic.
+    // both. `engine.gutter_hover_window` is updated by `route_gutter_hover`,
+    // called from the same shared `MouseMoved` path on both backends.
+    // (`App::handle_dispatch`) — no per-backend hover logic.
     let fold_open_markers_visible = match engine.settings.fold_controls {
         FoldControlsMode::Always => true,
         FoldControlsMode::Never => false,
@@ -585,7 +574,7 @@ pub(crate) fn build_rendered_window(
     // Build rendered lines (fold-aware: skip hidden lines, jump over fold bodies)
     let mut lines = Vec::with_capacity(visible_lines);
 
-    // #1653: inline virtual text (`virt_text_pos = "inline"`) shifts later
+    // Inline virtual text (`virt_text_pos = "inline"`) shifts later
     // text on its line right — `(anchor_col, inserted_chars)` pairs per
     // `line_idx`, consulted once the cursor's screen column is computed
     // below (`view.cursor.col` itself stays in *buffer* coordinates; only
@@ -601,7 +590,7 @@ pub(crate) fn build_rendered_window(
     // pair land on exactly the same row. Without it we fall back to a
     // seek-from-`scroll_top` heuristic, then back up over any leading
     // padding so a hunk's filler rows render at the top of the viewport
-    // when scroll_top lands just past them (#166).
+    // when scroll_top lands just past them.
     let mut aligned_idx: usize = if let Some(aligned) = diff_aligned {
         if let Some(top) = view.aligned_top {
             top.min(aligned.len())
@@ -756,7 +745,7 @@ pub(crate) fn build_rendered_window(
             )
         };
 
-        // #1653: apply plugin decorations anchored to this line — highlight
+        // Apply plugin decorations anchored to this line — highlight
         // spans first (merged into `spans` so the wrapped-line segmentation
         // below slices them exactly like any syntax span), then overlay/
         // inline virtual text, which mutates `line_str` + `spans` together
@@ -768,7 +757,7 @@ pub(crate) fn build_rendered_window(
             .collect();
         let mut spans = spans;
         let mut line_str = line_str;
-        // #1653 review: LSP diagnostics/spell-check ranges below are
+        // LSP diagnostics/spell-check ranges below are
         // computed from UTF-16/byte offsets measured against the buffer's
         // real text, *before* any decor splice below mutates `line_str` —
         // reusing the (possibly already-spliced) `line_str` there would
@@ -794,22 +783,20 @@ pub(crate) fn build_rendered_window(
                 }
             }
         }
-        // #1653 review: process left-to-right by anchor column, tracking
-        // how many characters earlier *inline* splices on this same line
-        // have already inserted (`col_shift`) — `m.col` is a buffer column,
-        // fixed at `set_mark` time, but `line_str` keeps growing as each
-        // earlier inline splice runs, so a second mark's splice point has
-        // to be adjusted by however much text landed before it, or it (and
-        // everything after it) lands `col_shift` characters too early.
-        // Overlay splices don't need to bump `col_shift` themselves since
-        // they replace exactly as many characters as they insert (net-zero
-        // width change) — only `Inline` grows the line.
+        // Process left-to-right by anchor column, tracking how many characters
+        // earlier *inline* splices on this same line have already inserted
+        // (`col_shift`) — `m.col` is a buffer column, fixed at `set_mark` time,
+        // but `line_str` keeps growing as each earlier inline splice runs, so a
+        // second mark's splice point has to be adjusted by however much text
+        // landed before it, or it (and everything after it) lands `col_shift`
+        // characters too early. Overlay splices don't need to bump `col_shift`
+        // themselves since they replace exactly as many characters as they insert
+        // (net-zero width change) — only `Inline` grows the line.
         //
-        // #1810 split the row's virtual-text marks in two here: `Overlay`
-        // and `Inline` splice into `line_str`/`spans` in the loop below,
-        // while `Eol` (and an unset `virt_text_pos`, which means the same
-        // thing) has no buffer column to splice at and paints through
-        // `RenderedLine::annotation` instead — see `decor_eol_text` below.
+        // The row's virtual-text marks are split here: `Overlay` and `Inline`
+        // splice into `line_str`/`spans` in the loop below, while `Eol` (and an
+        // unset `virt_text_pos`, which means the same thing) has no buffer column
+        // to splice at and paints through `RenderedLine::annotation` instead.
         let (mut virt_text_marks, mut eol_marks): (Vec<&DecorMark>, Vec<&DecorMark>) = line_decor
             .iter()
             .filter(|m| m.row == line_idx && !m.opts.virt_text.is_empty())
@@ -857,7 +844,7 @@ pub(crate) fn build_rendered_window(
                         .push((m.col, inserted));
                 }
                 Some(VirtTextPos::Eol) | None => {
-                    // `partition`ed into `eol_marks` above (#1810), so this
+                    // `partition`ed into `eol_marks` above, so this
                     // arm is dead for every mark that reaches this loop.
                     // Left as an explicit no-op rather than `unreachable!`
                     // so a future change to the partition predicate can
@@ -865,44 +852,23 @@ pub(crate) fn build_rendered_window(
                 }
             }
         }
-        // #1810: end-of-line virtual text (`virt_text_pos = "eol"`, or no
+        // End-of-line virtual text (`virt_text_pos = "eol"`, or no
         // `virt_text_pos` at all — the same default) has no buffer column
         // to splice at like Overlay/Inline above, and must never wrap or
-        // push the line the way real spliced content would. It converges
-        // on `vimcode.buf.annotate_line`'s existing paint path instead
-        // (`RenderedLine::annotation`, below), which already paints after
+        // push the line the way real spliced content would. It uses
+        // `RenderedLine::annotation` instead, which already paints after
         // the line's content in `theme.annotation_fg` and is hard-truncated
-        // at the window edge rather than wrapped — exactly the behaviour
-        // #1810 asks for. Several eol marks on one line draw in creation
-        // order (oldest `set_mark` first, i.e. ascending `MarkId` — note
-        // `DecorOpts` has no `priority` field at all; "creation order" is
-        // what the code below actually does),
-        // separated by a space.
+        // at the window edge rather than wrapped. Several eol marks on one line
+        // draw in creation order (oldest `set_mark` first, i.e. ascending
+        // `MarkId`), separated by a space.
         //
-        // Two deliberate differences from the blame annotation it shares
-        // that field with (both applied at the `annotation:` sites below):
-        // on a wrapped line it rides the *last* visual segment, not the
-        // first, and it is not muted while the user is in Insert mode. One
-        // consequence of the first-row/last-row split: if the viewport cuts
-        // off before this line's last wrap segment (the `lines.len() >=
-        // visible_lines` guard below can stop early), `decor_eol_text` is
-        // dropped for that line entirely — it never rides an earlier,
-        // still-visible segment the way the blame annotation does. Probably
-        // the right trade-off (there's no "end of line" to show until the
-        // line's actual end scrolls into view), but it means a long wrapped
-        // line's eol text can silently vanish below the fold.
-        //
-        // Per-mark colour (the chunk's own `hl_group`, as Overlay/Inline
-        // get via `resolve_decor_style`) is NOT implemented: quadraui's
+        // On a wrapped line it rides the *last* visual segment, not the
+        // first, and it is not muted while the user is in Insert mode. If the
+        // viewport cuts off before this line's last wrap segment, `decor_eol_text`
+        // is dropped for that line entirely — it never rides an earlier,
+        // still-visible segment. Per-mark colour is not implemented: quadraui's
         // `EditorLine::annotation` is a single `Option<String>` painted in
-        // one theme-wide `annotation_fg` colour — there is no quadraui
-        // primitive for multiple independently-coloured runs in the
-        // trailing-annotation area. That needs quadraui infra first (a
-        // quadraui issue, per the platform-neutrality rule) before eol
-        // text can paint in its own highlight's colour rather than
-        // `annotation_fg` — drafted as a quadraui gap in
-        // `docs/PENDING_QUADRAUI_ISSUES.md` (also covers the TUI-vs-GTK
-        // leading-pad inconsistency) rather than left only in this comment.
+        // one theme-wide `annotation_fg` colour.
         eol_marks.sort_by_key(|m| m.id.0);
         let decor_eol_text: Option<String> = {
             let parts: Vec<String> = eol_marks
@@ -922,40 +888,22 @@ pub(crate) fn build_rendered_window(
         // `bp_part` below): the first mark with `sign_text` touching this
         // line, truncated to its first character.
         //
-        // #1653's own scope text asks for "1-2 display cells" of sign_text
-        // plus `sign_hl`, but neither half of that can actually paint
-        // through this column today, and the reason is a *quadraui*
-        // limitation, not a vimcode one: both backends' gutter rasterisers
-        // hardcode the breakpoint/sign slot at exactly one character —
-        // quadraui's `gtk/editor.rs::paint_gutter_row_number` does
-        // `rl.gutter_text.chars().take(1)` for the bp glyph and then
-        // advances its own `char_offset` by a bare `1` before reading the
-        // git column; `tui/editor.rs`'s gutter loop computes `git_offset =
-        // bp_offset + 1` the same fixed way. Handing either backend a
-        // 2-character `gutter_text` here would not render a wider sign —
-        // it would misalign the git/line-number columns after it, since
-        // neither rasteriser's `+1` is driven by any width this crate
-        // controls. Likewise, colouring just the sign glyph with `sign_hl`
-        // would need a per-glyph colour channel on quadraui's `EditorLine`
-        // that doesn't exist (`gutter_text` is one plain `String`, painted
-        // in one colour chosen from `is_breakpoint`/`is_dap_current`/
-        // `git_diff`). Per the platform-neutrality rule this needs
-        // quadraui-side infra first (a real `bp_col_width`/per-glyph-colour
-        // API) rather than a per-backend workaround here — drafted as a
-        // quadraui gap in `docs/PENDING_QUADRAUI_ISSUES.md` rather than
-        // left only in this comment; until it lands, `sign_text` is truncated to 1
-        // character and `sign_hl` is parsed/stored (round-trips through
-        // `get_mark`) but has no paint effect.
+        // The sign slot is hardcoded to exactly one character in both backends'
+        // gutter rasterisers, a quadraui limitation: colouring just the sign
+        // glyph with `sign_hl` would need a per-glyph colour channel on
+        // quadraui's `EditorLine` that doesn't exist. Until quadraui provides
+        // infra for this, `sign_text` is truncated to 1 character and `sign_hl`
+        // is parsed/stored but has no paint effect.
         let decor_sign_glyph: Option<String> = line_decor
             .iter()
             .find_map(|m| m.opts.sign_text.as_deref())
             .and_then(|s| s.chars().next())
             .map(|c| c.to_string());
 
-        // Git diff status for this line, falling back to the #1515
-        // ACP-turn overlay (`acp_turn_status`) where the real git diff has
-        // nothing to say about it — a file already git-dirty before the
-        // turn keeps showing its real git status first.
+        // Git diff status for this line, falling back to the ACP-turn
+        // overlay (`acp_turn_status`) where the real git diff has nothing
+        // to say about it — a file already git-dirty before the turn keeps
+        // showing its real git status first.
         let git_status = if has_git {
             buffer_state
                 .git_diff
@@ -1015,7 +963,7 @@ pub(crate) fn build_rendered_window(
                 } else if is_breakpoint {
                     "●" // breakpoint
                 } else {
-                    // #1653: a plugin decor sign shows in this column when
+                    // A plugin decor sign shows in this column when
                     // there's no real breakpoint/DAP marker on the line —
                     // priority is DAP-current/breakpoint, then decor sign,
                     // then blank.
@@ -1042,7 +990,7 @@ pub(crate) fn build_rendered_window(
             diags
                 .iter()
                 .map(|d| {
-                    // #1653 review: must use the pre-decor-splice text —
+                    // Must use the pre-decor-splice text —
                     // `d.range` is measured against the buffer's real
                     // content, not whatever `line_str` looks like after an
                     // inline/overlay virtual-text splice shifted its bytes.
@@ -1079,7 +1027,7 @@ pub(crate) fn build_rendered_window(
                     .and_then(|p| p.to_str())
                     .and_then(crate::core::syntax::SyntaxLanguage::from_path);
                 let line_start_byte = buffer.content.line_to_byte(line_idx);
-                // #1653 review: same pre-splice-text rationale as the
+                // Same pre-splice-text rationale as the
                 // diagnostics block above — spell errors are columns into
                 // the buffer's real line text.
                 crate::core::spell::check_line(
@@ -1117,10 +1065,10 @@ pub(crate) fn build_rendered_window(
         // fills its last wrapped row spill the newline into an extra, blank
         // continuation row that `ensure_cursor_visible_wrap` (which counts
         // rows on the EOL-stripped text) never accounted for, so `G` could
-        // land the cursor below the viewport (#1496).
+        // land the cursor below the viewport.
         let wrap_text_len = line_str.trim_end_matches(['\n', '\r']).len();
         let line_char_len = line_str[..wrap_text_len].chars().count();
-        // 'list' (#1190): applied only to the copy handed to the renderer
+        // 'list': applied only to the copy handed to the renderer
         // below (`raw_text`/`spans`) — `line_str` above (already consumed
         // by the diagnostics/spell-check UTF-16 offset math) and the word-
         // wrap segmentation just above stay on the untransformed text, so
@@ -1162,7 +1110,7 @@ pub(crate) fn build_rendered_window(
                 // Diagnostics/spell marks are attached only to the segment
                 // that isn't a continuation (index-0-relative, same as
                 // `seg_text`), so they share that segment's glyph-expansion
-                // offset table rather than a separately-recomputed one (#1208).
+                // offset table rather than a separately-recomputed one.
                 let seg_diagnostics = if is_cont {
                     Vec::new()
                 } else {
@@ -1207,8 +1155,7 @@ pub(crate) fn build_rendered_window(
                     is_wrap_continuation: is_cont,
                     segment_col_offset: seg_start_char,
                     annotation: join_annotation(
-                        // Blame keeps its pre-#1810 placement exactly:
-                        // first visual row only, hidden while typing.
+                        // Blame annotation: first visual row only, hidden while typing.
                         if is_cont
                             || (engine.mode == crate::core::Mode::Insert
                                 && !engine.is_vscode_mode())
@@ -1272,7 +1219,7 @@ pub(crate) fn build_rendered_window(
                 }
             }
         } else {
-            // 'list' glyphs never apply to fold-header summary lines (#1208)
+            // 'list' glyphs never apply to fold-header summary lines
             // — real vim's 'list' doesn't touch the folded-line-count text,
             // and this branch is also where non-wrapped lines land, so the
             // gate has to live here rather than on `list_mode` alone.
@@ -1307,7 +1254,7 @@ pub(crate) fn build_rendered_window(
                 is_wrap_continuation: false,
                 segment_col_offset: 0,
                 // Same split as the wrapped branch above: blame is muted in
-                // Insert mode, decor eol text is not (#1810).
+                // Insert mode, decor eol text is not.
                 annotation: join_annotation(
                     if engine.mode == crate::core::Mode::Insert && !engine.is_vscode_mode() {
                         None
@@ -1360,7 +1307,7 @@ pub(crate) fn build_rendered_window(
             }
         }
 
-        // #1517: in-buffer inline review — right after the last line of
+        // In-buffer inline review — right after the last line of
         // any still-outstanding hunk, paint a virtual `[a] keep  [r]
         // reject` action row (no buffer content of its own, same
         // `is_wrap_continuation: true` convention the ghost-completion
@@ -1442,7 +1389,7 @@ pub(crate) fn build_rendered_window(
                         _ => CursorShape::Block,
                     }
                 };
-                // #1653: inline virtual text anchored before the cursor's
+                // Inline virtual text anchored before the cursor's
                 // buffer column on this line shifted the painted text right
                 // by its character count — the cursor's painted column has
                 // to follow, even though `view.cursor.col` itself stays in
@@ -1628,7 +1575,7 @@ pub(crate) fn build_rendered_window(
         Vec::new()
     };
 
-    // `'showmatch'` (#1207): while `Engine::showmatch_flash` is armed (the one
+    // `'showmatch'`: while `Engine::showmatch_flash` is armed (the one
     // frame right after a matched closing bracket was typed in Insert mode —
     // cleared at the top of the *next* `handle_insert_key`, see the field's
     // doc comment on `Engine`), highlight the opening bracket it matched with
@@ -1675,7 +1622,7 @@ pub(crate) fn build_rendered_window(
         vec![]
     };
 
-    // ── Sticky scroll (#1546) ────────────────────────────────────────────
+    // ── Sticky scroll ────────────────────────────────────────────────────
     // Pin the header lines of `scroll_top`'s enclosing scopes at the top of
     // the viewport by splicing them directly over `lines[0..k]` — reusing
     // the exact same per-row paint + click-to-jump machinery every other

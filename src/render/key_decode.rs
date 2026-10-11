@@ -1,54 +1,24 @@
-// ─── Shared key decode (#826) ─────────────────────────────────────────────────
+// ─── Shared key decode ────────────────────────────────────────────────────────
 //
 // The single implementation of "raw key → engine-facing `(key_name, unicode,
-// ctrl)`" both backends now call. TUI used to get here by converting the
-// `quadraui::Key` the runner had *already* decoded back into a synthesised
-// crossterm `KeyEvent` (`quadraui::tui::events::synth_keyevent`) and re-decoding
-// that with a TUI-only `translate_key` (crossterm `KeyCode`/`KeyModifiers`) —
-// a pure round trip, since `crossterm_key_to_uievent`/`synth_keyevent`
-// (`quadraui::tui::events`) carry `Key::Char`/`Modifiers` losslessly. This
-// function is `translate_key`'s logic verbatim, typed against `quadraui::Key`/
-// `Modifiers` instead, so there is nothing left to round-trip through.
+// ctrl)`" both backends call. This function's `Key::Named` arm is the one place
+// the table of named keys (`"Escape"`, `"Return"`, `"BackSpace"`, `"Tab"`,
+// the arrows, `F1`-`F12`, …) is stated, shared by both GTK and TUI.
 //
-// GTK's own decode was a separate, simpler ~40-line inline match producing
-// identical spellings for the named keys both backends share (`"Escape"`,
-// `"Return"`, `"BackSpace"`, `"Tab"`, the arrows, `F1`-`F12`, …) — this
-// function's `Key::Named` arm is now the one place that table is stated, and
-// GTK's `handle_dispatch` calls it too. GTK's `Key::Char` decode stays
-// backend-local (`c.to_string()`, no ctrl/shift folded into the name): GDK
-// hands GTK an already-resolved keysym for every physical key, so it never
-// hits the terminal-only ambiguity the `Key::Char` arm below exists to
-// resolve (see `keyboard_enhanced`), and the engine already accepts *both*
-// spellings for the handful of Ctrl+symbol chords the two backends' `Key::Char`
-// paths diverge on (`"backslash"` vs `"\\"`, `"bracketright"` vs `"]"` — see
-// `Engine::handle_key`'s `keys.rs`), which is what makes it safe for the two
-// backends' `Key::Char` decodes to stay independent rather than forcing GTK
-// through terminal-flavoured renaming it has no ambiguity to resolve.
+// `keyboard_enhanced` indicates whether the terminal supports the kitty protocol /
+// `REPORT_ALL_KEYS_AS_ESCAPE_CODES` flag. With it off, a handful of Ctrl+symbol
+// chords arrive from the terminal as byte sequences crossterm cannot distinguish
+// from `Ctrl+<digit>` (Ctrl+\ arrives identically to Ctrl+4, Ctrl+/ to Ctrl+7,
+// Ctrl+Shift+[ to Ctrl+3, Ctrl+Shift+] to Ctrl+5) — the `!keyboard_enhanced`
+// arms below resolve the ambiguity back to the symbolic name. GTK has no such
+// ambiguity (GDK always hands over the real keysym for the physical key pressed),
+// so it always passes `true`, which disables those terminal-only fallback arms.
 //
-// `keyboard_enhanced` is TUI's kitty-protocol / `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
-// flag (the pre-#1434 TUI shell's `setup`, `supports_keyboard_enhancement`). With it off, a
-// handful of Ctrl+symbol chords arrive from the terminal as byte sequences
-// crossterm cannot distinguish from `Ctrl+<digit>` (Ctrl+\ arrives identically
-// to Ctrl+4, Ctrl+/ to Ctrl+7, Ctrl+Shift+[ to Ctrl+3, Ctrl+Shift+] to
-// Ctrl+5) — the `!keyboard_enhanced` arms below resolve the ambiguity back to
-// the symbolic name. GTK has no such ambiguity (GDK always hands over the
-// real keysym for the physical key pressed), so it always passes `true`,
-// which simply disables those terminal-only fallback arms.
-//
-// #1744: `App::handle_dispatch` (the *one* shared dispatcher both GTK and
-// TUI run through, not a GTK-only thing despite the paragraph above calling
-// it "GTK's own decode") only calls this function from its `Key::Named`
-// arm — its `Key::Char` arm has its own, independent one-line decode
-// (`c.to_string()`), matching the "GTK never needs this function's
-// `Key::Char` ambiguity-resolution" reasoning above for GTK, but also
-// (accidentally) true for TUI since the #1422/#1499 unification. This
-// function's own `Key::Char` arm therefore has no production caller at
-// all — every one of its branches, old and new, is exercised only by this
-// file's own unit tests below, not by a real keypress on either backend.
-// `App::handle_dispatch`'s `Key::Char` arm carries the one special case
-// that chord actually needs (Ctrl+Shift+\'s `"Shift_backslash"`, mirrored
-// from this function's own arms for the same chord) directly, rather than
-// calling into this function — see that match's own comment.
+// `App::handle_dispatch` only calls this function from its `Key::Named` arm —
+// its `Key::Char` arm has its own independent decode (`c.to_string()`). This
+// function's own `Key::Char` arm therefore has no production caller at all:
+// every one of its branches is exercised only by unit tests below, not by a real
+// keypress on either backend.
 pub fn engine_key_from_ui(
     key: &quadraui::Key,
     modifiers: quadraui::Modifiers,
@@ -72,40 +42,20 @@ pub fn engine_key_from_ui(
                 } else if lower == '|' {
                     // Ctrl+Shift+\: the literal already-shifted glyph —
                     // same pattern as the bracket pairs' literal '}'/'{'
-                    // arms below. #1744: VS Code's
-                    // `editor.action.jumpToBracket`.
-                    //
-                    // This whole `Key::Char` arm has no production caller
-                    // (see this function's own module doc: the only live
-                    // call site, `App::handle_dispatch`, only reaches
-                    // `engine_key_from_ui` from the `Key::Named` arm), so
-                    // renaming `'|'` to `"Shift_backslash"` here is not
-                    // what makes this shape reachable in production —
-                    // `App::handle_dispatch`'s own `Key::Char` arm forwards
-                    // the raw `"|".to_string()` unchanged, and
-                    // `Engine::handle_vscode_key`'s `"Shift_backslash" |
-                    // "|"` arm already accepts that literal spelling
-                    // directly. Kept here anyway so this function's test
-                    // coverage for every other Ctrl+symbol spelling
-                    // continues to exercise one real decode table rather
-                    // than a partial, stale copy of it.
+                    // arms below.
                     "Shift_backslash".to_string()
                 } else if lower == '\\' && shift {
                     // Ctrl+Shift+\ via an explicit Shift modifier bit
                     // (kitty/CSI-u reporting the base key plus SHIFT rather
                     // than the shifted glyph) — same pattern as the bracket
-                    // pairs' `&& shift` arms below. #1744. See the sibling
-                    // arm above: also dead in production, mirrored by
-                    // `App::handle_dispatch`'s own `Key::Char('\\') if
-                    // modifiers.ctrl && modifiers.shift` arm, which is what
-                    // actually makes this chord reachable.
+                    // pairs' `&& shift` arms below.
                     "Shift_backslash".to_string()
                 } else if lower == '\\' || (!keyboard_enhanced && lower == '4') {
                     // Ctrl+\ sends byte 0x1C; without keyboard enhancement crossterm decodes
                     // 0x1C as KeyCode::Char('4')+CONTROL (formula: 0x1C-0x1C+'4'='4').
                     // Map both to "backslash" so Ctrl+\ works in all terminals.
                     //
-                    // #1744: a *legacy* (non-keyboard-enhanced) terminal has
+                    // A *legacy* (non-keyboard-enhanced) terminal has
                     // no way to report Ctrl+Shift+\ distinctly from Ctrl+\ at
                     // all — Ctrl+\ is the ANSI C0 byte 0x1C regardless of
                     // Shift (same shift-blindness as the Ctrl+K/Ctrl+P
@@ -189,7 +139,7 @@ pub fn engine_key_from_ui(
             NamedKey::PageUp => Some(("Page_Up".to_string(), None, false)),
             NamedKey::PageDown => Some(("Page_Down".to_string(), None, false)),
             NamedKey::F(n) => Some((format!("F{n}"), None, false)),
-            // #1060: GTK used to bypass this decoder for `Insert` entirely
+            // GTK used to bypass this decoder for `Insert` entirely
             // (returning `None` here would have silently dropped its
             // terminal PTY passthrough, which reads the literal `"Insert"`
             // name — see `terminal_ops::key_to_pty_bytes`). Naming it here
@@ -200,8 +150,6 @@ pub fn engine_key_from_ui(
             // crossterm's `KeyCode::Insert` into this same `NamedKey::Insert`
             // (quadraui `tui/events.rs`) but had nowhere for it to go.
             NamedKey::Insert => Some(("Insert".to_string(), None, false)),
-            // No engine binding today — same set `translate_key` (via
-            // crossterm's reverse `KeyCode` mapping) used to drop.
             NamedKey::CapsLock | NamedKey::NumLock | NamedKey::ScrollLock | NamedKey::Menu => None,
         },
     }
@@ -242,19 +190,12 @@ fn shift_map_us(c: char) -> char {
 
 #[cfg(test)]
 mod engine_key_from_ui_tests {
-    //! #804 (ported from `tui_main::mod::translate_key_tests` by #826):
-    //! crossterm decodes raw terminal control bytes into `KeyEvent`s, and the
-    //! runner (`quadraui::tui::events::crossterm_key_to_uievent`) decodes
-    //! those *before* this function ever sees them — a real terminal never
-    //! hands us the byte 0x08 directly, it hands us the `Key`/`Modifiers` it
-    //! already parsed it into. These tests build exactly the `Key`/`Modifiers`
-    //! crossterm+quadraui produce for each byte (per crossterm's own
-    //! control-code decoding: bytes 0x01-0x1A become `Char(('a' - 1 + byte) as
-    //! char)` + `CONTROL`, except the handful with dedicated named keys) and
-    //! assert what [`engine_key_from_ui`] does with it — this is what pinned
-    //! down that `<C-h>`/`<C-j>`/`<C-c>` arrive as ctrl+letter, not as the
-    //! named `BackSpace`/`Return`/`Escape` keys `handle_insert_key` matches on
-    //! by name (see `Engine::handle_insert_key`, `#804`).
+    //! These tests build the `Key`/`Modifiers` that crossterm+quadraui produce
+    //! for various terminal bytes (per crossterm's control-code decoding: bytes
+    //! 0x01-0x1A become `Char(('a' - 1 + byte) as char)` + `CONTROL`, except those
+    //! with dedicated named keys) and assert what [`engine_key_from_ui`] does with
+    //! it. This verifies correct handling of control codes like `<C-h>`, `<C-j>`,
+    //! `<C-c>` that arrive as ctrl+letter rather than as named keys.
     use super::*;
     use quadraui::{Key, Modifiers, NamedKey};
 
@@ -326,9 +267,8 @@ mod engine_key_from_ui_tests {
     }
 
     /// Plain letter, no modifiers: name is empty (the general fallback reads
-    /// `unicode`), consistent with the pre-#826 `translate_key` contract that
-    /// several call sites still rely on (`if key_name.is_empty() { use
-    /// unicode }`).
+    /// `unicode`), consistent with the decoder's contract that call sites rely on
+    /// (`if key_name.is_empty() { use unicode }`).
     #[test]
     fn plain_letter_has_empty_name_and_carries_unicode() {
         let (name, unicode, ctrl) =
@@ -421,7 +361,7 @@ mod engine_key_from_ui_tests {
         assert_eq!(name, "4");
     }
 
-    /// #1744: GTK (and a terminal that resolves the shifted glyph before
+    /// GTK (and a terminal that resolves the shifted glyph before
     /// reporting it) delivers Ctrl+Shift+\ as the literal shifted character
     /// '|', same pattern as the bracket pairs' literal '}'/'{' arms — must
     /// decode distinctly from plain Ctrl+\'s `"backslash"` (VS Code's
@@ -434,7 +374,7 @@ mod engine_key_from_ui_tests {
         assert!(ctrl);
     }
 
-    /// #1744: the kitty/CSI-u counterpart — the base key plus an explicit
+    /// The kitty/CSI-u counterpart — the base key plus an explicit
     /// Shift bit, rather than the shifted glyph — must decode to the same
     /// distinct name.
     #[test]
@@ -460,12 +400,11 @@ mod engine_key_from_ui_tests {
         assert_eq!(name, "backslash");
     }
 
-    /// Named keys carry no engine binding today for the handful crossterm
-    /// can decode but the engine never asked for.
+    /// Named keys that the engine has no binding for today.
     ///
-    /// `NamedKey::Insert` used to be in this list — see
+    /// `NamedKey::Insert` used to return `None` — see
     /// `insert_key_decodes_to_the_gtk_terminal_pty_spelling` below for why
-    /// #1060 gave it a real arm instead.
+    /// it now has a real arm instead.
     #[test]
     fn unbound_named_keys_return_none() {
         for named in [
@@ -478,19 +417,9 @@ mod engine_key_from_ui_tests {
         }
     }
 
-    /// #1060: GTK's `handle_dispatch` used to special-case `NamedKey::Insert`
-    /// to `"Insert"` *outside* this decoder specifically because routing it
-    /// through here used to return `None` — which would have silently
-    /// dropped the key (nothing reaches `handle_key_press`, so GTK's
-    /// terminal PTY passthrough — `terminal_ops::key_to_pty_bytes`'s
-    /// `"Insert"` arm, reached via `canonical_terminal_key_name`'s
-    /// pass-through — would never see it). Now that this decoder names it
-    /// directly, GTK's special case was deleted with no change in the
-    /// string it hands `handle_key_press` (still `"Insert"`), and TUI gains
-    /// a working `Insert` key (it already decodes crossterm's
-    /// `KeyCode::Insert` to this same `NamedKey::Insert` — quadraui's
-    /// `tui/events.rs` — but had nowhere for it to go before this arm
-    /// existed).
+    /// `NamedKey::Insert` now decodes to the terminal PTY spelling `"Insert"`.
+    /// This enables both GTK and TUI to handle the Insert key correctly through
+    /// the shared decoder.
     #[test]
     fn insert_key_decodes_to_the_gtk_terminal_pty_spelling() {
         let (name, unicode, ctrl) =
@@ -501,8 +430,7 @@ mod engine_key_from_ui_tests {
     }
 
     /// Shift+Up (no ctrl): VSCode-mode selection-extension spelling, shared
-    /// by both backends now that GTK also calls this function for named keys
-    /// (previously GTK-only lacked shift+arrow selection entirely).
+    /// by both backends.
     #[test]
     fn shift_up_is_shift_up() {
         let mods = Modifiers {

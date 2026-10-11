@@ -1,10 +1,7 @@
 //! GTK-only click-context construction. Everything else that used to live
-//! in this file (`pixel_to_click_target`, `handle_mouse_click`,
-//! `handle_mouse_double_click`, `handle_mouse_drag`,
-//! `resolve_tab_right_click`, the tab-bar pixel-geometry helpers, ...) moved
-//! to the backend-neutral `crate::click` (#862) — none of it named a
-//! `gtk4`/`pango` type. Re-exported below so this module's own tests (and
-//! the rest of `crate::gtk`) keep resolving the names unchanged.
+//! in this file moved to the backend-neutral `crate::click` — none of it
+//! named a `gtk4`/`pango` type. Re-exported below so this module's own tests
+//! (and the rest of `crate::gtk`) keep resolving the names unchanged.
 #[cfg(test)]
 use gtk4::pango;
 #[cfg(test)]
@@ -16,12 +13,11 @@ use pangocairo::functions as pangocairo;
 #[allow(unused_imports)]
 pub(crate) use crate::click::*;
 
-// The rest of this module is tests only — they exercise the re-exported
-// `crate::click` functions against real headless Pango layouts, which is why
-// this GTK-only file (rather than the neutral `crate::click`) still hosts
-// them. `use super::*` inside each `mod ... tests` pulls these in, mirroring
-// what `use super::*` (of `crate::gtk`) used to provide before #862 moved the
-// production code out.
+// This module's tests exercise the re-exported `crate::click` functions
+// against real headless Pango layouts, which is why this GTK-only file
+// (rather than the neutral `crate::click`) still hosts them. `use super::*`
+// inside each `mod ... tests` pulls these in, mirroring what `use super::*`
+// (of `crate::gtk`) used to provide before the production code moved out.
 #[cfg(test)]
 use crate::core;
 #[cfg(test)]
@@ -43,28 +39,14 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::rc::Rc;
 
-/// Build a throwaway Pango context, fonted with nothing in particular, for
-/// tests that need to hand a `GtkBackend` *some* stored `pango::Context` so
-/// `GtkBackend::editor_col_at_x`'s last-resort `editor_pango_layout()`
-/// fallback (quadraui#971) has something to build a `pango::Layout` from —
-/// `editor_pango_layout()` fonts that layout from the backend's *own*
-/// `editor_font_family`/`editor_font_size_pt` state (set via
-/// `Backend::set_editor_font`), ignoring whatever font description this
-/// context itself carries, so a throwaway context is exactly as good as a
-/// real widget one for that purpose.
-///
-/// **#1104:** production no longer calls this. Before #1104, vimcode's mouse
-/// handlers never received the runner's own live `GtkBackend` (`App`'s
-/// `handle()` override didn't thread it past `handle_dispatch`), so
-/// `App::render_content` kept a SECOND, separately-constructed `GtkBackend`
-/// (`self.backend`) alive purely for click-time hit-testing, and called this
-/// function every frame to give that second backend a Pango context of its
-/// own — mirroring the "stable widget Pango context" `quadraui::gtk::run`'s
-/// `activate()` already sets on the real backend at widget realize. #1104
-/// threaded the real backend through the whole click/drag/modal-stack call
-/// chain instead, so there is no second backend left needing one of these.
-/// Kept `#[cfg(test)]` as a fixture builder for this module's own
-/// `GtkBackend::editor_col_at_x` unit tests below, which still want a
+/// Build a throwaway Pango context for tests that need to hand a `GtkBackend`
+/// a stored `pango::Context` so `GtkBackend::editor_col_at_x`'s fallback
+/// `editor_pango_layout()` has something to build from. The fallback fonts the
+/// layout from the backend's own `editor_font_family`/`editor_font_size_pt`
+/// state (set via `Backend::set_editor_font`), ignoring whatever font
+/// description this context itself carries, so a throwaway context is as good
+/// as a real widget one. Kept `#[cfg(test)]` as a fixture builder for this
+/// module's own `GtkBackend::editor_col_at_x` unit tests, which need a
 /// from-scratch backend with no painted frame.
 #[cfg(test)]
 pub(crate) fn build_editor_click_context() -> Option<pango::Context> {
@@ -75,28 +57,15 @@ pub(crate) fn build_editor_click_context() -> Option<pango::Context> {
 
 #[cfg(test)]
 mod emoji_click_column_tests {
-    //! #560 regression: a manual smoke test on the shared-quadraui-inverse
-    //! fix reported clicks landing one column to the right of the intended
-    //! glyph on markdown lines containing emoji (✅ 🟡 ❌ ⏭️), with the
-    //! drift compounding for every wide/multi-byte glyph preceding the
-    //! click point on the line. Root-cause investigation (see the vimcode
-    //! issue #560 durable-findings log) reproduced the *exact* symptom
-    //! shape — perfect on plain monospace text, growing drift after each
-    //! emoji — only when `GtkBackend::editor_col_at_x` falls back to
-    //! `EditorLayout::col_at_x`'s uniform-monospace division (the TUI path,
-    //! which assumes every glyph is exactly one `cell_width` wide). That
-    //! fallback fires when no Pango layout is available; the real
-    //! per-glyph `quadraui::gtk::editor_col_at_x` (Pango `xy_to_index`)
-    //! path was verified byte-exact for this same string (base emoji,
-    //! astral-plane emoji, and a variation-selector emoji) in isolation.
-    //!
-    //! This test pins the production pipeline end to end — real
-    //! `md_inline_spans` bold-span byte offsets via `build_screen_layout`,
-    //! then `render::editor_text_layout` + `quadraui::gtk::editor_col_at_x`
-    //! — against a headless Pango layout, so a future regression that
-    //! silently reintroduces the naive fallback (or corrupts the
-    //! span byte-offset pipeline feeding Pango's attributes) fails a
-    //! `cargo test`, not just a manual click in the running app.
+    //! A smoke test on click-to-column resolution with emoji (✅ 🟡 ❌ ⏭️).
+    //! The per-glyph Pango path (`xy_to_index`) resolves correctly; the
+    //! uniform-monospace fallback would drift +1 column per preceding wide
+    //! glyph. These tests pin the production pipeline end-to-end — real
+    //! `md_inline_spans` bold-span byte offsets via `build_screen_layout`, then
+    //! `render::editor_text_layout` + `quadraui::gtk::editor_col_at_x` against
+    //! a headless Pango layout, so a future regression that silently reintroduces
+    //! the naive fallback (or corrupts the span byte-offset pipeline feeding
+    //! Pango's attributes) fails a `cargo test`.
     use super::*;
     use crate::core::WindowRect;
     use crate::render::build_screen_layout;
@@ -195,37 +164,30 @@ mod emoji_click_column_tests {
         assert_eq!(char_count, text.chars().count());
     }
 
-    /// #560 iteration 2: the test above calls `quadraui::gtk::editor_col_at_x`
-    /// *directly* with a hand-built, correctly-fonted layout — it verifies the
-    /// per-glyph Pango inverse but **bypasses** `GtkBackend::editor_col_at_x`'s
-    /// runtime branch-selection (`current_frame_refs()` → `last_editor_pango_layout`
-    /// → `pango_ctx` → naive `EditorLayout::col_at_x`). A live mouse click goes
-    /// through the *trait* method, outside any frame scope, so it depends on the
-    /// backend having stashed a correctly-fonted layout during paint. This test
-    /// drives exactly that path: paint the editor through the trait (as
-    /// `draw_window` does), then resolve clicks through
-    /// `GtkBackend::editor_col_at_x` (as `pixel_to_click_target` does) — so a
-    /// regression that makes live clicks fall through to the naive uniform-cell
-    /// division (perfect on plain text, +1 col per preceding wide glyph on emoji
-    /// lines — the exact reported symptom) fails here.
-    /// #560 iteration 2 robustness: build the `Engine`/`Editor`/`EditorLayout`
-    /// for the emoji markdown line and the pixel-`x` click for every glyph,
-    /// then resolve each through `GtkBackend::editor_col_at_x` under the exact
-    /// backend state named by `set_pango_context`. `paint_first` selects which
-    /// fallback branch the trait method takes:
+    /// The test above calls `quadraui::gtk::editor_col_at_x` directly with a
+    /// hand-built, correctly-fonted layout — it verifies the per-glyph Pango
+    /// inverse but bypasses `GtkBackend::editor_col_at_x`'s runtime branch
+    /// selection. A live mouse click goes through the trait method, so it
+    /// depends on the backend having stashed a correctly-fonted layout during
+    /// paint. This test drives exactly that path: paint the editor through the
+    /// trait (as `draw_window` does), then resolve clicks through
+    /// `GtkBackend::editor_col_at_x` (as `pixel_to_click_target` does).
+    /// Build the `Engine`/`Editor`/`EditorLayout` for the emoji markdown line
+    /// and the pixel-`x` click for every glyph, then resolve each through
+    /// `GtkBackend::editor_col_at_x` under the exact backend state named by
+    /// `set_pango_context`. `paint_first` selects which fallback branch the
+    /// trait method takes:
     ///
     /// * `true`  → an editor paint runs through the trait first, so
     ///   `last_editor_pango_layout` is stashed (the steady-state live path
     ///   after frame 1).
     /// * `false` → NO paint, but `set_pango_context` has stored a
-    ///   correctly-fonted editor context (what `draw::draw_editor` now does
-    ///   every frame), so the trait method resolves via the `pango_ctx`
-    ///   fallback instead of the naive `EditorLayout::col_at_x` division.
+    ///   correctly-fonted editor context, so the trait method resolves via
+    ///   the `pango_ctx` fallback instead of naive division.
     ///
     /// Both must land every click on its own glyph. Emoji here render 1.7–2.3×
-    /// the cell width (see the sibling paint test's provenance), so a naive
-    /// uniform-cell division would drift +1 column per preceding wide glyph and
-    /// fail — this is what pins that neither branch degrades to it.
+    /// the cell width, so a naive uniform-cell division would drift and fail —
+    /// this pins that neither branch degrades to it.
     fn assert_emoji_columns_resolve(paint_first: bool) {
         // Concurrent Pango/Cairo text work from two test threads segfaults
         // inside FreeType — see `src/test_paint.rs`.
@@ -270,7 +232,7 @@ mod emoji_click_column_tests {
         assert_eq!(rw.lines[0].raw_text, text, "line should not wrap");
 
         let backend = Rc::new(RefCell::new(super::backend::GtkBackend::new()));
-        // Mirror `App::render_content` (#947): `set_editor_font` with the
+        // Mirror `App::render_content`: `set_editor_font` with the
         // same family/size the paint side used, plus a throwaway Pango
         // context (NOT the paint layout) for `editor_pango_layout()`'s
         // fallback to build a layout from — that layout fonts itself from
@@ -339,31 +301,22 @@ mod emoji_click_column_tests {
         assert_emoji_columns_resolve(true);
     }
 
-    /// #560 robustness: even with NO stashed layout, the editor-fonted
-    /// `pango_ctx` (now set every frame by `draw::draw_editor`) keeps the
+    /// Even with NO stashed layout, the editor-fonted `pango_ctx` keeps the
     /// resolution on the per-glyph Pango path instead of the naive division —
-    /// so a build that hasn't painted yet, or a quadraui lacking the stash,
-    /// still resolves emoji clicks exactly.
+    /// so a build that hasn't painted yet still resolves emoji clicks exactly.
     #[test]
     fn editor_col_at_x_falls_back_to_editor_font_context_not_naive_division() {
         assert_emoji_columns_resolve(false);
     }
 
-    /// #947: click-to-column resolution must track `settings.font_family`/
-    /// `font_size` — not a hardcoded `"Monospace"` family matched only by a
-    /// probed size. Before #947, the click backend was always fonted as
-    /// `"Monospace"` (mirroring the *paint* side's own former hardcode) no
-    /// matter what `App::render_content` was asked to
-    /// paint, so a non-monospace family would have silently resolved clicks
-    /// against the wrong glyph advances — structurally, not just as a bug,
-    /// since the family itself was never a parameter. `Backend::set_editor_font`
-    /// (quadraui#422, wired for both paint and click in #947) is now the
-    /// single source of truth for both, so this drives them from the SAME
-    /// live `(family, size)` pair, asserted at two sizes and at a
-    /// non-`Monospace` family. It also paints NO frame, so resolution must
-    /// go through `GtkBackend::editor_col_at_x`'s `editor_pango_layout()`
-    /// fallback (quadraui#971) — proving the live `set_editor_font` state
-    /// drives correctness, not a stashed `last_editor_pango_layout`.
+    /// Click-to-column resolution must track `settings.font_family`/
+    /// `font_size` — not a hardcoded family matched only by a probed size.
+    /// The click backend must be fonted from the same `(family, size)` pair
+    /// driving the paint backend, verified at two sizes and at a
+    /// non-`Monospace` family. Resolution must go through
+    /// `GtkBackend::editor_col_at_x`'s `editor_pango_layout()` fallback to
+    /// prove the live `set_editor_font` state drives correctness, not a
+    /// stashed layout.
     #[test]
     fn click_column_resolves_at_non_monospace_family_and_two_sizes() {
         for (family, size_pt) in [("Sans", 10.0_f32), ("Sans", 22.0_f32)] {
@@ -371,10 +324,8 @@ mod emoji_click_column_tests {
         }
     }
 
-    /// Shared body for the test above: run the exact sequence
-    /// `App::render_content`'s `sync_per_frame_backend_state` runs on the
-    /// (single, #1104) backend every frame — `set_editor_font` with the live
-    /// `(family, size)`, plus a stored Pango context — then assert every
+    /// Run the exact sequence every frame — `set_editor_font` with the live
+    /// `(family, size)` plus a stored Pango context — then assert every
     /// character on a plain ASCII line resolves to its own column via
     /// `GtkBackend::editor_col_at_x` — the exact trait method
     /// `pixel_to_click_target` calls on a live click.
@@ -427,7 +378,7 @@ mod emoji_click_column_tests {
         measure.set_text(text);
 
         // ── The exact production sequence `sync_per_frame_backend_state`
-        // runs on the live backend (#947): `set_editor_font` with the live
+        // runs on the live backend: `set_editor_font` with the live
         // `(family, size)`, then a throwaway Pango context — NO frame ever
         // painted. ──
         let backend = Rc::new(RefCell::new(super::backend::GtkBackend::new()));
@@ -457,26 +408,12 @@ mod emoji_click_column_tests {
 
 #[cfg(test)]
 mod cross_split_drag_focus_tests {
-    //! #568 regression: dragging a text selection in one editor group (a
-    //! GTK split pane created via the tab bar's split button /
-    //! `Engine::open_editor_group`, i.e. VS Code-style side-by-side panes)
+    //! Dragging a text selection in one editor group (a GTK split pane)
     //! must not steal focus to a neighboring group's window merely because
-    //! the mouse passes over it while the button is held.
-    //!
-    //! `Engine::mouse_drag`'s origin-window lock (`mouse_drag_origin_window`)
-    //! already keeps the selection *data* pinned to the originating window
-    //! — see the core-level `test_mouse_drag_locked_to_origin_window`. But
-    //! GTK's `pixel_to_click_target` used to call
-    //! `engine.activate_group_for_window(window_id)` unconditionally, as a
-    //! side effect of resolving ANY pixel position — including drag
-    //! continuation. That flipped `engine.active_group` (and therefore
-    //! `active_window_id()`) to the neighboring pane just from hovering over
-    //! it mid-drag, which made `render::build_selection`'s `is_active` gate
-    //! light up the wrong pane's selection overlay even though the
-    //! underlying selection state never actually changed. This pins that a
-    //! drag-continuation hit-test (`mutate_focus: false`) leaves
-    //! `active_group`/`active_window_id()` untouched, while a genuine click
-    //! (`mutate_focus: true`) still focuses the pane it lands in.
+    //! the mouse passes over it while the button is held. `Engine::mouse_drag`
+    //! keeps the selection data pinned to the originating window. But a
+    //! drag-continuation hit-test must leave `active_group`/`active_window_id()`
+    //! untouched, while a genuine click still focuses the pane it lands in.
     use super::*;
     use crate::render::build_screen_layout;
 
@@ -487,10 +424,8 @@ mod cross_split_drag_focus_tests {
     #[test]
     fn drag_continuation_does_not_steal_focus_to_neighboring_group() {
         let mut engine = Engine::new();
-        // #1543: line numbers now default on, widening the gutter beyond
-        // one column — pin the pre-#1543 no-gutter geometry this test's
-        // `char_width * 2.0` pixel math assumes, since gutter width isn't
-        // what this test is about.
+        // Pin the no-gutter geometry this test's `char_width * 2.0` pixel math
+        // assumes, since gutter width isn't what this test is about.
         engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
         engine.buffer_mut().insert(0, "hello world");
         let wid_a = engine.active_window_id();
@@ -553,7 +488,7 @@ mod cross_split_drag_focus_tests {
             &screen,
             &tab_pixel_hits,
             None, // no cached FrameHitMap in this test — exercises the
-            // `screen_zone_hit_test` fallback path (#449)
+            // `screen_zone_hit_test` fallback path
             &HashMap::new(),
             false, // mutate_focus: drag continuation
             &mut quadraui::DragState::default(),
@@ -613,16 +548,13 @@ mod cross_split_drag_focus_tests {
 
 #[cfg(test)]
 mod frame_hit_map_tests {
-    //! #449 regression: `frame_zone_to_screen_zone` and the `frame_hit_map`
-    //! branch of `pixel_to_click_target` are the actual mechanism this issue
-    //! introduced — mapping `quadraui::FrameZone::TabBar { idx }` /
+    //! `frame_zone_to_screen_zone` and the `frame_hit_map` branch of
+    //! `pixel_to_click_target` map `quadraui::FrameZone::TabBar { idx }` /
     //! `FrameZone::Editor { idx }` back to `render::ScreenZone`. These tests
-    //! build a *real* `quadraui::FrameHitMap` via `ScreenLayout::hit_map()`
-    //! (quadraui#425, landed as `c316f15`) from the same `Surface::Editor` /
-    //! `Surface::TabBar` construction `App::render_content` uses
-    //! (`src/gtk/mod.rs` ~7712-7830), instead of exercising only the
-    //! pre-existing `screen_zone_hit_test` fallback (as the two tests in
-    //! `cross_split_drag_focus_tests` above do by passing `None, &[]`).
+    //! build a real `quadraui::FrameHitMap` via `ScreenLayout::hit_map()` from
+    //! the same `Surface::Editor` / `Surface::TabBar` construction
+    //! `App::render_content` uses, instead of exercising only the `screen_zone_hit_test`
+    //! fallback.
     use super::*;
     use crate::core::WindowRect;
     use crate::render::build_screen_layout;
@@ -762,10 +694,8 @@ mod frame_hit_map_tests {
         // opposed to the `None` fallback path already covered by
         // `cross_split_drag_focus_tests`.
         let mut engine = Engine::new();
-        // #1543: line numbers now default on, widening the gutter beyond
-        // one column — pin the pre-#1543 no-gutter geometry this test's
-        // `char_width * 2.0` pixel math assumes, since gutter width isn't
-        // what this test is about.
+        // Pin the no-gutter geometry this test's `char_width * 2.0` pixel math
+        // assumes, since gutter width isn't what this test is about.
         engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
         engine.buffer_mut().insert(0, "hello world");
         let wid = engine.active_window_id();
@@ -811,50 +741,30 @@ mod frame_hit_map_tests {
 
 #[cfg(test)]
 mod single_group_tab_click_dispatch_tests {
-    //! #553 regression, pinned at the GTK **click-dispatch entry point** the
-    //! issue's root-cause hint names (`pixel_to_click_target`, this file):
-    //! with ONE tab group, clicking a non-active tab did not activate it and
-    //! clicking a tab's × did not close it, while two or more groups worked.
-    //!
-    //! The defect lived in `screen_zone_hit_test`'s single-group arm, which
-    //! hardcoded the tab row's top at the coordinate-system origin (`y >= 0.0`)
+    //! Clicking a non-active tab in a single-group layout, or a tab's ×,
+    //! must resolve correctly. The defect lived in `screen_zone_hit_test`'s
+    //! single-group arm, which hardcoded the tab row's top at the origin
     //! instead of deriving it from the window rects the way the split arm did.
-    //! Once #552 gave GTK a persistent menu/title-bar band the content origin
-    //! moved down, so the single-group band pointed at chrome pixels no tab was
-    //! ever drawn on — and every single-group tab click resolved to
-    //! `ScreenZone::None` → `ClickTarget::None`. `render::tab_bar_hit_bands`
-    //! (this PR) is what now forces both shapes through one derivation.
+    //! Once the chrome included a menu/title-bar band, the content origin
+    //! moved down, so the single-group band pointed at chrome pixels no tab
+    //! was drawn on — and every single-group tab click resolved to `ScreenZone::None`.
     //!
     //! Two things make these tests discriminate where the black-box
-    //! `gtk::testing` pair does not (see the note in that module and in the PR
-    //! description):
+    //! `gtk::testing` pair does not:
     //!
     //! 1. `frame_hit_map: None` — forcing the `screen_zone_hit_test` fallback
-    //!    branch. GTK's production routing prefers the cached
-    //!    `quadraui::FrameHitMap` (#449) and only falls back here on a hit-map
-    //!    miss / before the first paint, so a driver-level click never reaches
-    //!    the code under test. Same technique, same rationale as
-    //!    `cross_split_drag_focus_tests::drag_continuation_does_not_steal_focus_to_neighboring_group`
-    //!    above.
-    //! 2. A **synthetic 100px content offset**, matching
-    //!    `render::tests::test_tab_bar_hit_bands_single_and_split_share_one_derivation`.
-    //!    The headless harness's default title-bar chrome only shifts the
-    //!    content origin ~23px, which is small enough that the painted click y
-    //!    falls inside *both* the correct band and the buggy hardcoded one —
-    //!    the offset has to exceed the bar height to separate them.
-    //!
-    //! The activate and close cases are separate `#[test]`s deliberately: with
-    //! the pre-`8fbbf85` bug reinstated in `render::tab_bar_hit_bands`'s
-    //! single-group arm (`y: 0.0` instead of `y: min_y - tab_bar_height`) BOTH
-    //! go red independently with `ClickTarget::None`, which a single test with
-    //! two sequential assertions could not show (it would panic on the first
-    //! and never reach the second). That FAIL/PASS pair is reproduced in the PR
-    //! description.
+    //!    branch. GTK's production routing prefers the cached `quadraui::FrameHitMap`
+    //!    and only falls back here on a hit-map miss / before the first paint.
+    //! 2. A **synthetic 100px content offset**, matching the test in `render::tests`.
+    //!    The headless harness's default title-bar chrome only shifts ~23px,
+    //!    which is small enough that the painted click y falls inside both the
+    //!    correct band and the buggy hardcoded one — the offset has to exceed
+    //!    the bar height to separate them.
     use super::*;
     use crate::render::build_screen_layout;
 
-    /// Chrome-shifted editor content origin — the #552 menu/title-bar band, at
-    /// an offset large enough to separate the correct band from the buggy one.
+    /// Chrome-shifted editor content origin — large enough to separate the
+    /// correct band from the buggy one.
     const CONTENT_X: f64 = 50.0;
     const CONTENT_Y: f64 = 100.0;
     const CONTENT_W: f64 = 800.0;
@@ -910,13 +820,11 @@ mod single_group_tab_click_dispatch_tests {
         idx as f64 * TAB_W + 107.0
     }
 
-    /// Three tabs in the default SINGLE editor group — the exact shape #553
-    /// reports as dead — laid out at the chrome-shifted content origin, plus
-    /// the cached rasteriser geometry and the empty legacy maps
-    /// `pixel_to_click_target` still takes.
-    ///
-    /// No buffer edits anywhere, so a close click isn't diverted into the
-    /// dirty-buffer confirm dialog.
+    /// Three tabs in a single editor group (the exact shape the regression
+    /// reports), laid out at the chrome-shifted content origin, plus the cached
+    /// rasteriser geometry and the empty legacy maps `pixel_to_click_target`
+    /// still takes. No buffer edits anywhere, so a close click isn't diverted
+    /// into the dirty-buffer confirm dialog.
     struct Fixture {
         engine: Engine,
         group: GroupId,
@@ -990,7 +898,7 @@ mod single_group_tab_click_dispatch_tests {
 
         /// Resolve a tab-bar click through the production GTK dispatch entry
         /// point, with `frame_hit_map: None` to force the `screen_zone_hit_test`
-        /// fallback branch #553 lives in (see this module's doc comment).
+        /// fallback branch (see this module's doc comment).
         fn click(&mut self, local_x: f64) -> ClickTarget {
             pixel_to_click_target(
                 &mut self.engine,
@@ -1030,8 +938,8 @@ mod single_group_tab_click_dispatch_tests {
         }
     }
 
-    /// #553, half one: clicking a non-active tab in a single-group layout must
-    /// resolve as a tab-bar hit and activate that tab.
+    /// Clicking a non-active tab in a single-group layout must resolve as a
+    /// tab-bar hit and activate that tab.
     #[test]
     fn single_group_tab_click_activates_that_tab_via_click_dispatch() {
         let mut f = Fixture::new();
@@ -1049,9 +957,8 @@ mod single_group_tab_click_dispatch_tests {
         );
     }
 
-    /// #553, half two: clicking a tab's × in a single-group layout must resolve
-    /// to `CloseTab` for that tab, and actually close it through the production
-    /// click handler.
+    /// Clicking a tab's × in a single-group layout must resolve to `CloseTab`
+    /// for that tab and actually close it.
     #[test]
     fn single_group_tab_close_click_targets_and_closes_that_tab_via_click_dispatch() {
         let mut f = Fixture::new();
@@ -1078,14 +985,10 @@ mod single_group_tab_click_dispatch_tests {
         );
     }
 
-    /// #814: `dispatch_tab_bar_target` used to re-implement every tab-bar
-    /// button arm by hand (`engine.open_editor_group(dir)` called directly
-    /// from GTK's own `ClickTarget::SplitButton` match arm) instead of
-    /// routing through `Engine::handle_tab_bar_click` — the single dispatch
-    /// the TUI already used. This pins the split-right button through the
-    /// full production `handle_mouse_click` entry point against the shared
-    /// engine call, so a future arm added to `handle_tab_bar_click` reaches
-    /// GTK without anyone having to remember to hand-port it here too.
+    /// The split-right button routes through the full production
+    /// `handle_mouse_click` entry point against the shared engine call, so a
+    /// future arm added to `handle_tab_bar_click` reaches GTK without anyone
+    /// having to hand-port it here.
     #[test]
     fn tab_bar_split_right_button_opens_new_group_via_shared_engine_dispatch() {
         let mut f = Fixture::new();
@@ -1094,7 +997,7 @@ mod single_group_tab_click_dispatch_tests {
 
         // Place a synthetic SplitRight button segment just past the three
         // tabs, mirroring the disjoint right-side button zones the
-        // rasteriser lays out in production (#515).
+        // rasteriser lays out in production.
         let seg_start = TAB_W * 3.0;
         let seg_end = seg_start + 24.0;
         f.tab_pixel_hits

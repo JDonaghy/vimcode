@@ -59,7 +59,7 @@ pub struct MdRendered {
 
 /// If `bytes[i..]` starts with `https://` or `http://`, return the
 /// scheme's byte length (`8`/`7`). Shared scheme-prefix check for the two
-/// bare-URL walks below (#1496).
+/// bare-URL walks below.
 fn url_scheme_len(bytes: &[u8], i: usize) -> Option<usize> {
     if bytes[i..].starts_with(b"https://") {
         Some(8)
@@ -78,7 +78,7 @@ fn url_scheme_len(bytes: &[u8], i: usize) -> Option<usize> {
 ///
 /// No regex crate is used. Shared by [`scan_bare_urls`] (span-only) and
 /// `linkify_bare_urls_in_line` (rewrites into a markdown link) — the same
-/// walk, previously duplicated between the two (#1496).
+/// walk, previously duplicated between the two.
 fn bare_url_end(bytes: &[u8], i: usize, scheme_len: usize) -> usize {
     let len = bytes.len();
     let mut j = i + scheme_len;
@@ -128,7 +128,7 @@ fn scan_bare_urls(chunk_bytes: &[u8], line_offset: usize, spans: &mut Vec<MdSpan
 /// Shared by the two fenced-code-block highlight mappers below —
 /// `render_markdown`'s `TagEnd::CodeBlock` arm (4-space indent) and
 /// [`hover_code_highlights`] (no indent) — which previously built this
-/// same map independently (#1496).
+/// same map independently.
 fn code_block_line_starts(raw_lines: &[&str]) -> Vec<usize> {
     let mut starts = Vec::with_capacity(raw_lines.len());
     let mut offset = 0usize;
@@ -612,49 +612,37 @@ pub fn render_markdown(input: &str) -> MdRendered {
     }
 }
 
-// ─── Hover-popup markdown (quadraui-backed, #821) ────────────────────────────
+// ─── Hover-popup markdown (quadraui-backed) ────────────────────────────
 //
 // `render_markdown` above (and the `MdRendered`/`MdSpan`/`MdStyle` types it
 // returns) remain the engine's markdown pipeline for the editor-buffer inline
-// highlighter (`src/render.rs`'s `md_inline_spans` — compensates for no
-// tree-sitter markdown injection, out of scope for #821) and for markdown
+// highlighter (`src/render.rs`'s `md_inline_spans`) and for markdown
 // *preview* buffers (`Engine::open_markdown_preview*`). Neither of those
 // consumes styled colour, so they stay on the local pulldown-cmark pipeline.
 //
 // The **hover-popup** path (`EditorHoverPopup` / `PanelHoverPopup`) instead
 // adopts `quadraui::compose::markdown::render_markdown_to_styled` — the
-// shared, cross-backend markdown renderer quadraui ships (quadraui#262) —
-// rather than hand-rolling the markdown-style-enum-to-color span walk vimcode
-// used to do in `render.rs` (`hover_line_to_styled_text`,
-// `markdown_rendered_to_quadraui_lines`, now removed). Structure (plain line
-// text, link ranges) is theme-independent, so it's computed once here, at
-// hover-show time; the *styled* spans (which need the live `render::Theme`,
-// not available in `core::`) are recomputed at paint time in `render.rs` from
-// the same markdown string.
+// shared, cross-backend markdown renderer quadraui ships — rather than
+// hand-rolling the markdown-style-enum-to-color span walk previously used in
+// `render.rs`. Structure (plain line text, link ranges) is theme-independent,
+// so it's computed once here, at hover-show time; the *styled* spans are
+// recomputed at paint time in `render.rs` from the same markdown string.
 //
 // One real feature gap vs. the local `render_markdown`: quadraui's parser
 // only recognizes `[text](url)` links, not bare `http://`/`https://`
-// autolinks (verified against the pinned rev — see `linkify_bare_urls`
-// below, which is the compatibility shim for that gap; a proper upstream
-// fix should still be filed against quadraui). Tree-sitter code-block syntax
-// highlighting is also quadraui-agnostic by design (its own doc: "Tree-sitter-
-// capable callers opt into per-language highlighting" via the `code_blocks`
-// side-channel) — `hover_markdown_structure` below does exactly that,
-// reusing the same `MdCodeHighlight`/`Syntax` machinery `render_markdown`
-// uses for markdown-preview code blocks. Distinct heading colors
-// (`Theme::md_heading1/2/3`) are *not* preserved — quadraui renders every
-// heading level as bold + a larger `line_scales` factor, with no per-level
-// color; this is an accepted, documented divergence, not a bug.
+// autolinks. The `linkify_bare_urls` function below is a compatibility shim
+// for that gap. Tree-sitter code-block syntax highlighting is also
+// quadraui-agnostic by design — `hover_markdown_structure` below does reuse
+// the same `MdCodeHighlight`/`Syntax` machinery `render_markdown` uses for
+// markdown-preview code blocks. Distinct heading colors are *not* preserved
+// — quadraui renders every heading level as bold + a larger `line_scales`
+// factor, with no per-level color; this is an accepted, documented divergence.
 //
-// Two further parity gaps vs. the local `render_markdown`, both documented as
-// intentional deferrals in quadraui's own `compose/markdown.rs` module doc
-// (pinned rev `4ff2a645`) rather than bugs to work around here: quadraui's
+// Two further parity gaps vs. the local `render_markdown`: quadraui's
 // renderer has **no image support** (`![alt](src)` degrades silently — no
-// alt-text fallback, unlike the local pipeline's `image_alt_text` handling),
-// and **only single-level list support** (nested `- a\n  - b` markdown does
-// not indent the nested item). Low real-world impact for LSP hover/doc-
-// comment text, which rarely nests lists or embeds images, but noted here so
-// a future caller doesn't assume full parity.
+// alt-text fallback), and **only single-level list support** (nested
+// `- a\n  - b` markdown does not indent the nested item). Low real-world
+// impact for LSP hover/doc-comment text.
 
 /// Wrap bare `http://` / `https://` URLs in `[url](url)` markdown link
 /// syntax so quadraui's `render_markdown_to_styled` (which only recognizes
@@ -772,9 +760,8 @@ pub fn hover_markdown_structure(markdown: &str) -> HoverMarkdownStructure {
         .links
         .iter()
         .filter_map(|(line_idx, range, url)| {
-            // Command URIs are never displayed in shortened ":Name?args" form
-            // by any current producer, but restore the prefix defensively —
-            // matches the pre-#821 `extract_hover_links` behaviour.
+            // Command URIs already in `[text](url)` form are left alone.
+            // Bare command URIs starting with `:` are wrapped in link syntax.
             let url = match url.strip_prefix(':') {
                 Some(rest) => format!("command:{rest}"),
                 None => url.clone(),
@@ -1028,8 +1015,6 @@ mod tests {
             "code_highlights length must match lines length"
         );
     }
-
-    // ─── Hover-popup markdown (quadraui-backed, #821) ───────────────────
 
     #[test]
     fn linkify_bare_urls_wraps_a_bare_url() {

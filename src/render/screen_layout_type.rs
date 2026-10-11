@@ -5,26 +5,11 @@ use super::*;
 /// The complete, platform-agnostic description of one editor frame.
 /// Build it with [`build_screen_layout`], then hand it to the backend renderer.
 ///
-/// # Every field has a composition verdict (#766)
+/// # Every field has a composition verdict
 ///
-/// #587 and #592 are both the same defect: a field populated here every frame
-/// and painted by nobody, so the *state* said the surface was open while the
-/// screen said it was not. #766's closing sweep audited all 36 fields against
-/// the three composers ([`compose_frame`], [`compose_editor_band`],
-/// [`compose_bottom_band`]) and the shared painters they call. The verdict:
-///
-/// * **All are composed** — either directly in a backend's rung arm, or in a
-///   shared painter that arm calls (`bottom_tabs`, for instance, is composed by
-///   [`paint_bottom_panel_rung`] from the `BottomOp::BottomPanel` arm on both
-///   backends, not by either backend itself).
-///
-/// #766 recorded one exception, `menu_dropdown_open`: populated every frame,
-/// painted by nobody, kept solely because the Win-GUI backend-parity harness
-/// read it as *state* to declare its expected element set. #812 deleted that
-/// harness (the backend it compared against was removed in 3e4bcff), which left
-/// the field with zero readers, so the field went with it. The dropdown itself
-/// is unaffected — it is painted by `MenuSystem::render` from the
-/// [`FrameOp::MenuDropdown`] rung, which reads the `MenuSystem` directly.
+/// Every field is composed by a backend renderer: either directly in a rung arm,
+/// or in a shared painter that arm calls. For example, `bottom_tabs` is composed by
+/// [`paint_bottom_panel_rung`] from the `BottomOp::BottomPanel` arm on both backends.
 ///
 /// Adding a field means adding its verdict — a rung in [`FRAME_Z_ORDER`] /
 /// [`EDITOR_Z_ORDER`] / [`BOTTOM_Z_ORDER`], or a doc comment saying where it is
@@ -63,34 +48,24 @@ pub struct ScreenLayout {
     pub tab_switcher: Option<TabSwitcherPanel>,
     /// Marker for "the editor area holds 2 or more groups", carrying the
     /// focused group + group count. `None` in the default single-group mode.
-    /// The per-group chrome it used to own lives on `group_tab_bars` /
-    /// `group_dividers` below, which are populated for *every* group count
-    /// (#551).
+    /// Per-group chrome lives on `group_tab_bars` / `group_dividers` below,
+    /// which are populated for *every* group count.
     pub editor_group_split: Option<EditorGroupSplitData>,
     /// Tab bar + bounds for every editor group, in tree traversal order.
     /// Always populated — a single group is a split of one, so this holds
     /// exactly one entry in the default unsplit case rather than being empty
     /// with a parallel single-group field. Backends iterate it unconditionally
     /// (via `tab_bar_draw_targets`) instead of carrying a hand-written
-    /// "exactly one group" draw path beside the generic N-group one (#551).
+    /// "exactly one group" draw path beside the generic N-group one.
     pub group_tab_bars: Vec<GroupTabBar>,
     /// Divider lines *between* editor groups (`Ctrl+W v` / `Ctrl+W s`
     /// boundaries), in tree traversal order. Naturally empty when there is
     /// only one group — `GroupLayout::Leaf::dividers()` returns `vec![]` — so
-    /// backends can paint it unconditionally (#551). Distinct from
+    /// backends can paint it unconditionally. Distinct from
     /// `window_dividers`, which are the `:split`/`:vsplit` boundaries *within*
-    /// each group.
-    /// **#764 audit verdict (#735 slice 3): composed here, on both backends.**
-    /// Before #764 this was the field #735's own body flagged: populated every
-    /// frame, hit-tested for divider drags on both backends
-    /// (`screen_zone_hit_test`), and *painted* only by TUI — GTK discarded it
-    /// into `_group_dividers` and drew only `window_dividers`, so a `Ctrl+W v`
-    /// boundary on GTK was draggable but invisible. It is now the
-    /// [`EditorOp::GroupDividers`] rung of [`EDITOR_Z_ORDER`], which both
-    /// backends walk, so "populated but never composed" is a compile error
-    /// here rather than something a `grep` has to notice.
+    /// each group. Composed as the [`EditorOp::GroupDividers`] rung of [`EDITOR_Z_ORDER`].
     pub group_dividers: Vec<GroupDivider>,
-    /// Board panel data (#521) — always `Some` so backends can check
+    /// Board panel data — always `Some` so backends can check
     /// `has_focus`.
     pub board: Option<BoardData>,
     /// Extension-provided panel data — `Some` when an extension panel is the active sidebar panel.
@@ -103,27 +78,10 @@ pub struct ScreenLayout {
     pub editor_hover: Option<EditorHoverPopupData>,
     /// Git diff peek popup — `Some` when the user is previewing a diff hunk.
     pub diff_peek: Option<DiffPeekPopup>,
-    /// The change-review surface (#955, shared with #525) — `Some` when a
-    /// tool-call `diff` (or a future #525 git-branch diff feed) is open
-    /// for review. Cloned wholesale from `Engine::change_review` rather
-    /// than converted field-by-field like `DiffPeekPopup`: it already
-    /// carries a fully paint-ready `quadraui::DiffView` per entry, so
-    /// there is nothing this projection needs to compute.
+    /// The change-review surface — `Some` when a tool-call `diff` is open
+    /// for review. Cloned wholesale from `Engine::change_review` because it
+    /// already carries a fully paint-ready `quadraui::DiffView` per entry.
     pub change_review: Option<crate::core::review::ChangeReviewState>,
-    // `diff_toolbar` used to sit here — the single-group mirror of
-    // `GroupTabBar::diff_toolbar`.
-    //
-    // **#765 audit verdict (#735 slice 4): superseded, deleted.** Slice 1
-    // recorded it as "never composed" and left the removal to whichever slice
-    // could fold its last readers away; this is that slice. #551 made
-    // `group_tab_bars` populated for *every* group count (a single group is a
-    // split of one), and both backends have painted from the per-group
-    // `gtb.diff_toolbar` via `tab_bar_draw_targets` ever since. Its only
-    // remaining readers were the three `collect_*_ui_elements` parity
-    // harnesses, each of which already carried a per-group branch immediately
-    // beside the single-group one; those two branches are now the one
-    // unconditional loop over `group_tab_bars` that the paint itself uses.
-    // (TUI's `mouse.rs` never read this field — it reads `gtb.diff_toolbar`.)
     /// Modal dialog popup — `Some` when a dialog is open.
     pub dialog: Option<DialogPanel>,
     /// Inline find/replace overlay — `Some` when the find/replace popup is open.
@@ -132,25 +90,12 @@ pub struct ScreenLayout {
     pub context_menu: Option<ContextMenuPanel>,
     /// Tab hover tooltip: shortened file path to display near the hovered tab.
     pub tab_tooltip: Option<String>,
-    // `tab_scroll_offset` and `tab_bar_primitive` used to sit here — the
-    // single-group mirrors of `GroupTabBar::tab_scroll_offset` and
-    // `GroupTabBar::bar`.
-    //
-    // **#764 audit verdict (#735 slice 3): superseded, deleted.** #551 made
-    // `group_tab_bars` populated for *every* group count (a single group is a
-    // split of one) and both backends have painted from the per-group
-    // `gtb.bar` via `tab_bar_draw_targets` ever since. `tab_bar_primitive` had
-    // zero readers anywhere, not even a test; `tab_scroll_offset`'s last
-    // reader was one TUI test assertion, which now reads
-    // `group_tab_bars[0].tab_scroll_offset` — the value the paint actually
-    // uses. Slice 1 recorded both as "superseded, never composed" and left the
-    // deletion to this slice because it lands in the editor band.
     /// The `quadraui::TabBarLayout` (char-cell columns, relative to the tab
     /// bar's left edge) for the single-group / active tab bar. A blank
     /// (zero-tab) layout in multi-group mode (each group carries its own
     /// layout on its `GroupTabBar::hit_regions`). Lets backends resolve
     /// tab-bar clicks through the shared `resolve_tab_bar_click` path instead
-    /// of per-backend pixel maps. (#515, #822)
+    /// of per-backend pixel maps.
     pub tab_bar_hit_regions: quadraui::TabBarLayout,
     /// When `status_line_above_terminal` is OFF and the terminal panel is open,
     /// this carries the active window's status line to render as a dedicated row
@@ -161,9 +106,9 @@ pub struct ScreenLayout {
     pub separated_status_line: Option<WindowStatusLine>,
     /// Window-split (`:split`/`:vsplit`) dividers across all editor groups'
     /// active tabs. Independent of `editor_group_split` — window splits exist
-    /// regardless of how many editor groups are open (#582).
+    /// regardless of how many editor groups are open.
     pub window_dividers: Vec<WindowDivider>,
-    /// Code-overview minimap for *every* editor window (#35, #722) — one
+    /// Code-overview minimap for *every* editor window — one
     /// entry per `WindowId` that has the `minimap` setting on and enough
     /// width to spare the strip, empty when none do. A `:vsplit` therefore
     /// carries two entries, one per pane, instead of a single strip pinned
@@ -203,7 +148,7 @@ pub(crate) mod tests {
         crate::core::session::suppress_disk_saves();
         // `Engine::new_for_test()` builds settings/session/history/git_branch
         // from in-memory defaults instead of loading ambient disk/git state
-        // (#615, #439, #617) — see its doc comment for why call-then-overwrite
+        // — see its doc comment for why call-then-overwrite
         // on `Engine::new()` doesn't reliably undo `app_shell.hide_sidebar()`,
         // and why leaving `git_branch` unset here matters: it feeds the
         // right-hand status segments rendered by this file's tests.

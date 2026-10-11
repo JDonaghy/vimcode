@@ -38,12 +38,8 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// #731: was `if let Some(ref da) = *self.menu_dropdown_da.borrow()`
-    /// — that field is permanently `None` under the ShellApp runner
-    /// (nothing assigns it), so this has been a no-op since #540. The menu
-    /// bar is repainted every frame by `render_content` from engine state
-    /// instead (see the `ActivityBarActivation::MenuToggled` comment).
-    /// Kept as a named no-op so its two call sites stay self-documenting.
+    /// This method is a named no-op: the menu bar is repainted every frame
+    /// by `render_content` from engine state instead.
     pub(crate) fn sync_menu_overlay(&self) {}
 
     /// Dispatch a menu action by command string, as produced by
@@ -77,16 +73,8 @@ impl App {
                     self.save_session_and_exit();
                 }
             }
-            // #1063: used to restate a subset of `dispatch_engine_action`'s
-            // match by hand (four variants named explicitly behind a bare
-            // `_ => {}`) instead of calling it — exactly the shape that hid
-            // #984 for months, since a menu item wired to a fifth variant
-            // nobody had added an arm for would silently no-op instead of
-            // failing to compile. `dispatch_engine_action(_, false)` is
-            // exhaustive (via `render::apply_engine_action`, #1063) and a
-            // menu activation is never a macro, so this is the same
-            // behavior for every variant this catch-all used to name, plus
-            // real handling — not a silent no-op — for every one it didn't.
+            // `dispatch_engine_action(_, false)` is exhaustive and handles every
+            // variant this catch-all would name, ensuring real handling for all.
             _ => {
                 let engine_action = self.engine.borrow_mut().dispatch_menu_action(&action);
                 self.dispatch_engine_action(engine_action, false);
@@ -96,25 +84,19 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// Effective sidebar visibility — reads directly from
-    /// `engine.app_shell` (owned by quadraui per #385). Replaces the
-    /// former `App.sidebar_visible` local cache so GTK and engine state
-    /// can never drift.
+    /// Effective sidebar visibility — reads directly from `engine.app_shell`.
+    /// Replaces the former local cache so GTK and engine state can never drift.
     pub(crate) fn current_sidebar_visible(&self) -> bool {
         self.engine.borrow().app_shell.sidebar_visible()
     }
 
     /// Effective active panel id, accounting for ext-panel synthetic IDs.
-    /// #823 item 7: was its own restatement of `render::sidebar_owner`'s
-    /// resolution; now just that plus
-    /// `SidebarOwner::panel_id_string` (see its doc comment).
     pub(crate) fn current_active_panel_id(&self) -> String {
         render::sidebar_owner(&self.engine.borrow()).panel_id_string()
     }
 
-    /// Re-sync GTK widget tree from engine sidebar state. Was previously
-    /// `sync_sidebar_from_engine` which copied into local cache fields;
-    /// the cache is gone (engine.app_shell is the single source of truth)
+    /// Re-sync GTK widget tree from engine sidebar state.
+    /// The cache is gone (engine.app_shell is the single source of truth)
     /// so this is now just a redraw trigger.
     pub(crate) fn sync_sidebar_from_engine(&mut self) {
         self.sync_sidebar_widgets();
@@ -122,12 +104,9 @@ impl App {
 
     /// Queue a redraw after sidebar visibility/focus state changes.
     ///
-    /// Used to update GTK widget visibility (revealer + panel boxes) and
-    /// grab focus on the active panel DA under the pre-#540 Relm4 widget
-    /// tree. Under the ShellApp runner there is no such widget tree to
-    /// sync — `render_content` repaints the whole sidebar from
-    /// `engine.app_shell` every frame — so this is now just the redraw
-    /// trigger (#731).
+    /// Under the ShellApp runner there is no widget tree to sync —
+    /// `render_content` repaints the whole sidebar from `engine.app_shell`
+    /// every frame — so this is now just the redraw trigger.
     pub(crate) fn sync_sidebar_widgets(&mut self) {
         self.draw_needed.set(true);
     }
@@ -140,12 +119,10 @@ impl App {
 
     /// Switch the sidebar to a different panel.
     ///
-    /// #754: the ext-panel-vs-built-in bookkeeping this used to spell out is
-    /// `render::apply_activity_panel_switch`, shared with TUI's activity-bar
-    /// arm. The only thing left here is this backend's own widget re-sync,
-    /// which differs by branch (a plugin panel does not move
-    /// `app_shell.active_panel_id()`, so `sync_sidebar_from_engine` has nothing
-    /// to sync for it).
+    /// Ext-panel vs built-in bookkeeping is handled by
+    /// `render::apply_activity_panel_switch`. The only thing left here is
+    /// this backend's own widget re-sync, which differs by branch (a plugin
+    /// panel does not move `app_shell.active_panel_id()`).
     pub(crate) fn switch_panel(&mut self, panel_id: String) {
         let is_ext = panel_id.starts_with("ext:");
         render::apply_activity_panel_switch(&mut self.engine.borrow_mut(), &panel_id);
@@ -193,20 +170,15 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// Resolve a press against the Explorer header's view-actions toolbar
-    /// row (#1693) — mirrors `Self::route_debug_sidebar_event`'s
-    /// chrome-band check for the Debug sidebar's own title/action bars.
-    /// `render::explorer_toolbar_hit_at` does the engine-only hit-test
-    /// (button index); this wrapper adds the one thing it can't do without
-    /// a `Backend` handle — converting `pos` to the character-cell
-    /// coordinates `Engine::open_explorer_overflow_menu` needs to anchor
-    /// the "..." popup, using `self.cached_explorer_metrics` (the same
-    /// paint-time metrics `explorer_ui_event` re-applies for its own
-    /// hit-test, #540).
+    /// Resolve a press against the Explorer header's view-actions toolbar row.
     ///
-    /// Returns `false` (and does nothing) when `pos` doesn't land on a
-    /// toolbar segment, so the caller falls through to the tree's own
-    /// click routing.
+    /// `render::explorer_toolbar_hit_at` does the engine-only hit-test (button
+    /// index); this wrapper converts `pos` to character-cell coordinates that
+    /// `Engine::open_explorer_overflow_menu` needs to anchor the popup,
+    /// using `self.cached_explorer_metrics`.
+    ///
+    /// Returns `false` (and does nothing) when `pos` doesn't land on a toolbar
+    /// segment, so the caller falls through to the tree's own click routing.
     pub(crate) fn route_explorer_toolbar_click(&mut self, pos: quadraui::Point) -> bool {
         let idx = {
             let engine = self.engine.borrow();
@@ -243,15 +215,12 @@ impl App {
 
     /// `UiEvent` (scroll, mouse) over the explorer panel — routed through
     /// `TreeController::handle` for scrollbar interaction.
-    /// Sidebar routing for the Explorer panel (#540/#754).
     ///
-    /// The `TreeController` widget dispatch itself — populate, re-apply the
-    /// paint-time metrics, `handle()`, resolve a `ContextMenuRequested` —
-    /// is [`render::route_explorer_tree_event`], shared with TUI's
-    /// the pre-#1434 TUI shell's `handle_mouse_event` explorer intercept. What stays here
-    /// is GTK-only plumbing: which events this panel claims at all
-    /// (`dominated`), pulling the metrics/backend/theme it needs to make the
-    /// call, and its own draw-invalidation bookkeeping.
+    /// The `TreeController` widget dispatch itself is
+    /// [`render::route_explorer_tree_event`], shared with TUI. What stays
+    /// here is GTK-only plumbing: which events this panel claims at all
+    /// (`dominated`), pulling the metrics/backend/theme it needs, and
+    /// draw-invalidation bookkeeping.
     pub(crate) fn explorer_ui_event(&mut self, ev: quadraui::UiEvent) {
         let dominated = matches!(
             ev,
@@ -278,7 +247,7 @@ impl App {
             render::Theme::from_name(&eng.settings.colorscheme)
         };
         // Re-apply the metrics the tree was drawn with so the hit-test row
-        // math matches the rendered rows (#540). `set_current_line_height`/
+        // math matches the rendered rows. `set_current_line_height`/
         // `set_current_char_width` are inherent on `GtkBackend`, not trait
         // methods on `dyn Backend`, so they must be set from here rather
         // than inside the shared function.
@@ -293,19 +262,15 @@ impl App {
         };
         drop(b);
 
-        // `None` means either the event was fully resolved inside
-        // `route_explorer_tree_event` (a `ContextMenuRequested` — #546) or
-        // the rect wasn't paintable; either way this panel already did
-        // everything it needs to.
+        // `None` means either the event was fully resolved inside the tree routing
+        // or the rect wasn't paintable; either way this panel already did everything it needs to.
         let Some(tree_event) = tree_event else {
             self.queue_explorer_draw();
             self.draw_needed.set(true);
             return;
         };
-        // #1429: shared empty-space right-click fallback, mirroring
-        // `tui_main::mouse`'s right-click arm — see
-        // `route_tree_empty_space_context_menu`'s doc for the upstream
-        // quadraui#1045 gap this stands in for and the deletion plan.
+        // Shared empty-space right-click fallback, mirroring `tui_main::mouse`'s
+        // right-click arm — see `route_tree_empty_space_context_menu`'s doc.
         if let quadraui::UiEvent::MouseDown {
             button: quadraui::MouseButton::Right,
             position,
@@ -324,7 +289,7 @@ impl App {
                 .borrow_mut()
                 .dispatch_explorer_tree_event(tree_event);
         } else if matches!(ev, quadraui::UiEvent::MouseDown { .. }) {
-            // #1429: record a potential drag-and-drop source — mirrors
+            // Record a potential drag-and-drop source — mirrors
             // TUI's identical arm in `mouse::handle_mouse` — only a genuine
             // row selection (not a chevron toggle or a scrollbar drag) arms
             // one.
@@ -342,29 +307,14 @@ impl App {
     }
 
     /// Drop the server-side WM titlebar in favour of the drawn CSD row from
-    /// `render_content`, the first time each run `Backend::window()` returns
-    /// `Some` while this backend draws its own chrome. Called from both
-    /// `setup()` (fast path, usually too early — the runner hasn't called
-    /// `window.present()` yet, so `backend.window()` is still `None`) and
-    /// `tick()` (reliable path — retried every frame via `csd_applied` until
-    /// it succeeds). (#552)
+    /// `render_content`. Called from both `setup()` (fast path, usually too
+    /// early) and `tick()` (reliable path — retried every frame until it succeeds).
     ///
-    /// Gated on `!backend.backend_caps().native_menu` rather than
-    /// `#[cfg(feature = "gui")]`: a backend with a real OS menu bar (macOS's
-    /// `MacBackend`, #901) keeps its native titlebar too — the drawn CSD row
-    /// only exists on backends that also draw their own menu bar (GTK,
-    /// Win-GUI) — so this is the same portable capability check `setup()`
-    /// already uses a few lines below to decide whether to install the
-    /// drawn menu bar at all, not a second per-backend fork of the same
-    /// decision.
-    ///
-    /// #1234 deleted this method's `gtk4::Window::list_toplevels()`
-    /// discovery scan (the former `find_visible_window`) along with the
-    /// `PlatformWindowHandle` seam it fed: `Backend::window()`
-    /// (quadraui#950) is now backed on every windowed backend, and
-    /// `GtkBackend` already tracks its own top-level window handle
-    /// internally the moment the runner constructs it, so `app.rs` never had
-    /// a genuine discovery gap here — only a missing portable accessor.
+    /// Gated on `!backend.backend_caps().native_menu`: a backend with a real
+    /// OS menu bar (macOS's `MacBackend`) keeps its native titlebar too.
+    /// The drawn CSD row only exists on backends that also draw their own menu bar.
+    /// This is the same portable capability check `setup()` uses to decide whether
+    /// to install the drawn menu bar at all.
     pub(crate) fn capture_window_and_apply_csd(&mut self, backend: &mut dyn quadraui::Backend) {
         if self.csd_applied.get() || backend.backend_caps().native_menu {
             return;
@@ -376,14 +326,14 @@ impl App {
         }
     }
 
-    /// Restore the window's saved size, position and maximized state
-    /// (#1529), the first time each run `Backend::window()` returns `Some`.
+    /// Restore the window's saved size, position and maximized state,
+    /// the first time each run `Backend::window()` returns `Some`.
     /// Called from both `setup()` (fast path, usually too early — the
     /// runner hasn't called `window.present()` yet, so `backend.window()`
     /// is still `None`) and `tick()` (reliable path — retried every frame
     /// via `window_geometry_restored` until it succeeds), mirroring
     /// `capture_window_and_apply_csd`'s own identical two-call-site shape
-    /// and doc (#552).
+    /// and doc.
     ///
     /// Order matters: size and (clamped) position are applied first, then
     /// maximized state last — `Backend::toggle_window_maximize` is a
@@ -433,29 +383,22 @@ impl App {
 
     /// Forward a pointer event over the sidebar content area to the active panel's
     /// controller. In ShellApp mode the sidebar has no dedicated per-panel
-    /// `DrawingArea`, so events the Relm4 build delivered straight to each panel's
-    /// DA must be routed here instead. Returns `true` when the event was
-    /// consumed. (#540 ShellApp port, #544 non-explorer panels)
+    /// `DrawingArea`, so events must be routed here instead. Returns `true` when
+    /// the event was consumed.
     ///
-    /// The panel arms mirror `render_content`'s own `match active_id` — each one
-    /// feeds the very controller (`TreeController` / `SidebarSystem` /
-    /// `FormController`) that painted the panel, at the rect it painted into.
-    /// That is the whole reason most arms are just a line or two of dispatch
-    /// and carry no GTK-specific hit-test: the geometry already lives in the
-    /// shared controller, exactly as `tui_main::shell_app`'s equivalent
-    /// intercepts use it. A few panels (settings, extensions, debug/git via
-    /// their helper functions below) need a bit more — focus bookkeeping or
-    /// translating a press into a chrome band's local coordinate space — but
-    /// none of them re-derive hit geometry the painter doesn't already own.
+    /// The panel arms mirror `render_content`'s own match, each feeding the
+    /// controller that painted the panel at the rect it painted into.
+    /// A few panels (settings, extensions, debug/git) need extra bookkeeping or
+    /// coordinate translation, but none re-derive hit geometry the painter doesn't
+    /// already own.
     ///
     /// # Drag / release follow-through
     ///
-    /// A press claimed here sets `sidebar_pointer_captured`, and while that is
-    /// set the subsequent `MouseMoved`(left held) / `MouseUp` are routed to the
-    /// same panel so scrollbar thumbs and tree drags track the pointer. An
-    /// *unclaimed* move/release is deliberately left alone, so an editor
-    /// text-drag that happens to cross into the sidebar still finalizes through
-    /// the editor's own mouse-up path.
+    /// A press claimed here sets `sidebar_pointer_captured`, and while that is set
+    /// subsequent `MouseMoved` (left held) / `MouseUp` are routed to the same panel
+    /// so scrollbar thumbs and tree drags track the pointer. An unclaimed
+    /// move/release is deliberately left alone, so an editor text-drag that crosses
+    /// into the sidebar still finalizes through the editor's own mouse-up path.
     pub(crate) fn try_route_sidebar_mouse_event(
         &mut self,
         backend: &dyn quadraui::Backend,
@@ -469,7 +412,7 @@ impl App {
             return false;
         };
         let dragging = self.sidebar_pointer_captured.get();
-        // #1429: once an explorer row has been picked up (`explorer_drag_src`)
+        // Once an explorer row has been picked up (`explorer_drag_src`)
         // or the drag is already active (`explorer_drag_active`), the *move*
         // and *release* that follow the initial press must reach
         // `handle_mouse_drag_msg`/`handle_mouse_up_msg` — the
@@ -512,14 +455,14 @@ impl App {
         }
         // Only a *press* moves keyboard focus into the panel. A wheel notch is
         // deliberately excluded: hovering-and-scrolling must not steal focus,
-        // the same rule the editor's own wheel path follows (#240/#646).
+        // the same rule the editor's own wheel path follows.
         let is_press = matches!(
             event,
             UiEvent::MouseDown { .. } | UiEvent::DoubleClick { .. }
         );
 
         // An open picker / command palette is painted *over* the sidebar and
-        // owns every press while it is up (#555). `render_content` centres the
+        // owns every press while it is up. `render_content` centres the
         // popup on the whole window, so with the sidebar open its left half
         // sits on top of the explorer tree — and without this the tree's row
         // hit-test underneath ate those presses before they could reach
@@ -535,7 +478,7 @@ impl App {
             return false;
         }
 
-        // #955 (ACP-4, review fix): same reasoning as the picker above, for
+        // Same reasoning as the picker above, for
         // the change-review surface — full-viewport, so its diff pane sits
         // squarely on top of the sidebar body underneath. Without this, a
         // click on the diff's left pane (which happens to fall inside
@@ -549,17 +492,10 @@ impl App {
             return false;
         }
 
-        // An engine-drawn context menu (editor / tab-bar / explorer — they
-        // all share `engine.context_menu`) takes priority over the sidebar's
-        // own click routing. An explorer-sourced menu typically renders
-        // inside these same sidebar bounds, so without this a click on it —
-        // an item, or an outside-click meant to dismiss it — fell straight
-        // through to `TreeController`'s row hit-test underneath: the menu
-        // *looked* interactive but every click acted on the tree row instead
-        // (#546 FAILED-2). Only a left press drives the menu's own
-        // hit-test/dismissal (mirrors `handle_mouse_click_msg`); any other
-        // press/double-click/scroll while a menu is open is swallowed here
-        // rather than leaking through to the tree underneath it.
+        // An engine-drawn context menu takes priority over the sidebar's own click
+        // routing. Without this check a click on the menu fell through to the tree
+        // underneath. Only a left press drives the menu's own hit-test/dismissal;
+        // any other press/double-click/scroll while a menu is open is swallowed here.
         if self.engine.borrow().context_menu.is_some() {
             if matches!(
                 event,
@@ -574,18 +510,13 @@ impl App {
             return true;
         }
 
-        // Which panel owns the sidebar body? `render::sidebar_owner` states
-        // that precedence once (#754) — `ext_panel_active` first, then
-        // `app_shell.active_panel_id()`, Explorer as the fallback — so the
-        // click router, the hover router and the painter can never disagree
-        // about who is on screen. This used to be an inline `format!("ext:{}")`
-        // here and an `if …is_some() / else if active_panel_is(…)` chain on
-        // TUI.
+        // Which panel owns the sidebar body? `render::sidebar_owner` states that
+        // precedence once so the click router, hover router and painter never disagree.
         let owner = render::sidebar_owner(&self.engine.borrow());
 
         let consumed = match &owner {
             render::SidebarOwner::Explorer => {
-                // #1693: the view-actions toolbar row sits above the tree
+                // The view-actions toolbar row sits above the tree
                 // (`paint_sidebar_panel_rung`'s `PANEL_EXPLORER` arm), so a
                 // press is checked against it first — mirrors
                 // `Self::route_debug_sidebar_event`'s chrome-band check.
@@ -627,34 +558,16 @@ impl App {
                 if is_press {
                     engine.settings_has_focus = true;
                 }
-                // `handle_settings_form_ui_event`'s own `bool` return (whether
-                // `FormController` recognized a row/field under the point) is
-                // deliberately ignored here: the position is already confirmed
-                // to be inside the sidebar's content bounds (checked above),
-                // so even a click on empty panel padding belongs to this panel,
-                // not the editor underneath it. Honoring `false` would let that
-                // click fall through to `handle_mouse_click_msg` at sidebar-local
-                // coordinates, which is exactly the leak every other arm in this
-                // match also guards against by returning `true` unconditionally.
-                //
-                // #1343: `engine.settings_form_rect`, not the raw `sb` —
-                // `paint_sidebar_panel_rung`'s `PANEL_SETTINGS` arm now
-                // reserves one row above the form for the shared search row
-                // (`SidebarPanelChrome::Search`, quadraui#1061, via
-                // `render::search_only_chrome`, #1391), so `sb` (the whole
-                // sidebar content rect the shell hands this frame) is one
-                // row taller than what `FormController::render_and_cache`
-                // actually painted into. `handle_settings_form_ui_event`'s
-                // own doc says `rect` must be "the *same* rect the last
-                // frame passed to `FormController::render_and_cache`" —
-                // `sb` stopped being that the moment the search row was
-                // added.
+                // The position is inside the sidebar's content bounds, so even a click on
+                // empty panel padding belongs to this panel, not the editor underneath.
+                // The form rect omits the search row above it (added per quadraui#1061),
+                // which `paint_sidebar_panel_rung` reserves one row above the form.
                 let settings_rect = engine.settings_form_rect.get();
                 render::handle_settings_form_ui_event(&mut engine, event, settings_rect);
                 true
             }
             render::SidebarOwner::ExtPanel(_) => {
-                // #1089: `render_content` now paints this panel through
+                // `render_content` now paints this panel through
                 // `render::ext_panel_to_tree_view` — the same adapter TUI
                 // uses — not `ext_sidebar_system` (the extension
                 // marketplace), so routing goes through the shared
@@ -668,7 +581,7 @@ impl App {
                 if is_press {
                     engine.ext_panel_has_focus = true;
                 }
-                // #146: a view-backed panel painted a `quadraui::Form`, so its
+                // A view-backed panel painted a `quadraui::Form`, so its
                 // clicks resolve through `FormController` (and dispatch to the
                 // plugin's `on_event`), not through the tree-row router.
                 let is_view = engine
@@ -681,7 +594,7 @@ impl App {
                 // empty panel padding belongs here rather than leaking to the
                 // editor underneath.
                 match event {
-                    // #1631: a `ViewBody`-kind view routes through its own
+                    // A `ViewBody`-kind view routes through its own
                     // matching primitive's click/scroll resolution instead
                     // of `FormController` — `render::route_plugin_view_body_
                     // event`, shared with the tab-hosted arm below. See the
@@ -730,11 +643,8 @@ impl App {
                     } => {
                         render::route_ext_panel_click(&mut engine, pos, false);
                     }
-                    // Right-click context menu and mid-drag follow-through
-                    // (`MouseUp`/`MouseMoved`) aren't wired for this panel yet
-                    // — out of #1089's scope (paint + left-click selection);
-                    // still consumed below so neither leaks through to the
-                    // editor underneath.
+                    // Right-click context menu and mid-drag follow-through aren't wired yet;
+                    // still consumed below so neither leaks through to the editor.
                     _ => {}
                 }
                 true
@@ -759,19 +669,12 @@ impl App {
         consumed
     }
 
-    /// Sidebar routing for the Debug panel (#544/#754).
+    /// Sidebar routing for the Debug panel.
     ///
-    /// `render_content` paints the title + action-button chrome through
-    /// `SidebarPanelBody::render_with`'s `StatusBars` variant and stashes its
-    /// `status_bar_hit_regions` in `engine.dap_sidebar_action_hits`, already
-    /// in `pos`'s own absolute pixel space — no per-backend translation step
-    /// (#1392; before quadraui#1061 the hits were bar-relative and had to be
-    /// translated via a separately cached `action_rect`, two independently
-    /// derived values for the same geometry). `dap_sidebar_action_click_at`
-    /// takes `pos` directly. Everything below the chrome goes to the shared
-    /// `SidebarSystem` at the body rect it painted into
-    /// ([`render::dispatch_dap_sidebar_body_event`]) — the same two shared
-    /// functions TUI calls for this panel.
+    /// `render_content` paints the title + action-button chrome and stashes its
+    /// hit regions in `engine.dap_sidebar_action_hits` in absolute pixel space.
+    /// Everything below the chrome goes to the shared `SidebarSystem` at the body
+    /// rect it painted into ([`render::dispatch_dap_sidebar_body_event`]).
     pub(crate) fn route_debug_sidebar_event(
         &mut self,
         event: &quadraui::UiEvent,
@@ -790,8 +693,7 @@ impl App {
         if starts_interaction && pos.y < body_rect.y {
             render::dap_sidebar_action_click_at(&mut engine, pos);
             // Claimed either way: the press landed on this panel's own chrome,
-            // so it must not leak through to the editor beneath (#637's rule
-            // for the TUI twin of this intercept).
+            // so it must not leak through to the editor beneath.
             return true;
         }
         let backend_rc = self.backend.clone();
@@ -804,16 +706,12 @@ impl App {
         true
     }
 
-    /// Sidebar routing for the git ("source control") panel (#544/#754).
+    /// Sidebar routing for the git ("source control") panel.
     ///
-    /// The panel is three stacked bands — header, commit-message input, and the
-    /// toolbar slab + change sections. `render_content` derives them via
-    /// `render::sc_sidebar_bands` and caches the result here, so this resolves a
-    /// press against the exact geometry that was painted rather than
-    /// re-deriving it (the pre-#544 handler assumed `DrawingArea`-local
-    /// coordinates with the panel top at `y == 0`, which the ShellApp painter
-    /// never produces). The dispatch itself is
-    /// [`render::route_sc_sidebar_click`], shared with TUI.
+    /// The panel is three stacked bands — header, commit-message input, and
+    /// toolbar + change sections. `render_content` derives them and caches the
+    /// result here. The dispatch itself is [`render::route_sc_sidebar_click`],
+    /// shared with TUI.
     pub(crate) fn route_sc_sidebar_event(
         &mut self,
         event: &quadraui::UiEvent,
@@ -828,21 +726,14 @@ impl App {
         true
     }
 
-    /// Sidebar routing for the Board panel (#521, right-click added #523).
+    /// Sidebar routing for the Board panel.
     ///
     /// `render::route_board_click` resolves the press against the
-    /// `quadraui::BoardLayout` `paint_sidebar_panel_rung`'s `PANEL_BOARD`
-    /// arm cached at paint time — the same "paint caches, click reads"
-    /// contract as `Engine::ext_panel_tree_layout`. Consumed
-    /// unconditionally like every other panel arm here, per
-    /// [`Self::route_sc_sidebar_event`]'s neighbouring doc.
-    ///
-    /// The right-click arm mirrors `handle_tab_right_click`/
-    /// `handle_editor_right_click`'s own pixel→cell conversion —
-    /// `Engine::open_board_context_menu`'s `x`/`y` are cell coordinates,
-    /// same convention every other `open_*_context_menu` uses, so the
-    /// conversion happens here rather than inside `render.rs` (which has no
-    /// notion of GTK's pixel metrics).
+    /// `quadraui::BoardLayout` cached at paint time — the same "paint caches,
+    /// click reads" contract as `Engine::ext_panel_tree_layout`. Consumed
+    /// unconditionally like every other panel arm, so clicks don't leak to the
+    /// editor. Right-click pixel→cell conversion uses `self.metrics` since
+    /// `Engine::open_board_context_menu` expects cell coordinates.
     pub(crate) fn route_board_sidebar_event(
         &mut self,
         event: &quadraui::UiEvent,
@@ -880,12 +771,12 @@ impl App {
         true
     }
 
-    /// Sidebar routing for the AI panel (#544/#754/#819).
+    /// Sidebar routing for the AI panel.
     ///
     /// `render_content` caches the panel rect in `Engine::ai_chat_rect` at
     /// paint time — resolving a press against that means the click router
-    /// can never derive a different layout than the one actually on screen
-    /// (#544/#582/#646). The dispatch itself is [`render::route_ai_chat_event`],
+    /// can never derive a different layout than the one actually on screen.
+    /// The dispatch itself is [`render::route_ai_chat_event`],
     /// which needs a live `Backend` (like [`Self::route_debug_sidebar_event`])
     /// for `ChatController::handle`'s own layout/hit-test math. Consumes the
     /// press unconditionally like every other panel arm in
@@ -905,13 +796,13 @@ impl App {
         }
         if starts_interaction {
             engine.ai_has_focus = true;
-            // #1507 review: a mouse click into the panel isn't part of any
+            // A mouse click into the panel isn't part of any
             // keyboard `<leader>ai` gesture, so it breaks one exactly like a
             // Named key would — discard rather than replay, since a click
             // (unlike a keystroke) has no natural place in the input to
             // insert buffered text.
             engine.ai_leader_toggle_pending.clear();
-            // #1513: a press landing on the pinned plan block's band
+            // A press landing on the pinned plan block's band
             // toggles its collapse state instead of reaching `ChatController`
             // — checked first (before the metrics re-apply/`route_ai_chat_
             // event` call below) exactly like `route_board_sidebar_event`'s
@@ -955,12 +846,9 @@ impl App {
         unicode: Option<char>,
         ctrl: bool,
     ) {
-        // #734 slice 1: the #426 explorer-ctx-menu intercept and the
-        // dialog patch-up ("route keys to the dialog handler, not the
-        // explorer dispatch") that used to open this function are gone —
-        // both were local re-statements of rungs `render::route_modal_key`
-        // now resolves at the top of `handle_key_press`, above the
-        // `explorer_has_focus` rung that is this function's only caller.
+        // The explorer-ctx-menu intercept and dialog patch-up that used to open
+        // this function are gone — both were local re-statements that
+        // `render::route_modal_key` now resolves at the top of `handle_key_press`.
 
         // Panel-nav shortcuts before engine dispatch.
         let (pk_toggle, pk_explorer, pk_search) = {
@@ -1014,7 +902,7 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// #731: was a redraw hint on `self.explorer_sidebar_da_ref`, permanently
+    /// Was a redraw hint on `self.explorer_sidebar_da_ref`, permanently
     /// `None` under the ShellApp runner. `render_content` repaints the whole
     /// sidebar from engine state every frame, so callers only need
     /// `self.draw_needed.set(true)` — kept as a named no-op (rather than
@@ -1060,9 +948,7 @@ impl App {
                 use crate::core::engine::sidebar::ActivityBarActivation;
                 let activation = self.engine.borrow_mut().activity_bar_activate();
                 match activation {
-                    // The menu bar is repainted every frame by
-                    // `render_content`'s `ShellApp` path (no dedicated overlay
-                    // DA to invalidate under the #540 cutover).
+                    // The menu bar is repainted every frame by `render_content` from engine state.
                     ActivityBarActivation::MenuToggled => self.draw_needed.set(true),
                     ActivityBarActivation::PanelFocused
                     | ActivityBarActivation::ExtPanelFocused(_) => {
@@ -1082,29 +968,11 @@ impl App {
         // Suppress the default engine key handler — key is consumed.
     }
 
-    /// #734 slice 1: the single sink for the shared context-menu key rung
-    /// (`render::ModalKeyRoute::ContextMenu`) — on every backend `App` hosts
-    /// now (#1433 flips TUI onto this same method; it was written when
-    /// `App` was still GTK-only, hence the "GTK-side" framing this doc used
-    /// to carry).
-    ///
-    /// Replaces two hand-rolled copies — the block that opened
-    /// `handle_key_press` and `handle_explorer_ctx_menu_key` (#426) on the
-    /// explorer DA path — both of which reimplemented selection movement
-    /// inline instead of calling `Engine::handle_context_menu_key`, and so
-    /// disagreed with TUI on `l` (confirm), `q`/`h` (close) and disabled-item
-    /// skipping. The engine owns all of that now; the only per-action part
-    /// left is dispatching the confirmed action, since `new_file` /
-    /// `open_terminal` / `find_in_folder` need backend plumbing —
-    /// `find_in_folder` itself has no remaining backend fork to record:
-    /// #1418 already converged TUI's explicit-target `"delete"`/
-    /// `"move_file"` handling and GTK's mismatched `"find_in_folder"`
-    /// (Search-panel-focus vs Grep-picker) onto the one shared
-    /// `render::apply_explorer_context_action`, which is what this method
-    /// calls below — #1433 re-checked this while auditing what became
-    /// backend-shared vs stayed backend-specific once `App` started running
-    /// on TUI in production, and confirmed there is nothing left to
-    /// reconcile here.
+    /// The single sink for the shared context-menu key rung
+    /// (`render::ModalKeyRoute::ContextMenu`). Dispatches the confirmed action,
+    /// since `new_file` / `open_terminal` / `find_in_folder` need backend plumbing.
+    /// The engine owns selection movement and menu navigation; only the final
+    /// action dispatch is per-backend.
     pub(crate) fn dispatch_context_menu_key(&mut self, key_name: &str, unicode: Option<char>) {
         let effective_key = if key_name.is_empty() {
             unicode.map(|c| c.to_string()).unwrap_or_default()

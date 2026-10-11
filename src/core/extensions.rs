@@ -77,28 +77,24 @@ pub struct ExtensionManifest {
     /// Derived at fetch time; not serialized to JSON/TOML.
     #[serde(skip)]
     pub registry_base_url: String,
-    /// Declares this extension as a Board-panel data provider (#522).
+    /// Declares this extension as a Board-panel data provider.
     /// `None` means this extension doesn't provide a board.
     #[serde(default)]
     pub board: Option<BoardProviderConfig>,
     /// Declares this extension as a document provider for buffer-based
-    /// authoring (#524). `None` means this extension can't open its
+    /// authoring. `None` means this extension can't open its
     /// documents as editable buffers.
     #[serde(default)]
     pub document: Option<DocumentProviderConfig>,
-    /// Minimum (or otherwise constrained) running vimcode version this
-    /// extension's Lua scripts require, as a semver requirement string
-    /// (e.g. `">=0.15.0"`) — #1807. Native `vimcode.*` APIs an extension's
-    /// scripts call (completion sources, extension-services, …) can land
-    /// in vimcode after the extension itself is published to the registry;
-    /// without this field a user on an older vimcode would install the
-    /// extension and only discover the gap when a script call errors out
+    /// Minimum running vimcode version this extension's Lua scripts require,
+    /// as a semver requirement string (e.g. `">=0.15.0"`). Native `vimcode.*`
+    /// APIs an extension's scripts call can land in vimcode after the extension
+    /// is published; without this field a user on an older vimcode would install
+    /// the extension and only discover incompatibility when a script call errors
     /// at load time.
     ///
-    /// `None` — the default, and what every extension predating #1807
-    /// implicitly declares — means "no constraint": compatible with every
-    /// vimcode version, matching pre-#1807 behavior exactly. See
-    /// [`ExtensionManifest::is_compatible_with_vimcode`] and
+    /// `None` — the default — means "no constraint": compatible with every
+    /// vimcode version. See [`ExtensionManifest::is_compatible_with_vimcode`] and
     /// [`ExtensionManifest::incompatibility_reason`].
     ///
     /// **Write an explicit comparator, not a bare version.** This string is
@@ -122,7 +118,7 @@ pub struct CommentConfig {
     pub block_close: String,
 }
 
-/// Declares an extension as a Board-panel data provider (#522).
+/// Declares an extension as a Board-panel data provider.
 ///
 /// Generic on purpose — this struct names no particular provider. Any
 /// extension can point `refresh_command` at an external tool that emits
@@ -142,7 +138,7 @@ pub struct BoardProviderConfig {
     #[serde(default = "default_board_poll_interval_secs")]
     pub poll_interval_secs: u64,
     /// Named, provider-declared actions a card can be dispatched through
-    /// (#523) — the context menu's contents, a stage keybinding table, and
+    /// — the context menu's contents, a stage keybinding table, and
     /// (via [`Self::action_by_name`]) the target of `quadraui::BoardAction`
     /// variants like `OpenIssue`/`OpenReview` that need somewhere to
     /// dispatch to. Generic on purpose, same spirit as the rest of this
@@ -153,7 +149,7 @@ pub struct BoardProviderConfig {
     #[serde(default)]
     pub actions: Vec<BoardActionDef>,
     /// Argv template(s) for reporting a review verdict from the
-    /// change-review surface (#526), keyed by
+    /// change-review surface, keyed by
     /// `crate::core::review::ReviewVerdict::token()`
     /// (`"approve"`/`"request-changes"`/`"comment"`). A provider that
     /// supports only approve/request-changes simply omits `"comment"` —
@@ -168,7 +164,7 @@ pub struct BoardProviderConfig {
     /// applies by sending its payload on stdin instead.
     #[serde(default)]
     pub verdict_commands: std::collections::HashMap<String, Vec<String>>,
-    /// Argv to run periodically as an opt-in freshness nudge (#523) — for a
+    /// Argv to run periodically as an opt-in freshness nudge — for a
     /// daemon-less provider whose pipeline only advances when some external
     /// "notify" command runs, so it doesn't stall just because vimcode is
     /// the only client with the board open. Empty (the default) means the
@@ -195,7 +191,7 @@ fn default_board_tick_interval_secs() -> u64 {
     300
 }
 
-/// One provider-declared, named board action (#523) — e.g. "dispatch this
+/// One provider-declared, named board action — e.g. "dispatch this
 /// card's work", "record a Test verdict", "merge". The provider names it,
 /// declares which stages (columns) it's valid in, an optional single-key
 /// binding, whether firing it needs confirmation, and the argv to run.
@@ -269,15 +265,11 @@ impl BoardActionDef {
     }
 }
 
-/// Declares an extension as a document provider (#524, Phase 1): its
-/// documents (e.g. issues) can be opened as real markdown scratch buffers
-/// for editing, with edits pushed back through a write command on `:w`.
-///
-/// Generic on purpose, same spirit as [`BoardProviderConfig`] — names no
-/// particular provider or lifecycle vocabulary. Any extension can point
-/// `read_command`/`write_command` at external tools that speak vimcode's
-/// document contract (`crate::core::tool_client::ToolDocument`) and get
-/// working buffer-based authoring.
+/// Documents an extension as a document provider: its documents can be
+/// opened as markdown scratch buffers for editing, with edits pushed back
+/// through a write command on `:w`. Generic on purpose — any extension can
+/// point `read_command`/`write_command` at external tools that speak
+/// vimcode's document contract and get working buffer-based authoring.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct DocumentProviderConfig {
     /// Argv to run to fetch a document's body for editing. The literal
@@ -344,9 +336,7 @@ impl BoardProviderConfig {
         self.actions.iter().find(|a| a.name == name)
     }
 
-    /// Every declared action valid for `stage_id` (a column id) — the
-    /// context menu's contents (#523: "listing the actions the provider
-    /// declares as valid for that card's stage").
+    /// Declared actions valid for `stage_id` (a column id) — the context menu's
     pub fn actions_for_stage(&self, stage_id: &str) -> Vec<&BoardActionDef> {
         self.actions
             .iter()
@@ -354,9 +344,7 @@ impl BoardProviderConfig {
             .collect()
     }
 
-    /// The declared action bound to `key`, if any, and valid for
-    /// `stage_id` — a stage keybinding lookup (#523's single-key verdict
-    /// bindings, e.g. `P`/`S`/`F`).
+    /// Declared action bound to `key`, if any, and valid for `stage_id` —
     pub fn action_for_key(&self, key: &str, stage_id: &str) -> Option<&BoardActionDef> {
         self.actions
             .iter()
@@ -429,24 +417,16 @@ pub struct LspConfig {
     /// `{"diagnostics": {"enable": false}}` for rust-analyzer).
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
-    /// Native tool acquisition (#1345): download, verify and unpack the LSP
-    /// binary directly, with no shell command, `sudo`, `unzip`, or PATH
-    /// edits. When present, `ext_install_from_registry` prefers this over
-    /// `install`/`install_linux`/`install_macos`/`install_windows` — see
-    /// `crate::core::tool_acquire`. Five of the eight `kind`s (`npm`,
-    /// `pip`, `go`, `cargo`, `dotnet-tool`, #1346) install via the matching
-    /// package manager instead of downloading a release archive, but still
-    /// into a private prefix under vimcode's managed tools dir rather than
-    /// a global, often `sudo`-requiring, install location — see
-    /// `Engine::ext_install_from_registry`'s LSP block for the runtime
-    /// dependency check (`tool_acquire::package_manager_runtime`) that
-    /// falls a manifest through to the visible-terminal tier when e.g.
-    /// `npm` itself isn't on PATH, instead of failing silently.
+    /// Native tool acquisition: download, verify and unpack the LSP binary
+    /// directly. When present, `ext_install_from_registry` prefers this over
+    /// `install`/`install_linux`/`install_macos`/`install_windows`. Five of
+    /// the eight `kind`s (`npm`, `pip`, `go`, `cargo`, `dotnet-tool`) install
+    /// via the matching package manager instead of downloading a release
+    /// archive, but still into a private prefix under vimcode's managed tools
+    /// dir — see `Engine::ext_install_from_registry`'s LSP block.
     #[serde(default)]
     pub acquire: Option<crate::core::tool_acquire::AcquireConfig>,
 }
-
-// ─── Target platform (testable seam, #919) ────────────────────────────────────
 
 /// A target platform for install-command resolution. Install commands are
 /// naturally platform-specific (`apt`/`brew`/`winget`, `sh -c` vs `cmd /C`);
@@ -504,11 +484,7 @@ impl LspConfig {
         self.install_cmd_for(Platform::host())
     }
 
-    /// Same as `install_cmd_for_platform`, but for an explicitly-named
-    /// platform rather than the one this binary happens to be compiled for.
-    /// This is the seam the #919 registry conformance test uses to check a
-    /// manifest resolves an install command on all three platforms from a
-    /// single (any-OS) test binary.
+    /// Same as `install_cmd_for_platform`, but for an explicitly-named platform.
     pub fn install_cmd_for(&self, platform: Platform) -> &str {
         self.install_cmd_with(platform, rustup_on_path())
     }
@@ -582,7 +558,7 @@ pub struct DapConfig {
     #[serde(default)]
     pub args: Vec<String>,
     /// System binaries that must be on PATH for the DAP adapter's **install
-    /// step** to work (#1719) — the `DapConfig` analogue of `LspConfig::
+    /// step** to work — the `DapConfig` analogue of `LspConfig::
     /// dependencies`. E.g. a manifest-declared adapter whose `install_*`
     /// shells out to a package manager names it here. Checked by
     /// `Engine::ext_install_from_registry_with_runtime_check` *before* the
@@ -593,7 +569,7 @@ pub struct DapConfig {
     /// the registry.
     #[serde(default)]
     pub dependencies: Vec<String>,
-    /// Native tool acquisition (#1345) — see `LspConfig::acquire`'s doc.
+    /// Native tool acquisition — see `LspConfig::acquire`'s doc.
     #[serde(default)]
     pub acquire: Option<crate::core::tool_acquire::AcquireConfig>,
 }
@@ -607,7 +583,7 @@ impl DapConfig {
 
     /// Same as `install_cmd_for_platform`, but for an explicitly-named
     /// platform. See `LspConfig::install_cmd_for` / `Platform` for why this
-    /// seam exists (#919).
+    /// seam exists.
     pub fn install_cmd_for(&self, platform: Platform) -> &str {
         let platform_field = platform_install_field(
             platform,
@@ -637,7 +613,7 @@ fn platform_install_field<'a>(
     }
 }
 
-// ─── Prerequisite install guidance (#918) ─────────────────────────────────────
+// ─── Prerequisite install guidance ────────────────────────────────────────────
 
 /// Per-platform install guidance for the handful of runtime prerequisites
 /// shared across many extensions' `lsp.dependencies` (e.g. `["npm"]`).
@@ -674,13 +650,7 @@ const PREREQ_INSTALLS: &[(&str, PrereqInstall)] = &[
             windows: "winget install Microsoft.DotNet.SDK.8",
         },
     ),
-    // #1719 bugbash (vimcode-ext#17): Ubuntu 24.04's `golang-go` apt package
-    // is Go 1.22, but `gopls@latest` (and anything else resolved with
-    // `@latest`) wants a materially newer `go` — and Debian's packaged Go
-    // pins `GOTOOLCHAIN=local`, so it can't just self-upgrade the way a
-    // stock `go` toolchain would. `snap install go --classic` tracks the
-    // current stable release instead of whatever a distro happened to
-    // package, so the retry after this hint actually succeeds.
+    // Ubuntu 24.04's `golang-go` apt package is Go 1.22, but `gopls@latest`
     (
         "go",
         PrereqInstall {
@@ -713,7 +683,7 @@ const PREREQ_INSTALLS: &[(&str, PrereqInstall)] = &[
             windows: "winget install Rustlang.Rustup",
         },
     ),
-    // #1346: runtime `[lsp.acquire]`/`[dap.acquire]` kind `pip` needs
+    // Runtime `[lsp.acquire]`/`[dap.acquire]` kind `pip` needs
     // `python3 -m venv` (Debian/Ubuntu split that out of the base `python3`
     // package into `python3-venv`), and the hint is shown wherever a `pip`
     // acquisition's runtime is missing — see `tool_acquire::package_manager_runtime`.
@@ -725,7 +695,7 @@ const PREREQ_INSTALLS: &[(&str, PrereqInstall)] = &[
             windows: "winget install Python.Python.3",
         },
     ),
-    // #1719: several registry manifests' `install_macos` shells straight
+    // Several registry manifests' `install_macos` shells straight
     // to `brew install …` (cpp, java, lua, markdown, latex, ruby,
     // terraform) with nothing declaring Homebrew itself as a prerequisite
     // — a Mac without it got no instruction, just `brew: command not
@@ -743,7 +713,7 @@ const PREREQ_INSTALLS: &[(&str, PrereqInstall)] = &[
             windows: "wsl --install ; wsl bash -c 'NONINTERACTIVE=1 /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"'",
         },
     ),
-    // #1719: the `java` extension's install needs a JDK on PATH; nothing
+    // The `java` extension's install needs a JDK on PATH; nothing
     // in the shared table named it before.
     (
         "java",
@@ -753,7 +723,7 @@ const PREREQ_INSTALLS: &[(&str, PrereqInstall)] = &[
             windows: "winget install EclipseAdoptium.Temurin.17.JDK",
         },
     ),
-    // #1719: curl/unzip/tar back the built-in codelldb/netcoredbg DAP
+    // Curl/unzip/tar back the built-in codelldb/netcoredbg DAP
     // installers (`dap_manager::codelldb_install_cmd_for`/
     // `netcoredbg_install_cmd_unix_for`) — see
     // `dap_manager::adapter_dependencies`, which is what actually checks
@@ -823,25 +793,16 @@ impl ExtensionManifest {
     }
 
     /// Returns `true` when this extension's `requires_vimcode` constraint
-    /// (if any) is satisfied by `running_version` (#1807).
+    /// (if any) is satisfied by `running_version`.
     ///
-    /// A missing constraint is always compatible — the pre-#1807 default.
-    /// A `requires_vimcode` string that fails to parse as a semver
-    /// requirement, or a `running_version` that fails to parse as semver,
-    /// is *also* treated as compatible rather than bricking the extension
-    /// over a malformed manifest field or an unparseable running-version
-    /// string (should not happen for `env!("CARGO_PKG_VERSION")`, but a
-    /// manifest field is untrusted input) — a one-line debug note is
-    /// logged for the malformed-requirement case so a registry-side typo
-    /// doesn't go silently invisible forever.
+    /// A missing constraint is always compatible. A `requires_vimcode` string
+    /// that fails to parse as semver, or a `running_version` that fails to
+    /// parse as semver, is treated as compatible rather than bricking the
+    /// extension — a debug note is logged for the malformed-requirement case.
     ///
-    /// `running_version`'s prerelease component (if any — e.g. a future
-    /// `Cargo.toml` carrying `"0.15.0-rc1"`) is stripped before matching:
-    /// `semver::VersionReq::matches` otherwise excludes prerelease
-    /// versions from a plain `">=0.15.0"` comparator by design, which
-    /// would make every `requires_vimcode` extension read as incompatible
-    /// on a prerelease build even though its release-version core
-    /// satisfies the bound.
+    /// `running_version`'s prerelease component (if any) is stripped before
+    /// matching: `semver::VersionReq::matches` otherwise excludes prerelease
+    /// versions from a plain `">=0.15.0"` comparator by design.
     pub fn is_compatible_with_vimcode(&self, running_version: &str) -> bool {
         let Some(req_str) = self.requires_vimcode.as_deref() else {
             return true;
@@ -864,14 +825,14 @@ impl ExtensionManifest {
     /// Human-readable reason this extension is incompatible with
     /// `running_version`, or `None` when it's compatible (including the
     /// no-constraint case). Shared by the marketplace install-refusal
-    /// message and the "skip at load" message (#1807).
+    /// message and the "skip at load" message.
     pub fn incompatibility_reason(&self, running_version: &str) -> Option<String> {
         // Structural rather than defensive: this branch is only reached
         // once `is_compatible_with_vimcode` has already returned `false`,
         // which itself only happens when `requires_vimcode` is `Some` (its
         // own first check returns early on `None`) — so this `if let` can
         // never actually take the `else` arm, unlike the `unwrap_or("")`
-        // it replaced (#1807 review).
+        // it replaced.
         if let Some(req) = self.requires_vimcode.as_deref() {
             if self.is_compatible_with_vimcode(running_version) {
                 None
@@ -885,21 +846,13 @@ impl ExtensionManifest {
         }
     }
 
-    /// Convenience wrapper over [`Self::incompatibility_reason`] against
-    /// the actual running vimcode (`env!("CARGO_PKG_VERSION")`) — the one
-    /// "what version is running" lookup every call site (marketplace
-    /// install refusal, available-list panel row, loader skip) otherwise
-    /// had to repeat independently (#1807 review nit).
+    /// Convenience wrapper over [`Self::incompatibility_reason`] against the
     pub fn incompatibility_reason_for_running_vimcode(&self) -> Option<String> {
         self.incompatibility_reason(env!("CARGO_PKG_VERSION"))
     }
 
-    /// The name to show the user: `display_name` when set, falling back to
-    /// the internal `name` otherwise. Several install-failure messages
-    /// (`lsp_manager.rs`'s `missing_dependency_message` and the two
-    /// `ensure_server_for_language` error branches, #918) all needed this
-    /// exact fallback independently — pulled out once here so it can't drift
-    /// between call sites.
+    /// The name to show the user: `display_name` when set, falling back to the
+    /// internal `name` otherwise.
     pub fn display_or_name(&self) -> &str {
         if self.display_name.is_empty() {
             &self.name
@@ -1018,10 +971,6 @@ mod tests {
 
     #[test]
     fn dap_install_routes_by_language_not_shared_adapter() {
-        // #212 follow-up. Both cpp and rust bundle codelldb. Previously
-        // `:DapInstall rust` matched on either language OR shared adapter
-        // and `.find()` returned whichever was iterated first (cpp wins
-        // alphabetically), telling the user to install the wrong extension.
         // Lookup must be by language_ids exclusively.
         let ms = vec![
             ExtensionManifest {
@@ -1088,7 +1037,7 @@ binary = "test-lsp"
 
     #[test]
     fn rust_analyzer_uses_rustup_when_available() {
-        // #436: bundled rust manifest ships `cargo install rust-analyzer`,
+        // Bundled rust manifest ships `cargo install rust-analyzer`,
         // which compiles from source (~10 min silent build).  When rustup
         // is available, swap to `rustup component add rust-analyzer`
         // (~30s binary download) on every platform.
@@ -1154,7 +1103,7 @@ binary = "test-lsp"
 
     #[test]
     fn install_cmd_for_resolves_explicit_platform_regardless_of_host() {
-        // #919: the whole point of `install_cmd_for(Platform)` is that a
+        // The whole point of `install_cmd_for(Platform)` is that a
         // test running on any host OS can ask "what would this resolve to
         // on Windows/macOS/Linux specifically" — not just "what does it
         // resolve to on the OS I happen to be compiled for".
@@ -1246,7 +1195,7 @@ confirm = true
         );
     }
 
-    /// #526: verdict commands parse from a `[board.verdict_commands]` TOML
+    /// Verdict commands parse from a `[board.verdict_commands]` TOML
     /// table (same nesting convention `[board.actions]` already uses) and
     /// `{id}`/`{body_file}` both substitute correctly. A verdict with no
     /// entry (`"comment"` here) resolves to `None` — "not offered", same as
@@ -1393,7 +1342,7 @@ refresh_command = ["example-tool", "board", "--json"]
 
     #[test]
     fn lsp_acquire_absent_from_toml_parses_to_none() {
-        // #1345: every existing registry manifest has no `[lsp.acquire]` /
+        // Every existing registry manifest has no `[lsp.acquire]` /
         // `[dap.acquire]` table — confirm they stay unaffected.
         let toml = r#"
 name = "rust"
@@ -1428,8 +1377,7 @@ binary_path = "terraform-ls"
         assert_eq!(acquire.product, "terraform-ls");
     }
 
-    /// #1346: the five package-manager `[lsp.acquire]` kinds parse from
-    /// TOML the same way the three #1345 archive kinds do.
+    /// The five package-manager `[lsp.acquire]` kinds parse from TOML.
     #[test]
     fn lsp_acquire_table_parses_package_manager_kinds() {
         let toml = r#"
@@ -1478,7 +1426,7 @@ package = "csharprepl"
         );
     }
 
-    /// #1346: `pip`'s runtime dependency (`python3`) needs its own
+    /// `pip`'s runtime dependency (`python3`) needs its own
     /// platform-specific install hint, same as `npm`/`go`/`cargo`/`dotnet`
     /// already had before this issue.
     #[test]
@@ -1486,11 +1434,7 @@ package = "csharprepl"
         assert!(prereq_install_cmd("python3").is_some());
     }
 
-    /// #1719 acceptance criterion: every `PREREQ_INSTALLS` entry, on every
-    /// platform, resolves to a single runnable command string — never
-    /// empty and never a placeholder (`TODO`, `<...>`, `xxx`) that would
-    /// just move the "command not found" failure from the install pane to
-    /// the retry the hint told the user to run.
+    /// Every `PREREQ_INSTALLS` entry, on every platform, resolves to a single
     #[test]
     fn every_prereq_install_entry_is_runnable_on_every_platform() {
         for (name, table) in PREREQ_INSTALLS {
@@ -1514,7 +1458,7 @@ package = "csharprepl"
         }
     }
 
-    /// #1719: `brew`, `java`, `curl`, `unzip`, `tar` are the new entries
+    /// `brew`, `java`, `curl`, `unzip`, `tar` are the new entries
     /// this issue adds to the shared hint table (Homebrew itself, a JDK,
     /// and the archive tools the built-in codelldb/netcoredbg DAP
     /// installers shell out to) — pinned individually so a future refactor
@@ -1548,8 +1492,6 @@ package = "csharprepl"
         assert_eq!(cfg.install_cmd_for(Platform::MacOS), "");
     }
 
-    // ─── #1807: requires_vimcode ─────────────────────────────────────────
-
     /// Parsing: `requires_vimcode` round-trips from TOML as a plain string
     /// field, same shape as every other optional manifest field.
     #[test]
@@ -1563,9 +1505,7 @@ requires_vimcode = ">=0.15.0"
         assert_eq!(m.requires_vimcode, Some(">=0.15.0".to_string()));
     }
 
-    /// Absent case: a manifest with no `requires_vimcode` field at all
-    /// (every extension predating #1807) parses to `None` and is
-    /// compatible with any running version — behaves exactly as today.
+    /// A manifest with no `requires_vimcode` field parses to `None` and is
     #[test]
     fn requires_vimcode_absent_parses_to_none_and_is_always_compatible() {
         let toml = r#"
@@ -1647,7 +1587,7 @@ display_name = "Legacy Extension"
     /// `">=0.15.0"` bound — `semver::VersionReq::matches` excludes
     /// prereleases from a non-prerelease comparator by design, which this
     /// method works around by stripping the prerelease component before
-    /// matching (#1807 review).
+    /// matching.
     #[test]
     fn requires_vimcode_tolerates_prerelease_running_version() {
         let m = ExtensionManifest {
@@ -1660,11 +1600,7 @@ display_name = "Legacy Extension"
         assert!(!m.is_compatible_with_vimcode("0.14.0-rc1"));
     }
 
-    /// `incompatibility_reason_for_running_vimcode` is the single
-    /// "compare against the actual running vimcode" convenience every
-    /// call site (marketplace install refusal, available-list panel row,
-    /// loader skip) shares, rather than each repeating
-    /// `env!("CARGO_PKG_VERSION")` independently (#1807 review nit).
+    /// `incompatibility_reason_for_running_vimcode` is the shared convenience
     #[test]
     fn incompatibility_reason_for_running_vimcode_matches_explicit_call() {
         let m = ExtensionManifest {

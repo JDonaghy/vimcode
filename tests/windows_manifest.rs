@@ -1,4 +1,4 @@
-//! Regression tests for the Windows Common-Controls v6 manifest gate (#1554).
+//! Regression tests for the Windows Common-Controls v6 manifest gate.
 //!
 //! # The bug
 //!
@@ -52,11 +52,11 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The build that was broken: Windows + MSVC + the `win` feature (the
-/// `vimcode.exe` GUI build) must get both flags, and the dependency must name
-/// version 6.0.0.0 with the Microsoft public key token. A wrong version or
-/// token still links — and still gets the process killed by the loader — so
-/// assert on the identity, not merely that some flag was emitted.
+/// Windows + MSVC + the `win` feature (the `vimcode.exe` GUI build)
+/// must get both flags, and the dependency must name version 6.0.0.0
+/// with the Microsoft public key token. A wrong version or token still
+/// links — and still gets the process killed by the loader — so assert
+/// on the identity, not merely that some flag was emitted.
 #[test]
 fn emits_manifest_flags_for_windows_msvc_gui_build() {
     let args = comctl_v6_link_args("windows", "msvc", true);
@@ -93,8 +93,7 @@ fn emits_manifest_flags_for_windows_msvc_gui_build() {
 }
 
 /// Every combination that must keep emitting nothing. The `win`-feature-off
-/// row is the important one: it is the `vcd.exe` TUI build, which never links
-/// quadraui's `win` backend, and #1554 must leave it byte-identical.
+/// row is the `vcd.exe` TUI build, which never links quadraui's `win` backend.
 #[test]
 fn emits_nothing_for_every_other_target_and_feature_combination() {
     for (os, env, win, why) in [
@@ -158,10 +157,9 @@ fn build_script_reads_target_cfg_not_host_cfg() {
     );
 }
 
-/// The lane that actually proves the fix on Windows must exist, must build the
-/// GUI binary with the `win` feature, and must *launch* it. Asserting it
-/// merely builds would be the same mistake #1554 was: `cargo build` succeeded
-/// the whole time the binary was unlaunchable.
+/// The Windows GUI lane must exist, build the GUI binary with the `win`
+/// feature, and launch it. Building alone would not prove the fix works;
+/// the binary must actually run.
 #[test]
 fn ci_has_a_windows_gui_lane_that_launches_the_exe() {
     let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))

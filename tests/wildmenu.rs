@@ -413,7 +413,7 @@ fn trailing_space_item_clears_wildmenu_for_next_tab() {
     );
 }
 
-// ── :set  + Tab cycles through settings (#360) ──────────────────────────
+// ── :set  + Tab cycles through settings ─────────────────────────────────
 
 #[test]
 fn set_tab_cycles_through_settings() {
@@ -440,29 +440,11 @@ fn set_tab_cycles_through_settings() {
     assert_eq!(e.command_buffer, items[1]);
 }
 
-// ── 'wildmode' drives genuinely different Tab behavior (#1206 review) ───
-//
-// Before this fix, `'wildmode'` was accepted and echoed back by `:set` but
-// consulted nowhere in the Tab-completion path — `:set wildmode=list`
-// changed nothing observable. These assert that different `'wildmode'`
-// values produce different, real `command_buffer`/`wildmenu_selected`
-// outcomes for the exact same keystrokes.
-//
-// `wildmode_longest_fills_common_prefix_without_selecting` and
-// `wildmode_list_leaves_command_line_untouched` are verified RED against
-// unfixed `develop` (via a local revert of the `WildmodeStage`/
-// `wildmode_tab_press` wiring): both failed with `command_buffer ==
-// "DapInfo"` instead of the correct `"DapIn"`/`"Dap"` — i.e. the legacy
-// hardcoded path (select-index-0-immediately) ran regardless of
-// `'wildmode'`, exactly the bug the review reported.
-// `wildmode_longest_comma_full_matches_documented_two_press_sequence`
-// passes even unfixed — the legacy hardcoded default path (common-prefix
-// on press 1, full-cycle from press 2) already happens to coincide with
-// `"longest,full"`'s documented sequence — so it isn't a red/green proof
-// on its own, but it does confirm the new stage-driven path reproduces
-// that coincidence *for the right reason* (consulting `'wildmode'`, not by
-// accident of the hardcoded default), which the two RED tests above prove
-// is no longer a given now that `'wildmode'` actually branches behavior.
+// `'wildmode'` drives different Tab-completion behavior.
+// These tests verify that different `'wildmode'` values produce
+// different `command_buffer`/`wildmenu_selected` outcomes for the
+// same keystrokes. The `WildmodeStage` logic consults `'wildmode'`
+// to determine behavior rather than using a hardcoded default path.
 
 #[test]
 fn wildmode_longest_fills_common_prefix_without_selecting() {
@@ -546,14 +528,10 @@ fn wildmode_longest_comma_full_matches_documented_two_press_sequence() {
 
 #[test]
 fn wildmode_default_full_keeps_vimcodes_existing_ux() {
-    // The bare default value ("full") deliberately keeps vimcode's
-    // pre-existing common-prefix-then-cycle UX rather than Vim's literal
-    // "select the first full match immediately" reading — this is the
-    // documented carve-out (`Settings::wildmode_is_plain_full`), locked in
-    // by `tab_cycles_through_items` et al. above. This test just confirms
-    // that carve-out and the new stage-driven `'longest'` path above
-    // produce genuinely *different* first-press results, which is the
-    // crux of the review finding this fixes.
+    // The default value "full" uses a common-prefix-then-cycle UX
+    // (documented in `Settings::wildmode_is_plain_full`) rather than
+    // Vim's literal "select the first full match immediately" reading.
+    // This test confirms that behavior differs from the `'longest'` path.
     let mut e = engine_with("hello\n");
     assert_eq!(e.settings.wildmode, "full");
     press(&mut e, ':');

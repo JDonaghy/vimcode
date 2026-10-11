@@ -1,4 +1,4 @@
-//! Backend-neutral **plugin-view** fixture + scenarios (#146).
+//! Backend-neutral **plugin-view** fixture + scenarios.
 //!
 //! # What this covers
 //!
@@ -11,18 +11,10 @@
 //! > next painted frame.**
 //!
 //! Every assertion below reads `ConformanceDriver::screen_has` /
-//! `inventory().text_runs()`. Nothing asserts that `Engine::plugin_views` is
-//! populated — that field was populated the whole time during development while
-//! `App`'s `ext:` arm still painted tree rows, which is exactly the
-//! state-vs-paint trap CLAUDE.md's rule (learned via #587/#592) names.
-//!
-//! # Why a real `PluginManager`, not a hand-built `PluginView`
-//!
-//! The fixture loads genuine Lua from a temp dir, so the `render` callback, the
-//! Lua-table → [`crate::core::plugin_ui::PluginView`] parse, the stored-callback
-//! dispatch (#1214's live-engine seam) and the paint are all in the measured
-//! path. A hand-built `PluginView` would skip the three parts most likely to
-//! break.
+//! `inventory().text_runs()`. The fixture loads genuine Lua from a temp dir, so
+//! the `render` callback, the Lua-table → [`crate::core::plugin_ui::PluginView`]
+//! parse, the stored-callback dispatch and the paint are all in the measured
+//! path.
 
 use std::path::PathBuf;
 
@@ -60,8 +52,6 @@ pub const ROW_TOGGLE: &str = "TgZQ146";
 /// already-too-long declared value. Starting empty leaves ample room.
 pub const ROW_EMPTY_TEXT_LABEL: &str = "EtZQ146";
 
-// ── #1631: ViewBody (list/tree/table/text_view) fixture needles ────────────
-
 /// Registered view names for each `ViewBody` kind's fixture.
 pub const LIST_VIEW: &str = "zqxw1631list";
 pub const TREE_VIEW: &str = "zqxw1631tree";
@@ -81,11 +71,8 @@ pub const LIST_ROW1_IDLE: &str = "Lr1idl1631";
 /// detail span "when there isn't room past the main text" (`tui::list`'s
 /// module doc), and the sidebar body in this fixture's viewport is narrow.
 pub const LIST_DETAIL: &str = "D1";
-/// Row count of the `List` fixture — deliberately more than any real
-/// viewport (sidebar or tab) fits, so a keyboard walk to the last row
-/// (#1631 review: selection must scroll to stay visible) actually needs a
-/// scroll to see it, rather than coincidentally already fitting on screen
-/// the way the original 2-item fixture always did.
+/// Row count of the `List` fixture — more than any real viewport (sidebar or
+/// tab) fits, so keyboard navigation to the last row needs a scroll to see it.
 pub const LIST_OVERFLOW_COUNT: usize = 80;
 /// The last row's painted text — the fixture's `render` gives every row
 /// from index 2 onward a generic `"Lx{{i}}1631"` label except the very
@@ -106,11 +93,9 @@ pub const TABLE_ROW1_KEY: &str = "Hk11631";
 pub const TABLE_ROW1_VALUE: &str = "Hv11631";
 pub const TABLE_EDITED: &str = "EDITED1631";
 /// Painted when `CellEdited{{row: 0, col: 1, ...}}` reaches the plugin — the
-/// *second* editable column (#1631 review: without column selection, Enter
-/// could only ever reach column 0).
-/// Short on purpose — same column-budget trap `LIST_DETAIL`'s doc comment
-/// names (`TABLE_EDITED`'s own "Key"/"Value" column is narrow enough that a
-/// longer needle gets ellipsis-truncated and never matches exactly).
+/// *second* editable column. Short on purpose — same column-budget constraint
+/// that `LIST_DETAIL`'s doc comment names (columns narrow enough that a longer
+/// needle gets ellipsis-truncated and never matches exactly).
 pub const TABLE_EDITED_COL1: &str = "EDC1631";
 
 /// `TextView` fixture needles — first and last of 50 generated lines, far
@@ -118,7 +103,7 @@ pub const TABLE_EDITED_COL1: &str = "EDC1631";
 pub const TEXT_FIRST_LINE: &str = "Ln0X1631";
 pub const TEXT_LAST_LINE: &str = "Ln49X1631";
 
-/// Lua source registering one view per `ViewBody` kind (#1631), appended
+/// Lua source registering one view per `ViewBody` kind, appended
 /// into the same fixture plugin the field-stack view above uses — one real
 /// `PluginManager` load exercises every kind's parse + paint + event round
 /// trip, per this module's "why a real `PluginManager`" doc.
@@ -365,7 +350,7 @@ pub fn engine_with_plugin_view() -> (Engine, PathBuf) {
     engine_with_named_plugin_view(VIEW)
 }
 
-/// Sidebar fixture for a `ViewBody`-kind view (#1631) — same construction as
+/// Sidebar fixture for a `ViewBody`-kind view — same construction as
 /// [`engine_with_plugin_view`], generalized to any of the fixture's
 /// registered view names so each kind's tests can pick its own.
 pub fn engine_with_named_plugin_view(view: &str) -> (Engine, PathBuf) {
@@ -406,12 +391,11 @@ pub fn engine_with_named_plugin_view(view: &str) -> (Engine, PathBuf) {
 }
 
 /// Build a fixture engine with the same registered view, opened as an
-/// **editor-area tab** instead of the sidebar (#1627's second hosting
-/// surface) — via the fixture's real `Zq146OpenTab` `:Command`, which calls
-/// `vimcode.ui.open_view(VIEW, {location = "tab"})`. Driving the real Lua
-/// command (rather than calling `Engine::open_plugin_view_tab` directly)
-/// keeps the Lua binding itself in the measured path, same rationale as this
-/// module's "why a real `PluginManager`" doc.
+/// **editor-area tab** instead of the sidebar — via the fixture's real
+/// `Zq146OpenTab` `:Command`, which calls `vimcode.ui.open_view(VIEW,
+/// {location = "tab"})`. Driving the real Lua command (rather than calling
+/// `Engine::open_plugin_view_tab` directly) keeps the Lua binding itself in
+/// the measured path.
 pub fn engine_with_plugin_view_tab() -> (Engine, PathBuf) {
     let dir = plugin_dir();
     let mut engine = Engine::new_for_test();
@@ -439,9 +423,9 @@ pub fn engine_with_plugin_view_tab() -> (Engine, PathBuf) {
     (engine, dir)
 }
 
-/// Tab twin of [`engine_with_plugin_view_tab`] for a body-kind view (#1631
-/// review) — `command` is the fixture's own `:Command` name for opening
-/// `view` as a tab (e.g. `"Zq1631ListOpenTab"` for [`LIST_VIEW`]).
+/// Tab twin of [`engine_with_plugin_view_tab`] for a body-kind view —
+/// `command` is the fixture's own `:Command` name for opening `view` as a tab
+/// (e.g. `"Zq1631ListOpenTab"` for [`LIST_VIEW`]).
 pub fn engine_with_named_plugin_view_tab(view: &str, command: &str) -> (Engine, PathBuf) {
     let dir = plugin_dir();
     let mut engine = Engine::new_for_test();
@@ -490,10 +474,6 @@ fn assert_paints(driver: &impl ConformanceDriver, needles: &[&str], what: &str) 
 }
 
 /// Scenario 1 — the declared tree is what gets painted.
-///
-/// Fails against a `develop` without #146: the `ext:` panel arm paints
-/// `ExtPanelItem` tree rows, and a view-backed panel has no items, so none of
-/// these needles appear at all.
 pub fn declared_tree_is_painted(driver: &impl ConformanceDriver) {
     assert_paints(
         driver,
@@ -540,12 +520,9 @@ pub fn clicking_a_button_reaches_the_plugin_handler(driver: &mut impl Conformanc
 /// interactive ones), `Enter` activates it.
 ///
 /// Field-to-field navigation is `Tab`/`Shift+Tab` rather than `j`/`k` because
-/// selection starts on the first interactive row — the `text` field — and
-/// since #1627 gave that field real text entry, `j`/`k` are now literal
-/// characters to type into it rather than navigation (typing them used to be
-/// this exact test's `j`/`j` walk, before #1627; see
-/// `plugin_view_typing_edits_a_focused_text_field` for the "j/k type into the
-/// field" side of that same change).
+/// selection starts on the first interactive row — the `text` field — and since
+/// that field supports real text entry, `j`/`k` are literal characters to type
+/// into it rather than navigation commands.
 pub fn keyboard_activation_reaches_the_plugin_handler(driver: &mut impl ConformanceDriver) {
     assert!(
         driver.screen_has(COUNT_0),
@@ -564,20 +541,14 @@ pub fn keyboard_activation_reaches_the_plugin_handler(driver: &mut impl Conforma
     );
 }
 
-/// Scenario 4 (#1627) — typing into a focused `Text` field inserts
-/// characters and paints a caret; the plugin sees `TextChanged` per
-/// keystroke and `TextCommitted` on Enter with the typed value.
+/// Scenario 4 — typing into a focused `Text` field inserts characters and
+/// paints a caret; the plugin sees `TextChanged` per keystroke and
+/// `TextCommitted` on Enter with the typed value.
 ///
 /// Navigates to [`ROW_EMPTY_TEXT_LABEL`]'s field (declared with an empty
-/// value) via three `Tab`s rather than typing into the already-focused
-/// `url` field — see that constant's doc for why growing
-/// [`ROW_TEXT_VALUE`] would risk tripping the sidebar's column-budget
-/// suppression instead of exercising #1627 at all.
-///
-/// Fails against a `develop` without #1627: the pre-#1627 `Text` field always
-/// painted with `cursor: None` (`plugin_view_to_form`'s doc, "Text *entry*
-/// ... is Phase 2"), so a focused field never showed a caret and typing did
-/// nothing to the painted value at all.
+/// value) via three `Tab`s rather than typing into the already-focused `url`
+/// field — see that constant's doc for why growing [`ROW_TEXT_VALUE`] would
+/// risk tripping the sidebar's column-budget suppression.
 pub fn typing_edits_the_focused_text_field(driver: &mut impl ConformanceDriver) {
     assert!(
         driver.screen_has(COUNT_0),
@@ -612,14 +583,10 @@ pub fn typing_edits_the_focused_text_field(driver: &mut impl ConformanceDriver) 
     );
 }
 
-/// Scenario 5 (#1627) — a view opened via `vimcode.ui.open_view(...,
+/// Scenario 5 — a view opened via `vimcode.ui.open_view(...,
 /// {location = "tab"})` paints in the editor area, not the sidebar, and a
 /// click on its button reaches the plugin's `on_event` handler exactly the
 /// way a sidebar click does.
-///
-/// Fails against a `develop` without #1627: `vimcode.ui.open_view` doesn't
-/// exist yet, so [`engine_with_plugin_view_tab`]'s fixture command errors out
-/// before this scenario ever gets to run.
 pub fn tab_paints_and_click_reaches_the_plugin_handler(driver: &mut impl ConformanceDriver) {
     assert_paints(
         driver,
@@ -635,7 +602,7 @@ pub fn tab_paints_and_click_reaches_the_plugin_handler(driver: &mut impl Conform
     );
 }
 
-/// Scenario 5b (#1631 review) — a body-kind (`List`) view opened as an
+/// Scenario 5b — a body-kind (`List`) view opened as an
 /// editor-area tab reaches mouse clicks exactly like its sidebar twin
 /// ([`list_paints_and_click_selects_the_right_index`]) does: a click on a
 /// row selects it, reaching the plugin as `ItemSelected{{index}}`.
@@ -667,14 +634,12 @@ pub fn list_tab_click_selects_the_right_index(driver: &mut impl ConformanceDrive
     );
 }
 
-/// Scenario 6 (#1627) — closing an editor-tab-hosted plugin view's tab
-/// removes it, exactly like any other tab.
+/// Scenario 6 — closing an editor-tab-hosted plugin view's tab removes it,
+/// exactly like any other tab.
 ///
 /// `Tab`, `Tab` moves focus off the initially-focused `Text` field onto the
-/// `Button` row first, so the following `:` falls through to real
-/// Command-mode entry instead of being typed literally into the field — see
-/// `Engine::handle_key`'s `#1627` guard (`keys.rs`) for why a focused text
-/// field would otherwise swallow it.
+/// `Button` row first, so the following `:` falls through to Command-mode
+/// entry instead of being typed literally into the field.
 pub fn closing_the_tab_removes_it(driver: &mut impl ConformanceDriver) {
     assert!(
         driver.screen_has(ROW_HEADER),
@@ -692,8 +657,6 @@ pub fn closing_the_tab_removes_it(driver: &mut impl ConformanceDriver) {
         painted(driver)
     );
 }
-
-// ── #1631: ViewBody (list/tree/table/text_view) scenarios ──────────────────
 
 /// Scenario 7 — a `kind = "list"` view paints its title, items and detail
 /// text, and a click on a row reaches the plugin's `on_event` with that
@@ -733,7 +696,7 @@ pub fn list_key_navigation_selects_the_right_index(driver: &mut impl Conformance
     );
 }
 
-/// Scenario 8b (#1631 review) — walking the selection all the way to the
+/// Scenario 8b — walking the selection all the way to the
 /// last of [`LIST_OVERFLOW_COUNT`] rows (far more than any real viewport
 /// fits) must scroll the list to keep the selection visible.
 ///
@@ -828,18 +791,10 @@ pub fn table_paints_and_enter_commits_a_cell_edit(driver: &mut impl ConformanceD
     );
 }
 
-/// Scenario 10b (#1631 review) — a table author who marks *more than one*
-/// column `editable` (e.g. #147's "Key"/"Value" pair, which this fixture's
-/// `{TABLE_VIEW}` mirrors exactly) can reach the second editable column
-/// too, not just the first: `Right` moves the column selection before
-/// `Enter` starts editing.
-///
-/// Fails against a `develop` without the review fix: `handle_plugin_view_
-/// table_key` resolved `editable_col` as `columns.iter().position(|c|
-/// c.editable)` unconditionally — always column 0 — with no `Left`/`Right`
-/// handling at all, so `Right` would be a no-op and the following two
-/// `Enter`s would edit column 0 again, never painting
-/// [`TABLE_EDITED_COL1`].
+/// Scenario 10b — a table author who marks *more than one* column `editable`
+/// (e.g. a "Key"/"Value" pair) can reach the second editable column too, not
+/// just the first: `Right` moves the column selection before `Enter` starts
+/// editing.
 pub fn table_right_key_reaches_the_second_editable_column(driver: &mut impl ConformanceDriver) {
     assert_paints(
         driver,
@@ -866,10 +821,6 @@ pub fn table_right_key_reaches_the_second_editable_column(driver: &mut impl Conf
 
 /// Scenario 11 — a `kind = "text_view"` with more lines than fit the
 /// viewport starts scrolled to the top and scrolls to the bottom on `End`.
-///
-/// Fails against a `develop` without #1631: there is no `text_view` kind at
-/// all, so the fixture's `render()` would error at parse time and neither
-/// needle would ever paint.
 pub fn text_view_scrolls_to_the_bottom_on_end(driver: &mut impl ConformanceDriver) {
     assert!(
         driver.screen_has(TEXT_FIRST_LINE),
@@ -935,7 +886,7 @@ mod tests {
         (h, dir)
     }
 
-    /// #1631: sidebar fixture for a named `ViewBody`-kind view (TUI arm).
+    /// Sidebar fixture for a named `ViewBody`-kind view (TUI arm).
     fn tui_named(
         view: &str,
     ) -> (
@@ -950,7 +901,7 @@ mod tests {
         (h, dir)
     }
 
-    /// #1631 review: editor-tab fixture for a named body-kind view (TUI arm).
+    /// Editor-tab fixture for a named body-kind view (TUI arm).
     fn tui_named_tab(
         view: &str,
         command: &str,
@@ -1076,7 +1027,7 @@ mod tests {
         (h, dir)
     }
 
-    /// #1631: sidebar fixture for a named `ViewBody`-kind view (GTK arm).
+    /// Sidebar fixture for a named `ViewBody`-kind view (GTK arm).
     #[cfg(feature = "gui")]
     fn gtk_named(
         view: &str,
@@ -1092,7 +1043,7 @@ mod tests {
         (h, dir)
     }
 
-    /// #1631 review: editor-tab fixture for a named body-kind view (GTK arm).
+    /// Editor-tab fixture for a named body-kind view (GTK arm).
     #[cfg(feature = "gui")]
     fn gtk_named_tab(
         view: &str,

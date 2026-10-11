@@ -1,36 +1,13 @@
-//! #1106: `vimcode` used to silently invent `DISPLAY=:0` whenever neither
-//! `DISPLAY` nor `WAYLAND_DISPLAY` was set — a guess, not a fallback, since
-//! `:0` is not guaranteed to be a real display (Xvfb commonly picks `:99`, a
-//! second X session `:1`, etc.). When the guess was wrong the failure didn't
-//! disappear, it just moved later and got less legible: `gtk4::init()` would
-//! still panic, just against a display name nobody chose and with the
-//! swap-crash panic hook's chatter mixed in — the same "surfaces later and
-//! less legibly" failure mode #979 fixed for `--help`.
+//! This spawns the actual compiled `vimcode` binary with both display
+//! env vars removed and asserts it prints a clear, immediate error and
+//! exits non-zero when neither `DISPLAY` nor `WAYLAND_DISPLAY` is set.
 //!
-//! This spawns the actual compiled `vimcode` binary (not `Args::parse` unit
-//! tests, which never reach `gtk::run`) with both display env vars removed
-//! and asserts it prints a clear, immediate error and exits non-zero,
-//! instead of a GTK panic.
-//!
-//! Observed RED against unfixed `develop`: with the `DISPLAY=:0` guess
-//! restored (and the loud early exit removed), this process instead runs
-//! past the top of `gtk::run` and panics inside `gtk4::init()` with "Failed
-//! to initialize GTK" — a non-zero exit, but with none of this test's
-//! specific assertions about *what* went wrong or *when*, and it doesn't
-//! reliably return quickly (a bad guessed `DISPLAY` can leave GTK to spend
-//! real time probing before giving up, unlike this fix's immediate check
-//! before anything is touched).
-//!
-//! X11/Wayland platforms only. `gtk::run`'s guard is deliberately gated to
-//! the platforms where GTK actually talks to a display server
-//! (`no_display_configured` in `src/gtk/mod.rs` is a no-op on macOS/quartz
-//! and Windows/win32, where there is no display variable to set and
-//! refusing to start would break a perfectly good GUI build). So on macOS
-//! this test's child process does *not* exit early — it goes on to call
-//! `gtk4::init()`, succeeds, opens a real window and runs the GTK main
-//! loop, and `Command::output()` blocks on it forever. That hung the whole
-//! `cargo test` run for >25 minutes with no failure output, which reads as
-//! "the suite is slow", not "this test can never pass here".
+//! The guard in `gtk::run` is deliberately gated to X11/Wayland platforms
+//! (a no-op on macOS/quartz and Windows/win32, where there is no display
+//! variable to set and refusing to start would break a perfectly good GUI
+//! build). On macOS this test's child process does *not* exit early — it
+//! goes on to call `gtk4::init()`, succeeds, opens a real window and runs
+//! the GTK main loop, so `Command::output()` would block forever.
 //!
 //! The guard's platform split is already covered without spawning anything
 //! by the `no_display_guard_tests` module beside it in `src/gtk/mod.rs`,

@@ -80,7 +80,7 @@ impl SpellChecker {
 
 /// Words from the bundled `en_US.dic` word list that start with `prefix`
 /// (case-insensitive), for `<C-x><C-k>` dictionary completion (`:h
-/// i_CTRL-X_CTRL-K`, #1160). Each `.dic` line is `word[/flags]`; only the
+/// i_CTRL-X_CTRL-K`). Each `.dic` line is `word[/flags]`; only the
 /// word part is used — flags describe applicable affixes, not spelling
 /// variants, so they aren't useful as completion candidates. Deduplicated
 /// and sorted; capped at 200 results since a short prefix (e.g. "a") can
@@ -166,14 +166,10 @@ pub fn check_line(
 ) -> Vec<SpellError> {
     let mut errors = Vec::new();
 
-    // Pre-filter the buffer-wide highlight list down to only the ranges
-    // that overlap this line. Without this, `is_in_comment_or_string`
-    // re-scans all N highlights in the buffer for every word on every
-    // visible line on every draw — catastrophic on large files with
-    // many highlights (a 190 k-line Rust file with tens of thousands
-    // of highlights pegged CPU at 100 % — see issue #153). The filter
-    // itself is O(N) per line, but the subsequent per-word checks
-    // scan only the tiny per-line slice.
+    // Filter the buffer-wide highlight list down to only the ranges
+    // that overlap this line, so that `is_in_comment_or_string` need not
+    // rescan all highlights for every word. The filter itself is O(N) per
+    // line, but subsequent per-word checks scan only the tiny per-line slice.
     let line_end_byte = line_start_byte + line.len();
     let line_highlights: Vec<(usize, usize, &str)> = highlights
         .iter()

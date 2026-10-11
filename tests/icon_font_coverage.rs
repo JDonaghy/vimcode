@@ -1,66 +1,33 @@
-//! CI gate for issue #197: every Nerd Font codepoint referenced by
-//! `Icon::new(...)` in `src/icons.rs` must actually be present in the
-//! bundled `data/fonts/vimcode-icons.ttf`, or the GTK explorer tree (and
-//! anywhere else that glyph is drawn) silently falls back to whatever the
-//! system font substitutes for the PUA codepoint -- tofu or a wrong-looking
-//! glyph, with no build-time signal.
+//! CI gate: every Nerd Font codepoint referenced by `Icon::new(...)`
+//! in `src/icons.rs` must be present in the bundled
+//! `data/fonts/vimcode-icons.ttf`, or the GTK explorer tree silently
+//! falls back to system font substitution (tofu or wrong-looking glyph).
 //!
-//! This test parses the codepoint list straight out of `src/icons.rs`'s
-//! source text (so it can never drift from the actual `Icon::new` calls)
-//! and the font's own `cmap` table (parsed by hand, format 4 + format 12 --
-//! no font-parsing crate dependency needed for this one check), and asserts
-//! every "nerd" codepoint (>= U+E000; see `scripts/gen_icon_font.py`'s
-//! module doc for why that threshold is the right split) is covered.
+//! This test parses the codepoint list from `src/icons.rs` source text
+//! and the font's `cmap` table (formats 4 and 12, parsed by hand without
+//! a font-parsing crate), and asserts every "nerd" codepoint (>= U+E000;
+//! see `scripts/gen_icon_font.py`'s module doc for the threshold) is covered.
 //!
 //! Regenerate the font with `scripts/gen_icon_font.py` if this fails after
 //! a new `Icon::new` call is added -- see that script's docstring for the
 //! source fonts it needs and why two are needed (upstream nerd-fonts >=
 //! v3.1.0 dropped three codepoints vimcode still uses).
 //!
-//! ## #1853: the bundled font is the *entire* Symbols Nerd Font, not a subset
+//! The bundled font is the entire Symbols Nerd Font (10,627 codepoints as
+//! of nerd-fonts v3.5.1), not a subset. This covers any codepoint a
+//! registry extension's panel icon might use (e.g., Git Insights extension's
+//! U+F1D3 and associated file-type glyphs), preventing tofu on platforms
+//! without a system-wide Nerd Font. Proportional variant is used, not Mono,
+//! to preserve pre-existing glyph metrics; see `scripts/gen_icon_font.py`'s
+//! module doc for details.
 //!
-//! Before #1853, `data/fonts/vimcode-icons.ttf` was subset down to exactly
-//! the 114 codepoints `src/icons.rs` referenced. That covered every icon
-//! vimcode itself draws but nothing else: a `vimcode-ext` registry
-//! extension's panel icon is an arbitrary Nerd Font codepoint the extension
-//! author picked, not one `scripts/gen_icon_font.py` ever knew about, so it
-//! rendered as tofu on any platform without a system-wide Nerd Font (native
-//! macOS/Windows, or GTK without one installed) -- caught via the Git
-//! Insights extension's `git_log_panel.lua`, which declares U+F1D3
-//! (`nf-fa-git`) as its panel icon and U+F15B/U+E7A8/U+F81F/U+E74E/U+E628/
-//! U+E620/U+E626 for file-type glyphs, none of which `src/icons.rs`
-//! referenced. The font now bundles nerd-fonts' entire (proportional)
-//! Symbols Nerd Font cmap (10,627 codepoints as of nerd-fonts v3.5.1) --
-//! not the Mono variant, which registers under a different family name
-//! (`Symbols Nerd Font Mono`) and would have rescaled every pre-#1853
-//! glyph's metrics, see `scripts/gen_icon_font.py`'s module doc -- so this
-//! class of bug can't recur for any codepoint a Nerd Font actually assigns.
-//! `bundled_font_covers_the_git_insights_extension_panel_icon` below is a
-//! named regression anchor for exactly the codepoints that motivated it;
-//! `bundled_font_covers_every_icon_codepoint` above keeps covering
-//! vimcode's own icons specifically.
-//!
-//! No `#[cfg(feature = ...)]` gate: this doesn't touch GTK, TUI, or any
-//! optional dependency, so it runs in both the `--no-default-features` and
-//! default-features CI lanes for free.
-//!
-//! ## #1540: raw PUA literals bypass this gate entirely
-//!
-//! The check above only ever sees codepoints that go through `Icon::new(...)`
-//! in `src/icons.rs`. #1540 was a macOS status bar showing tofu for the
-//! sidebar/panel/menu toggles and the done-notification bell: those glyphs
-//! were `\u{f0616}`/`\u{f018d}`/`\u{f009e}` written directly as raw literals
-//! in `render.rs` (a couple as literal PUA *characters* in the source, not
-//! even `\u{...}` escapes), so `scripts/gen_icon_font.py` and the test above
-//! never knew the codepoints existed, and the bundled subset font never
-//! picked them up. `no_raw_pua_literals_outside_icons_rs` below closes that
-//! gap structurally: it scans every `.rs` file under `src/` (except
-//! `icons.rs` itself and the test-support exemptions documented on
-//! `is_exempt_path`) for any PUA character or `\u{...}` PUA escape, so a
-//! future icon literal added straight to `render.rs` (or anywhere else) fails
-//! the build immediately instead of silently shipping as tofu on whatever
-//! platform's system font doesn't happen to share the same PUA assignment a
-//! Nerd Font uses.
+//! Raw PUA literals bypass this gate entirely: codepoints written directly
+//! as `\u{...}` or literal characters outside `Icon::new(...)` in `icons.rs`
+//! are invisible to the regex scan. The `no_raw_pua_literals_outside_icons_rs`
+//! test below scans every `.rs` file under `src/` (except `icons.rs` and
+//! documented exemptions) for any PUA character or escape, so icon literals
+//! added elsewhere fail the build immediately instead of silently shipping
+//! as tofu.
 
 use regex::Regex;
 
@@ -69,10 +36,9 @@ const FONT_BYTES: &[u8] = include_bytes!("../data/fonts/vimcode-icons.ttf");
 
 /// Nerd Font glyphs live in the Private Use Areas: U+E000-U+F8FF (BMP PUA)
 /// and U+F0000-U+FFFFD (Supplementary PUA-A, used by extended glyphs like
-/// `\u{f035c}`). A handful of `Icon::new` calls (GTK client-side-titlebar
-/// window controls, #552/#715) deliberately use ordinary BMP Unicode below
-/// this and are covered by any system font -- they're not part of this
-/// font's job. Keep this threshold in sync with
+/// `\u{f035c}`). Some `Icon::new` calls (GTK client-side-titlebar window
+/// controls) deliberately use ordinary BMP Unicode below this range and are
+/// covered by any system font. Keep this threshold in sync with
 /// `scripts/gen_icon_font.py::NERD_RANGE_START`.
 const NERD_RANGE_START: u32 = 0xE000;
 
@@ -83,11 +49,8 @@ const NERD_RANGE_START: u32 = 0xE000;
 fn referenced_nerd_codepoints() -> Vec<u32> {
     // The `[^"]*` after the `\u{...}` escape tolerates trailing literal
     // characters before the closing quote (e.g. `"\u{f0da} "` -- a trailing
-    // space, as used by EXPAND_DOWN/COLLAPSE_RIGHT in src/icons.rs to pad the
-    // rendered glyph). Requiring the closing `"` to immediately follow `}`
-    // silently dropped those codepoints from the "wanted" set (#197
-    // fix-iteration-1 review finding). Keep in sync with
-    // `scripts/gen_icon_font.py::ICON_NEW_RE`.
+    // space, as used by EXPAND_DOWN/COLLAPSE_RIGHT to pad the rendered
+    // glyph). Keep in sync with `scripts/gen_icon_font.py::ICON_NEW_RE`.
     let re = Regex::new(r#"Icon::new\(\s*"\\u\{([0-9a-fA-F]+)\}[^"]*""#).unwrap();
     let mut codepoints: Vec<u32> = re
         .captures_iter(ICONS_RS_SOURCE)
@@ -275,7 +238,7 @@ fn sanity_known_codepoints_are_parsed_from_icons_rs() {
     );
     assert!(wanted.contains(&0xEA76), "FIND_CLOSE (\\u{{ea76}})");
     assert!(wanted.contains(&0xF81F), "FILE_PYTHON (\\u{{f81f}})");
-    // Plain-Unicode window-control glyphs (#552/#715) must NOT show up here
+    // Plain-Unicode window-control glyphs must NOT show up here
     // -- they're below the PUA threshold and are intentionally not part of
     // this font's job (see NERD_RANGE_START doc comment).
     assert!(
@@ -286,15 +249,9 @@ fn sanity_known_codepoints_are_parsed_from_icons_rs() {
 
 #[test]
 fn bundled_font_covers_the_explorer_view_actions_glyphs() {
-    // #1693 named-regression anchor: the Explorer view-actions toolbar
-    // introduced the first two `Icon::new` codepoints that were *not*
-    // already in the bundled subset (U+F066 `fa-compress` for Collapse
-    // All, U+F141 `fa-ellipsis_h` for the "..." overflow menu), so the
-    // branch shipped a font that rendered both as tofu until the subset
-    // was regenerated. `bundled_font_covers_every_icon_codepoint` above
-    // catches this generically; this test names the two codepoints so the
-    // failure says *which* feature lost its glyphs rather than just
-    // printing a bare codepoint list.
+    // Named-regression anchor: U+F066 (fa-compress) and U+F141 (fa-ellipsis_h)
+    // used by the Explorer view-actions toolbar. This test names the
+    // codepoints so the failure says which feature lost its glyphs.
     let covered = font_covered_codepoints(FONT_BYTES);
     for (cp, what) in [
         (0xF066, "EXPLORER_COLLAPSE_ALL (nf-fa-compress)"),
@@ -310,20 +267,12 @@ fn bundled_font_covers_the_explorer_view_actions_glyphs() {
 
 #[test]
 fn bundled_font_covers_the_git_insights_extension_panel_icon() {
-    // #1853 named-regression anchor: the Git Insights extension
-    // (`vimcode-ext`'s `git_log_panel.lua`) declares `icon = "\u{f1d3}"`
-    // (nf-fa-git) for its sidebar panel, plus U+F15B/U+E7A8/U+F81F/U+E74E/
-    // U+E628/U+E620/U+E626 for file-type glyphs it draws in the log view --
-    // none of which `src/icons.rs` references, so none were covered by the
-    // pre-#1853 114-codepoint subset and all rendered as tofu on any
-    // platform without a system-wide Nerd Font (native macOS/Windows, GTK
-    // without one installed). `bundled_font_covers_every_icon_codepoint`
-    // above only ever checks codepoints `src/icons.rs` itself references,
-    // so it could not have caught this -- these codepoints are a registry
-    // extension's own choice, invisible to that regex. This test names them
-    // directly against the bundled font's cmap so a future shrink back to a
-    // vimcode-only subset fails loudly here instead of shipping silent tofu
-    // to extension authors again.
+    // Named-regression anchor: Git Insights extension (`git_log_panel.lua`)
+    // declares `icon = "\u{f1d3}"` (nf-fa-git) for its sidebar panel, plus
+    // U+F15B/U+E7A8/U+F81F/U+E74E/U+E628/U+E620/U+E626 for file-type glyphs.
+    // These codepoints are invisible to the main icon scan (which only checks
+    // `src/icons.rs`), so this test ensures they remain covered by the
+    // bundled font's cmap.
     let covered = font_covered_codepoints(FONT_BYTES);
     for (cp, what) in [
         (0xF1D3, "Git Insights panel icon (nf-fa-git)"),
@@ -351,13 +300,8 @@ fn bundled_font_covers_the_git_insights_extension_panel_icon() {
     }
 }
 
-// ─── #1540: no raw PUA literal outside icons.rs ─────────────────────────────
-
-/// Same PUA ranges the #1540 bug used: BMP Private Use Area, plus the
-/// Supplementary Private Use Areas nerd-fonts' extended glyphs live in (see
-/// this file's module doc and `scripts/gen_icon_font.py`'s `NERD_RANGE_START`
-/// doc comment -- this check additionally covers U+F0000 and up, which that
-/// simpler `>= U+E000` threshold already includes).
+/// Private Use Area ranges: BMP (U+E000-U+F8FF) and Supplementary PUA-A
+/// (U+F0000 and up), which nerd-fonts' extended glyphs use.
 fn is_pua_codepoint(cp: u32) -> bool {
     (0xE000..=0xF8FF).contains(&cp) || cp >= 0xF0000
 }
@@ -368,13 +312,10 @@ fn is_pua_codepoint(cp: u32) -> bool {
 ///
 /// - `src/harness/**`: fixtures that register plugin panels via
 ///   `PanelRegistration`/`ExtPanelItem`, whose `icon` fields are
-///   provider-supplied at runtime -- inherently arbitrary data no
-///   `icons.rs` table could enumerate, not a vimcode-owned glyph.
-/// - `**/testing.rs` (e.g. `src/gtk/testing.rs`, the `GtkDriver` harness
-///   from #646) and `**/*_tests.rs`: `#[cfg(test)]`-only modules that
-///   sometimes assert against a *specific known* codepoint on purpose
-///   (including, in one regression test, a deliberately-deleted constant's
-///   old codepoint) -- the literal there is the point of the assertion.
+///   provider-supplied at runtime.
+/// - `**/testing.rs` and `**/*_tests.rs`: test modules that assert against
+///   specific codepoints on purpose, including regression tests for
+///   deliberately-deleted constants' old codepoints.
 fn is_exempt_from_pua_scan(repo_relative_path: &str) -> bool {
     let path = std::path::Path::new(repo_relative_path);
     if path.components().any(|c| c.as_os_str() == "harness") {

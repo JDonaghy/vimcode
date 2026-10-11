@@ -1,13 +1,13 @@
-//! Schema test for `tests/smoke-spec/catalogue.yaml` (#1729).
+//! Schema test for `tests/smoke-spec/catalogue.yaml`.
 //!
-//! `claude-coordinator`'s `coord bugbash vimcode` (claude-coordinator#3580)
+//! `claude-coordinator`'s `coord bugbash vimcode`
 //! reads that file to drive its bug-bash journeys. This test is the guard
 //! that keeps the catalogue honest: a malformed entry (duplicate id, an enum
 //! value outside the schema's known set, an empty `expected`) must fail CI
 //! *here*, in this repo, rather than silently degrading bugbash's coverage
 //! at run time in a different repo.
 //!
-//! RED-verified (#1729): temporarily duplicating an `id` and blanking an
+//! RED-verified: temporarily duplicating an `id` and blanking an
 //! `expected` field each independently failed `catalogue_schema_is_valid`
 //! with a clear panic message before the catalogue content below was
 //! restored.
@@ -73,10 +73,8 @@ fn catalogue_schema_is_valid() {
     validate(&cat);
 }
 
-/// Separate from the file-driven test above so the *targets* (minimum
-/// journey counts per area, from #1729's issue body) are pinned as their own
-/// named, independently-failing assertions rather than folded into one
-/// generic validation pass.
+/// This test pins coverage targets as independently-failing assertions
+/// rather than folding them into a generic validation pass.
 #[test]
 fn catalogue_meets_coverage_targets() {
     let cat = load_catalogue();
@@ -205,10 +203,8 @@ fn validate(cat: &Catalogue) {
     }
 }
 
-/// #1729's extensions-out-of-scope rule: no journey should mention installing
-/// or invoking the extension system (`:ExtInstall`, LSP/DAP install flows are
-/// a different, already-catalogued-elsewhere concern from "install an
-/// extension").
+/// Journeys must not mention installing or invoking the extension system
+/// (`:ExtInstall`, LSP/DAP install flows are a different concern).
 #[test]
 fn catalogue_has_no_extension_install_journeys() {
     let cat = load_catalogue();

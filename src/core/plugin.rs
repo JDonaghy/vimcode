@@ -11,7 +11,7 @@
 //! # Two API tiers: legacy queued (`vimcode.buf.*`) vs immediate (`vimcode.buffer.*`)
 //!
 //! There are two ways for Lua to touch the editor, and they differ in *when*
-//! the edit lands (#1214):
+//! the edit lands:
 //!
 //! * **Legacy, queued — `vimcode.buf.*`, `vimcode.opt.*`, …** Reads come from
 //!   a snapshot taken *before* the callback ran ([`PluginCallContext`]); writes
@@ -88,7 +88,7 @@ pub struct AsyncShellRequest {
 
 use super::git;
 
-// ─── Live engine access for the immediate API (#1214) ────────────────────────
+// ─── Live engine access for the immediate API ────────────────────────────────
 
 thread_local! {
     /// The engine currently loaned to Lua, or null when no plugin dispatch is
@@ -106,30 +106,31 @@ thread_local! {
 ///
 /// # Why a guarded raw pointer and not `Lua::scope`
 ///
-/// #1214 requires that a Lua function which was **stored and invoked later**
-/// (kept in a Lua table or the registry and fired from a subsequent event) can
-/// use the immediate API — that is the shape a timer callback and a UI widget
-/// event handler will have. `Lua::scope` cannot express that: everything it
-/// creates is non-`'static` and may not escape the scope, so a callback stored
-/// at load time could not be handed a scoped buffer/window object, and a scoped
-/// *function* cannot be put in the registry at all. Integer handles plus a
-/// pointer parked outside the Lua value graph have no lifetime relationship to
-/// the Lua values that use them, so "stored at load, invoked much later" needs
-/// no special support: whatever dispatch is in flight installs the loan, and
-/// every Lua function reached from it — however it was reached — sees it.
+/// A Lua function stored and invoked later (in a table or registry, fired
+/// from a subsequent event) needs the immediate API: that is the shape of
+/// a timer callback and a UI widget event handler. `Lua::scope` cannot
+/// express that: everything it creates is non-`'static` and may not escape
+/// the scope, so a callback stored at load time could not be handed a
+/// scoped buffer/window object, and a scoped *function* cannot be put in
+/// the registry at all. Integer handles plus a pointer parked outside the
+/// Lua value graph have no lifetime relationship to the Lua values that
+/// use them, so "stored at load, invoked much later" needs no special
+/// support: whatever dispatch is in flight installs the loan, and every
+/// Lua function reached from it — however it was reached — sees it.
 ///
 /// # Borrow discipline (asserted, not assumed)
 ///
-/// 1. `EngineLoan` borrows the `Engine` for the loan's whole lifetime, so the
-///    caller cannot touch `self` while Lua may be mutating through the pointer.
-/// 2. Reborrows are short: [`with_live_engine`] hands `&mut Engine` to exactly
-///    one closure and drops it before returning to Lua.
+/// 1. `EngineLoan` borrows the `Engine` for the loan's whole lifetime, so
+///    the caller cannot touch `self` while Lua may be mutating through
+///    the pointer.
+/// 2. Reborrows are short: [`with_live_engine`] hands `&mut Engine` to
+///    exactly one closure and drops it before returning to Lua.
 /// 3. While a reborrow is live, `ENGINE_BORROWED` is set and a nested
-///    [`with_live_engine`] returns `None` (debug builds assert) rather than
-///    creating a second `&mut`.
-/// 4. Nested *dispatch* — Lua → engine edit → event → Lua — cannot happen at
-///    all: `Engine::plugin_event` defers a nested event onto a queue instead of
-///    re-entering Lua (see `Engine::plugin_dispatch_depth`).
+///    [`with_live_engine`] returns `None` (debug builds assert) rather
+///    than creating a second `&mut`.
+/// 4. Nested *dispatch* — Lua → engine edit → event → Lua — cannot happen
+///    at all: `Engine::plugin_event` defers a nested event onto a queue
+///    instead of re-entering Lua (see `Engine::plugin_dispatch_depth`).
 /// 5. Loans nest lexically (`prev` is restored on drop), so an engine that
 ///    somehow dispatches from inside a dispatch still restores the outer
 ///    pointer rather than clearing it.
@@ -203,7 +204,7 @@ fn live_engine<R>(what: &str, f: impl FnOnce(&mut Engine) -> R) -> LuaResult<R> 
     })
 }
 
-// ─── Lua → plugin_ui vocabulary (#146) ───────────────────────────────────────
+// ─── Lua → plugin_ui vocabulary ──────────────────────────────────────────────
 
 /// Parse the table a view's `render()` returned into a
 /// [`crate::core::plugin_ui::PluginView`].
@@ -227,7 +228,7 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
     }
     let id: String = tbl.get("id").unwrap_or_default();
 
-    // #1631: a `kind = "list"/"tree"/"table"/"text_view"` table is a single
+    // A `kind = "list"/"tree"/"table"/"text_view"` table is a single
     // `ViewBody` widget, not a field stack — parse it and return early,
     // exactly the "one sibling translation per kind" the issue asks for,
     // kept out of the `fields` loop below rather than interleaved with it.
@@ -350,8 +351,8 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
     })
 }
 
-/// Parse a `kind = "..."` table into a [`crate::core::plugin_ui::ViewBody`]
-/// (#1631). Sibling of the field-stack loop in [`lua_table_to_view`], not
+/// Parse a `kind = "..."` table into a [`crate::core::plugin_ui::ViewBody`].
+/// Sibling of the field-stack loop in [`lua_table_to_view`], not
 /// interleaved with it — see that function's call site for why.
 fn lua_table_to_view_body(
     kind: &str,
@@ -567,14 +568,14 @@ pub enum ExtPanelStyle {
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
-// ─── Plugin-declared UI views (#146) ─────────────────────────────────────────
+// ─── Plugin-declared UI views ────────────────────────────────────────────────
 
 /// A `vimcode.ui.register_view` registration, harvested at load time.
 ///
-/// The two Lua functions live in the Lua registry (not in a `PluginCallContext`)
-/// precisely because they are **stored and invoked later** — the shape #1214's
-/// live-engine seam exists to support, and what lets an `on_event` handler use
-/// the immediate `vimcode.buffer.*` API.
+/// The two Lua functions live in the Lua registry (not in a
+/// `PluginCallContext`) because they are stored and invoked later — they
+/// support the shape of timer and event handler callbacks that use the
+/// immediate `vimcode.buffer.*` API.
 struct ViewRegistration {
     panel: PanelRegistration,
     render: LuaRegistryKey,
@@ -603,9 +604,9 @@ pub struct PluginManager {
     pub panels: HashMap<String, PanelRegistration>,
     /// Extension panel help bindings harvested from plugin scripts.
     pub help_bindings: HashMap<String, Vec<(String, String)>>,
-    /// `vimcode.ui.register_view` registrations, by view name (#146).
+    /// `vimcode.ui.register_view` registrations, by view name.
     views: HashMap<String, StoredView>,
-    /// `vimcode.keymap.set` registrations harvested at load time (#1623),
+    /// `vimcode.keymap.set` registrations harvested at load time,
     /// leader-expanded and merged into `Engine::user_keymaps` by
     /// `Engine::set_plugin_manager` (via [`Self::take_raw_lua_keymaps`]) so
     /// they are consulted through the same before-built-ins path as a config
@@ -619,19 +620,19 @@ pub struct PluginManager {
     lua_keymap_callbacks: RefCell<HashMap<u64, LuaKeymapCallback>>,
     /// Next id [`Self::register_lua_keymap`] hands out.
     lua_keymap_next_id: Cell<u64>,
-    /// Per-buffer `BufWriteCmd`-style write-override callbacks (#1623),
+    /// Per-buffer `BufWriteCmd`-style write-override callbacks,
     /// registered via `vimcode.buffer.set_write_handler` and keyed by the
     /// buffer's handle. `RefCell` for the same reason as
     /// `lua_keymap_callbacks`: registration happens through the immediate
     /// API, with only `&PluginManager` available.
     write_handlers: RefCell<HashMap<i64, LuaRegistryKey>>,
     /// `id -> callback` for every live `vimcode.loop.timer`/`vimcode.schedule`/
-    /// `vimcode.defer` registration (#1624). The scheduling bookkeeping
+    /// `vimcode.defer` registration. The scheduling bookkeeping
     /// (interval, next-due, repeat) lives on `Engine::plugin_timers`, keyed
     /// by the same id — this map only holds the Lua side (the callback
     /// itself), mirroring `write_handlers`/`lua_keymap_callbacks`.
     timer_callbacks: RefCell<HashMap<u64, LuaRegistryKey>>,
-    /// `id -> callbacks` for every live `vimcode.loop.spawn` handle (#1624).
+    /// `id -> callbacks` for every live `vimcode.loop.spawn` handle.
     /// The process/pipes/receiver live on `Engine::plugin_spawns`, keyed by
     /// the same id.
     spawn_callbacks: RefCell<HashMap<u64, SpawnCallbacks>>,
@@ -641,7 +642,7 @@ pub struct PluginManager {
     /// for picker items, a disjoint per-picker map), so there is no collision
     /// risk, and one counter is simpler than several.
     next_handle_id: Cell<u64>,
-    /// Live `vimcode.picker.open` registrations (#1630), keyed by the id
+    /// Live `vimcode.picker.open` registrations, keyed by the id
     /// [`Self::register_picker`] handed out. `RefCell` for the same reason as
     /// `spawn_callbacks`: `set_items`/`append`/`close` reach here through the
     /// immediate API, with only `&PluginManager` available.
@@ -653,28 +654,28 @@ pub struct PluginManager {
     /// regression, but pickers are the first surface where per-item counts
     /// can run into the thousands (e.g. live-grep results), which will make
     /// any latent registry-growth cost from that pattern far more visible
-    /// than it was for a handful of timer/spawn callbacks (#1630 review).
+    /// than it was for a handful of timer/spawn callbacks.
     pickers: RefCell<HashMap<u64, PluginPicker>>,
-    /// `id -> callback` for every in-flight `vimcode.http.request` handle
-    /// (#1632). The child process/receiver live on `Engine::
+    /// `id -> callback` for every in-flight `vimcode.http.request` handle.
+    /// The child process/receiver live on `Engine::
     /// plugin_http_requests`, keyed by the same id — mirrors `spawn_callbacks`
     /// exactly, minus the "three callbacks" shape (HTTP has exactly one).
     http_callbacks: RefCell<HashMap<u64, LuaRegistryKey>>,
     /// `id -> source` for every live `vimcode.completion.register`
-    /// registration (#1805). Unlike the request-scoped maps above, these
+    /// registration. Unlike the request-scoped maps above, these
     /// are long-lived — a source stays registered for the plugin's whole
     /// lifetime, invoked fresh on every `Engine::trigger_completion`.
     completion_sources: RefCell<HashMap<u64, PluginCompletionSource>>,
     /// `id -> callbacks` for every in-flight `vimcode.fs.walk`/`vimcode.fs.
-    /// grep` handle (#1806). The background thread/receiver live on
+    /// grep` handle. The background thread/receiver live on
     /// `Engine::plugin_fs_ops`, keyed by the same id — mirrors
     /// `http_callbacks` except each handle has two callbacks (`on_batch`,
     /// called zero or more times, then `on_done` once) instead of one.
     fs_callbacks: RefCell<HashMap<u64, FsCallbacks>>,
 }
 
-/// A `vimcode.fs.walk`/`vimcode.fs.grep` handle's registered callbacks
-/// (#1806). Unlike [`SpawnCallbacks`], both are mandatory — the Lua binding
+/// A `vimcode.fs.walk`/`vimcode.fs.grep` handle's registered callbacks.
+/// Unlike [`SpawnCallbacks`], both are mandatory — the Lua binding
 /// requires `on_batch` and `on_done` as positional arguments, matching the
 /// issue's `walk(root, opts, on_batch, on_done)` signature.
 struct FsCallbacks {
@@ -682,7 +683,7 @@ struct FsCallbacks {
     on_done: LuaRegistryKey,
 }
 
-/// A `vimcode.loop.spawn` handle's registered callbacks (#1624). Any of the
+/// A `vimcode.loop.spawn` handle's registered callbacks. Any of the
 /// three may be absent — a plugin that only cares about the exit status need
 /// not pass `on_stdout`/`on_stderr`.
 struct SpawnCallbacks {
@@ -691,7 +692,7 @@ struct SpawnCallbacks {
     on_exit: Option<LuaRegistryKey>,
 }
 
-/// A live `vimcode.completion.register` source (#1805): a plugin-supplied
+/// A live `vimcode.completion.register` source: a plugin-supplied
 /// insert-mode completion provider that merges into the built-in buffer-
 /// word/LSP popup.
 struct PluginCompletionSource {
@@ -712,15 +713,13 @@ struct PluginCompletionSource {
     callback: LuaRegistryKey,
     /// Set the first time this source's callback errors, so
     /// `Engine::plugin_request_completions` reports a broken source's
-    /// error to the status line once instead of once per keystroke
-    /// (review finding — an un-gated error spams and clobbers whatever
-    /// message was already there).
+    /// error to the status line once instead of once per keystroke.
     errored: Cell<bool>,
 }
 
 /// Position + request identity for one `vimcode.completion.register`
 /// source invocation — bundled into one argument so `call_completion_
-/// source` doesn't blow past clippy's `too_many_arguments` (#1805).
+/// source` doesn't blow past clippy's `too_many_arguments`.
 pub(crate) struct CompletionSourceCall<'a> {
     pub request_id: u64,
     /// Buffer handle (`0` = current, same convention as every other
@@ -746,7 +745,7 @@ pub(crate) struct PluginCompletionItemSpec {
     pub documentation: Option<String>,
 }
 
-/// A live `vimcode.picker.open` registration (#1630): the three optional
+/// A live `vimcode.picker.open` registration: the three optional
 /// callbacks plus every item currently in the list, keyed by an id private to
 /// this picker (assigned by [`PluginManager::register_picker_item`]) so
 /// `PickerAction::Custom("plugin_item:<picker_id>:<item_id>")` can look the
@@ -765,7 +764,7 @@ struct PluginPickerItemEntry {
     preview: Option<PluginPickerPreview>,
 }
 
-/// Where a `vimcode.picker.open` item's preview content comes from (#1630).
+/// Where a `vimcode.picker.open` item's preview content comes from.
 /// Plain data (no Lua registry involved), so `Engine::picker_load_preview`
 /// can read it without calling back into Lua.
 #[derive(Debug, Clone)]
@@ -791,13 +790,13 @@ pub(crate) struct PluginPickerItemSpec {
     /// every other `PickerItem` producer too, not something new here) — see
     /// `render.rs`'s `PickerPanelItem`. Kept on the documented item shape so
     /// a future patch can wire it in without an API break; a plugin author
-    /// who sets it today will just see it silently do nothing (#1630 review).
+    /// who sets it today will just see it silently do nothing.
     pub icon: Option<String>,
     pub(crate) data: Option<LuaRegistryKey>,
     pub(crate) preview: Option<PluginPickerPreview>,
 }
 
-/// A registered `vimcode.keymap.set` callback (#1623), looked up by the
+/// A registered `vimcode.keymap.set` callback, looked up by the
 /// opaque id a [`UserKeymapAction::Lua`] carries.
 struct LuaKeymapCallback {
     callback: LuaRegistryKey,
@@ -820,7 +819,7 @@ struct PendingLuaKeymap {
     desc: Option<String>,
 }
 
-/// Process-wide id source for `vimcode.completion.register` (#1805).
+/// Process-wide id source for `vimcode.completion.register`.
 ///
 /// Every other runtime registration (`register_timer_callback`, `register_
 /// picker`, …) hands out ids via `PluginManager::next_handle_id`, a `Cell`
@@ -842,7 +841,7 @@ fn next_completion_source_id() -> u64 {
 }
 
 /// A `vimcode.completion.register` call harvested during load-time script
-/// execution (#1805) — same reason as [`PendingLuaKeymap`]: the engine-side
+/// execution — same reason as [`PendingLuaKeymap`]: the engine-side
 /// registration (needs `&PluginManager`) isn't reachable from inside the
 /// Lua closure `exec()` is running.
 struct PendingCompletionSource {
@@ -872,12 +871,9 @@ pub struct LoadedPlugin {
 /// `Rope` is reference-counted, so cloning is O(1)). Lua callers that ask
 /// for line contents via `vimcode.buf.lines()` / `buf.line(n)` /
 /// `buf.get_lines(s, e)` pay the `String` allocation only for the range
-/// they actually read. A previous design eagerly materialised every line
-/// into `buf_lines: Vec<String>` on every plugin event — on a 190k-line
-/// buffer that was a 100 MB allocation per event, which pegged CPU at
-/// 100 % when any plugin chained `async_shell` calls in its callback
-/// (each completion fired a plugin event → new ctx → new allocation).
-/// See issue #153.
+/// they actually read. Eager materialization of every line into a vector
+/// on every plugin event can be a significant allocation; on large buffers
+/// this approach is more efficient.
 #[derive(Default)]
 pub struct PluginCallContext {
     // ── Inputs ──────────────────────────────────────────────────────────────
@@ -950,7 +946,7 @@ pub struct PluginCallContext {
     /// Panel input field text values to set: `(panel_name, text)`.
     pub panel_input_values: Vec<(String, String)>,
     /// `vimcode.ui.refresh(name)` requests — view names whose `render` callback
-    /// should run again after this call returns (#146).
+    /// should run again after this call returns.
     pub plugin_view_refresh: Vec<String>,
     /// Editor hover content registrations: `(0-indexed line, markdown)`.
     pub editor_hover_entries: Vec<(usize, String)>,
@@ -986,7 +982,7 @@ struct PluginRegistrations {
     completion_sources: Vec<PendingCompletionSource>,
 }
 
-// ─── Lua → picker vocabulary (#1630) ─────────────────────────────────────────
+// ─── Lua → picker vocabulary ─────────────────────────────────────────────────
 
 /// Parse a `vimcode.picker.open`/`:set_items`/`:append` item's optional
 /// `preview` table: `{ file = "path", line = 3 }` or `{ buffer = 0, line = 3 }`
@@ -1123,7 +1119,7 @@ fn make_picker_handle(lua: &Lua, id: u64) -> LuaResult<LuaTable<'_>> {
     Ok(handle)
 }
 
-// ─── `vimcode.json` (#1632) ───────────────────────────────────────────────────
+// ─── `vimcode.json` ───────────────────────────────────────────────────────────
 //
 // Hand-rolled `LuaValue <-> serde_json::Value` conversion rather than mlua's
 // optional `serialize` feature (as `lua_table_to_view` above already does for
@@ -1276,7 +1272,7 @@ fn json_to_lua_value<'lua>(lua: &'lua Lua, v: &serde_json::Value) -> LuaResult<L
     }
 }
 
-// ─── Plugin-scoped storage (#1632) ────────────────────────────────────────────
+// ─── Plugin-scoped storage ────────────────────────────────────────────────────
 //
 // One JSON file per (plugin, scope): `<vimcode data dir>/plugin_storage/
 // <plugin>/store.json` for the global scope, `.../<plugin>/workspaces/
@@ -1350,11 +1346,10 @@ fn sanitize_storage_component(name: &str) -> String {
 }
 
 /// A short, filesystem-safe key derived from the current working directory,
-/// used to shard `{workspace = true}` storage by workspace. `std::env::
-/// current_dir()` (not `Engine::cwd`) so this resolves identically whether
-/// called at plugin-load time (no live engine loaned yet) or from any later
-/// callback — vimcode's own `:cd` already calls `std::env::set_current_dir`
-/// (`Engine::buffers.rs`), so the two never disagree in practice.
+/// used to shard `{workspace = true}` storage by workspace. Uses
+/// `std::env::current_dir()` (not `Engine::cwd`) so this resolves
+/// identically whether called at plugin-load time (no live engine loaned
+/// yet) or from any later callback.
 fn workspace_storage_key() -> String {
     use sha2::{Digest, Sha256};
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1517,7 +1512,7 @@ impl PluginManager {
             for (panel_name, bindings) in reg.help_bindings {
                 self.help_bindings.insert(panel_name, bindings);
             }
-            // #146: a view-backed panel is registered in `panels` like any other
+            // A view-backed panel is registered in `panels` like any other
             // (so the activity bar and `Engine::ext_panels` need no new path)
             // *and* in `views`, whose presence is what makes the sidebar paint a
             // `quadraui::Form` instead of tree rows.
@@ -1532,7 +1527,7 @@ impl PluginManager {
                     },
                 );
             }
-            // #1623: `vimcode.keymap.set` calls made at load time. Assign
+            // `vimcode.keymap.set` calls made at load time. Assign
             // each an id now (needs `&mut self`, unavailable from inside the
             // Lua closure that ran during `exec()` above) and stash the
             // resulting `UserKeymap` for `Engine::set_plugin_manager` to
@@ -1548,7 +1543,7 @@ impl PluginManager {
                     desc: pending.desc,
                 });
             }
-            // #1805: `vimcode.completion.register` calls made at load time
+            // `vimcode.completion.register` calls made at load time
             // — same shape as the `lua_keymaps` harvest above, just with no
             // later leader-expansion/merge step needed.
             for pending in reg.completion_sources {
@@ -1683,7 +1678,7 @@ impl PluginManager {
         (true, ctx)
     }
 
-    // ─── `vimcode.keymap.set` keymaps (#1623) ──────────────────────────────
+    // ─── `vimcode.keymap.set` keymaps ──────────────────────────────────────
 
     /// Take every load-time `vimcode.keymap.set` registration, for
     /// `Engine::set_plugin_manager` to leader-expand and merge into
@@ -1746,8 +1741,8 @@ impl PluginManager {
     }
 
     /// List every active keymap — config-defined and Lua-registered alike —
-    /// as `(mode, lhs, buffer_handle, desc)`, for `vimcode.keymap.list()`
-    /// (#1623), the enumeration a which-key style extension renders from.
+    /// as `(mode, lhs, buffer_handle, desc)`, for `vimcode.keymap.list()`,
+    /// the enumeration a which-key style extension renders from.
     /// `buffer_handle` is `None` for a global mapping.
     pub(crate) fn list_keymaps_from(
         keymaps: &[UserKeymap],
@@ -1765,7 +1760,7 @@ impl PluginManager {
             .collect()
     }
 
-    // ─── `vimcode.buffer.set_write_handler` (#1623) ────────────────────────
+    // ─── `vimcode.buffer.set_write_handler` ────────────────────────────────
 
     /// Register `callback` as the write-override for buffer `buf` (a handle,
     /// already resolved — never `0`/"current").
@@ -1803,7 +1798,7 @@ impl PluginManager {
         (found, ctx)
     }
 
-    // ─── `vimcode.loop`/`vimcode.schedule`/`vimcode.defer` (#1624) ─────────
+    // ─── `vimcode.loop`/`vimcode.schedule`/`vimcode.defer` ─────────────────
 
     fn next_handle_id(&self) -> u64 {
         let id = self.next_handle_id.get();
@@ -1938,7 +1933,7 @@ impl PluginManager {
             .unwrap_or_default()
     }
 
-    // ─── `vimcode.http` (#1632) ─────────────────────────────────────────────
+    // ─── `vimcode.http` ─────────────────────────────────────────────────────
 
     /// Register a `vimcode.http.request` handle's callback and return its id.
     pub(crate) fn register_http_callback(&self, callback: LuaRegistryKey) -> u64 {
@@ -1994,7 +1989,7 @@ impl PluginManager {
             .unwrap_or_default()
     }
 
-    // ─── `vimcode.completion` (#1805) ──────────────────────────────────────
+    // ─── `vimcode.completion` ──────────────────────────────────────────────
 
     /// Register a `vimcode.completion.register` source under an id already
     /// minted by [`next_completion_source_id`] (the Lua binding mints it
@@ -2167,7 +2162,7 @@ impl PluginManager {
         (ctx, result)
     }
 
-    // ─── `vimcode.fs` (#1806) ───────────────────────────────────────────────
+    // ─── `vimcode.fs` ───────────────────────────────────────────────────────
 
     /// Register a `vimcode.fs.walk`/`vimcode.fs.grep` handle's callbacks and
     /// return its id.
@@ -2197,7 +2192,7 @@ impl PluginManager {
     /// the defensive, shouldn't-happen-for-a-`root`-rooted-walk case where
     /// `strip_prefix` fails — so by the time this function runs, `paths` are
     /// already in their final, relative-when-possible shape; it does no
-    /// path manipulation of its own (#1806 review).
+    /// path manipulation of its own.
     pub(crate) fn call_fs_walk_batch(
         &self,
         id: u64,
@@ -2231,7 +2226,7 @@ impl PluginManager {
     /// consistent with the pre-existing `ProjectMatch::col`) — it is *not*
     /// guaranteed to match `vimcode.buf.cursor()`'s `col`, which is a
     /// character index; the two disagree on any line with non-ASCII before
-    /// the match (#1806 review).
+    /// the match.
     pub(crate) fn call_fs_grep_batch(
         &self,
         id: u64,
@@ -2281,7 +2276,7 @@ impl PluginManager {
             .unwrap_or_default()
     }
 
-    // ─── `vimcode.picker` (#1630) ───────────────────────────────────────────
+    // ─── `vimcode.picker` ───────────────────────────────────────────────────
 
     /// Register a new picker's callbacks and return its id. Called from
     /// `Engine::plugin_api_picker_open` while a live engine is loaned, so the
@@ -2315,12 +2310,8 @@ impl PluginManager {
     }
 
     /// Number of live `vimcode.picker.open` registrations this manager
-    /// currently holds. Not used by any production code path — it exists so
-    /// black-box tests (`tests/extensions.rs`) can prove a picker's
-    /// registration was actually released rather than merely becoming
-    /// unreachable (the #1630 review's leak findings: `plugin_api_picker_
-    /// open` superseding a still-registered handle, and `close_picker()`
-    /// being called without plugin teardown on a non-Escape dismiss path).
+    /// currently holds. Allows tests to verify that picker registrations
+    /// are properly released.
     pub fn picker_registration_count(&self) -> usize {
         self.pickers.borrow().len()
     }
@@ -2336,9 +2327,7 @@ impl PluginManager {
 
     /// Register one item's `data`/preview under picker `id` and return its
     /// item id. A no-op (item id still returned, just never stored) if `id`
-    /// names a picker that no longer exists — defensive only: callers reach
-    /// here after `Engine::plugin_picker_is_active` already confirmed the
-    /// picker is live, so this should not normally happen.
+    /// names a picker that no longer exists.
     pub(crate) fn register_picker_item(
         &self,
         id: u64,
@@ -2440,7 +2429,7 @@ impl PluginManager {
             .unwrap_or_default()
     }
 
-    // ─── Plugin-declared UI views (#146) ───────────────────────────────────
+    // ─── Plugin-declared UI views ──────────────────────────────────────────
 
     /// Names of every `vimcode.ui.register_view` view, in unspecified order.
     pub fn view_names(&self) -> Vec<String> {
@@ -2517,9 +2506,9 @@ impl PluginManager {
     /// The `ctx` table handed to `render(ctx)` / `on_event(ctx, event)`.
     ///
     /// Deliberately minimal: everything a callback needs is already reachable
-    /// through `vimcode.*` (including the immediate `vimcode.buffer.*` API,
-    /// #1214). `ctx` only names *which* view is being rendered, so one Lua
-    /// function can serve several registered views.
+    /// through `vimcode.*` (including the immediate `vimcode.buffer.*` API).
+    /// `ctx` only names *which* view is being rendered, so one Lua function
+    /// can serve several registered views.
     fn view_ctx_table(&self, view: &str) -> LuaTable<'_> {
         let tbl = self.lua.create_table().unwrap_or_else(|_| {
             // `create_table` only fails on OOM; there is no useful fallback, and
@@ -2580,14 +2569,15 @@ impl PluginManager {
     fn setup_vimcode_api(lua: &Lua) -> LuaResult<()> {
         let vimcode = lua.create_table()?;
 
-        // ── Harden the global `load` (#1632 review) ──────────────────────────
+        // ── Harden the global `load` ─────────────────────────────────────────
         //
         // `current_plugin_chunk_name` (used to namespace `vimcode.storage.*`)
         // trusts a Lua chunk's own debug `source`, which stock Lua's `load(chunk,
-        // chunkname)` lets *any* caller set to an arbitrary string. Left alone,
-        // `load(payload, "other-plugin-name")()` would let a malicious plugin
-        // impersonate another plugin's storage namespace — all plugins share one
-        // `Lua` VM (`PluginManager::new`), so nothing else stops it.
+        // chunkname)` lets *any* caller set to an arbitrary string. Without
+        // hardening, `load(payload, "other-plugin-name")()` would let a
+        // malicious plugin impersonate another plugin's storage namespace — all
+        // plugins share one `Lua` VM (`PluginManager::new`), so nothing else
+        // stops it.
         //
         // Replace the global `load` with a wrapper that ignores whatever
         // chunkname the *caller* passes and always substitutes the caller's own
@@ -2620,7 +2610,7 @@ impl PluginManager {
             globals.set("load", hardened_load)?;
         }
 
-        // ── vimcode.json (#1632) ─────────────────────────────────────────────
+        // ── vimcode.json ─────────────────────────────────────────────────────
         //
         // The `null`/`empty_object` sentinels are created once here (not
         // lazily inside `encode`/`decode`) so every comparison in
@@ -2664,7 +2654,7 @@ impl PluginManager {
         )?;
         vimcode.set("json", json_tbl)?;
 
-        // ── vimcode.storage (#1632) ──────────────────────────────────────────
+        // ── vimcode.storage ──────────────────────────────────────────────────
         let storage_tbl = lua.create_table()?;
         storage_tbl.set(
             "get",
@@ -2758,24 +2748,24 @@ impl PluginManager {
             })?,
         )?;
 
-        // vimcode.keymap(mode, key, fn) — legacy (unchanged, #1214-and-earlier
-        // back-compat): dispatched *after* built-ins, via
-        // `Engine::plugin_run_keymap` / `PluginManager::call_keymap`.
+        // vimcode.keymap(mode, key, fn) — legacy call form (unchanged):
+        // dispatched *after* built-ins, via `Engine::plugin_run_keymap` /
+        // `PluginManager::call_keymap`.
         //
         // vimcode.keymap.set(mode, lhs, fn, opts) / vimcode.keymap.list() —
-        // the new API (#1623): a table with a `__call` metamethod keeps the
-        // legacy call form working (`vimcode.keymap("v", "Q", fn)` calls the
-        // table, invoking `legacy_call` below with the table as the extra
-        // first argument Lua's `t(...)` sugar passes to `__call`).
+        // the new API: a table with a `__call` metamethod keeps the legacy call
+        // form working (`vimcode.keymap("v", "Q", fn)` calls the table,
+        // invoking `legacy_call` below with the table as the extra first
+        // argument Lua's `t(...)` sugar passes to `__call`).
         //
         // `.set` maps are consulted *before* built-ins (`Engine::user_keymaps`
-        // / `try_user_keymap`), which is what lets a plugin own a key with a
-        // built-in meaning (`s`, `ys`, `gc`, …). `opts` (all optional):
-        // `expr` (bool — the callback's return value is fed back through the
-        // key path instead of being expected to act directly), `buffer`
-        // (handle — restricts the map to one buffer; only meaningful when
-        // `.set` is called from inside a callback, where a live buffer
-        // exists), `desc` (string — surfaced by `.list()`).
+        // / `try_user_keymap`), which lets a plugin own a key with a built-in
+        // meaning (`s`, `ys`, `gc`, …). `opts` (all optional): `expr` (bool —
+        // the callback's return value is fed back through the key path instead
+        // of being expected to act directly), `buffer` (handle — restricts the
+        // map to one buffer; only meaningful when `.set` is called from inside
+        // a callback, where a live buffer exists), `desc` (string — surfaced by
+        // `.list()`).
         let keymap_tbl = lua.create_table()?;
         let keymap_mt = lua.create_table()?;
         keymap_mt.set(
@@ -2866,8 +2856,8 @@ impl PluginManager {
 
         vimcode.set("keymap", keymap_tbl)?;
 
-        // vimcode.fire_event(name) — fire a plugin-defined "User" event
-        // (#1623), the escape hatch for a plugin to signal its own
+        // vimcode.fire_event(name) — fire a plugin-defined "User" event,
+        // the escape hatch for a plugin to signal its own
         // lifecycle points to other plugins: `vimcode.on("User", function(name)
         // if name == "MyPluginReady" then ... end end)`.
         vimcode.set(
@@ -3037,7 +3027,7 @@ impl PluginManager {
             })?,
         )?;
 
-        // vimcode.async_shell_exit_code(callback_event) → integer | nil (#1624)
+        // vimcode.async_shell_exit_code(callback_event) → integer | nil
         //
         // `async_shell`'s callback signature is frozen (`function(output)`),
         // so the exit status this issue adds is surfaced out of band instead
@@ -3054,7 +3044,7 @@ impl PluginManager {
             })?,
         )?;
 
-        // vimcode.schedule(fn) — run `fn` once, on the next idle tick (#1624).
+        // vimcode.schedule(fn) — run `fn` once, on the next idle tick.
         // Implemented as a zero-delay, non-repeating `vimcode.loop.timer`:
         // "next idle tick" is exactly what an already-due, non-repeating
         // timer entry gives for free from `Engine::poll_plugin_timers`.
@@ -3068,7 +3058,7 @@ impl PluginManager {
             })?,
         )?;
 
-        // vimcode.defer(ms, fn) — run `fn` once, after `ms` milliseconds (#1624).
+        // vimcode.defer(ms, fn) — run `fn` once, after `ms` milliseconds.
         vimcode.set(
             "defer",
             lua.create_function(|lua, (ms, cb): (i64, LuaFunction)| {
@@ -3079,7 +3069,7 @@ impl PluginManager {
             })?,
         )?;
 
-        // ── vimcode.loop (#1624) ─────────────────────────────────────────────
+        // ── vimcode.loop ─────────────────────────────────────────────────────
         let loop_tbl = lua.create_table()?;
 
         // vimcode.loop.timer(ms, fn, {repeat=bool}) → handle with :stop()
@@ -3194,17 +3184,16 @@ impl PluginManager {
 
         vimcode.set("loop", loop_tbl)?;
 
-        // ── vimcode.http (#1632) ─────────────────────────────────────────────
+        // ── vimcode.http ─────────────────────────────────────────────────────
         let http_tbl = lua.create_table()?;
 
         // vimcode.http.request({method, url, headers, body, timeout_ms}, cb)
         // → handle with :cancel(). `cb` is called exactly once, on the main
-        // thread via `Engine::poll_plugin_http`, with `{status, headers,
-        // body, elapsed_ms}` on success or `{error}` on failure — never both,
-        // never neither. Delivered the same way as every other stored
-        // callback (#1624's `PluginCallContext`/`EngineLoan` machinery), so
-        // it can use the immediate `vimcode.buffer`/`vimcode.window` API and
-        // `vimcode.ui.refresh` just like a timer or spawn callback can.
+        // thread via `Engine::poll_plugin_http`, with `{status, headers, body,
+        // elapsed_ms}` on success or `{error}` on failure. Delivered using the
+        // same machinery as every other stored callback, so it can use the
+        // immediate `vimcode.buffer`/`vimcode.window` API and `vimcode.ui.
+        // refresh` just like a timer or spawn callback can.
         http_tbl.set(
             "request",
             lua.create_function(|lua, (opts, cb): (LuaTable, LuaFunction)| {
@@ -3224,11 +3213,7 @@ impl PluginManager {
                     for (k, v) in h.pairs::<String, String>().flatten() {
                         // Reject CR/LF in header names/values here, at the
                         // Lua boundary, so a plugin gets an immediate, clear
-                        // error instead of a generic "failed to start"
-                        // further down — `spawn_http_request` also rejects
-                        // these defensively (#1632 review: unstripped CR/LF
-                        // let a header value smuggle extra header lines onto
-                        // the wire, e.g. from response data or a template).
+                        // error instead of a generic "failed to start" later.
                         if k.contains('\r')
                             || k.contains('\n')
                             || v.contains('\r')
@@ -4435,7 +4420,7 @@ impl PluginManager {
 
         vimcode.set("panel", panel_tbl)?;
 
-        // ── vimcode.ui subtable (#146) ─────────────────────────────────────
+        // ── vimcode.ui subtable ────────────────────────────────────────────
         let ui_tbl = lua.create_table()?;
 
         // vimcode.ui.register_view(name, {title=, icon=, fallback_icon=,
@@ -4512,19 +4497,18 @@ impl PluginManager {
         )?;
 
         // vimcode.ui.open_view(name, {location = "tab"}) — open a registered
-        // view as an editor-area tab (#1627), the second of the two hosting
-        // surfaces #146 deferred ("Not yet supported" in EXTENSIONS.md).
-        // `"tab"` is the only supported `location` today; a call with any
-        // other value (or a `name` that isn't a registered view) is a Lua
-        // error rather than a silent no-op, matching `register_view`'s own
-        // "fail loudly at the Lua/Rust boundary" convention.
+        // view as an editor-area tab. `"tab"` is the only supported
+        // `location` today; a call with any other value (or a `name` that
+        // isn't a registered view) is a Lua error rather than a silent no-op,
+        // matching `register_view`'s "fail loudly at the Lua/Rust boundary"
+        // convention.
         //
         // Immediate ("live engine") API, like `vimcode.buffer.*`: opening a
-        // tab is a structural engine mutation (`Engine::
-        // open_plugin_view_tab` — a real `Tab`/`Window`/scratch `BufferId`,
-        // via the pre-existing `Engine::new_tab`), not queued output data, so
-        // it needs `live_engine` the way `vimcode.buffer.create` does rather
-        // than a `PluginCallContext` field `apply_plugin_ctx` applies later.
+        // tab is a structural engine mutation (`Engine::open_plugin_view_tab` —
+        // a real `Tab`/`Window`/scratch `BufferId`, via the pre-existing
+        // `Engine::new_tab`), not queued output data, so it needs `live_engine`
+        // the way `vimcode.buffer.create` does rather than a `PluginCallContext`
+        // field `apply_plugin_ctx` applies later.
         ui_tbl.set(
             "open_view",
             lua.create_function(|_, (name, opts): (String, Option<LuaTable>)| {
@@ -4552,29 +4536,25 @@ impl PluginManager {
 
         vimcode.set("ui", ui_tbl)?;
 
-        // ── vimcode.completion (#1805) ───────────────────────────────────────
+        // ── vimcode.completion ───────────────────────────────────────────────
         //
         // `vimcode.completion.register({name, filetypes?, trigger_chars?,
         // priority?, source})` adds a plugin-fed source to the built-in
-        // insert-mode completion popup — the one capability #1212's plugin
-        // triage flagged as missing (snippet/path-completion extensions need
-        // it). `source(ctx, request_id)` is called on every completion
-        // trigger with `ctx = {buf, line, col, prefix}` (1-indexed
-        // `line`/`col`, `buf`/`0` current-buffer handle convention). It
-        // returns a table of `{label, insert_text?, kind?, detail?,
-        // documentation?}` items for an immediate result, or `nil` to
-        // deliver them later — from any async callback (`vimcode.loop.spawn`,
-        // `vimcode.http.request`, a timer) — via
-        // `vimcode.completion.complete(request_id, items)`. A `complete()`
-        // call for a `request_id` from a since-superseded trigger (the user
-        // kept typing) is silently dropped.
+        // insert-mode completion popup. `source(ctx, request_id)` is called on
+        // every completion trigger with `ctx = {buf, line, col, prefix}`
+        // (1-indexed `line`/`col`, `buf`/`0` current-buffer handle convention).
+        // It returns a table of `{label, insert_text?, kind?, detail?,
+        // documentation?}` items for an immediate result, or `nil` to deliver
+        // them later — from any async callback (`vimcode.loop.spawn`,
+        // `vimcode.http.request`, a timer) — via `vimcode.completion.complete(
+        // request_id, items)`. A `complete()` call for a `request_id` from a
+        // since-superseded trigger (the user kept typing) is silently dropped.
         //
         // `filetypes` restricts the source to those buffers (omitted = every
-        // filetype). `trigger_chars` lets the source fire on an otherwise-
-        // empty prefix (e.g. member access right after `.`), mirroring LSP
-        // `triggerCharacters`. `priority` (default `0`, same as every
-        // buffer-word/LSP candidate) controls merge order: higher sorts
-        // earlier in the popup.
+        // filetype). `trigger_chars` lets the source fire on an otherwise-empty
+        // prefix (e.g. member access right after `.`), mirroring LSP
+        // `triggerCharacters`. `priority` (default `0`) controls merge order:
+        // higher sorts earlier in the popup.
         let completion_tbl = lua.create_table()?;
         completion_tbl.set(
             "register",
@@ -4656,25 +4636,24 @@ impl PluginManager {
         )?;
         vimcode.set("completion", completion_tbl)?;
 
-        // ── vimcode.picker (#1630) ──────────────────────────────────────────
+        // ── vimcode.picker ──────────────────────────────────────────────────
         //
-        // `vimcode.picker.open({title, items, on_select, on_cancel, on_query})`
-        // opens the built-in fuzzy picker (`src/core/engine/picker.rs`) fed by
-        // plugin data instead of a built-in `PickerSource` — the telescope-
-        // style seam #1212's epic asks for. Items are `{display, filter_text?,
-        // detail?, icon?, data?, preview?}`; `data` is an opaque value handed
-        // back to `on_select` verbatim (any Lua value, including `nil`).
-        // `preview` is `{file=path, line=n}` or `{buffer=handle, line=n}`
-        // (`line` optional and 1-indexed either way).
+        // `vimcode.picker.open({title, items, on_select, on_cancel,
+        // on_query})` opens the built-in fuzzy picker (`src/core/engine/
+        // picker.rs`) fed by plugin data instead of a built-in `PickerSource`.
+        // Items are `{display, filter_text?, detail?, icon?, data?, preview?}`;
+        // `data` is an opaque value handed back to `on_select` verbatim (any
+        // Lua value, including `nil`). `preview` is `{file=path, line=n}` or
+        // `{buffer=handle, line=n}` (`line` optional and 1-indexed either way).
         //
-        // The returned handle supports live updates, for an async source fed
-        // by e.g. `vimcode.loop.spawn`'s streamed stdout: `:set_items(items)`
+        // The returned handle supports live updates, for an async source fed by
+        // e.g. `vimcode.loop.spawn`'s streamed stdout: `:set_items(items)`
         // replaces the whole list, `:append(items)` adds to it (re-filtering
         // against the current query without resetting the selection),
         // `:set_loading(bool)` marks it still-fetching, `:close()` closes it
         // early. All four are immediate-API calls, like `vimcode.loop.spawn`'s
-        // handle methods — and, like those, callable with `.` or `:` (the
-        // first parameter is an ignored `self`).
+        // handle methods — and, like those, callable with `.` or `:` (the first
+        // parameter is an ignored `self`).
         let picker_tbl = lua.create_table()?;
         picker_tbl.set(
             "open",
@@ -4711,30 +4690,26 @@ impl PluginManager {
         )?;
         vimcode.set("picker", picker_tbl)?;
 
-        // ── vimcode.fs (#1806) ──────────────────────────────────────────────
+        // ── vimcode.fs ──────────────────────────────────────────────────────
         //
         // `vimcode.fs.walk(root, opts, on_batch, on_done)` /
-        // `vimcode.fs.grep(root, pattern, opts, on_batch, on_done)`: the
-        // same in-process, gitignore-aware `ignore`-crate walker the native
-        // Files/Grep pickers use, exposed to Lua so a finder extension (the
-        // #1212 epic's telescope-style seam) never depends on `rg`/`fd`
-        // being installed. Work runs on a background thread; `on_batch` is
-        // called zero or more times with up to ~100-200 results each, then
-        // `on_done` fires once (never, if the handle is cancelled first).
-        // `root` empty/omitted means the workspace root (`Engine::cwd`);
+        // `vimcode.fs.grep(root, pattern, opts, on_batch, on_done)`: the same
+        // in-process, gitignore-aware `ignore`-crate walker the native Files/
+        // Grep pickers use, exposed to Lua so a finder extension never depends
+        // on `rg`/`fd` being installed. Work runs on a background thread;
+        // `on_batch` is called zero or more times with up to ~100-200 results
+        // each, then `on_done` fires once (never, if the handle is cancelled
+        // first). `root` empty/omitted means the workspace root (`Engine::cwd`);
         // relative otherwise resolved against it.
         //
-        // `opts` (either call): `include`/`exclude` are gitignore-glob-
-        // syntax string arrays (matched relative to `root`); `vimcode.fs.
-        // walk` additionally takes `hidden` (bool) and `max_depth` (int);
-        // `vimcode.fs.grep` additionally takes `case_sensitive` (bool),
-        // `use_regex` (bool, default false = literal match), and
-        // `max_results` (int).
+        // `opts` (either call): `include`/`exclude` are gitignore-glob-syntax
+        // string arrays (matched relative to `root`); `vimcode.fs.walk`
+        // additionally takes `hidden` (bool) and `max_depth` (int); `vimcode.fs.
+        // grep` additionally takes `case_sensitive` (bool), `use_regex` (bool,
+        // default false = literal match), and `max_results` (int).
         //
         // The returned handle's `:cancel()` stops the walk promptly (checked
-        // between every entry/batch) — a finder re-querying on every
-        // keystroke is expected to cancel its previous handle before
-        // starting the next one.
+        // between every entry/batch).
         let fs_tbl = lua.create_table()?;
 
         fn lua_table_to_fs_walk_options(
@@ -4882,7 +4857,7 @@ impl PluginManager {
             })?,
         )?;
 
-        // ── vimcode.buffer / vimcode.window: the immediate API (#1214) ──────
+        // ── vimcode.buffer / vimcode.window: the immediate API ──────────────
         Self::setup_live_api(lua, &vimcode)?;
 
         lua.globals().set("vimcode", vimcode)?;
@@ -4975,10 +4950,7 @@ impl PluginManager {
             )?,
         )?;
 
-        // vimcode.buffer.create({scratch=bool, name=string}) → handle
-        //
-        // `listed` is deliberately absent: vimcode has no unlisted-buffer
-        // concept yet, and inventing one is outside #1214's seam-only scope.
+        // vimcode.buffer.create({scratch=bool, name=string}) → handle.
         buffer.set(
             "create",
             lua.create_function(|_, opts: Option<LuaTable>| {
@@ -5000,12 +4972,10 @@ impl PluginManager {
             })?,
         )?;
 
-        // vimcode.buffer.set_write_handler(buf, fn) — claim `buf`'s writes
-        // (#1623, the oil.nvim `BufWriteCmd` shape): `:w`/`save()` on `buf`
-        // calls `fn(buf)` instead of writing to disk. `fn` is responsible for
-        // whatever persistence makes sense; the buffer is marked clean
-        // afterwards (there is no `vim.bo.modified`-equivalent setter yet for
-        // it to do that itself). Returns `false` when `buf` doesn't name a
+        // vimcode.buffer.set_write_handler(buf, fn) — claim `buf`'s writes:
+        // `:w`/`save()` on `buf` calls `fn(buf)` instead of writing to disk.
+        // `fn` is responsible for whatever persistence makes sense; the buffer
+        // is marked clean afterwards. Returns `false` when `buf` doesn't name a
         // live buffer.
         buffer.set(
             "set_write_handler",
@@ -5110,10 +5080,10 @@ impl PluginManager {
 
         vimcode.set("window", window)?;
 
-        // ── vimcode.decor (#1653, Native API P5) ─────────────────────────────
+        // ── vimcode.decor (Native API P5) ─────────────────────────────────
         Self::setup_decor_api(lua, vimcode)?;
 
-        // ── vimcode.syntax / vimcode.undo / vimcode.diagnostics (#1654, P6) ──
+        // ── vimcode.syntax / vimcode.undo / vimcode.diagnostics (P6) ──
         Self::setup_syntax_api(lua, vimcode)?;
         Self::setup_undo_api(lua, vimcode)?;
         Self::setup_diagnostics_api(lua, vimcode)?;
@@ -5199,7 +5169,7 @@ impl PluginManager {
                         if let Some(sh) = &m.opts.sign_hl {
                             t.set("sign_hl", sh.clone())?;
                         }
-                        // #1653 review: a mark with virtual text couldn't be
+                        // A mark with virtual text couldn't be
                         // round-tripped back through `get_mark` at all —
                         // only hl_group/sign_text/sign_hl came back. Mirror
                         // `set_mark`'s own `virt_text = {{text, hl_group},
@@ -5270,12 +5240,11 @@ impl PluginManager {
         Ok(())
     }
 
-    /// Install `vimcode.syntax.*` (#1654, Native API P6): read-only
-    /// tree-sitter access over whatever parse the engine already keeps for
-    /// highlighting (`BufferState::syntax`) — no Lua-side tree object, every
-    /// call returns a plain table. See `Engine::plugin_api_syntax_node_at`/
-    /// `_query` (`engine/plugins.rs`) and `core::syntax::Syntax::node_at`/
-    /// `query_captures` for the underlying logic.
+    /// Install `vimcode.syntax.*`: read-only tree-sitter access over whatever
+    /// parse the engine already keeps for highlighting (`BufferState::syntax`)
+    /// — no Lua-side tree object, every call returns a plain table. See
+    /// `Engine::plugin_api_syntax_node_at`/`_query` (`engine/plugins.rs`) and
+    /// `core::syntax::Syntax::node_at`/`query_captures` for the underlying logic.
     fn setup_syntax_api(lua: &Lua, vimcode: &LuaTable) -> LuaResult<()> {
         let syntax = lua.create_table()?;
 
@@ -5330,9 +5299,9 @@ impl PluginManager {
         Ok(())
     }
 
-    /// Install `vimcode.undo.*` (#1654, Native API P6): read the live undo
-    /// tree and jump straight to a recorded state by `seq`. See
-    /// `Engine::plugin_api_undo_tree`/`_jump` (`engine/plugins.rs`).
+    /// Install `vimcode.undo.*`: read the live undo tree and jump straight to
+    /// a recorded state by `seq`. See `Engine::plugin_api_undo_tree`/`_jump`
+    /// (`engine/plugins.rs`).
     fn setup_undo_api(lua: &Lua, vimcode: &LuaTable) -> LuaResult<()> {
         let undo = lua.create_table()?;
 
@@ -5375,10 +5344,9 @@ impl PluginManager {
         Ok(())
     }
 
-    /// Install `vimcode.diagnostics.get` (#1654, Native API P6). The
-    /// `DiagnosticChanged` event (fired from `Engine::set_diagnostics_for_
-    /// path`, `engine/panels.rs`) uses the existing generic `vimcode.on`
-    /// registration — no separate wiring needed here.
+    /// Install `vimcode.diagnostics.get`. The `DiagnosticChanged` event (fired
+    /// from `Engine::set_diagnostics_for_path`, `engine/panels.rs`) uses the
+    /// existing generic `vimcode.on` registration — no separate wiring needed.
     fn setup_diagnostics_api(lua: &Lua, vimcode: &LuaTable) -> LuaResult<()> {
         let diagnostics = lua.create_table()?;
 
@@ -5469,16 +5437,9 @@ fn lua_table_to_hl_def(t: &LuaTable) -> LuaResult<HlGroupDef> {
 }
 
 /// Parses a `virt_text_pos` string from Lua into its typed form. Returns
-/// `None` for anything unrecognised — including a typo like `"eo1"` or
-/// `"right_align"` — and `None` is *also* what an absent `virt_text_pos`
-/// field parses to upstream of this function, so both cases are
-/// indistinguishable to the render path (render.rs's `Some(Eol) | None`
-/// arm, #1810): a typo silently paints at end-of-line instead of being
-/// rejected. Neovim errors on an invalid `virt_text_pos` value; this is a
-/// known, harmless-but-surprising divergence, not fixed here because it
-/// would change this function's signature from `Option` to `Result` and
-/// thread a new error path through every caller for a cosmetic typo-safety
-/// improvement, out of scope for #1810.
+/// `None` for anything unrecognised. An absent `virt_text_pos` field also
+/// parses to `None`, so both cases are indistinguishable to the render path:
+/// an unrecognised value silently paints at end-of-line.
 fn lua_parse_virt_text_pos(s: &str) -> Option<VirtTextPos> {
     match s {
         "eol" => Some(VirtTextPos::Eol),
@@ -5765,7 +5726,7 @@ mod tests {
         assert_eq!(ctx.async_shell_requests.len(), 0);
     }
 
-    // ── #146: `vimcode.ui.*` view registration and dispatch ─────────────
+    // ── `vimcode.ui.*` view registration and dispatch ─────────────
 
     fn pm_with_view(tag: &str, code: &str) -> PluginManager {
         let dir = std::env::temp_dir().join(format!("vc_plugin_view_unit_{tag}"));
@@ -5871,7 +5832,7 @@ mod tests {
         );
     }
 
-    // ── #1631: `kind = "list"/"tree"/"table"/"text_view"` view bodies ────
+    // ── `kind = "list"/"tree"/"table"/"text_view"` view bodies ────
 
     #[test]
     fn a_list_body_parses_its_items() {

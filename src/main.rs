@@ -1,20 +1,13 @@
-//! Thin GUI-binary shim over `vimcode_core` (#657).
+//! Thin GUI-binary shim over `vimcode_core`.
 //!
-//! Everything this binary used to declare as a `mod` — `core`, `gtk`,
-//! `icons`, `render`, `tui_main` — now lives in the library crate, so that
-//! integration tests under `tests/` (a separate crate, which links only
-//! against `[lib] vimcode_core`) can reach the UI backends and their
+//! Everything this binary declares lives in the library crate so that
+//! integration tests under `tests/` can reach the UI backends and their
 //! black-box harnesses. See `src/lib.rs`.
 //!
-//! # Backend selection (#859)
+//! # Backend selection
 //!
-//! This target used to carry `required-features = ["gui"]` in `Cargo.toml`.
-//! That list is an **AND**, so every feature set without `gui` made cargo
-//! omit the whole bin — silently, with a green exit code and no diagnostic
-//! (the #645 trap; see the stanza comment in `Cargo.toml` for the measured
-//! incident). The requirement is now empty and the decision moved here, into
-//! [`COMPILED_GUI_BACKEND`], so the target compiles in *every* feature set
-//! and its disappearance can never again be mistaken for success.
+//! The decision is made at compile time in [`COMPILED_GUI_BACKEND`],
+//! ensuring the target compiles in every feature set.
 //!
 //! Four backends, resolved at compile time:
 //!
@@ -26,17 +19,16 @@
 //! | none of the above | `None` | terminal UI, with a one-line stderr notice |
 //!
 //! `--tui` / `-t` short-circuits all of that and runs the terminal UI
-//! regardless, exactly as before.
+//! regardless.
 //!
 //! `Win`'s row reads "on Windows", not "with `win`", because unlike `macos`
 //! (target-gated inside quadraui itself, so `--features macos` compiles
-//! nothing on Linux), quadraui's `win` module type-checks on every host
-//! (#866 — see `Cargo.toml`'s `win` feature comment). `--features win` alone
-//! therefore compiles `vimcode_core::win` everywhere, but this file still
-//! only ever *launches* it on `target_os = "windows"` — launching it
-//! anywhere else would reach `quadraui::win::run::run_with`'s non-Windows
-//! stub, which `todo!()`s rather than degrading gracefully the way the GTK/
-//! TUI paths do.
+//! nothing on Linux), quadraui's `win` module type-checks on every host.
+//! `--features win` alone therefore compiles `vimcode_core::win` everywhere,
+//! but this file still only ever *launches* it on `target_os = "windows"`.
+//! Launching it elsewhere would reach `quadraui::win::run::run_with`'s
+//! non-Windows stub, which `todo!()`s rather than degrading gracefully the
+//! way the GTK/TUI paths do.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -57,14 +49,14 @@ enum GuiBackend {
     /// GTK4 via `vimcode_core::gtk::run` — the `gui` feature, on by default.
     Gtk,
     /// Native AppKit via `vimcode_core::macos::run` — the `macos` feature on
-    /// a macOS host (#859). See [`COMPILED_GUI_BACKEND`]'s doc comment for
+    /// a macOS host. See [`COMPILED_GUI_BACKEND`]'s doc comment for
     /// the precedence rule against `Gtk` and why `--features gui,macos` is
     /// untested; build the native app as `--no-default-features --features
     /// macos`, which is also the only shape macmini can build (no Homebrew/
     /// gtk4/pkg-config there by policy).
     MacOs,
     /// Native Direct2D/Win32 via `vimcode_core::win::run` — the `win`
-    /// feature on a Windows host (#866). Same precedence posture as
+    /// feature on a Windows host. Same precedence posture as
     /// `MacOs`: wins over `Gtk` when both are compiled in, untested and
     /// unsupported as a combination for the same Pango-vs-native-backend
     /// reason. Unlike `MacOs`, `win` alone compiles on every host (quadraui
@@ -127,11 +119,8 @@ struct Args {
     tui: bool,
     /// `--debug <logfile>`: write a debug log to this path.
     debug_log: Option<String>,
-    /// `--ext-install <name>`: headless prerequisite check (and, when every
-    /// prerequisite is present, install) for one extension — #1719's "an
-    /// external driver (vimcode-ext#17's CI matrix) can exercise vimcode's
-    /// real prerequisite-selection logic without reimplementing it" entry
-    /// point. Never touches a GUI/TUI backend.
+    /// `--ext-install <name>`: headless prerequisite check and install
+    /// for one extension, without touching a GUI/TUI backend.
     ext_install: Option<String>,
     /// `--json`: with `--ext-install`, print the result as one JSON object
     /// instead of plain text.
@@ -151,7 +140,7 @@ impl Args {
         let debug_flag = argv.iter().position(|a| a == "--debug");
         let debug_log = debug_flag.and_then(|i| argv.get(i + 1)).cloned();
 
-        // --ext-install <name>: headless prerequisite check / install (#1719)
+        // --ext-install <name>: headless prerequisite check / install
         let ext_install_flag = argv.iter().position(|a| a == "--ext-install");
         let ext_install = ext_install_flag.and_then(|i| argv.get(i + 1)).cloned();
         let json = argv.iter().any(|a| a == "--json");
@@ -214,10 +203,7 @@ for one extension, no GUI/TUI\n\
 }
 
 /// The version banner, including which quadraui this binary is made of
-/// (#638 — the dependency is a pinned git rev, so nothing else in the build
-/// records which one was used) and which GUI backend is compiled in (#859/
-/// #866 — with four possible backends and a silent-omission history, "which
-/// one is this?" needs to be answerable from the binary).
+/// and which GUI backend is compiled in.
 fn version_banner(backend: GuiBackend) -> String {
     let backend = match backend {
         GuiBackend::Gtk => "gtk",
@@ -239,11 +225,8 @@ fn version_banner(backend: GuiBackend) -> String {
 /// body so that each build only ever *names* the modules it actually has:
 /// `vimcode_core::gtk` does not exist without `gui`, `vimcode_core::macos`
 /// does not exist without `macos` on a Mac, and while `vimcode_core::win`
-/// exists on every host under `win` (#866 — quadraui does not target-gate
-/// its own `win` module, see `Cargo.toml`'s `win` feature comment), this
-/// function only ever *calls* `vimcode_core::win::run` on `target_os =
-/// "windows"` — calling it elsewhere would reach
-/// `quadraui::win::run::run_with`'s non-Windows `todo!()` stub.
+/// exists on every host under `win`, this function only ever *calls*
+/// `vimcode_core::win::run` on `target_os = "windows"`.
 #[cfg(all(
     feature = "gui",
     not(all(feature = "macos", target_os = "macos")),
@@ -285,27 +268,19 @@ fn launch_gui(args: Args) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Headless `--ext-install <name>` entry point (#1719).
+/// Headless `--ext-install <name>` entry point.
 ///
-/// Runs the same prerequisite check `Engine::ext_install_from_registry_
+/// Runs the same prerequisite check as `Engine::ext_install_from_registry_
 /// with_runtime_check` runs before dispatching an install, with no GUI/TUI
-/// backend involved — the point is that an external driver (vimcode-ext#17's
-/// cross-platform CI matrix) can exercise vimcode's *real* detect/instruct
-/// logic end to end instead of re-implementing it and drifting, which is
-/// exactly what happened three times over in the bugbash this issue
-/// describes. Prints a JSON (`--json`) or plain-text verdict and exits
+/// backend involved. Prints a JSON (`--json`) or plain-text verdict and exits
 /// non-zero the moment a prerequisite is missing, **without** dispatching
-/// the doomed install — contract item 1 ("detect before install").
+/// the doomed install.
 ///
-/// Scope, documented rather than silently partial: once every declared
-/// prerequisite is present, this runs the resolved install command
-/// synchronously (there is no terminal pane to hand it to in headless mode)
-/// and reports its exit status. It does not yet speak LSP/DAP `initialize`
-/// against the freshly installed server/adapter to confirm "working" per
-/// the issue's contract item 3 — that verification is left to vimcode-ext#17's
-/// own matrix, which has the per-language client fixtures to drive it; this
-/// entry point's job is just to stop re-implementation of the *selection and
-/// detection* half.
+/// Once every declared prerequisite is present, this runs the resolved install
+/// command synchronously and reports its exit status. It does not verify the
+/// installation by speaking LSP/DAP `initialize` against the freshly installed
+/// server/adapter; that verification is left to external tests with the
+/// per-language client fixtures to drive it.
 fn run_ext_install(name: &str, json: bool) -> ExitCode {
     let engine = vimcode_core::core::engine::Engine::new();
     let Some(manifest) = engine
@@ -324,13 +299,9 @@ fn run_ext_install(name: &str, json: bool) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    // #1807: the headless `--ext-install` entry point must refuse an
-    // incompatible extension the same way the interactive marketplace
-    // does (`Engine::ext_install_from_registry_with_runtime_check`) —
-    // without this check the two paths diverge: the interactive path
-    // refuses, but this CI-facing one (#1719's vimcode-ext driver) would
-    // sail straight through and install scripts that error at load time
-    // on a missing `vimcode.*` API.
+    // The headless `--ext-install` entry point must refuse an incompatible
+    // extension the same way the interactive path does, so the two paths
+    // do not diverge.
     if let Some(reason) = manifest.incompatibility_reason_for_running_vimcode() {
         if json {
             println!(
@@ -349,11 +320,10 @@ fn run_ext_install(name: &str, json: bool) -> ExitCode {
 
     let present = |dep: &str| vimcode_core::core::lsp_manager::resolve_command(dep).is_some();
 
-    // Same gating `Engine::ext_install_from_registry_with_runtime_check`
-    // applies before checking `lsp.dependencies`/`dap.dependencies`: native
-    // `[lsp.acquire]`/`[dap.acquire]` tables have their own runtime check
-    // (#1346, `resolve_acquire_action`) and are not this function's concern,
-    // and there is nothing to check if no install command exists at all.
+    // The same gating applies before checking `lsp.dependencies`/
+    // `dap.dependencies`: native `[lsp.acquire]`/`[dap.acquire]` tables have
+    // their own runtime check and are not this function's concern, and there
+    // is nothing to check if no install command exists at all.
     let mut missing: Vec<String> = Vec::new();
     if !manifest.lsp.binary.is_empty()
         && manifest.lsp.acquire.is_none()
@@ -459,10 +429,8 @@ fn run_ext_install(name: &str, json: bool) -> ExitCode {
 }
 
 /// Run a shell command synchronously and return its exit code (or `1` if it
-/// could not be spawned / had no exit code). The shell choice mirrors the
-/// install pane's: `sh` on Unix, Windows PowerShell on Windows (#1715 — no
-/// `cmd.exe`, so every `PREREQ_INSTALLS`/manifest install string already has
-/// to be valid in one of these two).
+/// could not be spawned or had no exit code). The shell choice mirrors the
+/// install pane's: `sh` on Unix, Windows PowerShell on Windows.
 #[cfg(not(target_os = "windows"))]
 fn run_shell_command(cmd: &str) -> i32 {
     std::process::Command::new("sh")
@@ -551,7 +519,7 @@ mod arg_parsing_tests {
         assert!(Args::parse(&argv(&["-h"])).help);
     }
 
-    /// #979: `--help` must not be mistaken for a positional file argument —
+    /// `--help` must not be mistaken for a positional file argument —
     /// it starts with `-`, so the existing positional-arg scan already skips
     /// it, but pin it explicitly since this is the exact flag the bug was
     /// filed about.
@@ -569,7 +537,7 @@ mod arg_parsing_tests {
         assert_eq!(a.file_path, None);
     }
 
-    /// #1719: `--ext-install <name>` takes its value, same as `--debug`
+    /// `--ext-install <name>` takes its value, same as `--debug`
     /// does, and `--json` is recognised as a separate bare flag.
     #[test]
     fn ext_install_flag_and_value_parse_and_json_is_recognised() {
@@ -593,7 +561,7 @@ mod arg_parsing_tests {
 mod gui_backend_tests {
     use super::*;
 
-    /// #859/#645: the `vimcode` bin target must compile — and therefore run
+    /// The `vimcode` bin target must compile — and therefore run
     /// its tests — in *every* feature set, including the GUI-less ones. This
     /// test existing at all is most of the point: with the old
     /// `required-features = ["gui"]`, `cargo test --no-default-features` and

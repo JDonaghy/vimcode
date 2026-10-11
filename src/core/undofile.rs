@@ -1,4 +1,4 @@
-//! `undofile` / `undodir` persistence (#1156): saves a buffer's full undo
+//! `undofile` / `undodir` persistence: saves a buffer's full undo
 //! tree next to its saves, so `u`/`g-`/`:earlier` still work after quitting
 //! and reopening the file. Mirrors `src/core/swap.rs`'s directory-and-hash
 //! convention for where a per-file sidecar lives.

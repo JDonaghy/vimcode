@@ -390,17 +390,11 @@ fn test_behavior_terminal_split_toggle() {
     assert!(!e.terminal_split, "second toggle should disable split");
 }
 
-/// #758 / #471 (resize half): a window resize must not reflow a *split*
-/// terminal's panes to the full panel width.
+/// A window resize must not reflow a *split* terminal's panes to the full panel width.
 ///
-/// `Engine::terminal_resize` — what `UiEvent::WindowResized` used to call
-/// directly — resizes every pane to the panel width, so both halves of a
-/// split silently became as wide as the whole panel while still being
-/// painted into their narrow rects; anything typed past the painted
-/// boundary wrapped out of view. `route_terminal_resize` splits the width
-/// instead. Asserts on the PTY's own reported `cols()`, which is what the
-/// painter reads back (`build_terminal_panel` -> `TerminalPanel::
-/// content_cols`).
+/// `route_terminal_resize` splits the width between panes instead of resizing each to the
+/// full panel width. This test asserts on the PTY's own reported `cols()`, which is what
+/// the painter reads back (`build_terminal_panel` -> `TerminalPanel::content_cols`).
 #[test]
 fn route_terminal_resize_keeps_a_split_split() {
     let mut e = test_engine("hello\n");

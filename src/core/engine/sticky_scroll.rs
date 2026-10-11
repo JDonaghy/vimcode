@@ -1,31 +1,16 @@
-//! Sticky scroll (#1546): pin the header lines of the buffer's enclosing
+//! Sticky scroll: pin the header lines of the buffer's enclosing
 //! scopes (e.g. `impl Foo {`, `fn bar() {`) at the top of the editor pane
-//! while scrolling, VS Code's `editor.stickyScroll.enabled`.
+//! while scrolling, like VS Code's `editor.stickyScroll.enabled`.
 //!
 //! # Scope source
 //!
-//! The issue asks for LSP `documentSymbol` ranges as the primary source,
-//! falling back to tree-sitter/indent folding ranges. This module ships
-//! **only the fallback half**: `SymbolInfo` (`crate::core::lsp`) currently
-//! only carries a symbol's `selectionRange` start position (`line`/
-//! `character` — used for "jump to symbol" in the command-center picker),
-//! not the full `range` a `DocumentSymbol` also reports, so there is no
-//! `end_line` to test "does this symbol's body enclose the top-of-viewport
-//! line" with. Adding that would mean threading a new field through
-//! `SymbolInfo` and its ~28 construction sites across `lsp.rs`/`picker.rs`/
-//! `tests.rs` — out of scope for this change's file list
-//! (`src/core/settings.rs`, `src/render.rs`, `src/core/engine/`). Filed as a
-//! follow-up rather than silently shipped as "the real thing": see the PR
-//! description for #1546.
-//!
-//! What ships here is a real, useful, independent implementation: the
-//! buffer's indent hierarchy, computed the same way
-//! `Engine::compute_indent_folds` does for `'foldmethod'=indent` but
-//! **independent of `'foldmethod'`** (sticky scroll must work regardless of
-//! the user's fold settings, exactly as VS Code's does) — using the same
-//! "the less-indented line immediately before a block is that block's
-//! header" heuristic `Engine::detect_fold_range`'s doc comment already
-//! documents and uses elsewhere in this crate.
+//! This module uses the buffer's indent hierarchy to compute sticky scroll
+//! ranges, computed the same way `Engine::compute_indent_folds` does for
+//! `'foldmethod'=indent` but **independent of `'foldmethod'`** (sticky scroll
+//! must work regardless of the user's fold settings, exactly as VS Code's
+//! does) — using the "the less-indented line immediately before a block is
+//! that block's header" heuristic `Engine::detect_fold_range`'s doc comment
+//! already documents and uses elsewhere in this crate.
 
 use crate::core::buffer::Buffer;
 

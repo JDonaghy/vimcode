@@ -1,6 +1,6 @@
 use super::*;
 
-// ─── Closing rungs (#762 / #734 slice 7) ────────────────────────────────────
+// ─── Closing rungs ────────────────────────────────────────────────────────
 //
 // Slices 1–6 lifted the ladder's big tiers into this module. What was left
 // behind in the two surviving entry points — the pre-#1434 TUI shell's
@@ -13,10 +13,10 @@ use super::*;
 //    the chord fell through to whatever tier was next — `Engine::handle_key`
 //    with the editor focused, or the focused sidebar panel's own key table
 //    otherwise — instead of being consumed as a repaint request.
-// 2. The modal folder picker (`quadraui::FolderPickerController`, #815) — key
-//    handling lives entirely in the controller now (`FolderPickerController::
-//    handle`), so there is no `render.rs` rung to state for it; both backends
-//    just feed it the raw `UiEvent` while the picker is open.
+// 2. The modal folder picker (`quadraui::FolderPickerController`) — key
+//    handling lives entirely in the controller now, so there is no `render.rs`
+//    rung to state for it; both backends just feed it the raw `UiEvent` while
+//    the picker is open.
 // 3. [`route_debug_fkey`] — F5/F9/F10/F11 and their Shift twins. Each backend
 //    had **half** of this rung: TUI had Shift+F5/Shift+F11 but no unshifted
 //    global F-key tier (a focused non-editor panel swallowed them), GTK had
@@ -28,7 +28,7 @@ use super::*;
 //    and moved the cursor / yanked the buffer instead of the popup.
 // 5. [`route_cmdline_selection_key`] — Ctrl+C copies the command-line /
 //    message-line mouse selection, any other key clears it. Shared by both
-//    backends (#816): TUI has populated `Engine::cmd_sel` since #602, and GTK
+//    backends: TUI has populated `Engine::cmd_sel` since #602, and GTK
 //    now arms the same field from its own press/drag handlers via
 //    `quadraui::CommandLineLayout::hit_test`.
 // 6. [`post_key_epilogue`] — the after-every-editor-keypress bookkeeping.
@@ -39,7 +39,7 @@ use super::*;
 
 /// The engine call each [`FocusKeyRoute`] arm makes once the resolver has
 /// named the focus owner — the *dispatch* half of slice 2's rung, which only
-/// shared the *routing* half (#762 / #734 slice 7).
+/// shared the *routing* half.
 ///
 /// Call with the backend's key name already normalised to the engine's own
 /// spelling (`Return`/`Escape`/`BackSpace`/`Up`/… and the bare character for
@@ -50,7 +50,7 @@ use super::*;
 /// - [`FocusKeyRoute::Debug`] needs a live `Backend` and the un-round-tripped
 ///   `UiEvent` to drive `dap_sidebar_system`,
 /// - [`FocusKeyRoute::Ai`] needs the same — a live `Backend` and the
-///   un-round-tripped `UiEvent` — to drive `ai_chat` (`ChatController`, #819);
+///   un-round-tripped `UiEvent` — to drive `ai_chat` (`ChatController`);
 ///   see [`route_ai_chat_event`],
 /// - [`FocusKeyRoute::Explorer`] is a backend widget on GTK and a `TuiSidebar`
 ///   on TUI,
@@ -60,9 +60,7 @@ use super::*;
 /// `sc_unicode` exists because the source-control panel's key table reads
 /// printables that its siblings read as named keys (`?`, `/`), so a backend
 /// whose translation layer distinguishes the two has a second spelling to
-/// hand over. #1422 deleted GTK's own such layer (`map_gtk_key_with_unicode`
-/// vs `map_gtk_key_name`) once its spelling turned out identical to
-/// `unicode`'s — both backends now pass `unicode` twice.
+/// hand over. Both backends now pass `unicode` twice.
 pub fn dispatch_sidebar_panel_key(
     engine: &mut Engine,
     route: FocusKeyRoute,
@@ -96,7 +94,7 @@ pub fn dispatch_sidebar_panel_key(
             // it and delivers `UiEvent::ClipboardPaste` straight to
             // `ShellApp::handle`, which routes through `Engine::route_paste`
             // (covering the search/replace fields) before any key event is
-            // dispatched (#593).
+            // dispatched.
             engine.dispatch_search_sidebar_key_unified(key_name, ctrl, alt, unicode);
             engine.search_has_focus
         }
@@ -116,9 +114,9 @@ pub fn dispatch_sidebar_panel_key(
 /// the legacy TUI loop had and GTK never did — GTK carried no Ctrl+L tier at
 /// all, so the chord was dispatched like any other Ctrl-modified `l`.
 ///
-/// #1243: TUI now honours the *full* semantics via
-/// `quadraui::Backend::request_full_repaint` (quadraui#1037) —
-/// the pre-#1434 TUI shell's `handle_key_pressed` calls it on this chord before returning
+/// TUI now honours the *full* semantics via
+/// `quadraui::Backend::request_full_repaint` — the pre-#1434 TUI shell's
+/// `handle_key_pressed` calls it on this chord before returning
 /// `Reaction::Redraw`, and `tui::run::run_inner`'s frame loop clears
 /// `ratatui::Terminal`'s previous-frame buffer the next time it paints. GTK's
 /// `DrawingArea` repaints in full every frame via Cairo (no incremental diff
@@ -126,27 +124,24 @@ pub fn dispatch_sidebar_panel_key(
 /// and `App::handle_key_press` requests only an ordinary redraw — see
 /// `Backend::request_full_repaint`'s own doc for why that default is
 /// correct rather than a gap. The same hook also covers the
-/// popup-disappearance clear this comment used to point at —
-/// the pre-#1434 TUI shell's `render_content`'s `had_popup_overlay` transition check.
+/// popup-disappearance clear: the pre-#1434 TUI shell's `render_content`'s
+/// `had_popup_overlay` transition check.
 ///
-/// **#1393 (quadraui#1060 consume side): the Ctrl+L call site now has a
-/// driver test that proves the repaint itself**, not just the decision
-/// logic — `tui_main::shell_app`'s
+/// A driver test proves the repaint itself, not just the decision logic —
+/// `tui_main::shell_app`'s
 /// `ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`,
 /// RED-verified by disabling this rung's `backend.request_full_repaint()`
-/// call. A `TestBackend`-based driver (`quadraui::tui::testing::TuiDriver`)
-/// genuinely cannot observe this — see [`popup_overlay_closed_this_frame`]'s
-/// doc for the full proof — so that test uses the vt100-backed
-/// `quadraui::tui::vt_testing::TuiVtDriver` instead (quadraui#1060,
-/// `driver_with_shell` + `inject_raw`, landed at this repo's pinned rev).
-/// The decision logic here is additionally unit-tested in
+/// call. A `TestBackend`-based driver genuinely cannot observe this — see
+/// [`popup_overlay_closed_this_frame`]'s doc for the full proof — so that
+/// test uses the vt100-backed `quadraui::tui::vt_testing::TuiVtDriver`
+/// instead. The decision logic here is additionally unit-tested in
 /// `slice7_router_tests` below; the wiring at the call site is a one-line
 /// delegation.
 ///
 /// `insert_ctrl_x_pending` is `engine.insert_ctrl_x_pending` (only ever true
 /// in the one-keystroke window right after `<C-x>` in Insert mode): right
 /// after `<C-x>`, `<C-x><C-l>` is the whole-line completion sub-mode
-/// (`:h i_CTRL-X_CTRL-L`, #1160), not a repaint request. This rung runs
+/// (`:h i_CTRL-X_CTRL-L`), not a repaint request. This rung runs
 /// *before* `Engine::handle_key` is ever called on either backend
 /// (`app.rs`/`shell_app.rs`), so without this carve-out the keystroke never
 /// reaches the engine at all for `<C-x><C-l>` to see it — the same shape of
@@ -166,60 +161,29 @@ pub fn is_force_redraw_key(
 
 /// Did an editor-anchored popup (the completions/hover-doc picker or the
 /// modal folder picker) that was visible last frame close this frame?
-/// (#1243, TUI-only — the pre-#1434 TUI shell's `render_content`'s `had_popup_overlay`.)
 ///
-/// The transition that must call `quadraui::Backend::request_full_repaint`
-/// (quadraui#1037): a popup staying open, staying closed, or newly opening
-/// all paint their own content this frame regardless of ratatui's diff
-/// cache, so only the *closing* transition can leave stale glyphs — ones
-/// the popup itself painted last frame, in cells nothing repaints this
-/// frame — for that cache to wrongly believe are still correct and skip.
-/// Pulled out as its own pure function (mirroring [`is_force_redraw_key`]
-/// just above) because it is the one piece of this wiring that *is*
-/// directly unit-testable from here.
+/// The transition that must call `quadraui::Backend::request_full_repaint`:
+/// a popup staying open, staying closed, or newly opening all paint their own
+/// content this frame regardless of ratatui's diff cache, so only the
+/// *closing* transition can leave stale glyphs — ones the popup itself painted
+/// last frame, in cells nothing repaints this frame — for that cache to
+/// wrongly believe are still correct and skip. Pulled out as its own pure
+/// function (mirroring [`is_force_redraw_key`] just above) because it is the
+/// one piece of this wiring that *is* directly unit-testable from here.
 ///
-/// **Why `tui_main::shell_app`'s `TestBackend`-driven
-/// `picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app` cannot
-/// assert on the *repaint* itself, only on this edge-detection predicate —
-/// verified directly against quadraui checkout rev `215e9e4`
-/// (`Cargo.toml`'s pin), not assumed:**
-/// `quadraui::tui::testing::TuiDriver` (`TestBackend`-backed) already
-/// consumes `request_full_repaint` in its own `render()` (it calls
-/// `Terminal::clear()` when the flag is set, exactly like the live
-/// runner) — that part isn't the blocker. The blocker is that
-/// `ratatui`'s `Terminal::clear()` is *provably output-identical* under a
-/// `TestBackend`: it blanks the backend buffer and resets the back
-/// buffer, so the following `draw` diffs a fully-desired frame against a
-/// blank previous frame and writes every non-blank cell — landing on
-/// byte-for-byte the same buffer the incremental path lands on, because
-/// `Terminal::draw`'s own contract already requires the render callback
-/// to repaint the whole frame. There is therefore no stale cell for a
-/// `TestBackend`-based driver to observe, and no `screen()` /
-/// `style_at()` / `terminal_cursor_position()` assertion that can
-/// distinguish the two paths. Only content written *outside* ratatui's
-/// `Buffer`/diff tracking (e.g. an embedded PTY writing raw bytes
-/// straight into the terminal) can produce the "diff believes this cell
-/// is unchanged" condition the hook exists to fix, and only
-/// [`TuiVtDriver`] (vt100-backed, real ANSI byte stream) can model that —
-/// see its own `render_actually_clears_stale_content_outside_the_diff_cache`
+/// A test cannot fully assert on the *repaint* itself with `TestBackend`,
+/// only on this edge-detection predicate — `ratatui`'s `Terminal::clear()` is
+/// provably output-identical under a `TestBackend`: it blanks the backend
+/// buffer and resets the back buffer, so the following `draw` diffs a
+/// fully-desired frame against a blank previous frame and writes every
+/// non-blank cell — landing on byte-for-byte the same buffer the incremental
+/// path lands on. There is therefore no stale cell for a `TestBackend`-based
+/// driver to observe. Only content written *outside* ratatui's `Buffer`/diff
+/// tracking (e.g. an embedded PTY writing raw bytes straight into the
+/// terminal) can produce the "diff believes this cell is unchanged" condition
+/// the hook exists to fix, and only the vt100-backed test driver can model
+/// that — see its own `render_actually_clears_stale_content_outside_the_diff_cache`
 /// test, which proves the *mechanism* works upstream.
-///
-/// **#1393 (quadraui#1060 consume side) closed the two seams that used to
-/// block reusing `TuiVtDriver` from a vimcode `ShellApp` impl**:
-/// `quadraui::tui::vt_testing::driver_with_shell` (mirroring
-/// `quadraui::tui::testing::driver_with_shell`) now wraps a `ShellApp` in
-/// the same `ShellAdapter` stack the live runner uses, and the public
-/// `TuiVtDriver::inject_raw` hook exposes the out-of-band byte injection
-/// that test's technique relies on — both landed at this repo's pinned
-/// rev. `tui_main::shell_app`'s
-/// `ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`
-/// and
-/// `popup_dismiss_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`
-/// use them to assert on the actual repaint this function's transition
-/// exists to trigger, RED-verified against unfixed `develop`-shaped wiring
-/// by disabling each call site in turn.
-///
-/// [`TuiVtDriver`]: https://github.com/JDonaghy/quadraui/blob/215e9e4/quadraui/src/tui/vt_testing.rs
 pub fn popup_overlay_closed_this_frame(was_open: bool, is_open_now: bool) -> bool {
     was_open && !is_open_now
 }
@@ -315,10 +279,9 @@ pub fn set_folder_picker_selected(picker: &mut quadraui::FolderPickerController,
     }
 }
 
-/// Where a mouse press against the open change-review surface (#955,
-/// shared with #525) lands, resolved against the *exact* geometry
-/// [`paint_change_review_rung`] last painted
-/// (`diff_rect`/`line_height` — both backends read these from
+/// Where a mouse press against the open change-review surface lands,
+/// resolved against the *exact* geometry [`paint_change_review_rung`] last
+/// painted (`diff_rect`/`line_height` — both backends read these from
 /// `Engine::change_review_diff_rect`/`Backend::line_height`, same
 /// "paint writes it, click routing reads it" contract as
 /// `command_line_rect`).
@@ -447,8 +410,8 @@ pub enum CmdSelKeyRoute {
 /// every other mode the selection indexes `Engine::message` with no offset.
 /// That one-column skew is the whole reason this is worth stating once.
 ///
-/// Both backends populate `sel` from `Engine::cmd_sel` (#816): TUI's
-/// the pre-#1434 TUI shell's `handle_mouse_event` (#602) and GTK's press/drag handlers
+/// Both backends populate `sel` from `Engine::cmd_sel`: TUI's
+/// `handle_mouse_event` and GTK's press/drag handlers
 /// (`handle_mouse_click_msg` / `handle_mouse_drag_msg`, driven through
 /// `quadraui::CommandLineLayout::hit_test`) both arm the same engine-level
 /// field, and `CommandLineState::command_line_selecting` mirrors
@@ -499,7 +462,7 @@ pub struct PostKeyEpilogue {
     /// Ctrl-W h/l overflowed left with a sidebar panel visible — give the
     /// sidebar band the keyboard. Also set when a panel reveal from inside
     /// `Engine::handle_key` asked for the keyboard via
-    /// `Engine::sidebar_focus_requested` (#1450).
+    /// `Engine::sidebar_focus_requested`.
     pub focus_sidebar: bool,
     /// Ctrl-W h/l overflowed left with **no** sidebar panel visible — put the
     /// cursor on the activity bar toolbar instead. GTK never did this: its
@@ -510,7 +473,7 @@ pub struct PostKeyEpilogue {
     pub arm_yank_highlight: bool,
 }
 
-/// The shared after-every-editor-keypress epilogue (#762 / #734 slice 7).
+/// The shared after-every-editor-keypress epilogue.
 ///
 /// Seven behaviours ran after each key that reached `Engine::handle_key`.
 /// TUI ran all seven inline; GTK ran three (nav overflow, clipboard sync,
@@ -547,7 +510,7 @@ pub fn post_key_epilogue(
 ) -> PostKeyEpilogue {
     let mut out = PostKeyEpilogue::default();
 
-    // #1450: a programmatic panel reveal from inside `Engine::handle_key`
+    // A programmatic panel reveal from inside `Engine::handle_key`
     // (Visual `<leader>ai`, `:{range}AI` with no message) asked for the
     // keyboard. One-shot — taken here so the *next* keypress routes normally
     // again. Shared, so TUI's cached `sidebar.has_focus` and GTK's
@@ -584,7 +547,7 @@ pub fn post_key_epilogue(
     // Keep the selected entry inside the six-row window — the active
     // window's location list shares this same scroll state when it (rather
     // than the global quickfix list) is the one occupying the bottom "list
-    // rung" (#1155).
+    // rung".
     if let Some(scroll_top) = quickfix_scroll_top {
         let selected = if engine.quickfix.open {
             Some(engine.quickfix.selected)
@@ -620,22 +583,15 @@ pub fn post_key_epilogue(
 /// clipboard. `last` is the caller's cache of what was last pushed, so an
 /// unchanged register is a no-op rather than a clipboard write on every call.
 ///
-/// #1239: GTK (`App::sync_plus_register_to_clipboard`) and TUI
-/// (`sync_tui_clipboard`) used to be two near-identical copies of this that
-/// had drifted — TUI mirrored `"` only, so on TUI a subsequent plain
-/// yank/delete (which only ever touches `"`, never `+`) could clobber the
-/// clipboard mirror of an earlier explicit `+` write instead of leaving it
-/// alone (see the `..._1239` tests in `gtk/testing.rs` and
-/// `tui_main/shell_app.rs` for the exact repro — the latter deleted by
-/// #1434). Both called this one function; GTK's own name survives as a
-/// thin wrapper (`App::sync_plus_register_to_clipboard`) so its existing
-/// call sites don't need to change — TUI's `sync_tui_clipboard` wrapper
-/// was deleted along with the rest of the pre-#1434 TUI shell, its callers
-/// now going through `App`. (The issue that raised
-/// this bug illustrated the explicit-write case as `:let @+='...'` — that
-/// ex command isn't actually implemented in vimcode, `VIM_COMPATIBILITY.md`
-/// marks `:let` N/A; every real write path to `+`, from `"+yy` to the Lua
-/// plugin API, goes through `Engine::set_register_typed`, which this
+/// GTK and TUI used to be two near-identical copies of this that had drifted
+/// — TUI mirrored `"` only, so on TUI a subsequent plain yank/delete (which
+/// only ever touches `"`, never `+`) could clobber the clipboard mirror of
+/// an earlier explicit `+` write instead of leaving it alone. Both backends
+/// call this one function; GTK's own name survives as a thin wrapper
+/// (`App::sync_plus_register_to_clipboard`) so its existing call sites don't
+/// need to change. (The issue that raised this bug illustrated the explicit-write
+/// case as `:let @+='...'`; every real write path to `+`, from `"+yy` to the
+/// Lua plugin API, goes through `Engine::set_register_typed`, which this
 /// function's `+`-first priority now matches on both backends.)
 ///
 /// Cadence: called after every editor keypress that might have yanked/cut
@@ -668,9 +624,9 @@ pub fn sync_register_to_clipboard(engine: &mut Engine, last: &mut Option<String>
     }
 }
 
-// ─── Panel-accelerator dispatch rung (#761 / #734 slice 6) ──────────────────
+// ─── Panel-accelerator dispatch rung ──────────────────────────────────────
 //
-// Both backends register the same 15-entry (#1577 added `focus_notifications`) `panel_keys` accelerator set
+// Both backends register the same 15-entry `panel_keys` accelerator set
 // (`register_panel_accelerators` in `gtk/mod.rs` / `tui_main/mod.rs`) and,
 // until now, each restated its own ~100-line `match id { ... }` translating
 // a fired accelerator into the engine call it makes. `PanelAccelerator`
@@ -700,22 +656,17 @@ pub fn sync_register_to_clipboard(engine: &mut Engine, last: &mut Option<String>
 //   state — collapsing them into one body would be papering over a real
 //   platform difference, not deleting duplication.
 //
-// #1499: this used to take a `host: &mut impl PanelAcceleratorHost` argument
-// — each backend supplied a thumbnail struct (`GtkAccelHost` / `TuiAccelHost`,
-// defined next to their call sites) implementing the five hook methods, so
-// the dispatcher itself never needed to know which backend was calling it.
 // With the TUI backend gone, `App` is the only implementation left, so
 // [`dispatch_panel_accelerator`] takes `app: &App` directly and queues onto
 // its `DeferredQueue` inline instead of through a trait object.
 //
-// #823 item 1: the *registration* half (the 15-entry `(id, binding)` table
-// and the loop that (un)registers each one) was, until now, a byte-identical
-// 44-line function pasted into `app.rs` and `tui_main/mod.rs`. It has no
-// backend-specific step at all — every call goes through the trait object
-// `&mut dyn quadraui::Backend` — so unlike the five deferred-queue actions
-// above, it needed no per-backend seam to collapse:
-// [`register_panel_accelerators`] below is the whole function, called
-// verbatim from both `App::setup` and `tui_main`'s startup path.
+// The *registration* half (the 15-entry `(id, binding)` table and the loop
+// that (un)registers each one) is a byte-identical 44-line function pasted
+// into both backends. It has no backend-specific step at all — every call
+// goes through the trait object `&mut dyn quadraui::Backend` — so unlike the
+// five deferred-queue actions above, it needed no per-backend seam to collapse:
+// [`register_panel_accelerators`] below is the whole function, called verbatim
+// from both `App::setup` and `tui_main`'s startup path.
 
 /// Register the panel-keys accelerator set on the backend. Re-runs on each
 /// settings reload so live rebinding takes effect.
@@ -778,7 +729,7 @@ pub enum PanelAccelerator {
     SplitEditorDown,
     NavBack,
     NavForward,
-    /// Give the toast/notification stack keyboard focus (#1577). Same
+    /// Give the toast/notification stack keyboard focus. Same
     /// effect as `:Notifications` — see `Engine::focus_toast_stack`.
     FocusNotifications,
 }
@@ -884,11 +835,7 @@ pub(crate) fn dispatch_panel_accelerator(
 /// function, called by both backends with their own key spellings, resolving
 /// to one route. The behavioural tier is the pair of black-box tests that
 /// drive the same chord against the same engine state on each backend and
-/// assert the same rendered result —
-/// `gtk::testing::slice7_debug_fkey_tests::shift_f5_stops_instead_of_continuing_on_gtk`
-/// and `tui_main::shell_app`'s
-/// `shift_f5_stops_the_debug_session_via_shell_app` /
-/// `f5_reaches_the_debugger_from_a_focused_panel_via_shell_app`.
+/// assert the same rendered result.
 #[cfg(test)]
 mod slice7_router_tests {
     use super::*;
@@ -898,7 +845,7 @@ mod slice7_router_tests {
     /// backend that reorders one silently diverges while every unit table
     /// below still passes.
     ///
-    /// **Verified RED by reordering one rung on one backend:** move
+    /// Verified RED by reordering one rung on one backend: move
     /// `render::route_debug_fkey` above `render::route_terminal_key` in
     /// the pre-#1434 TUI shell's `handle_key_pressed` and
     /// `terminal_keeps_its_own_function_keys` below fails — a focused PTY
@@ -966,7 +913,7 @@ mod slice7_router_tests {
         assert!(!is_force_redraw_key("k", Some('k'), true, false));
     }
 
-    /// #1160: right after `<C-x>` in Insert mode, `<C-x><C-l>` is the
+    /// Right after `<C-x>` in Insert mode, `<C-x><C-l>` is the
     /// whole-line completion sub-mode (`:h i_CTRL-X_CTRL-L`), not a repaint
     /// request — `insert_ctrl_x_pending = true` must make the same Ctrl+L
     /// chord that `ctrl_l_is_a_force_redraw_from_either_backends_spelling`
@@ -978,7 +925,7 @@ mod slice7_router_tests {
         assert!(!is_force_redraw_key("l", None, true, true));
     }
 
-    /// #1243: only the popup-was-up-last-frame-and-is-gone-this-frame edge
+    /// Only the popup-was-up-last-frame-and-is-gone-this-frame edge
     /// must fire `Backend::request_full_repaint` — every other transition
     /// (staying open, staying closed, or newly opening) repaints its own
     /// content this frame regardless of the diff cache, so requesting a
@@ -1193,13 +1140,10 @@ mod slice7_router_tests {
         .is_some());
     }
 
-    // ── #901: menu defs → native MenuBar conversion ─────────────────────
+    // ── menu defs → native MenuBar conversion ────────────────────────────
 
     /// `build_menu_defs` must populate `key_equivalent` from any parseable
-    /// shortcut, alongside the pre-existing `detail` display text — RED
-    /// against the pre-#901 body (which only ever set `detail`, so this
-    /// field was `None` for every item, and the native macOS menu installer
-    /// had no accelerator to wire).
+    /// shortcut, alongside the pre-existing `detail` display text.
     #[test]
     fn build_menu_defs_populates_key_equivalent_from_shortcut() {
         let defs = build_menu_defs(false);
@@ -1273,7 +1217,7 @@ mod slice7_router_tests {
         );
     }
 
-    // ── #1580: menu_style → quadraui::MenuStyle, native-vs-in-window ─────
+    // ── menu_style → quadraui::MenuStyle, native-vs-in-window ──────────
 
     fn caps_with_native_menu(native_menu: bool) -> quadraui::BackendCaps {
         quadraui::BackendCaps {
@@ -1306,11 +1250,10 @@ mod slice7_router_tests {
 
     /// `Auto` and `Native` both defer to the backend's own capability via
     /// `quadraui::MenuStyle::resolve` — they never force a native popup
-    /// onto a backend that can't paint one (GTK, TUI), matching #901's
-    /// identical gate for the menu bar. This is quadraui's own contract
-    /// (covered by its own unit tests), pinned here so a future
-    /// `to_quadraui_menu_style` regression that mis-maps a variant would
-    /// still be caught end-to-end.
+    /// onto a backend that can't paint one (GTK, TUI), matching the identical
+    /// gate for the menu bar. This is quadraui's own contract (covered by its
+    /// own unit tests), pinned here so a future `to_quadraui_menu_style`
+    /// regression that mis-maps a variant would still be caught end-to-end.
     #[test]
     fn menu_style_resolves_native_only_with_capability() {
         use crate::core::settings::MenuStyle;
@@ -1347,7 +1290,7 @@ mod slice7_router_tests {
         );
     }
 
-    /// `paint_context_menu_rung` always paints in-window now (#1580) — the
+    /// `paint_context_menu_rung` always paints in-window now — the
     /// native path moved to `show_context_menu_now`, called at
     /// event-handler time instead of from this render rung. This is the
     /// RED-able regression pin for that split: it proves the rung this
@@ -1378,11 +1321,11 @@ mod slice7_router_tests {
         );
     }
 
-    // ─── 'list' glyph substitution (#1190, 'listchars' #1206) ──────────────
+    // ─── 'list' glyph substitution ('listchars') ──────────────────────────
 
     /// A `Settings` with `listchars` overridden and `tabstop` at its default
     /// (8) — the shape every `apply_list_glyphs`/`compute_list_glyph_expansion`
-    /// test below needs, since #1206 made both option-driven.
+    /// test below needs, since both are now option-driven.
     fn list_glyphs_settings(listchars: &str) -> Settings {
         let mut settings = Settings::default();
         settings.listchars = listchars.to_string();
@@ -1437,11 +1380,11 @@ mod slice7_router_tests {
         assert_eq!(text, "hello", "mark_eol=false must not append $");
     }
 
-    /// RED against unfixed `develop` (#1206): before this change,
+    /// RED against unfixed `develop`: before this change,
     /// `apply_list_glyphs` unconditionally appended `$` regardless of
     /// `'listchars'` — this asserts the *opposite* (default `'listchars'`
     /// has no `eol` item, so nothing is appended), which fails against the
-    /// pre-#1206 hardcoded-`$` implementation.
+    /// pre-fix hardcoded-`$` implementation.
     #[test]
     fn apply_list_glyphs_default_listchars_has_no_eol_marker() {
         let settings = Settings::default();
@@ -1473,11 +1416,11 @@ mod slice7_router_tests {
         assert_eq!(text, "a^Ib");
     }
 
-    /// RED against unfixed `develop` (#1206): before this change, `'list'`
+    /// RED against unfixed `develop`: before this change, `'list'`
     /// always rendered a tab as literal `^I`. Neovim's real default
     /// `'listchars'` (`"tab:> ,trail:-,nbsp:+"`) instead fills to the next
     /// `'tabstop'` stop with `>` then spaces — this fails against the
-    /// pre-#1206 hardcoded-`^I` implementation.
+    /// pre-fix hardcoded-`^I` implementation.
     #[test]
     fn apply_list_glyphs_default_listchars_renders_tab_as_arrow_fill() {
         let settings = Settings::default();
@@ -1495,7 +1438,7 @@ mod slice7_router_tests {
         assert_eq!(text, "a>  b");
     }
 
-    /// RED against unfixed `develop` (#1206): 'trail' had no implementation
+    /// RED against unfixed `develop`: 'trail' had no implementation
     /// at all before this change (trailing spaces just rendered as spaces).
     #[test]
     fn apply_list_glyphs_trailing_spaces_use_trail_glyph() {
@@ -1526,7 +1469,7 @@ mod slice7_router_tests {
         assert_eq!(text, "a  b--");
     }
 
-    /// RED against unfixed `develop` (#1206): 'nbsp' had no implementation
+    /// RED against unfixed `develop`: 'nbsp' had no implementation
     /// at all before this change.
     #[test]
     fn apply_list_glyphs_nbsp_uses_nbsp_glyph() {
@@ -1617,8 +1560,8 @@ mod slice7_router_tests {
     fn apply_list_glyphs_remaps_diagnostic_and_spell_marks_past_a_tab() {
         // "\tfoo" — a diagnostic/spell mark on "foo" (char cols 1..4) must
         // land on "^Ifoo"'s "foo" (char cols 2..5) once the tab expands to
-        // the 2-char `^I` (#1208 bug 1: these are char-index based, unlike
-        // `spans`, so they need their own remap through the same table).
+        // the 2-char `^I` (these are char-index based, unlike `spans`, so they
+        // need their own remap through the same table).
         let settings = list_glyphs_settings("");
         let diags = vec![DiagnosticMark {
             start_col: 1,
@@ -1651,7 +1594,7 @@ mod slice7_router_tests {
         );
     }
 
-    // ── #146: plugin-declared view → `quadraui::Form` ───────────────────
+    // ── plugin-declared view → `quadraui::Form` ───────────────────────
 
     fn fixture_view() -> crate::core::plugin_ui::PluginView {
         use crate::core::plugin_ui::{PluginView, ViewField, ViewFieldKind, VIEW_SCHEMA_VERSION};
@@ -1711,9 +1654,9 @@ mod slice7_router_tests {
     #[test]
     fn plugin_view_form_never_hands_a_plugin_the_text_cursor() {
         // `cursor`/`selection_anchor` are byte offsets into the value; letting a
-        // plugin set them is how you get a caret mid-codepoint. #146's ABI
-        // decision keeps them out of the vocabulary entirely — assert the
-        // adapter does not invent one either.
+        // plugin set them is how you get a caret mid-codepoint. The ABI decision
+        // keeps them out of the vocabulary entirely — assert the adapter does not
+        // invent one either.
         let form = plugin_view_to_form("my-ext", &fixture_view(), 0, 0, false, None);
         match &form.fields[1].kind {
             quadraui::FieldKind::TextInput {

@@ -3,13 +3,9 @@ use super::*;
 
 impl App {
     pub(crate) fn handle_poll_tick(&mut self, backend: &mut dyn quadraui::Backend) {
-        // Schedule a redraw if the colorscheme changed (e.g. via
-        // `:colorscheme`). #1498: this used to also reload a GTK-only CSS
-        // provider theming the native file dialog here; that provider is
-        // gone (JDonaghy/quadraui#1091 moved the equivalent stylesheet into
-        // `GtkPlatformServices`, reloaded every frame by
-        // `sync_per_frame_backend_state`'s `Backend::set_theme` call), so
-        // this block's only remaining job is the redraw schedule.
+        // Schedule a redraw if the colorscheme changed (e.g. via `:colorscheme`).
+        // The only remaining job is the redraw schedule; theming is now handled
+        // per-frame by `sync_per_frame_backend_state`'s `Backend::set_theme` call.
         {
             let current = self.engine.borrow().settings.colorscheme.clone();
             if current != self.last_colorscheme {
@@ -18,34 +14,9 @@ impl App {
             }
         }
 
-        // #949: reload settings.json if it changed on disk. This used to be
-        // driven by a GTK-only `gio::FileMonitor` that sent a
-        // `DeferredAction::SettingsFileChanged` on a native file-change
-        // event; that watcher is gone, and `check_settings_reload`'s
-        // portable mtime poll (inside `settings_file_changed`) now runs
-        // unconditionally every tick instead — the same mechanism TUI's own
-        // `tick` has always used. quadraui's GTK/macOS idle-poll fallback
-        // ceiling is 250ms (`runner.rs`'s `ShellApp::tick` doc), so the
-        // reload lag here matches what TUI already ships, not a regression
-        // from the watcher's near-immediate `ChangesDoneHint`.
+        // Reload settings.json if it changed on disk via mtime poll,
+        // run unconditionally every tick (same mechanism as TUI's own `tick`).
         self.settings_file_changed();
-
-        // #731: a ~135-line block used to live here polling
-        // `self.mouse_pos_cell` at 20Hz for four distinct hover features —
-        // h-scrollbar hover, tab-close (×) hover + tab tooltip, debug
-        // toolbar button hover, and LSP hover-on-dwell popups
-        // (`Engine::editor_hover_mouse_move`). All four were gated on a
-        // `da_size` derived from `self.drawing_area`, permanently `None`
-        // under the ShellApp runner (nothing assigns it) — so none of the
-        // four have worked since the #540 cutover, and nothing else in
-        // this file writes `h_sb_hovered`/`tab_close_hover`/
-        // `debug_button_hovered`/calls `editor_hover_mouse_move`. This is
-        // the single biggest confirmed-dead surface this issue found (see
-        // the PR description) — restoring it needs a live, correctly
-        // absolute-coordinate DA size (the removed code used a `(0, 0)`
-        // origin the neighboring comment already flagged as the #582/#646
-        // coordinate-frame bug, so it was not simply "wire the same code
-        // back up"), which is follow-up work, not a dead-code deletion.
 
         // Explorer refresh after confirmed file move — GTK-only, no TUI
         // counterpart (see `Self::explorer_needs_refresh`'s own doc).
@@ -54,12 +25,11 @@ impl App {
             self.refresh_file_tree();
         }
 
-        // #1248: the rest of this function's chores — per-window viewport
-        // sync, tab-visibility re-check, window title, yank-highlight clear,
+        // The rest of this function's chores — per-window viewport sync,
+        // tab-visibility re-check, window title, yank-highlight clear,
         // idle/SC polling, deferred quit, terminal command, ext-panel focus,
-        // platform-action drain — are shared with the pre-#1434 TUI shell's
-        // `tick`. See `render::run_shared_tick_chores`'s header comment for
-        // the full list.
+        // platform-action drain — are shared with TUI's `tick`.
+        // See `render::run_shared_tick_chores`'s header comment for the full list.
         let engine_rc = self.engine.clone();
         let needs_redraw = {
             let mut engine = engine_rc.borrow_mut();
@@ -71,30 +41,16 @@ impl App {
     }
 
     /// Map a pixel x-offset within the editor hover popup's content
-    /// area to a character column on `content_line`, using Pango to
-    /// measure proportional UI-font widths (#218). The legacy code
-    /// did `(rel_x / cached_char_width)` which drifts as the column
-    /// index grows because UI_FONT is proportional. Heading rows
-    /// (font scale > 1.0) need the scale applied to the layout so
-    /// `xy_to_index` returns the right position.
+    /// area to a character column on `content_line`. The fallback uses
+    /// approximate `rel_x / char-width`-style calculation because
+    /// a live font-metrics source is unavailable.
     ///
-    /// #731: the Pango-measured path below was gated on
-    /// `self.drawing_area`, permanently `None` under the ShellApp runner
-    /// (nothing assigns it), so this has always taken the approximate
-    /// `rel_x / char-width`-style fallback in practice — see `terminal_cols`
-    /// for the same "no live font-metrics source without a widget handle"
-    /// root cause.
-    /// Run the shared editor-hover-popup rung (#755) against this frame's
+    /// Run the shared editor-hover-popup rung against this frame's
     /// painted geometry and apply whatever it decides.
     ///
     /// Returns `true` when the press belonged to the popup and must not fall
-    /// through to the editor. Called from `handle_mouse_click_msg` **above**
-    /// the scroll-surface dispatch — this backend used to run its bespoke
-    /// copy ~90 lines *below* it, which is why a click aimed at the popup's
-    /// own scrollbar was swallowed by the surface painted behind it
-    /// (#229/#486) — and from `handle_mouse_double_click_msg`, which never
-    /// consulted the popup at all, so a double-click on it fell through to
-    /// the editor's word-select (#490).
+    /// through to the editor. Called from `handle_mouse_click_msg` above
+    /// the scroll-surface dispatch and from `handle_mouse_double_click_msg`.
     pub(crate) fn route_and_apply_editor_hover_popup(
         &self,
         backend: &dyn quadraui::Backend,
@@ -113,7 +69,7 @@ impl App {
                 links: &links,
                 scrollbar: self.editor_hover_scrollbar.get(),
                 has_focus,
-                // #1429: `units.hover_popup_pad` — was hardcoded to GTK's
+                // `units.hover_popup_pad` — was hardcoded to GTK's
                 // 4px/4px inset even on the `tui` harness arm (`App` on
                 // `TuiBackend`), disagreeing with that arm's own painted
                 // 2-cell/1-cell popup frame.
@@ -129,7 +85,7 @@ impl App {
         );
         let effect = render::apply_editor_hover_popup_route(&mut self.engine.borrow_mut(), route);
         if let Some(url) = effect.open_url {
-            // #1134: `Engine::open_url` validates `is_safe_url` and queues a
+            // `Engine::open_url` validates `is_safe_url` and queues a
             // `PendingPlatformAction::OpenUrl` for `tick_dispatch` to carry
             // out through `PlatformServices` — this method has no `backend`
             // handle of its own (see `Engine::pending_platform_actions`'s doc).
@@ -139,9 +95,7 @@ impl App {
             let drag_rc = backend.drag_state_handle();
             drag_rc.borrow_mut().begin(target);
             // Seek immediately, with the same thumb-aware math the drag
-            // frames will use. This backend used to run a *second*,
-            // ratio-based calculation at press time, so the thumb jumped
-            // once on press and again on the first drag frame.
+            // frames will use.
             let drag = drag_rc.borrow().clone();
             for ev in quadraui::dispatch_mouse_drag(
                 &drag,
@@ -162,17 +116,8 @@ impl App {
         effect.consumed
     }
 
-    /// Run the shared panel-hover-popup click rung (#1067) against this
+    /// Run the shared panel-hover-popup click rung against this
     /// frame's painted link rects.
-    ///
-    /// Before #1067 this backend painted and cached `panel_hover_link_rects`
-    /// (`render::panel_hover_popup_paint`, called from `render_content`) but
-    /// never read them back on click — clicking a link in the source-control
-    /// / extension-panel item dwell tooltip was a complete no-op on GTK,
-    /// where TUI already copied the URL (or ran the `command:` link) via its
-    /// own inline hit test in `mouse::handle_mouse`. `panel_hover_popup_paint`'s
-    /// own doc traces this back to the #540 Relm4->ShellApp migration
-    /// retiring `Msg::PanelHoverClick` without a replacement.
     ///
     /// Returns `true` when the press landed on a link and must not fall
     /// through to whatever is painted underneath.
@@ -185,7 +130,7 @@ impl App {
         }
         let effect = render::apply_panel_hover_popup_route(&mut self.engine.borrow_mut(), route);
         if let Some(url) = effect.open_url {
-            // #1134: see `route_and_apply_editor_hover_popup`'s identical
+            // See `route_and_apply_editor_hover_popup`'s identical
             // comment above — `Engine::open_url` validates + queues.
             self.engine.borrow_mut().open_url(&url);
         }
@@ -195,19 +140,16 @@ impl App {
 
     /// Popup-content column under `rel_x` (pixels from the content origin).
     ///
-    /// Used by the hover-selection *drag* follow-through; the press itself
-    /// goes through `render::route_editor_hover_popup_click`, which divides by
-    /// the same `col_width`. Before #755 this returned `rel_x as usize` — a
-    /// column per *pixel* — so a drag-selection inside the popup ran off the
-    /// end of the line on the first few pixels of travel and never agreed
-    /// with the column the press had chosen.
+    /// Used by the hover-selection drag follow-through. Dividing by the same
+    /// `col_width` ensures drag-selection inside the popup agrees with the
+    /// column the press had chosen.
     pub(crate) fn pixel_to_editor_hover_col(&self, rel_x: f64, _content_line: usize) -> usize {
         (rel_x.max(0.0) / self.cached_char_width.max(1.0)) as usize
     }
 
     /// Push or pop the editor hover popup on the modal stack so
     /// click dispatch can decide modal-vs-base for both left- and
-    /// right-clicks (#216). The popup is registered whenever it's
+    /// right-clicks. The popup is registered whenever it's
     /// visible (focused or not) so right-clicks anywhere inside it
     /// stop falling through to the editor's context menu. Picker-
     /// style reconcile: `push` dedupes on id, so calling this every
@@ -233,24 +175,12 @@ impl App {
     /// Route a left-click against the currently open engine-drawn context
     /// menu — `engine.context_menu` is shared by the editor, tab-bar, and
     /// explorer sources, so this applies uniformly regardless of which one
-    /// opened it. Mirrors the modal-stack arbitration
-    /// (`quadraui::dispatch_mouse_down` for outside-click dismissal,
-    /// `ContextMenuLayout::hit_test` for inner row resolution) that used to
-    /// live inline in `handle_mouse_click_msg` (Phase B.5b Stage 4).
+    /// opened it.
     ///
     /// Returns `true` iff a menu was open and this call consumed the click
-    /// (dismissed it, fired an item, or kept it open on an inert row) — the
-    /// caller should treat that as "handled, stop routing". Returns `false`
-    /// when no menu was open, after defensively popping any stale
-    /// modal-stack entry left by an Esc/Enter close the click handler never
-    /// saw; the caller should then proceed with its own routing.
-    ///
-    /// Callable from both `handle_mouse_click_msg` (main-content clicks) and
-    /// `try_route_sidebar_mouse_event` (#546 FAILED-2: an explorer-sourced
-    /// menu typically renders inside the sidebar's own content bounds, so
-    /// without giving it priority there too, clicks on it fell straight
-    /// through to `TreeController`'s row hit-test underneath instead of
-    /// firing the menu action or dismissing it).
+    /// (dismissed it, fired an item, or kept it open on an inert row) —
+    /// the caller should treat that as "handled, stop routing". Returns `false`
+    /// when no menu was open; the caller should then proceed with its own routing.
     pub(crate) fn dispatch_context_menu_click(
         &mut self,
         backend: &dyn quadraui::Backend,
@@ -288,14 +218,13 @@ impl App {
     }
 
     /// Editor content bounds + tab-bar height **as last painted**, in the
-    /// absolute DA coordinate frame mouse events arrive in (#582).
+    /// absolute DA coordinate frame mouse events arrive in.
     ///
     /// Divider hit-testing must run against the geometry the renderer used, not
     /// a parallel re-derivation: `render_content` anchors `editor_bounds` at
     /// `AppShellLayout::main_content_bounds` (offset right by the activity
     /// bar/sidebar, down by the title-bar band), so any handler that rebuilt
-    /// bounds at `(0.0, 0.0)` hit-tested a phantom divider displaced by that
-    /// offset — the `:vsplit` failure in #582.
+    /// bounds at `(0.0, 0.0)` hit-tested a phantom divider displaced by that offset.
     ///
     /// `None` only before the first frame has been painted, when there is no
     /// divider on screen to hit anyway.
@@ -307,7 +236,7 @@ impl App {
     /// `render_content` hands `draw_tab_bar` / the terminal pane, i.e. the
     /// editor's left edge, right of the activity bar and sidebar.
     ///
-    /// [`render::BottomPanelMetrics::panel_left`] (#754). Falls back to `0.0`
+    /// [`render::BottomPanelMetrics::panel_left`]. Falls back to `0.0`
     /// before the first frame, when there is no panel on screen to click.
     pub(crate) fn painted_bottom_panel_left(&self) -> f64 {
         self.cached_editor_bounds
@@ -318,7 +247,7 @@ impl App {
 
     /// Resolve `(x, y)` against the currently-painted `screen.windows`,
     /// returning the name and rect of the editor-tab-hosted plugin view
-    /// under it, if any (#1627, #1631).
+    /// under it, if any.
     ///
     /// Shared by every mouse route that needs to know whether a pixel
     /// belongs to a `vimcode.ui.register_view` view opened as an editor-area
@@ -342,15 +271,12 @@ impl App {
     /// [`render::route_divider_grab`] needs from this backend.
     ///
     /// Derived from [`Self::painted_editor_bounds`] rather than a fresh
-    /// drawing-area measurement, for the #582 reason recorded there.
-    /// #753 named it because the click arm and the drag arm both needed it and
-    /// each used to re-derive its own half.
+    /// drawing-area measurement, for coordinate-frame accuracy.
     ///
     /// `on_tab_bar` exists so a click on a group's tab bar reaches the tab
     /// handlers instead of arming a group-divider drag; it is deliberately
-    /// GTK-only (see `render::DividerState::on_tab_bar`). It is also skipped
-    /// entirely in single-group mode, where `group_dividers` is empty and
-    /// nothing could match anyway.
+    /// GTK-only. It is also skipped entirely in single-group mode, where
+    /// `group_dividers` is empty and nothing could match anyway.
     pub(crate) fn painted_divider_geometry(
         &self,
         x: f64,
@@ -390,7 +316,7 @@ impl App {
     /// divider lines *within* each group.
     ///
     /// `window_editors` collects each window's owned `quadraui::Editor` for
-    /// the caller's `FrameHitMap` (#449), so the map hit-tests the SAME
+    /// the caller's `FrameHitMap`, so the map hit-tests the SAME
     /// objects that were painted rather than a second copy that could drift.
     ///
     /// TUI's twin is `render_impl::render_all_windows`, which also paints its
@@ -407,7 +333,7 @@ impl App {
             let editor = render::to_q_editor(rw);
             let rect = editor.rect;
 
-            // #1627: an editor-tab-hosted `vimcode.ui.register_view` view
+            // An editor-tab-hosted `vimcode.ui.register_view` view
             // paints a `Form`, not buffer text — the same shared
             // `quadraui::Form` primitive + adapter
             // (`render::plugin_view_to_form`) the sidebar body already paints
@@ -422,7 +348,7 @@ impl App {
             if let Some(view_name) = &rw.plugin_view {
                 let engine = self.engine.borrow();
                 engine.plugin_view_tab_form_rect.set(rect);
-                // #1631: same body-kind branch as the sidebar arm
+                // Same body-kind branch as the sidebar arm
                 // (`paint_sidebar_panel_rung`'s `ext:` case) — see that
                 // arm's comment for why `plugin_view_tab_form_rect` is
                 // reused as "the rect the active body last painted into"
@@ -518,7 +444,7 @@ impl App {
                 status,
                 quadraui::WidgetId::new(format!("status:{}", rw.window_id.0)),
             );
-            // #1690: with exactly one window (no `:split`/`:vsplit`), paint
+            // With exactly one window (no `:split`/`:vsplit`), paint
             // a plain backdrop fill edge-to-edge across the real window/
             // terminal width *before* the real (window-bounded) bar below —
             // VS Code's status bar runs under the activity bar and sidebar
@@ -548,20 +474,13 @@ impl App {
                     real_bg,
                 );
             }
-            // #672: recover segment hit zones the same way the dead
-            // `draw.rs::draw_window_status_bar` did, so `pixel_to_click_target`'s
-            // `WindowZone::StatusBar` arm has a real `status_segment_map` entry
-            // to resolve against instead of an always-empty one.
+            // Recover segment hit zones the same way `draw_status_bar` does, so
+            // `pixel_to_click_target`'s `WindowZone::StatusBar` arm has a real
+            // `status_segment_map` entry to resolve against.
             // `draw_status_bar` lays segments out bar-relative from `(0, 0)`
-            // regardless of `sb_rect`'s own origin (see
-            // `route_debug_sidebar_event`'s doc comment for the same
-            // "`StatusBar::layout` always starts at 0,0" contract), which is
-            // exactly the window-relative `local_x` `window_zone_hit_test`
-            // hit-tests with — no coordinate translation needed.
-            //
-            // #764: this is the layout the *paint* resolved, not a second
-            // `status_bar_layout` re-measure of the same bar as it used to be —
-            // same reasoning as `render::PaintedTabBar::layout`.
+            // regardless of `sb_rect`'s own origin, which is exactly the
+            // window-relative `local_x` `window_zone_hit_test` hit-tests with.
+            // This is the layout the paint resolved, not a second re-measure.
             let sb_layout = backend.draw_status_bar_interactive(
                 sb_rect,
                 &win_bar,
@@ -573,17 +492,9 @@ impl App {
             );
         }
 
-        // `:split`/`:vsplit` boundaries had no visual of their own in GTK
-        // before #582 — nothing told the user where to grab. Painted via
-        // quadraui's `Split` primitive rather than hand-rolled Cairo. Both
-        // axes: the #582 iteration-2 smoke found `:split` only *seemed*
-        // draggable because the per-window status bar happens to sit one line
-        // above the boundary and reads as a divider, which is a coincidence of
-        // an unrelated feature, not a handle.
-        //
-        // These are the *within*-group dividers, hence part of this rung
-        // rather than `EditorOp::GroupDividers` — the same split TUI makes,
-        // where `render_all_windows` paints them via `render_separators`.
+        // Divider boundaries painted via quadraui's `Split` primitive.
+        // These are the within-group dividers, part of this rung rather than
+        // `EditorOp::GroupDividers` — the same split TUI makes.
         render::draw_dividers_as_splits(backend, &screen.window_dividers, |div| {
             quadraui::WidgetId::new(format!("wdiv:{}:{}", div.group_id.0, div.split_index))
         });
@@ -593,30 +504,14 @@ impl App {
     /// group and recover the pixel hit geometry the rasteriser resolved.
     ///
     /// Multi-group (post-split) layouts get a bar per group at the top edge of
-    /// its own bounds; a single group is a split of one and gets one
-    /// full-width bar at the editor top (#515/#551).
+    /// its own bounds; a single group gets one full-width bar at the editor top.
     ///
     /// Painting goes through `render::paint_tab_bars` →
     /// `Backend::draw_tab_bar_icons` rather than a `Surface::TabBar` push,
-    /// because quadraui's `Surface` enum carries no icon sidecar (adding a
-    /// field to it would be the same hard break on downstream consumers that
-    /// kept the icons off `TabItem` in the first place). With an empty sidecar
-    /// the two are byte-identical — quadraui's `draw_tab_bar` forwards to
-    /// `draw_tab_bar_icons` with `&[]` — so this is a pure superset of the old
-    /// call (#703). `hit_bars` still collects a `Surface::TabBar` for the
-    /// caller's `FrameHitMap`: that map is only ever consumed via `hit_map()`
-    /// (never drawn) and its zones are whole-bar rects, which icons do not
-    /// move.
-    /// Compose the [`render::FrameOp::SidebarPanel`] rung: the *active panel's
-    /// body*, into the content rect `AppShell` reserved for it.
-    ///
-    /// Extracted out of `render_content`'s walk (#766) because it was 210 of
-    /// the walk's lines on its own — a `match` over seven panel ids, each with
-    /// its own hit-test-cache publication — and #766's whole point is that
-    /// `render_content` reads as the frame's *order*, not as the frame's
-    /// contents. The surrounding sidebar chrome (activity bar, header,
-    /// separator) is quadraui's, painted by the runner before `render_content`
-    /// is entered; this fills only `q_sb`.
+    /// because quadraui's `Surface` enum carries no icon sidecar. With an
+    /// empty sidecar the two are byte-identical — quadraui's `draw_tab_bar`
+    /// forwards to `draw_tab_bar_icons` with `&[]` — so this is a pure
+    /// superset of the old call.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn paint_sidebar_panel_rung(
         &self,
@@ -628,14 +523,13 @@ impl App {
         lh: f64,
         cw: f64,
     ) {
-        // Which panel is active? #823 item 7: was its own restatement of
-        // `render::sidebar_owner`'s resolution.
+        // Which panel is active?
         let active_id: String = render::sidebar_owner(engine).panel_id_string();
 
         match active_id.as_str() {
             PANEL_EXPLORER => {
-                // #1389: composed through `SidebarPanelBody::render_with`
-                // (quadraui#1059) in a single call — `None`/`None` here
+                // Composed through `SidebarPanelBody::render_with`
+                // in a single call — `None`/`None` here
                 // reproduce this arm's pre-existing "no chrome" behaviour
                 // exactly (`layout.body_rect == q_sb`); TUI's
                 // `panels::render_explorer_sidebar_content` uses the same
@@ -645,7 +539,7 @@ impl App {
                 // `Engine` can be the body directly instead of the
                 // hand-copied `render::paint_sidebar_panel_chrome` split
                 // #1242 needed before #1059 existed.
-                // #1693: `StatusBars` reserves one row above the tree for
+                // `StatusBars` reserves one row above the tree for
                 // the view-actions toolbar (New File / New Folder /
                 // Refresh / Collapse All / "..." overflow) — the same
                 // `SidebarPanelChrome` variant the Debug sidebar's title/
@@ -665,7 +559,7 @@ impl App {
                 // Capture the exact metrics the tree is drawn with so the
                 // click hit-test (which reads the backend's mutable
                 // current_line_height at a later, possibly-different time) can
-                // re-apply them and resolve the correct row. (#540)
+                // re-apply them and resolve the correct row.
                 self.cached_explorer_metrics
                     .set((backend.line_height() as f64, backend.char_width() as f64));
                 let layout = panel.render_with(backend, q_sb, |backend, body_rect| {
@@ -678,18 +572,10 @@ impl App {
                     .replace(layout.status_bar_hit_regions);
             }
             PANEL_SEARCH => {
-                // #1065: `search_sidebar_system` never had `set_backend_info`
-                // called on this backend — the exact #971 gap
-                // (`render::UnitProfile::sidebar_system_metrics`'s own doc)
-                // that left `SidebarSystem::handle_cached` returning
-                // `SidebarEvent::Ignored` unconditionally, fixed for
-                // `sc_sidebar_system` (this match's `PANEL_GIT` arm) and
-                // `ext_sidebar_system` (`refresh_ext_sidebar_metrics`) but
-                // missed here. Every content-row press *and* every wheel
-                // notch over the search results list silently no-op'd —
-                // `search_panel_click_focuses_the_query_field`'s click landed
-                // on the query text box, a separate hit-test that never goes
-                // through `handle_cached`, so it never caught this.
+                // `search_sidebar_system` needs backend info set so `handle_cached`
+                // returns real events instead of `Ignored` unconditionally.
+                // Every content-row press and every wheel notch over the search results
+                // list was silently no-op before this call was added.
                 let search_lh = backend.line_height();
                 engine
                     .search_sidebar_system
@@ -700,20 +586,12 @@ impl App {
                 engine.search_sidebar_system.borrow().render(backend, q_sb);
             }
             PANEL_DEBUG => {
-                // #1392: composed through `SidebarPanelBody::render_with`
-                // (quadraui#1059) with `SidebarPanelChrome::StatusBars`
-                // (quadraui#1061, `render::debug_sidebar_chrome`) instead of
-                // slicing `q_sb` into a title row + action row by hand and
-                // calling `Backend::draw_status_bar` on each directly. The
-                // returned layout's `status_bar_hit_regions` are already in
-                // `q_sb`'s own absolute pixel space, so they're stored
-                // straight onto `engine.dap_sidebar_action_hits` for
-                // `route_debug_sidebar_event` to read — no more separately
-                // cached `action_rect` to translate a press into (that was
-                // a second, independently-derived copy of the same
-                // geometry the paint used, which is exactly what let paint
-                // and click disagree). TUI's `render_debug_sidebar` builds
-                // the identical chrome through the same helper.
+                // Composed through `SidebarPanelBody::render_with`
+                // with `SidebarPanelChrome::StatusBars` instead of slicing `q_sb` into
+                // rows by hand. The returned layout's `status_bar_hit_regions` are
+                // already in `q_sb`'s own absolute pixel space and stored onto
+                // `engine.dap_sidebar_action_hits`, eliminating a second independently-derived
+                // copy of geometry that could disagree with what was painted.
                 let panel = render::SidebarPanelBody {
                     background: None,
                     chrome: render::debug_sidebar_chrome(&screen.debug_sidebar, theme),
@@ -732,17 +610,11 @@ impl App {
                     .replace(layout.status_bar_hit_regions);
             }
             PANEL_GIT => {
-                // #1390: composed through `SidebarPanelBody::render_with`
-                // (quadraui#1059, the composer the `PANEL_EXPLORER` arm
-                // uses, #1389) instead of operating on `q_sb` directly with
-                // no wrapper. `chrome: SidebarPanelChrome::None` — the
-                // shell's own sidebar header already titles this panel
-                // "SOURCE CONTROL", so `sc_header_status_bar`'s row below
-                // (live branch/ahead-behind) is body content, not a second
-                // title (#1256's double-header bug). `None` chrome reserves
-                // no rows, so `body_rect` is pixel-identical to `q_sb` —
-                // shadow `q_sb` with it below rather than threading a second
-                // name through every band/popup rect in this arm.
+                // Composed through `SidebarPanelBody::render_with` with
+                // `chrome: SidebarPanelChrome::None` — the shell's sidebar header
+                // already titles this panel "SOURCE CONTROL", and `sc_header_status_bar`'s
+                // row below is body content, not a second title. `None` chrome reserves
+                // no rows, so `body_rect` is pixel-identical to `q_sb`.
                 let panel = render::SidebarPanelBody {
                     background: None,
                     chrome: render::SidebarPanelChrome::None,
@@ -751,24 +623,12 @@ impl App {
                 panel.render_with(backend, q_sb, |backend, body_rect| {
                     let q_sb = body_rect;
                     if let Some(ref sc) = screen.source_control {
-                        // Header row + commit-input box (#480). Previously
-                        // entirely unpainted under ShellApp — the only place
-                        // that ever drew them was the dead
-                        // `draw.rs::draw_source_control_panel` Cairo painter,
-                        // which has zero live callers (superseded by this
-                        // `render_content` path back when the 14 legacy DAs
-                        // were collapsed into one, #493). Paint them for
-                        // real now that quadraui#222 (TextInput) has landed,
-                        // through the same `render::sc_*` adapters TUI uses
-                        // so the two renderers can't drift.
-                        // Band geometry (header / commit box / slab) comes from
-                        // the shared `render::sc_sidebar_bands` so the click
-                        // router in `try_route_sidebar_mouse_event` resolves a
-                        // press against the *same* derivation that painted it
-                        // (#544). `SC_COMMIT_BORDER_PX` is the primitive's 1px
-                        // border top+bottom — GTK's native unit is pixels,
-                        // unlike TUI's whole-cell border (see
-                        // `render::sc_commit_input_box_height` doc).
+                        // Header row + commit-input box. Paint them via `render::sc_*` adapters
+                        // the same way TUI uses so the two renderers cannot drift.
+                        // Band geometry comes from the shared `render::sc_sidebar_bands` so the
+                        // click router in `try_route_sidebar_mouse_event` resolves a press
+                        // against the same derivation that painted it. `SC_COMMIT_BORDER_PX` is
+                        // the primitive's 1px border top+bottom.
                         let bands = render::sc_sidebar_bands(
                             &sc.commit_message,
                             q_sb,
@@ -791,7 +651,7 @@ impl App {
                         // header + commit input.
                         let slab_rect = bands.slab;
                         render::draw_sc_sidebar_panel(backend, engine, sc, slab_rect);
-                        // Focused-hint row (#1361): shared with TUI through
+                        // Focused-hint row: shared with TUI through
                         // `render::sc_hint_status_bar`, painted only when
                         // `ScSidebarBands::hint` was reserved (i.e. the panel
                         // has focus) so it can't show unreserved space.
@@ -810,7 +670,7 @@ impl App {
                             .map(|l| l.content_bounds)
                             .unwrap_or(slab_rect);
                         engine.sc_sidebar_body_rect.set(body_rect);
-                        // #971: without this, `sc_sidebar_system.handle_cached`
+                        // Without this, `sc_sidebar_system.handle_cached`
                         // returns `Ignored` unconditionally and every
                         // content-row press (header collapse, row select) is a
                         // silent no-op — see `render::UnitProfile::
@@ -831,14 +691,9 @@ impl App {
                         render::populate_sc_sidebar_system(engine, theme);
                         engine.sc_sidebar_system.borrow().render(backend, body_rect);
 
-                        // Branch picker / create popup (dual-mode Palette,
-                        // quadraui#224) and help dialog (Dialog + DialogTable,
-                        // quadraui#225) — both keyboard-reachable via
-                        // `dispatch_sc_sidebar_key_unified` even though the
-                        // git sidebar has no live mouse-click routing yet
-                        // (#449 tracks that separately). Render over the
-                        // whole sidebar content area, same popup-over-panel
-                        // z-order TUI uses.
+                        // Branch picker / create popup and help dialog — both keyboard-reachable
+                        // even though the git sidebar has no live mouse-click routing yet.
+                        // Render over the whole sidebar content area.
                         if let Some(ref bp) = sc.branch_picker {
                             let palette = render::sc_branch_picker_to_palette(bp);
                             let popup_w = q_sb.width.min(40.0 * cw as f32);
@@ -874,15 +729,15 @@ impl App {
                 });
             }
             PANEL_EXTENSIONS => {
-                // #1343: the shell's own `AppShell` sidebar header already
+                // The shell's own `AppShell` sidebar header already
                 // paints " EXTENSIONS " above `q_sb` — this arm paints only
                 // the search/filter row (#1256 found GTK painting neither
                 // row at all).
                 //
-                // #1391: composed through `SidebarPanelBody::render_with`
+                // Composed through `SidebarPanelBody::render_with`
                 // (quadraui#1059, the composer the `PANEL_EXPLORER`/
                 // `PANEL_GIT` arms use) with `SidebarPanelChrome::Search`
-                // (quadraui#1061) instead of the bespoke `render::
+                // instead of the bespoke `render::
                 // paint_sidebar_search_row` (deleted by this issue) — see
                 // `render::search_only_chrome`'s doc. TUI's `panels::
                 // render_ext_sidebar` builds the identical chrome through
@@ -908,7 +763,7 @@ impl App {
                 });
             }
             PANEL_BOARD => {
-                // #521: generic Board panel host — the *only* GTK-specific
+                // Generic Board panel host — the *only* GTK-specific
                 // code here is picking which `screen.board` field to read
                 // and where to put the rect; the actual rasterisation is
                 // `Backend::draw_board`, the same call TUI's
@@ -933,21 +788,21 @@ impl App {
                 }
             }
             PANEL_SETTINGS => {
-                // #1343: Settings is a shell bottom item that owns the
+                // Settings is a shell bottom item that owns the
                 // sidebar header (quadraui#1055, #1356's pin bump) — the
                 // shell paints " SETTINGS " above `q_sb`, so this arm
                 // paints only the filter row, instead of the pre-#1343
                 // `SidebarPanelChrome::None` (no chrome at all — #1256's
                 // `settings_filter_row_is_painted::gtk` gap).
                 //
-                // #1391: composed through `SidebarPanelBody::render_with`
-                // with `SidebarPanelChrome::Search` (quadraui#1061) instead
+                // Composed through `SidebarPanelBody::render_with`
+                // with `SidebarPanelChrome::Search` instead
                 // of the bespoke `render::paint_sidebar_search_row` (deleted
                 // by this issue) — see `render::search_only_chrome`'s doc.
                 // TUI's `panels::render_settings_panel` builds the identical
                 // chrome through the same helper.
                 //
-                // #1574: `background` is `Some(theme.tab_bar_bg)`, not
+                // `background` is `Some(theme.tab_bar_bg)`, not
                 // `None` — the same sidebar background the `PANEL_EXPLORER`
                 // arm's doc comment above says TUI passes for this composer.
                 // With `None`, nothing fills the strip under the settings
@@ -971,15 +826,10 @@ impl App {
                     scrollbar_gutter: None,
                 };
                 panel.render_with(backend, q_sb, |backend, body_rect| {
-                    // Cache the exact rect this frame painted the form into
-                    // (mirrors TUI's `panels::render_settings_panel`, #1238)
-                    // — `try_route_sidebar_mouse_event`'s `Settings` arm
-                    // reads this back instead of the raw, unshrunk `q_sb`,
-                    // which would resolve clicks against `FormController`'s
-                    // row geometry one search-row off from what was
-                    // actually painted (#1343 review: this is exactly the
-                    // `settings_row_click_below_its_glyph_hits_its_own_row_gtk`
-                    // regression a stale `sb` reintroduced).
+                    // Cache the exact rect this frame painted the form into —
+                    // `try_route_sidebar_mouse_event`'s `Settings` arm reads this back
+                    // instead of the raw, unshrunk `q_sb`, so clicks resolve against
+                    // `FormController`'s row geometry at the correct painted position.
                     engine.settings_form_rect.set(body_rect);
                     render::populate_settings_form_controller(engine);
                     engine
@@ -992,14 +842,14 @@ impl App {
                 .strip_prefix("ext:")
                 .is_some_and(|name| engine.is_plugin_view(name)) =>
             {
-                // #146: a `vimcode.ui.register_view` panel — the plugin declared
+                // A `vimcode.ui.register_view` panel — the plugin declared
                 // a widget tree, so paint it as a `quadraui::Form` through the
                 // *same* shared `FormController` the `PANEL_SETTINGS` arm above
                 // uses, rather than as `ExtPanelItem` tree rows. This is the
                 // whole per-surface cost of plugin UI: one arm in the shared
                 // shell, zero lines in `src/gtk/` or `src/tui_main/`.
                 //
-                // #1631: a view whose `render()` returned a `kind = "..."`
+                // A view whose `render()` returned a `kind = "..."`
                 // table instead of `fields` paints through the matching
                 // `ListView`/`TreeView`/`DataTable`/`TextDisplay` primitive
                 // instead — still one arm here, still zero lines in
@@ -1088,20 +938,10 @@ impl App {
                 });
             }
             id if id.starts_with("ext:") => {
-                // #1089: a plugin-provided panel — paint its own sections +
-                // items via `render::ext_panel_to_tree_view` +
-                // `Backend::draw_tree`, the same adapter
-                // `tui_main::panels::render_ext_panel` uses, instead of
-                // falling through to `ext_sidebar_system` (the extension
-                // *marketplace* — INSTALLED/AVAILABLE — which is what this
-                // arm painted before this fix, unconditionally, for every
-                // `ext:<name>` id).
-                //
-                // #1242: chrome + body now composed through quadraui#1041's
-                // `SidebarPanelBody::render` (`render::ExtPanelTreeBody`,
-                // same `&dyn BackendWidget` path `panels::render_ext_panel`
-                // uses). `scrollbar_gutter: None` — unlike TUI, this arm has
-                // never painted one.
+                // A plugin-provided panel — paint its own sections + items via
+                // `render::ext_panel_to_tree_view` + `Backend::draw_tree`, the same
+                // adapter `tui_main::panels::render_ext_panel` uses.
+                // Composed through `SidebarPanelBody::render` with chrome, same as TUI.
                 if let Some(ref panel) = screen.ext_panel {
                     // Cache the whole content rect (chrome included),
                     // verbatim — mirrors `render_ext_panel`'s own
@@ -1130,7 +970,7 @@ impl App {
                     let layout = sidebar_panel.render(backend, q_sb, &body);
 
                     if layout.body_rect.height > 0.0 {
-                        // #1089: cache the exact `Backend::tree_layout` this
+                        // Cache the exact `Backend::tree_layout` this
                         // frame painted with — the click router
                         // (`render::route_ext_panel_click`, shared with TUI's
                         // `mouse::handle_mouse`) reads this instead of
@@ -1146,16 +986,10 @@ impl App {
                         engine.ext_panel_tree_layout.replace(None);
                     }
 
-                    // #636: the `?`-triggered keybindings help popup, drawn
-                    // over the whole panel content area via `Tooltip` +
-                    // `Backend::draw_tooltip_with_chrome` (JDonaghy/
-                    // quadraui#541, landed at this repo's pinned rev) —
-                    // see `render::ext_panel_help_tooltip_layout`'s own doc
-                    // for why this is the real fix and not a stand-in.
-                    // Nothing painted this popup at all before this change
-                    // (the 2026-10-05 triage update on the issue): `?` set
-                    // `Engine::ext_panel_help_open` but no backend ever read
-                    // it back.
+                    // The `?`-triggered keybindings help popup, drawn over the whole panel
+                    // content area via `Tooltip` + `Backend::draw_tooltip_with_chrome` — see
+                    // `render::ext_panel_help_tooltip_layout`'s own doc for why this is the
+                    // real implementation and not a stand-in.
                     if panel.help_open {
                         let (tooltip, tlayout, chrome) = render::ext_panel_help_tooltip_layout(
                             &panel.name,
@@ -1171,14 +1005,14 @@ impl App {
                 }
             }
             PANEL_AI => {
-                // #819: adopts quadraui's `ChatController` — one shared
+                // Adopts quadraui's `ChatController` — one shared
                 // `render()` for both backends, like `explorer_tree` and
                 // `ext_sidebar_system` above, replacing the hand-painted
                 // `draw_ai_sidebar_panel`. `ai_chat_rect` is cached on
                 // `Engine` (not here) so `route_ai_chat_event` re-derives
-                // the identical layout `render()` painted (#544/#582/#646).
+                // the identical layout `render()` painted.
                 render::populate_ai_chat_controller(engine, theme, backend);
-                // #1513: the pinned plan block gets a band carved off the
+                // The pinned plan block gets a band carved off the
                 // top of the panel rect *before* `ChatController` ever sees
                 // the remainder — `ai_chat_rect` (and therefore every
                 // `route_ai_chat_event` hit-test) is the shrunk rect, so a
@@ -1201,53 +1035,38 @@ impl App {
                 render::paint_ai_plan_band(backend, engine, theme, plan_rect);
                 engine.ai_chat_rect.set(chat_rect);
                 engine.ai_chat.borrow().render(backend, chat_rect);
-                // #956 (ACP-5): slash-command completions, painted on top —
-                // no-op unless the input matches an agent-declared command.
-                // `chat_rect` (not `q_sb`), per `paint_ai_command_completions`'s
-                // own contract: the same rect `ai_chat.render()` just used,
-                // so the popup anchors off the input box's *actual* position
-                // — unaffected by the #1513 plan-band split in the common
-                // case (the band only eats space off the top), but wrong to
-                // silently keep passing the unshrunk sidebar rect here now
-                // that the two can differ.
+                // Slash-command completions, painted on top — no-op unless the input
+                // matches an agent-declared command. Pass `chat_rect` (not `q_sb`) so
+                // the popup anchors off the input box's actual position, unaffected by
+                // layout changes.
+                // `cached_ai_chat_metrics`'s drift guard: capture what `render()` used
+                // so `route_ai_chat_event` can re-apply before `handle()`.
                 render::paint_ai_command_completions(backend, engine, chat_rect);
                 // `cached_explorer_metrics`'s drift guard, ported: `backend`'s
                 // "current" line_height/char_width are mutable and can be
                 // overwritten by whatever paints next this frame or the
                 // next, so capture what `render()` actually used here for
-                // `route_ai_chat_event` to re-apply before `handle()` (#819).
+                // `route_ai_chat_event` to re-apply before `handle()`.
                 self.cached_ai_chat_metrics
                     .set((backend.line_height() as f64, backend.char_width() as f64));
             }
             _ => {}
         }
 
-        // The sidebar-item hover popup used to be composed here,
-        // nested inside this rung. #765 lifted it out to
-        // `BottomOp::PanelHover`: as a *sidebar* rung it could
-        // only run while `sidebar_content_bounds` was `Some`,
-        // so collapsing the sidebar left
-        // `panel_hover_popup_rect` pinned at its last painted
-        // value and `handle_mouse_press` went on arbitrating
-        // clicks against a popup that was no longer on screen.
+        // The sidebar-item hover popup is composed in a later rung (not here)
+        // to ensure it stays visible when the sidebar is collapsed.
     }
 
     /// Re-derive `ext_sidebar_system`'s backend metrics from what `backend`
-    /// is about to paint with (#971).
+    /// is about to paint with.
     ///
     /// Without this, `ext_sidebar_system.handle_cached` returns `Ignored`
     /// unconditionally and every content-row press on the plugin ext panel
-    /// (header collapse, row select) is a silent no-op — see
-    /// `render::UnitProfile::sidebar_system_metrics`'s own doc for the full
-    /// story. Reads `backend.line_height()` directly rather than accepting a
-    /// cached `lh` parameter — see the `PANEL_GIT` arm's identical comment
-    /// in [`Self::paint_sidebar_panel_rung`] on why: a cached value can lag
-    /// behind what `backend` reports by the time `render()` actually reads
-    /// it, so the metrics `handle_cached` hit-tests against could disagree
-    /// with what this exact `render()` call paints. Shared by the
-    /// `PANEL_EXTENSIONS` arm and the `id if id.starts_with("ext:")` arm
-    /// above, which were previously two verbatim copies of this same
-    /// four-line snippet.
+    /// is a silent no-op. Reads `backend.line_height()` directly rather than
+    /// accepting a cached parameter — a cached value can lag behind what
+    /// `backend` reports by the time `render()` actually reads it. Shared by
+    /// multiple sidebar panel arms that were previously verbatim copies of
+    /// the same code.
     pub(crate) fn refresh_ext_sidebar_metrics(
         backend: &mut dyn quadraui::Backend,
         engine: &Engine,
@@ -1263,30 +1082,20 @@ impl App {
     /// Compose the editor-anchored popups: completion menu, LSP hover, editor
     /// hover (rich markdown), diff peek and signature help.
     ///
-    /// Extracted out of `render_content` (#766) for the same reason as
-    /// [`Self::paint_sidebar_panel_rung`] — it was ~160 lines of geometry in
-    /// the middle of what #766 makes a statement of the frame's *order*.
-    /// Deliberately **not** a `FrameOp` rung: these are anchored to the active
-    /// window's cursor rather than to a band, and both backends compose them at
-    /// exactly this point (TUI through `render_impl.rs`'s `paint_editor_popups`),
-    /// between the editor band and the bottom band.
+    /// Extracted out of `render_content` to make that function read as the
+    /// frame's order. Deliberately **not** a `FrameOp` rung: these are anchored
+    /// to the active window's cursor rather than to a band.
     ///
-    /// #1167: the build-adapter → `.layout()` → `backend.draw_*` → cache-
-    /// output part (identical to TUI's `render_impl::paint_editor_popups`,
-    /// modulo coordinate units) now lives once in `render::paint_editor_popups`.
-    /// #1237 folded the anchor-point arithmetic itself into
-    /// `render::editor_popup_anchors` too (see its doc — GTK's completion
-    /// anchor, and all four non-completion anchors on *both* backends, used
-    /// the raw character column as a tab-expanded display column, drifting
-    /// left of the cursor on tab-indented lines). This method's own job
-    /// shrank to exactly what stays genuinely per-backend: finding the
-    /// active window, scaling into GTK's native pixel units (`lh`/`cw`),
-    /// and picking each popup's clip viewport.
+    /// The build-adapter → `.layout()` → `backend.draw_*` → cache-output part
+    /// now lives once in `render::paint_editor_popups`. #1237 folded the
+    /// anchor-point arithmetic into `render::editor_popup_anchors` too (see its
+    /// doc for why). This method's own job is: finding the active window,
+    /// scaling into GTK's native pixel units (`lh`/`cw`), and picking each
+    /// popup's clip viewport.
     ///
     /// `main` is `AppShellLayout::main_content_bounds` — the clip viewport
     /// every popup but the completion menu and editor-hover popup is placed
-    /// inside; those two clamp to the active window's own rect instead (see
-    /// `render::paint_editor_popups`'s doc for why).
+    /// inside; those two clamp to the active window's own rect instead.
     pub(crate) fn paint_editor_popups_rung(
         &self,
         backend: &mut dyn quadraui::Backend,
@@ -1310,24 +1119,15 @@ impl App {
             )
         });
 
-        // #1237: the char→display column arithmetic (tab expansion, scroll
-        // offset) for every one of the five anchors below now lives once in
-        // `render::editor_popup_anchors`, shared with TUI's
-        // `render_impl::paint_editor_popups`. GTK uses its raw sub-pixel
-        // float window origin as-is (no whole-cell snapping — that's a
-        // TUI-only concern).
-        //
+        // The char→display column arithmetic (tab expansion, scroll offset)
+        // for every anchor now lives once in `render::editor_popup_anchors`,
+        // shared with TUI. GTK uses its raw sub-pixel float window origin as-is
+        // (no whole-cell snapping).
         // Note the precision drop: `win_origin`/`cw`/`lh` are cast to `f32`
-        // *here*, before the anchor arithmetic runs, whereas pre-#1237 each
-        // anchor's arithmetic ran entirely in `f64` and only cast to `f32`
-        // at the very end for `PopupAnchor`. `editor_popup_anchors` is
-        // shared with TUI, whose native units are already `f32` cell
-        // columns, so it takes `f32` throughout — GTK pays for that sharing
-        // with one extra rounding step. Immaterial at realistic screen-pixel
-        // magnitudes (`f32` keeps ~7 significant decimal digits, far more
-        // than any on-screen coordinate needs), and reviewed as acceptable
-        // in #1237's follow-up round rather than threading `f64` generics
-        // through a function TUI also calls.
+        // *here*, before anchor arithmetic, whereas pre-#1237 each anchor ran
+        // entirely in `f64` and only cast to `f32` at the end. GTK pays for
+        // sharing with TUI an extra rounding step here, but this is immaterial
+        // at realistic screen-pixel magnitudes.
         let win_origin = active_win.map(|w| (w.rect.x as f32, w.rect.y as f32));
         let anchor_points = render::editor_popup_anchors(screen, win_origin, cw as f32, lh as f32);
 
@@ -1336,40 +1136,14 @@ impl App {
         // modal stack.
         let completion = screen.completion.as_ref().and_then(|menu| {
             let (cursor_x, cursor_y) = anchor_points.completion?;
-            // Longest candidate + 4 cells of padding/border, floored at 12
-            // cells' worth of raw units (`cw`-scaled, not a bare pixel
-            // constant — #1432: this function runs unmodified for both `gtk`
-            // and TUI-via-`App`, and a flat `100.0` floor is a GTK pixel
-            // width. On TUI `cw` is `1.0` (cell = 1 raw unit), so that same
-            // constant used to demand a 100-*cell*-wide popup — wider than
-            // most terminals — which made `Completions::layout`'s own
-            // right-edge-overflow branch always fire and clamp `x` straight
-            // back to `viewport.x`, discarding the correctly-computed cursor
-            // anchor outright (observed: popup pinned at the window's left
-            // edge regardless of cursor column). Both the `+4`/`.max(12.0)`
-            // now match `tui_main::render_impl`'s independent
-            // completion-width calc exactly (its own comment there names
-            // the same reasoning) — this used to read `+2`, which happened
-            // to never matter while `100.0` always dominated it, but once
-            // scaled down to a real cell-sized floor a too-narrow candidate
-            // term clipped the popup's own last character (observed:
-            // `"ZQXWFOOBAR"` painted as `"ZQXWFOOBA"`, missing the border's
-            // trailing padding cell). Scaling the shared `12.0` floor by
-            // `cw` here keeps GTK's effective minimum close to its old
-            // ~100px (12 * a typical ~8px cell) while giving TUI-via-`App`
-            // the same sane 12-cell floor `render_impl` already ships.
-            //
-            // #420: `Completions::layout` clamps the popup's *position*
-            // into `win_viewport` (`x.max(viewport.x)`) but never clamps
-            // `popup_w` itself, so a long enough candidate label can still
-            // render past the window's own right edge even once positioned
-            // as far left as it can go. That's a gap in the shared
-            // `quadraui::Completions::layout` primitive (it already clips
-            // height the same way, via `clipped_h`), not something to patch
-            // around per-backend — see the Platform-Neutrality Rule.
-            // Tracked as a follow-up pending a quadraui-side fix rather than
-            // duplicating a `.min(...)` clamp here and in
-            // `tui_main::render_impl`.
+            // Longest candidate + 4 cells of padding/border, floored at 12 cells.
+            // Both the `+4`/`.max(12.0)` match `tui_main::render_impl`'s completion
+            // width calculation. Scaling the `12.0` floor by `cw` keeps GTK's effective
+            // minimum close to its old ~100px while giving TUI-via-`App` the same
+            // sane 12-cell floor `render_impl` already ships.
+            // `Completions::layout` clamps position but never clamps `popup_w` itself,
+            // so a long candidate can still render past the window's right edge — a gap
+            // in the shared quadraui primitive, not something to patch per-backend.
             let popup_w = ((menu.max_width + 4) as f64 * cw).max(12.0 * cw);
             let max_popup_h = 10.0 * lh;
             Some((
@@ -1408,8 +1182,8 @@ impl App {
 
         // Editor hover popup anchor (rich markdown; `gh` key, diagnostic/
         // annotation/plugin hovers, or mouse dwell). Bounds/link rects/
-        // scrollbar geometry are cached for the click + drag handlers
-        // (#215), same as `draw.rs::draw_editor_hover_popup` did.
+        // scrollbar geometry are cached for the click + drag handlers,
+        // same as `draw.rs::draw_editor_hover_popup` did.
         let editor_hover = anchor_points.editor_hover.and_then(|(x, y)| {
             Some(render::PopupAnchor {
                 x,
@@ -1449,8 +1223,8 @@ impl App {
     /// `:set ui_font_size=N` reaches the rasterisers on the very next paint
     /// instead of never; the two hit-test registries are cleared so a panel or
     /// window that closed this frame leaves no stale entry for
-    /// `dispatch_scroll` / `pixel_to_click_target` to resolve against
-    /// (#592/#672). Extracted out of `render_content` (#766) so that function
+    /// `dispatch_scroll` / `pixel_to_click_target` to resolve against.
+    /// Extracted out of `render_content` so that function
     /// reads as the frame's *order* and nothing else.
     pub(crate) fn sync_per_frame_backend_state(
         &self,
@@ -1459,41 +1233,34 @@ impl App {
         theme: &Theme,
     ) {
         backend.set_theme(render::to_quadraui_theme(theme));
-        // #1580: re-synced every frame, same reasoning as the theme sync
+        // Re-synced every frame, same reasoning as the theme sync
         // right above — a runtime `:set menu_style=...` (or its Settings-
         // sidebar equivalent) reaches quadraui's own `MenuStyle` on the
         // very next paint. `set_menu_style` only persists a value on the
         // backend struct (no popup, no blocking call), so calling it
         // every frame is as cheap as the theme/font syncs it sits next to.
         backend.set_menu_style(render::to_quadraui_menu_style(engine.settings.menu_style));
-        // (#547) Re-synced every frame so runtime toggles (`:set
+        // Re-synced every frame so runtime toggles (`:set
         // nonerdfonts`) take effect immediately, matching TUI.
         render::sync_nerd_fonts(backend, engine);
         // Re-synced every frame so a runtime `:set guifont`/font-size change
-        // takes effect immediately (#217/#672). Ported from the dead
+        // takes effect immediately. Ported from the dead
         // `draw.rs::draw_editor`'s top-of-frame call, which was the only
         // live caller — `UI_FONT()` (used a few paint calls below for the
         // raw-Pango chrome that doesn't go through `Backend::set_ui_font`)
         // read the process-global atomic this writes, so before this port it
         // silently stayed pinned at the default size forever.
         sync_ui_font_size(&engine.settings, backend);
-        // #705 item 3 / quadraui#624: push the same UI_FONT() family+size
-        // onto the *paint* backend's `ui_font`, which `draw_status_bar`
-        // (breadcrumbs, per-window/global status lines), `draw_tree`
-        // (explorer), `draw_tab_bar_icons`, and `draw_menu_bar` now all
-        // honour for both paint and their no-paint measurement twins
-        // (quadraui#624). Before this call `ui_font` on the paint backend
-        // was never touched, so it
-        // sat at quadraui's own "Sans 11" default forever: chrome text
-        // didn't track `settings.ui_font_size`, and — per #700's item 3 —
-        // status-bar-painted breadcrumb text had no font of its own to
-        // decouple it from whatever font a prior draw call in the frame
-        // left on the shared Pango layout. Re-set every frame (not just
-        // once from `setup()`) so a runtime `:set ui_font_size=N` takes
-        // effect immediately, matching `sync_ui_font_size`/`sync_nerd_fonts`
-        // just above.
+        // Push the UI_FONT() family+size onto the paint backend's `ui_font`,
+        // which `draw_status_bar`, `draw_tree`, `draw_tab_bar_icons`, and
+        // `draw_menu_bar` now all honour for both paint and measurement. Re-set
+        // every frame (not just once) so a runtime `:set ui_font_size=N` takes
+        // effect immediately.
+        // Push `settings.font_family`/`font_size` onto the paint backend's editor
+        // font every frame, so a runtime change reaches the painted editor text
+        // on the very next frame.
         backend.set_ui_font(&UI_FONT());
-        // #947 / quadraui#422: push `settings.font_family`/`font_size` onto
+        // Push `settings.font_family`/`font_size` onto
         // the *paint* backend's editor font every frame, so a runtime
         // `:set guifont`/`:set font_size=N`/`zoomin`/`zoomout` reaches the
         // painted editor text on the very next frame — mirroring
@@ -1503,13 +1270,13 @@ impl App {
         // the editor painted at whatever default quadraui's `GtkBackend`/
         // `MacBackend` ship with ("Monospace 11") regardless of the setting.
         //
-        // #1542: resolved through `resolve_editor_font` (same function
+        // Resolved through `resolve_editor_font` (same function
         // `shell_config`'s pre-seed above uses) instead of the raw fields,
         // so an un-customized setting keeps tracking this backend's
         // platform-native convention every frame, not just at startup.
         let (editor_family, editor_size_pt) = resolve_editor_font(&engine.settings, backend);
         backend.set_editor_font(&editor_family, editor_size_pt);
-        // #1864: on the native macOS GUI, override `set_editor_font`'s own
+        // On the native macOS GUI, override `set_editor_font`'s own
         // natural (Core Text ascent+descent+leading, ~1.17x) line height
         // with VS Code's row pitch (`round(font_px * 1.5)` by default, or
         // `settings.line_height`'s explicit multiplier) — see
@@ -1535,14 +1302,14 @@ impl App {
             quadraui::Backend::set_current_line_height(backend, lh);
         }
 
-        // #672: scroll surfaces are re-registered from scratch every frame
+        // Scroll surfaces are re-registered from scratch every frame
         // (mirrors TUI's `render_impl.rs` `scroll_surfaces.borrow_mut().clear()`)
         // so a panel that closes — or moves — doesn't leave a stale entry
         // behind for `dispatch_scroll`/`dispatch_click` to hit-test against.
         // Ported from the dead `draw.rs::draw_editor`'s equivalent top-of-frame
-        // clear, which was this list's only writer under `ShellApp` (#592/#672).
+        // clear, which was this list's only writer under `ShellApp`.
         engine.scroll_surfaces.borrow_mut().clear();
-        // Per-window status bar segment hit zones (#672): `click.rs`'s
+        // Per-window status bar segment hit zones: `click.rs`'s
         // `pixel_to_click_target` reads this to resolve `WindowZone::StatusBar`
         // clicks (goto-line, change-language, switch-branch, ...) to a
         // `StatusAction`, but under `ShellApp` nothing ever populated it — the
@@ -1554,14 +1321,12 @@ impl App {
         self.status_segment_map.borrow_mut().clear();
     }
 
-    /// Compose the **editor band** (#764, #735 slice 3; converged into one
-    /// shared walk by #1251) and recover this frame's `FrameHitMap` from it.
+    /// Compose the **editor band** and recover this frame's `FrameHitMap` from it.
     ///
     /// Walks `render::paint_editor_band_rungs`, the single loop both this
-    /// method and the pre-#1434 TUI shell's `paint_editor_band` now call —
-    /// see that function's own doc for exactly which rungs need `self` and
-    /// why. Extracted out of `render_content` (#766) so that function reads
-    /// as the frame's *order*.
+    /// method and TUI now call — see that function's own doc for which rungs
+    /// need `self` and why. Extracted out of `render_content` so that function
+    /// reads as the frame's order.
     ///
     /// `band` carries the editor column's origin and width (its height is not
     /// used); `metrics` is `(line_height, char_width)` and `tab_metrics` is
@@ -1583,52 +1348,30 @@ impl App {
 
         // Reset the pixel-accurate hit caches; repopulated by the `TabBars`
         // rung below so the click / hover hit-tests use the exact drawn
-        // geometry (#515). Cleared here, before the walk, rather than from an
+        // geometry. Cleared here, before the walk, rather than from an
         // absent-rung branch: `compose_editor_band` returns only the live
         // rungs, so a frame with no tab bars has no arm to clear them from.
         self.cached_group_tab_bar_layouts.borrow_mut().clear();
         self.cached_tab_slots_abs.borrow_mut().clear();
-        // #1165: reset alongside the hit caches above — this frame's
+        // Reset alongside the hit caches above — this frame's
         // `TabBars` rung (if any) repopulates it, and `handle_poll_tick`
         // wants this frame's measurements, not an accumulation across
         // frames (mirrors TUI's `tab_visible_counts.borrow_mut().clear()`).
         self.tab_visible_counts.borrow_mut().clear();
 
-        // `window_editors`/`hit_bars` stash what the `Windows`/`TabBars`
-        // rungs painted, past the walk (#449), so the `FrameHitMap` built
-        // below references the SAME objects just painted rather than a
-        // second copy that could drift — see `render::paint_editor_band_rungs`'s
-        // doc for why this bookkeeping can't move into the shared walk itself.
-        //
-        // #1128 (was #731): both scrollbars ARE painted for the editor on
-        // GTK today. quadraui#968 taught `gtk::editor::draw_editor` (the
-        // rasteriser `Surface::Editor` below calls into) to paint both
-        // scrollbars itself, the way `tui::editor::draw_editor` already
-        // did — geometry comes from `Editor::layout`, the same call
-        // hit-testing uses, so paint and click agree by construction (see
-        // that rasteriser's module doc, "Scrollbars" section). This
-        // replaced the #731-era claim that GTK "deliberately skips
-        // scrollbars and defers to the host" — that sentence described the
-        // dead Relm4-era native `gtk4::Scrollbar` overlay path
-        // (`sync_scrollbar`/`create_window_scrollbars`) #731 deleted, which
-        // never ran under the ShellApp runner in the first place (nothing
-        // assigns `self.overlay`/`self.drawing_area`).
-        //
-        // `app_support::editor_scrollbar_layout` builds the same
-        // `Editor`/`EditorLayout` pair (minus the rendered text, which
-        // scrollbar geometry never reads) so the axis-parameterised
-        // `scrollbar_thumb_geometry`/`scrollbar_hit_test` (#1493, was one
-        // hand-rolled pair per axis) below can never resolve a hover/drag
-        // rect paint didn't actually draw — #1128 deleted the pre-#968
-        // h-scrollbar geometry helper that independently guessed its own
-        // track width and could disagree with what was actually painted.
-        // #1891: that agreement also depends on both sides reading the same
-        // `v_scrollbar_w` — paint reads it from
-        // `backend.editor_v_scrollbar_width()` (set by `App::setup`'s
-        // `backend.set_editor_v_scrollbar_width(Some(14.0))` on GTK/macOS/
-        // Win), so `editor_scrollbar_layout`'s callers must pass that same
-        // value through rather than defaulting to `None`, which would size
-        // the hit-test column at `cell_width` instead of the painted 14px.
+        // `window_editors`/`hit_bars` stash what the `Windows`/`TabBars` rungs
+        // painted, past the walk, so the `FrameHitMap` references the SAME objects
+        // just painted rather than a second copy that could drift.
+        // Both scrollbars ARE painted for the editor on GTK. quadraui#968 taught
+        // `gtk::editor::draw_editor` to paint both scrollbars itself. Geometry comes
+        // from `Editor::layout`, the same call hit-testing uses, so paint and click
+        // agree by construction.
+        // `app_support::editor_scrollbar_layout` builds the same `Editor`/`EditorLayout`
+        // pair (minus the rendered text) so the axis-parameterised geometry helpers
+        // can never resolve a hover/drag rect paint didn't actually draw.
+        // That agreement also depends on both sides reading the same `v_scrollbar_w`.
+        // Paint reads it from `backend.editor_v_scrollbar_width()`, so
+        // `editor_scrollbar_layout`'s callers must pass that same value through.
         let mut window_editors = Vec::with_capacity(screen.windows.len());
         let mut hit_bars = Vec::new();
         let units = render::EditorBandUnits::px(lh, cw, tab_row_h);
@@ -1654,13 +1397,13 @@ impl App {
             debug_assert!(false, "GTK {why}");
         }
 
-        // ── Recover a FrameHitMap for Editor/TabBar zone detection (#449) ──────
+        // ── Recover a FrameHitMap for Editor/TabBar zone detection ─────────────
         // Pure `.push()` accumulation into a *separate* `ScreenLayout`, built
         // from the same `Editor` objects painted by the `Windows` rung above
         // (`window_editors`, same order as `screen.windows` so
         // `FrameZone::Editor { idx }` maps straight back to
         // `cached_layout.windows[idx]`) plus the `TabBar` surfaces the
-        // `TabBars` rung recorded. `ScreenLayout::hit_map()` (quadraui#425)
+        // `TabBars` rung recorded. `ScreenLayout::hit_map()`
         // makes no `backend.draw_*()` calls, so accumulating into it can never
         // reorder or repeat the real painting done above — see
         // `click::pixel_to_click_target` for the consumer side.
@@ -1700,7 +1443,7 @@ impl App {
 }
 
 // ── Dormant ShellApp impl (#448-B) ──────────────────────────────────────────
-// This impl compiles alongside the Relm4 path but is NOT wired up.
+// This impl compiles but is NOT wired up.
 impl App {
     /// Paint the title-bar band: the menu bar + any open dropdown, the app-icon
     /// slot, and the inline window controls.
@@ -1712,7 +1455,7 @@ impl App {
     /// round-2/3 "buttons render blank" regression). Kept off
     /// [`render::FRAME_Z_ORDER`]'s overlay tail because TUI has neither an app icon nor
     /// in-canvas window controls, so they cannot be part of a *shared*
-    /// sequence; they ride the `MenuDropdown` rung instead (#735).
+    /// sequence; they ride the `MenuDropdown` rung instead.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn paint_title_bar_band(
         &self,
@@ -1726,12 +1469,12 @@ impl App {
     ) {
         {
             // `menu_items_rect`, not `menu_row_rect` — the app icon owns the
-            // leading slot (#720). `MenuSystem::render` positions the open
+            // leading slot. `MenuSystem::render` positions the open
             // dropdown from this same rect, so passing the narrowed one is
             // what keeps a dropdown under the label that opened it.
             engine.menu_system.borrow().render(backend, menu_items_rect);
 
-            // ── App icon, left of `File` (#720) ──────────────────────────
+            // ── App icon, left of `File` ─────────────────────────────────
             // `draw_menu_bar` above only filled `menu_items_rect`, so the
             // reserved slot still shows the frame-clear colour
             // (`theme.background`) rather than the bar's own `tab_bar_bg`.
@@ -1757,27 +1500,21 @@ impl App {
                 );
                 // `app_icon_image_for_paint` (this file) — see its doc
                 // comment for why every backend can now share the same
-                // [`crate::render::app_icon_image`] builder here (#1102).
+                // [`crate::render::app_icon_image`] builder here.
                 let _ = backend.draw_image(app_icon_rect, &app_icon_image_for_paint());
             }
         }
 
-        // ── Inline window controls (min/max/close) — after the bar (#552) ────
+        // ── Inline window controls (min/max/close) — after the bar ───────────
         // `menu_system.render()` above repaints `draw_menu_bar` across the full
         // `menu_row_rect` band, so the controls must be painted *after* it or
-        // they get erased (the round-2/3 "buttons render blank" regression).
-        // The controls sit in the title-bar band, to the right of the menu
-        // labels; the dropdown body drops *below* the band, so painting here
-        // never covers an open dropdown.
-        //
-        // #735 moved this from the very end of `render_content` (below the
-        // dialog and context menu) to here. It is title-bar chrome, so the
-        // modal rungs of `render::FRAME_Z_ORDER` now paint over it — which is
-        // the point: a modal dialog covering the window controls is what
-        // "modal" means, and it is what TUI already did with everything it
-        // painted into its own title-bar row.
+        // they get erased. The controls sit in the title-bar band, to the right
+        // of the menu labels; the dropdown body drops *below* the band, so painting
+        // here never covers an open dropdown. It is title-bar chrome, so the
+        // modal rungs paint over it — which is the point: a modal dialog should
+        // cover the window controls.
         if let Some(controls_rect) = controls_rect {
-            // #1234: read live via `WindowControl::is_maximized()` rather
+            // Read live via `WindowControl::is_maximized()` rather
             // than the deleted `self.window`/`PlatformWindowHandle` seam —
             // `backend` is already in hand here, so there is no "no backend
             // in scope" problem to cache around (contrast

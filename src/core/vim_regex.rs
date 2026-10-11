@@ -1,4 +1,4 @@
-//! Vim pattern → Rust `regex` translation (#801).
+//! Vim pattern → Rust `regex` translation.
 //!
 //! Vim's regular expressions are *not* PCRE and are *not* Rust `regex` syntax:
 //! quantifiers are backslash-escaped in the default `magic` mode (`\+`, `\{n,m}`),
@@ -24,16 +24,15 @@
 //! [`Translation::group_map`] records the Vim-group → Rust-group mapping that
 //! replacement expansion must apply to `\1` … `\9`.
 //!
-//! ## Look-around (`\@=` / `\@!` / `\@<=` / `\@<!`, #1157)
+//! ## Look-around (`\@=` / `\@!` / `\@<=` / `\@<!`)
 //!
 //! Unlike `\zs`/`\ze`, real look-around has a direct target in `fancy_regex`
-//! (already linked for `\1`..`\9` backreferences, #1004), so it's a syntax
-//! rewrite of the atom that was just emitted rather than an engine-level
-//! workaround: `\(bar\)\@=` becomes `(?=(bar))` — the inner capturing group
-//! is kept so Vim's "groups are numbered by position, look-around or not"
-//! rule still holds for `\1`..`\9`.
+//! and supports it natively, so it's a syntax rewrite of the atom that was just
+//! emitted rather than an engine-level workaround: `\(bar\)\@=` becomes
+//! `(?=(bar))` — the inner capturing group is kept so Vim's "groups are numbered
+//! by position, look-around or not" rule still holds for `\1`..`\9`.
 //!
-//! ## Position assertions (`\%23l` / `\%23c` / `\%V`, #1157)
+//! ## Position assertions (`\%23l` / `\%23c` / `\%V`)
 //!
 //! Neither `regex` nor `fancy_regex` has an "absolute line/column" or
 //! "inside this byte range" primitive, so these translate to no regex text
@@ -45,7 +44,7 @@
 //!
 //! A pattern that cannot be translated returns `Err` with a Vim-style message.
 //! Callers must surface it — falling back to literal matching is exactly the
-//! silent-wrong-answer failure mode #801 exists to remove. `\&` (branch
+//! silent-wrong-answer failure mode that must be removed. `\&` (branch
 //! concat) and `\%[...]` (optional sequence) stay in this category: neither
 //! `regex` nor `fancy_regex` exposes a primitive they can be translated to.
 
@@ -85,7 +84,7 @@ pub enum Cmp {
 /// A zero-width position assertion that can't be expressed inside the
 /// translated regex itself (`regex`/`fancy_regex` have no "current absolute
 /// line/column" or "inside this byte range" primitive) — recorded here and
-/// applied as a post-match filter by [`Compiled`] instead (#1157).
+/// applied as a post-match filter by [`Compiled`] instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PosConstraint {
     /// `\%23l` / `\%<23l` / `\%>23l` — 1-indexed line number of the match start.
@@ -113,10 +112,10 @@ pub struct Translation {
     pub group_map: Vec<usize>,
     /// `true` if the pattern contains a `\1`..`\9` backreference, which
     /// `regex`'s linear-time automaton cannot execute — such a pattern must
-    /// be compiled with `fancy_regex` instead (#1004).
+    /// be compiled with `fancy_regex` instead.
     pub has_backref: bool,
     /// `true` if the pattern contains `\@=` / `\@!` / `\@<=` / `\@<!`
-    /// look-around, which also requires `fancy_regex` (#1157).
+    /// look-around, which also requires `fancy_regex`.
     pub has_lookaround: bool,
     /// Zero-width position assertions (`\%23l`, `\%23c`, `\%V`) that must be
     /// applied as a post-match filter — see [`PosConstraint`].
@@ -171,7 +170,7 @@ pub fn escape_literal(s: &str) -> String {
 }
 
 /// Escape a string so it matches literally when re-parsed as a **Vim**
-/// pattern under the current `'magic'` setting (#1207). Used by `*` / `#`,
+/// pattern under the current `'magic'` setting. Used by `*` / `#`,
 /// which wrap the word under the cursor in `\<` … `\>` and then run it back
 /// through [`compile_with_keyword_class`] at that same `magic` level.
 ///
@@ -220,9 +219,8 @@ fn class_for(c: char) -> Option<&'static str> {
         'i' => "[0-9A-Za-z_]",
         'I' => "[A-Za-z_]",
         // `k`/`K` are handled dynamically by `Translator::class_for_dynamic`
-        // (#1191, `'iskeyword'`-driven) — not reachable via this table, kept
+        // (`'iskeyword'`-driven) — not reachable via this table, kept
         // here only as the defensive fallback `keyword_class_fallback` uses
-        // if `'iskeyword'` is somehow unparsable.
         'k' => "[0-9A-Za-z_]",
         'K' => "[A-Za-z_]",
         'f' => "[^ \\t]",
@@ -270,7 +268,7 @@ struct Translator<'a> {
 
 impl<'a> Translator<'a> {
     /// Like [`class_for`], but resolves `\k`/`\K` dynamically against
-    /// `'iskeyword'` instead of the fixed ASCII fallback (#1191) — every
+    /// `'iskeyword'` instead of the fixed ASCII fallback — every
     /// other letter is unaffected.
     fn class_for_dynamic(&self, c: char) -> Option<String> {
         match c {
@@ -576,10 +574,8 @@ impl<'a> Translator<'a> {
                 // `\@=` / `\@!` / `\@<=` / `\@<!` — look-around, applied to
                 // the atom that was just emitted (almost always a `\(...\)`
                 // or `\%(...\)` group, but any single atom qualifies).
-                // `regex`'s automaton can't do look-around at all, but
-                // `fancy_regex` (already linked for `\1`..`\9`, #1004)
-                // supports it natively, so this is a pure syntax rewrite of
-                // the atom already sitting in `self.out`.
+                // `fancy_regex` supports this natively, so this is a pure
+                // syntax rewrite of the atom already sitting in `self.out`.
                 let Some(start) = self.last_atom_start.take() else {
                     return Err("E-vimcode: \\@=/\\@!/\\@<=/\\@<! must follow an atom".to_string());
                 };
@@ -759,7 +755,7 @@ impl<'a> Translator<'a> {
                         }
                         None => return Err("E682: Invalid search pattern".to_string()),
                     },
-                    // `. * ^ $ ~ [ ]` (#1207): whether *bare* is special
+                    // `. * ^ $ ~ [ ]`: whether *bare* is special
                     // depends on the magic level (`bare_special`), but a
                     // backslash always **toggles** it — under `magic` that
                     // means "make literal" (the common case, already the
@@ -868,7 +864,7 @@ impl<'a> Translator<'a> {
     /// Emit the special (as opposed to literal) form of `c`, one of
     /// `. * ^ $ ~ [ ]` — i.e. exactly what `run()`'s own bare-character
     /// match would emit for `c` if it appeared unescaped. Used from the
-    /// escaped-atom branch (#1207) when the current magic level makes `c`
+    /// escaped-atom branch when the current magic level makes `c`
     /// literal bare (`nomagic`/`\V`), so a backslash in front of it must
     /// toggle it *to* special rather than *away from* it. `was_start` is
     /// the caller's `self.at_start` snapshot from before the backslash was
@@ -914,9 +910,8 @@ impl<'a> Translator<'a> {
 /// ASCII-only `\k`/`\K` classes (`:h /\k`) — this module's own unit tests
 /// use this and don't exercise `'iskeyword'`. The real, `'iskeyword'`-aware
 /// caller path is [`compile_with_keyword_class`] (via
-/// [`translate_with_keyword_class`], #1191); [`compile`] is the same ASCII
-/// default as this fn, for callers (currently none outside tests) that
-/// don't have a `Settings` to hand.
+/// [`translate_with_keyword_class`]); [`compile`] is the same ASCII
+/// default as this fn, for callers that don't have a `Settings` to hand.
 ///
 /// `last_sub` is the previous `:s` replacement text, which `~` expands to.
 #[cfg(test)]
@@ -930,7 +925,7 @@ fn translate(pattern: &str, magic: Magic, last_sub: &str) -> Result<Translation,
 /// `keyword_class`/`keyword_class_no_digits` are the `[...]`-body fragments
 /// `\k`/`\K` expand to — see
 /// [`crate::core::settings::Settings::iskeyword_regex_class_bodies`], the
-/// only intended source for these two (#1191).
+/// only intended source for these two.
 pub fn translate_with_keyword_class(
     pattern: &str,
     magic: Magic,
@@ -1017,7 +1012,6 @@ pub fn translate_with_keyword_class(
 /// never defines) is passed through unmapped; `fancy_regex::Regex::new`
 /// rejects that as `Err(InvalidBackref)` rather than panicking, which is the
 /// desired "fail, don't crash" behaviour for `\0` and undefined groups
-/// (#1004).
 fn resolve_backref_marks(src: &str, group_map: &[usize]) -> String {
     let mut out = String::with_capacity(src.len());
     let mut chars = src.chars();
@@ -1088,7 +1082,7 @@ impl<'t> Captures<'t> {
 /// constraint that rules out backreferences entirely — not a missing
 /// feature to work around. `fancy_regex` layers a backtracking VM on top of
 /// `regex` and is used *only* when the pattern actually contains `\1`..`\9`,
-/// so the common (and hot) case keeps `regex`'s speed and guarantees (#1004).
+/// so the common (and hot) case keeps `regex`'s speed and guarantees.
 #[derive(Debug)]
 pub enum CompiledRegex {
     Fast(regex::Regex),
@@ -1188,7 +1182,7 @@ impl Compiled {
     }
 
     /// First raw engine match at-or-after byte offset `at`, with no
-    /// constraint filtering — the pre-#1157 behaviour of `captures_at`.
+    /// constraint filtering.
     fn raw_captures_at<'t>(&self, text: &'t str, at: usize) -> Option<Captures<'t>> {
         match &self.regex {
             CompiledRegex::Fast(re) => re.captures_at(text, at).map(Captures::Fast),
@@ -1206,7 +1200,7 @@ impl Compiled {
                 CompiledRegex::Fast(re) => re.is_match(text),
                 // A catastrophic-backtrack pattern hits fancy_regex's backtrack
                 // limit and returns `Err`; treat that as "no match" rather than
-                // propagating a panic (#1004).
+                // propagating a panic.
                 CompiledRegex::Backref(re) => re.is_match(text).unwrap_or(false),
             };
         }
@@ -1293,7 +1287,7 @@ impl Compiled {
 /// Compile a Vim pattern using the historical ASCII-only `\k`/`\K` classes.
 /// Real production callers should use [`compile_with_keyword_class`]
 /// instead, threading the current `'iskeyword'` setting through — this is
-/// kept only for this module's own unit tests (#1191).
+/// kept only for this module's own unit tests.
 #[cfg(test)]
 pub fn compile(
     pattern: &str,
@@ -1320,9 +1314,9 @@ pub fn compile(
 /// — the `'iskeyword'`-derived `[...]`-body fragments `\k`/`\K` expand to,
 /// bundled into one param to stay under clippy's argument-count limit. See
 /// [`crate::core::settings::Settings::iskeyword_regex_class_bodies`], the
-/// only intended source for these two (#1191).
+/// only intended source for these two.
 ///
-/// `magic` is the current `'magic'` setting (#1207) — the *starting* magic
+/// `magic` is the current `'magic'` setting — the *starting* magic
 /// level for the pattern before any inline `\v`/`\V`/`\m`/`\M` override.
 /// `true` → [`Magic::Magic`] (Vim's own default), `false` → [`Magic::NoMagic`]
 /// (`:h 'nomagic'`: only `^`/`$` stay special unescaped; `.`, `*`, `[`, `~`
@@ -1464,7 +1458,7 @@ mod tests {
         assert_eq!(tr("\\M^a$"), "^a$");
     }
 
-    /// RED against unfixed `develop` (#1207): before the `push_toggled_special`
+    /// RED against unfixed `develop`: before the `push_toggled_special`
     /// fix, an escaped `.`/`*`/`^`/`$` under `nomagic`/`\V` fell through to
     /// the generic `push_literal` fallback regardless of magic level, so
     /// `\.` under `nomagic` produced a *literal* dot instead of "matches any
@@ -1498,14 +1492,14 @@ mod tests {
         // deliberately: those two are the ones this module can't get right
         // on its own, since real Vim ties them to `'iskeyword'` — see
         // `keyword_class_is_unicode_aware_with_the_default_iskeyword` below
-        // for the actual `'iskeyword'`-driven behavior (#1191).
+        // for the actual `'iskeyword'`-driven behavior.
         assert_eq!(tr("\\k"), "[0-9A-Za-z_]");
         assert_eq!(tr("\\K"), "[A-Za-z_]");
     }
 
     #[test]
     fn keyword_class_is_unicode_aware_with_the_default_iskeyword() {
-        // #1191: before this fix, `\k`'s regex class was unconditionally
+        // Before this fix, `\k`'s regex class was unconditionally
         // the hardcoded ASCII `"[0-9A-Za-z_]"` (see `character_classes`
         // above) — no non-ASCII letter could ever match `\k`, even though
         // real Vim's default `'iskeyword'` (`@,48-57,_,192-255`) makes
@@ -1611,8 +1605,8 @@ mod tests {
 
     #[test]
     fn backref_matches_repeated_text() {
-        // The #1004 oracle case: `/\(foo\)\1` must match "foofoo" — not stop
-        // at the first "foo", and not treat `\1` as a literal "1".
+        // `/\(foo\)\1` must match "foofoo" — not stop at the first "foo",
+        // and not treat `\1` as a literal "1".
         let c = compile("\\(foo\\)\\1", false, false, true, "", None).unwrap();
         let text = "foo foofoo";
         let caps = c.captures(text).expect("matches foofoo");
@@ -1660,10 +1654,9 @@ mod tests {
         assert!(err.contains("Invalid pattern"), "{err}");
     }
 
-    // #1157: look-around routes through `fancy_regex` (already linked for
-    // `\1`..`\9`, #1004) instead of being rejected — one test per form, plus
-    // an end-to-end `compile()` case proving the translated regex actually
-    // matches/rejects the right text, not just that translation succeeds.
+    // Look-around routes through `fancy_regex` instead of being rejected —
+    // one test per form, plus an end-to-end `compile()` case proving the
+    // translated regex actually matches/rejects the right text.
 
     #[test]
     fn lookahead_positive_wraps_the_preceding_group() {
@@ -1699,7 +1692,7 @@ mod tests {
 
     #[test]
     fn lookahead_after_a_bare_quantifier_fails_to_compile_not_silently_wrong() {
-        // #1157 review: `last_atom_start` isn't updated by a bare `\+`/`*`/
+        // `last_atom_start` isn't updated by a bare `\+`/`*`/
         // `\=` quantifier, so a look-around stacked directly after one
         // (`x\+\@=`) doesn't wrap the quantified atom `x\+` the way
         // `\(x\)\+\@=` would — it re-points at the quantifier's own output
@@ -1781,7 +1774,7 @@ mod tests {
         assert_eq!(t.group_map, vec![0, 1]);
     }
 
-    // #1157: `\_x` — cross-line character classes. The whole buffer is
+    // `\_x` — cross-line character classes. The whole buffer is
     // matched as one string with `(?m)` set (see `compile`), so "cross-line"
     // just means "also accept the embedded `\n`".
 
@@ -1828,7 +1821,7 @@ mod tests {
         assert_eq!(tr("foo\\%$"), "foo\\z");
     }
 
-    // #1157: `\%d123` / `\%x2a` — decimal/hex character-code literals.
+    // `\%d123` / `\%x2a` — decimal/hex character-code literals.
 
     #[test]
     fn percent_d_decimal_char_code() {
@@ -1853,7 +1846,7 @@ mod tests {
         assert!(translate("\\%dx", Magic::Magic, "").is_err());
     }
 
-    // #1157: `\%23l` / `\%23c` — absolute line/column position assertions,
+    // `\%23l` / `\%23c` — absolute line/column position assertions,
     // applied as a post-match filter (`Compiled::pos_ok`) since neither
     // `regex` nor `fancy_regex` has an "absolute line number" primitive.
 
@@ -1891,7 +1884,7 @@ mod tests {
         assert!(!c.is_match("foo\nfoo"));
     }
 
-    // #1157: `\%V` — restrict the match to the last Visual selection, given
+    // `\%V` — restrict the match to the last Visual selection, given
     // to `compile` as a byte range (the engine, not `vim_regex`, knows what
     // the last selection was).
 
@@ -1909,7 +1902,7 @@ mod tests {
         assert!(!c.is_match("foo"));
     }
 
-    // #1157: `\&` and `\%[...]` stay rejected (no faithful translation exists
+    // `\&` and `\%[...]` stay rejected (no faithful translation exists
     // in either regex crate) but with a clearer message than before.
 
     #[test]
@@ -1960,17 +1953,11 @@ mod tests {
         assert!(c.is_match("a\nb"));
     }
 
-    // ── `'magic'` (#1207) ────────────────────────────────────────────────
+    // ── `'magic'` setting ─────────────────────────────────────────────────
     //
-    // These exercise `compile_with_keyword_class`'s new `magic: bool` param
-    // directly (not the inline `\v`/`\V`/`\m`/`\M` overrides, which already
-    // had coverage via `tr()` before #1207) — i.e. the *setting*, with no
-    // per-pattern override in the pattern text itself. RED against unfixed
-    // `develop`: before #1207, `compile_with_keyword_class` hardcoded
-    // `Magic::Magic` as the starting level with no way to reach
-    // `Magic::NoMagic` short of an inline `\M`, so `magic_setting_off_makes_dot_and_star_literal`
-    // would have failed — a bare `.` would have matched any char instead of
-    // a literal dot.
+    // These exercise `compile_with_keyword_class`'s `magic: bool` param
+    // directly (not the inline `\v`/`\V`/`\m`/`\M` overrides) — i.e. the
+    // *setting*, with no per-pattern override in the pattern text itself.
 
     #[test]
     fn magic_setting_off_makes_dot_and_star_literal() {

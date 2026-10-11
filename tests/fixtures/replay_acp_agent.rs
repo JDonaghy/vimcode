@@ -1,4 +1,4 @@
-//! ACP transcript replay agent (#1461) — plays the *agent* side of a
+//! ACP transcript replay agent — plays the *agent* side of a
 //! recorded ACP session back at a real `AcpClient`, so contract tests can
 //! drive the engine's actual NDJSON transport + dispatch path against a
 //! fixed, realistic wire recording instead of either (a) a hand-scripted
@@ -194,34 +194,15 @@ fn main() {
         }
     }
 
-    // The transcript is exhausted — now *stay alive* until the client
+    // The transcript is exhausted — now stay alive until the client
     // disconnects (stdin EOF), the way a real ACP agent does. It does not
     // exit the instant a turn reaches `stopReason: end_turn`; it sits idle
     // waiting for the next prompt, and only dies when the client closes the
     // connection (`AcpClient::drop` kills the child explicitly, so nothing
     // is orphaned when a test ends).
     //
-    // Returning from `main` here instead — which is what this binary used to
-    // do — made every contract test that asserts on state a turn *leaves
-    // behind* racy. Process exit makes `AcpClient`'s reader thread emit
-    // `AcpEvent::AgentExited`, and the engine treats a dead agent as the end
-    // of the whole session: `acp_dispatch_events`' `AgentExited` arm wipes
-    // the session-scoped state, `self.change_review = None` included (#955).
-    // Because `poll_acp` drains every queued event before returning, a test
-    // whose poll tick happened to land after the exit saw the review opened
-    // and cleared again inside one `poll_acp()` call — so the contract test
-    // that then asserted on a `diff` block opening a review (since retired
-    // by #1516; `turn_write_transcript_opens_a_hunk_level_turn_review_over_
-    // the_wire` asserts on a turn review the same way today) failed roughly
-    // half its runs on its 30s deadline with `change_review`
-    // never observably `Some`, on `develop` as much as on any branch. Staying
-    // up removes the exit from the middle of the scenario entirely rather
-    // than papering over it with a longer deadline or a retry.
-    //
     // Client traffic arriving after the transcript's last step is drained and
-    // ignored rather than failed on: "loud failure" above is about a client
-    // message that *contradicts the next expected step*, and once the
-    // transcript is done there is no next step left to contradict.
+    // ignored rather than failed on: there is no next step left to contradict.
     for line in lines {
         if line.is_err() {
             break;

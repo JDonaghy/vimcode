@@ -1,4 +1,4 @@
-//! Native tool acquisition (#1345): download, verify and unpack an LSP
+//! Native tool acquisition: download, verify and unpack an LSP
 //! server / DAP adapter binary without a shell command, `sudo`, `unzip`, or
 //! PATH edits.
 //!
@@ -28,7 +28,7 @@
 //! in-process (the `zip` and `tar`+`flate2` crates), never the `unzip`/`tar`
 //! binaries, so there is no `sh -c` anywhere in this module.
 //!
-//! Five more acquisition kinds (#1346) cover the package-manager ecosystems
+//! Five more acquisition kinds cover the package-manager ecosystems
 //! a language's LSP/DAP tooling is usually published to instead of a
 //! standalone release archive: `npm`, `pip`, `go`, `cargo`, `dotnet-tool`.
 //! Each installs into a **private prefix** under the same
@@ -64,15 +64,15 @@ pub enum AcquireKind {
     GithubRelease,
     #[default]
     UrlTemplate,
-    /// `npm install --prefix <dir> <package>@<version>` (#1346).
+    /// `npm install --prefix <dir> <package>@<version>`.
     Npm,
-    /// `python3 -m venv <dir>` then `<dir>/bin/pip install <package>` (#1346).
+    /// `python3 -m venv <dir>` then `<dir>/bin/pip install <package>`.
     Pip,
-    /// `GOBIN=<dir>/bin go install <package>@<version>` (#1346).
+    /// `GOBIN=<dir>/bin go install <package>@<version>`.
     Go,
-    /// `cargo install --root <dir> <package>` (#1346).
+    /// `cargo install --root <dir> <package>`.
     Cargo,
-    /// `dotnet tool install --tool-path <dir> <package>` (#1346).
+    /// `dotnet tool install --tool-path <dir> <package>`.
     DotnetTool,
 }
 
@@ -99,7 +99,7 @@ pub struct AcquireConfig {
     #[serde(default)]
     pub url: String,
     /// Package/module/crate name to install (`npm`, `pip`, `go`, `cargo`,
-    /// `dotnet-tool` only, #1346), e.g. `"pyright"` (npm),
+    /// `dotnet-tool`), e.g. `"pyright"` (npm),
     /// `"python-lsp-server"` (pip), `"golang.org/x/tools/gopls"` (go),
     /// `"ripgrep"` (cargo).
     #[serde(default)]
@@ -110,7 +110,7 @@ pub struct AcquireConfig {
     /// Path of the executable inside the downloaded archive
     /// (`hashicorp-release`/`github-release`/`url-template`), e.g.
     /// `"terraform-ls"`. For a package-manager kind (`npm`/`pip`/`go`/
-    /// `cargo`/`dotnet-tool`, #1346) this instead names the executable
+    /// `cargo`/`dotnet-tool`) this instead names the executable
     /// the install produces inside its private prefix, e.g. the console
     /// script `npm`/`pip` write out or the binary `go`/`cargo install`
     /// build. Defaults to the tool's own binary name (the resolver's
@@ -143,9 +143,9 @@ pub enum Arch {
 
 impl Arch {
     /// Every architecture vimcode resolves acquisitions for, in a stable
-    /// order — mirrors `extensions::Platform::ALL`. Lets a single test (or
-    /// the #1347 registry liveness check) sweep every arch regardless of
-    /// which one the test binary happens to be compiled for.
+    /// order — mirrors `extensions::Platform::ALL`. Lets a single test
+    /// sweep every arch regardless of which one the test binary happens to
+    /// be compiled for.
     pub const ALL: [Arch; 2] = [Arch::Amd64, Arch::Arm64];
 
     /// The architecture this binary was actually compiled for.
@@ -232,7 +232,7 @@ pub fn expand_template(template: &str, version: &str, os: &str, arch: &str) -> S
         .replace("{arch}", arch)
 }
 
-// ─── Package-manager acquisition (#1346) ───────────────────────────────────
+// ─── Package-manager acquisition ───────────────────────────────────────────
 
 /// The runtime binary that must already be on PATH before `kind` can be
 /// used — `None` for the three archive-download kinds, which need nothing
@@ -240,9 +240,7 @@ pub fn expand_template(template: &str, version: &str, os: &str, arch: &str) -> S
 /// this a pure function: the caller (`Engine::ext_install_from_registry`)
 /// decides how to probe (the shared `binary_on_path`, which also checks the
 /// vimcode-managed tools dir and the extra tool dirs, not just PATH) and
-/// what to do when it's missing — fall through to the visible-terminal
-/// tier with a dependency hint instead of failing silently, per #1346's
-/// acceptance criteria.
+/// what to do when it's missing.
 pub fn package_manager_runtime(kind: AcquireKind) -> Option<&'static str> {
     match kind {
         AcquireKind::HashicorpRelease | AcquireKind::GithubRelease | AcquireKind::UrlTemplate => {
@@ -258,8 +256,8 @@ pub fn package_manager_runtime(kind: AcquireKind) -> Option<&'static str> {
     }
 }
 
-/// Is `kind` one of the five package-manager kinds (#1346), as opposed to
-/// one of the three archive-download kinds from #1345?
+/// Is `kind` one of the five package-manager kinds, as opposed to
+/// one of the three archive-download kinds?
 pub fn is_package_manager_kind(kind: AcquireKind) -> bool {
     package_manager_runtime(kind).is_some()
 }
@@ -275,11 +273,8 @@ pub struct PackageManagerStep {
     pub env: Vec<(String, String)>,
 }
 
-/// Build the argv (no shell string, ever — #1346 replaces the old
-/// `npm install -g …` / `pip install …` / `go install …` / `cargo install
-/// …` shell one-liners specifically because they need a shell or a global,
-/// often root-owned, prefix) for installing `cfg.package` via `kind` into
-/// the private prefix `dir` (always
+/// Build the argv (no shell string, ever) for installing `cfg.package`
+/// via `kind` into the private prefix `dir` (always
 /// `paths::managed_tool_version_dir(tool_name, version)` in production —
 /// passed in explicitly here so this stays a pure, network-free function
 /// tests can drive directly against a throwaway path).
@@ -290,10 +285,8 @@ pub struct PackageManagerStep {
 ///
 /// A pure function of `(kind, cfg, dir, platform)` — no PATH probing, no
 /// process spawn, no network — so every kind's argv can be asserted for
-/// every platform in one test run regardless of what happens to be
-/// installed on (or what OS is running) the machine running the suite
-/// (mirrors `resolve_asset`'s `url-template` branch, the one archive kind
-/// #1345 could already test this way).
+/// every platform in one test run regardless of the suite's host OS or
+/// what happens to be installed on it.
 pub fn package_manager_argv(
     kind: AcquireKind,
     cfg: &AcquireConfig,
@@ -419,11 +412,9 @@ fn exe_named(bin: &str, platform: Platform) -> String {
 }
 
 /// Where a package-manager install of `kind` puts `bin` inside its private
-/// prefix `dir`, per platform (#1346 acceptance: "binary-path resolution
-/// per kind, including the Windows `Scripts\`/`.exe` variants"). A pure
-/// function — no filesystem access — so every kind × platform combination
-/// is assertable in one test run, the same reasoning `resolved_os`/
-/// `resolved_arch` above already applies to the archive kinds.
+/// prefix `dir`, per platform (including the Windows `Scripts\`/`.exe`
+/// variants). A pure function — no filesystem access — so every kind ×
+/// platform combination is assertable in one test run.
 pub fn package_manager_binary_path(
     kind: AcquireKind,
     dir: &Path,
@@ -594,7 +585,7 @@ fn is_safe_relative_path(p: &str) -> bool {
 /// so `components()` alone would let a Windows-flavoured traversal through
 /// on the very platform where the join would later be interpreted.
 ///
-/// Exported (#1345 review) because every destructive operation keyed by a
+/// Exported because every destructive operation keyed by a
 /// manifest-supplied name must gate on the same predicate:
 /// `tool_acquire`'s own install path does, and `Engine::ext_remove_tools`'s
 /// `remove_dir_all(managed_tool_dir(bin_name))` — the mirror-image removal
@@ -770,23 +761,10 @@ pub const ALLOW_FILE_URL_DOWNLOADS_ENV: &str = "VIMCODE_TEST_ALLOW_FILE_URL_DOWN
 
 /// Is a `file://` download URL acceptable in *this* build?
 ///
-/// Second review round on #1345: `file://` used to be accepted
-/// unconditionally, in production code, next to `https://`. That is an
-/// arbitrary-file-read primitive reachable from a community-submitted or
-/// compromised registry manifest — `[lsp.acquire]`/`[dap.acquire]` with
-/// `kind = "url-template"` and `url = "file:///home/user/.ssh/id_rsa"` made
-/// `download_asset` shell out to `curl -sfL -o <staging> file://…` (curl
-/// enables the `file` protocol by default), copying any file the vimcode
-/// process can read into a predictable `temp_dir()` staging path before any
-/// archive-format check runs. The allowance now exists **only** in test
-/// builds:
-///
-/// * in-crate unit/driver tests (`cfg(test)`) — `tool_acquire.rs`'s own
-///   end-to-end fixtures and `tui_main::shell_app`'s driver tests — get it
-///   for free;
-/// * integration-test crates opt in explicitly via
-///   [`ALLOW_FILE_URL_DOWNLOADS_ENV`], and even that read is compiled out
-///   of `--release` builds by the `debug_assertions` gate.
+/// `file://` is accepted only in test builds: in-crate unit/driver tests
+/// get it for free; integration-test crates opt in explicitly via
+/// [`ALLOW_FILE_URL_DOWNLOADS_ENV`], and even that read is compiled out
+/// of `--release` builds by the `debug_assertions` gate.
 ///
 /// A shipped binary therefore accepts `https://` and nothing else.
 fn file_url_downloads_allowed() -> bool {
@@ -805,19 +783,14 @@ fn file_url_downloads_allowed() -> bool {
 }
 
 /// Reject any download URL that isn't `https://`. A pure, network-free check
-/// so it's independently unit-testable (review finding on #1345 — the
-/// acceptance criteria say "Download over https only", and neither
-/// `resolve_url_template` nor the old inline check in
-/// `install_resolved_asset` enforced it): a manifest (or a compromised/
-/// typo'd registry entry) declaring a plain `http://` URL is rejected here
-/// rather than fetched in the clear, for every acquire kind
-/// (`hashicorp-release`, `github-release`, `url-template` all funnel
+/// so it's independently unit-testable: a manifest declaring a plain `http://`
+/// URL is rejected here rather than fetched in the clear, for every acquire
+/// kind (`hashicorp-release`, `github-release`, `url-template` all funnel
 /// through `install_resolved_asset`, so this is the one choke point that
 /// covers all three).
 ///
 /// `file://` is accepted *only* in test builds — see
-/// [`file_url_downloads_allowed`] for why that is a compile-time property
-/// and not a runtime one.
+/// [`file_url_downloads_allowed`] for why that is a compile-time property.
 fn validate_download_url(url: &str) -> Result<(), AcquireError> {
     validate_download_url_with(url, file_url_downloads_allowed())
 }
@@ -839,16 +812,13 @@ fn validate_download_url_with(url: &str, allow_file_urls: bool) -> Result<(), Ac
 }
 
 /// Download the resolved asset archive to `dest`. Deliberately its own
-/// `curl` invocation rather than reusing `registry::download_script`
-/// (review finding on #1345): that helper omits `-L`, and a GitHub release
-/// asset's `browser_download_url` is well known to 302-redirect through
-/// `objects.githubusercontent.com` — without `-L`, `curl -f` doesn't treat
-/// the redirect as an error, so the "download" can silently succeed while
-/// writing a near-empty/HTML body instead of the real archive. `-sfL`
-/// matches the flag set `http_get_bytes` above already uses for the JSON
-/// API calls in this module. `file://` URLs (used by this module's own
-/// tests, see the `tests` block below — and rejected outright in a release
-/// build, see `validate_download_url`) are unaffected by `-L`.
+/// `curl` invocation rather than reusing `registry::download_script`: that
+/// helper omits `-L`, and a GitHub release asset's `browser_download_url`
+/// is well known to 302-redirect through `objects.githubusercontent.com` —
+/// without `-L`, `curl -f` doesn't treat the redirect as an error, so the
+/// "download" can silently succeed while writing a near-empty/HTML body
+/// instead of the real archive. `-sfL` matches the flag set `http_get_bytes`
+/// above already uses for the JSON API calls in this module.
 fn download_asset(url: &str, dest: &Path) -> Result<(), AcquireError> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -989,16 +959,8 @@ fn resolve_github_release(
     // GitHub releases have no standard checksum-file location; a mismatch
     // here is silently absent rather than fabricated. Callers should still
     // prefer `hashicorp-release` when available for exactly this reason.
-    //
-    // Review note (#1345): this makes the "SHA-256 verification is mandatory
-    // whenever the upstream publishes checksums" criterion vacuously true for
-    // this kind — the upstream publishes nothing to verify against, so the
-    // only integrity guarantee a `github-release` acquisition has is TLS
-    // (`validate_download_url` refuses anything but `https://`). A registry
-    // manifest should therefore use `hashicorp-release`, or a `url-template`
-    // pointing at a checksummed artifact, whenever the project offers one,
-    // and `github-release` only as a last resort. Worth restating in the
-    // extension-authoring docs when they land.
+    // The only integrity guarantee a `github-release` acquisition has is TLS
+    // (`validate_download_url` refuses anything but `https://`).
     Ok(ResolvedAsset {
         url,
         version,
@@ -1035,7 +997,7 @@ fn resolve_url_template(
 /// Resolve `cfg` to a concrete downloadable asset for `platform`/`arch`.
 /// Hits the network for `hashicorp-release`/`github-release`; pure for
 /// `url-template`. Only meaningful for the three archive-download kinds —
-/// `acquire_and_install_for` routes every package-manager kind (#1346) to
+/// `acquire_and_install_for` routes every package-manager kind to
 /// [`install_via_package_manager`] before this is ever called, so the
 /// fallback arm below should be unreachable in practice.
 pub fn resolve_asset(
@@ -1153,16 +1115,11 @@ fn install_resolved_asset(
         .unwrap_or_else(|| tool_name.to_string());
 
     // Stage the unpacked binary *inside the managed tools tree* rather than
-    // under the system temp dir (review finding on #1345): staging under
-    // `std::env::temp_dir()` and then `rename`-ing into
-    // `managed_tool_version_dir` fails with `EXDEV` whenever `/tmp` and the
-    // data dir are on different filesystems/mounts — a common layout
-    // (tmpfs `/tmp`, or a separate `/home` partition on many distros).
-    // Staging as a sibling of the final version dir under the same tool
-    // directory guarantees the swap-in `rename` is same-filesystem;
-    // `rename_or_copy` below still falls back to copy+remove for the rare
-    // case (e.g. a read-only bind mount split across the tool dir) where it
-    // somehow isn't.
+    // under the system temp dir: staging under `std::env::temp_dir()` and then
+    // `rename`-ing into `managed_tool_version_dir` fails with `EXDEV` whenever
+    // `/tmp` and the data dir are on different filesystems/mounts. Staging as
+    // a sibling of the final version dir under the same tool directory
+    // guarantees the swap-in `rename` is same-filesystem.
     let tool_dir = super::paths::managed_tool_dir(tool_name);
     std::fs::create_dir_all(&tool_dir)?;
     let stage_dir = tool_dir.join(format!(
@@ -1202,12 +1159,11 @@ fn install_resolved_asset(
     Ok(version_dir.join(&extracted_name))
 }
 
-/// Install `cfg` (one of the five #1346 package-manager kinds) for tool
+/// Install `cfg` (one of the five package-manager kinds) for tool
 /// `tool_name` by spawning `package_manager_argv`'s steps directly — no
 /// shell, so there is nowhere for `cfg.package`/`cfg.version` (free-form
 /// text from a community-submitted registry manifest) to break out of the
-/// argument list the way it could if this built a `sh -c "npm install …"`
-/// string instead.
+/// argument list.
 ///
 /// Installs into the **same** `paths::managed_tool_version_dir(tool_name,
 /// version)` the archive kinds unpack into (a private prefix vimcode owns,
@@ -1215,10 +1171,7 @@ fn install_resolved_asset(
 /// `sudo`), staged as a sibling directory first and atomically swapped in —
 /// mirroring `install_resolved_asset`'s staging/rename pattern exactly.
 ///
-/// Unlike the archive kinds, a package-manager install has no upstream API
-/// to resolve `"latest"` to a concrete version number (`resolve_asset`
-/// deliberately requires a pin for `url-template` for the same reason).
-/// An unpinned `cfg.version` therefore installs into the literal `"latest"`
+/// An unpinned `cfg.version` installs into the literal `"latest"`
 /// version directory, which a later unpinned reinstall overwrites in place.
 fn install_via_package_manager(
     tool_name: &str,
@@ -1241,17 +1194,12 @@ fn install_via_package_manager(
     } else {
         cfg.binary_path.clone()
     };
-    // `bin_name` (from the manifest's `binary_path`, free-form text from a
-    // community-submitted registry manifest) is joined onto `stage_dir`
-    // below, ultimately reaching `link_binary_into_prefix`'s
-    // `stage_dir.join(bin_name)` `link_path`, which that function
-    // `remove_file`s before creating a symlink in its place. Per the
-    // field's own doc comment above it names a single executable, never a
-    // nested path, so gate it with the *stricter* `is_safe_single_segment_
-    // name` (rejects `/`, `\`, and `..` outright) rather than
-    // `is_safe_relative_path` (only rejects `..`, and would let a manifest
-    // walk `link_path` outside `stage_dir` to delete-and-symlink an
-    // arbitrary file the vimcode process can reach, #1346 review).
+    // `bin_name` is joined onto `stage_dir` below, ultimately reaching
+    // `link_binary_into_prefix`'s `stage_dir.join(bin_name)` `link_path`.
+    // It names a single executable, never a nested path, so gate it with
+    // the stricter `is_safe_single_segment_name` (rejects `/`, `\`, and `..`)
+    // rather than `is_safe_relative_path` to prevent a manifest from
+    // deleting-and-symlinking an arbitrary file the vimcode process can reach.
     if !is_safe_single_segment_name(&bin_name) {
         return Err(AcquireError::PathTraversal(bin_name));
     }
@@ -1341,9 +1289,8 @@ fn run_package_manager_steps(steps: &[PackageManagerStep]) -> Result<(), Acquire
             return Err(AcquireError::Archive(format!(
                 "`{}` failed: {}",
                 step.argv.join(" "),
-                // #1346 acceptance: "on failure, surface the last lines of
-                // stderr in the notification" — never the whole, potentially
-                // huge, npm/cargo/dotnet build log.
+                // Surface the last lines of stderr in the notification,
+                // never the whole, potentially huge, npm/cargo/dotnet build log.
                 tail_of(&String::from_utf8_lossy(&output.stderr), 20)
             )));
         }
@@ -1352,9 +1299,8 @@ fn run_package_manager_steps(steps: &[PackageManagerStep]) -> Result<(), Acquire
 }
 
 /// Last `n` non-empty lines of `text` — used to surface a package manager's
-/// own diagnostics (the acceptance criterion: "on failure, surface the
-/// last lines of stderr in the notification") without dumping a
-/// potentially huge npm/cargo/dotnet build log into the status line.
+/// own diagnostics without dumping a potentially huge npm/cargo/dotnet build
+/// log into the status line.
 fn tail_of(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(n);
@@ -1570,8 +1516,6 @@ binary_path = "example-dap"
         assert_eq!(acquire.version, "1.2.3");
     }
 
-    // ── placeholder substitution / os-arch mapping (#1345 acceptance) ────
-
     #[test]
     fn expand_template_substitutes_all_placeholders() {
         assert_eq!(
@@ -1602,8 +1546,7 @@ binary_path = "example-dap"
 
     #[test]
     fn arch_all_covers_both_variants_and_displays_lowercase() {
-        // #1347: the registry liveness check sweeps `Arch::ALL` the same way
-        // the #919 conformance gate sweeps `Platform::ALL`.
+        // The registry liveness check sweeps `Arch::ALL` the same way the
         assert_eq!(Arch::ALL, [Arch::Amd64, Arch::Arm64]);
         assert_eq!(Arch::Amd64.to_string(), "amd64");
         assert_eq!(Arch::Arm64.to_string(), "arm64");
@@ -1955,8 +1898,6 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
         let _ = std::fs::remove_dir_all(&fixture_dir);
     }
 
-    // ── https-only enforcement (review finding on #1345) ───────────────
-
     #[test]
     fn install_resolved_asset_rejects_plain_http_url() {
         let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1982,10 +1923,9 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
 
     #[test]
     fn validate_download_url_accepts_https_and_rejects_every_other_scheme() {
-        // Pure, network-free check (review finding on #1345) — exercised
-        // directly rather than through `install_resolved_asset`, which
-        // would otherwise need a real network call for any URL that gets
-        // past the scheme check.
+        // Pure, network-free check — exercised directly rather than through
+        // `install_resolved_asset`, which would need a real network call for
+        // any URL that gets past the scheme check.
         assert!(validate_download_url("https://example.com/tool.zip").is_ok());
         for bad in [
             "http://example.com/tool.zip",
@@ -2003,15 +1943,11 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
 
     #[test]
     fn release_builds_reject_file_urls_outright() {
-        // Second review round on #1345: `file://` used to be accepted
-        // unconditionally in production code, giving a community-submitted
-        // or compromised registry manifest an arbitrary-file-read primitive
-        // (`url = "file:///home/user/.ssh/id_rsa"` → `curl -o <staging>`).
-        // The allowance is now a *build* property, so assert the release
-        // behaviour directly by passing the production value of the flag.
-        //
-        // RED against the previous commit: `validate_download_url` there had
-        // no flag at all and returned `Ok(())` for every one of these.
+        // `file://` used to be accepted unconditionally in production code,
+        // giving a community-submitted or compromised registry manifest an
+        // arbitrary-file-read primitive (`url = "file:///home/user/.ssh/id_rsa"`
+        // → `curl -o <staging>`). The allowance is now a *build* property, so
+        // assert the release behaviour directly by passing the production value.
         for hostile in [
             "file:///home/user/.ssh/id_rsa",
             "file:///etc/passwd",
@@ -2034,8 +1970,6 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
             "in-crate `cfg(test)` builds must keep the `file://` fixture allowance"
         );
     }
-
-    // ── path-traversal guard on `tool_name`/`version` (review finding) ──
 
     #[test]
     fn install_resolved_asset_rejects_traversal_in_version() {
@@ -2065,8 +1999,6 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
         assert!(matches!(err, AcquireError::PathTraversal(_)));
     }
 
-    // ── atomic-install staging (EXDEV review finding) ────────────────────
-
     #[test]
     fn copy_dir_recursive_copies_nested_files_and_dirs() {
         let root = std::env::temp_dir().join(format!("vimcode_test_copy_dir_{}", unique_suffix()));
@@ -2093,11 +2025,9 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
     #[test]
     fn rename_or_copy_falls_back_to_copy_when_rename_fails() {
         // `std::fs::rename` onto a non-empty directory fails on Linux/macOS
-        // (`ENOTEMPTY`) the same way it would for a genuine cross-filesystem
-        // `EXDEV` — both make `rename_or_copy` fall back to
-        // `copy_dir_recursive` + removing `src`. This is the fallback
-        // `install_resolved_asset` leans on if staging next to the version
-        // dir ever still isn't same-filesystem (review finding on #1345).
+        // (`ENOTEMPTY`) the same way it would for a cross-filesystem `EXDEV` —
+        // both make `rename_or_copy` fall back to `copy_dir_recursive` +
+        // removing `src`.
         let root =
             std::env::temp_dir().join(format!("vimcode_test_rename_fallback_{}", unique_suffix()));
         let src = root.join("src");
@@ -2119,14 +2049,14 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ── github asset download uses -L (review finding, doc-only note) ───
+    // ── github asset download uses -L ────────────────────────────────────
     //
     // `download_asset`'s `-sfL` flags (vs. `registry::download_script`'s
     // `-sf`) aren't independently unit-testable without a real HTTP
     // redirect server; covered by inspection — see `download_asset`'s doc
     // comment for the GitHub redirect scenario this avoids.
 
-    // ── package-manager acquisition: argv construction (#1346) ─────────
+    // ── package-manager acquisition: argv construction ─────────────────
     //
     // Pure, network-free, no process spawn — `package_manager_argv` is a
     // function of `(kind, cfg, dir, platform)` alone, so every kind ×
@@ -2405,7 +2335,7 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
         }
     }
 
-    // ── package-manager acquisition: runtime dependency (#1346) ─────────
+    // ── package-manager acquisition: runtime dependency ─────────────────
 
     #[test]
     fn package_manager_runtime_maps_each_kind_to_its_runtime_binary() {
@@ -2448,12 +2378,11 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
         }
     }
 
-    // ── package-manager acquisition: binary-path resolution (#1346) ─────
+    // ── package-manager acquisition: binary-path resolution ──────────────
     //
     // Pure, no filesystem access — `package_manager_binary_path` is a
     // function of `(kind, dir, bin, platform)` alone, including the
-    // Windows `Scripts\`/`.exe` variants the #1346 acceptance criteria
-    // call out explicitly.
+    // Windows `Scripts\`/`.exe` variants.
 
     #[test]
     fn package_manager_binary_path_npm_unix_and_windows() {
@@ -2551,7 +2480,7 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
         );
     }
 
-    // ── package-manager acquisition: install orchestration (#1346) ──────
+    // ── package-manager acquisition: install orchestration ──────────────
 
     #[test]
     #[cfg(unix)]
@@ -2648,7 +2577,7 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
 
     #[test]
     fn install_via_package_manager_rejects_traversal_in_binary_path() {
-        // #1346 review: a community-submitted manifest's `binary_path` was
+        // A community-submitted manifest's `binary_path` was
         // joined onto `stage_dir` (via `package_manager_binary_path` and
         // then `link_binary_into_prefix`'s `stage_dir.join(bin_name)`) with
         // no traversal guard at all — a `binary_path` like
@@ -2697,12 +2626,10 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
 
     /// #1346 acceptance criterion: "on failure, surface the last lines of
     /// stderr in the notification". Drives a real, deterministically-failing
-    /// subprocess (the actual `sh` binary, not a mocked `Command`) so the
-    /// spawn → non-zero exit → stderr-capture path in
+    /// subprocess so the spawn → non-zero exit → stderr-capture path in
     /// `run_package_manager_steps` is exercised end-to-end, with no
     /// dependency on `npm`/`pip`/`go`/`cargo`/`dotnet` actually being
-    /// installed (or reachable over the network) on the machine running the
-    /// suite.
+    /// installed on the machine running the suite.
     #[test]
     #[cfg(unix)]
     fn run_package_manager_steps_surfaces_stderr_tail_on_failure() {

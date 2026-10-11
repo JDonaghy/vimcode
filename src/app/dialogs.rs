@@ -2,10 +2,10 @@ use super::construction::{dialog_btn_index, PendingFileDialog};
 use super::*;
 
 impl App {
-    /// Run a file dialog requested via [`PendingFileDialog`] (#572), using
+    /// Run a file dialog requested via [`PendingFileDialog`], using
     /// the runner-owned `backend`'s `PlatformServices` — `show_file_open_dialog`
-    /// / `show_file_save_dialog` block (via quadraui's nested-mainloop pump,
-    /// #427) until the user picks or cancels, then this returns synchronously.
+    /// / `show_file_save_dialog` block until the user picks or cancels,
+    /// then this returns synchronously.
     pub(crate) fn run_pending_file_dialog(
         &mut self,
         req: PendingFileDialog,
@@ -13,7 +13,7 @@ impl App {
     ) {
         // Bodies shared with TUI's synchronous call sites — see
         // `render::run_open_file_dialog`/`run_save_workspace_as_dialog`'s
-        // rung header comment (#1125) for why this stays one implementation
+        // rung header comment for why this stays one implementation
         // with two thin call sites instead of a per-backend copy.
         match req {
             PendingFileDialog::OpenFile => {
@@ -34,11 +34,9 @@ impl App {
     }
 
     /// Present the native message dialog queued by `render_content`'s
-    /// edge-trigger check (#727), using the runner-owned `backend`'s
-    /// `PlatformServices` — `show_message_dialog` blocks (via quadraui's
-    /// nested-mainloop pump, #666, the same adapter #427's file dialogs
-    /// use) until the user picks a button or dismisses it. Mirrors
-    /// `run_pending_file_dialog` above.
+    /// edge-trigger check, using the runner-owned `backend`'s
+    /// `PlatformServices` — `show_message_dialog` blocks until the user
+    /// picks a button or dismisses it. Mirrors `run_pending_file_dialog` above.
     ///
     /// Maps the response back through the same `"dialog:btn:N"` id
     /// convention and `Engine::dialog_click_button` / `Engine::dialog_cancel`
@@ -74,12 +72,11 @@ impl App {
     }
 
     /// Apply the `EngineAction` produced by dismissing a dialog — clears
-    /// `explorer_needs_refresh` (some dialog outcomes, e.g. "Discard &
-    /// Close", can trigger a sidebar refresh) and handles quit/save-quit.
-    /// Shared by the in-canvas mouse-click path
-    /// (`handle_mouse_click_msg`'s dialog-button block) and the native
-    /// message-dialog path (`run_pending_native_dialog`, #727) so both
-    /// produce exactly the same outcome for a given `EngineAction`.
+    /// `explorer_needs_refresh` (some dialog outcomes can trigger a sidebar
+    /// refresh) and handles quit/save-quit. Shared by the in-canvas
+    /// mouse-click path (`handle_mouse_click_msg`'s dialog-button block)
+    /// and the native message-dialog path (`run_pending_native_dialog`)
+    /// so both produce exactly the same outcome for a given `EngineAction`.
     pub(crate) fn apply_dialog_action(&mut self, action: EngineAction) {
         if self.engine.borrow().explorer_needs_refresh {
             self.engine.borrow_mut().explorer_needs_refresh = false;
@@ -97,11 +94,8 @@ impl App {
 impl App {
     /// Minimize the application window (inline window-control button).
     ///
-    /// Routed through `Backend::window()` (quadraui#950, #1124) rather than
-    /// the old GTK-only `self.window`/`PlatformWindowHandle` seam (deleted
-    /// #1234) — that seam was `None` on macOS/Win-GUI, so this used to be a
-    /// silent no-op there; `WindowControl` is backed on every windowed
-    /// backend.
+    /// Routed through `Backend::window()` rather than a platform-specific
+    /// seam — this is backed on every windowed backend.
     pub(crate) fn window_minimize(&mut self, backend: &mut dyn quadraui::Backend) {
         self.last_window_control_action
             .set(Some(render::WINDOW_MINIMIZE_ACTION));
@@ -113,7 +107,7 @@ impl App {
     /// Maximize or restore the application window (inline window-control
     /// button).
     ///
-    /// Goes through `Backend::toggle_window_maximize` (#813) rather than
+    /// Goes through `Backend::toggle_window_maximize` rather than
     /// driving the OS window handle's maximize/unmaximize directly — the
     /// same toggle the CSD-titlebar double-click gesture already calls
     /// (`handle_dispatch`'s `UiEvent::DoubleClick` arm) — so there is only
@@ -127,14 +121,14 @@ impl App {
 
     /// Close the application window (inline window-control button).
     ///
-    /// Routes through `show_quit_confirm` (#857) instead of driving the real
+    /// Routes through `show_quit_confirm` instead of driving the real
     /// OS window's `close()` directly: `close()` emits GTK's `close-request`
     /// signal *synchronously, on the same stack* — quadraui's handler for
     /// that signal re-enters `backend.borrow_mut()` while this dispatch path
     /// still holds it (see quadraui `run.rs:616`/`896`), which panics with
     /// `BorrowMutError` inside a signal trampoline that cannot unwind and so
     /// aborts the process instead of just panicking. `window_toggle_maximize`
-    /// above already avoids the equivalent trap for maximize (#813) by
+    /// above already avoids the equivalent trap for maximize by
     /// routing through the engine instead of the OS window handle; this is
     /// the same fix applied to close. `show_quit_confirm` either raises the
     /// unsaved-changes dialog or sets `exit_requested`, which
@@ -149,12 +143,6 @@ impl App {
 
     /// User triggered quit; exit straight away when nothing is unsaved,
     /// otherwise raise the "unsaved changes" confirmation dialog.
-    ///
-    /// #823 item 4: the dialog body used to be restated here (byte-identical
-    /// to `Engine::show_quit_confirm`, `core/engine/panels.rs`) instead of
-    /// calling it — same `DialogButton` literals, just copy-pasted. TUI
-    /// already calls the engine method directly (`tui_main/shell_app.rs`,
-    /// `tui_main/mouse.rs`).
     pub(crate) fn show_quit_confirm(&mut self) {
         if !self.engine.borrow().has_any_unsaved() {
             self.save_session_and_exit();
@@ -167,32 +155,20 @@ impl App {
     /// Show a native "Open File" dialog.
     pub(crate) fn open_file_dialog(&mut self) {
         // Deferred to tick(), which has the runner-owned `backend`
-        // handle PlatformServices needs — see PendingFileDialog (#572).
+        // handle PlatformServices needs — see PendingFileDialog.
         self.pending_file_dialog
             .set(Some(PendingFileDialog::OpenFile));
         self.draw_needed.set(true);
     }
 
-    /// Show the shared folder/workspace picker modal (#815).
+    /// Show the shared folder/workspace picker modal.
     ///
-    /// Before #815 this opened a *native* `gtk4::FileDialog` in
-    /// "select folder" mode: at the time, `quadraui::PlatformServices` had no
-    /// directory-select primitive (only `show_file_open_dialog` /
-    /// `show_file_save_dialog`, both file pickers), so a native chooser was
-    /// the only option. `quadraui::FolderPickerController` (shipped
-    /// 2026-05-25, quadraui#166) made that escape hatch unnecessary — it does
-    /// its own filesystem walk — so this opens the identical `Palette`-based
-    /// picker TUI does; see `FrameOp::FolderPicker` and
-    /// `handle_key_press`'s folder-picker rung. TUI's
-    /// `new_folder_picker_controller` builds the same controller.
-    ///
-    /// `PlatformServices` has since gained `show_folder_open_dialog`
-    /// (quadraui#935) — the premise above is now stale on its own, but the
-    /// decision it led to isn't: this stays on `FolderPickerController`
-    /// deliberately (#815; see issue #945), because it's the shape that
-    /// behaves identically on every backend, whereas
-    /// `show_folder_open_dialog` is a native-only primitive that TUI can't
-    /// implement the same way GTK/macOS/Win-GUI would.
+    /// Opens the `Palette`-based picker identical to what TUI does via
+    /// `quadraui::FolderPickerController` (see `FrameOp::FolderPicker` and
+    /// `handle_key_press`'s folder-picker rung). This stays on
+    /// `FolderPickerController` deliberately, because it's the shape that
+    /// behaves identically on every backend, whereas native file-dialog
+    /// primitives are backend-specific and TUI cannot implement the same way.
     pub(crate) fn open_folder_dialog(&mut self) {
         let engine = self.engine.borrow();
         let controller = quadraui::FolderPickerController::new(
@@ -207,14 +183,13 @@ impl App {
 
     /// Drive an open folder picker with one raw `UiEvent` and apply the
     /// result. The decision (key→intent, filesystem walk, filtering,
-    /// scroll) is entirely `quadraui::FolderPickerController`'s own (#815);
+    /// scroll) is entirely `quadraui::FolderPickerController`'s own;
     /// this only applies the `Confirmed`/`Cancelled` outcomes to GTK-local
     /// state and the engine. Mirrors TUI's identical
     /// `apply_folder_picker_event` (`shell_app.rs`) — same controller, same
     /// outcome handling; the popup rect comes from the painted-rect cache
-    /// (`folder_picker_popup_rect`, #582/#646) here instead of a fresh
-    /// `Backend::viewport()` call, since this method has no live `backend`
-    /// handle.
+    /// (`folder_picker_popup_rect`) here instead of a fresh
+    /// `Backend::viewport()` call, since this method has no live `backend` handle.
     pub(crate) fn apply_folder_picker_event(&mut self, event: &quadraui::UiEvent) {
         let Some(popup_rect) = self.folder_picker_popup_rect.get() else {
             return;
@@ -289,7 +264,7 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// #955 (ACP-4, shared with #525): the change-review surface's mouse
+    /// The change-review surface's mouse
     /// handling, called from `handle_mouse_click_msg` — same shared
     /// `render::route_change_review_click` TUI's `mouse::handle_mouse`
     /// calls.
@@ -317,7 +292,7 @@ impl App {
 
     /// Show a native "Save Workspace As" dialog.
     pub(crate) fn save_workspace_as_dialog(&mut self) {
-        // Deferred to tick() — see PendingFileDialog (#572).
+        // Deferred to tick() — see PendingFileDialog.
         self.pending_file_dialog
             .set(Some(PendingFileDialog::SaveWorkspaceAs));
         self.draw_needed.set(true);
@@ -325,7 +300,7 @@ impl App {
 
     /// Show the "Open Recent" workspace picker.
     pub(crate) fn open_recent_dialog(&mut self) {
-        // #274: replaced the native gtk4::Dialog with the engine's
+        // Replaced the native gtk4::Dialog with the engine's
         // unified picker (PickerSource::RecentWorkspaces). Picker
         // confirm calls open_folder + sets explorer_needs_refresh
         // so the file tree rebuilds on the next render — no
@@ -341,10 +316,6 @@ impl App {
     }
 
     /// User clicked ✕ on a tab with unsaved changes — ask what to do.
-    ///
-    /// #823 item 4: was a byte-identical restatement of
-    /// `Engine::show_close_tab_confirm` (`core/engine/panels.rs`) instead of
-    /// calling it.
     pub(crate) fn show_close_tab_confirm(&mut self) {
         self.engine.borrow_mut().show_close_tab_confirm();
         self.draw_needed.set(true);
@@ -353,17 +324,14 @@ impl App {
     /// Editor content pixel width last painted by `render_content`
     /// (`cached_editor_bounds`) — the same width the bottom (terminal) panel
     /// spans, since `editor_bounds` is derived from `main_content_bounds`
-    /// with the sidebar/activity bar already excluded (#582). Used by
+    /// with the sidebar/activity bar already excluded. Used by
     /// [`Self::terminal_panel_cols`] callers with no live pixel width of
     /// their own in scope (accelerator/menu/tick paths) — callers that DO
     /// have one (a click/drag handler's own `width` parameter) should pass
-    /// that same-frame value to `terminal_panel_cols` directly instead, for
-    /// the #1058 reason recorded on `terminal_panel_cols` itself.
+    /// that same-frame value to `terminal_panel_cols` directly instead.
     ///
     /// Falls back to the cached window width before the first frame has
     /// painted (`cached_editor_bounds` is still `None`).
-    ///
-    /// #1421: replaces the old hardcoded `terminal_cols() -> 80`.
     pub(crate) fn painted_editor_content_width(&self) -> f64 {
         self.cached_editor_bounds
             .get()
@@ -378,15 +346,12 @@ impl App {
     pub(crate) const TERMINAL_PANEL_SB_W: f64 = 6.0;
 
     /// Convert a *live* terminal-panel pixel width to a column count using
-    /// the last-painted char advance (`cached_char_width`). #1058: this used
-    /// to be a fallback of a hardcoded `terminal_cols() -> 80` (and, for the
-    /// terminal-split finalize path specifically, a separate `da_w = 800.0`
-    /// guess) rather than a real conversion of the live width, so any window
-    /// that wasn't exactly 800px wide split the terminal into the wrong
-    /// column counts. `cached_char_width` is seeded to a positive default in
-    /// `App::new` and only ever grows from a real paint, so clamping it to a
-    /// `1.0` floor (rather than branching on a `<= 0.0` fallback) is enough
-    /// to avoid a divide-by-zero without a second hardcoded column count.
+    /// the last-painted char advance (`cached_char_width`). This performs
+    /// a real conversion of the live width rather than using a hardcoded
+    /// fallback, so any window width is split into the correct column count.
+    /// `cached_char_width` is seeded to a positive default in `App::new`
+    /// and only ever grows from a real paint, so clamping it to a `1.0`
+    /// floor is enough to avoid a divide-by-zero.
     pub(crate) fn terminal_panel_cols(&self, width: f64) -> u16 {
         let cw = self.cached_char_width.max(1.0);
         ((width - Self::TERMINAL_PANEL_SB_W).max(0.0) / cw) as u16
@@ -401,7 +366,7 @@ impl App {
     /// in scope — agree with what was actually painted. Same reasoning as
     /// [`Self::painted_editor_content_width`]'s fallback.
     ///
-    /// #1421: replaces the old hardcoded `terminal_target_maximize_rows() ->
+    /// Replaces the old hardcoded `terminal_target_maximize_rows() ->
     /// 10`. Mirrors the TUI equivalent,
     /// `tui_main::terminal_target_maximize_rows_tui`.
     pub(crate) fn terminal_maximize_target_rows(&self, engine: &Engine) -> u16 {

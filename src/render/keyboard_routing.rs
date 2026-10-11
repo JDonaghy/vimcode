@@ -1,25 +1,9 @@
 use super::*;
 
-// ─── Modal keyboard routing (#734 slice 1) ────────────────────────────────────
+// Modal keyboard routing: the top rung of the precedence ladder.
+// Sequences spell suggestions → dialog → context menu, matching the order
+// in `Engine::handle_key`.
 //
-// The keyboard twin of `route_modal_overlay_click` above, and the top rung
-// of the precedence ladder #734 exists to state once. Before this, the ladder
-// was transcribed per backend and had drifted:
-//
-//   TUI  dialog → folder picker → activity bar → sidebar (which carried its
-//        OWN copy of the context-menu rung) → … → context menu → engine
-//   GTK  context menu (hand-rolled, NOT `Engine::handle_context_menu_key`) →
-//        activity bar → explorer (which carried a SECOND hand-rolled copy of
-//        the context-menu rung, plus a dialog patch-up) → … → engine
-//
-// Four hand-rolled copies of one rung, and GTK had no top-level dialog rung
-// at all — so a dialog opened while the activity bar / explorer / an
-// extension panel held focus lost its keys to that panel.
-//
-// `Engine::handle_key` already sequences these three correctly for the keys
-// that reach it (`core/engine/keys.rs`: spell suggestions → dialog → context
-// menu). This function states the same order for the *backends*, so their
-// focus ladders can no longer cut in front of it.
 
 /// Which modal surface owns a keystroke, resolved before either backend
 /// consults its own focus ladder (activity bar, sidebar, extension panel,
@@ -49,18 +33,9 @@ pub enum ModalKeyRoute {
 /// Order matches `Engine::handle_key`'s own: spell suggestions, then a
 /// modal dialog, then the context menu.
 pub fn route_modal_key(engine: &Engine) -> ModalKeyRoute {
-    // Spell-suggestion selection intercepts all keys (`keys.rs`'s first
-    // branch); a dialog is modal and intercepts everything below it.
-    // The change-review surface (#955, shared with #525) is the same
-    // shape: a full-viewport overlay that must own every keypress
-    // regardless of which panel would otherwise have focus — in
-    // particular, the AI panel's own focus route sends keys straight to
-    // `render::route_ai_chat_event`, bypassing `Engine::handle_key`
-    // entirely, so without this a keypress meant for a diff opened
-    // *while* the AI panel has focus (exactly when a tool-call diff
-    // arrives) would type into the chat input instead.
-    // `handle_change_review_key` (inside `Engine::handle_key`, same place
-    // as the other two) is the actual interception.
+    // Spell-suggestion selection, dialog, and change-review surface are
+    // all modal: they intercept every keystroke regardless of which panel
+    // would otherwise have focus.
     if engine.spell_suggestions.is_some()
         || engine.dialog.is_some()
         || engine.change_review.is_some()
@@ -78,68 +53,9 @@ pub fn route_modal_key(engine: &Engine) -> ModalKeyRoute {
     ModalKeyRoute::None
 }
 
-// ─── Focus-owner keyboard routing (#757 / #734 slice 2) ──────────────────────
-//
-// The rung directly beneath [`route_modal_key`]: once no modal surface has
-// claimed the key, the *focus owners* get their turn — the activity bar, and
-// then whichever sidebar panel holds keyboard focus.
-//
-// Before this, the ladder was transcribed per backend and had drifted in four
-// separate ways:
-//
-//   TUI (`handle_sidebar_focused_key`, 442 lines — now `handle_focus_owner_key`)
-//        activity bar → [gate: `sidebar.has_focus && !picker_open &&
-//        !terminal_has_focus`] → search → debug → ext panel → extensions →
-//        settings → AI → source control → explorer (unguarded fallback),
-//        with each panel selected by `active_panel_is(PANEL_*)` — the
-//        *visible* panel — rather than by the engine's focus flag.
-//   GTK (the block inside `handle_key_press`)
-//        activity bar → explorer → ext panel → extensions → settings →
-//        search → source control → debug → AI, each selected by the engine's
-//        `*_has_focus` flag, with no picker/terminal gate at all.
-//
-// The four divergences, all of them user-visible:
-//
-//  1. **Picker.** TUI suppressed the whole band while `picker_open`; GTK did
-//     not. Opening the command palette with the explorer focused sent j/k to
-//     the explorer on GTK and to the palette on TUI.
-//  2. **Terminal.** TUI suppressed the band while `terminal_has_focus` (the
-//     "Press Enter to close…" state after an extension install); GTK did not,
-//     so those keys were eaten by whichever panel still held a focus flag.
-//  3. **Ext panel vs explorer order.** `Engine::activity_bar_activate` sets
-//     `ext_panel_has_focus` *without* clearing `explorer_has_focus` (unlike
-//     `focus_sidebar_panel`, which calls `clear_sidebar_focus` first), so both
-//     flags can be true at once. TUI checked the ext panel first and got the
-//     plugin panel; GTK checked the explorer first and sent the keys to a
-//     panel that is not even on screen.
-//  4. **Visible panel vs focused panel.** TUI keyed its arms off
-//     `active_panel_is`, GTK off the focus flags. They agree whenever
-//     `focus_sidebar_panel` put them in sync and disagree the moment anything
-//     moves one without the other.
-//
-// This function states the ladder once. Both backends keep their own *sinks*
-// (`handle_focus_owner_key` on TUI, the `match` in `handle_key_press` on GTK)
-// because the per-panel dispatch needs backend-local plumbing — key-name
-// translation tables, `TuiSidebar::ext_panel_name`, GTK's
-// `focus_after_sidebar_key` — exactly as `route_modal_key` left
-// `ContextMenu`'s action dispatch backend-side.
-//
-// **Verdict on two rungs deliberately *not* converged here:**
-//
-//  * *Completion popup* (#734 slice 1 listed it as unconverged). Re-measured
-//    on `develop`: **neither backend intercepts completion keys.** There is no
-//    `completion_idx` read anywhere in either keyboard ladder — both hand the
-//    key to `Engine::handle_key`, whose own precedence chain
-//    (`core/engine/keys.rs`) owns Ctrl-N/Ctrl-P/Tab/Up/Down over the popup.
-//    The rung is already stated once, in the engine. Promoting it to
-//    [`ModalKeyRoute`] would *add* behaviour — making the popup outrank the
-//    sidebar band — with no bug behind it, so it is left alone.
-//  * *Folder picker* (#815): `quadraui::FolderPickerController` now owns its
-//    own key handling directly (`FolderPickerController::handle`), so there
-//    is nothing left to state in this ladder — both backends check
-//    `folder_picker.is_some()` right after `route_modal_key` declines (a
-//    modal dialog still outranks the picker) and hand the raw event straight
-//    to the controller instead.
+// Focus-owner keyboard routing: the rung directly beneath `route_modal_key`.
+// Sequences activity bar → sidebar panel (checked by both focus flag and
+// visible panel). All sides check the picker and terminal gates here.
 
 /// Which focus owner owns a keystroke, resolved after [`route_modal_key`] has
 /// declined it and before either backend reaches its editor/terminal tier.
@@ -169,7 +85,7 @@ pub enum FocusKeyRoute {
     Ai,
     /// The source-control panel — `dispatch_sc_sidebar_key_unified`.
     SourceControl,
-    /// The Board panel (#521) — `Engine::dispatch_board_key_unified`.
+    /// The Board panel — `Engine::dispatch_board_key_unified`.
     Board,
     /// The file explorer — `Engine::dispatch_explorer_key`. Also the
     /// terminal fallback: a key that reaches the sidebar band and matches no
@@ -217,9 +133,8 @@ pub fn route_focus_key(engine: &Engine, sidebar_band_focused: bool) -> FocusKeyR
     }
 
     // Each built-in panel matches on its focus flag *or* on being the visible
-    // panel — the union of the two predicates the backends used to disagree
-    // over (divergence 4). They coincide whenever `focus_sidebar_panel` set
-    // them together, which is the overwhelmingly common case.
+    // panel — the union of the two predicates, valid whenever `focus_sidebar_panel`
+    // set them together.
     if engine.search_has_focus || engine.active_panel_is(PANEL_SEARCH) {
         return FocusKeyRoute::Search;
     }
@@ -269,28 +184,7 @@ pub enum SidebarChordAction {
 /// Ctrl-W sidebar chord: arm on `Ctrl-W`, then on the very next keypress
 /// navigate `h`/`Left` to the activity bar toolbar or `l`/`Right` to the
 /// editor, consuming any other follow-up. `None` means the key was neither
-/// the arming chord nor a pending follow-up — the caller's own ladder
-/// continues unclaimed.
-///
-/// A Vim chord, so — like [`route_debug_fkey`] and the other shared rungs in
-/// this file — it stays a plain key-name match rather than a declared
-/// accelerator. Only meaningful while some sidebar panel (not the activity
-/// bar itself) holds focus; both callers only reach this after their own
-/// focus-owner routing has already claimed the key for such a panel, so
-/// there is no separate "is the sidebar band focused" gate here.
-///
-/// Promoted out of TUI-only `TuiSidebar::pending_ctrl_w` (#1419, closing
-/// #406): GTK kept no per-keypress chord latch of its own to hang that field
-/// on, so Ctrl-W h/l silently did nothing there. `Engine::sidebar_ctrl_w_pending`
-/// is the shared latch both backends now read and write through this
-/// function, so GTK gets the same navigation TUI already had.
-///
-/// `key_name`/`unicode` are [`engine_key_from_ui`]'s own output: a plain
-/// letter like `h`/`l`/`w` arrives as `unicode`, with `key_name` empty
-/// (`engine_key_from_ui` only fills `key_name` for `Ctrl`-held or named
-/// keys), while `Left`/`Right` arrive as `key_name` with `unicode: None` —
-/// so both must be checked, matching every other rung in this file
-/// ([`dispatch_sidebar_panel_key`], [`route_terminal_key`], …).
+/// the arming chord nor a pending follow-up.
 pub fn route_sidebar_chord_key(
     engine: &mut Engine,
     key_name: &str,
@@ -358,54 +252,9 @@ pub fn activity_bar_key_action(key: &str, ctrl: bool) -> ActivityBarKeyAction {
     }
 }
 
-// ─── Terminal (PTY) keyboard rung (#758 / #734 slice 3, #351, #471) ──────────
-//
-// The rung directly beneath [`route_focus_key`]: once no modal overlay and no
-// focus owner has claimed the key, a focused embedded terminal takes it before
-// the editor ever sees it.
-//
-// **Where the encoder lives.** quadraui's `TerminalSession` already owns the
-// *mouse* encoder (`encode_mouse` / `forward_mouse`) and, since quadraui#343,
-// bracketed paste (`paste` / `bracketed_paste_enabled`) — but quadraui#342
-// ("lift the keyboard → PTY encoder out of the example into the engine") has
-// **not** landed on the pinned rev, so there is no upstream
-// `TerminalSession::key_bytes`. The key encoder therefore stays where it
-// already is: [`crate::core::engine::terminal_ops::key_to_pty_bytes`], which is
-// platform-neutral `core` code and satisfies `CLAUDE.md`'s neutrality rule
-// exactly as well. When quadraui#342 lands, `key_to_pty_bytes` is the single
-// call site to swap; nothing in either backend changes.
-//
-// **What diverged.** TUI hand-rolled this rung inside `handle_key_pressed`
-// (~80 lines). GTK's twin was deleted outright by the #540 Relm4→ShellApp
-// cutover — the whole `if engine.borrow().terminal_has_focus { … }` block lived
-// in the per-window `EventControllerKey` closure that went with the Relm4
-// `view!`, and nothing replaced it. Since #540, GTK keys typed into a focused
-// terminal have fallen through to `Engine::handle_key` and edited the *buffer*
-// instead of reaching the PTY. Three concrete disagreements this router ends:
-//
-//  1. **GTK forwarded nothing at all.** Typing in the terminal ran vim normal
-//     mode commands on the editor buffer. This is the live half of **#471** —
-//     the other half was the old GTK arm's `sender.input(Msg::Resize)` after
-//     every terminal keypress, whose handler called
-//     `terminal_resize(full_panel_cols, …)` on *every* pane. In split mode that
-//     reflowed the half-width panes to the full panel width on each keystroke
-//     while they were still painted into their narrow rects, so freshly typed
-//     text in the right pane wrapped off the painted area and "disappeared".
-//     This router performs no resize, and [`route_terminal_resize`] is
-//     split-aware, so neither half can come back.
-//  2. **Key-name spelling.** TUI reached past `translate_key` and re-derived
-//     names from the raw crossterm `KeyCode` (`"Page_Up"`, `"ISO_Left_Tab"`)
-//     because `translate_key`'s editor-facing names (`"Shift_Up"`,
-//     `"Shift_Return"`) have no PTY encoding; GTK speaks `"PageUp"` /
-//     `"BackTab"`. [`canonical_terminal_key_name`] accepts both spellings, so
-//     PageUp scrolls the scrollback on GTK too (it previously did not exist,
-//     and would have fallen through to a raw `ESC[5~` write had it).
-//  3. **`SendToPty` follow-through.** TUI polled the PTY immediately after the
-//     write so the echo landed in the same frame; the old GTK arm did not, and
-//     relied on the next poll tick. The router always polls.
-//
-// Both backends now call [`route_terminal_key`] and do nothing else for this
-// rung.
+// Terminal (PTY) keyboard rung: the rung directly beneath `route_focus_key`.
+// Once no modal overlay and no focus owner has claimed the key, a focused
+// embedded terminal takes it before the editor sees it.
 
 /// Canonicalise a backend key name into the spelling
 /// [`crate::core::engine::terminal_ops::key_to_pty_bytes`] and
@@ -543,63 +392,10 @@ pub fn route_terminal_resize(engine: &mut Engine, panel_cols: u16, rows: u16) {
     }
 }
 
-// ─── Alt-modifier / VSCode-mode keyboard rung (#759 / #734 slice 4) ──────────
-//
-// An Alt chord can mean three different things, and the decision between them
-// is a *sequence*, not a lookup: menu accelerator → editor/shell chord →
-// pass-through to `Engine::handle_key`. The first tier is already shared
-// (`quadraui::MenuSystem::handle` + `MenuBar::find_alt_target`, gated
-// identically on both backends by #695). The second tier is what this rung
-// converges.
-//
-// **What diverged.** TUI hand-rolled the whole tier as a ~66-line
-// `if key_event.modifiers.contains(KeyModifiers::ALT) { match key_event.code
-// { … } }` block inside `handle_key_pressed`. GTK had **no Alt tier at all**:
-// `handle_key_press` took an `alt: bool` and used it for exactly two things —
-// forwarding it to the terminal router and suppressing the debug F-keys — and
-// then dropped it on the floor, because `Engine::handle_key` has no `alt`
-// parameter. So since the #540 Relm4→ShellApp cutover, **every chord below was
-// silently dead on GTK**:
-//
-//   Alt+Left / Alt+Right (resize the sidebar), Alt+M (toggle Vim ↔ VSCode
-//   editing mode), Alt+, / Alt+. (resize the editor-group split), Alt+] /
-//   Alt+[ (cycle AI ghost-text alternatives), and — the VSCode-mode half —
-//   Alt+Up / Alt+Down (move line), Alt+Shift+Up / Alt+Shift+Down (add a
-//   cursor above/below) and Alt+Z (toggle word wrap).
-//
-// That is the #499/#484 shape again: `Engine::vscode_move_line_up`,
-// `add_cursor_at_pos` and the `Alt_*` arm of `handle_vscode_key` are all
-// platform-neutral `core` code with a full unit-test suite, reachable from
-// exactly one of the two backends.
-//
-// **The VSCode-mode statement.** The reason the second half diverged is that
-// neither backend wrote down *what VSCode mode means for a keystroke*; each
-// had (or, on GTK, lacked) its own ad-hoc branch. [`vscode_alt_key_name`] is
-// that statement, in one place: in VSCode mode these Alt chords are VS Code
-// editor commands, spelled in the `Alt_*` dialect
-// `Engine::handle_vscode_key` decodes; in Vim mode they are not, and fall
-// through to the vim mapping layer. Both backends now ask that one function.
-//
-// **Shift+Alt+F is deliberately absent from the "GTK gained it" list.** It is
-// in the resolver (LSP format document), but on both backends the menu tier
-// above claims it first whenever the menu bar is live: `find_alt_target`
-// lower-cases the chord and `&File` triggers on `f`. GTK's menu bar is always
-// visible and TUI's is visible in VSCode mode, so the reachable case is TUI in
-// Vim mode. Converging the rung does not change that ordering — it is the same
-// on both backends, which is the point.
-//
-// #1764 (non-blocking review note) narrows this slightly on the *toggleable*
-// (TUI) profile only: `alt_mnemonic_open_allowed` now refuses a fresh menu
-// open while mid-text-entry (Insert/Replace) or mid-command-line
-// (Command/Search), so on TUI a Shift+Alt+F pressed in one of those modes no
-// longer gets swallowed by the menu tier — it reaches this arm and runs
-// `lsp_format_current()` instead. GTK (never toggleable) is unaffected: its
-// menu tier still claims the chord first in every mode, exactly as before.
-// Plausibly an improvement (formatting while typing is a reasonable thing to
-// want), but it is a real, if narrow, ordering change worth knowing about
-// when reading the "reachable case is TUI in Vim mode" sentence above — that
-// sentence is now true only for the menu-open half of the story, not for
-// where this specific chord ends up executing on every TUI mode.
+// Alt-modifier / VSCode-mode keyboard rung: an Alt chord can mean three
+// different things, decided by sequence: menu accelerator → editor/shell
+// chord → pass-through to `Engine::handle_key`. The menu tier is already
+// shared. This rung converges the second tier.
 
 /// Lower bound Alt+Left clamps the sidebar width to, in `AppShell` width units
 /// (columns on TUI, line-heights on GTK — see
@@ -623,20 +419,20 @@ pub const ALT_SIDEBAR_WIDTH_MAX: u16 = 150;
 /// `AppShell::set_sidebar_width`'s own internal clamp cannot narrow the rung's
 /// range on one backend and not the other. That was live on GTK before #759:
 /// quadraui's generic default is `8.0..=50.0`, which TUI had already overridden
-/// for exactly this reason (#634) and GTK had not.
+/// for exactly this reason and GTK had not.
 pub fn alt_resized_sidebar_width(current: u16, delta: i32) -> u16 {
     let next = current as i32 + delta;
     next.clamp(ALT_SIDEBAR_WIDTH_MIN as i32, ALT_SIDEBAR_WIDTH_MAX as i32) as u16
 }
 
-/// #1764: whether the engine's current mode is safe for an Alt+<mnemonic>
+/// Whether the engine's current mode is safe for an Alt+<mnemonic>
 /// `KeyPressed` to open a *closed* `quadraui::MenuSystem` dropdown.
 ///
 /// Vim mode has no `<M-x>` mapping support at all — nothing in
 /// `src/core/engine` spells a `"<M-"` binding — so the only two things an
 /// Alt-modified keypress reaching the menu-bar intercept can plausibly be
 /// are a genuine (currently unbound, meaningless) Meta-key chord, or — per
-/// the #1763 bugbash finding this issue (#1764) is the follow-up to — a real
+/// the #1763 bugbash finding this issue is the follow-up to — a real
 /// pty collapsing a fast Escape-then-letter into exactly this chord, because
 /// that is the standard xterm 8-bit-meta encoding for Alt and a raw
 /// terminal reader cannot always tell the two apart from bytes alone.
@@ -736,7 +532,7 @@ fn alt_chord_base(key_name: &str, unicode: Option<char>) -> Option<AltBase> {
     unicode.or(from_name).map(AltBase::Char)
 }
 
-/// #1764: whether an unclaimed Alt chord's base key is a printable
+/// Whether an unclaimed Alt chord's base key is a printable
 /// character (letter/digit/punctuation) rather than a named key
 /// (`Enter`/`BackSpace`/`Up`/`Down`/`Home`/`Delete`/`Page_Up`/…). Only the
 /// printable-char shape is what a real pty's Escape-then-letter fusion (the
@@ -804,7 +600,7 @@ fn vscode_alt_key_name(base: AltBase, shift: bool) -> Option<&'static str> {
 /// `alt == false` is an immediate `Fallthrough`, so a caller may invoke this
 /// unconditionally rather than wrapping it in its own modifier test.
 ///
-/// `ctrl` (#1744) distinguishes two chords that otherwise share a base/shift
+/// `ctrl` distinguishes two chords that otherwise share a base/shift
 /// shape: Ctrl+Alt+Up/Down is VS Code's real `insertCursorAbove`/
 /// `insertCursorBelow` (forwarded to `Engine::handle_vscode_key` as `Alt_Up`/
 /// `Alt_Down` with `ctrl` now passed through instead of hardcoded `false`,
@@ -852,20 +648,11 @@ pub fn route_alt_key(
     // working exactly as it did, and gives GTK (which never had the chord at
     // all) the same tolerance.
     match base {
-        // #1744: in VSCode mode, Ctrl+Shift+Alt+Left/Right is sidebar
-        // resize's alternate home — plain Alt+Left/Right now means navigate
-        // back/forward in that mode (the arm below, via
-        // `vscode_alt_key_name`), and plain Ctrl+Alt+Left/Right is already
-        // claimed, above this rung, by the `panel_keys.nav_back`/
-        // `nav_forward` global accelerator — see this function's own doc
-        // for why `ctrl` alone is not a usable alternate home. Outside
-        // VSCode mode `ctrl`/`shift` are ignored, same as every other
-        // mode-independent arm here, so Vim mode keeps resizing on plain
-        // Alt+Left/Right (with or without Shift, as before #1744) exactly
-        // as before — Shift+Alt+Left/Right's own VSCode-mode fate (nothing:
-        // deliberately left unbound, since Ctrl+Shift+Alt is the chord that
-        // now owns this) is documented on the arm below that doesn't match
-        // it.
+        // In VSCode mode, Ctrl+Shift+Alt+Left/Right is sidebar resize's
+        // alternate home — plain Alt+Left/Right now means navigate
+        // back/forward in that mode. Outside VSCode mode `ctrl`/`shift` are
+        // ignored, so Vim mode keeps resizing on plain Alt+Left/Right exactly
+        // as before.
         AltBase::Left if ctrl && shift && engine.is_vscode_mode() => {
             return AltKeyOutcome::ResizeSidebar(-1);
         }
@@ -921,46 +708,10 @@ pub fn route_alt_key(
     AltKeyOutcome::Fallthrough
 }
 
-// ─── Clipboard-paste pre-load / Ctrl+Shift+V rung (#760 / #734 slice 5) ─────
-//
-// Two small tiers that sit directly below the Alt rung above and directly
-// above `Engine::handle_key` on both backends.
-//
-// **Pre-load.** Before a `p`/`P` (Vim mode) or Ctrl+V (VSCode mode) keypress
-// reaches `Engine::handle_key`, the system clipboard has to be read and
-// copied into the paste registers first — `handle_key`'s `p` has no clipboard
-// access of its own. Both backends called the same two engine methods
-// (`needs_clipboard_for_paste` / `prepare_paste_clipboard`, shared since
-// #381) but each restated the four-line "if it needs it, read it, load it"
-// glue around them; [`preload_paste_clipboard`] is that glue, once.
-//
-// **Ctrl+Shift+V.** #593 wired GTK's Ctrl+V (and, incidentally, Ctrl+Shift+V —
-// quadraui's GTK runner intercepts both and redelivers them as
-// `UiEvent::ClipboardPaste`, per its own `ctrl_shift_v_delivers_the_clipboard_
-// selection_as_a_paste` / `ctrl_shift_v_is_intercepted_not_forwarded_as_raw_v`
-// tests at the pinned rev) straight through `Engine::route_paste` — the same
-// arm this crate's `ClipboardPaste` handler already uses for TUI's bracketed
-// paste. TUI's terminal side never got the same treatment: quadraui's TUI
-// runner only synthesizes `ClipboardPaste` for a real bracketed-paste escape
-// sequence (`CtEvent::Paste`), not for a Ctrl+Shift+V keypress, so that chord
-// arrives as an ordinary `KeyEvent` and TUI hand-rolled a second paste path —
-// read the clipboard, `load_clipboard_for_paste`, then either replay `p` or
-// splice characters into insert mode one at a time — instead of calling
-// `route_paste` like every other paste destination does. That hand-rolled
-// path covered only Normal/Visual/Insert/Replace, so a Ctrl+Shift+V while the
-// terminal, picker, explorer rename, search box, SC commit message, extension
-// sidebar or AI chat had focus fell through to whatever `handle_key` does
-// with a bare `V`, instead of pasting into that context the way plain Ctrl+V
-// (via `prepare_paste_clipboard` + `p`) already does.
-// [`route_ctrl_shift_v_paste`] replaces it with the one-line call the other
-// destinations use, so the whole `route_paste` priority chain (terminal →
-// picker → explorer rename → search → SC commit → ext sidebar → AI chat →
-// mode dispatch) applies to Ctrl+Shift+V too. It has no GTK caller — GTK
-// never sees the raw keystroke to route in the first place — which is the
-// point: both backends now reach `Engine::route_paste`, GTK via quadraui's
-// `ClipboardPaste` interception and TUI via this function, rather than one
-// going through `UiEvent::ClipboardPaste` and the other through a bespoke key
-// branch that duplicated (and under-covered) what `route_paste` already does.
+// Clipboard-paste pre-load and Ctrl+Shift+V routing: two small tiers
+// directly below the Alt rung and directly above `Engine::handle_key`.
+// Both backends pre-load the clipboard before `p`/`P`/Ctrl+V reach the
+// engine. Ctrl+Shift+V reaches `Engine::route_paste` on both backends now.
 
 /// Pre-load the system clipboard into the paste registers before a paste
 /// keystroke reaches `Engine::handle_key` — shared by both backends (#381
@@ -1000,16 +751,7 @@ pub fn route_ctrl_shift_v_paste(engine: &mut Engine, key_name: &str, ctrl: bool)
 
 #[cfg(test)]
 mod alt_key_router_tests {
-    //! #759 / #734 slice 4 — the Alt-modifier / VSCode-mode rung.
-    //!
-    //! The two backends spell the *same physical chord* differently, and that
-    //! is precisely how the old duplicated blocks were able to drift without
-    //! anyone noticing. These tests feed both spellings of one chord into
-    //! [`route_alt_key`] and assert the two resolve identically; the
-    //! rendered-output halves live in `src/tui_main/app_on_tui_tests.rs`
-    //! (`alt_*_via_shell_app`, plus #1744's `mod vscode_mode_alt_rung_1744`)
-    //! and `src/gtk/testing.rs` (`alt_*_on_gtk`, plus #1744's
-    //! `mod alt_rung_1744`).
+    //! Alt-modifier / VSCode-mode rung tests.
     use super::*;
     use crate::core::Mode;
 
@@ -1113,9 +855,7 @@ mod alt_key_router_tests {
     }
 
     /// Alt+Z is a VS Code editor command (toggle word wrap) in VSCode mode and
-    /// nothing at all in Vim mode. Before #759 that decision existed only
-    /// inside TUI's `handle_key_pressed`; GTK dropped `alt` on the floor, so
-    /// the chord was inert there in *both* modes.
+    /// nothing at all in Vim mode.
     #[test]
     fn alt_z_is_a_vscode_command_and_a_vim_passthrough() {
         let (outcome, _, message) = resolves_identically(&ALT_Z, true);
@@ -1136,12 +876,8 @@ mod alt_key_router_tests {
     }
 
     /// Alt+Down moves the current line down in VSCode mode; Alt+Shift+Down
-    /// duplicates it downward instead (#1744 — it used to add a cursor,
-    /// VS Code's real chord for *that* is Ctrl+Alt+Down, see
-    /// [`ctrl_alt_up_down_add_a_cursor_distinct_from_plain_alt_up_down`]
-    /// below). The shift discrimination is the part TUI wrote against
-    /// crossterm's raw `KeyCode` + modifier flags and GTK never wrote at
-    /// all, so it is the arm most likely to drift again.
+    /// duplicates it downward instead. The shift discrimination is the part
+    /// TUI wrote and GTK never wrote at all, so it is the arm most likely to drift.
     #[test]
     fn alt_down_moves_a_line_and_alt_shift_down_duplicates_it() {
         let (outcome, text, _) = resolves_identically(&ALT_DOWN, true);
@@ -1173,7 +909,7 @@ mod alt_key_router_tests {
         );
     }
 
-    /// #1744: VS Code's real `insertCursorAbove`/`insertCursorBelow` is
+    /// VS Code's real `insertCursorAbove`/`insertCursorBelow` is
     /// Ctrl+Alt+Up/Down, not plain Alt+Up/Down — and must leave the buffer
     /// untouched (unlike the move-line chord it shares a base key with).
     /// Verified RED against unfixed `develop`: before this change
@@ -1236,7 +972,7 @@ mod alt_key_router_tests {
     /// Alt+Left / Alt+Right resize the sidebar in Vim mode (mode-independent,
     /// handing the width change back to the caller because the two backends
     /// store the sidebar width in different places — the *clamp* is shared).
-    /// #1744: in VSCode mode the plain chord means navigate back/forward
+    /// In VSCode mode the plain chord means navigate back/forward
     /// instead (see [`vscode_mode_alt_left_right_navigate_instead_of_resize`]
     /// below), so Ctrl+**Shift**+Alt+Right is VSCode mode's alternate resize
     /// home — plain Ctrl+Alt+Right is already the shipped
@@ -1295,7 +1031,7 @@ mod alt_key_router_tests {
         );
     }
 
-    /// #1798: the sidebar's opening width is a line-height *multiple*, so one
+    /// The sidebar's opening width is a line-height *multiple*, so one
     /// number means a 20-column strip on TUI and a ~460px slab on a GUI
     /// backend — which left an 800px window no room for a second editor tab.
     /// [`UnitProfile::sidebar_width_lh`] carries the per-unit value; this
@@ -1311,9 +1047,7 @@ mod alt_key_router_tests {
     fn unit_profiles_scale_the_sidebar_width_per_unit_1798() {
         let (px, cell) = (UnitProfile::px(), UnitProfile::cell());
 
-        // 1. The TUI is untouched: 20 *cells*, the value it already shipped
-        //    (`ShellConfig::new`'s own default, which `App::shell_config`
-        //    used to leave alone on every backend).
+        // The TUI ships 20 cells; the GUI opens narrower because one line
         assert_eq!(cell.sidebar_width_lh, 20.0);
 
         // 2. The GUI opens narrower than that, because one GUI line height
@@ -1336,7 +1070,7 @@ mod alt_key_router_tests {
         //        the same bound (measured at 10.0 on GTK: 230px -> 345px on
         //        Alt+Right, then stuck at 345px on Alt+Left).
         //    Lowering that floor per-unit is a change to the *shared* rung's
-        //    cross-backend contract (#759) and wants its own issue; until
+        //    cross-backend contract and wants its own issue; until
         //    then this is the real lower bound on `sidebar_width_lh`.
         for (name, p) in [("px", px), ("cell", cell)] {
             assert!(
@@ -1357,15 +1091,9 @@ mod alt_key_router_tests {
         }
     }
 
-    /// #1744: VS Code's `workbench.action.navigateBack` (Alt+Left) returns the
+    /// VS Code's `workbench.action.navigateBack` (Alt+Left) returns the
     /// cursor to the last jump-list entry — the same mechanism Vim mode's
-    /// Ctrl-O already uses (`Engine::jump_list_back`) — rather than resizing
-    /// the sidebar, which is where this chord used to land unconditionally
-    /// (`AltBase::Left`'s old mode-independent arm, with no VSCode-mode
-    /// exception at all). Verified RED against unfixed `develop`: the old
-    /// unconditional `AltBase::Left => ResizeSidebar(-1)` arm ran before the
-    /// VSCode-mode tier ever got a chance, so this chord could never reach
-    /// `jump_list_back` (`KNOWN_GAPS::ALT_LEFT_RIGHT_IS_SIDEBAR_RESIZE`).
+    /// Ctrl-O already uses — rather than resizing the sidebar.
     #[test]
     fn vscode_mode_alt_left_right_navigate_instead_of_resize() {
         let mut e = engine();
@@ -1410,14 +1138,6 @@ mod alt_key_router_tests {
 
     /// A chord with no arm must fall through untouched — this rung itself
     /// never sinks it. `Alt+q` is deliberately not bound to anything.
-    ///
-    /// #1764: this rung's own `Fallthrough` return is no longer the end of
-    /// the story for a printable-char base like `'q'` — the caller
-    /// (`App::handle_key_press`'s `Fallthrough` arm) now substitutes an
-    /// implicit Escape for it instead of redelivering the bare key. That
-    /// substitution lives in `app.rs`, one layer above what this function
-    /// and this test can see; what this test still pins is this rung's own
-    /// contract, that it does not claim the chord itself.
     #[test]
     fn an_unclaimed_alt_chord_falls_through_on_both_spellings() {
         let unbound = Chord {
@@ -1450,7 +1170,7 @@ mod alt_key_router_tests {
         );
     }
 
-    /// #1764 (review nit, round 1): every other predicate on this rung has
+    /// Every other predicate on this rung has
     /// its own exhaustive-over-`Mode` unit test here; `alt_mnemonic_open_
     /// allowed` had none. Pins both halves of its contract: on the
     /// toggleable (TUI) profile only Normal/Visual* allow a fresh open, and

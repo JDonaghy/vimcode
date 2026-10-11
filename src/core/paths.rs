@@ -8,36 +8,9 @@ use std::path::{Path, PathBuf};
 // Per-thread stand-in for `$HOME`, honoured by [`home_dir`] and
 // [`vimcode_config_dir`] in `--lib` test builds only.
 //
-// # Why this exists instead of `std::env::set_var("HOME", …)` (#957 smoke)
-//
-// A handful of tests need vimcode to believe the home directory is a
-// throwaway temp dir (a fake `~/.local/bin` to resolve a tool out of, an
-// empty `~/.config/vimcode` so `Engine::new()` can't inherit the
-// developer's real settings). Doing that with `set_var` is
-// **process-global**, and the `--lib` test binary runs ~3.6k tests across
-// as many threads as the machine has cores — so for the duration of one
-// such test, *every other test* saw the fake `$HOME` too. Two concrete
-// victims, both reproducible in roughly a third of full-suite runs and in
-// none when run alone:
-//
-// * `TerminalSession::spawn` runs the developer's real `$SHELL` and
-//   portable-pty snapshots the environment at fork time, so a PTY test on
-//   another thread got a shell with no rc files in `$HOME`. That shell
-//   still starts, but as a bare shell with different startup/line-editor
-//   behaviour, and the command lines `Engine::terminal_run_command` /
-//   `Engine::acp_launch_terminal_login` inject straight after spawn were
-//   then processed differently — an ACP terminal-auth login pane exiting
-//   instantly without running the login command, an extension-install
-//   pane never reaching `is_exited()` so its finalize message never
-//   painted.
-// * `core::session::tests::test_workspace_session_path_is_stable` asserts
-//   two successive `session_path_for_workspace` calls agree; a `$HOME`
-//   flip between them is enough to break it.
-//
-// A thread-local has none of that reach: the override applies only to the
-// thread that set it, so concurrent tests (and any background thread the
-// engine spawns) keep seeing the real `$HOME`. Same mechanism, and same
-// motivation, as `settings.rs`'s `TEST_SETTINGS_PATH_OVERRIDE`.
+// Thread-local override ensures each test sees only its own fake `$HOME`,
+// preventing interference between concurrent tests. The real `$HOME` remains
+// visible to background threads and unrelated tests on other threads.
 //
 // Set it with [`set_test_home`]; the returned guard restores the previous
 // value on drop.
@@ -132,7 +105,7 @@ pub fn home_dir() -> PathBuf {
 }
 
 /// Return the platform-appropriate VimCode *data* directory — where
-/// vimcode-managed tool acquisitions (#1345) are unpacked, as opposed to
+/// vimcode-managed tool acquisitions are unpacked, as opposed to
 /// [`vimcode_config_dir()`]'s user-editable settings/manifests.
 ///
 /// - **Linux**: `$XDG_DATA_HOME/vimcode` (falls back to `$HOME/.local/share/vimcode`)
@@ -141,7 +114,7 @@ pub fn home_dir() -> PathBuf {
 ///
 /// `VIMCODE_TEST_DATA_HOME` overrides this outright on every target — the
 /// same pattern `lsp_manager::homebrew_prefixes()`'s
-/// `VIMCODE_TEST_HOMEBREW_PREFIXES` uses (#917) — so tests can point tool
+/// `VIMCODE_TEST_HOMEBREW_PREFIXES` uses — so tests can point tool
 /// acquisition at a throwaway directory instead of a real user data dir.
 pub fn vimcode_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("VIMCODE_TEST_DATA_HOME") {
@@ -174,7 +147,7 @@ pub fn vimcode_data_dir() -> PathBuf {
     }
 }
 
-/// Root directory for vimcode-managed tool acquisitions (#1345):
+/// Root directory for vimcode-managed tool acquisitions:
 /// `<data dir>/tools`. Each tool gets `tools/<tool>/<version>/` plus a
 /// `tools/<tool>/current` pointer file naming the active version.
 pub fn managed_tools_dir() -> PathBuf {
@@ -222,7 +195,7 @@ pub fn set_managed_tool_current(tool: &str, version: &str) -> std::io::Result<()
 
 /// Resolve `binary`'s absolute path under the managed tools dir, if any
 /// version is currently selected there. This is the seam
-/// `lsp_manager::resolve_command` probes first (#1345) — a vimcode-acquired
+/// `lsp_manager::resolve_command` probes first — a vimcode-acquired
 /// tool is found without any PATH/env changes.
 pub fn managed_tool_binary_path(binary: &str) -> Option<PathBuf> {
     let version = managed_tool_current_version(binary)?;
@@ -306,12 +279,9 @@ mod tests {
         assert!(!dir.as_os_str().is_empty());
     }
 
-    // ── #1345: managed tools dir ────────────────────────────────────────────
-    //
-    // `VIMCODE_TEST_DATA_HOME` is process-global env state, mutated by tests
-    // in this module, `tool_acquire.rs`, and `tui_main/shell_app.rs` alike —
-    // see `super::VIMCODE_TEST_DATA_HOME_LOCK`'s doc comment for why they
-    // all share one lock rather than each guarding their own.
+    // `VIMCODE_TEST_DATA_HOME` is process-global env state, shared by tests
+    // in this module, `tool_acquire.rs`, and `tui_main/shell_app.rs`:
+    // see `super::VIMCODE_TEST_DATA_HOME_LOCK`'s doc comment for the shared lock.
 
     struct DataHomeGuard {
         old: Option<std::ffi::OsString>,

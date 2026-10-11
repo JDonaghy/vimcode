@@ -7,22 +7,6 @@
 //! **Critical:** No GTK, Cairo, Pango, or Relm4 dependencies are allowed here.
 //! All types must be plain Rust structs with no platform coupling.
 
-// #937's mandatory quadraui pin bump (dbb3023 -> 68f0ef9, needed for
-// `register_font_from_memory`/`set_nerd_font_fallback`) newly deprecated
-// `Backend::draw_status_bar`/`draw_toolbar`/`draw_sidebar_panel` (quadraui#819)
-// and the tab-bar hit struct plus a syntax-highlight span shape (quadraui#822/
-// #823) that this file used. #1490 migrated every `draw_status_bar` call site
-// to `draw_status_bar_interactive`; #1491 migrated every tab-bar paint/measure
-// call site off the now-removed deprecated struct onto `TabBarLayout`. #1652
-// (quadraui#1108/#1109) finished the set: `draw_toolbar`/`draw_sidebar_panel`
-// now call their `_interactive` twins directly, and `raw_syntax_spans` is
-// `Vec<quadraui::MinimapSpan>` — no `quadraui`-only `#[allow(deprecated)]`
-// remains in this file.
-//
-// `dead_code` dropped by #1489: the ~600 lines it was silently covering
-// (two whole dead data pipelines plus five dead helpers) are gone; any new
-// dead code in this file is a real warning again.
-
 use crate::core::buffer::{Buffer, DecorMark, VirtTextPos};
 use crate::core::engine::sidebar::{
     HAMBURGER_PANEL_ID, PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT,

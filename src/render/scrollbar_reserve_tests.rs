@@ -1,28 +1,15 @@
 use super::*;
 
-// ─── scrollbar_reserve (#828) ──────────────────────────────────────────
+// ─── scrollbar_reserve ─────────────────────────────────────────────────
 
-/// #828 acceptance: `build_screen_layout`'s `scrollbar_reserve` is an
-/// explicit parameter now, honored exactly as given — not re-derived
-/// from `char_width` via the old `if char_width > 1.0 { 8.0 } else {
-/// 0.0 }` convention this file used to hardcode at the call site inside
-/// `build_rendered_window`.
-///
-/// RED against that pre-#828 shape: a `char_width == 1.0` call (the old
-/// convention's "this is TUI" signal) always mapped to a hardcoded
-/// `0.0` reserve, with no way for a caller to say otherwise — there was
-/// no `scrollbar_reserve` parameter to pass a non-zero value through in
-/// the first place. This pins that a real, non-default
-/// `quadraui::Backend::scrollbar_reserve()` answer is now genuinely
-/// subtracted regardless of `char_width`, by comparing the painted
-/// `text_viewport_cols` with and without a non-zero reserve at
-/// `char_width == 1.0`.
+/// `scrollbar_reserve` is an explicit parameter, honored exactly as given.
+/// It is subtracted from the viewport width regardless of `char_width`.
 #[test]
 fn build_screen_layout_honors_an_explicit_scrollbar_reserve_even_at_char_width_one() {
     let mut engine = test_engine(
         "a line of text long enough to fill the whole pane width and then some more text",
     );
-    // #1094: minimap off, to isolate `scrollbar_reserve`'s own effect on
+    // Minimap off, to isolate `scrollbar_reserve`'s own effect on
     // the viewport from the (new, intentional) interaction where a pane
     // too narrow to afford both the strip and the scroll gutter beside
     // it suppresses the strip instead — this fixture's 40-col pane is
@@ -66,37 +53,22 @@ fn build_screen_layout_honors_an_explicit_scrollbar_reserve_even_at_char_width_o
     );
 }
 
-/// #1093 acceptance criteria 4 and 5: clicking the vertical middle of the
-/// strip seeks to ~50% of the strip's *painted window*, not 50% of the
-/// whole file, and the scroll it produces is centred on that line (VS
-/// Code parity), not top-aligned. Backend-independent — both backends
-/// call exactly this.
-///
-/// **RED against the pre-#1093 shape:** the old assertion here was
-/// `(line as f64 / total).abs() < 0.1` — i.e. "lands near 50% of the
-/// whole file" — which is exactly the bug this issue reports (the whole
-/// buffer squeezed into the strip on every frame, so 50% of the strip
-/// always meant 50% of the file regardless of scroll position).
-/// Confirmed by hand: reverting `build_minimap_data`'s windowing (handing
-/// `quadraui::primitives::minimap::block_bounds` the whole
-/// `total_buffer_lines` again) makes `window_len < total` (this test's
-/// own setup-sanity check) fail
-/// outright, since the window would once again cover the entire file.
+/// Clicking the vertical middle of the strip seeks to ~50% of the strip's
+/// *painted window*, not 50% of the whole file, and the scroll is centred
+/// on that line (VS Code parity), not top-aligned.
 #[test]
 fn minimap_click_at_the_middle_seeks_to_the_middle_of_the_painted_window() {
-    // #1186: `minimap_engine()`'s 201 lines now fits *entirely* inside
-    // this strip's window (compression covers whole small files, which
-    // is the point of #1186) — `windowed_minimap_engine` is large enough
-    // to stay in #1093's genuine sliding-window regime even after
-    // #1186's compression, which is what this test is actually about.
+    // This test uses a large file (50,000 lines) to maintain a genuine
+    // sliding-window regime: `minimap_engine()`'s 201 lines fit entirely inside
+    // this geometry's compressed window, so a larger fixture is needed.
     let mut e = windowed_minimap_engine(50_000);
     let screen = render_engine(&e, 120.0, 30.0);
     let win_id = screen.windows[0].window_id;
     let mm = screen.minimap.first().expect("minimap present");
     let total = mm.minimap.total_buffer_lines;
     // The real span of buffer lines the window covers — `lines.len()`
-    // (a row/block *count*) stopped being a reliable proxy for that the
-    // moment #1186 let a block cover more than one buffer line.
+    // (a row/block *count*) no longer reliably proxies this since a block
+    // may cover more than one buffer line.
     let window_len = mm.minimap.lines.last().unwrap().line_idx + 1 - mm.minimap.lines[0].line_idx;
     assert!(
         window_len < total,
@@ -153,34 +125,21 @@ fn minimap_click_at_the_middle_seeks_to_the_middle_of_the_painted_window() {
     );
 }
 
-/// #1093 acceptance criteria 1 and 4: at the top of the file, the
-/// strip's bottom row must NOT jump to EOF — the exact repro in the
-/// issue ("open a 647-line file at line 1, click the bottom of the
-/// strip, the view jumps to EOF"). It must instead land near the end of
-/// the painted window, i.e. advance by roughly one strip's worth of
-/// file. A point outside the strip must still miss so the caller falls
-/// through to normal editor clicks.
-///
-/// **RED against the pre-#1093 shape:** confirmed by hand — the old
-/// assertion (`bottom >= total - total / 10`, "lands in the last tenth
-/// of the file") passed on unfixed `develop` and would fail against
-/// this fix (`bottom` lands far short of `total`); the new assertions
-/// below fail against unfixed `develop` instead, since there `bottom`
-/// really is in the file's last tenth regardless of scroll position.
+/// At the top of the file, the strip's bottom row must NOT jump to EOF.
+/// It must instead land near the end of the painted window, advancing by
+/// roughly one strip's worth of file. A point outside the strip must miss.
+/// A click in the last tenth of the file is the bug being tested against.
 #[test]
 fn minimap_click_at_the_bottom_does_not_jump_to_eof() {
-    // #1186: see the sibling middle-click test's doc comment — a
-    // 201-line file now fits entirely inside this geometry's compressed
-    // window, so a much larger fixture is needed to keep exercising
-    // #1093's genuine sliding-window regime.
+    // This test uses a large file (50,000 lines) to maintain a genuine
+    // sliding-window regime — a 201-line file fits entirely in this geometry.
     let e = windowed_minimap_engine(50_000);
     let screen = render_engine(&e, 120.0, 30.0);
     let win_id = screen.windows[0].window_id;
     let mm = screen.minimap.first().expect("minimap present");
     let total = mm.minimap.total_buffer_lines;
-    // Real buffer-line span the window covers — see the sibling test's
-    // comment on why `lines.len()` (a row count) is no longer a
-    // reliable proxy for this under #1186's multi-line blocks.
+    // Real buffer-line span the window covers — `lines.len()` (a row count)
+    // no longer reliably proxies this since a block may cover multiple lines.
     let window_len = mm.minimap.lines.last().unwrap().line_idx + 1 - mm.minimap.lines[0].line_idx;
     assert!(
         window_len < total,
@@ -214,32 +173,11 @@ fn minimap_click_at_the_bottom_does_not_jump_to_eof() {
     );
 }
 
-/// #1253: `minimap_click_line`/`minimap_press` must resolve against the
-/// **paint-time** `MinimapLayout` a prior `draw_minimap_strip` call
-/// cached on `RenderedMinimap::resolved_layout`, not re-derive their own
-/// via `layout_with_sizing` every click — the cache is only proven wired
-/// up if a cached layout whose `bounds` genuinely disagrees with what a
-/// fresh `layout_with_sizing(minimap_strip_rect(mm), ...)` call would
-/// produce wins the hit-test.
-///
-/// Stashes a `MinimapLayout` whose `bounds` is shifted 1000px away from
-/// the strip's real `mm.rect` (impossible for any real paint to
-/// produce — this is a synthetic probe, not a realistic backend
-/// scale/pitch difference) directly into `resolved_layout`. A point at
-/// the real strip's centre must then MISS (the cached, shifted bounds
-/// don't cover it) while the same point offset into the shifted bounds
-/// must HIT — the opposite of what a from-scratch `layout_with_sizing`
-/// recompute against the real, unshifted `mm.rect` would ever report,
-/// so this can only pass if the cached layout is what actually got
-/// consulted.
-///
-/// **RED without the #1253 wiring:** confirmed by hand — reverting
-/// `minimap_layout_for_click` to unconditionally call
-/// `mm.minimap.layout_with_sizing(minimap_strip_rect(mm), ...)` (the
-/// pre-#1253 body of both `minimap_click_line` and `minimap_press`,
-/// ignoring `resolved_layout` entirely) makes the real-strip-centre
-/// assertion below fail (`Some` where the shifted cache must report
-/// `None`) and the shifted-point assertion fail the opposite way.
+/// Click resolution must use the **paint-time** `MinimapLayout` cached on
+/// `RenderedMinimap::resolved_layout`, not re-derive fresh layout per click.
+/// This test verifies the cache is wired by stashing a synthetic layout
+/// with `bounds` shifted 1000px away, confirming a hit-test uses the cached
+/// bounds rather than recomputing layout from the real strip rectangle.
 #[test]
 fn minimap_click_and_press_resolve_against_the_cached_paint_time_layout() {
     let e = windowed_minimap_engine(50_000);
@@ -302,7 +240,7 @@ fn minimap_click_and_press_resolve_against_the_cached_paint_time_layout() {
     );
 }
 
-/// #1187: a press on the viewport-highlight band itself begins a drag
+/// A press on the viewport-highlight band itself begins a drag
 /// that preserves the grab offset — `jump` is unset, and `grab_offset`
 /// is the press's own offset from the band's top edge, never `0.0`
 /// (which would jump the band's top under the cursor, the "grab
@@ -315,8 +253,8 @@ fn minimap_press_on_the_highlight_band_preserves_the_grab_offset() {
     let mm = screen.minimap.first().expect("minimap present");
 
     // The cursor starts at the top of the file, so the viewport
-    // highlight's own top edge coincides with the strip's top row
-    // (#1093). At this fixture's geometry the band is exactly one row
+    // highlight's own top edge coincides with the strip's top row.
+    // At this fixture's geometry the band is exactly one row
     // tall (`FixedPitch(1.0)`'s own row pitch), so a press has to land
     // within that single row — 0.4 units down is safely inside
     // `[rect.y, rect.y + 1.0)` without being able to round into the row
@@ -340,11 +278,9 @@ fn minimap_press_on_the_highlight_band_preserves_the_grab_offset() {
     );
 }
 
-/// #1187: a press on the track *outside* the band must jump-to-position
-/// (today's #1093 centring, applied by the caller — see
-/// `MinimapPress::jump`'s doc comment) and then continue as a normal
-/// thumb drag with `grab_offset: 0.0`, mirroring
-/// `resolve_editor_scrollbar_click`'s track-click convention.
+/// A press on the track *outside* the band must jump-to-position (applying
+/// #1093's centring) and then continue as a normal thumb drag with
+/// `grab_offset: 0.0`, mirroring `resolve_editor_scrollbar_click`'s convention.
 #[test]
 fn minimap_press_outside_the_band_sets_jump_and_zero_grab_offset() {
     let e = windowed_minimap_engine(50_000);
@@ -369,14 +305,11 @@ fn minimap_press_outside_the_band_sets_jump_and_zero_grab_offset() {
     );
 }
 
-/// #1187's actual fix: `max_scroll` must be the whole file's scroll
-/// ceiling (`total_buffer_lines - viewport_lines`, the same arithmetic
-/// `View::ensure_cursor_visible` clamps against) — never the strip's own
-/// painted window, which is only a fraction of the file once #1093's
-/// sliding window is in play. Anchoring to the window instead is exactly
-/// the root cause: the window re-slides under a drag in lockstep with
-/// `scroll_top`, so the drag's motion cancels itself out and a
-/// whole-strip drag reaches only about one window's worth of lines.
+/// `max_scroll` must be the whole file's scroll ceiling
+/// (`total_buffer_lines - viewport_lines`) — never the strip's own painted
+/// window, which is only a fraction of the file. The window re-slides under
+/// a drag in lockstep with `scroll_top`, so anchoring to it causes the
+/// drag's motion to cancel itself out.
 #[test]
 fn minimap_press_max_scroll_is_the_whole_files_scroll_ceiling() {
     let e = windowed_minimap_engine(50_000);
@@ -421,19 +354,14 @@ fn minimap_press_returns_none_outside_the_strip() {
     );
 }
 
-/// Shared fixture for the [`fine_seek_geometry`] unit tests below:
-/// a synthetic painted window (`base` 1000, `span` 401 — deliberately
-/// not a round multiple of the real strip's own height, so a formula
-/// that silently degenerated to the coarse, file-wide one would produce
-/// a visibly different (and wrong) result rather than an accidental
-/// match) inside a `bounds`/`max_scroll` pair distinct from either.
+/// Fixture for the [`fine_seek_geometry`] unit tests: a synthetic painted
+/// window (`base` 1000, `span` 401 — deliberately not a round multiple of
+/// the strip's height to avoid accidental correctness) inside a distinct
+/// `bounds`/`max_scroll` pair.
 ///
-/// The returned `thumb_length` is an arbitrary, non-zero stand-in for
-/// the real, already-painted `viewport_highlight.height` a live caller
-/// would pass (#1828 review: `fine_seek_geometry` no longer re-derives
-/// this itself — see its doc comment) — neither test below depends on
-/// its actual value, only that it is threaded straight through
-/// unmodified into `track_length`.
+/// The returned `thumb_length` is a non-zero stand-in for the real,
+/// already-painted `viewport_highlight.height` — it is threaded through
+/// unmodified into `track_length` and neither test depends on its value.
 fn fine_geometry_fixture() -> (quadraui::Rect, quadraui::Minimap, usize, f32) {
     let bounds = quadraui::Rect::new(0.0, 10.0, 5.0, 20.0); // S0 = 10, Sh = 20
     let minimap = quadraui::Minimap {
@@ -495,7 +423,7 @@ fn dispatch_offset_at(
         .expect("a ScrollbarY drag with max_scroll > 0 must emit ScrollOffsetChanged")
 }
 
-/// #1271: `fine_seek_geometry`'s `grab_offset` is derived by requiring
+/// `fine_seek_geometry`'s `grab_offset` is derived by requiring
 /// the mapping to be an **identity at the press point** — dispatching a
 /// drag-move at the exact pixel the press happened at, with no
 /// movement, must reproduce the current `scroll_top` exactly, not just
@@ -536,7 +464,7 @@ fn fine_seek_geometry_grab_offset_is_an_identity_at_the_press_point() {
     );
 }
 
-/// #1271: the virtual track spans exactly the painted window — at the
+/// The virtual track spans exactly the painted window — at the
 /// real strip's top (`y = S0`) the derived offset must be `base` (the
 /// painted window's first buffer line), and at the real strip's bottom
 /// (`y = S0 + Sh`) it must be `base + span` (one past its last line).
@@ -595,7 +523,7 @@ fn fine_seek_geometry_endpoints_span_exactly_the_painted_window() {
     );
 }
 
-/// #1187/#722: `Engine::activate_window` — what the minimap press rung's
+/// `Engine::activate_window` — what the minimap press rung's
 /// non-jump (in-band) branch calls instead of the jump branch's
 /// `apply_minimap_click` — must switch which window is active without
 /// moving that (or any) window's cursor or scroll position. This is the
@@ -648,16 +576,10 @@ fn minimap_click_is_a_no_op_when_the_setting_is_off() {
 }
 
 /// The sampled lines and aggregated spans are quadraui's output, keyed
-/// back to real buffer lines — a transposed or empty sample would show up
-/// here before it reaches a snapshot.
-///
-/// #1093: renamed from `minimap_samples_the_whole_buffer_in_order` — the
-/// strip now holds a *window*, not the whole buffer, so the claim in the
-/// old name is no longer true (the window merely happens to start at
-/// line 0 here, since the cursor starts at the top of the file). The
-/// in-order/strictly-increasing assertions below are unchanged; a
-/// `window_len < total_buffer_lines` check is added so this stays
-/// honest about no longer covering the whole file.
+/// back to real buffer lines. The strip holds a *window*, not the whole
+/// buffer — it samples in order starting at the top, and strictly-increasing
+/// line indices are checked. A `window_len < total_buffer_lines` check
+/// verifies this no longer covers the whole file.
 #[test]
 fn minimap_window_samples_in_order_starting_at_the_top() {
     let e = minimap_engine();
@@ -691,25 +613,15 @@ fn minimap_window_samples_in_order_starting_at_the_top() {
     );
 }
 
-/// #1093 acceptance criterion 1: a file several times taller than the
-/// strip, cursor at line 1 — the strip's last painted row's `line_idx`
-/// must be well short of `total_buffer_lines`. This is the issue's own
-/// repro (`src/app_support.rs`, 647 lines, TUI minimap, cursor at line
-/// 1: "the strip's bottom row is line ~647").
-///
-/// **RED against unfixed `develop`:** the pre-#1093 shape squeezed the
-/// whole buffer into the strip on every frame, so the last painted row
-/// was always `total_buffer_lines - 1` regardless of scroll position —
-/// this exact assertion (`last_line_idx < total - total / 4`) fails
-/// against that shape at any scroll position, including the top.
+/// A file several times taller than the strip with cursor at line 1 must
+/// show the strip's last painted row well short of `total_buffer_lines`.
+/// Both ends of the file must be reachable by scrolling (VS Code's
+/// `minimap.size: proportional`).
 #[test]
 fn minimap_window_stays_short_of_eof_when_scrolled_to_the_top() {
-    // #1211: `K` (hence the window's own length) is now a function of
-    // this call's geometry alone (`editor_visible_rows`, `target_lines`
-    // == 160 here) — never of the buffer's own length — so any file
-    // longer than that geometry-only window still cannot cover the
-    // whole file, and 20,000 lines keeps exercising #1093's genuine
-    // sliding-window regime exactly as it always has.
+    // The window's length depends only on the geometry (`editor_visible_rows`,
+    // `target_lines` == 160 here), not the buffer's length — any file longer
+    // than that geometry-only window still exercises the sliding-window regime.
     let e = large_minimap_engine(20_000);
     let theme = Theme::onedark();
     let wid = e.active_window_id();
@@ -730,13 +642,11 @@ fn minimap_window_stays_short_of_eof_when_scrolled_to_the_top() {
     );
 }
 
-/// #1093 acceptance criterion 2: the same file scrolled to the bottom —
-/// the strip's last painted row **is** the last line of the file, and
-/// its first row is not line 0 (both ends of the file are reachable by
-/// scrolling, VS Code's `minimap.size: proportional`).
+/// The same file scrolled to the bottom — the strip's last painted row
+/// **is** the last line of the file, and its first row is not line 0.
 #[test]
 fn minimap_window_reaches_eof_when_scrolled_to_the_bottom() {
-    // #1211: see the sibling "stays short of eof" test's comment — the
+    // See the sibling "stays short of eof" test's comment — the
     // window's length is geometry-only, so a 20,000-line buffer stays
     // outside it at this rect's `target_lines` (160) and the window
     // still has to slide.
@@ -759,7 +669,7 @@ fn minimap_window_reaches_eof_when_scrolled_to_the_bottom() {
         .expect("minimap must build")
         .minimap;
 
-    // #1186: the last `lines` entry is now a *block's* starting line,
+    // The last `lines` entry is now a *block's* starting line,
     // not necessarily the file's literal last line — a block can cover
     // several real lines (`MINIMAP_MAX_COMPRESSION` at most here, since
     // 20,000 lines sits well past the compression ceiling), so "reaches
@@ -779,25 +689,11 @@ fn minimap_window_reaches_eof_when_scrolled_to_the_bottom() {
     );
 }
 
-/// #1211 acceptance: the scale (buffer lines per painted row) is a
-/// function of the strip's own geometry (`editor_visible_rows`,
-/// `target_lines`) — **never** of `total_buffer_lines`. #1186 derived
-/// `K` from `total_buffer_lines.div_ceil(target_lines)`, which squeezed
-/// the *whole file* into the strip for every file shorter than
-/// `MINIMAP_MAX_COMPRESSION * target_lines` (essentially every real
-/// file), disabling #1093's slide — this test locks in the fix: two
-/// files of wildly different lengths, same strip geometry, must land on
-/// the *identical* scale, and neither shows through to EOF while
-/// scrolled to the top (both must still slide to reach it).
-///
-/// **RED against unfixed `develop`:** confirmed by hand — restoring the
-/// pre-#1211 `k = total_buffer_lines.div_ceil(target_lines)` makes
-/// `step(&mm_medium)` (1,500 lines) come out to `10` and
-/// `step(&mm_huge)` (50,000 lines) come out to `64` (the
-/// `MINIMAP_MAX_COMPRESSION` clamp binding) — different from each other,
-/// failing the `assert_eq!` below — and `mm_medium` reaches EOF from the
-/// top (the whole 1,500-line file fit in one window), failing the
-/// "must NOT reach EOF" assertion for the medium fixture.
+/// The scale (buffer lines per painted row) is a function of the strip's
+/// own geometry (`editor_visible_rows`, `target_lines`) — **never** of
+/// `total_buffer_lines`. Two files of wildly different lengths with the same
+/// strip geometry must land on the identical scale. Neither shows through to
+/// EOF while scrolled to the top; both must slide to reach it.
 #[test]
 fn minimap_scale_is_constant_across_file_length_not_derived_from_it() {
     let theme = Theme::onedark();
@@ -833,9 +729,8 @@ fn minimap_scale_is_constant_across_file_length_not_derived_from_it() {
              per painted row"
     );
 
-    // The core #1211 property: 1,500 lines and 50,000 lines, same
-    // geometry, must produce the exact same scale — `K` is a function
-    // of the strip, not the file.
+    // Two files at the same geometry must produce the same scale —
+    // `K` is a function of the strip, not the file.
     assert_eq!(
         step(&mm_medium),
         step(&mm_huge),
@@ -855,9 +750,7 @@ fn minimap_scale_is_constant_across_file_length_not_derived_from_it() {
     );
 
     // Neither file's window may reach EOF while scrolled to the top —
-    // both are longer than the (geometry-only) window, so #1093's slide
-    // must still be required to reach the end, for the small file just
-    // as much as the huge one.
+    // both are longer than the (geometry-only) window, so sliding must still
     for (label, mm) in [("medium", &mm_medium), ("huge", &mm_huge)] {
         assert_eq!(
             mm.lines[0].line_idx, 0,
@@ -874,10 +767,8 @@ fn minimap_scale_is_constant_across_file_length_not_derived_from_it() {
     }
 }
 
-/// #1093 acceptance criterion 6: a file that fits entirely within the
-/// strip's own capacity must still paint top-to-bottom with no window —
-/// no regression to the pre-#1093 behaviour for the common case where
-/// the whole file already fits.
+/// A file that fits entirely within the strip's own capacity must still
+/// paint top-to-bottom with no window — no regression for the common case.
 #[test]
 fn minimap_window_is_the_whole_file_when_it_fits_the_strip() {
     let e = large_minimap_engine(10);

@@ -32,12 +32,10 @@ pub struct RenderedWindow {
     pub window_id: WindowId,
     /// Window rectangle. GTK reads it directly as sub-pixel float geometry
     /// (Cairo paints exactly what's here). TUI reads it too — for popup
-    /// positioning (`tui_main::render_impl`'s completion/hover popup
-    /// clamping, #420) and, truncated to whole cells first via
-    /// [`tui_window_paint_rect`], for click/drag/hover column resolution
-    /// (#1040) — but is *not* the geometry TUI's own paint path draws
-    /// into; see [`tui_window_paint_rect`]'s doc for why TUI code must
-    /// truncate before using it.
+    /// positioning and click/drag/hover column resolution via
+    /// [`tui_window_paint_rect`], but is *not* the geometry TUI's own paint
+    /// path draws into; see [`tui_window_paint_rect`]'s doc for why TUI code
+    /// must truncate before using it.
     pub rect: WindowRect,
     /// Visible lines, one per row.
     ///
@@ -46,13 +44,7 @@ pub struct RenderedWindow {
     /// (`line_idx < total_lines`), so on a buffer shorter than the
     /// viewport this is shorter than the number of rows the window
     /// actually has room to paint. Use [`Self::visible_line_capacity`]
-    /// for "how many rows could this window show" — e.g. feeding
-    /// `Engine::set_viewport_for_window` (#1779: using `lines.len()`
-    /// there pinned a 1-line buffer's `view.viewport_lines` to `1`, so
-    /// the very next `ensure_cursor_visible` — on the keystroke that grew
-    /// the buffer to 2 lines — believed the viewport could show only one
-    /// line and scrolled line 0 out of view to keep the cursor's new
-    /// line "visible").
+    /// for "how many rows could this window show".
     pub lines: Vec<RenderedLine>,
     /// This window's row *capacity* at the geometry `rect`/`line_height`
     /// this frame painted with — `(rect.height / line_height).floor()`,
@@ -60,8 +52,7 @@ pub struct RenderedWindow {
     /// the `visible_lines` local `build_screen_layout`'s window loop
     /// computes and feeds into `build_rendered_window`). Unlike
     /// [`Self::lines`]`.len()`, this does **not** shrink just because the
-    /// buffer itself is shorter than the viewport — see that field's doc
-    /// for the #1779 bug this distinction exists to keep fixed.
+    /// buffer itself is shorter than the viewport — see that field's doc.
     pub visible_line_capacity: usize,
     /// Cursor position + shape, or `None` if the cursor is scrolled off-screen.
     pub cursor: Option<(CursorPos, CursorShape)>,
@@ -86,16 +77,14 @@ pub struct RenderedWindow {
     /// uses accurate geometry.
     pub text_viewport_cols: usize,
     /// Width reserved to the right of the text for the minimap strip plus
-    /// the scroll-affordance gutter it always leaves clear alongside it
-    /// (#1094 review), in the caller's own unit — `0.0` when the strip is
-    /// off/self-suppressed for this window. `rect` reaches the pane's true
-    /// right edge (#1094's own fix), so `window_zone_hit_test` needs this
-    /// to find the strip's boundary and exclude it from `TextArea`/gutter
-    /// click routing without re-deriving `scroll_gutter_width` (a private,
-    /// backend-`scrollbar_reserve`-dependent quantity) a second time from
-    /// scratch. Mirrors exactly what `build_rendered_window` already
-    /// subtracted to produce `text_viewport_cols` above, so the two can
-    /// never drift from each other.
+    /// the scroll-affordance gutter it always leaves clear alongside it,
+    /// in the caller's own unit — `0.0` when the strip is off/self-suppressed
+    /// for this window. `rect` reaches the pane's true right edge, so
+    /// `window_zone_hit_test` needs this to find the strip's boundary and
+    /// exclude it from `TextArea`/gutter click routing without re-deriving
+    /// `scroll_gutter_width` a second time from scratch. Mirrors exactly
+    /// what `build_rendered_window` already subtracted to produce
+    /// `text_viewport_cols` above, so the two can never drift from each other.
     pub minimap_reserved_w: f64,
     /// Whether this is the focused window.
     pub is_active: bool,
@@ -128,12 +117,11 @@ pub struct RenderedWindow {
     /// Per-window status line (Vim-style), or `None` when the setting is off.
     pub status_line: Option<WindowStatusLine>,
     /// Set when this window's buffer hosts a `vimcode.ui.register_view` view
-    /// as an editor-area tab (`BufferState::plugin_view`, #1627), naming the
-    /// view. `lines`/`cursor`/every other buffer-content field is left at its
-    /// `build_rendered_window`-`empty()` default when this is `Some` — the
-    /// window's content is a `Form`, painted by
-    /// `App::paint_editor_windows_rung` instead of `Surface::Editor`, not
-    /// buffer text.
+    /// as an editor-area tab, naming the view. `lines`/`cursor`/every other
+    /// buffer-content field is left at its `build_rendered_window`-`empty()`
+    /// default when this is `Some` — the window's content is a `Form`,
+    /// painted by `App::paint_editor_windows_rung` instead of `Surface::Editor`,
+    /// not buffer text.
     pub plugin_view: Option<String>,
 }
 
@@ -213,7 +201,7 @@ pub fn wildmenu_to_status_bar(wm: &WildmenuData, theme: &Theme) -> quadraui::Sta
 /// Data needed to render the word-completion popup in insert mode.
 #[derive(Debug, Clone)]
 pub struct CompletionMenu {
-    /// Sorted list of candidates. `CompletionCandidate` (#1805) carries
+    /// Sorted list of candidates. `CompletionCandidate` carries
     /// optional kind/detail/documentation metadata — buffer-word and LSP
     /// candidates leave those `Text`/`None`, a `vimcode.completion.
     /// register` plugin source can set them.
@@ -287,45 +275,11 @@ pub fn completion_menu_to_quadraui_completions(menu: &CompletionMenu) -> quadrau
 
 // ─── HoverPopup ──────────────────────────────────────────────────────────────
 
-/// Convert an engine `HoverPopup` + on-screen anchor cell into a fully
-/// resolved `quadraui::Tooltip` and its `TooltipLayout`.
-///
-/// `anchor_x` / `anchor_y` are the screen cell at the requested symbol
-/// (cursor position, already resolved for scroll + gutter). The popup's
-/// width is sized to the longest text line + 4 cells of padding /
-/// border, and the height is the line count clamped to 20.
-///
-/// Placement is `Top` with fallback `Bottom` via the Tooltip primitive's
-/// own viewport-fit logic. The anchor rectangle is given
-/// `width = popup_width` so the primitive's horizontal-centering math
-/// aligns the popup's left edge with the cursor cell (as the legacy
-/// hover popup did). `margin=0` matches the legacy 0-cell gap above /
-/// 0-cell gap below the cursor line.
 /// Build a `quadraui::Tooltip` from the two fields every vimcode call
 /// site must supply — `id` and `text` — with every other field at its
 /// behaviour-preserving default (`styled_lines: None`, `placement:
 /// Bottom`, `bg: None`, `fg: None`). Callers that need a non-default
 /// then assign the public field directly.
-///
-/// # Why a local helper and not `quadraui::Tooltip::new` (#661)
-///
-/// quadraui#541 added exactly this constructor upstream, as
-/// `Tooltip::new(id, text)` plus `.with_styled_lines/.with_placement/
-/// .with_bg/.with_fg`. It is **not callable from vimcode yet**: it
-/// landed on quadraui `develop` *after* the rev this repo is pinned to
-/// (the `rev` on the `quadraui` dependency in `Cargo.toml`, formerly
-/// `quadraui-pin.txt` = `f6d27c2`; see #691). Calling it compiles only
-/// once the pin moves, which is its own deliberate, `cargo test`-verified
-/// commit — ~70 quadraui commits rode along in `f6d27c2..develop` at the
-/// time this was written, including tooltip-box and tab-label paint
-/// changes that restate this repo's snapshots.
-///
-/// Routing through this helper still buys #661's actual goal today:
-/// vimcode names `Tooltip`'s field set in exactly **one** place instead
-/// of seven exhaustive literals across three modules, so an upstream
-/// field addition is a one-line fix here rather than seven `E0063`s.
-/// When the pin does move, this body becomes a single delegation to
-/// `quadraui::Tooltip::new(id, text)` and every call site is untouched.
 pub fn quadraui_tooltip(id: quadraui::WidgetId, text: impl Into<String>) -> quadraui::Tooltip {
     quadraui::Tooltip {
         id,
@@ -339,7 +293,7 @@ pub fn quadraui_tooltip(id: quadraui::WidgetId, text: impl Into<String>) -> quad
 
 /// `unit_w` / `unit_h` scale a single character cell / text row into the
 /// caller's coordinate space — `1.0, 1.0` for TUI (already cell-native) or
-/// `char_width, line_height` in pixels for GTK (#669). `anchor_x`/`anchor_y`
+/// `char_width, line_height` in pixels for GTK. `anchor_x`/`anchor_y`
 /// must already be expressed in that same space. `Tooltip::layout`'s own
 /// anchor/viewport/measure arithmetic is unit-agnostic (plain `Rect` math),
 /// so scaling only the chars/rows-derived sizes here is sufficient — no
@@ -386,9 +340,7 @@ pub struct HoverPopup {
 /// Data for rendering an editor hover popup with rich markdown content.
 #[derive(Debug, Clone)]
 pub struct EditorHoverPopupData {
-    /// Raw markdown source. Styled at paint time with the active theme —
-    /// see `markdown_hover_to_quadraui_lines` (#821: adopts
-    /// `quadraui::compose::markdown::render_markdown_to_styled`).
+    /// Raw markdown source. Styled at paint time with the active theme.
     pub markdown: String,
     /// Plain per-line text (markdown syntax stripped).
     pub line_text: Vec<String>,
@@ -421,9 +373,8 @@ pub const EDITOR_HOVER_MAX_ROWS: usize = 20;
 
 /// Geometry + drag-math inputs for a popup's scrollbar, captured by
 /// the renderer so click/drag handlers don't have to recompute the
-/// layout. Used by both backends for #215. Native units: cells (TUI)
-/// or pixels (GTK) — matches whatever `RichTextPopupLayout` was built
-/// with.
+/// layout. Used by both backends. Native units: cells (TUI)
+/// or pixels (GTK) — matches whatever `RichTextPopupLayout` was built with.
 #[derive(Debug, Clone, Copy)]
 pub struct PopupScrollbarHit {
     pub track: quadraui::Rect,
@@ -436,16 +387,14 @@ pub struct PopupScrollbarHit {
 
 /// Render hover-popup markdown into per-line `quadraui::StyledText` + per-line
 /// heading font scale, via quadraui's shared
-/// `quadraui::compose::markdown::render_markdown_to_styled` (#821 — replaces
-/// the previous hand-rolled `MdStyle`-to-color byte-position span walk).
+/// `quadraui::compose::markdown::render_markdown_to_styled`.
 /// Shared by every rich-text hover/popup builder (editor hover, panel-item
 /// hover) so markdown → styled-span conversion lives in exactly one place.
 ///
 /// `code_highlights` are vimcode's own tree-sitter highlights for fenced
-/// code-block lines (precomputed once at hover-show time by
+/// code-block lines (precomputed at hover-show time by
 /// `core::markdown::hover_markdown_structure`, since quadraui's renderer is
-/// deliberately language-agnostic — see its own doc: "Tree-sitter-capable
-/// callers opt into per-language highlighting"). They're overlaid onto the
+/// deliberately language-agnostic). They're overlaid onto the
 /// relevant lines after quadraui's render.
 pub(crate) fn markdown_hover_to_quadraui_lines(
     markdown: &str,
@@ -576,17 +525,10 @@ pub fn editor_hover_to_quadraui_rich_text(
 }
 
 /// Build, rasterise and hit-region-extract the editor hover popup via the
-/// `quadraui::RichTextPopup` primitive. Shared by both backends' paint
-/// paths (#669) — GTK previously duplicated this in the now-dead
-/// `src/gtk/draw.rs::draw_editor_hover_popup`, with an added Pango-exact
-/// link-width measure; that precision isn't reachable from
-/// `render_content`'s `&mut dyn Backend`-only signature (no raw
-/// `pango::Layout`, same class of gap TUI's now-deleted
-/// `render_editor_hover_popup` wrapper hit for the raw `Frame` — see
-/// `PLAN.md`), so both backends now use the same char-count-based
-/// `link_widths` closure, scaled by `unit_w`. This only affects link
-/// *hit-region* precision, not paint — the rasteriser re-measures glyphs
-/// itself when drawing.
+/// `quadraui::RichTextPopup` primitive. Shared by both backends' paint paths.
+/// Both backends now use the same char-count-based `link_widths` closure,
+/// scaled by `unit_w`. This only affects link *hit-region* precision, not
+/// paint — the rasteriser re-measures glyphs itself when drawing.
 ///
 /// `unit_w` / `unit_h` are `1.0, 1.0` for TUI (cell-native) or
 /// `char_width, line_height` in pixels for GTK. `popup_x` / `popup_y` /
@@ -594,9 +536,7 @@ pub fn editor_hover_to_quadraui_rich_text(
 ///
 /// Returns `(link_rects, popup_bounds, scrollbar_hit)` — all `quadraui::Rect`,
 /// in the caller's units — for mouse hit-testing. Called by the shared
-/// [`paint_editor_popups`] (#1167), which both `render_impl.rs`'s TUI
-/// wrapper and GTK's `App::paint_editor_popups_rung` call through; there is
-/// no per-backend copy of this geometry any more (#831).
+/// [`paint_editor_popups`], which both TUI and GTK call through.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn editor_hover_popup_paint(
     backend: &mut dyn quadraui::Backend,
@@ -620,15 +560,7 @@ pub fn editor_hover_popup_paint(
         .max(10.0 * unit_w)
         .min((viewport.width - 4.0 * unit_w).max(10.0 * unit_w));
     let measure = quadraui::RichTextPopupMeasure::new(content_w, unit_h);
-    // #504: this used to be a char-count estimate (`chars().count() as f32
-    // * unit_w`) — fine on TUI's fixed-width grid, but on a proportional
-    // GTK font it drifts further from the real painted glyph position with
-    // every preceding span, so a later link on the same line could end up
-    // with a hit region nowhere near where it was actually drawn.
-    // `quadraui::Backend::measure_text` already exists for exactly this
-    // (D-014: real shaped advance on GUI backends, the same cell-count
-    // this closure used to compute by hand on TUI) — route through it
-    // instead of re-deriving the estimate here, so the hit region tracks
+    // Measure via the backend's shaped advance, so the hit region tracks
     // the same font the rasteriser paints with.
     let layout = popup.layout(
         popup_x,
@@ -707,19 +639,13 @@ pub struct EditorPopupPoints {
 /// rather than read from `RenderedWindow::rect` directly because TUI must
 /// snap it to the whole-cell grid its paint path actually truncated to
 /// first (via [`tui_window_paint_rect`]; `RenderedWindow` rects come from
-/// continuous float split math and are not integer-valued in general,
-/// #1040), while GTK uses its raw sub-pixel float rect as-is — exactly the
+/// continuous float split math and are not integer-valued in general),
+/// while GTK uses its raw sub-pixel float rect as-is — exactly the
 /// same origin each backend already independently derives for its own
 /// `win_viewport`.
 ///
-/// Shared by TUI (`tui_main::render_impl::paint_editor_popups`) and GTK
-/// (`App::paint_editor_popups_rung`) as of #1237 — before that each backend
-/// re-derived every one of these five anchor points itself (gutter width,
-/// scroll offset, tab-aware column resolution), and only TUI's completion
-/// anchor happened to call [`quadraui::text_util::char_col_to_visual`]
-/// first; the other four
-/// anchors on *both* backends, and GTK's completion anchor specifically,
-/// used the raw character column as a display column outright.
+/// Shared by TUI and GTK — both backends now use this to compute the five
+/// anchor points (gutter width, scroll offset, tab-aware column resolution).
 pub fn editor_popup_anchors(
     screen: &ScreenLayout,
     win_origin: Option<(f32, f32)>,
@@ -804,35 +730,17 @@ pub fn editor_popup_anchors(
 /// Paint the editor-anchored popups: completion menu, LSP hover, the rich
 /// "editor hover" markdown popup, diff-peek, and signature-help.
 ///
-/// Shared by TUI (`tui_main::render_impl::paint_editor_popups`) and GTK
-/// (`App::paint_editor_popups_rung`) as of #1167 — before that the two were
-/// ~160/~164-line near-verbatim copies of the same five
-/// build-adapter → `.layout()` → `backend.draw_*` → cache-output-for-hit-
-/// testing blocks, differing only in coordinate units and in exactly how
-/// each anchor point is derived from the active window (gutter width,
-/// scroll offsets, tab-aware column resolution for the cursor).
+/// Shared by TUI and GTK. This function owns everything from "given a
+/// resolved anchor + viewport" onward. Resolving the anchor point itself
+/// goes through the shared [`editor_popup_anchors`], so only viewport
+/// selection and the completion popup's width/height clamp remain
+/// per-backend wiring. One per-backend difference remains: the editor-hover
+/// popup's clip viewport — TUI clamps into the whole frame `area`, GTK
+/// clamps into the active window's own rect.
 ///
-/// This function owns everything from "given a resolved anchor + viewport"
-/// onward. Resolving the anchor point itself now goes through the shared
-/// [`editor_popup_anchors`] (#1237 — see its doc for why GTK's completion
-/// anchor and *all four* non-completion anchors on both backends used to
-/// drift left on tab-indented lines), so only viewport selection and the
-/// completion popup's width/height clamp remain per-backend wiring. One
-/// deliberate *pre-existing* per-backend difference survives that
-/// convergence too — the editor-hover popup's clip viewport: TUI clamps
-/// into the whole frame `area`, GTK clamps into the active window's own
-/// rect. Folding that one together would be a behavior change needing its
-/// own issue + black-box test, not something to smuggle into this
-/// refactor.
-///
-/// The four output caches are cleared unconditionally at the top (matching
-/// GTK's existing per-frame behavior) rather than only-on-`Some` (TUI's
-/// prior behavior for `completion_layout`/`editor_hover_link_rects`) —
-/// verified safe, not a behavior change: every consumer
-/// (`render::route_modal_overlay_click`'s `completion_open` /
-/// `editor_hover_*` routing) already gates on live engine state before ever
-/// reading the cached layout, so a stale cache was unreachable dead data,
-/// never a click-routing hazard.
+/// The four output caches are cleared unconditionally at the top rather
+/// than conditionally — every consumer already gates on live engine state
+/// before reading the cached layout, so a stale cache is unreachable.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_editor_popups(
     backend: &mut dyn quadraui::Backend,
@@ -962,7 +870,7 @@ pub struct SignatureHelp {
 /// legacy behavior).
 /// `unit_w` / `unit_h` scale cell/row-derived sizes into the caller's
 /// coordinate space — see [`hover_popup_to_quadraui_tooltip`]'s doc for why
-/// this is enough to make the one adapter serve both backends (#669).
+/// this is enough to make the one adapter serve both backends.
 pub fn signature_help_to_quadraui_tooltip(
     sig: &SignatureHelp,
     anchor_x: f32,
@@ -1029,7 +937,7 @@ pub fn signature_help_to_quadraui_tooltip(
 mod tests {
     use super::*;
 
-    // ─── Completion popup → quadraui primitive (#1805) ─────────────────────
+    // ─── Completion popup → quadraui primitive ─────────────────────────────
 
     /// A plugin-sourced `CompletionCandidate`'s `kind`/`detail`/
     /// `documentation` must thread all the way into the quadraui

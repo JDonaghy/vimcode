@@ -1,22 +1,16 @@
 //! `Engine::poll_acp` — the one call site `poll_idle` uses to drain the ACP
-//! transport (#951 ACP-0 built the transport; #952 ACP-1 adds the session
-//! lifecycle drive and the `session/update` -> AI-panel chunk mapping this
-//! module implements; #953 ACP-2 adds `session/request_permission` — the
-//! human-in-the-loop tool-call approval chokepoint — routed onto the
-//! existing dialog system, plus `session/cancel` wiring; #954 ACP-3 adds
-//! `fs/read_text_file`/`fs/write_text_file`, served through vimcode's own
-//! buffers rather than the raw filesystem — see [`Engine::acp_read_text_file`]
-//! / [`Engine::acp_write_text_file`]). `tool_call`/`tool_call_update`/`plan`
-//! updates are still intentionally left unhandled here — ignored without
-//! breaking the stream — per ACP-1's scope; ACP-4/5 add real handling for
-//! those on top of the same `AcpEvent` stream, not a transport change.
+//! transport. This module implements the session lifecycle drive and the
+//! `session/update` -> AI-panel chunk mapping. `tool_call`/`tool_call_update`/
+//! `plan` updates are intentionally left unhandled here — ignored without
+//! breaking the stream — allowing real handling for those on top of the same
+//! `AcpEvent` stream.
 
 use super::*;
 use crate::core::acp::{AcpChunkKind, AcpEvent};
 
 impl Engine {
     /// Read-only access to the *active* ACP session — the one the AI panel
-    /// currently paints (#1463). Every other session in `acp_sessions`
+    /// currently paints. Every other session in `acp_sessions`
     /// keeps its client polled by [`Self::poll_acp`] regardless of which
     /// one this points at.
     pub fn acp(&self) -> &crate::core::acp_session::AcpSession {
@@ -28,7 +22,7 @@ impl Engine {
         &mut self.acp_sessions[self.acp_active_session]
     }
 
-    /// Mark the active session's turn as started (#1508): the one place
+    /// Mark the active session's turn as started: the one place
     /// `ai_streaming` flips `true` from. Every call site that used to write
     /// `self.acp_mut().ai_streaming = true;` directly now calls this
     /// instead, so `AcpSession::turn_started_at` — the status-strip elapsed
@@ -39,7 +33,7 @@ impl Engine {
         session.turn_started_at = Some(std::time::Instant::now());
     }
 
-    /// Non-blocking drain of every live ACP session's events (#1463) — not
+    /// Non-blocking drain of every live ACP session's events — not
     /// just the active one, so a backgrounded session keeps its agent's
     /// stdout drained (and its turn progressing) while another session is
     /// in the foreground. Returns `true` if a redraw is needed (a visible
@@ -74,7 +68,7 @@ impl Engine {
 
     /// Advance [`Self::ai_spinner_frame`] once per `poll_idle` tick while
     /// any session (not just the foreground one — a backgrounded turn is
-    /// still genuinely running) is `ai_streaming` (#1508). Returns `true`
+    /// still genuinely running) is `ai_streaming`. Returns `true`
     /// (a redraw is warranted) exactly when it actually advanced, so a
     /// fully idle engine doesn't request a repaint every tick forever.
     ///
@@ -110,8 +104,7 @@ impl Engine {
     /// `is_foreground` is `true` only when that session is the one the AI
     /// panel is actually showing right now — a `session/request_permission`
     /// on a backgrounded session must never pop the modal dialog on top of
-    /// whatever the human is looking at (#1463's "without stealing focus");
-    /// see [`Self::acp_handle_permission_request`].
+    /// whatever the human is looking at; see [`Self::acp_handle_permission_request`].
     fn acp_dispatch_events(&mut self, events: Vec<AcpEvent>, is_foreground: bool) -> bool {
         let mut redraw = false;
         for event in events {
@@ -153,20 +146,20 @@ impl Engine {
                     self.acp_mut().client = None;
                     self.acp_mut().session_id = None;
                     self.acp_mut().pending_prompt = None;
-                    // #1459: a resume the agent died before completing must
+                    // A resume the agent died before completing must
                     // not silently apply to whatever agent starts next, and
                     // its deferred display line (if any) goes with it — the
                     // agent is gone, so there's no transcript left for it to
                     // land after.
                     self.acp_pending_resume = None;
                     self.acp_mut().pending_prompt_display = None;
-                    // #1512: the agent this was queued for is gone — same
+                    // The agent this was queued for is gone — same
                     // "no transcript left for it to land after" reasoning
                     // as `pending_prompt_display` just above.
                     self.acp_mut().queued_prompt = None;
                     self.acp_mut().queued_prompt_idx = None;
                     self.acp_mut().streaming_turn = None;
-                    // #956 (ACP-5): session-scoped, same as the decisions
+                    // Session-scoped, same as the decisions
                     // map above — see `Engine::ai_clear`'s matching reset.
                     self.acp_mut().plan.clear();
                     self.acp_mut().available_commands.clear();
@@ -174,28 +167,28 @@ impl Engine {
                     self.acp_mut().modes.clear();
                     self.acp_mut().current_mode_id = None;
                     self.acp_mut().usage = None;
-                    // #957 (ACP-6): session-scoped, same as the rest above.
+                    // Session-scoped, same as the rest above.
                     self.acp_mut().auth_methods.clear();
                     self.acp_mut().authenticated = false;
                     self.acp_mut().prompt_capabilities =
                         crate::core::acp::AcpPromptCapabilities::default();
-                    // #1487: session-scoped, same reasoning — the MCP
+                    // Session-scoped, same reasoning — the MCP
                     // servers this (now-dead) session started with no
                     // longer apply to whatever session starts next.
                     self.acp_mut().mcp_capabilities =
                         crate::core::acp::AcpMcpCapabilities::default();
                     self.acp_mut().active_mcp_servers.clear();
-                    // #955 (ACP-4): session-scoped, same as the rest above
+                    // Session-scoped, same as the rest above
                     // — see `Engine::ai_clear`'s matching reset.
                     self.acp_mut().tool_calls.clear();
-                    // #1511: session-scoped, same reasoning as `tool_calls`
+                    // Session-scoped, same reasoning as `tool_calls`
                     // just above.
                     self.acp_mut().tool_call_anchor.clear();
                     self.acp_mut().tool_call_expanded.clear();
                     self.acp_mut().thought_expanded.clear();
                     self.acp_mut().transcript_turn_kinds.get_mut().clear();
                     self.change_review = None;
-                    // #1460: deliberately NOT cleared here, unlike
+                    // Deliberately NOT cleared here, unlike
                     // `acp_tool_calls`/`change_review` above — a dead agent
                     // may still have completed turns worth reviewing/
                     // restoring (`acp_turn_checkpoints`), and an in-flight
@@ -214,7 +207,7 @@ impl Engine {
                     agent_capabilities,
                     ..
                 } => {
-                    // #1519: the handshake's `protocolVersion` must match
+                    // The handshake's `protocolVersion` must match
                     // what this client pinned in its own `initialize`
                     // request (`AcpClient::PROTOCOL_VERSION` — the module
                     // doc's "protocol version is pinned at 1"). A mismatch
@@ -244,14 +237,14 @@ impl Engine {
                         redraw = true;
                         continue;
                     }
-                    // #1449: capture `promptCapabilities` before anything
+                    // Capture `promptCapabilities` before anything
                     // else touches this event — both the auth-choice and
                     // straight-to-session branches below need it available
                     // for the first `session/prompt` either way, and
                     // `agent_capabilities` isn't read again after this.
                     self.acp_mut().prompt_capabilities =
                         crate::core::acp::parse_prompt_capabilities(&agent_capabilities);
-                    // #1487: same reasoning — `acp_begin_session` below
+                    // Same reasoning — `acp_begin_session` below
                     // (the straight-to-session branch) and the "acp_auth_
                     // choice" dialog's skip button (the other call site of
                     // `acp_begin_session`) both need `mcpCapabilities`
@@ -259,7 +252,7 @@ impl Engine {
                     // sent.
                     self.acp_mut().mcp_capabilities =
                         crate::core::acp::parse_mcp_capabilities(&agent_capabilities);
-                    // #1459: cache whether this agent supports `session/
+                    // Cache whether this agent supports `session/
                     // load` — keyed by agent name so `:AiSessions` can
                     // answer without spawning the agent first, and
                     // persisted so the answer survives a vimcode restart.
@@ -289,7 +282,7 @@ impl Engine {
                     redraw = true;
                 }
                 AcpEvent::Authenticated { .. } => {
-                    // #957 (ACP-6): a `type: "agent"` auth method
+                    // A `type: "agent"` auth method
                     // succeeded — proceed exactly like an agent that never
                     // required auth in the first place. A failure instead
                     // comes through `AcpEvent::RequestFailed` below, whose
@@ -308,7 +301,7 @@ impl Engine {
                     ..
                 } => {
                     self.acp_mut().session_id = Some(session_id.clone());
-                    // #1459: remember this session (id, agent, cwd, first
+                    // Remember this session (id, agent, cwd, first
                     // prompt) so `:AiSessions` can offer it again in a later
                     // run — `acp_pending_prompt` is read, not taken, so the
                     // "send the queued prompt" branch below still sees it.
@@ -325,7 +318,7 @@ impl Engine {
                         );
                         self.acp_session_index.save();
                     }
-                    // #956 (ACP-5): `session/new`'s optional `modes` field —
+                    // `session/new`'s optional `modes` field —
                     // an agent that doesn't support modes at all simply omits
                     // it, which `parse_session_modes` treats as "no modes",
                     // not an error.
@@ -334,7 +327,7 @@ impl Engine {
                         self.acp_mut().modes = list;
                         self.acp_mut().current_mode_id = current;
                     }
-                    // #1520: `session/new`'s optional `configOptions` field
+                    // `session/new`'s optional `configOptions` field
                     // — same "absent means the agent doesn't support it,
                     // not an error" policy as `modes` above.
                     if let Some(config_options_json) = config_options {
@@ -342,7 +335,7 @@ impl Engine {
                             crate::core::acp::parse_config_options(&config_options_json);
                     }
                     if let Some(text) = self.acp_mut().pending_prompt.take() {
-                        // #1449: rebuilt fresh here (rather than carrying
+                        // Rebuilt fresh here (rather than carrying
                         // pre-built blocks in `acp_pending_prompt` itself)
                         // so the attachment reflects whatever's the active
                         // buffer *now*, at the moment the handshake
@@ -365,7 +358,7 @@ impl Engine {
                     config_options,
                     ..
                 } => {
-                    // #1459: `acp_session_id` was already set to the
+                    // `acp_session_id` was already set to the
                     // resumed id by `Engine::acp_begin_session` before the
                     // `session/load` request was even sent — see that
                     // function's doc for why (a resuming agent may emit
@@ -384,14 +377,14 @@ impl Engine {
                         self.acp_mut().modes = list;
                         self.acp_mut().current_mode_id = current;
                     }
-                    // #1520: same "resumed session re-declares its config
+                    // Same "resumed session re-declares its config
                     // options" contract as `modes` immediately above.
                     if let Some(config_options_json) = config_options {
                         self.acp_mut().config_options =
                             crate::core::acp::parse_config_options(&config_options_json);
                     }
                     if let Some(session_id) = self.acp_mut().session_id.clone() {
-                        // #1459 review: refresh this record's `updated_at`
+                        // Refresh this record's `updated_at`
                         // (idempotent by id, see `record_session`'s doc) so a
                         // session just resumed and used again bubbles back
                         // to the top of a later `:AiSessions` picker instead
@@ -402,7 +395,7 @@ impl Engine {
                         self.acp_session_index
                             .record_session(&session_id, &agent_name, &cwd, "");
                         self.acp_session_index.save();
-                        // #1459 review: a message deferred by the
+                        // A message deferred by the
                         // `acp_reopen_last_session` auto-resume path
                         // (`ai_send_message_via_acp`) is shown now — only
                         // after the replayed `session/update` history above
@@ -450,11 +443,11 @@ impl Engine {
                             content: format!("[turn stopped: {stop_reason}]"),
                         });
                     }
-                    // #1460: the turn just ended — checkpoint whatever it
+                    // The turn just ended — checkpoint whatever it
                     // wrote and open the combined turn-review surface, same
                     // moment `:AiReview` would open it manually.
                     self.acp_end_turn();
-                    // #1512: send whatever queued up while this turn was
+                    // Send whatever queued up while this turn was
                     // streaming — a no-op if nothing did. Must run after
                     // `ai_streaming` is cleared above (it flips back to
                     // `true` itself, via `acp_begin_streaming`, the moment
@@ -483,7 +476,7 @@ impl Engine {
                         content: format!("\u{26a0} {method} failed: {message}"),
                     });
                     if method == "session/load" {
-                        // #1459 review: `acp_begin_session`'s resume branch
+                        // `acp_begin_session`'s resume branch
                         // sets `acp_session_id` to the resumed id *before*
                         // the request goes out (see its doc, and
                         // `ACP_FAKE_LOAD_SESSION_ERROR`'s fixture doc for the
@@ -525,7 +518,7 @@ impl Engine {
                         self.acp_mut().pending_prompt = None;
                         self.acp_mut().pending_prompt_display = None;
                     }
-                    // #1512: a failed `session/prompt` (the `else` branch
+                    // A failed `session/prompt` (the `else` branch
                     // above) still ends the turn that had something queued
                     // behind it — give the queued message its chance to
                     // send rather than leaving it stuck forever. Harmless
@@ -553,7 +546,7 @@ impl Engine {
                         "fs/write_text_file" => {
                             self.acp_handle_write_text_file(request_id, params);
                         }
-                        // #1522: served only when `settings.acp_terminal_
+                        // Served only when `settings.acp_terminal_
                         // enabled` is on (default) — matching
                         // `AcpClient::initialize`'s own gate on actually
                         // advertising `clientCapabilities.terminal`. A
@@ -611,8 +604,6 @@ impl Engine {
             .unwrap_or_else(|| self.cwd.clone())
     }
 
-    // ── multi-agent registry (#958, ACP-7) ───────────────────────────────────
-
     /// Name of the entry in `settings.acp_agents` that is currently active.
     /// `settings.acp_active_agent` if it still names a real entry, else the
     /// registry's first entry, else empty (meaning "no registry configured
@@ -651,7 +642,7 @@ impl Engine {
     /// agent spawn: `argv`, `cwd`, extra `env`, and a human-readable label
     /// for error messages. Reads the registry (`settings.acp_agents` +
     /// `acp_active_agent`) when non-empty; otherwise falls back to the
-    /// pre-#958 single-string `acp_agent_command`, unchanged. This is the
+    /// single-string `acp_agent_command`, unchanged. This is the
     /// **one** place that knows about the registry at all — a second agent
     /// profile flows through the exact same argv/cwd/env-shaped spawn call
     /// the first one always did, never a branch on which profile it is.
@@ -680,12 +671,11 @@ impl Engine {
     }
 
     /// Combine `settings.acp_mcp_servers` (global) with the active agent
-    /// profile's own `mcp_servers` override, if any (#1487, redo of #1462):
-    /// a profile entry whose `name` matches a global entry replaces it in
-    /// place; any other profile entry is appended. No profile (single-
-    /// agent `acp_agent_command` path) or an empty `profile.mcp_servers`
-    /// (every pre-#1462 profile) yields the global list unchanged — same
-    /// "config fact, no new branch" posture `acp_resolve_agent_launch`
+    /// profile's own `mcp_servers` override, if any: a profile entry whose
+    /// `name` matches a global entry replaces it in place; any other profile
+    /// entry is appended. No profile (single-agent `acp_agent_command` path)
+    /// or an empty `profile.mcp_servers` yields the global list unchanged —
+    /// same "config fact, no new branch" posture `acp_resolve_agent_launch`
     /// documents for the registry itself.
     pub(crate) fn acp_resolve_mcp_servers(&self) -> Vec<crate::core::acp::AcpMcpServerConfig> {
         let profile_servers = self
@@ -708,7 +698,7 @@ impl Engine {
 
     /// Human-readable summary of `settings.acp_agents` and which is
     /// active, for `:AiAgent` with no argument — same shape as
-    /// `acp_mode_status_line` above. #1487: also appends which MCP servers
+    /// `acp_mode_status_line` above. Also appends which MCP servers
     /// the *active session* actually started with, if any — see
     /// `acp_mcp_servers_status_suffix`.
     pub(crate) fn acp_agent_registry_status_line(&self) -> String {
@@ -733,12 +723,12 @@ impl Engine {
         format!("{base}{}", self.acp_mcp_servers_status_suffix())
     }
 
-    /// `" | MCP: <names>"` appended to `:AiAgent`'s status line (#1487) —
+    /// `" | MCP: <names>"` appended to `:AiAgent`'s status line —
     /// the MCP servers the *active session* actually started with
     /// (`AcpSession::active_mcp_servers`, set by `acp_begin_session` from
     /// what `build_mcp_servers_wire` didn't drop), not merely configured.
     /// Empty (no live session yet, or none configured/all dropped) yields
-    /// no suffix at all, so a pre-#1462 status line is unchanged.
+    /// no suffix at all, so a status line with no servers is unchanged.
     fn acp_mcp_servers_status_suffix(&self) -> String {
         if self.acp().active_mcp_servers.is_empty() {
             String::new()
@@ -750,12 +740,10 @@ impl Engine {
     /// Switch the active agent to `target` (matched case-insensitively
     /// against `settings.acp_agents[].name`), for `:AiAgent <target>`.
     /// Takes effect on the *next* message — the next `ai_send_message`
-    /// call spawns the newly-active profile, per #958's "no restart
-    /// required" acceptance bar. Ends whatever session is currently live
-    /// via `ai_clear` first: a different agent process shares no context
-    /// with the old one, so leaving the old transcript on screen next to a
-    /// new agent's replies would be actively misleading — same reasoning
-    /// `:AiClear` already documents for its own transcript wipe.
+    /// call spawns the newly-active profile. Ends whatever session is
+    /// currently live via `ai_clear` first: a different agent process
+    /// shares no context with the old one, so leaving the old transcript
+    /// on screen next to a new agent's replies would be actively misleading.
     pub(crate) fn acp_switch_agent(&mut self, target: &str) {
         let Some(profile) = self
             .settings
@@ -779,7 +767,7 @@ impl Engine {
             format!("Switched to agent \"{name}\" \u{2014} starts fresh on next message");
     }
 
-    // ── multiple concurrent sessions (#1463) ────────────────────────────────
+    // ── multiple concurrent sessions ────────────────────────────────────────
 
     /// `:AiNew [agent]` — open a new ACP session tab and make it active.
     /// If the currently active tab has never been used
@@ -852,7 +840,7 @@ impl Engine {
     /// Switch the AI panel to session `idx` (clamped into range) — the one
     /// place `:AiNext`/`:AiPrev`/a session-tab click all funnel through, so
     /// "switching to a tab reveals whatever permission request it was
-    /// badging" (#1463) can't be forgotten by a future third caller. If
+    /// badging" can't be forgotten by a future third caller. If
     /// `idx` has a `session/request_permission` parked from while it was
     /// backgrounded (`acp_handle_permission_request` deliberately withheld
     /// its dialog then — see that method's doc) and no other dialog is
@@ -929,7 +917,7 @@ impl Engine {
     }
 
     /// Every tab's `(index, label, is_active, has_permission_badge)` for
-    /// the AI panel's session strip (#1463) — both backends paint from
+    /// the AI panel's session strip — both backends paint from
     /// this, never from `acp_sessions` directly, so the "background
     /// session surfaces its pending permission request as a badge, not a
     /// stolen focus" acceptance bar has exactly one source of truth.
@@ -953,7 +941,7 @@ impl Engine {
             .collect()
     }
 
-    // ── session history / resume (#1459) ────────────────────────────────────
+    // ── session history / resume ────────────────────────────────────────────
 
     /// `:AiSessions` entry point. Lists past sessions for the active agent
     /// and workspace from the local index (`acp_session_index` — ACP has no
@@ -979,7 +967,7 @@ impl Engine {
         self.open_picker(PickerSource::AcpSessions);
     }
 
-    /// Resume a past session by id (#1459) — the `:AiSessions` picker's
+    /// Resume a past session by id — the `:AiSessions` picker's
     /// confirm action. Handles every state `acp_client` can be in by
     /// funnelling all three through the same [`Self::acp_begin_session`]
     /// that already implements the resume-vs-fresh branch and the
@@ -995,7 +983,7 @@ impl Engine {
     /// - A live session already: call `acp_begin_session` immediately —
     ///   there is no handshake left to wait for.
     ///
-    /// #1459 review: every branch first cancels whatever turn might still
+    /// Every branch first cancels whatever turn might still
     /// be streaming on the *current* session and clears the displayed
     /// transcript — see [`Self::acp_reset_transcript_for_resume`] — so the
     /// resumed session's replayed history starts from a blank transcript
@@ -1003,7 +991,7 @@ impl Engine {
     pub(crate) fn acp_resume_session(&mut self, session_id: String) {
         self.acp_cancel_turn();
         self.acp_reset_transcript_for_resume();
-        // #1459 review: mark busy from the moment the resume is requested
+        // Mark busy from the moment the resume is requested
         // — `AcpEvent::SessionLoaded`'s "no pending prompt" branch is the
         // one thing that turns this back off, whichever of the branches
         // below gets there; leaving it `false` in between would show the
@@ -1038,7 +1026,7 @@ impl Engine {
     }
 
     /// Session-scoped transcript/UI state that must not survive switching
-    /// to a different session (#1459 review) — shared by every branch of
+    /// to a different session — shared by every branch of
     /// [`Self::acp_resume_session`] so the resumed session's `session/
     /// update` replay always lands on a blank transcript, never spliced
     /// onto whatever conversation (if any) was already displayed. Before
@@ -1061,13 +1049,13 @@ impl Engine {
     pub(crate) fn acp_reset_transcript_for_resume(&mut self) {
         self.acp_mut().remembered_decisions.clear();
         self.acp_mut().ai_messages.clear();
-        // #1512: whatever was queued belonged to the session being
+        // Whatever was queued belonged to the session being
         // abandoned here — the resumed session's replayed history is
         // about to occupy `ai_messages` from index 0, so a leftover
         // `queued_prompt_idx` would point at the wrong turn entirely.
         self.acp_mut().queued_prompt = None;
         self.acp_mut().queued_prompt_idx = None;
-        // #1510: same reasoning as `Engine::ai_clear` — a resumed session's
+        // Same reasoning as `Engine::ai_clear` — a resumed session's
         // freshly-replayed messages must not land on stale cached markdown
         // renders left over at the same indices.
         self.acp_mut().markdown_turn_cache.get_mut().clear();
@@ -1078,7 +1066,7 @@ impl Engine {
         self.acp_mut().current_mode_id = None;
         self.acp_mut().usage = None;
         self.acp_mut().tool_calls.clear();
-        // #1511: same reasoning as `Engine::ai_clear` — see that function's
+        // Same reasoning as `Engine::ai_clear` — see that function's
         // comment on the same three lines.
         self.acp_mut().tool_call_anchor.clear();
         self.acp_mut().tool_call_expanded.clear();
@@ -1087,8 +1075,6 @@ impl Engine {
         self.change_review = None;
         self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
     }
-
-    // ── authMethods / authenticate / terminal login (#957, ACP-6) ───────────
 
     /// Send `session/new` for the live `acp_client` — the second half of
     /// the handshake, run either immediately after `Initialized` (no auth
@@ -1102,7 +1088,7 @@ impl Engine {
     /// `AcpEvent`) can call it directly — the other three call sites are
     /// all in this same module.
     ///
-    /// #1459: if [`Self::acp_pending_resume`] holds a session id (set by
+    /// If [`Self::acp_pending_resume`] holds a session id (set by
     /// `:AiSessions`'s resume action, or the `acp_reopen_last_session`
     /// setting's "resume on first `:AI`" path), sends `session/load` for it
     /// instead of `session/new` — folded into this one shared function so
@@ -1114,7 +1100,7 @@ impl Engine {
     /// response line arrives, and `SessionUpdate`'s handler only accepts
     /// updates for whatever `acp_session_id` already is.
     ///
-    /// #1487 (redo of #1462 on the multi-session engine): also resolves
+    /// Also resolves
     /// the user-configured MCP server list (`settings.acp_mcp_servers`,
     /// merged with the active agent profile's own override via
     /// `acp_resolve_mcp_servers`) into `session/new`/`session/load`'s
@@ -1256,7 +1242,7 @@ impl Engine {
         self.acp_mut().ai_streaming = false;
         self.acp_mut().streaming_turn = None;
         self.acp_mut().pending_prompt = None;
-        // #1459: same reasoning as `AgentExited` — an abandoned/failed
+        // Same reasoning as `AgentExited` — an abandoned/failed
         // login drops the client entirely, so any deferred resume display
         // line has nowhere left to land.
         self.acp_mut().pending_prompt_display = None;
@@ -1266,12 +1252,10 @@ impl Engine {
         self.acp_mut().auth_methods.clear();
         self.acp_mut().authenticated = false;
         self.acp_mut().prompt_capabilities = crate::core::acp::AcpPromptCapabilities::default();
-        // #1487: same reasoning as `prompt_capabilities` immediately above.
+        // Same reasoning as `prompt_capabilities` immediately above.
         self.acp_mut().mcp_capabilities = crate::core::acp::AcpMcpCapabilities::default();
         self.acp_mut().active_mcp_servers.clear();
     }
-
-    // ── fs/read_text_file, fs/write_text_file (#954, ACP-3) ─────────────────
 
     /// Directories an ACP agent's `fs/write_text_file` may write inside.
     /// Today that's just the session `cwd` — ACP's `session/new` has an
@@ -1285,7 +1269,7 @@ impl Engine {
         vec![self.acp_workspace_cwd()]
     }
 
-    // ── prompt context: current buffer + `@`-mentions (#1449) ───────────────
+    // ── prompt context: current buffer + `@`-mentions ───────────────────────
 
     /// The active buffer, resolved into an ACP `resource_link` content
     /// block plus a short "what got attached" chip line for the
@@ -1321,7 +1305,7 @@ impl Engine {
         Some((block, format!("\u{29c9} {display}")))
     }
 
-    /// Cap on how many files a single `@dir/` mention (#1513) expands into
+    /// Cap on how many files a single `@dir/` mention expands into
     /// individual `resource_link` blocks — the same order of magnitude
     /// `ai_mention_completions`' `MAX_CANDIDATES` already uses for the
     /// completion popup, so "how much can one mention pull in" stays
@@ -1332,24 +1316,20 @@ impl Engine {
     /// Resolve one `@`-mention query (the raw text after `@`, as typed —
     /// relative paths are joined onto the first workspace root, same
     /// convention `fs/read_text_file` uses) into its `session/prompt`
-    /// content block(s) (#1513 extends this from "one file" to three
-    /// shapes):
+    /// content block(s):
     ///
-    /// * A mention accepted from the `@symbol` completion popup (`ai_
-    ///   mention_accept_selected` stages it into `self.acp_pending_symbol_
-    ///   mentions` instead of relying on this function) carries a literal
-    ///   `path#Name` in the typed text — this function skips it (`None`,
-    ///   `Vec::new()` at the call site below) rather than trying to resolve
-    ///   `"path#Name"` as a filesystem path, which would just fail anyway.
-    /// * A `@dir/` mention (trailing slash — `ai_mention_completions`'
-    ///   directory-candidate marker) expands into one `resource_link` per
-    ///   contained file (workspace-ignore-aware, same walk the completion
-    ///   popup uses), capped at [`Self::ACP_MAX_DIR_MENTION_FILES`]. A
-    ///   directory with more files than the cap gets a single synthetic
-    ///   `text` block listing (a capped prefix of) its relative file paths
-    ///   instead of individually attaching every one of them.
-    /// * Anything else resolves as a single `resource_link`, same as
-    ///   before #1513.
+    /// * A mention accepted from the `@symbol` completion popup carries a
+    ///   literal `path#Name` in the typed text — this function skips it
+    ///   (`None`, `Vec::new()` at the call site below) rather than trying
+    ///   to resolve `"path#Name"` as a filesystem path.
+    /// * A `@dir/` mention (trailing slash — directory-candidate marker)
+    ///   expands into one `resource_link` per contained file
+    ///   (workspace-ignore-aware, same walk the completion popup uses),
+    ///   capped at [`Self::ACP_MAX_DIR_MENTION_FILES`]. A directory with
+    ///   more files than the cap gets a single synthetic `text` block
+    ///   listing (a capped prefix of) its relative file paths instead of
+    ///   individually attaching every one of them.
+    /// * Anything else resolves as a single `resource_link`.
     ///
     /// A mention that doesn't resolve to a real path inside the workspace
     /// — file or directory — is silently dropped from the wire content;
@@ -1455,8 +1435,8 @@ impl Engine {
             .collect()
     }
 
-    /// Build the ACP `session/prompt` content-block array for `text`
-    /// (#1449): the typed text verbatim as a `{"type": "text"}` block —
+    /// Build the ACP `session/prompt` content-block array for `text`:
+    /// the typed text verbatim as a `{"type": "text"}` block —
     /// including any literal `@path` mentions, untouched — plus a
     /// `resource_link` for the active buffer
     /// ([`Self::acp_current_buffer_attachment`]) and one more for every
@@ -1465,17 +1445,16 @@ impl Engine {
     /// ACP v1 — every agent must accept it, no `promptCapabilities` check
     /// needed (unlike the embedded-context block below).
     ///
-    /// #1450: also consumes `self.acp_pending_attachment` (the Visual
+    /// Also consumes `self.acp_pending_attachment` (the Visual
     /// selection / `:{range}AI` attachment), if one is staged, into its own
     /// content block(s) via [`crate::core::acp::AcpRangeAttachment::
     /// content_blocks`] — the one call in this codebase that reads
     /// `self.acp_mut().prompt_capabilities` to choose `resource` vs.
-    /// `resource_link` + fenced text. `&mut self` (not `&self`, unlike
-    /// #1449's original signature) purely for the `.take()` — the
-    /// attachment is consumed exactly once, whichever of this function's
-    /// two call sites ends up sending it (immediately in
-    /// `Self::ai_send_message_via_acp`, or after the handshake completes in
-    /// `Self::poll_acp`'s `SessionCreated` arm).
+    /// `resource_link` + fenced text. `&mut self` (not `&self`) purely for
+    /// the `.take()` — the attachment is consumed exactly once, whichever
+    /// of this function's two call sites ends up sending it (immediately
+    /// in `Self::ai_send_message_via_acp`, or after the handshake completes
+    /// in `Self::poll_acp`'s `SessionCreated` arm).
     pub(crate) fn acp_prompt_content_blocks(&mut self, text: &str) -> Vec<serde_json::Value> {
         let mut blocks = vec![serde_json::json!({"type": "text", "text": text})];
         if let Some((block, _chip)) = self.acp_current_buffer_attachment() {
@@ -1484,7 +1463,7 @@ impl Engine {
         for mention in crate::core::acp::parse_at_mentions(text) {
             blocks.extend(self.acp_mention_content_blocks(&mention));
         }
-        // #1513: every `@symbol` mention accepted from the completion
+        // Every `@symbol` mention accepted from the completion
         // popup since the last send — staged by `ai_mention_accept_
         // selected` rather than re-resolved from the literal `path#Name`
         // text (there's nothing in that text to re-derive a line range
@@ -1497,7 +1476,7 @@ impl Engine {
         if let Some(attachment) = self.acp_pending_attachment.take() {
             blocks.extend(attachment.content_blocks(self.acp_mut().prompt_capabilities));
         }
-        // #1464: every manually attached file/image, in the order they were
+        // Every manually attached file/image, in the order they were
         // attached — `drain(..)` so a removed-before-send attachment (Ctrl+R)
         // never reaches this point in the first place, and a sent one is
         // gone for the *next* prompt, same one-shot-per-send contract
@@ -1508,7 +1487,7 @@ impl Engine {
         blocks
     }
 
-    // ── prompt context: manual file/image attachments (#1464) ───────────────
+    // ── prompt context: manual file/image attachments ───────────────────────
 
     /// `:AiAttach <path>` — stage `path` as the next prompt's attachment.
     /// `path` is resolved the same way `Self::acp_current_buffer_attachment`
@@ -1591,7 +1570,7 @@ impl Engine {
     }
 
     /// Paste an image straight off the system clipboard as the next
-    /// prompt's attachment (#1464) — the "paste an image" half of the
+    /// prompt's attachment — the "paste an image" half of the
     /// issue, alongside `:AiAttach`'s "attach by path" half.
     /// `self.clipboard_read_image` is the callback the GTK backend wires at
     /// startup (`App::setup_gtk_clipboard`'s image twin), straight through
@@ -1651,7 +1630,7 @@ impl Engine {
         self.message = "Attached clipboard image".to_string();
     }
 
-    // ── prompt context: Visual selection / `:{range}AI` (#1450) ─────────────
+    // ── prompt context: Visual selection / `:{range}AI` ─────────────────────
 
     /// Build an [`crate::core::acp::AcpRangeAttachment`] for lines
     /// `[start_line, end_line]` (0-based, inclusive) of the active buffer.
@@ -1697,22 +1676,18 @@ impl Engine {
         })
     }
 
-    /// `:{range}AI [message]` (#1450 point 1) — stage lines `[start_line,
-    /// end_line]` of the current buffer as the next attachment, then either
-    /// send `message` immediately (mirroring plain `:AI <message>`) or, if
-    /// `message` is empty (`:'<,'>AI` alone), just focus the panel so the
-    /// user can type one — the attachment stays staged either way, so it's
-    /// not lost by typing the message separately.
+    /// `:{range}AI [message]` — stage lines `[start_line, end_line]` of
+    /// the current buffer as the next attachment, then either send `message`
+    /// immediately (mirroring plain `:AI <message>`) or, if `message` is
+    /// empty (`:'<,'>AI` alone), just focus the panel so the user can type
+    /// one — the attachment stays staged either way, so it's not lost by
+    /// typing the message separately.
     ///
-    /// The two cases differ in *keyboard* focus, deliberately (#958
-    /// regression): with a message the user handed over a complete ex
-    /// command and stays where they were, so this only reveals the panel
-    /// (`ai_has_focus`, exactly what plain `:AI <message>` has always done)
-    /// and must **not** pull the keyboard into the chat input — otherwise
-    /// the next `:` typed after `:AI hi` becomes chat text instead of
-    /// opening the command line, and consecutive ex commands (`:AI hi` then
-    /// `:AiAgent beta`) stop working. With no message there is nothing to
-    /// send until the user types one, so the input does need the keyboard.
+    /// With a message the user handed over a complete ex command and stays
+    /// where they were, so this only reveals the panel and must **not**
+    /// pull the keyboard into the chat input. With no message there is
+    /// nothing to send until the user types one, so the input does need
+    /// the keyboard.
     pub(crate) fn ai_attach_range(&mut self, start_line: usize, end_line: usize, message: &str) {
         if let Some(attachment) = self.acp_build_range_attachment(start_line, end_line, None) {
             self.acp_pending_attachment = Some(attachment);
@@ -1725,15 +1700,14 @@ impl Engine {
         }
     }
 
-    /// `<leader>ai` in Visual mode (#1450 point 2): stage the current
-    /// selection as the next attachment (exact text for characterwise/
-    /// blockwise, whole lines for linewise — point 5), exit Visual mode,
-    /// and focus the AI panel with the cursor in its input — without
-    /// sending; the user still types and submits a message. Outside Visual
-    /// mode, or with nothing to attach to (no active selection, or the
-    /// active buffer has no file), this just focuses the panel — the same
-    /// "no attachment, just open the panel" fallback `chat_open` already
-    /// has.
+    /// `<leader>ai` in Visual mode: stage the current selection as the next
+    /// attachment (exact text for characterwise/blockwise, whole lines for
+    /// linewise), exit Visual mode, and focus the AI panel with the cursor
+    /// in its input — without sending; the user still types and submits a
+    /// message. Outside Visual mode, or with nothing to attach to (no active
+    /// selection, or the active buffer has no file), this just focuses the
+    /// panel — the same "no attachment, just open the panel" fallback
+    /// `chat_open` already has.
     pub(crate) fn acp_attach_visual_selection_and_focus(&mut self) {
         if let Some((start, end)) = self.get_visual_selection_range() {
             let linewise = matches!(self.mode, Mode::VisualLine);
@@ -1774,7 +1748,7 @@ impl Engine {
     /// `PostKeyEpilogue::focus_sidebar` for whichever backend is running. A
     /// one-shot request, not a "whenever `ai_has_focus` is set" rule: the
     /// latter also fires on the keypresses *after* the reveal, which is what
-    /// broke `:AI hi` followed by `:AiAgent beta` (#958) — see
+    /// broke `:AI hi` followed by `:AiAgent beta` — see
     /// [`Self::ai_attach_range`].
     fn acp_focus_ai_panel_for_keyboard(&mut self) {
         self.focus_sidebar_panel(crate::core::engine::sidebar::PANEL_AI);
@@ -1792,7 +1766,7 @@ impl Engine {
         };
         match self.acp_read_text_file(std::path::Path::new(&req.path), req.line, req.limit) {
             Ok(content) => {
-                // #1514: reveal what the agent just read, when "follow the
+                // Reveal what the agent just read, when "follow the
                 // agent" is on — after the read itself succeeds, so a
                 // rejected/invalid request never moves the editor.
                 self.acp_follow_reveal(std::path::Path::new(&req.path), req.line);
@@ -1807,46 +1781,35 @@ impl Engine {
         }
     }
 
-    /// "Follow the agent" (#1514, Zed-style): reveal `path` at `line`
-    /// (1-based, the ACP wire convention every caller here already has —
-    /// [`crate::core::acp::ReadTextFileParams::line`], a tool call's
-    /// `locations` entry — same convention [`Self::ai_open_tool_call_location`]
-    /// takes for the user-initiated "click a card to jump to its location"
-    /// gesture, #1511) in the last-used editor window, when
-    /// `settings.acp_follow_agent` is on. A silent no-op when the setting is
-    /// off (the default), when `path` can't be resolved inside
-    /// [`Self::acp_workspace_roots`], or when it doesn't name a real file
-    /// (e.g. a `tool_call` location for a path the agent hasn't created
-    /// yet).
+    /// "Follow the agent": reveal `path` at `line` (1-based, the ACP wire
+    /// convention every caller here already has) in the last-used editor
+    /// window, when `settings.acp_follow_agent` is on. A silent no-op when
+    /// the setting is off (the default), when `path` can't be resolved inside
+    /// [`Self::acp_workspace_roots`], or when it doesn't name a real file.
     ///
-    /// Unlike [`Self::ai_open_tool_call_location`] (an explicit, one-off
-    /// user click), this fires automatically on *every* served
+    /// Unlike the user-initiated "click a card to jump to its location"
+    /// gesture, this fires automatically on *every* served
     /// `fs/read_text_file`/`fs/write_text_file` and every `tool_call`/
     /// `tool_call_update` with `locations` — an agent can easily touch
-    /// dozens of files in one turn while exploring. Two differences follow
-    /// from that:
+    /// dozens of files in one turn while exploring. Two differences follow:
     /// - Resolution goes through [`crate::core::acp::resolve_path_within_roots`]
     ///   (the same safety check `fs/write_text_file` uses) rather than a bare
     ///   "join the workspace cwd" — this is unattended, so there's no reason
     ///   to let an agent point the editor at an arbitrary filesystem path
     ///   outside the workspace, even for a read-only reveal.
     /// - It opens in [`OpenMode::Preview`], not `Permanent`: a permanent tab
-    ///   per file would otherwise leave dozens behind from one turn — the
-    ///   same "dimmed tab, replaced by the next one" behaviour a file
-    ///   explorer single-click already gives. The cursor-placement half
-    ///   (`active_window_id` + `set_cursor_for_window` +
-    ///   `ensure_cursor_visible`) is shared with
-    ///   [`Self::ai_open_tool_call_location`] verbatim.
+    ///   per file would otherwise leave dozens behind — the same "dimmed tab,
+    ///   replaced by the next one" behaviour a file explorer single-click
+    ///   already gives. The cursor-placement half is shared with the
+    ///   user-initiated gesture verbatim.
     ///
     /// Never touches keyboard focus: `open_file_with_mode`/
     /// `switch_window_buffer`/`set_cursor_for_window` only mutate
     /// `self.active_window`'s buffer/view and the buffer manager — none of
-    /// the sidebar focus flags (`ai_has_focus`, `sidebar_focus_requested`)
-    /// the chat input's caret depends on. Because focusing the AI panel
-    /// (`focus_sidebar_panel`) never touches `self.active_group`/
+    /// the sidebar focus flags the chat input's caret depends on. Because
+    /// focusing the AI panel never touches `self.active_group`/
     /// `self.active_window` either, "the last-used editor window" is simply
-    /// whatever window was active before the user moved into the chat
-    /// input — exactly what the issue asks for.
+    /// whatever window was active before the user moved into the chat input.
     pub(crate) fn acp_follow_reveal(&mut self, path: &Path, line: Option<u32>) {
         if !self.settings.acp_follow_agent {
             return;
@@ -1875,10 +1838,10 @@ impl Engine {
     /// Read `path`'s text content for `fs/read_text_file`. **Buffer-first**:
     /// an already-open buffer's in-memory content — including unsaved edits
     /// — wins over whatever is on disk. This is the single most important
-    /// correctness property in #954's slice: an agent that reads a dirty
-    /// buffer from disk reasons about stale text and proposes edits against
-    /// lines the user already changed. Falls back to the filesystem only
-    /// when no buffer has this path open. `line`/`limit` are applied via
+    /// correctness property: an agent that reads a dirty buffer from disk
+    /// reasons about stale text and proposes edits against lines the user
+    /// already changed. Falls back to the filesystem only when no buffer
+    /// has this path open. `line`/`limit` are applied via
     /// [`crate::core::acp::select_text_lines`] regardless of which source
     /// served the content.
     pub(crate) fn acp_read_text_file(
@@ -1904,9 +1867,7 @@ impl Engine {
     /// Answer a parked `fs/write_text_file` request. A malformed request
     /// gets a JSON-RPC error; a well-formed one that fails for another
     /// reason (path outside the workspace, disk write error, ...) gets its
-    /// message surfaced as a JSON-RPC error too — never a swallowed
-    /// failure the way the pre-#954 closed-file `apply_workspace_edit`
-    /// branch was.
+    /// message surfaced as a JSON-RPC error too — never a swallowed failure.
     fn acp_handle_write_text_file(&mut self, request_id: i64, params: serde_json::Value) {
         let Some(req) = crate::core::acp::parse_write_text_file_params(&params) else {
             self.acp_respond_error(request_id, "invalid fs/write_text_file params");
@@ -1914,7 +1875,7 @@ impl Engine {
         };
         match self.acp_write_text_file(std::path::Path::new(&req.path), &req.content) {
             Ok(()) => {
-                // #1514: reveal what the agent just wrote, when "follow the
+                // Reveal what the agent just wrote, when "follow the
                 // agent" is on. No line info on a whole-file write.
                 self.acp_follow_reveal(std::path::Path::new(&req.path), None);
                 if let Some(client) = self.acp_mut().client.as_ref() {
@@ -1945,7 +1906,7 @@ impl Engine {
     pub(crate) fn acp_write_text_file(&mut self, path: &Path, content: &str) -> Result<(), String> {
         let roots = self.acp_workspace_roots();
         let resolved = crate::core::acp::resolve_path_within_roots(path, &roots)?;
-        // #1460 review (non-blocking finding): must be checked *before*
+        // Must be checked *before*
         // `open_file` below — which never touches disk for a path that
         // doesn't exist yet, so this is still accurate afterward too, but
         // reads clearest right next to path resolution — to tell "the
@@ -1956,7 +1917,7 @@ impl Engine {
             .buffer_manager
             .open_file(&resolved)
             .map_err(|e| format!("failed to open {}: {e}", resolved.display()))?;
-        // #1460: capture this file's content *before* it's overwritten below
+        // Capture this file's content *before* it's overwritten below
         // — the "pre-turn contents captured the first time each file is
         // touched" acceptance bar — before anything below mutates the
         // buffer. `acp_record_turn_write` is a no-op (besides advancing the
@@ -1979,7 +1940,7 @@ impl Engine {
     /// Write `content` into the real buffer/disk for `path` exactly like
     /// [`Self::acp_write_text_file`] (open-or-reuse, single undo group,
     /// persisted to disk) but **without** recording it into the in-flight
-    /// turn's snapshot (#1460) — used to apply a turn-review *revert*
+    /// turn's snapshot — used to apply a turn-review *revert*
     /// (writing a file's own already-captured pre-turn content back), which
     /// must not be mistaken for a fresh agent write a later checkpoint would
     /// otherwise capture *this* write as the "before" state for.
@@ -1999,12 +1960,11 @@ impl Engine {
     }
 
     /// Delete `path` from disk and close its buffer if one is open — the
-    /// revert counterpart to [`Self::acp_write_file_untracked`] for a turn
-    /// entry whose `pre_turn_content` is `None` (#1460 review non-blocking
-    /// finding): the agent *created* this path, so "revert" must undo the
-    /// creation rather than leave an emptied-but-present file behind. A
-    /// missing file is a silent no-op — reverting to "doesn't exist" when
-    /// it already doesn't exist is not an error.
+    /// revert counterpart to [`Self::acp_write_file_untracked`]: the agent
+    /// *created* this path, so "revert" must undo the creation rather than
+    /// leave an emptied-but-present file behind. A missing file is a silent
+    /// no-op — reverting to "doesn't exist" when it already doesn't exist
+    /// is not an error.
     pub(crate) fn acp_delete_file_untracked(&mut self, path: &Path) -> Result<(), String> {
         let roots = self.acp_workspace_roots();
         let resolved = crate::core::acp::resolve_path_within_roots(path, &roots)?;
@@ -2064,7 +2024,7 @@ impl Engine {
 
     /// Reply to an agent -> client request whose `method` this client has
     /// no handler for, with the JSON-RPC standard `-32601 Method not
-    /// found` error — never leave it parked (#1519). The agent is then
+    /// found` error — never leave it parked. The agent is then
     /// free to treat the rejection as "capability not supported" and
     /// route around it instead of a turn stalling on a reply that would
     /// otherwise never arrive.
@@ -2078,7 +2038,7 @@ impl Engine {
     }
 
     // ── terminal/create, terminal/output, terminal/wait_for_exit,
-    //    terminal/kill, terminal/release (#1522) ─────────────────────────
+    //    terminal/kill, terminal/release ─────────────────────────────────
 
     /// Answer a parked `terminal/create` request. A malformed request
     /// (missing `sessionId`/`command`) gets a JSON-RPC error, never
@@ -2219,7 +2179,7 @@ impl Engine {
     }
 
     /// Background sweep for every `terminal/create`d terminal across every
-    /// ACP session (#1522) — mirrors `poll_terminal`'s per-tick PTY drain
+    /// ACP session — mirrors `poll_terminal`'s per-tick PTY drain
     /// for the *visible* Terminal panel, but for the entirely separate
     /// `AcpSession::acp_terminals` registry a client-served ACP terminal
     /// lives in (it never appears in `self.terminal_panes`). Called from
@@ -2318,14 +2278,14 @@ impl Engine {
 
     /// Dispatch one `session/update` notification's inner tagged-union
     /// payload to whichever variant it matches. `session_update_chunk`
-    /// (message/thought/user-echo streaming, ACP-1) is tried first since
+    /// (message/thought/user-echo streaming) is tried first since
     /// it's the highest-traffic variant; the rest are each a full
     /// wholesale replacement of the corresponding `Engine` field, never a
-    /// delta — most importantly `plan`, whose #956 acceptance bar requires
+    /// delta — most importantly `plan`, whose acceptance bar requires
     /// two successive updates leave exactly one plan rendered.
-    /// `tool_call`/`tool_call_update` remain unhandled here (ACP-4's scope).
+    /// `tool_call`/`tool_call_update` remain unhandled here.
     ///
-    /// `session_id` is only needed for `session_info_update` (#1519) — it
+    /// `session_id` is only needed for `session_info_update` — it
     /// addresses the `AcpSessionIndex` record to title, which is keyed by
     /// session id rather than living on the (already session-scoped)
     /// `AcpSession` this method otherwise mutates via `self.acp_mut()`.
@@ -2342,7 +2302,6 @@ impl Engine {
         } else if let Some((config_option_id, value_id)) =
             crate::core::acp::parse_config_option_update(inner)
         {
-            // #1520.
             self.acp_apply_config_option_update(&config_option_id, &value_id);
         } else if let Some(usage) = crate::core::acp::parse_usage_update(inner) {
             self.acp_mut().usage = Some(usage);
@@ -2353,7 +2312,7 @@ impl Engine {
             // #955 (ACP-4).
             self.acp_apply_tool_call_update(update);
         } else if let Some(title) = crate::core::acp::parse_session_info_update(inner) {
-            // #1519: title the already-recorded `AcpSessionIndex` entry so
+            // Title the already-recorded `AcpSessionIndex` entry so
             // `:AiSessions`' picker shows it instead of the first prompt.
             self.acp_session_index.set_title(session_id, &title);
             self.acp_session_index.save();
@@ -2363,31 +2322,20 @@ impl Engine {
         // established for the whole stream.
     }
 
-    // ── tool_call / tool_call_update (#955, ACP-4) ──────────────────────────
-
     /// Insert or replace `call` in `self.acp_mut().tool_calls`, keyed by
     /// `AcpToolCall::id` — the "addressable collection, not an
-    /// append-only log" the issue asks for.
+    /// append-only log" design.
     ///
-    /// #1516: a `diff` content block is **display-only** (the ACP spec's
+    /// A `diff` content block is **display-only** (the ACP spec's
     /// own contract) — it is never applied to a buffer/disk from here.
-    /// Pre-#1516 this method opened (or extended) the change-review
-    /// surface for it and let `a` write `newText` straight to the file;
-    /// that "proposal review" write path is retired outright, since a real
-    /// adapter is free to *also* apply the edit itself via
-    /// `fs/write_text_file` (`Self::acp_write_text_file`) — the #1454
-    /// double-apply race this client could only ever heuristically guard
-    /// against (`crate::core::review::resolve_fragment`'s `AlreadyApplied`
-    /// case), never eliminate, as long as a second write path existed at
-    /// all. `call.content` is still stored on the call as before, so the
-    /// tool card's own expanded body still renders a `diff` block's
-    /// `+A -R path` summary (`crate::core::acp::tool_call_expanded_text`) —
-    /// the "annotate the tool card" half of the design stays exactly as it
-    /// already was; only the write half is gone. Reviewing/reverting an
-    /// agent's real writes is what the turn-review surface (#1460, #1516)
-    /// is for.
+    /// `call.content` is stored on the call as before, so the tool card's
+    /// own expanded body still renders a `diff` block's `+A -R path`
+    /// summary — the "annotate the tool card" half of the design stays
+    /// exactly as it already was; only the write half is gone. Reviewing/
+    /// reverting an agent's real writes is handled through the turn-review
+    /// surface instead.
     fn acp_upsert_tool_call(&mut self, call: crate::core::acp::AcpToolCall) {
-        // #1514: reveal a location this call already carries at creation
+        // Reveal a location this call already carries at creation
         // time (some agents send it on the initial `tool_call`, not only a
         // later `tool_call_update`) — before the move into `tool_calls`
         // below.
@@ -2400,7 +2348,7 @@ impl Engine {
         {
             Some(existing) => *existing = call,
             None => {
-                // #1511: stamp this call's chronological anchor — the
+                // Stamp this call's chronological anchor — the
                 // number of `ai_messages` accumulated so far — the first
                 // (and only the first) time this id is ever seen. See
                 // `AcpSession::tool_call_anchor`'s doc for why this must
@@ -2415,7 +2363,7 @@ impl Engine {
         }
     }
 
-    /// "Follow the agent" (#1514) for a tool call's `locations` list:
+    /// "Follow the agent" for a tool call's `locations` list:
     /// reveal the first entry via [`Self::acp_follow_reveal`] — a tool call
     /// rarely carries more than one, and revealing every one in a list
     /// would just make the editor jump around repeatedly for a single
@@ -2428,21 +2376,18 @@ impl Engine {
     }
 
     /// Apply a `tool_call_update` patch by id: `status`, when present,
-    /// replaces the call's status — the `pending -> in_progress ->
-    /// completed | failed` transition the issue's acceptance bar checks —
-    /// and `content`/`locations`, when present, each **replace** the
-    /// call's existing field wholesale (#1519 — the ACP spec's actual
-    /// contract; #955 originally appended, duplicating blocks). An update
-    /// for an id this client never saw a `tool_call` for is a no-op —
-    /// nothing to patch, and inventing a call from a bare update would
-    /// render with an empty title.
+    /// replaces the call's status — the `pending -> in_progress ->`
+    /// `completed | failed` transition — and `content`/`locations`,
+    /// when present, each **replace** the call's existing field wholesale.
+    /// An update for an id this client never saw a `tool_call` for is a
+    /// no-op — nothing to patch, and inventing a call from a bare update
+    /// would render with an empty title.
     ///
-    /// #1516: `content`'s `diff` blocks are display-only here too, same as
+    /// `content`'s `diff` blocks are display-only here too, same as
     /// [`Self::acp_upsert_tool_call`]'s own doc — no review surface opens
-    /// and nothing is written from a `diff` block arriving on an update
-    /// either.
+    /// and nothing is written from a `diff` block arriving on an update.
     fn acp_apply_tool_call_update(&mut self, update: crate::core::acp::AcpToolCallUpdate) {
-        // #1514: locations this update replaces `call.locations` with, if
+        // Locations this update replaces `call.locations` with, if
         // any — captured to reveal *after* the mutable borrow of `call`
         // below ends (`acp_follow_reveal` needs its own `&mut self`).
         let mut revealed_locations: Option<Vec<(String, Option<u32>)>> = None;
@@ -2464,7 +2409,7 @@ impl Engine {
             call.locations = locations.clone();
             revealed_locations = Some(locations);
         }
-        // #1511: same "present replaces" contract as content/locations
+        // Same "present replaces" contract as content/locations
         // above — most agents don't know `rawOutput` until the tool
         // finishes, so this is the normal way it arrives.
         if let Some(raw_input) = update.raw_input {
@@ -2482,9 +2427,7 @@ impl Engine {
     /// [`Self::acp_read_text_file`] does, first resolved within the
     /// workspace roots (matching where [`Self::acp_write_text_file`] will
     /// eventually write) — the "current contents" a turn review diffs a
-    /// checkpoint entry's `pre_turn_content` against
-    /// (`crate::core::engine::acp_turn_ops::Engine::acp_open_turn_review`,
-    /// `Engine::change_review_reject_current_hunk`, #1460/#1516).
+    /// checkpoint entry's `pre_turn_content` against.
     pub(crate) fn acp_current_file_content(&self, path: &Path) -> Result<String, String> {
         let roots = self.acp_workspace_roots();
         let resolved = crate::core::acp::resolve_path_within_roots(path, &roots)?;
@@ -2516,8 +2459,8 @@ impl Engine {
     /// declared modes by id or name (case-insensitive). The displayed mode
     /// does **not** change optimistically here — it only changes once the
     /// agent's own `current_mode_update` notification lands
-    /// (`Self::acp_handle_session_update`), matching #956's "displayed mode
-    /// follows `current_mode_update`" acceptance criterion rather than the
+    /// (`Self::acp_handle_session_update`), matching the acceptance criterion
+    /// "displayed mode follows `current_mode_update`" rather than the
     /// request succeeding.
     pub(crate) fn acp_set_mode(&mut self, target: &str) {
         let Some(session_id) = self.acp_mut().session_id.clone() else {
@@ -2540,7 +2483,7 @@ impl Engine {
         }
     }
 
-    // ── configOptions / session/set_config_option (#1520) ──────────────────
+    // ── configOptions / session/set_config_option ──────────────────────────
     //
     // ACP v1 has no dedicated `session/set_model`; a config option tagged
     // `category: "model"` is the *only* model picker the spec offers at
@@ -2680,8 +2623,6 @@ impl Engine {
         self.acp_set_config_option(&option_id, name);
     }
 
-    // ── session/request_permission (#953, ACP-2) ────────────────────────────
-
     /// Handle a parked `session/request_permission` request: either
     /// auto-answer it from a remembered `allow_always`/`reject_always`
     /// decision, or park it behind the `"acp_permission"` dialog
@@ -2753,7 +2694,7 @@ impl Engine {
             }
         }
 
-        // `acp_permission_default` (#1518): a static config default,
+        // `acp_permission_default`: a static config default,
         // consulted *after* the remembered-decision check above so an
         // explicit human choice made earlier this session always wins over
         // it. `Ask` (the default) never matches here, so this is a no-op
@@ -2775,7 +2716,7 @@ impl Engine {
         let (title, body, buttons) = Self::acp_permission_dialog_parts(&req);
 
         // A backgrounded session's permission request must not pop a modal
-        // over whatever the human is actually looking at (#1463) — it
+        // over whatever the human is actually looking at — it
         // still gets parked below (`pending_permission`, read by
         // `Engine::acp_session_tabs` for the tab strip's badge), just
         // without `show_dialog`. Switching to that session later
@@ -2790,7 +2731,7 @@ impl Engine {
         if is_foreground {
             self.show_dialog("acp_permission", &title, body, buttons);
         }
-        // #1514: a toast, not just the tab-strip `!` badge above — any
+        // A toast, not just the tab-strip `!` badge above — any
         // session waiting on a permission decision while the AI panel isn't
         // focused is otherwise easy to miss entirely: a backgrounded
         // session's badge lives on a tab the human isn't looking at, and
@@ -2809,7 +2750,7 @@ impl Engine {
         self.acp_mut().pending_permission = Some((request_id, req));
     }
 
-    /// Resolve `acp_permission_default` (#1518) against one request's
+    /// Resolve `acp_permission_default` against one request's
     /// `kind`/`options`: `Some(option_id)` to auto-answer without ever
     /// opening the dialog, `None` to fall through to it as normal.
     /// `AllowEdits` only matches `kind == "edit"`; `AllowAll` matches every
@@ -2856,7 +2797,7 @@ impl Engine {
                 });
             }
         }
-        // #1518: show the proposed change itself, not just its title/kind/
+        // Show the proposed change itself, not just its title/kind/
         // locations — a human was otherwise asked to approve blind. An
         // edit tool call's `diff` content block(s) win over `rawInput` when
         // both are present (a diff is strictly more informative than the
@@ -2893,7 +2834,7 @@ impl Engine {
         // pairs like "Allow Once" / "Always Allow" (both 'a'), and
         // `handle_dialog_key`'s hotkey scan matches the *first* button with
         // a given letter, so a collision silently makes every button after
-        // the first one keyboard-unreachable by hotkey (#953 review). Scan
+        // the first one keyboard-unreachable by hotkey. Scan
         // each option's own name left-to-right for the first alphabetic
         // character not already claimed by an earlier button in this same
         // dialog; fall back to no hotkey (`'\0'`, still selectable by mouse
@@ -2941,7 +2882,7 @@ impl Engine {
 
     /// Truncate `lines` to [`Self::PERMISSION_BODY_PREVIEW_LINE_CAP`],
     /// appending a trailing "N more lines" marker instead of growing the
-    /// dialog body without bound (#1518). Shared by the `diff`-block and
+    /// dialog body without bound. Shared by the `diff`-block and
     /// `rawInput`-fallback preview branches of
     /// [`Self::acp_permission_dialog_parts`].
     fn acp_permission_preview_cap(mut lines: Vec<String>) -> Vec<String> {
@@ -2968,7 +2909,7 @@ impl Engine {
     /// Format a pretty-printed `rawInput` fallback body, capped via
     /// [`Self::acp_permission_preview_cap`] — same bound as the diff-preview
     /// branch, since `rawInput` is arbitrary agent-supplied JSON with no
-    /// size guarantee, not just a short shell command (#1518 review).
+    /// size guarantee, not just a short shell command.
     fn acp_permission_raw_input_preview_lines(pretty: &str) -> Vec<String> {
         Self::acp_permission_preview_cap(pretty.lines().map(str::to_string).collect())
     }
@@ -2979,7 +2920,7 @@ impl Engine {
     /// than the human's own button choice funnels through (`session/cancel`
     /// via `acp_cancel_turn`, and `show_dialog`'s own guard below for an
     /// unrelated dialog replacing it), so "every path out of the dialog
-    /// produces exactly one reply" (#953) is enforced in one place instead
+    /// produces exactly one reply" is enforced in one place instead
     /// of re-derived at each call site. Does NOT handle the agent-died case
     /// — see `poll_acp`'s `AgentExited` arm, which must not write to a dead
     /// stdin and clears the same state without calling this.
@@ -3001,16 +2942,12 @@ impl Engine {
         }
     }
 
-    /// Abort the in-flight ACP turn (#953: "the user must be able to abort
-    /// a running turn from the panel"). Sends `session/cancel`, replies
+    /// Abort the in-flight ACP turn. Sends `session/cancel`, replies
     /// `cancelled` to any open permission dialog first (never leaves it
     /// parked once the turn it belonged to is being torn down), marks
-    /// every still-unfinished tool call `Cancelled` (#1519 — the wire
-    /// protocol has no obligation to send a final `tool_call_update` for
-    /// a call the client itself aborted, so a `pending`/`in_progress`
-    /// call would otherwise sit spinning forever in the transcript), and
-    /// clears the panel's busy state immediately rather than waiting for
-    /// a `PromptStopped` that a hung/misbehaving agent might never send.
+    /// every still-unfinished tool call `Cancelled`, and clears the panel's
+    /// busy state immediately rather than waiting for a `PromptStopped`
+    /// that a hung/misbehaving agent might never send.
     ///
     /// A no-op when no ACP session is running — callers don't need to
     /// guard on that themselves.
@@ -3082,50 +3019,22 @@ mod tests {
         engine
     }
 
-    /// #1374 (review round 1): on an account with no zsh startup files — a
-    /// freshly provisioned CI runner account is the realistic case, since
-    /// any real user who has already installed/configured vimcode and an
-    /// ACP agent has used a terminal before and therefore has dotfiles —
-    /// interactively spawning zsh auto-launches its own
-    /// `zsh-newuser-install` wizard before running anything else. The
-    /// wizard reads exactly one raw keystroke to pick a menu option, which
-    /// swallows the first character of whatever
-    /// `Engine::acp_launch_terminal_login` injects into the shell right
-    /// after spawn — every test below that drives a `type: "terminal"`
-    /// auth method through to a real login pane (and this file's GTK/TUI
-    /// driver twins, `gtk::testing::…ai_panel_terminal_auth_choice_…` and
-    /// `tui_main::shell_app::tests::…ai_panel_terminal_auth_choice_…`) hit
-    /// exactly this on a bare macOS CI runner.
-    ///
-    /// The first attempt at this fix (#1374 round 1) worked around it in
-    /// *production* code, unconditionally prefixing the injected command
-    /// with a bare `q\n` (the wizard's own "quit and do nothing" option) —
-    /// rejected on review: it is a real, if narrow, user-visible behaviour
-    /// change for every real login on every Unix shell (a stray `q` /
-    /// "command not found" line ahead of the real prompt), and outright
-    /// breaks the flow for any user with a `q` alias (e.g. `alias
-    /// q=exit`, common pager/vim muscle memory). The bare CI account with
-    /// no dotfiles is a property of the *test runner*, not of real users —
-    /// #1374's own root-cause writeup already frames it as narrow — so per
-    /// this repo's rule for fixture problems (as in #1350), the fix
-    /// belongs in test setup, not product code.
+    /// On an account with no zsh startup files — a freshly provisioned CI
+    /// runner account is the realistic case — interactively spawning zsh
+    /// auto-launches its own `zsh-newuser-install` wizard before running
+    /// anything else. The wizard reads exactly one raw keystroke to pick a
+    /// menu option, which swallows the first character of whatever is
+    /// injected into the shell right after spawn.
     ///
     /// Pointing `$ZDOTDIR` at a throwaway directory that already contains
     /// empty `.zshenv`/`.zprofile`/`.zshrc`/`.zlogin` files satisfies
     /// zsh's own "not a brand-new account" check directly — no injected
-    /// keystroke or command line involved at all, so there is nothing for
-    /// an alias or a wizard-absent prompt to mis-swallow. `$ZDOTDIR` is
-    /// read by zsh alone; nothing else in vimcode or its tests consults
-    /// it, so — unlike `$HOME` (see `core::paths::TEST_HOME_OVERRIDE`'s
-    /// doc comment for the real cross-test corruption a shared `$HOME`
-    /// mutation caused, #957 smoke) — overriding it for the rest of the
-    /// test process can't disturb any other test's path resolution.
-    /// `std::sync::Once` makes the one-time global mutation race-free
-    /// against `cargo test`'s parallel threads without needing a
-    /// restore-on-drop guard: every caller wants the exact same "some
-    /// directory with empty dotfiles" state (unlike e.g.
-    /// `VIMCODE_TEST_DATA_HOME`, where distinct tests need distinct
-    /// throwaway values and therefore do need a lock), so there is nothing
+    /// keystroke or command line involved at all. `$ZDOTDIR` is read by zsh
+    /// alone; nothing else in vimcode or its tests consults it, so
+    /// overriding it for the rest of the test process can't disturb other
+    /// tests. `std::sync::Once` makes the one-time global mutation race-free
+    /// against `cargo test`'s parallel threads: every caller wants the exact
+    /// same "some directory with empty dotfiles" state, so there is nothing
     /// to race over, and leaving the override in place for the rest of the
     /// process is harmless — it only ever affects a freshly spawned
     /// interactive zsh, and does so by *suppressing* wizard behaviour that
@@ -3234,17 +3143,16 @@ mod tests {
         );
     }
 
-    // ── ACP-1 (#952): session lifecycle drive + session/update chunk mapping ──
+    // ── ACP-1: session lifecycle drive + session/update chunk mapping ──
 
     /// Full round trip: `Engine::ai_send_message` on an already-`initialize`d
     /// agent queues the prompt until the `session/new` handshake completes
     /// (`poll_acp`'s `Initialized`/`SessionCreated` handling), then the
     /// fixture's `agent_thought_chunk` and two `agent_message_chunk`s land as
     /// two *separate* transcript turns — the thought kept visually distinct
-    /// from the message per ACP-1's acceptance criteria — with the two
-    /// message chunks merged into one streamed turn, not two. Uses
-    /// `ACP_FAKE_NO_TOOL_REQUEST` so the turn completes without needing the
-    /// fs/* bridge (a later ACP slice, #952's own scope note).
+    /// from the message — with the two message chunks merged into one streamed
+    /// turn, not two. Uses `ACP_FAKE_NO_TOOL_REQUEST` so the turn completes
+    /// without needing the fs/* bridge.
     #[cfg(unix)]
     #[test]
     fn ai_send_message_via_acp_streams_thought_and_message_then_completes() {
@@ -3304,8 +3212,6 @@ mod tests {
              streamed turn, not create a turn each"
         );
     }
-
-    // ── #1449: attach the current buffer + `@`-mentions ──────────────────
 
     /// Path the fixture's `ACP_FAKE_CAPTURE_PROMPT_TO` writes each captured
     /// `session/prompt` request line to, one per test so parallel `cargo
@@ -3542,11 +3448,13 @@ mod tests {
         let _ = std::fs::remove_file(&capture);
     }
 
-    /// #1449 acceptance: `@`-mention completions list open buffers before
-    /// workspace files sharing the same prefix, and both sources are
-    /// searched (not just one). No live ACP agent needed — this is pure
-    /// `Engine::ai_mention_completions` state, the same "no subprocess
-    /// needed" tier as the pure parsing tests in `core::acp`.
+    /// `@`-mention completions list open buffers before workspace files
+    /// sharing the same prefix, and both sources are searched (not just one).
+    /// No live ACP agent needed — this is pure `Engine::ai_mention_completions`
+    /// state, the same "no subprocess needed" tier as the pure parsing tests.
+    /// Path the fixture's `ACP_FAKE_CAPTURE_PROMPT_TO` writes each captured
+    /// `session/prompt` request line to, one per test so parallel `cargo test`
+    /// runs never collide.
     #[test]
     fn ai_mention_completions_lists_open_buffer_before_workspace_only_file() {
         let mut engine = Engine::new_for_test();
@@ -3691,8 +3599,6 @@ mod tests {
              resource block: {blocks:?}"
         );
     }
-
-    // ── #1450: Visual selection / `:{range}AI` range attachment ──────────
 
     /// Write `contents` to a fresh temp file and point the active buffer's
     /// `file_path` at it, returning the path for cleanup/comparison. Shared
@@ -4001,7 +3907,7 @@ mod tests {
         let _ = std::fs::remove_file(&file_path);
     }
 
-    /// #1464: with no range attachment staged, Ctrl+R falls through to
+    /// With no range attachment staged, Ctrl+R falls through to
     /// popping the most-recently manually-attached file/image instead —
     /// same "one key, most-recent-first" removal `dispatch_ai_chat_event`'s
     /// doc promises, just the other one of the two attachment kinds it
@@ -4064,11 +3970,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
-    /// #1512 acceptance: submitting a second message while the first turn
-    /// is still streaming (`ai_streaming`) must queue it — a dimmed
-    /// `"user-queued"` transcript turn plus `AcpSession::queued_prompt` —
-    /// instead of the pre-#1512 silent no-op (`ai_send_message`'s old
-    /// `if text.is_empty() || self.acp_mut().ai_streaming { return; }`).
+    /// Submitting a second message while the first turn is still streaming
+    /// must queue it — a dimmed `"user-queued"` transcript turn plus
+    /// `AcpSession::queued_prompt` — instead of silently dropping it.
     /// Nothing extra reaches the wire yet: only the first turn's
     /// `session/prompt` is captured.
     ///
@@ -4076,13 +3980,6 @@ mod tests {
     /// the wire (not just synchronously busy for one tick) so this can
     /// assert against a turn actually confirmed in flight, not merely
     /// `ai_send_message`'s own synchronous `ai_streaming = true` write.
-    ///
-    /// RED verified: reverting `ai_send_message` to the pre-#1512 `if
-    /// text.is_empty() || self.acp_mut().ai_streaming { return; }` early
-    /// return makes this fail — the second call is silently dropped,
-    /// `queued_prompt` stays `None`, and `ai_messages.len()` never grows
-    /// past the first turn's three entries (user/thought/tool-call-less
-    /// nothing — see the assertion below for the exact pre-fix count).
     #[cfg(unix)]
     #[test]
     fn queuing_a_second_message_while_busy_defers_it_and_shows_a_dimmed_turn() {
@@ -4133,18 +4030,12 @@ mod tests {
         let _ = std::fs::remove_file(&capture);
     }
 
-    /// #1512 acceptance: a queued message is sent automatically the moment
-    /// the in-flight turn reaches `AcpEvent::PromptStopped` — no further
-    /// user action required. Uses `ACP_FAKE_NO_TOOL_REQUEST` so both turns
-    /// complete on their own; the second message is submitted synchronously
-    /// right after the first (before any `poll_acp` has run), which is
-    /// exactly the busy window `ai_streaming` guarantees is still open at
-    /// that point.
-    ///
-    /// RED verified: with `Engine::ai_dispatch_queued_message`'s call in
-    /// `PromptStopped`'s handler removed, this fails — `queued_prompt`
-    /// stays `Some("second")` forever and only one `"assistant"` turn ever
-    /// lands, since nothing ever sends the second prompt.
+    /// A queued message is sent automatically the moment the in-flight turn
+    /// reaches `AcpEvent::PromptStopped` — no further user action required.
+    /// Uses `ACP_FAKE_NO_TOOL_REQUEST` so both turns complete on their own;
+    /// the second message is submitted synchronously right after the first
+    /// (before any `poll_acp` has run), which is exactly the busy window
+    /// `ai_streaming` guarantees is still open at that point.
     #[cfg(unix)]
     #[test]
     fn queued_message_auto_sends_once_the_turn_ends() {
@@ -4221,7 +4112,7 @@ mod tests {
     }
 
     /// #1512 acceptance: Ctrl+R falls through to discarding a queued
-    /// message once neither attachment kind (#1450/#1464) is staged —
+    /// message once neither attachment kind is staged —
     /// the third rung of the same "most-recent-first" removal chain
     /// `ctrl_r_falls_through_to_popping_the_last_manual_attachment_when_
     /// none_is_staged` already covers the first two rungs of.
@@ -4401,7 +4292,7 @@ mod tests {
         assert_eq!(range.chip(&workspace), "\u{29c9} src/main.rs:10-24");
     }
 
-    /// Review regression (#952): a `RequestFailed` for `session/new` — a
+    /// Review regression: a `RequestFailed` for `session/new` — a
     /// non-fatal JSON-RPC error during the handshake, agent stays alive —
     /// must clear `ai_streaming`/`acp_streaming_turn`/`acp_pending_prompt`
     /// just like a failed `session/prompt` does, not just log the warning.
@@ -4484,8 +4375,6 @@ mod tests {
              cleared the busy state"
         );
     }
-
-    // ── #1464: manual file/image attachments ──────────────────────────────
 
     /// Write `contents` (bytes, not necessarily valid UTF-8/a real image —
     /// the fixture agent and `Engine::acp_attach_file` never decode it,
@@ -4899,7 +4788,7 @@ mod tests {
         );
     }
 
-    // ── ACP-2 (#953): session/request_permission human-in-the-loop dialog ──
+    // ── ACP-2: session/request_permission human-in-the-loop dialog ──
 
     /// Poll `engine` until it has a dialog open tagged `"acp_permission"`.
     #[cfg(unix)]
@@ -4912,8 +4801,8 @@ mod tests {
     /// A `session/request_permission` request must open the
     /// `"acp_permission"` dialog with the tool call's `title`/`kind`/
     /// `locations` actually rendered into it — not just some state flag
-    /// flipped. "A permission prompt with no visible target is not a
-    /// decision, it is a rubber stamp" (#953's acceptance bar).
+    /// flipped. A permission prompt with no visible target is not a
+    /// decision, it is a rubber stamp.
     #[cfg(unix)]
     #[test]
     fn request_permission_opens_dialog_with_tool_title_kind_and_locations() {
@@ -4952,12 +4841,12 @@ mod tests {
         );
     }
 
-    /// #1518: an edit tool call whose `toolCall.content` carries a `diff`
+    /// An edit tool call whose `toolCall.content` carries a `diff`
     /// block must render the actual proposed change (added/removed lines,
     /// not just counts) in the permission dialog body — a human must not
     /// have to approve blind. RED-verified: reverting the
     /// `acp_permission_dialog_parts` diff-block branch back to only
-    /// rendering `title`/`kind`/`locations` (pre-#1518) makes this fail,
+    /// rendering `title`/`kind`/`locations` makes this fail,
     /// since neither `old line` nor `new line` appears anywhere in the
     /// title/kind/locations text the unmodified body already contains.
     #[cfg(unix)]
@@ -4984,7 +4873,7 @@ mod tests {
         );
     }
 
-    /// #1518 review (non-blocking concern): the `rawInput` fallback branch
+    /// The `rawInput` fallback branch
     /// of `acp_permission_dialog_parts` must cap its preview the same way
     /// the `diff`-block branch already does — an agent putting a large
     /// payload in `rawInput` (arbitrary JSON, not just a short shell
@@ -5037,7 +4926,7 @@ mod tests {
         );
     }
 
-    /// #1518: an execute (non-edit) tool call with no `diff` content block
+    /// An execute (non-edit) tool call with no `diff` content block
     /// must fall back to showing `rawInput` — the command about to run —
     /// so approving it isn't blind either. RED-verified: reverting the
     /// `acp_permission_dialog_parts` `rawInput` fallback branch makes this
@@ -5063,7 +4952,7 @@ mod tests {
         );
     }
 
-    /// #1518: `acp_permission_default = allow_all` must auto-answer a
+    /// `acp_permission_default = allow_all` must auto-answer a
     /// `session/request_permission` request with the first `allow_*`
     /// option, without ever opening the dialog at all.
     #[cfg(unix)]
@@ -5087,7 +4976,7 @@ mod tests {
         );
     }
 
-    /// #1518: `acp_permission_default = allow_edits` only auto-answers
+    /// `acp_permission_default = allow_edits` only auto-answers
     /// `edit`-kind tool calls — an `execute` request must still open the
     /// dialog and wait for a human.
     #[cfg(unix)]
@@ -5153,7 +5042,7 @@ mod tests {
         );
     }
 
-    /// #953: "Esc-dismiss replies cancelled and the turn ends cleanly
+    /// "Esc-dismiss replies cancelled and the turn ends cleanly
     /// rather than hanging." `dialog_cancel()` is the engine-level
     /// equivalent of the in-canvas Escape key / GTK native dialog's
     /// dismiss-without-a-button path (`panels.rs`'s `dialog_cancel` doc).
@@ -5183,7 +5072,7 @@ mod tests {
         );
     }
 
-    /// #953: "allow_always suppresses the second prompt for the same tool
+    /// "allow_always suppresses the second prompt for the same tool
     /// within the session, and not beyond it." Two prompts in the *same*
     /// session — the second must complete without ever reopening the
     /// dialog, because the fake agent still blocks on a reply each time
@@ -5234,7 +5123,7 @@ mod tests {
         );
     }
 
-    /// #953: "Agent death with a dialog open leaves no dialog on screen and
+    /// "Agent death with a dialog open leaves no dialog on screen and
     /// no write to a dead pipe." `poll_acp`'s `AgentExited` arm clears the
     /// dialog directly rather than routing through
     /// `acp_cancel_pending_permission` (which would call
@@ -5254,18 +5143,13 @@ mod tests {
         engine.ai_send_message("please edit".to_string());
 
         // The fixture emits the request_permission request and exits in the
-        // same breath (no blocking read in between, unlike every other
-        // fixture branch) — same shape as `core::acp::tests::
-        // agent_death_mid_session_surfaces_as_event_no_panic`'s
-        // `ACP_FAKE_DIE_AFTER_INIT` case: the `ClientRequest` and the
-        // `AgentExited` its EOF produces can land in the *same*
+        // same breath (no blocking read in between) — the `ClientRequest` and
+        // the `AgentExited` its EOF produces can land in the *same*
         // `AcpClient::poll()` drain, processed in order within the same
         // `poll_acp()` call, so a dialog-open checkpoint in between is not
-        // reliably observable (see that test's doc for why asserting an
-        // intermediate state here would be a scheduling-dependent flake,
-        // not a real assertion). What's actually guaranteed — and what
-        // #953 asks for — is the *end* state: drive polls until the death
-        // is fully drained, then confirm nothing was left dangling.
+        // reliably observable. What's actually guaranteed — and required —
+        // is the *end* state: drive polls until the death is fully drained,
+        // then confirm nothing was left dangling.
         poll_acp_until(&mut engine, |e| e.acp().client.is_none());
         assert!(
             engine.acp_mut().client.is_none(),
@@ -5282,20 +5166,14 @@ mod tests {
         );
     }
 
-    /// #953 review: "the user must be able to abort a running turn from the
-    /// panel" — `dispatch_ai_chat_event`'s Ctrl+C wiring
+    /// `dispatch_ai_chat_event`'s Ctrl+C wiring
     /// (`src/core/engine/ext_panel.rs`) must actually route through
     /// `acp_cancel_turn` while a live ACP turn is streaming, not just exist
-    /// as an unreferenced method. Exercises it exactly the way the AI panel
+    /// as an unreferenced method. This exercises it exactly the way the AI panel
     /// does: a `ChatControllerEvent::KeyPressed` for Ctrl+C dispatched while
     /// `acp_client.is_some() && ai_streaming` — with a permission dialog
     /// parked mid-turn, so this also covers "session cancelled while a
-    /// prompt is open -> close the dialog, reply cancelled" (#953's
-    /// acceptance bar).
-    ///
-    /// RED verified: with `acp_cancel_turn`'s body emptied to a no-op, this
-    /// test fails outright (`ai_streaming` stays `true` and the dialog stays
-    /// open immediately after dispatch, instead of clearing synchronously).
+    /// prompt is open -> close the dialog, reply cancelled".
     #[cfg(unix)]
     #[test]
     fn ctrl_c_during_a_streaming_turn_cancels_via_acp_cancel_turn_not_ai_clear() {
@@ -5360,17 +5238,11 @@ mod tests {
         );
     }
 
-    // ── #1519: ACP conformance fixes ────────────────────────────────────────
-
-    /// #1519, fix 3: `session/cancel` must mark every still-unfinished tool
-    /// call `Cancelled` — the fixture's `$ACP_FAKE_TOOL_CALL_HANGS` announces
+    /// `session/cancel` must mark every still-unfinished tool call
+    /// `Cancelled` — the fixture's `$ACP_FAKE_TOOL_CALL_HANGS` announces
     /// one `in_progress` call and then never answers `session/prompt` at
     /// all, so the only way this call ever leaves `in_progress` is the
     /// client-side sweep `Engine::acp_cancel_turn` now does.
-    ///
-    /// RED verified: with the `for call in ... is_unfinished()` sweep
-    /// removed from `acp_cancel_turn`, this fails — the call is still
-    /// `InProgress` after cancelling.
     #[cfg(unix)]
     #[test]
     fn acp_cancel_turn_marks_unfinished_tool_calls_cancelled() {
@@ -5400,20 +5272,13 @@ mod tests {
         );
     }
 
-    /// #1519, fix 1: a `tool_call_update` with `content`/`locations` must
-    /// **replace** the existing call's fields wholesale, never append to
-    /// them — the exact spec deviation the issue reports (#955 originally
-    /// appended). Calls `acp_upsert_tool_call`/`acp_apply_tool_call_update`
-    /// directly (the same pure engine methods `acp_handle_session_update`
-    /// dispatches to) rather than through the fixture, since this is a
-    /// property of the merge logic itself, independent of transport framing
-    /// — `tool_call_update_over_the_wire_replaces_content_and_locations`
-    /// below covers the wire round trip.
-    ///
-    /// RED verified: with `call.content.append(&mut blocks)` /
-    /// `call.locations.append(...)` restored in place of the plain
-    /// assignment, this fails — both fields end up with two entries
-    /// instead of one.
+    /// A `tool_call_update` with `content`/`locations` must **replace**
+    /// the existing call's fields wholesale, never append to them.
+    /// Calls `acp_upsert_tool_call`/`acp_apply_tool_call_update` directly
+    /// (the same pure engine methods `acp_handle_session_update` dispatches
+    /// to) rather than through the fixture, since this is a property of the
+    /// merge logic itself, independent of transport framing — the wire round
+    /// trip test below covers that path.
     #[test]
     fn acp_apply_tool_call_update_replaces_content_and_locations_not_appends() {
         use crate::core::acp::{
@@ -5503,17 +5368,12 @@ mod tests {
         );
     }
 
-    /// #1519, fix 2: an agent -> client request whose method this client
-    /// has no handler for must be answered immediately with JSON-RPC
-    /// `-32601`, never left parked. `$ACP_FAKE_UNKNOWN_REQUEST` sends one
-    /// mid-turn and BLOCKS reading the reply before it can send `end_turn`
-    /// — if the request were left parked (the pre-#1519 `_ => {}` no-op),
-    /// this poll would time out with `ai_streaming` still `true` and no
-    /// reply ever recorded.
-    ///
-    /// RED verified: reverting the `_` arm in `acp_dispatch_events`'s
-    /// `ClientRequest` match to `_ => {}` makes this fail — the turn never
-    /// reaches `PromptStopped` within `TEST_DEADLINE`.
+    /// An agent → client request whose method this client has no handler
+    /// for must be answered immediately with JSON-RPC `-32601`, never left
+    /// parked. `$ACP_FAKE_UNKNOWN_REQUEST` sends one mid-turn and blocks
+    /// reading the reply before it can send `end_turn` — if the request were
+    /// left parked, this poll would time out with `ai_streaming` still `true`
+    /// and no reply ever recorded.
     #[cfg(unix)]
     #[test]
     fn unknown_agent_request_is_answered_with_method_not_found_not_left_parked() {
@@ -5535,16 +5395,10 @@ mod tests {
         );
     }
 
-    /// #1519, fix 4: `initialize`'s `protocolVersion` must be checked
-    /// against what this client pinned in its own request — a mismatch
-    /// aborts the handshake (kills the agent, never sends `session/new`)
-    /// instead of silently proceeding to speak a wire format this client
-    /// was never built against.
-    ///
-    /// RED verified: deleting the `if protocol_version != PROTOCOL_VERSION`
-    /// guard in `acp_dispatch_events`'s `Initialized` arm makes this fail —
-    /// the fixture's `session/new` still succeeds (`session_id` becomes
-    /// `Some`) even though it claimed protocol version `99`.
+    /// `initialize`'s `protocolVersion` must be checked against what this
+    /// client pinned in its own request — a mismatch aborts the handshake
+    /// (kills the agent, never sends `session/new`) instead of silently
+    /// proceeding to speak a wire format this client was never built against.
     #[cfg(unix)]
     #[test]
     fn initialize_protocol_version_mismatch_refuses_to_start_a_session() {
@@ -5570,13 +5424,9 @@ mod tests {
         );
     }
 
-    /// #1519, fix 5: a `session_info_update` notification's `title` must be
-    /// recorded against the session in `AcpSessionIndex`, and
-    /// `:AiSessions`' picker must prefer it over the first prompt.
-    ///
-    /// RED verified: with `parse_session_info_update`'s call site removed
-    /// from `acp_handle_session_update`, this fails — the picker entry
-    /// still reads the literal first-prompt text.
+    /// A `session_info_update` notification's `title` must be recorded
+    /// against the session in `AcpSessionIndex`, and `:AiSessions`' picker
+    /// must prefer it over the first prompt.
     #[cfg(unix)]
     #[test]
     fn session_info_update_titles_the_session_and_the_picker_prefers_it() {
@@ -5627,7 +5477,7 @@ mod tests {
         );
     }
 
-    /// #953 review: the *other* named reply path for a parked permission
+    /// The *other* named reply path for a parked permission
     /// dialog — "dialog dismissed ... or by any unrelated action that
     /// closes it" — must also produce exactly one `cancelled` reply, not
     /// just the Esc/`dialog_cancel()` half already covered above.
@@ -5676,7 +5526,7 @@ mod tests {
         );
     }
 
-    /// #953 review (non-blocking concern): the malformed-request error path
+    /// The malformed-request error path
     /// — "a JSON-RPC error, since there is nothing a human could
     /// meaningfully select" — must actually reach the (fake) agent exactly
     /// like every other reply path in this file, and must never open a
@@ -5708,8 +5558,6 @@ mod tests {
         );
     }
 
-    // ── fs/read_text_file, fs/write_text_file (#954, ACP-3) ────────────────
-
     fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "acp3-{tag}-{}-{}",
@@ -5720,37 +5568,28 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        // #1374: canonicalize before handing back. On macOS `std::env::
-        // temp_dir()` is `/var/folders/...`, and `/var` is a symlink to
-        // `/private/var` — but `Engine::acp_write_text_file`'s
-        // `resolve_path_within_roots` canonicalizes both the workspace
-        // root and the resolved target path before opening the buffer, so
-        // the buffer ends up keyed by the `/private/var/...` form while a
-        // caller comparing against this un-canonicalized `dir`-derived
-        // path (e.g. `buffer_manager.get(id).file_path == Some(file_path.
-        // as_path())`, an exact-path comparison, not the canonicalizing
-        // one `BufferManager::open_file`/`Engine::acp_read_text_file` use
-        // for their own buffer lookups) never matches on that platform —
-        // same class of bug as #1350. Canonicalizing here once, up front,
-        // makes every path this helper hands out agree with what
-        // `resolve_path_within_roots` resolves to, on every platform.
+        // Canonicalize before returning. On macOS `std::env::temp_dir()`
+        // is `/var/folders/...`, and `/var` is a symlink to `/private/var`
+        // — but `Engine::acp_write_text_file`'s `resolve_path_within_roots`
+        // canonicalizes both the workspace root and the resolved target path
+        // before opening the buffer, so the buffer ends up keyed by the
+        // `/private/var/...` form while a caller comparing against this
+        // un-canonicalized `dir`-derived path never matches on that
+        // platform. Canonicalizing here once, up front, makes every path
+        // this helper hands out agree with what `resolve_path_within_roots`
+        // resolves to, on every platform.
         dir.canonicalize().unwrap_or(dir)
     }
 
-    /// #954's core correctness property: a dirty (unsaved) open buffer's
-    /// in-memory content must win over disk when the agent calls
-    /// `fs/read_text_file` — reading from disk instead makes the agent
-    /// reason about stale text and propose edits against lines the user
-    /// already changed. Drives the real dispatch path (`poll_acp` ->
-    /// `Engine::acp_handle_read_text_file` -> `Engine::acp_read_text_file`)
-    /// against the fixture's `ACP_FAKE_FS_READ_PATH` branch, which echoes
-    /// whatever content it got back into the transcript — so this reads the
-    /// answer off `ai_messages`, not off internal engine state.
-    ///
-    /// RED verified: reverting `acp_read_text_file` to always
-    /// `std::fs::read_to_string` (skip the buffer-first lookup) makes this
-    /// fail — the transcript shows `"read:on disk"` instead of
-    /// `"read:dirty in memory"`.
+    /// A dirty (unsaved) open buffer's in-memory content must win over disk
+    /// when the agent calls `fs/read_text_file` — reading from disk instead
+    /// makes the agent reason about stale text and propose edits against
+    /// lines the user already changed. This drives the real dispatch path
+    /// (`poll_acp` -> `Engine::acp_handle_read_text_file` ->
+    /// `Engine::acp_read_text_file`) against the fixture's
+    /// `ACP_FAKE_FS_READ_PATH` branch, which echoes whatever content it got
+    /// back into the transcript — so this reads the answer off `ai_messages`,
+    /// not off internal engine state.
     #[cfg(unix)]
     #[test]
     fn fs_read_text_file_serves_dirty_buffer_content_not_disk() {
@@ -5824,19 +5663,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #954: "`fs/write_text_file` on a closed file -> file opens, edit
-    /// applies, a single undo reverts it." Drives the real dispatch path
-    /// (`poll_acp` -> `Engine::acp_handle_write_text_file` ->
-    /// `Engine::acp_write_text_file`) against the fixture's
-    /// `ACP_FAKE_FS_WRITE_PATH` branch, which reports back `"write:ok"` or
-    /// `"write:error:..."` depending on whether the reply was a JSON-RPC
-    /// error, so the reply itself is observed through the transcript, not
-    /// just trusted.
-    ///
-    /// RED verified: reverting `apply_workspace_edit`'s pre-#954
-    /// closed-file shape onto this call path (raw `fs::write`, no buffer,
-    /// no undo group) makes the final `state.undo()` assertion fail outright
-    /// (no buffer ever exists to undo) instead of reverting the content.
+    /// `fs/write_text_file` on a closed file must open the file, apply the
+    /// edit, leaving it dirty (no auto-save), with a single undo reverting it.
+    /// This drives the real dispatch path (`poll_acp` ->
+    /// `Engine::acp_handle_write_text_file` -> `Engine::acp_write_text_file`)
+    /// against the fixture's `ACP_FAKE_FS_WRITE_PATH` branch, which reports
+    /// back `"write:ok"` or `"write:error:..."` depending on whether the
+    /// reply was a JSON-RPC error, so the reply itself is observed through the
+    /// transcript.
     #[cfg(unix)]
     #[test]
     fn fs_write_text_file_on_closed_file_opens_buffer_applies_and_a_single_undo_reverts_it() {
@@ -5921,23 +5755,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #1460 review (non-blocking finding): the fixture's
-    /// `ACP_FAKE_FS_WRITE_PATH2`/`ACP_FAKE_FS_WRITE_PATH3` support (added
-    /// for this feature) was otherwise never exercised by any test — every
-    /// other #1460 test drives `Engine::acp_write_text_file` /
-    /// `Engine::acp_end_turn` as plain Rust calls, bypassing the real ACP
-    /// JSON-RPC wire path this feature actually adds
-    /// (`AcpEvent::PromptStopped` -> `Engine::acp_end_turn`, above). This
-    /// drives a real three-file agent turn end to end through the fixture
-    /// and asserts on both the turn-review surface and the checkpoint
-    /// bookkeeping `:AiRestore` depends on — not just that the writes
-    /// landed on disk.
+    /// The fixture's `ACP_FAKE_FS_WRITE_PATH2`/`ACP_FAKE_FS_WRITE_PATH3`
+    /// support is exercised here: a real three-file agent turn end to end
+    /// through the fixture, driving `Engine::acp_write_text_file` /
+    /// `Engine::acp_end_turn` through the real ACP JSON-RPC wire path
+    /// (`AcpEvent::PromptStopped` -> `Engine::acp_end_turn`), with assertions
+    /// on both the turn-review surface and the checkpoint bookkeeping
+    /// `:AiRestore` depends on.
     ///
-    /// Explicitly opts into `acp_review_on_turn_end = auto` (#1515 changed
-    /// the *default* to `badge`, which no longer auto-opens the modal this
-    /// test asserts on) — this test's whole point is proving the wire path
-    /// reaches `Engine::acp_open_turn_review` at all, which is exactly
-    /// what `auto` (the pre-#1515 behaviour) still does.
+    /// Explicitly opts into `acp_review_on_turn_end = auto` — this test's
+    /// whole point is proving the wire path reaches `Engine::acp_open_turn_review`.
     #[cfg(unix)]
     #[test]
     fn acp_turn_with_three_fs_writes_over_the_wire_opens_a_three_file_turn_review() {
@@ -6026,7 +5853,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #954: "Write to a new path inside cwd creates the file" + "a single
+    /// "Write to a new path inside cwd creates the file" + "a single
     /// undo reverts it" for the brand-new-file case too (no prior on-disk
     /// content to fall back to).
     #[test]
@@ -6074,7 +5901,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #954: "write outside cwd is refused." No JSON-RPC round trip needed
+    /// "write outside cwd is refused." No JSON-RPC round trip needed
     /// here — this is `Engine::acp_write_text_file`'s own contract, and the
     /// fixture round trip above already proves the reply mechanism works.
     #[test]
@@ -6100,7 +5927,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
-    /// #954: "Write error (read-only path) surfaces to the user and returns
+    /// "Write error (read-only path) surfaces to the user and returns
     /// a JSON-RPC error, not a swallowed failure." Skips itself when running
     /// as root (common in some CI containers) — root bypasses Unix
     /// permission bits entirely, so the write would simply succeed and the
@@ -6152,21 +5979,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── apply_workspace_edit closed-file regression (#954) ──────────────────
+    // ── apply_workspace_edit closed-file regression ─────────────────────────
 
-    /// The fix itself: a closed file targeted by a workspace edit (LSP
-    /// rename-across-files, or a code action touching an unopened file)
-    /// must be opened into a buffer and edited through the same
-    /// undo-grouped path an already-open file gets — not written straight
-    /// to disk with `fs::write` (no undo, errors swallowed — the pre-#954
-    /// bug). This also proves the fix does *not* silently persist to disk
-    /// on its own: the edit is left dirty for the user to review/save, the
-    /// same as an edit to an already-open buffer would be.
-    ///
-    /// RED verified: this exact assertion sequence (buffer opens with the
-    /// edit applied, disk untouched, one undo reverts it) cannot pass
-    /// against the pre-fix code, which never created a buffer at all for a
-    /// closed-file edit — there'd be nothing in `buffer_manager` to find.
+    /// A closed file targeted by a workspace edit (LSP rename-across-files,
+    /// or a code action touching an unopened file) must be opened into a
+    /// buffer and edited through the same undo-grouped path an already-open
+    /// file gets — not written straight to disk with `fs::write` (no undo,
+    /// errors swallowed). The edit is left dirty for the user to review/save,
+    /// the same as an edit to an already-open buffer.
     #[test]
     fn apply_workspace_edit_opens_closed_file_into_a_buffer_undo_grouped_no_auto_save() {
         let dir = unique_temp_dir("workspace-edit-closed");
@@ -6234,11 +6054,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The other half of the regression: the pre-#954 closed-file branch
-    /// used `if let Ok(text) = fs::read_to_string(...)`, so a failure (a
-    /// path that can't be read as text — here, a directory) was silently
-    /// dropped with no error and no buffer. `apply_workspace_edit` must
-    /// surface it instead.
+    /// A closed-file edit where the path can't be read as text (here, a
+    /// directory) must surface the error instead of silently dropping it.
     #[test]
     fn apply_workspace_edit_surfaces_the_previously_swallowed_open_error() {
         let dir = unique_temp_dir("workspace-edit-error");
@@ -6273,7 +6090,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #954: path safety must reject writes escaping the workspace root even
+    /// Path safety must reject writes escaping the workspace root even
     /// via `..` traversal, not just a plain "different directory" check —
     /// see `core::acp::resolve_path_within_roots`'s own dedicated tests for
     /// the pure-function coverage; this confirms `Engine::
@@ -6301,7 +6118,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sibling);
     }
 
-    /// #956 (ACP-5): `:AiMode` (no argument) must summarise the agent's
+    /// `:AiMode` (no argument) must summarise the agent's
     /// declared modes and mark which one is current — engine-level coverage
     /// underneath the driver-tier round-trip test
     /// (`gtk::testing::sidebar_panel_clicks::
@@ -6329,7 +6146,7 @@ mod tests {
         assert_eq!(engine.message, "No active ACP session");
     }
 
-    /// #1520: `:AiConfig` (no argument) must summarise every declared
+    /// `:AiConfig` (no argument) must summarise every declared
     /// config option and mark each one's current value — engine-level
     /// coverage underneath the driver-tier round-trip test that covers
     /// `:AiConfig <id> <value>`/`:AiModel <name>` actually reaching the
@@ -6366,7 +6183,7 @@ mod tests {
         assert_eq!(engine.message, "No active ACP session");
     }
 
-    /// #1520: `:AiModel` (no argument) is sugar for the `category: "model"`
+    /// `:AiModel` (no argument) is sugar for the `category: "model"`
     /// config option — same summary `:AiConfig model` produces, reached
     /// without the caller needing to know that option's id.
     #[cfg(unix)]
@@ -6388,24 +6205,15 @@ mod tests {
         assert_eq!(engine.message, "ACP agent has no model config option");
     }
 
-    // ── #957 (ACP-6): auth.terminal — subscription login ─────────────────
-
     /// `settings.acp_agent_command` pointing at the fixture agent — a
     /// *shell command string*, not an argv, because that is what
     /// `Engine::acp_launch_terminal_login` injects verbatim into the login
-    /// pane's interactive shell.
-    ///
-    /// The fixture path is double-quoted because `CARGO_MANIFEST_DIR` is
-    /// not guaranteed to be space-free: a checkout can live under a path
-    /// like `~/Library/Application Support/...` on macOS, and unquoted
-    /// the login shell word-splits that into `sh /Users/…/Library/Application`
-    /// and exits 127 ("command not found") before the fixture ever runs —
-    /// so the login reads as *failed* and `acp_authenticated` never flips.
-    /// Double quotes are understood by both consumers of this string: POSIX
-    /// shells (the login pane) and `core::acp::parse_agent_command` (the
-    /// argv splitter). Same class of checkout-shaped fixture bug as #1350
-    /// and #1374, and likewise test-only — a real user's
-    /// `acp_agent_command` is their own shell string to quote.
+    /// pane's interactive shell. The fixture path is double-quoted because
+    /// `CARGO_MANIFEST_DIR` is not guaranteed to be space-free: on macOS,
+    /// a checkout can live under a path like `~/Library/Application Support/...`,
+    /// and unquoted it would be word-split by the login shell, exiting 127
+    /// before the fixture ever runs. Double quotes are understood by both
+    /// consumers of this string: POSIX shells and `core::acp::parse_agent_command`.
     fn acp6_fixture_argv_string() -> String {
         format!(
             "sh \"{}\"",
@@ -6425,15 +6233,11 @@ mod tests {
         });
     }
 
-    /// The gate itself, at the engine level: every pre-#957 fixture
-    /// response (`authMethods: []`, the default with no extra env) must
-    /// proceed straight to `session/new` exactly as before — no dialog, no
-    /// behavior change for every agent that doesn't advertise auth. This is
-    /// the engine-level half of "with the capability not advertised, the
-    /// method is absent, confirming the gate is real" (the wire-level half
-    /// — the fixture only offers a `type: "terminal"` entry when it
-    /// actually saw `auth.terminal: true` on the request — lives in
-    /// `core::acp`'s own tests).
+    /// Every pre-login fixture response (`authMethods: []`, the default with
+    /// no extra env) must proceed straight to `session/new` exactly as before
+    /// — no dialog, no behavior change for every agent that doesn't advertise
+    /// auth. This is the engine-level half of the gate: with the capability
+    /// not advertised, the method is absent.
     #[cfg(unix)]
     #[test]
     fn no_auth_methods_skips_the_dialog_same_as_before_957() {
@@ -6451,12 +6255,6 @@ mod tests {
     /// An agent that offers `authMethods` must present the choice — with
     /// both the agent-kind and terminal-kind methods rendered as their own
     /// buttons — instead of silently opening a session.
-    ///
-    /// RED verified: with the `!self.acp_mut().auth_methods.is_empty()` branch of
-    /// `poll_acp`'s `Initialized` handler deleted (always calling
-    /// `acp_begin_session()` unconditionally, i.e. #957 reverted), this
-    /// test fails — `engine.dialog` stays `None` and `acp_session_id`
-    /// becomes `Some("sess-1")` immediately instead.
     #[cfg(unix)]
     #[test]
     fn auth_methods_present_opens_choice_dialog_before_session_new() {
@@ -6544,7 +6342,7 @@ mod tests {
 
     /// A failed `authenticate` call must leave the panel usable — clear the
     /// busy state and surface a message — never wedge it, matching the
-    /// established `RequestFailed` contract (#952 review) this reuses
+    /// established `RequestFailed` contract this reuses
     /// unmodified.
     #[cfg(unix)]
     #[test]
@@ -6739,20 +6537,12 @@ mod tests {
         assert!(engine.acp_mut().client.is_none());
     }
 
-    // ── retired proposal-review write path (#1516) ──────────────────────
-    //
     // Pre-#1516 this section tested `acp_open_review_for_diffs` resolving
-    // an ACP `diff` block's fragment (#1454) into a whole-file
-    // `ProposedChange` and opening a review whose `a` key wrote it to
-    // disk. That mechanism is gone outright — the ACP spec's own contract
-    // is that `diff` content is display-only, and a real adapter applying
-    // the edit itself via `fs/write_text_file` made the write path a
-    // standing double-apply hazard (#1454's `AlreadyApplied` case was only
-    // ever a heuristic mitigation for it, never an elimination). These
-    // tests now prove the retirement: a `diff` block never opens a review
-    // and never touches disk, on either a fresh `tool_call` or a later
-    // `tool_call_update`, no matter how the fragment resolves against the
-    // file's current content.
+    // an ACP `diff` block's fragment into a whole-file `ProposedChange`
+    // and opening a review. That mechanism is retired — the ACP spec's own
+    // contract is that `diff` content is display-only. These tests now prove
+    // the retirement: a `diff` block never opens a review and never touches
+    // disk, on either a fresh `tool_call` or a later `tool_call_update`.
 
     fn diff_block(
         path: &str,
@@ -6782,12 +6572,9 @@ mod tests {
         }
     }
 
-    /// #1516's core assertion, RED against the pre-#1516 code (which
-    /// called `acp_open_review_for_diffs` from here and always opened a
-    /// review for an unambiguous fragment): a `tool_call` carrying a
-    /// `diff` content block must never open the change-review surface, and
-    /// the target file must never be touched — display-only, exactly the
-    /// ACP spec's own contract for this content kind.
+    /// A `tool_call` carrying a `diff` content block must never open the
+    /// change-review surface, and the target file must never be touched —
+    /// display-only, exactly the ACP spec's own contract for this content kind.
     #[test]
     fn tool_call_diff_block_never_opens_a_review_or_touches_disk() {
         let dir = unique_temp_dir("retired-write-path-tool-call");
@@ -6810,19 +6597,15 @@ mod tests {
             "line1\nold line\nline3\n",
             "a diff content block must never write to disk"
         );
-        // Still stored for the tool card's own display (#1511's `+A -R
-        // path` summary) — only the *write* half is retired, not the
-        // "annotate the card" half.
+        // Still stored for the tool card's own display — only the *write*
+        // half is retired, not the "annotate the card" half.
         assert_eq!(engine.acp_mut().tool_calls[0].content.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Same guarantee on the `tool_call_update` path (a diff attached to a
-    /// later status transition, #955's original scenario) — the update
-    /// still replaces `content` wholesale (#1519's own contract,
-    /// unaffected by this retirement) but still never opens a review or
-    /// writes.
+    /// A `tool_call_update` with a `diff` block must never open a review or
+    /// write, even though the update still replaces `content` wholesale.
     #[test]
     fn tool_call_update_diff_block_never_opens_a_review_or_touches_disk() {
         let dir = unique_temp_dir("retired-write-path-update");
@@ -6861,12 +6644,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The exact #1454 double-apply scenario, now closed by removing the
-    /// second write path entirely rather than heuristically detecting it:
-    /// an adapter that (a) actually writes the file via
-    /// `fs/write_text_file` *and* (b) separately reports the same edit as
-    /// a `diff` tool-call block must end up with the file written exactly
-    /// once, by the real write — the `diff` block contributes nothing.
+    /// An adapter that (a) actually writes the file via `fs/write_text_file`
+    /// *and* (b) separately reports the same edit as a `diff` tool-call block
+    /// must end up with the file written exactly once, by the real write — the
+    /// `diff` block contributes nothing.
     #[test]
     fn a_diff_block_alongside_a_real_write_never_double_applies() {
         let dir = unique_temp_dir("retired-write-path-alongside-real-write");
@@ -6895,9 +6676,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    // ── user-configured MCP servers on session/new + session/load (#1487,
-    // redo of #1462 on the multi-session engine) ────────────────────────────
 
     /// Path the fixture's `ACP_FAKE_CAPTURE_SESSION_NEW_TO`/`ACP_FAKE_
     /// CAPTURE_SESSION_LOAD_TO` writes each captured request line to, one
@@ -6930,7 +6708,7 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// Acceptance (#1487): a `stdio` entry in `settings.acp_mcp_servers` is
+    /// Acceptance: a `stdio` entry in `settings.acp_mcp_servers` is
     /// always sent on `session/new`, and an `http` entry is dropped — with
     /// a status-line warning naming it — when the agent's `initialize`
     /// response doesn't advertise `agentCapabilities.mcpCapabilities.http`
@@ -7000,7 +6778,7 @@ mod tests {
         let _ = std::fs::remove_file(&capture);
     }
 
-    /// Acceptance (#1487), other half: the same `http` server IS sent when
+    /// Acceptance, other half: the same `http` server IS sent when
     /// the agent's `initialize` response DOES advertise
     /// `agentCapabilities.mcpCapabilities.http` (`$ACP_FAKE_MCP_HTTP`).
     ///
@@ -7060,15 +6838,8 @@ mod tests {
         let _ = std::fs::remove_file(&capture);
     }
 
-    /// #1487: `session/load` (a resumed session) resends the configured
-    /// MCP servers exactly the same way `session/new` does — the redo's
-    /// own "Send them on session/new and session/load" acceptance bar,
-    /// which #1462 (single-session engine, no `session/load` existed yet)
-    /// couldn't cover.
-    ///
-    /// RED verified: with the resume branch of `Engine::acp_begin_session`
-    /// reverted to `client.load_session(&session_id, &cwd, vec![])`, this
-    /// fails — the captured `session/load` line's `mcpServers` is empty.
+    /// `session/load` (a resumed session) resends the configured MCP servers
+    /// exactly the same way `session/new` does.
     #[cfg(unix)]
     #[test]
     fn session_load_resends_configured_mcp_servers_on_resume() {
@@ -7136,10 +6907,9 @@ mod tests {
         let _ = std::fs::remove_file(&capture);
     }
 
-    /// Acceptance (#1487, per-profile override): an `AcpAgentProfile`'s own
-    /// `mcp_servers` entry with the same `name` as a global `settings.
-    /// acp_mcp_servers` entry replaces it — the profile's `command` reaches
-    /// `session/new`, not the global one.
+    /// An `AcpAgentProfile`'s `mcp_servers` entry with the same `name` as a
+    /// global `settings.acp_mcp_servers` entry replaces it — the profile's
+    /// `command` reaches `session/new`, not the global one.
     #[cfg(unix)]
     #[test]
     fn agent_profile_mcp_servers_override_replaces_global_entry_by_name() {
@@ -7171,9 +6941,8 @@ mod tests {
         assert_eq!(resolved[0].command, "profile-mcp-fs");
     }
 
-    /// Acceptance (#1487, per-profile override): an `AcpAgentProfile`
-    /// `mcp_servers` entry with a *different* name is appended alongside
-    /// the global list, not a replacement for it.
+    /// An `AcpAgentProfile` `mcp_servers` entry with a *different* name is
+    /// appended alongside the global list, not a replacement for it.
     #[cfg(unix)]
     #[test]
     fn agent_profile_mcp_servers_override_appends_a_new_name() {
@@ -7200,8 +6969,6 @@ mod tests {
         let names: Vec<&str> = resolved.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["fs", "search"]);
     }
-
-    // ── #1459: session history / resume ─────────────────────────────────────
 
     /// An `Engine` configured with a `settings.acp_agents` registry entry
     /// naming this fixture, so `Engine::acp_resume_session`'s cold-start
@@ -7605,8 +7372,6 @@ mod tests {
         );
     }
 
-    // ── #1463: multiple concurrent sessions ─────────────────────────────────
-
     /// A still-blank tab (nothing ever sent through it) is reused in place;
     /// only a tab that's actually been used gets a genuine new slot —
     /// otherwise `:AiNew` pressed twice before typing anything would pile
@@ -7736,12 +7501,6 @@ mod tests {
     /// keep separate transcripts, and a backgrounded session's agent
     /// keeps making progress — `poll_acp` must drain *every* session each
     /// tick, not just whichever one is currently in the foreground.
-    ///
-    /// RED verified (2026-09-26, this session): reverting `poll_acp` to
-    /// only ever poll `acp_sessions[acp_active_session]` (the pre-#1463
-    /// shape) makes this test hang until `TEST_DEADLINE` and fail both
-    /// final assertions — session B's `agent_message_chunk`s never arrive
-    /// because its process's stdout is never read while A is foreground.
     #[cfg(unix)]
     #[test]
     fn two_sessions_keep_separate_transcripts_and_both_keep_streaming_in_background() {

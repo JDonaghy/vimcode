@@ -27,11 +27,11 @@ pub struct GroupTabBar {
     /// The resolved `quadraui::TabBarLayout` this tab bar painted with, in
     /// char-cell units relative to the tab bar's left edge (column 0 = left
     /// edge of group bounds). Backends hit-test clicks against this directly
-    /// via [`resolve_tab_bar_click`] instead of re-deriving geometry (#822).
+    /// via [`resolve_tab_bar_click`] instead of re-deriving geometry.
     pub hit_regions: quadraui::TabBarLayout,
     /// Pre-built quadraui `TabBar` primitive — backends draw this directly.
     pub bar: quadraui::TabBar,
-    /// Per-tab icon sidecar parallel to `bar.tabs` (#703), from
+    /// Per-tab icon sidecar parallel to `bar.tabs`, from
     /// [`build_tab_bar_icons`]. Empty when Nerd Fonts are off. Backends must
     /// pass this to **both** `Backend::draw_tab_bar_icons` and
     /// `Backend::tab_bar_layout_icons`.
@@ -45,47 +45,22 @@ pub const TAB_CLOSE_COLS: u16 = 2;
 /// Cell width of one tab in the tab bar: the label plus [`TAB_CLOSE_COLS`]
 /// for the close glyph and its trailing separator.
 ///
-/// # Why this counts display columns and not `char`s (#654, quadraui#554)
-///
-/// `.chars().count()` is *not* a terminal display width — a CJK ideograph or
-/// a wide emoji occupies two columns. The width used here has to agree with
-/// the width the **rasteriser** paints with, so for as long as quadraui's TUI
-/// tab bar measured *and* painted per-`char` this function had to as well,
-/// and #654 documented that at length rather than "fixing" it into a
-/// mismatch.
-///
-/// quadraui#554 (`77a5142`, in the pin bumped by #659) fixed both quadraui
-/// sides together: `TuiBackend::draw_tab_bar` / `tab_bar_layout` now measure
-/// with `display_width`, and `quadraui::tui::draw_tab_bar` strides the
-/// label-paint loop by [`quadraui::tui::char_cell_width`] instead of a flat
-/// `x += 1`. That commit names this function as its downstream follow-up,
-/// and #654's own note said this would be the single edit needed on the
-/// vimcode side — #654 had already routed the tooltip, both context-menu
-/// hit-tests, the click router and the drag-slot map through
-/// [`compute_tab_bar_layout`], so nothing else measures a tab.
-///
-/// A tab named `"日本語.rs"` (9 chars, 12 columns) is now both measured
-/// and painted 12 cells wide, so the next tab starts at cell 12 and every hit
-/// box lands on the glyph it covers. Reverting this to `.chars().count()`
-/// against a post-#554 quadraui shifts every hit box *left* of what is drawn
-/// — the mirror image of the pre-#554 hazard, and caught by
-/// `tui_main::render_impl::tests::
-/// tab_hit_regions_match_painted_columns_for_wide_names`, which reads the
-/// expected columns out of the rendered buffer.
+/// Measures display columns (where CJK ideographs and wide emojis occupy two
+/// columns), not `char` count, to match the width the rasteriser paints with.
+/// The layout, hit-tests, and paint all use [`quadraui::tui::display_width`]
+/// to ensure tabs measure and paint the same width.
 ///
 /// `icon_cols` is the per-tab icon reservation from
-/// [`quadraui::tab_icon_cols`] (#703) — glyph width + a 1-column gap, or `0`
-/// for an undecorated tab. It has to be folded in here for the same reason
-/// the trailing space on [`TabInfo::name`] does: `TuiBackend::draw_tab_bar_icons`
-/// adds `tab_icon_cols` to its own per-tab width budget, so a hit box measured
-/// without it sits one glyph left of the painted tab — the #654 desync again,
-/// this time surfacing as "the close × closes the tab to its right".
+/// [`quadraui::tab_icon_cols`] — glyph width plus a 1-column gap, or `0`
+/// for an undecorated tab. It must be folded in here because
+/// `TuiBackend::draw_tab_bar_icons` adds `tab_icon_cols` to its per-tab width
+/// budget; a hit box measured without it sits one glyph left of the painted tab.
 fn tab_hit_width(t: &TabInfo, icon_cols: u16) -> usize {
     quadraui::tui::display_width(&t.name) + TAB_CLOSE_COLS as usize + icon_cols as usize
 }
 
 /// Build the per-tab icon sidecar that decorates a tab bar with VS Code's
-/// coloured language badge (#703).
+/// coloured language badge.
 ///
 /// The result is a slice **parallel to `tabs`** (and therefore to the
 /// `quadraui::TabBar::tabs` that [`build_tab_bar_primitive`] derives from the
@@ -106,10 +81,9 @@ pub fn build_tab_bar_icons(tabs: &[TabInfo]) -> Vec<Option<quadraui::TabIcon>> {
     }
     tabs.iter()
         .map(|t| {
-            // `TabInfo::name` carries a deliberate trailing space (see its
-            // doc); the filename lookup has to read the trimmed name so a
-            // filename-badged file (`Dockerfile`, `.gitignore`, #992) can
-            // still match exactly, not just its (often absent) extension.
+            // `TabInfo::name` carries a deliberate trailing space; the filename
+            // lookup reads the trimmed name so a filename-badged file can match
+            // exactly, not just its (often absent) extension.
             let name = tab_name_filename(&t.name);
             Some(quadraui::TabIcon {
                 glyph: icons::file_icon_for_name(name).to_string(),
@@ -146,21 +120,15 @@ pub(crate) fn tab_icon_color(name: &str) -> Color {
 ///
 /// All positions are in char-cell columns relative to the tab bar left edge.
 ///
-/// Per D6: layout math lives in `quadraui::TabBar::layout()`. This
-/// function builds the TabBar primitive and asks it for a layout — the
-/// same `quadraui::TabBarLayout` both backends cache on `GroupTabBar`
-/// and hit-test directly via [`resolve_tab_bar_click`] /
-/// `quadraui::TabBarLayout::hit_test`. (#822: this used to downconvert
-/// into a vimcode-local `(TabBarHitRegion, TabBarClickTarget)` shape as
-/// a bridge for backends that hadn't migrated to `TabBarLayout` yet —
-/// both had, so the downconversion was pure duplication.)
+/// Layout math lives in `quadraui::TabBar::layout()`. This function builds
+/// the TabBar primitive and asks it for a layout — the same
+/// `quadraui::TabBarLayout` both backends cache on `GroupTabBar` and hit-test
+/// directly via [`resolve_tab_bar_click`].
 ///
 /// `icons_sidecar` is the sidecar from [`build_tab_bar_icons`] — the *same*
 /// slice the backend paints with. It must be threaded through here because an
-/// icon widens its tab by `tab_icon_cols`; measuring with `&[]` while painting
-/// with icons is the measure/paint desync #654 exists to prevent. (Named with
-/// the suffix because bare `icons` would shadow the [`crate::icons`] module
-/// this file uses throughout.)
+/// icon widens its tab by `tab_icon_cols`; measuring without icons while
+/// painting with them causes a measure/paint desync.
 pub fn compute_tab_bar_layout(
     tabs: &[TabInfo],
     icons_sidecar: &[Option<quadraui::TabIcon>],
@@ -199,10 +167,9 @@ pub fn compute_tab_bar_layout(
         None,
     );
 
-    // Per-tab width: see `tab_hit_width` — the single place tab geometry is
-    // measured now that #654 routed every TUI hit-test through these regions.
+    // Per-tab width: tab geometry is measured here and in `tab_hit_width`.
     // Close hit region is the trailing 2 cells (matches legacy behaviour:
-    // clicks on × or the trailing separator count as close).
+    // clicks on × or the trailing separator both count as close).
     let tab_widths: Vec<usize> = tabs
         .iter()
         .enumerate()
@@ -250,17 +217,14 @@ fn tab_bar_hit_target(hit: quadraui::TabBarHit) -> Option<crate::core::engine::T
 /// Resolve an x position (relative to the tab bar's left edge, in the
 /// layout's own unit — char cells for the TUI char-cell layout, pixels for a
 /// pixel-accurate GTK paint) to a `TabBarClickTarget` by hit-testing the
-/// `TabBarLayout` paint already produced — per `feedback_cache_paint_layout`,
-/// this reads what paint produced instead of re-deriving geometry in the
-/// click handler. Row is fixed at `0.0`: every hit region in a `TabBarLayout`
-/// spans the bar's single row, so an x-only probe lands inside every
-/// region's `y` range regardless of the layout's `bar_height`.
+/// `TabBarLayout` paint already produced. Row is fixed at `0.0`: every hit
+/// region in a `TabBarLayout` spans the bar's single row, so an x-only probe
+/// lands inside every region's `y` range regardless of the layout's
+/// `bar_height`.
 ///
-/// One function for both the TUI char-cell path (`x` is a whole column,
-/// e.g. `col as f32`) and GTK's pixel-accurate path (#1491 migrated GTK's
-/// own tab-bar click resolution off the deprecated `TabBarHits` onto this
-/// same call, so both backends now share it rather than GTK hand-rolling a
-/// parallel pixel hit-test).
+/// Used by both the TUI char-cell path (`x` is a whole column, e.g. `col as
+/// f32`) and GTK's pixel-accurate path; both backends now share it instead of
+/// hand-rolling parallel hit-tests.
 pub fn resolve_tab_bar_click(
     layout: &quadraui::TabBarLayout,
     x: f32,
@@ -392,7 +356,7 @@ pub enum BreadcrumbClickResult {
     /// A clickable segment was hit — carries the group whose bar was clicked
     /// and the segment index *within that group's* breadcrumbs.
     ///
-    /// The `GroupId` is load-bearing, not decoration (#555): every group's bar
+    /// The `GroupId` is load-bearing, not decoration: every group's bar
     /// is scanned here, but the segment list a bare index would be resolved
     /// against downstream (`Engine::rebuild_breadcrumb_segments`) is the
     /// **active** group's. With two groups open on files of different path
@@ -454,34 +418,21 @@ pub struct BreadcrumbDrawTarget<'a> {
 
 /// Compute which breadcrumb bars should be painted this frame, and where.
 ///
-/// Both backends call this instead of re-deriving the skip conditions
-/// themselves — TUI previously duplicated the same `segments.is_empty() ||
-/// terminal_maximized` check in both its split-group and single-group
-/// branches, and GTK's ShellApp render path was simply missing it entirely,
-/// which was the root cause of the #547 breadcrumb regression (the legacy
-/// Relm4-era draw path that *did* draw breadcrumbs stopped being called
-/// after the #540 ShellApp migration and nothing replaced it).
+/// Centralizes the skip conditions (`segments.is_empty() || terminal_maximized`)
+/// that both backends need — TUI previously duplicated this check in both its
+/// split-group and single-group branches.
 ///
 /// `bc.bounds` is already in the caller's screen space: both backends feed
-/// `build_screen_layout` window rects in absolute terminal/pixel coordinates
-/// (#550 — TUI used to compute content-area-relative rects and every draw
-/// call site had to re-add the editor area's origin via an `origin_offset`
-/// param here; that offset is always `(0.0, 0.0)` now that TUI's
-/// `content_bounds` origin matches GTK's convention, so the param was
-/// dropped).
+/// `build_screen_layout` absolute terminal/pixel coordinates.
 ///
-/// Targets with zero width (the `min_x == f64::MAX` fallback in
-/// `build_screen_layout` when a group has no matching window rects, e.g.
-/// during a transient group-tree mutation) are filtered out here rather than
-/// left to each caller: TUI's pre-existing call sites already guarded on
-/// `rect.width > 0.0`, but GTK's new one didn't, so centralizing it removes a
-/// footgun instead of asking every backend to remember it independently.
+/// Targets with zero width are filtered out here rather than left to each
+/// caller: TUI's pre-existing call sites already guarded on `rect.width > 0.0`,
+/// but GTK's didn't, so centralizing it removes a footgun.
 ///
 /// The painted rect's height is `bc.bounds.height` — whatever
-/// `build_screen_layout`/`build_screen_layout_with_breadcrumb_row` computed
-/// the breadcrumb row at (#700: fixed-pixel on GTK, one row on TUI) — not a
-/// separate `line_height` argument, so paint can never drift from the space
-/// actually reserved above the window content.
+/// `build_screen_layout` computed for the breadcrumb row — not a separate
+/// `line_height` argument, so paint can never drift from the space actually
+/// reserved above the window content.
 pub fn breadcrumb_draw_targets(
     screen: &ScreenLayout,
     terminal_maximized: bool,
@@ -509,10 +460,7 @@ pub fn breadcrumb_draw_targets(
 /// Sync the backend's Nerd-Font-glyph-vs-fallback selection with current
 /// settings. Both backends call this at startup and once per frame so
 /// runtime toggles (`:set nonerdfonts`) take effect immediately; centralizing
-/// it avoids the #547 regression where GTK's only call site was inside a
-/// message handler (GTK's `Msg::CacheFontMetrics`, retired in #732) that stopped firing after the
-/// #540 ShellApp migration, silently freezing the GTK backend's nerd-fonts
-/// flag at its default (`false`) forever.
+/// it ensures settings changes propagate to both backends.
 pub fn sync_nerd_fonts(b: &mut dyn quadraui::Backend, engine: &Engine) {
     b.set_nerd_fonts(engine.settings.use_nerd_fonts());
 }
@@ -527,67 +475,47 @@ const NERD_FONT_FALLBACK_FAMILY: &str = "Symbols Nerd Font";
 
 /// Register the bundled Nerd Font icon subset with the backend and point its
 /// fallback cascade at it, so Nerd-Font glyphs resolve instead of painting
-/// as tofu (#937).
+/// as tofu.
 ///
 /// `sync_nerd_fonts` above only ever toggles the glyph-vs-fallback *flag*
 /// (`Backend::set_nerd_fonts`) — it never tells a backend which font to
 /// resolve a glyph against. Core Text (macOS) and DirectWrite (Windows)
-/// never cascade to an arbitrary installed font for Private-Use-Area
-/// codepoints without an explicit per-font fallback list, which is exactly
-/// what `Backend::register_font_from_memory` + `Backend::
-/// set_nerd_font_fallback` install. GTK used to get this for free from a
-/// vimcode-side fontconfig filesystem install (`install_bundled_icon_font`,
-/// deleted in #1130); now that quadraui#1013 gives `GtkBackend` a real
-/// `register_font_from_memory` override (in-process, no filesystem write and
-/// no font-cache-refresh shell-out), this one call registers the font for
-/// GTK too — the same call
-/// that already covered macOS/Windows. TUI takes the trait's no-op default
-/// harmlessly (a fixed-cell backend has no font concept), so this call is
-/// platform-neutral: no `#[cfg(target_os)]` needed here or at either call
-/// site.
+/// need an explicit per-font fallback list, which this function installs
+/// via `Backend::register_font_from_memory` + `Backend::set_nerd_font_fallback`.
+/// TUI takes the trait's no-op default harmlessly, so this call is
+/// platform-neutral: no `#[cfg(target_os)]` needed.
 ///
-/// Call once, from `setup()` — **not** the per-frame
-/// `sync_nerd_fonts`/`sync_per_frame_backend_state` path. Unlike the
-/// nerd-fonts flag, there is no runtime setting to re-sync every frame, and
-/// on macOS a second `register_font_from_memory` call in the same process
-/// (e.g. a test harness constructing more than one `App`/backend) fails with
+/// Call once, from `setup()` — **not** per-frame. Unlike the nerd-fonts flag,
+/// there is no runtime setting to re-sync every frame. On macOS, a second
+/// `register_font_from_memory` call in the same process fails with
 /// "duplicate PostScript name already registered" — harmless here because a
 /// `None` falls back to [`NERD_FONT_FALLBACK_FAMILY`], the literal name the
-/// font is known to register under, so `set_nerd_font_fallback` still gets
-/// a usable family either way.
+/// font is known to register under.
 ///
-/// # Why it registers at most once per process (#1853)
+/// # Why it registers at most once per process
 ///
-/// "Call once" is the contract, but a *process* can legitimately build many
-/// `App`s/backends — every `GtkDriver`/`TuiDriver` harness in the test suite
-/// does, several hundred times per `cargo test` run — and each one used to
-/// hand the whole font to its backend again. Registration is **not** free
-/// and **not** idempotent on the platform side:
+/// A *process* can legitimately build many `App`s/backends (every test harness
+/// does, several hundred times per `cargo test`), and each one used to hand
+/// the whole font to its backend again. Registration is **not** free and
+/// **not** idempotent on the platform side:
 ///
-/// - GTK registers via Fontconfig's `FcConfigAppFontAddFile`, which has no
-///   in-memory entry point, so quadraui writes the bytes to a fresh temp
-///   file per call and deliberately never deletes it (Fontconfig/FreeType
-///   may re-open it lazily at shape time). Each call also appends another
-///   `FcPattern` — with its full charset — to the process's application
-///   font set, which every subsequent font match then has to sort.
+/// - GTK registers via Fontconfig's `FcConfigAppFontAddFile`, so quadraui
+///   writes the bytes to a fresh temp file per call. Each call appends another
+///   `FcPattern` to the application font set, which every subsequent font
+///   match then has to sort.
 /// - macOS fails outright on the second call (duplicate PostScript name).
 ///
-/// With the pre-#1853 114-glyph subset (29 KB) the per-harness copies were
-/// invisible. With the full Symbols Nerd Font (2.5 MB) the same suite wrote
-/// ~1.5 GB of temp files and grew the application font set by ~600 copies of
-/// a 10,627-codepoint font in a single `cargo test` run — enough to redden a
-/// CI runner that has far less headroom (disk and RAM) than a dev box.
+/// With the full Symbols Nerd Font (2.5 MB), a test suite would write ~1.5 GB
+/// of temp files and grow the application font set by hundreds of copies of
+/// the font — expensive in both disk and RAM.
 ///
-/// So the first backend that *accepts* the font wins: its resolved family is
+/// The first backend that *accepts* the font wins: its resolved family is
 /// remembered for the process, and later backends are only handed the font
 /// again if they cannot already see that family themselves
-/// ([`quadraui::Backend::has_font_family`]). That keeps the semantics each
-/// platform actually needs rather than assuming process-global registration:
-/// GTK/Fontconfig and Core Text both register process-wide, so a later
-/// backend answers `Some(true)` and skips; Win-GUI's DirectWrite custom
-/// collection is per-backend, so a fresh `WinBackend` answers `Some(false)`
-/// and does register; the TUI backend answers `None` ("can't know") and
-/// takes the no-op default exactly as before.
+/// ([`quadraui::Backend::has_font_family`]). GTK/Fontconfig and Core Text
+/// register process-wide, so a later backend answers `Some(true)` and skips.
+/// DirectWrite (per-backend) answers `Some(false)` and registers. TUI answers
+/// `None` ("can't know") and takes the no-op default.
 pub fn register_nerd_font_fallback(b: &mut dyn quadraui::Backend) {
     /// The family the bundled icon font actually registered under, the
     /// first time any backend in this process accepted it.
@@ -623,7 +551,7 @@ pub fn register_nerd_font_fallback(b: &mut dyn quadraui::Backend) {
 pub struct TabBarDrawTarget<'a> {
     pub rect: quadraui::Rect,
     pub bar: &'a quadraui::TabBar,
-    /// Per-tab icon sidecar parallel to `bar.tabs` (#703). Pass to **both**
+    /// Per-tab icon sidecar parallel to `bar.tabs`. Pass to **both**
     /// `Backend::draw_tab_bar_icons` and `Backend::tab_bar_layout_icons` —
     /// see [`build_tab_bar_icons`].
     pub icons: &'a [Option<quadraui::TabIcon>],
@@ -635,41 +563,20 @@ pub struct TabBarDrawTarget<'a> {
 /// Compute which tab bar(s) should be painted this frame, and where.
 ///
 /// Both backends previously re-derived the same skip-condition + rect math
-/// independently in their `if let Some(split) = screen.editor_group_split
-/// { .. } else { .. }` blocks (#549, follow-up from the #547 breadcrumb
-/// unification which deliberately left this one out to keep that PR scoped).
-/// Each backend still does its own drawing + hit-test-geometry recovery
-/// afterwards (GTK caches pixel hit-tests into `Rc<RefCell<...>>` maps, TUI
-/// tracks visible tab counts) — that part isn't shareable and stays inline
-/// at each call site.
-///
-/// #549 unified the *call sites* but kept the split-vs-single branch inside
-/// this function, with a caller-supplied `single_group_rect` for the N=1 case.
-/// #551 deleted that too: `ScreenLayout::group_tab_bars` is now populated for
-/// every group count, so one group is just a split of one and the generic
-/// bounding-box math below produces the identical full-width rect the
-/// hand-written single-group arm used to hard-code. That removes the last
-/// place a single-group tab-bar calculation could silently drift from the
-/// N-group one — the exact failure #547 hit with breadcrumbs.
+/// independently in their split-vs-single-group branches. Each backend still
+/// does its own drawing + hit-test-geometry recovery afterwards — that part
+/// isn't shareable and stays inline at each call site.
 ///
 /// `tab_row_h` is the height of the tab row itself (GTK: `lh * 1.6` in
 /// pixels; TUI: `1.0` row). `reserved_h` is the *total* space reserved above
 /// the group's window content — the tab row plus, when breadcrumbs are on,
-/// the breadcrumb row too (GTK: `tab_bar_height_px`; TUI: `tui_tbh`, 1 or
-/// 2 rows) — used to recover the tab row's own top edge from
-/// `GroupTabBar::bounds.y`, which is the *window* content's top edge.
+/// the breadcrumb row too — used to recover the tab row's own top edge from
+/// `GroupTabBar::bounds.y`, which is the window content's top edge.
 ///
-/// `bounds` is already in the caller's screen space, same convention as
-/// `breadcrumb_draw_targets` (#550 — the `origin_offset` param this function
-/// used to carry for TUI's content-area-relative rects was dropped once TUI
-/// started feeding absolute rects like GTK).
-///
-/// Targets with zero-width bounds (the `min_x == f64::MAX` fallback in
-/// `build_screen_layout` when a group has no matching window rects, e.g.
-/// during a transient group-tree mutation) are filtered out here, same as
-/// `breadcrumb_draw_targets` — TUI's pre-existing call site already guarded on
-/// `tab_w > 0`, but GTK's didn't, so centralizing it removes a footgun instead
-/// of asking every backend to remember it independently.
+/// `bounds` is already in the caller's screen space. Targets with zero-width
+/// bounds are filtered out here, same as `breadcrumb_draw_targets` — TUI's
+/// pre-existing call site already guarded on `tab_w > 0`, but GTK's didn't,
+/// so centralizing it removes a footgun.
 pub fn tab_bar_draw_targets<'a>(
     engine: &Engine,
     screen: &'a ScreenLayout,
@@ -697,12 +604,12 @@ pub fn tab_bar_draw_targets<'a>(
 /// Present when the editor area is split into two or more independent groups.
 ///
 /// This is a *marker* for "2 or more editor groups", not a container for the
-/// per-group chrome: the tab bars and dividers it used to own now live on
+/// per-group chrome: the tab bars and dividers now live on
 /// `ScreenLayout::group_tab_bars` / `ScreenLayout::group_dividers`, which are
-/// populated uniformly for every group count including one (#551). Backends
-/// draw from those unconditionally; this type only gates the hit-test paths
-/// that genuinely differ between one group and many (single-group tab-bar
-/// clicks resolve through `ScreenLayout::tab_bar_hit_regions`).
+/// populated uniformly for every group count. Backends draw from those
+/// unconditionally; this type only gates the hit-test paths that genuinely
+/// differ between one group and many (single-group tab-bar clicks resolve
+/// through `ScreenLayout::tab_bar_hit_regions`).
 #[derive(Debug, Clone)]
 pub struct EditorGroupSplitData {
     /// ID of the currently focused group.
@@ -713,18 +620,12 @@ pub struct EditorGroupSplitData {
 
 // ─── Tab drop-zone (shared) ─────────────────────────────────────────────────
 //
-// #1370: this used to be vimcode's own hand-rolled geometry (`TabDropGroup`,
-// `build_tab_drop_groups`, `compute_tab_drop_zone`, `compute_tab_drop_overlay`)
-// layered on top of quadraui's geometry-only `compute_drop_zone` primitive.
-// quadraui#998 landed the missing piece — `resolve_tab_drop`, a
-// host-owned-model adoption path that takes the drag *source* (which pane/tab,
-// per vimcode's own `Engine::editor_groups`) and returns a position-based
-// `TabDropInstruction` instead of mutating a `TabGroupController`-owned
-// `Vec<Pane>` vimcode doesn't have. [`TabDropCtx`]/[`build_tab_drop_ctx`] is
-// now the only local adapter: it flattens a frame's group geometry into the
-// parallel index-aligned slices `resolve_tab_drop` (mutation) and
-// `drop_zone_hit_test`/`drop_zone_overlay` (overlay) both key off of the same
-// `group_idx`/`pane_idx`.
+// quadraui#998 provided the missing piece — `resolve_tab_drop`, a
+// host-owned-model adoption path that takes the drag *source* (which pane/tab)
+// and returns a position-based `TabDropInstruction`. [`TabDropCtx`]/
+// [`build_tab_drop_ctx`] is the only local adapter: it flattens a frame's group
+// geometry into index-aligned slices that `resolve_tab_drop` and
+// `drop_zone_hit_test`/`drop_zone_overlay` key off of.
 
 /// Per-frame tab-drop geometry, index-aligned so `group_ids[i]` /
 /// `rects[i]` / `tab_counts[i]` all describe the same pane — the same index
@@ -830,21 +731,12 @@ pub fn build_tab_drop_ctx(
 ///
 /// [`DropGroupBounds`] (and [`build_tab_drop_ctx`], which reconstructs the
 /// tab-bar band by subtracting `tab_bar_height` back out) expects
-/// **content-area** bounds — i.e. already past the tab bar — which is exactly
-/// what every `GroupTabBar::bounds` is ("content area of this group; tab bar
-/// drawn at top edge"), in absolute screen space (#550).
+/// **content-area** bounds — already past the tab bar — which is exactly
+/// what every `GroupTabBar::bounds` is in absolute screen space.
 ///
-/// #551: this used to branch on `editor_group_split`, with a single-group arm
-/// that re-derived the content rect from a caller-supplied
-/// `editor_origin`/`editor_size`/`tab_bar_height` triple because there was no
-/// per-group `bounds` to read in that mode (#477 fix iteration 1: omitting the
-/// `tab_bar_height` skip there produced a negative `bounds.y` that put the
-/// cursor's tab-bar row just *above* the computed tab-bar band, so drops
-/// always fell through to `Split(Top)` instead of `TabReorder`).
-/// `ScreenLayout::group_tab_bars` is now populated for one group too, so the
-/// generic arm covers it and those three parameters — plus the
-/// `if split.is_some() { (0,0) } else { editor origin }` dance every caller
-/// had to perform to feed them (#515) — are gone.
+/// `ScreenLayout::group_tab_bars` is now populated for every group count
+/// including one, so the generic arm covers single-group tabs and those three
+/// parameters formerly needed for that case are gone.
 pub fn screen_to_drop_group_bounds(screen: &ScreenLayout) -> Vec<DropGroupBounds> {
     screen
         .group_tab_bars
@@ -877,25 +769,19 @@ fn split_edge_to_vimcode(edge: quadraui::DropEdge) -> (SplitDirection, bool) {
 }
 
 /// Resolve a live tab drag against `ctx` into vimcode's own
-/// [`crate::core::window::DropZone`] — the shape `Engine::apply_tab_drop_zone`
-/// already mutates from — via quadraui's host-owned-model adoption path
-/// (`quadraui::compose::resolve_tab_drop`, #998) instead of a hand-rolled
-/// geometry walk (#1370, replaces the old `compute_tab_drop_zone`).
+/// [`crate::core::window::DropZone`] via quadraui's host-owned-model adoption
+/// path (`quadraui::compose::resolve_tab_drop`).
 ///
 /// `source` is `(group, tab index)` of the tab being dragged, captured when
 /// the drag began — [`resolve_tab_drop`][quadraui::compose::resolve_tab_drop]
-/// needs it up front to decide same-pane reorder vs. cross-pane merge, unlike
-/// the old geometry-only `compute_tab_drop_zone`, which deferred that
-/// decision to `apply_tab_drop_zone` at commit time.
+/// needs it up front to decide same-pane reorder vs. cross-pane merge.
 ///
 /// `MoveToPane` collapses what used to be two distinct `DropZone` variants
 /// (`Center` for a content-area drop, `TabReorder` for a tab-bar drop into
 /// another group) into one instruction — its `insert_idx` already defaults to
 /// "append at the end" for the former, so mapping both to `DropZone::TabReorder`
-/// here reproduces the old mutation exactly. The lost visual distinction
-/// (highlight-the-whole-group vs. an insertion bar) is not lost overall: the
-/// overlay is resolved independently, from the same `ctx`, by
-/// [`tab_drop_overlay`] against quadraui's geometry-only `DropZoneKind`.
+/// here reproduces the old mutation exactly. The lost visual distinction is
+/// not lost overall: the overlay is resolved independently by [`tab_drop_overlay`].
 pub fn resolve_tab_drop_zone(
     ctx: &TabDropCtx,
     source: (GroupId, usize),
@@ -953,16 +839,14 @@ pub fn resolve_tab_drop_zone(
 
 /// Resolve the drop-zone overlay geometry for `ctx` at `(cursor_x, cursor_y)`
 /// — straight from quadraui's own [`quadraui::drop_zone_hit_test`] /
-/// [`quadraui::drop_zone_overlay`], no vimcode-local adapter (#1370, replaces
-/// the old `compute_tab_drop_overlay`/`TabDropOverlay`).
+/// [`quadraui::drop_zone_overlay`].
 ///
-/// Deliberately independent of [`resolve_tab_drop_zone`]: that function
-/// answers "what mutation should this drop commit", collapsing `Center` and
-/// cross-pane `TabReorder` into one `MoveToPane`; this function answers "what
-/// should the overlay look like *right now*", which still needs that
-/// distinction (a highlight over the whole pane vs. an insertion bar) to
-/// paint correctly. Both are pure queries over the same `ctx`, so computing
-/// the hit test twice (once per question) costs nothing correctness-relevant.
+/// Independent of [`resolve_tab_drop_zone`]: that function answers "what
+/// mutation should this drop commit", collapsing `Center` and cross-pane
+/// `TabReorder` into one `MoveToPane`; this function answers "what should the
+/// overlay look like *right now*", which still needs that distinction (a
+/// highlight over the whole pane vs. an insertion bar). Both are pure queries
+/// over the same `ctx`, so computing the hit test twice costs nothing.
 pub fn tab_drop_overlay(
     ctx: &TabDropCtx,
     cursor_x: f32,

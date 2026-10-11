@@ -1,5 +1,5 @@
 //! Integration tests for `.githooks/` — the versioned git hooks that make the
-//! graphify knowledge graph usable from a *linked worktree* (see issue #611).
+//! graphify knowledge graph usable from a *linked worktree*.
 //!
 //! `graphify-out/` is gitignored by design (only `graphify-out/.gitignore` is
 //! tracked), so `git worktree add` normally materialises an empty
@@ -9,17 +9,11 @@
 //! of the base checkout's graph into the new worktree's `graphify-out/`.
 //!
 //! It deliberately does NOT replace `graphify-out/` itself with a symlink.
-//! That was the shape of the original port, and it was a live incident
-//! (claude-coordinator#1617): `git worktree add` checks out the tracked
-//! `graphify-out/.gitignore`, so `rm -rf graphify-out && ln -sfn ...` deleted
-//! a tracked file out from under git, leaving every fresh worktree with a
-//! deleted `.gitignore` plus an untracked, machine-local, absolute-path
-//! symlink — both of which the worktree-rescue sweep then committed onto
-//! unrelated worker branches. `graphify-out/.gitignore` is `*` / `!.gitignore`,
-//! so entries placed *inside* the directory are invisible to git for free,
-//! provided that tracked file survives. `worktree_add_leaves_git_status_empty`
-//! below is the assertion whose absence let that ship; treat it as the
-//! acceptance bar for any future change to this hook.
+//! Replacing the directory would delete the tracked `graphify-out/.gitignore`,
+//! leaving worktrees with a deleted tracked file plus an untracked, machine-local
+//! symlink. Since entries *inside* the directory are invisible to git
+//! (due to `*` / `!.gitignore`), the hook symlinking *into* the tracked
+//! directory preserves git status without replacing it.
 //!
 //! These tests drive *real* `git` via `std::process::Command`: build a temp
 //! "base" repo, copy in the actual `.githooks/` directory from this repo,
@@ -214,7 +208,7 @@ fn worktree_add_links_base_graph_contents_into_worktree() {
         printed
     );
 
-    // claude-coordinator#1617: `graphify-out/` itself must stay a real
+    // `graphify-out/` itself must stay a real
     // directory. Replacing it with a symlink deletes the tracked
     // `graphify-out/.gitignore` and pollutes the worker's branch.
     let dir = wt.join("graphify-out");
@@ -256,10 +250,8 @@ fn worktree_add_links_base_graph_contents_into_worktree() {
 
 // ── 1b. the acceptance bar: a fresh linked worktree is `git status` clean ───
 //
-// This is the assertion whose absence let claude-coordinator#1617 ship. The
-// original bug showed up here as a *deleted* tracked `graphify-out/.gitignore`
-// plus a *new untracked* absolute-path symlink — both invisible to any check
-// that only looks at what the link points to.
+// This assertion confirms the directory symlinking strategy preserves git status:
+// no deleted tracked files and no untracked symlinks.
 
 #[test]
 fn worktree_add_leaves_git_status_empty() {

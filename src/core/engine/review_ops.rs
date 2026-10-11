@@ -1,4 +1,4 @@
-//! `Engine` wiring for the change-review surface (#955, shared with #525):
+//! `Engine` wiring for the change-review surface:
 //! opening/closing, keyboard navigation, accept/reject application, and
 //! location resolution. `crate::core::review` itself stays free of any
 //! `Engine`/buffer/backend knowledge — this module is the only place that
@@ -29,21 +29,18 @@ use crate::core::tool_client::BranchReviewTarget;
 impl Engine {
     /// Open the change-review surface for `changes`, replacing whatever
     /// was open before. A no-op on an empty list — nothing to review.
-    /// Public so a future source-agnostic feeder (a #525 git-branch diff
-    /// list, say) can call it directly without going through ACP at all.
     pub fn open_change_review(&mut self, changes: Vec<ProposedChange>) {
-        // A *proposal* review (#955) never has a turn checkpoint behind it
+        // A *proposal* review never has a turn checkpoint behind it
         // — see `Self::open_change_review_with_turn_marker`'s doc for why
         // `None` here matters, not just what it does.
         self.open_change_review_with_turn_marker(changes, None);
     }
 
-    /// Shared reset-and-populate tail [`Self::open_change_review`] (a
+    /// Shared reset-and-populate for [`Self::open_change_review`] (a
     /// *proposal* review, `turn_checkpoint_id: None`) and
     /// [`crate::core::engine::acp_turn_ops::Engine::acp_open_turn_review`]
-    /// (a *turn* review, `turn_checkpoint_id: Some(id)`) both need — #1460
-    /// review nit: this used to be duplicated three lines in each caller.
-    /// A no-op on an empty `changes` list — nothing to review.
+    /// (a *turn* review, `turn_checkpoint_id: Some(id)`). A no-op on an
+    /// empty `changes` list — nothing to review.
     pub(crate) fn open_change_review_with_turn_marker(
         &mut self,
         changes: Vec<ProposedChange>,
@@ -53,13 +50,13 @@ impl Engine {
             return;
         }
         self.change_review = Some(crate::core::review::ChangeReviewState::new(changes));
-        // Always reset first — only `Engine::open_review_card` (board_ops.rs,
-        // #526) knows the reviewed card's id and sets it back afterward. An
-        // ACP tool-call diff (or a direct `open_branch_review` call with no
-        // board card behind it) must never inherit a stale id left over
-        // from an earlier board review.
+        // Always reset first — only `Engine::open_review_card` (board_ops.rs)
+        // knows the reviewed card's id and sets it back afterward. An ACP
+        // tool-call diff (or a direct `open_branch_review` call with no board
+        // card behind it) must never inherit a stale id left over from an
+        // earlier board review.
         self.review_card_id = None;
-        // #1460: `turn_checkpoint_id` names the turn review is for, or
+        // `turn_checkpoint_id` names the turn review is for, or
         // `None` for a proposal review — either way this always overwrites
         // whatever was left over from an earlier review of either kind, so
         // neither marker can ever outlive the surface it named.
@@ -67,24 +64,20 @@ impl Engine {
     }
 
     /// Build a source-agnostic change list from a local git branch diff
-    /// (#525) and open it via [`Self::open_change_review`] — the git
-    /// feeder for the surface #955 built, proving it really is source-
-    /// agnostic (see `crate::core::review`'s own non-ACP unit test for the
-    /// same point at the data-model level). `target` is typically resolved
-    /// from a board card through a provider's `"OpenReview"` action
-    /// (`Engine::open_review_card` in `board_ops.rs`) — this method itself
-    /// has no idea where `target` came from, it just turns two git
-    /// revisions into a diff.
+    /// and open it via [`Self::open_change_review`]. The git feeder for
+    /// the surface, proving it is source-agnostic (see `crate::core::review`'s
+    /// own non-ACP unit test for the same point at the data-model level).
+    /// `target` is typically resolved from a board card through a provider's
+    /// `"OpenReview"` action (`Engine::open_review_card` in `board_ops.rs`)
+    /// — this method itself has no idea where `target` came from, it just
+    /// turns two git revisions into a diff.
     ///
-    /// Worktree-local (#525's stated scope): both `target.branch` and
-    /// `target.base` must already be resolvable in the local repository —
-    /// still no fetch, no `ssh` handling, even after #530 (Track A Phase
-    /// 5). That issue's "review-where-the-code-is" mode is *vimcode itself
-    /// running on the worker box*, at which point `target.branch`/`.base`
-    /// are trivially local again — the only new data this method threads
-    /// through unexamined is `target.host`, purely for the provenance
-    /// footer (`render::paint_change_review_rung`) to show which machine
-    /// that local checkout happens to be on.
+    /// Worktree-local: both `target.branch` and `target.base` must already
+    /// be resolvable in the local repository — still no fetch, no `ssh`
+    /// handling. The only new data this method threads through unexamined
+    /// is `target.host`, purely for the provenance footer
+    /// (`render::paint_change_review_rung`) to show which machine that local
+    /// checkout happens to be on.
     pub fn open_branch_review(&mut self, target: BranchReviewTarget) -> Result<(), String> {
         let root = self
             .workspace_root
@@ -96,12 +89,11 @@ impl Engine {
         // stale fetch) is exactly the provenance a human is about to need
         // while they go figure out why, not something to silently drop.
         self.review_target = Some(target.clone());
-        // `changed_files_between` now distinguishes "git failure" (`None`
+        // `changed_files_between` distinguishes "git failure" (`None`
         // — unknown ref, bad revision, no repo) from "a real, empty diff"
         // (`Some(vec![])`), so a misconfigured provider's bogus branch/base
         // name surfaces as its own message rather than silently reading
-        // the same as "nothing changed" (review non-blocking finding,
-        // #525).
+        // the same as "nothing changed".
         let paths =
             match crate::core::git::changed_files_between(&root, &target.base, &target.branch) {
                 Some(paths) if !paths.is_empty() => paths,
@@ -137,27 +129,23 @@ impl Engine {
     }
 
     /// Commit any working-tree edits made while reviewing a branch, and
-    /// push them — the "human edits, pushed back" leg of #528 (Track A
-    /// Phase 3), modelled on coordinator's remote-fix `finalize`: a
-    /// commit, then a plain (non-force) [`crate::core::git::push`], so a
-    /// rejected push never loses anything — the commit, and the worktree
-    /// it lives in, are left exactly where they are for a human to
-    /// resolve and retry. Reachable as `:GFinalize [message]` (`execute.
-    /// rs`); `message` defaults to `"Review edits"` when omitted.
+    /// push them — a commit, then a plain (non-force) [`crate::core::git::push`],
+    /// so a rejected push never loses anything — the commit, and the worktree
+    /// it lives in, are left exactly where they are for a human to resolve
+    /// and retry. Reachable as `:GFinalize [message]` (`execute.rs`); `message`
+    /// defaults to `"Review edits"` when omitted.
     ///
     /// Safety check: if a branch review was opened this session
     /// (`self.review_target`, set by [`Self::open_branch_review`] and left
-    /// in place after the diff surface itself is closed — see that
-    /// field's own doc), refuses to push unless the worktree is *still*
-    /// on that exact branch. Nothing stops a human from `git checkout`ing
-    /// elsewhere in the same worktree mid-review and then hitting
-    /// finalize, which would otherwise push edits meant for the reviewed
-    /// branch onto whatever branch happens to be checked out — precisely
-    /// the "must know which branch they're editing" footgun the issue
-    /// calls out. No review opened this session (`review_target: None`)
-    /// — finalize is then a generic "commit and push whatever's here",
-    /// same as `:Gcommit` + `:Gpush` already are, so there is nothing to
-    /// check against.
+    /// in place after the diff surface itself is closed — see that field's
+    /// own doc), refuses to push unless the worktree is *still* on that exact
+    /// branch. Nothing stops a human from `git checkout`ing elsewhere in the
+    /// same worktree mid-review and then hitting finalize, which would
+    /// otherwise push edits meant for the reviewed branch onto whatever branch
+    /// happens to be checked out — a footgun this guards against. No review
+    /// opened this session (`review_target: None`) — finalize is then a
+    /// generic "commit and push whatever's here", same as `:Gcommit` +
+    /// `:Gpush` already are, so there is nothing to check against.
     pub fn finalize_review_edits(&mut self, message: &str) -> Result<String, String> {
         let dir = self
             .workspace_root
@@ -212,7 +200,7 @@ impl Engine {
     /// — closing only discards the *surface*, not decisions already made.
     pub fn close_change_review(&mut self) {
         self.change_review = None;
-        // #1460: a closed turn review can still be reopened by checkpoint
+        // A closed turn review can still be reopened by checkpoint
         // id (`:AiReview`, `Engine::acp_open_turn_review`) — that's the
         // *first* thing `restore_checkpoint_keeps_a_user_edit_made_in_
         // between` test below exercises — so this only clears the "is a
@@ -236,16 +224,16 @@ impl Engine {
     /// | `[`         | Jump to the previous hunk                  |
     /// | `n` / Tab   | Next file                                  |
     /// | `p`         | Previous file                              |
-    /// | `a`         | **Turn review (#1460):** keep the current hunk (#1516) — pure decision, no write. **Proposal/branch review:** accept the whole file, unchanged since #955/#525. |
-    /// | `r`         | **Turn review:** revert the current hunk to its pre-turn content (#1516), one undo group. **Proposal/branch review:** reject the whole file, unchanged. |
-    /// | `A`         | **Turn review:** keep every hunk in the current file (#1516). **Otherwise:** Approve — report a verdict (#526). |
-    /// | `R`         | **Turn review only:** revert every hunk in the current file (#1516). No effect otherwise. |
-    /// | `ga`        | **Turn review only:** keep every remaining hunk in every file (#1516). |
-    /// | `gr`        | **Turn review only:** revert every remaining hunk in every file (#1516). |
-    /// | `C`         | Request changes — report a verdict (#526)  |
-    /// | `M`         | Comment-only — report a verdict (#526)     |
-    /// | `c`         | Add/edit a comment on the current line (#527) |
-    /// | `d`         | Delete the comment on the current line (#527) |
+    /// | `a`         | **Turn review:** keep the current hunk — pure decision, no write. **Proposal/branch review:** accept the whole file, unchanged since #955/#525. |
+    /// | `r`         | **Turn review:** revert the current hunk to its pre-turn content, one undo group. **Proposal/branch review:** reject the whole file, unchanged. |
+    /// | `A`         | **Turn review:** keep every hunk in the current file. **Otherwise:** Approve — report a verdict. |
+    /// | `R`         | **Turn review only:** revert every hunk in the current file. No effect otherwise. |
+    /// | `ga`        | **Turn review only:** keep every remaining hunk in every file. |
+    /// | `gr`        | **Turn review only:** revert every remaining hunk in every file. |
+    /// | `C`         | Request changes — report a verdict  |
+    /// | `M`         | Comment-only — report a verdict     |
+    /// | `c`         | Add/edit a comment on the current line |
+    /// | `d`         | Delete the comment on the current line |
     ///
     /// The verdict keys hand off to [`Self::start_review_verdict`], which
     /// closes this surface and opens a body-composer buffer — see
@@ -258,7 +246,7 @@ impl Engine {
     /// one whenever a turn review is open, since the two can never both
     /// apply to the same open surface (a turn review is never card-backed).
     pub fn handle_change_review_key(&mut self, key_name: &str, unicode: Option<char>) -> bool {
-        // `g` starts the `ga`/`gr` two-key sequence (#1516) — any other key
+        // `g` starts the `ga`/`gr` two-key sequence — any other key
         // first consumes (and clears) a pending one, whether or not it
         // completes the sequence, mirroring vim's own g-prefix contract: an
         // unrecognised follow-up key still gets handled normally below,
@@ -411,24 +399,18 @@ impl Engine {
     /// Accept the currently-shown entry: write `new_text` into a buffer
     /// for its `path` (opening or reusing one, undo-grouped, saved to
     /// disk) via the same buffer-write path `Engine::acp_write_text_file`
-    /// uses for `fs/write_text_file` (#954), reused here rather than
-    /// duplicated. Auto-closes the surface once every entry has a
-    /// decision.
+    /// uses for `fs/write_text_file`, reused here rather than duplicated.
+    /// Auto-closes the surface once every entry has a decision.
     ///
     /// Safe to write `new_text` as the buffer's entire content precisely
-    /// because it's guaranteed whole-file by construction. Since #1516
-    /// retired the ACP proposal-review write path (a `diff` content block
-    /// is display-only — see `acp_ops.rs`'s
-    /// `Engine::acp_upsert_tool_call` doc), the only feeder that still
-    /// reaches this branch is a
-    /// non-ACP one that builds whole-file
-    /// [`crate::core::review::ProposedChange`]s directly (#525's
-    /// git-branch diff list), so no possibly-fragment text can arrive here
-    /// at all. This function itself does no fragment resolution — writing
-    /// an edited-region fragment over a whole file is exactly the #1454
-    /// data loss that motivated the retirement.
+    /// because it's guaranteed whole-file by construction. The only feeder
+    /// that reaches this branch is a non-ACP one that builds whole-file
+    /// [`crate::core::review::ProposedChange`]s directly (git-branch diff list),
+    /// so no possibly-fragment text can arrive here at all. This function itself
+    /// does no fragment resolution — writing an edited-region fragment over a
+    /// whole file is exactly the data loss that must be avoided.
     pub(crate) fn change_review_accept_current(&mut self) {
-        // #1460: a turn review's files are already written to disk — "keep"
+        // A turn review's files are already written to disk — "keep"
         // is a pure decision, never a write (see `acp_turn_ops.rs`'s module
         // doc for the full a/r truth table).
         if self.turn_review_checkpoint_id.is_some() {
@@ -463,9 +445,9 @@ impl Engine {
         }
     }
 
-    /// Reject the currently-shown entry. In a *proposal* review (#955):
+    /// Reject the currently-shown entry. In a *proposal* review:
     /// no buffer effect — the change was never applied. In a **turn**
-    /// review (#1460): actually reverts the file to its pre-turn content
+    /// review: actually reverts the file to its pre-turn content
     /// (`entry.change.old_text`) through the single-undo-group buffer path
     /// — the file already holds the agent's write, so "reject" here means
     /// "revert it". Auto-closes the surface once every entry has a
@@ -481,7 +463,7 @@ impl Engine {
             entry.decision = crate::core::review::ChangeDecision::Rejected;
             let path = entry.change.path.clone();
             let old_text = entry.change.old_text.clone();
-            // #1460 review (non-blocking finding): `None` means the agent
+            // `None` means the agent
             // created this path this turn (no pre-turn content) — revert
             // means delete it, not write an empty file back. See
             // `AcpTurnFileEntry`'s doc for the full reasoning.
@@ -494,7 +476,7 @@ impl Engine {
             if let Err(msg) = result {
                 self.message = format!("Failed to revert {path}: {msg}");
             } else {
-                // #1460 review: reconcile the checkpoint's own bookkeeping
+                // Reconcile the checkpoint's own bookkeeping
                 // now that this path is actually back at its pre-turn
                 // content, so a later `:AiRestore` on this checkpoint
                 // neither re-reverts an already-reverted file nor
@@ -531,7 +513,7 @@ impl Engine {
         }
     }
 
-    // ── hunk-level Keep/Reject (#1516) — turn review only ───────────────
+    // ── hunk-level Keep/Reject — turn review only ───────────────────────
     //
     // Every method below is only ever reached from `handle_change_review_
     // key` while `self.turn_review_checkpoint_id.is_some()` — a branch/
@@ -568,15 +550,12 @@ impl Engine {
 
     /// `r` on a turn review: revert the hunk under the cursor to its
     /// pre-turn content, as a single undo group, saved to disk — "reject
-    /// reverts a hunk, not the whole file" (#1516's own words). Recomputes
-    /// the entry's diff/hunks afterward (`ChangeReviewEntry::
-    /// refresh_after_edit`) so the rejected hunk disappears and every
-    /// other hunk's position/decision stays correct. If the file is now
-    /// back to exactly its pre-turn content (every hunk gone), forgets it
-    /// from the checkpoint's own bookkeeping (same tail
-    /// [`Self::change_review_reject_current`]'s turn-review branch already
-    /// used) so a later `:AiRestore` neither re-reverts it nor misreports
-    /// it as refused.
+    /// reverts a hunk, not the whole file". Recomputes the entry's diff/hunks
+    /// afterward (`ChangeReviewEntry::refresh_after_edit`) so the rejected hunk
+    /// disappears and every other hunk's position/decision stays correct. If
+    /// the file is now back to exactly its pre-turn content (every hunk gone),
+    /// forgets it from the checkpoint's own bookkeeping so a later
+    /// `:AiRestore` neither re-reverts it nor misreports it as refused.
     pub(crate) fn change_review_reject_current_hunk(&mut self) {
         let Some(checkpoint_id) = self.turn_review_checkpoint_id else {
             return;
@@ -628,10 +607,9 @@ impl Engine {
     }
 
     /// `A` on a turn review: keep every hunk in the current file still
-    /// `Pending` — the whole-file sweep #1516 asks for, expressed as "keep
-    /// every remaining hunk" rather than a separate whole-file code path,
-    /// so it can never disagree with what individually keeping each hunk
-    /// would have done.
+    /// `Pending` — the whole-file sweep, expressed as "keep every remaining
+    /// hunk" rather than a separate whole-file code path, so it can never
+    /// disagree with what individually keeping each hunk would have done.
     pub(crate) fn change_review_keep_current_file_hunks(&mut self) {
         let Some(review) = &mut self.change_review else {
             return;
@@ -731,18 +709,18 @@ impl Engine {
 
     /// Resolve a click against the currently-shown entry's `DiffView` to a
     /// `(path, line)` and jump there — "clicking a location jumps to that
-    /// file and line" (#955's acceptance bar), implemented against the
-    /// diff surface's own row/hunk geometry (`DiffViewHit::Row`) rather
-    /// than new transcript-click infrastructure quadraui doesn't ship yet.
+    /// file and line", implemented against the diff surface's own row/hunk
+    /// geometry (`DiffViewHit::Row`) rather than new transcript-click
+    /// infrastructure quadraui doesn't ship yet.
     ///
     /// Closes the change-review surface on a successful jump (same as the
     /// keyboard `Return` path's explicit `close_change_review()`), since
     /// the surface is full-viewport on both backends — leaving it open
     /// would paint the diff right back over the buffer the jump just
-    /// switched to, silently undoing the whole point of the click. A
-    /// failed resolution (row not inside any hunk) leaves the surface
-    /// open, mirroring `Return`'s own `row_to_location` failure case
-    /// being a no-op rather than a forced close.
+    /// switched to, silently undoing the whole point of the click. A failed
+    /// resolution (row not inside any hunk) leaves the surface open, mirroring
+    /// `Return`'s own `row_to_location` failure case being a no-op rather than
+    /// a forced close.
     pub(crate) fn change_review_jump_to_hit(&mut self, hit: quadraui::DiffViewHit) {
         let quadraui::DiffViewHit::Row { row_idx, .. } = hit else {
             return;
@@ -831,7 +809,7 @@ mod tests {
         dir
     }
 
-    // ── open_branch_review (#525) ───────────────────────────────────────
+    // ── open_branch_review ──────────────────────────────────────────────
 
     /// Set up a repo with a base commit, a `feature` branch carrying a
     /// modified file and a brand-new file, *and* a commit made on the base
@@ -901,7 +879,7 @@ mod tests {
             })
             .expect("branch review should build a change list");
 
-        // Provenance (#528): opening a branch review must record which
+        // Provenance: opening a branch review must record which
         // branch/base it resolved, so the UI (and `finalize_review_edits`'s
         // safety check) can tell the human which branch they're on.
         assert_eq!(
@@ -981,8 +959,6 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("no workspace"));
     }
-
-    // ── finalize_review_edits / :GFinalize (#528, Track A Phase 3) ─────────
 
     /// Small `git -C dir <args>` runner shared by the finalize tests below
     /// — same shape as `init_branch_review_repo`'s local closure, just
@@ -1110,10 +1086,9 @@ mod tests {
     }
 
     /// Safety check: a review worktree that has since been checked out to
-    /// a different branch than the one under review must refuse to
-    /// finalize rather than silently pushing the human's edit onto
-    /// whichever branch happens to be checked out — the provenance
-    /// footgun #528 calls out. No commit/push may happen at all.
+    /// a different branch than the one under review must refuse to finalize
+    /// rather than silently pushing the human's edit onto whichever branch
+    /// happens to be checked out. No commit/push may happen at all.
     #[test]
     fn finalize_review_edits_refuses_when_worktree_left_the_reviewed_branch() {
         let (work_dir, remote_dir, branch) =
@@ -1254,12 +1229,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// "Clicking a location jumps to that file and line" (#955's
-    /// acceptance bar), exercised via `Return`'s keyboard-reachable
-    /// equivalent (see this module's top doc for why the mouse path
-    /// itself isn't wired yet): opens the buffer for the entry's path and
-    /// lands the cursor on the changed row's 1-based line, converted to
-    /// the engine's 0-based cursor line.
+    /// "Clicking a location jumps to that file and line", exercised via
+    /// `Return`'s keyboard-reachable equivalent: opens the buffer for the
+    /// entry's path and lands the cursor on the changed row's 1-based line,
+    /// converted to the engine's 0-based cursor line.
     #[test]
     fn return_jumps_to_the_current_rows_file_and_line() {
         let dir = unique_temp_dir("jump");
@@ -1312,7 +1285,7 @@ mod tests {
         assert_eq!(line, 2);
     }
 
-    // ── verdict keys (#526) ──────────────────────────────────────────────
+    // ── verdict keys ─────────────────────────────────────────────────────
 
     fn install_mock_provider_with_approve_verdict(engine: &mut Engine) {
         use crate::core::extensions::{BoardProviderConfig, ExtensionManifest};
@@ -1346,8 +1319,8 @@ mod tests {
     }
 
     /// `A` while the surface is open closes it (same as Esc) and opens a
-    /// verdict-composer buffer bound to the reviewed card — the
-    /// keyboard-reachable path into #526's verdict flow.
+    /// verdict-composer buffer bound to the reviewed card — the keyboard-reachable
+    /// path into the verdict flow.
     #[test]
     fn shift_a_closes_the_surface_and_opens_a_verdict_composer() {
         let mut engine = Engine::new_for_test();

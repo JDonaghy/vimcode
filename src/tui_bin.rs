@@ -2,12 +2,10 @@
 //!
 //! Build with: `cargo build --release --bin vimcode-tui --no-default-features`
 
-//! #657: `core` / `icons` / `render` / `tui_main` were promoted into
-//! `vimcode_core`, so this binary no longer re-compiles them as private
-//! modules — it just calls into the library. The crate-wide
-//! `allow(dead_code, unused_imports)` this file used to carry (because the
-//! shared modules contain GTK-only code with no caller on this lane) moved
-//! with them, narrowed to `render` / `tui_main` on the no-GTK lane only.
+//! `core` / `icons` / `render` / `tui_main` are library modules
+//! used by this binary; the `allow(dead_code, unused_imports)`
+//! for `render` / `tui_main` on the no-GTK lane accommodates code
+//! that is not called from this binary.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -17,10 +15,7 @@ use vimcode_core::tui_main;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // --help / -h: print usage and exit (#979 — this used to print nothing
-    // at all and exit 0, which is a smaller bug than the GTK-binary crash
-    // this issue was filed for, but the same neighbourhood: fixed alongside
-    // it rather than filed separately).
+    // --help / -h: print usage and exit
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
             "VimCode {} (terminal UI)\n\n\
@@ -38,7 +33,7 @@ fn main() {
 
     // --version / -V: print version and exit
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        // Name the quadraui this binary is made of (#638): it is a path dep, so
+        // Name the quadraui this binary is made of: it is a path dep, so
         // nothing else in the build records which one was used.
         println!(
             "VimCode {} ({})",

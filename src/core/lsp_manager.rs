@@ -317,7 +317,7 @@ fn mason_bin_dir() -> Option<PathBuf> {
 /// binaries into `<prefix>/bin`, so the binary a manifest names doesn't match
 /// the formula that ships it. `clangd` ships in the `llvm` formula, which is
 /// keg-only because symlinking it into the prefix would shadow the
-/// system-provided `/usr/bin/clang` (#917). Extend this list if another
+/// system-provided `/usr/bin/clang`. Extend this list if another
 /// registry extension's `install_macos` hits the same problem.
 ///
 /// Not `#[cfg(macos)]`-gated: it's inert data, and leaving it compiled on
@@ -326,7 +326,7 @@ fn mason_bin_dir() -> Option<PathBuf> {
 /// OS instead of a duplicated copy.
 const HOMEBREW_KEG_ONLY_FORMULAS: &[(&str, &str)] = &[("clangd", "llvm")];
 
-/// Homebrew prefix directories to probe for LSP/DAP binaries (#917).
+/// Homebrew prefix directories to probe for LSP/DAP binaries.
 ///
 /// A native macOS `.app` launched from Finder/Dock/launchd gets launchd's
 /// minimal PATH, which contains neither Homebrew prefix — Apple Silicon
@@ -336,7 +336,7 @@ const HOMEBREW_KEG_ONLY_FORMULAS: &[(&str, &str)] = &[("clangd", "llvm")];
 /// both architectures (only one will ever exist on a given machine).
 ///
 /// On non-macOS targets this returns an empty list — Windows/Linux discovery
-/// order is intentionally unchanged by #917.
+/// order is intentionally unchanged.
 ///
 /// The `VIMCODE_TEST_HOMEBREW_PREFIXES` environment variable overrides the
 /// probed prefixes with a `PATH`-style (`:`-separated) list of directories,
@@ -345,13 +345,8 @@ const HOMEBREW_KEG_ONLY_FORMULAS: &[(&str, &str)] = &[("clangd", "llvm")];
 /// Homebrew layout without touching (or depending on the contents of) a real
 /// `/opt/homebrew`; real builds never set it.
 ///
-/// #918 follow-up: the override used to be `cfg(not(macos))`-gated, which
-/// meant the two `resolve_command_finds_*_homebrew_*` tests silently probed
-/// the host's *real* Homebrew prefixes when the suite ran on a Mac and could
-/// never pass there (the fake prefix was ignored; `clangd` resolved to
-/// `/usr/bin/clangd`). The override is deliberately *exclusive* — when set,
-/// the real prefixes are not probed — so a test can assert on exactly the
-/// layout it created.
+/// The override is deliberately *exclusive* — when set, the real prefixes are
+/// not probed — so a test can assert on exactly the layout it created.
 fn homebrew_prefixes() -> Vec<PathBuf> {
     if let Some(val) = std::env::var_os("VIMCODE_TEST_HOMEBREW_PREFIXES") {
         return std::env::split_paths(&val).filter(|p| p.is_dir()).collect();
@@ -371,11 +366,9 @@ fn homebrew_prefixes() -> Vec<PathBuf> {
 }
 
 /// Directories `resolve_command` probes for `binary` beyond `PATH`, in probe
-/// order (#1344). Pulled out of `resolve_command` so a failure message can
-/// name exactly where vimcode looked (`missing_dependency_message`-style)
-/// without hand-duplicating the list — which would silently drift the moment
-/// `resolve_command` gains or drops a directory, exactly the kind of
-/// two-lookups-disagree bug #1344 fixes.
+/// order. Pulled out of `resolve_command` so a failure message can
+/// name exactly where vimcode looked without hand-duplicating the list — which
+/// would silently drift the moment `resolve_command` gains or drops a directory.
 fn extra_tool_dirs(binary: &str) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     // Mason bin directory, if it exists.
@@ -388,7 +381,7 @@ fn extra_tool_dirs(binary: &str) -> Vec<PathBuf> {
     dirs.push(home.join(".local/bin"));
     dirs.push(home.join("go/bin"));
     dirs.push(home.join(".npm-global/bin"));
-    // #917: Homebrew prefixes (macOS only — see `homebrew_prefixes()`).
+    // Homebrew prefixes (macOS only — see `homebrew_prefixes()`).
     for prefix in homebrew_prefixes() {
         dirs.push(prefix.join("bin"));
         // Keg-only formulas (e.g. clangd/llvm) never reach `<prefix>/bin`;
@@ -403,7 +396,7 @@ fn extra_tool_dirs(binary: &str) -> Vec<PathBuf> {
 }
 
 /// Human-readable description of the directories `resolve_command` probes
-/// for `binary`, for use in "installed but still not found" messages (#1344)
+/// for `binary`, for use in "installed but still not found" messages
 /// — naming where vimcode actually looked is far more actionable than just
 /// saying "not found on PATH", especially since most of these directories
 /// are *not* on PATH for a desktop-launched vimcode in the first place.
@@ -422,16 +415,15 @@ pub fn probed_tool_dirs_description(binary: &str) -> String {
 /// Checks Mason bin directory first (if it exists), then falls back to PATH.
 ///
 /// `pub` (rather than crate-private) specifically so `tests/extensions.rs`
-/// — a separate integration-test crate — can drive it directly for #917's
-/// black-box Homebrew-resolution coverage. Also the sole lookup shared by
-/// install-time checks, install finalization, and server launch (#1344) —
-/// see `crate::core::engine::binary_on_path`, which delegates here instead of
-/// walking `PATH` on its own.
+/// — a separate integration-test crate — can drive it directly.
+/// Also the sole lookup shared by install-time checks, install finalization,
+/// and server launch — see `crate::core::engine::binary_on_path`, which
+/// delegates here instead of walking `PATH` on its own.
 pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
     // Split on whitespace to get just the binary name
     let binary = cmd.split_whitespace().next().unwrap_or(cmd);
 
-    // #1345: the vimcode-managed tool acquisition dir is probed first — a
+    // The vimcode-managed tool acquisition dir is probed first — a
     // tool vimcode downloaded, verified and unpacked itself can never
     // collide with a same-named binary elsewhere on the system, and needs
     // no PATH/env changes to be found.
@@ -439,11 +431,10 @@ pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
         return Some(managed);
     }
 
-    // Paths already probed (and rejected) in the loop below — #1386: `which`
+    // Paths already probed (and rejected) in the loop below: `which`
     // frequently resolves to the exact same path the tool-dirs loop already
     // rejected (e.g. a broken rustup proxy in `~/.cargo/bin`), and probing
-    // it again doubles the cost of a slow-to-fail probe for no new
-    // information.
+    // it again doubles the cost of a slow-to-fail probe for no new information.
     let mut already_probed: Vec<PathBuf> = Vec::new();
 
     for dir in extra_tool_dirs(binary) {
@@ -482,17 +473,13 @@ pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
         let first_line = path_str.lines().next()?.trim();
         if !first_line.is_empty() {
             let resolved = PathBuf::from(first_line);
-            // #1386 review follow-up: compare canonicalized paths, not just
-            // the raw strings — `which`/`where` can resolve to a
-            // differently-formatted-but-equivalent path to a candidate the
-            // tool-dirs loop above already rejected (a symlink, a relative
-            // vs. absolute form, etc.), which a plain string comparison
-            // would miss, reintroducing the double-probe for that shape.
-            // `canonicalize()` is a cheap stat-based syscall, not a spawn —
-            // nowhere near the cost this fix targets — so falling back to
-            // the raw path on failure (e.g. it vanished between `which`
-            // returning and this call) only ever loses the dedupe, never
-            // adds a spurious one.
+            // Compare canonicalized paths to avoid probing the same path twice:
+            // `which`/`where` can resolve to a differently-formatted-but-equivalent
+            // path to a candidate the tool-dirs loop already rejected (a symlink,
+            // a relative vs. absolute form, etc.), which a plain string comparison
+            // would miss. `canonicalize()` is a cheap stat-based syscall, not a
+            // spawn, so falling back to the raw path on failure (e.g. it vanished
+            // between `which` returning and this call) only loses the dedupe.
             let already_seen = already_probed.contains(&resolved)
                 || resolved.canonicalize().is_ok_and(|c| {
                     already_probed
@@ -521,7 +508,7 @@ pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
 /// access) so tests can drive the message-building logic directly with a
 /// synthetic `missing` list instead of depending on which of `npm`,
 /// `dotnet`, `go`, etc. happen to be installed on the machine running the
-/// test suite (#918) — mirrors the `install_cmd_with(rustup_available:
+/// test suite — mirrors the `install_cmd_with(rustup_available:
 /// bool)` split already used in `extensions.rs` for the same reason.
 ///
 /// `pub` (rather than crate-private) so `tests/extensions.rs` — a separate
@@ -531,7 +518,7 @@ pub fn missing_dependency_message(
     missing: &[&str],
 ) -> String {
     let name = manifest.display_or_name();
-    // #918: naming the missing binary alone ("requires npm — install npm
+    // Naming the missing binary alone ("requires npm — install npm
     // and try again") tells the user what's missing but not what to
     // actually run. Attach a runnable, platform-specific command for the
     // prerequisites shared across the registry (npm, dotnet, go, gem,
@@ -560,7 +547,7 @@ pub fn missing_dependency_message(
 /// long after the last work item ends, so the indicator doesn't flicker
 /// bright during the gaps between rust-analyzer's progress phases.
 /// 3 seconds is roughly the longest gap observed between Fetching → end
-/// and Indexing → begin on a cold workspace start (#450).
+/// and Indexing → begin on a cold workspace start.
 const PROGRESS_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub struct LspManager {
@@ -581,13 +568,13 @@ pub struct LspManager {
     /// Extension manifests for *installed* extensions only (used for server config lookup).
     ext_manifests: Vec<extensions::ExtensionManifest>,
     /// All extension manifests (installed + available) — used to check if a language is
-    /// covered by an extension, so we don't fall back to the built-in registry for languages
+    /// covered by an extension, so the built-in registry doesn't fall back for languages
     /// that have a (not-yet-installed) extension.
     all_ext_manifests: Vec<extensions::ExtensionManifest>,
     /// Servers that have returned at least one non-empty response (symbols, hover, etc.).
     /// This indicates the server has finished indexing and is truly "ready".
     server_has_responded: HashMap<LspServerId, bool>,
-    /// In-flight `$/progress` tokens per server (#450, enriched in #221).
+    /// In-flight `$/progress` tokens per server.
     /// Vec preserves begin order so `current_progress` can return the
     /// most-recently-begun work item for status-bar display. Populated
     /// by WorkProgressBegin/Report, drained by WorkProgressEnd.
@@ -607,23 +594,18 @@ pub struct LspManager {
     /// Negative cache: languages whose server resolution has already been
     /// attempted and failed, so `ensure_server_for_language` doesn't re-run
     /// the (possibly slow — broken rustup proxy, uninstalled binary) probe
-    /// on every buffer open (#1386). Maps language_id → the error message
+    /// on every buffer open. Maps language_id → the error message
     /// that was produced the first time, so later opens still surface it.
     ///
     /// Populated on *any* `resolve_and_start_server` failure, not only
     /// "binary could not be resolved" — a transient `LspServer::start`
     /// spawn failure on an already-resolved binary (resource exhaustion,
-    /// permissions) is cached too, so it no longer gets a silent retry on
-    /// the next open the way it did before #1386. That's a deliberate
-    /// trade-off in favor of a bounded probe cost: an explicit
-    /// `:LspRestart` (`restart_server_for_language`), reinstalling the
-    /// extension (`add_registry_entry`), or the extension set changing
-    /// (`set_ext_manifests`) all clear the affected entry/entries and let
-    /// the next open re-probe.
+    /// permissions) is cached too. Cleared by `:LspRestart`,
+    /// `add_registry_entry`, or when the extension set changes (`set_ext_manifests`).
     failed_language_resolutions: HashMap<String, Option<String>>,
 }
 
-/// Snapshot of a `$/progress` work item shown in the status bar (#221).
+/// Snapshot of a `$/progress` work item shown in the status bar.
 /// Title is set at begin time (e.g. "Indexing"); message and percentage
 /// are updated by interim "report" notifications.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -659,20 +641,16 @@ impl LspManager {
         self.server_has_responded.insert(server_id, true);
     }
 
-    /// Record that a `$/progress` work item has begun on a server
-    /// (#450, enriched with title/message/percentage in #221).
+    /// Record that a `$/progress` work item has begun on a server.
     /// Duplicate begin for the same token replaces the existing entry —
     /// servers shouldn't do this, but be defensive.
     ///
     /// Returns `true` if this actually changed the tracked snapshot (a new
     /// token, or a duplicate begin whose payload differs from what was
     /// already stored) — `false` for a byte-identical duplicate begin.
-    /// #1583: the caller (`Engine::poll_lsp`) uses this to decide whether a
-    /// redraw is warranted; unconditionally redrawing on every `$/progress`
-    /// notification — including ones a chatty server repeats with identical
-    /// payloads — forced a full repaint far more often than the on-screen
-    /// status segment (the only thing this data feeds) ever actually
-    /// changed.
+    /// The caller uses this to decide whether a redraw is warranted; a
+    /// server that repeats identical payloads must not force a redraw when
+    /// the on-screen status segment hasn't changed.
     #[must_use]
     pub fn work_progress_begin(
         &mut self,
@@ -700,15 +678,12 @@ impl LspManager {
     }
 
     /// Update an in-flight work item's message/percentage from a
-    /// `$/progress` "report" notification (#221). Silently ignored if
+    /// `$/progress` "report" notification. Silently ignored if
     /// the token isn't tracked.
     ///
     /// Returns `true` only if the stored message or percentage actually
-    /// changed value (#1583 — see [`Self::work_progress_begin`]'s doc for
-    /// why this matters: a server that re-reports the same message/
-    /// percentage repeatedly — or reports on a token this manager never
-    /// tracked — must not force a redraw the on-screen status text can't
-    /// show any change for).
+    /// changed value — a server that re-reports the same message/percentage
+    /// repeatedly, or reports on a token never tracked, must not force a redraw.
     #[must_use]
     pub fn work_progress_report(
         &mut self,
@@ -735,14 +710,13 @@ impl LspManager {
         changed
     }
 
-    /// Record that a `$/progress` work item has ended on a server (#450).
+    /// Record that a `$/progress` work item has ended on a server.
     /// Only updates the cooldown timestamp if we actually had this token
     /// tracked — a stray `end` for an unknown token (race / bug on the
     /// server side) shouldn't extend the dim state.
     ///
-    /// Returns `true` if a tracked token was actually removed (#1583 — a
-    /// stray `end` for a token already gone is a genuine no-op, not just a
-    /// cooldown-timestamp no-op, and must not force a redraw either).
+    /// Returns `true` if a tracked token was actually removed — a stray `end`
+    /// for a token already gone is a no-op and must not force a redraw either.
     #[must_use]
     pub fn work_progress_end(&mut self, server_id: LspServerId, token: &str) -> bool {
         let removed = self
@@ -782,7 +756,7 @@ impl LspManager {
         false
     }
 
-    /// Return the most-recently-begun progress item for a server (#221).
+    /// Return the most-recently-begun progress item for a server.
     /// Used by the status bar to format `name • title: message` while
     /// the server is indexing. Returns None when no progress is open.
     pub fn current_progress(&self, server_id: LspServerId) -> Option<&LspProgress> {
@@ -794,7 +768,7 @@ impl LspManager {
 
     /// Look up the server handling a given language. Public accessor so
     /// the engine can correlate buffer-language → server_id for things
-    /// like `is_indexing` (#450).
+    /// like `is_indexing`.
     pub fn server_id_for_language(&self, lang: &str) -> Option<LspServerId> {
         self.language_to_server.get(lang).copied()
     }
@@ -882,7 +856,7 @@ impl LspManager {
     ) {
         self.ext_manifests = installed;
         self.all_ext_manifests = all;
-        // #1386: the extension set changing can change what
+        // The extension set changing can change what
         // `ensure_server_for_language` resolves to (a newly installed
         // extension, a different manifest's dependencies) — stale negative
         // cache entries would otherwise block the new resolution forever.
@@ -893,15 +867,13 @@ impl LspManager {
     /// if a server is available (or was just started), None if no config exists
     /// or the binary is not on PATH/Mason bin.
     ///
-    /// #1386: a failed resolution (e.g. a broken rustup proxy that takes
+    /// A failed resolution (e.g. a broken rustup proxy that takes
     /// 200-300ms to fail its `--version` probe) is remembered in
     /// `failed_language_resolutions` so repeat opens of files in the same
     /// language don't pay the probe cost again — a single file open already
-    /// calls this twice (did-open + semantic tokens), and every subsequent
-    /// open of the same language used to re-run the full probe from
-    /// scratch. The cache is cleared by `set_ext_manifests`,
-    /// `add_registry_entry`, `restart_server_for_language` and
-    /// `stop_server_for_language` — anything that could change the outcome.
+    /// calls this twice (did-open + semantic tokens). The cache is cleared by
+    /// `set_ext_manifests`, `add_registry_entry`, `restart_server_for_language`
+    /// and `stop_server_for_language` — anything that could change the outcome.
     pub fn ensure_server_for_language(&mut self, language_id: &str) -> Option<LspServerId> {
         // Already running?
         if let Some(&id) = self.language_to_server.get(language_id) {
@@ -976,7 +948,7 @@ impl LspManager {
         {
             Some(pair) => pair,
             None => {
-                // #436: surface an actionable hint instead of falling through
+                // Surface an actionable hint instead of falling through
                 // to the generic "No LSP server found" message.  When the
                 // matching extension manifest has an install command, tell
                 // the user exactly what to run.
@@ -986,16 +958,11 @@ impl LspManager {
                     let install_cmd = manifest.lsp.install_cmd_for_platform();
                     let name = manifest.display_or_name();
                     self.last_start_error = Some(if !install_cmd.is_empty() {
-                        // #918 review follow-up: branch only on `install_cmd`
-                        // being present, not also on `manifest.lsp.binary`
-                        // being non-empty. The old `&&` condition discarded a
-                        // real, resolvable install command whenever a
-                        // manifest happened to have an empty `lsp.binary`
-                        // field, silently falling to the generic "no install
-                        // command" message below even though one *was*
-                        // known. Fall back to the extension's display name
-                        // for the "not found" label in that edge case
-                        // instead of printing an empty binary name.
+                        // Branch only on `install_cmd` being present, not also on
+                        // `manifest.lsp.binary` being non-empty. Check whether the
+                        // binary field is empty and fall back to the extension's
+                        // display name for the label instead of printing an empty
+                        // binary name.
                         let binary_label = if manifest.lsp.binary.is_empty() {
                             name
                         } else {
@@ -1003,14 +970,8 @@ impl LspManager {
                         };
                         format!("{binary_label} not found. Run: {install_cmd}")
                     } else {
-                        // #918: previously this branch fell through to
-                        // `return None` with `last_start_error` left
-                        // untouched, so the user saw the generic "No
-                        // LSP server found" with no hint an extension
-                        // was even involved (`java` hits this on every
-                        // platform — no install command anywhere in
-                        // its manifest). Always name the extension and
-                        // say plainly that it has no installer here.
+                        // When there is no install command, name the extension and
+                        // say plainly that it has no installer on this platform.
                         format!(
                             "{name} extension declares no LSP install command for this \
                              platform — install its language server manually."
@@ -1035,10 +996,8 @@ impl LspManager {
                 Some(id)
             }
             Err(e) => {
-                // #436: previously the error was silently dropped, so
-                // :LspInfo just said "No LSP servers running" with no
-                // hint that the spawn failed.  Surface the error message
-                // and log it so the next debug session is one step ahead.
+                // Surface spawn errors so the user sees why the server failed to start,
+                // rather than a generic "No LSP servers running".
                 install_log(&format!(
                     "[lsp-start] FAILED for {} (lang={language_id}): {e}",
                     config.command
@@ -1051,7 +1010,7 @@ impl LspManager {
 
     /// Add a server config to the in-memory registry (does not persist to disk).
     pub fn add_registry_entry(&mut self, config: LspServerConfig) {
-        // #1386: a fresh registry entry (e.g. just installed via
+        // A fresh registry entry (e.g. just installed via
         // :ExtInstall) can resolve where the old candidate list couldn't —
         // drop any negative-cache entries for the languages it covers so
         // the next `ensure_server_for_language` actually re-probes.
@@ -1076,16 +1035,8 @@ impl LspManager {
             ));
 
             // Run via shell so npm/pip/dotnet etc. resolve from user PATH.
-            // `shell_cmd()` (#1492, built on quadraui#970's `shell_command()`)
-            // picks `sh -c` vs `cmd /C` and hides the console window on
-            // Windows — the single construction point every shell spawn
-            // site now goes through, so this call site can't drift from
-            // the others.
-            //
-            // #948 review (non-blocking): no dedicated regression test for
-            // this call site — same identical `shell_cmd()` pattern
-            // already covered by `:!`'s tests, so a future divergence here
-            // wouldn't be caught by this PR's tests.
+            // `shell_cmd()` picks `sh -c` vs `cmd /C` and hides the console window
+            // on Windows — the single construction point every shell spawn site goes through.
             let result = crate::core::terminal::shell_cmd(&install_cmd).output();
 
             match result {
@@ -1135,16 +1086,13 @@ impl LspManager {
         });
     }
 
-    /// Test-only event injection (#1583): pushes a synthetic [`LspEvent`]
+    /// Test-only event injection: pushes a synthetic [`LspEvent`]
     /// through the exact channel a real spawned server would use, so a
     /// driver-tier test can exercise `Engine::poll_lsp`'s redraw decision
     /// against real event plumbing (`poll_events` → the event match in
     /// `Engine::poll_lsp`) instead of calling e.g. `work_progress_report`
-    /// directly — which would bypass `poll_lsp` (and its redraw-worthiness
-    /// decision) entirely. See
-    /// `tui_main::app_on_tui_tests`'s `idle_ticks_with_repeated_lsp_progress_*`
-    /// tests, which use this to prove a chatty server that repeats an
-    /// identical `$/progress` payload no longer forces a redraw every time.
+    /// directly — which would bypass `poll_lsp` and its redraw-worthiness
+    /// decision entirely.
     #[cfg(test)]
     pub(crate) fn test_send_event(&self, event: LspEvent) {
         let _ = self.event_tx.send(event);
@@ -1466,7 +1414,7 @@ impl LspManager {
 
     /// Shutdown and restart the server for a given language.
     pub fn restart_server_for_language(&mut self, language_id: &str) -> Option<LspServerId> {
-        // #1386: an explicit restart is a request to re-probe, even if a
+        // An explicit restart is a request to re-probe, even if a
         // prior resolution attempt failed and was cached.
         self.failed_language_resolutions.remove(language_id);
         // Shutdown existing
@@ -1518,7 +1466,7 @@ impl LspManager {
 
     /// Stop the server for a given language.
     pub fn stop_server_for_language(&mut self, language_id: &str) {
-        // #1386: also let a subsequent open re-probe rather than reusing a
+        // Also let a subsequent open re-probe rather than reusing a
         // stale negative-cache entry from before the server was started.
         self.failed_language_resolutions.remove(language_id);
         if let Some(&server_id) = self.language_to_server.get(language_id) {
@@ -1640,7 +1588,7 @@ impl Drop for LspManager {
 mod tests {
     use super::*;
 
-    // #450 / #221: progress_data lifecycle. Without a real LSP server we
+    // Progress_data lifecycle. Without a real LSP server we
     // drive the helpers directly — that's all the indicator's gate
     // consults.
     #[test]
@@ -1711,7 +1659,7 @@ mod tests {
         );
     }
 
-    // ─── #221: LspProgress accessors ────────────────────────────────────
+    // ─── LspProgress accessors ──────────────────────────────────────
     #[test]
     fn current_progress_is_none_when_idle() {
         let mgr = LspManager::new(PathBuf::from("."), &[]);
@@ -1761,15 +1709,12 @@ mod tests {
         assert!(mgr.current_progress(sid).is_none());
     }
 
-    // ─── #1583: idempotent progress must not report "changed" ─────────────
+    // ─── Idempotent progress must not report "changed" ──────────────
     //
-    // A chatty server (or one confused about a workspace root, as rust-
-    // analyzer can be for a file outside any Cargo project) resends the
-    // exact same $/progress payload repeatedly. `Engine::poll_lsp` uses
-    // these `bool` returns to decide whether a redraw is warranted — before
-    // this fix they didn't exist at all, and every notification forced one
-    // regardless of whether the stored snapshot (the only thing a redraw
-    // could possibly repaint differently) changed.
+    // A chatty server resends the exact same $/progress payload repeatedly.
+    // `Engine::poll_lsp` uses these `bool` returns to decide whether a redraw
+    // is warranted. Every notification must not force one if the stored snapshot
+    // (the only thing a redraw could possibly repaint differently) hasn't changed.
 
     #[test]
     fn work_progress_begin_reports_changed_only_on_first_call() {
@@ -1872,19 +1817,15 @@ mod tests {
         assert_eq!(p.title, "Fetching");
     }
 
-    // ─── #1386: negative-cache / probe-dedup coverage ──────────────────────
+    // ─── Negative-cache / probe-dedup coverage ──────────────────────
     //
     // A rustup proxy for an uninstalled component exists on disk in
-    // `~/.cargo/bin` but takes real wall-clock time (200-300ms on the
-    // reporting machine) to fail its `--version` probe. Before this fix,
-    // `ensure_server_for_language` re-ran that probe on every call — and one
-    // file open already calls it twice (did-open + semantic tokens) — so N
-    // opens of an unresolvable language cost 2N (or 4N counting
-    // `resolve_command`'s own tool-dirs-loop + `which` duplicate probe of
-    // the same path) subprocess spawns instead of one. These tests fake the
-    // proxy with a script that records each invocation to a counter file
-    // and exits non-zero, so the assertions are on an invocation count —
-    // never on wall-clock time.
+    // `~/.cargo/bin` but takes real wall-clock time (200-300ms) to fail its
+    // `--version` probe. Before caching, `ensure_server_for_language` re-ran
+    // that probe on every call — one file open already calls it twice (did-open +
+    // semantic tokens) — so N opens cost 2N subprocess spawns instead of one.
+    // These tests fake the proxy with a script that records each invocation to a
+    // counter file and exits non-zero, so assertions are on invocation count.
 
     /// Build `<home>/.cargo/bin/<binary_name>` as a script that appends a
     /// line to `counter_file` on every invocation and exits non-zero —
@@ -1918,29 +1859,11 @@ mod tests {
             std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        // #523 smoke follow-up — burn the `ETXTBSY` window before any
-        // counting starts.
-        //
-        // A *freshly written* executable can transiently fail to `exec` on
-        // Linux with `ETXTBSY`: `fs::write` above holds a writable fd on this
-        // file for a microsecond or two, and any of the ~3900 other `--lib`
-        // tests sharing this process can `fork` inside that window. The
-        // forked child inherits the writable fd and keeps the kernel's
-        // "open for writing" count above zero until it `exec`s, and while
-        // that lasts, exec'ing this script fails.
-        //
-        // That matters here because `cargo_bin_probe_ok` treats a failed
-        // *spawn* exactly like a failed *probe*: it logs and returns `false`
-        // without the script ever running, so the invocation counter the
-        // tests below assert on silently reads one short. The result is a
-        // load-dependent flake that only shows up when the machine is busy
-        // (i.e. on the coordinator's Test stage, never in an isolated run).
-        //
-        // So: run the proxy here until it genuinely execs, then truncate the
-        // counter file. Once this loop succeeds no writable fd to the file
-        // exists anywhere and none can reappear (nothing reopens it), so
-        // every later probe is guaranteed to reach the script. Assertions
-        // downstream are unchanged — they still start counting from zero.
+        // Ensure the script is executable before testing — a freshly written
+        // executable can transiently fail to `exec` on Linux with `ETXTBSY` when
+        // other processes have the file open for writing. Run it here until it
+        // genuinely execs, then truncate the counter file so later probes start
+        // counting from zero.
         let mut execd = false;
         for _ in 0..200 {
             if std::process::Command::new(&binary_path)
@@ -1996,9 +1919,7 @@ mod tests {
         let counter_file = counter_dir.join("probes.log");
 
         let home = fake_cargo_bin_broken_proxy("cache", binary_name, &counter_file);
-        // Thread-local, not `set_var("HOME", …)` — see
-        // `core::paths::TEST_HOME_OVERRIDE` for why the process-global
-        // version corrupts concurrently-running tests (#957 smoke).
+        // Thread-local home override — see `core::paths::TEST_HOME_OVERRIDE`.
         let _home_guard = crate::core::paths::set_test_home(&home);
 
         let mut mgr = LspManager::new(
@@ -2046,7 +1967,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&counter_dir);
     }
 
-    /// #1386: `resolve_command` must not probe the same path twice within
+    /// `resolve_command` must not probe the same path twice within
     /// one call — once via the `extra_tool_dirs` loop, again via `which`
     /// resolving to that identical path (which is exactly what happens for
     /// a real rustup proxy: it lives in `~/.cargo/bin` *and* is normally on

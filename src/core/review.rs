@@ -1,12 +1,9 @@
-//! The change-review surface (#955, shared with #525): a source-agnostic
-//! list of proposed file changes, rendered through `quadraui::DiffView`.
+//! The change-review surface: a source-agnostic list of proposed file
+//! changes, rendered through `quadraui::DiffView`.
 //!
-//! Neither #955 (ACP tool-call diffs) nor #525 (git branch diff review)
-//! owns this — whichever lands first builds it, the other consumes it.
-//! #955 lands it: [`ProposedChange`] carries nothing ACP-specific (just
-//! `path`/`old_text`/`new_text`), so a git-derived feeder for #525
-//! constructs the exact same struct from `git diff` output instead of a
-//! `session/update` `diff` content block. See this module's
+//! [`ProposedChange`] carries nothing source-specific (just `path`/`old_text`/
+//! `new_text`), so both ACP-derived and git-derived feeders construct the
+//! exact same struct from their respective inputs. See this module's
 //! `builds_from_a_hand_rolled_non_acp_change_list` test for a non-ACP feed
 //! proving the point.
 //!
@@ -18,27 +15,19 @@
 
 use quadraui::{DiffEditability, DiffMode, DiffPane, DiffView};
 
-/// One proposed change to a single file — source-agnostic: a git-branch
-/// diff (#525) and an ACP turn's tracked writes (#1460, via
-/// `crate::core::engine::acp_turn_ops::Engine::acp_open_turn_review`) both
-/// construct this the same way. `old_text: None` marks a new file (no left
-/// side at all) — distinct from `Some(String::new())` (an existing, empty
-/// file), though [`ChangeReviewEntry::new`] diffs both the same way
-/// (`compute_hunks` against `""`).
+/// One proposed change to a single file — source-agnostic: both git-branch
+/// diffs and ACP turn's tracked writes construct this the same way.
+/// `old_text: None` marks a new file (no left side at all) — distinct from
+/// `Some(String::new())` (an existing, empty file), though
+/// [`ChangeReviewEntry::new`] diffs both the same way (`compute_hunks`
+/// against `""`).
 ///
-/// **Both `old_text` and `new_text` must be whole-file content by the time
-/// they land here** — never a fragment/snippet. #1454 first stated this
-/// contract for a since-retired feeder (a `diff` ACP tool-call content
-/// block, resolved fragment-against-current-content before landing here);
-/// #1516 retired that feeder outright (a `diff` block is display-only per
-/// the ACP spec — see `crate::core::engine::acp_ops::Engine::
-/// acp_upsert_tool_call`'s doc for why), but the whole-file contract itself
-/// stays, since every remaining feeder already only ever constructs a
-/// `ProposedChange` from real whole-file content (a `git show` for #525, a
-/// tracked turn's pre/post content for #1460) — this is what makes both the
-/// accept-write (`Engine::change_review_accept_current`, which writes
-/// `new_text` as the entire file) and the `DiffView` this module builds
-/// correct at once, rather than each needing its own fragment-awareness.
+/// **Both `old_text` and `new_text` must be whole-file content** — never a
+/// fragment/snippet. Every feeder constructs a `ProposedChange` from real
+/// whole-file content (a `git show` or a tracked turn's pre/post content),
+/// which is what makes both the accept-write (`Engine::change_review_accept_current`,
+/// which writes `new_text` as the entire file) and the `DiffView` this module
+/// builds correct at once.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProposedChange {
     pub path: String,
@@ -56,15 +45,13 @@ pub enum ChangeDecision {
     Rejected,
 }
 
-/// A single pinned review comment (#527, Track A Phase 3): a short note
-/// anchored to one file/line within an open [`ChangeReviewState`],
-/// collected into [`ChangeReviewState::comments`] and folded into the
-/// verdict body #526 composes (via [`markdown_findings_serializer`], or
-/// whichever [`FindingsSerializer`] the host has installed). `file` is
-/// whatever path the reviewed [`ProposedChange`] itself carries (the same
-/// string [`ChangeReviewEntry::change`]'s `path` uses — not necessarily
-/// absolute), `line` is 1-based, matching every other line number this
-/// module already hands out (`row_to_location`, `DiffHunk::left_start`/
+/// A single pinned review comment: a short note anchored to one file/line
+/// within an open [`ChangeReviewState`], collected into
+/// [`ChangeReviewState::comments`] and folded into the verdict body.
+/// `file` is whatever path the reviewed [`ProposedChange`] itself carries
+/// (the same string [`ChangeReviewEntry::change`]'s `path` uses — not
+/// necessarily absolute), `line` is 1-based, matching every other line number
+/// this module already hands out (`row_to_location`, `DiffHunk::left_start`/
 /// `right_start`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewComment {
@@ -74,7 +61,7 @@ pub struct ReviewComment {
 }
 
 /// A verdict on the review as a whole, reported through a provider-declared
-/// command (#526) — distinct from [`ChangeDecision`], which is per-file
+/// command — distinct from [`ChangeDecision`], which is per-file
 /// accept/reject within the diff surface itself. Generic vocabulary: these
 /// are universal code-review terms (GitHub, GitLab, Gerrit all use them),
 /// not any specific pipeline tool's — `src/core/` and `src/render.rs` must
@@ -103,7 +90,7 @@ impl ReviewVerdict {
     }
 }
 
-/// A findings-list serializer (#527): turns the pinned [`ReviewComment`]s
+/// A findings-list serializer: turns the pinned [`ReviewComment`]s
 /// collected on a [`ChangeReviewState`] into the text a verdict composer
 /// buffer is prefilled with. Deliberately just a plain function pointer,
 /// not a hardcoded call — the issue's own acceptance bar is "the findings
@@ -120,17 +107,15 @@ pub type FindingsSerializer = fn(&[ReviewComment]) -> String;
 
 /// The generic default [`FindingsSerializer`]: a Markdown bullet list,
 /// `- **file:line** — text` per finding, under a `## Findings` heading —
-/// the same universal, no-specific-tool's-wire-format bar
-/// [`ReviewVerdict::token`] already holds itself to (every mainstream
-/// review UI renders a Markdown bullet list the same way). Comments are
-/// listed in collection order (the order they were pinned in), not
-/// sorted by file/line — [`ChangeReviewState::comments`] is already a
-/// plain append/edit/delete list, so preserving that order is "no
-/// surprise reordering" for the human proof-reading the composed body
-/// before `:w`.
+/// a source-agnostic format (every mainstream review UI renders a Markdown
+/// bullet list the same way). Comments are listed in collection order (the
+/// order they were pinned in), not sorted by file/line — [`ChangeReviewState::
+/// comments`] is already a plain append/edit/delete list, so preserving that
+/// order is "no surprise reordering" for the human proof-reading the composed
+/// body before `:w`.
 ///
 /// Empty `comments` produces an empty string, so a review with no pinned
-/// findings composes exactly the blank body it did before #527.
+/// findings composes exactly the blank body it did before.
 pub fn markdown_findings_serializer(comments: &[ReviewComment]) -> String {
     if comments.is_empty() {
         return String::new();
@@ -179,7 +164,7 @@ pub struct ChangeReviewEntry {
     pub change: ProposedChange,
     pub view: DiffView,
     pub decision: ChangeDecision,
-    /// Per-hunk decision (#1516), one entry per `view.hunks[i]` — the
+    /// Per-hunk decision, one entry per `view.hunks[i]` — the
     /// granularity a turn review's `a`/`r` (current hunk) and `A`/`R`
     /// (whole file, all of its hunks at once) act on. A branch/proposal
     /// review never reads this field (its `a`/`r` keys stay whole-file,
@@ -191,13 +176,12 @@ pub struct ChangeReviewEntry {
 
 /// Diff hunks for one whole-file `(old, new)` pair — the geometry both
 /// [`ChangeReviewEntry::new`] (an editable, acceptable review surface) and
-/// [`unified_diff_preview_lines`] (a read-only text preview, #1518's ACP
-/// permission dialog) build from, so the two never compute a diff two
-/// different ways for the same content. `old_text: None` is "no left side
-/// at all" (new file) — see `ProposedChange::old_text`'s doc for why this
-/// is not the same as diffing against `""`: `pure_addition_hunks` builds
-/// the addition directly rather than routing through
-/// `quadraui::compute_hunks("", new_text)`.
+/// [`unified_diff_preview_lines`] (a read-only text preview) build from, so
+/// the two never compute a diff two different ways for the same content.
+/// `old_text: None` is "no left side at all" (new file) — see
+/// `ProposedChange::old_text`'s doc for why this is not the same as diffing
+/// against `""`: `pure_addition_hunks` builds the addition directly rather
+/// than routing through `quadraui::compute_hunks("", new_text)`.
 pub fn diff_hunks_for(old_text: Option<&str>, new_text: &str) -> Vec<quadraui::DiffHunk> {
     match old_text {
         None => pure_addition_hunks(new_text),
@@ -215,7 +199,7 @@ pub fn diff_hunks_for(old_text: Option<&str>, new_text: &str) -> Vec<quadraui::D
 /// linearised into a `Vec<String>` instead of painted into a split-pane
 /// widget.
 ///
-/// #1518: this is what lets a `session/request_permission` dialog body
+/// This is what lets a `session/request_permission` dialog body
 /// show the *actual proposed change* for an edit tool call, instead of
 /// only its title/kind/locations — a human was otherwise asked to approve
 /// blind. Deliberately reuses the existing `Dialog`/`DialogButton`
@@ -281,9 +265,8 @@ impl ChangeReviewEntry {
     }
 
     /// Row index (into `self.view.flat_rows()`) where each hunk starts, in
-    /// order — used to derive "the next/previous hunk" from the current
-    /// scroll offset without a separate index field that could drift out
-    /// of sync with it.
+    /// order — used to derive "the next/previous hunk" from the current scroll
+    /// offset without a separate index field that could drift out of sync.
     fn hunk_start_rows(&self) -> Vec<usize> {
         let mut starts = Vec::with_capacity(self.view.hunks.len());
         let mut acc = 0usize;
@@ -296,7 +279,7 @@ impl ChangeReviewEntry {
 
     /// Which hunk (index into `self.view.hunks`/`self.hunk_decisions`) the
     /// surface is currently scrolled to — what a turn review's `a`/`r`
-    /// (#1516) act on. `None` only for a genuinely hunk-less entry (no
+    /// act on. `None` only for a genuinely hunk-less entry (no
     /// real diff at all — shouldn't happen for an entry that exists, but
     /// this stays fallible rather than panicking).
     pub(crate) fn current_hunk_index(&self) -> Option<usize> {
@@ -316,10 +299,10 @@ impl ChangeReviewEntry {
     }
 
     /// The scroll-offset row of the first hunk still `Pending` in
-    /// [`Self::hunk_decisions`], if any — how a whole-file/whole-review
-    /// hunk sweep (`A`/`R`, `ga`/`gr`, #1516) walks every remaining hunk by
-    /// repeatedly moving "the cursor" to it and reusing the single-hunk
-    /// operation, rather than duplicating the hunk-reconstruction logic.
+    /// [`Self::hunk_decisions`], if any — how a whole-file/whole-review hunk
+    /// sweep walks every remaining hunk by repeatedly moving "the cursor" to it
+    /// and reusing the single-hunk operation, rather than duplicating the
+    /// hunk-reconstruction logic.
     pub(crate) fn first_pending_hunk_row(&self) -> Option<usize> {
         let starts = self.hunk_start_rows();
         self.hunk_decisions
@@ -333,7 +316,7 @@ impl ChangeReviewEntry {
     /// `self.change.new_text`) back to its left-side (pre-turn) text —
     /// every other line, inside or outside any other hunk, is left exactly
     /// as `new_text` already has it. `None` if `hunk_idx` is out of range.
-    /// The core mechanism behind hunk-level reject (#1516): reusing the
+    /// The core mechanism behind hunk-level reject: reusing the
     /// exact rows already computed for painting (`self.view.hunks`) rather
     /// than re-deriving the diff a second way, so "what reject undoes" can
     /// never disagree with "what the surface is showing".
@@ -356,22 +339,20 @@ impl ChangeReviewEntry {
     }
 
     /// Recompute this entry's `view`/`hunks` from `self.change.old_text`
-    /// (immutable across the review's life) against `new_text` (the file's
-    /// fresh content after a hunk decision changed it, #1516) — reusing
-    /// [`Self::new`]'s exact construction so the rebuilt view can never
-    /// disagree with a freshly-opened one. `id_suffix` is only ever used
-    /// for the rebuilt `DiffView`'s widget id, which is then overwritten
-    /// with `self.view.id`'s original value, so a caller doesn't need to
-    /// track a globally-unique suffix — just something to pass through.
+    /// (immutable across the review's life) against `new_text` (the file's fresh
+    /// content after a hunk decision changed it) — reusing [`Self::new`]'s exact
+    /// construction so the rebuilt view can never disagree with a freshly-opened
+    /// one. `id_suffix` is only ever used for the rebuilt `DiffView`'s widget id,
+    /// which is then overwritten with `self.view.id`'s original value, so a
+    /// caller doesn't need to track a globally-unique suffix — just something to
+    /// pass through.
     ///
-    /// Every hunk decision already made is carried forward by matching
-    /// hunks on `left_start` — a position within the *immutable* pre-turn
-    /// text, so it stays a stable identity no matter how much a rejected
-    /// hunk elsewhere in the file shifts every later hunk's right-side line
-    /// numbers. A hunk whose `left_start` no longer appears at all (the
-    /// diff against it has disappeared — the common case right after that
-    /// exact hunk was itself just rejected) is simply gone, nothing to
-    /// carry forward.
+    /// Every hunk decision already made is carried forward by matching hunks on
+    /// `left_start` — a position within the *immutable* pre-turn text, so it
+    /// stays a stable identity no matter how much a rejected hunk elsewhere in
+    /// the file shifts every later hunk's right-side line numbers. A hunk whose
+    /// `left_start` no longer appears at all (the diff against it has disappeared)
+    /// is simply gone, nothing to carry forward.
     pub(crate) fn refresh_after_edit(&mut self, id_suffix: usize, new_text: String) {
         let carried: Vec<(usize, ChangeDecision)> = self
             .view
@@ -404,7 +385,7 @@ impl ChangeReviewEntry {
     /// Roll [`Self::hunk_decisions`] up into the whole-file
     /// [`Self::decision`] every branch/proposal-review code path (auto-
     /// close, the footer's "(pending/accepted/rejected)" label) already
-    /// reads — so hunk-level decisions (#1516) stay compatible with that
+    /// reads — so hunk-level decisions stay compatible with that
     /// existing generic machinery instead of it needing its own
     /// hunk-awareness. `Pending` while any hunk is undecided; once every
     /// hunk has a decision, `Accepted` unless *every* hunk was rejected (in
@@ -439,27 +420,23 @@ impl ChangeReviewEntry {
 pub struct ChangeReviewState {
     pub entries: Vec<ChangeReviewEntry>,
     pub current: usize,
-    /// Pinned line comments collected while this review is open (#527,
-    /// Track A Phase 3) — provider-agnostic, in pin order. Never sorted or
-    /// deduplicated automatically; [`Self::comment_index_at`] is how a
-    /// caller finds "the comment already on this line" to edit/delete
+    /// Pinned line comments collected while this review is open — provider-agnostic,
+    /// in pin order. Never sorted or deduplicated automatically; [`Self::comment_index_at`]
+    /// is how a caller finds "the comment already on this line" to edit/delete
     /// rather than accumulating duplicates.
     pub comments: Vec<ReviewComment>,
-    /// Transient two-key sequence state for `ga`/`gr` (#1516, "reject/keep
-    /// every remaining hunk in every file"): set by a bare `g` keypress,
-    /// consumed (and cleared) by the very next keypress regardless of
-    /// whether that key completes the sequence — mirrors vim's own
-    /// g-prefix contract (an unrecognised follow-up key is handled fresh,
-    /// never silently swallowed). Lives here, not on `Engine`, since it's
-    /// UI input state scoped entirely to this surface being open.
+    /// Transient two-key sequence state for `ga`/`gr` ("reject/keep every remaining
+    /// hunk in every file"): set by a bare `g` keypress, consumed (and cleared) by
+    /// the very next keypress regardless of whether that key completes the sequence —
+    /// mirrors vim's own g-prefix contract (an unrecognised follow-up key is handled
+    /// fresh, never silently swallowed). Lives here, not on `Engine`, since it's UI
+    /// input state scoped entirely to this surface being open.
     pub pending_g: bool,
 }
 
 impl ChangeReviewState {
-    /// Build a fresh review surface from `changes`. Callers (both #955's
-    /// ACP feeder and any future #525 git feeder) should only call this
-    /// with a non-empty list — an empty one produces a surface with
-    /// nothing to show.
+    /// Build a fresh review surface from `changes`. Callers should only call this
+    /// with a non-empty list — an empty one produces a surface with nothing to show.
     pub fn new(changes: Vec<ProposedChange>) -> Self {
         let entries = changes
             .into_iter()
@@ -664,22 +641,15 @@ pub(crate) fn row_to_location(entry: &ChangeReviewEntry, row_idx: usize) -> Opti
 }
 
 /// Build a copy of `entry.view` with any [`ReviewComment`]s pinned to
-/// `entry.change.path` appended inline to their row's rendered text — the
-/// "existing line-annotation / virtual-text channel" #527 names
-/// (`src/core/engine/plugins.rs`'s `ctx.annotate_lines` -> `RenderedLine::
-/// annotation`) reused for the diff surface: extra text spliced into what
-/// gets *painted*, never touching the underlying [`ProposedChange`]/diff
-/// data itself, same "virtual, not real" contract that channel already
-/// holds for the plain editor buffer. `quadraui::DiffRow` has no
-/// dedicated annotation slot (unlike `RenderedLine`), so the text is
-/// appended directly onto the row's `right` (or `left`, for a pure-removal
-/// row with no right side) string — since `draw_diff_view` takes ordinary
-/// row text, this is the whole mechanism, no backend-specific code on
-/// either side needed.
+/// `entry.change.path` appended inline to their row's rendered text — extra
+/// text spliced into what gets *painted*, never touching the underlying
+/// [`ProposedChange`]/diff data itself. `quadraui::DiffRow` has no dedicated
+/// annotation slot, so the text is appended directly onto the row's `right`
+/// (or `left`, for a pure-removal row with no right side) string.
 ///
-/// Returns a borrowed `Cow` when there is nothing to add (no comments at
-/// all, or none on this file) — the common case, so a review with no
-/// pinned findings costs no per-frame clone.
+/// Returns a borrowed `Cow` when there is nothing to add (no comments at all,
+/// or none on this file) — the common case, so a review with no pinned findings
+/// costs no per-frame clone.
 pub fn view_with_inline_comments<'a>(
     comments: &[ReviewComment],
     entry: &'a ChangeReviewEntry,
@@ -812,7 +782,7 @@ mod tests {
         );
     }
 
-    // ── hunk-level machinery (#1516) ────────────────────────────────────
+    // ── hunk-level machinery ────────────────────────────────────────────
 
     /// Two well-separated changes land in two hunks, each starting with a
     /// fresh `hunk_decisions` entry all `Pending` — the ground state
@@ -943,7 +913,7 @@ mod tests {
 
     /// Rejecting the single hunk of a brand-new file (`old_text: None`)
     /// reconstructs to an empty string — the "nothing left, this is really
-    /// a delete" signal the engine-level reject uses (#1516).
+    /// a delete" signal the engine-level reject uses.
     #[test]
     fn content_with_hunk_reverted_is_empty_for_a_new_files_only_hunk() {
         let state = ChangeReviewState::new(vec![change("new.rs", None, "fn main() {}\n")]);
@@ -1028,8 +998,6 @@ mod tests {
         assert_eq!(state.entries[1].change.new_text, "z");
     }
 
-    // ── #527 Track A Phase 3: pinned line comments ────────────────────
-
     #[test]
     fn new_review_starts_with_no_comments() {
         let state = ChangeReviewState::new(vec![change("f", Some("a"), "b")]);
@@ -1102,10 +1070,8 @@ mod tests {
         assert!(state.delete_comment(0).is_none(), "already empty");
     }
 
-    /// #527 acceptance: "render pinned comments inline". Asserted on the
-    /// rendered `DiffView` text a backend would actually paint, not on
-    /// `comments` being populated — a comment pinned to a row must show
-    /// up spliced into that exact row's content, not some other row's.
+    /// Asserts that pinned comments render inline: a comment pinned to a row must
+    /// show up spliced into that exact row's content, not some other row's.
     #[test]
     fn view_with_inline_comments_splices_text_into_the_right_row() {
         let state = ChangeReviewState::new(vec![change("f.rs", Some("a\nb\nc\n"), "a\nB\nc\n")]);
@@ -1187,11 +1153,10 @@ mod tests {
         assert!(body.contains("second"));
     }
 
-    /// #527's own acceptance bar: "the findings serializer is pluggable,
-    /// not hardcoded to one provider's format" — proven here by two
-    /// different [`FindingsSerializer`]s producing two different bodies
-    /// from the identical `Vec<ReviewComment>`, both reachable through the
-    /// same `FindingsSerializer` function-pointer type.
+    /// Proves the findings serializer is pluggable, not hardcoded to one provider's
+    /// format — two different [`FindingsSerializer`]s produce two different bodies
+    /// from the identical `Vec<ReviewComment>`, both reachable through the same
+    /// function-pointer type.
     #[test]
     fn findings_serializer_is_pluggable_not_a_single_hardcoded_format() {
         fn plain_csv(comments: &[ReviewComment]) -> String {

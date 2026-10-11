@@ -1,25 +1,7 @@
-//! #979: `vimcode --help` used to initialize GTK before the flag was even
-//! looked at, so on any host with no `DISPLAY`/`WAYLAND_DISPLAY` (SSH, a
-//! container, CI) it panicked instead of printing usage — the exact repro
-//! from the v0.11.0 release smoke on `dellserver`.
-//!
-//! This spawns the actual compiled `vimcode`/`vcd` binaries (not the
-//! in-process `Args::parse` unit tests in `src/main.rs`, which only pin the
-//! parsing logic and can't observe GTK ever being touched) with
-//! `DISPLAY`/`WAYLAND_DISPLAY` removed — the one condition the original bug
-//! required — and asserts they print usage and exit 0 rather than crashing.
-//!
-//! Observed RED against unfixed `develop`: with the `--help` check removed
-//! from `src/main.rs`'s dispatcher (restoring the pre-fix ordering, where
-//! `--help` fell through to `launch_gui`),
-//! `vimcode_help_prints_usage_and_exits_0_with_no_display` failed — on the
-//! host that reproduced this locally, GTK's own `GApplication` argument
-//! parser intercepted `--help` and printed its generic `[OPTION…]` help
-//! instead of vimcode's usage (the `assert!(stdout.contains("Usage:
-//! vimcode"))` failed); on the release-smoke host in the original report,
-//! the same code path instead panicked in `gtk4::rt::init` ("Failed to
-//! initialize GTK") with a non-zero exit. Either way, `--help` never reaches
-//! the dispatcher's own usage text without the fix.
+//! This test spawns the compiled `vimcode`/`vcd` binary with
+//! `DISPLAY`/`WAYLAND_DISPLAY` removed and asserts it prints usage
+//! and exits 0 rather than panicking or printing GTK's generic help.
+//! The `--help` flag must be processed before any GTK initialization.
 
 use std::process::Command;
 

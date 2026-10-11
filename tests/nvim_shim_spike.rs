@@ -1,39 +1,22 @@
-//! Issue #1213 (Phase 0 of #1212) — go/no-go spike for a pure-Lua `vim.*`
-//! prelude over `vimcode.*`.
+//! A regression test harness for the `vim.*` prelude over `vimcode.*`.
 //!
-//! **This is a spike, not a feature.** The deliverable is the written
-//! go/no-go verdict in the PR description; this file is the measurement
-//! harness that produced it, kept as regression coverage for the specific,
-//! reproducible findings the report cites (both of which are architectural
-//! gaps in `vimcode.*`, confirmed here without touching anything under
-//! `src/`, per #1213's "zero Rust changes" constraint).
+//! This suite verifies two architectural constraints in `vimcode.*` via
+//! direct measurement: the read-after-write staleness in `buf.set_lines`
+//! followed by `buf.get_lines` within a single callback, and the cursor
+//! positioning behavior of the `lastplace` pattern (`BufRead` + `BufWinEnter`
+//! event sequence with a persisted mark).
 //!
-//! ## What's covered here vs. what was measured by hand
+//! ## Test setup
 //!
-//! Step 2 of #1213 ("load `ethanholz/nvim-lastplace` unmodified") was done
-//! for real during the investigation: the actual plugin source was fetched
-//! from GitHub and loaded against both a real Neovim and vimcode +
-//! `contrib/nvim-shim/init.lua`. That is reported in the PR description, not
-//! reproduced here — this suite does not fetch or vendor third-party code,
-//! so it stays hermetic (no network) and does not add a permanent copy of
-//! someone else's plugin to this repo for what is explicitly disposable spike
-//! code. Instead, [`tests/fixtures/nvim_shim/lastplace_like.lua`] is a small,
-//! self-contained reproduction of nvim-lastplace's two load-bearing patterns,
-//! built from only public `vim.*` API — the same file is fed to a real
-//! embedded Neovim ([`run_lastplace_pattern_in_neovim`]) and to
-//! `PluginManager` + the shim ([`run_lastplace_pattern_in_vimcode`]), and the
-//! resulting cursor position is compared, which is the "measured, not
-//! eyeballed" oracle-comparison step #1213 asks for (§4), simplified from
-//! `tests/nvim_conformance.rs`'s full attached-UI RPC transport down to a
-//! single-shot `nvim --headless -l driver.lua` run: this spike needs one
-//! deterministic post-hoc buffer+cursor read, not window-relative redraw
-//! fidelity, so the simpler, pre-#1008 oracle style is a deliberate,
-//! documented choice here — not a regression of that lesson.
+//! The kill test (step 3) is in-process against `PluginManager`, checking
+//! the read-after-write staleness directly: `vimcode.buf.set_lines` queues
+//! onto `ctx.set_lines_range` and is applied only after the callback
+//! returns, while `vimcode.buf.get_lines` reads the pre-call snapshot.
 //!
-//! Step 3 (the kill test) is reproduced directly, in-process, against
-//! `PluginManager` — no oracle needed, since it's a vimcode-only structural
-//! bug (read-after-write staleness), already known-failing by inspection of
-//! `src/core/plugin.rs:810-830` vs `:771-790` before this file existed.
+//! The oracle comparison (step 4) runs [`tests/fixtures/nvim_shim/lastplace_like.lua`]
+//! — a self-contained reproduction of `nvim-lastplace`'s two load-bearing
+//! patterns — against both a real embedded Neovim and `PluginManager` + the shim,
+//! comparing the resulting cursor position.
 //!
 //! ## Requires `nvim` on PATH, same policy as `nvim_conformance.rs`
 //!
@@ -80,23 +63,17 @@ fn fixture_path(name: &str) -> std::path::PathBuf {
 // ---------------------------------------------------------------------------
 
 /// `nvim_buf_set_lines` then immediately `nvim_buf_get_lines`: real Neovim
-/// (and the `vim.*` API contract in general) guarantees read-after-write —
-/// the second call sees the first call's edit. vimcode's plugin ABI does
-/// not: `vimcode.buf.set_lines` queues onto `ctx.set_lines_range`
-/// (`src/core/plugin.rs:807-838`), applied by the engine only *after* the
-/// whole callback returns (`Engine::apply_plugin_ctx`,
-/// `src/core/engine/plugins.rs`), while `vimcode.buf.get_lines` reads the
-/// pre-call `ctx.buf_rope` snapshot (`src/core/plugin.rs:769-805`) — the two
-/// never see each other within one callback.
-///
-/// This was "known to fail by inspection" per #1213's brief; this test pins
-/// the *exact* failure mode: no error, no panic, just a silently stale read
-/// (the old first line, not `"x"`).
+/// guarantees read-after-write — the second call sees the first call's edit.
+/// vimcode's plugin ABI does not: `vimcode.buf.set_lines` queues onto
+/// `ctx.set_lines_range` (`src/core/plugin.rs:807-838`), applied by the engine
+/// only *after* the whole callback returns, while `vimcode.buf.get_lines`
+/// reads the pre-call `ctx.buf_rope` snapshot (`src/core/plugin.rs:769-805`).
+/// This test pins the exact failure mode: no error or panic, just a silently
+/// stale read (the old first line, not `"x"`).
 #[test]
 fn kill_test_set_lines_then_get_lines_is_stale_not_x() {
     let dir = plugin_dir_with_shim("killtest", &fixture_path("lastplace_like.lua"));
-    // A tiny command that performs exactly #1213's kill-test snippet and
-    // reports what it actually saw.
+    // Performs the kill-test snippet: set_lines("x"), then get_lines.
     std::fs::write(
         dir.join("20_killtest.lua"),
         r#"
@@ -133,15 +110,11 @@ fn kill_test_set_lines_then_get_lines_is_stale_not_x() {
     let (found, ctx) = pm.call_command("KillTest", "", ctx);
     assert!(found, "KillTest command did not register");
 
-    // Exact failure mode: get_lines after set_lines within the same callback
-    // returns the PRE-call snapshot, not the just-written "x". This is what
-    // #1213 predicted and what this test proves stays true post-shim: the
-    // prelude cannot paper over this, it's below the Lua boundary.
-    // Note the trailing "\n": `vimcode.buf.get_lines` returns ropey's
-    // `line()` slices verbatim, which include the line terminator — a
-    // second, smaller vimcode.* ABI wart the shim's `nvim_buf_get_lines`
-    // does not paper over. Not the point of this test, but visible in the
-    // assertion below.
+    // get_lines after set_lines returns the PRE-call snapshot, not "x".
+    // This is the expected failure: the prelude cannot paper over the
+    // read-after-write staleness, which is below the Lua boundary.
+    // Note: `vimcode.buf.get_lines` returns ropey's `line()` slices verbatim,
+    // which include the line terminator — see the "\n" in the assertion.
     assert_eq!(
         ctx.message.as_deref(),
         Some("seen=original first line\n"),
@@ -274,9 +247,7 @@ fn nested_autocmd_registration_is_silently_dropped() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Oracle comparison (#1213 step 4): same Lua, real Neovim vs. vimcode+shim.
-// ---------------------------------------------------------------------------
+// Oracle comparison: same Lua, real Neovim vs. vimcode+shim.
 
 fn nvim_available() -> bool {
     Command::new("nvim")
@@ -289,17 +260,9 @@ fn nvim_available() -> bool {
 }
 
 /// Run `tests/fixtures/nvim_shim/lastplace_like.lua` (unmodified, real
-/// `vim.*` API — no shim involved) against a real embedded Neovim: seed a
-/// 5-line buffer, set the `'"'` mark to line 3, fire `BufRead` then
-/// `BufWinEnter` the way opening a file for the second time would, and read
+/// `vim.*` API) against a real embedded Neovim: seed a 5-line buffer, set
+/// the `'"'` mark to line 3, fire `BufRead` then `BufWinEnter`, and read
 /// back the cursor line Neovim landed on.
-///
-/// Deliberately the simpler `nvim --headless -l driver.lua` oracle style
-/// (pre-#1008 in `tests/nvim_conformance.rs`'s terms) rather than the
-/// attached-UI RPC transport: this spike needs one deterministic post-hoc
-/// buffer+cursor read, not window-relative redraw fidelity, so the
-/// documented weaknesses that motivated #1008 (stale `w_topline` etc.) don't
-/// apply to what this test asserts on.
 fn run_lastplace_pattern_in_neovim(tmp: &Path) -> Option<i64> {
     let fixture = fixture_path("lastplace_like.lua");
     let driver = tmp.join("oracle_driver.lua");

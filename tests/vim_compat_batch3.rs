@@ -360,7 +360,7 @@ fn test_rot13_multiline() {
 
 #[test]
 fn test_visual_block_i_with_short_lines() {
-    // #805: `j`/`k` now remember the desired column (`curswant`) through a
+    // `j`/`k` now remember the desired column (`curswant`) through a
     // shorter intervening line instead of losing it — this applies to
     // Visual Block's cursor too, so the block's column stays 3 (matching
     // real Vim: a block selection anchored at column 3 keeps aiming for
@@ -381,13 +381,8 @@ fn test_visual_block_i_with_short_lines() {
     type_chars(&mut e, "|");
     press_key(&mut e, "Escape");
     // Insert at column 3 of the block on lines long enough to reach it.
-    //
-    // #807: the short middle line is **skipped entirely**, not padded. The
-    // padding this test used to assert was a hand-authored guess; `:h v_b_I`
-    // says "if the line is short ... no text is inserted", and the nvim
-    // oracle agrees (`vb:I on short line skipped` in
-    // `tests/nvim_conformance.rs`). Padding is what block `A` does — see
-    // `vb:A on short line padded`.
+    // The short middle line is skipped entirely, not padded.
+    // Block insert (`I`) skips short lines; block append (`A`) pads them.
     assert_buf(&e, "abc|de\nab\nabc|de\n");
 }
 

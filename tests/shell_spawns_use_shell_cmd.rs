@@ -1,22 +1,13 @@
-//! #1492: every "run this string through the user's shell" spawn site must
+//! Every "run this string through the user's shell" spawn site must
 //! go through `core::terminal::shell_cmd()` — the single construction
 //! point that wraps `Command::new(shell)` in `git::hidden_command` so the
 //! console window stays hidden on Win-GUI (`CREATE_NO_WINDOW`).
 //!
-//! Before this issue, `:!`, `:r !`, `!{motion}` filters and plugin shell
-//! requests each hand-rolled `let (shell, flag) = shell_command();
-//! Command::new(shell).arg(flag).arg(cmd)` directly, bypassing
-//! `hidden_command` entirely — only the LSP install-command spawn site
-//! wrapped it (by hand, not through a shared helper). This test guards
-//! against that pattern reappearing at a *new* call site: it greps every
+//! This test guards against directly constructing `Command::new(shell)`
+//! at call sites that should use `shell_cmd()` instead. It greps every
 //! `src/core/**/*.rs` file other than `terminal.rs` itself (which defines
 //! `shell_cmd`) for a literal `Command::new(shell)` / `Command::new(&shell)`
 //! construction — the exact shape that bypasses `hidden_command`.
-//!
-//! Verified RED against unfixed develop: before #1492, this grep matched
-//! three sites (`execute.rs` x2, `windows.rs`) plus a `Command::new(shell)`
-//! in `plugins.rs`, so this test failed loudly instead of passing against
-//! the bug.
 
 use std::path::Path;
 
@@ -70,7 +61,7 @@ fn no_direct_shell_command_construction_outside_terminal_rs() {
     );
 }
 
-/// The five sites named in #1492 must all route through `shell_cmd(`.
+/// All known shell spawn sites must route through `shell_cmd()`.
 #[test]
 fn known_shell_spawn_sites_use_shell_cmd() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));

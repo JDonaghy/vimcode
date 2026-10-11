@@ -71,7 +71,7 @@ impl Engine {
     /// group reverts, which is not always where the (real, on-screen) cursor
     /// happened to be when the group started — e.g. a Visual delete restores
     /// to the start of the selection even though the cursor was sitting at
-    /// the end of it when `d` was pressed (#886). Callers use this to record
+    /// the end of it when `d` was pressed. Callers use this to record
     /// that "correct" position without disturbing the actual view cursor.
     pub fn start_undo_group_at(&mut self, cursor: Cursor) {
         // Save line state before modification (for U command)
@@ -81,13 +81,12 @@ impl Engine {
 
     /// Finish the current undo group for the active buffer, committing it
     /// as a new undo-tree node (see [`BufferState::finish_undo_group`]) if
-    /// it actually changed anything (#804: a no-op call — e.g.
-    /// `split_insert_undo_group` firing on every insert-mode cursor
-    /// movement — must not touch the tree at all).
+    /// it actually changed anything — a no-op call must not touch the tree
+    /// at all.
     pub fn finish_undo_group(&mut self) {
         let cursor = self.view().cursor;
         let committed = self.active_buffer_state_mut().finish_undo_group(cursor);
-        // `:undojoin` (#1156): fold the group that just committed back into
+        // `:undojoin`: fold the group that just committed back into
         // whatever undo step preceded it. Consumed unconditionally — even a
         // no-op `finish_undo_group` call means "the change `:undojoin` was
         // waiting for already happened, or never will", so the mark
@@ -126,7 +125,7 @@ impl Engine {
     /// Insert text with undo recording.
     pub fn insert_with_undo(&mut self, pos: usize, text: &str) {
         // Snapshot before the edit — `char_to_line` needs the pre-insert
-        // buffer to know which line `pos` falls on (#806).
+        // buffer to know which line `pos` falls on.
         let at_line = if text.contains('\n') {
             Some(self.buffer().content.char_to_line(pos))
         } else {
@@ -137,8 +136,7 @@ impl Engine {
         // the cursor line, …). When it does, the ENTIRE original content of
         // `at_line` — including any mark sitting exactly on that line —
         // slides down by the inserted line count, not just marks strictly
-        // below it (#806 review: a mark on the same line `O` is invoked from
-        // was silently left pointing at the new, blank line otherwise).
+        // below it.
         let at_line_start = at_line.is_some_and(|l| pos == self.buffer().line_to_char(l));
         self.active_buffer_state_mut().record_insert(pos, text);
         self.buffer_mut().insert(pos, text);
@@ -156,7 +154,7 @@ impl Engine {
         // at a line boundary — see `shift_marks_for_line_delete` for why that
         // matters and why a mid-line splice (e.g. `J`'s newline removal,
         // handled separately with precise column tracking) must NOT go
-        // through this path (#806).
+        // through this path.
         let at_line = if !self.suppress_mark_line_adjust && deleted_text.contains('\n') {
             Some(self.buffer().content.char_to_line(start))
         } else {
@@ -174,11 +172,7 @@ impl Engine {
     /// Shift every mark strictly below `at_line` down by `line_count` —
     /// real Vim's rule for a full-line insertion (`O`, `o`, `:put`, …): a
     /// mark's column is left alone (Vim never re-derives it from an edit
-    /// elsewhere on the line — verified against real Vim: deleting text
-    /// earlier on a line leaves a mark's stored column unchanged, even
-    /// though it may now point at a different character), only its line
-    /// number moves (#806, "mark:mark shifts after O", "mark:'a after text
-    /// insert above").
+    /// elsewhere on the line), only its line number moves.
     pub(crate) fn shift_marks_for_line_insert(
         &mut self,
         at_line: usize,
@@ -191,7 +185,7 @@ impl Engine {
         // A whole-line insertion (`at_line_start`) pushes `at_line`'s own
         // original content down too, so a mark sitting exactly on `at_line`
         // must shift with it — otherwise it silently points at the new,
-        // inserted (blank) line instead (#806 review).
+        // inserted (blank) line instead.
         let shifts = |line: usize| line > at_line || (at_line_start && line == at_line);
         let buffer_id = self.active_window().buffer_id;
         if let Some(bm) = self.marks.get_mut(&buffer_id) {
@@ -207,18 +201,16 @@ impl Engine {
                 *line += line_count;
             }
         }
-        // #1653: plugin decoration marks (`vimcode.decor.set_mark`) follow
+        // Plugin decoration marks (`vimcode.decor.set_mark`) follow
         // the same full-line-insertion rule as the vim marks just above.
         self.decor
             .shift_insert(buffer_id, at_line, line_count, at_line_start);
     }
 
     /// Shift/remove marks for a full-line deletion covering `[at_line,
-    /// at_line + line_count)`. A mark inside the removed range no longer has
-    /// a line to point at and is unset — real Vim removes it too (`:h
-    /// mark-motions`) — rather than left dangling on whatever line happens
-    /// to have slid into its old slot; a mark below the range shifts up
-    /// (#806, "mark:mark on deleted line").
+    /// at_line + line_count)`. A mark inside the removed range is unset
+    /// rather than left dangling on whatever line happens to have slid into
+    /// its old slot; a mark below the range shifts up.
     pub(crate) fn shift_marks_for_line_delete(&mut self, at_line: usize, line_count: usize) {
         if line_count == 0 {
             return;
@@ -241,7 +233,7 @@ impl Engine {
                 *line -= line_count;
             }
         }
-        // #1653: same full-line-deletion rule for plugin decoration marks.
+        // Same full-line-deletion rule for plugin decoration marks.
         self.decor.shift_delete(buffer_id, at_line, line_count);
     }
 
@@ -249,7 +241,7 @@ impl Engine {
     /// the active buffer's file) as an absolute character offset, using the
     /// buffer as it exists *right now* — call before mutating it. Paired
     /// with `restore_marks_from_offsets`, used by `join_lines` for its
-    /// precise column-aware mark fixup (#806).
+    /// precise column-aware mark fixup.
     pub(crate) fn snapshot_marks_as_offsets(&self) -> (MarkOffsets, MarkOffsets) {
         let buffer_id = self.active_window().buffer_id;
         let local = self
@@ -339,7 +331,7 @@ impl Engine {
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
             self.shift_decor_across_undo_nav(&old_text);
-            // #1787: an undo swaps in an entire prior buffer snapshot, so any
+            // An undo swaps in an entire prior buffer snapshot, so any
             // open completion popup's `completion_candidates` (computed from
             // the pre-undo text, e.g. the whole word the user was mid-typing)
             // is now stale — nothing else re-triggers completion on an undo,
@@ -366,7 +358,7 @@ impl Engine {
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
             self.shift_decor_across_undo_nav(&old_text);
-            // #1787: see the matching comment in `undo` above — a redo swaps
+            // See the matching comment in `undo` above — a redo swaps
             // in a different buffer snapshot too, so the same staleness
             // applies.
             self.dismiss_completion();
@@ -410,7 +402,7 @@ impl Engine {
 
     /// Navigate to an earlier buffer state chronologically (`g-`) — unlike
     /// plain `u`, this crosses into a branch a prior `u` + new edit
-    /// abandoned (#1156).
+    /// abandoned.
     pub fn g_earlier(&mut self) -> bool {
         let old_text = self.buffer().to_string();
         match self.active_buffer_state_mut().undo_older() {
@@ -436,7 +428,7 @@ impl Engine {
         }
     }
 
-    /// `:earlier {count}` / `:earlier {N}[smhd]` (#1156). `spec` is either a
+    /// `:earlier {count}` / `:earlier {N}[smhd]`. `spec` is either a
     /// plain count (steps, like `count` repeated `g-` presses) or a
     /// `{N}[smhd]` time offset (seconds/minutes/hours/days) — see `:h
     /// :earlier`. Returns an error message for a malformed `spec`.
@@ -559,21 +551,21 @@ impl Engine {
         if self.active_buffer_state().is_registries_buf {
             return self.save_registries_buffer();
         }
-        // Provider document buffer (#524): push title/body back through
+        // Provider document buffer: push title/body back through
         // the bound provider's write command instead of disk.
         if self.active_buffer_state().tool_document.is_some() {
             return self.save_tool_document_buffer();
         }
-        // Review verdict composer buffer (#526): report the verdict
+        // Review verdict composer buffer: report the verdict
         // through the bound provider's verdict command instead of disk.
         if self.active_buffer_state().review_verdict.is_some() {
             return self.save_review_verdict_buffer();
         }
-        // Plugin-owned write (`BufWriteCmd` shape, #1623): a plugin claimed
-        // this buffer's writes via `vimcode.buffer.set_write_handler` (the
-        // oil.nvim pattern — a scratch buffer whose ":w" means "apply my
-        // edits", not "write these lines to a file"). The plugin owns
-        // persistence entirely; the normal disk-write path below never runs.
+        // Plugin-owned write: a plugin claimed this buffer's writes via
+        // `vimcode.buffer.set_write_handler` (the oil.nvim pattern — a scratch
+        // buffer whose ":w" means "apply my edits", not "write these lines to
+        // a file"). The plugin owns persistence entirely; the normal disk-write
+        // path below never runs.
         let active_id = self.active_buffer_id();
         if self
             .plugin_manager
@@ -588,7 +580,7 @@ impl Engine {
         let state = self.active_buffer_state_mut();
         if let Some(ref path) = state.file_path.clone() {
             let path_str = path.to_string_lossy().into_owned();
-            // #1623: BufWritePre fires *before* the write — unlike `save`/
+            // BufWritePre fires *before* the write — unlike `save`/
             // `BufWrite` below, which both fire after (kept exactly as-is
             // for back-compat: shipped extensions rely on "the file is
             // already on disk" at that point).
@@ -622,7 +614,7 @@ impl Engine {
     }
 
     /// Run a plugin's `vimcode.buffer.set_write_handler` callback instead of
-    /// writing `buf_id` to disk (#1623). Fires `BufWritePre` first, same as
+    /// writing `buf_id` to disk. Fires `BufWritePre` first, same as
     /// the normal disk-write path, so a `BufWritePre` hook sees the same
     /// "about to be written" moment either way. On success, clears `dirty`
     /// (there is no `vim.bo.modified`-equivalent Lua setter yet for the
@@ -660,15 +652,12 @@ impl Engine {
     /// (git diff, LSP `didSave`, swap-file cleanup, `save`/`BufWrite`
     /// plugin events) — but parameterized by buffer id instead of assuming
     /// the active buffer/window, so a background write can drive it without
-    /// switching windows first. Used by ACP's `fs/write_text_file` (#954,
-    /// ACP-3), which must persist to disk on a buffer that may not even be
-    /// the one currently shown.
+    /// switching windows first.
     ///
     /// Deliberately a thin sibling of [`Self::save`] rather than a
     /// refactor of it: `save()` also handles the keymaps/registries scratch
     /// buffers and writes into `self.message`, neither of which apply to a
-    /// background write a caller wants to report through its own channel
-    /// (a JSON-RPC error reply, here) instead.
+    /// background write a caller wants to report through its own channel.
     pub(crate) fn save_buffer_by_id(&mut self, buffer_id: BufferId) -> Result<(), String> {
         let path = self
             .buffer_manager
@@ -759,7 +748,7 @@ impl Engine {
                     .unwrap_or_default();
                 if let Some(state) = self.buffer_manager.get_mut(buf_id) {
                     if state.reload_from_disk().is_ok() {
-                        // #222: re-sync the buffer with the LSP server so
+                        // Re-sync the buffer with the LSP server so
                         // semantic_tokens (which override tree-sitter for
                         // Rust) are refreshed against the new content.
                         // lsp_flush_changes clears the cached tokens,
@@ -958,7 +947,7 @@ impl Engine {
     /// Build a directory listing string for netrw.
     ///
     /// `exclude` is `Settings::explorer_exclude` — entries hidden regardless
-    /// of `show_hidden` (#1545), so the netrw listing doesn't start with a
+    /// of `show_hidden`, so the netrw listing doesn't start with a
     /// `.git/` row now that `show_hidden_files` defaults on.
     pub(crate) fn netrw_build_listing(dir: &Path, show_hidden: bool, exclude: &[String]) -> String {
         let mut lines = Vec::new();
@@ -1579,8 +1568,8 @@ impl Engine {
     }
 
     /// Jump to the next changed region below the cursor.
-    /// When the buffer has outstanding in-buffer agent-review hunks
-    /// (#1517): navigates those exclusively. Otherwise, on real files:
+    /// When the buffer has outstanding in-buffer agent-review hunks:
+    /// navigates those exclusively. Otherwise, on real files:
     /// uses `git_diff` markers. On diff buffers: searches for `@@`
     /// headers. In two-window diff mode: uses `diff_results` for
     /// navigation.
@@ -1598,7 +1587,7 @@ impl Engine {
         let has_git = git_diff.is_some_and(|d| !d.is_empty());
 
         if self.has_inline_review_hunks(bid) {
-            // Outstanding agent hunks (#1517) take priority over the raw
+            // Outstanding agent hunks take priority over the raw
             // `git diff HEAD` markers: for any git-tracked file the agent
             // just edited, `git_diff` is non-empty too (it's the union of
             // *every* uncommitted turn's changes against HEAD), so an
@@ -1676,7 +1665,7 @@ impl Engine {
             .is_empty()
     }
 
-    /// `]c`/`[c` fallback (#1517): the 0-based buffer line of the first
+    /// `]c`/`[c` fallback: the 0-based buffer line of the first
     /// in-buffer-review hunk (`Engine::acp_inline_review_hunks`) whose
     /// right-side start is strictly after/before `cur` — `None` when this
     /// buffer has no file path, no outstanding hunks, or no hunk on the
@@ -1704,8 +1693,8 @@ impl Engine {
     }
 
     /// Jump to the previous changed region above the cursor.
-    /// When the buffer has outstanding in-buffer agent-review hunks
-    /// (#1517): navigates those exclusively. Otherwise, on real files:
+    /// When the buffer has outstanding in-buffer agent-review hunks:
+    /// navigates those exclusively. Otherwise, on real files:
     /// uses `git_diff` markers. On diff buffers: searches for `@@`
     /// headers. In two-window diff mode: uses `diff_results` for
     /// navigation.
@@ -2256,10 +2245,8 @@ impl Engine {
         }
         self.split_window(SplitDirection::Vertical, None);
         // Reset cursor/scroll: the new window inherited the previous window's
-        // view (which may have cursor.line > help-buffer line count), but the
-        // help buffer is short.  Without this reset, update_bracket_match and
-        // render code call ropey line_to_char with an out-of-bounds index and
-        // panic.  Fix for #596.
+        // view, but the help buffer is short. Without this reset, update_bracket_match
+        // and render code call ropey line_to_char with an out-of-bounds index.
         {
             let win = self.active_window_mut();
             win.buffer_id = buf_id;
@@ -2347,11 +2334,10 @@ impl Engine {
         }
     }
 
-    /// Finalize review edits: commit + push (`:GFinalize [message]`, #528).
+    /// Finalize review edits: commit + push (`:GFinalize [message]`).
     /// See `Engine::finalize_review_edits` for the actual git work and its
     /// safety semantics; this wrapper just supplies the default commit
-    /// message and turns the result into a status message + `EngineAction`,
-    /// the same shape every other `cmd_git_*` wrapper in this file uses.
+    /// message and turns the result into a status message + `EngineAction`.
     pub(crate) fn cmd_git_finalize_review(&mut self, message: Option<&str>) -> EngineAction {
         let message = message.filter(|m| !m.is_empty()).unwrap_or("Review edits");
         match self.finalize_review_edits(message) {
@@ -3090,15 +3076,11 @@ impl Engine {
         // NOTE: raw `content.lines()` (ropey's `Rope::lines()`) yields one
         // MORE element than `Buffer::len_lines()` whenever the buffer ends
         // in '\n' — ropey treats a trailing '\n' as starting a new, empty
-        // final line (see `Buffer::len_lines()`'s doc comment), but that
-        // phantom empty line is not a "real" line anywhere else in the
-        // engine (window rendering, cursor bounds, etc. all key off
+        // final line, but that phantom empty line is not a "real" line anywhere
+        // else in the engine (window rendering, cursor bounds, etc. all key off
         // `buffer.len_lines()`). We must `.take(len_lines())` here so
         // `a_lines`/`b_lines` — and therefore the `a_len`/`b_len` passed to
-        // `diff_state_from_hunks` below — match the same logical line count
-        // the rest of the engine uses. Skipping this step used to silently
-        // grow `aligned_a`/`aligned_b` by one phantom entry per file ending
-        // in '\n' (i.e. on almost every real diff).
+        // `diff_state_from_hunks` below — match the same logical line count.
         let a_lines: Vec<String> = {
             if let Some(w) = self.windows.get(&a_win) {
                 if let Some(s) = self.buffer_manager.get(w.buffer_id) {
@@ -3550,10 +3532,9 @@ impl Engine {
     // Preview mode
     // =======================================================================
 
-    /// Refresh the cached `preview_buffer_id` mirror from `preview_tab`
-    /// (quadraui#597's shared preview-tab tier), the single source of truth
-    /// for which buffer, if any, is currently the preview. Call after every
-    /// `preview_tab` mutation.
+    /// Refresh the cached `preview_buffer_id` mirror from `preview_tab`,
+    /// the single source of truth for which buffer, if any, is currently
+    /// the preview. Call after every `preview_tab` mutation.
     pub(super) fn sync_preview_buffer_id(&mut self) {
         self.preview_buffer_id = self
             .preview_tab
@@ -3584,7 +3565,7 @@ impl Engine {
     /// If the file is already open as a permanent buffer, just switches to it regardless of mode.
     ///
     /// Neovim treats landing on a different buffer this way as jump-worthy
-    /// regardless of line (#1158) — records a jumplist entry for the
+    /// regardless of line — records a jumplist entry for the
     /// pre-switch position. See [`Engine::open_file_for_jump_recovery`] for
     /// the one caller (jumplist navigation's own recovery fallback) that
     /// must NOT record another jump while replaying one.
@@ -3594,7 +3575,7 @@ impl Engine {
 
     /// [`Engine::apply_jump_list_entry`]'s fallback when the recorded pane no
     /// longer exists: opens `path` into the current window without pushing a
-    /// new jumplist entry (#1158). This call *is* jumplist navigation, not a
+    /// new jumplist entry. This call *is* jumplist navigation, not a
     /// jump-worthy event in its own right — recording here would corrupt the
     /// list a `<C-o>`/`<C-i>` walk is trying to replay.
     pub(crate) fn open_file_for_jump_recovery(&mut self, path: &Path) -> Result<(), String> {
@@ -3614,7 +3595,7 @@ impl Engine {
         // Neovim's `:edit` (and anything else routed through this fn — gf,
         // jumplist navigation, panel/git/DAP opens, CLI startup) renames the
         // still-pristine startup scratch buffer in place instead of leaving
-        // it behind as a numbered phantom (#1298) -- but only when this
+        // it behind as a numbered phantom -- but only when this
         // would otherwise *create* a brand-new buffer. If `path` is already
         // open under a different id, switching to that existing buffer wins
         // and the pristine buffer is left untouched (verified against real
@@ -3672,7 +3653,7 @@ impl Engine {
 
         match mode {
             OpenMode::Preview => {
-                // Ask the shared preview tier (quadraui#597) to open/replace
+                // Ask the shared preview tier to open/replace
                 // the preview slot; it tells us which old preview buffer, if
                 // any, was displaced so we can unload it.
                 let label = path
@@ -3889,7 +3870,7 @@ impl Engine {
                     state.update_syntax();
                 }
                 self.refresh_git_diff(bid);
-                // #222: re-sync the buffer with the LSP server so
+                // Re-sync the buffer with the LSP server so
                 // semantic_tokens (which override tree-sitter for Rust)
                 // are refreshed against the new content. lsp_flush_changes
                 // clears the cached tokens, sends notify_did_change, and
@@ -3992,7 +3973,7 @@ impl Engine {
         self.workspace_root = Some(canonical.clone());
         let _ = std::env::set_current_dir(&canonical);
 
-        // Reset explorer state for the new workspace (#274). The old
+        // Reset explorer state for the new workspace. The old
         // workspace's `explorer_expanded` paths don't apply here, and the
         // new root needs to be in the set so `build_explorer_rows` shows
         // top-level entries instead of just the collapsed root.
@@ -4328,12 +4309,10 @@ fn parse_undo_time_spec(spec: &str) -> Option<std::time::SystemTime> {
 mod netrw_build_listing_tests {
     use super::Engine;
 
-    /// #1545: `netrw_build_listing`'s `exclude` parameter must hide
+    /// `netrw_build_listing`'s `exclude` parameter must hide
     /// `.git`/etc. regardless of `show_hidden` — a user browsing a project
     /// root with `:Explore` (netrw) now shows dotfiles by default, but the
-    /// listing must not lead with a `.git/` row. Unit-level coverage per
-    /// the reviewer's non-blocking note: this is a pure function, trivial
-    /// to test directly, and had no pre-existing test even before #1545.
+    /// listing must not lead with a `.git/` row.
     #[test]
     fn hides_excluded_entries_even_when_show_hidden_is_true() {
         let dir = std::env::temp_dir().join(format!(

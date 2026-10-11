@@ -32,7 +32,7 @@ pub struct ProjectMatch {
 /// struct — rather than four flat fields duplicated per binding — is what
 /// lets `Engine`'s `qf_*` methods (`src/core/engine/picker.rs`) implement
 /// open/close/navigate/jump exactly once and have both `:c*` and `:l*` call
-/// through the same code with a different target (#1155).
+/// through the same code with a different target.
 #[derive(Debug, Clone, Default)]
 pub struct QuickfixList {
     /// The list's entries, in order.
@@ -75,7 +75,7 @@ pub struct ReplaceResult {
 
 /// Build a compiled regex from the user query and search options.
 ///
-/// Shared by `search_in_project`, `replace_in_project`, and (#1806)
+/// Shared by `search_in_project`, `replace_in_project`, and
 /// `grep_project_streaming`.
 pub(crate) fn build_search_regex(
     query: &str,
@@ -164,7 +164,7 @@ pub fn search_in_project(
     Ok(results)
 }
 
-// ─── Streaming walk/grep for `vimcode.fs.*` (#1806) ────────────────────────
+// ─── Streaming walk/grep for `vimcode.fs.*` ────────────────────────────────
 //
 // The native `PickerSource::Files`/`PickerSource::Grep` pickers
 // (`src/core/engine/picker.rs`) and `search_in_project` above all walk
@@ -189,7 +189,7 @@ pub fn search_in_project(
 // before calling in) — the same `filter_entry` `Engine::picker_populate_files`
 // installs, so e.g. `.git`/`.svn` and any user `:set explorer_exclude=...`
 // entry are pruned for `vimcode.fs.walk` exactly like they are for the native
-// Files picker it's meant to replace (#1806 review). `grep_project_streaming`
+// Files picker it's meant to replace. `grep_project_streaming`
 // does *not* apply it — it mirrors `search_in_project` above, which never
 // has either, not `picker_populate_files`.
 
@@ -233,7 +233,7 @@ pub struct FsWalkOptions {
     /// `Engine::plugin_api_fs_walk` from live settings, not settable from
     /// Lua. Applied the same way `Engine::picker_populate_files` applies it:
     /// as a `filter_entry` that prunes a matching *directory* rather than
-    /// walking into it and discarding every entry underneath (#1806 review).
+    /// walking into it and discarding every entry underneath.
     pub explorer_exclude: Vec<String>,
 }
 
@@ -755,7 +755,7 @@ mod tests {
         );
     }
 
-    // ── Streaming walk/grep tests (#1806) ───────────────────────────────
+    // ── Streaming walk/grep tests ───────────────────────────────────────
 
     /// Build a temp project with `n` plain files (`f0000.txt`..) directly
     /// under `dir`, each containing the single line `needle`. Used by the
@@ -765,7 +765,7 @@ mod tests {
         // pid+thread-id suffixed (not just `test_name`) so two concurrent
         // `cargo test` *processes* (as opposed to the threads within one,
         // which `test_name` alone already disambiguates) don't fight over
-        // the same directory (#1806 review).
+        // the same directory.
         let dir = std::env::temp_dir().join(format!(
             "vimcode_fswalk_{test_name}_{}_{:?}",
             std::process::id(),
@@ -818,7 +818,7 @@ mod tests {
         );
     }
 
-    /// #1806 review: `walk_project_streaming` must apply
+    /// `walk_project_streaming` must apply
     /// `FsWalkOptions::explorer_exclude` the same way `Engine::
     /// picker_populate_files` applies `Settings::explorer_exclude` — pruning
     /// a matching directory (here `.git`, via the real default pattern

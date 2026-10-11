@@ -1,24 +1,13 @@
-//! Integration tests for the branch-protection config (#796).
+//! Integration tests for the branch-protection config.
 //!
-//! CI ran on every PR and push to `main`/`develop`, but nothing *enforced* it:
-//! `develop` — the default branch, where all work lands — had no protection
-//! object at all, and `main` had one with no `required_status_checks` key. A
-//! PR with red checks was mergeable by clicking the button. `#796` closes that
-//! by declaring the settings in `.github/branch-protection.json` and applying
-//! them with `scripts/apply-branch-protection.sh`.
+//! This test ensures that required status checks in `.github/branch-protection.json`
+//! match the job names in `.github/workflows/ci.yml`. GitHub matches required status
+//! checks by name, and a required context naming a job that no longer exists is never
+//! reported — it stays forever-pending and blocks every pull request.
 //!
-//! The settings are versioned rather than living only in the repo's web UI so
-//! that this test can exist. It guards the one failure mode most likely to
-//! wedge the merge queue: **GitHub matches required status checks by name**,
-//! and a required context naming a job that no longer exists is never reported
-//! — it stays forever-pending and blocks *every* pull request. So renaming a
-//! job in `.github/workflows/ci.yml` without updating the config must fail the
-//! test suite, loudly, on the branch that renames it.
-//!
-//! `required_contexts_match_ci_job_names` is the assertion that does that.
-//! `dry_run_*` drive the real script via `std::process::Command` and assert on
-//! the JSON it actually emits — the same body it PUTs to the GitHub API — so a
-//! change to the rendering logic is caught too, not just the config data.
+//! `required_contexts_match_ci_job_names` asserts that all required contexts exist as
+//! jobs in the CI workflow. `dry_run_*` drive the script via `std::process::Command`
+//! and assert on the JSON it actually emits — the same body it PUTs to the GitHub API.
 //!
 //! Unix-only: the script is bash, and the tests shell out to it.
 #![cfg(unix)]
@@ -61,7 +50,7 @@ fn strings(value: &serde_json::Value) -> BTreeSet<String> {
 /// Whether a tool the tests shell out to is present.
 ///
 /// Missing on a dev machine → skip (the test prints why). Missing under CI →
-/// hard fail, mirroring `tests/nvim_conformance.rs` (#795): a silent skip in
+/// hard fail, mirroring `tests/nvim_conformance.rs`: a silent skip in
 /// CI is how a gate quietly stops being a gate.
 fn require_tool(name: &str) -> bool {
     let found = Command::new("sh")
@@ -197,17 +186,8 @@ fn required_contexts_match_ci_job_names() {
     let jobs = ci_job_names(&workflow);
 
     // Anti-vacuity: a parser that silently returned nothing would make the
-    // equality below pass against an empty config. CI has six lanes — the
-    // two Linux ones from #645 (the `--no-default-features` lane and the GUI
-    // lane), the native macOS lane added in #1042, which is the only one
-    // that compiles `src/macos/` at all, the Windows `vcd.exe` TUI build,
-    // the Windows `vimcode.exe` GUI build added in #1554, which is the
-    // only lane that links quadraui's `win` backend (and so the only one
-    // that can catch a loader failure like the missing Common-Controls v6
-    // manifest) before a release does, and the smoke-spec lane added in
-    // #1646, the only one that parses `tests/smoke-spec/*.yaml` with coord's
-    // real Tier-2 driver loaders (no cargo target imports them). All six are
-    // load bearing, so anything other than six named jobs means the scan
+    // equality below pass against an empty config. The CI workflow has six lanes:
+    // all six are load bearing, so anything other than six named jobs means the scan
     // drifted from the file it is meant to read.
     assert_eq!(
         jobs.len(),

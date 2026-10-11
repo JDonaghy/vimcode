@@ -208,8 +208,7 @@ pub struct Theme {
     /// Foreground for activity bar icons.
     pub activity_bar_fg: Color,
     /// Colour of the 2px left-edge accent line on the active activity-bar
-    /// item (`quadraui::ActivityBar::active_accent`, #658). Mirrors VS
-    /// Code's `activityBar.activeBorder`.
+    /// item. Mirrors VS Code's `activityBar.activeBorder`.
     pub activity_active_accent: Color,
 }
 
@@ -296,12 +295,9 @@ impl Theme {
             // (0.9, 0.9, 0.9)
             command_fg: hex("#e5e5e5"),
 
-            // VS Code's `editorLineNumber.foreground` (#699 Tier 2a / #701).
-            // Was #b2b2b2 (0.7, 0.7, 0.7), which read brighter than the
-            // editor's own body text (`default_fg` #abb2bf) and pulled the
-            // eye into the gutter. The cursor's line is brightened
-            // separately via `line_number_active_fg` below, so dimming the
-            // inactive token *increases* the active/inactive contrast.
+            // VS Code's `editorLineNumber.foreground`. Dimming the inactive line
+            // number increases the active/inactive contrast, as the cursor's line
+            // is brightened separately via `line_number_active_fg` below.
             line_number_fg: hex("#858585"),
             // (0.9, 0.9, 0.5)
             line_number_active_fg: hex("#e5e57f"),
@@ -382,11 +378,9 @@ impl Theme {
             semantic_macro: hex("#56b6c2"), // cyan
 
             breadcrumb_bg: hex("#21252b"),
-            // #699 Tier 2a / #701: the non-trailing crumbs recede. Was
-            // #7f848e, a straight 15% dim of which is #6c7079 — same hue,
-            // now clearly below the editor's body text (`default_fg`
-            // #abb2bf) so the path reads as chrome rather than competing
-            // with the code. The trailing/current crumb keeps
+            // The non-trailing crumbs recede below the editor's body text
+            // (`default_fg` #abb2bf) so the path reads as chrome rather than
+            // competing with the code. The trailing/current crumb keeps
             // `breadcrumb_active_fg` at full body-text brightness.
             breadcrumb_fg: hex("#6c7079"),
             breadcrumb_active_fg: hex("#abb2bf"),
@@ -1237,25 +1231,6 @@ impl Theme {
 
     /// Parse a VSCode theme JSON file and map its colours to a `Theme`.
     /// Falls back to OneDark defaults for any missing keys.
-    ///
-    /// #829 note: this stays a local implementation rather than delegating
-    /// the `colors` (chrome) mapping to `quadraui::Theme::from_vscode_json`
-    /// (quadraui#775). That upstream function was "lifted from" this one
-    /// but has since diverged for quadraui's own primitive set — e.g. it
-    /// reads `title_fg` from `titleBar.activeForeground` and `header_bg`
-    /// from `sideBarSectionHeader.background`, where vimcode derives the
-    /// conceptually-similar `fuzzy_title_fg` from the syntax palette
-    /// (`theme.type_name`) and `status_bg` from `statusBar.background`.
-    /// A field-name-based reverse mapping from the upstream `quadraui::Theme`
-    /// back onto this struct would silently change which VS Code JSON key
-    /// feeds which vimcode field — exactly what "assert rendered chrome
-    /// colours match before and after" (#829's acceptance bar) exists to
-    /// catch. This `colors`-object walk stays local for that reason;
-    /// only the `Color` type itself (this file's former `Color` struct,
-    /// `to_q_color` / `to_quadraui_color` conversions) was adopted from
-    /// quadraui, per #829. `strip_json_comments` itself has no
-    /// theme-specific semantics — it moved to `quadraui::text_util` in
-    /// #1494.
     pub fn from_vscode_json(path: &std::path::Path) -> Option<Self> {
         let data = std::fs::read_to_string(path).ok()?;
         // VSCode themes often have comments — strip them
@@ -1621,12 +1596,9 @@ impl Theme {
     }
 
     /// Same scope-name -> colour mapping as [`scope_color`](Self::scope_color),
-    /// but `None` for a name this theme doesn't recognise instead of
-    /// silently falling back to `default_fg`. Lets a caller (e.g. #1653's
-    /// `vimcode.decor.set_hl` `link` resolution in `resolve_decor_style`)
-    /// tell "this is a real theme role" apart from "unknown name, use the
-    /// default foreground" — `scope_color` can't make that distinction once
-    /// it's collapsed to a concrete `Color`.
+    /// but returns `None` for a name this theme doesn't recognise instead of
+    /// silently falling back to `default_fg`. Lets a caller distinguish
+    /// "this is a real theme role" from "unknown name, use the default".
     pub fn scope_color_opt(&self, scope: &str) -> Option<Color> {
         Some(match scope {
             "keyword" => self.keyword,
@@ -1709,30 +1681,10 @@ impl Theme {
 /// of each editor window's own rect, given the engine's current state.
 ///
 /// Single source of truth for "does this window reserve its bottom row for
-/// its own status line" (#728). Before this, the question was answered
-/// independently — and inconsistently — in two places:
-///   - `build_screen_layout_with_breadcrumb_row` used `per_window_status &&
-///     !separate_status`, correctly handling `status_line_above_terminal`
-///     being OFF with the bottom panel open (which pulls the active
-///     window's status into a *separated* bar above the terminal instead,
-///     freeing that window's own bottom row) but never checking
-///     `terminal_maximized`.
-///   - GTK's old hand-rolled h-scrollbar geometry helper used
-///     `window_status_line && !terminal_maximized` (to avoid offsetting the
-///     horizontal scrollbar for a status row that isn't painted while the
-///     terminal panel covers the editor windows entirely), but never
-///     checked `separate_status`.
-///
-/// Each covered an axis the other didn't, so either one alone could
-/// disagree with what actually gets painted.
-///
-/// #1128: GTK's own scrollbar geometry no longer consults this function at
-/// all — `quadraui::Editor::layout` (what paint actually uses, quadraui#968)
-/// lays scrollbars out against the window's raw, unshrunk rect regardless of
-/// a per-window status line, so `app_support::editor_scrollbar_layout`
-/// applying an offset here would just reintroduce a hover/paint disagreement
-/// in the opposite direction. `build_screen_layout_with_breadcrumb_row`
-/// remains this function's one live caller.
+/// its own status line". Accounts for `per_window_status`,
+/// `separate_status` (which pulls the active window's status into a
+/// separated bar above the terminal when on), and `terminal_maximized`
+/// (which covers editor windows entirely).
 pub fn window_status_row_reserved(engine: &Engine) -> bool {
     // While the terminal panel is maximized, editor windows are not the
     // visible surface at all (`breadcrumb_draw_targets` suppresses every
@@ -1748,9 +1700,9 @@ pub fn window_status_row_reserved(engine: &Engine) -> bool {
     per_window_status && !separate_status
 }
 
-/// `Settings::window_status_line` narrowed by `'laststatus'` (#1206, `:h
-/// 'laststatus'`) — the value every status-line-visibility read site should
-/// use instead of the raw field.
+/// `Settings::window_status_line` narrowed by `'laststatus'` (`:h 'laststatus'`)
+/// — the value every status-line-visibility read site should use instead
+/// of the raw field.
 ///
 /// `'laststatus'` is `0`/`1`/`2`/`3` in real Vim; vimcode's status line is
 /// architecturally per-window (`Settings::window_status_line`), not the
@@ -1769,19 +1721,10 @@ pub fn effective_window_status_line(engine: &Engine) -> bool {
 /// to be visible at all, independent of `Settings::window_status_line`
 /// (`:h 'laststatus'`).
 ///
-/// This is the other half of `'laststatus'`'s policy that
-/// `effective_window_status_line` alone cannot express: that function
-/// answers "should each window paint its own row", so it also returns
-/// `false` for `laststatus=0` and `laststatus=1` with one window — the two
-/// cases where no status line of *any* kind should show. A naive
-/// `!effective_window_status_line(engine)` read of that `false` as "show
-/// the single global bar instead" (the correct reading for
-/// `window_status_line=false` at `laststatus=2`) reintroduces exactly the
-/// row it was supposed to hide (#1235 follow-up: `laststatus=0` painted a
-/// full-width global status bar with the per-window-row-count row freed by
-/// this same fix, because `global_status_bar`'s `if per_window_status {
-/// None } else { Some(..) }` conflated "not per-window" with "show the
-/// global fallback").
+/// Returns `false` for `laststatus=0` and `laststatus=1` with one window,
+/// the cases where no status line of *any* kind should show. This
+/// complements `effective_window_status_line`, which also returns `false`
+/// in those cases but cannot express whether to show a global fallback bar.
 pub fn any_status_line_visible(engine: &Engine) -> bool {
     match engine.settings.laststatus {
         0 => false,
@@ -1806,25 +1749,20 @@ pub fn global_status_bar_visible(engine: &Engine) -> bool {
 pub(crate) mod tests {
     use super::*;
 
-    // ─── quadraui theme mapping (#1574) ────────────────────────────────────
+    // ─── quadraui theme mapping ────────────────────────────────────────────
     //
     // `to_quadraui_theme` (and its `_chrome`/`_editor` halves) is the single
     // place vimcode's rich `render::Theme` is narrowed down to the small
-    // `quadraui::Theme` every rasteriser actually paints with. Before #1574,
-    // three of its fields were wrong or missing entirely and fell through to
-    // quadraui's own hardcoded dark `Theme::default()` — this is the
-    // regression test for that class of bug, not just the two named fields
-    // the issue reported.
+    // `quadraui::Theme` every rasteriser actually paints with. This is the
+    // regression test for bugs where fields were wrong or missing and fell
+    // through to quadraui's own hardcoded dark `Theme::default()`.
 
-    /// The two concrete bugs #1574 reported: `inactive_selected_bg` was
-    /// never set at all (falling through to quadraui's dark
-    /// `Theme::default()`, `rgb(35, 40, 58)`, painted behind `#333` text —
-    /// unreadable), and `scrollbar_track` was mapped to `theme.separator`
-    /// instead of vimcode's own dedicated `theme.scrollbar_track` field.
-    /// Both are asserted against `vscode_light`, whose values for these
-    /// fields are nothing like quadraui's dark defaults, so a regression
-    /// back to either bug fails loudly here instead of only looking wrong
-    /// on screen.
+    /// `inactive_selected_bg` was never set at all (falling through to
+    /// quadraui's dark `Theme::default()`, `rgb(35, 40, 58)`, unreadable),
+    /// and `scrollbar_track` was mapped to `theme.separator` instead of
+    /// vimcode's own dedicated `theme.scrollbar_track` field. Both are
+    /// asserted against `vscode_light`, whose values for these fields are
+    /// nothing like quadraui's dark defaults.
     #[test]
     fn to_quadraui_theme_maps_inactive_selected_bg_and_scrollbar_track_from_vimcode_theme() {
         let theme = Theme::vscode_light();
@@ -1838,10 +1776,9 @@ pub(crate) mod tests {
         assert_ne!(q.scrollbar_track, default.scrollbar_track);
     }
 
-    /// The remaining unmapped keys #1574 audited (`badge_*`, `board_*`,
-    /// `card_hint_*`) — every one must trace back to a vimcode theme field
-    /// rather than silently keeping quadraui's dark default, the same way
-    /// `inactive_selected_bg` did before this issue.
+    /// Every unmapped key must trace back to a vimcode theme field rather
+    /// than silently keeping quadraui's dark default, the same way
+    /// `inactive_selected_bg` did.
     #[test]
     fn to_quadraui_theme_maps_badge_board_and_card_hint_keys_from_vimcode_theme() {
         let theme = Theme::vscode_light();
@@ -1872,13 +1809,10 @@ pub(crate) mod tests {
     }
 
     /// Every field on `quadraui::Theme` must be reachable from
-    /// `to_quadraui_theme`'s output via *some* vimcode `Theme` field — this
-    /// is the structural half of #1574: `to_quadraui_theme_chrome`'s struct
-    /// literal has no `..quadraui::Theme::default()` spread any more, so a
-    /// future field added upstream is a compile error here (`E0063`) until
-    /// it's mapped, rather than a silent dark leak discovered by eye later.
-    /// This test pins the full mapping table so a regression on any single
-    /// field (not just the ones called out above) is caught.
+    /// `to_quadraui_theme`'s output via some vimcode `Theme` field.
+    /// The struct literal has no `..quadraui::Theme::default()` spread,
+    /// so a future field added upstream is a compile error until mapped,
+    /// rather than a silent dark leak discovered by eye later.
     #[test]
     fn to_quadraui_theme_maps_every_field_from_vscode_light() {
         let theme = Theme::vscode_light();

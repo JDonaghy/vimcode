@@ -1,5 +1,5 @@
 // `open_url`/`install_bundled_icon_font` moved to the backend-neutral
-// `crate::app_support` (#862) — neither named a `gtk4`/`gio` type. Nothing
+// `crate::app_support` — neither named a `gtk4`/`gio` type. Nothing
 // under `crate::gtk` referenced them by this path (only `crate::app` did, and
 // it now imports `crate::app_support` directly), so no re-export is needed.
 
@@ -7,12 +7,7 @@
 /// value, and the stem of the installed icon files. Must match the shipped
 /// `data/io.github.jdonaghy.VimCode.desktop` / `data/icons/io.github.jdonaghy.VimCode.svg`
 /// and the flatpak manifest (`flatpak/io.github.jdonaghy.VimCode.yml`) exactly.
-///
-/// #716: this file used to write a *second*, different identity
-/// (`com.vimcode.VimCode` / icon name `vimcode`) to `~/.local/share/`,
-/// competing with the shipped one — whichever the desktop shell indexed
-/// first determined whether the WM taskbar/alt-tab icon resolved at all.
-/// `APP_ID` is now the only identity string this module writes anywhere.
+/// This is the only identity string this module writes anywhere.
 pub(super) const APP_ID: &str = "io.github.jdonaghy.VimCode";
 
 /// Whether this host's `gdk-pixbuf` can decode an SVG at all (i.e. has the
@@ -20,25 +15,12 @@ pub(super) const APP_ID: &str = "io.github.jdonaghy.VimCode";
 ///
 /// Test-only (`#[cfg(test)]`): gates two things — (1) the tests below that
 /// exercise [`install_icon_and_desktop_at`]'s per-size PNG rendering, which
-/// needs the same loader via `Pixbuf::from_file_at_size`; (2) the #720 GTK
-/// pixel probe in `gtk::testing`'s `app_icon` tests, since without the
-/// loader `Backend::draw_image` reports `Unsupported` for the menu-row app
-/// icon and paints nothing there — an environment gap (`librsvg2-common` is
-/// only a `Recommends` of `libgtk-4-1` on Ubuntu, so a
-/// `--no-install-recommends` install can legitimately lack it; CI installs
-/// it explicitly, see `.github/workflows/ci.yml`), not a regression in this
-/// code.
-///
-/// Before #1102 this same probe doubled as vimcode's own once-per-run
-/// pre-rasteriser for the *painted* icon (`app_icon_image`/
-/// `cached_app_icon_png`/`rasterise_app_icon_png`, deleted here): quadraui's
-/// `Image` shipped no caching layer, so handing `Backend::draw_image` the raw
-/// 1024×1024 SVG meant librsvg rendered a megapixel canvas on *every* repaint,
-/// measured at +16.5 ms/frame on the headless GTK harness. quadraui#1014 added
-/// a decode cache inside `GtkBackend::draw_image` itself, so every backend now
-/// hands the same [`crate::render::app_icon_image`] straight through — see
-/// `app_icon_image_for_paint` in `crate::app`, which no longer forks on
-/// `#[cfg(feature = "gui")]`.
+/// needs the same loader via `Pixbuf::from_file_at_size`; (2) GTK pixel
+/// probe in `gtk::testing`'s `app_icon` tests. Without the loader,
+/// `Backend::draw_image` reports `Unsupported` for the menu-row app icon.
+/// This reflects an environment gap: `librsvg2-common` is only a `Recommends`
+/// of `libgtk-4-1` on Ubuntu, so a `--no-install-recommends` install can
+/// legitimately lack it.
 #[cfg(test)]
 pub(super) fn host_has_svg_loader() -> bool {
     use std::sync::OnceLock;
@@ -58,14 +40,14 @@ const ICON_PNG_SIZES: [u32; 5] = [48, 64, 128, 256, 512];
 /// Name of the stamp file [`install_icon_and_desktop_at`] writes after a
 /// successful install, holding the `CARGO_PKG_VERSION` it installed.
 ///
-/// #1106: before this stamp existed, the installer — writes to
+/// Before this stamp existed, the installer — writes to
 /// `~/.local/share/icons/hicolor`, a `.desktop` file, and a
 /// `gtk-update-icon-cache` subprocess spawn — ran unconditionally on *every*
 /// launch, even though the files it writes never change between runs of the
 /// same build. The stamp lets [`install_icon_and_desktop_at`] recognise "this
 /// version is already installed" and skip straight to returning.
 ///
-/// #1106 review (nit): lives under [`ICON_INSTALL_STAMP_DIR`] — a
+/// Lives under [`ICON_INSTALL_STAMP_DIR`] — a
 /// vimcode-specific subdirectory of `data_dir` — rather than directly in the
 /// shared XDG data root, so it can't be mistaken for someone else's stray
 /// dotfile at that level the way `hicolor`/`applications` (namespaced by
@@ -81,7 +63,7 @@ const ICON_INSTALL_STAMP_DIR: &str = "vimcode";
 /// this call can skip all filesystem writes and the `gtk-update-icon-cache`
 /// spawn.
 ///
-/// Split out as a pure function (#1106) so the decision is unit-testable
+/// Split out as a pure function so the decision is unit-testable
 /// without touching a filesystem or spawning a subprocess: given the stamp
 /// file's contents (if any) and whether the installed files are still there,
 /// decide once, the same way [`install_icon_and_desktop_at`] and its test
@@ -125,7 +107,7 @@ pub(super) fn install_icon_and_desktop() {
 
 /// Does the actual writing, parameterised on the `~/.local/share`-equivalent
 /// directory so tests can point it at a scratch directory instead of the
-/// real one (#1106). [`install_icon_and_desktop`] is the real entry point;
+/// real one. [`install_icon_and_desktop`] is the real entry point;
 /// this is `pub(super)` only so `super::tests` below can drive it directly.
 pub(super) fn install_icon_and_desktop_at(data_dir: &std::path::Path) {
     use std::fs;
@@ -142,44 +124,35 @@ pub(super) fn install_icon_and_desktop_at(data_dir: &std::path::Path) {
         current_version,
         icon_install_files_present(&hicolor, &app_dir),
     ) {
-        // #1106: this version is already installed and every file it wrote
+        // This version is already installed and every file it wrote
         // is still there — skip the writes and the `gtk-update-icon-cache`
         // subprocess spawn below entirely, rather than redoing packaging
         // work on every single launch.
         return;
     }
 
-    // SVG icon for scalable size (GTK/GNOME renders SVGs natively). Same
-    // bytes as the shipped `data/icons/io.github.jdonaghy.VimCode.svg` —
-    // deduplicated under #716, this used to be a separate `vim-code.svg`
-    // copy at the repo root that could silently drift from the shipped one.
+    // SVG icon for scalable size (GTK/GNOME renders SVGs natively).
+    // The bytes live in `render::APP_ICON_SVG`, shared with the menu-row app
+    // icon, so the installed theme icon and the one painted left of `File`
+    // can never be different artwork.
     let svg_dir = hicolor.join("scalable/apps");
     let svg_path = svg_dir.join(format!("{APP_ID}.svg"));
-    // #720: the bytes now live in exactly one place (`render::APP_ICON_SVG`),
+    // The bytes now live in exactly one place (`render::APP_ICON_SVG`),
     // shared with the menu-row app icon, so the installed theme icon and the
     // one painted left of `File` can never be different artwork.
     let svg_bytes: &[u8] = crate::render::APP_ICON_SVG;
     if fs::create_dir_all(&svg_dir).is_ok() {
         let _ = fs::write(&svg_path, svg_bytes);
     }
-    // #716: remove the stale pre-fix icon file installed under the old,
+    // Remove the stale pre-fix icon file installed under the old,
     // wrong name so it can't shadow the correctly-named one above.
     let _ = fs::remove_file(svg_dir.join("vimcode.svg"));
 
     // Render the SVG to PNG at multiple sizes so compositors and window
     // managers that don't support SVG lookup (or only read _NET_WM_ICON
     // pixel data at a fixed size) get a crisp icon in alt-tab / taskbar.
-    //
-    // #1106 review: this used to skip re-rendering a size whose PNG already
-    // existed on disk, regardless of whether its bytes matched the SVG this
-    // call just wrote. That was harmless when the function ran on every
-    // launch (an existing PNG was always current, since nothing else changes
-    // the artwork), but the version-stamp gate above means reaching this
-    // point at all now means "the version changed or a file went missing" —
-    // exactly the case where a stale PNG from a previous version's artwork
-    // must NOT be left in place. So: unconditionally (re)render every size
-    // whenever we've decided a reinstall is needed at all, matching the SVG
-    // and `.desktop` file below, which already do the same.
+    // Unconditionally (re)render every size whenever a reinstall is needed,
+    // matching the SVG and `.desktop` file below.
     if svg_path.exists() {
         for size in ICON_PNG_SIZES {
             let png_dir = hicolor.join(format!("{size}x{size}/apps"));
@@ -192,7 +165,7 @@ pub(super) fn install_icon_and_desktop_at(data_dir: &std::path::Path) {
                     let _ = pixbuf.savev(&png_path, "png", &[]);
                 }
             }
-            // #716: same cleanup as the SVG above, at every rendered size.
+            // Same cleanup as the SVG above, at every rendered size.
             let _ = fs::remove_file(png_dir.join("vimcode.png"));
         }
     }
@@ -215,12 +188,12 @@ pub(super) fn install_icon_and_desktop_at(data_dir: &std::path::Path) {
     if fs::create_dir_all(&app_dir).is_ok() {
         let _ = fs::write(&desktop_path, desktop_entry_contents(&exe));
     }
-    // #716: a stale desktop entry under the old, wrong identity left behind
+    // A stale desktop entry under the old, wrong identity left behind
     // by a pre-fix install would otherwise keep shadowing the correct one
     // in some desktop-shell indexes across an upgrade.
     let _ = fs::remove_file(app_dir.join("com.vimcode.VimCode.desktop"));
 
-    // #1106: record what we just installed so the next launch (same
+    // Record what we just installed so the next launch (same
     // version, files intact) can skip straight past the check above.
     if fs::create_dir_all(&stamp_dir).is_ok() {
         let _ = fs::write(&stamp_path, current_version);
@@ -234,19 +207,11 @@ pub(super) fn install_icon_and_desktop_at(data_dir: &std::path::Path) {
 /// theme index yet (`gtk-update-icon-cache` targets the *cache*, not the
 /// theme's search path list).
 ///
-/// #1498 moved this out of `App::new`, which used to run it right next to
-/// `crate::gtk::css::load_css` (`App::new`'s other, now-deleted GTK-only
-/// step — JDonaghy/quadraui#1091 gave `GtkPlatformServices` its own
-/// equivalent stylesheet, so vimcode stopped needing one at all). With that
-/// step gone, `App::new` and `App::new_portable` no longer differed by
-/// anything but this one GDK-only call, so folding them left this as the
-/// single remaining piece [`crate::gtk::run`] still has to do itself before
+/// This is a GDK-only call that [`crate::gtk::run`] must do itself before
 /// handing off to the shared, backend-neutral constructor — quadraui has no
-/// portable icon-theme search-path surface for any backend to reach through
-/// `quadraui::Backend`.
+/// portable icon-theme search-path surface for any backend.
 ///
-/// A no-op with `$HOME` unset or no default `gdk::Display` yet (mirrors the
-/// two guards `App::new`'s inline version used to have).
+/// A no-op with `$HOME` unset or no default `gdk::Display` yet.
 pub(super) fn add_icon_theme_search_path() {
     let Some(home) = std::env::var_os("HOME") else {
         return;
@@ -260,7 +225,7 @@ pub(super) fn add_icon_theme_search_path() {
 
 /// Contents of the runtime-installed `.desktop` file. Factored out from
 /// [`install_icon_and_desktop`] so the identity fields are unit-testable
-/// without touching the filesystem (#716).
+/// without touching the filesystem.
 pub(super) fn desktop_entry_contents(exe: &str) -> String {
     format!(
         "[Desktop Entry]\n\
@@ -327,19 +292,16 @@ pub(super) unsafe extern "C" fn gtk_log_writer(
 mod tests {
     use super::*;
 
-    /// #716: this is the one identity string vimcode should ever write —
+    /// This is the one identity string vimcode should ever write —
     /// pin it so a future edit can't silently reintroduce a second one.
     #[test]
     fn app_id_matches_shipped_packaging() {
         assert_eq!(APP_ID, "io.github.jdonaghy.VimCode");
     }
 
-    /// #716 regression test: the runtime-installed `.desktop` file used to
-    /// claim `Icon=vimcode` / `StartupWMClass=com.vimcode.VimCode`, a
-    /// different identity than the shipped `data/io.github.jdonaghy.VimCode.desktop`.
-    /// Whichever one the desktop shell indexed first determined whether the
-    /// WM taskbar/alt-tab icon resolved. Assert there is exactly one
-    /// identity in the generated contents, and it's the canonical one.
+    /// Assert that the runtime-installed `.desktop` file uses the canonical app
+    /// identity (`io.github.jdonaghy.VimCode`), not a different one, in all
+    /// locations (`Icon=`, `StartupWMClass=`).
     #[test]
     fn desktop_entry_uses_canonical_app_id_everywhere() {
         let contents = desktop_entry_contents("/usr/bin/vimcode");
@@ -363,7 +325,7 @@ mod tests {
         assert!(contents.contains("Exec=/opt/vimcode/bin/vimcode\n"));
     }
 
-    /// #1106: the gate that lets a second launch skip the install entirely.
+    /// The gate that lets a second launch skip the install entirely.
     /// Pure-logic coverage of [`icon_install_up_to_date`] — no filesystem,
     /// no subprocess — for every combination the real callsite can hit.
     #[test]
@@ -380,7 +342,7 @@ mod tests {
 
         // Stamp is a different (older or newer) version: re-install even
         // though the files are all present, so a version bump's changed
-        // artwork/`.desktop` contents actually land (#716's symptom).
+        // artwork/`.desktop` contents actually land.
         assert!(!icon_install_up_to_date(Some("1.2.2"), current, true));
 
         // A trailing newline (as `fs::read_to_string` would hand back from a
@@ -397,12 +359,9 @@ mod tests {
     }
 
     /// RAII guard around a [`scratch_data_dir`] temp directory: removes it on
-    /// drop, including via unwinding, so a panicking `assert_eq!` partway
-    /// through a test (#1106 review nit) can't leak the directory the way a
-    /// plain `let _ = std::fs::remove_dir_all(&data_dir);` at the *end* of
-    /// the test body would — that line is simply never reached if an earlier
-    /// assertion panics first. `Deref<Target = Path>` lets call sites keep
-    /// using it exactly like the `PathBuf` it used to be.
+    /// drop, including via unwinding, so panicking assertions can't leak the
+    /// directory. `Deref<Target = Path>` lets call sites use it exactly like
+    /// the `PathBuf` it wraps.
     struct ScratchDataDir(std::path::PathBuf);
 
     impl std::ops::Deref for ScratchDataDir {
@@ -434,15 +393,9 @@ mod tests {
         ScratchDataDir(dir)
     }
 
-    /// #1106 regression test: a second call with an unchanged version must
-    /// perform **no** filesystem writes and spawn **no**
-    /// `gtk-update-icon-cache` — both gated by the same early return, so
-    /// proving the writes didn't happen proves the spawn didn't either.
-    ///
-    /// Observed RED against unfixed `develop` (which had no gate at all):
-    /// with the early-return removed, the second call always rewrites
-    /// `desktop_path`, so the sentinel content this test plants gets
-    /// clobbered and the final assertion fails.
+    /// A second call with an unchanged version must perform **no** filesystem
+    /// writes and spawn **no** `gtk-update-icon-cache` — both gated by the same
+    /// early return. This tests that the version check gate is effective.
     #[test]
     fn second_install_with_unchanged_version_is_a_no_op() {
         if !host_has_svg_loader() {
@@ -495,8 +448,8 @@ mod tests {
         );
     }
 
-    /// #1106: a version bump must still trigger a real re-install (#716's
-    /// symptom — a stale icon in the WM app bar/alt-tab — must not return).
+    /// A version bump must still trigger a real re-install so stale icons in
+    /// the WM app bar/alt-tab don't persist.
     #[test]
     fn install_after_version_bump_still_reinstalls() {
         if !host_has_svg_loader() {

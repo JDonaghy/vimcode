@@ -1,15 +1,9 @@
 //! `vimcode_core` — the whole editor as a library.
 //!
-//! #657 promoted `render`, `tui_main` and `gtk` out of the `vimcode` / `vcd`
-//! binaries and into this crate, so that an **integration test** (a separate
-//! crate that links only against `[lib] vimcode_core`) can reach the UI
-//! backends and their black-box harnesses. Before the promotion, every
-//! black-box test in this repo *had* to be in-crate, because `tests/*.rs`
-//! could see nothing but `core` + `icons`. That made the coordinator's
-//! sealed-`tests/acceptance/` oracle loop impossible here — see the
-//! `tests/acceptance.rs` crate root, and `docs/ARCHITECTURE.md`.
+//! This crate exposes `render`, `tui_main`, and `gtk` so that integration
+//! tests can reach the UI backends and their black-box harnesses.
 //!
-//! `src/main.rs` (GTK) and `src/tui_bin.rs` (TUI) are now thin shims over
+//! `src/main.rs` (GTK) and `src/tui_bin.rs` (TUI) are thin shims over
 //! this crate: argument parsing plus a call into `gtk::run` / `tui_main::run`.
 //!
 //! GTK lives behind the `gui` feature, exactly as it did in the bin, so
@@ -18,25 +12,19 @@
 pub mod core;
 pub mod icons;
 
-// #657: promoted out of `src/main.rs` / `src/tui_bin.rs`, which used to
-// declare these as private `mod`s. No lint allows are re-stated here: each
-// needs its own inner attributes at the top of its own file only where it
-// still has dead code to silence (`render.rs`'s `#![allow(dead_code)]`,
-// `gtk/mod.rs`'s `#![allow(deprecated)]`) — repeating them here would trip
-// clippy's `duplicated_attributes`. `tui_main/mod.rs` carried its own
-// `#![allow(unused_assignments, dead_code, deprecated, ...)]` here too until
-// #1434 deleted the unreachable code it existed to silence.
+// These modules are public because they are used by external tests.
+// Lint allows are stated in each module's own file where dead code exists.
 pub mod render;
 pub mod tui_main;
 
-/// Backend-neutral pixel→click-target resolution shared by `crate::app`
-/// (#862). Split out of the formerly `gui`-gated `src/gtk/click.rs`, which
+/// Backend-neutral pixel→click-target resolution shared by `crate::app`.
+/// Split out of the formerly `gui`-gated `src/gtk/click.rs`, which
 /// re-exports these names so its own tests and the rest of `crate::gtk` keep
 /// resolving them unchanged.
 pub(crate) mod click;
 
 /// Backend-neutral shell support functions (UI-font helpers, tab-bar pixel
-/// geometry, h-scrollbar geometry, ...) shared by `crate::app` (#862). Split
+/// geometry, h-scrollbar geometry, ...) shared by `crate::app`. Split
 /// out of the formerly `gui`-gated `src/gtk/mod.rs`, which re-exports these
 /// names so the rest of `crate::gtk` keeps resolving them unchanged.
 pub(crate) mod app_support;
@@ -47,74 +35,34 @@ pub(crate) mod app_support;
 #[cfg(feature = "gui")]
 pub mod gtk;
 
-/// `struct App` — the backend-neutral editor shell application, hoisted out
-/// of `src/gtk/mod.rs` by #785 (stage 1 of #47) so a second native backend
-/// can reuse it instead of re-implementing ~6,900 lines of portable shell
-/// logic. #862 dropped the `gui` gate itself: the remaining platform-typed
-/// field (`window`) was type-erased behind a small local trait until #1234
-/// deleted it outright once `quadraui::Backend::window()` shipped upstream.
-/// A second, `settings_monitor` (a GTK-only `gio::FileMonitor` behind an
-/// opaque `Box<dyn Any>` drop-guard), was deleted outright by #949 rather
-/// than type-erased — `Engine::check_settings_reload`'s portable mtime poll,
-/// already the sole reload mechanism on TUI, made it redundant. A third,
-/// `css_provider` (a `PlatformCssProvider`-erased `gtk4::CssProvider` theming
-/// the native file dialog's fallback widgets), was deleted outright by #1498
-/// once JDonaghy/quadraui#1091 gave `GtkPlatformServices` its own equivalent
-/// stylesheet, reloaded on every `Backend::set_theme` call — see
-/// `src/gtk/util.rs`'s icon-theme search-path doc for what #1498 also moved
-/// there. The `crate::gtk::{click, util}` reliance moved to the neutral
-/// `crate::click`/`crate::app_support` above. `App::new`, the once-GTK-only
-/// constructor, is gone too: #1498 folded it into the shared
-/// `App::new_portable` every other GUI backend already used, once the
-/// `css_provider` deletion left the icon-theme search path as the only
-/// display-dependent step still standing — `crate::gtk::run` now calls that
-/// one step directly (`crate::gtk::util::add_icon_theme_search_path`)
-/// instead of `App::new` doing it inline. What's left behind
-/// `#[cfg(feature = "gui")]` *inside* `src/app.rs` is a few inline
-/// `gtk4::Settings`/window-discovery call sites.
-/// See `src/app.rs`'s module doc for the full inventory.
+/// `struct App` — the backend-neutral editor shell application.
+/// Reusable by multiple native backends instead of re-implementing portable
+/// shell logic. Platform-specific fields have been removed or type-erased,
+/// and display-dependent initialization steps are now called directly by
+/// each backend's `run` function. See `src/app.rs`'s module doc for details.
 pub mod app;
 
 /// The native macOS (AppKit) backend — a thin wrapper over
-/// `quadraui::macos::shell_runner::run_with_shell` (#859, stage 2 of #47).
+/// `quadraui::macos::shell_runner::run_with_shell`.
 ///
-/// Double-gated, on the `macos` feature **and** `target_os = "macos"`, for
-/// the same reason quadraui gates its own `macos` module that way
-/// (`quadraui/src/lib.rs:128`): the module's whole dependency surface —
-/// `MacBackend`, AppKit, Core Graphics, Core Text — does not exist off a
-/// Mach-O host, so `--features macos` on Linux resolves cleanly and compiles
-/// none of it. That makes the feature safe to enable anywhere (it is what
-/// the `vimcode` bin's GUI-less build test in `src/main.rs` leans on) at the
-/// price that a Linux build proves nothing about this code. See
-/// `src/macos/mod.rs`'s "Verifying this file without a Mac" section for what
-/// was done about that and why the obvious `--target aarch64-apple-darwin`
-/// cross-check does not work here (`tree-sitter`'s C build script).
+/// Double-gated, on the `macos` feature **and** `target_os = "macos"`,
+/// because the module's dependencies (AppKit, Core Graphics, Core Text)
+/// do not exist off a Mach-O host. This allows `--features macos` on Linux
+/// to resolve cleanly without compiling this module.
 #[cfg(all(feature = "macos", target_os = "macos"))]
 pub mod macos;
 
 /// The native Windows GUI (Direct2D/DirectWrite) backend — a thin wrapper
-/// over `quadraui::win::shell_runner::run_with_shell` (#866, stage 3 of
-/// #47, the Win-GUI twin of `macos` above).
+/// over `quadraui::win::shell_runner::run_with_shell`.
 ///
 /// Gated on the `win` feature **alone** — unlike `macos`, which is also
-/// gated on `target_os = "macos"` because quadraui gates its own `macos`
-/// module that way. quadraui's `win` module (`quadraui/src/lib.rs`, next to
-/// the `macos` arm) deliberately does **not** target-gate itself: every real
-/// WinAPI call inside it is individually `cfg(target_os = "windows")`-gated
-/// with a `todo!()` fallback everywhere else, specifically so `cargo check
-/// --features win` type-checks `WinBackend` on an ordinary Linux CI runner
-/// (see that module's own doc comment and `Cargo.toml`'s `win` feature
-/// comment here). `src/win/mod.rs` inherits the same posture, so this line
-/// mirrors it rather than diverging — target-gating this module too would
-/// make `--features win` on Linux compile nothing, silently reintroducing
-/// the #645 trap `macos`'s own `target_os` gate deliberately avoids getting
-/// near for the "does the bin still build without `gui`?" probe. What *is*
-/// `target_os`-gated is where `src/main.rs::launch_gui` actually calls
-/// `vimcode_core::win::run` — see that file's doc comment.
+/// gated on `target_os = "macos"`. This allows `cargo check --features win`
+/// to type-check `WinBackend` on non-Windows platforms: individual WinAPI
+/// calls inside are `cfg(target_os = "windows")`-gated with `todo!()` fallbacks.
 #[cfg(feature = "win")]
 pub mod win;
 
-/// Backend-neutral conformance-test harness (#928) — adopts quadraui's
+/// Backend-neutral conformance-test harness — adopts quadraui's
 /// `ConformanceDriver`/`PixelClickConformance` so a black-box scenario is
 /// written once and run against every GUI backend's own driver
 /// (`GtkDriver`/`MacDriver`/`WinDriver`), instead of a GTK-only suite of
@@ -125,7 +73,7 @@ pub mod win;
 #[cfg(any(test, feature = "test-support"))]
 pub mod harness;
 
-/// Process-wide working-directory arbitration for the test run (#785) — the
+/// Process-wide working-directory arbitration for the test run — the
 /// lock that keeps a `chdir`-ing test from moving the ground under a
 /// concurrently painting harness. Test-only; never compiled into a release
 /// binary.

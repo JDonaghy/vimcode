@@ -7,7 +7,7 @@ impl Engine {
     pub fn open_picker(&mut self, source: PickerSource) {
         // Opening a picker is a "user is now focused on this modal"
         // event — dismiss any passive overlays (LSP hover) so they
-        // don't render behind the picker (#247).
+        // don't render behind the picker.
         self.dismiss_editor_hover();
 
         self.picker_query.clear();
@@ -85,13 +85,13 @@ impl Engine {
     }
 
     /// Open the Grep picker scoped to `dir` — the explorer context menu's
-    /// "Find in Folder..." action (#1418/#1438). Search results are
+    /// "Find in Folder..." action. Search results are
     /// restricted to `dir` (via [`Self::picker_grep_scope`]) instead of the
     /// whole workspace, matching the menu label. `open_picker` already
     /// reset `picker_grep_scope` to `None`, so this only needs to set it
     /// afterwards. The picker title is switched from the plain "Live Grep"
     /// to `"Grep in <dir relative to cwd>/"` so the scope is visible in the
-    /// UI, not just in search behavior (#1438).
+    /// UI, not just in search behavior.
     pub fn open_grep_picker_scoped(&mut self, dir: &Path) {
         self.open_picker(PickerSource::Grep);
         self.picker_grep_scope = Some(dir.to_path_buf());
@@ -173,7 +173,7 @@ impl Engine {
     /// that represents the user backing out without confirming anything
     /// (Escape, GTK click-outside-to-dismiss) must use
     /// [`Self::close_picker_cancelling_plugin`] instead so the plugin
-    /// registration isn't leaked (#1630 review).
+    /// registration isn't leaked.
     pub fn close_picker(&mut self) {
         self.picker_open = false;
         self.picker_query.clear();
@@ -189,12 +189,10 @@ impl Engine {
 
     /// Close the picker the way a user-initiated "back out" gesture should:
     /// if it's a `vimcode.picker.open` one, fire `on_cancel` and release its
-    /// `PluginManager` registration before returning — exactly what
-    /// `handle_picker_key`'s `Escape` arm used to do inline. Used by every
-    /// non-key path that dismisses the picker without confirming an item
-    /// (GTK's click-outside-to-dismiss, `render::PickerRoute::Dismiss`) so
-    /// that path doesn't leak the registration the way #1630's review found
-    /// it did when it called `close_picker()` directly.
+    /// `PluginManager` registration before returning. Used by every non-key path
+    /// that dismisses the picker without confirming an item (GTK's
+    /// click-outside-to-dismiss, `render::PickerRoute::Dismiss`) so that path
+    /// doesn't leak the registration.
     pub fn close_picker_cancelling_plugin(&mut self) {
         let plugin_id = self.plugin_picker_id();
         self.close_picker();
@@ -263,7 +261,7 @@ impl Engine {
 
     /// Focus `group_id` if it exists, so the breadcrumb helpers below (which
     /// all read the *active* group's buffer and cursor) resolve against the
-    /// bar the user actually clicked (#555).
+    /// bar the user actually clicked.
     fn focus_breadcrumb_group(&mut self, group_id: GroupId) {
         if self.active_group != group_id && self.editor_groups.contains_key(&group_id) {
             self.active_group = group_id;
@@ -272,16 +270,11 @@ impl Engine {
 
     /// Open a scoped picker for the currently selected breadcrumb segment.
     /// Path segments open the file picker for that directory.
-    /// Handle a breadcrumb segment click from either backend.
-    /// Focuses the clicked group, rebuilds its segments, selects the clicked
-    /// index, and opens scoped.
     ///
     /// `group_id` comes from `render::BreadcrumbClickResult::Hit` — it is the
     /// group whose *bar* was clicked, which is not necessarily the focused one
-    /// in a split. Resolving the index against the focused group instead was
-    /// the #555 "clicks do nothing" bug: an index valid for the clicked bar
-    /// could be out of range for the focused group's shorter segment list, and
-    /// `breadcrumb_open_scoped` would silently bail.
+    /// in a split. The focused group's segment list may be shorter than the
+    /// clicked bar's, so the index must be resolved against the focused group.
     pub fn handle_breadcrumb_click(&mut self, group_id: GroupId, idx: usize) {
         self.focus_breadcrumb_group(group_id);
         self.rebuild_breadcrumb_segments();
@@ -322,7 +315,7 @@ impl Engine {
         // Filter to symbols whose container matches this segment's parent,
         // matching VSCode behavior (clicking a function shows sibling functions).
         //
-        // #465: `open_picker` resets the scope filter as part of its state-clear
+        // `open_picker` resets the scope filter as part of its state-clear
         // pass, so both assignments happen AFTER the open call — otherwise the
         // filter is wiped before the async LSP response can read it.
         //
@@ -352,7 +345,7 @@ impl Engine {
     fn picker_populate_files(&mut self) {
         let cwd = self.cwd.clone();
         let show_hidden = self.settings.show_hidden_files;
-        // #1545: `show_hidden_files` now defaults on, so the walk would
+        // `show_hidden_files` now defaults on, so the walk would
         // otherwise descend into `.git/` and fill quick-open with
         // `HEAD`/`config`/object files. `explorer_exclude` is the single
         // source of truth for that noise; applied as a `filter_entry` so an
@@ -736,8 +729,8 @@ impl Engine {
             .collect();
     }
 
-    /// Populate the picker with recent workspace paths from the session.
-    /// Most-recent first (the session stores them oldest-first). #274.
+    /// Populate the picker with recent workspace paths from the session,
+    /// most-recent first.
     fn picker_populate_recent_workspaces(&mut self) {
         let current = self.workspace_root.clone();
         self.picker_all_items = self
@@ -768,14 +761,11 @@ impl Engine {
             .collect();
     }
 
-    /// Populate the `:AiSessions` picker (#1459) from the local session
-    /// index, scoped to the active agent + workspace, most-recently-used
-    /// first (`AcpSessionIndex::sessions_for` already sorts that way). The
-    /// entry's `display` prefers the agent-assigned `title` (#1519,
-    /// `session_info_update`) when one has been learned, else falls back
-    /// to the first prompt that started the session, else the raw session
-    /// id (a record predating either field, which can't happen post-#1459
-    /// but costs nothing to guard) — since a bare session id means nothing
+    /// Populate the `:AiSessions` picker from the local session index,
+    /// scoped to the active agent + workspace, most-recently-used first.
+    /// The entry's `display` prefers the agent-assigned `title` when one has
+    /// been learned, else falls back to the first prompt that started the
+    /// session, else the raw session id — since a bare session id means nothing
     /// to a human; `detail` is a relative "last used" timestamp, reusing
     /// `git::epoch_to_relative`'s bucketing rather than re-deriving it.
     fn picker_populate_acp_sessions(&mut self) {
@@ -826,7 +816,7 @@ impl Engine {
             return;
         }
 
-        // `vimcode.picker.open` (#1630): still fuzzy-filter locally against
+        // `vimcode.picker.open`: still fuzzy-filter locally against
         // whatever items the plugin has supplied so far, then let a dynamic
         // source's `on_query` re-populate them for the new query (e.g. a
         // live-grep extension re-spawning `rg`). Unlike Grep/CommandCenter
@@ -1176,7 +1166,7 @@ impl Engine {
         //    that don't have a line (and the existing test surface).
         //
         // Line-based lookup wins when available because tree-sitter and LSP
-        // disagree on naming for impl blocks (#465): tree-sitter returns just
+        // disagree on naming for impl blocks: tree-sitter returns just
         // the implemented type (`VsplitLayout`), while rust-analyzer names the
         // impl `impl WindowGroupLayout for VsplitLayout`. Lines are unique and
         // language-server-agnostic.
@@ -1283,7 +1273,7 @@ impl Engine {
     /// first symbol whose start line matches `target_line`. Used by the
     /// breadcrumb scope filter to locate the clicked-on parent by line —
     /// language-server-agnostic, unlike name matching which breaks for impl
-    /// blocks where tree-sitter and LSP disagree on naming (#465).
+    /// blocks where tree-sitter and LSP disagree on naming.
     fn find_symbol_at_line(
         symbols: &[lsp::SymbolInfo],
         target_line: usize,
@@ -1387,7 +1377,7 @@ impl Engine {
                 sym.line as usize,
                 sym.character as usize,
             );
-            // #262: symbol items are never expandable. Every row is a
+            // Symbol items are never expandable. Every row is a
             // jumpable destination (GotoSymbol). Children are emitted
             // flat at increasing depth so the indent still shows the
             // hierarchy, but Enter / click always jumps via picker_confirm
@@ -1555,12 +1545,11 @@ impl Engine {
     /// Run a project grep search with a given query string and populate picker_items.
     /// Shared between the standalone Grep picker source and Command Center `%` prefix.
     ///
-    /// Searches under [`Self::picker_grep_scope`] when set (the "Find in
-    /// Folder..." context-menu action, #1418/#1438) — [`Self::cwd`]
-    /// otherwise. Displayed paths always stay relative to [`Self::cwd`]
-    /// (the workspace root), even when the search itself is scoped to a
-    /// subfolder, so opening a result behaves exactly as it does for the
-    /// unscoped picker (#1438).
+    /// Searches under [`Self::picker_grep_scope`] when set (a context-menu action
+    /// for "Find in Folder...") — [`Self::cwd`] otherwise. Displayed paths always
+    /// stay relative to [`Self::cwd`] (the workspace root), even when the search
+    /// itself is scoped to a subfolder, so opening a result behaves exactly as
+    /// it does for the unscoped picker.
     fn picker_cc_grep_search(&mut self, query: &str) {
         let options = project_search::SearchOptions::default();
         let search_root = self
@@ -1769,12 +1758,11 @@ impl Engine {
     /// If a question is provided, shows a "Send to AI" item.
     /// Otherwise shows "Open AI Panel".
     fn picker_populate_chat(&mut self, question: &str) {
-        // An ACP agent (`acp_agent_command`) is a third valid transport
-        // alongside a direct-provider API key or Ollama (#952 ACP-1) —
-        // `ai_send_message` already routes to it, so the palette's gate
-        // must recognise it too, or an ACP-only user (no `ai_api_key`,
-        // default `ai_provider`) hits "Configure AI provider first" and
-        // never reaches the `chat_send:` action.
+        // An ACP agent (`acp_agent_command`) is a third valid transport alongside
+        // a direct-provider API key or Ollama. `ai_send_message` already routes to
+        // it, so the palette's gate must recognise it too, or an ACP-only user
+        // (no `ai_api_key`, default `ai_provider`) hits "Configure AI provider
+        // first" and never reaches the `chat_send:` action.
         let configured = !self.settings.ai_api_key.is_empty()
             || self.settings.ai_provider == "ollama"
             || !self.settings.acp_agent_command.trim().is_empty();
@@ -1910,7 +1898,7 @@ impl Engine {
         }
     }
 
-    /// `vimcode.picker.open` item preview (#1630): a declared `preview`
+    /// `vimcode.picker.open` item preview: a declared `preview`
     /// table names either a file (+ optional line, windowed the same way
     /// `PickerAction::OpenFileAtLine` is above) or a live buffer handle (+
     /// optional line, read from the buffer's in-memory rope rather than
@@ -2025,10 +2013,7 @@ impl Engine {
                         EngineAction::None
                     }
                     "goto_line" => {
-                        // #193: open Command mode so the user can type a
-                        // line number directly. Previously printed a
-                        // status message suggesting `:N` — unhelpful as
-                        // a first-class palette action.
+                        // Open Command mode so the user can type a line number directly.
                         self.mode = Mode::Command;
                         self.command_buffer.clear();
                         self.command_cursor = 0;
@@ -2045,7 +2030,7 @@ impl Engine {
                         EngineAction::None
                     }
                     "substitute" => {
-                        // #193: open the find/replace overlay directly
+                        // Open the find/replace overlay directly
                         // (same as the Ctrl+H binding) rather than
                         // printing a tip about :%s/...
                         self.open_find_replace();
@@ -2160,7 +2145,7 @@ impl Engine {
                 EngineAction::None
             }
             PickerAction::OpenWorkspace(path) => {
-                // #274: recent-workspaces picker confirm. Switch workspace,
+                // Recent-workspaces picker confirm. Switch workspace,
                 // focus the explorer (so the active file's row renders with
                 // the focused selection bg — surfaces visibly in GTK whose
                 // inactive_selected_bg is too close to surface_bg to read),
@@ -2175,11 +2160,10 @@ impl Engine {
                 EngineAction::None
             }
             PickerAction::ResumeAcpSession(session_id) => {
-                // #1459: `:AiSessions` picker confirm. Reveal the panel the
-                // same way `:AI <message>` does (`ff739abb`/#1453) so the
-                // replayed transcript is actually visible, then resume —
-                // `Engine::acp_resume_session` handles every client state
-                // (none yet, mid-handshake, or already live) uniformly.
+                // `:AiSessions` picker confirm. Reveal the panel the same way `:AI <message>`
+                // does so the replayed transcript is actually visible, then resume.
+                // `Engine::acp_resume_session` handles every client state (none yet,
+                // mid-handshake, or already live) uniformly.
                 self.focus_sidebar_panel(crate::core::engine::sidebar::PANEL_AI);
                 self.acp_resume_session(session_id);
                 EngineAction::None
@@ -2218,7 +2202,7 @@ impl Engine {
                 EngineAction::None
             }
             PickerAction::Custom(key) => {
-                // `vimcode.picker.open` item confirmed (#1630): fire the
+                // `vimcode.picker.open` item confirmed: fire the
                 // plugin's `on_select` with this item's `data`. `close_picker`
                 // already ran above, so this only needs to dispatch + tear
                 // down the picker's bookkeeping.
@@ -2275,7 +2259,7 @@ impl Engine {
                     // Focus the AI chat panel
                     self.close_picker();
                     self.ai_has_focus = true;
-                    // #1507 review: fresh entry into the panel from the
+                    // Fresh entry into the panel from the
                     // command palette bypasses `clear_sidebar_focus`, so
                     // reset here too — see the identical comment on the
                     // `<leader>ai` entry arm in `keys.rs`.
@@ -2335,7 +2319,7 @@ impl Engine {
     ) -> EngineAction {
         match key_name {
             "Escape" => {
-                // #1630: a `vimcode.picker.open` picker fires `on_cancel` on
+                // A `vimcode.picker.open` picker fires `on_cancel` on
                 // user-initiated cancel and releases its registration.
                 self.close_picker_cancelling_plugin();
                 EngineAction::None
@@ -2529,7 +2513,7 @@ impl Engine {
 // targets via `win: Option<WindowId>` (`None` = the global quickfix list,
 // `Some(id)` = window `id`'s location list) and is the single
 // implementation behind both the `:c*` and `:l*` ex-command families
-// (`src/core/engine/execute.rs`) (#1155).
+// (`src/core/engine/execute.rs`).
 
 impl Engine {
     /// Borrow the target list mutably, creating an empty location list on
@@ -2552,16 +2536,8 @@ impl Engine {
     }
 
     /// The "list is empty" message for the target, matching Vim's distinct
-    /// quickfix (`E42`) vs location-list (`E776`) wording.
-    ///
-    /// #1283: confirmed by hand against `nvim --headless -u NONE` — the
-    /// global-list message is `E42: No Errors` verbatim (capital `E` in
-    /// `Errors`), not the "Quickfix list is empty" prose this used to read.
-    /// The wrong casing/wording was invisible before #1283 because nothing
-    /// in the oracle corpus compared it: the buffer/cursor-only `Case`
-    /// harness `ex:cc on empty quickfix list` (#1154) can't see `message` at
-    /// all, and its paired engine-level test asserted the same wrong text
-    /// back (`.contains("No errors")`) — see that test's #1283 update.
+    /// quickfix (`E42: No Errors`) vs location-list (`E776: No location list`)
+    /// wording.
     pub(super) fn qf_empty_msg(win: Option<WindowId>) -> String {
         if win.is_some() {
             "E776: No location list".to_string()
@@ -2584,13 +2560,11 @@ impl Engine {
         if win.is_none() {
             self.qf_push_history();
         }
-        // #1307: this flips `open` unconditionally (existing behaviour,
-        // unrelated to #1307) but deliberately does *not* call
-        // `qf_ensure_panel_window` — a plain `:grep`/`:vimgrep` re-run must
-        // not conjure a real split window out of nowhere; only `:copen`/
-        // `:lopen`/`:cwindow`/`:lwindow` do that. If one is *already* open
-        // (from an earlier `:copen`), keep it live instead of leaving it
-        // showing stale entries.
+        // This flips `open` unconditionally but deliberately does *not* call
+        // `qf_ensure_panel_window` — a plain `:grep`/`:vimgrep` re-run must not
+        // conjure a real split window out of nowhere; only `:copen`/`:lopen`/
+        // `:cwindow`/`:lwindow` do that. If one is *already* open (from an
+        // earlier `:copen`), keep it live instead of leaving it showing stale entries.
         self.qf_refresh_panel_if_open(win);
     }
 
@@ -2667,7 +2641,7 @@ impl Engine {
         list.items.iter().map(Self::qf_format_item).collect()
     }
 
-    /// If a real panel window is currently open for `target` (#1307),
+    /// If a real panel window is currently open for `target`,
     /// refresh its buffer text from the list's current items and move its
     /// cursor to the list's current `selected` index — call after anything
     /// that mutates a `QuickfixList`'s `items`/`selected` so an already-open
@@ -2691,7 +2665,7 @@ impl Engine {
     }
 
     /// Does `target` have a real `WindowLayout` leaf open for it right now
-    /// (#1307)? `render.rs`'s legacy overlay-band renderer
+    ///? `render.rs`'s legacy overlay-band renderer
     /// (`quickfix_panel_rows`, `compute_editor_layout`, `build_screen_
     /// layout_with_breadcrumb_row`'s `screen.quickfix` builder) calls this
     /// to self-suppress for a target that already has a real window —
@@ -2709,7 +2683,7 @@ impl Engine {
 
     /// The window id `execute_command`'s `:l*` family should pass as
     /// `qf_get`'s `win` — ordinarily just the active window, *except* when
-    /// the active window is itself a location-list panel window (#1307): a
+    /// the active window is itself a location-list panel window: a
     /// real Neovim location-list window keeps a hidden reference to the
     /// window it was opened for (`getloclist(0, {'filewinid': 0})`), so
     /// `:lclose`/`:lnext`/... typed *while inside* the panel still target
@@ -2723,7 +2697,7 @@ impl Engine {
         }
     }
 
-    /// If `id` is a quickfix/location-list panel window (#1307), the list it
+    /// If `id` is a quickfix/location-list panel window, the list it
     /// targets (`qf_get`'s `win` shape: `None` = global, `Some(owner)` =
     /// window `owner`'s location list). `None` if `id` isn't a panel window.
     pub(crate) fn qf_panel_target(&self, id: WindowId) -> Option<Option<WindowId>> {
@@ -2734,17 +2708,13 @@ impl Engine {
     }
 
     /// Undo `qf_open`'s bookkeeping when `window_id` — possibly a quickfix/
-    /// location-list panel window (#1307) — is removed from `self.windows`
-    /// through *any* window-close path, not just `qf_close`/
-    /// `qf_close_panel_window` (`CTRL-W q`/`CTRL-W c` on a focused panel
-    /// window, `:only`, closing its owning tab/group, a diff-pair cleanup,
-    /// ...). Every one of those already removes the window correctly on its
-    /// own — a panel window is now an entirely ordinary `Window`/
-    /// `WindowLayout` leaf — so this only keeps `QuickfixList::open`/
-    /// `has_focus` from lying about a window that no longer exists, and
-    /// drops the now-stale `qf_panel_windows` entry. A no-op for any id that
-    /// isn't a panel window (the overwhelmingly common case, since
-    /// `qf_panel_windows` rarely holds more than one or two entries).
+    /// location-list panel window — is removed from `self.windows` through
+    /// *any* window-close path, not just `qf_close`/`qf_close_panel_window`
+    /// (`CTRL-W q`/`CTRL-W c` on a focused panel window, `:only`, closing its
+    /// owning tab/group, a diff-pair cleanup, ...). This keeps
+    /// `QuickfixList::open`/`has_focus` from lying about a window that no
+    /// longer exists, and drops the now-stale `qf_panel_windows` entry. A no-op
+    /// for any id that isn't a panel window.
     pub(crate) fn forget_closed_panel_window(&mut self, window_id: WindowId) {
         if let Some(target) = self.qf_panel_target(window_id) {
             self.qf_panel_windows.remove(&target);
@@ -2756,19 +2726,14 @@ impl Engine {
 
     /// Open the target panel and give it focus.
     ///
-    /// #1283 finding, confirmed by hand against `nvim --headless -u NONE`:
     /// `:copen` opens the quickfix window **unconditionally** — even on a
-    /// totally empty list (`winnr('$')` goes 1 -> 2, no error) — so the
-    /// global list (`win == None`, which always exists per `qf_get`) must
-    /// never refuse here. `:lopen` only refuses when the *window has never
-    /// had a location list at all* (`E776: No location list`); once one
-    /// exists — even populated with zero items via `setloclist(0, [])` —
-    /// `:lopen` opens it exactly like `:copen`. `qf_get` (read-only, no
-    /// autovivify) is what distinguishes "never created" from "empty",
-    /// unlike `qf_get_mut`'s `entry(..).or_default()` this used to check
-    /// against, which collapsed both into the same wrong refusal.
-    ///
-    /// #1307: also opens (or reuses) the panel's real `WindowLayout` leaf
+    /// totally empty list — so the global list (`win == None`, which always
+    /// exists per `qf_get`) must never refuse here. `:lopen` only refuses when
+    /// the *window has never had a location list at all* (`E776: No location
+    /// list`); once one exists — even populated with zero items via
+    /// `setloclist(0, [])` — `:lopen` opens it exactly like `:copen`. `qf_get`
+    /// (read-only, no autovivify) distinguishes "never created" from "empty".\n///
+    /// Also opens (or reuses) the panel's real `WindowLayout` leaf
     /// (`qf_ensure_panel_window`) — the reason `:copen`/`:lopen` are the
     /// entry points that get a real window at all, unlike `qf_set_list`'s
     /// implicit auto-open, which only flips the flags below.
@@ -2791,7 +2756,7 @@ impl Engine {
     }
 
     /// Close the target panel, including its real `WindowLayout` leaf if one
-    /// is open (#1307).
+    /// is open.
     pub fn qf_close(&mut self, win: Option<WindowId>) -> EngineAction {
         self.qf_close_panel_window(win);
         let list = self.qf_get_mut(win);
@@ -2803,14 +2768,12 @@ impl Engine {
     /// `:cwindow`/`:lwindow` — open the panel only if the target list is
     /// non-empty; close it (if open) otherwise.
     ///
-    /// #1283 finding: `:cwindow` never errors (the global list always
-    /// exists), matching the pre-existing behaviour below. But `:lwindow`
+    /// `:cwindow` never errors (the global list always exists). But `:lwindow`
     /// on a window with **no location list at all** does error (`E776: No
-    /// location list`, confirmed against a live oracle) rather than silently
-    /// no-op like it does once a list exists (even an empty one, via
-    /// `setloclist(0, [])`) — the same "never created" vs "empty" split as
-    /// `qf_open` above, so it needs the same `qf_get` (not `qf_get_mut`)
-    /// existence check first.
+    /// location list`) rather than silently no-op like it does once a list exists
+    /// (even an empty one, via `setloclist(0, [])`) — the same "never created"
+    /// vs "empty" split as `qf_open` above, so it needs the same `qf_get`
+    /// (not `qf_get_mut`) existence check first.
     pub fn qf_window(&mut self, win: Option<WindowId>) -> EngineAction {
         if win.is_some() && self.qf_get(win).is_none() {
             self.message = Self::qf_empty_msg(win);
@@ -2839,15 +2802,9 @@ impl Engine {
 
     /// Move to the next entry and jump to it.
     ///
-    /// #1283 finding: on an empty (or, for a location list, altogether
-    /// absent) target, real Neovim's `:cnext`/`:lnext` refuse with an
-    /// explicit error (`E42: No Errors` / `E776: No location list`) rather
-    /// than silently doing nothing. Before this fix `qf_jump` still declined
-    /// to move (there is no item at index 0 of an empty `Vec`), so the
-    /// buffer/cursor-only oracle `Case` harness could not see the gap — only
-    /// `engine.message` can, which is why this is paired with an
-    /// engine-level test rather than relying on a `Case` alone (same
-    /// precedent as `ex:cc on empty quickfix list`, #1154).
+    /// On an empty (or, for a location list, altogether absent) target, Neovim's
+    /// `:cnext`/`:lnext` refuse with an explicit error (`E42: No Errors` /
+    /// `E776: No location list`) rather than silently doing nothing.
     pub fn qf_next(&mut self, win: Option<WindowId>) -> EngineAction {
         if self.qf_get(win).is_none_or(|l| l.items.is_empty()) {
             self.message = Self::qf_empty_msg(win);
@@ -2859,8 +2816,8 @@ impl Engine {
         self.qf_jump(win)
     }
 
-    /// Move to the previous entry and jump to it. See [`Engine::qf_next`]'s
-    /// #1283 doc comment — same empty/absent-list refusal.
+    /// Move to the previous entry and jump to it. See [`Engine::qf_next`] for
+    /// the behavior on an empty or absent list.
     pub fn qf_prev(&mut self, win: Option<WindowId>) -> EngineAction {
         if self.qf_get(win).is_none_or(|l| l.items.is_empty()) {
             self.message = Self::qf_empty_msg(win);
@@ -2885,7 +2842,7 @@ impl Engine {
     /// location list *is* bound to a window, so navigating it must reuse
     /// that window (`open_file_in_window`) — otherwise each jump would open
     /// a fresh tab/window and `self.active_window_id()` would drift away
-    /// from the window the list actually belongs to (#1155).
+    /// from the window the list actually belongs to.
     pub fn qf_jump(&mut self, win: Option<WindowId>) -> EngineAction {
         let item = {
             let list = self.qf_get_mut(win);
@@ -2906,7 +2863,7 @@ impl Engine {
             self.set_cursor_for_window(win_id, m.line, m.col);
             self.ensure_cursor_visible();
         }
-        // #1307: the panel window (if open) stays open after a jump — real
+        // The panel window (if open) stays open after a jump — real
         // Neovim leaves the quickfix window in place after `<CR>` too — but
         // its own cursor should still land on the entry that was just
         // jumped to, so tabbing back into it later starts on the right row.
@@ -2981,7 +2938,7 @@ impl Engine {
             self.message = "E471: Argument required".to_string();
             return EngineAction::None;
         }
-        // #1308: unlike `:cc`/`:cnext`/`:clist`/`:cfirst`/`:clast`, real
+        // Unlike `:cc`/`:cnext`/`:clist`/`:cfirst`/`:clast`, real
         // Neovim's `:cdo`/`:cfdo`/`:ldo`/`:lfdo` are a silent no-op on an
         // empty list — confirmed against a live `nvim --headless -u NONE`
         // oracle. `pcall` succeeds and `v:errmsg` stays empty, so this must
@@ -3091,7 +3048,7 @@ mod grep_scope_tests {
     }
 
     /// `open_grep_picker_scoped(dir)` + a query matching files both inside
-    /// and outside `dir` must return only the match under `dir` (#1438).
+    /// and outside `dir` must return only the match under `dir`.
     #[test]
     fn open_grep_picker_scoped_only_returns_matches_under_dir() {
         let (mut engine, dir) = engine_with_scoped_and_unscoped_files("scoped_only");
@@ -3117,8 +3074,7 @@ mod grep_scope_tests {
         );
     }
 
-    /// The scoped picker's title must show the folder being searched
-    /// (#1438's "Show the scope in the picker title" requirement).
+    /// The scoped picker's title must show the folder being searched.
     #[test]
     fn open_grep_picker_scoped_shows_folder_in_title() {
         let (mut engine, dir) = engine_with_scoped_and_unscoped_files("title");
@@ -3159,10 +3115,9 @@ mod grep_scope_tests {
     }
 
     /// Right-clicking a *file* (not a folder) must scope the grep picker
-    /// to the file's parent directory, per #1438's acceptance criteria —
-    /// `apply_explorer_context_action`'s `"find_in_folder"` arm resolves
-    /// this via `explorer_ctx_action_dir` before calling
-    /// `open_grep_picker_scoped`.
+    /// to the file's parent directory. `apply_explorer_context_action`'s
+    /// `"find_in_folder"` arm resolves this via `explorer_ctx_action_dir`
+    /// before calling `open_grep_picker_scoped`.
     #[test]
     fn find_in_folder_on_a_file_target_scopes_to_its_parent_directory() {
         let (mut engine, dir) = engine_with_scoped_and_unscoped_files("file_target");

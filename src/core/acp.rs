@@ -1,10 +1,10 @@
 //! ACP (Agent Client Protocol) transport — NDJSON JSON-RPC 2.0 over a
-//! subprocess's stdio, plus a minimal session lifecycle (#951, ACP-0).
+//! subprocess's stdio, plus a minimal session lifecycle.
 //!
-//! This is the foundation of the ACP track (epic #531). It ships the
-//! transport and the client<->agent session lifecycle only — **no UI**.
-//! Later slices build the AI panel state machine and rendering on top of
-//! [`AcpEvent`] and [`Engine::poll_acp`](crate::core::Engine::poll_acp).
+//! This is the foundation of the ACP track. It ships the transport and
+//! the client<->agent session lifecycle only — **no UI**. Later slices
+//! build the AI panel state machine and rendering on top of [`AcpEvent`]
+//! and [`Engine::poll_acp`](crate::core::Engine::poll_acp).
 //!
 //! ## Why this is not `lsp.rs` reuse
 //!
@@ -42,8 +42,7 @@
 //!
 //! ### How terminal auth differs from `authenticate`
 //!
-//! Two distinct mechanisms, and conflating them is the trap the issue
-//! calls out:
+//! Two distinct mechanisms, and conflating them is the trap:
 //!
 //! - `type: "agent"` methods -> call [`AcpClient::authenticate`]
 //!   (`authenticate {methodId}`).
@@ -60,9 +59,9 @@
 //! - Protocol version is pinned at `1` (a draft v2 restructures capabilities
 //!   and drops `fs/*`/`terminal/*` in favour of MCP-over-ACP).
 //! - Capabilities advertised in `initialize` are **only** what later slices
-//!   actually implement. Omitted means unsupported. As of #954 (ACP-3) that
-//!   is `fs.readTextFile` and `fs.writeTextFile` — see [`AcpClient::initialize`].
-//! - `terminal/*` (#1522): served when `settings.acp_terminal_enabled` is on
+//!   actually implement. Omitted means unsupported. As of ACP-3 that is
+//!   `fs.readTextFile` and `fs.writeTextFile` — see [`AcpClient::initialize`].
+//! - `terminal/*`: served when `settings.acp_terminal_enabled` is on
 //!   (default), via `Engine::acp_terminal_create`/`acp_terminal_refresh`
 //!   (`src/core/engine/terminal_ops.rs`) — see that module's doc for how a
 //!   served terminal reuses the same "spawn an interactive shell, inject the
@@ -116,19 +115,19 @@ pub enum AcpEvent {
         modes: Option<serde_json::Value>,
         config_options: Option<serde_json::Value>,
     },
-    /// Response to our `session/load` request (#1459) — the agent has
-    /// finished (or acknowledged) resuming a previously-created session.
-    /// Unlike [`AcpEvent::SessionCreated`], the response carries no
-    /// `sessionId` of its own (the caller already knows it — it's the id
-    /// being resumed), so there is none to hoist out here; the caller sets
-    /// `acp_session_id` itself before sending the request (see
-    /// `Engine::acp_begin_session`'s doc for why that ordering matters: a
-    /// resuming agent may emit its history as `session/update`
-    /// notifications *before* this response line arrives).
+    /// Response to our `session/load` request — the agent has finished (or
+    /// acknowledged) resuming a previously-created session. Unlike
+    /// [`AcpEvent::SessionCreated`], the response carries no `sessionId` of
+    /// its own (the caller already knows it — it's the id being resumed), so
+    /// there is none to hoist out here; the caller sets `acp_session_id`
+    /// itself before sending the request (see `Engine::acp_begin_session`'s
+    /// doc for why that ordering matters: a resuming agent may emit its
+    /// history as `session/update` notifications *before* this response line
+    /// arrives).
     SessionLoaded {
         request_id: i64,
         modes: Option<serde_json::Value>,
-        /// (#1520) same optional `configOptions` field as
+        /// same optional `configOptions` field as
         /// [`AcpEvent::SessionCreated`] — a resumed session re-declares its
         /// config options exactly like a fresh one.
         config_options: Option<serde_json::Value>,
@@ -170,10 +169,10 @@ pub enum AcpEvent {
         stderr: String,
         was_initialized: bool,
     },
-    /// Response to our `authenticate` request (#957, ACP-6) — a `type:
-    /// "agent"` auth method succeeded. A failure comes through
-    /// [`AcpEvent::RequestFailed`] instead (method `"authenticate"`), same
-    /// as every other client -> agent request.
+    /// Response to our `authenticate` request — a `type: "agent"` auth
+    /// method succeeded. A failure comes through [`AcpEvent::RequestFailed`]
+    /// instead (method `"authenticate"`), same as every other client ->
+    /// agent request.
     Authenticated { request_id: i64 },
 }
 
@@ -183,7 +182,7 @@ pub enum AcpEvent {
 
 /// Encode a JSON-RPC message as one NDJSON line: compact JSON followed by
 /// `\n`. ACP puts exactly one message per line; there is no header framing
-/// to get wrong the way LSP's `Content-Length` is (#951).
+/// to get wrong the way LSP's `Content-Length` is.
 pub fn encode_ndjson_line(body: &serde_json::Value) -> Vec<u8> {
     let mut s = body.to_string();
     s.push('\n');
@@ -277,21 +276,21 @@ fn absolute_path_string(path: &Path) -> String {
 /// shell syntax — `$VAR` expansion, globs, pipes, single quotes — is
 /// interpreted; this is argv construction for `Command::args`, not a shell
 /// (`core::terminal::shell_command` is the seam for actual `sh -c` use, and
-/// does not apply here per #1255's reasoning: this is a fixed program
-/// invocation, not a user-supplied shell command string).
+/// does not apply here: this is a fixed program invocation, not a
+/// user-supplied shell command string).
 ///
 /// **This same `settings.acp_agent_command` string is parsed a second,
-/// different way for the `type: "terminal"` auth login path** (#957,
-/// ACP-6): `Engine::acp_launch_terminal_login`
-/// (`src/core/engine/terminal_ops.rs`) writes it verbatim into a real
-/// interactive shell via `build_acp_auth_wrapper`, where it *is*
-/// shell-interpreted (`$VAR`, backticks, `;`, pipes, …), unlike this
-/// splitter. A command containing shell metacharacters would therefore
-/// behave differently between the two paths for the same setting. The
-/// command is operator-configured, not attacker input, so this is a
-/// latent correctness surprise rather than a security bug — worth
-/// revisiting (e.g. quoting the wrapper's injected command) if it ever
-/// causes real confusion, but out of scope for #957 itself.
+/// different way for the `type: "terminal"` auth login path** — the
+/// `Engine::acp_launch_terminal_login` (`src/core/engine/terminal_ops.rs`)
+/// writes it verbatim into a real interactive shell via
+/// `build_acp_auth_wrapper`, where it *is* shell-interpreted (`$VAR`,
+/// backticks, `;`, pipes, …), unlike this splitter. A command containing
+/// shell metacharacters would therefore behave differently between the two
+/// paths for the same setting. The command is operator-configured, not
+/// attacker input, so this is a latent correctness surprise rather than a
+/// security bug — worth revisiting (e.g. quoting the wrapper's injected
+/// command) if it ever causes real confusion, but out of scope for
+/// terminal auth itself.
 pub fn parse_agent_command(cmd: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -314,9 +313,9 @@ pub fn parse_agent_command(cmd: &str) -> Vec<String> {
 }
 
 /// One entry in the user-configured multi-agent registry
-/// (`settings.acp_agents`, #958 ACP-7). Bringing up a *second* ACP agent is
-/// meant to be a pure config fact — a second `AcpAgentProfile` spawned
-/// through the exact same [`AcpClient::spawn_with_env`] call the single-agent
+/// (`settings.acp_agents`). Bringing up a *second* ACP agent is meant to
+/// be a pure config fact — a second `AcpAgentProfile` spawned through the
+/// exact same [`AcpClient::spawn_with_env`] call the single-agent
 /// `acp_agent_command` path already used — never a new branch on which
 /// agent is active anywhere in this file or `Engine`. See
 /// `Engine::acp_resolve_agent_launch` (`src/core/engine/acp_ops.rs`), the
@@ -341,12 +340,11 @@ pub struct AcpAgentProfile {
     /// skipped rather than erroring.
     #[serde(default)]
     pub env: Vec<String>,
-    /// Per-agent override of `settings.acp_mcp_servers` (#1487): any entry
-    /// here whose `name` matches a global entry replaces it; any other
-    /// entry is appended. Empty (the default, every pre-#1487 profile)
-    /// leaves the global list untouched. See
-    /// `Engine::acp_resolve_mcp_servers` (`src/core/engine/acp_ops.rs`),
-    /// the one place that reads this field.
+    /// Per-agent override of `settings.acp_mcp_servers`: any entry here
+    /// whose `name` matches a global entry replaces it; any other entry is
+    /// appended. Empty (the default) leaves the global list untouched. See
+    /// `Engine::acp_resolve_mcp_servers` (`src/core/engine/acp_ops.rs`), the
+    /// one place that reads this field.
     #[serde(default)]
     pub mcp_servers: Vec<AcpMcpServerConfig>,
 }
@@ -363,10 +361,10 @@ pub fn parse_agent_env(env: &[String]) -> Vec<(String, String)> {
 }
 
 // ---------------------------------------------------------------------------
-// User-configured MCP servers (#1487, redo of #1462 on the multi-session
-// engine — see this module's session-scoped `AcpSession::mcp_capabilities`/
-// `AcpSession::active_mcp_servers`, not a global `Engine` field)
+// User-configured MCP servers — session-scoped configuration
 // ---------------------------------------------------------------------------
+// See this module's session-scoped `AcpSession::mcp_capabilities`/
+// `AcpSession::active_mcp_servers` and `Engine::acp_resolve_mcp_servers`.
 
 /// One entry in the user-configured MCP server list — `settings.
 /// acp_mcp_servers` (global) and optionally overridden per-agent by
@@ -430,7 +428,7 @@ fn kv_pairs_to_wire(pairs: &[String]) -> Vec<serde_json::Value> {
 }
 
 /// Turn user-configured MCP server entries into the wire `McpServer` array
-/// for `session/new`/`session/load`'s `mcpServers` field (#1487), dropping
+/// for `session/new`/`session/load`'s `mcpServers` field, dropping
 /// any `http`/`sse` entry the live agent hasn't advertised support for via
 /// `caps` (`agentCapabilities.mcpCapabilities`, see
 /// [`parse_mcp_capabilities`]). `stdio` entries are never dropped — that
@@ -488,9 +486,9 @@ pub fn build_mcp_servers_wire(
 }
 
 /// Which optional MCP server transports the agent's `initialize` response
-/// declared support for (`agentCapabilities.mcpCapabilities`, #1487) —
-/// `stdio` needs no such flag (baseline ACP v1); this is only `http`/
-/// `sse`. Captured per-session (`AcpSession::mcp_capabilities`) so
+/// declared support for (`agentCapabilities.mcpCapabilities`) — `stdio`
+/// needs no such flag (baseline ACP v1); this is only `http`/`sse`.
+/// Captured per-session (`AcpSession::mcp_capabilities`) so
 /// [`build_mcp_servers_wire`] can drop a user-configured `http`/`sse` MCP
 /// server the live agent doesn't actually support, rather than sending it
 /// and letting `session/new`/`session/load` fail or silently ignore it.
@@ -520,11 +518,10 @@ pub fn parse_mcp_capabilities(agent_capabilities: &serde_json::Value) -> AcpMcpC
 }
 
 /// Which kind of `session/update` chunk a notification carries, as mapped
-/// onto the AI panel's own transcript roles by
-/// `Engine::acp_append_chunk` (`src/core/engine/acp_ops.rs`, ACP-1,
-/// #952). Kept here rather than in the engine because recognizing the
-/// wire shape (`sessionUpdate` tag + `content.text`) is transport-schema
-/// knowledge, not panel policy.
+/// onto the AI panel's own transcript roles by `Engine::acp_append_chunk`
+/// (`src/core/engine/acp_ops.rs`). Kept here rather than in the engine
+/// because recognizing the wire shape (`sessionUpdate` tag +
+/// `content.text`) is transport-schema knowledge, not panel policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpChunkKind {
     /// `agent_message_chunk` — the assistant's visible reply text.
@@ -541,13 +538,11 @@ pub enum AcpChunkKind {
 /// Extract `(kind, text)` from a `session/update` notification's `update`
 /// object, per the ACP v1 schema: a `sessionUpdate` string tag plus a
 /// `content` [`ContentBlock`](https://agentclientprotocol.com/protocol/content)
-/// (`{"type": "text", "text": "..."}`).
-///
-/// Returns `None` for update kinds this slice does not render —
-/// `tool_call`/`tool_call_update`/`plan`, left to ACP-4/ACP-5 per #952's
-/// scope — or for a malformed/unrecognized shape. Never panics; a missing
-/// `content.text` yields an empty string rather than dropping the chunk,
-/// so a still-loading tool-adjacent update doesn't desync the stream.
+/// (`{"type": "text", "text": "..."}`). Returns `None` for update
+/// kinds not rendered in this slice or for a malformed/unrecognized shape.
+/// Never panics; a missing `content.text` yields an empty string rather
+/// than dropping the chunk, so a still-loading update doesn't desync the
+/// stream.
 pub fn session_update_chunk(update: &serde_json::Value) -> Option<(AcpChunkKind, String)> {
     let kind = update.get("sessionUpdate").and_then(|v| v.as_str())?;
     let chunk_kind = match kind {
@@ -566,34 +561,35 @@ pub fn session_update_chunk(update: &serde_json::Value) -> Option<(AcpChunkKind,
 }
 
 // ---------------------------------------------------------------------------
-// plan, available_commands_update, current_mode_update, usage_update
-// (#956, ACP-5)
+// Plan, available commands, current mode, usage updates
 // ---------------------------------------------------------------------------
+// The plan model itself is source-agnostic and lives in
+// [`crate::core::plan`] — a future Board/remote-worker plan preview
+// reuses the exact same plan types with a completely different feeder.
 
 /// The plan model itself is source-agnostic and lives in
-/// [`crate::core::plan`] (#529, Track A Phase 4) — a future Board/remote-
-/// worker plan preview reuses the exact same [`PlanEntry`]/
-/// [`PlanEntryStatus`]/`plan_to_checklist_text` with a completely
-/// different feeder, so nothing ACP-specific belongs in the model itself.
-/// Re-exported here under their original names so every existing ACP call
-/// site (`AcpSession::plan` (via `Engine::acp()`), `render::populate_ai_chat_controller`) is
-/// unaffected by the move.
+/// [`crate::core::plan`] — a future Board/remote-worker plan preview
+/// reuses the exact same [`PlanEntry`]/[`PlanEntryStatus`]/
+/// `plan_to_checklist_text` with a completely different feeder, so
+/// nothing ACP-specific belongs in the model itself. Re-exported here
+/// under their original names so every existing ACP call site
+/// (`AcpSession::plan` (via `Engine::acp()`),
+/// `render::populate_ai_chat_controller`) is unaffected by the move.
 pub use crate::core::plan::{
     plan_to_checklist_text, PlanEntry as AcpPlanEntry, PlanEntryStatus as AcpPlanEntryStatus,
 };
 
 /// Parse a `session/update`'s `plan` variant: `{"sessionUpdate": "plan",
-/// "entries": [{"content", "status"}]}`. Returns `None` for a non-`plan`
-/// update. The envelope check (`sessionUpdate == "plan"`) is ACP's own —
-/// entry parsing itself is [`crate::core::plan::parse_plan_entries`], which
-/// knows nothing about this envelope and is reused as-is by any other
-/// plan-preview producer.
+/// "entries": [{"content", "status"}]}`. Returns `None` for a
+/// non-`plan` update. The envelope check (`sessionUpdate == "plan"`)
+/// is ACP's own — entry parsing itself is
+/// [`crate::core::plan::parse_plan_entries`], which knows nothing about
+/// this envelope and is reused as-is by any other plan-preview producer.
 ///
-/// **Every call is a full replacement, never a delta** — see
-/// `AcpSession::plan` (via `Engine::acp()`)'s doc. Treating consecutive `plan` updates as
-/// append-only is the single most common way to get this variant wrong
-/// per #956's own scope note; nothing in this function accumulates state,
-/// by construction, since it takes no previous plan as input.
+/// **Every call is a full replacement, never a delta** — treating
+/// consecutive `plan` updates as append-only is incorrect. This function
+/// never accumulates state, by construction, since it takes no previous
+/// plan as input.
 pub fn parse_plan_update(update: &serde_json::Value) -> Option<Vec<AcpPlanEntry>> {
     if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("plan") {
         return None;
@@ -680,11 +676,11 @@ pub fn parse_session_modes(modes: &serde_json::Value) -> (Option<String>, Vec<Ac
 }
 
 /// Parse a `session/update`'s `current_mode_update` variant:
-/// `{"sessionUpdate": "current_mode_update", "currentModeId": "..."}`.
-/// This is the **only** thing that should ever change `Engine::
-/// acp_current_mode_id` — a `session/set_mode` request succeeding is not
-/// itself sufficient, per #956's acceptance bar ("the displayed mode
-/// follows `current_mode_update`").
+/// `{"sessionUpdate": "current_mode_update", "currentModeId": "..."}`,
+/// This is the **only** thing that should ever change
+/// `Engine::acp_current_mode_id` — a `session/set_mode` request
+/// succeeding is not itself sufficient; the displayed mode follows
+/// `current_mode_update`.
 pub fn parse_current_mode_update(update: &serde_json::Value) -> Option<String> {
     if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("current_mode_update") {
         return None;
@@ -696,7 +692,7 @@ pub fn parse_current_mode_update(update: &serde_json::Value) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// configOptions / config_option_update / session/set_config_option (#1520)
+// configOptions / config_option_update / session/set_config_option
 // ---------------------------------------------------------------------------
 
 /// One value a config option can be set to (`session/new`'s
@@ -707,12 +703,12 @@ pub struct AcpConfigOptionValue {
     pub name: String,
 }
 
-/// One config option an agent exposes (`session/new`'s `configOptions`,
-/// #1520). Unlike [`AcpSessionMode`] — one agent-wide "current mode" shared
+/// One config option an agent exposes (`session/new`'s `configOptions`).
+/// Unlike [`AcpSessionMode`] — one agent-wide "current mode" shared
 /// across a fixed `availableModes` list — each option carries its **own**
 /// current value, since an agent may declare several independent knobs
-/// (model, reasoning effort, ...) at once. `category`, when present, is how
-/// `:AiModel` finds "the" model option among however many an agent
+/// (model, reasoning effort, ...) at once. `category`, when present, is
+/// how `:AiModel` finds "the" model option among however many an agent
 /// declares (`category == "model"`) — ACP v1 has no dedicated
 /// `session/set_model`; a `category: "model"` config option is the only
 /// model picker the spec offers at all.
@@ -743,8 +739,8 @@ impl AcpConfigOption {
     }
 }
 
-/// Parse `session/new`/`session/load`'s `configOptions` result field
-/// (#1520): `[{"id", "name"?, "category"?, "currentValueId"?, "values":
+/// Parse `session/new`/`session/load`'s `configOptions` result field:
+/// `[{"id", "name"?, "category"?, "currentValueId"?, "values":
 /// [{"id", "name"?}]}]`. Absent/malformed input yields an empty list — like
 /// `modes`, config options are an optional agent capability, not a
 /// required one. An entry missing `id` is dropped outright (nothing a
@@ -802,7 +798,7 @@ pub fn parse_config_options(value: &serde_json::Value) -> Vec<AcpConfigOption> {
         .collect()
 }
 
-/// Parse a `session/update`'s `config_option_update` variant (#1520):
+/// Parse a `session/update`'s `config_option_update` variant:
 /// `{"sessionUpdate": "config_option_update", "configOptionId": "...",
 /// "currentValueId": "..."}`. Returns `(config_option_id, current_value_id)`
 /// on a well-formed match. This is the **only** thing that should ever
@@ -867,7 +863,7 @@ pub fn parse_usage_update(update: &serde_json::Value) -> Option<AcpUsage> {
 }
 
 /// Parse a `session/update`'s `session_info_update` variant — the
-/// agent-assigned session title (#1519), e.g. an agent summarising "Fix
+/// agent-assigned session title, e.g. an agent summarising "Fix
 /// the login bug" once it has enough of the conversation to name it.
 /// Tolerant of `title` living flattened on `update` directly or nested
 /// under a `sessionInfo`/`info` object, matching [`parse_usage_update`]'s
@@ -908,8 +904,7 @@ pub fn format_usage_summary(usage: &AcpUsage) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// fs/read_text_file, fs/write_text_file — wire-shape parsing + path safety
-// (#954, ACP-3)
+// File-read/write requests — wire-shape parsing and path safety
 // ---------------------------------------------------------------------------
 
 /// A parsed `fs/read_text_file` request: `{sessionId, path, line?, limit?}`
@@ -1014,23 +1009,21 @@ fn lexically_normalize(path: &Path) -> std::path::PathBuf {
     out
 }
 
-/// How an already-[`resolve_path_within_roots`]-resolved `path` should be
-/// *shown* to the user: relative to `workspace_cwd` when it lives inside it,
-/// else the full absolute path.
+/// How an already-[`resolve_path_within_roots`]-resolved `path` should
+/// be *shown* to the user: relative to `workspace_cwd` when it lives
+/// inside it, else the full absolute path.
 ///
-/// The subtlety this exists for (and the reason it is one shared function
-/// rather than a `strip_prefix` open-coded at each chip site): the path has
-/// been **canonicalized** by [`resolve_path_within_roots`], while
-/// `workspace_cwd` is whatever the user's `cwd`/`--workspace` string was —
-/// *not* canonicalized. Any symlink anywhere in that prefix makes a plain
-/// `resolved.strip_prefix(workspace_cwd)` miss, and the chip then renders a
-/// full absolute path instead of `t.rs:1-2`. That is not hypothetical or
-/// platform-specific trivia: on macOS `std::env::temp_dir()` is
-/// `/var/folders/…`, a symlink to `/private/var/folders/…`, so *every*
-/// workspace under the temp dir hit it — which is precisely how #1452's test
-/// run caught this (green on Linux, red on macOS). A user whose project sits
-/// under any symlinked path (`/tmp/proj`, a symlinked `$HOME`, a symlinked
-/// network mount) saw the same thing.
+/// The subtlety this exists for: the path has been **canonicalized** by
+/// [`resolve_path_within_roots`], while `workspace_cwd` is whatever the
+/// user's `cwd`/`--workspace` string was — *not* canonicalized. Any
+/// symlink anywhere in that prefix makes a plain `resolved.strip_prefix
+/// (workspace_cwd)` miss, and the chip then renders a full absolute
+/// path instead of relative. On macOS `std::env::temp_dir()` is
+/// `/var/folders/…`, a symlink to `/private/var/folders/…`, so every
+/// workspace under the temp dir hits this — this is why the test run
+/// with temp-dir workspaces showed full paths on macOS but not Linux.
+/// A user whose project sits under any symlinked path (`/tmp/proj`, a
+/// symlinked `$HOME`, a symlinked network mount) sees the same thing.
 ///
 /// So: try the literal prefix first (the common, no-symlink case, and no
 /// filesystem access at all), then retry against the canonicalized
@@ -1114,16 +1107,16 @@ pub fn resolve_path_within_roots(
 }
 
 // ---------------------------------------------------------------------------
-// Prompt context — current buffer + `@`-mentions (#1449)
+// Prompt context — current buffer + `@`-mentions
 // ---------------------------------------------------------------------------
 
-/// `@path` tokens in a `session/prompt` message's raw text (#1449) — every
+/// `@path` tokens in a `session/prompt` message's raw text — every
 /// whitespace-delimited word that starts with `@` and has at least one
-/// character after it. The literal text is left untouched in the prompt's
-/// `text` content block (per the issue: "the literal `@path` stays in the
-/// text block") — this is only used to derive the *extra* `resource_link`
-/// blocks that ride alongside it, so an agent that ignores resource links
-/// entirely still sees exactly what the user typed.
+/// character after it. The literal text is left untouched in the
+/// prompt's `text` content block — this is only used to derive the
+/// *extra* `resource_link` blocks that ride alongside it, so an agent
+/// that ignores resource links entirely still sees exactly what the
+/// user typed.
 pub fn parse_at_mentions(text: &str) -> Vec<String> {
     text.split_whitespace()
         .filter_map(|tok| tok.strip_prefix('@'))
@@ -1133,7 +1126,7 @@ pub fn parse_at_mentions(text: &str) -> Vec<String> {
 }
 
 /// The `@mention` token currently being typed at the end of the AI panel
-/// input, if any (#1449): the last whitespace-delimited word, when it
+/// input, if any: the last whitespace-delimited word, when it
 /// starts with `@`. Returns the byte offset of the `@` itself (so a caller
 /// can splice the input in place to accept a completion) and the query
 /// text after it (possibly empty, right after typing a bare `@`).
@@ -1157,16 +1150,17 @@ pub fn trailing_at_mention_query(input: &str) -> Option<(usize, &str)> {
 }
 
 /// Which optional content-block kinds the agent's `initialize` response
-/// declared support for (`agentCapabilities.promptCapabilities`, #1449) —
+/// declared support for (`agentCapabilities.promptCapabilities`) —
 /// captured per-session so this issue's follow-up (selection/range
 /// context) can branch on `embedded_context`, and a future image/audio
 /// attachment can branch on the other two. `resource_link` itself (what
-/// this issue actually sends) needs none of these — it is baseline ACP v1,
-/// which every agent must accept regardless of `promptCapabilities`.
+/// this issue actually sends) needs none of these — it is baseline ACP
+/// v1, which every agent must accept regardless of `promptCapabilities`.
 ///
-/// An agent that omits `promptCapabilities` entirely (every pre-#1449 test
-/// fixture, and any agent that predates the field) parses as all-`false`,
-/// never an error — the whole struct is optional per the ACP v1 schema.
+/// An agent that omits `promptCapabilities` entirely (every pre-#1449
+/// test fixture, and any agent that predates the field) parses as
+/// all-`false`, never an error — the whole struct is optional per the
+/// ACP v1 schema.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AcpPromptCapabilities {
     pub embedded_context: bool,
@@ -1193,12 +1187,12 @@ pub fn parse_prompt_capabilities(agent_capabilities: &serde_json::Value) -> AcpP
     }
 }
 
-/// Parse `agentCapabilities.loadSession` (#1459) out of the whole
+/// Parse `agentCapabilities.loadSession` out of the whole
 /// `agentCapabilities` object — the same shape [`parse_prompt_capabilities`]
 /// reads, just a top-level sibling field rather than a nested object.
-/// Absent (every pre-#1459 fixture, and any agent that doesn't support
-/// resume) parses as `false`, never an error, same "optional means
-/// unsupported" convention as the rest of this handshake.
+/// Absent (when an agent doesn't support resume) parses as `false`, never
+/// an error, same "optional means unsupported" convention as the rest of
+/// this handshake.
 pub fn parse_load_session_capability(agent_capabilities: &serde_json::Value) -> bool {
     agent_capabilities
         .get("loadSession")
@@ -1207,10 +1201,10 @@ pub fn parse_load_session_capability(agent_capabilities: &serde_json::Value) -> 
 }
 
 // ---------------------------------------------------------------------------
-// Prompt context — Visual selection / `:{range}AI` (#1450)
+// Prompt context — Visual selection / `:{range}AI`
 // ---------------------------------------------------------------------------
 
-/// A buffer line-range staged for the *next* prompt (#1450): either a
+/// A buffer line-range staged for the *next* prompt: either a
 /// `:{range}AI` ex command (whole lines, built by
 /// `Engine::acp_build_range_attachment` with `exact_text: None`) or the
 /// Visual-mode `<leader>ai` mapping (`Engine::
@@ -1241,11 +1235,10 @@ pub struct AcpRangeAttachment {
 
 impl AcpRangeAttachment {
     /// The `⧉ <path>:<range>` chip shown in the AI panel while this
-    /// attachment is pending (#1450 point 4) — `path` relative to
-    /// `workspace_cwd` when possible (see [`workspace_relative_display`] for
-    /// the symlinked-prefix case), matching
-    /// `Engine::acp_current_buffer_attachment`'s chip convention. A
-    /// single-line range renders as `path:N`, not `path:N-N`.
+    /// attachment is pending — `path` relative to `workspace_cwd` when
+    /// possible (see [`workspace_relative_display`] for the symlinked-prefix
+    /// case), matching `Engine::acp_current_buffer_attachment`'s chip
+    /// convention. A single-line range renders as `path:N`, not `path:N-N`.
     pub fn chip(&self, workspace_cwd: &std::path::Path) -> String {
         let display = workspace_relative_display(&self.path, workspace_cwd);
         let (start1, end1) = (self.start_line + 1, self.end_line + 1);
@@ -1268,8 +1261,8 @@ impl AcpRangeAttachment {
         )
     }
 
-    /// This attachment's `session/prompt` content block(s) (#1450 point 3),
-    /// chosen per `caps.embedded_context`:
+    /// This attachment's `session/prompt` content block(s), chosen per
+    /// `caps.embedded_context`:
     ///
     /// * `true` — a single `resource` block whose `resource.text` is the
     ///   exact attached text (unsaved edits included), `resource.uri`
@@ -1331,11 +1324,11 @@ fn mime_type_for_path(path: &std::path::Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Prompt context — `@symbol` mentions (#1513)
+// Prompt context — `@symbol` mentions
 // ---------------------------------------------------------------------------
 
 /// A `@symbol` mention accepted from the AI panel's `@`-completion popup
-/// (#1513) — staged the moment the user accepts a symbol candidate
+/// — staged the moment the user accepts a symbol candidate
 /// (`Engine::ai_mention_accept_selected`) into `Engine::acp_pending_
 /// symbol_mentions`, the same "compute now, send whenever the next prompt
 /// goes out" contract [`AcpRangeAttachment`] already uses.
@@ -1410,14 +1403,14 @@ impl AcpSymbolMention {
 }
 
 // ---------------------------------------------------------------------------
-// Prompt context — manual file/image attachments (#1464)
+// Prompt context — manual file/image attachments
 // ---------------------------------------------------------------------------
 
 /// `image/<kind>` for a recognized raster-image file extension, or `None`
 /// for anything else (including no extension) — the gate
 /// [`crate::core::engine::Engine::acp_attach_file`] uses to decide "attach
-/// as an `image` content block" vs. "attach as a baseline `resource_link`"
-/// (#1464). A real IANA mime type, unlike [`mime_type_for_path`]'s
+/// as an `image` content block" vs. "attach as a baseline `resource_link`".
+/// A real IANA mime type, unlike [`mime_type_for_path`]'s
 /// `text/x-*` hint above — an ACP `image` block's `mimeType` is what the
 /// agent hands straight to a real image decoder, so it has to be one this
 /// codebase can't afford to make up.
@@ -1433,7 +1426,7 @@ pub fn image_mime_type_for_path(path: &Path) -> Option<&'static str> {
     })
 }
 
-/// Maximum raw byte size accepted for one image attachment (#1464) —
+/// Maximum raw byte size accepted for one image attachment —
 /// 5&nbsp;MiB, checked *before* base64 inflation (~33% larger on the wire).
 /// There is no ACP-side limit `promptCapabilities` declares to match; this
 /// is a generous "definitely a screenshot, not a mistake" ceiling picked so
@@ -1443,7 +1436,7 @@ pub fn image_mime_type_for_path(path: &Path) -> Option<&'static str> {
 pub const ACP_MAX_IMAGE_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
 
 /// `"1.2 MB"` / `"512 KB"` / `"37 B"` — human-readable byte count for the
-/// oversize-attachment refusal message (#1464). Binary (1024-based) units,
+/// oversize-attachment refusal message. Binary (1024-based) units,
 /// one decimal place above the `KB` tier, no tier above `MB` (nothing this
 /// codebase sizes ever needs `GB`).
 pub fn format_byte_size(bytes: u64) -> String {
@@ -1459,16 +1452,16 @@ pub fn format_byte_size(bytes: u64) -> String {
     }
 }
 
-/// A manually attached file or image (#1464): via `:AiAttach <path>` or a
+/// A manually attached file or image: via `:AiAttach <path>` or a
 /// clipboard image paste (`Engine::acp_attach_clipboard_image`). Distinct
-/// from [`AcpRangeAttachment`] (#1450, a buffer line-range) — each of
-/// these represents a whole file the user explicitly attached, kept in
-/// `Engine::acp_manual_attachments` (a `Vec`, unlike the range
-/// attachment's single `Option`, since more than one file can ride on the
-/// same prompt) until the next `session/prompt` consumes all of them, or
-/// the user removes the most-recently-attached one (Ctrl+R while the panel
-/// has focus — the same key [`AcpRangeAttachment`] already uses, extended
-/// to fall through to this list once no range attachment is staged; see
+/// from [`AcpRangeAttachment`] — each of these represents a whole file
+/// the user explicitly attached, kept in `Engine::acp_manual_attachments`
+/// (a `Vec`, unlike the range attachment's single `Option`, since more
+/// than one file can ride on the same prompt) until the next
+/// `session/prompt` consumes all of them, or the user removes the
+/// most-recently-attached one (Ctrl+R while the panel has focus — the
+/// same key [`AcpRangeAttachment`] already uses, extended to fall through
+/// to this list once no range attachment is staged; see
 /// `Engine::dispatch_ai_chat_event`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AcpManualAttachment {
@@ -1504,7 +1497,7 @@ pub enum AcpManualAttachment {
 impl AcpManualAttachment {
     /// The `\u{1f4ce} <name>` (file) / `\u{1f5bc} <name>` (image) chip
     /// shown in the AI panel header while this attachment is pending
-    /// (#1464) — distinct icons from [`AcpRangeAttachment::chip`]'s `⧉` so
+    /// — distinct icons from [`AcpRangeAttachment::chip`]'s `⧉` so
     /// a whole-file/image attachment reads differently from a buffer
     /// line-range at a glance.
     pub fn chip(&self) -> String {
@@ -1520,7 +1513,7 @@ impl AcpManualAttachment {
         }
     }
 
-    /// This attachment's single `session/prompt` content block (#1464).
+    /// This attachment's single `session/prompt` content block.
     pub fn content_block(&self) -> serde_json::Value {
         match self {
             AcpManualAttachment::File { path } => {
@@ -1549,7 +1542,7 @@ impl AcpManualAttachment {
 }
 
 /// Encode `pixels` (straight RGBA8, row-major, `width * height * 4` bytes —
-/// [`quadraui::RgbaImage`]'s own contract) as a PNG byte stream (#1464) —
+/// [`quadraui::RgbaImage`]'s own contract) as a PNG byte stream —
 /// what turns a clipboard-image paste's already-decoded pixels into the
 /// `data` an ACP `image` block's `mimeType: "image/png"` promises. `Err`
 /// only on a pixel-buffer/dimension mismatch or a write failure to the
@@ -1572,7 +1565,7 @@ pub fn encode_png_rgba8(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8
 }
 
 // ---------------------------------------------------------------------------
-// authMethods — wire-shape parsing (#957, ACP-6)
+// Authentication methods — wire-shape parsing
 // ---------------------------------------------------------------------------
 
 /// Which RPC flow authenticates an [`AcpAuthMethod`] — the distinction the
@@ -1611,30 +1604,28 @@ pub struct AcpAuthMethod {
     pub kind: AcpAuthMethodKind,
     /// Extra argv words a [`AcpAuthMethodKind::Terminal`] method's own
     /// launch command must be run with to actually perform *this specific*
-    /// login (#1444). Empty for `Agent` methods (unused — those authenticate
-    /// via the plain `authenticate` RPC, not a subprocess launch) and for
-    /// any `Terminal` method whose wire entry omits `args`.
+    /// login. Empty for `Agent` methods (unused — those authenticate via the
+    /// plain `authenticate` RPC, not a subprocess launch) and for any
+    /// `Terminal` method whose wire entry omits `args`.
     ///
-    /// The reference Claude ACP adapter (`@agentclientprotocol/
-    /// claude-agent-acp`) advertises three distinct `terminal` methods that
-    /// all share one underlying command but differ *only* in these args —
-    /// e.g. `["--cli", "auth", "login", "--claudeai"]` for its subscription
-    /// login vs `["--cli", "auth", "login", "--console"]` for its console
-    /// login. Running the bare command (pre-#1444 behavior) starts the
-    /// adapter's NDJSON server instead of any login flow, so it just sits
-    /// there until the pane is closed — read by a user as "abandoned".
-    /// `Engine::acp_launch_terminal_login` (`src/core/engine/
-    /// terminal_ops.rs`) appends these to the resolved agent command before
-    /// launching it.
+    /// The reference Claude ACP adapter advertises three distinct `terminal`
+    /// methods that all share one underlying command but differ *only* in
+    /// these args — e.g. `["--cli", "auth", "login", "--claudeai"]` for
+    /// its subscription login vs `["--cli", "auth", "login",
+    /// "--console"]` for its console login. Running the bare command (before
+    /// handling args) starts the adapter's NDJSON server instead of any
+    /// login flow, so it just sits there until the pane is closed — read by
+    /// a user as "abandoned". `Engine::acp_launch_terminal_login`
+    /// (`src/core/engine/terminal_ops.rs`) appends these to the resolved
+    /// agent command before launching it.
     ///
     /// Not yet handled: the adapter's alternate `_meta["terminal-auth"]`
-    /// field (a full `{command, args, label}` override), which only
-    /// applies when the client advertises a `_meta` capability this client
-    /// does not yet send — `args` on the method itself is what the client
-    /// actually receives today. Likewise, no wire example of a `terminal`
-    /// method carrying its own `env` has been observed yet (only `args`,
-    /// per the adapter source cited above), so `env` isn't parsed here —
-    /// revisit if that ever appears on the wire.
+    /// field (a full `{command, args, label}` override), which only applies
+    /// when the client advertises a `_meta` capability this client does not
+    /// yet send — `args` on the method itself is what the client actually
+    /// receives today. Likewise, no wire example of a `terminal` method
+    /// carrying its own `env` has been observed yet (only `args`), so `env`
+    /// isn't parsed here — revisit if that ever appears on the wire.
     pub args: Vec<String>,
 }
 
@@ -1644,7 +1635,7 @@ pub struct AcpAuthMethod {
 /// defaulted rather than dropping the whole entry — see [`AcpAuthMethod::
 /// name`] and [`AcpAuthMethodKind`]'s docs for the specific defaults and
 /// why, and [`AcpAuthMethod::args`]'s doc for why a `Terminal` method's
-/// `args` must not be dropped (#1444).
+/// `args` must not be dropped.
 pub fn parse_auth_methods(methods: &[serde_json::Value]) -> Vec<AcpAuthMethod> {
     methods
         .iter()
@@ -1679,7 +1670,7 @@ pub fn parse_auth_methods(methods: &[serde_json::Value]) -> Vec<AcpAuthMethod> {
 }
 
 // ---------------------------------------------------------------------------
-// session/request_permission — wire-shape parsing (#953, ACP-2)
+// Permission requests — wire-shape parsing
 // ---------------------------------------------------------------------------
 
 /// One option the agent offered in a `session/request_permission` request.
@@ -1700,14 +1691,13 @@ pub struct AcpPermissionOption {
 }
 
 /// The `toolCall` a `session/request_permission` request asks about:
-/// `title`, `kind`, `locations` (#953's original acceptance bar — exactly
-/// what a human sees before deciding), plus `content`/`raw_input` (#1518 —
-/// the proposed diff for an edit, or the raw command for an execute/other
-/// tool call), so the permission dialog no longer asks a human to approve
-/// blind. `status` is deliberately still out of scope here: a tool call
-/// being asked about hasn't run yet, so a wire-sent `status` on this
-/// particular request would be meaningless (ACP-4/5's [`AcpToolCall`]
-/// tracks the real lifecycle once approved).
+/// `title`, `kind`, `locations` (exactly what a human sees before
+/// deciding), plus `content`/`raw_input` (the proposed diff for an edit,
+/// or the raw command for an execute/other tool call), so the permission
+/// dialog no longer asks a human to approve blind. `status` is
+/// deliberately still out of scope here: a tool call being asked about
+/// hasn't run yet, so a wire-sent `status` on this particular request
+/// would be meaningless.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcpToolCallInfo {
     pub title: String,
@@ -1721,17 +1711,17 @@ pub struct AcpToolCallInfo {
     /// supply one.
     pub locations: Vec<(String, Option<u32>)>,
     /// `toolCall.content[]`, parsed the same way [`AcpToolCall::content`]
-    /// is (via [`parse_tool_call_content`]) — #1518: a `Diff` block here is
-    /// what lets the permission dialog preview the actual proposed change
+    /// is (via [`parse_tool_call_content`]) — a `Diff` block here is what
+    /// lets the permission dialog preview the actual proposed change
     /// (`crate::core::review::unified_diff_preview_lines`) rather than just
     /// naming the file. Empty when the agent's `toolCall` carried no
-    /// `content` array, same "absent, not a parse failure" convention
-    /// every other optional field on this struct already has.
+    /// `content` array, same "absent, not a parse failure" convention every
+    /// other optional field on this struct already has.
     pub content: Vec<AcpToolCallContentBlock>,
-    /// `toolCall.rawInput`, if the agent sent one — #1518: for a
-    /// non-`edit` tool call (`execute` most importantly) this is usually
-    /// the only human-legible description of what's about to run, since
-    /// `execute` tool calls don't carry a `diff` content block.
+    /// `toolCall.rawInput`, if the agent sent one — for a non-`edit` tool
+    /// call (`execute` most importantly) this is usually the only
+    /// human-legible description of what's about to run, since `execute`
+    /// tool calls don't carry a `diff` content block.
     pub raw_input: Option<serde_json::Value>,
 }
 
@@ -1754,7 +1744,7 @@ pub struct AcpPermissionRequest {
 /// request (with a JSON-RPC error, not silence) rather than open a dialog
 /// with nothing selectable in it.
 ///
-/// `content`/`rawInput` (#1518) are parsed the same way
+/// `content`/`rawInput` are parsed the same way
 /// [`parse_tool_call`]/[`parse_tool_call_update`] parse them off a
 /// `tool_call`/`tool_call_update` — `parse_tool_call_content` for the
 /// former, a direct `.get("rawInput").cloned()` for the latter — so a
@@ -1799,15 +1789,14 @@ pub fn parse_request_permission(params: &serde_json::Value) -> Option<AcpPermiss
             .unwrap_or("Option")
             .to_string();
         // A spec-conformant agent always sends `kind`; a missing one is
-        // malformed input, not a signal to default toward the *most*
-        // permissive category. Default to `""` (matches neither the
-        // `allow_`/`reject_` prefix `Engine::acp_handle_permission_request`
-        // checks for a remembered `allow_always`/`reject_always` decision,
-        // nor anything a real agent would send) so the option still renders
-        // as a selectable button — never silently vanishes — but can never
-        // be auto-answered from memory and can never masquerade as
-        // `allow_once` (#953 review: "defaulting toward allow on missing
-        // data in a permission-approval path is the wrong direction").
+        // malformed input, not a signal to default toward the most
+        // permissive category. Default to `""` (matches neither
+        // `allow_`/`reject_` prefix the permission handler checks for a
+        // remembered `allow_always`/`reject_always` decision, nor anything
+        // a real agent would send) so the option still renders as a
+        // selectable button — never silently vanishes — but can never be
+        // auto-answered from memory and can never masquerade as
+        // `allow_once`.
         let opt_kind = opt
             .get("kind")
             .and_then(|v| v.as_str())
@@ -1843,12 +1832,12 @@ pub fn permission_outcome_selected(option_id: &str) -> serde_json::Value {
     serde_json::json!({"outcome": {"outcome": "selected", "optionId": option_id}})
 }
 
-/// Build the `result` value for a `session/request_permission` reply when
-/// no option was chosen (Esc-dismissed, the session was cancelled, an
-/// unrelated dialog replaced it, ...). Shape: `{outcome: {outcome:
+/// Build the `result` value for a `session/request_permission` reply
+/// when no option was chosen (Esc-dismissed, the session was cancelled,
+/// an unrelated dialog replaced it, ...). Shape: `{outcome: {outcome:
 /// "cancelled"}}` per the ACP v1 schema. This is the reply every parked
-/// permission request must eventually get exactly one of, per #953's
-/// hang-avoidance requirement — see `Engine::acp_cancel_pending_permission`.
+/// permission request must eventually get exactly one of — see
+/// `Engine::acp_cancel_pending_permission`.
 pub fn permission_outcome_cancelled() -> serde_json::Value {
     serde_json::json!({"outcome": {"outcome": "cancelled"}})
 }
@@ -1865,7 +1854,7 @@ pub fn permission_outcome_cancelled() -> serde_json::Value {
 /// [`Self::Cancelled`] is **client-local only** — the wire schema's
 /// `status` enum has exactly `pending | in_progress | completed |
 /// failed`, no `cancelled` value, so [`Self::parse`] never produces it.
-/// It exists so `session/cancel` (#1519) has somewhere to put "this call
+/// It exists so `session/cancel` has somewhere to put "this call
 /// was still unfinished when the user aborted the turn" that's visibly
 /// distinct from an agent-reported `failed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1903,7 +1892,7 @@ impl AcpToolCallStatus {
 
     /// A tool call this status describes is still unresolved — neither a
     /// terminal success nor a terminal failure/cancellation. What
-    /// `session/cancel` (#1519) sweeps over: every call still `Pending`
+    /// `session/cancel` sweeps over: every call still `Pending`
     /// or `InProgress` when the turn is aborted gets marked
     /// [`Self::Cancelled`].
     pub fn is_unfinished(self) -> bool {
@@ -1911,17 +1900,17 @@ impl AcpToolCallStatus {
     }
 }
 
-/// One block of an [`AcpToolCall::content`] list, per the ACP v1 schema's
-/// tagged union. `{type: "content"}` (text/image output) — only the text
-/// case renders; image content parses to `None` rather than an
-/// empty-string block, so it's visibly absent instead of a confusing
-/// blank line. `{type: "diff", path, oldText, newText}` is the shape
-/// #955 exists for — it opens the shared change-review surface
-/// (`crate::core::review`). `{type: "terminal", terminalId}` (#1522)
+/// One block of an [`AcpToolCall::content`] list, per the ACP v1
+/// schema's tagged union. `{type: "content"}` (text/image output) —
+/// only the text case renders; image content parses to `None` rather
+/// than an empty-string block, so it's visibly absent instead of a
+/// confusing blank line. `{type: "diff", path, oldText, newText}` is
+/// the shape — it opens the shared change-review surface
+/// (`crate::core::review`). `{type: "terminal", terminalId}`
 /// references a terminal the agent previously opened with
 /// `terminal/create` — the client renders its live output by looking
-/// `terminal_id` up in `AcpSession::acp_terminals`
-/// (see [`tool_call_expanded_text`]'s `terminal_view` parameter), not from
+/// `terminal_id` up in `AcpSession::acp_terminals` (see
+/// [`tool_call_expanded_text`]'s `terminal_view` parameter), not from
 /// anything carried in the content block itself (the block is just a
 /// pointer).
 #[derive(Debug, Clone, PartialEq)]
@@ -2005,12 +1994,12 @@ pub struct AcpToolCall {
     pub locations: Vec<(String, Option<u32>)>,
     pub content: Vec<AcpToolCallContentBlock>,
     /// The raw `rawInput` value the agent sent with the tool call, if any
-    /// (#1511) — the arguments the tool was invoked with, verbatim, shown
+    /// — the arguments the tool was invoked with, verbatim, shown
     /// pretty-printed in the card's expanded view
     /// ([`tool_call_expanded_text`]). `None` when the agent didn't send one
     /// (the field is optional on the wire).
     pub raw_input: Option<serde_json::Value>,
-    /// The raw `rawOutput` value, if any (#1511) — usually arrives later,
+    /// The raw `rawOutput` value, if any — usually arrives later,
     /// on a `tool_call_update` once the tool finishes. Same "shown
     /// pretty-printed when expanded" treatment as `raw_input`.
     pub raw_output: Option<serde_json::Value>,
@@ -2050,21 +2039,21 @@ pub fn parse_tool_call(update: &serde_json::Value) -> Option<AcpToolCall> {
 /// [`AcpToolCall`] by `id`, never a wholesale replacement of the call
 /// itself. `status: None` means the update didn't touch status;
 /// `content: None` / `locations: None` mean the wire message had no
-/// `content` / `locations` field at all. Per the ACP spec (#1519, fixing
-/// #955's original append-based reading), a *present* `content` or
-/// `locations` **replaces** the existing call's field wholesale — it is
-/// the tool call's current content/locations, not a delta to append.
+/// `content` / `locations` field at all. Per the ACP spec, a *present*
+/// `content` or `locations` **replaces** the existing call's field
+/// wholesale — it is the tool call's current content/locations, not a
+/// delta to append.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcpToolCallUpdate {
     pub id: String,
     pub status: Option<AcpToolCallStatus>,
     pub content: Option<Vec<AcpToolCallContentBlock>>,
     pub locations: Option<Vec<(String, Option<u32>)>>,
-    /// Present when the wire message carried a `rawInput` field (#1511) —
+    /// Present when the wire message carried a `rawInput` field —
     /// same "present replaces, absent leaves untouched" contract as
     /// `content`/`locations`.
     pub raw_input: Option<serde_json::Value>,
-    /// Present when the wire message carried a `rawOutput` field (#1511) —
+    /// Present when the wire message carried a `rawOutput` field —
     /// this is normally how a call's output actually arrives, since the
     /// initial `tool_call` fires before the tool has run.
     pub raw_output: Option<serde_json::Value>,
@@ -2102,7 +2091,7 @@ pub fn parse_tool_call_update(update: &serde_json::Value) -> Option<AcpToolCallU
 }
 
 /// The one-line `{glyph} {kind}: {title}` header every rendering of an
-/// [`AcpToolCall`] starts with (#1511) — no locations, no content, just the
+/// [`AcpToolCall`] starts with — no locations, no content, just the
 /// status/kind/title triple. Split out of [`tool_call_summary_line`] so it
 /// can also serve as [`quadraui::ChatController::turn_summary_line`]'s
 /// override for a *collapsed* card (`▸ [x] edit: Edit src/foo.rs`):
@@ -2115,16 +2104,16 @@ pub fn tool_call_title_line(call: &AcpToolCall) -> String {
 
 /// Render one [`AcpToolCall`] as its collapsed transcript summary line —
 /// [`tool_call_title_line`] prefixed by [`AcpToolCallStatus::glyph`] so
-/// `pending -> in_progress -> completed | failed` transitions are visible
-/// without expanding anything, plus one indented `-> path[:line]` line per
-/// location. Content blocks (`Text`/`Terminal`) are never inlined here —
-/// "collapsed by default" — a `Diff` block instead opens the change-review
-/// surface (`crate::core::engine::review_ops::acp_open_review_for_new_diffs`)
+/// `pending -> in_progress -> completed | failed` transitions are
+/// visible without expanding anything, plus one indented `-> path[:line]`
+/// line per location. Content blocks (`Text`/`Terminal`) are never
+/// inlined here — "collapsed by default" — a `Diff` block instead opens
+/// the change-review surface
+/// (`crate::core::engine::review_ops::acp_open_review_for_new_diffs`)
 /// rather than dumping a patch into the chat log.
 ///
-/// Used by the request-permission dialog body and by tests written before
-/// #1511 gave cards their own expand/collapse; the live transcript card
-/// itself uses [`tool_call_title_line`] (collapsed) /
+/// Used by the request-permission dialog body and by tests. The live
+/// transcript card itself uses [`tool_call_title_line`] (collapsed) /
 /// [`tool_call_expanded_text`] (expanded) instead — see
 /// `render::populate_ai_chat_controller`.
 pub fn tool_call_summary_line(call: &AcpToolCall) -> String {
@@ -2138,24 +2127,22 @@ pub fn tool_call_summary_line(call: &AcpToolCall) -> String {
     line
 }
 
-/// Render one [`AcpToolCall`] as its **expanded** card body (#1511's
-/// acceptance bar: "expanded ▾ shows rawInput/rawOutput/text content in a
-/// fenced block; diff content summarised as `+12 -3 src/foo.rs`") —
-/// [`tool_call_summary_line`]'s title+locations header, followed by every
-/// content block in full:
+/// Render one [`AcpToolCall`] as its **expanded** card body — the title
+/// and locations header, followed by every content block in full:
 ///
 /// - [`AcpToolCallContentBlock::Text`] — a fenced block, verbatim.
-/// - [`AcpToolCallContentBlock::Diff`] — summarised as `+A -R path` (added/
-///   removed line counts via [`crate::core::acp_turn::count_changed_lines`],
-///   the same helper the turn-review badge uses) rather than the full
-///   patch — the diff itself already opened the change-review surface when
-///   this call streamed in (see [`tool_call_summary_line`]'s doc), so
-///   repeating it here would just be noise.
-/// - [`AcpToolCallContentBlock::Terminal`] — a live card (#1522) built by
+/// - [`AcpToolCallContentBlock::Diff`] — summarised as `+A -R path`
+///   (added/removed line counts via
+///   [`crate::core::acp_turn::count_changed_lines`], the same helper
+///   the turn-review badge uses) rather than the full patch — the diff
+///   itself already opened the change-review surface when this call
+///   streamed in, so repeating it here would just be noise.
+/// - [`AcpToolCallContentBlock::Terminal`] — a live card built by
 ///   [`terminal_card_text`] from whatever `terminal_view(terminal_id)`
-///   returns; a `None` (the terminal was never created by this session, or
-///   `settings.acp_terminal_enabled` was off when the agent tried) falls
-///   back to a one-line placeholder instead of panicking or going blank.
+///   returns; a `None` (the terminal was never created by this session,
+///   or `settings.acp_terminal_enabled` was off when the agent tried)
+///   falls back to a one-line placeholder instead of panicking or going
+///   blank.
 ///
 /// then `rawInput`/`rawOutput`, each pretty-printed into its own fenced
 /// `json` block when the agent sent one.
@@ -2163,8 +2150,9 @@ pub fn tool_call_summary_line(call: &AcpToolCall) -> String {
 /// `terminal_view` is a lookup callback rather than a `&HashMap` so this
 /// otherwise-pure module never needs a `quadraui::terminal_engine`
 /// dependency of its own — the live `TerminalSession`/PTY handle stays
-/// owned by `AcpTerminalRecord` (`crate::core::acp_session`), which builds
-/// the read-only [`AcpTerminalView`] this function actually renders.
+/// owned by `AcpTerminalRecord` (`crate::core::acp_session`), which
+/// builds the read-only [`AcpTerminalView`] this function actually
+/// renders.
 pub fn tool_call_expanded_text(
     call: &AcpToolCall,
     terminal_view: impl Fn(&str) -> Option<AcpTerminalView>,
@@ -2211,7 +2199,7 @@ pub fn tool_call_expanded_text(
 
 // ---------------------------------------------------------------------------
 // terminal/create, terminal/output, terminal/wait_for_exit, terminal/kill,
-// terminal/release — wire-shape parsing + result builders (#1522)
+// terminal/release — wire-shape parsing + result builders
 // ---------------------------------------------------------------------------
 
 /// A parsed `terminal/create` request: `{sessionId, command, args?, env?,
@@ -2348,7 +2336,7 @@ pub fn terminal_output_result(
 }
 
 /// Read-only snapshot of a served `terminal/create` terminal's live state,
-/// for rendering only (#1522) — built by
+/// for rendering only — built by
 /// `crate::core::acp_session::AcpTerminalRecord::view`, the type that
 /// actually owns the live `TerminalSession`/PTY. Kept as a separate,
 /// narrower type so this module (pure ACP wire parsing) never needs a
@@ -2378,9 +2366,9 @@ pub struct AcpTerminalView {
     pub truncated: bool,
 }
 
-/// Render one live/finished ACP terminal as the card body #1522 asks for:
-/// the command line, its cwd, elapsed time, exit status once known, a
-/// truncation note, then the captured output fenced as a code block.
+/// Render one live/finished ACP terminal as the card body — the command
+/// line, its cwd, elapsed time, exit status once known, a truncation
+/// note, then the captured output fenced as a code block.
 pub fn terminal_card_text(view: &AcpTerminalView) -> String {
     let mut out = format!("$ {}", view.command_display);
     if let Some(cwd) = &view.cwd {
@@ -2439,16 +2427,15 @@ pub struct AcpClient {
     /// emitted; drained by [`Self::respond_to_client_request`].
     pending_client_requests: Arc<Mutex<HashMap<i64, String>>>,
     rx: mpsc::Receiver<AcpEvent>,
-    /// Transcript recorder (#1461, ACP contract-test infra) — `Some` only
-    /// when spawned via [`Self::spawn_with_recording`] with a `record_to`
-    /// path. Every raw NDJSON line in *both* directions is appended here,
-    /// one line per message, prefixed `"> "` for client->agent (written in
+    /// Transcript recorder — `Some` only when spawned via
+    /// [`Self::spawn_with_recording`] with a `record_to` path. Every raw
+    /// NDJSON line in *both* directions is appended here, one line per
+    /// message, prefixed `"> "` for client->agent (written in
     /// [`Self::send_raw`]) or `"< "` for agent->client (written in
-    /// [`reader_thread_main`]) — see that file's own doc for why a plain
-    /// text prefix rather than a wrapping JSON envelope: it keeps each
-    /// recorded line byte-identical to what actually crossed the wire, so
-    /// a replay agent (or a human) can diff a transcript against a fresh
-    /// recording without a serialization round-trip in the way.
+    /// [`reader_thread_main`]) — each recorded line is byte-identical to
+    /// what actually crossed the wire, so a replay agent (or a human) can
+    /// diff a transcript against a fresh recording without a serialization
+    /// round-trip in the way.
     recorder: Option<Arc<Mutex<std::fs::File>>>,
     // Held only to keep the thread alive; dropped (and thus joined-on-exit
     // implicitly via detach) when AcpClient is dropped.
@@ -2476,15 +2463,15 @@ impl AcpClient {
 
     /// Like [`Self::spawn_with_env`], but when `record_to` is `Some`, tees
     /// every raw NDJSON line crossing stdio — both directions — into that
-    /// file (#1461: the "record mode" a contract test's corpus is captured
-    /// with). `record_to`'s parent directory must already exist; the file
-    /// itself is created (truncating any previous contents) so re-running a
-    /// recording session always starts clean.
+    /// file (for contract-test corpus capture). `record_to`'s parent
+    /// directory must already exist; the file itself is created (truncating
+    /// any previous contents) so re-running a recording session always
+    /// starts clean.
     ///
     /// See [`AcpClient::recorder`]'s doc for the on-disk line format
-    /// (`"> "`/`"< "` prefix + the exact raw line, no re-encoding) and
-    /// `docs/ACP_CONTRACT_TESTS.md` for how to record a corpus fixture and
-    /// replay it back with the `acp-replay-agent` binary.
+    /// (`"> "/`"< "` prefix + the exact raw line, no re-encoding`) and
+    /// see `docs/ACP_CONTRACT_TESTS.md` for how to record a corpus fixture
+    /// and replay it back with the `acp-replay-agent` binary.
     pub fn spawn_with_recording(
         argv: &[String],
         cwd: &Path,
@@ -2621,26 +2608,24 @@ impl AcpClient {
     }
 
     /// Send the `initialize` request. Advertises `fs.readTextFile` and
-    /// `fs.writeTextFile` (#954, ACP-3) and `auth.terminal` (#957, ACP-6) —
-    /// the only `clientCapabilities` this client implements so far, per the
-    /// module doc's capability negotiation commitment ("omitted means
-    /// unsupported"). `auth.terminal: true` is what makes an agent's
-    /// `initialize` response allowed to offer a `type: "terminal"` auth
-    /// method at all (e.g. `claude-ai-login` / "Claude Subscription" from
-    /// `@agentclientprotocol/claude-agent-acp`) — omitting it is how a
-    /// client opts out of subscription login and forces API-key-only, which
-    /// this client deliberately does not do (see the module doc's ACP-6
-    /// section). `terminal/*` — the unrelated *client-served* terminal
-    /// methods — is still never advertised (out of scope for the whole
-    /// track).
-    /// `terminal_enabled` gates the `terminal` capability (#1522,
-    /// `settings.acp_terminal_enabled` — default on): when `false`, the
-    /// wire request omits `clientCapabilities.terminal` entirely (never
-    /// sends `false` — same "omitted means unsupported" convention as
-    /// every other capability here), so an agent never offers a
-    /// `{type: "terminal"}` tool-content block or calls `terminal/*` in
-    /// the first place, matching `Engine::acp_dispatch_events`'s own gate
-    /// on actually serving those methods.
+    /// `fs.writeTextFile` and `auth.terminal` — the only `clientCapabilities`
+    /// this client implements so far, per the module doc's capability
+    /// negotiation commitment ("omitted means unsupported"). `auth.terminal:
+    /// true` is what makes an agent's `initialize` response allowed to offer
+    /// a `type: "terminal"` auth method at all — omitting it is how a client
+    /// opts out of subscription login and forces API-key-only, which this
+    /// client deliberately does not do (see the module doc's ACP-6 section).
+    /// `terminal/*` — the unrelated *client-served* terminal methods — is
+    /// still never advertised (out of scope for the whole track).
+    ///
+    /// `terminal_enabled` gates the `terminal` capability
+    /// (`settings.acp_terminal_enabled` — default on): when `false`, the wire
+    /// request omits `clientCapabilities.terminal` entirely (never sends
+    /// `false` — same "omitted means unsupported" convention as every other
+    /// capability here), so an agent never offers a `{type: "terminal"}`
+    /// tool-content block or calls `terminal/*` in the first place, matching
+    /// `Engine::acp_dispatch_events`'s own gate on actually serving those
+    /// methods.
     pub fn initialize(&mut self, terminal_enabled: bool) -> i64 {
         let mut client_capabilities = serde_json::json!({
             "fs": {
@@ -2668,10 +2653,9 @@ impl AcpClient {
     }
 
     /// Send an `authenticate` request for a `type: "agent"` auth method
-    /// (#957, ACP-6) — `{"methodId": method_id}`. Distinct from `type:
-    /// "terminal"` methods, which never call this RPC at all; see the
-    /// module doc's "How terminal auth differs from `authenticate`" note
-    /// and [`AcpAuthMethodKind`].
+    /// — `{"methodId": method_id}`. Distinct from `type: "terminal"` methods,
+    /// which never call this RPC at all; see the module doc's "How terminal auth
+    /// differs from `authenticate`" note and [`AcpAuthMethodKind`].
     pub fn authenticate(&mut self, method_id: &str) -> i64 {
         self.send_request("authenticate", serde_json::json!({"methodId": method_id}))
     }
@@ -2699,7 +2683,7 @@ impl AcpClient {
         )
     }
 
-    /// Send `session/load` (#1459) — resume a previously-created session by
+    /// Send `session/load` — resume a previously-created session by
     /// id, rather than `session/new`'s "start empty". Only meaningful when
     /// the most recent `initialize` response's `agentCapabilities.
     /// loadSession` was `true` (see [`parse_load_session_capability`]);
@@ -2727,10 +2711,9 @@ impl AcpClient {
         )
     }
 
-    /// Send `session/set_mode` (#956, ACP-5). The displayed mode does not
-    /// change from this call's response — only from the agent's own
-    /// `current_mode_update` notification afterward; see
-    /// `Engine::acp_set_mode`'s doc for why.
+    /// Send `session/set_mode`. The displayed mode does not change from this
+    /// call's response — only from the agent's own `current_mode_update`
+    /// notification afterward; see `Engine::acp_set_mode`'s doc for why.
     pub fn set_mode(&mut self, session_id: &str, mode_id: &str) -> i64 {
         self.send_request(
             "session/set_mode",
@@ -2738,7 +2721,7 @@ impl AcpClient {
         )
     }
 
-    /// Send `session/set_config_option` (#1520) — ACP v1's only model
+    /// Send `session/set_config_option` — ACP v1's only model
     /// picker; there is no dedicated `session/set_mode`-style method for a
     /// model. Like [`Self::set_mode`], the displayed value does not change
     /// from this call's response — only from the agent's own
@@ -3148,7 +3131,7 @@ mod tests {
         assert!(parse_agent_command("   \t  ").is_empty());
     }
 
-    // ---- parse_agent_env (#958, ACP-7 agent registry): pure, no subprocess ----
+    // ---- parse_agent_env: pure, no subprocess ----
 
     #[test]
     fn parse_agent_env_splits_key_value_pairs() {
@@ -3234,7 +3217,7 @@ mod tests {
     }
 
     // ---- plan / available_commands_update / current_mode_update / usage_update:
-    //      pure, no subprocess (#956, ACP-5) ----
+    // ---- pure, no subprocess ----
 
     /// The core acceptance bar: two successive `plan` updates must leave
     /// exactly one plan when applied the way `Engine::acp_handle_session_update`
@@ -3376,7 +3359,7 @@ mod tests {
         assert!(list.is_empty());
     }
 
-    /// #957 (ACP-6): the pure parser side of "the terminal method is
+    /// The pure parser side of "the terminal method is
     /// absent when the capability isn't advertised" — an `authMethods`
     /// array with no `type: "terminal"` entry at all (what a real agent
     /// would send when it never saw `auth.terminal: true`) must classify
@@ -3433,18 +3416,16 @@ mod tests {
         assert_eq!(parsed[0].name, "api-key");
     }
 
-    /// #1444: a `type: "terminal"` method's own `args` — the reference
-    /// Claude ACP adapter's exact wire shape
-    /// (`@agentclientprotocol/claude-agent-acp` 0.81.2,
-    /// `dist/acp-agent.js:1048-1061`) — must survive parsing so
-    /// `Engine::acp_launch_terminal_login` can append them to the resolved
-    /// agent command. Dropping them (pre-#1444 behavior) makes the client
-    /// launch the bare command, which a real adapter answers by starting
-    /// its NDJSON server and never actually logging in.
+    /// A `type: "terminal"` method's own `args` — the reference Claude ACP
+    /// adapter's exact wire shape — must survive parsing so
+    /// `Engine::acp_launch_terminal_login` can append them to the resolved agent
+    /// command. Dropping them makes the client launch the bare command, which a
+    /// real adapter answers by starting its NDJSON server and never actually
+    /// logging in.
     ///
-    /// A `type: "agent"` entry with no `args` at all must not error or
-    /// synthesize one — it defaults to empty, matching every pre-#1444
-    /// fixture response that never carried the field.
+    /// A `type: "agent"` entry with no `args` at all must not error or synthesize
+    /// one — it defaults to empty, matching agent responses that never carried
+    /// the field.
     #[test]
     fn parse_auth_methods_carries_terminal_args_and_defaults_agent_args_to_empty() {
         let methods = vec![
@@ -3663,9 +3644,9 @@ mod tests {
         assert_eq!(format_usage_summary(&nothing), "");
     }
 
-    // ---- parse_request_permission / permission_outcome_*: pure, no subprocess (#953, ACP-2) ----
+    // ---- parse_request_permission / permission_outcome_*: pure, no subprocess ----
 
-    /// #1518: a `diff` content block on `toolCall.content` must parse into
+    /// A `diff` content block on `toolCall.content` must parse into
     /// `AcpToolCallInfo::content`, the same shape a `tool_call`/
     /// `tool_call_update` update parses it as — this is what lets the
     /// permission dialog preview the actual proposed change instead of
@@ -3696,7 +3677,7 @@ mod tests {
         );
     }
 
-    /// #1518: `toolCall.rawInput` must parse into
+    /// `toolCall.rawInput` must parse into
     /// `AcpToolCallInfo::raw_input` verbatim — the permission dialog's
     /// fallback for a non-edit (`execute` most importantly) tool call that
     /// carries no `diff` content.
@@ -3782,7 +3763,7 @@ mod tests {
         assert!(req.tool_call.locations.is_empty());
     }
 
-    /// #953 review (non-blocking concern): a missing per-option `kind` must
+    /// A missing per-option `kind` must
     /// default to something neutral, never to `"allow_once"` — the most
     /// permissive category — since that would let a request with a missing
     /// `kind` silently match `AcpSession::remembered_decisions`'s
@@ -3852,7 +3833,7 @@ mod tests {
         );
     }
 
-    // ---- tool_call / tool_call_update: pure, no subprocess (#955, ACP-4) ----
+    // ---- tool_call / tool_call_update: pure, no subprocess ----
 
     #[test]
     fn parse_tool_call_reads_title_kind_status_locations_and_content() {
@@ -4044,7 +4025,7 @@ mod tests {
         );
     }
 
-    // ---- fs/read_text_file, fs/write_text_file: pure, no subprocess (#954, ACP-3) ----
+    // ---- fs/read_text_file, fs/write_text_file: pure, no subprocess ----
 
     #[test]
     fn parse_read_text_file_params_reads_path_line_and_limit() {
@@ -4108,7 +4089,7 @@ mod tests {
         );
     }
 
-    // ---- terminal/* wire-shape parsing + result builders (#1522) ----
+    // ---- terminal/* wire-shape parsing + result builders ------------
 
     #[test]
     fn parse_terminal_create_params_reads_every_field() {
@@ -4327,7 +4308,7 @@ mod tests {
         assert_eq!(select_text_lines(content, Some(0), None), "one\ntwo");
     }
 
-    /// #1452: an attachment chip must stay workspace-relative even when the
+    /// An attachment chip must stay workspace-relative even when the
     /// workspace path reaches the project through a symlink. The resolved
     /// path is canonical (`resolve_path_within_roots` canonicalizes), the
     /// `workspace_cwd` is whatever the user typed — so the naive
@@ -4367,7 +4348,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // ── #1464: manual file/image attachments ───────────────────────────────
+    // ── manual file/image attachments ───────────────────────────────
 
     #[test]
     fn image_mime_type_for_path_recognizes_common_raster_extensions_case_insensitively() {
@@ -4438,7 +4419,7 @@ mod tests {
         );
     }
 
-    /// #1513: `caps.embedded_context == true` produces a `resource` block
+    /// `caps.embedded_context == true` produces a `resource` block
     /// carrying an `#L<line>-L<line>` fragment and the symbol's `detail`
     /// as inline text.
     #[test]
@@ -4600,7 +4581,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- prompt context: `@`-mentions + promptCapabilities (#1449) ----
+    // ---- prompt context: `@`-mentions + promptCapabilities ------------
 
     #[test]
     fn parse_at_mentions_extracts_every_at_token_and_leaves_bare_words_alone() {
@@ -4638,12 +4619,12 @@ mod tests {
         assert!(parsed.image);
         assert!(!parsed.audio);
 
-        // Every pre-#1449 fixture/agent omits the field entirely.
+        // Every fixture/agent omits the field entirely.
         let absent = parse_prompt_capabilities(&serde_json::Value::Null);
         assert_eq!(absent, AcpPromptCapabilities::default());
     }
 
-    // ---- User-configured MCP servers (#1487, redo of #1462) ----
+    // ---- User-configured MCP servers ----
 
     #[test]
     fn parse_mcp_capabilities_reads_declared_flags_and_defaults_absent_to_false() {
@@ -4652,7 +4633,7 @@ mod tests {
         assert!(parsed.http);
         assert!(!parsed.sse);
 
-        // Every pre-#1487 fixture/agent omits the field entirely.
+        // Every fixture/agent omits the field entirely.
         let absent = parse_mcp_capabilities(&serde_json::Value::Null);
         assert_eq!(absent, AcpMcpCapabilities::default());
     }
@@ -4740,10 +4721,8 @@ mod tests {
         assert_eq!(wire[0]["name"], "events");
     }
 
-    /// Review nit: direct unit coverage for [`parse_load_session_capability`]
-    /// — modeled on `parse_prompt_capabilities`'s sibling test above, which
-    /// this one previously lacked (only exercised indirectly via the
-    /// fixture/engine tests).
+    /// Direct unit coverage for [`parse_load_session_capability`]
+    /// — modeled on `parse_prompt_capabilities`'s sibling test above.
     #[test]
     fn parse_load_session_capability_reads_the_flag_and_defaults_absent_to_false() {
         let caps = serde_json::json!({"loadSession": true});
@@ -4752,18 +4731,16 @@ mod tests {
         let caps = serde_json::json!({"loadSession": false});
         assert!(!parse_load_session_capability(&caps));
 
-        // Every pre-#1459 fixture/agent omits the field entirely.
+        // Every fixture/agent omits the field entirely.
         assert!(!parse_load_session_capability(&serde_json::Value::Null));
         assert!(!parse_load_session_capability(&serde_json::json!({})));
     }
 
     // ---- Integration: fake NDJSON echo agent subprocess ----
     //
-    // `tests/fixtures/fake_acp_agent.sh` is the fixture the whole ACP track
-    // depends on (per #951's "fixture this slice owes the rest of the
-    // track") — deterministic canned responses keyed by method name via
-    // plain `/bin/sh` + `case`, no jq/python/node, so it runs in CI (#951:
-    // "CI has no Node and no agent login").
+    // `tests/fixtures/fake_acp_agent.sh` is the fixture the ACP track depends
+    // on — deterministic canned responses keyed by method name via plain `/bin/sh`
+    // + `case`, no jq/python/node, so it runs in CI.
 
     #[cfg(unix)]
     fn fixture_path() -> std::path::PathBuf {
@@ -4781,7 +4758,7 @@ mod tests {
         // script (`fake_acp_agent.sh`) that is itself `#!/bin/sh` and
         // documents its use of POSIX-only features (`case...esac`, `sed`,
         // shell functions) — it is not portable to `$SHELL` being e.g. fish
-        // or csh/tcsh. "sh" must stay hardcoded here (see #1255).
+        // or csh/tcsh. "sh" must stay hardcoded here.
         let argv = vec![
             "sh".to_string(),
             fixture_path().to_string_lossy().into_owned(),
@@ -4810,20 +4787,11 @@ mod tests {
     /// Poll, *accumulating* across drains, until `done` is satisfied by the
     /// events collected so far or the deadline passes.
     ///
-    /// Use this instead of a second `poll_until` whenever the events under
-    /// test are produced by the agent back-to-back. `AcpClient::poll` drains
-    /// whatever the reader thread has queued at that instant, so how many
-    /// events land in one call is pure scheduling luck: with
-    /// `ACP_FAKE_DIE_AFTER_INIT` the fixture writes its `initialize` response
-    /// and exits immediately, so the `Initialized` event and the `AgentExited`
-    /// that its EOF produces may arrive in *one* drain or in two. Asserting
-    /// "the first poll returns Initialized, the second returns AgentExited"
-    /// therefore passes or fails at random — it was the flake seen at #984's
-    /// test stage. Nothing about the client's contract promises a one-event-
-    /// per-poll cadence, and no deadline can repair that — a drain that
-    /// already returned both events leaves the *next* one empty however long
-    /// you wait. Accumulating is the fix; the property under test is that
-    /// both events *arrive*, in order, not how they are batched.
+    /// Use this instead of a second `poll_until` whenever the events under test
+    /// are produced by the agent back-to-back. `AcpClient::poll` drains whatever
+    /// the reader thread has queued at that instant, so how many events land in
+    /// one call is pure scheduling luck. The property under test is that both
+    /// events *arrive* in order, not how they are batched.
     #[cfg(unix)]
     fn poll_collecting_until(
         client: &mut AcpClient,
@@ -4843,18 +4811,14 @@ mod tests {
 
     /// How long a fixture-backed test waits for an event before giving up.
     ///
-    /// Deliberately generous rather than "roughly how long the fixture takes
-    /// on an idle box". Every wait loop in this module exits the instant its
-    /// condition holds, so the bound is only ever reached on the *failing*
-    /// path — which means a larger value costs a passing run exactly nothing
-    /// and only buys headroom on a loaded one. That headroom is the point:
-    /// a full `cargo test` drives the GTK harness, ~2.7k lib tests and the
-    /// nvim conformance oracles concurrently, and a `sh` fork+exec plus a
-    /// pipe round-trip can be descheduled for orders of magnitude longer
-    /// there than the couple of milliseconds it costs standalone. The two
-    /// death-path tests (here and in `engine::acp_ops`) were the ones that
-    /// went red at #984's test stage, so they are the ones that must not be
-    /// sitting near their bound.
+    /// Deliberately generous rather than "roughly how long the fixture takes on an
+    /// idle box". Every wait loop exits the instant its condition holds, so the
+    /// bound is only ever reached on the *failing* path — which means a larger
+    /// value costs a passing run exactly nothing and only buys headroom on a loaded
+    /// one. A full `cargo test` drives the GTK harness, ~2.7k lib tests and the
+    /// nvim conformance oracles concurrently, and a `sh` fork+exec plus a pipe
+    /// round-trip can be descheduled for orders of magnitude longer there than the
+    /// couple of milliseconds it costs standalone.
     #[cfg(unix)]
     const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -4942,20 +4906,16 @@ mod tests {
         }
     }
 
-    // ---- Transcript recording (#1461: contract-test corpus infra) ----
+    // ---- Transcript recording: contract-test corpus infra ----
 
-    /// `AcpClient::spawn_with_recording` tees every raw line, both
-    /// directions, into the recording file, in wire order, unmodified byte
-    /// for byte — the property the `acp-replay-agent` fixture binary and any
-    /// contract test built on it rely on (a recorded transcript must be
-    /// byte-identical to what a fresh session would produce, or replaying it
-    /// proves nothing about the real wire shape). Drives the same
-    /// initialize -> session/new -> session/prompt (`ACP_FAKE_NO_TOOL_
-    /// REQUEST`, so there's no agent->client request to park on) lifecycle
-    /// as `full_session_lifecycle_reaches_end_turn` above, then asserts on
-    /// the file's actual contents rather than just "it exists" — the #587/
-    /// #592 lesson (state populated is not the same as content correct)
-    /// applies to test infrastructure too, not just paint.
+    /// `AcpClient::spawn_with_recording` tees every raw line, both directions,
+    /// into the recording file, in wire order, unmodified byte for byte — the
+    /// property the `acp-replay-agent` fixture binary and any contract test built
+    /// on it rely on (a recorded transcript must be byte-identical to what a fresh
+    /// session would produce, or replaying it proves nothing about the real wire
+    /// shape). Drives the same initialize -> session/new -> session/prompt
+    /// lifecycle as `full_session_lifecycle_reaches_end_turn` above, then asserts
+    /// on the file's actual contents rather than just "it exists".
     #[cfg(unix)]
     #[test]
     fn spawn_with_recording_captures_both_directions_of_the_wire() {
@@ -5037,7 +4997,7 @@ mod tests {
         }
     }
 
-    /// #954 (ACP-3): the `fs.readTextFile`/`fs.writeTextFile`
+    /// The `fs.readTextFile`/`fs.writeTextFile`
     /// clientCapabilities must actually reach the wire in the `initialize`
     /// request, not just exist as a `serde_json::json!` literal nobody
     /// sends. The fixture echoes back whether it saw each flag — see its
@@ -5067,7 +5027,7 @@ mod tests {
         }
     }
 
-    /// #957 (ACP-6): `auth.terminal: true` must actually reach the wire in
+    /// `auth.terminal: true` must actually reach the wire in
     /// the `initialize` request — same "the capability flag isn't just a
     /// `serde_json::json!` literal nobody sends" contract as the fs/* test
     /// above, and the same fixture echo mechanism
@@ -5091,7 +5051,7 @@ mod tests {
         }
     }
 
-    /// #957 (ACP-6): with `$ACP_FAKE_AUTH_METHODS` set, the fixture's
+    /// With `$ACP_FAKE_AUTH_METHODS` set, the fixture's
     /// `authMethods` includes a `type: "terminal"` entry *because* it saw
     /// `auth.terminal: true` on the wire (this client always sends it —
     /// see the test above) — a real, request-driven gate, not a hardcoded
@@ -5119,7 +5079,7 @@ mod tests {
         }
     }
 
-    /// #957 (ACP-6): a `type: "agent"` auth method answers via the plain
+    /// A `type: "agent"` auth method answers via the plain
     /// `authenticate {methodId}` RPC — a real round trip through
     /// [`AcpClient::authenticate`], not just JSON construction.
     #[cfg(unix)]

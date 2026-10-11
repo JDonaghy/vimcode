@@ -1,4 +1,4 @@
-//! Process-wide working-directory arbitration for the test run (#785).
+//! Process-wide working-directory arbitration for the test run.
 //!
 //! # Why this exists
 //!
@@ -18,14 +18,8 @@
 //!   the repo's name and file list — a *different frame* around whatever the
 //!   test was actually probing.
 //!
-//! [`CwdGuard`] (#785, first round) restored the directory on `Drop`, which
-//! fixed the *leak* — every test that started **after** a writer finished.
-//! It did nothing for tests running **during** the writer's window, which is
-//! the same bug reached by a different scheduling order and is why
-//! `tab_hover_tooltip_paints_below_tab_row_not_inside_it` went red on a
-//! diff that touches neither tooltips nor the explorer. It reproduces 15/15
-//! with:
-//!
+//! [`CwdGuard`] restores the directory on `Drop`, serializing writer tests
+//! so that concurrent reader tests see a consistent working directory.
 //! ```text
 //! cargo test --lib -- tab_hover_tooltip_paints_below \
 //!     test_lsp_flush_clears_diagnostics_by_canonical_path \
