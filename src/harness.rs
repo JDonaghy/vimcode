@@ -144,6 +144,600 @@ use quadraui::NamedKey;
 use crate::app::App;
 use crate::core::Engine;
 
+// ── Role-based locators (#1887) ────────────────────────────────────────
+//
+// Typed, stable names for each UI region. Maps 1:1 to `WidgetId` strings
+// `AppShell::render`'s `register_chrome_zones` already registers -- no
+// upstream quadraui change required.
+
+/// Semantic role for a UI region that `AppShell::render`'s
+/// `register_chrome_zones` already registers as a `WidgetId`-keyed zone.
+///
+/// Each variant maps 1:1 to a known `WidgetId` string via [`UiRole::zone_id`].
+/// `#[non_exhaustive]`: new regions can be added without breaking existing
+/// match arms.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UiRole {
+    // Chrome regions (app-shell:* zones)
+    Window,
+    ActivityBar,
+    MainContent,
+    TitleBar,
+    SidebarHeader,
+    SidebarContent,
+    Divider,
+    BottomPanel,
+    CommandLine,
+    StatusBar,
+
+    // Activity-bar panels (panel:* / bottom:* zones)
+    Explorer,
+    Search,
+    SourceControl,
+    Debug,
+    Extensions,
+    Settings,
+}
+
+impl UiRole {
+    /// The `WidgetId` string `register_chrome_zones` registers this role under.
+    pub const fn zone_id(&self) -> &'static str {
+        match self {
+            Self::Window => "app-shell:window",
+            Self::ActivityBar => "app-shell:activity-bar",
+            Self::MainContent => "app-shell:main-content",
+            Self::TitleBar => "app-shell:title-bar",
+            Self::SidebarHeader => "app-shell:sidebar-header",
+            Self::SidebarContent => "app-shell:sidebar-content",
+            Self::Divider => "app-shell:divider",
+            Self::BottomPanel => "app-shell:bottom-panel",
+            Self::CommandLine => "app-shell:command-line",
+            Self::StatusBar => "app-shell:status-bar",
+            Self::Explorer => "panel:explorer",
+            Self::Search => "panel:search",
+            Self::SourceControl => "panel:git",
+            Self::Debug => "panel:debug",
+            Self::Extensions => "panel:extensions",
+            Self::Settings => "bottom:settings",
+        }
+    }
+}
+
+/// A resolved reference to a UI element located by role in the current frame.
+#[derive(Debug, Clone, Copy)]
+pub struct RoleRef {
+    pub role: UiRole,
+    pub bounds: quadraui::Rect,
+}
+
+impl RoleRef {
+    /// Center point of this element's painted bounds.
+    pub fn center(&self) -> (f32, f32) {
+        (
+            self.bounds.x + self.bounds.width / 2.0,
+            self.bounds.y + self.bounds.height / 2.0,
+        )
+    }
+}
+
+/// Role-based locator methods, layered on top of any `ConformanceDriver`.
+pub trait RoleLocator: ConformanceDriver {
+    /// Find the zone registered for `role` in the current frame's inventory.
+    fn find_by_role(&self, role: UiRole) -> Option<RoleRef> {
+        let id = quadraui::WidgetId::new(role.zone_id());
+        self.inventory()
+            .zones()
+            .iter()
+            .find(|z| z.id == id)
+            .map(|z| RoleRef {
+                role,
+                bounds: z.bounds,
+            })
+    }
+
+    /// Like [`Self::find_by_role`], but panics if the role is not found.
+    fn require_role(&self, role: UiRole) -> RoleRef {
+        self.find_by_role(role).unwrap_or_else(|| {
+            panic!(
+                "{role:?} (zone_id {:?}) not in frame inventory",
+                role.zone_id()
+            )
+        })
+    }
+
+    /// True if `needle` is painted inside the zone for `role`.
+    fn text_inside_role(&self, needle: &str, role: UiRole) -> bool {
+        let id = quadraui::WidgetId::new(role.zone_id());
+        self.inventory().inside(needle, &id)
+    }
+
+    /// True if the zone for `role` is present in the current frame.
+    fn role_visible(&self, role: UiRole) -> bool {
+        self.find_by_role(role).is_some()
+    }
+}
+
+impl<D: ConformanceDriver> RoleLocator for D {}
+
+/// Role-based click methods for drivers with raw mouse input.
+pub trait RoleClick: RoleLocator + DriverInput {
+    /// Click the center of the zone for `role`.
+    fn click_role(&mut self, role: UiRole) -> quadraui::runner::Reaction {
+        let center = self.require_role(role).center();
+        self.click(center.0, center.1)
+    }
+}
+
+impl<D: RoleLocator + DriverInput> RoleClick for D {}
+
+/// Relational assertions between two roles.
+pub trait RoleRelations: RoleLocator {
+    /// True if `role_a`'s zone is entirely above `role_b`'s zone.
+    fn role_above_role(&self, role_a: UiRole, role_b: UiRole) -> bool {
+        match (self.find_by_role(role_a), self.find_by_role(role_b)) {
+            (Some(a), Some(b)) => a.bounds.y + a.bounds.height <= b.bounds.y,
+            _ => false,
+        }
+    }
+
+    /// True if `role_a`'s zone is entirely left of `role_b`'s zone.
+    fn role_left_of_role(&self, role_a: UiRole, role_b: UiRole) -> bool {
+        match (self.find_by_role(role_a), self.find_by_role(role_b)) {
+            (Some(a), Some(b)) => a.bounds.x + a.bounds.width <= b.bounds.x,
+            _ => false,
+        }
+    }
+}
+
+impl<D: RoleLocator> RoleRelations for D {}
+
+// ── Scenario registry (#1888) ──────────────────────────────────────────
+
+/// Feature area a conformance scenario covers.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FeatureArea {
+    Editor,
+    Chrome,
+    Navigation,
+    Search,
+    SourceControl,
+    Terminal,
+    FileOps,
+    Panels,
+    TabBar,
+    StatusBar,
+    ActivityBar,
+    ContextMenu,
+    CommandPalette,
+    Settings,
+    Scroll,
+    DragDrop,
+    Keyboard,
+    Extensions,
+    DebugOutput,
+}
+
+impl std::fmt::Display for FeatureArea {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Editor => "editor",
+            Self::Chrome => "chrome",
+            Self::Navigation => "navigation",
+            Self::Search => "search",
+            Self::SourceControl => "source-control",
+            Self::Terminal => "terminal",
+            Self::FileOps => "file-ops",
+            Self::Panels => "panels",
+            Self::TabBar => "tab-bar",
+            Self::StatusBar => "status-bar",
+            Self::ActivityBar => "activity-bar",
+            Self::ContextMenu => "context-menu",
+            Self::CommandPalette => "command-palette",
+            Self::Settings => "settings",
+            Self::Scroll => "scroll",
+            Self::DragDrop => "drag-drop",
+            Self::Keyboard => "keyboard",
+            Self::Extensions => "extensions",
+            Self::DebugOutput => "debug-output",
+        })
+    }
+}
+
+/// Which driver trait bound a scenario requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DriverCap {
+    /// Keyboard-only: `ConformanceDriver` bound.
+    TextOnly,
+    /// Needs raw click: `ConformanceDriver + DriverInput` bound.
+    ClickInput,
+    /// Needs pixel-precise native click: `PixelClickConformance` bound (not TUI).
+    PixelClick,
+}
+
+/// Which backends a scenario is registered on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendSet {
+    pub gtk: bool,
+    pub tui: bool,
+    pub tui_prod: bool,
+    pub macos: bool,
+    pub win: bool,
+}
+
+impl BackendSet {
+    pub const ALL_MACRO: Self = Self {
+        gtk: true,
+        tui: true,
+        tui_prod: true,
+        macos: false,
+        win: false,
+    };
+}
+
+/// One entry in the scenario registry.
+#[derive(Debug, Clone)]
+pub struct ScenarioMeta {
+    pub name: &'static str,
+    pub area: FeatureArea,
+    pub driver_cap: DriverCap,
+    pub backends: BackendSet,
+    pub issue: Option<u32>,
+    pub description: &'static str,
+}
+
+impl ScenarioMeta {
+    pub fn backends_list(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.backends.gtk {
+            v.push("gtk");
+        }
+        if self.backends.tui {
+            v.push("tui");
+        }
+        if self.backends.tui_prod {
+            v.push("tui_prod");
+        }
+        if self.backends.macos {
+            v.push("macos");
+        }
+        if self.backends.win {
+            v.push("win");
+        }
+        v
+    }
+
+    pub fn cap_label(&self) -> &'static str {
+        match self.driver_cap {
+            DriverCap::TextOnly => "text",
+            DriverCap::ClickInput => "click",
+            DriverCap::PixelClick => "pixel",
+        }
+    }
+}
+
+/// Complete scenario registry. One entry per `backend_conformance!` invocation.
+pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
+    ScenarioMeta {
+        name: "sweep_hit_band_integrity_proof",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Explorer row click lands on its own hit band",
+    },
+    ScenarioMeta {
+        name: "sc_hint_row_shows_only_while_focused",
+        area: FeatureArea::SourceControl,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(1361),
+        description: "SC panel hint row appears only while focused",
+    },
+    ScenarioMeta {
+        name: "sc_panel_changes_section_shows_status_badges_after_startup_cwd_fix_1797",
+        area: FeatureArea::SourceControl,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(1797),
+        description: "SC CHANGES section shows M/U status badges after startup cwd fix",
+    },
+    ScenarioMeta {
+        name: "settings_row_sweep_hit_band_integrity",
+        area: FeatureArea::Settings,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Settings row click lands on its own hit band",
+    },
+    ScenarioMeta {
+        name: "explorer_row_sweep_hit_band_integrity",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Explorer tree row click lands on its own hit band",
+    },
+    ScenarioMeta {
+        name: "explorer_drag_and_drop_opens_confirm_move_dialog",
+        area: FeatureArea::DragDrop,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Explorer drag-and-drop opens the confirm-move dialog",
+    },
+    ScenarioMeta {
+        name: "hover_popup_press_and_drag_extends_selection",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Press-and-drag from a hover popup extends text selection",
+    },
+    ScenarioMeta {
+        name: "explorer_right_click_below_last_row_opens_root_context_menu",
+        area: FeatureArea::ContextMenu,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Right-click below the last explorer row opens the root context menu",
+    },
+    ScenarioMeta {
+        name: "confirm_prompt_text_is_painted",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Confirm prompt text is painted on screen",
+    },
+    ScenarioMeta {
+        name: "confirm_report_line_excludes_skipped_matches",
+        area: FeatureArea::Search,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Confirm report line count excludes skipped matches",
+    },
+    ScenarioMeta {
+        name: "bottom_item_second_click_collapses_sidebar",
+        area: FeatureArea::ActivityBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Second click on the bottom activity-bar item collapses the sidebar",
+    },
+    ScenarioMeta {
+        name: "activity_bar_panel_click_open_then_close_via_converged_shadow_sync",
+        area: FeatureArea::ActivityBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Activity bar click open/close uses converged shadow sync",
+    },
+    ScenarioMeta {
+        name: "tab_bar_click_switches_via_shared_dispatch",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Tab bar click switches the active tab via shared dispatch",
+    },
+    ScenarioMeta {
+        name: "tab_bar_click_closes_via_shared_dispatch",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Tab bar close-button click closes the tab via shared dispatch",
+    },
+    ScenarioMeta {
+        name: "tab_bar_click_in_close_gutter_closes_not_selects",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Click in the tab close gutter closes rather than selecting",
+    },
+    ScenarioMeta {
+        name: "tab_bar_overflow_right_segment_click_opens_action_menu",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Tab bar overflow right-segment click opens the action menu",
+    },
+    ScenarioMeta {
+        name: "split_tab_bar_click_switches_via_shared_dispatch",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Split-view tab bar click switches to the correct group",
+    },
+    ScenarioMeta {
+        name: "split_tab_bar_click_closes_via_shared_dispatch",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Split-view tab bar close click closes the correct tab",
+    },
+    ScenarioMeta {
+        name: "activity_bar_click_focuses_search_panel_proof",
+        area: FeatureArea::ActivityBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(1360),
+        description: "Activity bar click moves keyboard focus into the search panel",
+    },
+    ScenarioMeta {
+        name: "sidebar_ctrl_w_l_returns_focus_to_the_editor_proof",
+        area: FeatureArea::Keyboard,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-W l returns keyboard focus from sidebar to the editor",
+    },
+    ScenarioMeta {
+        name: "sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar_proof",
+        area: FeatureArea::Keyboard,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-W h moves focus from sidebar to the activity bar toolbar",
+    },
+    ScenarioMeta {
+        name: "context_menu_new_file_starts_inline_edit",
+        area: FeatureArea::ContextMenu,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Context menu 'New File' starts inline filename editing",
+    },
+    ScenarioMeta {
+        name: "context_menu_delete_opens_confirm_dialog",
+        area: FeatureArea::ContextMenu,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Context menu 'Delete' opens the confirm dialog",
+    },
+    ScenarioMeta {
+        name: "context_menu_open_terminal_opens_terminal_tab",
+        area: FeatureArea::ContextMenu,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Context menu 'Open Terminal' opens a terminal tab",
+    },
+    ScenarioMeta {
+        name: "context_menu_find_in_folder_scopes_grep_to_the_folder",
+        area: FeatureArea::ContextMenu,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Context menu 'Find in Folder' scopes grep to that folder",
+    },
+    ScenarioMeta {
+        name: "command_palette_new_tab_shortcut_matches_live_binding",
+        area: FeatureArea::CommandPalette,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Command palette's New Tab shortcut matches the live key binding",
+    },
+    ScenarioMeta {
+        name: "wheel_scroll_direction_and_magnitude",
+        area: FeatureArea::Scroll,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(554),
+        description: "Wheel scroll direction and magnitude are correct",
+    },
+    ScenarioMeta {
+        name: "debug_output_wheel_scroll_direction_and_magnitude",
+        area: FeatureArea::DebugOutput,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(1266),
+        description: "Debug output panel scroll direction and re-pin behavior",
+    },
+];
+
+/// Print the human-readable scenario table to stdout.
+pub fn print_scenario_table(filter_area: Option<FeatureArea>, filter_backend: Option<&str>) {
+    println!(
+        "{:<60} {:<18} {:<8} {:<20} {}",
+        "SCENARIO", "AREA", "CAP", "BACKENDS", "ISSUE"
+    );
+    for s in SCENARIO_REGISTRY {
+        if let Some(area) = filter_area {
+            if s.area != area {
+                continue;
+            }
+        }
+        if let Some(backend) = filter_backend {
+            let has = match backend {
+                "gtk" => s.backends.gtk,
+                "tui" => s.backends.tui,
+                "tui_prod" => s.backends.tui_prod,
+                "macos" => s.backends.macos,
+                "win" => s.backends.win,
+                _ => false,
+            };
+            if !has {
+                continue;
+            }
+        }
+        let issue_str = match s.issue {
+            Some(n) => format!("#{n}"),
+            None => "-".to_string(),
+        };
+        println!(
+            "{:<60} {:<18} {:<8} {:<20} {}",
+            s.name,
+            s.area.to_string(),
+            s.cap_label(),
+            s.backends_list().join(","),
+            issue_str,
+        );
+    }
+}
+
+// ── Registry lint ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod registry_lint {
+    use super::*;
+
+    /// Every label in SCENARIO_REGISTRY must correspond to a real
+    /// `backend_conformance!` invocation, and vice versa.
+    #[test]
+    fn registry_covers_all_macro_invocations() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/harness.rs"
+        ))
+        .unwrap();
+
+        let label_re =
+            regex::Regex::new(r"backend_conformance!\s*\{\s*label:\s*(\w+)").unwrap();
+        let source_labels: std::collections::HashSet<&str> = label_re
+            .captures_iter(&source)
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+
+        let registry_labels: std::collections::HashSet<&str> =
+            SCENARIO_REGISTRY.iter().map(|s| s.name).collect();
+
+        let missing: Vec<_> = source_labels.difference(&registry_labels).collect();
+        let orphaned: Vec<_> = registry_labels.difference(&source_labels).collect();
+
+        assert!(
+            missing.is_empty(),
+            "backend_conformance! labels not in SCENARIO_REGISTRY: {missing:?}"
+        );
+        assert!(
+            orphaned.is_empty(),
+            "SCENARIO_REGISTRY entries with no backend_conformance! invocation: {orphaned:?}"
+        );
+    }
+
+    /// No duplicate names in the registry.
+    #[test]
+    fn no_duplicate_registry_names() {
+        let mut seen = std::collections::HashSet::new();
+        for entry in SCENARIO_REGISTRY {
+            assert!(
+                seen.insert(entry.name),
+                "duplicate SCENARIO_REGISTRY entry: {:?}",
+                entry.name
+            );
+        }
+    }
+}
+
 /// True if `needle` appears in the painted text of any single screen **row**,
 /// that row's runs joined left-to-right first.
 ///

@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+#
+# scripts/regress -- single-backend conformance-test runner.
+#
+# Wraps `cargo test` with the right feature flags and test-name filters
+# for one backend at a time, complementing scripts/platform-conformance.sh
+# (which is a multi-lane release gate, not a developer iteration tool).
+#
+# Usage:
+#   scripts/regress --backend tui                          # run all TUI scenarios
+#   scripts/regress --backend gtk --area tab-bar           # run only tab-bar scenarios on GTK
+#   scripts/regress --backend macos --list                 # list macOS-capable scenarios
+#   scripts/regress --backend tui --list --json            # list as JSON
+#   scripts/regress --backend gtk --guided                 # (placeholder) visual checklist
+#   scripts/regress --backend win --json                   # run win scenarios, JSON output
+#
+# Exit codes (same discipline as platform-conformance.sh):
+#   0  all selected scenarios passed
+#   1  at least one scenario failed (or zero tests ran -- the #645 guard)
+#   2  the selected backend is not available on this host
+#   3  internal error (bad arguments, missing cargo, etc.)
+#
+set -euo pipefail
+
+# -- Constants ---------------------------------------------------------------
+
+EXIT_PASS=0
+EXIT_FAIL=1
+EXIT_SKIP=2
+EXIT_ERROR=3
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# -- Argument parsing --------------------------------------------------------
+
+BACKEND=""
+AREA=""
+LIST=false
+GUIDED=false
+JSON=false
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/regress --backend <tui|gtk|macos|win> [OPTIONS]
+
+Options:
+  --backend <name>   Required. One of: tui, gtk, macos, win.
+  --area <area>      Filter to a feature area (e.g. tab-bar, scroll, editor).
+  --list             List available scenarios for this backend without running.
+  --guided           (Placeholder) Visual checklist mode.
+  --json             Output results as JSON.
+  -h, --help         Show this help.
+
+Exit codes:
+  0  all pass    1  failures    2  backend not available    3  error
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --backend)
+            BACKEND="$2"
+            shift 2
+            ;;
+        --area)
+            AREA="$2"
+            shift 2
+            ;;
+        --list)
+            LIST=true
+            shift
+            ;;
+        --guided)
+            GUIDED=true
+            shift
+            ;;
+        --json)
+            JSON=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "error: unknown argument: $1" >&2
+            usage >&2
+            exit $EXIT_ERROR
+            ;;
+    esac
+done
+
+if [[ -z "$BACKEND" ]]; then
+    echo "error: --backend is required" >&2
+    usage >&2
+    exit $EXIT_ERROR
+fi
+
+case "$BACKEND" in
+    tui|gtk|macos|win) ;;
+    *)
+        echo "error: unknown backend: $BACKEND (must be tui, gtk, macos, or win)" >&2
+        exit $EXIT_ERROR
+        ;;
+esac
+
+# -- Guided mode (placeholder) ----------------------------------------------
+
+if $GUIDED; then
+    echo "Phase 0.5 visual checklist: not yet implemented."
+    echo "Run without --guided to execute tests, or --list to see available scenarios."
+    exit 0
+fi
+
+# -- Backend availability probe ---------------------------------------------
+# Mirrors platform-conformance.sh's probe logic.
+
+probe_backend() {
+    case "$1" in
+        tui)
+            return 0
+            ;;
+        gtk)
+            if command -v pkg-config >/dev/null 2>&1 && pkg-config --modversion gtk4 >/dev/null 2>&1; then
+                return 0
+            else
+                echo "gtk backend: gtk4 not found via pkg-config" >&2
+                return 1
+            fi
+            ;;
+        macos)
+            if [[ "$(uname)" == "Darwin" ]]; then
+                return 0
+            else
+                echo "macos backend: requires macOS (uname = Darwin)" >&2
+                return 1
+            fi
+            ;;
+        win)
+            if command -v cargo-xwin >/dev/null 2>&1; then
+                return 0
+            else
+                echo "win backend: cargo-xwin not found on PATH" >&2
+                return 1
+            fi
+            ;;
+    esac
+}
+
+# -- List mode ---------------------------------------------------------------
+
+if $LIST; then
+    cd "$REPO_DIR"
+
+    # Collect all backend_conformance! labels from source.
+    # Matches indented `label: <ident>,` lines that are not inside comments
+    # or strings (the macro definition's `$label:ident` is filtered by the
+    # leading `$`).
+    LABELS=$(grep -E '^[[:space:]]+label: ' src/harness.rs 2>/dev/null \
+        | grep -v '//' | grep -v '"' | grep -v '\$' \
+        | sed 's/.*label: *//' | sed 's/,.*//' || true)
+
+    if [[ -z "$LABELS" ]]; then
+        echo "No backend_conformance! scenarios found in src/harness.rs" >&2
+        exit $EXIT_ERROR
+    fi
+
+    # Filter to scenarios that include this backend.
+    # All current macro invocations use backends: [gtk, tui, tui_prod].
+    filter_for_backend() {
+        local backend="$1"
+        case "$backend" in
+            tui|tui_prod|gtk)
+                echo "$LABELS"
+                ;;
+            macos|win)
+                echo ""
+                ;;
+        esac
+    }
+
+    FILTERED=$(filter_for_backend "$BACKEND")
+
+    if [[ -z "$FILTERED" ]]; then
+        if $JSON; then
+            echo "[]"
+        else
+            echo "No scenarios available for backend '$BACKEND'."
+        fi
+        exit 0
+    fi
+
+    if [[ -n "$AREA" ]]; then
+        echo "# Note: --area filtering requires the compiled scenario registry." >&2
+        echo "# Showing all scenarios for backend '$BACKEND'; filter visually." >&2
+    fi
+
+    if $JSON; then
+        echo "["
+        first=true
+        while IFS= read -r label; do
+            [[ -z "$label" ]] && continue
+            if $first; then
+                first=false
+            else
+                echo ","
+            fi
+            printf '  {"name": "%s", "backend": "%s"}' "$label" "$BACKEND"
+        done <<< "$FILTERED"
+        echo ""
+        echo "]"
+    else
+        printf "%-60s %s\n" "SCENARIO" "BACKEND"
+        printf "%-60s %s\n" "--------" "-------"
+        while IFS= read -r label; do
+            [[ -z "$label" ]] && continue
+            printf "%-60s %s\n" "$label" "$BACKEND"
+        done <<< "$FILTERED"
+    fi
+    exit 0
+fi
+
+# -- Probe before running ---------------------------------------------------
+
+if ! probe_backend "$BACKEND"; then
+    echo "Backend '$BACKEND' is not available on this host." >&2
+    exit $EXIT_SKIP
+fi
+
+# -- Build the cargo test command -------------------------------------------
+
+cd "$REPO_DIR"
+
+cargo_cmd=()
+cargo_test_filter=""
+
+case "$BACKEND" in
+    tui)
+        cargo_cmd=(cargo test --no-default-features)
+        cargo_test_filter="harness::"
+        ;;
+    gtk)
+        cargo_cmd=(cargo test)
+        cargo_test_filter="harness::"
+        ;;
+    macos)
+        cargo_cmd=(cargo test --lib --no-default-features --features macos)
+        cargo_test_filter="macos::"
+        ;;
+    win)
+        if [[ "$(uname -s)" == *MINGW* ]] || [[ "$(uname -s)" == *MSYS* ]] || [[ "$(uname -s)" == *CYGWIN* ]]; then
+            cargo_cmd=(cargo test --no-default-features --features win)
+        else
+            export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
+            cargo_cmd=(cargo xwin test --target x86_64-pc-windows-msvc --no-default-features --features win)
+        fi
+        cargo_test_filter="win::"
+        ;;
+esac
+
+# -- Area filter -> cargo test name filter ----------------------------------
+
+if [[ -n "$AREA" ]]; then
+    case "$AREA" in
+        tab-bar)         cargo_test_filter="harness::.*tab_bar" ;;
+        scroll)          cargo_test_filter="harness::.*scroll" ;;
+        source-control)  cargo_test_filter="harness::.*sc_" ;;
+        activity-bar)    cargo_test_filter="harness::.*activity_bar" ;;
+        context-menu)    cargo_test_filter="harness::.*context_menu" ;;
+        command-palette) cargo_test_filter="harness::.*command_palette" ;;
+        drag-drop)       cargo_test_filter="harness::.*drag" ;;
+        settings)        cargo_test_filter="harness::.*settings" ;;
+        keyboard)        cargo_test_filter="harness::.*ctrl_w" ;;
+        explorer|file-ops) cargo_test_filter="harness::.*explorer" ;;
+        editor)          cargo_test_filter="harness::.*hover" ;;
+        chrome)          cargo_test_filter="harness::.*confirm\|harness::.*sweep\|harness::.*bottom" ;;
+        debug-output)    cargo_test_filter="harness::.*debug_output" ;;
+        *)
+            echo "warning: unknown area '$AREA', running all scenarios" >&2
+            ;;
+    esac
+fi
+
+# -- Run --------------------------------------------------------------------
+
+echo "=== regress: backend=$BACKEND area=${AREA:-all} ==="
+echo "Command: ${cargo_cmd[*]} -- $cargo_test_filter"
+echo ""
+
+OUTFILE=$(mktemp)
+trap 'rm -f "$OUTFILE"' EXIT
+
+set +e
+"${cargo_cmd[@]}" -- "$cargo_test_filter" 2>&1 | tee "$OUTFILE"
+TEST_EXIT=${PIPESTATUS[0]}
+set -e
+
+# -- Parse results ----------------------------------------------------------
+
+TOTAL_LINE=$(grep -E '^test result: ' "$OUTFILE" | tail -1 || true)
+PASSED=$(echo "$TOTAL_LINE" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || echo "0")
+FAILED=$(echo "$TOTAL_LINE" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo "0")
+
+# The #645 vacuous-green guard: if zero tests ran, that is a failure.
+TOTAL=$((PASSED + FAILED))
+if [[ $TOTAL -eq 0 && $TEST_EXIT -eq 0 ]]; then
+    echo ""
+    echo "ERROR: zero tests ran -- this is the #645 vacuous-green trap, not a pass."
+    echo "The backend '$BACKEND' with filter '$cargo_test_filter' matched no test functions."
+    TEST_EXIT=1
+fi
+
+# -- Output -----------------------------------------------------------------
+
+VERDICT="$([ $TEST_EXIT -eq 0 ] && echo "pass" || echo "fail")"
+
+echo ""
+echo "=== regress summary ==="
+
+if $JSON; then
+    cat <<ENDJSON
+{
+  "backend": "$BACKEND",
+  "area": "${AREA:-all}",
+  "passed": $PASSED,
+  "failed": $FAILED,
+  "total": $TOTAL,
+  "verdict": "$VERDICT",
+  "exit": $TEST_EXIT
+}
+ENDJSON
+else
+    echo "Backend:  $BACKEND"
+    echo "Area:     ${AREA:-all}"
+    echo "Passed:   $PASSED"
+    echo "Failed:   $FAILED"
+    echo "Total:    $TOTAL"
+    if [[ $TEST_EXIT -eq 0 ]]; then
+        echo "Verdict:  PASS"
+    else
+        echo "Verdict:  FAIL"
+    fi
+fi
+
+echo "REGRESS_SUMMARY backend=$BACKEND area=${AREA:-all} passed=$PASSED failed=$FAILED total=$TOTAL verdict=$VERDICT exit=$TEST_EXIT"
+
+exit $TEST_EXIT
