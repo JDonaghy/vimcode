@@ -145,6 +145,26 @@ jobs:
     - name: Run validator unit tests
       run: python3 -m pytest tests/test_validate_smoke_specs.py -v
 
+  # #1896: `tools/comment_history_lint.py` counts fix-history comments (issue
+  # refs, "used to"/"no longer"/etc. phrasing) per module and fails a PR that
+  # raises any group's count above `tools/comment_history_thresholds.json`.
+  # Stdlib-only, so no dependency install beyond the Python the runner image
+  # already ships. Its own unit test (`tools/test_comment_history_lint.py`)
+  # runs first so a regression in the checker itself is caught before it
+  # ships a silently-weaker gate.
+  comment-history-lint:
+    name: Comment-history lint
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run comment_history_lint unit tests
+      run: python3 tools/test_comment_history_lint.py -v
+
+    - name: Run comment_history_lint
+      run: python3 tools/comment_history_lint.py --verbose
+
   # #645: the job above compiles GTK OUT (`--no-default-features`), so a green
   # run there carries zero information about `src/gtk/`. This job is the lane
   # that actually compiles and tests the GTK backend. It runs headlessly — no
