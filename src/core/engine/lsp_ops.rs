@@ -96,7 +96,7 @@ impl Engine {
         // sync (see `adopt_cwd_for_startup_file`) without always matching the
         // OS process cwd. Install hints and auto-install commands need this
         // value, not the process cwd, so a pinned `rust-toolchain.toml` at the
-        // workspace root is actually honored (#1905).
+        // workspace root is actually honored.
         let root = self.cwd.clone();
         let mut mgr = LspManager::new(root, &self.settings.lsp_servers);
         mgr.set_ext_manifests(
