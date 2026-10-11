@@ -168,6 +168,7 @@ fn spawn_under_conpty(
     cmd.env("USERPROFILE", home);
     cmd.env("LOCALAPPDATA", &appdata);
     cmd.env("VIMCODE_TEST_DATA_HOME", home.join("data"));
+    cmd.env("VIMCODE_TEST_HOME_ISOLATED", "1");
 
     let child = pair
         .slave

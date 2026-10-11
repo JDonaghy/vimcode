@@ -36,6 +36,7 @@ fn vimcode_with_no_display_prints_a_clear_error_and_exits_nonzero() {
     let exe = env!("CARGO_BIN_EXE_vimcode");
     let output = Command::new(exe)
         .env("HOME", &home)
+        .env("VIMCODE_TEST_HOME_ISOLATED", "1")
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
         .output()

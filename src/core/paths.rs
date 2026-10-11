@@ -126,6 +126,17 @@ pub(crate) fn guard_real_config_write(path: &Path) {
         // an equivalent direct `session::suppress_disk_saves()` call).
         return;
     }
+    if std::env::var_os("VIMCODE_TEST_HOME_ISOLATED").is_some() {
+        // A test-spawned child process (e.g.
+        // `tests/editor_mode_startup_persistence.rs`) sets `HOME` to an
+        // isolated temp dir and this env var to signal the guard that
+        // config-dir writes are landing in a throwaway sandbox, not the
+        // developer's real `~/.config/vimcode`. Cargo's feature unification
+        // compiles the `vcd` binary with `test-build-guard` during
+        // `cargo test`, so without this escape hatch the spawned binary
+        // would panic on its first save despite having a safe `HOME`.
+        return;
+    }
     panic!(
         "refusing to write to the real vimcode config dir at {}: this test \
          never isolated its home directory. Use `tests/common::engine_with()` \

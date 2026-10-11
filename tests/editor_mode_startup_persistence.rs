@@ -110,6 +110,10 @@ fn spawn_under_pty(main_rs: &PathBuf, home: &PathBuf) -> SpawnedPty {
         "VIMCODE_TEST_DATA_HOME",
         home.join(".local").join("share").join("vimcode"),
     );
+    // The spawned `vcd` binary is compiled with `test-build-guard` (Cargo
+    // feature unification), so `guard_real_config_write` needs this env var
+    // to recognize the throwaway `HOME` as a safe sandbox.
+    cmd.env("VIMCODE_TEST_HOME_ISOLATED", "1");
 
     let child = pair
         .slave
