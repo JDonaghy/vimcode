@@ -10182,6 +10182,68 @@ impl Engine {
         self.replay_keymap_buf(buf)
     }
 
+    /// Resolve a single keypress through the same `self.user_keymaps` table
+    /// [`Self::try_user_keymap`] consults, into the Ctrl-W window-navigation
+    /// direction it's bound to, if any: `'h'` for a mapping whose rhs is
+    /// `<C-w>h`/`<C-w><Left>` or `:wincmd h`, `'l'` for `<C-w>l`/`<C-w><Right>`
+    /// or `:wincmd l`. `None` if the key has no such mapping.
+    ///
+    /// Lets a remapped key such as `<C-h>` (after `nnoremap <C-h> <C-w>h`)
+    /// drive the activity bar toolbar/sidebar panel chord through the exact
+    /// same direction logic as the literal keys — the sidebar/toolbar chord
+    /// routing never needs a direction table of its own.
+    ///
+    /// Only resolves a *direct* one-level mapping: no recursive rhs
+    /// expansion, no multi-key buffering. The caller (the sidebar/toolbar
+    /// chord) handles one already-focused keypress at a time, not a
+    /// Vim-style ambiguous-prefix wait.
+    pub(crate) fn resolve_wincmd_keymap_direction(
+        &self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+    ) -> Option<char> {
+        if self.keymap_replaying || self.user_keymaps.is_empty() {
+            return None;
+        }
+        let active_modes = self.active_keymap_modes();
+        if active_modes.is_empty() {
+            return None;
+        }
+        let encoded = encode_keypress(key_name, unicode, ctrl);
+        let active_buffer = self.active_buffer_id();
+        for km in &self.user_keymaps {
+            if !active_modes.contains(&km.mode.as_str()) {
+                continue;
+            }
+            if km.buffer.is_some_and(|b| b != active_buffer) {
+                continue;
+            }
+            if km.keys.len() != 1 || km.keys[0] != encoded {
+                continue;
+            }
+            let direction = match &km.action {
+                UserKeymapAction::Keys(rhs) if rhs.len() == 2 && rhs[0] == "<C-w>" => {
+                    match rhs[1].as_str() {
+                        "h" | "<Left>" => Some('h'),
+                        "l" | "<Right>" => Some('l'),
+                        _ => None,
+                    }
+                }
+                UserKeymapAction::Ex(cmd) => match cmd.trim() {
+                    "wincmd h" => Some('h'),
+                    "wincmd l" => Some('l'),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if direction.is_some() {
+                return direction;
+            }
+        }
+        None
+    }
+
     /// Replay a buffered (encoded) keypress sequence that turned out not to
     /// match any user keymap because the *next* keystroke ruled it out
     /// (`try_user_keymap`'s own fallthrough — not used by

@@ -172,48 +172,114 @@ pub enum SidebarChordAction {
     /// `h`/`Left` to the activity bar toolbar, `l`/`Right` to the editor.
     /// `Engine::clear_sidebar_focus` (and, for `h`/`Left`,
     /// `Engine::activity_bar_focus_in_at`) already ran; the caller only
-    /// needs to clear its own "sidebar band holds the keyboard" latch, if it
-    /// keeps one (TUI's `TuiSidebar::has_focus` does; GTK has none).
+    /// needs to redraw — neither backend keeps a focus latch of its own to
+    /// clear, since `route_focus_key`'s `band` argument is recomputed fresh
+    /// from `Engine::sidebar_has_focus()` on every keypress.
     FocusOut,
+    /// The chord's follow-up key moved focus from the activity bar toolbar
+    /// to the sidebar panel that was already active (`l`/`Right`, with a
+    /// panel visible) — never the toolbar cursor's row, and never a panel
+    /// switch. `Engine::focus_sidebar_panel` already ran; the caller only
+    /// needs to redraw.
+    FocusPanel,
     /// The chord's follow-up key was consumed but wasn't a recognised
-    /// direction — ignored, like an unmapped Ctrl-W combo in Vim's own
-    /// window commands.
+    /// direction, or (from the activity bar toolbar) was `h`/`Left`, which
+    /// has nowhere left to go — ignored, like an unmapped Ctrl-W combo in
+    /// Vim's own window commands.
     Consumed,
 }
 
 /// Ctrl-W sidebar chord: arm on `Ctrl-W`, then on the very next keypress
-/// navigate `h`/`Left` to the activity bar toolbar or `l`/`Right` to the
-/// editor, consuming any other follow-up. `None` means the key was neither
-/// the arming chord nor a pending follow-up.
+/// navigate the window-navigation chain's sidebar/toolbar stops, consuming
+/// any other follow-up. `None` means the key was neither the arming chord
+/// nor a pending follow-up.
+///
+/// With a sidebar panel focused: `h`/`Left` moves to the activity bar
+/// toolbar, `l`/`Right` moves to the editor. With the activity bar toolbar
+/// focused (`Engine::activity_bar_focused`): the toolbar is the leftmost
+/// stop, so `h`/`Left` is a no-op; `l`/`Right` moves to the panel named by
+/// `Engine::activity_bar_toolbar_idx_for_active_panel`'s inverse —
+/// `AppShell::active_panel_id` — if the sidebar is visible, or to the editor
+/// otherwise.
 pub fn route_sidebar_chord_key(
     engine: &mut Engine,
     key_name: &str,
     unicode: Option<char>,
     ctrl: bool,
 ) -> Option<SidebarChordAction> {
-    if ctrl && key_name.eq_ignore_ascii_case("w") {
-        engine.sidebar_ctrl_w_pending = true;
-        return Some(SidebarChordAction::Armed);
-    }
     if !engine.sidebar_ctrl_w_pending {
-        return None;
+        if ctrl && key_name.eq_ignore_ascii_case("w") {
+            engine.sidebar_ctrl_w_pending = true;
+            return Some(SidebarChordAction::Armed);
+        }
+        // A user keymap may bind a single key directly to the Ctrl-W h/l
+        // chord (e.g. `nnoremap <C-h> <C-w>h`) — resolve it through the same
+        // `UserKeymap` table `Engine::try_user_keymap` consults, then drive
+        // it through the identical `resolve_chord_direction` below, as if
+        // the two keystrokes had been typed. The chord never gets a second,
+        // hard-coded direction table.
+        return match engine.resolve_wincmd_keymap_direction(key_name, unicode, ctrl) {
+            Some('h') => Some(resolve_chord_direction(engine, false)),
+            Some('l') => Some(resolve_chord_direction(engine, true)),
+            _ => None,
+        };
     }
     engine.sidebar_ctrl_w_pending = false;
-    let to_toolbar = key_name == "Left" || unicode == Some('h');
     let to_editor = key_name == "Right" || unicode == Some('l');
-    Some(if to_toolbar {
+    let to_toolbar = key_name == "Left" || unicode == Some('h');
+    Some(if to_editor {
+        resolve_chord_direction(engine, true)
+    } else if to_toolbar {
+        resolve_chord_direction(engine, false)
+    } else {
+        SidebarChordAction::Consumed // Unknown Ctrl-W combo: ignore.
+    })
+}
+
+/// The single direction resolver for the sidebar/toolbar leg of the Ctrl-W
+/// window-navigation chain — shared by the literal `h`/`l`/`Left`/`Right`
+/// follow-up key and any user keymap that resolves to the same chord
+/// (`Engine::resolve_wincmd_keymap_direction`), both in
+/// [`route_sidebar_chord_key`] above. `to_editor = false` means "toward the
+/// toolbar" (`h`/`Left`); `to_editor = true` means "toward the editor"
+/// (`l`/`Right`).
+fn resolve_chord_direction(engine: &mut Engine, to_editor: bool) -> SidebarChordAction {
+    if engine.activity_bar_focused {
+        return if to_editor {
+            let active_panel = if engine.app_shell.sidebar_visible() {
+                engine
+                    .app_shell
+                    .active_panel_id()
+                    .map(|w| w.as_str().to_string())
+            } else {
+                None
+            };
+            if let Some(id) = active_panel {
+                // Toolbar -> the already-active sidebar panel.
+                engine.focus_sidebar_panel(&id);
+                SidebarChordAction::FocusPanel
+            } else {
+                // Toolbar -> editor (no sidebar panel visible to land on).
+                engine.activity_bar_focus_out();
+                SidebarChordAction::FocusOut
+            }
+        } else {
+            // `h`/`Left` (toolbar is the leftmost stop), or any other
+            // follow-up: consumed, focus stays on the toolbar.
+            SidebarChordAction::Consumed
+        };
+    }
+    if to_editor {
+        // Panel -> editor.
+        engine.clear_sidebar_focus();
+        SidebarChordAction::FocusOut
+    } else {
         // Panel -> activity bar toolbar.
         let idx = engine.activity_bar_toolbar_idx_for_active_panel();
         engine.clear_sidebar_focus();
         engine.activity_bar_focus_in_at(idx);
         SidebarChordAction::FocusOut
-    } else if to_editor {
-        // Panel -> editor.
-        engine.clear_sidebar_focus();
-        SidebarChordAction::FocusOut
-    } else {
-        SidebarChordAction::Consumed // Unknown Ctrl-W combo: ignore.
-    })
+    }
 }
 
 /// What a key does once [`FocusKeyRoute::ActivityBar`] has claimed it.
@@ -1201,5 +1267,135 @@ mod alt_key_router_tests {
             );
             assert!(alt_mnemonic_open_allowed(mode, false));
         }
+    }
+}
+
+/// `route_sidebar_chord_key`/`resolve_chord_direction` tests covering the
+/// activity bar toolbar's place in the Ctrl-W window-navigation chain — the
+/// panel/toolbar leg, not the leftmost-editor-window overflow leg
+/// (`Engine::window_nav_overflow`, tested elsewhere).
+#[cfg(test)]
+mod sidebar_chord_toolbar_tests {
+    use super::*;
+    use crate::core::engine::sidebar::PANEL_EXPLORER;
+    use crate::core::engine::{UserKeymap, UserKeymapAction};
+
+    fn engine() -> Engine {
+        crate::core::session::suppress_disk_saves();
+        Engine::new_for_test()
+    }
+
+    /// Drive the two-keystroke `Ctrl-W <dir>` chord as a backend would: arm,
+    /// then feed the follow-up.
+    fn ctrl_w_chord(
+        engine: &mut Engine,
+        key_name: &str,
+        unicode: Option<char>,
+    ) -> SidebarChordAction {
+        assert_eq!(
+            route_sidebar_chord_key(engine, "w", None, true),
+            Some(SidebarChordAction::Armed),
+            "Ctrl-W must arm the chord"
+        );
+        route_sidebar_chord_key(engine, key_name, unicode, false)
+            .expect("an armed chord's follow-up is always handled")
+    }
+
+    #[test]
+    fn toolbar_ctrl_w_left_is_a_noop() {
+        let mut e = engine();
+        e.activity_bar_focus_in_at(2);
+        let action = ctrl_w_chord(&mut e, "Left", None);
+        assert_eq!(action, SidebarChordAction::Consumed);
+        assert!(e.activity_bar_focused);
+        assert_eq!(e.activity_bar_selected, 2);
+    }
+
+    #[test]
+    fn toolbar_ctrl_w_right_focuses_the_active_panel_not_the_cursor_row() {
+        let mut e = engine();
+        e.toggle_sidebar_panel(PANEL_EXPLORER);
+        let explorer_idx = e.activity_bar_toolbar_idx_for_active_panel();
+        e.activity_bar_focus_in_at(explorer_idx);
+        // Simulate `j` moving the toolbar cursor off the active row before
+        // the chord fires — the destination must still be the active panel.
+        e.activity_bar_selected = explorer_idx + 3;
+        let action = ctrl_w_chord(&mut e, "Right", Some('l'));
+        assert_eq!(action, SidebarChordAction::FocusPanel);
+        assert!(!e.activity_bar_focused);
+        assert!(e.explorer_has_focus);
+    }
+
+    #[test]
+    fn toolbar_ctrl_w_right_falls_through_to_the_editor_with_no_panel_visible() {
+        let mut e = engine();
+        e.app_shell.hide_sidebar();
+        e.activity_bar_focus_in_at(1);
+        let action = ctrl_w_chord(&mut e, "Right", Some('l'));
+        assert_eq!(action, SidebarChordAction::FocusOut);
+        assert!(!e.activity_bar_focused);
+    }
+
+    #[test]
+    fn toolbar_ctrl_w_unrecognised_followup_is_consumed() {
+        let mut e = engine();
+        e.activity_bar_focus_in_at(1);
+        let action = ctrl_w_chord(&mut e, "x", Some('x'));
+        assert_eq!(action, SidebarChordAction::Consumed);
+        assert!(e.activity_bar_focused);
+    }
+
+    #[test]
+    fn panel_ctrl_w_left_moves_focus_to_the_toolbar_row_for_that_panel() {
+        let mut e = engine();
+        e.toggle_sidebar_panel(PANEL_EXPLORER);
+        let expected_idx = e.activity_bar_toolbar_idx_for_active_panel();
+        let action = ctrl_w_chord(&mut e, "Left", None);
+        assert_eq!(action, SidebarChordAction::FocusOut);
+        assert!(e.activity_bar_focused);
+        assert_eq!(e.activity_bar_selected, expected_idx);
+    }
+
+    #[test]
+    fn panel_ctrl_w_right_moves_focus_to_the_editor() {
+        let mut e = engine();
+        e.toggle_sidebar_panel(PANEL_EXPLORER);
+        let action = ctrl_w_chord(&mut e, "Right", Some('l'));
+        assert_eq!(action, SidebarChordAction::FocusOut);
+        assert!(!e.sidebar_has_focus());
+    }
+
+    #[test]
+    fn a_user_keymap_bound_to_the_chord_resolves_identically_to_the_literal_chord() {
+        let mut e = engine();
+        e.toggle_sidebar_panel(PANEL_EXPLORER);
+        e.user_keymaps.push(UserKeymap {
+            mode: "n".to_string(),
+            noremap: true,
+            keys: vec!["<C-h>".to_string()],
+            action: UserKeymapAction::Keys(vec!["<C-w>".to_string(), "h".to_string()]),
+            buffer: None,
+            desc: None,
+        });
+        e.user_keymaps.push(UserKeymap {
+            mode: "n".to_string(),
+            noremap: true,
+            keys: vec!["<C-l>".to_string()],
+            action: UserKeymapAction::Keys(vec!["<C-w>".to_string(), "l".to_string()]),
+            buffer: None,
+            desc: None,
+        });
+
+        let to_toolbar = route_sidebar_chord_key(&mut e, "h", Some('h'), true)
+            .expect("the rebound chord must resolve, not fall through");
+        assert_eq!(to_toolbar, SidebarChordAction::FocusOut);
+        assert!(e.activity_bar_focused);
+        assert!(!e.explorer_has_focus);
+
+        let to_panel = route_sidebar_chord_key(&mut e, "l", Some('l'), true)
+            .expect("the rebound chord must resolve, not fall through");
+        assert_eq!(to_panel, SidebarChordAction::FocusPanel);
+        assert!(!e.activity_bar_focused);
+        assert!(e.explorer_has_focus);
     }
 }
