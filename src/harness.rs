@@ -1018,6 +1018,20 @@ fn activity_bar_zone_center<D: ConformanceDriver>(driver: &D, panel_id: &str) ->
 /// and back, then types `"y"`: only landing back in the Search query box
 /// (caret still at the end of `"zz"`) paints `"zzy"` — landing in the
 /// editor, a different panel, or a reset query box would not.
+///
+/// **Not independently red against unfixed `develop`:** before the fix,
+/// `Ctrl-W` was never armed on the toolbar's own key rung, so the chord's
+/// second keystroke (`h` / `l`, sent via `type_char` with no Ctrl held) fell
+/// straight to the toolbar's *plain* key table, where unmodified `h` already
+/// means "focus out to the panel" and unmodified `l` already means
+/// "activate the toolbar's current row". The toolbar cursor never moves off
+/// the Search row in this scenario, so that old plain-key path happens to
+/// activate the same panel and this assertion still holds pre-fix. The
+/// sibling scenario below,
+/// [`panel_toolbar_round_trip_uses_the_active_panel_not_the_toolbar_cursor`],
+/// moves the toolbar cursor first and is the one that actually goes red —
+/// this scenario is kept as a baseline that the simple, cursor-unmoved round
+/// trip still works post-fix.
 pub fn panel_toolbar_round_trip_returns_to_the_same_panel<D: ConformanceDriver + DriverInput>(
     driver: &mut D,
 ) {
@@ -1051,6 +1065,16 @@ pub fn panel_toolbar_round_trip_returns_to_the_same_panel<D: ConformanceDriver +
 /// row before crossing back — the toolbar->panel leg of the chord must still
 /// land on the panel that was active when the toolbar was entered, never on
 /// whatever row the cursor happens to sit on.
+///
+/// **Verified RED against unfixed `develop`:** reverting
+/// `App::handle_key_press`'s dispatch of `render::route_sidebar_chord_key`
+/// ahead of `handle_activity_bar_key` for `FocusKeyRoute::ActivityBar`
+/// (restoring the old unconditional `handle_activity_bar_key` call) makes
+/// this fail: with the cursor moved to the Source Control row by the plain
+/// `j`, the old plain-key table's unmodified `l` activates *that* row
+/// instead of returning to the panel that was active when the toolbar was
+/// entered, so the final `screen_has("zzy")` assertion sees no `"y"` typed
+/// into the Search query box.
 pub fn panel_toolbar_round_trip_uses_the_active_panel_not_the_toolbar_cursor<
     D: ConformanceDriver + DriverInput,
 >(
@@ -1092,6 +1116,16 @@ pub fn panel_toolbar_round_trip_uses_the_active_panel_not_the_toolbar_cursor<
 /// exactly, with one extra, inert `Ctrl-W h` inserted while already on the
 /// toolbar: the outcome (landing on Source Control via `j`, `l`) is
 /// unchanged, which only holds if the extra chord had no effect.
+///
+/// **Verified RED against unfixed `develop` (runs on `gtk`/`tui_prod` only —
+/// see its `backend_conformance!` registration):** before the fix, the
+/// toolbar's key rung never checked for an armed `Ctrl-W` chord, so the
+/// second `Ctrl-W h`'s `h` keystroke fell to the toolbar's own plain key
+/// table, where unmodified `h` means "focus out to the panel". That extra,
+/// supposedly inert chord actually knocks focus back out to the Search
+/// panel, so the following `j`/`l` type into the Search query box instead
+/// of moving the toolbar's own row selector, and the final
+/// `screen_has("control")` assertion fails.
 pub fn toolbar_ctrl_w_left_is_a_noop<D: ConformanceDriver + DriverInput>(driver: &mut D) {
     use crate::core::engine::sidebar::PANEL_SEARCH;
 
@@ -1125,13 +1159,28 @@ pub fn toolbar_ctrl_w_left_is_a_noop<D: ConformanceDriver + DriverInput>(driver:
     );
 }
 
-/// Same round trip as [`panel_toolbar_round_trip_returns_to_the_same_panel`],
-/// but driven entirely through a user keymap that rebinds the chord onto
-/// single keystrokes (`nnoremap <C-h> <C-w>h`, `nnoremap <C-l> <C-w>l`) --
-/// the literal two-keystroke `Ctrl-W` chord is never pressed. Proves the
-/// toolbar/panel leg is reached through the same
-/// `Engine::resolve_wincmd_keymap_direction` rung any other rebound window
-/// command uses, not a second, toolbar-only keymap table.
+/// Walks the *whole* window-navigation chain both ways -- editor -> panel
+/// -> toolbar -> panel -> editor -- driven entirely through a user keymap
+/// that rebinds the chord onto single keystrokes (`nnoremap <C-h> <C-w>h`,
+/// `nnoremap <C-l> <C-w>l`); the literal two-keystroke `Ctrl-W` chord is
+/// never pressed. Proves every leg -- not just the toolbar/panel one -- is
+/// reached through the same `Engine::resolve_wincmd_keymap_direction` rung
+/// any other rebound window command uses, not a second, toolbar-only
+/// keymap table.
+///
+/// **Verified RED against unfixed `develop`:** reverting
+/// `App::handle_key_press`, `Engine::resolve_wincmd_keymap_direction` and
+/// `route_sidebar_chord_key` to their pre-fix state makes this test fail —
+/// but not on the editor -> panel leg: that hop is served by the
+/// pre-existing window-navigation-overflow rung, which the rebound-keymap
+/// lookup already reaches unchanged, so the `"abcd"` assertion still
+/// passes. The failure is on the panel <-> toolbar leg instead, for the
+/// same reason [`panel_toolbar_round_trip_uses_the_active_panel_not_the_toolbar_cursor`]
+/// goes red: pre-fix, the toolbar's own plain key table (not the chord
+/// rung) handles the rebound `<C-h>`/`<C-l>`'s underlying unmodified
+/// `h`/`l`, so the panel <-> toolbar round trip never reaches the panel
+/// that was active when the toolbar was entered and the `"abcdef"`
+/// assertion below fails.
 pub fn rebound_ctrl_h_ctrl_l_walk_the_same_chain<D: ConformanceDriver + DriverInput>(
     driver: &mut D,
 ) {
@@ -1139,22 +1188,55 @@ pub fn rebound_ctrl_h_ctrl_l_walk_the_same_chain<D: ConformanceDriver + DriverIn
 
     let (x, y) = activity_bar_zone_center(driver, PANEL_SEARCH);
     driver.click(x, y);
-    driver.type_text("zz");
+    driver.type_text("ab");
     assert!(
-        driver.screen_has("zz"),
+        driver.screen_has("ab"),
         "precondition: clicking the Search icon then typing must land in \
          its query box"
     );
 
+    ConformanceDriver::press_named(driver, NamedKey::Escape);
+    ConformanceDriver::press_named(driver, NamedKey::Escape);
+    driver.type_text("j");
+    assert!(
+        driver.screen_has("Ln 2,"),
+        "precondition: Esc, Esc must return keyboard focus to the editor, \
+         leaving Search as the sidebar's active panel"
+    );
+
+    // Editor -> panel: with only one editor window there is nowhere further
+    // left to go, so the window-navigation-overflow rung hands focus to the
+    // sidebar's active panel (Search) instead -- through the rebound
+    // `<C-h>`, never the literal `Ctrl-W` chord.
+    ConformanceDriver::ctrl_char(driver, 'h');
+    driver.type_text("cd");
+    assert!(
+        driver.screen_has("abcd"),
+        "the rebound <C-h> must move keyboard focus from the editor back \
+         into the Search panel's own query box (still holding \"ab\" from \
+         before), not reset it or land on a different panel"
+    );
+
+    // Panel -> toolbar -> panel, exactly as
+    // `panel_toolbar_round_trip_returns_to_the_same_panel`, but through the
+    // rebound keys only.
     ConformanceDriver::ctrl_char(driver, 'h');
     ConformanceDriver::ctrl_char(driver, 'l');
-    driver.type_text("y");
-
+    driver.type_text("ef");
     assert!(
-        driver.screen_has("zzy"),
+        driver.screen_has("abcdef"),
         "the rebound <C-h>/<C-l> keystrokes must walk the identical panel \
          <-> toolbar chain the literal Ctrl-W chord does, landing back in \
          the Search panel's own query box"
+    );
+
+    // Panel -> editor, closing the loop.
+    ConformanceDriver::ctrl_char(driver, 'l');
+    driver.type_text("k");
+    assert!(
+        driver.screen_has("Ln 1,"),
+        "the rebound <C-l> must return keyboard focus to the editor -- a \
+         motion key typed right after must move the cursor"
     );
 }
 
