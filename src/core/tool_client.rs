@@ -389,13 +389,18 @@ pub fn fetch_branch_review_target(
 /// user's job (temp dir cleanup), and a provider might read it
 /// asynchronously after this process's call returns.
 pub fn write_review_body_temp_file(body: &str) -> std::io::Result<std::path::PathBuf> {
+    // The clock alone is not unique: macOS `SystemTime` ticks in
+    // microseconds, so two calls from parallel threads can read the same
+    // value. The per-process counter makes every path distinct.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
-        "vimcode-review-body-{}-{}.md",
+        "vimcode-review-body-{}-{}-{}.md",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos()
+            .as_nanos(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::write(&path, body)?;
     Ok(path)
@@ -705,5 +710,31 @@ mod tests {
         assert_ne!(a, b);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn write_review_body_temp_file_paths_are_unique_across_threads() {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    (0..50)
+                        .map(|j| write_review_body_temp_file(&format!("{i}-{j}")).unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let paths: Vec<_> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            unique.len(),
+            paths.len(),
+            "every call must get its own file"
+        );
+        for p in &paths {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
