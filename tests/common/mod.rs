@@ -12,7 +12,7 @@ use vimcode_core::{Cursor, Engine, EngineAction, Mode, RegType};
 ///
 /// Also calls `suppress_disk_saves()` so that commands like `:ExtInstall` that
 /// trigger `save()` do not overwrite the user's real `~/.config/vimcode/` files
-/// during `cargo test`, and `suppress_disk_loads()` (#1304) so that
+/// during `cargo test`, and `suppress_disk_loads()` so that
 /// `Engine::new()`'s `HistoryState::load()` does not seed every test's
 /// `:history`/`<C-r>` state with whatever command history happens to be
 /// sitting in the developer machine's real config directory.
@@ -139,7 +139,7 @@ pub fn assert_mode(e: &Engine, mode: Mode) {
 /// Assert a register's text and charwise/linewise-ness.
 ///
 /// Kept boolean for the ~100 existing call sites; use
-/// [`assert_register_typed`] when the case is about blockwise-ness (#807).
+/// [`assert_register_typed`] when the case is about blockwise-ness.
 /// A blockwise register fails here whichever bool you pass — that is
 /// deliberate, so a charwise assertion cannot silently pass on a block.
 pub fn assert_register(e: &Engine, reg: char, text: &str, linewise: bool) {
@@ -148,7 +148,7 @@ pub fn assert_register(e: &Engine, reg: char, text: &str, linewise: bool) {
 
 /// Assert a register's text and its exact [`RegType`] — including
 /// [`RegType::Blockwise`], which `<C-v>y` must set so a later `p` re-inserts
-/// a rectangle instead of pasting the block's rows as plain lines (#807).
+/// a rectangle instead of pasting the block's rows as plain lines.
 pub fn assert_register_typed(e: &Engine, reg: char, text: &str, ty: RegType) {
     let (t, actual) = e
         .registers

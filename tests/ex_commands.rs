@@ -26,9 +26,7 @@ fn normalizer_colo_to_colorscheme() {
 fn normalizer_di_to_display() {
     let mut e = engine_with("hello\n");
     exec(&mut e, "di");
-    // `:di` abbreviates to `:display`, which since #1299 prints Neovim's real
-    // `Type Name Content` table header rather than vimcode's old invented
-    // `--- Registers ---` banner.
+    // `:di` abbreviates to `:display`, which prints Neovim's `Type Name Content`
     assert_msg_contains(&e, "Type Name Content");
 }
 
@@ -200,7 +198,7 @@ fn cmd_display_shows_registers() {
     let mut e = engine_with("hello\n");
     exec(&mut e, "yank a");
     exec(&mut e, "display");
-    // #1299: Neovim's real header + `  {type}  "{name}   {content}` columns,
+    // Neovim's real header + `  {type}  "{name}   {content}` columns,
     // with embedded newlines shown as `^J`, replacing vimcode's old invented
     // `--- Registers ---` / `"a  l  hello\n` layout.
     assert_msg_contains(&e, "Type Name Content");
@@ -246,18 +244,10 @@ fn cmd_reg_multi_char_argument_lists_each_register() {
     );
 }
 
-// #1300: Neovim's `:marks` always lists the three automatic marks (`'`
-// previous-context, `"` last-position-before-leaving-buffer, `.`
-// last-change) alongside any user-set ones — vimcode's `"marks"` arm used to
-// iterate only `self.marks` (user marks), silently dropping all three.
-// `maG:marks` is the exact key sequence the oracle-backed
-// `msg:ex::marks lists a set mark` case in `tests/nvim_conformance.rs` drives
-// against a live `nvim --headless`; this is its engine-tier twin so the
-// listing stays covered even where the oracle isn't installed.
-//
-// Verified RED against unfixed `develop`: the pre-#1300 arm only emitted
-// `" a      2    0"` (the user mark, no `file/text` column and none of the
-// three auto marks), so every assertion below failed.
+// Neovim's `:marks` lists the three automatic marks (`'` previous-context,
+// `"` last-position-before-leaving-buffer, `.` last-change) alongside
+// user-set ones. The listing includes all marks with their `file/text` column.
+// `maG:marks` is the sequence tested in engine-tier to verify this behavior.
 #[test]
 fn cmd_marks_lists_auto_marks_alongside_user_marks() {
     let mut e = engine_with("one\ntwo\nthree\n");
@@ -720,7 +710,7 @@ fn abbrev_h_help() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Group N: Vim abbreviations — :abbreviate / :iabbrev / :cabbrev (#1152)
+//  Group N: Vim abbreviations — :abbreviate / :iabbrev / :cabbrev
 //
 //  Oracle cases named by the issue: full-id expansion, end-id expansion,
 //  <C-v> suppression, :cabbrev on the command line, and "does not fire

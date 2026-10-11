@@ -89,7 +89,7 @@ fn test_L_goes_to_screen_bottom() {
 
 #[test]
 fn test_M_goes_to_screen_middle() {
-    // #805: M's target is `scroll_top + (visible_lines - 1) / 2`, matching
+    // M's target is `scroll_top + (visible_lines - 1) / 2`, matching
     // real Vim's own `(height - 1) / 2` — NOT `viewport_lines / 2`, which
     // this test asserted before the fix and which is off by one for an
     // even-height window (verified against real `nvim`: a freshly opened
@@ -104,7 +104,7 @@ fn test_M_goes_to_screen_middle() {
 
 #[test]
 fn test_H_respects_scrolloff() {
-    // #805: 'scrolloff' keeps H at least that many lines below the window's
+    // 'scrolloff' keeps H at least that many lines below the window's
     // top edge, not pinned exactly to scroll_top.
     let mut e = engine_with("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n");
     e.set_viewport_lines(6);
@@ -117,7 +117,7 @@ fn test_H_respects_scrolloff() {
 
 #[test]
 fn test_L_respects_scrolloff() {
-    // #805: mirror of `test_H_respects_scrolloff` for the bottom edge.
+    // Mirror of `test_H_respects_scrolloff` for the bottom edge.
     let mut e = engine_with("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n");
     e.set_viewport_lines(6);
     e.settings.scrolloff = 2;
@@ -129,7 +129,7 @@ fn test_L_respects_scrolloff() {
 
 #[test]
 fn test_ctrl_d_count_sets_sticky_scroll_value() {
-    // #805: an explicit count on <C-d> SETS Vim's 'scroll' option (replacing,
+    // An explicit count on <C-d> SETS Vim's 'scroll' option (replacing,
     // not multiplying, any previous value), and a later bare <C-d> reuses it.
     let mut e = engine_with(&(1..=60).map(|n| format!("L{n}\n")).collect::<String>());
     e.set_viewport_lines(20);
@@ -149,7 +149,7 @@ fn scroll_fixture() -> vimcode_core::Engine {
     e
 }
 
-// #805 review: the conformance labels `scroll:C-d C-d`, `scroll:5C-d C-d`,
+// The conformance labels `scroll:C-d C-d`, `scroll:5C-d C-d`,
 // `scroll:C-d twice then C-u` and `scroll:C-f C-f` stay in KNOWN_DEVIATIONS
 // because the *headless* nvim oracle mis-handles the second and later scroll
 // command of a single feedkeys burst (see the group-B comment block in
@@ -194,11 +194,9 @@ fn test_counted_ctrl_d_then_bare_ctrl_d_full_window() {
 
 #[test]
 fn test_ctrl_b_chain_lands_on_the_window_bottom_when_clamped() {
-    // #1008: real Neovim — headless *and* interactive, they agree on 0.12 —
-    // puts `2<C-b>` from line 60 on line 22. The second `<C-b>` cannot scroll
-    // a whole page, so "cursor to the last line of the new window" (what Vim
-    // does) stops agreeing with "cursor to a fixed offset from the old
-    // window" (what `page_up` used to compute, giving 20).
+    // When `<C-b>` lands on the window's last line and a second `<C-b>`
+    // cannot scroll a whole page, the cursor lands on the clamped top line
+    // rather than a fixed offset from the previous window.
     let mut e = scroll_fixture();
     e.view_mut().cursor.line = 59;
     e.ensure_cursor_visible();
@@ -210,10 +208,8 @@ fn test_ctrl_b_chain_lands_on_the_window_bottom_when_clamped() {
 
 #[test]
 fn test_ctrl_b_keeps_the_cursor_scrolloff_above_the_window_bottom() {
-    // #1008: `<C-b>` lands on the window's last line, so `'scrolloff'` pushes
-    // the cursor *up* from it — the pre-#1008 formula moved it down instead,
-    // which no test and no conformance case exercised. Real Neovim on the
-    // same geometry (`:set so=5`, 60 lines, 22 rows, topline 19) answers 35.
+    // `<C-b>` lands on the window's last line, so `'scrolloff'` pushes
+    // the cursor *up* from it, not down.
     let mut e = scroll_fixture();
     e.settings.scrolloff = 5;
     // Placed directly rather than via `ensure_cursor_visible`, which has a
@@ -240,7 +236,7 @@ fn test_ctrl_f_chain_pages_forward_twice() {
 
 #[test]
 fn test_dollar_sticks_through_ctrl_e_scrolloff_push() {
-    // #805 review: <C-e>/<C-y> are curswant-preserving, so when scrolloff
+    // <C-e>/<C-y> are curswant-preserving, so when scrolloff
     // forces the cursor onto a new line the column must be re-derived from
     // the `$`-set CURSWANT_EOL, not clamped from the old column.
     let mut e = engine_with("aaaaaaaa\nbb\ncccccccc\ndddddddd\neeeeeeee\n");
@@ -397,7 +393,7 @@ fn test_count_ctrl_a() {
     assert_buf(&e, "x 8 y\n");
 }
 
-/// `<C-a>` / `<C-x>` across every 'nrformats' shape VimCode supports (#807).
+/// `<C-a>` / `<C-x>` across every 'nrformats' shape VimCode supports.
 ///
 /// Expectations are the **oracle's**, not hand-authored: each row was taken
 /// from `nvim --headless` on the same buffer + keys (they are also covered
@@ -410,8 +406,6 @@ fn test_number_formats_table() {
     // (start, keys-are-<C-a>?, expected buffer, expected cursor col)
     let cases: &[(&str, bool, &str, usize)] = &[
         // Leading zeros: the width is preserved, and the run is *decimal*
-        // (before #807, `0099<C-x>` parsed as octal into an i64 and underflowed
-        // to "1777777777777777777777").
         ("007", true, "008", 2),
         ("009", true, "010", 2),
         ("0099", false, "0098", 3),
@@ -452,7 +446,7 @@ fn test_number_formats_table() {
 
 /// Visual-mode `<C-a>` bumps every line's first selected number by the same
 /// amount, `g<C-a>` steps per changed line, and the cursor lands on the first
-/// change — not on the last line touched (#807).
+/// change — not on the last line touched.
 #[test]
 fn test_visual_ctrl_a_variants() {
     let mut e = engine_with("1\n1\n1\n");
@@ -659,10 +653,8 @@ fn test_changes_shows_change_list() {
 
 // ── :history ─────────────────────────────────────────────────────────────────
 
-/// #1327: `:history`'s no-argument listing must match Neovim's own
-/// `      #  cmd history` header and column layout (confirmed against a
-/// live oracle) instead of the vimcode-invented `--- Command History ---`
-/// header this used to assert on.
+/// `:history`'s no-argument listing shows the Neovim-compatible
+/// `      #  cmd history` header and column layout.
 #[test]
 fn test_history_shows_command_history() {
     let mut e = engine_with("hello\n");
@@ -676,23 +668,9 @@ fn test_history_shows_command_history() {
     assert!(e.message.contains("echo hello"));
 }
 
-/// Hermeticity regression for #1304: `Engine::new()` used to read the real
-/// `~/.config/vimcode/history.json` unconditionally, so `:history` printed
-/// whatever the developer machine's config had lying around (confirmed:
-/// this repo's own dev machine had ~100 stale entries) instead of only the
-/// commands this test itself typed. `engine_with` now calls
-/// `suppress_disk_loads()` before `Engine::new()`, so `HistoryState::load()`
-/// returns `Default` instead of touching disk. Assert the exact rendered
-/// `:history` output — not just that *a* history entry is present, which
-/// would pass just as well with real disk history leaked in ahead of it.
-///
-/// #1327 rewrote the expected string to match Neovim's real `:history`
-/// format: the `      #  cmd history` header (not vimcode's invented
-/// `--- Command History ---`) and a leading `>` marker on the newest entry
-/// (`echo two`, the last one added — `exec` calls `execute_command`
-/// directly, bypassing the command-line UI path that would otherwise also
-/// add `"history"` itself to `command_history`, so the newest entry stays
-/// `echo two`). Both confirmed against a live oracle.
+/// Only commands added during this test appear in `:history` output,
+/// with the `      #  cmd history` header and a leading `>` marker on
+/// the newest entry.
 #[test]
 fn test_history_is_hermetic_and_shows_only_this_tests_commands() {
     let mut e = engine_with("hello\n");
@@ -707,11 +685,8 @@ fn test_history_is_hermetic_and_shows_only_this_tests_commands() {
     );
 }
 
-/// #1327: `:history /` (and its `?`/`search` spellings, `:h :history`)
-/// selects the *search* history rather than the command one — confirmed
-/// against a live oracle. Before #1327, any argument to `:history` fell
-/// through to "not an editor command" (the old match arm matched only the
-/// bare `"history"` string), so this is new behavior, not a reformat.
+/// `:history /` (and its `?`/`search` spellings, `:h :history`)
+/// selects the *search* history rather than the command one.
 #[test]
 fn test_history_slash_selects_search_history() {
     let mut e = engine_with("hello\nworld\n");
@@ -724,7 +699,7 @@ fn test_history_slash_selects_search_history() {
     );
 }
 
-/// #1327: `:history all` lists every history kind's table back to back —
+/// `:history all` lists every history kind's table back to back —
 /// `cmd`, `search`, then the always-empty `expr`/`input`/`debug` headers
 /// (vimcode tracks none of those three) — with no separator line between
 /// sections, confirmed against a live oracle.
@@ -740,7 +715,7 @@ fn test_history_all_lists_every_kind() {
     );
 }
 
-/// #1327: a trailing `{first}[,{last}]` index range (`:h
+/// A trailing `{first}[,{last}]` index range (`:h
 /// :history-indexing`) restricts which rows of the selected history print —
 /// confirmed against a live oracle, including that `first` and `last` are
 /// each entries' *absolute* position, unaffected by the filter (row `1` is
@@ -754,7 +729,7 @@ fn test_history_range_filters_rows() {
     assert_eq!(e.message, "      #  cmd history\n>     2  echo two");
 }
 
-/// #1327: on a totally fresh session — nothing ever recorded in *any*
+/// On a totally fresh session — nothing ever recorded in *any*
 /// history kind — every one of `:history`, `:history {name}` and
 /// `:history all` errors with Neovim's own `'history' option is zero`
 /// message (`:h :history`) rather than printing an empty table. Confirmed
@@ -767,7 +742,7 @@ fn test_history_named_empty_kind_errors() {
     assert!(matches!(action, EngineAction::Error));
 }
 
-/// #1327 review: the `'history' option is zero` gate is session-wide, not
+/// The `'history' option is zero` gate is session-wide, not
 /// per-requested-kind — confirmed against a live oracle. Once *any* kind has
 /// recorded something (here, only `cmd` via `run_cmd`), requesting a
 /// *different*, still-empty kind (`search`) must print that kind's empty
@@ -782,7 +757,7 @@ fn test_history_other_kind_empty_prints_empty_table_when_something_recorded() {
     assert!(!matches!(action, EngineAction::Error));
 }
 
-/// #1327 review: the symmetric case of the test above — only `search`
+/// The symmetric case of the test above — only `search`
 /// history has ever been recorded, `cmd` history (the bare `:history`
 /// default, `:h :history`) is empty. Must print an empty table, not error.
 /// Confirmed against a live oracle.
@@ -795,7 +770,7 @@ fn test_history_bare_default_prints_empty_table_when_only_search_recorded() {
     assert!(!matches!(action, EngineAction::Error));
 }
 
-/// #1327 review: `:history all` on a totally fresh session — nothing ever
+/// `:history all` on a totally fresh session — nothing ever
 /// recorded in any kind — errors exactly like a single named kind does,
 /// rather than printing five empty headers. Confirmed against a live
 /// oracle.
@@ -815,9 +790,7 @@ fn test_reg_shows_registers() {
     press(&mut e, 'y');
     press(&mut e, 'w'); // yank 'hello'
     exec(&mut e, "reg");
-    // #1299: Neovim's real `Type Name Content` table. The old assertion here
-    // was `contains("Registers") || contains('"')`, which passed against any
-    // listing at all — including the pre-#1299 invented header.
+    // Neovim's real `Type Name Content` table.
     assert!(
         e.message.starts_with("Type Name Content\n"),
         ":reg header: {:?}",
@@ -877,17 +850,9 @@ fn test_shell_command_shows_output() {
     assert!(e.message.contains("test_output"));
 }
 
-/// #948: `:!` used to hardcode `Command::new("sh")`, ignoring `$SHELL`
-/// entirely (and having no Windows leg at all — `sh` doesn't exist there).
-/// Point `$SHELL` at a fake shell script that unconditionally prints a
-/// marker regardless of the command string it's handed, then run `:!` with
-/// a *different* command. If `:!` really resolves the shell binary through
-/// quadraui's `shell_command()` seam (as fixed), the fake shell runs and the
-/// marker shows up in the output instead of the real command's output.
-/// Verified RED against unfixed develop: reverting #948's `execute.rs`
-/// change back to `Command::new("sh")` makes this fail because a real `sh`
-/// ignores `$SHELL` and runs `echo real_sh_output` literally, never
-/// producing the marker.
+/// `:!` resolves the shell binary through the shell environment variable.
+/// Point `$SHELL` at a fake shell script that prints a marker, then run `:!`
+/// with a different command. The marker appears if the shell respects `$SHELL`.
 #[test]
 #[cfg(unix)]
 fn test_bang_command_honours_shell_env_var() {
@@ -1082,8 +1047,6 @@ fn test_set_textwidth() {
     assert_eq!(e.settings.textwidth, 79);
 }
 
-// ── #806: mark adjustment, '' toggling, macro failure-stop/recursion ───────────
-
 #[test]
 fn test_mark_shifts_after_line_inserted_above() {
     // `:h mark-motions` — inserting a line above a mark must shift the
@@ -1115,12 +1078,9 @@ fn test_mark_shifts_after_line_inserted_above() {
 
 #[test]
 fn test_mark_on_same_line_shifts_when_o_inserts_above() {
-    // #806 review: `O` splices a new blank line in at COLUMN 0 of the
-    // cursor's own line, so the entire original line — including a mark
-    // sitting on that same line, not just marks strictly below it — slides
-    // down by one. Before this fix, `shift_marks_for_line_insert` only
-    // shifted `cursor.line > at_line`, silently leaving a same-line mark
-    // pointing at the new, blank line instead of the text it used to mark.
+    // `O` splices a new blank line in at COLUMN 0 of the cursor's own line,
+    // so the entire original line — including a mark sitting on that same line —
+    // shifts down by one. Marks on the same line must shift, not point to the blank.
     let mut e = engine_with("a\nb\nc\n");
     press(&mut e, 'm');
     press(&mut e, 'a'); // mark a := (line 0, "a") -- the line `O` fires from
@@ -1144,7 +1104,7 @@ fn test_mark_on_same_line_shifts_when_o_inserts_above() {
 
 #[test]
 fn test_visual_expr_register_prompts() {
-    // #806 review: the Visual-mode `'"'` pending-key arm mirrored the
+    // The Visual-mode `'"'` pending-key arm mirrored the
     // Normal-mode register-name set but dropped the `'='` branch that opens
     // `expr_register_pending` — typing `"=` in Visual mode just set
     // `selected_register = Some('=')` with no prompt ever shown, so the
@@ -1236,9 +1196,7 @@ fn test_recursive_macro_terminates_at_eof() {
     drain_macro_queue(&mut e); // nothing should be queued, but be safe
     press(&mut e, '@');
     press(&mut e, 'a'); // the real, recursive invocation
-                        // Bounded drain: assert it terminates well before any "safety cap"
-                        // would — a regression back to the old behavior spins until
-                        // MAX_MACRO_RECURSION, which this loop deliberately doesn't reach.
+                        // Assert termination well before any safety cap would trigger.
     let mut iterations = 0;
     while !e.macro_playback_queue.is_empty() && iterations < 1000 {
         e.advance_macro_playback();
@@ -1261,7 +1219,7 @@ fn test_recursive_macro_terminates_at_eof() {
     );
 }
 
-/// `r<CR>` / `r<Tab>` and Replace-mode `<BS>` (#807).
+/// `r<CR>` / `r<Tab>` and Replace-mode `<BS>`.
 ///
 /// Expectations are the nvim oracle's (`op:r<CR>`, `op:3r<CR>`, `misc:r Tab`,
 /// `op:5r beyond eol`, `op:R BS restores`, `op:2R`, `op:R <CR>`).
@@ -1324,13 +1282,8 @@ fn test_r_special_keys_and_replace_mode_backspace() {
     assert_buf(&e, "ax\nydef\n");
 }
 
-/// Counts on the screen-relative operators and motions (#807).
-///
-/// `dH` / `dL` used to throw their count away (`let _ = self.take_count()`),
-/// and `M` / `gm` / `gM` never consumed theirs at all, so it leaked into the
-/// next command. The conformance suite cannot cover these: its headless nvim
-/// oracle mis-reports window-relative state (see the Group A comment in
-/// `tests/nvim_conformance.rs`), so they are pinned here instead.
+/// Counts on the screen-relative operators and motions.
+/// `dH` / `dL` / `M` / `gm` / `gM` consume their counts correctly.
 #[test]
 fn test_screen_relative_counts() {
     let fixture = || {

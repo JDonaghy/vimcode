@@ -1,4 +1,4 @@
-//! #522: `src/core/` and `src/render/` (formerly the single `src/render.rs`)
+//! `src/core/` and `src/render/` (formerly the single `src/render.rs`)
 //! must carry no coordinator vocabulary. vimcode is an editor that can
 //! *host* a coordinator client (through the generic, coord-agnostic seam in
 //! `src/core/tool_client.rs`) — it is not a coordinator client itself.
@@ -131,10 +131,7 @@ fn core_and_render_have_no_coordinator_vocabulary() {
         scan_file(file, &tokens, &mut hits);
     }
 
-    // #3xxx (render.rs split into src/render/*.rs): the single-file check
-    // below became a directory walk, same as `src/core` above — the file
-    // no longer exists as one file, but every line that used to live in it
-    // still needs this same scan.
+    // src/render is a directory walk; every line that used to live in
     let render_dir = Path::new("src/render");
     assert!(
         render_dir.is_dir(),

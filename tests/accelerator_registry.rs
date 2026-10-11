@@ -180,13 +180,12 @@ fn unregister_accelerator_removes_match() {
         .is_none());
 }
 
-/// #1495: the engine's accelerator registry used to carry its own copy of
-/// the `KeyBinding` → canonical-string parsing table; it now delegates
-/// entirely to `quadraui::accelerator::parse_binding`. Round-trip a
-/// user-configured binding string through `register_accelerator` /
-/// `match_accelerator` and confirm the match decision agrees with what
-/// quadraui's own parser says the binding means — proving the engine isn't
-/// running a second, possibly-diverging parser under the hood.
+/// The engine's accelerator registry delegates entirely to
+/// `quadraui::accelerator::parse_binding` for parsing. This test
+/// round-trips a user-configured binding string through
+/// `register_accelerator` / `match_accelerator` and confirms the
+/// match decision agrees with what quadraui's own parser says the
+/// binding means.
 #[test]
 fn user_configured_binding_round_trips_through_quadraui_parser() {
     let mut e = engine_with("");
@@ -232,18 +231,15 @@ fn user_configured_binding_round_trips_through_quadraui_parser() {
         .is_none());
 }
 
-/// #1495 review finding: `register_accelerator` must reject the same
-/// malformed `KeyBinding::Literal` strings the pre-#1495 code rejected via
-/// `settings::parse_key_binding_named` — Cmd modifiers (`<D-...>`/`<M-...>`,
-/// which vimcode's Linux/Windows backends have no equivalent for) and
-/// bindings with no explicit modifier at all (`<t>`, `<F5>`; vimcode's
-/// config format has never accepted those in bracket form). quadraui's own
-/// `parse_key_binding` accepts both — `<D-t>` maps Cmd to `Modifiers::cmd`
-/// and drops it from `match_accelerator`'s comparison, and `<t>`/`<F5>`
-/// simply have no modifier letters — so if `register_accelerator` ever
-/// starts calling quadraui's parser directly for `Literal` bindings instead
-/// of routing through the guarded `parse_key_binding_named`, this binding
-/// would silently start firing on a bare, unmodified `t` keypress.
+/// `register_accelerator` must reject malformed `KeyBinding::Literal`
+/// strings: Cmd modifiers (`<D-...>`/`<M-...>`, which vimcode's
+/// Linux/Windows backends have no equivalent for) and bindings with no
+/// explicit modifier at all (`<t>`, `<F5>`). quadraui's own
+/// `parse_key_binding` accepts both — `<D-t>` maps Cmd to
+/// `Modifiers::cmd` and drops it from `match_accelerator`'s
+/// comparison, and `<t>`/`<F5>` simply have no modifier letters — so
+/// `register_accelerator` must route through the guarded
+/// `parse_key_binding_named` to prevent these bindings from firing.
 #[test]
 fn register_accelerator_rejects_cmd_and_unmodified_literal_bindings() {
     let mut e = engine_with("");

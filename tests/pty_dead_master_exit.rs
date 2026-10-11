@@ -1,100 +1,26 @@
-//! #1735/#1765: real-pty regression test that a real `vcd` process exits
+//! Real-pty regression test that a real `vcd` process exits
 //! promptly (bounded wall-clock time, bounded CPU) once its pty's master
 //! side closes, instead of busy-spinning on the dead fd forever.
 //!
-//! # Why this file exists alongside `crossterm_dead_pty_busy_loop.rs`
+//! # How this test exercises the fix
 //!
-//! That file drives `ratatui::crossterm::event::poll` directly, in-process,
-//! against a real dead pty — a deliberate, deterministic repro of the
-//! *upstream* `crossterm` 0.29.0 defect (its Linux event source never
-//! breaks out of a TTY read loop on a bare `Ok(0)`/EOF read). Its own
-//! module doc explains at length why that file is `#[ignore]`d: the actual
-//! fix quadraui#1765 picks up (quadraui#1295) does **not** patch `crossterm`
-//! itself — it adds a `poll(2)`-based hangup guard to
-//! `quadraui::tui::backend::TuiBackend::wait_events`/`poll_events` that
-//! refuses to ever delegate into `crossterm` once the watched fd is seen
-//! hung up. A test that calls raw `crossterm::event::poll` bypasses that
-//! guard entirely by construction, so it cannot observe the fix — it can
-//! only observe whether `crossterm` itself was patched, which it was not.
-//!
-//! This file is the test that actually exercises the shipped fix: a real
-//! `vcd` binary, under a real Unix pty (mirrors the `spawn_under_pty` shape
-//! in `tests/pty_settings_header_delay.rs`), whose pty *master* is closed
-//! out from under it — exactly the documented trigger condition of
-//! `TuiBackend::wait_events` — while this test watches, from the outside,
-//! whether the process exits on its own in bounded time without pegging a
-//! CPU core while it does.
+//! This test runs a real `vcd` binary under a real Unix pty (similar to
+//! `spawn_under_pty` in `tests/pty_settings_header_delay.rs`), closes the
+//! pty master from outside, and verifies that the process exits on its own
+//! in bounded time without consuming excessive CPU. `TuiBackend::wait_events`
+//! calls `wait_for_stdin_ready`, a `poll(2)`-based check that detects
+//! `POLLHUP` immediately, rather than delegating a blocking wait to
+//! `crossterm::event::poll`.
 //!
 //! # Every dup of the master fd must close, not just one handle
 //!
 //! `portable_pty::MasterPty::try_clone_reader`/`take_writer` both `dup(2)`
-//! the master fd (confirmed by reading `portable-pty` 0.9.0's own Unix
-//! implementation: `UnixMasterPty::try_clone_reader`/`take_writer` each
-//! call `self.fd.try_clone()`). The pty's master side stays open — and the
-//! slave never sees a hangup — until *every* dup'd fd referencing it is
-//! closed, not just the original `MasterPty` handle. An earlier version of
-//! this test spawned a background thread holding a long-lived clone of the
-//! reader to capture `vcd`'s startup output (mirroring the shape in
-//! `tests/pty_settings_header_delay.rs`, which never needs to fully close
-//! its master), then dropped only the original `master` object — leaving
-//! that thread's cloned reader fd (and the writer clone it also held)
-//! open, so the master was never actually fully closed and `vcd` correctly
-//! never saw a hangup at all. This file reads everything on the main test
-//! thread instead (no background thread, no fd outliving this function's
-//! own locals) specifically so that a single explicit `drop` of the
-//! reader, writer, and master together is a real, complete close.
-//!
-//! # Un-`#[ignore]`d by #1775 — RED-confirmed (5/5 runs) against the
-//! #1765 pin, GREEN against quadraui#1301
-//!
-//! This test deliberately is **not** a controlling-terminal pty
-//! (`CommandBuilder::set_controlling_tty(false)`) — see the comment at its
-//! call site for why a controlling terminal makes this test pass for the
-//! wrong reason (a real `SIGHUP`, not the fix, kills `vcd`). Without that
-//! backstop, this test deterministically reproduced #1735 against the
-//! #1765 pin (quadraui `8425673`, carrying only quadraui#1295's
-//! periodic-recheck guard). **Measured on macOS** (`sample(1)`, 1ms
-//! interval, 2s window, on the real `vcd` process mid-run, against that
-//! pin): the main thread was parked inside `TuiBackend::wait_events` →
-//! `ratatui::crossterm::event::poll` → `UnixInternalEventSource::try_read`,
-//! issuing a bare `read()` syscall ~1390 times in that window
-//! with **no** `stdin_hung_up` frame anywhere on the stack — i.e. the
-//! guard was checked, came back `false`, and crossterm was entered,
-//! exactly as designed, right before the hangup landed; once inside, that
-//! specific delegated call never returned, so the guard never got another
-//! chance to run either (`quadraui#1295`'s own b145a55 commit message
-//! said as much: "Slicing narrows, but does not eliminate, that race").
-//!
-//! #1775 bumps the pin to quadraui `a536053`, which carries quadraui#1301
-//! (`4fda8f7`, `a536053`) — the structural fix that b145a55 said would be
-//! needed: `TuiBackend::wait_events`/`poll_events` no longer delegate a
-//! blocking wait straight into crossterm's broken reader at all. They now
-//! call quadraui's own `poll(2)`-based `wait_for_stdin_ready` first,
-//! blocking *there* for the caller's real timeout, and only ever hand
-//! crossterm a guaranteed non-blocking `Duration::ZERO` call once
-//! readiness with no hangup bit is already confirmed. `poll(2)` reports
-//! `POLLHUP` the instant a hangup happens — including mid-wait, not only
-//! between slices — so the hangup itself is now the wakeup instead of
-//! something a periodic re-check has to race a call that never returns.
-//! This test is GREEN against that pin (confirmed on Linux; macOS
-//! unverified by this change — no macOS host was available in this
-//! dispatch to re-run the `sample(1)` measurement above against the new
-//! pin. The fix should carry over: `wait_for_stdin_ready` is `#[cfg(unix)]`
-//! in quadraui, not Linux-only, so macOS takes the same `poll(2)` path —
-//! but `POLLHUP`-on-a-pty-slave is exactly the bit a Linux run alone
-//! doesn't confirm, so treat macOS as structurally-argued, not measured).
-//! Per this repo's Platform-Neutrality Rule, that fix correctly landed in
-//! quadraui, not as a vimcode-side workaround — vimcode's only change
-//! here is consuming the new pin and un-ignoring this test. See
-//! `docs/PENDING_QUADRAUI_ISSUES.md`'s "crossterm 0.29.0 ... busy-spins"
-//! entry (its "#1775 update" section) for the full writeup. Note that
-//! un-ignoring this test does **not** imply that
-//! `crossterm_dead_pty_busy_loop.rs` should also be un-ignored — that
-//! file drives raw `crossterm::event::poll` directly, bypassing
-//! `TuiBackend` entirely, so it cannot observe this fix and stays
-//! `#[ignore]`d pending an upstream `crossterm` fix (see that file's own
-//! module doc, and the PENDING entry's "Note on the two `#[ignore]`d
-//! vimcode tests" paragraph).
+//! the master fd. The pty's master side stays open — and the slave never
+//! sees a hangup — until *every* dup'd fd referencing it is closed, not
+//! just the original `MasterPty` handle. This test reads on the main test
+//! thread without background threads holding cloned reader/writer fds, so
+//! a single explicit `drop` of the reader, writer, and master is a real,
+//! complete close.
 #![cfg(unix)]
 
 use std::io::{ErrorKind, Read, Write};
@@ -112,14 +38,11 @@ const PTY_COLS: u16 = 100;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Upper bound on how long this test waits, after closing the pty master,
-/// for `vcd` to exit on its own. A fixed build (quadraui#1301,
-/// `wait_for_stdin_ready`'s own blocking `poll(2)` in `TuiBackend::
-/// wait_events`) observes the hangup as the `POLLHUP` wakeup itself —
-/// not something a periodic re-check has to race — and exits essentially
-/// immediately; the pre-#1301 bug never exits at all. This budget is
-/// generous relative to "promptly" but still tight enough that a
-/// reproduction of the bug fails this test in a few seconds rather than
-/// hanging the suite.
+/// for `vcd` to exit on its own. `TuiBackend::wait_events` calls
+/// `wait_for_stdin_ready`, which uses `poll(2)` to detect `POLLHUP`
+/// immediately, and exits essentially right away; a busy-spinning process
+/// never exits. This budget is tight enough that a busy-spin bug is caught
+/// in seconds rather than hanging the suite.
 const EXIT_BUDGET: Duration = Duration::from_secs(5);
 
 /// Upper bound on how much CPU time (seconds, `utime + stime` as reported
@@ -339,18 +262,9 @@ fn vcd_should_exit_promptly_once_its_pty_master_closes() {
     // Deliberately *not* a controlling terminal (`setsid`/`TIOCSCTTY`,
     // `portable_pty::CommandBuilder`'s default) — a real controlling
     // terminal's hangup kills the child via the default `SIGHUP`
-    // disposition long before `TuiBackend::wait_events`'s own
-    // `wait_for_stdin_ready` poll (quadraui#1301) would ever run, which
-    // would make this test pass for the wrong reason (confirmed: with
-    // this left at its default `true`, the test passes identically
-    // against both the pinned quadraui rev and the pre-#1301 rev it
-    // replaces — the fix never gets a chance to matter either way).
-    // This mirrors "exactly what
-    // drives a headless vcd session" per `stdin_hung_up`'s own doc in
-    // quadraui, and the bugbash's own real driving harness
-    // (`coord`'s `tui-pty` driver / `UnixPtyChild`) — see `tests/
-    // crossterm_dead_pty_busy_loop.rs`'s module doc for the same point
-    // made about its own raw-pty repro.
+    // disposition, which would make this test pass for the wrong reason.
+    // This mirrors the real headless vcd session that `wait_for_stdin_ready`
+    // is meant to handle.
     cmd.set_controlling_tty(false);
 
     let mut child = pair
@@ -388,15 +302,11 @@ fn vcd_should_exit_promptly_once_its_pty_master_closes() {
     );
 
     // Baseline CPU time right before the hangup, so the assertion below
-    // measures only what vcd spends *after* its pty dies, not whatever
-    // startup/paint work it already did. `None` (the baseline `ps` call
-    // itself failed — e.g. a transient `ps` spawn hiccup) is kept distinct
-    // from `Some(0.0)` rather than silently defaulted to zero: a silent
-    // zero-fallback would turn a missing baseline into "measure vcd's
-    // *total* CPU including all of its startup/tree-sitter work," which
-    // could fail the CPU assertion below for a reason that has nothing to
-    // do with #1735. If the baseline is missing, the CPU assertion is
-    // skipped below rather than measuring the wrong thing.
+    // measures only what vcd spends *after* its pty dies, not startup/paint
+    // work. `None` (the baseline `ps` call itself failed) is kept distinct
+    // from `Some(0.0)`: a silent zero-fallback would measure vcd's *total*
+    // CPU including startup, which could fail the assertion for unrelated
+    // reasons. If the baseline is missing, the CPU assertion is skipped.
     let cpu_before = ps_cpu_time_secs(pid);
 
     // The bugbash's own trigger: the driving terminal/process goes away.

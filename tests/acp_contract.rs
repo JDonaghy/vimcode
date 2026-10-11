@@ -1,4 +1,4 @@
-//! ACP contract tests (#1461): drive a real `Engine` against a *recorded*
+//! ACP contract tests: drive a real `Engine` against a *recorded*
 //! NDJSON transcript replayed by the `acp-replay-agent` binary (`tests/
 //! fixtures/replay_acp_agent.rs`), through the exact same transport code
 //! path (`AcpClient::spawn_with_env` -> `poll_acp` -> `AcpEvent` dispatch)
@@ -23,7 +23,7 @@
 //! record_acp_transcript.rs` documents how to re-record against a real
 //! adapter once one is reachable.
 //!
-//! One exception: `turn_write_hunk_review.transcript` (#1516) is
+//! One exception: `turn_write_hunk_review.transcript` is
 //! *hand-authored* to the exact shape `fake_acp_agent.sh`'s
 //! `ACP_FAKE_FS_WRITE_PATH` branch emits, because `record_acp_transcript`
 //! auto-answers every agent -> client request with `{}` and therefore never
@@ -179,31 +179,10 @@ fn basic_session_transcript_streams_and_completes_via_replay() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// #1516's retirement of the proposal-review write path, asserted over the
-/// real transport: `fragment_diff_edit.transcript` reports a `diff` content
-/// block whose `oldText`/`newText` ("old line\n" -> "new line\n") is only
-/// the *edited region* of a larger file — the exact shape
-/// `@agentclientprotocol/claude-agent-acp`'s `Edit` tool sends and
-/// `fake_acp_agent.sh`'s `ACP_FAKE_TOOL_CALL` branch was written to match
-/// (see that fixture's own header) — and performs **no** `fs/write_text_
-/// file`. A `diff` block is display-only per the ACP spec's own contract,
-/// so this turn must leave the file byte-identical on disk and must open no
-/// review surface at all. Reviewing an agent's *real* writes is what the
-/// turn-review surface is for — see
-/// [`turn_write_transcript_opens_a_hunk_level_turn_review_over_the_wire`]
-/// below, which drives that path through this same transport.
-///
-/// This replaces the pre-#1516
-/// `fragment_diff_transcript_preserves_surrounding_file_content_on_accept`,
-/// which asserted the opposite (the diff block opened a review whose `a`
-/// wrote `newText` to disk). #1454's fragment-resolution safety net existed
-/// only to make that write path survivable; with the write path gone there
-/// is nothing left to resolve, and the double-apply race #1454 could only
-/// heuristically detect is structurally impossible.
-///
-/// RED against unfixed `develop`: there `Engine::acp_apply_tool_call_update`
-/// called `acp_open_review_for_diffs`, so `change_review` is `Some` when the
-/// turn ends and the first assertion below fails.
+/// Display-only contract test: a `diff` content block does not write to
+/// disk and does not open a review surface. The `diff` block is for display
+/// only per the ACP spec. The `fs/write_text_file` and its review are tested
+/// separately in [`turn_write_transcript_opens_a_hunk_level_turn_review_over_the_wire`].
 #[test]
 fn fragment_diff_transcript_is_display_only_and_never_writes() {
     let dir = unique_temp_dir("fragment");
@@ -245,25 +224,12 @@ fn fragment_diff_transcript_is_display_only_and_never_writes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// #1516's headline capability — hunk-level Keep/Reject — end to end over
-/// the real transport. `turn_write_hunk_review.transcript` is the shape a
-/// real adapter actually produces for an edit: a `tool_call`, an actual
-/// `fs/write_text_file` request carrying the whole new file body, *and* a
-/// separate `tool_call_update` reporting the same edit as a `diff` block
-/// (the #1454 double-apply scenario). The write must land exactly once; the
-/// review that opens must be the *turn* review over what was really
-/// written, not a second proposal review from the diff block; and `r` must
-/// revert only the hunk under the cursor, leaving the other hunk's
-/// agent-written content on disk.
-///
-/// RED against unfixed `develop` on two independent assertions:
-/// - `develop`'s `r` reverted the **whole file**, so `AGENT-B` would be
-///   gone from disk after the first `r` (the exact limitation #1516
-///   reports), and the surface would have auto-closed with one keypress
-///   instead of staying open for the second hunk.
-/// - `develop` also opened a proposal review from the `tool_call_update`'s
-///   diff block mid-turn, so `change_review` was `Some` before the turn
-///   ever ended.
+/// Hunk-level Keep/Reject over the real transport: `turn_write_hunk_review.
+/// transcript` contains a `tool_call`, an `fs/write_text_file` request with
+/// the whole new file body, and a `tool_call_update` with the same edit as a
+/// `diff` block. The write lands exactly once; the review opens at the turn
+/// level over what was really written, not from the diff block; and `r`
+/// reverts only the hunk under the cursor, leaving other hunks on disk.
 #[test]
 fn turn_write_transcript_opens_a_hunk_level_turn_review_over_the_wire() {
     let dir = unique_temp_dir("turn-write-hunks");
@@ -276,8 +242,7 @@ fn turn_write_transcript_opens_a_hunk_level_turn_review_over_the_wire() {
 
     let mut engine = engine_with_replay("turn_write_hunk_review.transcript", &dir);
     engine.workspace_root = Some(dir.clone());
-    // #1515 made `badge` the default; this test is about the modal the
-    // `auto` mode opens when a turn ends.
+    // The `auto` mode opens a modal review when a turn ends.
     engine.settings.acp_review_on_turn_end = vimcode_core::core::settings::AcpReviewOnTurnEnd::Auto;
 
     engine.ai_send_message("please edit two places".to_string());

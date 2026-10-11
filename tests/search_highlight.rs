@@ -43,7 +43,7 @@ fn search_highlights_refresh_after_insert_mode_typing() {
     let mut e = engine_with("ab ab ab");
     search_fwd(&mut e, "ab");
     assert_eq!(e.search_matches.len(), 3);
-    // #801: `/` now lands on the *next* match after the cursor (Vim's rule),
+    // `/` now lands on the *next* match after the cursor (Vim's rule),
     // so reset the cursor to the buffer start — this test is about highlight
     // refresh after an edit, not about where the search lands.
     e.view_mut().cursor.col = 0;
@@ -61,7 +61,7 @@ fn search_highlights_refresh_after_normal_mode_delete() {
     let mut e = engine_with("foo bar foo baz foo");
     search_fwd(&mut e, "foo");
     assert_eq!(e.search_matches.len(), 3);
-    // #801: `/` now lands on the *next* match after the cursor (Vim's rule),
+    // `/` now lands on the *next* match after the cursor (Vim's rule),
     // so reset the cursor to the buffer start — this test is about highlight
     // refresh after an edit, not about where the search lands.
     e.view_mut().cursor.col = 0;
@@ -92,7 +92,7 @@ fn search_highlights_refresh_after_insert_mode_backspace() {
     let mut e = engine_with("ab ab ab");
     search_fwd(&mut e, "ab");
     assert_eq!(e.search_matches.len(), 3);
-    // #801: `/` now lands on the *next* match after the cursor (Vim's rule),
+    // `/` now lands on the *next* match after the cursor (Vim's rule),
     // so reset the cursor to the buffer start — this test is about highlight
     // refresh after an edit, not about where the search lands.
     e.view_mut().cursor.col = 0;
@@ -110,7 +110,7 @@ fn search_highlights_correct_positions_after_insert() {
     let mut e = engine_with("aa bb aa");
     search_fwd(&mut e, "aa");
     assert_eq!(e.search_matches.len(), 2);
-    // #801: `/` now lands on the *next* match after the cursor (Vim's rule),
+    // `/` now lands on the *next* match after the cursor (Vim's rule),
     // so reset the cursor to the buffer start — this test is about highlight
     // refresh after an edit, not about where the search lands.
     e.view_mut().cursor.col = 0;
@@ -164,7 +164,7 @@ fn search_highlights_refresh_after_replace_char() {
     let mut e = engine_with("abc abc");
     search_fwd(&mut e, "abc");
     assert_eq!(e.search_matches.len(), 2);
-    // #801: `/` now lands on the *next* match after the cursor (Vim's rule),
+    // `/` now lands on the *next* match after the cursor (Vim's rule),
     // so reset the cursor to the buffer start — this test is about highlight
     // refresh after an edit, not about where the search lands.
     e.view_mut().cursor.col = 0;

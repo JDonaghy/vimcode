@@ -1,37 +1,26 @@
-//! Integration tests for the pinned Rust toolchain (#639).
+//! Integration tests for the pinned Rust toolchain.
 //!
-//! Before #639, `.github/workflows/*.yml` installed Rust with
-//! `dtolnay/rust-toolchain@stable` and the repo had no `rust-toolchain.toml`,
-//! while `ci.yml` gates on `cargo clippy --no-default-features -- -D warnings`.
-//! Every six weeks a Rust stable release ships new clippy lints, so **a Rust
-//! release could turn CI red with zero code changes** — no commit, no PR,
-//! nothing in the history explaining it. That is the same failure class as
-//! #615 (ambient `$HOME` leaking into `test_engine`) and #625/#638 (an
-//! unpinned quadraui sibling restating snapshots on every machine at once): a
-//! build input that moves without a commit.
+//! A floating Rust toolchain (installed without a pinned version) is a build
+//! input that can change without a commit: every six weeks a stable release
+//! ships new clippy lints, and CI gates on `cargo clippy --no-default-features`.
+//! A new lint can turn CI red with zero code changes, with nothing in the
+//! commit history explaining it. The fix is `rust-toolchain.toml` at the repo
+//! root, pinning an exact version, plus an explicit `toolchain:` input on every
+//! workflow's install step, so a toolchain bump is a deliberate, reviewable commit.
 //!
-//! The fix is `rust-toolchain.toml` at the repo root plus an explicit
-//! `toolchain:` input on every workflow's install step, so a toolchain bump is
-//! a deliberate, reviewable commit. This file is what keeps the two in sync:
-//! the workflows cannot be edited back to a floating channel, and they cannot
-//! drift to a different version than the one local builds use, without a red
-//! test on the branch that does it.
-//!
-//! Three invariants, each guarding a distinct way the pin can rot:
+//! This file enforces three invariants to keep the pin from rotting:
 //!
 //! * `rust_toolchain_toml_pins_an_exact_version` — the file exists and names a
-//!   concrete `X.Y.Z`, not `stable`/`beta`/`nightly` (a `channel = "stable"`
-//!   pin is no pin at all).
+//!   concrete `X.Y.Z`, not `stable`/`beta`/`nightly`.
 //! * `workflows_do_not_use_a_floating_toolchain` +
 //!   `workflow_toolchain_matches_rust_toolchain_toml` — no workflow installs a
-//!   floating channel, and the version each one does install is the same
-//!   version `rust-toolchain.toml` names.
+//!   floating channel, and the version each one installs is the same version
+//!   `rust-toolchain.toml` names.
 //! * `workflow_toolchain_steps_install_clippy_and_rustfmt` — `dtolnay/rust-toolchain`
-//!   installs with `--profile minimal`. That was invisible while the workflows
-//!   asked for `stable`, because GitHub runners *preinstall* stable with
-//!   clippy and rustfmt already in it. A pinned non-preinstalled version is
-//!   downloaded fresh, so `cargo fmt -- --check` / `cargo clippy` would fail
-//!   with "no such subcommand" unless the components are requested explicitly.
+//!   installs with `--profile minimal`. When using a preinstalled toolchain,
+//!   clippy and rustfmt are already present on the runner. A pinned fresh-downloaded
+//!   version needs these components requested explicitly, or `cargo fmt -- --check`
+//!   and `cargo clippy` fail with "no such subcommand".
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

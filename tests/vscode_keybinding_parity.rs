@@ -1,4 +1,4 @@
-//! #1730: VS Code mode parity — binding coverage vs VS Code's real per-OS
+//! VS Code mode parity — binding coverage vs VS Code's real per-OS
 //! defaults, plus a reachability matrix for what a real keyboard can actually
 //! deliver on each surface vimcode ships.
 //!
@@ -36,7 +36,7 @@
 //!    deletion of the table row and the gate entry, the same way `KNOWN_BUGS`
 //!    forces deletion on `FixLanded`.
 //!
-//! ## Correction (#1745): there is a real macOS GUI backend in this repo
+//! ## Correction: there is a real macOS GUI backend in this repo
 //!
 //! This file originally claimed "there is no macOS GUI backend in this repo
 //! to regress against" and marked every `macos_gui` reachability cell
@@ -162,13 +162,9 @@ enum Os {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     /// vimcode's key name + ctrl flag implements this VS Code default
-    /// exactly (for the `Os` the row is cited for). #1745: every row that
-    /// used to carry a (now-deleted) `MacDiverges` status because the Mac
-    /// chord was not a plain Ctrl-to-Cmd substitution on the *terminal*
-    /// build is `Matches` now that the macOS *GUI* backend exists to
-    /// translate it (`normalize_mac_cmd_as_ctrl`, `src/app.rs`) —
-    /// Cmd is a GUI-only modifier, so the terminal-build reasoning in the
-    /// module doc's macOS-terminal decision is unaffected.
+    /// exactly (for the `Os` the row is cited for). The macOS *GUI*
+    /// backend translates Cmd to Ctrl for plain substitutions
+    /// (`normalize_mac_cmd_as_ctrl`, `src/app.rs`).
     Matches,
     /// VS Code binds this command by default; vimcode's VS Code mode does
     /// not bind it to anything, or binds the chord to a different command
@@ -201,18 +197,6 @@ struct VscodeBinding {
 /// Mac default is not simply "same chord with Cmd for Ctrl".
 static VSCODE_BINDINGS: &[VscodeBinding] = &[
     // ── Confirmed matches (Linux/Windows) ──────────────────────────────
-    // #1744 fixed the five rows that used to live here as `Status::Missing`
-    // (`insertCursorAbove`/`Below`, `copyLinesUpAction`/`DownAction`,
-    // `navigateBack`/`Forward`, `jumpToBracket`) — see
-    // `ctrl_alt_up_has_a_distinct_wire_representation_from_alt_up` (renamed
-    // from `gap_ctrl_alt_up_is_move_line_not_insert_cursor_above` once the
-    // fix landed) and its four siblings below for the now-`FixLanded`,
-    // deleted `KNOWN_GAPS` entries,
-    // `render::alt_key_router_tests` for `route_alt_key`'s own
-    // spelling-identity unit coverage, and — the actual black-box proof for
-    // all five chords, per CLAUDE.md's rendered-output rule —
-    // `src/gtk/testing.rs`'s `mod alt_rung_1744` and
-    // `src/tui_main/app_on_tui_tests.rs`'s `mod vscode_mode_alt_rung_1744`.
     VscodeBinding {
         command_id: "editor.action.insertCursorAbove",
         os: Os::WinLinux,
@@ -453,11 +437,6 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
         note: "Covered by tests/vscode_mode.rs::test_vscode_ctrl_shift_p_command_palette.",
     },
     // ── Fixed by #1745: plain Ctrl-to-Cmd substitutions on the macOS GUI ──
-    // `normalize_mac_cmd_as_ctrl` (`src/app.rs`) folds `Modifiers::cmd`
-    // into `ctrl` whenever the live backend reports `platform_name() ==
-    // "macos"`, so every row below now matches on that backend too. On
-    // macOS *TUI* these stay Ctrl-only per this issue's own decision (Cmd
-    // never reaches a terminal).
     VscodeBinding {
         command_id: "workbench.action.toggleSidebarVisibility",
         os: Os::Mac,
@@ -648,7 +627,7 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
     },
 
     // ═════════════════════════════════════════════════════════════════════
-    // #1746: expand the table to VS Code's full default editor/workbench
+    // Expand the table to VS Code's full default editor/workbench
     // set. Every row below is cross-referenced directly against
     // `src/core/engine/vscode.rs`'s own match arms (grepped, not recalled
     // from memory) — see this file's own closing report (in the PR/commit
@@ -779,9 +758,7 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
     },
     // ── #1746 review correction: these four rows previously claimed
     //    `Status::Matches` on the strength of tests that feed
-    //    `handle_key("Shift_Home"/"BackSpace"/..., None, true)` directly —
-    //    triples the one shared decoder (`render::engine_key_from_ui`) can
-    //    never actually emit from a real keypress, on any backend. See each
+    //    `handle_key` with decoder-unreachable triples. See each
     //    row's own KNOWN_GAPS gate below for the exact match-arm proof. ───
     VscodeBinding {
         command_id: "cursorTopSelect",
@@ -1142,11 +1119,8 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
                evidence of VS Code parity.",
     },
 
-    // ── #1746 deliverable 1: the previously-missing categories — save,
-    //    Win/Linux find/replace (Mac already had rows for these via
-    //    Cmd+F/Cmd+Option+F), and the editor-group/tab command family
-    //    (Win/Linux and Mac share these chords unmodified — VS Code's own
-    //    defaults have no Mac override for any of them) ───────────────────
+    // ── #1746 deliverable 1: new rows — save, Win/Linux find/replace,
+    //    and editor-group/tab commands ───────────────────────────────────
     VscodeBinding {
         command_id: "workbench.action.files.save",
         os: Os::WinLinux,
@@ -1537,7 +1511,7 @@ static VSCODE_BINDINGS: &[VscodeBinding] = &[
                Win/Linux selectHighlights row above.",
     },
 
-    // ── Mac: real gaps turned up by this pass (#1746) ──────────────────────
+    // ── Mac: real gaps turned up by this pass ──────────────────────────────
     VscodeBinding {
         command_id: "redo",
         os: Os::Mac,
@@ -1719,7 +1693,7 @@ fn test_vscode_ctrl_v_pastes_copied_text() {
     // Select "hell" (columns 0..4) and copy it. This hand-builds the
     // selection that `Shift+Right` x4 would produce, so it must also set
     // `visual_end_exclusive` the same way `vscode_extend_selection` does
-    // (#1788 review) — otherwise the selection defaults to Vim's inclusive
+    // — otherwise the selection defaults to Vim's inclusive
     // convention and this copies "hello" (5 chars) instead of "hell".
     e.visual_anchor = Some(Cursor { line: 0, col: 0 });
     e.mode = Mode::Visual;
@@ -1731,10 +1705,8 @@ fn test_vscode_ctrl_v_pastes_copied_text() {
     e.mode = Mode::Insert;
     e.view_mut().cursor = Cursor { line: 0, col: 11 };
     e.handle_key("v", Some('v'), true);
-    // Exact match, not just "something longer got pasted" — a weaker
-    // assertion here would pass against #1788's off-by-one (it pasted
-    // "hello", 5 chars, for this 4-char selection) just as easily as
-    // against a correct fix.
+    // Exact match, not just "something longer got pasted" — this
+    // assertion catches off-by-one errors.
     assert_eq!(
         buf(&e),
         "hello worldhell\n",
@@ -1742,16 +1714,9 @@ fn test_vscode_ctrl_v_pastes_copied_text() {
     );
 }
 
-/// #1788: a 6-char Shift+Right selection of "hello " (indices 0..6 in
-/// "hello world") must copy exactly those 6 characters, not 7. VSCode mode's
-/// selection cursor sits *after* the last selected char (exclusive end) —
-/// this used to be extracted with Vim's own inclusive-of-cursor range,
-/// which is correct for Vim's Visual mode but copies one extra trailing
-/// character in VSCode mode.
-///
-/// **Verified RED against unfixed `develop`:** before the fix, the final
-/// assertion fails with `"hello worldhello w"` (7-char selection plus
-/// the extra 'w') instead of `"hello worldhello "`.
+/// A 6-char Shift+Right selection of "hello " (indices 0..6 in
+/// "hello world") must copy exactly those 6 characters, not 7.
+/// VSCode mode's selection cursor sits *after* the last selected char
 #[test]
 fn test_vscode_ctrl_c_six_char_selection_copies_exactly_six_chars() {
     let mut e = engine_with("hello world\n");
@@ -2038,9 +2003,8 @@ fn test_vscode_plain_delete_removes_char_under_cursor() {
     assert_eq!(buf(&e), "ello\n");
 }
 
-// ─── #1746: new engine-level coverage for the rows added to expand the
-// table to 100+ (plain arrow/Home/End movement, plain Shift-extend, Ctrl+K
-// Ctrl+W) ────────────────────────────────────────────────────────────────
+// ─── #1746: new engine-level coverage for arrow/Home/End movement,
+//     plain Shift-extend, and Ctrl+K Ctrl+W ─────────────────────────────
 
 #[test]
 fn test_vscode_plain_right_clears_selection_and_moves() {
@@ -2164,12 +2128,8 @@ fn test_vscode_shift_end_extends_selection_without_ctrl() {
     assert_eq!(e.cursor().col, 5);
 }
 
-// ─── #1746 deliverable 1: new engine-level coverage for the save /
-//     tab-switcher rows added above. `test_vscode_ctrl_f_opens_find` and
-//     `test_vscode_ctrl_h_opens_find_replace` already existed in this file
-//     (used only by the two `Os::Mac` rows' notes, never by a Win/Linux
-//     row — exactly the gap this round's new `actions.find`/`editor.
-//     action.startFindReplaceAction` `Os::WinLinux` rows above close) ──────
+// ─── #1746 deliverable 1: new engine-level coverage for save and
+//     tab-switcher rows added above ──────────────────────────────────────
 
 #[test]
 fn test_vscode_ctrl_s_saves_file() {
@@ -2197,21 +2157,17 @@ fn test_vscode_ctrl_tab_opens_tab_switcher() {
     assert!(e.tab_switcher_open, "Ctrl+Tab should open the tab switcher");
 }
 
-// #1746 review correction: `test_vscode_ctrl_k_ctrl_w_closes_all_editors_
-// in_group` used to live here, asserting today's (wrong) `Some(1)` outcome,
-// while its own row above was marked `Matches` with a note claiming the
-// opposite ("closes every tab in the active group") — a false parity claim.
-// Moved to section 3 as `gap_ctrl_k_ctrl_w_closes_every_tab`, which asserts
-// the *correct* VS Code outcome and is gated to panic until it lands.
+// `test_vscode_ctrl_k_ctrl_w_closes_all_editors_in_group` used to
+// assert today's (wrong) outcome marked as `Matches`. Moved to section 3
+// as `gap_ctrl_k_ctrl_w_closes_every_tab`, now gated to panic until fixed.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2. Reachability matrix — does real input ever produce the key the table
 //    above says `handle_vscode_key` wants?
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// One surface vimcode ships — `macos_gui` is `src/macos/`, a real backend
-/// since #859/#896 (#1730 wrongly assumed otherwise; see the module doc's
-/// correction).
+/// One surface vimcode ships — `macos_gui` is `src/macos/`, a real
+/// backend since #859/#896.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reach {
     /// Reaches the engine as the correct, unambiguous key.
@@ -2236,7 +2192,7 @@ struct ReachabilityRow {
     macos_tui: Reach,
     macos_gui: Reach,
     reason: &'static str,
-    /// #1746 (deliverable 2): what a TUI user on `tui_legacy_xterm` or
+    /// What a TUI user on `tui_legacy_xterm` or
     /// `conpty_legacy` should press instead, when the chord's `Reach` on
     /// either of those is `No`. VS Code's own alternative binding where one
     /// exists (e.g. F1 for the command palette); otherwise a proposed
@@ -2556,14 +2512,9 @@ fn reachability_table_rows_are_well_formed() {
             "{:?} has an empty fallback",
             row.chord
         );
-        // #1746 non-blocking review fix: deliverable 2 asks every row whose
-        // chord is unreachable on a legacy terminal surface to record a
-        // real fallback, not just an empty or placeholder string. A row is
-        // only exempt (`"n/a"`-prefixed) when both legacy surfaces are
-        // already `Yes` — anything else must spell out what to press
-        // instead, enforced here so a future row can't silently skip it
-        // the way the four `Matches`-claimed rows this round downgraded
-        // originally did.
+        // Deliverable 2 requires every row whose chord is unreachable
+        // on a legacy terminal surface to record a real fallback, not just
+        // an empty or placeholder string.
         let legacy_blocked = row.tui_legacy_xterm == Reach::No || row.conpty_legacy == Reach::No;
         if legacy_blocked {
             assert!(
@@ -2649,7 +2600,7 @@ fn ctrl_shift_k_with_keyboard_enhancement_produces_the_distinct_name() {
     assert!(ctrl);
 }
 
-/// #1744: `Ctrl+Alt+Up` (`Alt_Up` with `ctrl: true`, the exact name+flag
+/// `Ctrl+Alt+Up` (`Alt_Up` with `ctrl: true`, the exact name+flag
 /// `route_alt_key` now hands `handle_vscode_key` for that chord — see
 /// `vscode_alt_key_name`'s doc) has a distinct wire representation from plain
 /// Alt+Up after all: `handle_vscode_key`'s `"Alt_Up" if ctrl` arm (checked
@@ -2704,58 +2655,23 @@ enum GapOutcome {
     FixLanded,
 }
 
-/// Labels of gaps that are *expected* to still reproduce today. THIS LIST
-/// MAY ONLY EVER SHRINK — an entry is deleted in the same change that fixes
-/// the gap it names (see [`gap_gate`]'s `FixLanded` panic, which enforces
-/// that deletion is not optional).
-///
-/// #1744 fixed every gap this list ever named (`CTRL_ALT_UP_IS_MOVE_LINE`,
-/// `CTRL_ALT_DOWN_IS_MOVE_LINE`, `ALT_SHIFT_UP_IS_ADD_CURSOR`,
-/// `ALT_LEFT_RIGHT_IS_SIDEBAR_RESIZE`,
-/// `CTRL_SHIFT_BACKSLASH_JUMP_TO_BRACKET_UNBOUND`); the `gap_*` tests for
-/// those five are now plain (ungated) assertions of the fixed behaviour,
-/// same as `src/harness.rs`'s own `KNOWN_BUGS` empty-list state. #1745 adds
-/// three new entries, all still open — see the matching `VSCODE_BINDINGS`
-/// rows (`editor.action.startFindReplaceAction`,
-/// `workbench.action.navigateBack / navigateForward`, and
-/// `workbench.action.toggleSidebarVisibility`) for the full writeup.
-///
-/// `PANEL_ACCELERATOR_CMD_CHORDS_DEAD_ON_MACOS_GUI` is the one entry here
-/// with no [`gap_gate`] call of its own: the defect it names
-/// (`render::apply_engine_action`'s `ToggleSidebar` arm never calling
-/// `Engine::toggle_sidebar`) is only reachable through the real production
-/// dispatch path, which is `pub(crate)` to `vimcode_core` and therefore
-/// invisible from this separate integration-test crate — see
-/// `src/macos/mod.rs`'s `cmd_b_does_not_toggle_sidebar_dead_panel_
-/// accelerator` for that entry's actual RED proof and the deletion
-/// instructions that live there instead. The structural self-check
-/// (`vscode_bindings_table_rows_are_well_formed`) still requires this
-/// label's `VSCODE_BINDINGS` row to name it, so a future edit that adds a
-/// `Missing` row without wiring up *some* gate still fails loudly.
+/// Labels of gaps that are *expected* to still reproduce today.
+/// THIS LIST MAY ONLY EVER SHRINK — an entry is deleted in the same
+/// change that fixes the gap it names (see [`gap_gate`]'s `FixLanded`
+/// panic).
 const KNOWN_GAPS: &[&str] = &[
     "CMD_OPTION_F_FIND_REPLACE_UNREACHABLE",
     "CTRL_MINUS_NAVIGATE_BACK_FORWARD_ON_MAC_UNVERIFIED",
     "PANEL_ACCELERATOR_CMD_CHORDS_DEAD_ON_MACOS_GUI",
-    // #1746, added while expanding VSCODE_BINDINGS past 100 rows — see each
-    // label's own VSCODE_BINDINGS row for the full writeup and its gate
-    // test below for the RED proof. Verified RED against unfixed `develop`
-    // by temporarily removing these six labels and re-running this suite:
-    // all six gate tests failed with `Regression` (the exact panics this
-    // issue's new code is supposed to pin), confirming each one can fail.
+    // #1746: added while expanding VSCODE_BINDINGS past 100 rows.
     "CMD_SHIFT_Z_REDO_UNREACHABLE_ON_MAC",
     "OPTION_BACKSPACE_DELETE_WORD_LEFT_UNBOUND_ON_MAC",
     "OPTION_DELETE_WORD_RIGHT_UNBOUND_ON_MAC",
     "CTRL_K_CTRL_C_TOGGLES_INSTEAD_OF_ADD_ONLY",
     "CTRL_K_CTRL_U_TOGGLES_INSTEAD_OF_REMOVE_ONLY",
     "SHIFT_PAGEUP_PAGEDOWN_SHIFT_BIT_DROPPED_BY_DECODER",
-    // Added in this #1746 review round: the decoder-level ctrl-bit-drop
-    // gaps the previous round's `Matches` rows missed, plus the
-    // `closeAllEditors` false-parity correction, plus the deliverable-1
-    // rows added for the editor-group/tab family and Win/Linux find/
-    // replace/save. Verified RED against unfixed `develop` the same way as
-    // the six above (all eight labels below temporarily removed, re-ran
-    // this suite: all eight gate tests failed with `Regression` — the
-    // exact panics each one's own doc comment claims — then restored).
+    // Added in #1746 review round: decoder-level ctrl-bit-drop gaps,
+    // `closeAllEditors` false-parity correction, deliverable-1 rows
     "CTRL_SHIFT_HOME_END_CTRL_BIT_DROPPED_BY_DECODER",
     "CTRL_BACKSPACE_DELETE_CTRL_BIT_DROPPED_BY_DECODER",
     "CTRL_K_CTRL_W_LEAVES_ONE_TAB_OPEN",
@@ -2784,21 +2700,8 @@ fn gap_gate_outcome<F: FnOnce()>(label: &str, body: F) -> GapOutcome {
     }
 }
 
-/// Pass/fail wrapper: turns `Regression`/`FixLanded` into a test failure
-/// with an actionable message; `Pass`/`ExpectedGap` return normally (an
-/// ordinary passing test, or today's gap, correctly still open).
-///
-/// #1744 fixed every gap `KNOWN_GAPS` named at the time, so for a while no
-/// `#[test]` in this file called this wrapper (each former `gap_*` test
-/// became a plain, ungated assertion — see e.g.
-/// `ctrl_alt_up_inserts_cursor_above_not_move_line`). #1745 adds two new
-/// gaps (`gap_cmd_option_f_find_replace_unreachable`,
-/// `gap_ctrl_minus_navigates_back_on_mac`), so this is live again — this is
-/// this file's whole reason for existing per its own module doc
-/// (deliverable 3, "a bidirectional gate for every binding
-/// `VSCODE_BINDINGS` marks `Missing` or wrong"), exactly as `src/harness.rs`'s
-/// `known_bug_gate` stays live infrastructure independent of how many bugs
-/// `KNOWN_BUGS` currently lists.
+/// Pass/fail wrapper: turns `Regression`/`FixLanded` into a test
+/// failure; `Pass`/`ExpectedGap` return normally.
 fn gap_gate(label: &'static str, body: impl FnOnce()) {
     match gap_gate_outcome(label, body) {
         GapOutcome::Pass | GapOutcome::ExpectedGap => {}
@@ -2857,16 +2760,10 @@ fn gap_gate_self_test_both_directions() {
     );
 }
 
-/// #1744, was `KNOWN_GAPS::CTRL_ALT_UP_IS_MOVE_LINE` (now deleted,
-/// `FixLanded`): VS Code's `editor.action.insertCursorAbove` (`Ctrl+Alt+Up`)
-/// adds a cursor one line above, leaving the buffer untouched.
-/// `render::route_alt_key` now forwards `ctrl` through to
-/// `Engine::handle_vscode_key` instead of hardcoding `false`, and that
-/// function's `"Alt_Up" if ctrl` arm (checked before the unguarded move-line
-/// arm) calls `vscode_add_cursor_above`. **Verified RED against unfixed
-/// `develop`** before this change landed — this test's body is unchanged
-/// from the `gap_gate`-wrapped version that asserted the same outcome and
-/// reported `ExpectedGap` (i.e. panicked) there.
+/// VS Code's `editor.action.insertCursorAbove` (`Ctrl+Alt+Up`) adds a
+/// cursor one line above. `render::route_alt_key` forwards `ctrl`
+/// through to `Engine::handle_vscode_key`, which calls
+/// `vscode_add_cursor_above`.
 #[test]
 fn ctrl_alt_up_inserts_cursor_above_not_move_line() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
@@ -2905,14 +2802,9 @@ fn ctrl_alt_down_inserts_cursor_below_not_move_line() {
     );
 }
 
-/// #1744, was `KNOWN_GAPS::ALT_SHIFT_UP_IS_ADD_CURSOR` (now deleted): VS
-/// Code's `Shift+Alt+Up` is `editor.action.copyLinesUpAction` (duplicate line
-/// upward), not add-a-cursor — that chord now belongs to Ctrl+Alt+Up (see
-/// `ctrl_alt_up_inserts_cursor_above_not_move_line` above).
-/// `handle_vscode_key`'s `"Alt_Shift_Up"` arm now calls the new
-/// `Engine::vscode_copy_line_up`. **Verified RED against unfixed `develop`**
-/// before this change landed (this test's body is unchanged from the
-/// `gap_gate`-wrapped version).
+/// VS Code's `Shift+Alt+Up` is `editor.action.copyLinesUpAction`
+/// (duplicate line upward). `handle_vscode_key`'s `"Alt_Shift_Up"` arm
+/// calls `Engine::vscode_copy_line_up`.
 #[test]
 fn alt_shift_up_copies_line_up_not_add_cursor() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
@@ -2931,17 +2823,7 @@ fn alt_shift_up_copies_line_up_not_add_cursor() {
 }
 
 /// Mirrors the above for `editor.action.copyLinesDownAction`
-/// (`Shift+Alt+Down`, `Engine::vscode_copy_line_down`). Not itself a
-/// `KNOWN_GAPS` conversion — the issue's gap list named only one label,
-/// `ALT_SHIFT_UP_IS_ADD_CURSOR`, for the Up/Down pair — but the root cause
-/// was identical in both directions: `"Alt_Shift_Down"` used to reach
-/// `vscode_add_cursor_below` the same way `"Alt_Shift_Up"` reached
-/// `vscode_add_cursor_above`. **Verified RED against unfixed `develop`**:
-/// reverting `handle_vscode_key`'s `"Alt_Shift_Down" =>
-/// self.vscode_copy_line_down(&mut changed)` arm to call
-/// `vscode_add_cursor_below()` instead reproduces both assertion failures
-/// here (the buffer stays `"aaa\nbbb\nccc\n"` and `extra_cursors` gains an
-/// entry).
+/// (`Shift+Alt+Down`, `Engine::vscode_copy_line_down`).
 #[test]
 fn alt_shift_down_copies_line_down_not_add_cursor() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
@@ -2959,18 +2841,9 @@ fn alt_shift_down_copies_line_down_not_add_cursor() {
     );
 }
 
-/// #1744, was `KNOWN_GAPS::ALT_LEFT_RIGHT_IS_SIDEBAR_RESIZE` (now deleted):
 /// VS Code's `Alt+Left`/`Alt+Right` (`workbench.action.navigateBack`/
-/// `navigateForward`) behave like Vim mode's Ctrl-O/Ctrl-I — jump back to (and
-/// forward from) a recorded jump-list entry. `render::route_alt_key`'s
-/// mode-independent tier no longer claims `AltBase::Left`/`Right`
-/// unconditionally for sidebar-resize; in VSCode mode it falls through to the
-/// VSCode-mode tier, which maps the chord to `"Alt_Left"`/`"Alt_Right"` and
+/// `navigateForward`) jump back and forward through the jump list.
 /// `handle_vscode_key` calls `Engine::jump_list_back`/`jump_list_forward`.
-/// Seeds a real jump-list entry with the already-public
-/// `Engine::push_jump_location` (the same mechanism Vim mode's motions use).
-/// **Verified RED against unfixed `develop`** before this change landed
-/// (this test's body is unchanged from the `gap_gate`-wrapped version).
 #[test]
 fn alt_left_navigates_back_not_resize_sidebar() {
     let mut e = engine_with(&"line\n".repeat(10));
@@ -2990,20 +2863,9 @@ fn alt_left_navigates_back_not_resize_sidebar() {
     );
 }
 
-/// #1744, was `KNOWN_GAPS::CTRL_SHIFT_BACKSLASH_JUMP_TO_BRACKET_UNBOUND` (now
-/// deleted): VS Code's `editor.action.jumpToBracket` (`Ctrl+Shift+\`) moves
-/// the cursor onto the matching bracket, exactly like Vim mode's `%` already
-/// does via `Engine::find_matching_bracket`/`move_to_matching_bracket`.
-/// `App::handle_dispatch`'s `Key::Char` arm (`src/app.rs`) now has a special
-/// case producing `"Shift_backslash"` for the one input shape that needs
-/// it, and `handle_vscode_key` has a `"Shift_backslash" | "|"` arm calling
-/// `move_to_matching_bracket`. This test, like its four siblings above,
-/// drives the engine with an already-decoded key name; the driver-tier
-/// proof that a real Ctrl+Shift+\ keypress decodes to that name on both
-/// backends is `src/gtk/testing.rs`'s `mod alt_rung_1744` and
-/// `src/tui_main/app_on_tui_tests.rs`'s `mod vscode_mode_alt_rung_1744`.
-/// **Verified RED against unfixed `develop`** before this change landed
-/// (this test's body is unchanged from the `gap_gate`-wrapped version).
+/// VS Code's `editor.action.jumpToBracket` (`Ctrl+Shift+\`) moves
+/// the cursor onto the matching bracket. `handle_vscode_key` calls
+/// `move_to_matching_bracket`.
 #[test]
 fn ctrl_shift_backslash_jumps_to_matching_bracket() {
     let mut e = engine_with("fn f() { (1 + 2) }\n");
@@ -3019,7 +2881,7 @@ fn ctrl_shift_backslash_jumps_to_matching_bracket() {
     );
 }
 
-/// #1745: `KNOWN_GAPS::CMD_OPTION_F_FIND_REPLACE_UNREACHABLE`. VS Code's
+/// `KNOWN_GAPS::CMD_OPTION_F_FIND_REPLACE_UNREACHABLE`. VS Code's
 /// `editor.action.startFindReplaceAction` Mac default is Cmd+Option+F, not
 /// a Ctrl-to-Cmd substitution of Ctrl+H (see this gap's `VSCODE_BINDINGS`
 /// row for why Cmd+H itself is unusable — macOS's system-wide "Hide
@@ -3037,7 +2899,7 @@ fn ctrl_shift_backslash_jumps_to_matching_bracket() {
 /// today — `gap_gate` reports `ExpectedGap` for a listed label, which is
 /// this test's normal, passing result until the gap closes.
 ///
-/// #1745 review: this body drives `'\u{192}'` — the exact glyph that will
+/// This body drives `'\u{192}'` — the exact glyph that will
 /// **stop** arriving once the quadraui fix lands (the fix is quadraui
 /// resolving Option+F to the base letter `'f'` instead). That means this
 /// test can only ever report `ExpectedGap` (today) or `Regression`
@@ -3072,22 +2934,10 @@ fn gap_cmd_option_f_find_replace_unreachable() {
     });
 }
 
-/// #1745: `KNOWN_GAPS::CTRL_MINUS_NAVIGATE_BACK_FORWARD_ON_MAC_UNVERIFIED`.
-/// Per this issue's own brief, VS Code's real Mac default for
-/// `workbench.action.navigateBack` is Ctrl+- (not Alt+Left, which is Win/
-/// Linux's default and already `Matches` — see that row). vimcode has no
-/// `"-"` binding in `handle_vscode_key` at all today, on any platform, so
-/// this reproduces independently of macOS: seeds a jump-list entry (the
-/// same `push_jump_location` mechanism `alt_left_navigates_back_not_
-/// resize_sidebar` above uses) and asserts Ctrl+- returns to it, which it
-/// does not.
-///
-/// Not fixed in this PR: confirming the exact real chord against VS Code's
-/// own `keybindings.json` needs a live web lookup this session did not
-/// have access to, and shipping a guessed chord would risk being wrong in
-/// a way this suite could not catch. Left for a follow-up vimcode issue
-/// once verified — not quadraui-blocked, since `-` is an ordinary
-/// `Key::Char` no different from the other symbol chords `#1745` fixed.
+/// `KNOWN_GAPS::CTRL_MINUS_NAVIGATE_BACK_FORWARD_ON_MAC_UNVERIFIED`.
+/// Per this issue's brief, VS Code's real Mac default for
+/// `workbench.action.navigateBack` is Ctrl+-. vimcode has no `"-"`
+/// binding in `handle_vscode_key`, so this chord does not navigate back.
 #[test]
 fn gap_ctrl_minus_navigates_back_on_mac() {
     gap_gate("CTRL_MINUS_NAVIGATE_BACK_FORWARD_ON_MAC_UNVERIFIED", || {
@@ -3106,7 +2956,7 @@ fn gap_ctrl_minus_navigates_back_on_mac() {
     });
 }
 
-// ─── #1746: new gates, found while expanding VSCODE_BINDINGS to 100+ rows ──
+// ─── #1746: new gates found while expanding VSCODE_BINDINGS to 100+ rows ──
 
 /// `KNOWN_GAPS::CMD_SHIFT_Z_REDO_UNREACHABLE_ON_MAC`. See this gap's
 /// `VSCODE_BINDINGS` row (`redo`, `Os::Mac`) for the full writeup: VS
@@ -3263,8 +3113,7 @@ fn gap_shift_pageup_pagedown_shift_bit_dropped_by_decoder() {
     });
 }
 
-// ─── #1746 review round: gates for the four `Matches`-claimed-but-
-//     unreachable chords plus the closeAllEditors false-parity claim ───────
+// ─── #1746 review round: gates for decoder-level unreachable chords ────────
 
 /// `KNOWN_GAPS::CTRL_SHIFT_HOME_END_CTRL_BIT_DROPPED_BY_DECODER`. See this
 /// gap's two `VSCODE_BINDINGS` rows (`cursorTopSelect`/`cursorBottomSelect`)

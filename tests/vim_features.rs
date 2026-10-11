@@ -105,7 +105,7 @@ fn test_gu_word_uppercase() {
 fn test_gn_selects_next_match() {
     let mut e = engine_with("foo bar foo\n");
     search_fwd(&mut e, "foo");
-    // #801: `/foo` from column 0 now lands on the *second* match, as Vim does.
+    // `/foo` from column 0 now lands on the *second* match, as Vim does.
     // Reset to the buffer start so this test still exercises what it names.
     e.view_mut().cursor.col = 0;
     // n moves to the second "foo"
@@ -123,7 +123,7 @@ fn test_gn_selects_next_match() {
 fn test_cgn_changes_next_match() {
     let mut e = engine_with("foo bar foo\n");
     search_fwd(&mut e, "foo");
-    // #801: `/foo` from column 0 now lands on the *second* match, as Vim does.
+    // `/foo` from column 0 now lands on the *second* match, as Vim does.
     // Reset to the buffer start so this test still exercises what it names.
     e.view_mut().cursor.col = 0;
     // Start at the first foo; cgn should delete "foo" and enter Insert
@@ -191,13 +191,9 @@ fn test_gv_reselects_last_visual() {
 
 // ── Group 3: Register Completeness ───────────────────────────────────────────
 
-// These used to assert directly on `e.registers`/`get_register_content` —
-// internal-state checks that can pass even when the register is unreachable
-// from real key sequences (see #806's `reg:"_dd then p` finding: `"_`
-// silently fell back to the unnamed register for months because nothing
-// exercised it end-to-end). Round-tripping through `p`/`"{reg}p` instead
-// asserts on the one thing a user actually observes: what lands in the
-// buffer.
+// These assertions round-trip through `p`/`"{reg}p` to test what a user
+// observes in the buffer, rather than internal register state. This catches
+// cases where a register is unreachable from real key sequences.
 
 #[test]
 fn test_register_0_set_on_yank() {
@@ -465,7 +461,7 @@ fn test_move_line_down() {
 #[test]
 fn test_move_line_to_dest() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
-    // Move current line (aaa) to after line 2 (bbb) — 1-based per #114.
+    // Move current line (aaa) to after line 2 (bbb) — 1-based line numbering.
     exec(&mut e, "m 2");
     let lines = get_lines(&e);
     assert_eq!(lines, vec!["bbb", "aaa", "ccc"]);
@@ -485,7 +481,7 @@ fn test_copy_line_to_top() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
     // Move to last line
     press(&mut e, 'G');
-    // :t 0 copies current line (ccc) to top — 1-based address 0 means "before line 1" (#114).
+    // :t 0 copies current line (ccc) to top — 1-based address 0 means "before line 1".
     exec(&mut e, "t 0");
     let lines = get_lines(&e);
     assert_eq!(lines, vec!["ccc", "aaa", "bbb", "ccc"]);
@@ -513,8 +509,6 @@ fn test_sort_r_flag_without_pattern_does_not_reverse() {
     // `r` selects the `/pattern/` *match* as the sort key; with no pattern
     // there is nothing to select, so the sort is a plain ascending one.
     // Verified against `nvim --headless -u NONE -c 'sort r'`: `c a b` → `a b c`.
-    // This repo used to treat `r` as "reverse", which broke `:sort /pat/ r`
-    // (#879).
     let mut e = engine_with("c\na\nb\n");
     exec(&mut e, "sort r");
     let lines = get_lines(&e);

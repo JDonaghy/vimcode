@@ -1,4 +1,4 @@
-//! #1779 (bugbash:tui-pty:linux): "Adding a line that becomes the buffer's
+//! "Adding a line that becomes the buffer's
 //! new last line is not repainted correctly (line 1 vanishes, content shown
 //! one row too high)".
 //!
@@ -238,11 +238,10 @@ fn send_bytes_best_effort(writer: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u
     let _ = w.flush();
 }
 
-/// #1779's exact single-line repro: `foo.txt` containing just `foo\n`,
-/// press `o`, type `bar`, press Escape. Both `foo` and `bar` must still be
-/// painted, each on its own row, in order — `foo` must not vanish, and
-/// `bar` must not land on `foo`'s row with a blank row below it (the
-/// reported symptom).
+/// When a new line is opened below the only line, both lines must be
+/// painted on separate rows in order — the original line must not vanish,
+/// and the new line must not share a row with the original line followed
+/// by a blank row.
 #[test]
 fn opening_a_line_below_the_only_line_paints_both_lines_1779() {
     let home = isolated_home();

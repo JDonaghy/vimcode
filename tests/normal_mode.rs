@@ -67,7 +67,7 @@ fn test_word_motion_w_b() {
 
 #[test]
 fn test_jj_col_memory_over_short_line() {
-    // #805: Vim remembers the "desired" column (`curswant`) across a chain of
+    // Vim remembers the "desired" column (`curswant`) across a chain of
     // vertical motions, even when an intervening line is too short to hold
     // it — the column comes back once a line long enough to hold it is
     // reached again, instead of staying clamped to the shortest line seen.
@@ -94,7 +94,7 @@ fn test_dollar_then_jj_sticks_to_end_of_line() {
 
 #[test]
 fn test_word_motion_w_onto_blank_line() {
-    // #805: an empty line is itself a "word" in Vim — `w` must stop there
+    // An empty line is itself a "word" in Vim — `w` must stop there
     // instead of skipping straight through to the next non-blank line.
     let mut e = engine_with("foo\n\nbar\n");
     press(&mut e, 'w');
@@ -105,7 +105,7 @@ fn test_word_motion_w_onto_blank_line() {
 
 #[test]
 fn test_paragraph_forward_whitespace_only_line_is_not_blank() {
-    // #805: Vim's `}`/`{` require a *completely* empty line to count as a
+    // Vim's `}`/`{` require a *completely* empty line to count as a
     // paragraph boundary — a whitespace-only line does not qualify.
     let mut e = engine_with("a\n   \nb\n\n");
     press(&mut e, '}');
@@ -140,8 +140,6 @@ fn test_paragraph_motion() {
 #[test]
 fn test_paragraph_forward_reaches_last_line() {
     // Pressing } repeatedly must eventually reach the last line of the file.
-    // Regression: previously stopped one jump short when the file ended without
-    // a trailing blank line.
     let mut e = engine_with("aaa\n\nbbb\nccc\n");
     // line 0: "aaa", line 1: "", line 2: "bbb", line 3: "ccc"
     press(&mut e, '}'); // -> blank line 1
@@ -332,7 +330,7 @@ fn test_named_register_yank_paste() {
 
 #[test]
 fn test_black_hole_register() {
-    // #806 (#2132/#553 lineage): the old version of this test asserted only
+    // The old version of this test asserted only
     // `lines.contains(&"keep")`, which stays true even if `"_dd` is treated
     // as a plain `dd` — "keep" was never touched by the delete either way,
     // so the assertion could not distinguish "black hole worked" from
@@ -543,7 +541,7 @@ fn test_ce_dot_repeat() {
     assert_buf(&e, "XXX XXX baz\n");
 }
 
-// #803: `.` records the *command* (replayed through the same key dispatcher
+// `.` records the *command* (replayed through the same key dispatcher
 // that produced it), not the inserted text. Each test below is a family the
 // old text-replay design got wrong — the assertion is the exact buffer, so a
 // regression to "insert the same text at the cursor" fails loudly.
@@ -648,7 +646,7 @@ fn test_dot_repeat_s_substitutes_char_then_inserts() {
 #[test]
 fn test_dot_repeat_p_repeats_the_paste_not_the_yank() {
     // `.` after `p` must repeat only the paste — not "yl" too, which would
-    // yank different text each time. Was entirely non-repeatable before #803.
+    // yank different text each time.
     let mut e = engine_with("ab\n");
     press(&mut e, 'y');
     press(&mut e, 'l');
@@ -661,7 +659,7 @@ fn test_dot_repeat_p_repeats_the_paste_not_the_yank() {
 
 #[test]
 fn test_dot_repeat_indent_gtgt() {
-    // `>>` was entirely non-repeatable before #803.
+    // `>>` must be repeatable with `.`.
     let mut e = engine_with("a\n");
     e.settings.shift_width = 4;
     e.settings.expand_tab = true;
@@ -675,8 +673,7 @@ fn test_dot_repeat_indent_gtgt() {
 
 #[test]
 fn test_dot_repeat_ctrl_a_increment() {
-    // `<C-a>` (increment number under cursor) was entirely non-repeatable
-    // before #803.
+    // `<C-a>` (increment number under cursor) must be repeatable with `.`.
     let mut e = engine_with("1\n2\n");
     ctrl(&mut e, 'a');
     assert_buf(&e, "2\n2\n");
@@ -730,12 +727,9 @@ fn test_dot_repeat_visual_block_insert() {
 
 #[test]
 fn test_dot_repeat_visual_block_change() {
-    // Named exact-buffer coverage for `vb:c then .` (previously covered only
-    // implicitly via its removal from KNOWN_DEVIATIONS in
-    // nvim_conformance.rs — see #803 review nits). Blockwise `c` is a
-    // blockwise delete followed by a blockwise insert at the same column
-    // (reusing `visual_block_insert_info`, the same mechanism block `I`/`A`
-    // use), so it should repeat the same way block `I` does.
+    // Blockwise `c` is a blockwise delete followed by a blockwise insert at
+    // the same column (reusing `visual_block_insert_info`, the same mechanism
+    // block `I`/`A` use), so it should repeat the same way block `I` does.
     let mut e = engine_with("abc\nabc\nabc\nabc\n");
     ctrl(&mut e, 'v');
     press(&mut e, 'j');
@@ -779,13 +773,9 @@ fn test_dot_repeat_count_override_dd() {
 
 #[test]
 fn test_dot_repeat_count_override_then_bare_dot_uses_override_not_stale_prefix() {
-    // Regression for #803 review: a count-override repeat (`2.`) must not
-    // corrupt the remembered dot-count for a *later* bare `.`. Before the
-    // fix, the "2" typed just before `.` leaked into the nested replay's own
-    // dot-recording and got concatenated onto the replayed "2", leaving the
-    // remembered count as 22 instead of 2 — so this third `.` would delete
-    // far more than the 2 characters Vim's `:h .` promises ("Count ... [is]
-    // remembered ... Use "4." ... Use "." to [repeat] again").
+    // A count-override repeat (`2.`) must not corrupt the remembered
+    // dot-count for a *later* bare `.`. The count is remembered per `:h .`
+    // and must be retained across nested replays.
     let mut e = engine_with("abcdefghij\n");
     press(&mut e, '3');
     press(&mut e, 'x');
@@ -820,11 +810,6 @@ fn test_dot_repeat_count_override_dd_then_bare_dot_uses_override_not_stale_prefi
     // remaining line in the buffer).
     assert_buf(&e, "i\nj\nk\n");
 }
-
-// ── #803 CI follow-up: regressions the first cut of the keystroke-replay
-// dot-repeat introduced, each caught by the nvim conformance oracle. These
-// pin the behaviour with plain engine-level assertions so a re-break fails
-// even on a machine without `nvim` installed.
 
 #[test]
 fn test_insert_count_is_abandoned_when_an_arrow_key_moves_the_cursor() {

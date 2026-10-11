@@ -1,11 +1,11 @@
-//! Black-box tests for `scripts/platform-conformance.sh` (#926).
+//! Black-box tests for `scripts/platform-conformance.sh`.
 //!
 //! The script is the single entrypoint for "do the native builds behave the
 //! same on every platform?" across the TUI, GTK, macOS and Win-GUI driver-tier
 //! harnesses. Its one load-bearing property is the vacuous-pass guard: a lane
 //! that ran but executed zero tests must be reported as a *failure*, not a
 //! pass. That guard exists because this repo already paid for its absence
-//! once (#645) -- `cargo test --no-default-features` silently omitted the
+//! once -- `cargo test --no-default-features` silently omitted the
 //! entire `vimcode` bin (all of `src/gtk/**`, `required-features = ["gui"]`),
 //! so the Test stage compiled zero GTK assertions and every GTK issue earned
 //! a vacuously green verdict with no error and no warning.
@@ -75,13 +75,8 @@ fn run_script(args: &[&str], envs: &[(&str, &str)]) -> (String, String, i32) {
 }
 
 /// A lane whose stubbed command reports 0 tests executed must fail the run,
-/// and the matrix line for it must NOT read `passed`.
-///
-/// THE RED-VERIFIED ASSERTION for #926: with the vacuous-pass guard in
-/// `run_lane()` (the `lines -eq 0` / `passed -eq 0` checks in
-/// `scripts/platform-conformance.sh`) temporarily deleted, this test was
-/// re-run and observed to fail (script exits 0, matrix printed `tui passed`)
-/// before the guard was restored. See the PR description for the transcript.
+/// and the matrix line for it must NOT read `passed`. This guards against
+/// silently omitting test suites.
 #[test]
 fn zero_tests_executed_fails_the_lane_not_passes_it() {
     let (stdout, _stderr, code) = run_script(
@@ -106,26 +101,10 @@ fn zero_tests_executed_fails_the_lane_not_passes_it() {
     );
 }
 
-/// #933 cause 2: the script must not exit 0 if it terminates unexpectedly
-/// (a bash abort, a killing signal, a future bug that bypasses every
-/// intentional exit point) -- that is a *separate* defect from the zero-test
-/// vacuous-pass guard above, and needs its own guard (an EXIT trap that
-/// checks whether a real exit point was reached) rather than relying on the
-/// lane-result bookkeeping to happen to catch it.
-///
-/// This is exactly the shape of bug #933 reported on macOS: `declare -A`
-/// failed (bash 3.2 has no associative arrays), a later reference to the
-/// never-populated array tripped `set -u`, and the script died mid-run yet
-/// still reported exit code 0 -- zero lanes run, vacuously green. The
-/// `PLATCONF_TEST_FORCE_UNHANDLED_EXIT` hook reproduces "died mid-run with
-/// an underlying exit status of 0" deterministically on any host's bash,
-/// without needing an actual bash-3.2 install in CI.
-///
-/// THE RED-VERIFIED ASSERTION: with the `on_exit` trap / `finish` plumbing
-/// in `scripts/platform-conformance.sh` temporarily reverted to a bare
-/// `exit "$OVERALL_FAILURE"` (no trap), this test was re-run against the
-/// `PLATCONF_TEST_FORCE_UNHANDLED_EXIT=1` hook and observed to fail (exit
-/// code 0) before the trap was restored.
+/// The script must not exit 0 if it terminates unexpectedly (a bash abort,
+/// a killing signal, or a future bug that bypasses every intentional exit
+/// point). The EXIT trap ensures an underlying unhandled termination is caught
+/// and reported as failure, separate from the zero-test vacuous-pass guard.
 #[test]
 fn unexpected_termination_forces_nonzero_exit() {
     let (stdout, stderr, code) = run_script(
@@ -335,34 +314,10 @@ fn script_is_executable() {
     );
 }
 
-// ── #1092: the release-gate contract ──────────────────────────────────
-//
-// Everything below is what a release step actually consumes: an exit code,
-// one summary line, and a JSON file. The stub mechanism above is what makes
-// them runnable on any host -- no gtk4, no cargo-xwin, no Darwin needed.
-//
-// THE RED-VERIFIED ASSERTION for every `exit_contract_*` / `summary_*` /
-// `print_plan_reports_verdict_plan_not_pass` / `docs_state_the_exit_contract_*`
-// test below (#1092): each was re-run, unmodified, against the
-// pre-#1092 `scripts/platform-conformance.sh` and `docs/PLATFORM_CONFORMANCE.md`
-// (`git show <parent-of-9460a09>:scripts/platform-conformance.sh` -- the
-// commit immediately before #1092's exit-contract/summary/lane-map work
-// landed, i.e. unfixed `develop` for this change) and observed to fail:
-// `--summary` was an unrecognized flag on that revision (no `--summary`
-// support, no `--print-plan` verdict/mode fields, no `skipped-capable` /
-// `not-in-scope` statuses, no JSON schema, no lane-to-machine map in the
-// docs), so `run_with_summary()` never found a summary file to parse and
-// `summary_line()` never found a `PLATFORM_CONFORMANCE_SUMMARY` line with
-// the new fields. Result: 8 of the 9 tests failed outright (`cargo test
-// --no-default-features --test platform_conformance -- <these test names>`
-// reported "FAILED. 1 passed; 8 failed"); the 9th,
-// `unwritable_summary_path_is_exit_2_before_any_lane_runs`, initially
-// passed for the *wrong* reason (an unrecognized `--summary` flag also
-// exits 2 on the old script, coincidentally), so its assertion was
-// strengthened to also require the specific "not writable" wording the new
-// validation emits -- re-verified RED against the same pre-#1092 revision
-// (now correctly failing, since the old script only ever says "unknown
-// argument") before being restored to green against this branch's script.
+// ── Release-gate contract ───────────────────────────────────────────
+// Everything below validates what a release step consumes: exit code,
+// summary line, and JSON file. The stub mechanism makes tests runnable
+// deterministically on any host without gtk4, cargo-xwin, or Darwin.
 
 /// Exit codes the script documents in its header and in
 /// `docs/PLATFORM_CONFORMANCE.md`. Anything but `PASS` means "do not roll".
@@ -486,7 +441,7 @@ fn exit_contract_all_green_run_is_exit_0_and_verdict_pass() {
     assert_eq!(lane_status(&summary, "tui"), "passed");
     assert_eq!(lane_status(&summary, "gtk"), "passed");
     assert_eq!(lane_status(&summary, "macos"), "passed");
-    // check-only is green but explicitly NOT "passed" -- see #926.
+    // win is check-only, not passed: see the zero-test guard above.
     assert_eq!(lane_status(&summary, "win"), "check-only");
     assert_eq!(summary["totals"]["tests_passed"], 23);
 }
@@ -608,11 +563,9 @@ fn exit_contract_capable_but_skipped_lane_is_exit_3_coverage_gap() {
     );
 }
 
-/// CONTRACT, zero-test lane: the #645 vacuous-green trap reported through
-/// the machine-readable surface a release step reads, not just the human
-/// matrix. `tests_passed: 0` with a green exit would be exactly the bug the
-/// script exists to prevent, so this pins exit 1 + `failed` + a detail that
-/// names the guard.
+/// CONTRACT, zero-test lane: a lane that reports zero tests executed must
+/// exit 1 with `failed` status and a guard name, not silently pass. This pins
+/// the vacuous-green trap as a machine-readable exit condition.
 #[test]
 fn exit_contract_zero_test_lane_is_exit_1_in_the_summary_too() {
     let (stdout, stderr, code, summary) = run_with_summary(
@@ -797,12 +750,12 @@ fn docs_state_the_exit_contract_and_the_lane_to_machine_map() {
         "--summary",
         "PLATFORM_CONFORMANCE_SUMMARY",
         "vimcode.platform-conformance/1",
-        // lane → machine map (#1092 scope item 3)
+        // lane → machine map
+        // what the release side calls
         "## Lane-to-machine map",
         "dellserver",
         "macmini",
         "dell64",
-        // what the release side calls (#1092 scope item 4)
         "## What the release side calls",
     ] {
         assert!(

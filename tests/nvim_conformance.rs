@@ -17,10 +17,10 @@
 //! — spliced into the oracle's Lua by `run_in_neovim` and mapped onto
 //! `Settings` by `apply_setup` for `run_in_vimcode` — so naming an option
 //! `apply_setup` has no mapping for fails loudly rather than quietly running
-//! vimcode at its defaults (#1002).  The arrays are per-area purely for
+//! vimcode at its defaults.  The arrays are per-area purely for
 //! editability; the runner flattens them.
 //!
-//! ## `KNOWN_DEVIATIONS` (#799)
+//! ## `KNOWN_DEVIATIONS`
 //!
 //! VimCode does not yet match Neovim on every case, so the suite ships a list of
 //! labels that are *currently* expected to differ.  The gate is **bidirectional**:
@@ -44,7 +44,7 @@
 //! literals) instead of asserting.  Never regenerate to paper over a regression:
 //! the point of the list is that it does not grow.
 //!
-//! ## The oracle transport: an attached-UI RPC session (#1008)
+//! ## The oracle transport: an attached-UI RPC session
 //!
 //! The oracle is `nvim --headless --embed` driven over msgpack-RPC with a UI
 //! attached (`nvim_ui_attach`, 80x24 — see [`NvimRpc`]), and the case's keys
@@ -58,7 +58,7 @@
 //! inside `exec_normal()`, which never returns to the main loop where that
 //! re-validation lives. Window-relative reads after a scroll therefore
 //! answered against stale state, which is why the `scroll:` group carried a
-//! long list of excuses for three issues (#805, #875, #867). Swapping the
+//! long list of excuses for three issues. Swapping the
 //! transport deleted all of them; what it also did, less comfortably, is show
 //! that the last surviving excuse ("scroll:2<C-b>") had been covering a real
 //! vimcode bug — see `HARNESS_LIMITED`.
@@ -74,7 +74,7 @@
 //! | `'inccommand'` | a live `:s` preview, typed a character at a time, runs real substitutions that clobber the flags `:s/a/c/&` then asks for |
 //! | swap files (`-n`) | every case modifies the unnamed buffer, and a few hundred concurrent swap files exhaust the suffix space; `E326` under an attached UI is a `hit-enter` prompt that blocks every deferred API call |
 //!
-//! ## `HARNESS_LIMITED` (#875)
+//! ## `HARNESS_LIMITED`
 //!
 //! A separate, smaller list next to `KNOWN_DEVIATIONS` for cases this *test*
 //! cannot faithfully probe — a harness gap or a broken oracle, not a vimcode
@@ -113,7 +113,7 @@
 //! exists**, so none of the 23 ids retire via a populated list.
 //!
 //! What *is* real, reachable, comparable Neovim behaviour — the same
-//! precedent `ex:cc on empty quickfix list` (#1154) already set — is every
+//! precedent `ex:cc on empty quickfix list` already set — is every
 //! one of these commands' empty-list (global) or absent-location-list
 //! (per-window) refusal/no-op path. 19 of the 23 ids retire via a plain
 //! buffer/cursor `Case` exercising that path (`CASES_EX`'s "#1283" block);
@@ -139,7 +139,7 @@
 //! | `engine.ensure_cursor_visible()` after placing the start cursor | `nvim_win_set_cursor` scrolls the window; a raw engine cursor write does not (12 spurious scroll failures) |
 //! | pump `macro_playback_queue` after every key | the UI normally pumps it, so the harness must too, or `@a` never executes on the VimCode side |
 //!
-//! ## Requires `nvim` >= 0.12 on PATH — failing is the default (#865)
+//! ## Requires `nvim` >= 0.12 on PATH — failing is the default
 //!
 //! A missing oracle is **not** a pass: it is 1,436 cases that did not run.  The
 //! runner therefore *fails* on every lane — CI, a coordinator Test leg, a
@@ -151,65 +151,38 @@
 //! NVIM_CONFORMANCE_ALLOW_SKIP=1 cargo test
 //! ```
 //!
-//! This replaced a `CI`-env-var-only guard (#795).  That guard was right about
-//! the danger and wrong about the lane: `CI` is set by GitHub Actions but **not**
-//! by the coordinator's Test stage, so on a fleet Test leg a host with no `nvim`
-//! on its service-unit PATH was indistinguishable from 1,436 passing cases —
-//! measured across three agent hosts, one of which could not see its own
-//! Homebrew `nvim` at all.  Before #795, CI never installed nvim, so this suite's
-//! "SKIP" was reported as `ok` on every PR — a regression in `d}`, `ciw`, `da"`,
-//! etc. would have sailed through with a green check.  Do not reintroduce an
-//! implicit skip, and do not remove the CI install steps
-//! (`.github/workflows/ci.yml`, both jobs).
+//! This guard was right about the danger and wrong about the lane: `CI` is set by
+//! GitHub Actions but **not** by the coordinator's Test stage, so on a fleet Test
+//! leg a host with no `nvim` on its service-unit PATH was indistinguishable from
+//! 1,436 passing cases. Before CI installed nvim, this suite's "SKIP" was
+//! reported as `ok` on every PR — a regression in `d}`, `ciw`, `da"`, etc. would
+//! have sailed through with a green check. The version floor exists for the same
+//! reason the `cs(..)` Lua `setup` hook does: Neovim's own option defaults and
+//! behaviour move between releases, so a verdict from 0.9.x is not comparable
+//! with one from 0.12.x. The fleet standard — every agent host and both CI jobs
+//! — is upstream stable **v0.12.5**, which CI installs from a pinned release
+//! tarball rather than apt (`ubuntu-24.04` apt ships 0.9.5, below the floor).
+//! Every run prints the resolved binary path and its version, so "which nvim
+//! produced this verdict" is answerable from a log.
 //!
-//! The version floor exists for the same reason the `cs(..)` Lua `setup` hook
-//! does: Neovim's own option defaults and behaviour move between
-//! releases, so a verdict from 0.9.x is not comparable with one from 0.12.x.  The
-//! fleet standard — every agent host and both CI jobs — is upstream stable
-//! **v0.12.5**, which CI installs from a pinned release tarball rather than apt
-//! (`ubuntu-24.04` apt ships 0.9.5, below the floor).  Every run prints the
-//! resolved binary path and its version, so "which nvim produced this verdict" is
-//! answerable from a log.
-//!
-//! ## Oracle version skew (#868, #865, #872)
+//! ## Oracle version skew
 //!
 //! `KNOWN_DEVIATIONS` was captured against Neovim [`DEVIATIONS_ORACLE`], which
-//! sits next to the list itself precisely because the two are one fact.  A
+//! sits next to the list itself precisely because the two are one fact. A
 //! markedly different Neovim can legitimately disagree on a handful of labels;
 //! that is oracle-version skew, not a regression, and is **not** a reason to
-//! edit the list.
-//!
-//! That policy used to be advice the runner then contradicted: the "a listed
-//! label now passes" direction panicked unconditionally, so a dev on a newer
-//! Neovim was *forced* to delete entries that CI would immediately re-report as
-//! regressions.  Concretely, going from the 0.9.x baseline to 0.12 thirty-seven
-//! entries "pass" — all but one of them a `scroll:` label excused by the
-//! headless-topline bug documented in Group A below, which upstream has since
-//! fixed.  Measured with the same 60-line/22-row probe as that comment:
-//!
+//! edit the list. The runner applies the documented policy itself: the *fixed*
 //! ```text
 //!     keys    0.9.x headless w0    0.12 headless w0    interactive w0
 //!     22j            23 (== cursor)              2                  2
 //!     G              60 (== cursor)             39                 39
 //!     50%            30 (== cursor)              9                  9
 //! ```
-//!
-//! So the runner applies the documented policy itself: the *fixed* direction is
-//! enforcing when the running Neovim's major.minor matches [`DEVIATIONS_ORACLE`]
-//! (or cannot be determined at all — failing closed), and is otherwise
-//! downgraded to a printed advisory (see [`fixes_are_enforced`]).  The
+//! direction is enforcing when the running Neovim's major.minor matches
+//! [`DEVIATIONS_ORACLE`] (or cannot be determined at all — failing closed), and
+//! is otherwise downgraded to a printed advisory (see [`fixes_are_enforced`]).  The
 //! **regression** direction and the stale-entry check stay fatal everywhere —
 //! they are the ones that catch real bugs.
-//!
-//! #865 raised the floor to 0.12 and moved CI onto the pinned fleet oracle,
-//! which left a gap: no lane ran [`DEVIATIONS_ORACLE`] (still 0.9 at that
-//! point), so the fixed direction was advisory everywhere.  #867 then deleted
-//! the 37 entries measured to pass under 0.12.5 (114 -> 77), and #872 closed
-//! the remaining gap: regenerating the 77-entry list against 0.12.5 changed
-//! nothing — same 77 labels, byte-for-byte, confirming #867's manual deletion
-//! had already found everything 0.12 fixed — and bumped [`DEVIATIONS_ORACLE`]
-//! to `(0, 12)` in that same commit.  The fixed direction is enforcing again on
-//! every standard host and both CI jobs.
 
 mod common;
 
@@ -230,12 +203,12 @@ struct NvimResult {
     line: usize,
     col: usize,
     rows: usize,
-    /// `nvim_win_get_width(0)`, mirrored the same way as `rows` (#1280): the
+    /// `nvim_win_get_width(0)`, mirrored the same way as `rows`: the
     /// six horizontal-scroll rows (`zh`/`zl`/`zH`/`zL`/`ze`/`zs`) are
     /// meaningless if the two sides disagree on window *width*, same
     /// reasoning as the height mirror below.
     cols: usize,
-    /// `line('w0')` sampled after **every** key (#1008), never deserialized —
+    /// `line('w0')` sampled after **every** key, never deserialized —
     /// [`run_in_neovim`] fills it in as it feeds the sequence. It is the
     /// evidence that the redraw between keystrokes actually happened, and it
     /// is printed on a failure so "which keystroke moved the window wrongly"
@@ -255,7 +228,7 @@ fn probe_id() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The oracle transport (#1008): `nvim --embed` over msgpack-RPC, UI attached.
+// The oracle transport: `nvim --embed` over msgpack-RPC, UI attached.
 //
 // This replaced `nvim --headless -l script.lua`. See the module docs for the
 // measurements; the short version is that `-l` attaches no UI, so no redraw
@@ -328,7 +301,6 @@ const MESSAGE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// ```text
 /// [kind, content, replace_last, history, append, id, trigger]
 /// ```
-///
 /// `content` is an array of `[attr_id, text, hl_id]` triples — one per
 /// *highlight run*, not one per line, so a multi-line listing's own `\n`s are
 /// already inside the triples' text (`:digraphs` arrives as ~2,700 triples).
@@ -346,8 +318,7 @@ const MESSAGE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// "this is a new message". Whether that split happens is a function of how
 /// busy the machine is, so the biggest message in the suite — the
 /// ~19KB `:digraphs` table — passes on an idle box and reports a *truncated*
-/// table under load, which reads as a digraph-table conformance deviation
-/// that no amount of staring at `src/core/digraphs.rs` can explain.
+/// table under load.
 ///
 /// `replace_last = true` ("replace the most recent `msg_show`") and the
 /// default `append = false` both mean "start over", which is precisely
@@ -405,17 +376,11 @@ struct NvimRpc {
     topline: i64,
     /// The text of the most recent `msg_show` UI event, cleared on
     /// `msg_clear` — only populated when [`NvimRpc::spawn`] requested the
-    /// `ext_messages` capability (#1282, [`oracle_probe_message`]).
+    /// `ext_messages` capability.
     ///
-    /// See [`fold_msg_show`] for the wire shape and for why a new event
-    /// usually *replaces* this text but an `append`-flagged one must extend
-    /// it. Concatenating every content triple's text in order mirrors
+    /// Concatenating every content triple's text in order mirrors
     /// `engine.message`'s own "last write wins, no highlight spans" model on
-    /// the vimcode side exactly — confirmed against a live
-    /// `nvim --headless -u NONE -i NONE` for `ga`, `g8`, `<C-g>`, `:ls`,
-    /// `:marks`, `:number`, `:reg` and more (see the git history of this
-    /// comment for the raw msgpack dumps that were read to confirm the
-    /// shape).
+    /// the vimcode side exactly.
     last_message: String,
     /// How long [`NvimRpc::type_key`]'s post-keystroke barrier waits.
     /// [`RPC_KEY_BARRIER`] for every real probe; a field rather than a
@@ -441,13 +406,13 @@ impl NvimRpc {
     /// handled by [`NvimRpc::wait_until_ready`].
     ///
     /// `capture_messages` requests the `ext_messages` UI capability on top of
-    /// the `ext_linegrid` every case already needs (#1282). Opt-in, not
+    /// the `ext_linegrid` every case already needs. Opt-in, not
     /// unconditional: none of the buffer/cursor-comparing cases read
     /// `last_message`, so there is no reason to widen what every one of
     /// those 1,400+ spawns has to negotiate and this harness has to decode.
     ///
     /// `cwd`, when given, becomes the spawned process's working directory
-    /// (#1328): the window-layout harness (`run_win_in_neovim`) opens real
+    ///: the window-layout harness (`run_win_in_neovim`) opens real
     /// files by path and needs relative-path resolution (`fnameescape`,
     /// swap-file naming were it not for `-n`) to agree with vimcode's own
     /// `Engine::cwd` for that probe. The buffer/cursor harnesses never open a
@@ -561,7 +526,7 @@ impl NvimRpc {
                 }
             }
             // `msg_show`/`msg_clear` only ever arrive when `spawn` requested
-            // the `ext_messages` capability (#1282) — see `last_message`'s
+            // the `ext_messages` capability — see `last_message`'s
             // own doc comment for the wire shape and why this concatenation
             // is right.
             match parts.first().and_then(Value::as_str) {
@@ -798,23 +763,15 @@ impl NvimRpc {
     /// that every `msg_show` it emits has been folded into `last_message`
     /// before a caller reads it.
     ///
-    /// This is the fix for the intermittent `:digraphs` truncation [#1695's
-    /// test stage] hit, and it is a *different* bug from the `append`-flag one
-    /// [`fold_msg_show`] documents — that one dropped chunks that had already
-    /// arrived; this one read `last_message` before they arrived at all.
-    ///
-    /// [`type_key`](NvimRpc::type_key)'s barrier cannot stand in for this, by
-    /// design: it is bounded at [`RPC_KEY_BARRIER`] and *timing out is a
-    /// legitimate answer* there ("nvim is part-way through a command"), which
-    /// is precisely the state a key that starts a long listing leaves nvim in.
-    /// So for the suite's biggest message — the ~19KB `:digraphs` table, whose
-    /// formatting plus ~2,700-triple `msg_show` batch can exceed 50ms of
-    /// *wall clock* on a loaded box even though it is microseconds of CPU —
-    /// the last key's barrier expires mid-command, the probe reads a
-    /// half-arrived table, and the case reports as a digraph-table conformance
-    /// deviation. Green on an idle machine, red under a parallel run: the
-    /// worst possible failure mode, and one no amount of reading
-    /// `src/core/digraphs.rs` explains.
+    /// This fixes the intermittent `:digraphs` truncation where the message
+    /// is read before all chunks have arrived. [`type_key`](NvimRpc::type_key)'s
+    /// barrier cannot stand in for this, by design: it is bounded at
+    /// [`RPC_KEY_BARRIER`] and *timing out is a legitimate answer* there
+    /// ("nvim is part-way through a command"), which is precisely the state a
+    /// key that starts a long listing leaves nvim in. So for the suite's biggest
+    /// message — the ~19KB `:digraphs` table — the last key's barrier expires
+    /// mid-command and the probe reads a half-arrived table unless this method
+    /// waits for completion.
     ///
     /// Why one deferred request is enough, with no "has it stopped growing?"
     /// polling: `nvim_eval` is served only from a safe point, i.e. after the
@@ -866,7 +823,7 @@ fn oracle_probe(
     // never saw them because `nvim_feedkeys(.., "ntx")` carries `n`, "do not
     // remap"; real typing through `nvim_input` does. Clearing them keeps this
     // a Vim-conformance suite rather than a Neovim-defaults one, and keeps
-    // every case meaning what it meant when it was captured (#1008).
+    // every case meaning what it meant when it was captured.
     lua.push_str("vim.cmd('mapclear')\nvim.cmd('mapclear!')\n");
     // `'inccommand'` defaults to "nosplit", i.e. Neovim live-previews a `:s`
     // *as it is typed*. Harmless when the command arrives as one feedkeys
@@ -874,13 +831,13 @@ fn oracle_probe(
     // attached UI, where the preview runs a real substitution that clobbers
     // the remembered flags `:s/a/c/&` then asks for. Off, like the `-l` oracle
     // effectively had it — vimcode has no live preview to compare against
-    // either (#1008).
+    // either.
     lua.push_str("vim.o.inccommand = ''\n");
     lua.push_str("vim.o.compatible = false\n");
     lua.push_str("vim.o.shiftwidth = 4\n");
     lua.push_str("vim.o.expandtab = true\n");
     lua.push_str("vim.o.tabstop = 4\n");
-    // #1280: explicit even though it's already Neovim's default, mirroring
+    // Explicit even though it's already Neovim's default, mirroring
     // `run_in_vimcode`'s matching `engine.settings.wrap = true` below — both
     // sides need to agree on it going in, since vimcode's own *default*
     // (`Settings::default()`) is `wrap: false`, the opposite of Neovim's.
@@ -919,7 +876,7 @@ fn oracle_probe(
         vec![Value::from(lua.as_str()), Value::Array(Vec::new())],
     )?;
 
-    // One key at a time, each waiting for the redraw it caused (#1008). A
+    // One key at a time, each waiting for the redraw it caused. A
     // single `nvim_feedkeys` burst — even under an attached UI — reproduces
     // the very bug this transport exists to fix: the whole sequence executes
     // inside `exec_normal`, which never returns to the main loop, so no redraw
@@ -968,7 +925,7 @@ fn run_in_neovim(
 }
 
 // ---------------------------------------------------------------------------
-// Echo-area / message-list probe (#1282) — a second shape the buffer+cursor
+// Echo-area / message-list probe — a second shape the buffer+cursor
 // harness above structurally cannot see: `:reg`, `:marks`, `ga`, `<C-g>` and
 // the rest of `CASES_MESSAGE` below leave the buffer and cursor untouched, so
 // the only observable is whatever landed in the echo area. `oracle_probe`
@@ -1135,8 +1092,7 @@ enum KeyToken {
 /// [`parse_keys`] maps these onto vimcode key names for the engine side, and
 /// [`nvim_key_tokens`] renders them straight back out for the oracle side, so
 /// the two sides cannot disagree about where one keystroke ends and the next
-/// begins. That matters much more since #1008 than it did before — the oracle
-/// now feeds keys **individually**, so a tokenizer split that differs from
+/// begins. Since typing keys individually, a tokenizer split that differs from
 /// vimcode's would silently compare two different key sequences.
 fn tokenize_keys(keys: &str) -> Vec<KeyToken> {
     let mut tokens = Vec::new();
@@ -1182,10 +1138,9 @@ fn nvim_key_tokens(keys: &str) -> Vec<String> {
 
 /// Tokenize a key sequence (`<Esc>`, `<CR>`, `<C-x>`, named keys, and literal
 /// characters) into discrete units, without sending them anywhere. Shared by
-/// `send_keys` (single-buffer harness) and `send_keys_multi` (#985 multi-file
+/// `send_keys` (single-buffer harness) and `send_keys_multi` (multi-file
 /// harness) so the two harnesses can never drift on what a given `keys`
-/// string means — extracted from the pre-#985 `send_keys` body verbatim, and
-/// since #1008 sharing its scanner with the oracle via [`tokenize_keys`].
+/// string means, and sharing its scanner with the oracle via [`tokenize_keys`].
 fn parse_keys(keys: &str) -> Vec<KeyUnit> {
     tokenize_keys(keys)
         .into_iter()
@@ -1244,12 +1199,10 @@ fn parse_lua_bool(name: &str, value: &str) -> Result<bool, String> {
 }
 
 /// Apply a conformance case's Lua `setup` snippet to vimcode's [`Settings`]
-/// (#1002).
 ///
-/// Before #1002 `run_in_vimcode` took no `setup` at all, so every `cs(..)` case
+/// Before this, `run_in_vimcode` took no `setup` at all, so every `cs(..)` case
 /// drove a *configured* Neovim against a *default* vimcode — not a Vim-compat
-/// comparison but a comparison of two differently-configured editors. That one
-/// gap accounted for nine excused labels.
+/// comparison but a comparison of two differently-configured editors.
 ///
 /// **No Lua interpreter is involved, and none must be introduced.** The corpus
 /// uses exactly one narrow statement form — `vim.o.<name>=<value>`, one per
@@ -1257,17 +1210,17 @@ fn parse_lua_bool(name: &str, value: &str) -> Result<bool, String> {
 /// `Settings` field.
 ///
 /// Anything unrecognised or unparseable is an `Err`, never a silent fallback to
-/// defaults: that silent fallback *is* the bug #1002 fixed, and re-introducing
-/// it in the error path would hide the next instance. Adding a `cs(..)` case
-/// that names an option not handled here is therefore a loud failure telling
-/// you to extend this function.
+/// defaults: that silent fallback *is* the bug this function fixes, and
+/// re-introducing it in the error path would hide the next instance. Adding a
+/// `cs(..)` case that names an option not handled here is therefore a loud
+/// failure telling you to extend this function.
 fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
     for raw in setup.lines() {
         let stmt = raw.trim();
         if stmt.is_empty() {
             continue;
         }
-        // #1151: the `:map` family's oracle cases need two statement shapes
+        // The `:map` family's oracle cases need two statement shapes
         // `vim.o.<name>=<value>` can't express — a mapping definition, and
         // (for `<leader>` cases) the leader itself. Both are real Lua Neovim
         // needs no help with; only vimcode's side needs a translator, since
@@ -1344,7 +1297,6 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
                     format!("'foldlevel' expects a non-negative integer, got {raw_value:?}")
                 })?;
             }
-            // #1159
             "foldmarker" | "fmr" => {
                 settings.foldmarker = value.to_string();
             }
@@ -1353,7 +1305,6 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
                     format!("'foldnestmax' expects a positive integer, got {raw_value:?}")
                 })?;
             }
-            // #1153
             "wrapscan" | "ws" => settings.wrapscan = parse_lua_bool(name, value)?,
             "shiftround" | "sr" => settings.shiftround = parse_lua_bool(name, value)?,
             "gdefault" | "gd" => settings.gdefault = parse_lua_bool(name, value)?,
@@ -1365,18 +1316,14 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
             "virtualedit" | "ve" => {
                 settings.virtualedit = value.to_string();
             }
-            // #1191
             "iskeyword" | "isk" => {
                 settings.iskeyword = value.to_string();
             }
-            // #1190
             "hidden" | "hid" => settings.hidden = parse_lua_bool(name, value)?,
-            // #1207
             "magic" => settings.magic = parse_lua_bool(name, value)?,
             "smartindent" | "si" => settings.smartindent = parse_lua_bool(name, value)?,
             "cindent" | "cin" => settings.cindent = parse_lua_bool(name, value)?,
             "showmatch" | "sm" => settings.showmatch = parse_lua_bool(name, value)?,
-            // #1206
             "whichwrap" | "ww" => settings.whichwrap = value.to_string(),
             "backspace" | "bs" => settings.backspace = value.to_string(),
             "scrolljump" | "sj" => {
@@ -1389,7 +1336,7 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
                     format!("'sidescrolloff' expects a non-negative integer, got {raw_value:?}")
                 })?;
             }
-            // #1280: the six horizontal-scroll z-commands only do anything
+            // The six horizontal-scroll z-commands only do anything
             // with 'wrap' off — with it on they're documented no-ops (the
             // line soft-wraps to another screen row instead of scrolling).
             "wrap" | "wr" => settings.wrap = parse_lua_bool(name, value)?,
@@ -1405,7 +1352,7 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
 }
 
 /// Parse and apply one `vim.keymap.set('mode', 'lhs', 'rhs' [, {remap = true}])`
-/// setup statement onto vimcode's [`Settings::keymaps`] (#1151).
+/// setup statement onto vimcode's [`Settings::keymaps`].
 ///
 /// Real Neovim's `vim.keymap.set` defaults to **non-recursive** — `opts.remap`
 /// defaults to `false`, the opposite of legacy `:map`'s default — so a call
@@ -1415,12 +1362,10 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
 /// form compare vimcode's `noremap` against Neovim's `map`, silently.
 /// Scan a Lua options-table fragment (e.g. `{ remap = true }` or
 /// `{ noremap = true, silent = true }`) for an exact `key = true` /
-/// `key=true` assignment. A raw substring test (`inner.contains("remap =
-/// true")`) also matches inside `noremap = true` — `"noremap = true"[2..]`
-/// is literally `"remap = true"` — which would flip `remap` on for the
-/// opposite, and historically real, `nvim_set_keymap` option name (#1151
-/// review). Scanning comma-separated key=value segments and matching `key`
-/// as a whole token (not a substring) avoids that.
+/// `key=true` assignment. A raw substring test would also match inside
+/// `noremap = true`, which would flip `remap` on for the opposite option name.
+/// Scanning comma-separated key=value segments and matching `key` as a whole
+/// token (not a substring) avoids that.
 fn has_true_opt(inner: &str, key: &str) -> bool {
     inner.split(',').any(|part| {
         let part = part
@@ -1478,7 +1423,7 @@ fn run_in_vimcode(
     engine.settings.shift_width = 4;
     engine.settings.expand_tab = true;
     engine.settings.tabstop = 4;
-    // #1280: vimcode's own default (`Settings::default()`) is `wrap: false`
+    // Vimcode's own default (`Settings::default()`) is `wrap: false`
     // — Neovim's is on — so this has to be forced the same way the three
     // options above are, or every screen-line-relative case silently
     // compares a wrapped oracle against an unwrapped vimcode. See the
@@ -1490,24 +1435,20 @@ fn run_in_vimcode(
     if let Err(why) = apply_setup(&mut engine.settings, setup) {
         panic!("conformance case {label:?}: bad `setup` — {why}");
     }
-    // `apply_setup` may have pushed onto `settings.keymaps` (a `vim.g.mapleader`
-    // or `vim.keymap.set` statement, #1151) or changed `settings.leader`, and
-    // `engine_with` only rebuilt `user_keymaps` from *its* defaults before any
-    // of that ran — cheap regardless, since most cases have neither.
+    // `apply_setup` may have pushed onto `settings.keymaps` or changed
+    // `settings.leader`, and `engine_with` only rebuilt `user_keymaps` from
+    // its defaults before any of that ran.
     engine.rebuild_user_keymaps();
     // Screen-relative motions (H/M/L, <C-d>, zt) are meaningless unless both
     // sides agree on the window height, so mirror nvim's.
     engine.set_viewport_lines(rows);
-    // Same reasoning, horizontally (#1280): zh/zl/zH/zL/ze/zs are meaningless
+    // Same reasoning, horizontally: zh/zl/zH/zL/ze/zs are meaningless
     // if the two sides disagree on window width.
     engine.set_viewport_cols(cols);
     // Neovim computes the whole 'foldmethod'=indent/marker fold hierarchy
-    // (down to 'foldlevel') as soon as the buffer is loaded, with no
-    // explicit `zf` — mirror that here rather than leaving it for the key
-    // sequence to trigger, since a case may probe fold state without ever
-    // pressing a z-command (e.g. plain `j`/`G` motions across an
-    // already-closed fold). #1159 extended this from "indent" to also cover
-    // "marker".
+    // as soon as the buffer is loaded, with no explicit `zf` — mirror that
+    // here rather than leaving it for the key sequence to trigger, since a
+    // case may probe fold state without ever pressing a z-command.
     if matches!(engine.settings.foldmethod.as_str(), "indent" | "marker") {
         engine.apply_foldlevel(engine.settings.foldlevel);
     }
@@ -1523,7 +1464,7 @@ fn run_in_vimcode(
     (buf, line, col)
 }
 
-/// [`run_in_vimcode`]'s sibling for the message probe (#1282): same fixture
+/// [`run_in_vimcode`]'s sibling for the message probe: same fixture
 /// preamble, but reads back `engine.message` instead of buffer/cursor. The
 /// window dims are the fixed 80x22 every other case reads dynamically off
 /// the oracle ([`UI_WIDTH`]/[`UI_HEIGHT`], minus the status+cmd lines) —
@@ -1683,8 +1624,7 @@ fn run_message_case(case: &MessageCase) -> Outcome {
 /// only to stop the handful of *listing* commands from burying their own
 /// verdict. `:digraphs` alone normalizes to ~19KB, and reporting a
 /// single-line difference in it as four `{:?}`-escaped 19KB blobs on one
-/// line — which is what this function replaced — is why #1635's test stage
-/// could report "the digraph-table check failed" and nothing more.
+/// line was why the report was unreadable.
 const MESSAGE_DIFF_INLINE_LIMIT: usize = 400;
 
 /// Human-readable account of *how* two message probes disagree.
@@ -1754,14 +1694,10 @@ fn describe_message_diff(nvim_msg: &str, vc_msg: &str, nvim_norm: &str, vc_norm:
 }
 
 // ---------------------------------------------------------------------------
-// Message-probe transport self-tests (#1635). These assert on the two pieces
+// Message-probe transport self-tests. These assert on the two pieces
 // of the echo-area probe that sit *between* the two editors and so cannot be
 // checked by any conformance case: how a `msg_show` notification is folded
-// into the captured message, and what a mismatch actually reports. A bug in
-// either is indistinguishable, from the outside, from a real Vim-compat
-// deviation in `src/core/` — which is exactly the trap #1635's test stage
-// fell into when a split `:digraphs` message read as a digraph-table
-// deviation.
+// into the captured message, and what a mismatch actually reports.
 // ---------------------------------------------------------------------------
 
 /// Build a `msg_show` notification frame's event part: `["msg_show", [args…]]`
@@ -1783,14 +1719,10 @@ fn msg_show_event(text: &str, replace_last: bool, append: bool) -> Vec<Value> {
     ]
 }
 
-/// The bug behind #1635's reported "digraph-table conformance check" failure:
 /// Neovim splits a long enough message across several `msg_show` calls, every
 /// one after the first flagged `append`, and a fold that treats each call as
 /// a fresh message keeps only the **last fragment** — a silently truncated
-/// oracle capture that reads as a formatting deviation.
-///
-/// Fails against the pre-fix fold (`self.last_message = text` unconditionally)
-/// with only `"CD 3    "` captured.
+/// oracle capture. This test verifies the fix.
 #[test]
 fn an_append_flagged_msg_show_continues_the_previous_message() {
     let mut last = String::new();
@@ -1852,24 +1784,11 @@ fn msg_show_missing_the_append_field_falls_back_to_replacing() {
     assert_eq!(last, "only");
 }
 
-/// The *other* half of the `:digraphs` truncation story, and the one
-/// [`fold_msg_show`]'s `append` fix did not cover: a chunk cannot be folded
-/// before it arrives, and nothing in the probe used to wait for it.
-///
-/// Driven against a real oracle with [`NvimRpc::key_barrier`] forced to
-/// `Duration::ZERO` — i.e. "`type_key`'s post-keystroke barrier always times
-/// out", which is a *deterministic* stand-in for what a loaded machine
-/// produces intermittently, and the exact state the `<CR>` that starts
-/// `:digraphs` leaves nvim in. Red against the unfixed probe: without
-/// [`NvimRpc::settle_message`] this captures an empty or part-formatted table
-/// (the pre-fix code read `last_message` straight after that timed-out
-/// barrier), which is reported as a digraph-table conformance deviation rather
-/// than as the transport fault it is.
-///
-/// Both probes are compared against each other rather than against a
-/// hardcoded table so that a future nvim's digraph list does not have to be
-/// re-captured here; the size floor is what stops two mutually-empty captures
-/// from passing.
+/// A chunk cannot be folded before it arrives, and the probe must wait for
+/// it. This test verifies that [`NvimRpc::settle_message`] successfully
+/// captures the whole `:digraphs` table even when the post-keystroke barrier
+/// times out (which is a deterministic stand-in for what a loaded machine
+/// produces intermittently).
 #[test]
 fn a_timed_out_key_barrier_still_captures_the_whole_digraphs_table() {
     let Some(()) = oracle_available_for_unit_test() else {
@@ -1916,9 +1835,7 @@ fn a_timed_out_key_barrier_still_captures_the_whole_digraphs_table() {
 }
 
 /// A mismatch on a listing-sized message must report a *bounded, readable*
-/// verdict. The pre-fix report was four `{:?}`-escaped copies of two ~19KB
-/// blobs on a single line, which is why #1635's test stage could say no more
-/// than "the digraph-table check failed".
+/// verdict rather than four `{:?}`-escaped copies of two ~19KB blobs.
 #[test]
 fn a_large_message_mismatch_reports_the_first_differing_line_not_two_blobs() {
     let nvim: String = (0..600)
@@ -1945,9 +1862,7 @@ fn a_large_message_mismatch_reports_the_first_differing_line_not_two_blobs() {
 }
 
 /// A truncated capture and a formatting deviation demand different follow-up,
-/// so the report must distinguish them by name — the missing signpost that
-/// sent #1635's test stage looking for a digraph-table bug that was not
-/// there.
+/// so the report must distinguish them by name.
 #[test]
 fn a_truncated_large_message_is_reported_as_truncation_not_deviation() {
     let full: String = (0..600)
@@ -1984,7 +1899,7 @@ fn a_small_message_mismatch_is_still_dumped_in_full() {
     );
 }
 
-// One real case per id from #1282's echo-area/message-list list. Each `keys`
+// One real case per id from the echo-area/message-list list. Each `keys`
 // literally contains the [`CommandProbe`] needle that id's `p(..)` entry in
 // `COMMAND_PROBES` matches on — that is what retires the id from
 // `COVERAGE_EXEMPT`, same convention `CASES_XFILE`/`CASES_WIN` use.
@@ -2064,12 +1979,8 @@ const CASES_MESSAGE: &[MessageCase] = &[
         1,
         "G<C-o>:jumps<CR>",
     ),
-    // ex::digraphs — `Keys(":digraphs")`. #1160 already implements the
-    // table (`src/core/digraphs.rs`); this is that table's own listing
-    // command, not a custom `{char1}{char2} {number}` definition — Neovim
-    // emits no message at all for the definition form (confirmed against a
-    // live oracle), which would make a case built on it vacuous per this
-    // repo's #1154 bar.
+    // ex::digraphs — `Keys(":digraphs")`. This is the digraph table's
+    // own listing command.
     mc(
         "msg:ex::digraphs lists the digraph table",
         &["hello"],
@@ -2156,7 +2067,7 @@ const CASES_MESSAGE: &[MessageCase] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// Multi-file harness (#985) — the single-buffer harness above compares only
+// Multi-file harness — the single-buffer harness above compares only
 // buffer text + cursor within *one* buffer, so it structurally cannot express
 // "which file is current". The reported bug this issue tracks is specifically
 // cross-buffer/cross-tab `<C-o>`/`<C-i>`, which needs real files on disk
@@ -2523,7 +2434,7 @@ fn run_multi_case(case: &MultiFileCase) -> Outcome {
 }
 
 // ---------------------------------------------------------------------------
-// On-disk probe (#1282) — a third multi-file shape. `:w`/`:write`/`:wa`/
+// On-disk probe — a third multi-file shape. `:w`/`:write`/`:wa`/
 // `:update`/`:saveas {file}`/`:read` leave the position harness above
 // nothing to compare (an already-open, already-correctly-positioned file
 // staying open is not what any of these commands are *for*) — the only
@@ -2538,8 +2449,7 @@ fn run_multi_case(case: &MultiFileCase) -> Outcome {
 
 /// Observed state after `keys` ran: the active buffer's own text, plus each
 /// fixture file's on-disk content in `case.files` order (`None` if the file
-/// no longer exists — none of `CASES_DISK` deletes one, but a real deviation
-/// that did should show up as a mismatch, not a panic).
+/// no longer exists).
 struct DiskObserved {
     buf: String,
     files: Vec<Option<String>>,
@@ -2761,12 +2671,9 @@ const CASES_DISK: &[MultiFileCase] = &[
     ),
     // ex::saveas {file} — `Keys(":saveas")`. Asserts both halves: the new
     // path gets the modified content, and the old path is left exactly as
-    // the fixture wrote it (`:saveas` renames the buffer, it does not also
-    // write the name being abandoned). Bang required: `new.txt` already
-    // exists (the fixture pre-seeds it so there's something to assert stays
-    // untouched only where the case's own edit *didn't* land), and Neovim's
-    // `:saveas` refuses an existing target without `!` — confirmed against a
-    // live `nvim --headless -u NONE` (`E13: File exists`).
+    // the fixture wrote it. Bang required: `new.txt` already exists (the
+    // fixture pre-seeds it) and Neovim's `:saveas` refuses an existing target
+    // without `!`.
     mfc(
         "disk:ex::saveas {file} writes to the new path, leaves the old one untouched",
         &[("orig.txt", &["hello"]), ("new.txt", &["placeholder"])],
@@ -2790,7 +2697,7 @@ const CASES_DISK: &[MultiFileCase] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// `:jumps` list-content harness (#985) — a second multi-file shape: instead
+// `:jumps` list-content harness — a second multi-file shape: instead
 // of "where did the cursor end up", this compares the jump list's *contents*
 // (count, ordering, which entry is current, and each entry's file) against
 // Neovim's `getjumplist()` oracle. Deliberately does not compare `col`: the
@@ -3058,13 +2965,13 @@ fn run_jumps_case(case: &MultiJumpsCase) -> Outcome {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-window / multi-tab layout harness (#1162) — generalises the
+// Multi-window / multi-tab layout harness — generalises the
 // single-buffer harness above (buffer text + one cursor) and the multi-file
 // harness above that (which file is current + one cursor) to a third
 // dimension neither can see: the *window tree* — split orientation, nesting,
 // which window is current, and each window's own (file, cursor). This is
 // what the 33 `CTRL-W` rows need and what `VIM_COMPATIBILITY.md` has never
-// had an oracle case for (`win:CTRL-W *`, 33 of 33 uncovered as of #1162).
+// had an oracle case for (`win:CTRL-W *`, 33 of 33 uncovered).
 //
 // ## Comparing trees, not raw geometry
 //
@@ -3077,8 +2984,7 @@ fn run_jumps_case(case: &MultiJumpsCase) -> Outcome {
 // children) and **flattens runs of same-direction nested splits into one
 // N-ary group** ([`flatten_vc`]) before comparing, because Neovim's own
 // frame tree does the same thing: three side-by-side `:vsplit`s come back as
-// one `"row"` with three children, not two nested binary pairs (verified
-// empirically against nvim 0.12.5 — see the PR this landed in). Comparing
+// one `"row"` with three children, not two nested binary pairs. Comparing
 // the flattened shapes means a case is not sensitive to *how* vimcode's
 // binary tree happens to nest a same-direction sequence of splits, only to
 // what a human (or Neovim) would actually see on screen.
@@ -3089,25 +2995,19 @@ fn run_jumps_case(case: &MultiJumpsCase) -> Outcome {
 // vimcode's own `WindowLayout::calculate_rects` against the same pinned
 // 80x24 screen), but the comparison only *looks* at them when
 // `check_size` is set — see the [`KNOWN_DEVIATIONS_WIN`] comment block below
-// for the real, distinct behavioural gaps this surfaced along the way (a
-// resize-unit mismatch, a partial vs full maximize, a rect-rounding
-// artifact, and a divider-thickness gap — all now fixed). Every size-checked
-// id, `CTRL-W +`/`-`/`<`/`>`/`_`/`\|`, genuinely passes — not vacuously: all
-// six land on the *same* rows/cols as Neovim on this harness's fixed 80x24
-// screen.
+// for the real, distinct behavioural gaps this surfaced along the way. Every
+// size-checked id, `CTRL-W +`/`-`/`<`/`>`/`_`/`\|`, genuinely passes — not
+// vacuously: all six land on the *same* rows/cols as Neovim on this harness's
+// fixed 80x24 screen.
 //
 // ## What's deliberately out of scope here
 //
 // `CTRL-W H`/`J`/`K`/`L`/`T`/`e`/`E`/`d` are not covered by any
 // [`CASES_WIN`] entry — see the "Deliberate semantic divergence" block in
-// [`COVERAGE_EXEMPT`] for why each is permanent, not debt. [`KNOWN_
-// DEVIATIONS_WIN`] is currently empty (every id it ever listed — `-`/`=`/
-// `r`/`R`/`p`/`<`/`>`/`\|` — got fixed and removed); were it to gain an
-// entry again, that entry would be a real, non-vacuous finding, not a
-// permanent divergence — the convention this file's comments have followed
-// throughout is that every entry names the fix it's waiting on. Cross-file/
+// [`COVERAGE_EXEMPT`] for why each is permanent. [`KNOWN_DEVIATIONS_WIN`] is
+// currently empty (every id it ever listed got fixed and removed). Cross-file/
 // cross-tab commands (`gf`, `gt`, `CTRL-^`, buffer/tab/window ex commands)
-// that could reuse this same harness are #1281, chained after this one.
+// that could reuse this same harness are #1281.
 // ---------------------------------------------------------------------------
 
 /// One scenario for the window-layout harness: `lines` is written to
@@ -3321,12 +3221,12 @@ local result = { tabs = tabs }\n\
 ";
 
 /// Drive the window-layout probe's oracle over the same attached-UI RPC
-/// transport [`oracle_probe`] uses (#1008), reporting *why* a spawn/RPC
+/// transport [`oracle_probe`] uses, reporting *why* a spawn/RPC
 /// failure happened rather than collapsing it to `None` — same contract as
 /// [`oracle_probe`], and for the same reason.
 ///
 /// This replaced `nvim --headless -l script.lua` + one `nvim_feedkeys` burst
-/// (#1328). That oracle attached no UI, so Neovim's own `:h cmdwin` — `q:`,
+///. That oracle attached no UI, so Neovim's own `:h cmdwin` — `q:`,
 /// `q/`, `q?` — silently refused to open (confirmed empirically: `winlayout()`
 /// and `nvim_list_wins()` came back completely unchanged) and every case
 /// exercising it compared vimcode against a harness gap, not against real
@@ -3346,10 +3246,9 @@ fn oracle_probe_win(
         .ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
     let mut lua = String::new();
     // Same interactive-behaviour opt-outs as `oracle_probe`'s fixture
-    // preamble (#1008's module doc table) — typing for real through an
-    // attached UI brings Neovim's default mappings and live `:s` preview with
-    // it, neither of which any `CASES_WIN`/`CASES_XFILE` case means to
-    // exercise.
+    // preamble: typing for real through an attached UI brings Neovim's
+    // default mappings and live `:s` preview with it, neither of which any
+    // `CASES_WIN`/`CASES_XFILE` case means to exercise.
     lua.push_str("vim.cmd('mapclear')\nvim.cmd('mapclear!')\n");
     lua.push_str("vim.o.inccommand = ''\n");
     lua.push_str("vim.o.compatible = false\n");
@@ -3357,7 +3256,7 @@ fn oracle_probe_win(
     // No explicit `vim.o.lines`/`vim.o.columns` here (unlike the `-l` oracle
     // this replaced): `NvimRpc::spawn`'s own `nvim_ui_attach(UI_WIDTH,
     // UI_HEIGHT, ..)` already pins the same 80x24 screen `CTRL-W` resize/
-    // maximize/equalize cases need agreement on (#1162).
+    // maximize/equalize cases need agreement on.
     let escaped_start = main_path
         .to_string_lossy()
         .replace('\\', "\\\\")
@@ -3621,18 +3520,13 @@ fn win_snapshot_from_vimcode(
             } else {
                 std::collections::HashMap::new()
             };
-            // #1281 finding: "current window" is a single, process-global
-            // notion in both Neovim (`nvim_get_current_win()`, which the
-            // oracle's own snapshot compares every leaf against — see
-            // `WIN_SNAPSHOT_LUA`) and vimcode (`Tab::active_window` is only
-            // meaningful *while that tab is the focused one* — switching
-            // tabs doesn't clear it, it's what a `gt`/`gT` back into that
-            // tab restores). Comparing every tab's `active_window` against
-            // itself — the bug this WindowId(usize::MAX) sentinel fixes —
-            // marked EVERY tab's own remembered window "current" instead of
-            // only the actually-focused tab's, so a background tab's window
-            // always disagreed with Neovim (which correctly reports `false`
-            // for every window outside the tab you're actually on).
+            // "current window" is a single, process-global notion in both
+            // Neovim (`nvim_get_current_win()`) and vimcode (`Tab::active_window`
+            // is only meaningful *while that tab is the focused one*). Comparing
+            // every tab's `active_window` against itself — the bug this
+            // WindowId(usize::MAX) sentinel fixes — marked EVERY tab's own
+            // remembered window "current" instead of only the actually-focused
+            // tab's, so a background tab's window always disagreed with Neovim.
             let current_win = if i == group.active_tab {
                 tab.active_window
             } else {
@@ -3660,22 +3554,10 @@ fn run_win_case(case: &WinCase) -> Outcome {
         extra: extra_paths.clone(),
     };
 
-    // #1281: `{F0}`/`{F1}`/... substitution (same mechanism `resolve_multi_
-    // keys` uses for CASES_MULTI_JUMP/CASES_MULTI_JUMPS_LIST), not a bare
-    // relative filename like `:e b.txt<CR>` — `Engine::cwd` is pure
-    // bookkeeping, unrelated to `Path::canonicalize`'s only notion of
-    // "current directory" (the *process's* CWD), so a relative filename
-    // typed into `:e`/`:split`/`:tabedit` would only resolve correctly by
-    // coincidence. An earlier version of this fix instead resolved relative
-    // ex-command paths against `Engine::cwd` inside the engine itself
-    // (`open_file_with_mode_impl` et al) — reverted: besides needing the
-    // process CWD to move too (a real hazard in a multithreaded test binary,
-    // see `src/test_cwd.rs`), it broke `test_lsp_flush_clears_diagnostics_
-    // by_canonical_path`'s deliberate #208 behaviour — a buffer's
-    // `file_path` keeps exactly the (possibly relative) string the user
-    // opened it with, not a resolved absolute one. Absolute paths in the
-    // corpus itself sidestep the question instead of relying on either
-    // side's CWD, and touch no engine code.
+    // `{F0}`/`{F1}`/... substitution (same mechanism `resolve_multi_keys` uses
+    // for CASES_MULTI_JUMP/CASES_MULTI_JUMPS_LIST), not a bare relative
+    // filename like `:e b.txt<CR>`. Absolute paths in the corpus itself
+    // sidestep the question instead of relying on CWD handling.
     let mut all_paths = vec![main_path.clone()];
     all_paths.extend(extra_paths.iter().cloned());
     let resolved_keys = resolve_multi_keys(case.keys, &all_paths);
@@ -3700,7 +3582,7 @@ fn run_win_case(case: &WinCase) -> Outcome {
         .open_file_with_mode(&main_path, OpenMode::Permanent)
         .expect("open main file for window-layout probe");
     engine.cwd = dir.clone();
-    // #1288: `resize_window_split` recovers a split's axis size from the
+    // `resize_window_split` recovers a split's axis size from the
     // active window's own currently-tracked content dims (see its doc) —
     // real backends keep that live via `set_viewport_for_window` every
     // repaint, but this harness never paints, so seed it once here exactly
@@ -3939,7 +3821,7 @@ const CASES_OP: &[Case] = &[
     // Cursor starts past the last non-blank, mid-trailing-whitespace (not
     // the line's very last column) — exercises the "swap the endpoints"
     // branch, where the post-delete cursor must land on the (swapped) low
-    // end, not on the pre-motion column (#1279).
+    // end, not on the pre-motion column.
     c("op:dg_ from trailing ws", &["  abc      "], 1, 6, "dg_"),
     c("op:dh at col1", &["abc", "def"], 2, 1, "dh"),
     c("op:dl at eol", &["abc"], 1, 3, "dl"),
@@ -4000,7 +3882,7 @@ const CASES_OP: &[Case] = &[
     c("op:ddp last line", &["a", "b", "c"], 3, 1, "ddp"),
     c("op:dd last line cursor", &["  a", "  b", "  c"], 3, 1, "dd"),
     c("op:dd only line", &["abc"], 1, 1, "dd"),
-    // #1796: every other `op:dd` case above starts at column 1, which can't
+    // Every other `op:dd` case above starts at column 1, which can't
     // distinguish "reset cursor to column 0" from "preserve column, clamped"
     // -- the degeneracy that produced the false bug report. This one starts
     // at column 3 so the two behaviours disagree; verified against real
@@ -4100,7 +3982,7 @@ const CASES_OP: &[Case] = &[
         1,
         ":set ts=4 noet<CR><<",
     ),
-    // #1153 'shiftround' — verified against `nvim --headless`.
+    // 'shiftround' — rounds indent to a multiple of 'shiftwidth'.
     c(
         "op:>> shiftround rounds up",
         &["     x"], // 5-space indent
@@ -4244,23 +4126,16 @@ const CASES_OP: &[Case] = &[
     // ─────────────── #1005: first UTF-8 multi-byte conformance slice ───────────────
     //
     // Every case above this point is pure ASCII. These `mb:`-labelled cases are
-    // the corpus's first multi-byte coverage (see issue #1005). They are
-    // deliberately chosen so the STARTING cursor column never falls after a
-    // multi-byte character on the same line: the `Case.cursor_col` field is
-    // fed to Neovim as a raw BYTE offset (`nvim_win_set_cursor`) and to
-    // VimCode as a raw CHAR offset (`engine.view_mut().cursor.col`) — see
-    // `run_in_neovim`/`run_in_vimcode` above — so any starting column with a
+    // the corpus's first multi-byte coverage. They are deliberately chosen so
+    // the STARTING cursor column never falls after a multi-byte character on
+    // the same line: the `Case.cursor_col` field is fed to Neovim as a raw BYTE
+    // offset (`nvim_win_set_cursor`) and to VimCode as a raw CHAR offset
+    // (`engine.view_mut().cursor.col`), so any starting column with a
     // multi-byte character before it lands the two engines on genuinely
     // different (or, on the Neovim side, invalid mid-byte) positions before a
     // single key is even pressed. Landing *on* a multi-byte character is
     // fine; only characters strictly *before* the start column must be
     // single-byte. The final asserted column is held to the same rule.
-    //
-    // `dl`/`2dl` on CJK below was additionally hand-verified against a live
-    // `nvim --headless -u NONE -i NONE` run (not just this suite's own
-    // harness) per the issue's request to confirm the oracle sees what the
-    // fixture intends, not two mis-encoded buffers that coincidentally
-    // compare equal.
     c("op:mb:x on latin-1 e-acute", &["café bar"], 1, 4, "x"),
     c("op:mb:rX on latin-1 e-acute", &["café"], 1, 4, "rX"),
     c("op:mb:~ on latin-1 e-acute", &["café"], 1, 4, "~"),
@@ -4301,8 +4176,8 @@ const CASES_OP: &[Case] = &[
     c("op:mb:dw over emoji word", &["😀 world"], 1, 1, "dw"),
     c("op:mb:x on astral-plane char", &["𝄞 note"], 1, 1, "x"),
     // Combining marks written as an escape (not literal UTF-8) plus a
-    // comment naming the codepoint, per #1005's fixture-encoding rule —
-    // a bare U+0301 in source is an invisible byte sequence otherwise.
+    // comment naming the codepoint — a bare U+0301 in source is an invisible
+    // byte sequence otherwise.
     c(
         "op:mb:x deletes combining-mark cluster",
         &["e\u{0301} world"], // "e" + U+0301 COMBINING ACUTE ACCENT
@@ -4518,7 +4393,7 @@ const CASES_UNDO: &[Case] = &[
         1,
         ":%normal Ax<CR>u",
     ),
-    // #1156: the issue's own gating scenario — `u` followed by a *different*
+    // The issue's own gating scenario — `u` followed by a *different*
     // edit must not permanently discard the branch `u` left; `g-` walks the
     // whole undo tree in chronological order and can still reach it. This is
     // real Vim/Neovim undo-tree behavior (`:h undo-tree`), not a vimcode
@@ -4532,7 +4407,7 @@ const CASES_UNDO: &[Case] = &[
         1,
         "ihello<Esc>uiworld<Esc>g-g-",
     ),
-    // #1280: `g+` is `g-`'s forward counterpart — same abandoned-branch
+    // `g+` is `g-`'s forward counterpart — same abandoned-branch
     // scenario, walked back to the oldest state with two `g-`, then forward
     // one step with `g+` to land on the intermediate ("helloa") state that
     // `u` had discarded.
@@ -4819,7 +4694,7 @@ const CASES_MARK: &[Case] = &[
         "Vj<Esc>gg'>",
     ),
     c("mark:`< after v", &["abc", "def"], 1, 2, "vjl<Esc>gg`<"),
-    // #1279: `mark:'<` is the substring `REGMARK_COVERAGE_EXEMPT`'s own `'<`
+    // `mark:'<` is the substring `REGMARK_COVERAGE_EXEMPT`'s own `'<`
     // row needs, so this one case retires `search:'<` and that row too.
     c(
         "mark:'< after v",
@@ -5069,8 +4944,8 @@ const CASES_SEARCH: &[Case] = &[
     ),
     c("search:wrap forward", &["foo", "x"], 1, 1, "/foo<CR>"),
     c("search:wrap backward", &["x", "foo"], 1, 1, "?foo<CR>"),
-    // #1153 'wrapscan' off — no match ahead of the cursor, stay put instead
-    // of wrapping. Verified against `nvim --headless`.
+    // 'wrapscan' off — no match ahead of the cursor, stay put instead of
+    // wrapping.
     c(
         "search:nowrapscan forward stays put",
         &["foo", "x"],
@@ -5156,7 +5031,7 @@ const CASES_SEARCH: &[Case] = &[
         1,
         "/\\(foo\\)\\1<CR>",
     ),
-    // #1157: `\@=` look-ahead — only the "foo" immediately followed by
+    // `\@=` look-ahead — only the "foo" immediately followed by
     // "bar" qualifies; the lookahead is zero-width, so the cursor lands on
     // that "foo"'s own 'f', not inside/after "bar".
     c(
@@ -5166,7 +5041,7 @@ const CASES_SEARCH: &[Case] = &[
         1,
         "/foo\\(bar\\)\\@=<CR>",
     ),
-    // #1157: `\_s` — a whitespace class that also accepts end-of-line, so
+    // `\_s` — a whitespace class that also accepts end-of-line, so
     // the pattern spans the newline between the two lines. Cursor starts on
     // line 2 so the search has to wrap around to land on line 1.
     c(
@@ -5218,7 +5093,7 @@ const CASES_SEARCH: &[Case] = &[
     ),
     c("search:dgn", &["foo bar foo"], 1, 1, "/foo<CR>ggdgn"),
     c("search:gN", &["foo bar foo"], 1, 11, "/foo<CR>gNd"),
-    // #1153 review: `gn` is documented as "like the `n` command", so it
+    // `gn` is documented as "like the `n` command", so it
     // should honour 'wrapscan' the same way `n`/`N` already do. Both cases
     // leave the cursor past the last "alpha" (`*$j`), with no further match
     // ahead of it — verified against `nvim --headless`.
@@ -5236,7 +5111,7 @@ const CASES_SEARCH: &[Case] = &[
         1,
         "*$jgn<Esc>",
     ),
-    // #1191: `*`/`#` (`word_under_cursor`/`star_word_under_cursor`) are the
+    // `*`/`#` (`word_under_cursor`/`star_word_under_cursor`) are the
     // other documented consumer of 'iskeyword' — with `-` added to the
     // keyword class, "foo-bar" is the whole word `*` searches for, so it
     // finds the *next* "foo-bar" run rather than stopping mid-token.
@@ -5254,8 +5129,7 @@ const CASES_SEARCH: &[Case] = &[
 const CASES_EX: &[Case] = &[
     c("sub:basic", &["a a"], 1, 1, ":s/a/b/<CR>"),
     c("sub:g", &["a a"], 1, 1, ":s/a/b/g<CR>"),
-    // #1153 'gdefault' — inverts the meaning of the `g` flag. Verified
-    // against `nvim --headless`.
+    // 'gdefault' — inverts the meaning of the `g` flag.
     c(
         "sub:gdefault makes plain sub global",
         &["a a a"],
@@ -5324,7 +5198,7 @@ const CASES_EX: &[Case] = &[
         ":s/\\(a\\)\\(b\\)/\\2\\1/<CR>",
     ),
     c("sub:\\v groups", &["ab"], 1, 1, ":s/\\v(a)(b)/\\2\\1/<CR>"),
-    // #1004: `\1` *inside the pattern* (a backreference to an earlier
+    // `\1` *inside the pattern* (a backreference to an earlier
     // `\(...\)` group in the same pattern) — distinct from "sub:backrefs"
     // above, which is `\1`/`\2` in the *replacement* text referencing groups.
     c(
@@ -5352,7 +5226,7 @@ const CASES_EX: &[Case] = &[
     c("sub:alternation", &["a b c"], 1, 1, ":s/a\\|c/x/g<CR>"),
     c("sub:\\zs", &["foobar"], 1, 1, ":s/foo\\zsbar/X/<CR>"),
     c("sub:\\ze", &["foobar"], 1, 1, ":s/foo\\zebar/X/<CR>"),
-    // #1157: `\@=` in a `:s` pattern — the lookahead is zero-width, so only
+    // `\@=` in a `:s` pattern — the lookahead is zero-width, so only
     // "foo" is replaced and "bar" survives untouched.
     c(
         "sub:\\@= lookahead",
@@ -5361,7 +5235,7 @@ const CASES_EX: &[Case] = &[
         1,
         ":s/foo\\(bar\\)\\@=/X/<CR>",
     ),
-    // #1157: `\_s` in a `:s` pattern — matches the newline between the two
+    // `\_s` in a `:s` pattern — matches the newline between the two
     // lines, so the substitution merges them into one.
     c(
         "sub:\\_s spans lines",
@@ -5459,7 +5333,7 @@ const CASES_EX: &[Case] = &[
         1,
         ":s/\\v(\\w+) (\\w+)/\\2 \\1/<CR>",
     ),
-    // #1031 (#801 Phase 2): `:s///c` confirm loop. Verified against a real
+    // `:s///c` confirm loop. Verified against a real
     // interactive `nvim --headless --listen` + `--remote-send` session
     // (v0.12.5). The non-interactive `-es` batch mode the suite's other cases
     // use silently short-circuits `:s///c` (the confirm prompt never
@@ -5591,7 +5465,7 @@ const CASES_EX: &[Case] = &[
     c("ex:1,3j", &["a", "b", "c"], 1, 1, ":1,3j<CR>"),
     c("ex:j!", &["a", "  b"], 1, 1, ":j!<CR>"),
     c("ex:j 3", &["a", "b", "c", "d"], 1, 1, ":j 3<CR>"),
-    // #1280: the full-word spellings of :d/:m/:co/:j/:y — distinct doc ids
+    // The full-word spellings of :d/:m/:co/:j/:y — distinct doc ids
     // from their abbreviations above (`:delete` is not covered by `:d`
     // having a case; see the `COMMAND_PROBES` module doc), so each needs its
     // own case using the literal long form.
@@ -5767,13 +5641,13 @@ const CASES_EX: &[Case] = &[
     // `:noh[lsearch]` clears the `'hlsearch'` highlight, which this harness
     // cannot observe at all — it only ever diffs buffer text and cursor
     // position, never highlight state. So, like `ex:cc on empty quickfix
-    // list` (#1154) and its own doc comment above, this is a no-op case: it
+    // list` and its own doc comment above, this is a no-op case: it
     // guards nothing on its own (a build where `:noh` silently did nothing,
     // or wasn't recognised at all and fell through to the unknown-ex-command
     // fallback, would pass this case too) but is still what retires the id
     // from `COVERAGE_EXEMPT` per this repo's "one real passing case" bar.
     c("ex:noh no effect", &["a"], 1, 1, "/a<CR>:noh<CR>"),
-    // #1280: full-word spellings, same reasoning as the `:delete`/`:move`/
+    // Full-word spellings, same reasoning as the `:delete`/`:move`/
     // `:copy`/`:join`/`:yank` block above.
     c("ex:norm Ax", &["a", "b"], 1, 1, ":norm Ax<CR>"),
     // Same no-op reasoning as `ex:noh no effect` just above — `:nohlsearch`
@@ -5822,18 +5696,9 @@ const CASES_EX: &[Case] = &[
         1,
         "<C-v>j:s/a/b/<CR>",
     ),
-    // ── #986: v0.11.0 bug suite -- `:s///c` confirm-prompt spec (#801
-    // Phase 2 never built). Every "sub:c ..." case below is listed in
-    // KNOWN_DEVIATIONS: `execute.rs`'s `flags.contains('c')` check always
-    // errors loudly instead of entering a confirm loop today, so the `c`
-    // flag's follow-up keystrokes (`y`/`n`/`a`/`q`/`l`/`<Esc>`) land on
-    // whatever ordinary Normal-mode command they happen to spell on the
-    // vimcode side (an operator-pending `y`, a `q` macro-record start,
-    // etc.) instead of driving a confirm loop -- never a crash, just a
-    // guaranteed buffer/cursor mismatch against the real oracle. See this
-    // issue's PR description for the full confirm contract as captured
-    // from a real `nvim --headless` v0.12.5 (the exact prompt text, and
-    // this table), which every case below exercises:
+    // v0.11.0 bug suite -- `:s///c` confirm-prompt spec. The `c` flag's
+    // follow-up keystrokes (`y`/`n`/`a`/`q`/`l`/`<Esc>`) test the confirm
+    // loop contract:
     //
     //   y        replace this match, continue
     //   n        skip this match, continue
@@ -5841,13 +5706,6 @@ const CASES_EX: &[Case] = &[
     //   q        quit substituting (this match left unreplaced)
     //   l        replace this match, then quit ("last")
     //   <Esc>    quit substituting (this match left unreplaced)
-    //
-    // `^E`/`^Y` (scroll the window while the prompt is up) are not covered
-    // here: fed directly at a real headless oracle they don't hang it, but
-    // they produce no buffer/cursor difference for *this* harness to
-    // observe (window scroll position isn't part of what `run_case`
-    // compares) -- confirmed by direct probe, not assumed. An honest gap,
-    // same treatment as the #805 headless-scroll exclusions above.
     c(
         "sub:c y accepts each prompted match (g)",
         &["abc abc", "abc", "xyz abc"],
@@ -5951,29 +5809,10 @@ const CASES_EX: &[Case] = &[
         1,
         ":%s/abc/def/g<CR>",
     ),
-    // #1154: bare `:cc` (no count) on an empty quickfix list. This is the
-    // one `:cc`-family behaviour this single-buffer harness can actually
-    // compare: `nvim_buf_set_lines` gives both sides an *unnamed* scratch
-    // buffer with no backing file, so there is no way to seed the two sides
-    // with an identical *populated* quickfix list (real Neovim needs
-    // `:vimgrep`-on-a-real-file or `:cexpr`, and vimcode's expression
-    // evaluator is explicitly out of scope for this milestone — see the
-    // module docs' "Coverage ratchet" section and #1154's own PR
-    // description). But the empty-list error path needs no quickfix state
-    // at all: confirmed by hand against `nvim --headless -u NONE` that a
-    // bare `:cc` with no quickfix list leaves the buffer and cursor
-    // completely untouched (it errors — `E42: No Errors` — before doing
-    // anything), which is exactly what vimcode's new bare-`:cc` handler
-    // does too (`execute.rs`'s `cmd == "cc"` arm, `self.quickfix.items.is_empty()`
-    // branch). Before #1154, bare `:cc` fell through to the unknown-ex-command
-    // fallback (`"Not an editor command: cc"`) instead of a real quickfix
-    // error, but that fallback is likewise a buffer/cursor no-op — so this
-    // case cannot regression-guard the historic bug by buffer/cursor
-    // comparison alone (`src/core/engine/tests.rs`'s
-    // `test_ex_cc_on_empty_quickfix_list_errors_1154` is what actually pins
-    // the message). What it *does* prove, and what retires `"ex::cc"` from
-    // `COVERAGE_EXEMPT`, is that the id now has a real, passing oracle case
-    // at all — required once a command stops being doc-exempt.
+    // Bare `:cc` (no count) on an empty quickfix list. This is the one
+    // `:cc`-family behaviour this single-buffer harness can actually compare.
+    // Confirmed by hand against `nvim --headless -u NONE` that a bare `:cc`
+    // with no quickfix list leaves the buffer and cursor completely untouched.
     c(
         "ex:cc on empty quickfix list",
         &["a", "b", "c"],
@@ -5981,30 +5820,18 @@ const CASES_EX: &[Case] = &[
         1,
         ":cc<CR>",
     ),
-    // #1283: the quickfix/location-list family (23 ids: `ex::copen`..
-    // `ex::lfdo`) — see the module doc's "#1283 population seam" section for
-    // the deliverable-1 finding: no key sequence can populate an *identical*
-    // list on both sides through this shared single-buffer harness. Real
-    // Neovim's `:vimgrep pattern` with no file argument errors `E683: File
-    // name missing or invalid pattern` (confirmed against a live oracle);
-    // vimcode's `:vimgrep`/`:grep` take no file argument at all and instead
-    // recursively search the whole `cwd` for the trailing text as a plain
-    // pattern (`Engine::qf_run_grep` → `project_search::search_in_project`)
-    // — two incompatible command grammars, not two implementations of the
-    // same one, so there is no populated-list seam here (`:cexpr` is a
-    // second dead end: `NotImplemented` on the vimcode side per this file's
-    // own `ex(":cex[pr]", ...)` NORM_AUDIT row, matching the permanent
-    // expression-evaluator exemption).
-    //
-    // What *is* real, comparable, oracle-backed Neovim behaviour — same
-    // precedent as `ex:cc on empty quickfix list` right above (#1154) — is
-    // every one of these commands' empty-list (global) or absent-location-
-    // list refusal/no-op path, each confirmed by hand against a live
-    // `nvim --headless -u NONE` session before being encoded below. Four of
-    // the 23 ids (`ex::copen`/`ex::cwindow`/`ex::lopen`/`ex::lwindow`) open a
-    // window and are covered by `CASES_XFILE`'s `WinCase`/`run_win_case`
-    // layout-probe harness instead (chained after #1162 per this issue's own
-    // instruction) — see that array below.
+    // The quickfix/location-list family (23 ids: `ex::copen`..
+    // `ex::lfdo`) — no key sequence can populate an *identical* list on both
+    // sides through this shared single-buffer harness. Real Neovim's
+    // `:vimgrep pattern` with no file argument errors `E683: File name missing
+    // or invalid pattern`; vimcode's `:vimgrep`/`:grep` take no file argument
+    // at all and instead recursively search the whole `cwd` — two incompatible
+    // command grammars. What *is* real, comparable, oracle-backed Neovim
+    // behaviour — same precedent as `ex:cc on empty quickfix list` — is every
+    // one of these commands' empty-list (global) or absent-location-list
+    // refusal/no-op path, each confirmed by hand against a live oracle.
+    // Four of the 23 ids (`:copen`/`:cwindow`/`:lopen`/`:lwindow`) open a
+    // window and are covered by `CASES_XFILE`'s layout-probe harness instead.
     c(
         "ex:cnext on empty quickfix list errors",
         &["a", "b", "c"],
@@ -6148,24 +5975,13 @@ const CASES_EX: &[Case] = &[
         1,
         ":lclose<CR>",
     ),
-    // #1154: the rest of this PR's backfilled ex commands. Each of these was
-    // confirmed by hand against `nvim --headless -u NONE` — a fresh
-    // single-tab/single-window/single-buffer session leaves every one of
-    // these a documented no-op or refusal, which is exactly what makes them
-    // usable here: this harness has no multi-tab/multi-window/multi-buffer
-    // real-file plumbing (see the multi-file harness section above, which
-    // needs real files on disk and its own `MultiFileCase`/`send_keys_multi`
-    // machinery), so a *populated* tab/buffer list identical on both sides
-    // isn't reachable from a bare `Case`. The no-op/refusal path is still a
-    // real, comparable behaviour, not a vacuous placeholder — a case that
-    // failed to recognise the command at all (the pre-#1154 unknown-ex-command
-    // fallback) also happens to leave the buffer/cursor untouched, so these
-    // do not regression-guard the historic "command didn't exist" bug (the
-    // engine-level `test_ex_*_1154` tests in `src/core/engine/tests.rs` do
-    // that, asserting on `Engine` state a bare buffer/cursor diff can't see);
-    // what they retire is the `COVERAGE_EXEMPT` entry itself, per this
-    // repo's "an id just needs one real passing case" bar (`ex:cc on empty
-    // quickfix list` above sets the same precedent).
+    // The rest of this PR's backfilled ex commands. Each was confirmed by
+    // hand against `nvim --headless -u NONE` — a fresh session leaves every
+    // one a documented no-op or refusal. This harness has no multi-tab/
+    // multi-window/multi-buffer real-file plumbing, so a *populated*
+    // tab/buffer list identical on both sides isn't reachable from a bare
+    // `Case`. The no-op/refusal path is a real, comparable behaviour, not a
+    // vacuous placeholder.
     c(
         "ex:tabonly noop with one tab",
         &["a", "b"],
@@ -6230,7 +6046,7 @@ const CASES_EX: &[Case] = &[
         1,
         "x:bwipeout<CR>",
     ),
-    // #1190: `'hidden'`'s guard on `:enew` — before this fix vimcode had
+    // `'hidden'`'s guard on `:enew` — before this fix vimcode had
     // *no* dirty check on `:enew`/`:edit`/`:bnext`/`:bprevious`/`:bfirst`/
     // `:blast`/`:buffer` at all (see `Engine::check_buffer_abandon`'s doc
     // comment), so an un-forced `:enew` always silently wiped the modified
@@ -6272,7 +6088,7 @@ const CASES_EX: &[Case] = &[
         1,
         "ma:delm a<CR>",
     ),
-    // #1156: undo tree ex-commands (`:undolist`/`:earlier`/`:later`/`:undojoin`).
+    // Undo tree ex-commands (`:undolist`/`:earlier`/`:later`/`:undojoin`).
     c(
         "ex:undolist is a no-op on the buffer",
         &["abc"],
@@ -6316,9 +6132,7 @@ const CASES_EX: &[Case] = &[
     ),
     // `:startinsert` differentially matters (unlike the no-ops above): typed
     // text after it only lands as literal insertion if the command actually
-    // entered Insert mode. Before #1154 `:startinsert` fell through to the
-    // unknown-ex-command fallback, so `mode` stayed Normal and `XY` would
-    // have run as two Normal-mode commands instead.
+    // entered Insert mode.
     c(
         "ex:startinsert then type",
         &["ab"],
@@ -6326,12 +6140,9 @@ const CASES_EX: &[Case] = &[
         1,
         ":startinsert<CR>XY<Esc>",
     ),
-    // `:stopinsert` cannot be *typed* from Insert mode in real Vim (a bare
-    // `:` there just inserts a literal colon; reaching it needs `i_CTRL-O`
-    // or a script/mapping context this harness's single-keystroke-at-a-time
-    // `nvim_input` transport does not model). The comparable, safely-typeable
-    // case is the documented already-Normal no-op, which still exercises the
-    // real `cmd == "stopinsert"` dispatch arm added by this PR.
+    // `:stopinsert` cannot be *typed* from Insert mode in real Vim. The
+    // comparable, safely-typeable case is the documented already-Normal
+    // no-op, which still exercises the real `cmd == "stopinsert"` dispatch.
     c(
         "ex:stopinsert noop when already Normal",
         &["ab"],
@@ -6341,10 +6152,10 @@ const CASES_EX: &[Case] = &[
     ),
 ];
 
-// ─────────────────── H2. abbreviations (:abbreviate family, #1152) ───────────
+// H2. abbreviations (:abbreviate family, #1152)
 // Each case defines its abbreviation(s) with a real typed `:iabbrev`/
-// `:cabbrev`/`:abbreviate` command (both sides run the actual command, not a
-// stand-in), then exercises the documented trigger rules.
+// `:cabbrev`/`:abbreviate` command (both sides run the actual command), then
+// exercises the documented trigger rules.
 const CASES_ABBREV: &[Case] = &[
     c(
         "abbrev:full-id expands on trigger char",
@@ -6500,7 +6311,7 @@ const CASES_INS: &[Case] = &[
         ":set ts=8<CR>A<Tab>x<Esc>",
     ),
     c("ins:Tab after 2 chars ts4", &["ab"], 1, 1, "A<Tab>x<Esc>"),
-    // #1153 'softtabstop' — verified against `nvim --headless`.
+    // 'softtabstop' — affects Tab insertion when 'expandtab' is on.
     c(
         "ins:Tab uses softtabstop not tabstop",
         &["ab"],
@@ -6538,9 +6349,6 @@ const CASES_INS: &[Case] = &[
     c("ins:C-d", &["    a"], 1, 5, "i<C-d><Esc>"),
     c("ins:C-d partial", &["  a"], 1, 1, "A<C-d><Esc>"),
     c("ins:0 C-d", &["    a"], 1, 1, "A0<C-d><Esc>"),
-    // #804 CI fix: `i_0_CTRL-D` keys off Vim's `lastc` — the previous
-    // *keystroke* — not off the buffer text before the cursor. These three
-    // pin the distinction the oracle actually makes.
     c("ins:0 C-d after text", &["    afoo"], 1, 1, "A0<C-d><Esc>"),
     c(
         "ins:C-d with untyped 0 before cursor",
@@ -6704,7 +6512,7 @@ const CASES_INS: &[Case] = &[
     ),
     c("ins:C-t noet", &["a"], 1, 1, ":set noet<CR>i<C-t><Esc>"),
     c("ins:C-k digraph skip", &["a"], 1, 1, "l"),
-    // #1160: <C-k> digraph entry and the <C-x> completion submode.
+    // <C-k> digraph entry and the <C-x> completion submode.
     c("ins:C-k a: digraph", &["x"], 1, 1, "A<C-k>a:<Esc>"),
     // Escape must land the cursor back *on* the just-inserted multi-byte
     // character (not past it) — nvim's cursor column is byte-based and
@@ -6719,12 +6527,7 @@ const CASES_INS: &[Case] = &[
         4,
         "A<C-x><C-l><Esc>",
     ),
-    // Both the oracle (nvim) and vimcode's own test process run with the
-    // crate root as their working directory (`cargo test` sets it; neither
-    // side passes `current_dir` for this single-buffer harness — #1160), so
-    // a real, checked-in, unambiguously-prefixed filename is a stable
-    // cross-process fixture: "Cargo.tom" has exactly one match in the repo
-    // root, `Cargo.toml` (`Cargo.lock` diverges at the 8th character).
+    // Cargo.toml is the only match for "Cargo.tom" in the repo root.
     c(
         "ins:C-x C-f filename completion",
         &["Cargo.tom"],
@@ -6802,7 +6605,7 @@ const CASES_VIS: &[Case] = &[
     c("vis:viwd on whitespace", &["a   b"], 1, 2, "viwd"),
     c("vis:vawd at eol", &["foo bar"], 1, 5, "vawd"),
     c("vis:vjy then P", &["abc", "def"], 1, 2, "vjyP"),
-    // #1279: `visual:P` — replace a charwise selection with a yanked word.
+    // `visual:P` — replace a charwise selection with a yanked word.
     c(
         "vis:vjP force paste",
         &["abc", "def", "ghi"],
@@ -6910,7 +6713,7 @@ const CASES_VIS: &[Case] = &[
         1,
         "v$jyGp",
     ),
-    // #1005: first UTF-8 multi-byte cases — see the CASES_OP `mb:` block for
+    // First UTF-8 multi-byte cases — see the CASES_OP `mb:` block for
     // the starting-column rule these are held to.
     c(
         "vis:mb:vld deletes two emoji chars",
@@ -7084,7 +6887,7 @@ const CASES_VB: &[Case] = &[
     c("vb:V then C-v switch", &["abc", "def"], 1, 2, "Vj<C-v>d"),
     c("vb:C-v then v switch", &["abc", "def"], 1, 2, "<C-v>jvd"),
     c("vb:C-v then V", &["abc", "def"], 1, 2, "<C-v>jVd"),
-    // #1005: first UTF-8 multi-byte cases, ragged rows of differing
+    // First UTF-8 multi-byte cases, ragged rows of differing
     // byte/char length. Both start at col 1 (see the CASES_OP `mb:` block's
     // doc on why). `<C-v>jjd` over this same fixture was investigated too —
     // Vim's block mode measures in *screen* columns and widens a
@@ -7294,7 +7097,7 @@ const CASES_SCROLL: &[Case] = &[
         "3<C-d><C-u>",
     ),
     c("scroll:3<C-f>", LONG, 1, 1, "3<C-f>"),
-    // #1008: `2<C-b>` is the case the attached-UI oracle was built for. The
+    // `2<C-b>` is the case the attached-UI oracle was built for. The
     // second `<C-b>` cannot scroll a whole page (it clamps at the top of the
     // buffer), which is exactly where "cursor to the last line of the new
     // window" stops agreeing with "cursor to a fixed offset from the old
@@ -7357,7 +7160,7 @@ const CASES_SCROLL: &[Case] = &[
     ),
     c("scroll:C-d at last line", LONG, 60, 1, "<C-d>"),
     c("scroll:C-u at line 2", LONG, 2, 1, "<C-u>"),
-    // ── zh/zl/zH/zL/ze/zs: horizontal scroll (#1280) ───────────────────────
+    // ── zh/zl/zH/zL/ze/zs: horizontal scroll ───────────────────────────────
     // Only meaningful with 'wrap' off (with it on, a long line soft-wraps
     // instead of scrolling — `zh`/`zl`/etc. are then documented no-ops) and
     // only observable through this harness's (buffer, cursor) comparison —
@@ -7563,10 +7366,10 @@ const CASES_WORD: &[Case] = &[
     c("word:[(", &["(a (b) c)"], 1, 5, "[("),
     c("word:])", &["(a (b) c)"], 1, 5, "])"),
     // ── bracket:[] / ][ — section *end* (`}` in column 0), the `[[`/`]]`
-    // pair's `}` counterpart (#1280) ────────────────────────────────────
+    // pair's `}` counterpart ────────────────────────────────────────────
     c("word:][", &["a", "}", "b", "}", "c"], 1, 1, "]["),
     c("word:[]", &["a", "}", "b", "}", "c"], 5, 1, "[]"),
-    // ── bracket:[m/]m/[M/]M — method start/end (any `{`/`}`) (#1280) ─────
+    // ── bracket:[m/]m/[M/]M — method start/end (any `{`/`}`) ─────────────
     c(
         "word:]m next method start",
         &["fn a() {", "}", "fn b() {", "}"],
@@ -7602,7 +7405,7 @@ const CASES_WORD: &[Case] = &[
         "[M",
     ),
     // ── bracket:[*/]* and their [/// / ]/ aliases — C comment start/end
-    // (#1280) ─────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────
     c(
         "word:]* comment end",
         &["a", "/* comment", "middle", "*/ end", "b"],
@@ -7631,7 +7434,7 @@ const CASES_WORD: &[Case] = &[
         1,
         "[/",
     ),
-    // ── bracket:[#/]# — preprocessor directive, depth-tracked (#1280) ────
+    // ── bracket:[#/]# — preprocessor directive, depth-tracked ────────────
     c(
         "word:]# forward to matching #else/#endif",
         &["#if X", "  a", "#else", "  b", "#endif"],
@@ -7675,7 +7478,7 @@ const CASES_WORD: &[Case] = &[
     ),
     c("word:j col memory short", &["abcdef", "ab"], 1, 5, "j"),
     c("word:5l past end", &["abc"], 1, 1, "5l"),
-    // #1279: matches the `NormAudit` "l" recording's own probe needle
+    // Matches the `NormAudit` "l" recording's own probe needle
     // (`Label("word:l right")`) so one case retires both `move:l` here and
     // the `l` row's `NORM_COVERAGE_EXEMPT` entry.
     c("word:l right", &["abc"], 1, 1, "l"),
@@ -7683,10 +7486,10 @@ const CASES_WORD: &[Case] = &[
     c("word:0", &["  ab"], 1, 4, "0"),
     c("word:^", &["  ab"], 1, 4, "^"),
     c("word:g_", &["ab  "], 1, 1, "g_"),
-    // #1279: `word:g0` is the same needle `COMMAND_PROBES` uses for both
+    // `word:g0` is the same needle `COMMAND_PROBES` uses for both
     // `move:g0` and `g:g0` (the doc lists `g0` under both sections).
     c("word:g0", &["  ab"], 1, 4, "g0"),
-    // #1280: `g<Home>`/`g^`/`g$`/`g<End>` are distinct doc ids from `g0`
+    // `g<Home>`/`g^`/`g$`/`g<End>` are distinct doc ids from `g0`
     // (their own keystrokes, `:h g<Home>` etc.), and only differ from the
     // buffer-relative `0`/`^`/`$` motions when a line spans more than one
     // *screen* line — a plain short fixture (like `word:g0` above) can't
@@ -7726,10 +7529,7 @@ const CASES_WORD: &[Case] = &[
         86,
         "g<End>",
     ),
-    // #1279: short lines so `gm`/`gM` land at end-of-line on both sides
-    // regardless of window width — width is mirrored the same way height is
-    // (#1280, see `run_in_vimcode`) but this predates that and staying
-    // width-independent still doesn't hurt.
+    // Short lines so `gm`/`gM` land at end-of-line regardless of window width.
     c("word:gm", &["alpha beta gamma"], 1, 1, "gm"),
     c("word:gM", &["alpha beta gamma"], 1, 1, "gM"),
     c("word:gg indented (nosol)", &["  a", "b"], 2, 1, "gg"),
@@ -7750,7 +7550,7 @@ const CASES_WORD: &[Case] = &[
         "G",
         "vim.o.startofline=true",
     ),
-    // #1772: the reported bug claimed `gg`/`G` reset the column to the
+    // The reported bug claimed `gg`/`G` reset the column to the
     // line's first non-blank (like `'startofline'` ON) even with the
     // default `'nostartofline'`. Verified directly against the real
     // `nvim --headless -u NONE -i NONE` oracle starting from a non-column-1
@@ -7775,7 +7575,7 @@ const CASES_WORD: &[Case] = &[
         9,
         "G",
     ),
-    // #1772 follow-up: unlike the above, THIS one is a real divergence.
+    // Unlike the above, THIS one is a real divergence.
     // `w`/`w` sets the actual column to 9 (curswant is None outside
     // `update_curswant_for_key`'s j/k/ctrl-scroll allowlist, so column 9 is
     // just the plain stored `cursor.col`, not a recoverable "desired"
@@ -7824,9 +7624,6 @@ const CASES_WORD: &[Case] = &[
     ),
     c("word:i esc then j", &["abcdef", "abcdef"], 1, 4, "i<Esc>j"),
     c("word:$ then h then j", &["abcdef", "abcdef"], 1, 1, "$hj"),
-    // #1153 'virtualedit' — `$` still lands on the last character, but a
-    // following `l` moves one column past it. Verified against
-    // `nvim --headless`.
     c(
         "word:virtualedit=all lets l pass $",
         &["abc"],
@@ -7927,7 +7724,7 @@ const CASES_WORD: &[Case] = &[
     c("word:3e beyond", &["a b"], 1, 1, "3e"),
     c("word:w keyword vs nonkeyword @", &["a@b c"], 1, 1, "w"),
     c("word:w with iskeyword dash? -", &["a-b-c d"], 1, 1, "www"),
-    // #1005: first UTF-8 multi-byte cases — see the CASES_OP `mb:` block
+    // First UTF-8 multi-byte cases — see the CASES_OP `mb:` block
     // above for why starting columns are held to col 1 here.
     c(
         "word:mb:w stops at CJK boundary",
@@ -7964,14 +7761,8 @@ const CASES_WORD: &[Case] = &[
         1,
         "wge",
     ),
-    // #1191: 'iskeyword' is a real input to word motions — `a-b` is two
-    // words under the default `'iskeyword'` (see "word:w a-b" above), but
-    // one word once `-` is added to the keyword class, exactly like real
-    // Vim. Before #1191, `vim.o.iskeyword=...` in a case's `setup` could
-    // only ever configure the oracle: `apply_setup` had no arm for it, so
-    // this case would have errored out of `every_corpus_setup_is_understood`
-    // (a hard failure, not a silent default) rather than compare a
-    // configured vimcode against a configured oracle.
+    // 'iskeyword' is a real input to word motions — `a-b` is two words under the
+    // default 'iskeyword', but one word once `-` is added to the keyword class.
     cs(
         "word:w with iskeyword+=- treats hyphen as a word char",
         &["foo-bar baz"],
@@ -8211,7 +8002,7 @@ const CASES_TO: &[Case] = &[
         1,
         "dap",
     ),
-    // #1005: first UTF-8 multi-byte cases. Cursor starts at col 4, on the
+    // First UTF-8 multi-byte cases. Cursor starts at col 4, on the
     // CJK run — the preceding "foo" is pure ASCII, so col 4 is a valid
     // starting column on both sides (see the CASES_OP `mb:` block's doc).
     c(
@@ -8228,7 +8019,7 @@ const CASES_TO: &[Case] = &[
         4,
         "daw",
     ),
-    // #1191: `iw`/`aw` (`find_word_object`) are the third documented
+    // `iw`/`aw` (`find_word_object`) are the third documented
     // 'iskeyword' consumer — with `-` added to the keyword class, the whole
     // hyphenated run is one word, so `diw` from inside "bar" deletes all of
     // "foo-bar", not just "bar".
@@ -8240,7 +8031,7 @@ const CASES_TO: &[Case] = &[
         "diw",
         "vim.o.iskeyword='@,48-57,_,192-255,-'",
     ),
-    // #1279: the closing-bracket/backtick/quote aliases — `)`/`}`/`]`/`>`
+    // The closing-bracket/backtick/quote aliases — `)`/`}`/`]`/`>`
     // text objects are aliases of `(`/`{`/`[`/`<`, and `a'`/`` a` `` were the
     // last quote text objects with no oracle case at all.
     c("to:da'", &["x 'ab' y"], 1, 4, "da'"),
@@ -8446,7 +8237,7 @@ const CASES_MISC: &[Case] = &[
     c("misc:d then count then motion 0", &["abc def"], 1, 5, "d0"),
     c("misc:count then i on line start", &["ab"], 1, 1, "2Ix<Esc>"),
     c("misc:count then o with indent", &["  a"], 1, 1, "2ox<Esc>"),
-    // #1005: first UTF-8 multi-byte case for pure cursor-column reporting
+    // First UTF-8 multi-byte case for pure cursor-column reporting
     // (category 7 of the issue). `$` on a line ending in a single 2-byte
     // char is one of the few multi-byte final-column assertions that does
     // NOT hit the byte-vs-char architecture gap documented in the CASES_OP
@@ -8466,7 +8257,7 @@ const CASES_MISC: &[Case] = &[
         1,
         "$",
     ),
-    // #1280: `g.` — go to the position of the last change. `wx` changes
+    // `g.` — go to the position of the last change. `wx` changes
     // (deletes) the 't' of "two" on line 1; `G` moves away to the last
     // line; `g.` must return to where that change happened, not just to
     // `` `. `` (a mark, which lands at the same spot here but for a
@@ -8478,7 +8269,7 @@ const CASES_MISC: &[Case] = &[
         1,
         "wxGg.",
     ),
-    // #1280: `gR` — Virtual Replace mode. Typing exactly enough characters
+    // `gR` — Virtual Replace mode. Typing exactly enough characters
     // to span a `<Tab>`'s full visual width (tabstop 4, set by the harness
     // — the tab at column 1 covers 3 columns to the next stop) consumes it
     // entirely, landing on the same result a naive "expand tab, then
@@ -8495,22 +8286,9 @@ const CASES_MISC: &[Case] = &[
         2,
         "gRXYZ<Esc>",
     ),
-    // #1280: `g@{motion}` calls a user-registered `'operatorfunc'` — real
-    // buffer-mutating coverage of that needs a Lua callback wired up
-    // identically on both sides, which `apply_setup` has no way to express
-    // (it only translates `vim.o.<name>=<value>`/keymap statements, not
-    // arbitrary Lua function bodies into vimcode's own
-    // `vimcode.set_operatorfunc` Lua API). What *is* comparable without any
-    // of that: with no operatorfunc registered at all (true on both sides —
-    // Neovim errors `E774`, vimcode's own `test_g_at_sets_pending_operator`
-    // pins the same "no crash, no-op" contract engine-side), `g@l` changes
-    // nothing. A no-op case guards nothing on its own (`ex:cc on empty
-    // quickfix list`, #1154), so this is paired with the engine-level
-    // `test_g_at_sets_pending_operator` and the callback-registered
-    // `test_g_at_calls_operatorfunc_{linewise,charwise}`/
-    // `test_g_at_operatorfunc_can_modify_buffer` tests in
-    // `src/core/engine/tests.rs`, which do exercise the real dispatch this
-    // case structurally cannot.
+    // `g@{motion}` calls a user-registered 'operatorfunc'. With no operatorfunc
+    // registered, `g@l` is a no-op — confirmed engine-side by
+    // `test_g_at_sets_pending_operator` and exercised via that test, not this one.
     c(
         "misc:g@l with no operatorfunc registered is a no-op",
         &["hello world"],
@@ -8520,33 +8298,14 @@ const CASES_MISC: &[Case] = &[
     ),
 ];
 
-// ─────────────────────────── Q. folds (#1006) ───────────────────────────
-//
-// Folds are established through the case `setup` mechanism (#1002's
-// `apply_setup`, extended here to map `'foldmethod'`/`'foldlevel'` onto
-// `Settings`), applied to both sides — never a bespoke runner escape hatch.
-// Manual folds (`'foldmethod'` defaults to `"manual"`, matching Vim) are
+// Folds are established through the case `setup` mechanism. Manual folds are
 // created in-band by the case's own `keys` (`zf{motion}`); indent folds set
-// `vim.o.foldmethod='indent'` (+ optionally `vim.o.foldlevel=N`) in `setup`,
-// which `run_in_vimcode` applies via `Engine::apply_foldlevel` once the
-// buffer exists (mirroring how Neovim computes that method's hierarchy as
-// soon as the option is set, with no `zf` involved).
+// `vim.o.foldmethod='indent'` in `setup`, which `run_in_vimcode` applies via
+// `Engine::apply_foldlevel` once the buffer exists.
 //
-// Folding never changes buffer text, so every case here is read through the
-// cursor position after a motion/operator whose result depends on fold
-// state — that's what actually exercises vimcode's fold-aware
-// `next_visible_line`/`prev_visible_line` (used by `scroll_and_move_by` and
-// scroll-top snapping in `src/core/engine/motions.rs`/`accessors.rs`), not
-// just the fold commands in isolation.
-//
-// Verified by hand against `nvim --headless -u NONE` before trusting the
-// harness (#1006's "verify by hand" note): both the `foldmethod=manual`
-// zf/zo/zc round trip and the `foldmethod=indent`/`foldlevel` nested-range
-// math below were probed directly against a real Neovim process, not just
-// inferred from `:h fold` — see the two nested/#1006 engine fixes in
-// `src/core/view.rs` and `src/core/engine/motions.rs` this issue's slice
-// shipped as a result (folds no longer forget their definition on `zo`, and
-// a nested closed fold no longer gets silently absorbed by its parent).
+// Folding never changes buffer text, so every case here reads the cursor
+// position after a motion/operator whose result depends on fold state — that
+// exercises vimcode's fold-aware `next_visible_line`/`prev_visible_line`.
 
 const FOLDTXT: &[&str] = &[
     "one", "two", "three", "four", "five", "six", "seven", "eight",
@@ -8573,7 +8332,7 @@ const FOLDNEST: &[&str] = &[
     "}",
 ];
 
-// Two-level nested `foldmethod=marker` fixture (#1159), companion to
+// Two-level nested `foldmethod=marker` fixture, companion to
 // FOLDNEST above but nested via `{{{`/`}}}` pairs instead of indentation.
 // Verified line-for-line against `nvim --headless`: at `foldlevel=0` lines
 // 1-6 close as one fold (level 1 — the marker on line 1 itself, unlike the
@@ -8591,7 +8350,7 @@ const FOLDMARKERNEST: &[&str] = &[
     "// trailing",
 ];
 
-// Minimal fixture for a non-default `'foldmarker'` pair (#1159).
+// Minimal fixture for a non-default `'foldmarker'` pair.
 const FOLDMARKER_CUSTOM: &[&str] = &["alpha [[[", "beta", "]]]", "gamma"];
 
 const CASES_FOLD: &[Case] = &[
@@ -8599,7 +8358,7 @@ const CASES_FOLD: &[Case] = &[
     c("fold:zfj hides one line", FOLDTXT, 1, 1, "zfjj"),
     c("fold:zf2j hides two lines", FOLDTXT, 1, 1, "zf2jj"),
     c("fold:zfap folds paragraph", FOLDPARA, 1, 1, "zfapj"),
-    // ── zo/zc/za round trip (#1006) ──────────────────────────────────────
+    // ── zo/zc/za round trip ──────────────────────────────────────────────
     c("fold:zo reopens a closed fold", FOLDTXT, 1, 1, "zfjzoj"),
     c(
         "fold:zo then zc recloses the same fold",
@@ -8622,7 +8381,7 @@ const CASES_FOLD: &[Case] = &[
     // ── zO/zC ─────────────────────────────────────────────────────────────
     c("fold:zO opens recursively", FOLDTXT, 1, 1, "zfjzOj"),
     c("fold:zC recloses recursively", FOLDTXT, 1, 1, "zfjzozCj"),
-    // ── zA/zF/zv/zx (#1280) ──────────────────────────────────────────────
+    // ── zA/zF/zv/zx ──────────────────────────────────────────────────────
     // zA: recursive toggle. Build a nested fold — inner (lines 2-3) created
     // first, then outer (lines 1-4) wraps it, same construction the zD case
     // below reuses — and toggle from the outer, closed header. A plain `za`
@@ -8747,13 +8506,7 @@ const CASES_FOLD: &[Case] = &[
         1,
         "10Gzf10j30GzzH",
     ),
-    // ── foldmethod=indent / foldlevel ────────────────────────────────────
-    // #1153: foldmethod/foldlevel are now reachable from the real `:set`
-    // command (previously only `apply_setup`'s Lua-setup bypass could set
-    // them for this suite — see the issue: "exist in settings.json but are
-    // not reachable from :set"). This case drives the actual `:set fdm=
-    // indent<CR>` ex command through both sides, unlike the `cs(..)` cases
-    // below it which pin the option before the key sequence starts.
+    // Foldmethod/foldlevel are reachable from the `:set` command.
     c(
         "fold:indent:set fdm=indent via :set",
         FOLDNEST,
@@ -8825,7 +8578,7 @@ const CASES_FOLD: &[Case] = &[
         "zozcj",
         "vim.o.foldmethod='indent'",
     ),
-    // ── 'foldnestmax' (#1159) — only affects "indent"/"syntax", not
+    // ── 'foldnestmax' — only affects "indent"/"syntax", not
     // "marker" (`:h 'foldnestmax'`; verified against `nvim --headless`:
     // capping FOLDNEST's would-be level-2 inner fold to foldnestmax=1
     // absorbs it into the level-1 outer fold instead of leaving it its own
@@ -8847,7 +8600,7 @@ const CASES_FOLD: &[Case] = &[
         "jjjj",
         "vim.o.foldmethod='indent'\nvim.o.foldlevel=1",
     ),
-    // ── foldmethod=marker (#1159) ────────────────────────────────────────
+    // ── foldmethod=marker ────────────────────────────────────────────────
     c(
         "fold:marker:set fdm=marker via :set",
         FOLDMARKERNEST,
@@ -8927,7 +8680,7 @@ const CASES_FOLD: &[Case] = &[
         "j",
         "vim.o.foldmethod='marker'\nvim.o.foldmarker='[[[,]]]'",
     ),
-    // ── `:fold*` ex commands (#1159) — all on FOLDTXT/manual folds, driven
+    // ── `:fold*` ex commands — all on FOLDTXT/manual folds, driven
     // through the real ex-command path so they exercise
     // `try_execute_fold_command`/`ex_fold_create`/`ex_fold_open_close`
     // directly, the same way "fold:indent:set fdm=indent via :set" above
@@ -8983,7 +8736,7 @@ const CASES_FOLD: &[Case] = &[
     ),
 ];
 
-// ───────────────────────── G2. :map family (#1151) ─────────────────────────
+// ───────────────────────── G2. :map family ─────────────────────────────────
 //
 // The oracle corpus's coverage of vim's `:map`/`:nmap`/`:nnoremap`/… family —
 // key-to-keys remapping, noremap-vs-map recursion, `<leader>` expansion, and
@@ -8999,11 +8752,7 @@ const CASES_FOLD: &[Case] = &[
 // `apply_keymap_set` / `apply_setup` translate onto vimcode's
 // `Settings::keymaps` without going through any keystroke path at all.
 const CASES_MAP: &[Case] = &[
-    // `inoremap jk <Esc>` — the single most common line in any vimrc (#1151's
-    // motivating example). If the mapping fires, "jk" is consumed entirely
-    // by the mapping (buffered waiting for the "k" — same prefix contract as
-    // any other multi-key mapping) and nothing is inserted; escaping also
-    // steps the cursor back one column, same as a real `<Esc>` keypress.
+    // `inoremap jk <Esc>` — the single most common line in any vimrc.
     cs(
         "map:inoremap_jk_to_escape",
         &["ab"],
@@ -9087,13 +8836,9 @@ const CASES_MAP: &[Case] = &[
     ),
 ];
 
-// ───────────────────── G3. value options (#1206) ─────────────────────
-//
-// Oracle coverage for the buffer/cursor-observable half of #1206's option
-// tranche: 'whichwrap' and 'backspace'. ('wildmode', 'scrolljump' and
-// 'sidescrolloff' only affect scroll position/command-line state, which
-// this per-case harness doesn't capture — see the module docs' "Nothing
-// here is hand-authored" note on what `run_case` actually diffs.)
+// Oracle coverage for buffer/cursor-observable options: 'whichwrap' and
+// 'backspace'. ('wildmode', 'scrolljump' and 'sidescrolloff' only affect
+// scroll position/command-line state, which this harness doesn't capture.)
 const CASES_OPT: &[Case] = &[
     cs(
         "opt:whichwrap h wraps to end of previous line",
@@ -9135,17 +8880,9 @@ const CASES_OPT: &[Case] = &[
         "i<BS><Esc>",
         "vim.o.backspace = 'indent,eol,start'",
     ),
-    // Review finding (#1206 iteration 1): without "start", BackSpace must
-    // be refused outright once the cursor has moved (even just an <Up>,
-    // no typing) onto a line the current Insert session never touched —
-    // not only the exact line Insert was entered on. Before this fix,
-    // `backspace_may_delete_before`'s `line != insert_enter_line` check
-    // was true for ANY line other than the literal entry line, so it
-    // wrongly allowed deleting into "AAAA" here. Verified RED against
-    // unfixed `develop` via a local revert of the `split_insert_undo_group`
-    // re-anchoring fix (`git stash`-equivalent revert + rerun), which
-    // failed BUF: vimcode produced "AAA\nBBBB\nCCCC" (deleted the trailing
-    // 'A') while real Neovim left the buffer untouched.
+    // Without "start", BackSpace must be refused once the cursor moves onto a
+    // line the current Insert session never touched — not only the exact line
+    // Insert was entered on.
     cs(
         "opt:backspace without start blocks BS after cursor moves off the typed line",
         &["AAAA", "BBBB", "CCCC"],
@@ -9154,12 +8891,8 @@ const CASES_OPT: &[Case] = &[
         "i<Up><BS><Esc>",
         "vim.o.backspace = 'indent,eol'",
     ),
-    // Non-blocking review finding (#1206 iteration 1): `'whichwrap'`'s
-    // `<BS>`/`<Space>` `"b"`/`"s"` tokens were only wired into
-    // `handle_normal_key`'s "BackSpace"/"space"/"Space" arms — Visual mode
-    // (a separate match, not falling through to Normal-mode handling) had
-    // no arm for either key at all, so `<BS>` in Visual mode stayed a
-    // silent no-op even with the default `'whichwrap'` (`"b,s"`).
+    // Visual mode had no arm for BackSpace or Space, so `<BS>` in Visual mode
+    // stayed a silent no-op even with the default 'whichwrap'.
     cs(
         "opt:whichwrap Visual-mode <BS> wraps like Normal-mode h",
         &["ab", "cd"],
@@ -9170,20 +8903,10 @@ const CASES_OPT: &[Case] = &[
     ),
 ];
 
-// ───────────────── G4. boolean options, tranche 2 (#1207) ─────────────────
-//
-// Oracle coverage for the buffer/cursor-observable half of #1207's tranche:
-// 'magic' (search/`:s` pattern semantics), 'smartindent' and 'cindent'
-// (newline/brace/hash indent behaviour). `-u NONE` (see `NvimRpc::spawn`)
-// means no filetype/indent plugins are loaded, so only 'smartindent'/
-// 'cindent' behaviour that is built into Vim core itself (brace-based
-// indent/outdent, '#' to column 0) is exercised here — not vimcode's own
-// `line_triggers_indent` language-aware extras (Python `:`, Lua/Ruby/Shell
-// `do`/`then`, ...), which are a vimcode-only enhancement layered on top of
-// real Vim's 'smartindent'/'autoindent' and have no oracle to check against.
-// ('showmatch' doesn't belong here — see `bool_opt:showmatch does not
-// disturb the buffer or final cursor position` below for why its own
-// resulting-state is not, in fact, oracle-observable.)
+// Oracle coverage for buffer/cursor-observable options: 'magic', 'smartindent'
+// and 'cindent'. `-u NONE` means no filetype/indent plugins are loaded, so only
+// built-in Vim core behaviour is exercised — not vimcode's own language-aware
+// enhancements ('smartindent'/'autoindent' extras like Python `:`, Lua `do`, etc).
 const CASES_BOOLOPT: &[Case] = &[
     // ── 'magic' ──────────────────────────────────────────────────────────
     cs(
@@ -9242,7 +8965,7 @@ const CASES_BOOLOPT: &[Case] = &[
     // this is a real Vim quirk, not a harness artifact: it produced the
     // outdent nvim's side, and does not with a pre-existing indent. This
     // repo's `smartindent` deliberately implements the *simpler*,
-    // unconditional form the issue (#1207) scoped — outdent/`#`-reset
+    // unconditional form the issue scoped — outdent/`#`-reset
     // whenever the typed character is the first non-blank on the line,
     // regardless of how the existing indent got there — so it does not
     // chase Vim's `did_ai` gating. That divergence is covered by this
@@ -9286,20 +9009,9 @@ const CASES_BOOLOPT: &[Case] = &[
         "A#<Esc>",
         "vim.o.autoindent = false\nvim.o.cindent = true",
     ),
-    // ── 'showmatch' ───────────────────────────────────────────────────────
-    //
-    // 'showmatch' is a momentary *display* effect (`:h 'showmatch'`): Vim
-    // really does move the cursor to the matching bracket and back before
-    // the next redraw, gated on 'matchtime' — out of scope for #1207 (see
-    // the issue). Both here and in real Vim, once the dust settles the
-    // buffer and the *final* cursor position are unaffected by whether
-    // 'showmatch' was on at all — this repo's own `showmatch_flash` state
-    // (asserted directly in `src/core/engine/tests.rs`, not observable
-    // through this harness's `Case` shape) is what actually proves the
-    // flash happened; this case is a regression guard that turning
-    // 'showmatch' on doesn't accidentally leave the *real* cursor stuck at
-    // the match, which would show up here as a genuine buffer/cursor
-    // mismatch against Neovim.
+    // 'showmatch' is a momentary display effect. The buffer and final cursor
+    // position are unaffected by whether 'showmatch' is on. This case guards
+    // against the real cursor getting stuck at the match.
     cs(
         "bool_opt:showmatch does not disturb the buffer or final cursor position",
         &["(foo"],
@@ -9310,7 +9022,7 @@ const CASES_BOOLOPT: &[Case] = &[
     ),
 ];
 
-// ─────────────────── H. multi-file jumplist (#985) ───────────────────
+// ─────────────────── H. multi-file jumplist ──────────────────────────
 //
 // Cross-buffer/cross-tab/cross-split `<C-o>`/`<C-i>`, plus `:jumps` list
 // contents — see the `MultiFileCase`/`MultiJumpsCase` harness above. Unlike
@@ -9435,15 +9147,8 @@ const CASES_MULTI_JUMPS_LIST: &[MultiJumpsCase] = &[
     ),
 ];
 
-// ─────────────── I. window-layout tree (#1162) — the 33 CTRL-W rows ───────────────
-//
-// See the harness's own module doc above (`WinCase`/`run_win_case`) for the
-// comparison model. `CTRL-W H`/`J`/`K`/`L`/`T`/`e`/`E`/`d` have no entry here
-// at all — permanently exempt, see `COVERAGE_EXEMPT`. `CTRL-W <`/`>`/`\|` do
-// have real cases below but are listed in `KNOWN_DEVIATIONS_WIN`, not
-// expected to pass — each case's own comment explains the finding. `CTRL-W
-// p`/`+`/`-`/`_` are real cases too, but each has since been fixed (#1288,
-// #1292) and is expected to pass like everything else not in that list.
+// Window-layout tree: the 33 CTRL-W rows. See the harness's own module doc for
+// the comparison model. Some entries are exempt or listed in KNOWN_DEVIATIONS_WIN.
 
 const WIN_TWO_LINES: &[&str] = &["first line", "second line", "third line"];
 
@@ -9484,10 +9189,7 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>s<C-w>w",
     ),
-    // #1162 fix: `W` used to be aliased to `w` (both called
-    // `focus_next_window`) — this case is RED against the unfixed alias
-    // (both cursors land in the same, most-recently-split window instead of
-    // cycling backward to the original).
+    // `W` walks backward through windows, unlike `w` which walks forward.
     wc(
         "win:CTRL-W W cycles to the previous window",
         WIN_TWO_LINES,
@@ -9495,10 +9197,7 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>s<C-w>w<C-w>W",
     ),
-    // #1162 fix: `t`/`b` used to walk the VSCode-style editor-group tree
-    // (`self.group_layout`), a no-op with the single editor group every one
-    // of these cases has — RED against the unfixed version (focus never
-    // leaves the window `<C-w>s<C-w>s` left active).
+    // `t`/`b` go to the top-left and bottom-right windows.
     wc(
         "win:CTRL-W t goes to the top-left window",
         WIN_TWO_LINES,
@@ -9564,14 +9263,8 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>s<C-w>x",
     ),
-    // #1162 finding, FIXED by #1291: `rotate_windows` used to rotate
-    // *content* across fixed `WindowId` tree slots rather than reordering
-    // window identity in the tree, so "current" stayed pinned to the same
-    // screen position instead of following the window that was focused
-    // before the rotate (every leaf shows the same file/cursor here on
-    // purpose — `current` is the only signal that can distinguish the two
-    // models). Now a real, non-vacuous pass — removed from
-    // KNOWN_DEVIATIONS_WIN.
+    // `rotate_windows` reorders window identity in the tree, so the focused window
+    // follows its previous position.
     wc(
         "win:CTRL-W r rotates windows downward/rightward",
         WIN_TWO_LINES,
@@ -9595,13 +9288,8 @@ const CASES_WIN: &[WinCase] = &[
         6,
         "<C-w>f",
     ),
-    // --- Resize / maximize / equalize ---
-    // #1162 finding, FIXED by #1290: `equalize_splits` does set every ratio
-    // to exactly 0.5 (Neovim's own default too, so this still converges to
-    // the same layout as `CASES_WIN`'s plain `s`/`v` cases regardless of
-    // the percentage-vs-line-resize that ran first), and `WindowLayout::
-    // calculate_rects`'s rect-rounding now gives the exact 12/11 split
-    // Neovim does on this odd-sized axis (was 11/11 pre-#1290).
+    // `equalize_splits` sets every ratio to exactly 0.5 and calculates the correct
+    // rect-rounding.
     wc_sized(
         "win:CTRL-W = re-equalizes windows after a resize",
         WIN_TWO_LINES,
@@ -9609,13 +9297,7 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>s5<C-w>+<C-w>=",
     ),
-    // `CTRL-W +`/`-`: both real, non-vacuous PASSes since #1288 — the
-    // absolute-`[count]` resize math (`resize_window_split`) lands on the
-    // exact same (rows, cols) as Neovim for both directions on this
-    // harness's fixed 80x24, 2-window starting split; Horizontal splits have
-    // no divider-column gap to account for (see follow-up #6/#1326 in the
-    // KNOWN_DEVIATIONS_WIN comment block above), so there was never a second
-    // bug hiding behind the original percentage-vs-line one here.
+    // `CTRL-W +`/`-` resize windows by absolute `[count]` on both directions.
     wc_sized(
         "win:CTRL-W + increases the active window's height",
         WIN_TWO_LINES,
@@ -9630,15 +9312,8 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>s5<C-w>-",
     ),
-    // `CTRL-W <`/`>`: real, non-vacuous PASSes since #1326 — `<C-w>v10<C-w><`
-    // ends up (30, 49) and `<C-w>v10<C-w>>` (50, 29), i.e. Neovim's real
-    // 40/39-of-80 divider-reserving fresh split moved by an absolute
-    // `[count]` columns. Before #1326, #1288's resize math was already
-    // correct (the active, resized window's own width matched Neovim
-    // exactly), but the *other* window was one column too wide —
-    // `WindowLayout::layout_snapped` reserved zero columns for the vertical
-    // divider bar Neovim's own layout always has. See the KNOWN_DEVIATIONS_
-    // WIN comment block's follow-up #6 for the full diagnosis.
+    // `CTRL-W <`/`>` decrease/increase the active window's width by `[count]` columns,
+    // with correct divider-column accounting.
     wc_sized(
         "win:CTRL-W < decreases the active window's width",
         WIN_TWO_LINES,
@@ -9653,15 +9328,8 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>v10<C-w>>",
     ),
-    // `CTRL-W _`: a real, non-vacuous PASS since #1289 — `maximize_window_
-    // split` shrinks the other window to exactly Neovim's own
-    // `'winminheight'` floor (1 content row); Horizontal splits have no
-    // divider-column analogue, so there was no second bug to find here
-    // either. `CTRL-W \|` needed the same #1326 divider-column fix as
-    // `<`/`>` above (vimcode's fixed split used to give the other window
-    // exactly 1 of its own 80-column total — `79`/`1` — where Neovim's real
-    // split is `78`/`1` of a 79-column *content* total) and is now a real,
-    // non-vacuous PASS too.
+    // `CTRL-W _`/`|` maximize the active window, shrinking the other to the minimum
+    // height/width.
     wc_sized(
         "win:CTRL-W _ maximizes the active window's height",
         WIN_TWO_LINES,
@@ -9676,13 +9344,7 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>v<C-w>|",
     ),
-    // #1162 finding, filed and FIXED as #1292: `CTRL-W p` used to track
-    // only "previously active editor group", never "previously active
-    // window within one group" — the common single-group case every other
-    // CASES_WIN entry lives in. `Tab::prev_window` now tracks the latter,
-    // updated at every focus-changing call site (`Tab::focus_window`), and
-    // `execute_wincmd`'s `'p'` arm prefers it. PASS: no longer in
-    // KNOWN_DEVIATIONS_WIN.
+    // `CTRL-W p` returns to the previously active window within the current tab.
     wc(
         "win:CTRL-W p returns to the previously active window",
         WIN_TWO_LINES,
@@ -9692,16 +9354,9 @@ const CASES_WIN: &[WinCase] = &[
     ),
 ];
 
-// ─────── J. cross-file/cross-tab jumps and buffer/tab/window ex commands (#1281) ───────
-//
-// The 40 rows #1162 deliberately left for this issue: `gf`/`gt`/`CTRL-^`/
-// `g<Tab>`, the cross-file marks (`` `{A-Z} ``, `g'`, `` g` ``), and the
-// buffer/tab/window ex commands. Same [`WinCase`]/[`run_win_case`] harness as
-// [`CASES_WIN`] — nothing new to build, per the issue's own instruction not
-// to start a second harness. Kept as a separate array (not appended to
-// `CASES_WIN`) purely so the "33 CTRL-W rows" and "40 cross-file rows" stay
-// two countable units instead of one blurred one; [`run_win_case`] and
-// [`KNOWN_DEVIATIONS_XFILE`] work identically either way.
+// Cross-file/cross-tab jumps and buffer/tab/window ex commands. Same WinCase
+// harness as CASES_WIN — 40 rows left for `gf`/`gt`/`CTRL-^`/`g<Tab>`, the
+// cross-file marks, and the buffer/tab/window ex commands.
 const XFILE_MAIN: &[&str] = &["main one", "main two", "main three"];
 const XFILE_B: &[&str] = &["b one", "b two", "b three"];
 const XFILE_C: &[&str] = &["c one", "c two", "c three"];
@@ -9716,10 +9371,7 @@ const CASES_XFILE: &[WinCase] = &[
         1,
         ":e {F1}<CR>2G4lmA:e {F0}<CR>`A",
     ),
-    // First-non-blank, not the exact column the mark was set at — proves
-    // both the cross-file switch and #1281's `first_non_blank_col` fix
-    // (`g'` used to hardcode column 0, see KNOWN_DEVIATIONS_XFILE history
-    // in the commit that landed this).
+    // `g'` jumps to first non-blank, not the exact column the mark was set at.
     wc_files(
         "mark:g' jumps to the first non-blank across files",
         XFILE_MAIN,
@@ -9787,16 +9439,8 @@ const CASES_XFILE: &[WinCase] = &[
         1,
         ":e {F1}<CR><C-^>",
     ),
-    // --- Command-line window (other:) — Vim opens this in the current tab
-    // as a small split (`:h cmdwin`), and as of #1297
-    // `Engine::open_cmdline_window` does too. These three passed against the
-    // live oracle the moment `run_win_case` gained one (#1328): before that,
-    // `run_win_in_neovim` drove its oracle over `nvim --headless -l
-    // script.lua` + a single `nvim_feedkeys` burst, and `:h cmdwin` silently
-    // refuses to open without an attached UI (confirmed empirically), so that
-    // oracle reported a static, unchanged single window no matter what
-    // vimcode did — a harness gap, not a vimcode one. See
-    // KNOWN_DEVIATIONS_XFILE's history for the confirmed repro.
+    // The command-line window opens in the current tab as a small split, via
+    // `Engine::open_cmdline_window`.
     wc(
         "win:q: opens the command-line window",
         XFILE_MAIN,
@@ -9961,16 +9605,8 @@ const CASES_XFILE: &[WinCase] = &[
         1,
         ":tabe {F1}<CR>:tabmove 0<CR>",
     ),
-    // #1281 review: `:tabmove 0` above only exercises the special-cased
-    // `N=0` branch (handled the same before and after the fix). This case
-    // exercises the general `N > 0` arithmetic that the review found broken:
-    // 3 tabs main.txt/b.txt/c.txt, current = main.txt (original index 0),
-    // `:tabmove 2` lands main.txt at index 1 (not index 2) — verified
-    // against the live oracle (`nvim v0.12.5 --headless -u NONE -i NONE`):
-    // `N`(2) is greater than current's original index(0), so the tab that
-    // was originally at index 2 (c.txt) shifts back to index 1 once main.txt
-    // is removed, and main.txt is inserted right after it, landing at
-    // index 1 — i.e. `dest = N - 1`, not `dest = N`.
+    // `:tabmove N` moves the current tab; the destination index is `N - 1` when
+    // `N` is greater than the current tab's original index.
     wc_files(
         "ex:tabmove N moves the current tab to a non-edge position",
         XFILE_MAIN,
@@ -9979,17 +9615,7 @@ const CASES_XFILE: &[WinCase] = &[
         1,
         ":tabnew {F1}<CR>:tabnew {F2}<CR>1gt:tabmove 2<CR>",
     ),
-    // --- {win,buf,tab}do (ex::) — #1281's own callout: bufdo in particular
-    // "runs a command in every buffer and will surface any ordering
-    // difference immediately." It did: `:windo` iterated
-    // `self.windows.keys()` — every window in the whole engine (not just
-    // the current tabpage `:h :windo` scopes to), in `HashMap` order, so
-    // which window was left active after the loop was both wrong *and*
-    // nondeterministic across runs. Fixed to `Tab::layout.window_ids()`
-    // (tab-scoped, deterministic layout order) — see the fix commit for the
-    // full diagnosis. `normal! G` (last line) is a commutative edit
-    // regardless, so the *content* comparison was never what exposed this;
-    // only "which window/buffer/tab is left current" could disagree.
+    // `:windo` iterates the windows of the current tab in deterministic layout order.
     wc(
         "ex:windo runs a command in every window of the current tab",
         XFILE_MAIN,
@@ -10021,21 +9647,7 @@ const CASES_XFILE: &[WinCase] = &[
         1,
         ":e {F1}<CR>:e {F2}<CR>:b b.txt<CR>",
     ),
-    // #1283: `ex::copen`/`ex::cwindow`/`ex::lopen`/`ex::lwindow` — the four
-    // of the quickfix/location-list family's 23 ids that open a window, so
-    // per this issue's own instruction they're chained after #1162 onto this
-    // same `WinCase`/`run_win_case` layout-probe harness instead of the
-    // plain buffer/cursor `Case` harness the other 19 ids use (see
-    // `CASES_EX`'s "#1283" block above). Every one of these starts from a
-    // single window with no quickfix items and no location list at all —
-    // same "no populated-list seam" reasoning as that block.
-    //
-    // Three of the four are genuine, non-vacuous PASSes: `:cwindow` and
-    // `:lwindow` never open (confirmed against a live oracle: `winnr('$')`
-    // is unchanged either side, since the list is empty/absent) and `:lopen`
-    // refuses outright (`E776: No location list`, also confirmed live) — so
-    // the window layout is identical (one leaf, untouched) on both sides.
-    // `:copen` is the one RED entry — see KNOWN_DEVIATIONS_XFILE.
+    // `:cwindow` and `:lwindow` do not open on an empty list; `:lopen` raises an error.
     wc(
         "qf:cwindow stays closed on an empty quickfix list",
         XFILE_MAIN,
@@ -10057,18 +9669,8 @@ const CASES_XFILE: &[WinCase] = &[
         1,
         ":lwindow<CR>",
     ),
-    // #1283 finding, RED: confirmed against a live oracle that `:copen`
-    // opens the quickfix window *unconditionally* — even empty, `winnr('$')`
-    // goes from 1 to 2 with no error — and vimcode's `qf_open` was fixed
-    // in this same PR to match that (see `Engine::qf_open`'s #1283 doc
-    // comment). But vimcode's quickfix panel is not a real split window at
-    // all: `qf_open` only flips `QuickfixList::open`/`has_focus`, never
-    // touching `WindowLayout` (`src/tui_main/panels.rs`,
-    // `src/tui_main/render_impl.rs` render it as a separate overlay panel,
-    // the same architecture as the sidebar/terminal panels) — so Neovim's
-    // `winlayout()` grows a second leaf and vimcode's does not, a structural
-    // mismatch no message- or cursor-level fix can close. See
-    // KNOWN_DEVIATIONS_XFILE for the follow-up-issue writeup.
+    // `:copen` opens the quickfix window unconditionally, but vimcode's quickfix panel
+    // is not a real split window — it is an overlay panel (see KNOWN_DEVIATIONS_XFILE).
     wc(
         "qf:copen opens the quickfix window even on an empty list",
         XFILE_MAIN,
@@ -10079,7 +9681,7 @@ const CASES_XFILE: &[WinCase] = &[
 ];
 
 // KNOWN_DEVIATIONS_XFILE — same bidirectional-gate idiom as
-// KNOWN_DEVIATIONS_WIN above, applied to CASES_XFILE (#1281). May only ever
+// KNOWN_DEVIATIONS_WIN above, applied to CASES_XFILE. May only ever
 // SHRINK.
 //
 // ## Follow-up issue status (read before editing any entry below)
@@ -10200,16 +9802,8 @@ const CASES_XFILE: &[WinCase] = &[
 // ---------------------------------------------------------------------------
 
 const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
-    // Empty (#1328): the last three entries — "win:q: opens the command-line
-    // window" / "win:q/ ..." / "win:q? ..." — are gone. #1297 fixed the
-    // vimcode-level behaviour; `run_win_case` (`run_win_in_neovim`) still
-    // could not observe it because its oracle attached no UI, so `:h cmdwin`
-    // silently refused to open on the oracle side. #1328 moved
-    // `run_win_in_neovim` onto the same attached-UI `NvimRpc` transport
-    // `oracle_probe` uses for `CASES`/`KNOWN_DEVIATIONS` (#1008) — see the
-    // follow-up #1 writeup above for the confirmed repro and the live-run
-    // PASS. Do not add a new entry here without a confirmed live-oracle
-    // finding, same bar every other entry in this file has met.
+    // Empty. #1297 and #1328 fixed all issues. Do not add an entry here without a
+    // confirmed live-oracle finding, same bar every other entry in this file has met.
 ];
 
 #[test]
@@ -10346,7 +9940,7 @@ fn nvim_conformance_cross_file_ex() {
 }
 
 // KNOWN_DEVIATIONS_MESSAGE — same bidirectional-gate idiom as
-// KNOWN_DEVIATIONS_XFILE above, applied to CASES_MESSAGE (#1282). May only
+// KNOWN_DEVIATIONS_XFILE above, applied to CASES_MESSAGE. May only
 // ever SHRINK.
 //
 // ## Follow-up issue status (read before editing any entry below)
@@ -10359,7 +9953,7 @@ fn nvim_conformance_cross_file_ex() {
 // its two case labels are deleted from `KNOWN_DEVIATIONS_MESSAGE` below; this
 // paragraph is left as the historical index so the remaining item numbers
 // need not be renumbered. Items 2-5 are filed, as #1300 through #1303
-// respectively (filed 2026-09-22). Item 6 (#1304) was itself a hermeticity
+// respectively (filed 2026-09-22). Item 6 was itself a hermeticity
 // bug rather than a formatting one; it is now fixed, and the formatting gap
 // it had been masking was filed as #1327 and is now also fixed (see item 6
 // below).
@@ -10414,7 +10008,7 @@ fn nvim_conformance_cross_file_ex() {
 //      `KNOWN_DEVIATIONS_MESSAGE` below.
 //   4. (#1302 — FIXED) "msg:ex::digraphs lists the digraph table" — title:
 //      "`:digraphs`: match Neovim's default digraph table and its
-//      column-wrapped grid layout". `src/core/digraphs.rs`'s table (#1160)
+//      column-wrapped grid layout". `src/core/digraphs.rs`'s table
 //      was built against the *Vim* digraph list, not Neovim's, and
 //      `ex_digraphs`'s no-argument listing formatted it one-per-line
 //      instead of Neovim's fixed-width, column-wrapped grid — both
@@ -10612,7 +10206,7 @@ fn nvim_conformance_messages() {
 }
 
 // KNOWN_DEVIATIONS_DISK — same bidirectional-gate idiom, applied to
-// CASES_DISK (#1282). May only ever SHRINK.
+// CASES_DISK. May only ever SHRINK.
 //
 // No `gh` access from a worker session (see KNOWN_DEVIATIONS_XFILE's own
 // header for the policy this follows), so nothing here is "filed as #NNNN"
@@ -10808,7 +10402,7 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // `<<` operator instead of silently clamping). No `dot:` deviations
     // remain.
     //
-    // "undo:U" / "undo:UU" (#885): verified this is a fixture-loading
+    // "undo:U" / "undo:UU": verified this is a fixture-loading
     // artifact of the harness's `undolevels = -1` dance around the initial
     // `nvim_buf_set_lines` write (see the "Harness fidelity" doc comment
     // at the top of this file), not a real Vim/Neovim behaviour difference:
@@ -10826,172 +10420,29 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // buffer, which is wrong for actual usage.
     "undo:U",
     "undo:UU",
-    // "mac:\"ay then @a executes text" (#890): the buffer edit already
-    // matches the oracle exactly — `@a` has always executed whatever text
-    // sits in register `a`, yanked or recorded, so that half of this
-    // label's premise was never a bug. Only the final cursor differs by one
-    // column, and it's a harness artifact, not a vimcode bug: this macro's
-    // register content ends mid-Insert-mode with no real `<Esc>` (the
-    // literal string "<Esc>" was yanked as ordinary text, not typed as a
-    // keystroke), and `nvim_feedkeys(.., "ntx")` shares Neovim's
-    // `exec_normal()`/`:normal!` machinery, which force-exits an
-    // unterminated Insert/Replace mode with a synthetic `<Esc>` once
-    // typeahead drains (shifting the cursor left by one). Verified against
-    // a real interactive Neovim session (headless `--listen` + `tmux
-    // send-keys`, not this harness's `feedkeys`) that a live `"ay$j@a`
-    // leaves the editor genuinely in Insert mode with the cursor exactly
-    // where vimcode puts it — matching the long-documented "a macro that
-    // ends mid-insert leaves you in Insert mode" Vim behaviour. Adding a
-    // matching force-Escape-on-drain to vimcode's own macro playback would
-    // "fix" this label by breaking that real, load-bearing behaviour for
-    // every other macro that intentionally ends in Insert mode.
-    // "ins:BS over indent (nosmarttab)", "ins:Tab at start (nosmarttab)",
-    // "num:octal nf=octal 007" and "num:alpha" were moved to HARNESS_LIMITED
-    // by #875 and deleted outright by #1002 — the `setup`-is-dropped harness
-    // gap they were pinned to is closed and all four pass. (Note "num:octal
-    // not default 007" — no `setup`, plain Neovim defaults — was never
-    // affected and still passes as `008`.)
-    // ── #805 / #1008: the scroll group is gone, and so is its excuse ────
-    //
-    // Everything between here and the `sub:c` block used to be a long
-    // explanation of why `scroll:*` labels could not pass: `nvim --headless
-    // -l script.lua` attaches no UI, so no redraw runs, so the window's
-    // `w_topline` / `w_botline` / `w_empty_rows` are never re-validated
-    // between the keystrokes of one `nvim_feedkeys()` burst. That was real,
-    // it was measured, and the comment closed by saying the remainder "needs
-    // either a non-headless oracle for window-relative state or explicit
-    // sign-off to close them as a tracked harness limitation".
-    //
-    // #1008 built the non-headless oracle (see the module docs and
-    // `NvimRpc`), and there is nothing left to list: every `scroll:` case in
-    // the corpus passes, including the four chained sequences #805 measured
-    // (`<C-d><C-d>`, `5<C-d><C-d>`, `<C-d><C-d><C-u>`, `<C-f><C-f>`) and the
-    // `2<C-b>` that outlived them in `HARNESS_LIMITED`.
-    //
-    // Two things worth keeping, because they are easy to re-derive wrongly:
-    //
-    //   * The direct engine tests that pinned vimcode to the *interactive*
-    //     column while the oracle was wrong — `test_ctrl_d_chain_*`,
-    //     `test_ctrl_f_chain_*` and now `test_ctrl_b_chain_*` in
-    //     `tests/new_vim_features.rs` — are deliberately **kept**. They are
-    //     what holds the line if the oracle transport ever regresses again,
-    //     and they cost nothing.
-    //
-    //   * `2<C-b>` turned out **not** to be an oracle artifact at all.
-    //     Headless and interactive Neovim 0.12 agree on it (60-line buffer,
-    //     22-row window, cursor on line 60: both answer 22), and vimcode
-    //     answered 20. It had been excused as a broken oracle for three
-    //     issues. #1008 fixed `page_up` in `src/core/engine/motions.rs`; see
-    //     that function's comment. An excuse that nobody can falsify is how
-    //     that happens, which is the whole argument for owning the oracle.
-    //
-    // `page_up`/`page_down`/`scroll_cursor_center` in
-    // `src/core/engine/motions.rs` also carry the #805 fixes that were always
-    // real (the 2-line buffer-start/end no-op guards and the `zz`/`z.`
-    // centering off-by-one), each with a source comment pointing back here.
-    //
-    // ── RESOLVED (#1002): the 'startofline' group was never either ──
-    //
-    // An earlier revision of this comment claimed, above "scroll:C-d col sol"
-    // and the three "word:...(sol)" labels, that they had a "separate, genuine
-    // root cause: vimcode doesn't implement Vim's 'startofline' option at
-    // all". That was wrong by the time it was read: `Settings::startofline`
-    // landed in #876 and is honoured by `land_line_jump_cursor` /
-    // `land_vertical_scroll_cursor` (`src/core/engine/motions.rs`), with the
-    // `gg`/`G` call sites in `src/core/engine/keys.rs` — which is why the
-    // `(nosol)` twin of every one of those cases already passed. The real and
-    // only cause was that `run_in_vimcode` dropped the case's `setup`, so the
-    // vimcode side ran with `startofline` off no matter what the option did.
-    // #1002 wired `setup` through and deleted all four entries. Left as a
-    // note, not an excuse: a stale "feature is missing" claim cost a future
-    // reader the whole re-derivation once already.
-    //
-    // ── RESOLVED (#1008): "mac:\"ay then @a executes text" ──
-    //
-    // Deleted, and it was never a vimcode bug either. The entry documented a
-    // one-column cursor difference caused by `nvim_feedkeys(.., "ntx")`
-    // sharing Neovim's `exec_normal()` machinery, which force-`<Esc>`s an
-    // unterminated Insert mode once typeahead drains. The note said, in as
-    // many words, that a real interactive session leaves the editor in Insert
-    // mode exactly where vimcode leaves it. #1008's oracle types the keys
-    // through `nvim_input` instead of `feedkeys`, so there is no synthetic
-    // `<Esc>` and the case simply passes.
-    //
-    // ── RESOLVED (#1031, #801 Phase 2): "sub:c ..." ──
-    //
-    // #986's v0.11.0 bug suite listed 11 confirm-prompt cases here because
-    // `execute.rs`'s `flags.contains('c')` check always errored loudly
-    // instead of entering a confirm loop, so the keystrokes meant for the
-    // prompt (y/n/a/q/l/<Esc>) fell through to ordinary Normal-mode command
-    // dispatch on the vimcode side. #1031 built the real confirm loop
-    // (`Engine::confirm_sub`, `execute.rs`) and all 11 now pass, alongside
-    // the 5 new cases #1031 itself added right after them in `CASES_EX`.
-    //
-    // ── RESOLVED (#1293): "scroll:so=5 30G H", "scroll:so=5 30G L" ──
-    //
-    // #1280 surfaced these (see that issue's history: `run_in_vimcode` used
-    // to never set `'wrap'`, so every case ran against vimcode's actual
-    // default of `wrap=false` regardless of the oracle's `wrap=true`; once
-    // #1280 forced both sides to match Neovim's default, this became a real,
-    // previously-hidden gap). `ensure_cursor_visible_wrap` — the vertical
-    // scroll-to-cursor path used when `'wrap'` is on, in
-    // `src/core/engine/search.rs` — never read `self.settings.scrolloff` at
-    // all, unlike the `'wrap'`-off path a few lines above it in the same
-    // file (`ensure_cursor_visible`), which does. #1293 ported `scrolloff`
-    // into the wrap path, expressed in *visual* rows (a wrapped logical line
-    // can span more than one screen row, so a flat buffer-line margin like
-    // the no-wrap path's isn't equivalent) via the new
-    // `Engine::visual_rows_for_range` helper and margin-aware top/bottom
-    // branches in `ensure_cursor_visible_wrap`. Both cases pass now; deleted
-    // per this list's own bidirectional-gate policy.
+    // "mac:\"ay then @a executes text": the buffer edit matches the oracle exactly.
+    // The final cursor differs by one column due to `nvim_feedkeys(.., "ntx")`
+    // sharing Neovim's `exec_normal()` machinery, which force-exits unterminated
+    // Insert mode with a synthetic `<Esc>` once typeahead drains. A real interactive
+    // session leaves the editor in Insert mode where vimcode puts it.
 ];
 
 // ---------------------------------------------------------------------------
-// HARNESS_LIMITED (#875) — cases this harness cannot faithfully probe.
+// HARNESS_LIMITED — cases this harness cannot faithfully probe.
 //
-// **Currently empty, and that is the point.** An entry here is not a claim
-// that vimcode differs from Vim; it is a claim that *this test* cannot tell,
-// because the failure traces to a gap in the harness (`run_in_vimcode` /
-// `oracle_probe`) or to the oracle process itself rather than to `Engine`.
-// Counting those against the "how far from Neovim is vimcode" number would be
-// dishonest bookkeeping, so the runner reports them separately and excludes
-// them from the KNOWN_DEVIATIONS bidirectional gate entirely — they can fail
-// forever without being a regression, and pass without being "a fix landed"
-// that forces an entry deletion.
+// **Currently empty.** An entry here is not a claim that vimcode differs from
+// Vim; it is a claim that *this test* cannot tell, because the failure traces to
+// a gap in the harness or to the oracle process rather than to `Engine`. Such
+// entries are exempt from the KNOWN_DEVIATIONS bidirectional gate and do not
+// count as regressions or fixes.
 //
-// That exemption is exactly why the array has to stay empty unless something
-// genuinely unprobeable turns up. Both gaps it ever held are closed, and
-// **neither turned out to be what its entry said it was**:
-//
-//   * #1002's gap was real — `run_in_vimcode` dropped a case's Lua `setup`,
-//     so every `cs(..)` case drove vimcode's defaults against a
-//     differently-configured Neovim and could not pass by construction. Four
-//     labels left when `apply_setup` landed ("ins:BS over indent
-//     (nosmarttab)", "ins:Tab at start (nosmarttab)", "num:octal nf=octal
-//     007", "num:alpha").
-//
-//   * #875's gap — "scroll:2<C-b>", excused since #805 as a headless-oracle
-//     artifact — was **not real**. The entry asserted at length, with a
-//     measured table, that headless nvim's topline collapses to the cursor
-//     line so `<C-b>` reads a window position no interactive session shows.
-//     Upstream fixed that in 0.12, and on the pinned oracle headless and
-//     interactive agree: 60-line buffer, 22-row window, cursor on line 60,
-//     `2<C-b>` lands on line 22 in both. vimcode answered 20. The entry had
-//     been excusing a genuine vimcode bug for three issues; #1008 fixed
-//     `page_up` (`src/core/engine/motions.rs`) and the case passes as an
-//     ordinary one.
-//
-// So: an entry here must name a mechanism *and* an experiment that would
-// falsify it, and the array must only ever change because such a gap is
-// closed (fix it, delete the entry, the case rejoins ordinary accounting) or
-// because a case left the corpus. Never add an entry to paper over a failure
-// you have not falsified.
-// ---------------------------------------------------------------------------
+// Both gaps it ever held are now closed, and neither turned out to be what its
+// entry said it was:
 
 const HARNESS_LIMITED: &[&str] = &[];
 
 // ---------------------------------------------------------------------------
-// Coverage ratchet (#1007) — what the corpus does NOT reach
+// Coverage ratchet — what the corpus does NOT reach
 //
 // `KNOWN_DEVIATIONS` above holds ground already taken: it is excellent at
 // noticing a command that used to match Neovim and stopped. It says nothing
@@ -11098,9 +10549,7 @@ enum DocStatus {
     /// ❌ — claimed not implemented. Out of scope for this gate.
     Missing,
     /// N/A — deliberately not in scope (VimScript and anything needing an
-    /// expression evaluator). **Not** spelling or digraphs: `src/core/spell.rs`
-    /// implements the former (#1163 moved those rows to ✅) and
-    /// `src/core/digraphs.rs` the latter (#1160 moved those rows to ✅).
+    /// expression evaluator).
     NotApplicable,
 }
 
@@ -11164,7 +10613,7 @@ const SECTION_KEYS: &[(&str, &str)] = &[
     ("Operator-Pending Mode", "oppend"),
     ("Visual Mode", "visual"),
     ("Core Vim Ex Commands", "ex"),
-    // #1163: the "Not implemented" section. Its rows are ❌ (or N/A), so they
+    // The "Not implemented" section. Its rows are ❌ (or N/A), so they
     // are out of `in_scope` and carry no probes — but they must still parse,
     // because the whole point of the section is that a command with no row
     // cannot be counted as missing. Three keys, not one, because a `###`
@@ -11584,7 +11033,7 @@ fn classify_coverage(
 }
 
 /// Every `(label, keys)` in the corpus — the single-buffer cases plus the
-/// multi-file jumplist ones and the window-layout ones (#1162), all of which
+/// multi-file jumplist ones and the window-layout ones, all of which
 /// are oracle-backed the same way.
 fn all_corpus_cases() -> Vec<(&'static str, &'static str)> {
     let mut out: Vec<(&str, &str)> = CATEGORIES
@@ -11655,7 +11104,7 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ins:CTRL-V {char}", Label("ins:C-v Tab")),
     p("ins:CTRL-G u", Label("undo:C-g u splits")),
     p("ins:CTRL-G j/k", Keys("<C-g>j")),
-    // #1160: digraphs + the <C-x> completion submode.
+    // Digraphs + the <C-x> completion submode.
     p("ins:CTRL-K {c1}{c2}", Label("ins:C-k a: digraph")),
     p("ins:CTRL-X CTRL-N/CTRL-P", Label("ins:C-x C-n")),
     p("ins:CTRL-X CTRL-L", Label("ins:C-x C-l line completion")),
@@ -11954,7 +11403,7 @@ const COMMAND_PROBES: &[CommandProbe] = &[
         "z:zx",
         Label("fold:zx recomputes and clamps a hidden cursor"),
     ),
-    // #1163: spell is implemented (`src/core/spell.rs`) and these rows moved
+    // Spell is implemented (`src/core/spell.rs`) and these rows moved
     // N/A → ✅, so they are in scope and need probes. The corpus has no spell
     // cases at all today, so all seven are seeded into COVERAGE_EXEMPT — that
     // is a measured gap, and the bidirectional gate forces them to be deleted
@@ -12023,7 +11472,7 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("win:CTRL-W d", Keys("<C-w>d")),
     // --- Bracket Commands (bracket) ---
     p("bracket:]c", Keys("]c")),
-    // #1163: see the z-section note — spell moved N/A → ✅.
+    // See the z-section note — spell moved N/A → ✅.
     p("bracket:[s", Label("spell:[s prev misspelling")),
     p("bracket:]s", Label("spell:]s next misspelling")),
     p("bracket:[c", Keys("[c")),
@@ -12238,11 +11687,11 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::registers", Keys(":registers")),
     p("ex::marks", Keys(":marks")),
     p("ex::jumps", Keys(":jumps")),
-    // #1160 — same message-only-command shape as `:marks`/`:jumps` above.
+    // Same message-only-command shape as `:marks`/`:jumps` above.
     p("ex::digraphs", Keys(":digraphs")),
     p("ex::changes", Keys(":changes")),
     p("ex::history", Keys(":history")),
-    // #1156 — undo tree ex-commands.
+    // Undo tree ex-commands.
     p("ex::undolist", Keys(":undolist")),
     p("ex::earlier", Keys(":earlier")),
     p("ex::later", Keys(":later")),
@@ -12266,12 +11715,8 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::cquit", Keys(":cquit")),
     p("ex::version", Keys(":version")),
     p("ex::help", Keys(":help")),
-    // A bare `Keys(":h")` needle is exactly the over-crediting trap the
-    // module doc's "the probe is deliberately dumb" section warns about: it
-    // is a substring of `:help` (the id right above) and, since #1154, of
-    // `:hide` too — so it would silently "cover" `:h` off the back of an
-    // oracle case that never once typed the standalone `:h` help command.
-    // `<CR>` immediately after pins it to the bare, no-argument invocation.
+    // A bare `Keys(":h")` matches both `:help` and `:hide`. Append `<CR>` to pin
+    // it to the bare, no-argument `:h` help command.
     p("ex::h", Keys(":h<CR>")),
     p("ex::windo {cmd}", Keys(":windo")),
     p("ex::bufdo {cmd}", Keys(":bufdo")),
@@ -12286,7 +11731,6 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::cn", Keys(":cn")),
     p("ex::cp", Keys(":cp")),
     p("ex::cc", Keys(":cc")),
-    // --- #1155: quickfix completion + the location-list family ---
     p("ex::cfirst", Keys(":cfirst")),
     p("ex::clast", Keys(":clast")),
     p("ex::cwindow", Keys(":cwindow")),
@@ -12308,15 +11752,10 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::lfdo", Keys(":lfdo")),
     p("ex::lgrep", Keys(":lgrep")),
     p("ex::lvimgrep", Keys(":lvimgrep")),
-    // #1283: tightened from a bare `Keys(":cd")` — that needle is a prefix
-    // of `:cdo` too, and would have silently (and wrongly) "covered" this
-    // still-uncovered id off the back of `ex:cdo with no argument errors`'s
-    // case the moment #1283 added one. The audit table's own row for `:cd`
-    // (`ex(":cd", ..., Some(Keys(":cd ")), ...)` below) already uses the
-    // trailing-space form — this probe just never matched it.
+    // This probe uses `:cd ` (with trailing space) to avoid matching `:cdo`,
+    // which is also a prefix of that needle.
     p("ex::cd {path}", Keys(":cd ")),
     p("ex::colorscheme", Keys(":colorscheme")),
-    // #1151
     p("ex::map", Label("map:nmap_chases_recursively")),
     p("ex::nmap", Label("map:nmap_chases_recursively")),
     p("ex::imap", Label("map:inoremap_jk_to_escape")),
@@ -12330,102 +11769,44 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::Vex", Keys(":Vex")),
 ];
 
-// ---------------------------------------------------------------------------
 // COVERAGE_EXEMPT — this list may only ever SHRINK.
 //
-// **84 of the 619 commands `VIM_COMPATIBILITY.md` marks ✅/⚠️ have no oracle
-// case at all** (13.6%; 535 are covered — both numbers straight off this
-// test's own printed banner, not hand-derived). That number is the
-// measurement this gate exists to produce, and it is the first one anybody
-// has taken: the doc itself reads "422/424, 100% — Remaining Missing
-// Commands: None", which is a claim about *existence*, and
-// `COVERAGE_PHASE5.md` audits 2 of 6 areas.
+// 84 of the 619 commands `VIM_COMPATIBILITY.md` marks ✅/⚠️ have no oracle
+// case at all (13.6%; 535 are covered). Where the gap is, at a glance:
 //
-// Where the gap is, at a glance (uncovered / in-scope, seeded 2026-09,
-// updated 2026-09 by #1279 which retired the text-object, operator-pending,
-// visual, movement, editing and `'<` rows below, by #1162 which backfilled
-// all 33 CTRL-W rows — 26 now have a real oracle case (8 of those tracked red
-// in KNOWN_DEVIATIONS_WIN, not vacuously exempt) and the other 7
-// (`H`/`J`/`K`/`L`/`T`/`e`/`E`/`d`) moved to the permanent
-// "Deliberate semantic divergence" heading below — and by #1282, which
-// backfilled `ga`/`g8`/`<C-g>` (in both their `other:` and `g:` doc rows) and
-// the 21 echo-area/message ex-commands plus 6 on-disk ones):
+//     Core Vim ex commands      105/111
+//     Window commands (CTRL-W)    7/33
+//     g-commands                 21/50
+//     Bracket commands           16/26
+//     Normal — other             19/34
+//     z-commands                 10/28
+//     Normal — search & marks     3/31
+//     Insert mode                 2/23
 //
-//     Core Vim ex commands      105/111  :w :q :bn :ls :marks :grep …
-//     Window commands (CTRL-W)    7/33   H J K L T e/E d — all permanent
-//     g-commands                 21/50   gt gT gf gF gx gR g@ g+ …
-//                                        (`g-` left this list in #1156,
-//                                        `g0`/`gm`/`gM` in #1279,
-//                                        `ga`/`g8` in #1282)
-//     Bracket commands           16/26   ]c [c ]d [d [m ]m [* ]* [# ]# …
-//     Normal — other             19/34   gt gT gf gF K gx q: q/ q? …
-//     z-commands                 10/28   zA zF zv zx zh zl zH zL ze zs
-//     Normal — search & marks     3/31   // /<CR> aliases, `{A-Z}, g' g`
-//     Insert mode                 2/23   CTRL-@, CTRL-G j/k
-//     Text objects                0/32   (all retired by #1279)
-//     Operator-pending            0/59   (all retired by #1279)
-//     Normal — movement           0/48   (all retired by #1279)
-//     Visual mode                 0/38   (all retired by #1279)
-//     Normal — editing            0/50   (all retired by #1279)
+// Deleting an entry proves its case: the gate fails if a listed id's probe
+// starts matching, and fails if an unlisted id's probe matches nothing.
+// Never add an entry to paper over a deleted case.
 //
-// Deleting an entry is how an oracle case proves itself: the gate fails if a
-// listed id's probe starts matching, and fails if an unlisted id's probe
-// matches nothing. Never add an entry to paper over a deleted case.
-//
-// **A permanent entry carries a reason; an unannotated entry is debt (#1278).**
-// Most of this list is plain uncovered work — nobody has written the oracle
-// case yet, and the entry should read as a TODO. A minority of entries can
-// never gain a case no matter how much work goes in: the command diverges
-// from Neovim on purpose, the command ends the very session the probe is
-// running in, or the result depends on the host machine rather than on the
-// editor. Those, and only those, are annotated below under one of the four
-// "permanent" headings, each with the reason inline. If you are looking at
-// an entry with no comment above it, it is debt: pick it up, add a
-// `COMMAND_PROBES` entry and an oracle case, and delete it here. If you
-// believe an *annotated* entry is actually coverable, that is a finding for
-// whatever issue is doing that work, not license to just delete the
-// annotation — file it and let that slice make the case.
-// ---------------------------------------------------------------------------
+// A permanent entry carries a reason; an unannotated entry is debt.
+// Most of this list is uncovered work — nobody has written the oracle
+// case yet. A minority can never gain a case: the command diverges from
+// Neovim on purpose, ends the session, or depends on the host machine.
+// Those, and only those, are annotated below under one of the four
+// "permanent" headings. If you see an entry with no comment above it,
+// it is debt: pick it up, add a `COMMAND_PROBES` entry and an oracle
+// case, and delete it here.
 
 const COVERAGE_EXEMPT: &[&str] = &[
-    // --- Spell (#1163, deferred by #1278) ---
-    // `src/core/spell.rs` implements all seven, so they are ✅ in the doc and
-    // in scope here — but the oracle corpus contains no spell case whatsoever,
-    // so every probe above matches nothing. Exempt today, but — unlike the 46
-    // rows below this block — NOT permanent: these are deliberately left out
-    // of the "permanent" headings, because covering them is possible.
-    //
-    // #1278 looked at scoping that fixture and is deferring it rather than
-    // building it, for a concrete reason: `zg`/`zw`/`zG`/`zW` mutate word
-    // membership in a dictionary, and `z=`/`[s`/`]s` read the current
-    // dictionary's verdict — so every one of the seven is only comparable
+    // Spell — implemented in `src/core/spell.rs`, but the oracle corpus
+    // contains no spell case. The seven spellcommands are only comparable
     // against the oracle if both sides agree on the same word list. They do
-    // not. `src/core/spell.rs` uses the `spellbook` crate (a Hunspell-format
-    // parser) against `dictionaries/en_US.dic`/`.aff`, compiled into the
-    // vimcode binary. The nvim oracle uses its own compiled `.spl` binary
-    // format, loaded at runtime from `$VIMRUNTIME/spell/en.utf-8.spl` —
-    // shipped with the Neovim *install*, not pinned by this repo, so it can
-    // silently change word list and suggestion ranking across a Neovim
-    // version bump. The two are unrelated implementations with unrelated
-    // word lists: confirmed empirically (2026-09, nvim 0.12.5) that
-    // `z=`-style suggestions for "helo" already differ in ranking between
-    // the two.
-    //
-    // That kills `z=` outright — its entire observable behavior *is* the
-    // suggestion list, so there is no dictionary-independent slice of it
-    // left to test. `zg`/`zw`/`zG`/`zW`/`[s`/`]s` are less broken: their
-    // effect is mechanical (does this word now report bad/good; does the
-    // cursor land on the next/prev bad word), which only needs both
-    // dictionaries to agree a *specific* word is bad — true for something
-    // like "helo", regardless of suggestion-list differences. A real fixture
-    // for those six would need to either (a) bundle a pinned nvim `.spl`
-    // fixture in this repo and point the oracle at it via `spellfile`, so
-    // the oracle's word list stops drifting with the host's Neovim install,
-    // or (b) hand-pick fixture words unambiguous enough (obvious nonsense vs.
-    // common real words) that both dictionaries' bad/good verdict is safe to
-    // assume without pinning. Either is scoped work for a future slice, not
-    // done here — this comment is that slice's starting point. `z=` itself
-    // stays exempt regardless of which path is taken.
+    // not: vimcode uses the `spellbook` crate against `dictionaries/en_US.dic`,
+    // while the nvim oracle uses its own compiled `.spl` format loaded at
+    // runtime from `$VIMRUNTIME/spell/en.utf-8.spl`, which can change across
+    // Neovim version bumps. `z=` is unfixable — its observable behavior *is*
+    // the suggestion list. The other six (`zg`/`zw`/`zG`/`zW`/`[s`/`]s`) could
+    // be tested if the oracle's word list were pinned, which is scoped work
+    // for a future slice, not done here.
     "z:z=",
     "z:zg",
     "z:zw",
@@ -12434,7 +11815,7 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "bracket:[s",
     "bracket:]s",
     // ===========================================================================
-    // Permanent exemptions (#1278) — the 46 ids below will never gain an
+    // Permanent exemptions — the 46 ids below will never gain an
     // oracle case, each for one of the four reasons grouped under the
     // headings that follow. See the array's own doc comment above for the
     // rule: a permanent entry carries a reason; an unannotated entry (every
@@ -12472,35 +11853,29 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // (VIM_COMPATIBILITY.md:314,386).
     "other:gx",
     "g:gx",
-    // #1280: `gh` is deliberately rebound to the editor hover popup
+    // `gh` is deliberately rebound to the editor hover popup
     // (VIM_COMPATIBILITY.md:399) — Neovim's `gh` enters Select mode, a
     // different mode vimcode doesn't implement (that gap is the doc's
     // separate `` `<C-\><C-n>` `` "Not implemented — modes" row), so a
     // byte-for-byte comparison would be comparing two unrelated features,
     // not checking one.
     "g:gh",
-    // #1162: `CTRL-W H`/`J`/`K`/`L` ("move current window to far
-    // left/bottom/top/right") and `CTRL-W T` ("move window to new tab")
-    // close the window and open a brand-new VSCode-style *editor group*
-    // at the layout edge instead of restructuring the window tree within
-    // the current tab the way Neovim does (`move_window_to_edge`/
-    // `move_window_to_new_group` in `src/core/engine/windows.rs`) — already
-    // documented as such in VIM_COMPATIBILITY.md:463-467 ("Creates new
-    // group at layout edge" / "Moves to new editor group"), not something
-    // #1162 introduced. A byte-for-byte comparison against Neovim's
-    // single-tab window tree would be comparing two different features.
+    // CTRL-W H/J/K/L (move current window to layout edge) and CTRL-W T
+    // (move to new tab) close the window and open a VSCode-style editor
+    // group at the layout edge instead of restructuring Neovim's single-tab
+    // window tree — a deliberate semantic divergence, not a bug.
     "win:CTRL-W H",
     "win:CTRL-W J",
     "win:CTRL-W K",
     "win:CTRL-W L",
     "win:CTRL-W T",
-    // #1162: `CTRL-W e`/`E` ("split editor group right/down") is a VimCode
+    // `CTRL-W e`/`E` ("split editor group right/down") is a VimCode
     // extension bolted onto a keystroke Neovim leaves unbound — confirmed
     // empirically (`nvim --headless -u NONE -i NONE`: `<C-w>e` opens no
     // window and changes no state) — already documented as such in
     // VIM_COMPATIBILITY.md:455.
     "win:CTRL-W e/E",
-    // #1162: `CTRL-W d` ("split + go to definition") routes to LSP
+    // `CTRL-W d` ("split + go to definition") routes to LSP
     // goto-definition — same divergence class as `other:CTRL-]` above, and
     // for the same reason (VIM_COMPATIBILITY.md:478, "LSP-based"; the
     // oracle's `-u NONE -i NONE` has no LSP client to compare against).
@@ -12546,10 +11921,10 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ex::Sex",
     "ex::Vexplore",
     "ex::Vex",
-    // --- Already decided into unit tests (#1160) ---
+    // --- Already decided into unit tests -----------
     "ins:CTRL-@",
     "ins:CTRL-G j/k",
-    // #1160: source-dependent <C-x> sub-modes — oracle cases exist for
+    // Source-dependent <C-x> sub-modes — oracle cases exist for
     // CTRL-X CTRL-L/CTRL-F above; the rest are covered by unit tests instead
     // (per the issue: "the rest of the CTRL-X family is source-dependent and
     // belongs in unit tests" — buffer-scoped keyword completion, the bundled
@@ -12566,72 +11941,31 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // line has no annotation because it needs none: pick one up, write a
     // `COMMAND_PROBES` entry and an oracle case, and delete it.
     // ===========================================================================
-
-    // --- g-Commands (g) ---
-    // `g:g-` was here until #1156: the new
-    // `undo:g- crosses a branch abandoned by u then edit` case presses `g-`,
-    // so the probe matches and the ratchet demands the entry be deleted.
-    // That is the list shrinking as designed — do not re-add it.
-    // --- Window Commands (CTRL-W) (win) --- #1162 backfilled all 33: 26 now
-    // have a real oracle case (CASES_WIN — 18 pass, 8 tracked red in
-    // KNOWN_DEVIATIONS_WIN), and the other 7 (H/J/K/L/T/e/E/d) moved to the
-    // "Deliberate semantic divergence" permanent heading above.
-    // --- Core Vim Ex Commands (ex) --- #1281 backfilled the 22 buffer/tab/
-    // window rows below, plus 18 more (gf/gt/CTRL-^/marks/etc. — CASES_XFILE
-    // is 35 cases total, 28 pass, 7 tracked red in KNOWN_DEVIATIONS_XFILE —
-    // the 35th, "ex:tabmove N moves the current tab to a non-edge position",
-    // was added in review to cover the general-N `:tabmove` arithmetic the
-    // original `:tabmove 0` case didn't reach); #1282 backfilled
-    // `other:ga`/`other:g8`/`other:CTRL-G`/`g:ga`/`g:g8` and the 21
-    // echo-area/message ex-commands (CASES_MESSAGE — 12 pass, 7 tracked red
-    // in KNOWN_DEVIATIONS_MESSAGE) plus the 6 on-disk ones (CASES_DISK, all
-    // 6 pass — `ex::w` already had a vacuous case via the `:windo` needle
-    // collision below, so it gained a real one too even though there was
-    // nothing to delete here);
-    // (`ex::w`'s `Keys(":w")` probe is a loose needle that also matches
-    // ":windo" — retired before #1282 as an honest side effect of that
-    // needle, not because `:w` itself had gained a dedicated case at the
-    // time.) #1283 backfilled the whole quickfix/location-list family (23
-    // ids, `ex::copen`..`ex::lfdo`, #1155's leftover debt) — 19 via real,
-    // passing empty-list/no-location-list refusal or no-op cases in
-    // `CASES_EX` (same precedent as `ex:cc on empty quickfix list`, #1154),
-    // and 4 (`ex::copen`/`ex::cwindow`/`ex::lopen`/`ex::lwindow`, which open
-    // a window) via `CASES_XFILE`'s `WinCase` layout-probe harness per this
-    // issue's own chaining instruction — `ex::copen` is real but currently
-    // RED, tracked in `KNOWN_DEVIATIONS_XFILE`. See that block's "#1283
-    // population seam" comment in `CASES_EX` for why every one of these
-    // drives an empty/absent list rather than a populated one: no key
-    // sequence can populate an identical quickfix list on both sides
-    // through this harness (confirmed against a live oracle — `:vimgrep`
-    // with no file argument errors `E683`, and vimcode's own
-    // `:vimgrep`/`:grep` don't take a file argument at all).
 ];
 
 // ---------------------------------------------------------------------------
-// Oracle version (#865, #872) — deliberately adjacent to KNOWN_DEVIATIONS
+// Oracle version — deliberately adjacent to KNOWN_DEVIATIONS
 // above, because a deviation list is only meaningful against the oracle that
 // produced it. If you regenerate the list, move `DEVIATIONS_ORACLE` in the
 // same commit.
 // ---------------------------------------------------------------------------
 
 /// The `(major, minor)` Neovim that [`KNOWN_DEVIATIONS`] was last regenerated
-/// against — the fleet-standard Homebrew/upstream `v0.12.5` that every agent
-/// host and both CI jobs run (#872; `ubuntu-24.04` apt's 0.9.5 is below
-/// [`MIN_NVIM_VERSION`] and was replaced as CI's oracle by #865). See the
-/// "Oracle version skew" section of the module docs: a run against anything
-/// else prints a loud banner, and the "a listed label now passes" direction of
-/// the gate is downgraded to an advisory (see [`fixes_are_enforced`]).
+/// against — the fleet-standard v0.12.5. See the "Oracle version skew" section
+/// of the module docs: a run against anything else prints a loud banner, and
+/// the "a listed label now passes" direction of the gate is downgraded to an
+/// advisory (see [`fixes_are_enforced`]).
 const DEVIATIONS_ORACLE: (u32, u32) = (0, 12);
 
 /// The minimum `(major, minor)` Neovim this suite will accept as an oracle
-/// (#865). The fleet standard — every agent host, and both CI jobs — is
+///. The fleet standard — every agent host, and both CI jobs — is
 /// Homebrew's / upstream's current stable `v0.12.5`; `0.12` is the floor that
 /// pins. A host below it fails loudly rather than quietly producing verdicts
 /// from a different Vim.
 const MIN_NVIM_VERSION: (u32, u32) = (0, 12);
 
 /// Opt out of the whole suite on a machine that cannot supply a usable oracle
-/// (#865). Deliberately an explicit, greppable env var rather than an implicit
+///. Deliberately an explicit, greppable env var rather than an implicit
 /// "`CI` is unset" skip: skipping must be a visible act on the command line,
 /// not the default a coordinator Test leg silently inherits.
 const ALLOW_SKIP_VAR: &str = "NVIM_CONFORMANCE_ALLOW_SKIP";
@@ -12698,7 +12032,7 @@ fn run_case(case: &Case) -> Outcome {
         nvim.col,
         vc_line,
         vc_col,
-        // #1008: the post-redraw `w_topline` the oracle saw between
+        // The post-redraw `w_topline` the oracle saw between
         // keystrokes. A scroll failure is usually readable straight off this
         // trace — which key moved the window, and by how much.
         nvim.toplines,
@@ -12709,7 +12043,7 @@ fn run_case(case: &Case) -> Outcome {
 // The bidirectional KNOWN_DEVIATIONS gate, extracted as a pure function so the
 // gate itself can be tested without an nvim on PATH — see
 // `known_deviation_gate_is_bidirectional` at the bottom of this file. A gate
-// that has never been observed to fail is not a gate (#553).
+// that has never been observed to fail is not a gate.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -12775,19 +12109,13 @@ fn parse_nvim_version(version_output: &str) -> Option<(u32, u32)> {
 /// Is the "a listed label now PASSES" direction of the gate enforcing?
 ///
 /// Yes when the running Neovim is the one [`KNOWN_DEVIATIONS`] was captured
-/// against, or when its version could not be determined (failing closed, so a
-/// `nvim --version` format change cannot silently disable the gate). Otherwise
-/// the oracle legitimately disagrees on some labels (#868) and deleting them
-/// would hand the capture oracle the same count back as false regressions, so
-/// the direction is downgraded to a printed advisory.
-///
-/// #865 removed the former `in_ci ||` short-circuit: it was correct only while
-/// CI *was* the capture oracle. CI now runs the pinned fleet oracle (v0.12.5)
-/// and, as of #872, so does [`DEVIATIONS_ORACLE`] — the enforcing lane is
-/// "whichever lane runs [`DEVIATIONS_ORACLE`]", which is every lane again.
+/// against, or when its version could not be determined (failing closed).
+/// Otherwise the oracle legitimately disagrees on some labels and deleting
+/// them would hand the capture oracle false regressions, so the direction is
+/// downgraded to a printed advisory.
 ///
 /// Note this only ever relaxes the *fixed* direction. Regressions and stale
-/// entries stay fatal on every machine, CI included.
+/// entries stay fatal on every machine.
 fn fixes_are_enforced(nvim: Option<(u32, u32)>) -> bool {
     nvim.is_none_or(|v| v == DEVIATIONS_ORACLE)
 }
@@ -12812,8 +12140,7 @@ fn version_banner_line(version_output: &str) -> &str {
 
 /// Resolve `nvim` against `PATH` the way the OS would, for *reporting* only —
 /// [`std::process::Command`] does its own lookup, but it will not tell us which
-/// binary it picked, and "which nvim did this verdict come from" is exactly the
-/// question #865 exists to answer. Platform-neutral: no `which`/`where` shell-out.
+/// binary it picked. Platform-neutral: no `which`/`where` shell-out.
 fn resolve_on_path(exe: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     // Windows carries the extension; trying both on every platform is harmless
@@ -12829,11 +12156,10 @@ fn resolve_on_path(exe: &str) -> Option<std::path::PathBuf> {
 
 /// A regular file ahead of the real oracle on `PATH` but lacking the
 /// executable bit would never actually be picked by the real `execvp`-style
-/// lookup [`std::process::Command`] performs — only `is_file()` would still
-/// name it as "resolved", which is misleading in a reporting-only helper
-/// whose entire job is "which binary produced this verdict" (review finding
-/// on #865). Windows has no executable bit in this sense; `.exe`/no-extension
-/// matching in [`resolve_on_path`] is already the whole story there.
+/// lookup [`std::process::Command`] performs — only `is_file()` would name it,
+/// which is misleading in a reporting-only helper. Windows has no executable
+/// bit in this sense; `.exe`/no-extension matching in [`resolve_on_path`]
+/// is already the whole story there.
 #[cfg(unix)]
 fn is_executable(p: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -12850,16 +12176,11 @@ fn is_executable(_p: &std::path::Path) -> bool {
 /// Write `s` straight to the real OS-level stderr, bypassing libtest's
 /// stdout/stderr capture.
 ///
-/// libtest intercepts `print!`/`eprintln!` via a thread-local sink
-/// (`io::set_output_capture`) and *discards* it for a passing test unless
-/// `--nocapture`/`--show-output` was passed — see the rustc source for
-/// `libtest::helpers::concurrency` capture handling. Neither of CI's `Run
-/// tests` steps nor the coordinator's plain `cargo test` Test leg passes
-/// either flag, and `nvim_conformance` passes on a healthy run — exactly the
-/// common case this banner exists to narrate (#865 review finding: a
-/// `println!` banner is invisible on precisely the lanes it was built for).
-/// Opening `/dev/stderr` writes to fd 2 directly, underneath that capture, so
-/// the banner reaches the log on a plain `cargo test` too.
+/// libtest intercepts `print!`/`eprintln!` and *discards* it for a passing
+/// test unless `--nocapture`/`--show-output` was passed. Neither of CI's
+/// `Run tests` steps nor the coordinator's plain `cargo test` passes either
+/// flag. Opening `/dev/stderr` writes to fd 2 directly, underneath that
+/// capture, so the banner reaches the log.
 #[cfg(unix)]
 fn print_unmissable(s: &str) {
     use std::io::Write as _;
@@ -12881,7 +12202,7 @@ fn print_unmissable(s: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Preflight (#865) — decide what to do about the oracle BEFORE running 1,436
+// Preflight — decide what to do about the oracle BEFORE running 1,436
 // cases. Pure, so the decision (and the exact wording of every message) is
 // testable on a machine with no nvim at all; `nvim_conformance` only probes
 // the environment and then does what this says.
@@ -12985,7 +12306,7 @@ fn nvim_conformance() {
         .as_deref()
         .map(|out| (resolved_display.as_str(), out));
 
-    // #865: a missing/too-old oracle must never read as 1,436 passing cases.
+    // A missing/too-old oracle must never read as 1,436 passing cases.
     // Failing is the default on every lane — CI, a coordinator Test leg and a
     // developer laptop alike; skipping requires the explicit opt-out.
     let allow_skip = std::env::var_os(ALLOW_SKIP_VAR).is_some();
@@ -12996,7 +12317,7 @@ fn nvim_conformance() {
             return;
         }
         Preflight::Run { banner, version } => {
-            // #865 review: println! is captured-and-discarded by libtest on a
+            // Println! is captured-and-discarded by libtest on a
             // passing test unless --nocapture/--show-output is passed, which
             // neither CI nor the coordinator's Test leg does — so this must
             // bypass that capture, not just write through it.
@@ -13021,7 +12342,7 @@ fn nvim_conformance() {
         );
     }
 
-    // #875: KNOWN_DEVIATIONS and HARNESS_LIMITED are mutually exclusive
+    // KNOWN_DEVIATIONS and HARNESS_LIMITED are mutually exclusive
     // buckets — a label wired into both would silently take whichever branch
     // the loop below checks first, masking the other array's accounting.
     {
@@ -13082,7 +12403,7 @@ fn nvim_conformance() {
     let mut detail: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
     let mut deviating: Vec<&str> = Vec::new();
     let mut nvim_broke: Vec<&str> = Vec::new();
-    // #875: harness-limited cases are tracked in a wholly separate bucket —
+    // Harness-limited cases are tracked in a wholly separate bucket —
     // (pass, fail) — and never touch `outcomes`/`totals`/`deviating`, so they
     // cannot become a regression, cannot force a KNOWN_DEVIATIONS deletion,
     // and cannot inflate the deviation count. See the HARNESS_LIMITED doc
@@ -13142,11 +12463,8 @@ fn nvim_conformance() {
                 if listed {
                     totals[*ci].1 += 1;
                     if verbose {
-                        // Print the full diff, not just the label: auditing a
-                        // KNOWN_DEVIATIONS entry (is it a real bug or a harness
-                        // artifact?) needs the expected-vs-actual values, and
-                        // they were previously only reachable by temporarily
-                        // deleting the entry to turn it into a "regression".
+                        // Print the full diff for auditing: is this a real
+                        // bug or a harness artifact?
                         println!("KNOWN-FAIL {msg}");
                     }
                 } else {
@@ -13187,7 +12505,7 @@ fn nvim_conformance() {
         );
     }
     if !harness_seen.is_empty() {
-        // #875: reported, but deliberately excluded from every column above
+        // Reported, but deliberately excluded from every column above
         // and from the deviation gate below — see the HARNESS_LIMITED doc
         // comment for why these don't count as "how far from Neovim".
         println!(
@@ -13214,7 +12532,6 @@ fn nvim_conformance() {
 
     // Stale entries (labels that no longer exist) would silently mask a
     // regression if the case were ever re-added, so treat them as errors too.
-    // Only meaningful on an unfiltered run.
     let all_labels: Vec<&str> = CATEGORIES
         .iter()
         .flat_map(|(_, g)| g.iter())
@@ -13226,7 +12543,7 @@ fn nvim_conformance() {
         filter.is_none().then_some(all_labels.as_slice()),
     );
 
-    // #875: HARNESS_LIMITED gets the same stale-entry hygiene as
+    // HARNESS_LIMITED gets the same stale-entry hygiene as
     // KNOWN_DEVIATIONS — a label matching no case would silently exclude
     // nothing and nobody would notice. Only meaningful on an unfiltered run;
     // reuse `verdict.stale` so it goes through the existing reporting path.
@@ -13240,7 +12557,7 @@ fn nvim_conformance() {
         );
     }
 
-    // #868: on a Neovim that is not the one the list was captured against,
+    // On a Neovim that is not the one the list was captured against,
     // "this listed label now passes" is ambiguous — it is far more often the
     // oracle having improved than vimcode having. Deleting the entries to
     // satisfy such a run would hand the capture oracle the same count back as
@@ -13307,14 +12624,8 @@ fn nvim_conformance() {
 // starts passing must have its entry deleted. May only ever SHRINK.
 // ---------------------------------------------------------------------------
 
-// #985 added the multi-file cases; #1158 fixed the underlying bug --
-// `open_file_with_mode` (`:e`/`:edit`), `new_tab` (`:tabnew`/`:tabe`), and
-// `split_window_with_new_first` (`:split`/`:vsplit`) now call
-// `push_jump_location` before switching the active buffer/window/tab away,
-// matching Neovim's rule that opening a different file this way is
-// jump-worthy regardless of line. All 9 entries this array used to carry
-// now PASS against the real oracle, so the array — which may only ever
-// SHRINK — is empty.
+// All 9 entries this array used to carry now PASS against the real oracle,
+// so the array — which may only ever SHRINK — is empty.
 const KNOWN_DEVIATIONS_MULTI: &[&str] = &[];
 
 #[test]
@@ -13475,106 +12786,14 @@ fn nvim_conformance_jumplist_multi_file() {
     panic!("\n\n{}\n", problems.join("\n\n"));
 }
 
-// ---------------------------------------------------------------------------
-// KNOWN_DEVIATIONS_WIN — same bidirectional-gate idiom as KNOWN_DEVIATIONS_MULTI
-// above, applied to CASES_WIN (#1162). May only ever SHRINK.
+// KNOWN_DEVIATIONS_WIN — same bidirectional-gate idiom as KNOWN_DEVIATIONS_MULTI,
+// applied to CASES_WIN. May only ever SHRINK.
 //
-// ## Follow-up issue status (read before editing any entry below)
-//
-// All 6 fixes below have filed GitHub issues: #1288, #1289, #1290, #1291,
-// #1292, #1326 respectively (#1288–#1292 filed 2026-09-22; #1326 filed as
-// the remainder #1288/#1289 left behind, recorded only in this file's
-// comments at the time — see below). The worker session that wrote this
-// harness ran under a policy that forbids it from running `gh` — issue
-// filing is reserved for the coordinator, not individual work sessions — so
-// the title/body to file was spelled out here first; it is kept below
-// verbatim as the diagnosis record for each filed issue:
-//
-//   1. (#1288) "win:CTRL-W -/</> resize by absolute count, not a fixed ratio step"
-//      — resize_window_split moves the split ratio by a fixed 5% per count
-//      step; Neovim moves the window boundary by an absolute [count]
-//      lines/columns. Fix: convert the absolute delta into a ratio delta
-//      against WindowLayout::dividers's axis_size. FIXED for the height case
-//      (`-`, and `+`/`_` were already coincidentally-then-genuinely correct);
-//      `<`/`>` (width) still failed post-fix, but for a *different*,
-//      previously-undiagnosed reason — see follow-up #6 (#1326) below.
-//   2. (#1289) "win:CTRL-W | give the current window a true winminwidth maximize"
-//      — maximize_window_split's 0.9/0.1 ratio happens to match Neovim's
-//      real "shrink the other window to its 'winminheight' minimum"
-//      behaviour for height (CTRL-W _) but not width (CTRL-W |), where 10%
-//      of 80 columns is well above Neovim's 'winminwidth' floor. Fixed:
-//      `maximize_window_split` now shrinks the other side down to a real,
-//      size-derived `'winminwidth'`/`'winminheight'` floor
-//      (`min_raw_extent`, both hardcoded at Neovim's shared default of 1
-//      since neither setting is wired up as a real `Settings` field yet)
-//      instead of a fixed ratio — same integer raw-line/column-space
-//      approach #1288 used for `resize_window_split`, for the same reason.
-//      `CTRL-W |` still failed post-fix, but — like `<`/`>` above — for the
-//      *same*, already-diagnosed divider-thickness reason, not the
-//      fixed-ratio one — see follow-up #6 (#1326) below. `CTRL-W _` needed
-//      no such fix: Horizontal splits have no divider-column analogue (each
-//      window's own status line already supplies the visual separation), so
-//      it was already a real, non-coincidental pass before and after this
-//      change.
-//   3. (#1290) "win:CTRL-W = fix off-by-one rect rounding on odd-sized splits"
-//      — WindowLayout::calculate_rects (SplitTreeMeasure::new(0.0)) rounded
-//      each child's share of a split independently instead of giving one
-//      side the exact remainder, so an odd-sized 50/50 split landed 11/11
-//      instead of Neovim's 12/11. FIXED: `calculate_rects`/`dividers` now
-//      round the split *boundary* once and derive both children's extents
-//      from that single value (moved off `quadraui::SplitTree::layout`
-//      entirely for `WindowLayout`, since that primitive's float division
-//      is correct and shared with `GroupLayout` — the rounding-tie bug was
-//      strictly downstream of it).
-//   4. (#1291) "win:CTRL-W r/R rotate window identity, not just content"
-//      — rotate_windows swapped buffer_id/view across fixed WindowId tree
-//      slots, leaving Tab::active_window pinned to the same screen
-//      position. Neovim rotates which window (identity + focus) occupies
-//      which position. FIXED: rotate_windows now permutes the `WindowId`s
-//      themselves through the tree's leaf slots (`WindowLayout::
-//      set_window_ids_in_order`) instead of copying `buffer_id`/`view`
-//      across static slots — `Tab::active_window` is left untouched, so a
-//      window that was focused before the rotate keeps its `WindowId` (and
-//      therefore focus) after landing in its new screen slot.
-//   5. (#1292) "win:CTRL-W p track Tab::prev_window for real previous-window recall"
-//      — execute_wincmd's 'p' arm only restores prev_active_group (the
-//      VSCode-style editor-group tree); there is no Tab-level "previously
-//      active window" at all, so CTRL-W p is a no-op with a single editor
-//      group. Needs a Tab::prev_window field updated at every
-//      window-focus-changing call site (cycle_next_window/cycle_prev_window/
-//      activate_window/set_cursor_for_window/mouse click — ~20 sites per a
-//      #1162 audit).
-//   6. (#1326) "win:CTRL-W </>/\| leave the other window one column too wide"
-//      — Neovim reserves one screen column for a `Vertical` split's divider
-//      bar (confirmed empirically — a fresh 80-column `<C-w>v` gives
-//      Neovim's two windows 40/39, not 40/40), but `WindowLayout::
-//      layout_snapped` hardcoded zero divider thickness for both split
-//      directions, so a vertical split's column widths always summed to the
-//      full bounds width. For `<`/`>`, the resized (active) window's own
-//      width already matched Neovim (#1288's ratio math was correct); only
-//      the *other* window was one column too wide. For `\|`, vimcode split
-//      79/1 of 80 columns where Neovim splits 78/1 of a 79-column content
-//      area. FIXED: `layout_snapped`'s `Vertical` arm now reserves one
-//      column for the divider (the boundary is still rounded exactly once
-//      against the reduced content width, per #1290's tie-break), and
-//      `split_window_with_new_first` reserves it too when seeding a fresh
-//      split's initial sizes, so `resize_window_split`/`maximize_window_
-//      split`'s existing `axis_size` (already the sum of both windows' own
-//      *current* content widths, never the raw bounds width) stays the
-//      content width post-fix without any change to either function's own
-//      math. `Horizontal` splits are unaffected: each window's own status
-//      line already supplies the visual separation, and `-`/`+`/`_` were
-//      already real, non-coincidental passes.
-//
-// None of the 6 was attempted in #1162 itself: each is a bigger, more
-// failure-prone change (rewriting window resize math, reworking a shared
-// rect-rounding routine, restructuring rotate's identity model, adding
-// focus-tracking to ~20 call sites, or reserving a divider column through
-// every consumer of `WindowLayout`'s geometry) than "generalise the harness"
-// should carry in the same slice. Kept as real, non-vacuous
-// KNOWN_DEVIATIONS_WIN findings rather than silently dropped or
-// mis-classified as passing.
-// ---------------------------------------------------------------------------
+// All 6 deviations below have been filed as GitHub issues (#1288–#1292, #1326).
+// Each represents a real fix needed; none was attempted in #1162 because each is
+// a bigger, more failure-prone change than "generalise the harness" should carry
+// in the same slice. Kept as real, non-vacuous KNOWN_DEVIATIONS_WIN findings
+// rather than silently dropped or mis-classified as passing.
 
 const KNOWN_DEVIATIONS_WIN: &[&str] = &[];
 
@@ -13711,17 +12930,13 @@ fn nvim_conformance_windows() {
     panic!("\n\n{}\n", problems.join("\n\n"));
 }
 
-// ---------------------------------------------------------------------------
-// #1002: `setup` must actually reach the vimcode side.
+// `setup` must actually reach the vimcode side.
 //
-// These need no nvim — they drive `run_in_vimcode` directly, which is the
-// function that used to drop `setup` entirely. Each one is written so that
-// *deleting the `apply_setup` call* makes it fail: the "with setup" and
-// "without setup" arms of every pair assert different results, so a refactor
-// that silently reverts to defaults collapses the pair and the test goes red.
-// A test that passes whether or not `setup` is wired would be worthless here —
-// that is exactly the shape of the bug being guarded against.
-// ---------------------------------------------------------------------------
+// These drive `run_in_vimcode` directly, which is the function that used to
+// drop `setup` entirely. Each is written so that *deleting the `apply_setup`
+// call* makes it fail: the "with setup" and "without setup" arms assert
+// different results, so a refactor that silently reverts to defaults collapses
+// the pair and the test goes red.
 
 /// Probe the vimcode side the way a `cs(..)` case does, with and without the
 /// option, and return `(cursor_line, cursor_col)` for each.
@@ -13806,15 +13021,13 @@ fn every_setup_option_the_corpus_uses_changes_vimcode_behaviour() {
 }
 
 /// An option `apply_setup` has no mapping for must be a hard, named failure —
-/// never a silent fall-back to vimcode's defaults, which is the entire bug
-/// #1002 fixed. The message has to name the offending statement so the reader
-/// knows what to add.
+/// never a silent fall-back to vimcode's defaults. The message must name the
+/// offending statement so the reader knows what to add.
 #[test]
 fn unrecognised_setup_is_a_hard_failure_naming_the_statement() {
     let mut s = Settings::default();
-    // #1153 added `virtualedit` to `apply_setup` — swapped this example for
-    // `listchars`, still unmapped (it's in vimcode's own "recognised but not
-    // implemented" `:set` table, not wired to any behaviour).
+    // `listchars` is recognized but not implemented (it's in vimcode's own
+    // `:set` table, not wired to any behaviour).
     let err = apply_setup(&mut s, "vim.o.listchars='eol:$'").expect_err("must not be accepted");
     assert!(err.contains("listchars"), "must name the option: {err}");
 
@@ -13860,7 +13073,7 @@ fn every_corpus_setup_is_understood() {
 }
 
 /// The gate itself, exercised without needing nvim: both directions must be
-/// able to fail, or `KNOWN_DEVIATIONS` is decoration rather than a gate (#553).
+/// able to fail, or `KNOWN_DEVIATIONS` is decoration rather than a gate.
 #[test]
 fn known_deviation_gate_is_bidirectional() {
     let all = ["a:one", "a:two", "b:three"];
@@ -13906,14 +13119,13 @@ fn known_deviation_gate_is_bidirectional() {
     assert!(filtered.is_clean());
 }
 
-/// #868/#865: the oracle-version escape hatch must relax the *fixed* direction
+/// The oracle-version escape hatch must relax the *fixed* direction
 /// only, and only on a Neovim that is not the one the list was captured
 /// against. Every other case stays enforcing.
 #[test]
 fn fixed_direction_is_advisory_only_on_a_different_nvim() {
-    // The relaxed case: a newer Neovim than the capture oracle (0.12.5, as of
-    // #872 — the version 0.12.5 that surfaced #868's 37 `scroll:` "passes" is
-    // now the oracle itself, so a still-newer minor is used here instead).
+    // A version above the capture oracle is legitimate skew, not the fleet
+    // standard. Version 0.13 is used here as an example of a newer minor.
     assert!(!fixes_are_enforced(Some((0, 13))));
     // ...and an *older* one skews just as legitimately.
     assert!(!fixes_are_enforced(Some((0, 8))));
@@ -13927,11 +13139,8 @@ fn fixed_direction_is_advisory_only_on_a_different_nvim() {
     assert!(fixes_are_enforced(None));
 }
 
-// ---------------------------------------------------------------------------
-// #865 preflight: a missing or too-old oracle must never read as a pass. These
-// assert on the exact text the runner emits (the messages are the product here
-// — an operator reading a CI log is the consumer), not on some internal flag.
-// ---------------------------------------------------------------------------
+// Missing or too-old oracle must never read as a pass. These assert on
+// the exact text the runner emits; an operator reading a CI log is the consumer.
 
 /// Acceptance #1: nvim absent, no opt-out → FAIL, and the message names both the
 /// missing binary and the opt-out variable so the reader knows the way out.
@@ -14011,8 +13220,7 @@ fn unparseable_nvim_version_is_refused_not_trusted() {
 /// version other than the capture oracle is loudly (but non-fatally) flagged.
 #[test]
 fn a_usable_oracle_runs_and_the_banner_names_path_version_and_skew() {
-    // A minor above the capture oracle ((0, 12) as of #872) — legitimate skew,
-    // not the fleet standard itself.
+    // A minor above the capture oracle — legitimate skew, not the fleet standard.
     let fleet = "NVIM v0.13.5\nBuild type: Release\n";
     let Preflight::Run { banner, version } =
         preflight(Some(("/home/x/.local/bin/nvim", fleet)), false)
@@ -14033,11 +13241,9 @@ fn a_usable_oracle_runs_and_the_banner_names_path_version_and_skew() {
         "{banner}"
     );
 
-    // Now the capture oracle itself. As of #872 it sits exactly at the floor
-    // (both are 0.12), so the branch below always takes the "runnable, no
-    // skew" arm today — kept as an if/else rather than collapsed so a future
-    // DEVIATIONS_ORACLE bump that again falls below MIN_NVIM_VERSION is still
-    // caught by this same assertion instead of silently going untested.
+    // The capture oracle itself. As of #872 it sits exactly at the floor, so the
+    // branch below always takes the "runnable, no skew" arm — kept as an if/else
+    // rather than collapsed so a future DEVIATIONS_ORACLE bump is still caught.
     let capture = format!("NVIM v{}.{}.5\n", DEVIATIONS_ORACLE.0, DEVIATIONS_ORACLE.1);
     let verdict = preflight(Some(("/usr/bin/nvim", &capture)), false);
     if DEVIATIONS_ORACLE < MIN_NVIM_VERSION {
@@ -14059,7 +13265,7 @@ fn a_usable_oracle_runs_and_the_banner_names_path_version_and_skew() {
 /// test rather than on `preflight` alone: re-invoke this very test binary with a
 /// PATH that contains no `nvim` (or a deliberately ancient fake one) and assert
 /// on the exit status and the operator-visible output. A gate that has only ever
-/// been exercised through a helper is not known to be wired up (#553).
+/// been exercised through a helper is not known to be wired up.
 ///
 /// `cfg(unix)`: the fake-oracle arm writes a `#!/bin/sh` stub. The `preflight`
 /// tests above carry the same coverage on every platform.
@@ -14094,8 +13300,7 @@ fn nvim_conformance_end_to_end_refuses_a_missing_or_ancient_oracle() {
         (out.status.success(), text)
     };
 
-    // 1. No nvim anywhere on PATH, no opt-out → the test FAILS (before #865 it
-    //    printed "SKIP" and reported `ok`).
+    // No nvim anywhere on PATH, no opt-out → the test FAILS.
     let (ok, output) = run_child(false);
     assert!(
         !ok,
@@ -14137,17 +13342,14 @@ fn nvim_conformance_end_to_end_refuses_a_missing_or_ancient_oracle() {
     );
 }
 
-/// #865 review finding: every other assertion on the banner (path, version,
-/// skew warning) either calls `preflight()` directly — which never goes
-/// through libtest at all — or re-invokes the binary with `--nocapture`,
-/// which CI and the coordinator's Test leg never pass. Neither proves the
-/// banner is visible on the run that actually ships: a PASSING run of a
-/// plain `cargo test` (no flags). Prove that here: re-invoke the real
-/// `nvim_conformance` test against a fake-but-healthy oracle running a minor
-/// above `DEVIATIONS_ORACLE` ((0, 12) as of #872) so the skew banner fires,
-/// filtered to match zero cases (fast, and doesn't need a real `nvim
-/// --headless`), *without* `--nocapture`, and confirm the banner — including
-/// the version-skew warning — reached the child's real stdout/stderr anyway.
+/// Every other assertion on the banner (path, version, skew warning) either
+/// calls `preflight()` directly or re-invokes the binary with `--nocapture`,
+/// which CI and the coordinator never pass. Neither proves the banner is
+/// visible on a plain `cargo test` (no flags). Prove that here: re-invoke
+/// `nvim_conformance` against a fake-but-healthy oracle running a minor above
+/// `DEVIATIONS_ORACLE` so the skew banner fires, filtered to match zero cases,
+/// *without* `--nocapture`, and confirm the banner reached the child's real
+/// stdout/stderr anyway.
 #[cfg(unix)]
 #[test]
 fn nvim_conformance_end_to_end_banner_visible_on_a_passing_uncaptured_run() {
@@ -14206,7 +13408,7 @@ fn nvim_conformance_end_to_end_banner_visible_on_a_passing_uncaptured_run() {
 
 #[test]
 fn nvim_version_parses_release_and_dev_banners() {
-    // The two that matter: CI's apt build, and the local build that hit #868.
+    // The two that matter: CI's apt build and a local Release build.
     assert_eq!(
         parse_nvim_version("NVIM v0.9.5\nBuild type: Release\n"),
         Some((0, 9))
@@ -14229,7 +13431,7 @@ fn nvim_version_parses_release_and_dev_banners() {
     assert_eq!(parse_nvim_version("NVIM vX.Y.Z\n"), None);
 }
 
-/// #1007 — the shrink-only coverage ratchet. Pure: no `nvim`, no subprocess,
+/// The shrink-only coverage ratchet. Pure: no `nvim`, no subprocess,
 /// so it runs on every lane including `--no-default-features` and a laptop
 /// with no oracle installed.
 #[test]
@@ -14288,7 +13490,7 @@ fn conformance_corpus_covers_every_implemented_command() {
 }
 
 /// The ratchet's two directions, on **synthetic** input so each is observed
-/// failing. A gate that has never been seen to fail is not a gate (#553).
+/// failing. A gate that has never been seen to fail is not a gate.
 #[test]
 fn coverage_ratchet_is_bidirectional() {
     let commands = vec![
@@ -14350,7 +13552,7 @@ fn coverage_ratchet_is_bidirectional() {
     assert_eq!(unprobed.unprobed.len(), 1);
     assert!(unprobed.unprobed[0].starts_with("win:CTRL-W h"));
 
-    // A probe (or an exempt entry) naming a command the doc no longer marks
+    // A probe (or exempt entry) naming a command the doc no longer marks as
     // implemented is stale — it would silently excuse the id if it came back.
     let stale = classify_coverage(
         &commands,
@@ -14377,23 +13579,10 @@ fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
     let commands = parse_compatibility_doc(doc).unwrap_or_else(|e| panic!("{e}"));
     let cases = all_corpus_cases();
 
-    // Direction 1 — delete a real entry without adding cases.
-    //
-    // #1162: this used to be "win:CTRL-W h", which is exactly the kind of
-    // entry the ratchet is meant to force out — CASES_WIN backfilled a real
-    // case for it, so it is no longer in COVERAGE_EXEMPT at all and this
-    // fixture would read "fixture drifted" (the assertion below) rather
-    // than test anything. #1281 did the same to `other:gt` (its own
-    // previous victim, backfilled by CASES_XFILE), #1282 did it again to
-    // `other:ga` (CASES_MESSAGE), and #1283 backfilled the quickfix family
-    // that included the next victim, `ex::copen` — which exhausted the
-    // "Uncovered work — plain debt" heading entirely (every id under it is
-    // now covered). `ex::grep` steps in from the permanent "Environment-
-    // dependent" heading instead: the mechanics below only need *some*
-    // currently-exempt id with zero matching cases, not one about to be
-    // backfilled, and `ex::grep` cannot ever pick up a case here (no
-    // installed `grep`/`rg` is deterministic across hosts) so it will not
-    // need yet another swap once this lands.
+    // Direction 1 — delete a real entry without adding cases. The ratchet is
+    // meant to force entries out when cases are backfilled. When an entry is
+    // deleted, use a different one that's still exempt from the permanent
+    // "Environment-dependent" heading, which will never gain a case.
     let victim = "ex::grep";
     assert!(COVERAGE_EXEMPT.contains(&victim), "fixture drifted");
     let without: Vec<&str> = COVERAGE_EXEMPT
@@ -14419,8 +13608,7 @@ fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
 }
 
 /// Criterion 5 of #1007: the doc is parsed strictly. Every one of these is a
-/// row that a lenient parser would drop, understating the gap — which is the
-/// failure mode of the status quo this test replaces.
+/// row that a lenient parser would drop, understating the gap.
 #[test]
 fn an_unparseable_compatibility_row_fails_and_names_the_line() {
     let cases: &[(&str, &str, &str)] = &[
@@ -14569,7 +13757,7 @@ fn the_real_compatibility_doc_parses_with_no_dropped_rows() {
     }
 }
 
-/// #1008: prove the oracle is what it claims to be — an **attached UI**, fed
+/// Prove the oracle is what it claims to be — an **attached UI**, fed
 /// **one key at a time**, re-validating the window between keystrokes.
 ///
 /// Every assertion below was red against the `nvim --headless -l script.lua`
@@ -14616,8 +13804,8 @@ fn oracle_revalidates_the_window_between_keystrokes() {
         "chained <C-d> lands on line 23 in a real Neovim; the headless-burst oracle said 22"
     );
 
-    // The case that outlived every other #805 excuse, and the reason
-    // `HARNESS_LIMITED` is empty: clamped `<C-b>` lands on the window bottom.
+    // The case that outlived every other #805 excuse: clamped `<C-b>` lands
+    // on the window bottom.
     let probe = oracle_probe(LONG, 60, 1, "2<C-b>", "").expect("oracle probe failed");
     assert_eq!(probe.line, 22, "2<C-b> from line 60 lands on line 22");
     assert_eq!(
@@ -14628,7 +13816,7 @@ fn oracle_revalidates_the_window_between_keystrokes() {
 }
 
 /// Shared guard for the unit tests that drive a real oracle: honour the same
-/// version floor and the same explicit opt-out the suite itself does (#865),
+/// version floor and the same explicit opt-out the suite itself does,
 /// rather than inventing a third skip rule.
 fn oracle_available_for_unit_test() -> Option<()> {
     let version_output = std::process::Command::new("nvim")
@@ -14654,34 +13842,28 @@ fn oracle_available_for_unit_test() -> Option<()> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Phase 5 audit slice — `:set` options (#1225)
+// Phase 5 audit slice — `:set` options
 //
 // `:help option-list` (Vim 9.1's `quickref.txt`) is a flat inventory of every
 // option Vim has: **421 of them**. [`OPTION_AUDIT`] below tags every one
 // Implemented / Partial / NotImplemented / Skipped against the `SettingDef`
-// registry in `src/core/settings.rs`, in `:help` order, so the tagging is
-// machine-checked rather than prose in a markdown file that nothing runs.
+// registry in `src/core/settings.rs`, in `:help` order.
 //
-// The measurement, as of this slice (`undofile`/`undodir`/`undolevels` moved
-// ❌ → ✅/🟡/🟡 when #1156 landed, which is the gate working, not drift):
+// The measurement, as of this slice:
 //
 //     ✅ Implemented       45
 //     🟡 Partial           12
 //     ❌ Not implemented  182
-//     ⏭️  Intentionally skipped  182   (each with a reason from SKIP_REASONS)
+//     ⏭️  Intentionally skipped  182
 //                        ────
 //                         421
 //
 // ## Why an options slice goes first, measured rather than assumed
 //
-// #26 deprioritised this audit on the grounds that "bugs found here tend to be
-// 'missing feature' not 'wrong behavior'". That held for the `g`-prefix slice;
-// it does not hold here. The oracle corpus probes seven options through its
-// `cs(..)` Lua `setup`, and three of them — `'joinspaces'`, `'smarttab'`,
-// `'nrformats'` — did not exist in `Settings` at all. They were found the
-// expensive way, as unexplained conformance deviations blamed on a harness
-// bug (#1000, #1001). The three *new* findings below are the same shape,
-// found in an afternoon by tagging instead of by debugging.
+// The oracle corpus probes seven options through its `cs(..)` Lua `setup`,
+// and three of them — `'joinspaces'`, `'smarttab'`, `'nrformats'` — did not
+// exist in `Settings` at all. They were found as unexplained conformance
+// deviations blamed on a harness bug.
 //
 // ## Gate 1 — the recorded surface must match the live registry
 //
@@ -14689,24 +13871,18 @@ fn oracle_available_for_unit_test() -> Option<()> {
 // option name, and [`option_audit_matches_the_live_settings_registry`]
 // recomputes it by driving `Settings::parse_set_option` and diffs the two.
 // That is the bidirectional half: tagging an option `NotImplemented` and then
-// implementing it fails the gate until the row is re-tagged, and a row
-// claiming `Implemented` for a name `:set` rejects fails immediately.
+// implementing it fails the gate until the row is re-tagged.
 //
-// The surface is finer-grained than a bool on purpose. Three of this slice's
-// findings are *asymmetries* — a name the mutation path knows and the query
-// path does not, or the reverse — which a yes/no "is it implemented" check
-// cannot see and which is exactly what a user hits when `:set autoread` works
-// and `:set autoread?` answers "Unknown option".
+// The surface is finer-grained than a bool on purpose. Asymmetries can exist
+// — a name the mutation path knows but the query path does not, or the reverse
+// — which a yes/no check cannot see.
 //
 // ## Gate 2 — oracle coverage, same shrink-only shape as #1007
 //
-// Every Implemented/Partial row also carries a probe naming the oracle case
-// that exercises it; [`OPTION_COVERAGE_EXEMPT`] lists the ones no case
-// reaches today. Both directions fail, exactly as in `COVERAGE_EXEMPT`: an
-// unexempt row whose probe matches nothing, and an exempt row whose probe
-// starts matching. Writing the missing cases is #1162's job, not this
-// slice's — the exempt list is the measurement it starts from.
-// ═══════════════════════════════════════════════════════════════════════════
+// Every Implemented/Partial row carries a probe naming the oracle case that
+// exercises it; [`OPTION_COVERAGE_EXEMPT`] lists the ones no case reaches
+// today. Both directions fail: an unexempt row whose probe matches nothing,
+// and an exempt row whose probe starts matching.
 
 /// The audit verdict for one `:help option-list` entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14744,21 +13920,20 @@ const EXMODE: &str = "Ex mode / legacy pager is out of scope (see gQ in the g-pr
 const SESSION: &str = "no :mksession/:mkview support planned";
 const ARCH: &str = "no counterpart in vimcode's architecture (Ropey buffers, no line cache)";
 const PLATFORM: &str = "option of a Vim build for a platform vimcode does not target";
-/// Added by the registers/marks slice (#1226) for `':` — Neovim's
+/// Added by the registers/marks slice for `':` — Neovim's
 /// prompt-buffer mark. vimcode has no `:h prompt-buffer` buffer type, so the
 /// mark has nothing to point at.
 const PROMPTBUF: &str = "no prompt buffers (:h prompt-buffer) in vimcode";
-/// Added by the ex-command slice (#1227) for the `:menu`/`:emenu`/`:popup`
+/// Added by the ex-command slice for the `:menu`/`:emenu`/`:popup`
 /// family. Distinct from [`VIMGUI`], which is about Vim *options* of a GUI
 /// build: vimcode does have menus, they are just quadraui widgets built from
 /// the accelerator registry, not entries a `:menu` command can define.
 const MENU: &str =
     "Vim's GUI menu commands (:menu/:emenu/:popup); vimcode's menus are quadraui widgets";
-/// Added by #1227 for `:tag`/`:ptag`/`:dsearch`/`:ilist` and the rest of the
-/// tags and 'include'-search families.
+/// Added by #1227 for tags and 'include'-search families.
 const CTAGS: &str =
     "no ctags or 'include' file search planned; vimcode uses LSP definitions/references";
-/// Added by #1227 for `:rshada`/`:wshada`/`:rviminfo`/`:wviminfo`.
+/// Added by #1227 for ShaDa/viminfo files.
 const SHADA: &str = "no ShaDa/viminfo file; vimcode persists its own session state";
 
 const SKIP_REASONS: &[&str] = &[
@@ -15597,7 +14772,7 @@ const OPTION_AUDIT: &[OptionAudit] = &[
       "maximum number of lines for a scroll"),
     o("ttytype", "tty", Skipped(TERMCAP), Absent, None,
       "alias for 'term'"),
-    // #1156 implemented these three (they were ❌ Absent when this slice ran).
+    // Implemented by #1156.
     o("undodir", "udir", Partial, Full, Some(OptSetup("vim.o.undodir=")),
       "accepts one directory; Vim's is a comma-separated priority list with \
        `.` and `//` forms, which vimcode has no per-directory fallback to drive"),
@@ -15690,27 +14865,16 @@ const OPTION_AUDIT: &[OptionAudit] = &[
       "request terminal codes from an xterm"),
 ];
 
-// ---------------------------------------------------------------------------
 // OPTION_COVERAGE_EXEMPT — this list may only ever SHRINK.
 //
 // The Implemented/Partial options the oracle corpus never pins. Seeded from a
-// measured run (`CONFORMANCE_DUMP_OPTION_COVERAGE=…`), not by hand, so the
-// number is the real one rather than an impression:
-//
-//     **25 of the 54 options vimcode implements have no oracle case**
-//     (29 are pinned, 54%).
-//
-// #1156 added three more implemented options (see the `undo*` entries at the
-// end of the list), so the live figure is now 28 of 57 unpinned — the ratchet
-// prints the current one on every passing run.
+// measured run, not by hand.
 //
 // Writing the cases that delete these entries is #1162's job; the entry is
-// deleted by the case, never by an editor's judgement, because gate 2 fails
-// the moment a listed option's probe starts matching.
-// ---------------------------------------------------------------------------
+// deleted by the case, never by judgment, because gate 2 fails the moment a
+// listed option's probe starts matching.
 const OPTION_COVERAGE_EXEMPT: &[&str] = &[
     // Display/gutter options: nothing in the corpus renders a screen, so no
-    // case can pin one until #1162 adds render-comparing cases.
     "colorcolumn",
     "cursorline",
     "laststatus",
@@ -15744,23 +14908,9 @@ const OPTION_COVERAGE_EXEMPT: &[&str] = &[
     // spell case at all — the same hole COVERAGE_EXEMPT records for z=/zg/zw.
     "spell",
     "spelllang",
-    // Undo persistence (#1156), seeded here the one way this list is allowed
-    // to grow: an option that was ❌ NotImplemented when this slice ran, and
-    // so had no probe and no entry, gained one. None of the three is
-    // reachable from a case's Lua `setup`, and not for want of writing one:
-    //
-    //   * 'undolevels' — `run_in_neovim` *overwrites* it (`= -1` around the
-    //     fixture write, then `= 1000`) after the case's `setup` has run, so
-    //     a setup that pins it is clobbered before the first keystroke. Only
-    //     an `OptKeys(":set ul=")` case could pin it, and that needs
-    //     vimcode's pruning order to match Vim's block-for-block first.
-    //   * 'undofile' / 'undodir' — the effect is a sidecar file written on
-    //     `:w` and re-read on the *next open of the same path*. The case
-    //     shape is one buffer, one keystroke sequence, compare text and
-    //     cursor; it never reopens a file, and `undofile::write` is a
-    //     `cfg!(test)` no-op on the vimcode side besides.
-    //
-    // Deleting these three is #1162's job, same as every entry above.
+    // Undo persistence — the three are reachable in principle but not in
+    // practice with this harness's case shape (one buffer, one keystroke
+    // sequence, compare text and cursor; never reopens a file).
     "undodir",
     "undofile",
     "undolevels",
@@ -15847,7 +14997,7 @@ fn measured_surface(name: &str) -> Surface {
 /// Every row whose recorded `surface` disagrees with what `:set` does now.
 /// Split out of the test so [`option_audit_gates_are_bidirectional`] can feed
 /// it a deliberately mis-tagged table and observe the gate go red — a gate
-/// nobody has seen fail is not a gate (#553).
+/// nobody has seen fail is not a gate.
 fn surface_drift(audit: &[OptionAudit], exceptions: &[(&str, Surface, &str)]) -> Vec<String> {
     let mut drift: Vec<String> = Vec::new();
     for e in audit {
@@ -15877,7 +15027,7 @@ fn surface_drift(audit: &[OptionAudit], exceptions: &[(&str, Surface, &str)]) ->
     drift
 }
 
-/// Gate 1 (#1225) — the table's `surface` column is a claim about live code,
+/// Gate 1 — the table's `surface` column is a claim about live code,
 /// and this re-measures every one of the 421 rows against it. Pure: no `nvim`,
 /// no subprocess, so it runs on every lane.
 #[test]
@@ -15897,7 +15047,7 @@ fn option_audit_matches_the_live_settings_registry() {
     );
 }
 
-/// Gate 1b (#1225) — the table describes itself correctly: complete, ordered,
+/// Gate 1b — the table describes itself correctly: complete, ordered,
 /// unique, no unreviewed row, every ⏭️ carrying a reason from the fixed
 /// vocabulary, and a probe on exactly the rows that can have one.
 #[test]
@@ -16080,9 +15230,9 @@ fn option_probe_corpus() -> Vec<(&'static str, String)> {
         .collect()
 }
 
-/// Gate 2 (#1225) — the #1007 ratchet's shape, applied to the audited options:
+/// Gate 2 — the #1007 ratchet's shape, applied to the audited options:
 /// an in-scope option whose probe matches nothing must be exempt, and an
-/// exempt option whose probe now matches must lose its entry. Pure.
+/// exempt option whose probe now matches must lose its entry.
 #[test]
 fn option_audit_oracle_coverage_is_shrink_only() {
     use std::collections::HashSet;
@@ -16133,11 +15283,10 @@ fn option_audit_oracle_coverage_is_shrink_only() {
     );
 }
 
-/// Both gates, observed **failing** — on synthetic input for the shapes a
-/// human would otherwise have to take on trust, and on the **real** table and
-/// corpus for the two that matter most. #553 shipped black-box tests that
-/// stayed green with the bug reinstated; an audit whose gate cannot go red is
-/// the same mistake in table form.
+/// Gate 1, direction A: a row that under-claims. 'tabstop' is fully
+/// implemented, so tagging it Absent must be caught.
+/// Gate 2 against the real table and corpus: deleting an exempt entry
+/// must fail, and adding a case that pins an exempt option must fail.
 #[test]
 fn option_audit_gates_are_bidirectional() {
     // ── Gate 1, direction A: a row that under-claims. 'tabstop' is fully
@@ -16219,10 +15368,9 @@ fn option_audit_gates_are_bidirectional() {
         vec!["wrapmargin"]
     );
 
-    // ── Gate 2 against the REAL table and corpus, the check #1007 makes for
-    // COVERAGE_EXEMPT: deleting an exempt entry must fail, and adding a case
-    // that pins an exempt option must fail. Anything less and the list could
-    // grow silently.
+    // Gate 2 — the check for COVERAGE_EXEMPT: deleting an exempt entry must
+    // fail, and adding a case that pins an exempt option must fail. Anything
+    // less and the list could grow silently.
     let corpus = option_probe_corpus();
     let victim = "listchars";
     assert!(
@@ -16249,11 +15397,11 @@ fn option_audit_gates_are_bidirectional() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Phase 5 audit slice — registers and marks (#1226)
+// Phase 5 audit slice — registers and marks
 //
 // Slice 2 of 5. Walks two `:help` areas end to end and tags every command in
-// them Implemented / Partial / NotImplemented / Skipped, the same way #1225
-// walked `:help option-list`:
+// them Implemented / Partial / NotImplemented / Skipped, the same way the
+// option slice walked `:help option-list`:
 //
 //   * `:help registers` — `runtime/doc/change.txt`, "Registers", the ten
 //     register *types* plus the commands that address them (`["x]`, `:reg`,
@@ -16263,7 +15411,7 @@ fn option_audit_gates_are_bidirectional() {
 //     `]'`/`` ]` ``/`['`/`` [` `` motions and the `:lockmarks` family.
 //
 // Both were read from the **pinned fleet oracle's own runtime docs** (Neovim
-// v0.12.5, [`DEVIATIONS_ORACLE`]) rather than from memory, so "what Vim does"
+// v0.12.5) rather than from memory, so "what Vim does"
 // here is the same Vim every other gate in this file compares against.
 //
 // The measurement, as of this slice:
@@ -16275,20 +15423,13 @@ fn option_audit_gates_are_bidirectional() {
 //                         ────
 //                          89   (34 registers, 55 marks)
 //
-// (#1299 moved `:reg[isters] {arg}` and `:di[splay] {arg}` from ❌ to ✅:
-// `execute_command`'s `"registers" | "display"` arm now parses a trailing
-// register-name argument and prints Neovim's real `Type Name Content` table
-// for both the bare and argument forms.)
-//
 // ## Why this slice is about *missing*, not *wrong*
 //
-// #1226 predicted it: the corpus already carries 44 `reg:` and 55
-// `mark:`/`jump:` cases and **none** of them is in [`KNOWN_DEVIATIONS`], so
-// the ground already entered is solid. What the walk finds is ground never
-// entered — 30 commands with no implementation at all, and 47 of the 86
-// in-scope rows that no oracle case names. That is exactly the blind spot
-// #1007 exists to measure, and the reason the deliverable is a table rather
-// than a report.
+// The corpus already carries 44 `reg:` and 55 `mark:`/`jump:` cases and
+// **none** of them is in [`KNOWN_DEVIATIONS`], so the ground already entered
+// is solid. What the walk finds is ground never entered — 30 commands with
+// no implementation at all, and 47 of the 86 in-scope rows that no oracle
+// case names.
 //
 // Two findings are worse than "missing", and are the reason [`Report`] is a
 // recorded column rather than a bool:
@@ -16298,30 +15439,25 @@ fn option_audit_gates_are_bidirectional() {
 //     unset, because Vim's answer and vimcode's cursor happen to coincide.
 //   * Command-line `<C-r>` is bound to a readline-style reverse-i-search over
 //     command history, so `:s/bar/<C-r>a/` never pastes register `a` — it
-//     runs a *different* substitute (and, before [`replay_live`] started
-//     clearing it, whatever the developer last typed at a `:` prompt).
+//     runs a *different* substitute.
 //
 // ## Gate 1 — the recorded behaviour must match the live engine
 //
 // Every non-Skipped row carries a [`Live`] recording: real keystrokes over a
 // real buffer, plus the buffer, cursor and `engine.message` vimcode produced
 // when the slice ran. [`regmark_audit_matches_the_live_engine`] replays all
-// of them and diffs. That is the bidirectional half — implementing `m[` or
-// `:marks {arg}` changes its recording and fails the gate until the row is
-// re-tagged, and a row claiming Implemented for something that starts
-// refusing fails immediately.
+// of them and diffs. Implementing `m[` or `:marks {arg}` changes its recording
+// and fails the gate until the row is re-tagged, and a row claiming
+// Implemented for something that starts refusing fails immediately.
 //
 // The recording is a black-box observation (keys in, rendered buffer +
-// cursor + message out), never an engine field: a gate that asserted
-// `engine.marks` was populated would have passed throughout the `` `[ ``
-// finding above, since the field is written — just not by `p`.
+// cursor + message out), never an engine field.
 //
 // ## Gate 2 — oracle coverage, same shrink-only shape as #1007
 //
 // Every non-Skipped row also carries a [`Probe`] naming the oracle case that
 // exercises it; [`REGMARK_COVERAGE_EXEMPT`] lists the ones no case reaches
-// today. Both directions fail, exactly as in `COVERAGE_EXEMPT`. Writing the
-// missing cases is #1162's job, not this slice's.
+// today. Both directions fail, exactly as in `COVERAGE_EXEMPT`.
 //
 // ## Out of scope, deliberately
 //
@@ -17984,10 +17120,9 @@ const REGMARK_AUDIT: &[RegMarkAudit] = &[
     ),
 ];
 
-/// Oracle cases this slice's rows are not (yet) pinned by — the measurement
-/// #1162 starts from. Shrink-only, exactly like [`COVERAGE_EXEMPT`]: adding a
-/// case for one of these fails [`regmark_audit_oracle_coverage_is_shrink_only`]
-/// until its entry is deleted.
+/// Oracle cases this slice's rows are not (yet) pinned by. Shrink-only,
+/// exactly like [`COVERAGE_EXEMPT`]: adding a case for one of these fails
+/// [`regmark_audit_oracle_coverage_is_shrink_only`] until its entry is deleted.
 const REGMARK_COVERAGE_EXEMPT: &[&str] = &[
     "\"#",
     "\"*",
@@ -18036,7 +17171,7 @@ const REGMARK_COVERAGE_EXEMPT: &[&str] = &[
 fn replay_live(p: &Live) -> (String, (usize, usize), String) {
     let mut engine = engine_with(&p.lines.join("\n"));
     // `engine_with` suppresses `HistoryState::load()`'s real-disk read
-    // (#1304), so `engine.history` already starts empty here — no manual
+    //, so `engine.history` already starts empty here — no manual
     // reset needed for the `c_CTRL-R` rows this replay covers.
     engine.settings.shift_width = 4;
     engine.settings.expand_tab = true;
@@ -18086,7 +17221,7 @@ fn regmark_drift(audit: &'static [RegMarkAudit]) -> Vec<String> {
     drift
 }
 
-/// Gate 1 (#1226) — every row's recorded behaviour is a claim about live
+/// Gate 1 — every row's recorded behaviour is a claim about live
 /// code, and this replays all 86 of them (the 89 rows minus the 3 ⏭️) against
 /// it. Pure: no `nvim`, no subprocess, so it runs on every lane.
 #[test]
@@ -18123,7 +17258,7 @@ fn regmark_audit_matches_the_live_engine() {
     );
 }
 
-/// Gate 1b (#1226) — the table describes itself correctly: complete, grouped
+/// Gate 1b — the table describes itself correctly: complete, grouped
 /// by `:help` area, unique, no unreviewed row, every ⏭️ carrying a reason from
 /// the shared vocabulary, and a live recording + probe on exactly the rows
 /// that can have one.
@@ -18248,9 +17383,9 @@ fn classify_regmark_coverage(
     v
 }
 
-/// Gate 2 (#1226) — #1007's ratchet, applied to the audited commands: an
-/// in-scope row whose probe matches nothing must be exempt, and an exempt row
-/// whose probe now matches must lose its entry. Pure.
+/// Gate 2 — #1007's ratchet, applied to the audited commands: an
+/// in-scope row whose probe matches nothing must be exempt, and an exempt
+/// row whose probe now matches must lose its entry.
 #[test]
 fn regmark_audit_oracle_coverage_is_shrink_only() {
     use std::collections::HashSet;
@@ -18276,9 +17411,7 @@ fn regmark_audit_oracle_coverage_is_shrink_only() {
             s.push_str(&format!("STALE\t{n}\n"));
         }
         // Every credited row plus the case that credits it — the
-        // over-crediting check the section doc demands a human be able to do
-        // in one grep (`Keys("g'")` silently matching `magg'a` is exactly
-        // the failure mode #1007's "deliberately dumb probe" note warns of).
+        // over-crediting check a human must be able to do in one grep.
         for e in REGMARK_AUDIT {
             let Some(probe) = e.probe else { continue };
             if let Some((label, _)) = corpus
@@ -18344,7 +17477,7 @@ fn register_percent_and_hash_paste_basenames_not_paths() {
         .open_file_with_mode(&beta, OpenMode::Permanent)
         .expect("open beta");
 
-    // `"%p` on the current buffer, then `"#p` for the alternate one (#1161).
+    // `"%p` on the current buffer, then `"#p` for the alternate one.
     send_keys(&mut engine, "\"%p");
     let after_percent = engine.buffer().to_string();
     assert!(
@@ -18374,9 +17507,8 @@ fn register_percent_and_hash_paste_basenames_not_paths() {
 
 /// All three gates, observed **failing** — on synthetic input for the shapes
 /// a human would otherwise take on trust, and on the **real** table and
-/// corpus for the two that matter most. #553 shipped black-box tests that
-/// stayed green with the bug reinstated; an audit whose gate cannot go red is
-/// the same mistake in table form.
+/// corpus for the two that matter most. A black-box test that stayed green
+/// with the bug reinstated is the same mistake in table form.
 #[test]
 fn regmark_audit_gates_are_bidirectional() {
     // ── Gate 1, direction A: a row that under-claims. `'a` works, so
@@ -18540,14 +17672,13 @@ fn regmark_audit_gates_are_bidirectional() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Phase 5 audit slice — ex commands (#1227)
+// Phase 5 audit slice — ex commands
 //
 // Slice 3 of 5, and the largest surface in the audit. Walks the pinned fleet
 // oracle's own `:help ex-cmd-index` (Neovim v0.12.5's `runtime/doc/index.txt`
-// §6, [`DEVIATIONS_ORACLE`]) end to end — **all 553 `:` commands, every one of
-// them** — and tags each Implemented / Partial / NotImplemented / Skipped
-// against `src/core/engine/execute.rs`, the same way #1225 walked
-// `:help option-list` and #1226 walked `:help registers`.
+// §6) end to end — **all 553 `:` commands, every one of them** — and tags each
+// Implemented / Partial / NotImplemented / Skipped against
+// `src/core/engine/execute.rs`.
 //
 // The measurement, as of this slice:
 //
@@ -18557,11 +17688,6 @@ fn regmark_audit_gates_are_bidirectional() {
 //     ⏭️  Intentionally skipped  180   (each with a reason from SKIP_REASONS)
 //                         ────
 //                          553
-//
-// The slice landed at 117/203; #1156's undo tree then moved `:earlier`,
-// `:later`, `:undojoin` and `:undolist` from ❌ to ✅, which is gate 1 doing
-// its job — the branch implemented them, the recorded `ExDispatch` stopped
-// matching the live dispatcher, and the rows had to be re-tagged.
 //
 // ## Why this slice was expected to grow the denominator, and did
 //
@@ -18585,37 +17711,28 @@ fn regmark_audit_gates_are_bidirectional() {
 // documented abbreviation silently point at a *different* command.
 //
 // [`ex_audit_matches_the_live_dispatcher`] replays all 551 runnable rows
-// (553 minus the two that crash, below) through a real engine and diffs.
-// Bidirectional by construction: implementing `:lcd` flips its row from
-// `Neither` and fails until it is re-tagged, and a command that stops
-// dispatching fails immediately.
+// (553 minus the two that crash) through a real engine and diffs.
+// Implementing `:lcd` flips its row from `Neither` and fails until it is
+// re-tagged, and a command that stops dispatching fails immediately.
 //
 // It is a black-box observation — an ex line in, `engine.message` out —
-// never an engine field. A gate that asserted "`execute.rs` contains the
-// string `lgetfile`" would be green for `:lg`, which is precisely the row
-// where vimcode runs the wrong command.
+// never an engine field.
 //
 // ## Gate 2 — oracle coverage, same shrink-only shape as #1007
 //
 // Every ✅/🟡 row carries a [`Probe`] naming the oracle case that exercises
 // it; [`EX_COVERAGE_EXEMPT`] lists the ones no case reaches today. Both
-// directions fail, exactly as in `COVERAGE_EXEMPT`. Writing the missing
-// cases is #1162's job, not this slice's — the exempt list is the
-// measurement it starts from.
+// directions fail, exactly as in `COVERAGE_EXEMPT`.
 //
-// ❌ rows carry no probe, deliberately. #1226 gave one to every non-skipped
-// row because it had 32 of them; this slice has 199, and 199 permanently
-// exempt entries would drown the ~114 that describe a *real* gap in a
-// shrink-only list nobody can read. ❌ rows are already gated — harder — by
-// gate 1: a command that gains an implementation changes its `ExDispatch`.
+// ❌ rows carry no probe, deliberately. This slice has 199 of them, and 199
+// permanently exempt entries would drown the ~114 that describe a *real* gap
+// in a shrink-only list nobody can read. ❌ rows are already gated — harder —
+// by gate 1: a command that gains an implementation changes its `ExDispatch`.
 //
 // ## Findings that are worse than "missing"
 //
-//   * `:bdelete` and `:bwipeout` **panic** when they delete the last buffer
-//     (`active_buffer_state`'s `unwrap` on a buffer that no longer exists),
-//     where Vim falls back to an empty [No Name] buffer. Recorded as
-//     [`ExDispatch::Crashes`] and pinned by
-//     [`bdelete_on_the_last_buffer_panics_instead_of_refusing`].
+//   * `:bdelete` and `:bwipeout` **panic** when they delete the last buffer,
+//     where Vim falls back to an empty [No Name] buffer.
 //   * `:!!` does not repeat the last `:!`; it passes the literal string `!`
 //     to the shell.
 //   * `:lg`, which `:help` documents as `:lg[etfile]`, runs `:lgrep`, and
@@ -18627,7 +17744,7 @@ fn regmark_audit_gates_are_bidirectional() {
 //     rejected — `:saveas` is the only way to write somewhere else.
 //   * `:1,2p` and `:1,2#` are rejected although bare `:p`/`:#` work: the
 //     print family takes no range.
-//   * pressing `:` then Enter answers `Not an editor command: `.
+//   * Pressing `:` then Enter answers `Not an editor command: `.
 //
 // ## Out of scope, deliberately
 //
@@ -18635,8 +17752,7 @@ fn regmark_audit_gates_are_bidirectional() {
 // `:call` and the rest of the ⏭️ block) is tagged Skipped per the standing
 // decision that vimcode implements Vim *keybindings and editing*, not a
 // VimScript runtime. Nothing here implements, fixes or changes any command:
-// this slice audits, tags and files. `COVERAGE_PHASE5.md` and
-// `VIM_COMPATIBILITY.md` were read, never written.
+// this slice audits, tags and files.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// What `Engine::execute_command` does with an ex command's two documented
@@ -19829,23 +18945,22 @@ const EX_AUDIT: &[ExAudit] = &[
        "recognised, but it is a straight alias of `:&`: Vim's `:~` reuses the last *replacement string* from any `:s`, which vimcode does not track separately"),
 ];
 
-/// ✅/🟡 rows that **no** oracle case reaches today. Shrink-only, exactly
-/// like `COVERAGE_EXEMPT` and `REGMARK_COVERAGE_EXEMPT`: deleting an entry
-/// requires a case that pins it, and a case that starts pinning one forces
-/// its entry to be deleted. Writing those cases is #1162.
+/// What `Engine::execute_command` does with an ex command's two documented
+/// spellings — measured by [`measured_ex_dispatch`], never asserted by hand.
+///
+/// Two spellings rather than one because they fail independently: vimcode's
+/// `EX_ABBREVS` table is separate from its dispatch, so "vimcode has this
+/// command" and "vimcode has this command under the name `:help` says you can
+/// type" are different questions, and 49 of the 553 rows answer them
 const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":abc[lear]",
     ":b[uffer]",
     ":bn[ext]",
     ":bp[revious]",
     ":cN[ext]",
-    // #1283: `:cclose`/`:cfirst`/`:clast`/`:clist`/`:cnewer`/`:colder`
-    // retire here — same real, oracle-backed empty-quickfix-list cases as
-    // `ex::cclose`/etc. in `COVERAGE_EXEMPT` above (`CASES_EX`'s "#1283"
-    // block). `:copen`/`:cwindow` retire via `CASES_XFILE`'s `WinCase`
-    // entries instead (they open a window) — `:copen`'s is currently RED,
-    // tracked in `KNOWN_DEVIATIONS_XFILE`, same as its `COVERAGE_EXEMPT`
-    // sibling.
+    // `:cclose`/`:cfirst`/`:clast`/`:clist`/`:cnewer`/`:colder` retire here.
+    // `:copen`/`:cwindow` retire via `CASES_XFILE`'s `WinCase` entries
+    // instead (they open a window).
     ":cd",
     ":cdo",
     ":cfd[o]",
@@ -19870,7 +18985,7 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":inorea[bbrev]",
     ":iu[nmap]",
     ":lN[ext]",
-    // #1283: `:lclose`/`:lfirst`/`:ll`/`:llast`/`:llist`/`:lnext`/
+    // `:lclose`/`:lfirst`/`:ll`/`:llast`/`:llist`/`:lnext`/
     // `:lprevious` retire the same way as their `:c*` siblings above.
     // `:lopen`/`:lwindow` retire via `CASES_XFILE`'s `WinCase` entries.
     ":ld[o]",
@@ -19970,7 +19085,7 @@ fn ex_dispatch_drift(audit: &'static [ExAudit]) -> Vec<String> {
     drift
 }
 
-/// Gate 1 (#1227) — every row's `ExDispatch` is a claim about live code, and
+/// Gate 1 — every row's `ExDispatch` is a claim about live code, and
 /// this replays all 551 runnable rows against it. Pure: no `nvim`, no
 /// subprocess except the one `:make` probe, so it runs on every lane.
 #[test]
@@ -20008,7 +19123,7 @@ fn ex_audit_matches_the_live_dispatcher() {
     );
 }
 
-/// Gate 1b (#1227) — the table describes itself correctly: complete, in
+/// Gate 1b — the table describes itself correctly: complete, in
 /// `:help` order, unique, no unreviewed row, every ⏭️ carrying a reason from
 /// the shared vocabulary, and a probe on exactly the rows that can have one.
 #[test]
@@ -20155,9 +19270,9 @@ fn classify_ex_coverage(
     v
 }
 
-/// Gate 2 (#1227) — #1007's ratchet, applied to the audited ex commands: an
-/// in-scope row whose probe matches nothing must be exempt, and an exempt row
-/// whose probe now matches must lose its entry. Pure.
+/// Gate 2 — #1007's ratchet, applied to the audited ex commands: an
+/// in-scope row whose probe matches nothing must be exempt, and an exempt
+/// row whose probe now matches must lose its entry.
 #[test]
 fn ex_audit_oracle_coverage_is_shrink_only() {
     use std::collections::HashSet;
@@ -20183,8 +19298,7 @@ fn ex_audit_oracle_coverage_is_shrink_only() {
             s.push_str(&format!("STALE\t{n}\n"));
         }
         // Every credited row plus the case that credits it — the
-        // over-crediting check #1007's "deliberately dumb probe" note demands
-        // a human be able to do in one grep.
+        // over-crediting check #1007's "deliberately dumb probe" note demands.
         for e in EX_AUDIT {
             let Some(probe) = e.probe else { continue };
             if let Some((label, _)) = corpus
@@ -20353,13 +19467,12 @@ fn ex_audit_gates_are_bidirectional() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// #1228 — Phase 5 audit slice 4/5: `:help visual-index`
+// Phase 5 audit slice 4/5: `:help visual-index`
 //
-// The fourth `:help`-area walk in the #26 audit, tagging every Visual-mode
+// The fourth `:help`-area walk in the audit, tagging every Visual-mode
 // command Implemented / Partial / NotImplemented / Skipped against the live
 // engine. Source: the **pinned fleet oracle's own** documentation — Neovim
-// v0.12.5's `runtime/doc/index.txt` §3, the same Vim every other gate in this
-// file compares against — walked end to end, all **84** rows:
+// v0.12.5's `runtime/doc/index.txt` §3 — walked end to end, all **84** rows:
 //
 //     ✅ Implemented       65
 //     🟡 Partial            6
@@ -20368,70 +19481,51 @@ fn ex_audit_gates_are_bidirectional() {
 //                          ──
 //                          84
 //
-// Unlike #1227's slice this one does *not* grow the denominator much —
-// `VIM_COMPATIBILITY.md`'s "Visual Mode" section and the operator/text-object
-// corpus already cover this ground well, and the tally above says so: 77% of
-// the area matches Neovim keystroke-for-keystroke. The value here is the 17
-// rows that do not, and in particular the four where vimcode does something
-// **destructive** rather than nothing (see the module-level findings in the
-// PR body): `CTRL-C`, `CTRL-\ CTRL-N`, `a>`/`i>` and `!{filter}`.
+// The value here is the 17 rows that do not match Neovim keystroke-for-keystroke,
+// and in particular the four where vimcode does something **destructive**
+// rather than nothing: `CTRL-C`, `CTRL-\ CTRL-N`, `a>`/`i>` and `!{filter}`.
 //
 // ## Gate 1 — the recorded behaviour must match the live engine
 //
 // Every non-Skipped row carries a [`VisLive`] recording: real keystrokes over
 // a real buffer, plus the buffer, cursor, **mode indicator** and
 // `engine.message` vimcode produced when the slice ran.
-// [`visual_audit_matches_the_live_engine`] replays all 82 and diffs. That is
-// the bidirectional half — implementing `a<` or fixing `CTRL-C` changes its
-// recording and fails the gate until the row is re-tagged, and a row claiming
-// Implemented for something that regresses fails immediately.
+// [`visual_audit_matches_the_live_engine`] replays all 82 and diffs.
+// Implementing `a<` or fixing `CTRL-C` changes its recording and fails the
+// gate until the row is re-tagged, and a row claiming Implemented for
+// something that regresses fails immediately.
 //
 // The recording is a black-box observation — keys in, rendered buffer +
-// cursor + the status line's own mode string (`Engine::mode_str`, what both
-// backends paint) + message out. Never an engine field: a gate that asserted
-// `engine.visual_start` was `Some` would have passed throughout every one of
-// the ❌ rows below, because vimcode *is* in Visual mode for all of them; what
-// is wrong is what the keystroke then does.
-//
+// cursor + the status line's mode string (`Engine::mode_str`) + message out.
 // Mode is recorded because most of this area is about mode transitions, and
-// buffer+cursor cannot see them. `v_v`'s whole content is "stop Visual mode";
-// without the mode column its recording is indistinguishable from a no-op.
+// buffer+cursor cannot see them.
 //
 // ## Why several recordings end in an operator
 //
 // A text object in Visual mode only *extends the selection* — the buffer does
-// not change, so a recording of `va(` alone would pin nothing. Each
-// text-object row therefore records `v{object}d`: the region the `d` removes
-// **is** the selection the object made, read back out of the rendered buffer.
-// Same reason `v_P`/`v_p` end in a second paste (it is the only way to see
-// whether the unnamed register was clobbered) and `v_V`/`v_CTRL-V` end in an
-// `x` (it is the only way to see that the *second* `V`/`CTRL-V` stopped
-// Visual mode rather than re-entering it).
+// not change, so each text-object row records `v{object}d`: the region the
+// `d` removes **is** the selection the object made. Same reason `v_P`/`v_p`
+// end in a second paste and `v_V`/`v_CTRL-V` end in an `x`.
 //
 // ## [`Touch`] — "silently mangles the buffer" is worse than "does nothing"
 //
 // Same role [`Report`] plays in #1226. For a ❌ row, a silent no-op leaves the
 // user's text intact; a row that *modifies the buffer* while doing the wrong
-// thing is strictly worse, because the user's next keystroke lands on text
-// they did not expect. Six of this slice's 11 ❌ rows are `Modified`, and
-// [`visual_audit_is_internally_consistent`] pins that count, so a future
-// change that quietly adds a seventh has to say so.
+// thing is strictly worse. Six of this slice's 11 ❌ rows are `Modified`, and
+// [`visual_audit_is_internally_consistent`] pins that count.
 //
 // ## Gate 2 — oracle coverage, same shrink-only shape as #1007
 //
 // Every non-Skipped row also carries a [`Probe`] naming the oracle case that
 // exercises it; [`VISUAL_COVERAGE_EXEMPT`] lists the 39 no case reaches
-// today. Both directions fail, exactly as in `COVERAGE_EXEMPT`. Writing the
-// missing cases is #1162's job, not this slice's.
+// today. Both directions fail, exactly as in `COVERAGE_EXEMPT`.
 //
 // ## Out of scope, deliberately
 //
-// Select mode itself (`gH`, `gV`, `g CTRL-H`) belongs to the g-prefix slice
-// and is parked as **#1193**; the four visual-index rows that reach into it
-// (`CTRL-G`, `CTRL-O`, `<BS>`, `CTRL-H`) cite #1193 rather than filing a
-// duplicate. `:help visual-index`'s opening sentence — "most commands in
-// Visual mode are the same as in Normal mode" — means the motions are *not*
-// here: they are `:help motion.txt`, i.e. another slice.
+// Select mode itself belongs to the g-prefix slice; the four visual-index
+// rows that reach into it cite that issue rather than filing a duplicate.
+// `:help visual-index`'s opening sentence means the motions are *not* here:
+// they are `:help motion.txt`, i.e. another slice.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Whether the recorded run left the buffer changed.
@@ -22225,7 +21319,7 @@ fn visual_drift(audit: &[VisualAudit]) -> Vec<String> {
     drift
 }
 
-/// Gate 1 (#1228) — every row's recorded behaviour is a claim about live
+/// Gate 1 — every row's recorded behaviour is a claim about live
 /// code, and this replays all 82 of them (the 84 rows minus the 2 ⏭️) against
 /// it. Pure: no `nvim`, no subprocess, so it runs on every lane.
 #[test]
@@ -22259,7 +21353,7 @@ fn visual_audit_matches_the_live_engine() {
     );
 }
 
-/// Gate 1b (#1228) — the table describes itself correctly: complete, unique,
+/// Gate 1b — the table describes itself correctly: complete, unique,
 /// no unreviewed row, every ⏭️ carrying a reason from the shared vocabulary,
 /// and a live recording + probe on exactly the rows that can have one.
 #[test]
@@ -22380,9 +21474,9 @@ fn classify_visual_coverage(
     v
 }
 
-/// Gate 2 (#1228) — #1007's ratchet, applied to the audited commands: an
-/// in-scope row whose probe matches nothing must be exempt, and an exempt row
-/// whose probe now matches must lose its entry. Pure.
+/// Gate 2 — #1007's ratchet, applied to the audited commands: an
+/// in-scope row whose probe matches nothing must be exempt, and an exempt
+/// row whose probe now matches must lose its entry.
 #[test]
 fn visual_audit_oracle_coverage_is_shrink_only() {
     use std::collections::HashSet;
@@ -22408,8 +21502,7 @@ fn visual_audit_oracle_coverage_is_shrink_only() {
             s.push_str(&format!("STALE\t{n}\n"));
         }
         // Every credited row plus the case that credits it — the
-        // over-crediting check #1007's "deliberately dumb probe" note demands
-        // a human be able to do in one grep.
+        // over-crediting check #1007's "deliberately dumb probe" note demands.
         for e in VISUAL_AUDIT {
             let Some(probe) = e.probe else { continue };
             if let Some((label, _)) = corpus
@@ -22478,12 +21571,12 @@ fn ctrl_c_in_visual_mode_deletes_the_selection_instead_of_stopping_visual_mode()
     );
 }
 
-/// Gate 3 (#1228) — the gates above are observed **RED**, so none of them is
+/// Gate 3 — the gates above are observed **RED**, so none of them is
 /// a test nobody has seen fail. Synthetic tables for the drift/consistency
 /// directions, and the real corpus for the coverage ones.
 #[test]
 fn visual_audit_gates_are_bidirectional() {
-    // ── Gate 1, direction A: a recording that no longer matches ──────────
+    // ── Gate 1, direction A: a recording that no longer matches ──
     let wrong_buffer = vec![vis(
         "d",
         "v_d",
@@ -22627,14 +21720,12 @@ fn visual_audit_gates_are_bidirectional() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// #1229 — Phase 5 audit slice 5/5: `:help normal-index`, everything outside `g`
+// Phase 5 audit slice 5/5: `:help normal-index`, everything outside `g`
 //
-// The last `:help`-area walk of the #26 audit. Source: the **pinned fleet
-// oracle's own** documentation — Neovim v0.12.5's `runtime/doc/index.txt` §2,
-// the same Vim every other gate in this file compares against — walked end to
-// end. Every row of the Normal-mode index outside the `g`-prefix cluster is
-// tagged Implemented / Partial / NotImplemented / Skipped against the live
-// engine:
+// The last `:help`-area walk of the audit. Source: the **pinned fleet
+// oracle's own** documentation — Neovim v0.12.5's `runtime/doc/index.txt` §2 —
+// walked end to end. Every row of the Normal-mode index outside the `g`-prefix
+// cluster is tagged Implemented / Partial / NotImplemented / Skipped:
 //
 //     §2    Normal mode                200 rows
 //     §2.2  Window commands (CTRL-W)    75 rows
@@ -22654,21 +21745,17 @@ fn visual_audit_gates_are_bidirectional() {
 //
 // ## What is *not* here, and why
 //
-// * §2.4 (`g{char}`) is slice 1 of #26, already landed. The dispatcher rows
-//   that only forward to another section — `g{char}`, `z{char}`, `[{char}`,
-//   `]{char}`, `CTRL-W {char}` — are excluded with them: they are pointers,
-//   and their targets are the subsections above.
-// * §2.1 (text objects) carries `v_a"`-style tags and was tagged by #1228's
+// * §2.4 (`g{char}`) is slice 1 of the audit, already landed. The dispatcher
+//   rows that only forward to another section — `g{char}`, `z{char}`,
+//   `[{char}`, `]{char}`, `CTRL-W {char}` — are excluded with them.
+// * §2.1 (text objects) carries `v_a"`-style tags and was tagged by
 //   `VISUAL_AUDIT`; re-tagging it here would duplicate 36 rows.
-// * The index's untagged "not used" rows (`CTRL-K`, `CTRL-Q`, `CTRL-S`,
-//   `CTRL-_`, `\`, `CTRL-W CTRL-G`, …) have no `:help` tag and no action to
-//   conform to.
-// * The nine `|count|` rows (`1` … `9`) are one command and are tagged once,
-//   as `1 - 9`.
+// * The index's untagged "not used" rows have no `:help` tag and no action.
+// * The nine `|count|` rows are one command and are tagged once.
 //
 // The index reuses a tag twice on purpose (`q` for both "record" and "stop
-// recording"; `~` for the 'tildeop' variant), so — unlike #1228's table —
-// this one keys on `item` and allows a repeated `help` tag.
+// recording"; `~` for the 'tildeop' variant), so — unlike the visual slice
+// — this one keys on `item` and allows a repeated `help` tag.
 //
 // ## Gate 1 — the recorded behaviour must match the live engine
 //
@@ -22684,9 +21771,7 @@ fn visual_audit_gates_are_bidirectional() {
 // rendered (`zc`, `zR`, `zv`), the CTRL-W section is *only* about the window
 // tree, and `zh`/`zL`/`ze`/`zs` move nothing but the first rendered column.
 // All eight are black-box observations of rendered output — never an engine
-// flag: a gate that asserted `view.folds` was non-empty would pass for `zE`,
-// whose whole bug is that the fold it failed to delete is **still rendered as
-// hidden**.
+// flag.
 //
 // ## Gate 1b — rows a keyboard cannot reach
 //
@@ -22701,26 +21786,17 @@ fn visual_audit_gates_are_bidirectional() {
 //
 // Every replayable, non-Skipped row carries a [`Probe`] naming the oracle
 // case that exercises it; [`NORM_COVERAGE_EXEMPT`] lists the ones no case
-// reaches today (98 of 323 covered as of #1162, up from 93 — `CTRL-W b`/`t`
-// and their `CTRL-W CTRL-T` alias now point at real [`CASES_WIN`] cases).
-// Both directions fail, exactly as in `COVERAGE_EXEMPT`. #1162 scoped itself
-// to the 33 `win:` ids `VIM_COMPATIBILITY.md`/`COMMAND_PROBES` track (its own
-// issue text), not this index's full 75-row CTRL-W surface — most of that
-// gap (aliases, uppercase synonyms, the preview-window family) is still
-// open, tracked here rather than re-litigated in the other gate.
+// reaches today. Both directions fail, exactly as in `COVERAGE_EXEMPT`.
 //
 // ## What the pinned oracle could and could not settle
 //
 // Every row was replayed through vimcode *and* through `nvim --headless -l`
 // v0.12.5 on the identical fixture, and the two were diffed before a status
-// was written. That is how rows like `CTRL-M`, `<Del>` and `<C-Left>` were
-// caught: they look plausible until Vim's answer is next to them.
+// was written.
 //
-// Four columns the `-l` oracle cannot answer, and which were therefore judged
-// against `:help` plus the corpus's own UI-attached cases (`scroll:*`,
-// `fold:*`): the first rendered line and column (no UI is attached, so
-// `line('w0')` does not move), fold state, and macro recording (`q` behaves
-// differently under `feedkeys`). Those rows say so in their notes.
+// Four columns the `-l` oracle cannot answer were judged against `:help` plus
+// the corpus's own UI-attached cases: the first rendered line and column,
+// fold state, and macro recording.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Added by this slice for the `CTRL-W P`/`CTRL-W z`/`CTRL-W }`/`CTRL-W g }`
@@ -22733,9 +21809,7 @@ const PREVIEW: &str = "no preview window (:h preview-window) in vimcode";
 ///
 /// Keys in; rendered buffer, cursor, painted mode string, message, first
 /// rendered line, first rendered column, rendered line ranges and window
-/// layout out. Replayed by gate 1. Deliberately a superset of #1228's
-/// `VisLive`: Visual mode needed buffer+cursor+mode, and most of
-/// `:help normal-index` does not touch any of the three.
+/// layout out. Replayed by gate 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NormLive {
     /// Starting buffer, one `&str` per line.
@@ -29781,13 +28855,8 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
             (1, 1),
             "NORMAL",
-            // #1280: `3zF` folds 3 total lines (count includes the header),
-            // not 4 — this recording used to claim otherwise (`4 lines`,
-            // range `1,5-30`) because `cmd_fold_create`'s `end` was computed
-            // as `line + count` instead of `line + count - 1`, an off-by-one
-            // measured against the real oracle (`3zF` then `j` landed on
-            // line 5, not Neovim's line 4 — see `fold:zF folds a count of
-            // lines`).
+            // `3zF` folds 3 total lines (count includes the header),
+            // not 4 — this reflects Vim's behaviour.
             "2 lines folded",
             1,
             1,
@@ -31282,7 +30351,7 @@ fn norm_drift(audit: &[NormAudit]) -> Vec<String> {
     drift
 }
 
-/// Gate 1 (#1229) — every row's recorded behaviour is a claim about live
+/// Gate 1 — every row's recorded behaviour is a claim about live
 /// code, and this replays all 323 of them against it. Pure: no `nvim`, no
 /// subprocess, so it runs on every lane.
 #[test]
@@ -31316,7 +30385,7 @@ fn normal_audit_matches_the_live_engine() {
     );
 }
 
-/// Gate 1b (#1229) — the table describes itself correctly: complete, unique,
+/// Gate 1b — the table describes itself correctly: complete, unique,
 /// no unreviewed row, every ⏭️ carrying a reason from the shared vocabulary,
 /// and a recording + probe on exactly the rows that can have one.
 #[test]
@@ -31443,9 +30512,9 @@ fn classify_norm_coverage(
     v
 }
 
-/// Gate 2 (#1229) — #1007's ratchet, applied to the audited commands: an
-/// in-scope row whose probe matches nothing must be exempt, and an exempt row
-/// whose probe now matches must lose its entry. Pure.
+/// Gate 2 — #1007's ratchet, applied to the audited commands: an
+/// in-scope row whose probe matches nothing must be exempt, and an exempt
+/// row whose probe now matches must lose its entry.
 #[test]
 fn normal_audit_oracle_coverage_is_shrink_only() {
     use std::collections::HashSet;
@@ -31509,13 +30578,12 @@ fn normal_audit_oracle_coverage_is_shrink_only() {
     );
 }
 
-/// Gate 2b (#1229) — the gate above can actually fail.
+/// Gate 2b — the gate above can actually fail.
 ///
-/// #553's lesson, applied to a ratchet: a shrink-only list is worthless if
-/// nothing proves the three failure directions fire. Deleting a real exempt
-/// entry must report it uncovered, adding a case that matches an exempt row
-/// must report it newly covered, and an exempt entry naming nothing must be
-/// reported stale.
+/// A shrink-only list is worthless if nothing proves the three failure
+/// directions fire. Deleting a real exempt entry must report it uncovered,
+/// adding a case that matches an exempt row must report it newly covered,
+/// and an exempt entry naming nothing must be reported stale.
 #[test]
 fn normal_audit_ratchet_can_fail() {
     let corpus = all_corpus_cases();
@@ -31565,25 +30633,17 @@ fn normal_audit_ratchet_can_fail() {
     );
 }
 
-/// The `g`-prefix slice's stale header, pinned from the *read-only* doc.
+/// The `g`-prefix slice's corrected tally.
 ///
-/// `COVERAGE_PHASE5.md`'s "Slice 1" header still reads
-/// `✅ 36 · 🟡 2 · ❌ 14 · ⏭️ 6`, but its own "Coverage summary so far" table
+/// The header of "Slice 1" in `COVERAGE_PHASE5.md` still reads
+/// `✅ 36 · 🟡 2 · ❌ 14 · ⏭️ 6`, but the "Coverage summary so far" table
 /// reads `41 / 2 / 9 / 6` for the same 58 commands. The summary is the
-/// correct one: #120–#123 were implemented and struck through in the gap
-/// list (`gF`, `g@`, `g<Tab>` and the five screen-line motions `g$` / `g0` /
-/// `g^` / `g<End>` / `g<Home>` — five rows moved from ❌ to ✅), and only the
-/// header was left behind.
-///
-/// #1229 was asked to carry that correction in **the table and the PR body**;
-/// editing `COVERAGE_PHASE5.md` is a coordinator follow-up, so this slice
-/// pins the right numbers here instead and reads the doc without writing it.
-/// The gate is deliberately asserted against the *summary row*, so "fixing"
-/// the contradiction by editing the summary down to the stale header's
-/// numbers fails here.
+/// correct one: several commands were implemented (`gF`, `g@`, `g<Tab>` and
+/// the five screen-line motions), but only the header was left behind.
+/// This constant pins the correct numbers and reads the doc without writing it.
 const G_PREFIX_CORRECTED_TALLY: (usize, usize, usize, usize) = (41, 2, 9, 6);
 
-/// Gate 3 (#1229) — the `g`-prefix slice's corrected tally still matches the
+/// Gate 3 — the `g`-prefix slice's corrected tally still matches the
 /// summary table of `COVERAGE_PHASE5.md`, and still sums to its 58 commands.
 #[test]
 fn g_prefix_slice_tally_is_the_summary_not_the_stale_header() {

@@ -1,13 +1,5 @@
-//! #1575: enforce, with a test, the owner's rule that vimcode contains no
+//! Enforce, with a test, the owner's rule that vimcode contains no
 //! hard-coded colours — every colour comes from the theme.
-//!
-//! Before this test the rule was only *partly* written down
-//! (`docs/PATTERNS.md` §"Theme Colors (CRITICAL)" bans new hex literals for
-//! derived `Theme` fields specifically, and is silent on paint code) and
-//! not enforced anywhere: the one violation this audit found
-//! (`render.rs`, since fixed by `def5437c`, "derive colorcolumn_bg from
-//! background instead of hardcoded hex") slipped in unnoticed because
-//! nothing scanned for it.
 //!
 //! This test scans every `.rs` file under `src/` for three call shapes
 //! that name a colour directly instead of reading one from a `Theme`:
@@ -27,7 +19,7 @@
 //!   — the raw Cairo call some GTK paint code could reach for directly
 //!   instead of going through a themed `Color`.
 //!
-//! ## Allowlist (each entry justified here, per #1575's acceptance bar)
+//! ## Allowlist (each entry justified here)
 //!
 //! - **`#[cfg(test)]` code.** Assertions like `assert_eq!(theme.cursor,
 //!   try_from_hex("#f5e0dc").unwrap())` and paint-sentinel colours like
@@ -37,13 +29,13 @@
 //!   are test fixtures asserting *against* the theme, not shipped chrome.
 //!   They are outside the rule's scope by construction.
 //!
-//!   Finding where a `#[cfg(test)]` item *ends* means counting braces, and
-//!   #1576 found that counting them naively (every `{`/`}` character,
-//!   including the ones inside strings and comments) silently loses the
-//!   exemption: `src/tui_main/app_on_tui_tests.rs` is wholly `#[cfg(test)]`
-//!   yet its raw brace count never balances, so the block "never closed"
-//!   and the entire test-only file got scanned. [`strip_non_code_runs`]
-//!   is what makes this allowlist entry actually hold.
+//!   Finding where a `#[cfg(test)]` item *ends* means counting braces.
+//!   Counting them naively (every `{`/`}` character, including the ones
+//!   inside strings and comments) silently loses the exemption: a wholly
+//!   `#[cfg(test)]` file with braces in strings never balances, so the block
+//!   "never closes" and the entire test-only file gets scanned.
+//!   [`strip_non_code_runs`] is what makes this allowlist entry actually
+//!   hold.
 //! - **The theme-constructor bodies** (`Theme::onedark`, `gruvbox_dark`,
 //!   `tokyo_night`, `solarized_dark`, `vscode_dark`, `vscode_light`).
 //!   These functions ARE the palette: something has to spell out
@@ -53,7 +45,7 @@
 //!   which is exactly what the un-allowlisted regexes above check for.
 //!
 //! No entry is needed for `src/icons.rs`'s per-language icon-identity
-//! palette (`ICON_BLUE`, `ICON_ORANGE`, ...; #703, "identity, not chrome" —
+//! palette (`ICON_BLUE`, `ICON_ORANGE`, ...; "identity, not chrome" —
 //! a `.rs` badge stays orange in every theme the same way its glyph stays
 //! the same glyph). Those constants are plain `(u8, u8, u8)` tuples, and
 //! the one place they reach a `Color` (`render::tab_icon_color`) converts
@@ -133,23 +125,6 @@ enum ScanState {
 /// boundaries — Rust strings, raw strings and block comments all span
 /// lines — and must be threaded through consecutive lines by the caller.
 /// [`block_end`] counts braces over the result.
-///
-/// Without this, one `format!("{")`-shaped brace inside a string
-/// desynchronises the depth count for the rest of the file. That is not
-/// hypothetical: `src/tui_main/app_on_tui_tests.rs` is a single 5.6k-line
-/// `#[cfg(test)] mod tests`, and its raw brace count never returns to zero
-/// (net +4, all from braces inside string literals and comments), so
-/// `block_end` returned `None` and the whole test-only file was scanned —
-/// the exact opposite of the "`#[cfg(test)]` code is exempt by
-/// construction" allowlist in this file's module doc. #1576 hit it when the
-/// first colour literal landed in that file's test bodies.
-///
-/// The cross-line state is load-bearing in the other direction too:
-/// `render.rs`'s `test_strip_json_comments` opens a multi-line raw string
-/// with `r#"{` and closes it with `}"#`. A line-scoped scan drops the `{`
-/// (it is inside a string) but keeps the `}` (its line looks like code), so
-/// it would end the enclosing `mod tests` ~6.5k lines early and start
-/// flagging test assertions.
 fn strip_non_code_runs(line: &str, state: &mut ScanState) -> String {
     let chars: Vec<char> = line.chars().collect();
     let mut out = String::new();
@@ -459,7 +434,7 @@ fn scanner_flags_planted_violations_and_ignores_allowlisted_ones() {
     );
 
     // `from_rgb(r, g, b)` with variable arguments (icons.rs's identity
-    // palette -> Color conversion, #703): never flagged.
+    // palette -> Color conversion): never flagged.
     let icon_conversion =
         "fn tab_icon_color(name: &str) -> Color {\n    let (r, g, b) = icons::file_icon_color_for_name(name);\n    Color::from_rgb(r, g, b)\n}\n";
     let hits = scan_content(
@@ -472,12 +447,11 @@ fn scanner_flags_planted_violations_and_ignores_allowlisted_ones() {
     );
 }
 
-/// #1576: the `#[cfg(test)]` exemption must survive a stray brace inside a
-/// string literal, a comment or a char literal. `block_end` used to count
-/// every `{`/`}` character, so a single `"{"` in a test body desynchronised
-/// the depth count for the rest of the file, the `mod tests` block never
-/// appeared to close, and the exemption silently stopped applying from
-/// there on.
+/// The `#[cfg(test)]` exemption must survive a stray brace inside a
+/// string literal, a comment or a char literal. Without proper handling,
+/// a single `"{"` in a test body desynchronises the depth count for the
+/// rest of the file, the `mod tests` block never appears to close, and
+/// the exemption silently stops applying from there on.
 #[test]
 fn cfg_test_exemption_survives_braces_inside_strings_comments_and_chars() {
     // A brace that only appears inside a string literal, an escaped-quote
@@ -561,12 +535,11 @@ fn cfg_test_exemption_survives_braces_inside_strings_comments_and_chars() {
     );
 }
 
-/// #1576 regression guard, against the real file that exposed the bug:
-/// `src/tui_main/app_on_tui_tests.rs` is one 5.6k-line `#[cfg(test)] mod
-/// tests`, and its raw brace count never returns to zero (braces inside
-/// strings and comments), so before [`strip_non_code_runs`] the whole
-/// test-only file was scanned. Asserts the file does contain literals the
-/// gate would otherwise flag, and that the exemption blanks every one.
+/// A wholly `#[cfg(test)] mod tests` file has a raw brace count that never
+/// returns to zero (braces inside strings and comments), so without
+/// [`strip_non_code_runs`] the whole test-only file would be scanned.
+/// Asserts that such a file containing colour literals is exempt and that
+/// the exemption blanks every one.
 #[test]
 fn a_wholly_cfg_test_file_with_colour_literals_is_exempt_end_to_end() {
     let path = Path::new("src/tui_main/app_on_tui_tests.rs");

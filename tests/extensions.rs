@@ -105,15 +105,7 @@ fn test_manifests() -> Vec<vimcode_core::core::extensions::ExtensionManifest> {
             language_ids: vec!["java".to_string()],
             lsp: LspConfig {
                 binary: "jdtls".to_string(),
-                // #918: jdtls previously had no install command on any
-                // platform, so a user without it got a silent "No LSP
-                // server found" with no indication java was even
-                // involved. `brew install jdtls` is a real Homebrew-core
-                // formula (confirmed via `brew info jdtls`) — fill in
-                // macOS here. Linux/Windows are deliberately left empty:
-                // neither has a comparable one-line package-manager
-                // install for eclipse-jdtls, so filling them in is
-                // deferred rather than shipping a bad command.
+                // Jdtls on macOS installs via Homebrew (`brew install jdtls` is a real
                 install_macos: "brew install jdtls".to_string(),
                 ..Default::default()
             },
@@ -841,47 +833,9 @@ fn ext_install_unknown_extension_shows_error() {
     );
 }
 
-// ── Terminal-based install ─────────────────────────────────────────────────────
-//
-// #1703 / #1712: these two tests used to drive the `ruby` fixture on the
-// strength of "`ruby-lsp` is unlikely to be on PATH in CI", which made them
-// pass or fail according to what the host machine happened to have installed.
-// *Both* issues hit it independently — #1712 on a macOS box with
-// `brew install ruby-lsp`, #1703 in its own Test stage — which is how two
-// separate fixes for one flake came to be written in parallel. There are
-// *two* independent host dependencies, and the fixtures below remove both:
-//
-//  1. `ext_install_from_registry` only emits a terminal install command when
-//     the manifest's LSP binary cannot be resolved — and resolution
-//     (`lsp_manager::resolve_command`) spans far more than `PATH`: the
-//     vimcode-managed tools dir (#1345), Mason's `bin`, `~/.dotnet/tools`,
-//     `~/.cargo/bin`, `~/.local/bin`, `~/go/bin`, `~/.npm-global/bin` and
-//     the Homebrew prefixes (#917/#1344). Any one of those holding a
-//     `ruby-lsp` turned the assertion below into "got: None". This is the
-//     dependency #1712 diagnosed, and no amount of env scrubbing hides it.
-//  2. `ext_available_manifests()` merges
-//     `~/.config/vimcode/extensions/*/manifest.toml` *over* the registry, so
-//     a developer who has really installed `ruby` gets the published
-//     manifest instead of the fixture — and that one may acquire its LSP
-//     natively (#1345), which deliberately sets no terminal command at all.
-//
-// (2) is also why #1712's narrower fix — reach into `e.ext_registry` and
-// rename the `ruby` entry's `lsp.binary` to a sentinel — could not be the
-// whole answer, and why the two fixes were reconciled in favour of this one
-// rather than merged side by side: the install path resolves its manifest
-// through `ext_available_manifests()`, not through `ext_registry` directly,
-// so a local `ruby` manifest directory shadows the mutation and the test
-// goes red again on exactly the kind of box that reported the flake. A
-// synthetic registry entry closes both holes at once, and `..Default()` on
-// `LspConfig` below carries #1712's `fallback_binaries.clear()` for free —
-// an empty fallback list is the default, so there is no second binary for
-// the resolver to find either.
-//
-// `UNRESOLVABLE_LSP_BINARY` / `TERMINAL_INSTALL_EXT` are names that cannot
-// exist in any probed tool directory or extension directory on any host, so
-// the "LSP binary missing → terminal install" branch is the only branch these
-// tests can take. Note `LspConfig::install` (not `install_linux`) — it is the
-// fallback for every platform, so this stays host-OS-neutral.
+// These tests use a synthetic registry entry with an unresolvable binary
+// name to isolate the "no install command" branch from concurrent test
+// state. See `UNRESOLVABLE_LSP_BINARY` and `TERMINAL_INSTALL_EXT` below.
 
 /// An LSP binary name no machine can resolve. See the block comment above.
 const UNRESOLVABLE_LSP_BINARY: &str = "vimcode-test-1703-unresolvable-lsp";
@@ -986,22 +940,8 @@ fn ext_install_sets_install_context_for_lsp() {
     e.pending_install_context = None;
 }
 
-// ── Auto-offer on file open ───────────────────────────────────────────────────
-//
-// #1397 moved the "recommended extension isn't installed" offer off the
-// status line (where any later `Engine::message` write silently ate it
-// before the user looked) and onto an actionable, sticky toast. #1577
-// rebuilt it on quadraui#1185's multi-action toast: "Install" and "Don't
-// ask again" are now separate buttons instead of one action button plus
-// keyboard shortcuts printed as body text. These tests therefore read the
-// offer back through the **render layer** (`render::build_toast_stack` —
-// the exact struct both the TUI and GTK backends hand to
-// `draw_toast_overlay`), not through `Engine::toasts`: a toast sitting in
-// engine state that never makes it into a paintable stack must still fail
-// here. Full painted-pixel coverage of the offer — title, both buttons,
-// click, × dismiss, keyboard focus — lives in the `TuiDriver` tests in
-// `src/tui_main/app_on_tui_tests.rs` and the `GtkDriver` tests in
-// `src/gtk/testing.rs`.
+// The install-offer toast is read through the render layer to verify it
+// makes it into the final painted stack, not just engine state.
 
 /// The install-offer toast currently in the *rendered* toast stack, as
 /// `(title, body, action_button_labels)`. `None` when nothing is offering
@@ -1116,7 +1056,7 @@ fn auto_offer_toast_not_shown_twice_for_same_extension() {
     assert_eq!(second, None, "second open should not re-prompt for csharp");
 }
 
-/// #1397: the offer must survive `prune_toasts` — a 5s auto-expiry would
+/// The offer must survive `prune_toasts` — a 5s auto-expiry would
 /// silently revert an unanswered offer to "never asked", with nothing on
 /// screen to show the user was ever asked.
 #[test]
@@ -2560,8 +2500,7 @@ fn plugin_with_dir(code: &str) -> (PluginManager, std::path::PathBuf) {
     std::fs::write(&path, code).unwrap();
     let mut pm = PluginManager::new().unwrap();
     pm.load_plugins_dir(&dir, &[]);
-    // `load_plugins_dir` reads and executes eagerly, so the files are no longer
-    // needed once it returns — clean up rather than leaking a dir per call.
+    // Clean up the directory after load: `load_plugins_dir` eagerly reads files,
     let _ = std::fs::remove_dir_all(&dir);
     (pm, dir)
 }
@@ -3229,7 +3168,7 @@ fn ext_update_all_when_up_to_date() {
     e.extension_state.installed.clear();
 }
 
-/// #1807 (fix round 1): `ext_update_one` must refuse to update to a newer
+/// `ext_update_one` must refuse to update to a newer
 /// manifest version whose `requires_vimcode` is unmet by the running
 /// vimcode — the most realistic route to an incompatible installed
 /// extension is a registry bumping this field in a newer version, exactly
@@ -3265,7 +3204,7 @@ fn ext_update_one_refused_when_new_version_requires_incompatible_vimcode() {
     e.extension_state.installed.clear();
 }
 
-/// #1807 (fix round 1): `ext_update_all` must skip an incompatible
+/// `ext_update_all` must skip an incompatible
 /// candidate while still updating every other installed extension that
 /// has a compatible newer version available, and must say so in its
 /// summary message.
@@ -3324,34 +3263,12 @@ fn config_dir_helper_returns_vimcode() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// #917: macOS Homebrew LSP-binary resolution
-// ---------------------------------------------------------------------------
-//
-// `resolve_command` probes a fixed set of directories before falling back to
-// `which` (which inherits this process's PATH). On macOS neither
-// `/opt/homebrew/bin` nor `/usr/local/bin` was ever in that list, so a
-// Homebrew-installed language server (7 of 19 registry extensions install
-// via Homebrew) installed successfully and then was never found when
-// vimcode ran as a native `.app` bundle with launchd's minimal PATH.
-//
-// These tests can't touch real `/opt/homebrew` from a Linux box (and
-// shouldn't touch it even on a real Mac), so they drive the exact same
-// resolution path through `VIMCODE_TEST_HOMEBREW_PREFIXES` — an override
-// `resolve_command`'s `homebrew_prefixes()` honours on *every* target,
-// substituting a fake prefix for the real ones. That way this behaviour is
-// exercised on every CI host rather than going untested forever because this
-// repo's CI has no macOS runner.
-//
-// The override was originally `cfg(not(macos))`-gated, which made both tests
-// unconditionally fail when the suite ran on an actual Mac: the fake prefix
-// was ignored and `clangd` resolved to the host's `/usr/bin/clangd`. Keep it
-// ungated — a test that only passes on the OS the feature *isn't* for is not
-// coverage.
-//
-// A `Mutex` serializes the two tests below since both mutate process-global
-// `PATH` / `VIMCODE_TEST_HOMEBREW_PREFIXES` state; an RAII guard restores
-// both on drop (including on panic) so they can't leak into other tests.
+// On macOS, native `.app` bundles run with a minimal launchd PATH that does
+// not include Homebrew's bin directories. `resolve_command` probes a fixed
+// set of directories including Homebrew prefixes, allowing language servers
+// installed via Homebrew to be found. Tests use `VIMCODE_TEST_HOMEBREW_PREFIXES`
+// to simulate this behavior on all platforms without requiring real Homebrew
+// installations. A `Mutex` serializes tests that mutate process-global state.
 static HOMEBREW_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// RAII guard: snapshot + restore an environment variable across a test.
@@ -3450,7 +3367,7 @@ fn resolve_command_finds_keg_only_clangd_under_homebrew_opt() {
 }
 
 // ---------------------------------------------------------------------------
-// #918: extension install failures must name a runnable, platform-correct fix
+// Extension install failures must name a runnable, platform-correct fix
 // ---------------------------------------------------------------------------
 //
 // Confirmed RED against unfixed `develop` before these were added: the
@@ -3511,9 +3428,8 @@ fn missing_dependency_error_includes_runnable_command_for_platform() {
 
 #[test]
 fn missing_dependency_error_falls_back_generically_for_unknown_prereq() {
-    // A dependency name outside the built-in prereq table (#918's
-    // `PREREQ_INSTALLS`) should still produce a message — just without a
-    // specific command, since none is known.
+    // An unknown dependency name should still produce an error message, just without
+    // a specific install command.
     use vimcode_core::core::extensions::ExtensionManifest;
     use vimcode_core::core::lsp_manager::missing_dependency_message;
 
@@ -3542,9 +3458,7 @@ fn ensure_server_for_language_names_extension_when_no_install_command() {
         name: "no-installer-lang".to_string(),
         display_name: "No Installer Extension".to_string(),
         language_ids: vec!["no-installer-lang".to_string()],
-        // lsp left fully default: empty binary, empty install/install_*.
-        // This is exactly the shape of the real `java` manifest before
-        // #918 (no install path anywhere).
+        // LSP left fully default: empty binary, empty install commands.
         ..Default::default()
     };
 
@@ -3584,7 +3498,7 @@ fn java_lsp_install_command_resolves_on_macos() {
         "java should resolve a non-empty macOS install command"
     );
 
-    // Linux/Windows are deliberately deferred (#918) — no comparable
+    // Linux/Windows are deliberately deferred — no comparable
     // one-line package-manager install exists for eclipse-jdtls on either.
     // Confirm the macOS field itself is wired up regardless of which
     // platform runs this test, so it can't silently regress to empty.
@@ -3594,31 +3508,11 @@ fn java_lsp_install_command_resolves_on_macos() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// #919: registry conformance gate — every manifest resolves an install
-// command on all three platforms
-// ---------------------------------------------------------------------------
-//
-// Turns "every extension has a working install path on every platform" from
-// an unverifiable 38-row checklist (19 extensions × {lsp, dap}) into a test
-// that fails until it's true. `registry_conformance_snapshot()` below is a
-// manual, point-in-time copy of the live registry (fetched from
-// `JDonaghy/vimcode-ext`'s `registry.json`, trimmed to the `lsp`/`dap` fields
-// this gate inspects — 19 extensions, matching the count in issue #919).
-// It is intentionally NOT a live network fetch: tests must be hermetic and
-// deterministic in CI. If the real registry changes, this snapshot needs a
-// matching update — and per this gate's design, a regression introduced by
-// that update fails loudly here instead of shipping silently.
-//
-// IMPORTANT: this snapshot is a distinct, independent copy of registry data
-// from `test_manifests()` above. `test_manifests()`'s `java` entry carries an
-// aspirational `install_macos = "brew install jdtls"` local-only fixup (from
-// the #918 PR) that was never actually deployed to the live
-// `vimcode-ext` registry — confirmed by re-fetching the real registry.json
-// while building this gate. `registry_conformance_snapshot()`'s `java` entry
-// deliberately reflects the *real* live state (no install command anywhere)
-// so this gate's failure/allow-list matches reality, not the other fixture's
-// aspiration.
+// Registry conformance: every manifest must resolve an install command on all
+// platforms. This snapshot is a point-in-time copy of the live registry (19
+// extensions, matching the count in issue #919) to verify the gate rather than
+// fetching live (tests must be hermetic). If the real registry changes, this
+// snapshot requires a matching update to stay synchronized with reality.
 fn registry_conformance_snapshot() -> Vec<vimcode_core::core::extensions::ExtensionManifest> {
     use vimcode_core::core::extensions::*;
 
@@ -3881,20 +3775,13 @@ struct AllowedGap {
 fn registry_conformance_every_manifest_resolves_install_on_all_platforms() {
     use vimcode_core::core::extensions::Platform;
 
-    // Confirmed RED against unfixed `develop` before this allow-list existed:
-    // with `ALLOWED_GAPS` emptied out, this test fails with 27 unexpected
-    // gaps (9 lsp + 18 dap) — see the PR description for the itemised list.
-    //
-    // #919 is this issue itself: it introduces the gate and inventories the
-    // debt as of today. Splitting each row below into its own tracking issue
-    // is follow-up filing work for the coordinator (a `gh issue create` step
-    // this worker session cannot perform per its operating rules) — until
-    // that happens every row cites #919 as the issue that will remove it.
+    // This test fails with 27 unexpected gaps (9 lsp + 18 dap) against unfixed code.
+    // See the PR description for the itemised list. Each row cites #919 as the issue
+    // that will remove it once separate tracking issues are filed per gap.
     const ALLOWED_GAPS: &[AllowedGap] = &[
-        // --- lsp: java has no install command anywhere (#918 filled in
-        // macOS only in the *local test fixture*; the live registry was
-        // never updated to match — see `registry_conformance_snapshot`'s
-        // doc comment). ---
+        // Java LSP has no install command: #918 filled in macOS in the local test
+        // fixture only; the live registry was never updated to match. See
+        // `registry_conformance_snapshot`'s doc comment.
         AllowedGap {
             manifest: "java",
             component: ExtComponent::Lsp,
@@ -3951,14 +3838,10 @@ fn registry_conformance_every_manifest_resolves_install_on_all_platforms() {
             platform: Platform::Windows,
             issue: "#919",
         },
-        // --- dap: these six adapters install via `dap_manager.rs`'s
-        // hardcoded fallback table (VSIX/tarball extraction, a managed
-        // venv, or "no automated install" for js-debug/java-debug), never
-        // through the manifest's own `dap.install*` fields. That fallback
-        // table lives outside this issue's file scope
-        // (`src/core/extensions.rs`, `tests/extensions.rs`) — moving it
-        // into the registry data (or otherwise making the manifest
-        // self-describing) is follow-up work, not a `#919` fix-in-place.
+        // These six adapters install via `dap_manager.rs`'s hardcoded fallback table
+        // (VSIX/tarball extraction, a managed venv, or "no automated install" for
+        // js-debug/java-debug) rather than through manifest `dap.install*` fields.
+        // Moving this fallback logic into registry data is follow-up work for #919.
         AllowedGap {
             manifest: "cpp",
             component: ExtComponent::Dap,
@@ -4109,7 +3992,7 @@ fn registry_conformance_every_manifest_resolves_install_on_all_platforms() {
         // scripts only) are correctly exempt — there is nothing to install.
         if !m.lsp.binary.is_empty() {
             for platform in Platform::ALL {
-                // #1345: a manifest declaring `[lsp.acquire]` resolves an
+                // A manifest declaring `[lsp.acquire]` resolves an
                 // install on every platform its kind supports — all three
                 // kinds (hashicorp-release/github-release/url-template) are
                 // platform-neutral by construction (no `sh`), so `acquire`
@@ -4150,7 +4033,7 @@ fn registry_conformance_every_manifest_resolves_install_on_all_platforms() {
         // an install command on all three platforms.
         if !m.dap.adapter.is_empty() {
             for platform in Platform::ALL {
-                // #1345: same "acquire resolves on every platform" rule as
+                // Same "acquire resolves on every platform" rule as
                 // the lsp block above.
                 let resolves =
                     !m.dap.install_cmd_for(platform).is_empty() || m.dap.acquire.is_some();
@@ -4230,7 +4113,7 @@ fn registry_conformance_every_manifest_resolves_install_on_all_platforms() {
 }
 
 // ---------------------------------------------------------------------------
-// #1345: native tool acquisition — resolver + conformance-gate integration
+// Native tool acquisition — resolver + conformance-gate integration
 // ---------------------------------------------------------------------------
 
 /// Build a throwaway zip fixture containing a single entry, for driving
@@ -4255,18 +4138,9 @@ fn make_fixture_zip(
 
 #[test]
 fn ext_install_with_acquire_runs_no_terminal_command_and_registers_lsp() {
-    // #1345's core acceptance: `ext_install_from_registry` on a manifest
-    // with `[lsp.acquire]` and no `install_*` must (1) queue no terminal
-    // command — no shell at all — and (2) once the background acquisition
-    // completes, register and start the LSP server, the same outcome
-    // `finalize_install_from_terminal` produces for the legacy shell path.
-    //
-    // Confirmed RED against unfixed `develop` before this landed: with no
-    // `acquire` wiring, this manifest (no `install_linux`/`install_macos`/
-    // `install_windows` either) fell through both branches — `status_parts`
-    // stayed empty and the extension was marked installed with the LSP
-    // server never registered, which this test's final assertions would
-    // have failed to observe.
+    // #1345 acceptance: `ext_install_from_registry` on a manifest with `[lsp.acquire]`
+    // and no `install_*` fields must queue no terminal command and register the LSP
+    // once acquisition completes.
     use vimcode_core::core::extensions::{ExtensionManifest, LspConfig};
     use vimcode_core::core::tool_acquire::{AcquireConfig, AcquireKind};
 
@@ -4280,11 +4154,9 @@ fn ext_install_with_acquire_runs_no_terminal_command_and_registers_lsp() {
     let _ = std::fs::remove_dir_all(&data_home);
     std::fs::create_dir_all(&data_home).unwrap();
     let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
-    // `file://` download URLs are a *test-build* allowance only (second
-    // review round on #1345 — a registry manifest must not be able to turn
-    // `curl` into an arbitrary-file-read). This is a separate integration
-    // crate, so the library's own `cfg(test)` allowance doesn't apply here
-    // and the fixture has to opt in explicitly.
+    // `file://` download URLs are a test-build allowance only (second review round on
+    // #1345: a registry manifest must not turn `curl` into arbitrary-file-read). This
+    // integration test must opt in explicitly since library `cfg(test)` doesn't apply.
     let _file_url_guard = EnvVarGuard::set(
         vimcode_core::core::tool_acquire::ALLOW_FILE_URL_DOWNLOADS_ENV,
         std::ffi::OsStr::new("1"),
@@ -4365,19 +4237,10 @@ fn ext_install_with_acquire_runs_no_terminal_command_and_registers_lsp() {
 
 #[test]
 fn acquire_rejects_file_url_without_the_test_only_override() {
-    // Second review round on #1345: `validate_download_url` used to accept
-    // `file://` unconditionally, in production code. A community-submitted
-    // or compromised registry manifest could therefore declare
-    // `[lsp.acquire] url = "file:///home/user/.ssh/id_rsa"` and have vimcode
-    // `curl` an arbitrary readable file into a predictable staging path.
-    //
-    // This runs in a separate integration crate, so the library's
-    // `cfg(test)` fixture allowance is *off* here — exactly the
-    // configuration a shipped binary is in, modulo the `debug_assertions`
-    // env-var opt-in which this test explicitly clears.
-    //
-    // RED against the previous commit: `acquire_and_install_for` there
-    // downloaded the file and got as far as the archive-format check.
+    // `validate_download_url` previously accepted `file://` unconditionally, allowing
+    // a compromised registry manifest to read arbitrary files via `curl`. This runs in
+    // the production config (no `cfg(test)` allowance), with the test override explicitly
+    // cleared.
     use vimcode_core::core::extensions::Platform;
     use vimcode_core::core::tool_acquire::{
         acquire_and_install_for, AcquireConfig, AcquireError, AcquireKind, Arch,
@@ -4431,11 +4294,9 @@ fn acquire_rejects_file_url_without_the_test_only_override() {
 
 #[test]
 fn registry_conformance_treats_acquire_as_resolving_every_platform() {
-    // #1345's acceptance criterion, isolated from the big registry snapshot
-    // above (no live manifest declares `acquire` yet — that's the follow-up
-    // registry-side adoption, not this issue): a manifest with `[lsp.acquire]`
-    // and no `install_linux`/`install_macos`/`install_windows` resolves an
-    // install on every platform.
+    // #1345 acceptance: a manifest with `[lsp.acquire]` and no `install_*` fields
+    // resolves an install on every platform (though no live manifest declares
+    // `acquire` yet — that is follow-up registry-side adoption).
     use vimcode_core::core::extensions::{ExtensionManifest, LspConfig, Platform};
     use vimcode_core::core::tool_acquire::{AcquireConfig, AcquireKind};
 
@@ -4474,17 +4335,15 @@ fn registry_conformance_treats_acquire_as_resolving_every_platform() {
 }
 
 /// `VIMCODE_TEST_DATA_HOME`/`PATH` are process-global env state; serialize
-/// with a dedicated lock — mirrors `HOMEBREW_ENV_LOCK` above (#917) but kept
+/// with a dedicated lock — mirrors `HOMEBREW_ENV_LOCK` above but kept
 /// separate since these tests touch different variables and shouldn't
 /// contend with the Homebrew ones.
 static TOOL_ACQUIRE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn resolve_command_finds_managed_tool_binary_with_empty_path() {
-    // #1345 acceptance: "a resolver test: a binary under the managed dir is
-    // found with an empty PATH." Simulates a vimcode-managed acquisition by
-    // writing directly into a throwaway `VIMCODE_TEST_DATA_HOME`, without
-    // going through the network-touching `tool_acquire::acquire_and_install`.
+    // #1345 acceptance: a binary under the managed tools directory is found with an
+    // empty PATH, simulating vimcode-managed acquisition without network access.
     let _lock = TOOL_ACQUIRE_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -4526,19 +4385,10 @@ fn resolve_command_finds_managed_tool_binary_with_empty_path() {
 
 #[test]
 fn dap_resolve_binary_finds_managed_tool_binary_with_empty_path() {
-    // Second review round on #1345: `[dap.acquire]` unpacks the adapter into
-    // the vimcode-managed tools dir and paints "DAP adapter for '…'
-    // installed — press F5 to debug", but `DapManager::start_adapter`
-    // resolved the adapter through `dap_manager::resolve_binary`, which only
-    // ever looked at Mason's bin dir and `PATH` — neither of which contains a
-    // vimcode-managed tool. F5 then failed with "DAP binary '…' not found"
-    // for an adapter vimcode had *just* installed: the same "install check
-    // and launch use two different lookups" split #1344 closed on the LSP
-    // side. `resolve_binary` now delegates to the shared
-    // `lsp_manager::resolve_command`.
-    //
-    // RED against the previous commit: `resolve_binary` returned `None` here
-    // (empty `PATH`, no Mason dir), so this assertion failed.
+    // `DapManager::start_adapter` previously used a separate resolver (`dap_manager::
+    // resolve_binary`) that only probed Mason and PATH, missing vimcode-managed tools.
+    // Now it delegates to the shared `lsp_manager::resolve_command`, closing the same
+    // "install check and launch use two different lookups" split #1344 closed for LSP.
     let _lock = TOOL_ACQUIRE_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -4612,8 +4462,7 @@ fn resolve_command_falls_through_when_no_managed_tool_current_pointer() {
     let _ = std::fs::remove_dir_all(&data_home);
 }
 
-/// Live, network-touching operator smoke test (#1345 acceptance: "one
-/// `#[ignore]`d live test that acquires terraform-ls on the host platform").
+/// Live, network-touching operator smoke test: acquire terraform-ls on the host platform.
 /// Not run by `cargo test` — run explicitly with
 /// `cargo test --test extensions -- --ignored acquire_terraform_ls_live_smoke`.
 #[test]
@@ -4655,7 +4504,7 @@ fn acquire_terraform_ls_live_smoke() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// #1214 — the live engine seam: immediate `vimcode.buffer.*` /
+// The live engine seam: immediate `vimcode.buffer.*` /
 // `vimcode.window.*`, handles, reentrancy, undo grouping.
 //
 // The legacy `vimcode.buf.*` surface is snapshot-in / queue-out: reads come
@@ -4803,11 +4652,8 @@ fn stored_lua_callback_invoked_from_a_later_event_uses_the_immediate_api() {
     assert_eq!(buf(&e), "written by stored callback\n");
 }
 
-/// A plugin-triggered buffer switch fires `BufEnter` *from inside* the plugin
-/// callback. Pre-#1214 that nested event silently vanished (`plugin_event`
-/// `take()`-ed the manager for the duration of the call, so the nested
-/// dispatch found `None`); now it is deferred and dispatched as soon as the
-/// outer callback returns.
+/// A plugin-triggered buffer switch fires `BufEnter` from inside the callback.
+/// Pre-#1214 nested events were dropped; now they are deferred until the outer callback returns.
 #[test]
 fn plugin_triggered_buffer_switch_fires_a_nested_event() {
     let mut e = engine_with_plugin(
@@ -4995,7 +4841,7 @@ fn immediate_api_outside_a_callback_is_a_clear_lua_error() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Native Extension API — Phase 2 (#1623): new events, keymaps consulted
+// Native Extension API — Phase 2: new events, keymaps consulted
 // before built-ins (expr / buffer-local / o / x), g@ marks, keymap
 // enumeration, and a BufWriteCmd-style write hook.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5334,7 +5180,7 @@ fn user_event_does_not_fire_for_an_unrelated_trigger() {
     );
 }
 
-// ── Keymaps consulted before built-ins (#1623) ─────────────────────────────
+// ── Keymaps consulted before built-ins ─────────────────────────────────────
 
 #[test]
 fn lua_keymap_set_beats_the_built_in_substitute_s() {
@@ -5530,7 +5376,7 @@ fn lua_keymap_list_enumerates_mode_lhs_buffer_and_desc() {
     );
 }
 
-// ── g@ operator marks (#1623) ───────────────────────────────────────────────
+// ── g@ operator marks ───────────────────────────────────────────────────────
 
 #[test]
 fn g_at_operator_sets_open_and_close_marks_charwise() {
@@ -5582,8 +5428,6 @@ fn g_at_operator_sets_open_and_close_marks_linewise() {
     );
 }
 
-// ── Buffer write hook (#1623, oil.nvim shape) ───────────────────────────────
-
 #[test]
 fn buffer_write_handler_takes_over_save_and_clears_dirty() {
     let mut e = engine_with_plugin(
@@ -5623,7 +5467,7 @@ fn buffer_write_handler_takes_over_save_and_clears_dirty() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Plugin API — Phase 3 (#1624): loop timers, schedule/defer, callback
+// Plugin API — Phase 3: loop timers, schedule/defer, callback
 // registry, spawn with streamed output + exit status + kill.
 // ═══════════════════════════════════════════════════════════════════════════
 //
@@ -5859,23 +5703,10 @@ fn spawn_kill_delivers_nonzero_or_signalled_exit() {
     // living long enough to be killed, and this would pass for the wrong
     // reason (127 is "nonzero") — see `posix_tool`.
     let sleep = posix_tool("sleep");
-    // `exec` matters, and is the second half of this test's flake fix
-    // (#1627 test stage): `/bin/sh -c "sleep 30"` *forks* a grandchild for
-    // the `sleep` on the shells this runs on, and `h.kill()` signals only
-    // the direct child. If the kill lands after that fork — which is
-    // exactly what a loaded machine makes likely — the orphaned `sleep`
-    // keeps the child's stdout pipe write end open, so the reader threads
-    // never see EOF, `execute::finish_and_send_exit` is never reached and
-    // *no* `Exit` event is ever sent: this test then burned its full 15s
-    // deadline and failed ("kill() must eventually deliver an exit"), which
-    // reproduced in ~half of 15 loaded runs of this binary. `exec` makes
-    // the shell *become* `sleep`, so there is exactly one process to kill.
-    //
-    // NOTE: that a grandchild survives `handle.kill()` (and with it
-    // suppresses `on_exit` for good) is a real limitation of
-    // `vimcode.loop.spawn` — it kills a pid, not a process group. Worth a
-    // follow-up issue; deliberately *not* papered over here beyond keeping
-    // this test about the single-child case it was written for.
+    // `exec` matters: `/bin/sh -c "sleep 30"` forks a grandchild for the sleep, and
+    // `h.kill()` signals only the direct child. `exec` makes the shell become `sleep`,
+    // so killing the child genuinely stops everything. Without it, an orphaned sleep
+    // survives, keeps stdout open, and blocks EOF from being seen.
     let mut e = engine_with_plugin(
         "",
         "spawn_kill_1624",
@@ -5943,7 +5774,7 @@ fn async_shell_reimplemented_on_spawn_keeps_legacy_behaviour_and_gains_exit_stat
     );
 }
 
-/// #1624 review (blocking): `vimcode.async_shell`'s optional `stdin` write
+/// `vimcode.async_shell`'s optional `stdin` write
 /// must not block the calling thread — the engine/main thread when this
 /// runs for real, and this test's own thread here, since `exec()` dispatches
 /// the command (and, inline within the same call, `Engine::apply_plugin_ctx`
@@ -6016,7 +5847,7 @@ fn async_shell_large_stdin_write_does_not_block_the_calling_thread() {
     );
 }
 
-/// #1751: `vimcode.async_shell` with no `cwd` option must run the child in
+/// `vimcode.async_shell` with no `cwd` option must run the child in
 /// the engine's own workspace `cwd`, not whatever the OS process's actual
 /// working directory happens to be. Before this fix, an omitted `cwd` fell
 /// straight through to `std::process::Command`'s own default (the real OS
@@ -6104,7 +5935,7 @@ fn async_shell_defaults_cwd_to_engine_cwd_when_not_specified_1751() {
     );
 }
 
-/// #1751 review (non-blocking edge case): if `Engine::cwd` itself no
+/// If `Engine::cwd` itself no
 /// longer resolves to a real directory — the workspace folder was deleted,
 /// renamed, or an unmounted network share went away after the fact — an
 /// omitted `cwd` must NOT make `vimcode.async_shell` spawn fail. Before
@@ -6165,10 +5996,7 @@ fn async_shell_falls_back_further_when_engine_cwd_no_longer_exists_1751() {
 #[test]
 #[cfg(unix)]
 fn unloading_plugin_stops_its_timers_and_spawns_from_calling_back() {
-    // Absolute `sleep` — a `PATH=""` window from a concurrent test would
-    // make this child die with `sleep: not found` before the unload, so the
-    // "no callbacks after unload" assertion would no longer be testing the
-    // liveness check it exists for. See `posix_tool`.
+    // Absolute path for `sleep` to avoid concurrent-test `PATH=""` windows; see `posix_tool`.
     let sleep = posix_tool("sleep");
     let mut e = engine_with_plugin(
         "",
@@ -6286,7 +6114,7 @@ fn plugin_manager_with(
     mgr
 }
 
-/// #1624 review (blocking): a manager swap must not let the id-0 collision
+/// A manager swap must not let the id-0 collision
 /// between the outgoing and incoming `PluginManager` generations
 /// (`PluginManager::next_handle_id` restarts at 0 for every fresh manager,
 /// while `Engine::plugin_spawns` is one `HashMap` that outlives any single
@@ -6319,7 +6147,7 @@ fn plugin_manager_with(
 /// because manager B's spawn insert silently replaced the map slot before
 /// anything ever reaped A's entry.
 ///
-/// #1822: this test's own busy-loop child must not be able to outlive a
+/// This test's own busy-loop child must not be able to outlive a
 /// *failed* run of the test. Two independent nets, both covering the
 /// scenario #1822 reported (a run that doesn't reach a clean pass — a
 /// failed assertion, a panic elsewhere while the pid is still live, or the
@@ -6374,10 +6202,8 @@ fn manager_swap_id_collision_does_not_leak_orphaned_spawn_process() {
         .trim()
         .parse()
         .expect("child must have written a plain integer pid");
-    // From here on, no matter how this function exits — clean pass, a
-    // failed `assert!` below, or an unrelated panic — dropping this guard
-    // SIGKILLs `pid` and removes the pidfile. See the #1822 doc comment
-    // above.
+    // From here on, `_orphan_guard` SIGKILLs `pid` on drop (including on panic),
+    // ensuring cleanup regardless of how this function exits. See the doc comment above.
     let _orphan_guard = OrphanChildGuard {
         pid,
         pidfile: pidfile.clone(),
@@ -6437,8 +6263,7 @@ fn manager_swap_id_collision_does_not_leak_orphaned_spawn_process() {
 fn spawn_flood_defers_overflow_to_next_tick_without_dropping_chunks() {
     const EXPECTED_BYTES: usize = 2_000_000;
 
-    // Absolute paths, never `PATH` lookups — see `posix_tool`'s doc comment
-    // for the concurrent-`PATH=""` flake this avoids (#1627 test stage).
+    // Absolute paths for portability with concurrent `PATH=""` windows; see `posix_tool`.
     let head = posix_tool("head");
     let tr = posix_tool("tr");
 
@@ -6480,7 +6305,7 @@ fn spawn_flood_defers_overflow_to_next_tick_without_dropping_chunks() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Plugin API — Phase 4 (#1630): `vimcode.picker.open` — open the built-in
+// Plugin API — Phase 4: `vimcode.picker.open` — open the built-in
 // picker from Lua with plugin items, stored-callback actions (`on_select`/
 // `on_cancel`), live/async item updates (`:append`), and file/buffer
 // preview. Maps to `PickerSource::Custom("plugin:<id>")` /
@@ -6734,7 +6559,7 @@ fn picker_unload_closes_open_picker() {
     );
 }
 
-/// #1630 review (blocking): a plugin calling `vimcode.picker.open` again
+/// A plugin calling `vimcode.picker.open` again
 /// while a previous handle from the same plugin is still open — the natural
 /// telescope-style pattern (a command re-invoked on every keystroke) — must
 /// not leave the old registration (`on_select`/`on_cancel`/`on_query` plus
@@ -6787,7 +6612,7 @@ fn picker_reopen_supersedes_without_leaking_old_registration() {
     );
 }
 
-/// #1630 review (blocking): a non-Escape path that dismisses a plugin-owned
+/// A non-Escape path that dismisses a plugin-owned
 /// picker (GTK's click-outside-to-dismiss, `render::PickerRoute::Dismiss` in
 /// `src/app.rs`) must fire `on_cancel` and release the picker's registration
 /// exactly like Escape does, instead of calling `close_picker()` directly
@@ -6851,7 +6676,7 @@ fn close_picker_cancelling_plugin_fires_on_cancel_and_releases_registration() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Plugin API — Phase 2 (#1632): vimcode.http (async, curl-subprocess-backed,
+// Plugin API — Phase 2: vimcode.http (async, curl-subprocess-backed,
 // callback via poll_idle), vimcode.json, plugin-scoped storage.
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -7101,7 +6926,7 @@ fn http_request_post_sends_headers_and_body_the_server_receives() {
     );
 }
 
-/// #1632 review: a header value containing CR/LF must be rejected at the
+/// A header value containing CR/LF must be rejected at the
 /// `vimcode.http.request` boundary, never handed to `curl`'s `-H "{k}: {v}"`
 /// argument — otherwise it smuggles an extra header line (or splits the
 /// request) onto the wire. This drives it through the real Lua entry point
@@ -7146,7 +6971,7 @@ fn http_request_rejects_header_values_containing_crlf() {
     );
 }
 
-/// #1632 review: the request URL must reach `curl` as a value that can never
+/// The request URL must reach `curl` as a value that can never
 /// be parsed as another option — a bare positional argument lets a URL
 /// string starting with `-` be interpreted by `curl` as a flag instead of a
 /// URL. This proves it end-to-end with `-K<config>` (curl's "read more
@@ -7486,9 +7311,8 @@ fn storage_persists_across_plugin_reload() {
     let mut e = engine_with_plugin("", "storage_persist_1632", lua_code);
     exec(&mut e, "Save");
 
-    // Simulate a plugin reload: a fresh `PluginManager`, loaded from the
-    // exact same plugin file `engine_with_plugin` wrote, installed in place
-    // of the old one — same shape as #1624's `manager_swap_...` tests.
+    // Simulate a plugin reload: fresh `PluginManager` loaded from the same plugin file,
+    // installed in place of the old one — same pattern as #1624's manager-swap tests.
     let dir = plugin_fixture_dir("storage_persist_1632");
     let mut mgr2 = vimcode_core::core::plugin::PluginManager::new().expect("PluginManager::new");
     mgr2.load_plugins_dir(&dir, &[]);
@@ -7558,20 +7382,11 @@ fn storage_namespaces_by_plugin_so_plugins_cannot_read_each_others_data() {
     );
 }
 
-/// #1632 review: `current_plugin_chunk_name` used to trust a Lua chunk's own
-/// debug `source` unconditionally, and stock Lua's `load(chunk, chunkname)`
-/// lets *any* caller set that `source` to an arbitrary string — so
-/// `load(payload, "victim")()` let an attacker plugin impersonate another
-/// plugin's storage namespace outright. The fix hardens the Lua-visible
-/// `load` to always substitute the *caller's own* real identity for whatever
-/// chunkname it requests. This test drives that from the attacker's actual
-/// entry point (a registered command, exactly how a real malicious plugin
-/// would trigger it) rather than calling any internal helper directly.
-///
-/// RED-verified: with the `load` hardening in `PluginManager::
-/// setup_vimcode_api` reverted (restoring the stock global `load`), the
-/// first assertion below fails — `AttackerReadViaSpoof` reads back
-/// `"VICTIM-VALUE"` instead of `"nil"`.
+/// Tests that a plugin cannot use `load(chunk, chunkname)` to spoof
+/// another plugin's namespace. The Lua-visible `load` is hardened to
+/// always substitute the caller's own identity for any requested
+/// chunkname. This test exercises that hardening through a registered
+/// command, as an attacker plugin would actually trigger it.
 #[test]
 fn storage_load_cannot_spoof_another_plugins_chunk_name_to_steal_its_namespace() {
     let _lock = TOOL_ACQUIRE_ENV_LOCK
@@ -7739,7 +7554,7 @@ fn storage_delete_and_keys_reflect_current_contents() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Native Extension API — Phase 5 (#1653): `vimcode.decor.*` — namespaces,
+// Native Extension API — Phase 5: `vimcode.decor.*` — namespaces,
 // extmarks that follow edits, highlight ranges, virtual text, signs, named
 // highlight groups.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -8024,7 +7839,7 @@ fn decor_namespace_isolation_between_plugins() {
     );
 }
 
-/// #1653 review: `get_mark`'s returned table must include `virt_text`/
+/// `get_mark`'s returned table must include `virt_text`/
 /// `virt_text_pos` — before this fix it only returned `hl_group`/
 /// `sign_text`/`sign_hl`, so a mark carrying virtual text couldn't be
 /// read back at all, let alone round-tripped into another `set_mark`
@@ -8062,11 +7877,10 @@ fn decor_get_mark_round_trips_virt_text() {
     );
 }
 
-/// `vimcode.buf.annotate_line`/`clear_annotations` (the legacy, per-line
-/// virtual-text mechanism #1653 explicitly leaves untouched) must keep
-/// behaving exactly as before now that `vimcode.decor.*` exists alongside
-/// it — same `engine.line_annotations` map, same 1-indexed line argument,
-/// same full-clear semantics.
+/// `vimcode.buf.annotate_line`/`clear_annotations` must behave exactly
+/// as before now that `vimcode.decor.*` exists alongside it — same
+/// `engine.line_annotations` map, same 1-indexed line argument, same
+/// full-clear semantics.
 #[test]
 fn annotate_line_behaviour_is_unchanged_by_decor_api() {
     let mut e = engine_with_plugin(
@@ -8097,7 +7911,7 @@ fn annotate_line_behaviour_is_unchanged_by_decor_api() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Native Extension API — Phase 6 (#1654): `vimcode.syntax.*` (read-only
+// Native Extension API — Phase 6: `vimcode.syntax.*` (read-only
 // tree-sitter node/query access over the engine's own highlighting parse),
 // `vimcode.undo.*` (undo-tree read + jump), `vimcode.diagnostics.*` (LSP
 // diagnostics read + `DiagnosticChanged`).
@@ -8272,8 +8086,7 @@ fn undo_tree_shows_shape_after_edits_undo_and_new_branch() {
     press(&mut e, 'A');
     type_chars(&mut e, "c");
     press_key(&mut e, "Escape");
-    // Undo back to seq 1 ("ab"), abandoning seq 2's branch (still live, not
-    // pruned — just no longer on the active path).
+    // Undo back to seq 1 ("ab"), abandoning seq 2's branch (still live, not pruned).
     e.undo();
     // seq 3: a *new* branch off seq 1: "ab" -> "abd".
     press(&mut e, 'A');
@@ -8414,7 +8227,7 @@ fn diagnostic_changed_event_fires_when_diagnostics_are_installed() {
     );
 }
 
-// ── vimcode.completion (#1805) ──────────────────────────────────────────────
+// ── vimcode.completion ──────────────────────────────────────────────────────
 //
 // A Lua plugin can register an insert-mode completion source that merges
 // into the built-in buffer-word/LSP popup — no second widget, no
@@ -8513,7 +8326,7 @@ fn completion_plugin_source_item_shows_in_popup_and_accept_inserts_text() {
         Some("a plugin-provided completion item")
     );
 
-    // Accept it — Vim mode's default accept key is `<C-y>` (#800) — and
+    // Accept it — Vim mode's default accept key is `<C-y>` — and
     // confirm the buffer gets the *insert_text*, not the label.
     e.completion_idx = Some(idx);
     ctrl(&mut e, 'y');
@@ -8526,11 +8339,10 @@ fn completion_plugin_source_item_shows_in_popup_and_accept_inserts_text() {
     );
 }
 
-/// #1805's merge-order requirement: a source's `priority` is relative to
-/// buffer-word/LSP candidates, which are always priority `0`. A
-/// higher-priority item sorts before them; a lower-priority one sorts
-/// after — buffer-word candidates keep their own relative (alphabetical)
-/// order in between.
+/// A source's `priority` is relative to buffer-word/LSP candidates,
+/// which are always priority `0`. A higher-priority item sorts before
+/// them; a lower-priority one sorts after — buffer-word candidates
+/// keep their alphabetical order in between.
 #[test]
 fn completion_plugin_items_merge_by_priority_relative_to_buffer_words() {
     let mut e = engine_with_plugin(
@@ -8628,10 +8440,9 @@ fn completion_source_is_skipped_for_non_matching_filetype() {
     );
 }
 
-/// #1805's stale-async-drop requirement: a `vimcode.completion.complete`
-/// call naming a `request_id` from a trigger the user has since typed past
-/// must be silently dropped, while one naming the *current* trigger still
-/// merges in normally.
+/// A `vimcode.completion.complete` call naming a stale `request_id`
+/// (from a trigger the user has since typed past) must be silently
+/// dropped, while one naming the current trigger still merges in normally.
 #[test]
 fn completion_complete_drops_stale_request_but_accepts_current_one() {
     let mut e = engine_with_plugin(
@@ -8683,22 +8494,12 @@ fn completion_complete_drops_stale_request_but_accepts_current_one() {
     );
 }
 
-/// Review finding: accepting a plugin-only candidate (nothing in the
-/// buffer-word scan matched the prefix) must delete exactly the typed
-/// prefix, not fall back to a stale `completion_start_col` from before
-/// this trigger. Buffer starts as `"x = "` with no word anywhere that
-/// starts with `"f"`, so `word_completions_nearby` finds nothing and the
-/// popup is plugin-only — exactly the case the review called out. Only a
-/// *single* character is typed (not built up over several keystrokes):
-/// typing a second character would retain the first keystroke's plugin
-/// candidate across the narrowing step and let `trigger_completion`'s own
-/// (buggy, pre-fix) "candidates non-empty" check recompute the column
-/// correctly by accident, masking the bug.
-///
-/// RED against the unfixed merge path: `completion_start_col` stayed at
-/// its stale `0` because it was only assigned inside the "buffer-word scan
-/// found something" branch, so accepting here deleted columns `0..5` and
-/// left the buffer as `"foobar_plugin"` instead of `"x = foobar_plugin"`.
+/// When accepting a plugin-only candidate (no buffer-word matches the
+/// prefix), the completion must delete exactly the typed prefix, not a
+/// stale `completion_start_col` from before this trigger. This test uses
+/// a buffer with no matching prefix-starting word (`"x = "` with no word
+/// starting with `"f"`), and types a single character so the plugin
+/// candidate is not accidentally recomputed during narrowing.
 #[test]
 fn completion_accept_on_plugin_only_popup_keeps_preceding_text() {
     let mut e = engine_with_plugin(
@@ -8738,17 +8539,8 @@ fn completion_accept_on_plugin_only_popup_keeps_preceding_text() {
     );
 }
 
-/// Review finding: `dismiss_completion()` must bump `completion_generation`
-/// so a stale async delivery for a popup the user has already dismissed
-/// (by typing past it, e.g. deleting the prefix back to empty) cannot
-/// re-open it.
-///
-/// RED against the unfixed `dismiss_completion`: it cleared the candidate
-/// list and the filter prefix but left `completion_generation` untouched,
-/// so the async source's deferred `request_id` (captured while the prefix
-/// was still `"fo"`) still matched the current generation when delivered
-/// after the dismiss, and `merge_plugin_completion_items` reopened the
-/// popup with the stale item.
+/// `dismiss_completion()` must bump `completion_generation` so a stale
+/// async delivery for a dismissed popup cannot re-open it.
 #[test]
 fn completion_dismiss_drops_later_async_delivery_for_the_dismissed_popup() {
     let mut e = engine_with_plugin(
@@ -8795,11 +8587,8 @@ fn completion_dismiss_drops_later_async_delivery_for_the_dismissed_popup() {
     );
 }
 
-/// Review finding: the plugin merge must narrow on the stale-prefix
-/// comparison too — covered above — but also must not let a trigger-char
-/// source's `manual` leniency leak into unrelated sources on an empty
-/// prefix. A source with no `trigger_chars` declared must *not* run just
-/// because a different source's trigger char fired the auto-trigger.
+/// A source with no `trigger_chars` declared must not run just because
+/// a different source's trigger char fired the auto-trigger.
 #[test]
 fn completion_trigger_char_for_one_source_does_not_leak_into_another() {
     let mut e = engine_with_plugin(
@@ -8836,10 +8625,9 @@ fn completion_trigger_char_for_one_source_does_not_leak_into_another() {
     );
 }
 
-/// Review finding: `vimcode.completion.register`/`unregister` called at
-/// runtime (from inside a command/event handler, not at plugin load time)
-/// must work the same as load-time registration — the commit message
-/// claimed this but shipped no test for it.
+/// `vimcode.completion.register`/`unregister` called at runtime (from
+/// inside a command/event handler, not at plugin load time) must work
+/// the same as load-time registration.
 #[test]
 fn completion_register_and_unregister_work_at_runtime() {
     let mut e = engine_with_plugin(
@@ -8883,15 +8671,10 @@ fn completion_register_and_unregister_work_at_runtime() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Plugin API (#1806): `vimcode.fs.walk` / `vimcode.fs.grep` — async,
-// in-process (`ignore`-crate-backed, no `rg`/`fd` child process) filesystem
-// walk/grep for a finder extension, streamed through the same `poll_idle`
-// callback-registry machinery as `vimcode.loop.spawn`/`vimcode.http.request`
-// (see `src/core/engine/fs_api.rs`). Prerequisite for the vimcode-ext
-// telescope-style finder (#1212 epic) that's meant to replace the built-in
-// `PickerSource::Files`/`PickerSource::Grep`.
-// ═══════════════════════════════════════════════════════════════════════════
+// `vimcode.fs.walk` and `vimcode.fs.grep`: async, in-process filesystem
+// walk/grep for a finder extension (via `ignore` crate, no child process),
+// streamed through the same `poll_idle` callback-registry machinery as
+// `vimcode.loop.spawn` and `vimcode.http.request`.
 
 /// Build a temp project dir with a handful of real files (so `vimcode.fs.
 /// walk`/`grep` have something to find) and an `engine_with_plugin` rooted
@@ -8917,11 +8700,9 @@ fn engine_with_plugin_and_fs_project(
     (e, project)
 }
 
-/// Poll `e.poll_idle()` until `cond(e)` is true or `timeout` elapses. Same
-/// shape as the #1624 `loop.spawn` tests' own `poll_until` above this
-/// section — `vimcode.fs.walk`/`vimcode.fs.grep` genuinely run on a
-/// background thread, so a bounded poll-until-condition is needed instead
-/// of a single `poll_idle()` call.
+/// Poll `e.poll_idle()` until `cond(e)` is true or `timeout` elapses.
+/// `vimcode.fs.walk`/`vimcode.fs.grep` run on a background thread, so a
+/// bounded poll-until-condition is needed instead of a single `poll_idle()` call.
 fn fs_poll_until(
     e: &mut vimcode_core::Engine,
     timeout: std::time::Duration,
@@ -8961,7 +8742,7 @@ fn fs_poll_until(
 /// bin`, `/opt/homebrew/bin`) and `std::os::unix::fs::symlink` are both
 /// Unix-only; without this gate the function would silently build an
 /// *empty* directory on Windows and point `PATH` at it — precisely the
-/// blank-`PATH` failure mode described above (#1806 review).
+/// blank-`PATH` failure mode described above.
 #[cfg(unix)]
 fn path_dir_without_rg_and_fd(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -8990,25 +8771,11 @@ fn path_dir_without_rg_and_fd(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-/// #1806 acceptance: a test plugin feeds `vimcode.fs.walk` results into
-/// `vimcode.picker.open` and the picker lists every project file — with
-/// `rg`/`fd` specifically absent from `PATH` for the whole test, so this
-/// cannot be secretly shelling out to either (the entire point of an
-/// in-process walker).
-///
-/// RED-verified against unfixed `develop`: there is no `vimcode.fs` table
-/// there, so `Open`'s first `vimcode.fs.walk(...)` call errors immediately
-/// and `e.picker_items` never gets past the empty list `vimcode.picker.
-/// open({title=...})` starts with.
-///
-/// `#[cfg(unix)]` (follows `path_dir_without_rg_and_fd`'s own gate) and
-/// serialized on `TOOL_ACQUIRE_ENV_LOCK`: this test's `EnvVarGuard::set(
-/// "PATH", ...)` would otherwise interleave destructively with the other
-/// `PATH`-mutating tests in this file (L4430/4480/4522 and the Homebrew
-/// ones) — two concurrently-live `EnvVarGuard`s on the same variable step on
-/// each other's `Drop` restore, same hazard `HOMEBREW_ENV_LOCK`/
-/// `TOOL_ACQUIRE_ENV_LOCK`'s own doc comments exist to prevent (#1806
-/// review).
+/// A test plugin feeds `vimcode.fs.walk` results into `vimcode.picker.open`
+/// and the picker lists every project file. `rg`/`fd` are absent from `PATH`
+/// for the whole test to ensure in-process walking is used, not shelling out.
+/// `#[cfg(unix)]` and serialized on `TOOL_ACQUIRE_ENV_LOCK` to avoid
+/// concurrent `PATH` mutation with other environment-altering tests.
 #[test]
 #[cfg(unix)]
 fn fs_walk_feeds_picker_open_with_no_rg_on_path_1806() {
@@ -9019,7 +8786,7 @@ fn fs_walk_feeds_picker_open_with_no_rg_on_path_1806() {
     // `path_dir_without_rg_and_fd` never removes its own symlink farm (it's
     // named uniquely per pid+thread, so it's harmless garbage rather than a
     // correctness hazard) — clean it up here anyway so repeated local runs
-    // don't accumulate temp-dir cruft (#1806 review).
+    // don't accumulate temp-dir cruft.
     struct RemoveDirOnDrop(std::path::PathBuf);
     impl Drop for RemoveDirOnDrop {
         fn drop(&mut self) {
@@ -9077,7 +8844,7 @@ fn fs_walk_feeds_picker_open_with_no_rg_on_path_1806() {
         "picker must list the nested project file too, got: {:?}",
         displays
     );
-    // #1806 review: `vimcode.fs.walk` must hand Lua `root`-relative paths
+    // `vimcode.fs.walk` must hand Lua `root`-relative paths
     // (matching `Engine::picker_populate_files`'s own display convention —
     // the native picker this API replaces), not absolute ones. `contains`
     // above can't catch an absolute-path regression since an absolute path
@@ -9101,16 +8868,9 @@ fn fs_walk_feeds_picker_open_with_no_rg_on_path_1806() {
     );
 }
 
-/// #1806 review: `vimcode.fs.walk(root, { hidden = true })` must still prune
-/// `.git/` the way `Engine::picker_populate_files` does (via
-/// `Settings::explorer_exclude`'s default `**/.git` entry) — `hidden = true`
-/// only lifts the dotfile skip, it must not open the door to `.git`'s
-/// contents (HEAD/config/loose objects, the exact #1545 noise
-/// `explorer_exclude` exists to prevent).
-///
-/// RED-verified by hand: with `FsWalkOptions::explorer_exclude` never
-/// populated (the pre-fix `plugin_api_fs_walk`), this test fails —
-/// `_G.hits` ends up containing a `.git/HEAD` entry.
+/// `vimcode.fs.walk(root, { hidden = true })` must still prune `.git/`
+/// (via `Settings::explorer_exclude`'s default `**/.git` entry) — `hidden = true`
+/// only lifts the dotfile skip, it must not open the door to `.git`'s contents.
 #[test]
 fn fs_walk_hidden_still_prunes_dot_git_1806() {
     let (mut e, project) = engine_with_plugin_and_fs_project(
@@ -9158,7 +8918,7 @@ fn fs_walk_hidden_still_prunes_dot_git_1806() {
     );
 }
 
-/// #1806 review: a bad `include`/`exclude` glob makes `vimcode.fs.walk`
+/// A bad `include`/`exclude` glob makes `vimcode.fs.walk`
 /// error immediately (`pcall` catches it) — covers `Engine::
 /// plugin_api_fs_walk`'s register-before-validate reordering (register the
 /// callbacks first, `remove_fs_callbacks` on a validation failure, rather
@@ -9212,7 +8972,7 @@ fn fs_walk_bad_glob_errors_then_api_stays_usable_1806() {
         "the error must be the documented \"failed to start\" message, got: {:?}",
         e.message
     );
-    // #1806 review: the actual `SearchError` text (naming the offending
+    // The actual `SearchError` text (naming the offending
     // glob) must reach Lua, not just a generic "bad glob pattern" — a
     // finder compiling a user-typed pattern on every keystroke needs to
     // show *which* pattern/reason failed.
@@ -9300,16 +9060,9 @@ fn fs_grep_streams_matches_then_fires_on_done_1806() {
     );
 }
 
-/// #1806 acceptance: `:cancel()` on a still-in-flight `vimcode.fs.walk`
-/// handle stops delivery promptly — no `on_batch`/`on_done` call reaches
-/// Lua afterward, even though there are far more files left to walk than
-/// one batch's worth.
-///
-/// RED-verified by hand: with `Engine::plugin_api_fs_cancel` changed to a
-/// no-op (`true` without storing into `cancelled`/removing the handle),
-/// this test fails — `_G.batches` ends up `> 0` and/or `_G.done` ends up
-/// `true`, because the background thread keeps delivering after `cancel()`
-/// returns.
+/// `:cancel()` on a still-in-flight `vimcode.fs.walk` handle stops delivery
+/// promptly — no `on_batch`/`on_done` call reaches Lua afterward, even though
+/// far more files remain to walk than one batch's worth.
 #[test]
 fn fs_walk_cancel_stops_delivery_promptly_1806() {
     let project = std::env::temp_dir().join(format!(

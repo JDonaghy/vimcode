@@ -243,7 +243,7 @@ fn test_context_menu_confirm_close() {
     let action = e.context_menu_confirm();
     assert_eq!(action.as_deref(), Some("close"));
     assert_eq!(e.active_group().tabs.len(), 2);
-    // #456: confirm must dismiss the menu so the TUI mouse intercept's
+    // Confirm must dismiss the menu so the TUI mouse intercept's
     // post-action state is consistent (no stale menu on screen).
     assert!(
         e.context_menu.is_none(),
@@ -253,7 +253,7 @@ fn test_context_menu_confirm_close() {
 
 #[test]
 fn test_explorer_context_menu_confirm_dismisses() {
-    // #456: regression — every TUI ctx menu intercept path (Down(Left)
+    // Regression — every TUI ctx menu intercept path (Down(Left)
     // and the newly-accepted Up(Left)) ends with `context_menu_confirm`
     // taking the menu. This test pins the engine-level contract that
     // `confirm` clears `context_menu`, so the renderer (and the next
@@ -503,7 +503,7 @@ fn test_open_side_from_context_menu() {
     assert_eq!(action.as_deref(), Some("open_side"));
     // Should have created a new editor group
     assert!(e.editor_groups.len() >= 2);
-    // #226: the new group's active window must hold the target file's buffer,
+    // The new group's active window must hold the target file's buffer,
     // not a clone of the prior tab. open_editor_group clones the current buffer
     // into the new group; open_side then has to replace it with the target.
     assert_eq!(
@@ -515,8 +515,7 @@ fn test_open_side_from_context_menu() {
 
 #[test]
 fn test_open_side_path_with_spaces() {
-    // Regression for #226: the prior implementation used `:e {path}` which
-    // tokenised on whitespace and silently dropped paths containing spaces.
+    // Opening paths with spaces requires proper escaping or quoting.
     let dir = std::env::temp_dir().join(format!("ctx_openside spaces {}", rand_name()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("my file.txt");
@@ -1120,7 +1119,7 @@ fn test_explorer_open_side_vsplit_creates_split() {
 
 #[test]
 fn test_explorer_open_side_vsplit_target_on_right_regardless_of_splitright() {
-    // #226: "Open to the Side" must place the target on the right
+    // "Open to the Side" must place the target on the right
     // regardless of the user's splitright setting. With vim's default
     // splitright=false, a plain :vsplit would put the new window on the
     // left — but the menu label commits to "to the side" semantics.
@@ -1310,7 +1309,7 @@ fn test_editor_context_menu_shortcuts_vim_mode() {
     let cm = e.context_menu.as_ref().unwrap();
 
     // Vim-style shortcuts.
-    // `gd` is Vim's local-declaration motion (#889); the LSP go-to-definition
+    // `gd` is Vim's local-declaration motion; the LSP go-to-definition
     // key in Vim mode is the tag jump `Ctrl-]`.
     assert_eq!(cm.items[0].shortcut, "Ctrl+]");
     assert_eq!(cm.items[1].shortcut, "gr");
@@ -1386,7 +1385,7 @@ fn test_editor_context_menu_first_enabled_selected() {
     assert_eq!(cm.items[cm.selected].action, "paste");
 }
 
-// ── ModalStack integration (#459) ─────────────────────────────────────────────
+// ── ModalStack integration ────────────────────────────────────────────────────
 
 /// Regression test: when a context menu is open and its bounds are pushed onto
 /// the ModalStack, hit_test() at the menu centre returns Some(menu_id) and
