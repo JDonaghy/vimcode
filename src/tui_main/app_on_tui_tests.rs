@@ -5158,7 +5158,7 @@ mod tests {
                 .map(|r| (r.bounds.x.round() as u16, r.bounds.y.round() as u16))
         }
 
-        /// #1903: VS Code's `explorer.autoReveal` (default on) expands the
+        /// VS Code's `explorer.autoReveal` (default on) expands the
         /// active file's ancestor folders, selects its row and scrolls it
         /// into view in the Explorer sidebar whenever the active editor
         /// changes — including a plain tab-bar click, not just opening a
@@ -5298,7 +5298,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// #1903: `explorer_auto_reveal` (default on, mirroring VS Code's
+        /// `explorer_auto_reveal` (default on, mirroring VS Code's
         /// `explorer.autoReveal`) must be possible to turn off — with it
         /// off, the same tab-bar click as
         /// `tab_bar_click_reveals_and_highlights_active_file_in_explorer_1903`
@@ -5389,7 +5389,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// #1903: bringing the Explorer panel to the front is an "active
+        /// Bringing the Explorer panel to the front is an "active
         /// editor changed, as far as the Explorer is concerned" moment too —
         /// VS Code reveals the active file when the Explorer view becomes
         /// visible, not only when the editor switches while it is already
@@ -5492,7 +5492,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// #1903: the reveal-on-panel-show in
+        /// The reveal-on-panel-show in
         /// `activity_bar_click_reveals_active_file_in_explorer_1903` obeys
         /// `explorer_auto_reveal` like every other reveal trigger: with the
         /// setting off, showing the Explorer must leave the collapsed tree
@@ -5556,7 +5556,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// #1903 regression: `Engine::explorer_reveal_path` is handed
+        /// Regression guard: `Engine::explorer_reveal_path` is handed
         /// whatever `target` the caller has, not necessarily an absolute
         /// one. The single most common real launch — `cd myrepo && vimcode
         /// src/main.rs` — hands `Engine::startup` a path relative to the
