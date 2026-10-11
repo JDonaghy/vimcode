@@ -279,8 +279,8 @@ pub(crate) fn pixel_to_click_target(
     }
 }
 
-/// Resolve the top-level `ScreenZone` using the cached `quadraui::FrameHitMap`
-///, which covers exactly the `Editor`/`TabBar` surfaces painted in
+/// Resolve the top-level `ScreenZone` using the cached `quadraui::FrameHitMap`,
+/// which covers exactly the `Editor`/`TabBar` surfaces painted in
 /// `App::render_content` via `quadraui::ScreenLayout::hit_map()`
 /// — pushed from the SAME objects/rects already painted, so
 /// this can never drift from what's on screen. Returns `ScreenZone::None`

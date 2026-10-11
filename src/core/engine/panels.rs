@@ -627,8 +627,8 @@ impl Engine {
                 // re-borrows `self.acp().client` immediately before use,
                 // rather than holding one `client` reference across the
                 // `remembered_decisions` mutation in between — the two now
-                // live in the same `AcpSession` behind `Engine::acp_sessions`
-                //, and unlike separate top-level `Engine` fields, a
+                // live in the same `AcpSession` behind `Engine::acp_sessions`,
+                // and unlike separate top-level `Engine` fields, a
                 // `Vec` index can't be borrow-split field-by-field, so an
                 // in-flight `&AcpClient` borrowed via `self.acp()` would
                 // conflict with the `self.acp_mut()` mutation.
@@ -1462,8 +1462,8 @@ impl Engine {
                     } else {
                         // Multiple results — populate the quickfix window.
                         // `qf_set_list` also snapshots whatever quickfix list
-                        // was there before onto the `:colder`/`:cnewer` stack
-                        //, same as `:grep`.
+                        // was there before onto the `:colder`/`:cnewer` stack,
+                        // same as `:grep`.
                         let n = locations.len();
                         let items = locations
                             .into_iter()

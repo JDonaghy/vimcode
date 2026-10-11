@@ -1489,8 +1489,8 @@ fn invalidate_install_exit_code(install_key: &str) {
     let _ = std::fs::remove_file(install_exit_code_path(install_key));
 }
 
-/// Path to the per-install **wrapper script** file for `install_key`
-///, sibling to [`install_exit_code_path`]. `terminal_run_command`
+/// Path to the per-install **wrapper script** file for `install_key`,
+/// sibling to [`install_exit_code_path`]. `terminal_run_command`
 /// writes [`build_terminal_install_wrapper`]'s output here rather than
 /// typing it into the PTY directly — see that call site's doc comment for
 /// why. Sanitizes `install_key` the same way `install_exit_code_path` does

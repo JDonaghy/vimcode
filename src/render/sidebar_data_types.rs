@@ -231,8 +231,8 @@ pub struct SourceControlData {
     /// SC help dialog visible.
     pub help_open: bool,
     /// Y coordinate (in native units) where the sections area begins —
-    /// the top of `SidebarPanelLayout.content_bounds` from the last paint
-    ///. TUI: terminal rows. GTK: pixels. `None` until first paint.
+    /// the top of `SidebarPanelLayout.content_bounds` from the last paint.
+    /// TUI: terminal rows. GTK: pixels. `None` until first paint.
     pub sc_sections_start_y: Option<f32>,
 }
 

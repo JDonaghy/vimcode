@@ -17,8 +17,8 @@ pub mod icons;
 pub mod render;
 pub mod tui_main;
 
-/// Backend-neutral pixel→click-target resolution shared by `crate::app`
-///. Split out of the formerly `gui`-gated `src/gtk/click.rs`, which
+/// Backend-neutral pixel→click-target resolution shared by `crate::app`.
+/// Split out of the formerly `gui`-gated `src/gtk/click.rs`, which
 /// re-exports these names so its own tests and the rest of `crate::gtk` keep
 /// resolving them unchanged.
 pub(crate) mod click;

@@ -1733,8 +1733,8 @@ impl Engine {
         }
 
         // :AiSessions — open the `:AiSessions` picker of past sessions for
-        // the active agent + workspace, or resume one via `session/load`
-        //. See `Engine::acp_open_sessions_picker`'s doc for the
+        // the active agent + workspace, or resume one via `session/load`.
+        // See `Engine::acp_open_sessions_picker`'s doc for the
         // "agent doesn't support resume" refusal.
         if cmd == "AiSessions" {
             self.acp_open_sessions_picker();

@@ -351,8 +351,8 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
     })
 }
 
-/// Parse a `kind = "..."` table into a [`crate::core::plugin_ui::ViewBody`]
-///. Sibling of the field-stack loop in [`lua_table_to_view`], not
+/// Parse a `kind = "..."` table into a [`crate::core::plugin_ui::ViewBody`].
+/// Sibling of the field-stack loop in [`lua_table_to_view`], not
 /// interleaved with it — see that function's call site for why.
 fn lua_table_to_view_body(
     kind: &str,
@@ -656,8 +656,8 @@ pub struct PluginManager {
     /// any latent registry-growth cost from that pattern far more visible
     /// than it was for a handful of timer/spawn callbacks.
     pickers: RefCell<HashMap<u64, PluginPicker>>,
-    /// `id -> callback` for every in-flight `vimcode.http.request` handle
-    ///. The child process/receiver live on `Engine::
+    /// `id -> callback` for every in-flight `vimcode.http.request` handle.
+    /// The child process/receiver live on `Engine::
     /// plugin_http_requests`, keyed by the same id — mirrors `spawn_callbacks`
     /// exactly, minus the "three callbacks" shape (HTTP has exactly one).
     http_callbacks: RefCell<HashMap<u64, LuaRegistryKey>>,
@@ -674,8 +674,8 @@ pub struct PluginManager {
     fs_callbacks: RefCell<HashMap<u64, FsCallbacks>>,
 }
 
-/// A `vimcode.fs.walk`/`vimcode.fs.grep` handle's registered callbacks
-///. Unlike [`SpawnCallbacks`], both are mandatory — the Lua binding
+/// A `vimcode.fs.walk`/`vimcode.fs.grep` handle's registered callbacks.
+/// Unlike [`SpawnCallbacks`], both are mandatory — the Lua binding
 /// requires `on_batch` and `on_done` as positional arguments, matching the
 /// issue's `walk(root, opts, on_batch, on_done)` signature.
 struct FsCallbacks {
@@ -1741,8 +1741,8 @@ impl PluginManager {
     }
 
     /// List every active keymap — config-defined and Lua-registered alike —
-    /// as `(mode, lhs, buffer_handle, desc)`, for `vimcode.keymap.list()`
-    ///, the enumeration a which-key style extension renders from.
+    /// as `(mode, lhs, buffer_handle, desc)`, for `vimcode.keymap.list()`,
+    /// the enumeration a which-key style extension renders from.
     /// `buffer_handle` is `None` for a global mapping.
     pub(crate) fn list_keymaps_from(
         keymaps: &[UserKeymap],
@@ -2856,8 +2856,8 @@ impl PluginManager {
 
         vimcode.set("keymap", keymap_tbl)?;
 
-        // vimcode.fire_event(name) — fire a plugin-defined "User" event
-        //, the escape hatch for a plugin to signal its own
+        // vimcode.fire_event(name) — fire a plugin-defined "User" event,
+        // the escape hatch for a plugin to signal its own
         // lifecycle points to other plugins: `vimcode.on("User", function(name)
         // if name == "MyPluginReady" then ... end end)`.
         vimcode.set(

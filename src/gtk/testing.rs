@@ -159,8 +159,8 @@ pub struct Harness<A: AppLogic> {
     /// leave no other headlessly-observable trace.
     pub last_window_control_action: Rc<Cell<Option<&'static str>>>,
     /// The full menu-bar row band the last frame laid out (`layout
-    /// .title_bar_bounds`), or a default (zero) rect before the first frame
-    ///. Aim app-icon pixel probes at
+    /// .title_bar_bounds`), or a default (zero) rect before the first frame.
+    /// Aim app-icon pixel probes at
     /// `render::split_menu_row_for_app_icon(this).0` rather than at guessed
     /// chrome offsets — see `app_icon_paints_left_of_the_file_menu`.
     pub menu_row_rect: Rc<Cell<quadraui::Rect>>,

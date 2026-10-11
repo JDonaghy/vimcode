@@ -739,8 +739,8 @@ impl AcpConfigOption {
     }
 }
 
-/// Parse `session/new`/`session/load`'s `configOptions` result field
-///: `[{"id", "name"?, "category"?, "currentValueId"?, "values":
+/// Parse `session/new`/`session/load`'s `configOptions` result field:
+/// `[{"id", "name"?, "category"?, "currentValueId"?, "values":
 /// [{"id", "name"?}]}]`. Absent/malformed input yields an empty list — like
 /// `modes`, config options are an optional agent capability, not a
 /// required one. An entry missing `id` is dropped outright (nothing a
@@ -1409,8 +1409,8 @@ impl AcpSymbolMention {
 /// `image/<kind>` for a recognized raster-image file extension, or `None`
 /// for anything else (including no extension) — the gate
 /// [`crate::core::engine::Engine::acp_attach_file`] uses to decide "attach
-/// as an `image` content block" vs. "attach as a baseline `resource_link`"
-///. A real IANA mime type, unlike [`mime_type_for_path`]'s
+/// as an `image` content block" vs. "attach as a baseline `resource_link`".
+/// A real IANA mime type, unlike [`mime_type_for_path`]'s
 /// `text/x-*` hint above — an ACP `image` block's `mimeType` is what the
 /// agent hands straight to a real image decoder, so it has to be one this
 /// codebase can't afford to make up.

@@ -118,8 +118,8 @@ pub(crate) fn build_source_control_data(engine: &Engine) -> Option<SourceControl
     })
 }
 
-/// Build the Source Control action-button row as a `quadraui::Toolbar`
-///. Commit carries its label + `(c)` key hint and is disabled while
+/// Build the Source Control action-button row as a `quadraui::Toolbar`.
+/// Commit carries its label + `(c)` key hint and is disabled while
 /// the commit message is empty; Push/Pull/Sync are icon-only. Button ids
 /// come from [`crate::core::engine::SC_BUTTON_IDS`] so click dispatch can
 /// map the hit-test result back to a button index. Both backends call this
@@ -169,8 +169,8 @@ pub fn sc_sidebar_panel(sc: &SourceControlData) -> quadraui::SidebarPanel {
 }
 
 /// Draw the SC bottom slab (toolbar + sections) through backend `b` and
-/// cache the full `SidebarPanelLayout` on `engine` for click/hover dispatch
-///. `rect` covers the "bottom slab" — from just below the commit input
+/// cache the full `SidebarPanelLayout` on `engine` for click/hover dispatch.
+/// `rect` covers the "bottom slab" — from just below the commit input
 /// to the bottom of the panel. Both backends call this inside their frame
 /// scope; section rendering then reads `content_bounds` from the cached
 /// layout. Keyboard focus → pressed_id, mouse hover → hovered_id.
@@ -203,8 +203,8 @@ pub fn sc_header_text(sc: &SourceControlData) -> String {
     }
 }
 
-/// Build the SC panel's header row as a single-segment `quadraui::StatusBar`
-///. GTK paints the header through this — TUI keeps its existing
+/// Build the SC panel's header row as a single-segment `quadraui::StatusBar`.
+/// GTK paints the header through this — TUI keeps its existing
 /// direct `set_cell` text row (both read the same [`sc_header_text`]
 /// string, so the two can't show different branch info even though the
 /// paint mechanism differs).

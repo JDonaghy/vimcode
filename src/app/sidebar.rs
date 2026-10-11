@@ -326,8 +326,8 @@ impl App {
         }
     }
 
-    /// Restore the window's saved size, position and maximized state
-    ///, the first time each run `Backend::window()` returns `Some`.
+    /// Restore the window's saved size, position and maximized state,
+    /// the first time each run `Backend::window()` returns `Some`.
     /// Called from both `setup()` (fast path, usually too early — the
     /// runner hasn't called `window.present()` yet, so `backend.window()`
     /// is still `None`) and `tick()` (reliable path — retried every frame
@@ -775,8 +775,8 @@ impl App {
     ///
     /// `render_content` caches the panel rect in `Engine::ai_chat_rect` at
     /// paint time — resolving a press against that means the click router
-    /// can never derive a different layout than the one actually on screen
-    ///. The dispatch itself is [`render::route_ai_chat_event`],
+    /// can never derive a different layout than the one actually on screen.
+    /// The dispatch itself is [`render::route_ai_chat_event`],
     /// which needs a live `Backend` (like [`Self::route_debug_sidebar_event`])
     /// for `ChatController::handle`'s own layout/hit-test math. Consumes the
     /// press unconditionally like every other panel arm in

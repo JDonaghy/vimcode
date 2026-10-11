@@ -253,8 +253,8 @@ fn minimap_press_on_the_highlight_band_preserves_the_grab_offset() {
     let mm = screen.minimap.first().expect("minimap present");
 
     // The cursor starts at the top of the file, so the viewport
-    // highlight's own top edge coincides with the strip's top row
-    //. At this fixture's geometry the band is exactly one row
+    // highlight's own top edge coincides with the strip's top row.
+    // At this fixture's geometry the band is exactly one row
     // tall (`FixedPitch(1.0)`'s own row pitch), so a press has to land
     // within that single row — 0.4 units down is safely inside
     // `[rect.y, rect.y + 1.0)` without being able to round into the row

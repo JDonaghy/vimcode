@@ -2464,8 +2464,8 @@ impl Settings {
     /// The `'wildmode'` flags active on the `press`'th `<Tab>` press of the
     /// current command-line completion round (0-indexed). Clamps to the
     /// last configured stage once `press` runs past the configured list,
-    /// matching Vim holding on the last stage for every press beyond it
-    ///. See [`WildmodeStage`] for which flags are distinctly wired.
+    /// matching Vim holding on the last stage for every press beyond it.
+    /// See [`WildmodeStage`] for which flags are distinctly wired.
     pub(crate) fn wildmode_stage_at(&self, press: usize) -> WildmodeStage {
         let stages = wildmode_stages(&self.wildmode);
         match stages.len() {

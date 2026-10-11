@@ -122,8 +122,8 @@ pub enum LspEvent {
         symbols: Vec<SymbolInfo>,
     },
     /// `$/progress` begin notification — a long-running work item started
-    /// on the server. Used by the indicator to track workspace indexing
-    ///. `token` is the unique progress-token string (LSP allows
+    /// on the server. Used by the indicator to track workspace indexing.
+    /// `token` is the unique progress-token string (LSP allows
     /// number or string; we stringify both for HashMap keying).
     /// `message` and `percentage` are the begin payload's optional
     /// progress fields.

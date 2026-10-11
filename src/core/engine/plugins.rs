@@ -309,8 +309,8 @@ impl Engine {
     ///
     /// Fires the `panel_focus` hook (how a `vimcode.panel.register` panel learns
     /// to populate its sections) and, for a `vimcode.ui.register_view` panel,
-    /// re-runs its `render` callback so the form painted this frame is current
-    ///. Both activation paths — the activity-bar click router in
+    /// re-runs its `render` callback so the form painted this frame is current.
+    /// Both activation paths — the activity-bar click router in
     /// `render.rs` and `Engine::activate_activity_bar_item` — go through here so
     /// the two cannot drift.
     pub(crate) fn on_ext_panel_focused(&mut self, name: &str) {
@@ -427,8 +427,8 @@ impl Engine {
         }
     }
 
-    /// Read the raw selected-column index for `host`'s `Table`-kind view
-    ///. "Raw" — callers that need it clamped to an actually-
+    /// Read the raw selected-column index for `host`'s `Table`-kind view.
+    /// "Raw" — callers that need it clamped to an actually-
     /// editable column (`render::handle_plugin_view_table_key`'s
     /// `current_col`) do that themselves, the same "read-time clamp"
     /// contract `Engine::plugin_view_selected` uses for a stale row index.

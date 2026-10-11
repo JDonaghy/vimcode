@@ -21582,8 +21582,8 @@ fn test_confirm_delete_folder() {
 
 // ─── `:CheckNerdFonts` dialog tests ──────────────────────────────────────────
 //
-// `crate::icons::{nerd_fonts_enabled, set_nerd_fonts}` is thread-local
-//, so any test that mutates it saves and restores the ambient value
+// `crate::icons::{nerd_fonts_enabled, set_nerd_fonts}` is thread-local,
+// so any test that mutates it saves and restores the ambient value
 // to avoid leaking into whatever other test Rust's runner schedules next on
 // the same worker thread — same discipline the shell_app.rs/gtk testing.rs
 // nerd-font tests already follow.
@@ -25915,8 +25915,8 @@ fn test_matrix_delete_forced_motion_kind() {
         // (inclusive of the char just before ')'); `dvt)` deletes one less,
         // "a(bc", leaving "d)e".
         ("dvt)", "a(bcd)e", 0, 0, "dvt)", "d)e", 0, 0),
-        // dvge / dvgE: `ge`/`gE` are naturally inclusive backward motions
-        //. Neovim 0.12.5: from col 6 ('f') on "abc def",
+        // dvge / dvgE: `ge`/`gE` are naturally inclusive backward motions.
+        // Neovim 0.12.5: from col 6 ('f') on "abc def",
         // `dge`/`dgE` both delete "c def" leaving "ab"; forced exclusive,
         // `dvge`/`dvgE` delete one less character ("c de"), leaving "abf".
         ("dvge", "abc def", 0, 6, "dvge", "abf", 0, 2),

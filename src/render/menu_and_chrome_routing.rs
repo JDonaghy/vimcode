@@ -490,8 +490,8 @@ pub fn menu_bar_intercept_rect(
 /// `AppShell::set_title_bar_visible` does. Call unconditionally on the way
 /// out of every dispatch (`handle`/`handle_dispatch`'s tail,
 /// `on_shell_event_ctx`'s tail) rather than only from the specific arms that
-/// change the flag, per `AppShell::set_title_bar_visible`'s own doc
-///: "toggling this and calling [layout/render] next is
+/// change the flag, per `AppShell::set_title_bar_visible`'s own doc:
+/// "toggling this and calling [layout/render] next is
 /// sufficient". A no-op whenever the flag hasn't changed since the last
 /// call.
 pub fn sync_menu_bar_title_row(ctx: &quadraui::ShellContext<'_>, engine: &Engine) {

@@ -1182,8 +1182,8 @@ impl App {
 
         // Editor hover popup anchor (rich markdown; `gh` key, diagnostic/
         // annotation/plugin hovers, or mouse dwell). Bounds/link rects/
-        // scrollbar geometry are cached for the click + drag handlers
-        //, same as `draw.rs::draw_editor_hover_popup` did.
+        // scrollbar geometry are cached for the click + drag handlers,
+        // same as `draw.rs::draw_editor_hover_popup` did.
         let editor_hover = anchor_points.editor_hover.and_then(|(x, y)| {
             Some(render::PopupAnchor {
                 x,
@@ -1223,8 +1223,8 @@ impl App {
     /// `:set ui_font_size=N` reaches the rasterisers on the very next paint
     /// instead of never; the two hit-test registries are cleared so a panel or
     /// window that closed this frame leaves no stale entry for
-    /// `dispatch_scroll` / `pixel_to_click_target` to resolve against
-    ///. Extracted out of `render_content` so that function
+    /// `dispatch_scroll` / `pixel_to_click_target` to resolve against.
+    /// Extracted out of `render_content` so that function
     /// reads as the frame's *order* and nothing else.
     pub(crate) fn sync_per_frame_backend_state(
         &self,

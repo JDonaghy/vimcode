@@ -425,8 +425,8 @@ pub fn build_minimap_data(
     // (distinct colours per decile of strip height dropped from ~9 to 1
     // right where this under-sampling predicted, on an unfixed `develop`).
     //
-    // This mirrors `visible_span_cols`'s column-axis fix immediately below
-    //: take the max of both backends' real row requirements rather
+    // This mirrors `visible_span_cols`'s column-axis fix immediately below:
+    // take the max of both backends' real row requirements rather
     // than branching on backend identity (Platform-Neutrality Rule — this
     // stays shared code). `rect.height` is in the caller's own native unit
     // (pixels for GTK, cell rows for TUI), exactly like `rect.width` was

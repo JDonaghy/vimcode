@@ -1836,8 +1836,8 @@ pub struct ContextMenuState {
     /// Height of the trigger element in line_height units (f32 so
     /// backends with sub-cell row heights — e.g. GTK's tab row at
     /// ceil(1.6 * line_height) — can place the menu flush against the
-    /// trigger). Non-zero opts into `ContextMenuPlacement::Below`
-    ///; right-click flows leave this at 0.0 and use AnchorPoint.
+    /// trigger). Non-zero opts into `ContextMenuPlacement::Below`;
+    /// right-click flows leave this at 0.0 and use AnchorPoint.
     pub trigger_height: f32,
 }
 
@@ -3714,8 +3714,8 @@ pub struct Engine {
     pub acp_session_index: crate::core::acp_sessions::AcpSessionIndex,
     /// A session id chosen via `:AiSessions`, waiting for the next
     /// `initialize` handshake to complete so `Engine::acp_begin_session`
-    /// can `session/load` it instead of `session/new`-ing a fresh one
-    ///. Also set by the `acp_reopen_last_session` setting's
+    /// can `session/load` it instead of `session/new`-ing a fresh one.
+    /// Also set by the `acp_reopen_last_session` setting's
     /// "resume on first `:AI` after startup" path
     /// (`Engine::ai_send_message_via_acp`). Consumed (taken) the moment
     /// `acp_begin_session` runs, however it got there — auth-choice
@@ -4197,8 +4197,8 @@ pub struct Engine {
     /// "Want" column for consecutive `<Down>`/`<Up>` in Insert mode: a run of
     /// vertical moves remembers the column the run started at, so stepping
     /// through a short intermediate line and back onto a long one restores
-    /// the original column instead of sticking to the short line's length
-    ///. Cleared by any other key.
+    /// the original column instead of sticking to the short line's length.
+    /// Cleared by any other key.
     pub insert_vertical_want_col: Option<usize>,
     /// Stores visual block insert/append info:
     /// `(start_line, end_line, col, is_append, virtual_end, left_col)`.
@@ -4551,8 +4551,8 @@ pub struct Engine {
     /// Channel for receiving the AI response from the background thread.
     pub ai_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// quadraui ChatController — owns the AI sidebar's transcript scroll,
-    /// multi-line input buffer/cursor/history, and scrollbar-drag state
-    ///. Both TUI and GTK call `render()` for painting and `handle()`
+    /// multi-line input buffer/cursor/history, and scrollbar-drag state.
+    /// Both TUI and GTK call `render()` for painting and `handle()`
     /// for mouse/keyboard events via the shared `render::route_ai_chat_event`
     /// wrapper.
     pub ai_chat: std::rc::Rc<std::cell::RefCell<quadraui::ChatController>>,
@@ -6026,8 +6026,8 @@ impl Engine {
         self.push_toast_inner(title, body, severity, Vec::new(), false)
     }
 
-    /// Push a toast with one or more action buttons and no auto-expiry
-    ///: the offer stays until the user picks an action or
+    /// Push a toast with one or more action buttons and no auto-expiry:
+    /// the offer stays until the user picks an action or
     /// dismisses it (×) — see `EngineToast::sticky`'s doc for why a 5s
     /// auto-expiry is wrong for a decision the user might not have looked
     /// up from yet. Single code path for every action toast vimcode pushes
@@ -6097,8 +6097,8 @@ impl Engine {
         self.toasts.len() != before
     }
 
-    /// Dispatch a `ToastHit` from the cached `toast_layout` to the engine
-    ///. Both backends call this with the result of
+    /// Dispatch a `ToastHit` from the cached `toast_layout` to the engine.
+    /// Both backends call this with the result of
     /// `layout.hit_test(x, y)` and check the bool: true = consumed (don't
     /// let the click reach the editor underneath); false = empty hit,
     /// fall through to whatever was below the toast.
@@ -6424,8 +6424,8 @@ fn list_custom_theme_names() -> Vec<String> {
 /// Returns true if `binary` is found and runnable.
 ///
 /// Delegates to [`super::lsp_manager::resolve_command`] — the exact resolver
-/// `LspManager` uses to launch servers — rather than walking `PATH` on its own
-///. Before this, install-time checks (this function) and server launch
+/// `LspManager` uses to launch servers — rather than walking `PATH` on its own.
+/// Before this, install-time checks (this function) and server launch
 /// used two different lookups: this one scanned only the process `PATH`, while
 /// `resolve_command` also probes the Mason bin dir, `~/.local/bin`,
 /// `~/.cargo/bin`, `~/go/bin`, `~/.dotnet/tools`, `~/.npm-global/bin` and the

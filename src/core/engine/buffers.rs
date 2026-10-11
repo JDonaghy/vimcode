@@ -1568,8 +1568,8 @@ impl Engine {
     }
 
     /// Jump to the next changed region below the cursor.
-    /// When the buffer has outstanding in-buffer agent-review hunks
-    ///: navigates those exclusively. Otherwise, on real files:
+    /// When the buffer has outstanding in-buffer agent-review hunks:
+    /// navigates those exclusively. Otherwise, on real files:
     /// uses `git_diff` markers. On diff buffers: searches for `@@`
     /// headers. In two-window diff mode: uses `diff_results` for
     /// navigation.
@@ -1693,8 +1693,8 @@ impl Engine {
     }
 
     /// Jump to the previous changed region above the cursor.
-    /// When the buffer has outstanding in-buffer agent-review hunks
-    ///: navigates those exclusively. Otherwise, on real files:
+    /// When the buffer has outstanding in-buffer agent-review hunks:
+    /// navigates those exclusively. Otherwise, on real files:
     /// uses `git_diff` markers. On diff buffers: searches for `@@`
     /// headers. In two-window diff mode: uses `diff_results` for
     /// navigation.

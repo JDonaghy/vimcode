@@ -652,8 +652,8 @@ pub struct BufferState {
     /// buffer content (even if the response was empty). Distinguishes
     /// "haven't responded yet" from "responded with zero tokens" — without
     /// this, `lsp_status_for_buffer` would keep the indicator pinned to
-    /// `Initializing` forever on files where the server returns no tokens
-    ///. Cleared in `lsp_flush_changes` when re-requesting after an
+    /// `Initializing` forever on files where the server returns no tokens.
+    /// Cleared in `lsp_flush_changes` when re-requesting after an
     /// edit so the indicator can briefly reflect the new pending request.
     pub semantic_tokens_received: bool,
     /// For netrw buffers: the directory currently being listed.

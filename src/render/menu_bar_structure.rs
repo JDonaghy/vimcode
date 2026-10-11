@@ -264,8 +264,8 @@ pub fn explorer_toolbar_status_bar(theme: &Theme) -> quadraui::StatusBar {
     }
 }
 
-/// Resolve a press against the Explorer header's view-actions toolbar row
-///, given `pos` in the same absolute space `SidebarPanelBody::
+/// Resolve a press against the Explorer header's view-actions toolbar row,
+/// given `pos` in the same absolute space `SidebarPanelBody::
 /// render_with` painted the chrome into — the same contract
 /// `dap_sidebar_action_click_at` follows for the Debug sidebar's own
 /// chrome row (see that function's doc). `engine.explorer_toolbar_hits` is

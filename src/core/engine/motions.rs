@@ -3461,8 +3461,8 @@ impl Engine {
     }
 
     /// Normal/Visual-mode "move right", wrapping to the start of the next
-    /// line when at the last column and `'whichwrap'` includes `token`
-    ///. Shared by `l` (`token = 'l'`), `<Space>` (`token = 's'`), and
+    /// line when at the last column and `'whichwrap'` includes `token`.
+    /// Shared by `l` (`token = 'l'`), `<Space>` (`token = 's'`), and
     /// `<Right>` (`token = '>'`) — see [`Self::move_left_whichwrap`].
     pub(crate) fn move_right_whichwrap(&mut self, token: char) {
         let line = self.view().cursor.line;

@@ -1591,8 +1591,8 @@ pub fn route_sidebar_hover(
             // content_row`'s uniform-row-height formula: a real multi-section
             // panel pitches header rows and item rows differently on
             // GTK/macOS/Win (`Engine::ext_panel_tree_layout`'s own doc), so a
-            // linear formula resolves the wrong row near a section boundary
-            //. `ext_panel_hit_flat_index` already returns an absolute
+            // linear formula resolves the wrong row near a section boundary.
+            // `ext_panel_hit_flat_index` already returns an absolute
             // flat index (matching `ext_panel_to_tree_view`'s own numbering),
             // so no `ext_panel_scroll_top` offset is added here — adding one
             // would double-count the scroll the cached layout already baked

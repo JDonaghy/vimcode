@@ -1209,8 +1209,8 @@ mod tests {
 
         // Removing the wrapped leaf restores exactly the original subtree —
         // the `close_window`/`qf_close_panel_window` precedent this exists
-        // to support relies on `remove` already handling a root-level wrap
-        //, not a new special case.
+        // to support relies on `remove` already handling a root-level wrap,
+        // not a new special case.
         let after_remove = layout.remove(WindowId(3)).expect("removable leaf");
         assert_eq!(after_remove.window_ids(), vec![WindowId(1), WindowId(2)]);
     }

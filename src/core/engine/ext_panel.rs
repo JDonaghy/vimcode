@@ -2837,8 +2837,8 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Close the cmdline window — it's a split in the current tab
-        //, not a whole tab, so close just the window.
+        // Close the cmdline window — it's a split in the current tab,
+        // not a whole tab, so close just the window.
         self.close_window();
 
         if is_search {

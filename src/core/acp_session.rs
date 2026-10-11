@@ -220,8 +220,8 @@ pub struct AcpSession {
     pub mcp_capabilities: AcpMcpCapabilities,
     /// Names of the MCP servers *this* session actually started with —
     /// i.e. what `session/new`/`session/load`'s `mcpServers` carried after
-    /// `build_mcp_servers_wire` dropped anything the agent doesn't support
-    ///. Empty before the session's handshake completes, or if none
+    /// `build_mcp_servers_wire` dropped anything the agent doesn't support.
+    /// Empty before the session's handshake completes, or if none
     /// were configured/all were dropped. Drives the `:AiAgent` status
     /// line's `" | MCP: ..."` suffix (`acp_agent_registry_status_line`).
     pub active_mcp_servers: Vec<String>,

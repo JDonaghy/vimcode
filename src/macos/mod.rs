@@ -1502,8 +1502,8 @@ mod mac_driver_tests {
     // **no** `PanelRegistration` — a hack that only made sense while
     // `App::paint_sidebar_panel_rung`'s `ext:` arm unconditionally painted
     // the extension marketplace regardless of which plugin id was active.
-    // Now that the arm paints a real `PanelRegistration`'s own sections
-    //, that fixture paints nothing and the test fails on its own
+    // Now that the arm paints a real `PanelRegistration`'s own sections,
+    // that fixture paints nothing and the test fails on its own
     // precondition. The property it existed to pin — a section-header
     // click, swept across its whole painted band, always toggles *that*
     // header and no other — is now covered against a genuine plugin panel,

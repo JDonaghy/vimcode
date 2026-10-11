@@ -43,8 +43,8 @@ pub fn point_over_command_line(rect: quadraui::Rect, point: quadraui::Point) -> 
 /// same time — `core::engine::keys` sets them together). Gating on
 /// `!message.is_empty()` alone let a click there arm a selection whose
 /// indices were hit-tested against the painted count text but whose Ctrl+C
-/// copy read `engine.message` — a real, reachable text/geometry mismatch
-///, not a hypothetical.
+/// copy read `engine.message` — a real, reachable text/geometry mismatch,
+/// not a hypothetical.
 pub fn command_line_selection_allowed(engine: &Engine) -> bool {
     match engine.mode {
         Mode::Command | Mode::Search => true,
@@ -503,8 +503,8 @@ pub fn divider_hit_test<D: DividerGeometry>(
 /// the new split ratio (unclamped — `set_ratio_at_index` on both
 /// `GroupLayout` and `WindowLayout` already clamps to `0.1..0.9`).
 ///
-/// Divides by `axis_size() - divider_thickness()`, not raw `axis_size()`
-///: `WindowLayout::layout_snapped` interprets a `Vertical` split's
+/// Divides by `axis_size() - divider_thickness()`, not raw `axis_size()`:
+/// `WindowLayout::layout_snapped` interprets a `Vertical` split's
 /// `ratio` as a fraction of the *content* width (bounds width minus the
 /// reserved divider column), so a drag that instead divided by the full
 /// `axis_size()` would feed back a ratio the layout doesn't mean — a

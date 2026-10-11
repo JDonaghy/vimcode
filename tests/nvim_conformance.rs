@@ -411,8 +411,8 @@ impl NvimRpc {
     /// `last_message`, so there is no reason to widen what every one of
     /// those 1,400+ spawns has to negotiate and this harness has to decode.
     ///
-    /// `cwd`, when given, becomes the spawned process's working directory
-    ///: the window-layout harness (`run_win_in_neovim`) opens real
+    /// `cwd`, when given, becomes the spawned process's working directory:
+    /// the window-layout harness (`run_win_in_neovim`) opens real
     /// files by path and needs relative-path resolution (`fnameescape`,
     /// swap-file naming were it not for `-n`) to agree with vimcode's own
     /// `Engine::cwd` for that probe. The buffer/cursor harnesses never open a
@@ -3225,8 +3225,8 @@ local result = { tabs = tabs }\n\
 /// failure happened rather than collapsing it to `None` — same contract as
 /// [`oracle_probe`], and for the same reason.
 ///
-/// This replaced `nvim --headless -l script.lua` + one `nvim_feedkeys` burst
-///. That oracle attached no UI, so Neovim's own `:h cmdwin` — `q:`,
+/// This replaced `nvim --headless -l script.lua` + one `nvim_feedkeys` burst.
+/// That oracle attached no UI, so Neovim's own `:h cmdwin` — `q:`,
 /// `q/`, `q?` — silently refused to open (confirmed empirically: `winlayout()`
 /// and `nvim_list_wins()` came back completely unchanged) and every case
 /// exercising it compared vimcode against a harness gap, not against real
@@ -11957,15 +11957,15 @@ const COVERAGE_EXEMPT: &[&str] = &[
 /// advisory (see [`fixes_are_enforced`]).
 const DEVIATIONS_ORACLE: (u32, u32) = (0, 12);
 
-/// The minimum `(major, minor)` Neovim this suite will accept as an oracle
-///. The fleet standard — every agent host, and both CI jobs — is
+/// The minimum `(major, minor)` Neovim this suite will accept as an oracle.
+/// The fleet standard — every agent host, and both CI jobs — is
 /// Homebrew's / upstream's current stable `v0.12.5`; `0.12` is the floor that
 /// pins. A host below it fails loudly rather than quietly producing verdicts
 /// from a different Vim.
 const MIN_NVIM_VERSION: (u32, u32) = (0, 12);
 
-/// Opt out of the whole suite on a machine that cannot supply a usable oracle
-///. Deliberately an explicit, greppable env var rather than an implicit
+/// Opt out of the whole suite on a machine that cannot supply a usable oracle.
+/// Deliberately an explicit, greppable env var rather than an implicit
 /// "`CI` is unset" skip: skipping must be a visible act on the command line,
 /// not the default a coordinator Test leg silently inherits.
 const ALLOW_SKIP_VAR: &str = "NVIM_CONFORMANCE_ALLOW_SKIP";
@@ -17170,8 +17170,8 @@ const REGMARK_COVERAGE_EXEMPT: &[&str] = &[
 /// rendered buffer + cursor + message out.
 fn replay_live(p: &Live) -> (String, (usize, usize), String) {
     let mut engine = engine_with(&p.lines.join("\n"));
-    // `engine_with` suppresses `HistoryState::load()`'s real-disk read
-    //, so `engine.history` already starts empty here — no manual
+    // `engine_with` suppresses `HistoryState::load()`'s real-disk read,
+    // so `engine.history` already starts empty here — no manual
     // reset needed for the `c_CTRL-R` rows this replay covers.
     engine.settings.shift_width = 4;
     engine.settings.expand_tab = true;

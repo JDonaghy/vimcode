@@ -280,8 +280,8 @@ impl Engine {
             // second fetch. But if *this* caller is non-quiet (an explicit,
             // user-requested refresh) and the in-flight fetch was armed
             // quiet (startup's automatic one), upgrade the flag so the
-            // fetch-in-progress still reports its result when it lands
-            //: otherwise the user's `r` keypress produces no
+            // fetch-in-progress still reports its result when it lands:
+            // otherwise the user's `r` keypress produces no
             // feedback at all, silently inheriting startup's silence policy.
             if !quiet {
                 self.ext_registry_quiet = false;
@@ -1489,8 +1489,8 @@ impl Engine {
         status
     }
 
-    /// Return the active `$/progress` snapshot for the buffer's server
-    ///. Used by the status bar to format
+    /// Return the active `$/progress` snapshot for the buffer's server.
+    /// Used by the status bar to format
     /// `name • Indexing: 319/320` segments. Returns None when no
     /// progress is open or the manager/language isn't set up.
     pub fn lsp_progress_for_buffer(

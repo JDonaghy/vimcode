@@ -389,15 +389,15 @@ impl App {
                         false, // no Alt-fine-seek context for a plain mouse-move
                     );
                     let had_hover = engine.editor_hover.is_some();
-                    // Popup keep-alive is geometry-independent on purpose
-                    //: the popup can spill over the active
+                    // Popup keep-alive is geometry-independent on purpose:
+                    // the popup can spill over the active
                     // window's gutter column or into a neighbouring split,
                     // where `pixel_to_click_target` resolves to
                     // `ClickTarget::None`/another window id and the `_`
                     // dismiss arm below would yank the popup out from under
                     // a pointer that is physically *on* it — e.g. while
-                    // travelling towards the `command:definition` link
-                    //. Checked before the target is classified,
+                    // travelling towards the `command:definition` link.
+                    // Checked before the target is classified,
                     // so "the mouse is over the popup" always wins.
                     let on_popup = self.editor_hover_popup_rect.get().is_some_and(|r| {
                         position.x >= r.x
@@ -499,8 +499,8 @@ impl App {
             }
         }
 
-        // ── CSD titlebar background: drag-to-move / double-click-maximize ──
-        //. Runs after the menu-item intercept, the
+        // ── CSD titlebar background: drag-to-move / double-click-maximize ──.
+        // Runs after the menu-item intercept, the
         // window-control-button check, and the edge-resize press above, so
         // all three take priority — only a press/double-click that lands in
         // the title bar band but misses every interactive segment (menu
@@ -1095,8 +1095,8 @@ impl App {
         self.capture_window_and_apply_csd(backend);
 
         // Retry restoring the saved window size/position/maximized state
-        // until the runner's window is mapped — see `restore_window_geometry`
-        //. No-ops once `window_geometry_restored` is set.
+        // until the runner's window is mapped — see `restore_window_geometry`.
+        // No-ops once `window_geometry_restored` is set.
         self.restore_window_geometry(backend);
 
         // Drain the actions async GTK callbacks queued for this frame.

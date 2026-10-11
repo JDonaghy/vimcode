@@ -3006,8 +3006,8 @@ impl Engine {
 
     /// Reorder a tab within its group.
     ///
-    /// No `tab_mru` fixup is needed here: the MRU stack is keyed by `TabId`
-    ///, and reordering never changes a tab's id — only its position
+    /// No `tab_mru` fixup is needed here: the MRU stack is keyed by `TabId`,
+    /// and reordering never changes a tab's id — only its position
     /// in `tabs`, which the MRU doesn't track.
     pub fn reorder_tab_in_group(&mut self, group_id: GroupId, from_idx: usize, to_idx: usize) {
         if let Some(g) = self.editor_groups.get_mut(&group_id) {

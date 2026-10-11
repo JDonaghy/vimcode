@@ -7156,8 +7156,8 @@ impl Engine {
                     } else if col > 0 {
                         // `:h 'backspace'`: without the `"start"` token,
                         // BackSpace refuses to delete at or before the
-                        // position where the current Insert session began
-                        //. This has to be its own `col > 0` arm
+                        // position where the current Insert session began.
+                        // This has to be its own `col > 0` arm
                         // rather than folded into the condition — falling
                         // through to `else if` here would hit the
                         // `line > 0` line-join branch below even though

@@ -388,8 +388,8 @@ impl quadraui::ShellApp for App {
         // *only* inside the `MenuRow` match arm below, which is gated on
         // `presence.menu_row` — i.e. on `menu_bar_visible`. A native-menu
         // backend (macOS's `MacBackend`) sets `menu_bar_visible = false` to
-        // suppress the redundant in-window row under AppKit's real menu bar
-        //, which left `command_center_rect` permanently `None` and
+        // suppress the redundant in-window row under AppKit's real menu bar,
+        // which left `command_center_rect` permanently `None` and
         // the `FrameOp::CommandCenter` arm's `command_center_rect.filter(...)`
         // guard always failed — the omnibar never painted even once its own
         // presence gate was split from `menu_row`'s (see
