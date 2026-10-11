@@ -187,11 +187,8 @@ pub fn tab_switcher_to_quadraui_list_view(
 
 // ─── TabSwitcherGeometry ──────────────────────────────────────────────────
 //
-// #733 slice 1: the tab-switcher popup rect used to be computed twice — in
-// the pre-#1434 TUI shell's `render_content` (cell units, percent-of-columns) and in
-// `src/gtk/mod.rs::render_content` (pixel units, clamp(350, 600)) — and the
-// GTK copy was *also* the only one fed to a click handler, which is why TUI
-// had no tab-switcher rung at all. One `compute`, two sizing constants,
+// The tab-switcher popup rect is computed once and fed to both the TUI and
+// GTK backends' click handlers. One `compute`, two sizing constants,
 // mirroring the `PickerSizing` / `PickerGeometry` split just above.
 
 /// Backend-specific sizing inputs for the tab-switcher popup.
@@ -296,53 +293,21 @@ impl TabSwitcherGeometry {
     }
 }
 
-// ─── Modal-overlay mouse router (#733 slice 1, finished in #751) ──────────
+// ─── Modal-overlay mouse router ──────────────────────────────────────────
 //
-// The top rung of the mouse precedence ladder, implemented once. Both
-// backends used to hand-roll it, in *different* orders: TUI ran
-// toast → find/replace → dialog, GTK ran toast → tab-switcher →
-// completion → context-menu → find/replace → … → dialog. TUI had no
-// tab-switcher arm at all (clicking an open Ctrl+Tab popup fell through
-// to the editor underneath and moved the cursor); GTK resolved the
-// dialog's inside/outside verdict through a `ModalStack` +
-// `dispatch_mouse_down` round-trip that `DialogHit::Outside` already
-// answers directly.
-//
-// #733 slice 1 shared four rungs — toast, dialog, tab switcher,
-// completion. #751 folded in the last three, whose per-backend copies had
-// drifted in the same two ways:
-//
-//  1. **Precedence.** TUI arbitrated the unified picker and the
-//     find/replace overlay ~1,100 lines *before* the context menu, and GTK
-//     arbitrated the context menu *after* find/replace and the picker —
-//     while [`FRAME_Z_ORDER`] paints the menu above both. Input and
-//     paint disagreeing is the #587/#592 failure shape.
-//     [`MOUSE_ARBITRATION_ORDER`] is now the router's own declared order,
-//     asserted against `FRAME_Z_ORDER` reversed.
-//  2. **Missing rungs.** GTK had no context-menu *hover* arm at all — its
-//     `MouseMoved` handler did nothing unless the left button was held —
-//     so a menu's highlight never followed the pointer (#373). GTK also
-//     hit-tested find/replace against the drawing-area width rather than
-//     the active group's, so with a sidebar open the clickable panel sat
-//     a couple of hundred pixels left of the painted one; and it neither
-//     confirmed a click on the already-selected picker row nor paged its
-//     scrollbar track the way TUI did.
-//
-// Deliberately *not* pushed into quadraui: `FrameHitMap` (quadraui
-// `frame.rs`) resolves "which registered rect is topmost", but the order
+// The top rung of the mouse precedence ladder, implemented once. The order
 // below is gated on vimcode engine state (`dialog.is_some()`,
 // `tab_switcher_open`, `completion_idx`, `picker_open`), which is app
 // knowledge. The per-surface `hit_test()` calls this function sequences
-// *are* quadraui's, and are used as-is.
+// are quadraui's, and are used as-is.
 //
 // Note every layout below is the one the last frame actually PAINTED
 // (`dialog_layout`, `tab_switcher_popup_rect`, `completion_layout`,
 // `context_menu_layout`, `picker_popup_rect`, `Engine::toast_layout`),
-// never a freshly recomputed one — #582 / #646.
+// never a freshly recomputed one.
 //
 // **Not a rung, deliberately:** the folder/workspace picker
-// (`quadraui::FolderPickerController`, #815). Both backends now paint it —
-// see [`FrameOp::FolderPicker`] — but it swallows every mouse event while
+// (`quadraui::FolderPickerController`). It swallows every mouse event while
 // open, the same way a modal dialog does, so it is checked directly by both
 // backends ([`route_folder_picker_click`]) ahead of this router rather than
 // competing for z-order through [`MOUSE_ARBITRATION_ORDER`].
@@ -355,10 +320,8 @@ pub enum ModalMouseAction {
     /// Left button *released*. Kept distinct from [`Self::LeftPress`]
     /// because the two rungs disagree about it on purpose:
     ///
-    /// * The context menu accepts either (#456 — alacritty via SGR mouse
-    ///   mode + tmux, and gnome-terminal in some configurations, drop
-    ///   `Down(Left)` and only emit `Up(Left)`; without accepting the
-    ///   release the menu item never fires).
+    /// * The context menu accepts either (some terminals via SGR mouse
+    ///   mode + tmux drop `Down(Left)` and only emit `Up(Left)`).
     /// * Every other rung accepts `LeftPress` alone, so a terminal that
     ///   sends *both* can't double-fire a dialog button.
     LeftRelease,
@@ -419,8 +382,7 @@ pub struct ModalOverlayState<'a> {
 
 /// What the context-menu rung decided about one event.
 ///
-/// Split out of [`ModalOverlayRoute`] so the *engine index* — the one piece
-/// both backends previously re-derived from `"context:N"` themselves — is
+/// The *engine index* — the one piece both backends need — is
 /// resolved here, once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextMenuRoute {
@@ -428,9 +390,7 @@ pub enum ContextMenuRoute {
     /// `Engine::context_menu_confirm`.
     Item(usize),
     /// Pointer moved onto item `idx` — set `selected` and consume. Both
-    /// backends must do this for keyboard/mouse selection to agree; before
-    /// #751 only TUI did, so on GTK whichever item was selected when the menu
-    /// opened stayed highlighted no matter where the pointer went (#373).
+    /// backends must do this for keyboard/mouse selection to agree.
     Hover(usize),
     /// On the menu but not on an actionable item (separator, disabled row,
     /// border) — consume, change nothing.
@@ -610,11 +570,9 @@ pub fn gtk_picker_rows(line_height: f32) -> PickerRowMetrics {
 
 /// The unified picker's painted geometry, in the caller's own units.
 ///
-/// Every field below is a *paint* result, never a fresh recomputation (#582 /
-/// #646). The derived quantities — effective scroll offset, thumb length,
-/// thumb top — used to be hand-rolled on both backends from these same inputs,
-/// and had already drifted: TUI paged the track and grabbed the thumb with an
-/// offset, GTK jumped proportionally and grabbed at zero.
+/// Every field below is a *paint* result, never a fresh recomputation.
+/// The derived quantities — effective scroll offset, thumb length,
+/// thumb top — used to be hand-rolled on both backends from these same inputs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PickerHitGeometry {
     /// Popup bounds.
@@ -809,10 +767,9 @@ pub enum ModalOverlayRoute {
 /// first** — the exact inverse of [`FRAME_Z_ORDER`]'s overlay tail, restricted
 /// to the rungs that take mouse input.
 ///
-/// Input precedence and paint order are the same fact stated twice, and #587 /
-/// #592 are what happens when the two disagree: whatever is painted on top is
-/// what the user is aiming at. Keeping this as a `const` rather than a comment
-/// lets `mouse_arbitration_matches_paint_z_order` assert the relationship
+/// Input precedence and paint order are the same fact stated twice:
+/// whatever is painted on top is what the user is aiming at. Keeping this as a `const`
+/// rather than a comment lets `mouse_arbitration_matches_paint_z_order` assert the relationship
 /// instead of asking reviewers to eyeball it.
 ///
 /// The completion popup is deliberately absent: it is editor-anchored, composed
@@ -1035,8 +992,7 @@ pub fn apply_picker_scroll_offset(engine: &mut Engine, new_offset: usize, visibl
 ///
 /// Clicking the already-selected row confirms it — or, in the command
 /// centre's `@` tree mode, expands/collapses it. Clicking a different row
-/// selects it. Before #751 only TUI did the confirm/expand half, so a GTK user
-/// had to click a row and then press Enter.
+/// selects it.
 pub fn apply_picker_row_click(engine: &mut Engine, idx: usize) {
     if idx >= engine.picker_items.len() {
         return;
@@ -1058,8 +1014,6 @@ pub fn apply_picker_row_click(engine: &mut Engine, idx: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── #733: the shared modal-overlay rung ──────────────────────────────
 
     #[test]
     fn tab_switcher_geometry_matches_the_two_backends_old_inline_math() {
@@ -1158,11 +1112,10 @@ mod tests {
         );
     }
 
-    /// #734 slice 1: the keyboard ladder's top rung, pinned in the order
+    /// The keyboard ladder's top rung, pinned in the order
     /// `Engine::handle_key` itself uses — spell suggestions, then a modal
     /// dialog, then the context menu. Both backends match on this, so a
-    /// reorder here is a cross-backend behaviour change and should have to
-    /// break a test to happen.
+    /// reorder here is a cross-backend behaviour change.
     #[test]
     fn modal_key_router_orders_spell_and_dialog_above_the_context_menu() {
         let mut engine = Engine::new();
@@ -1308,18 +1261,12 @@ mod tests {
         );
     }
 
-    /// #546 FAILED-3 regression: GTK's `main_content_bounds` gained a
-    /// persistent nonzero `(x, y)` offset once the always-visible
-    /// menu/title-bar chrome band landed (#552) — every window rect (and
-    /// every click coordinate) GTK builds lives in that same absolute
-    /// space, not one that starts at `(0, 0)`. The single-group branch of
-    /// `screen_zone_hit_test` used to hardcode `y >= 0.0` as the tab row's
-    /// top, so a click on the actually-rendered (offset) tab bar — e.g. a
-    /// tab's close button — was silently misclassified as a `Window` hit
-    /// instead of `TabBar`, and the click just moved the cursor instead of
-    /// closing the tab. This pins the fix: derive the bar's bounds from the
-    /// real (possibly-offset) window rects, exactly like the multi-group
-    /// branch above already does via `GroupTabBar::bounds`.
+    /// GTK's `main_content_bounds` has a persistent nonzero `(x, y)` offset
+    /// from the always-visible menu/title-bar chrome band — every window rect
+    /// (and every click coordinate) GTK builds lives in that absolute space.
+    /// The single-group branch of `screen_zone_hit_test` must derive the bar's
+    /// bounds from the real (possibly-offset) window rects, exactly like the
+    /// multi-group branch does via `GroupTabBar::bounds`.
     #[test]
     fn test_single_group_tab_bar_hit_test_with_editor_offset() {
         use crate::core::engine::Engine;
@@ -1392,17 +1339,11 @@ mod tests {
         );
     }
 
-    /// #553 (click-side counterpart of #549's draw-loop unification): the
-    /// single-group and split-group tab-bar hit bands come out of ONE
+    /// The single-group and split-group tab-bar hit bands come out of ONE
     /// derivation, and in both shapes the band's top edge is
     /// `window_content_top - tab_bar_height` — never a hardcoded origin.
     ///
-    /// The regression this guards is asymmetric by construction: with a
-    /// chrome-shifted content origin the split arm kept working (it derived the
-    /// top from `GroupTabBar::bounds`) while the single arm went dead (it
-    /// assumed `y >= 0.0`), which is exactly the "works with 2+ groups, dead
-    /// with 1" symptom #553 reports. So both shapes are asserted here against
-    /// the same offset layout.
+    /// Both shapes are asserted here against the same offset layout.
     #[test]
     fn test_tab_bar_hit_bands_single_and_split_share_one_derivation() {
         use crate::core::engine::Engine;
@@ -1411,7 +1352,7 @@ mod tests {
         let line_height = 20.0;
         let char_width = 8.0;
         let tbh = tab_bar_height_px(line_height, false);
-        // Chrome-shifted content origin — the #552 menu/title-bar band.
+        // Chrome-shifted content origin from the menu/title-bar band.
         let content = WindowRect::new(50.0, 100.0, 800.0, 600.0);
         let theme = Theme::onedark();
 
@@ -1487,15 +1428,11 @@ mod tests {
         assert!(xs[0] < xs[1], "split bands must sit side by side: {xs:?}");
     }
 
-    /// Pins that `bc.bounds.y` (row units, matching TUI's convention) shifts
+    /// `bc.bounds.y` (row units, matching TUI's convention) shifts
     /// up by one row when a single-tab group's tab bar is hidden
-    /// (`hide_single_tab`), and down by one when it's shown. TUI's
-    /// single-group breadcrumb draw used to special-case
-    /// `is_tab_bar_hidden` itself instead of trusting `bc.bounds.y` (#547);
-    /// this pins the equivalence that made unifying it onto
-    /// `breadcrumb_draw_targets` safe — `calculate_group_window_rects` →
-    /// `adjust_group_rects_for_hidden_tabs` is what actually shifts the
-    /// window (and thus breadcrumb) bounds.
+    /// (`hide_single_tab`), and down by one when it's shown.
+    /// `calculate_group_window_rects` →
+    /// `adjust_group_rects_for_hidden_tabs` shifts the window (and thus breadcrumb) bounds.
     #[test]
     fn test_single_group_breadcrumb_bounds_reflect_hidden_tab_bar() {
         use crate::core::engine::Engine;
@@ -1625,15 +1562,11 @@ mod tests {
         );
     }
 
-    /// Direct unit test for `tab_bar_draw_targets` (#549, follow-up to
-    /// #547's `breadcrumb_draw_targets`; rewritten for #551).
+    /// Direct unit test for `tab_bar_draw_targets`.
     ///
-    /// The single-group case used to be served by a hand-written `else` arm
-    /// that painted a caller-supplied `(x, y, width)` rect. #551 deleted it:
     /// `ScreenLayout::group_tab_bars` now holds one entry for one group, and
     /// the generic `bounds.y - reserved_h` math must reproduce *exactly* the
-    /// full-width editor-top rect the deleted arm hard-coded. That equivalence
-    /// is the whole point of the refactor, so it is asserted explicitly below
+    /// full-width editor-top rect. That equivalence is asserted explicitly below
     /// against the `content_bounds` the caller laid the frame out with.
     #[test]
     fn test_tab_bar_draw_targets_single_and_split() {
@@ -1663,7 +1596,7 @@ mod tests {
             gtk_minimap_sizing(),
         );
         assert!(screen.editor_group_split.is_none());
-        // #551: the per-group chrome is populated even with a single group.
+        // The per-group chrome is populated even with a single group.
         assert_eq!(
             screen.group_tab_bars.len(),
             1,
@@ -1676,8 +1609,7 @@ mod tests {
 
         let targets = tab_bar_draw_targets(&engine, &screen, tab_row_h, reserved_h);
         assert_eq!(targets.len(), 1);
-        // Exactly the rect the deleted single-group arm used to hard-code from
-        // the caller's editor origin/width.
+        // The rect the single-group code path computes from the caller's editor origin/width.
         assert_eq!(targets[0].rect.x, content_bounds.x as f32);
         assert_eq!(targets[0].rect.y, content_bounds.y as f32);
         assert_eq!(targets[0].rect.width, content_bounds.width as f32);
@@ -1770,12 +1702,10 @@ mod tests {
         );
     }
 
-    /// #551: the single `GroupTabBar` synthesised for an unsplit editor must
+    /// The single `GroupTabBar` synthesised for an unsplit editor must
     /// carry byte-for-byte the same tab content the old single-group-only
     /// fields did. If these ever diverge, the unified draw path would silently
-    /// paint a *different* tab bar than the pre-#551 code did — the exact
-    /// class of regression #547 hit when a single-group calculation drifted
-    /// from the generic one.
+    /// paint a different tab bar.
     #[test]
     fn test_single_group_tab_bar_matches_legacy_single_group_fields() {
         use crate::core::engine::Engine;
@@ -1814,12 +1744,10 @@ mod tests {
             assert_eq!(a.active, b.active);
             assert_eq!(a.dirty, b.dirty);
         }
-        // #764: `ScreenLayout::tab_scroll_offset` — the single-group mirror
-        // this used to compare against — is deleted; `GroupTabBar` is the only
-        // copy now, so the equivalence this line asserted is structural.
-        // #822: `ScreenLayout::tab_bar_hit_regions` is now a clone of this
+        // `GroupTabBar` is the only copy now, so this equivalence is structural.
+        // `ScreenLayout::tab_bar_hit_regions` is now a clone of this
         // group's own `TabBarLayout` (`quadraui::TabBarLayout` derives
-        // `PartialEq`), so the equality is exact, not just debug-string equal.
+        // `PartialEq`), so the equality is exact.
         assert_eq!(
             gtb.hit_regions, screen.tab_bar_hit_regions,
             "group tab bar layout must match the legacy single-group mirror"
@@ -1831,12 +1759,10 @@ mod tests {
         assert_eq!(gtb.bounds.width, content_bounds.width);
     }
 
-    /// #551: `screen_to_drop_group_bounds` lost its
-    /// origin/size/tab-bar-height parameters along with the single-group arm
-    /// that needed them. The bounds it returns for an unsplit editor must
+    /// `screen_to_drop_group_bounds` lost its origin/size/tab-bar-height
+    /// parameters. The bounds it returns for an unsplit editor must
     /// still be the *content* area (past the tab bar), which is what
-    /// `build_tab_drop_groups` reconstructs the tab-bar band from — the #477
-    /// regression this pins.
+    /// `build_tab_drop_groups` reconstructs the tab-bar band from.
     #[test]
     fn test_drop_group_bounds_single_group_is_content_area() {
         use crate::core::engine::Engine;
@@ -1875,11 +1801,8 @@ mod tests {
     }
 
     /// Explorer tree row icons must always carry both a Nerd Font glyph and
-    /// a distinct fallback (#547) — selection between them is entirely the
+    /// a distinct fallback — selection between them is entirely the
     /// backend's job (`Backend::set_nerd_fonts`), not `build_explorer_tree_rows`'s.
-    /// This is the platform-neutral half of the #547 icon regression: the
-    /// shared row-building logic was never the problem, but pinning it
-    /// guards against the fix drifting back to a GTK-only icon shim.
     #[test]
     fn test_explorer_tree_rows_carry_glyph_and_fallback_icons() {
         use crate::core::engine::{Engine, ExplorerRow};

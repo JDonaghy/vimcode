@@ -8,7 +8,7 @@ pub(crate) fn build_source_control_data(engine: &Engine) -> Option<SourceControl
         .clone()
         .unwrap_or_else(|| "HEAD".to_string());
 
-    // #991: conflicted files carry neither side, so they land here and
+    // Conflicted files carry neither side, so they land here and
     // nowhere else.
     let merge: Vec<ScFileItem> = engine
         .sc_file_statuses
@@ -119,7 +119,7 @@ pub(crate) fn build_source_control_data(engine: &Engine) -> Option<SourceControl
 }
 
 /// Build the Source Control action-button row as a `quadraui::Toolbar`
-/// (#505). Commit carries its label + `(c)` key hint and is disabled while
+///. Commit carries its label + `(c)` key hint and is disabled while
 /// the commit message is empty; Push/Pull/Sync are icon-only. Button ids
 /// come from [`crate::core::engine::SC_BUTTON_IDS`] so click dispatch can
 /// map the hit-test result back to a button index. Both backends call this
@@ -157,7 +157,7 @@ pub fn sc_button_toolbar(sc: &SourceControlData) -> quadraui::Toolbar {
 }
 
 /// Build the SC `SidebarPanel` — a `quadraui::SidebarPanel` wrapping the
-/// action-button toolbar as its header slot (#509). `toolbar_height: None`
+/// action-button toolbar as its header slot. `toolbar_height: None`
 /// defers to each backend's idiomatic default (1 cell TUI, `line_height` GTK).
 pub fn sc_sidebar_panel(sc: &SourceControlData) -> quadraui::SidebarPanel {
     use quadraui::{SidebarPanel, WidgetId};
@@ -170,7 +170,7 @@ pub fn sc_sidebar_panel(sc: &SourceControlData) -> quadraui::SidebarPanel {
 
 /// Draw the SC bottom slab (toolbar + sections) through backend `b` and
 /// cache the full `SidebarPanelLayout` on `engine` for click/hover dispatch
-/// (#509). `rect` covers the "bottom slab" — from just below the commit input
+///. `rect` covers the "bottom slab" — from just below the commit input
 /// to the bottom of the panel. Both backends call this inside their frame
 /// scope; section rendering then reads `content_bounds` from the cached
 /// layout. Keyboard focus → pressed_id, mouse hover → hovered_id.
@@ -190,7 +190,7 @@ pub fn draw_sc_sidebar_panel(
 
 /// Format the SC panel's header row text: branch name + ahead/behind
 /// counts when present. Shared by both backends so the header text can't
-/// drift between TUI and GTK renderers (#480).
+/// drift between TUI and GTK renderers.
 pub fn sc_header_text(sc: &SourceControlData) -> String {
     let branch_icon = crate::icons::GIT_BRANCH.nerd;
     if sc.ahead > 0 || sc.behind > 0 {
@@ -204,7 +204,7 @@ pub fn sc_header_text(sc: &SourceControlData) -> String {
 }
 
 /// Build the SC panel's header row as a single-segment `quadraui::StatusBar`
-/// (#480). GTK paints the header through this — TUI keeps its existing
+///. GTK paints the header through this — TUI keeps its existing
 /// direct `set_cell` text row (both read the same [`sc_header_text`]
 /// string, so the two can't show different branch info even though the
 /// paint mechanism differs).
@@ -224,11 +224,11 @@ pub fn sc_header_status_bar(sc: &SourceControlData, theme: &Theme) -> quadraui::
 
 /// The SC panel's focused-hint text, shared so it can't drift between the
 /// row-reservation math in [`sc_sidebar_bands`] and the text actually
-/// painted (#1361).
+/// painted.
 pub const SC_HINT_TEXT: &str = " Press '?' for help";
 
 /// Build the SC panel's focused-hint row as a single-segment
-/// `quadraui::StatusBar` (#1361), mirroring [`sc_header_status_bar`]. Both
+/// `quadraui::StatusBar`, mirroring [`sc_header_status_bar`]. Both
 /// backends paint this through `draw_status_bar` into the row
 /// [`sc_sidebar_bands`] reserves via `ScSidebarBands::hint`, so the hint
 /// can't appear on one backend and not the other, or land on a different
@@ -249,13 +249,13 @@ pub fn sc_hint_status_bar(theme: &Theme) -> quadraui::StatusBar {
 
 /// Number of text rows in the SC commit message (at least 1, even when
 /// empty). Shared raw line count — both backends derive their own
-/// border/line-height-aware box height from this (#480).
+/// border/line-height-aware box height from this.
 pub fn sc_commit_input_row_count(commit_message: &str) -> u16 {
     commit_message.split('\n').count().max(1) as u16
 }
 
 /// Height in *rows* of the SC commit-input box on TUI, including the
-/// `TextInput` primitive's 1-cell border on top and bottom (#480). TUI's
+/// `TextInput` primitive's 1-cell border on top and bottom. TUI's
 /// native unit is one screen cell, so the border costs exactly 2 whole
 /// rows — this is the single source of truth shared by TUI's paint code
 /// (`panels.rs`) and its click hit-test math (`mouse.rs`), so the two
@@ -272,10 +272,7 @@ pub fn sc_commit_input_box_height(commit_message: &str) -> u16 {
 /// `TextInput` box, and the toolbar-slab + section list that fills the rest.
 ///
 /// Returned by [`sc_sidebar_bands`] so a backend's *painter* and its *click
-/// router* read one derivation instead of two. Both used to inline this
-/// arithmetic separately, which is exactly how the pre-#544 GTK click path
-/// ended up hit-testing against DrawingArea-local `y` (`0` at the panel top)
-/// while the ShellApp painter drew at absolute window coordinates.
+/// router* read one derivation instead of two.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScSidebarBands {
     /// Header row (branch name + summary).
@@ -286,7 +283,7 @@ pub struct ScSidebarBands {
     /// commit box and the focused-hint row (or the panel bottom, when
     /// unfocused).
     pub slab: quadraui::Rect,
-    /// The "Press '?' for help" row (#1361), reserved at the panel's
+    /// The "Press '?' for help" row, reserved at the panel's
     /// bottom only while the panel has keyboard focus — `None` means no
     /// row was reserved, so `slab` already extends to the panel bottom.
     pub hint: Option<quadraui::Rect>,
@@ -299,7 +296,7 @@ pub struct ScSidebarBands {
 /// border on top *and* bottom costs in that same unit — 2.0 px on GTK, 2.0
 /// rows on TUI (see [`sc_commit_input_box_height`], which is the row-unit
 /// spelling of the same constant). `has_focus` reserves one `row_height`
-/// row at the bottom for the focused-hint (#1361) — both the painter and
+/// row at the bottom for the focused-hint — both the painter and
 /// the click router pass the same `SourceControlData::has_focus` /
 /// `engine.sc_has_focus` value so the reservation can't drift between the
 /// two.
@@ -333,7 +330,7 @@ pub fn sc_sidebar_bands(
     }
 }
 
-/// #1361: `sc_sidebar_bands` is the *only* place the focused-hint row's
+/// `sc_sidebar_bands` is the *only* place the focused-hint row's
 /// reservation is computed — both `App::paint_sidebar_panel_rung`'s
 /// `PANEL_GIT` arm (paint) and `App::route_sc_sidebar_event`/
 /// `tui_main::mouse`'s `SidebarOwner::Git` arm (click routing) call this
@@ -406,10 +403,8 @@ mod sc_sidebar_bands_tests {
         let unfocused = sc_sidebar_bands("", rect(), row_height, 2.0, false);
         let focused = sc_sidebar_bands("", rect(), row_height, 2.0, true);
 
-        // Same header/commit-input geometry regardless of focus — only the
-        // slab shrinks to make room for the hint (#1361's own "only the
-        // paint mechanism differs" scoping, applied to geometry: nothing
-        // above the slab should ever move because of focus).
+        // Header and commit-input geometry do not change with focus — only the
+        // slab shrinks to make room for the hint row.
         assert_eq!(unfocused.header, focused.header);
         assert_eq!(unfocused.commit_input, focused.commit_input);
 
@@ -428,10 +423,8 @@ mod sc_sidebar_bands_tests {
 
     #[test]
     fn a_multiline_commit_message_shifts_the_hint_reservation_but_not_its_height() {
-        // #1361 acceptance: hit-testing for rows *below* the commit box
-        // must account for the reserved row regardless of how tall the
-        // commit box itself is — the hint row's height must always stay
-        // one row, only its `y` (and the slab's) should move.
+        // The hint row's height must always stay one row; only its `y` and the
+        // slab's should move with the commit box height.
         let row_height = 1.0;
         let one_line = sc_sidebar_bands("single line", rect(), row_height, 2.0, true);
         let three_lines = sc_sidebar_bands("a\nb\nc", rect(), row_height, 2.0, true);
@@ -452,13 +445,10 @@ mod sc_sidebar_bands_tests {
     }
 }
 
-/// Adapt the SC commit-message state into a `quadraui::TextInput` (#480,
-/// migrating the hand-rolled `set_cell` commit-row painter to the shared
-/// primitive shipped in quadraui#222).
+/// Adapt the SC commit-message state into a `quadraui::TextInput`,
+/// converting the engine's byte-offset cursor into the primitive's
+/// `(cursor_line, cursor_col)` char-column coordinates.
 ///
-/// Converts the engine's byte-offset cursor (`sc.commit_cursor`, an index
-/// into the flat `\n`-joined `commit_message` string) into the
-/// primitive's `(cursor_line, cursor_col)` char-column coordinates.
 /// Render-only: the engine's `handle_sc_commit_input_key` remains the sole
 /// owner of edit logic — this function only builds a paint-time snapshot.
 pub fn sc_commit_message_to_text_input(sc: &SourceControlData) -> quadraui::TextInput {
@@ -492,17 +482,13 @@ pub fn sc_commit_message_to_text_input(sc: &SourceControlData) -> quadraui::Text
 }
 
 /// Adapt the SC branch-picker popup state into a dual-mode
-/// `quadraui::Palette` (#480, migrating the hand-rolled popup to the
-/// primitive shipped in quadraui#224). `create_mode` maps to
-/// `PaletteMode::Input` (free-text new-branch name); otherwise
-/// `PaletteMode::List` with the fuzzy-filtered branch results, current
-/// branch marked with a leading bullet.
+/// `quadraui::Palette`. `create_mode` maps to `PaletteMode::Input`
+/// (free-text new-branch name); otherwise `PaletteMode::List` with the
+/// fuzzy-filtered branch results, current branch marked with a leading bullet.
 ///
-/// Render-only, same as [`sc_commit_message_to_text_input`]: query/cursor
-/// editing and selection remain owned by `Engine::handle_sc_branch_picker_key`
-/// / `handle_sc_branch_create_key` — this is purely a paint-time snapshot,
-/// not an adoption of `DualModePaletteController`'s own (would-be
-/// duplicate) key-handling state machine.
+/// Render-only: query/cursor editing and selection remain owned by
+/// `Engine::handle_sc_branch_picker_key` / `handle_sc_branch_create_key` —
+/// this is purely a paint-time snapshot.
 pub fn sc_branch_picker_to_palette(bp: &BranchPickerData) -> quadraui::Palette {
     use quadraui::{Palette, PaletteItem, PaletteMode, StyledText, WidgetId};
 
@@ -559,10 +545,8 @@ pub fn sc_branch_picker_to_palette(bp: &BranchPickerData) -> quadraui::Palette {
     }
 }
 
-/// Static keybindings table for the SC help dialog (#480, migrating the
-/// hand-rolled 2-column popup to `Dialog` + `DialogTable`, shipped in
-/// quadraui#225). Shared by both backends so the bindings list has one
-/// source of truth.
+/// Static keybindings table for the SC help dialog. Shared by both
+/// backends so the bindings list has one source of truth.
 pub fn sc_help_dialog() -> quadraui::Dialog {
     use quadraui::{Dialog, DialogButton, DialogTable, StyledText, WidgetId};
 
@@ -611,10 +595,9 @@ pub fn sc_help_dialog() -> quadraui::Dialog {
 
 /// Compute the `DialogLayout` for [`sc_help_dialog`] from generic
 /// char-cell/pixel metrics (TUI: `1.0, 1.0`; GTK: real `char_width`/
-/// `line_height`, #546-style dual-backend convention). Mirrors
-/// `dialog_generic_layout`'s char-cell approximation formula, but sized
-/// from the table's own `tui_total_width`/`tui_total_height` helpers
-/// since this dialog has no body text driving its width.
+/// `line_height`). Mirrors `dialog_generic_layout`'s char-cell approximation
+/// formula, but sized from the table's own `tui_total_width`/`tui_total_height`
+/// helpers since this dialog has no body text driving its width.
 pub fn sc_help_dialog_layout(
     viewport: quadraui::Rect,
     char_width: f32,
@@ -654,30 +637,14 @@ pub fn sc_help_dialog_layout(
 }
 
 /// Build the `(Tooltip, TooltipLayout, TooltipChrome)` for a plugin
-/// ext-panel's own `?`-triggered keybindings help popup (#636).
-///
-/// #635 (Stage 6b item C) migrated this popup from raw `set_cell`
-/// box-drawing (full 4-sided border + centred title embedded in the top
-/// border) to `Backend::draw_tooltip`, which at the time could only ever
-/// paint TUI's side-bars-only chrome with no way to ask for a full border
-/// or a title at all — a real regression, filed upstream as
-/// JDonaghy/quadraui#541. #541 has since landed at this repo's pinned
-/// quadraui rev: `TooltipChrome` (a sidecar value passed to the new
-/// `Backend::draw_tooltip_with_chrome`, so it doesn't touch `Tooltip`'s or
-/// `TooltipLayout`'s own field sets) carries exactly the `border`/`title`
-/// vocabulary this popup needs, with `TooltipBorder::Full` + a title
-/// landing it in the same full-border-with-embedded-title shape the
-/// original raw-drawing code painted. This is the real fix, not the
-/// "documented temporary stand-in" the issue anticipated needing — #541
-/// was built (and references JDonaghy/vimcode#635 by name in its own doc
-/// comment) specifically to unblock this call site.
+/// ext-panel's own `?`-triggered keybindings help popup with a full border
+/// and embedded title.
 ///
 /// `panel_name` namespaces the tooltip's `WidgetId` so two different
-/// plugin panels' help popups (never shown simultaneously, but still)
-/// don't collide; `bindings` is the plugin-registered `(key, description)`
-/// list (`Engine::ext_panel_help_bindings`). `char_width`/`line_height`
-/// follow the same generic char-cell/pixel convention
-/// [`sc_help_dialog_layout`] uses (TUI: `1.0, 1.0`; GTK: real metrics).
+/// plugin panels' help popups don't collide; `bindings` is the plugin-registered
+/// `(key, description)` list (`Engine::ext_panel_help_bindings`).
+/// `char_width`/`line_height` follow the same generic char-cell/pixel
+/// convention [`sc_help_dialog_layout`] uses (TUI: `1.0, 1.0`; GTK: real metrics).
 pub fn ext_panel_help_tooltip_layout(
     panel_name: &str,
     bindings: &[(String, String)],
@@ -766,33 +733,10 @@ pub fn populate_ext_sidebar_system(engine: &Engine) {
 /// `MsvLayoutMetrics` for a pixel-unit GUI backend's `SidebarSystem`
 /// instances (Source Control, plugin ext panels).
 ///
-/// #971: `SidebarSystem::handle_cached` returns `SidebarEvent::Ignored`
-/// unconditionally until `set_backend_info` has been called at least once,
-/// and nothing on GTK/macOS ever called it — TUI's own one-time
-/// `set_backend_info(1.0, ..)` at startup (`tui_main/shell_app.rs`'s
-/// `App::from_engine`) is the *only* call site in the whole crate before
-/// this one. So every content-row press on the Source Control and plugin
-/// ext panels (header collapse, row select/activate) silently did nothing
-/// on both GUI backends — it just looked like the feature had never been
-/// wired up rather than "the same bug on every backend", because the one
-/// existing GTK test for this panel (`sidebar_panel_clicks::
-/// git_panel_click_activates_the_commit_box_but_not_the_header`) only
-/// exercises the header/commit-input bands, which return early in
-/// `route_sc_sidebar_click` before ever reaching `handle_cached`. #971's
-/// own sweep tests are what surfaced it: `src/macos/mod.rs`'s
-/// `sc_panel_header_click_hit_band_matches_the_painted_row` /
-/// `ext_panel_header_click_hit_band_matches_the_painted_row` sanity-check
-/// that one header click actually toggles the section *before* trusting
-/// the sweep's own cross-sample comparison — a sweep whose probe silently
-/// does nothing passes just as cleanly as one that works, since every
-/// sample would agree with the (unchanged) baseline either way.
-///
 /// Called fresh every frame from each GTK/macOS `paint_sidebar_panel_rung`
-/// call site, not once at startup like TUI's fixed metrics — a pixel
-/// backend's `line_height` can change (zoom, font settings) where TUI's
-/// cell grid cannot, the same #540/#967 drift class every other
-/// pixel-backend hit-test in this file re-applies its metrics against
-/// rather than trusting a stale snapshot.
+/// call site, not once at startup — a pixel backend's `line_height` can change
+/// (zoom, font settings) where TUI's cell grid cannot, so metrics must be
+/// recomputed each frame rather than trusted from a stale snapshot.
 pub fn gui_sidebar_system_metrics(line_height: f32) -> quadraui::MsvLayoutMetrics {
     quadraui::MsvLayoutMetrics {
         // Matches `SidebarSystem::compute_tree_layout`'s own row-height
@@ -814,10 +758,8 @@ pub fn gui_sidebar_system_metrics(line_height: f32) -> quadraui::MsvLayoutMetric
 
 /// A plain leaf `TreeRow`: no icon, no badge, not expandable, no inline
 /// edit overlay, `Decoration::Normal` — just a `path`, `indent`, and
-/// rendered `text`. Shared shape for the many sidebar-panel builders below
-/// that previously each wrote out the full `TreeRow { … }` literal with
-/// these same five fields fixed and only `path`/`indent`/`text` varying
-/// (#1496).
+/// rendered `text`. Shared shape for sidebar-panel builders that only vary
+/// `path`, `indent`, and `text`.
 pub(crate) fn plain_tree_row(
     path: Vec<u16>,
     indent: u16,
@@ -839,7 +781,7 @@ pub(crate) fn plain_tree_row(
 mod tests {
     use super::*;
 
-    // ─── SC SidebarPanel tests (#509) ────────────────────────────────────────
+    // ─── SC SidebarPanel tests ───────────────────────────────────────────────
 
     #[test]
     fn test_sc_sidebar_panel_toolbar_slot_reserved_at_top() {

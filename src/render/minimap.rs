@@ -1,59 +1,35 @@
 use super::*;
 
-// ─── Minimap (#35) ────────────────────────────────────────────────────────────
+// ─── Minimap ──────────────────────────────────────────────────────────────────
 
 /// Fraction of a pane's own width the minimap strip may reserve, as an
-/// *upper bound* — **TUI-only** since #1869 (`TUI_MINIMAP_SIZING`'s own
-/// `fraction` field; TUI sizing is explicitly out of #1869's scope).
-///
-/// Before #1869 this doc comment claimed "VS Code does not scale its
-/// minimap with window width at all: it derives a *fixed* width from
-/// `minimap.maxColumn`" and this fraction/`gtk_minimap_sizing` shared it as
-/// a narrow-pane cap on top of that fixed width. That claim was wrong —
-/// confirmed against `EditorLayoutInfoComputer` in VS Code's own
-/// `src/vs/editor/common/config/editorOptions.ts`: `minimap.maxColumn`
-/// (120, [`MINIMAP_TARGET_COLS`]) is a *cap*, not the width. Below the cap
-/// VS Code sizes the strip from the pane's remaining width, the editor's
-/// real character width and its vertical scrollbar's width — see
-/// [`vs_code_minimap_width_px`], which ports that real formula for
-/// GTK/macOS/Win. This fraction survives only as TUI's own, deliberately
-/// much cruder, column-based approximation.
+/// *upper bound* — **TUI-only** (TUI sizing is out of scope for
+/// the pixel-based formula [`vs_code_minimap_width_px`] ports).
 pub const MINIMAP_WIDTH_FRACTION: f64 = 0.15;
 
 /// Target minimap width for **GTK/macOS/Win**, in raw pixels — VS Code's
-/// `minimap.maxColumn` default (#728): VS Code renders its minimap at one
-/// pixel per assumed source column, so at 120px this is "precisely 1px per
-/// column". #1869: this is the *cap* [`vs_code_minimap_width_px`]'s ported
-/// formula clamps to — not, as a pre-#1869 version of this doc comment
-/// claimed, the width itself.
-///
-/// #989: despite the name, this is GTK-only — it used to be reused for TUI's
-/// `TUI_MINIMAP_SIZING` too on the theory that "columns for TUI" made the
-/// same number trivially portable, but 120 *terminal columns* is wider than
-/// almost any real terminal, so in `resolve_width` the fraction term always
-/// won and the TUI strip scaled with the pane instead of holding steady. See
-/// [`MINIMAP_TARGET_COLS_TUI`] for TUI's own, deliberately much smaller,
-/// value.
+/// `minimap.maxColumn` default (120 pixels, [`MINIMAP_TARGET_COLS`]),
+/// which is the *cap* [`vs_code_minimap_width_px`]'s ported formula
+/// clamps to, not the width itself: VS Code sizes the strip from the
+/// pane's remaining width, the editor's real character width, and its
+/// vertical scrollbar's width (see [`vs_code_minimap_width_px`]).
+/// Despite the name, this constant is used only for GTK/macOS/Win.
+/// See [`MINIMAP_TARGET_COLS_TUI`] for TUI's own, deliberately much
+/// smaller, value.
 pub(crate) const MINIMAP_TARGET_COLS: f64 = 120.0;
 
-/// Target minimap width for TUI, in cell columns — **not** `MINIMAP_TARGET_COLS`
-/// (#989). `MINIMAP_TARGET_COLS` (120) is meaningful only in GTK's pixel unit:
-/// at 120*px* it is VS Code's "precisely 1px per column" parity, but the same
-/// number read as 120 *columns* is wider than almost any real terminal, so in
+/// Target minimap width for TUI, in cell columns — **not**
+/// `MINIMAP_TARGET_COLS` (120), which is meaningful only in GTK's pixel
+/// unit. At 120 *px* it is VS Code's "precisely 1px per column" parity,
+/// but 120 *columns* is wider than almost any real terminal, so in
 /// `resolve_width`'s `target_cols.min(pane_width_cols * fraction)` the
-/// `fraction` term always won instead — the strip scaled with the pane on
-/// every ordinary terminal width, the exact bug #989 reports. This is the
-/// same pixels-vs-columns unit split `gtk_minimap_sizing`'s doc comment
-/// covers, just seen from the TUI side: reusing the pixel-flavoured constant
-/// here is the defect, not a redundancy to "simplify" back.
-///
+/// `fraction` term would always win — the strip would scale with the
+/// pane on every ordinary terminal width instead of holding steady.
 /// Chosen so `target_cols.min(pane_width_cols * MINIMAP_WIDTH_FRACTION)`
-/// resolves to this fixed value — not the fraction — across ordinary
-/// terminal widths (80..200 cols): at the narrow end (80 cols),
-/// `80 * 0.15 = 12`, so any target at or below 12 makes the target win from
-/// 80 cols up. Below 80 cols the fraction (and eventually `MINIMAP_MIN_COLS`)
-/// still take over, so the strip keeps narrowing smoothly on panes that
-/// genuinely can't afford it.
+/// resolves to this fixed value across ordinary terminal widths
+/// (80..200 cols): at the narrow end (80 cols), `80 * 0.15 = 12`, so any
+/// target at or below 12 makes the target win from 80 cols up. Below 80
+/// cols the fraction (and eventually `MINIMAP_MIN_COLS`) still take over.
 pub(crate) const MINIMAP_TARGET_COLS_TUI: f64 = 12.0;
 
 /// Floor on the reserved width for TUI, in cell columns directly — see
@@ -100,7 +76,7 @@ pub const TUI_MINIMAP_SIZING: quadraui::MinimapSizing = quadraui::MinimapSizing:
 /// caught by a driver test (`gtk::testing::minimap`) exercising the real
 /// paint path.
 ///
-/// #1869: VS Code's *real* width formula (`EditorLayoutInfoComputer` in
+/// VS Code's *real* width formula (`EditorLayoutInfoComputer` in
 /// `editorOptions.ts`) is not that linear-fraction shape at all — it is
 /// [`vs_code_minimap_width_px`], which genuinely does divide by the
 /// editor's real character width (that's how VS Code arrives at ~100px for
@@ -121,7 +97,7 @@ pub fn gtk_minimap_sizing() -> quadraui::MinimapSizing {
     }
 }
 
-/// VS Code's own minimap width formula (#1869), ported from
+/// VS Code's own minimap width formula, ported from
 /// `EditorLayoutInfoComputer` in
 /// `src/vs/editor/common/config/editorOptions.ts`. [`MINIMAP_TARGET_COLS`]
 /// (120, `minimap.maxColumn`) is a *cap* — below it, the strip is sized
@@ -139,20 +115,13 @@ pub fn gtk_minimap_sizing() -> quadraui::MinimapSizing {
 ///                                       / (typicalHalfwidthCharacterWidth + minimapCharWidth)))
 ///                         + MINIMAP_GUTTER_WIDTH(8))
 /// ```
-///
 /// `remaining_width` is **already gutter-subtracted** by the caller
-/// ([`minimap_reserved_width`]) — matching the formula block quoted above,
-/// where `remainingWidth = editor outer width - gutter (glyph margin + line
-/// numbers + folding)`, never the pane's raw rect width. A pre-#1869-fix-
-/// round-1 version of this function was fed the full, un-subtracted pane
-/// width here and this doc comment claimed that was correct ("the caller's
-/// own pane width") — it was not: at the issue's measured case (editor area
-/// ≈872px, Menlo 12, `cw≈7.22`) that shape gave 112px against VS Code's own
-/// ≈97–104px, off by roughly the gutter term it was skipping.
-/// `typical_char_width` is the *real* editor font's cell width — unlike the
-/// linear-fraction formula this replaces (see `gtk_minimap_sizing`'s doc
-/// comment), this one is explicitly a function of it, so the minimap
-/// genuinely narrows on a wider editor font, matching VS Code.
+/// ([`minimap_reserved_width`]) — matching the formula's own
+/// `remainingWidth = editor outer width - gutter (glyph margin + line
+/// numbers + folding)`. `typical_char_width` is the *real* editor
+/// font's cell width — unlike the linear-fraction formula this replaces,
+/// this one is explicitly a function of it, so the minimap genuinely
+/// narrows on a wider editor font, matching VS Code.
 pub(crate) fn vs_code_minimap_width_px(remaining_width: f64, typical_char_width: f64) -> f64 {
     let cw = if typical_char_width > 0.0 {
         typical_char_width
@@ -181,116 +150,61 @@ pub(crate) const MINIMAP_GUTTER_WIDTH_PX: f64 = 8.0;
 
 /// VS Code's own default `editor.scrollbar.verticalScrollbarSize` (14 CSS
 /// px), consulted only by [`vs_code_minimap_width_px`]'s ported formula.
-/// quadraui 0.1.3 shipped the host-settable
-/// `Backend::set_editor_v_scrollbar_width`/`Editor::layout_with_options_and_v_scrollbar_w`
-/// quadraui#1869 asked for, and `App::setup` now calls
-/// `backend.set_editor_v_scrollbar_width(Some(14.0))` so GTK/macOS/Win
-/// actually paint (and, via `app_support::editor_scrollbar_layout`,
-/// hit-test) a 14px vertical scrollbar matching this constant — see
-/// `docs/PENDING_QUADRAUI_ISSUES.md`'s #1869 entry for the closed-out
-/// history. VS Code itself computes the minimap's width against its
-/// *configured* scrollbar width regardless of what ends up painted, so this
-/// constant remains correct for the minimap formula independent of that.
+/// This constant remains correct for the minimap formula regardless of
+/// the scrollbar width actually painted.
 const MINIMAP_VERTICAL_SCROLLBAR_WIDTH_PX: f64 = 14.0;
 
 /// Buffer lines sampled per *display* row of minimap height.
-///
-/// This is quadraui's TUI braille factor — the denser of the two backends —
-/// and it is deliberately used for both. Per quadraui's own `minimap_app`
-/// example, the app "samples generously at the denser factor" and lets each
-/// rasteriser group/tile the result via `Minimap::layout`, so vimcode never
-/// has to know which backend is about to paint. For GTK (which paints one
-/// buffer line per row) it also lands the row pitch at `line_height / 4`,
-/// i.e. the ~2–6 px band #35 asks for.
+/// This is the TUI's braille factor — the denser of the two backends.
+/// For GTK (which paints one buffer line per row) it also lands the row
+/// pitch at `line_height / 4`, i.e. the ~2–6 px band of visual height.
 pub(crate) const MINIMAP_LINES_PER_ROW: usize = 4;
 
-/// Ceiling on the compression factor `K` [`build_minimap_data`] applies —
-/// still a safety clamp (#1186's "compressed scale mode"), but since #1211 no
-/// longer the *load-bearing* knob: `K` is derived from the strip's own
-/// geometry (see [`MINIMAP_VIEWPORT_MULTIPLE`]), never from
-/// `total_buffer_lines`, so `K` stays small and constant for every real
-/// caller and only a pathological `rect`/`editor_visible_rows` pairing (a
-/// strip far shorter than the editor's own viewport) could ever push it this
-/// high.
-///
-/// Chosen empirically against [`quadraui::primitives::minimap::BLOCK_LINE_SAMPLE_CAP`]
-/// (8): once a block is wider than the cap,
-/// `quadraui::primitives::minimap::block_sample_indices` already
-/// spreads exactly `cap` samples across it regardless of how much wider it
-/// gets, so growing `K` past the point where blocks already exceed the cap
-/// costs no extra line fetches — only a larger buffer span per block. A
-/// `K_max` far beyond that point (64, i.e. blocks up to 8x the sample cap)
-/// still keeps each block's aggregated row a meaningful, dithered summary of
-/// real content rather than a coin-flip over the whole file.
-///
-/// `pub(crate)` since #1211 so `src/tui_main/shell_app.rs`'s tests can read
-/// the real ceiling instead of hand-copying a `COMPRESSION_CEILING_MIRROR`
-/// constant that could drift out of sync with this one.
+/// Ceiling on the compression factor `K` [`build_minimap_data`] applies.
+/// `K` is derived from the strip's own geometry (see
+/// [`MINIMAP_VIEWPORT_MULTIPLE`]), never from `total_buffer_lines`, so
+/// `K` stays small and constant for every real caller and only a
+/// pathological `rect`/`editor_visible_rows` pairing could push it this
+/// high. Chosen empirically: once a block is wider than the sample cap,
+/// spreading exactly that many samples across it regardless of width
+/// means growing `K` past the point where blocks already exceed the cap
+/// costs no extra line fetches — only a larger buffer span per block.
+/// `pub(crate)` so tests can read the real ceiling.
 pub(crate) const MINIMAP_MAX_COMPRESSION: usize = 64;
 
-/// How many editor viewports [`build_minimap_data`]'s window covers at its
-/// default, uncompressed scale (`K == 1`) — VS Code's own default minimap
-/// (`editor.minimap.size: "proportional"`, decoded from the shipped bundle
-/// for #1211): a fixed `BASE_CHAR_HEIGHT * scale` row pitch against a
-/// `lineHeight` roughly 9x taller, independent of the file's length. `K` is
-/// then chosen (see the comment at its own definition, below) so the
-/// window's real line count — `target_lines * K` — comes out to
-/// `editor_visible_rows * MINIMAP_VIEWPORT_MULTIPLE`, regardless of how
-/// `target_lines` itself was derived (GTK's ~2px fixed pitch vs the TUI's
-/// braille-native one): on GTK, `target_lines` already comes out to roughly
-/// `9 * editor_visible_rows` (`gtk_row_capacity`, above), so `K` naturally
-/// falls out to `1` — one buffer line per row, #1093's slide re-engaged. On
-/// the TUI, `target_lines` is only `4 * editor_visible_rows`
-/// (`MINIMAP_LINES_PER_ROW`), so `K` comes out to `ceil(9 / 4) == 3` — three
-/// real buffer lines dithered into each braille row — the TUI's rough
-/// approximation of the same ~9-viewport window, bounded and constant
-/// instead of growing without limit as the file gets longer (#1211's root
-/// cause: the pre-fix `K` was `total_buffer_lines.div_ceil(target_lines)`,
-/// which squeezed the *whole file* into the strip for every file shorter
-/// than `MINIMAP_MAX_COMPRESSION * target_lines` — i.e. essentially every
-/// real file — disabling #1093's slide on both backends and regressing GTK,
-/// which was already at exact VS Code parity at `K == 1`, from correct to
-/// "whole file squeezed in").
+/// How many editor viewports [`build_minimap_data`]'s window covers at
+/// its default, uncompressed scale (`K == 1`) — VS Code's own default
+/// minimap: a fixed `BASE_CHAR_HEIGHT * scale` row pitch against a
+/// `lineHeight` roughly 9x taller, independent of file length. `K` is
+/// then chosen so the window's real line count —
+/// `target_lines * K` — comes out to
+/// `editor_visible_rows * MINIMAP_VIEWPORT_MULTIPLE`. On GTK,
+/// `target_lines` already comes out to roughly `9 * editor_visible_rows`,
+/// so `K` naturally falls out to `1`. On the TUI, `target_lines` is only
+/// `4 * editor_visible_rows` (`MINIMAP_LINES_PER_ROW`), so `K` comes out
+/// to `ceil(9 / 4) == 3` — the TUI's approximation of the same window.
 const MINIMAP_VIEWPORT_MULTIPLE: usize = 9;
 
 /// Ceiling on how many characters into a line `build_minimap_data`'s
-/// `to_col` closure ever looks when measuring a highlight's own column.
+/// `to_col` closure ever looks when measuring a highlight's column.
 /// Past this many characters, `aggregate_spans` would discard the column
-/// anyway (see `grid.cols` below), so counting further is wasted, unbounded
-/// work on a long (e.g. minified) line (#728). Renamed from
-/// `MINIMAP_SPAN_COLS` by #1030, which stopped using it to size
-/// `grid.cols` itself (that now comes from the painted strip's own width)
-/// — it survives purely as this scan cap.
+/// anyway, so counting further is wasted work on long lines. Survives
+/// purely as this scan cap.
 const MINIMAP_MAX_RELEVANT_COLS: usize = 400;
 
 /// The `+ 1` keeps `to_col`'s boundary value itself exact rather than
-/// off-by-one short (#728).
+/// off-by-one short.
 const MINIMAP_COL_SCAN_LIMIT: usize = MINIMAP_MAX_RELEVANT_COLS + 1;
 
-// #1098: block partitioning, coverage aggregation and dither arithmetic all
-// moved to quadraui#1012 (`quadraui::primitives::minimap::{block_bounds,
-// block_sample_indices, sample_blocks, dither_threshold_met, BAYER4,
-// BLOCK_LINE_SAMPLE_CAP}`) — this file used to carry byte-identical private
-// copies (`minimap_block_bounds`, `MINIMAP_BLOCK_LINE_SAMPLE_CAP`,
-// `minimap_block_sample_indices`, `MINIMAP_BAYER4`,
-// `minimap_block_dither_threshold_met`, `minimap_block_text`), built here by
-// #1085 before the primitive existed to hold them. `build_minimap_data`
-// below now calls the quadraui functions directly; the arithmetic itself
-// (and its unit tests) live in quadraui, not here.
+// Block partitioning, coverage aggregation and dither arithmetic
+// live in quadraui (`quadraui::primitives::minimap`). `build_minimap_data`
+// below calls the quadraui functions directly.
 
-// #1096: how many times `minimap_line_text` has actually fetched a buffer
-// line's text — a deterministic work counter, not a wall-clock ceiling.
-// `pub(crate)` and `#[cfg(test)]`-only (compiled out of any non-test build)
-// so both this file's own tests and the black-box companion in
-// `tui_main::shell_app` (which only has a `TuiDriver`, not this file's
-// private sampling internals, to assert against) can pin "line fetches per
-// frame is bounded by strip geometry, not buffer length" without the flake
-// risk an absolute-time budget has — the old #728 guard's own doc comment
-// records 517-586ms flakes at a ~20% margin under full-suite contention,
-// and a *constant*-factor regression (e.g. 8x more reads at unchanged strip
-// geometry) cancels out of a same-geometry ratio entirely, which is exactly
-// why that guard stayed green through #1096's regression. Use
-// `count_minimap_line_fetches` rather than touching this directly.
+// How many times `minimap_line_text` has actually fetched a buffer
+// line's text — a deterministic work counter. `pub(crate)` and
+// `#[cfg(test)]`-only so tests can pin "line fetches per frame is
+// bounded by strip geometry, not buffer length" without flake risk.
+// Use `count_minimap_line_fetches` rather than touching this directly.
 #[cfg(test)]
 thread_local! {
     pub(crate) static MINIMAP_LINE_FETCH_COUNT: std::cell::Cell<usize> =
@@ -307,23 +221,14 @@ pub(crate) fn count_minimap_line_fetches(f: impl FnOnce()) -> usize {
     MINIMAP_LINE_FETCH_COUNT.with(|c| c.get())
 }
 
-/// Read buffer line `i`'s text, trimming the trailing newline — the exact
-/// line-fetch `build_minimap_data` used inline before #1085 split it out,
-/// and now hands to `quadraui::sample_blocks` as its `line_at` accessor
-/// (#1098) so a block's aggregated row text is built without vimcode ever
-/// materialising the window as a `Vec<String>`.
-///
-/// #1096: the highlight-mapping loop this doc comment used to say shared
-/// this fetch no longer does — see `minimap_line_content_byte_len` below,
-/// which answers the loop's only real question (a byte offset's character
-/// column within one line) directly against the rope, without ever
-/// materialising the line as a `String`. So every call to this function is
-/// now bounded by `sample_blocks`'s own read budget, which reads at most
-/// [`quadraui::primitives::minimap::BLOCK_LINE_SAMPLE_CAP`] lines per
-/// block — `target_lines * BLOCK_LINE_SAMPLE_CAP` `String`s per frame,
-/// never buffer length (the #728 invariant
-/// `minimap_line_fetch_count_tracks_target_lines_not_buffer_size` pins
-/// with [`MINIMAP_LINE_FETCH_COUNT`], incremented here in tests only).
+/// Read buffer line `i`'s text, trimming the trailing newline.
+/// The highlight-mapping loop this function was split from no longer
+/// calls this — see `minimap_line_content_byte_len` below, which answers
+/// the loop's only question (a byte offset's character column within one
+/// line) directly without materialising the line as a `String`. Every
+/// call is now bounded by `sample_blocks`'s own read budget, which reads
+/// at most [`quadraui::primitives::minimap::BLOCK_LINE_SAMPLE_CAP`] lines
+/// per block — never buffer length.
 fn minimap_line_text(rope: &ropey::Rope, i: usize) -> String {
     #[cfg(test)]
     MINIMAP_LINE_FETCH_COUNT.with(|c| c.set(c.get() + 1));
@@ -339,13 +244,10 @@ fn minimap_line_text(rope: &ropey::Rope, i: usize) -> String {
 }
 
 /// Byte length of a buffer line's content, excluding any trailing line
-/// terminator (`\n`, `\r\n`, or `\r`) — the same trim `minimap_line_text`
-/// applies, but read directly off the caller's own `RopeSlice` (a single
-/// line, already fetched) so it costs no allocation and no further
-/// whole-rope traversal. Used by `build_minimap_data`'s highlight loop
-/// (#1096) to clamp a highlight span's byte offset to the real line it was
-/// measured against, the same clamp `to_col` used to get for free from
-/// `line_str.len()` before that loop fetched a `String` per line.
+/// terminator — the same trim `minimap_line_text` applies, but read
+/// directly off the caller's own `RopeSlice` so it costs no allocation.
+/// Used by `build_minimap_data`'s highlight loop to clamp a highlight
+/// span's byte offset to the real line it was measured against.
 fn minimap_line_content_byte_len(slice: ropey::RopeSlice) -> usize {
     let mut n = slice.len_chars();
     let mut len = slice.len_bytes();
@@ -372,91 +274,46 @@ pub struct RenderedMinimap {
     pub rect: WindowRect,
     /// The quadraui descriptor. Already sampled — `lines` is final, but
     /// `syntax_spans` starts **empty**. Colour aggregation can't happen
-    /// here: it needs `cols_per_cell`, and that scale is no longer a host
-    /// constant since quadraui#1032 made TUI's default resolve adaptively
-    /// from the buffer's own width (GTK's stays a fixed `1`). Only the
-    /// backend that is about to paint knows which one it'll use — asking
-    /// via `Backend::minimap_layout` requires a live backend, which this
-    /// struct (built at screen-layout time, before any backend-specific
-    /// call) does not have. `draw_minimap_strip` (`src/render.rs`) does
-    /// have one, reads `cols_per_cell` back from it, aggregates
-    /// `raw_syntax_spans` with a matching [`quadraui::MinimapGrid`], and
-    /// fills this field in immediately before painting — see that
-    /// function's doc comment (#1175).
+    /// here: `cols_per_cell` (since quadraui#1032, adaptive to the buffer's
+    /// widest sampled line) is not known until paint time. `draw_minimap_strip`
+    /// aggregates `raw_syntax_spans` with the backend's real `cols_per_cell`
+    /// and fills this field in immediately before painting.
     pub minimap: quadraui::Minimap,
     /// Syntax highlight spans in raw, un-aggregated form (real character
     /// columns, not cells) — [`draw_minimap_strip`] folds these into
     /// `minimap.syntax_spans` once it knows the real `cols_per_cell` to
-    /// aggregate them at (#1175). Kept separate from `minimap` itself
+    /// aggregate them at. Kept separate from `minimap` itself
     /// (rather than one `RenderedMinimap::raw_spans` living beside an
     /// eagerly-aggregated `syntax_spans`) so there is exactly one place
     /// aggregation ever happens, not two that could silently drift.
     pub raw_syntax_spans: Vec<quadraui::MinimapSpan>,
-    /// Backend-resolved layout from this frame's [`draw_minimap_strip`] paint
-    /// of this strip, if any (#1253) — read back by [`minimap_click_line`]
-    /// and [`minimap_press`] instead of each re-deriving its own
-    /// `layout_with_sizing` call. Mirrors [`BreadcrumbBar::draw_layout`]'s
-    /// same paint-then-read-back shape: `RefCell` because `draw_minimap_strip`
-    /// only ever sees `&ScreenLayout` (this `RenderedMinimap` is already
-    /// behind the shared `cached_screen_layout` `RefCell` by the time
-    /// painting runs) and still needs to fill this field in after paint.
-    ///
-    /// `None` until the first paint of a given frame's `ScreenLayout`, and
-    /// permanently `None` for any `ScreenLayout` a caller builds without ever
-    /// calling `draw_minimap_strip` — most of this module's own unit tests,
-    /// which click-test geometry directly off `build_screen_layout`'s output.
-    /// Both click resolvers fall back to re-deriving via `layout_with_sizing`
-    /// in that case (this field's pre-#1253 behaviour verbatim), so a missing
-    /// paint can only ever cost the recompute this issue exists to skip —
-    /// never a dropped or misrouted click.
+    /// Backend-resolved layout from this frame's [`draw_minimap_strip`] paint,
+    /// if any — read back by [`minimap_click_line`] and [`minimap_press`]
+    /// instead of re-deriving `layout_with_sizing`. `RefCell` because
+    /// `draw_minimap_strip` only sees `&ScreenLayout` and still needs to fill
+    /// this field in after paint. `None` until the first paint, and
+    /// permanently `None` for any `ScreenLayout` built without calling
+    /// `draw_minimap_strip`. Both click resolvers fall back to re-deriving
+    /// via `layout_with_sizing` in that case, so a missing paint only costs
+    /// the recompute, never a dropped or misrouted click.
     pub resolved_layout: std::cell::RefCell<Option<quadraui::MinimapLayout>>,
     /// The [`quadraui::MinimapScale`] this strip's `lines`/`window_len`
-    /// were sized against (`Settings::resolved_minimap_scale`, issue
-    /// #1532) — [`draw_minimap_strip`] pushes this onto the live backend
-    /// via `Backend::set_minimap_scale` immediately before painting, so
-    /// the row pitch quadraui actually rasterises at can never drift from
-    /// the one this strip's own sampling math (`build_minimap_data`'s
-    /// `effective_row_pitch_px`) assumed.
+    /// were sized against — [`draw_minimap_strip`] pushes this onto the
+    /// backend via `Backend::set_minimap_scale` immediately before painting,
+    /// so the row pitch actually rasterised can never drift from the one
+    /// this strip's sampling math assumed.
     pub minimap_scale: quadraui::MinimapScale,
 }
 
 /// Width the minimap reserves alongside the editor, in the caller's units.
-///
-/// #828/quadraui#776: `sizing` — [`TUI_MINIMAP_SIZING`] or
-/// [`gtk_minimap_sizing`] — is supplied by the caller, who already knows its
-/// own backend by construction, instead of being selected here from a
-/// `char_width > 1.0` runtime check. This function still never branches on
-/// backend identity — only on which `sizing` *value* the caller explicitly
-/// handed it, via the match below — and it only asks that value to resolve
-/// a width before applying the on/off decision.
-///
-/// #1869: TUI's column-based `sizing.resolve_width()` path (unchanged,
-/// still forced to `char_width == 1.0` — out of #1869's scope) cannot
-/// express VS Code's real width formula, which divides by the editor's
-/// character width rather than scaling linearly by a fraction. So
-/// `gtk_minimap_sizing`'s `target_cols` (120, [`MINIMAP_TARGET_COLS`]) is
-/// used as that value's own marker — still never colliding with TUI's
-/// `target_cols` of 12 ([`MINIMAP_TARGET_COLS_TUI`]) — to route GTK/macOS/
-/// Win to [`vs_code_minimap_width_px`] instead, fed the *real* `char_width`
-/// rather than a forced `1.0`. The real `char_width` (`cw` below) is always
-/// used for the `MINIMAP_MIN_TEXT_COLS` suppression check, which genuinely
-/// wants the editor's own font metric regardless of which width formula
-/// ran.
-///
-/// Delegates the on/off decision to `quadraui::reserved_width` so both
-/// backends (and `build_screen_layout`, which shrinks each window rect by
-/// exactly this much) reclaim identical geometry when `:set nominimap`
-/// turns the strip off.
-///
-/// `gutter_width` (#1869 review round 1) is the pane's own line-number/fold
-/// gutter, in the same unit as `rect_width` — subtracted *only* on the
-/// [`vs_code_minimap_width_px`] path, matching VS Code's own
-/// `remainingWidth = editor outer width - gutter` (see that function's doc
-/// comment). TUI's `sizing.resolve_width()` path ignores it: TUI sizing is
-/// out of #1869's scope and its callers (and every unit test below except
-/// the real `build_screen_layout` call site) pass `0.0`, i.e. "rect_width is
-/// already the remaining width" — the function's pre-#1869-round-1 contract,
-/// preserved for every caller that isn't the real per-window production path.
+/// `sizing` (supplied by the caller) never branches on backend identity —
+/// only on which `sizing` *value* the caller handed it. GTK/macOS/Win's
+/// `gtk_minimap_sizing`'s `target_cols` (120, [`MINIMAP_TARGET_COLS`])
+/// routes GTK to [`vs_code_minimap_width_px`] with the *real* `char_width`.
+/// TUI's `sizing` uses its own [`MINIMAP_TARGET_COLS_TUI`] value (12).
+/// `gutter_width` is the pane's own line-number/fold gutter, subtracted
+/// *only* on the [`vs_code_minimap_width_px`] path to match VS Code's
+/// `remainingWidth = editor outer width - gutter`.
 pub fn minimap_reserved_width(
     engine: &Engine,
     rect_width: f64,
@@ -477,34 +334,14 @@ pub fn minimap_reserved_width(
     quadraui::reserved_width(want as f32, has) as f64
 }
 
-/// This window's own line-number/fold gutter width, in the caller's pixel
-/// unit — the `remaining_width = editor outer width - gutter` term
-/// [`vs_code_minimap_width_px`]'s formula needs and the pre-#1869-round-1
-/// shape silently skipped (2026-review finding: "remaining_width is wrong").
-///
-/// Computed from [`calculate_gutter_cols`] — the same function
-/// `build_rendered_window` uses for the real painted gutter — fed this
-/// window's own buffer/settings state directly, since this runs *before*
-/// `build_rendered_window` (the `minimap_widths` map in
-/// `build_screen_layout_with_breadcrumb_row` has to know the strip's width
-/// before it can compute each window's rect). Two inputs
-/// `build_rendered_window`'s own `has_git`/`has_bp` fold in are deliberately
-/// **not** replicated here, both documented, bounded deviations:
-///
-/// - `has_git` there also covers the in-flight ACP-turn-checkpoint overlay
-///   (`acp_turn_status`) — here it is just `!git_diff.is_empty()`, since the
-///   checkpoint lookup needs a `pre_turn_content` fetch this sizing pass has
-///   no reason to pay for on every frame.
-/// - `has_bp` there also covers an in-viewport decor sign (`has_decor_sign`)
-///   — here it is just "a real breakpoint is set, or a DAP session is
-///   live", since the decor check needs a resolved scroll/visible-lines
-///   window this sizing pass doesn't have yet.
-///
-/// Both gaps can only make the *real* painted gutter one column wider than
-/// this estimate, and only while a checkpoint/decor sign is actually
-/// outstanding — a transient, bounded case where the minimap strip comes
-/// out fractionally wider than VS Code's formula predicts, not a silent
-/// misrepresentation of the formula's own `remainingWidth` term.
+/// This window's own line-number/fold gutter width, in the caller's
+/// pixel unit — the `remaining_width` term [`vs_code_minimap_width_px`]
+/// needs. Computed from [`calculate_gutter_cols`], the same function
+/// `build_rendered_window` uses, fed this window's buffer/settings state
+/// directly, since this runs *before* `build_rendered_window`. Deliberately
+/// omits some status overlays to avoid expensive checks at sizing time;
+/// the *real* painted gutter can be at most one column wider than this
+/// estimate, and only while such overlays are outstanding.
 pub(crate) fn window_minimap_gutter_width_px(
     engine: &Engine,
     window_id: WindowId,
@@ -534,63 +371,25 @@ pub(crate) fn window_minimap_gutter_width_px(
     cols as f64 * char_width
 }
 
-/// Width of the scroll-affordance gutter a pane's rightmost edge must keep
-/// clear of the minimap strip (#1094), in the caller's own unit.
-///
-/// `scrollbar_reserve` (0.0 for TUI) states only GTK's overlay-chrome
-/// concept (`quadraui::Backend::scrollbar_reserve()`, #828/quadraui#776) —
-/// it says nothing about TUI's own vertical scrollbar, which is an inline
-/// column `quadraui::tui::editor::draw_editor` always paints at its own
-/// `area.right - 1` whenever the window overflows (`quadraui`'s `Editor`
-/// primitive, not a value this crate controls — see the doc comment on the
-/// `Surface::Editor` push in `app.rs`). That column is exactly one
-/// `char_width` wide. Taking the larger of the two generalises to both
-/// backends without branching on which one is asking: on TUI
-/// (`scrollbar_reserve == 0.0`, `char_width == 1.0`) this resolves to
-/// exactly one cell; on GTK it resolves to `scrollbar_reserve` whenever
-/// that's already the wider of the two, which is the ordinary case (a GTK
-/// `char_width` in pixels and its 8px overlay reserve are the same order of
-/// magnitude).
-///
-/// `pub(crate)` (not private) since #1094's GTK driver tests
-/// (`gtk::testing::minimap`) need the same formula to predict the real
-/// paint path's column count, not just this module's own tests.
-///
-/// #1094 review: on GTK the `.max` does *not* reliably resolve to
-/// `scrollbar_reserve` — `gtk::testing`'s own
-/// `cols_without_reserve`/`cols_with_reserve` fixture asserts real editor
-/// char widths already exceed the 8px overlay reserve
-/// (`cw_probe > SCROLLBAR_RESERVE_PX`), so `char_width` is the *ordinary*
-/// winner on GTK, not a rare very-large-font edge case. That's still
-/// correct here — reserving a full extra text column's worth of gutter
-/// alongside the strip is a superset of the ~8px the real scrollbar
-/// overlay needs, never a shortfall — but it does mean the strip can end
-/// up a little narrower than `minimap_reserved_width` alone would afford
-/// whenever `char_width > scrollbar_reserve`, everyday on GTK rather than
-/// only at unusually large font sizes. Left as a comment rather than a
-/// `debug_assert!`: there is no threshold here that's actually wrong to
-/// cross, only a width trade-off worth knowing about.
+/// Width of the scroll-affordance gutter a pane's rightmost edge must
+/// keep clear of the minimap strip, in the caller's own unit. TUI's
+/// vertical scrollbar is an inline column always painted at `area.right - 1`
+/// when the window overflows, exactly one `char_width` wide. GTK has an
+/// overlay-chrome reserve. Taking the larger of the two generalises to
+/// both backends without branching: on TUI this resolves to exactly one
+/// cell; on GTK it resolves to `scrollbar_reserve` whenever that's the
+/// wider value. `pub(crate)` since GTK driver tests need this formula.
 pub(crate) fn scroll_gutter_width(scrollbar_reserve: f64, char_width: f64) -> f64 {
     scrollbar_reserve.max(char_width)
 }
 
 /// Build the quadraui `Minimap` for `window_id` over the strip `rect`.
-///
-/// Returns `None` when the setting is off (the caller passes a zero-width
-/// strip in that case), when the strip cannot hold a single row, or when the
-/// window/buffer has gone away. All sampling (`sample_blocks`) and colour
-/// reduction (`aggregate_spans`) is quadraui's — this function only maps
-/// vimcode's tree-sitter byte-offset highlights into quadraui's
-/// `MinimapSpan` input type.
-///
+/// Returns `None` when the setting is off, when the strip cannot hold a
+/// single row, or when the window/buffer has gone away. All sampling and
+/// colour reduction is quadraui's — this function only maps vimcode's
+/// tree-sitter byte-offset highlights into quadraui's `MinimapSpan` type.
 /// `editor_visible_rows` is the *editor pane's* own visible row count —
-/// deliberately a separate parameter from `rect`/`line_height` (which size
-/// the minimap *strip*, and drive `target_lines`, the sampling budget)
-/// since #1085: the two only coincide because the strip is as tall as the
-/// editor pane today. Passing the editor's own count rather than
-/// re-deriving it from the strip's height keeps the viewport highlight
-/// band correct even if a future layout ever makes the strip shorter than
-/// the editor.
+/// deliberately separate from `rect`/`line_height` (which size the strip)
 pub fn build_minimap_data(
     engine: &Engine,
     theme: &Theme,
@@ -607,7 +406,7 @@ pub fn build_minimap_data(
     if display_rows == 0 {
         return None;
     }
-    // #1052: GTK's minimap rasteriser paints each sampled line at a
+    // GTK's minimap rasteriser paints each sampled line at a
     // **fixed** `ROW_PITCH_PX` (2px) row pitch, completely decoupled from
     // the editor's own `line_height` (`quadraui::gtk::minimap`'s module
     // doc: "Rows tile at a fixed ROW_PITCH_PX ... independent of the
@@ -627,7 +426,7 @@ pub fn build_minimap_data(
     // right where this under-sampling predicted, on an unfixed `develop`).
     //
     // This mirrors `visible_span_cols`'s column-axis fix immediately below
-    // (#1030): take the max of both backends' real row requirements rather
+    //: take the max of both backends' real row requirements rather
     // than branching on backend identity (Platform-Neutrality Rule — this
     // stays shared code). `rect.height` is in the caller's own native unit
     // (pixels for GTK, cell rows for TUI), exactly like `rect.width` was
@@ -642,7 +441,7 @@ pub fn build_minimap_data(
     // ROW_PITCH_PX` (0.5) — so this candidate can only ever win on GTK's
     // own numbers, never accidentally overriding TUI's.
     //
-    // #1532: `resolved_minimap_scale` (quadraui#1143) resolves to
+    // `resolved_minimap_scale` resolves to
     // `MinimapScale::One` — whose `row_pitch_px()` is exactly the old
     // hardcoded `ROW_PITCH_PX` constant this replaced — everywhere except
     // a pixel (GUI) backend that has both `minimap_render_characters` on
@@ -665,43 +464,21 @@ pub fn build_minimap_data(
         return None;
     }
 
-    // #1093: the strip holds a *fixed vertical scale* — one `lines` entry
-    // is always worth exactly one buffer line — instead of the whole
-    // buffer being squeezed end-to-end into the strip on every frame. The
-    // old squeeze pinned the file's last line to the strip's bottom row at
-    // *every* scroll position (so a bottom-of-strip click always jumped to
-    // EOF); VS Code's `minimap.size: proportional` this issue asks for
-    // instead shows a `target_lines`-line *window* onto the buffer that
-    // slides as the editor scrolls, so both ends of the file are reachable
-    // and a bottom click pages roughly one strip's worth of file.
-    //
-    // #1186: that fixed one-line-per-block window is #1093's *uncompressed*
-    // (`K == 1`) case. `k` below grows the window to `k * target_lines`
-    // lines — still capped, still O(target_lines) blocks — so
-    // `quadraui::primitives::minimap::block_bounds` (just below) takes its
-    // striding branch instead of its "never upscales" one and each block
-    // becomes `k` real buffer lines wide, aggregated by the exact same
-    // `quadraui::sample_blocks` path #1098 lifted from #1085's own
-    // `minimap_block_text`.
-    //
-    // #1211: `k` is a function of the strip's own geometry
-    // (`editor_visible_rows`, `target_lines`) — **never** of
-    // `total_buffer_lines`. The pre-#1211 `k` here was
-    // `total_buffer_lines.div_ceil(target_lines)`, chosen to fit the *whole
-    // buffer* into one window — which squeezed the entire file into the
-    // strip for every file shorter than `MINIMAP_MAX_COMPRESSION *
-    // target_lines` (essentially every real file), pinning `max_start` to
-    // `0` below and permanently disabling #1093's slide. See
-    // `MINIMAP_VIEWPORT_MULTIPLE`'s own doc comment for why this
-    // `desired_window_lines` formula reproduces VS Code's default
-    // (`minimap.size: "proportional"`) fixed-scale behaviour on GTK
-    // (`k == 1`) while still giving the TUI's coarser `target_lines` a small,
-    // constant compression factor (`k == 3`) instead of one that grows
-    // without bound as the file gets longer.
+    // The strip holds a *fixed vertical scale* — one `lines` entry is
+    // always worth exactly one buffer line — instead of the whole buffer
+    // being squeezed into the strip at every frame. The window is
+    // `target_lines`-line *window* onto the buffer that slides as the
+    // editor scrolls, so both ends of the file are reachable. That fixed
+    // window is the *uncompressed* case (`K == 1`). `k` grows the window
+    // to `k * target_lines` lines — still capped, still O(target_lines)
+    // blocks — so each block becomes `k` real buffer lines wide,
+    // aggregated by the exact same path #1098 lifted from #1085. `k` is
+    // derived from the strip's own geometry, **never** from
+    // `total_buffer_lines`.
     let desired_window_lines = editor_visible_rows
         .max(1)
         .saturating_mul(MINIMAP_VIEWPORT_MULTIPLE);
-    // #1532: in character-render mode (`minimap_scale` resolved to
+    // In character-render mode (`minimap_scale` resolved to
     // `MinimapScale::Two`, above) every block must stay exactly one real
     // buffer line wide — a `k > 1` block would hand `sample_blocks` more
     // than one line to aggregate, and it has no font to render a
@@ -725,39 +502,18 @@ pub fn build_minimap_data(
             .div_ceil(target_lines.max(1))
             .clamp(1, MINIMAP_MAX_COMPRESSION)
     };
-    // #1247 (quadraui#1044): the window's *sizing* (`window_len`, via `k`
-    // above) stays host-side — it depends on this strip's own geometry
-    // (`target_lines`/`editor_visible_rows`), which quadraui has no way to
-    // know — but where the window *starts* is now quadraui's own decision,
-    // via `window_start_line`. Before #1044 that primitive didn't exist, so
-    // this function pre-sliced the buffer down to a `window_len`-sized
-    // range by hand and handed quadraui only the already-sliced result;
-    // quadraui's own post-sample slide (`Minimap::layout_with_sizing`'s
-    // `FixedPitch` arm, `slide_window_start_row`) never saw more `lines`
-    // than the strip could already hold, so it always took its "already
-    // fits" branch and returned `0` — permanently defeated, as that
-    // function's own doc comment used to note. `window_start_line` is the
-    // pre-sample counterpart #1044 added specifically to close that gap:
-    // calling it here, instead of re-deriving the same fraction-of-buffer
-    // arithmetic host-side, makes the slide live rather than defeated,
-    // while still costing O(window_len) per frame, not O(file) (the
-    // #728/#1085 regression this function exists to avoid — `window_len`
-    // is still capped below `total_buffer_lines` before this call runs).
+    // The window's *sizing* (`window_len`, via `k` above) stays host-side —
+    // it depends on this strip's own geometry (`target_lines`/
+    // `editor_visible_rows`). But where the window *starts* is now
+    // quadraui's own decision, via `window_start_line`, making the slide
+    // live rather than permanently defeated.
     let window_len = target_lines.saturating_mul(k).min(total_buffer_lines);
     // `total_at_position` is `max_scroll_top + 1`, the number of distinct
-    // scroll positions the editor itself can reach — not `total_buffer_lines`
-    // — so the slide is anchored to the editor's own scroll *ceiling*
-    // (`total_buffer_lines - editor_visible_rows`, the same arithmetic
-    // `View::ensure_cursor_visible` clamps `scroll_top` against) exactly the
-    // way #1093/#1211 always have: the window reaches its own bottom exactly
-    // when the editor viewport reaches the real bottom of the file, not some
-    // fraction short of it (which a `scroll_top / total_buffer_lines`
-    // fraction would leave — the editor's own `scroll_top` never reaches
-    // `total_buffer_lines - 1` except in a one-row viewport).
-    // `window_start_line`'s own `total_at_position <= 1` branch returns `0`
-    // here exactly when `max_scroll_top == 0`, so a one-screen file still
-    // stays top-aligned with no slide, byte-for-byte the pre-#1093
-    // behaviour.
+    // scroll positions the editor itself can reach. The window reaches its
+    // bottom exactly when the editor viewport reaches the real bottom of
+    // the file. `window_start_line`'s own `total_at_position <= 1` branch
+    // returns `0` exactly when `max_scroll_top == 0`, so a one-screen file
+    // stays top-aligned with no slide.
     let max_scroll_top = total_buffer_lines.saturating_sub(editor_visible_rows.max(1));
     let scroll_top_for_window = window.view.scroll_top.min(max_scroll_top);
     let window_start_line = quadraui::window_start_line(
@@ -784,53 +540,18 @@ pub fn build_minimap_data(
     // the windowing math in isolation — keep that mismatch out of the one
     // real call site.
 
-    // #1085/#1098: partition the *window* into `target_lines`-many blocks
-    // *before* fetching any line text (same #728 discipline the old
-    // point-sampler followed — decide what's worth reading before reading
-    // it), then aggregate each block's lines (capped, see
-    // [`quadraui::primitives::minimap::BLOCK_LINE_SAMPLE_CAP`]) into one
-    // representative row instead of keeping one line and discarding the
-    // rest of the block outright. The block-partitioning and text/dither
-    // aggregation arithmetic itself now lives in quadraui
-    // (quadraui#1012); this loop only maps vimcode's own tree-sitter
-    // highlights onto the same block indices quadraui's own
-    // `sample_blocks` call (below) will read.
-    //
-    // #1096: build the syntax-span mapping in the same bounded pass over
-    // sampled lines (`block_sample_indices`, at most
-    // `BLOCK_LINE_SAMPLE_CAP` per block), instead of a second, separate
-    // pass over the *entire* `buffer_state.highlights` vec — `highlights`
-    // spans the whole buffer (`update_syntax` always parses in full; the
-    // viewport-scoped `refresh_syntax_visible` has no callers), so a full
-    // scan of it is itself O(buffer) even when every non-matching entry is
-    // skipped in O(1) (confirmed by hand: an O(1)-per-skip `sampled_at:
-    // HashMap<line, block>` early-out, checked once per entry via
-    // `rope.byte_to_line(*start)`, still left the ratio guard failing —
-    // `buffer_state.highlights.len()` itself grows with the buffer, so
-    // *touching* every entry once already costs more the bigger the file
-    // is, allocation or not).
-    //
-    // `buffer_state.highlights` is sorted by start byte
-    // (`update_syntax_with_limit` sorts it), so for each sampled line this
-    // binary-searches straight to the handful of spans that start on it —
-    // O(log highlights.len()) to find them, not O(highlights.len()) to
-    // filter them. The same sorted-highlights-plus-`partition_point` idiom
-    // already narrows highlights to the viewport a few thousand lines up in
-    // this file; this is that same trick applied per sampled line instead
-    // of to one contiguous window, since the minimap's sampled lines are
-    // scattered across the whole buffer rather than contiguous.
-    // `bounds` is *window*-relative (`0..window_len`), matching
-    // `block_sample_indices`'s own contract — remapped to real buffer line
-    // numbers below (`+ window_start_line`), both when reading from `rope`
-    // and when stamping `MinimapLine::line_idx`. At `K == 1` (`window_len
-    // <= target_lines`) this takes the "never upscales" branch and every
-    // block is exactly one line wide, same as pre-#1186; at `K > 1`
-    // (#1186's compressed mode, `window_len == target_lines * k`) it takes
-    // the striding branch instead and each block becomes `k` real buffer
-    // lines wide — the exact multi-line aggregation `sample_blocks` was
-    // already built for by #1085/#1012, now actually exercised by the one
-    // production call site instead of only by tests that pass a
-    // `total_lines` bigger than `target_lines` directly.
+    // Partition the *window* into `target_lines`-many blocks *before*
+    // fetching any line text (same #728 discipline), then aggregate each
+    // block's lines into one representative row. The block-partitioning
+    // and text/dither aggregation arithmetic live in quadraui; this loop
+    // only maps vimcode's tree-sitter highlights onto the same block
+    // indices quadraui's `sample_blocks` will read. Build the syntax-span
+    // mapping in the same bounded pass over sampled lines instead of a
+    // second pass over the *entire* `buffer_state.highlights` vec, which
+    // would be O(buffer). `buffer_state.highlights` is sorted by start
+    // byte, so for each sampled line this binary-searches to the handful
+    // of spans that start on it. `bounds` is *window*-relative, remapped
+    // to real buffer line numbers below.
     let bounds = quadraui::primitives::minimap::block_bounds(window_len, target_lines);
     if bounds.len() < 2 {
         return None;
@@ -867,19 +588,11 @@ pub fn build_minimap_data(
             // belonged here.
             let content_byte_len = minimap_line_content_byte_len(slice);
             // quadraui's rasterisers treat span columns as *character*
-            // columns (GTK converts them back to byte offsets for Pango
-            // attributes), so convert here rather than handing over raw
-            // byte deltas — locally, against this one line's own
-            // `RopeSlice`, which costs only O(log line_length) and does not
-            // grow with the buffer the way a whole-rope `byte_to_char`
-            // would (measured across #1096's fix iterations: an earlier
-            // version that binary-searched to the right lines but still
-            // converted columns via `rope.byte_to_char` on the whole rope
-            // left the large side of the ratio guard over 600ms/frame).
+            // columns, so convert from byte offsets locally, against this
+            // line's own `RopeSlice`, which costs only O(log line_length).
             // Capped at `MINIMAP_COL_SCAN_LIMIT` chars: columns past
-            // `MINIMAP_MAX_RELEVANT_COLS` never affect `aggregate_spans`'s
-            // output (it drops any cell at/past `grid.cols`), so counting
-            // further into a long — e.g. minified — line is wasted (#728).
+            // `MINIMAP_MAX_RELEVANT_COLS` are dropped by `aggregate_spans`,
+            // so counting further into a long line is wasted work.
             let to_col = |b: usize| -> usize {
                 let b = b.min(content_byte_len);
                 slice.byte_to_char(b).min(MINIMAP_COL_SCAN_LIMIT)
@@ -903,19 +616,12 @@ pub fn build_minimap_data(
             }
         }
     }
-    // #1098: `sample_blocks` takes a **line accessor**, not a materialised
-    // slice — it calls `line_at` only for the (at most
-    // `BLOCK_LINE_SAMPLE_CAP`-per-block) lines its own read budget says it
-    // needs, so this never allocates a `String` for the whole window up
-    // front the way the pre-#1098 `owned: Vec<String>` /
-    // `borrowed: Vec<&str>` pair did — that whole-window materialisation
-    // was #1096's own root cause. `total_lines: window_len` against
-    // `target_rows: target_lines` recomputes the exact same `bounds` this
-    // function already derived above (pure arithmetic, no rope access), so
-    // `line_at` only ever gets called for the same window-relative indices
-    // `block_sample_indices` picked for the highlight loop, shifted by
-    // `window_start_line` here rather than there since `sample_blocks`
-    // itself is window-relative.
+    // `sample_blocks` takes a **line accessor**, not a materialised slice —
+    // it calls `line_at` only for the lines its own read budget needs, so
+    // this never allocates a `String` for the whole window up front. `total_lines`
+    // and `target_rows` recompute the same `bounds` already derived, so
+    // `line_at` only gets called for the same window-relative indices
+    // the highlight loop picked.
     let mut lines = quadraui::sample_blocks(window_len, target_lines, |i| {
         minimap_line_text(rope, i + window_start_line)
     });
@@ -928,37 +634,26 @@ pub fn build_minimap_data(
     for line in lines.iter_mut() {
         line.line_idx += window_start_line;
     }
-    // #1175 (quadraui#1032): colour aggregation used to happen right here,
-    // against a `MinimapGrid` built from a hardcoded `MINIMAP_COLS_PER_CELL`.
-    // That stopped being safe the moment quadraui#1032 made TUI's default
-    // `cols_per_cell` adaptive to the buffer's own widest sampled line
-    // (GTK's stays a fixed `1`) — this function has no backend to ask, so
-    // it cannot know which scale will actually be painted. Aggregation is
-    // deferred to `draw_minimap_strip`, which *does* have a live
-    // `&dyn quadraui::Backend` and reads `cols_per_cell` back from
-    // `Backend::minimap_layout` immediately before painting (see that
-    // function's doc comment). `raw_spans` survives to that point
-    // unaggregated, in real (not cell) character columns.
+    // Colour aggregation used to happen right here. That stopped being
+    // safe when quadraui#1032 made TUI's default `cols_per_cell` adaptive
+    // to the buffer's widest sampled line (GTK's stays a fixed `1`).
+    // `build_minimap_data` has no backend to ask, so it cannot know which
+    // scale will be painted. Aggregation is deferred to `draw_minimap_strip`,
+    // which does have a live backend and reads `cols_per_cell` before
+    // painting. `raw_spans` survives unaggregated, in real character columns.
     let raw_syntax_spans = raw_spans;
 
     // Where the editor's viewport lands inside `lines`. Uses the editor
     // pane's own visible row count (`editor_visible_rows`), not
     // `display_rows` (the minimap *strip's* sampling budget, above) — see
-    // this function's doc comment (#1085).
+    // this function's doc comment.
     let scroll_top = window.view.scroll_top.min(total_buffer_lines);
     let viewport_end = scroll_top.saturating_add(editor_visible_rows.max(1));
-    // #1186: each `lines` entry is a block that can now span several real
-    // buffer lines (`K > 1`), so `scroll_top`/`viewport_end` will usually
-    // fall *inside* a block's line range rather than land exactly on a
-    // `line_idx` boundary. The pre-#1186 formula
-    // (`position(|l| l.line_idx >= scroll_top)`) is only correct when every
-    // block is exactly one line wide — otherwise it skips the block that
-    // actually *contains* `scroll_top` and finds the next one instead.
-    // `partition_point` finds the last block whose start is `<= scroll_top`
-    // (i.e. the block `scroll_top` itself falls inside): at `K == 1` a block
-    // with `line_idx == scroll_top` is always present, so the two formulas
-    // agree exactly — this is a strict generalisation, not a behaviour
-    // change, for the uncompressed case.
+    // Each `lines` entry is a block that can span several real buffer
+    // lines (`K > 1`), so `scroll_top`/`viewport_end` will usually fall
+    // *inside* a block's line range rather than land exactly on a
+    // `line_idx` boundary. `partition_point` finds the last block whose
+    // start is `<= scroll_top` (the block `scroll_top` falls inside).
     let visible_row_start = lines
         .partition_point(|l| l.line_idx <= scroll_top)
         .saturating_sub(1);
@@ -971,7 +666,7 @@ pub fn build_minimap_data(
             id: quadraui::WidgetId::new(format!("minimap:{}", window_id.0)),
             lines,
             // Filled in by `draw_minimap_strip` once it knows the real,
-            // backend-resolved `cols_per_cell` to aggregate at (#1175).
+            // backend-resolved `cols_per_cell` to aggregate at.
             syntax_spans: Vec::new(),
             visible_row_start,
             visible_row_count: visible_row_end.saturating_sub(visible_row_start).max(1),
@@ -983,63 +678,17 @@ pub fn build_minimap_data(
     })
 }
 
-/// Paint every entry in `screen.minimap` (#722 — one per editor pane, not
-/// just the active one) through the backend's own rasteriser and stash each
-/// strip's resolved layout on its own `RenderedMinimap::resolved_layout`
-/// (#1253) for [`minimap_click_line`]/[`minimap_press`] to read back at click
-/// time instead of re-deriving via `layout_with_sizing`. No return value:
-/// before #1253 this returned `Vec<quadraui::MinimapLayout>` in `screen.minimap`
-/// order for the caller to zip back up itself, but every call site (both
-/// backends' `render_content`) discarded it rather than doing that — the
-/// per-strip cache is both the fix and a simpler contract, since a caller
-/// can no longer get the pairing wrong.
-///
-/// This is the *entire* backend-side contract for the minimap: GTK's font
-/// scaling and TUI's braille packing are quadraui's implementations of
-/// `Backend::draw_minimap`, so each backend's wiring is a single call to this
-/// function. Nothing about sampling, dot packing or the *mechanics* of
-/// colour aggregation exists on either side of it in vimcode — only the
-/// *timing* of the one `quadraui::aggregate_spans` call does (#1175).
-///
-/// # Colour aggregation happens here, not in `build_minimap_data` (#1175)
-///
-/// quadraui#1032 made TUI's default `cols_per_cell` adapt to the buffer's
-/// own widest sampled line (GTK's stays a fixed `1`) instead of a constant
-/// either backend could hardcode. `build_minimap_data` runs at
-/// screen-layout time, before any backend-specific call, so it cannot know
-/// which scale is about to be painted — it hands `RenderedMinimap` an
-/// un-aggregated `raw_syntax_spans` (real character columns) alongside a
-/// `Minimap` whose `syntax_spans` starts empty. This function *does* have
-/// a live backend, so for each strip it:
-///
-/// 1. Asks `Backend::minimap_layout` for the `cols_per_cell` that backend
-///    will actually paint with — a no-paint call, since `syntax_spans` is
-///    still empty at this point and `minimap_layout` only reads `.lines`
-///    (mirrors `examples/common/minimap_app.rs`'s own read-back pattern
-///    upstream, which is what closed quadraui#1032's own colour/dot
-///    desync risk on quadraui's side of this fix).
-/// 2. Builds a [`quadraui::MinimapGrid`] from that *same* value — so the
-///    grid a cell's colour is aggregated at can never drift from the scale
-///    its dots are painted at, the exact desync #1000's review flagged and
-///    quadraui#1032 reopened by making the scale adaptive.
-/// 3. Aggregates `raw_syntax_spans` into that grid and paints.
-///
-/// #723: the strip carries its own scroll affordance — `Minimap::layout`
-/// resolves a `viewport_highlight` band that *both* quadraui rasterisers
-/// already paint (a background accent across the visible rows on TUI, a
-/// translucent slider on GTK). `MinimapLayout.scrollbar` is deliberately
-/// **not** painted on top of it: TUI's `draw_editor` already paints a solid
-/// one-column vertical scrollbar in the column immediately left of the
-/// strip, so an extra solid bar in the strip's own first column reads as
-/// two bars jammed together — the exact regression
-/// `test_tui_two_groups_single_boundary_scrollbar_481` guards. The pane's
-/// scrollbar instead stays *beside* the strip on both backends; GTK's
-/// native widget is inset past the strip by `native_scrollbar_margin_start`
-/// in `src/gtk/mod.rs`, which reads the strip width from
-/// [`minimap_reserved_width`] — the same call that reserved it here.
+/// Paint every entry in `screen.minimap` through the backend's own
+/// rasteriser and stash each strip's resolved layout on its own
+/// `RenderedMinimap::resolved_layout` for click handlers to read back
+/// instead of re-deriving via `layout_with_sizing`. No return value.
+/// This is the *entire* backend-side contract for the minimap: each
+/// backend's wiring is a single call to this function. Nothing about
+/// sampling, dot packing or colour aggregation exists in vimcode — only
+/// the *timing* of the one `quadraui::aggregate_spans` call.
 pub fn draw_minimap_strip(backend: &mut dyn quadraui::Backend, screen: &ScreenLayout) {
     for mm in &screen.minimap {
-        // #1532: keep the live backend's `MinimapScale` in sync with the
+        // Keep the live backend's `MinimapScale` in sync with the
         // one `build_minimap_data` already sized this strip's `lines`/
         // `window_len` against (`mm.minimap_scale`) — a backend that never
         // overrides `Backend::minimap_scale`/`set_minimap_scale` (TUI) no-ops
@@ -1076,40 +725,14 @@ pub fn draw_minimap_strip(backend: &mut dyn quadraui::Backend, screen: &ScreenLa
 
 /// Raw-column budget (`MinimapGrid::cols`) for a strip `cols_per_cell`
 /// columns wide per cell — see [`draw_minimap_strip`]'s doc comment for
-/// where `cols_per_cell` itself comes from (the backend's own resolved
-/// scale, never a host constant, as of #1175/quadraui#1032).
-///
-/// `rect_width` cannot alone answer "how many raw columns does this strip
-/// paint" for both backends, because it is in the *caller's own unit*
-/// (`RenderedMinimap::rect`'s doc comment: cells for TUI, pixels for GTK)
-/// and the two backends do not turn that unit into painted columns the
-/// same way:
-///
-/// - TUI's braille cell packs `cols_per_cell` raw columns per painted
-///   cell, so `rect_width` cells of TUI strip consult exactly
-///   `rect_width * cols_per_cell` raw columns — `rect_width` really is a
-///   column count here, and the formula is dimensionally exact.
-/// - GTK's rasteriser (`quadraui::gtk::minimap::draw_minimap`) does *not*
-///   scale its per-row paint walk with `rect_width`'s pixel value at all:
-///   every row is capped at a fixed
-///   `quadraui::primitives::minimap::COLUMN_CAPACITY` (120) character
-///   columns regardless of how wide the strip is in pixels (see that
-///   constant's doc comment upstream), and its own `cols_per_cell` is
-///   always `1` (`MinimapLayout`'s `Default`, and what
-///   `Minimap::layout_with_sizing` always sets), so `rect_width * 1` (a
-///   pixel count, in the `0..=MINIMAP_TARGET_COLS` (0..=120) range
-///   [`vs_code_minimap_width_px`] resolves to) is not dimensionally a
-///   column count at all.
-///
-/// Rather than branch on backend identity here (Platform-Neutrality Rule
-/// — this is shared code, not per-backend wiring), take the max of both
-/// backends' real requirements: TUI's exact `rect_width * cols_per_cell`
-/// and GTK's fixed `COLUMN_CAPACITY`. An overestimate only ever costs
-/// unreachable aggregation work; an underestimate silently drops colour
-/// data for columns a backend does paint (#990, and precisely the failure
-/// mode #1175 exists to close for TUI's now-adaptive scale — a fixed
-/// `COLUMN_CAPACITY` floor alone is not always enough once `cols_per_cell`
-/// itself can widen past what a hardcoded floor anticipated).
+/// where `cols_per_cell` comes from. `rect_width` is in the *caller's own
+/// unit* (cells for TUI, pixels for GTK) and the two backends turn that
+/// unit into painted columns differently: TUI's braille packs
+/// `cols_per_cell` raw columns per cell, so `rect_width * cols_per_cell`
+/// is exact; GTK's rasteriser does *not* scale with pixel width, capping
+/// at a fixed `quadraui::primitives::minimap::COLUMN_CAPACITY`. Rather
+/// than branch on backend identity, take the max of both backends'
+/// requirements: an overestimate only costs unreachable aggregation work.
 fn minimap_grid_cols(rect_width: f64, cols_per_cell: usize) -> usize {
     let visible_span_cols = ((rect_width.round().max(1.0)) as usize * cols_per_cell)
         .max(quadraui::primitives::minimap::COLUMN_CAPACITY);
@@ -1128,39 +751,15 @@ pub fn minimap_strip_rect(mm: &RenderedMinimap) -> quadraui::Rect {
 }
 
 /// The `MinimapLayout` to hit-test `mm` against: [`draw_minimap_strip`]'s
-/// backend-resolved paint-time layout if this frame has already painted this
-/// strip (#1253, `mm.resolved_layout`), else re-derived via
-/// `layout_with_sizing` exactly as every call site here did before #1253.
-///
-/// The fallback exists for callers that build a `ScreenLayout` without ever
-/// calling `draw_minimap_strip` — most of this module's own unit tests,
-/// which click-test geometry directly off `build_screen_layout`'s output —
-/// so a missing paint can only ever cost the recompute this cache exists to
-/// skip, never a dropped or misrouted click.
-///
-/// `FixedPitch(1.0)` is the fallback's sizing rather than
-/// `MinimapSizing::Fill` (used to be #1093's choice) because it is safe for
-/// *both* real rasterisers' own pitches: it never overestimates the strip's
-/// real row pitch, so `rows_that_fit` can only come out larger than reality,
-/// never smaller — and since `mm.minimap.lines` is already host-windowed to
-/// fit the strip's real capacity (`build_minimap_data`), `rows_that_fit >=
-/// lines.len() / lines_per_row` holds regardless, so `layout_with_sizing`
-/// never re-slides on top of the host-side window already computed. This is
-/// also why swapping in the *real* paint-time layout above never disagrees
-/// with the fallback it replaces: TUI's own rasteriser already resolves at
-/// this exact `FixedPitch(1.0)` (`quadraui::tui::minimap::tui_minimap_layout`),
-/// and GTK's real `ROW_PITCH_PX` pitch only ever narrows `rows_shown` below
-/// `row_count`, which the host-side windowing above already keeps from
-/// happening in the first place.
-///
-/// CLAUDE.md's black-box test exemption, invoked explicitly: TUI ships no
-/// new/updated `TuiDriver` test for this change because there is no
-/// TUI-visible behaviour to cover — TUI's resolved paint-time layout and the
-/// pre-#1253 `FixedPitch(1.0)` fallback it now caches are mathematically
-/// identical (previous paragraph), and TUI's `shell_app.rs`/`render_impl.rs`
-/// call sites already discarded `draw_minimap_strip`'s old `Vec` return
-/// value, so no TUI wiring changed either (`scripts/prod_lines.py
-/// src/tui_main` delta: 0). This is an internal refactor on the TUI side.
+/// backend-resolved paint-time layout if this frame already painted this
+/// strip, else re-derived via `layout_with_sizing` as every call site did
+/// before #1253. The fallback exists for callers that build a
+/// `ScreenLayout` without calling `draw_minimap_strip` — most of this
+/// module's unit tests — so a missing paint only costs the recompute,
+/// never a misrouted click. The fallback uses `FixedPitch(1.0)` because
+/// it is safe for *both* real rasterisers' pitches: it never overestimates
+/// the strip's row pitch, so `rows_that_fit` only comes out larger than
+/// reality, never smaller.
 fn minimap_layout_for_click(mm: &RenderedMinimap) -> quadraui::MinimapLayout {
     if let Some(layout) = mm.resolved_layout.borrow().as_ref() {
         return layout.clone();
@@ -1172,32 +771,12 @@ fn minimap_layout_for_click(mm: &RenderedMinimap) -> quadraui::MinimapLayout {
     )
 }
 
-/// Resolve a click/drag at `(x, y)` (backend units, same space as
-/// [`minimap_strip_rect`]) against every pane's minimap track (#722),
-/// returning the window it hit plus the buffer line to scroll that window
-/// to. `None` when no pane has a minimap or the point misses all of them.
-///
-/// Panes never overlap, so at most one strip can claim a given point — the
-/// loop stops at the first hit rather than needing to pick a "closest" one.
-///
-/// Needs no backend instance: `MinimapLayout::hit_test` resolves purely from
-/// `bounds`, which is the same strip rect both rasterisers were handed —
-/// `lines_per_row` only shapes the *painted* rows, never the hit fraction. So
-/// "click the vertical middle → ~50% of the *painted window*" is one
-/// behaviour computed once, not two implementations that can drift.
-///
-/// #1093: `sizing` used to be `MinimapSizing::Fill`, which (like every other
-/// sizing variant) never actually changed `hit_test`'s fraction — `hit_test`
-/// only ever reads `layout.bounds`, which is the `bounds` argument handed back
-/// verbatim, never reshaped by the sizing branch. What sizing *does* change is
-/// `layout.visible_lines`, which [`minimap_fraction_to_line`] now consults (the
-/// `start_line_idx` bridge its own doc describes) to resolve the fraction
-/// against the rows actually on screen rather than against
-/// `total_buffer_lines` — so this now has to agree with whichever pitch the
-/// real rasteriser painted with, or the two would resolve different windows.
-/// See [`minimap_layout_for_click`]'s doc comment (#1253) for why the paint-time
-/// layout it prefers and the `FixedPitch(1.0)` fallback it falls back to always
-/// agree here.
+/// Resolve a click/drag at `(x, y)` against every pane's minimap track,
+/// returning the window it hit plus the buffer line to scroll to. `None`
+/// when no pane has a minimap or the point misses all of them. Panes
+/// never overlap, so at most one strip can claim a point. Needs no
+/// backend instance: `MinimapLayout::hit_test` resolves purely from
+/// `bounds`, which is the same strip rect both rasterisers were handed.
 pub fn minimap_click_line(screen: &ScreenLayout, x: f64, y: f64) -> Option<(WindowId, usize)> {
     for mm in &screen.minimap {
         let layout = minimap_layout_for_click(mm);
@@ -1211,33 +790,12 @@ pub fn minimap_click_line(screen: &ScreenLayout, x: f64, y: f64) -> Option<(Wind
     None
 }
 
-/// Apply a minimap click/drag: focus the *hit* pane, scroll it so the
-/// clicked line sits at the *centre* of the viewport (VS Code parity), and
-/// carry the cursor with it, so the next `ensure_cursor_visible` doesn't snap
-/// the view straight back. Works against whichever pane's strip the point
-/// landed on (#722), not just the active window.
-///
-/// The focus switch (`focus_group_for_window` + `set_cursor_for_window`,
-/// the same pair `Engine::mouse_click` uses for a plain buffer click) is a
-/// #722 follow-up: before every pane had its own minimap, only the active
-/// pane's strip was ever clickable, so "click a strip without focusing its
-/// pane" could never arise. Now that a background pane's strip is
-/// reachable too, scrolling it without also bringing it to the front would
-/// read as broken — a click that visibly moves a pane's view but leaves
-/// focus (and keyboard input) somewhere else.
-///
-/// #1093: centres rather than top-aligns — `set_scroll_top_for_window` used
-/// to be handed `line` directly, which put the clicked line at the very top
-/// of the viewport. Combined with the strip no longer spanning the whole
-/// file, top-aligning a bottom-of-strip click made the viewport's *bottom*
-/// land a further `viewport_lines` past the clicked point, reading as an
-/// overshoot/page-down rather than "scroll to roughly here" — VS Code
-/// centres the viewport on the clicked point instead.
-///
-/// Returns the window scrolled and the buffer line scrolled to (the raw
-/// clicked line — the cursor's own target — not the centred `scroll_top`),
-/// or `None` when the point missed every strip (in which case the caller
-/// must fall through to its normal editor click handling).
+/// Apply a minimap click: focus the *hit* pane and scroll it so the
+/// clicked line sits at the *centre* of the viewport (VS Code parity),
+/// carrying the cursor with it. Works against whichever pane's strip the
+/// point landed on, not just the active window. The focus switch is
+/// necessary because every pane now has its own minimap, so a background
+/// pane's strip can be clicked without bringing it to the front.
 pub fn apply_minimap_click(
     engine: &mut Engine,
     screen: &ScreenLayout,
@@ -1256,7 +814,7 @@ pub fn apply_minimap_click(
     Some((window_id, line))
 }
 
-/// `quadraui::WidgetId` for a minimap strip's own thumb drag (#1187) —
+/// `quadraui::WidgetId` for a minimap strip's own thumb drag —
 /// `minimap:<window_id>`, parsed back out by [`apply_scroll_offset`].
 /// Shared by both backends' press rungs so the id can never drift from what
 /// the apply-side table matches on.
@@ -1264,29 +822,17 @@ pub fn minimap_drag_widget(window_id: WindowId) -> quadraui::WidgetId {
     quadraui::WidgetId::new(format!("minimap:{}", window_id.0))
 }
 
-/// Outcome of resolving a **press** (not a continued drag-move) against a
-/// minimap strip (#1187) — mirrors [`EditorScrollbarClick`], but for the
-/// strip's own viewport-highlight band rather than a `quadraui::Scrollbar`
-/// thumb (#723's own scrollbar is deliberately never painted over the band —
-/// see [`draw_minimap_strip`]'s doc comment).
-///
-/// Every press that hits the strip at all begins a
-/// `quadraui::DragTarget::ScrollbarY` drag — there is no `PageTo`-style
-/// track-page outcome here, unlike [`resolve_editor_scrollbar_click`] — a
-/// press outside the band must still jump-to-position (#1093 centring),
-/// which the caller performs by calling [`apply_minimap_click`] before
-/// arming the drag whenever [`Self::jump`] is set, so a plain click's
-/// existing behaviour is unchanged: only what happens on the *next* move
-/// differs.
-///
-/// This is the fix for #1187: previously both backends re-ran
-/// `apply_minimap_click` (an absolute seek against the strip's own,
-/// scroll-following painted window) on every drag-move sample, which mostly
-/// cancelled itself out — the window re-slid the same direction the click
-/// just scrolled. Arming a real `DragTarget::ScrollbarY` against
-/// `max_scroll` (the whole file's scroll ceiling, [`Self::max_scroll`]) once
-/// on press, instead of re-seeking every move, makes a whole-strip drag
-/// traverse the whole file exactly like the real vertical scrollbar does.
+/// Outcome of resolving a **press** against a minimap strip — mirrors
+/// [`EditorScrollbarClick`], but for the strip's viewport-highlight band
+/// rather than a `quadraui::Scrollbar` thumb. Every press begins a
+/// `quadraui::DragTarget::ScrollbarY` drag; a press outside the band
+/// must still jump-to-position, which the caller performs by calling
+/// [`apply_minimap_click`] before arming the drag whenever [`Self::jump`]
+/// is set, so a plain click's behaviour is unchanged: only what happens
+/// on the *next* move differs. This fix (née #1187) prevents each
+/// drag-move sample from re-running the seek, which would mostly cancel
+/// itself out; arming a real drag once instead makes a whole-strip drag
+/// traverse the whole file like the real vertical scrollbar does.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MinimapPress {
     /// The pane whose strip was hit.
@@ -1312,35 +858,20 @@ pub struct MinimapPress {
     /// cursor by construction.
     pub grab_offset: f32,
     /// The press landed on the track *outside* the viewport-highlight band:
-    /// the caller must call [`apply_minimap_click`] first (today's #1093
-    /// jump-to-position + cursor move) before arming the drag described by
-    /// the rest of this struct.
+    /// the caller must call [`apply_minimap_click`] first (jump-to-position
+    /// + cursor move) before arming the drag.
     pub jump: bool,
 }
 
-/// Resolve a press against every pane's minimap strip (#722), returning the
-/// geometry needed to arm a [`quadraui::DragTarget::ScrollbarY`] drag. `None`
-/// when no pane has a minimap or the point misses all of them — mirrors
-/// [`minimap_click_line`]'s "first hit wins" contract (panes never overlap).
-///
-/// Read-only (`&Engine`, not `&mut`): unlike [`apply_minimap_click`], this
-/// never mutates scroll/cursor state itself — see [`MinimapPress::jump`] for
-/// why the caller still might need to call that function too.
-///
-/// `fine` is #1271's minimap-scale seek, **the default since #1828**: when
-/// set, the geometry armed for the subsequent `ScrollbarY` drag is remapped
-/// from the whole file (`max_scroll` stays file-wide — #1187's own
-/// guarantee, unchanged) onto the strip's *currently painted window*
-/// instead, via a **virtual track** fed to the same primitive — see
-/// [`fine_seek_geometry`] for the derivation. This is the mapping VS Code
-/// itself uses: the viewport slider moves within the minimap's own
-/// (possibly sliding, #1093) scale, never the whole file's. `false`
-/// reproduces the pre-#1828 (file-wide, #1187) geometry — a drag that
-/// traverses virtually the whole file in one gesture, like a real
-/// scrollbar handle. `click::pixel_to_click_target`'s call site passes
-/// `!alt`, so holding **Alt** is now what reaches *this* geometry (the old
-/// #1187 default), kept as a power-user "fast scroll" affordance rather
-/// than dropped outright (#1828).
+/// Resolve a press against every pane's minimap strip, returning the
+/// geometry needed to arm a [`quadraui::DragTarget::ScrollbarY`] drag.
+/// `None` when no pane has a minimap or the point misses all of them.
+/// Read-only (`&Engine`, not `&mut`): unlike [`apply_minimap_click`],
+/// this never mutates scroll/cursor state. `fine` remaps the drag
+/// geometry from the whole file onto the strip's *currently painted window*
+/// instead (the default since #1828), making the viewport slider move
+/// within the minimap's own scale like VS Code does. `false` reproduces
+/// the pre-#1828 file-wide geometry; holding **Alt** reaches that mode.
 pub fn minimap_press(
     engine: &Engine,
     screen: &ScreenLayout,
@@ -1350,7 +881,7 @@ pub fn minimap_press(
 ) -> Option<MinimapPress> {
     for mm in &screen.minimap {
         let bounds = minimap_strip_rect(mm);
-        // #1253: same paint-time-layout-first, `FixedPitch(1.0)`-fallback
+        // Same paint-time-layout-first, `FixedPitch(1.0)`-fallback
         // resolution `minimap_click_line` uses — see
         // `minimap_layout_for_click`'s doc comment.
         let layout = minimap_layout_for_click(mm);
@@ -1408,62 +939,26 @@ pub fn minimap_press(
     None
 }
 
-/// Derive the **virtual track** #1271's fine seek arms in place of
-/// the real, file-wide one (#1828: the default drag mapping; the old
-/// file-wide one now needs Alt held) — remapping the same strip pixels onto the
-/// strip's *currently painted window* (`~MINIMAP_LINES_PER_ROW` lines per
-/// cell) instead of the whole file (`~max_scroll / track_length` lines per
-/// cell), while still feeding `quadraui::dispatch_mouse_drag`'s unmodified
-/// `ScrollbarY` arithmetic — no quadraui change needed.
-///
-/// Let `S0`/`Sh` be the real strip's top/height (`bounds`), `M` the file-wide
-/// `max_scroll`, `base` the first buffer line the strip currently paints and
-/// `span` its line extent (both read off `minimap.lines`, matching the
-/// `window_len` convention `minimap_click_at_the_middle_seeks_to_the_middle_
-/// of_the_painted_window` already uses — `lines.last().line_idx + 1 -
-/// lines[0].line_idx`, robust to #1186 multi-line blocks). Then:
-///
+/// Derive the **virtual track** #1271's fine seek arms in place of the
+/// real, file-wide one — remapping the same strip pixels onto the strip's
+/// *currently painted window* instead of the whole file, while still
+/// feeding `quadraui::dispatch_mouse_drag`'s unmodified `ScrollbarY`
+/// arithmetic. Let `S0`/`Sh` be the real strip's top/height, `M` the
+/// file-wide `max_scroll`, `base` the first buffer line the strip
+/// currently paints, and `span` its line extent. Then:
 /// ```text
 /// effective_track = Sh * M / span      // dispatch's own track_length - thumb_length
 /// track_start     = S0 - base * Sh / span
 /// track_length    = effective_track + thumb_length
 /// ```
-///
 /// `thumb_length` is taken straight from the caller's own, already-painted
-/// [`quadraui::MinimapLayout::viewport_highlight`] band height — **not**
-/// re-derived here as a naive `Sh * viewport_lines / span` proportion
-/// (#1828 review: that naive form omits `quadraui::fit_thumb`'s
-/// `min_thumb_len` floor, so on a file small enough that the real band is
-/// clamped to the floor — the exact regime
-/// `minimap_drag_keeps_seeking_while_the_button_is_held`'s short fixture
-/// exercises — the naive thumb came out *smaller* than what is actually
-/// painted/hit-tested, throwing off `effective_track`'s complement
-/// `track_length - thumb_length` dispatch itself recomputes and landing a
-/// drag to the strip's middle at ~19% of the file instead of ~50%).
-/// Whichever `thumb_length` is passed in cancels exactly out of dispatch's
-/// own `track_length - thumb_length` (since `track_length` is *defined* as
-/// `effective_track + thumb_length` above), so reusing the real band height
-/// costs nothing and keeps this virtual track's thumb bound to the one
-/// users actually see and click.
-///
-/// Check: at `y = S0`, dispatch's `rel = base/M` → offset `base`; at
-/// `y = S0 + Sh`, `rel = (base+span)/M` → offset `base + span` — the virtual
-/// strip spans exactly the painted window, at `M/span` times the real
-/// strip's resolution. This holds regardless of `thumb_length`'s value, by
-/// the cancellation above.
-///
-/// `grab_offset` is derived by requiring the mapping to be an **identity at
-/// the press point** (dragging zero pixels must reproduce the current
-/// `scroll_top`) rather than by hand-rolling band arithmetic against the
-/// virtual track: `grab_offset = py - track_start - (scroll_top / M) *
-/// effective_track`. This subsumes the non-fine convention (`py - band.y`),
-/// which is the same identity solved against the *real* track/thumb instead.
-///
-/// Returns `None` (falling back to the real, file-wide geometry) when the
-/// window has no line extent (`span == 0`, an empty minimap) or the file
-/// already fits the viewport (`max_scroll == 0`, matching
-/// `dispatch_mouse_drag`'s own `*max_scroll > 0` guard — a zero-`max_scroll`
-/// drag never moves either way, so the geometry choice is moot).
+/// [`quadraui::MinimapLayout::viewport_highlight`] band height, not
+/// re-derived here — reusing the real band height keeps this virtual
+/// track's thumb bound to the one users actually see. `grab_offset` is
+/// derived by requiring the mapping to be an **identity at the press
+/// point** (dragging zero pixels must reproduce the current `scroll_top`)
+/// rather than hand-rolling band arithmetic. Returns `None` when the
+/// window has no line extent or the file already fits the viewport.
 pub(crate) fn fine_seek_geometry(
     bounds: &quadraui::Rect,
     minimap: &quadraui::Minimap,
@@ -1499,7 +994,7 @@ pub(crate) fn fine_seek_geometry(
 
 /// Buffer line a minimap click at `fraction` of the track should scroll to,
 /// resolved against the strip's actual **painted window** — not against
-/// [`quadraui::Minimap::total_buffer_lines`] (#1093). Once the strip holds a
+/// [`quadraui::Minimap::total_buffer_lines`]. Once the strip holds a
 /// fixed-scale window rather than the whole file, "50% down the track" means
 /// "the row halfway through what's currently painted", which for a file
 /// taller than the strip is a real buffer line far short of 50% of the file.
@@ -1545,7 +1040,7 @@ pub struct ContextMenuPanel {
     /// Trigger element height in line_height units (f32; supports
     /// sub-cell rows like GTK's 1.6× tab row). 0.0 = no trigger →
     /// render at click coords (AnchorPoint). Non-zero opts into
-    /// `ContextMenuPlacement::Below` (#434).
+    /// `ContextMenuPlacement::Below`.
     pub trigger_height: f32,
 }
 
@@ -1610,15 +1105,8 @@ pub fn context_menu_panel_to_quadraui_context_menu(
 }
 
 /// The view-local point a `ContextMenuPanel`'s trigger anchors to, in
-/// `char_width`/`line_height` units converted to pixels/cells.
-///
-/// Shared by [`context_menu_generic_layout`] (the in-window path, which
-/// turns it into a zero-width `Rect` for `ContextMenu::layout_at`) and
-/// [`paint_context_menu_rung`]'s native branch (#902, `Backend::
-/// show_context_menu`'s `anchor: Point` parameter) — both must place the
-/// popup at the same spot the trigger (right-click point / menu row) was
-/// at, so this is computed once from `panel.screen_col`/`screen_row`
-/// rather than copied into two call sites that could drift.
+/// `char_width`/`line_height` units converted to pixels/cells. Shared by
+/// the in-window and native paint paths so the two cannot drift.
 pub(crate) fn context_menu_anchor_point(
     panel: &ContextMenuPanel,
     char_width: f64,
@@ -1632,17 +1120,12 @@ pub(crate) fn context_menu_anchor_point(
 
 /// Compute a backend-agnostic [`quadraui::ContextMenuLayout`] for a
 /// `ContextMenuPanel` from just `char_width`/`line_height`. Ports the
-/// char-count width budget both GTK's (formerly dead-code-only)
-/// `draw_context_menu_popup` and TUI's `draw_frame` independently
-/// duplicated, now shared so both backends derive their click geometry
-/// from the same formula (#546).
-///
+/// char-count width budget both backends independently duplicated, now
+/// shared so both derive their click geometry from the same formula.
 /// `border_chrome_inset` shrinks the computed width by `2 * inset` (in
 /// `char_width` units) to account for a border the rasteriser draws
-/// *outside* `layout.bounds` rather than inside it — TUI's ASCII box-drawing
-/// border is external, so it passes `1.0` (matching its pre-#546 inline
-/// `outer_width - 2.0`); GTK draws its border/padding inside the bounds via
-/// the primitive itself, so it passes `0.0`.
+/// *outside* `layout.bounds` rather than inside it — TUI passes `1.0`,
+/// GTK passes `0.0`.
 pub fn context_menu_generic_layout(
     panel: &ContextMenuPanel,
     viewport: quadraui::Rect,
@@ -1703,7 +1186,7 @@ pub struct DialogPanel {
     pub body: Vec<String>,
     /// Each button is `(formatted_label, is_selected, is_cancel)`. `is_cancel`
     /// is derived from the engine-side `DialogButton::action == "cancel"`
-    /// (#727) — it has no other visual effect in-canvas, but flows through
+    /// — it has no other visual effect in-canvas, but flows through
     /// [`dialog_panel_to_quadraui_dialog`] into `quadraui::DialogButton::is_cancel`
     /// so a native GTK `AlertDialog` knows which button Escape/close-box
     /// should activate. Accepted: dialogs with no `action == "cancel"`
@@ -1778,19 +1261,10 @@ pub struct DialogInputPanel {
 
 /// Compute a backend-agnostic [`quadraui::DialogLayout`] for a `DialogPanel`
 /// from just `char_width`/`line_height` — no text-measurement backend access
-/// required. Ports the char-cell approximation formula TUI's `draw_frame`
-/// used inline (`char_width == line_height == 1.0` there, one screen cell),
-/// scaled by real pixel metrics for GTK (#546).
+/// required. Uses a char-cell approximation formula scaled by real pixel metrics.
 ///
-/// Both backends call this (TUI at render time; GTK at render time, since
-/// its ShellApp `render_content` only has generic `&mut dyn Backend`
-/// metrics, not raw Pango) so a dialog's clickable geometry is always
-/// derived from the exact same math the renderer used to paint it — no
-/// more per-backend hand-rolled dialog sizing that can silently drift from
-/// what was actually drawn (previously TUI recomputed a *second*,
-/// independently-formulated copy of this at click time in `mouse.rs`; see
-/// that call site for the follow-up that now reuses this `DialogLayout`
-/// directly via `hit_test` instead).
+/// Both backends call this at render time so a dialog's clickable geometry is
+/// always derived from the exact same math the renderer used to paint it.
 pub fn dialog_generic_layout(
     panel: &DialogPanel,
     viewport: quadraui::Rect,
@@ -1862,14 +1336,11 @@ pub fn dialog_generic_layout(
 }
 
 // Re-export hit-test types and functions from engine so backends can use `render::*`.
-// The find/replace types live in `quadraui::primitives::find_replace`
-// after #271; engine re-exports keep the legacy paths working.
 pub use crate::core::engine::{compute_find_replace_hit_regions, FR_PANEL_WIDTH};
 
 /// The inline find/replace overlay displayed at the top-right of the
-/// active editor group. Lifted to [`quadraui::FindReplacePanel`] in
-/// #271; this alias preserves the legacy `render::FindReplacePanel`
-/// path so existing call sites compile unchanged.
+/// active editor group. This alias provides the legacy `render::FindReplacePanel`
+/// path for existing call sites.
 pub type FindReplacePanel = quadraui::FindReplacePanel;
 
 /// Format a button label with the hotkey character bracketed.
@@ -1919,7 +1390,7 @@ pub struct DiffPeekPopup {
 /// left-aligns with the cursor cell — matches the legacy popup.
 /// `unit_w` / `unit_h` scale cell/row-derived sizes into the caller's
 /// coordinate space — see [`hover_popup_to_quadraui_tooltip`]'s doc for why
-/// this is enough to make the one adapter serve both backends (#669).
+/// this is enough to make the one adapter serve both backends.
 pub fn diff_peek_to_quadraui_tooltip(
     peek: &DiffPeekPopup,
     anchor_x: f32,

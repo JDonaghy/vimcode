@@ -1,30 +1,18 @@
 use super::*;
 
-// ─── Frame composition: the editor band (#764, #735 slice 3) ────────────────
+// ─── Frame composition: the editor band ────────────────
 //
 // The band *below* the chrome band (next section) and the overlay band (below
 // that): the editor column itself — windows, minimap strips, tab bars,
 // breadcrumb bars, group dividers, the tab-drag ghost and the tab-hover
 // tooltip.
 //
-// The divergence this removes, measured on `develop` before #764 — both
-// backends walked the same run of rungs, in two different orders, and one of
-// them was missing a rung outright:
-//
-//   GTK  windows(+`:split` dividers) → minimap → tab bars → breadcrumbs →
-//        tooltip → …editor popups… → **tab-drag ghost**
-//        (no between-group divider paint at all)
-//   TUI  windows(+`:split` dividers) → minimap → tab bars → breadcrumbs →
-//        **group dividers** → tab-drag ghost → tooltip
-//
-// Two real defects fell out of that, not just a cosmetic ordering difference:
+// Two real defects were fixed by centralizing this band's composition:
 //
 //   * **group dividers were never painted on GTK.** `ScreenLayout
-//     ::group_dividers` was populated every frame and hit-tested for drags
-//     (`gtk/click.rs`'s `screen_zone_hit_test`), so a `Ctrl+W v` boundary was
-//     draggable but invisible — input and paint disagreeing, the #587/#592
-//     failure shape verbatim, and exactly what #735's own body predicted this
-//     slice would find. GTK discarded the field into `_group_dividers` and
+//     ::group_dividers` was populated every frame and hit-tested for drags,
+//     so a `Ctrl+W v` boundary was draggable but invisible — input and
+//     paint disagreeing. GTK discarded the field into `_group_dividers` and
 //     painted only `window_dividers` (the `:split`/`:vsplit` boundaries
 //     *within* a group).
 //   * **the tab-drag ghost sat on the wrong side of the editor popups on
@@ -37,7 +25,7 @@ use super::*;
 // backends walk it.
 //
 // **Why here and not in quadraui** (`CLAUDE.md`'s "check quadraui first"):
-// the same verdict slices 1 and 2 recorded, re-run for this band. quadraui's
+// the same verdict applies to this band as to slices 1 and 2. quadraui's
 // `compose::app_shell::AppShell` hands both backends the *shell's* zones and
 // stops at `main_content_bounds`; what vimcode stacks inside that rect —
 // which of N editor groups gets a tab bar, where the breadcrumb row sits
@@ -72,7 +60,7 @@ pub enum EditorOp {
     /// windows because the strip is inset into the window's own right edge.
     Minimap,
     /// One tab bar per editor group (`ScreenLayout::group_tab_bars` via
-    /// [`tab_bar_draw_targets`]). A single group is a split of one (#551), so
+    /// [`tab_bar_draw_targets`]). A single group is a split of one, so
     /// there is no separate "unsplit" rung.
     TabBars,
     /// One breadcrumb bar per group, below that group's tab bar
@@ -88,7 +76,7 @@ pub enum EditorOp {
     /// tab row. A stacked (`Ctrl+W s`) boundary runs *through* one instead —
     /// this rung's body ([`painted_group_dividers`]) never paints that
     /// direction at all, relying on the lower group's own tab row to read as
-    /// the separator (#1586) — so composition order is moot for it either
+    /// the separator — so composition order is moot for it either
     /// way.
     GroupDividers,
     /// The tab-drag drop feedback: drop-zone highlight, insertion bar and the
@@ -106,7 +94,7 @@ pub enum EditorOp {
 /// we stack the editor column in" is one artefact rather than two
 /// transcriptions. Adding a surface means adding a variant here — a compile
 /// error in both backends' `match` until both handle it, which is what makes
-/// "populated but never composed" (#587/#592) structurally harder to reach,
+/// "populated but never composed" structurally harder to reach,
 /// and is precisely the guard [`EditorOp::GroupDividers`] did not have.
 ///
 /// The whole band sits *below* [`FRAME_Z_ORDER`]: every editor rung is
@@ -128,10 +116,9 @@ pub const EDITOR_Z_ORDER: [EditorOp; 7] = [
 
 /// Is this group's tab bar painted this frame?
 ///
-/// The single predicate behind both [`tab_bar_draw_targets`]'s filter and
-/// [`compose_editor_band`]'s `TabBars` gate, so the gate cannot claim a rung
-/// the paint then skips (or vice versa) — the drift [`FrameOp`]'s two
-/// hand-written sidebar/menu-row gates had actually accumulated before #763.
+/// Both [`tab_bar_draw_targets`]'s filter and [`compose_editor_band`]'s
+/// `TabBars` gate use this same predicate, so the gate cannot claim a rung
+/// the paint then skips (or vice versa).
 pub(crate) fn tab_bar_is_drawn(engine: &Engine, gtb: &GroupTabBar) -> bool {
     !engine.is_tab_bar_hidden(gtb.group_id) && gtb.bounds.width > 0.0
 }
@@ -145,16 +132,14 @@ pub(crate) fn breadcrumb_is_drawn(bc: &BreadcrumbBar) -> bool {
 
 /// Which editor rungs a frame in this state must compose, in canonical order.
 ///
-/// Like [`compose_frame`], this returns
-/// only the *live* rungs: no editor rung owns a hit-test cache that has to be
-/// cleared from an absent branch (the two that come closest — GTK's tab pixel
-/// hit maps and the breadcrumb draw layouts — are cleared wholesale at the top
-/// of the frame, before the walk).
+/// Like [`compose_frame`], this returns only the *live* rungs: no editor rung
+/// owns a hit-test cache that has to be cleared from an absent branch (the two
+/// that come closest — GTK's tab pixel hit maps and the breadcrumb draw
+/// layouts — are cleared wholesale at the top of the frame, before the walk).
 ///
 /// `drag_active` is the one input that is not derivable from `screen`: the
-/// drag lives in each backend's own `render::TabDragState` (GTK's
-/// `App::tab_drag`, TUI's the pre-#1434 TUI shell's `tab_drag`), not in `ScreenLayout`.
-/// Both pass `tab_drag.source().is_some()`.
+/// drag lives in each backend's own `render::TabDragState`, not in `ScreenLayout`.
+/// Both backends pass `tab_drag.source().is_some()`.
 pub fn compose_editor_band(
     engine: &Engine,
     screen: &ScreenLayout,
@@ -180,14 +165,13 @@ pub fn compose_editor_band(
             }
             // Naturally empty with a single group — `GroupLayout::Leaf
             // ::dividers()` returns `vec![]` — so this needs no
-            // `editor_group_split.is_some()` gate (#551). Gated on the
-            // *painted* set (#1586's `painted_group_dividers`), not the raw
-            // one: a frame whose only group divider is a stacked one (never
-            // painted, see that fn's doc) composes no line at all, so this
+            // `editor_group_split.is_some()` gate. Gated on the *painted* set,
+            // not the raw one: a frame whose only group divider is a stacked one
+            // (never painted, see that fn's doc) composes no line at all, so this
             // rung isn't live for it either — keeps this filter and
-            // [`paint_editor_band_rungs`]'s body from being able to
-            // disagree about what "live" means for this op, the same
-            // invariant [`tab_bar_is_drawn`] states for `TabBars`.
+            // [`paint_editor_band_rungs`]'s body from being able to disagree about
+            // what "live" means for this op, the same invariant [`tab_bar_is_drawn`]
+            // states for `TabBars`.
             EditorOp::GroupDividers => !painted_group_dividers(&screen.group_dividers).is_empty(),
             EditorOp::TabDragOverlay => drag_active,
             EditorOp::TabTooltip => screen.tab_tooltip.is_some(),
@@ -258,7 +242,7 @@ pub struct EditorBandUnits {
 }
 
 impl EditorBandUnits {
-    /// One terminal cell — what the pre-#1434 TUI shell's `paint_editor_band` composes in.
+    /// One terminal cell — what the TUI shell's `paint_editor_band` composes in.
     pub const CELL: Self = Self {
         metrics: FrameMetrics::CELL,
         tab_row_h: 1.0,
@@ -276,34 +260,25 @@ impl EditorBandUnits {
     }
 }
 
-// #1499: [`paint_editor_band_rungs`]'s four "genuinely per-backend" rungs —
-// `Windows`, `TabBars`, `GroupDividers`, `TabDragOverlay` — used to live
-// behind a `host: &mut impl EditorBandHost<'screen>` trait, implemented once
-// per backend (`GtkEditorBandHost` in `app.rs`, a TUI twin before #1434).
-// With only `App` left, the function takes `app: &App` plus the
-// `window_editors`/`hit_bars` accumulators directly instead — see its own
-// doc below.
+// The four "genuinely per-backend" rungs — `Windows`, `TabBars`,
+// `GroupDividers`, `TabDragOverlay` — take `app: &App` plus the
+// `window_editors`/`hit_bars` accumulators directly.
 //
 // `Minimap`, `Breadcrumbs` and `TabTooltip` need no `app` at all: their
-// bodies were already byte-identical between GTK and TUI, which is exactly
-// what made them safe to inline into the shared walk directly rather than
-// leaving them as a fifth/sixth/seventh trivial forwarding method.
+// bodies are byte-identical between backends, inlined into the shared walk
+// directly.
 //
 // [`EditorOp::Windows`] (every editor window's text, gutter, per-window
 // status line and the `:split`/`:vsplit` divider lines within each group)
 // accumulates each window's owned `quadraui::Editor` into `window_editors` so
-// `App`'s own `FrameHitMap` (#449) hit-tests the exact objects just painted,
-// never a second copy that could drift. [`EditorOp::TabBars`] (one tab bar
-// per editor group) similarly recovers the rasteriser's exact *pixel* hit
-// geometry (`cached_tab_pixel_hits`/`cached_tab_close_abs`/
-// `cached_tab_slots_abs`) for pixel-accurate click/hover resolution (#515,
-// #703, #764) into `hit_bars`. [`EditorOp::GroupDividers`] (the
-// between-*group* `Ctrl+W v`/`Ctrl+W s` boundary lines) and
-// [`EditorOp::TabDragOverlay`] (the tab-drag drop-zone highlight, insertion
-// bar and dragged-tab ghost) need no accumulator at all.
+// `App`'s own `FrameHitMap` hit-tests the exact objects just painted.
+// [`EditorOp::TabBars`] (one tab bar per editor group) similarly recovers
+// the rasteriser's exact *pixel* hit geometry into `hit_bars`.
+// [`EditorOp::GroupDividers`] (the between-*group* `Ctrl+W v`/`Ctrl+W s`
+// boundary lines) and [`EditorOp::TabDragOverlay`] (the tab-drag drop-zone
+// highlight, insertion bar and dragged-tab ghost) need no accumulator.
 
-/// The shared **editor band** walk (#1251): the single ordered loop both
-/// the pre-#1434 TUI shell's `paint_editor_band` and `App::compose_editor_band_rungs` run
+/// The shared **editor band** walk: the single ordered loop both backends run
 /// over [`compose_editor_band`], replacing what used to be two hand-written
 /// copies of the same seven-armed `match`. `Minimap`, `Breadcrumbs` and
 /// `TabTooltip` paint identically on both backends (modulo `units`) and are
@@ -316,10 +291,8 @@ impl EditorBandUnits {
 /// tab strip's own painted row height. `window_editors`/`hit_bars` accumulate
 /// across the `Windows`/`TabBars` calls — the caller destructures them back
 /// out once this returns, to build its `FrameHitMap`. Returns the rungs
-/// actually composed, in order, for the caller to stash and validate with
-/// [`check_editor_band_order`] — callers do that themselves (rather than this
-/// function doing it) so the assertion message keeps each backend's own
-/// "TUI "/"GTK " prefix, unchanged from before this convergence.
+/// actually composed, in order, for the caller to validate with
+/// [`check_editor_band_order`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_editor_band_rungs<'screen>(
     backend: &mut dyn quadraui::Backend,
@@ -343,7 +316,7 @@ pub(crate) fn paint_editor_band_rungs<'screen>(
                 units.metrics.line_height as f64,
                 window_editors,
             ),
-            // #35/#722: minimap strips on every window's right edge (one
+            // Minimap strips on every window's right edge (one
             // entry per `WindowId` in `screen.minimap`, not just the active
             // window's) — one call, the rasteriser is quadraui's.
             EditorOp::Minimap => draw_minimap_strip(backend, screen),
@@ -401,7 +374,7 @@ pub(crate) fn paint_editor_band_rungs<'screen>(
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Bottom band (#765, #735 slice 4)
+// Bottom band (#735 slice 4)
 // ══════════════════════════════════════════════════════════════════════════
 //
 // The fourth and last of #735's *ordered runs*. Below the editor column
@@ -410,77 +383,44 @@ pub(crate) fn paint_editor_band_rungs<'screen>(
 // quickfix, the bottom panel (terminal / debug output), the debug toolbar, the
 // separated status line, and the sidebar-item hover popup that overhangs them.
 //
-// Before this slice that run was transcribed **three** times — GTK's
-// `render_content`, TUI's `render_content`, and TUI's `#[cfg(test)]`
+// Before this composition was centralized, the run was transcribed three times
+// — GTK's `render_content`, TUI's `render_content`, and TUI's `#[cfg(test)]`
 // `draw_frame` parity twin — and the three transcriptions had drifted in four
 // separate ways, three of them real defects rather than cosmetic ordering:
 //
 //   * **GTK's panel-hover popup could not clear its own click-routing cache.**
-//     The rung lived *inside* the [`FrameOp::SidebarPanel`] arm, nested under
-//     `if let Some(q_sb) = layout.sidebar_content_bounds`, and so were its two
-//     cache resets. Collapse the sidebar while a source-control / extension
-//     item tooltip was up and `App::panel_hover_popup_rect` kept the last
-//     painted rect **forever**: `handle_mouse_press` went on arbitrating
-//     clicks against a popup that was no longer on screen, swallowing them
-//     before the editor ever saw them. Input and paint disagreeing about a
-//     surface that is not painted — the #587/#592 failure shape verbatim, and
-//     precisely what a band walk makes structurally hard to reach, since
-//     [`BottomOp::PanelHover`] is now composed (or not) at the top level where
-//     the absent branch is reachable.
-//   * **TUI's debug toolbar had the mirror-image bug.** Its rung had no `else`
-//     at all, so the pre-#1434 TUI shell's `debug_toolbar_rect` kept its last value when
-//     the toolbar hid — while GTK's `else` zeroed the equivalent two caches.
-//     Two backends, two different halves of the same cache-clearing rule.
+//     The rung lived nested under the sidebar rung, so caches were not reset
+//     when the sidebar collapsed. A source-control / extension item tooltip
+//     left open while collapsing would keep its last painted rect forever:
+//     `handle_mouse_press` would arbitrate clicks against a popup no longer on
+//     screen. Input and paint disagreeing about what is painted.
+//   * **TUI's debug toolbar had the mirror-image bug.** Its rung had no else
+//     case, so the toolbar's rect kept its last value when the toolbar hid,
+//     while GTK's else zeroed the equivalent caches. Two backends, two
+//     different halves of the same cache-clearing rule.
 //   * **the separated status line was composed in two different places.** TUI
 //     painted it *second*, before the bottom panel; GTK painted it *fourth*,
 //     after the debug toolbar. Both backends' *geometry* agrees it belongs
-//     last (GTK's `separated_status_y` y-cursor chain, TUI's own
-//     `bottom_chrome_rects_for_shell_content` constraint array, which orders
-//     `[editor, quickfix, bottom, debug, separated_status]`), so TUI's paint
-//     order contradicted TUI's own layout order. Benign only for as long as no
-//     rung in the band ever overdraws its neighbour. [`BOTTOM_Z_ORDER`] takes
-//     the geometry order, which both backends already reserved space in.
+//     last, so TUI's paint order contradicted TUI's own layout order.
+//     [`BOTTOM_Z_ORDER`] takes the geometry order, which both backends already
+//     reserved space in.
 //   * the two gates for the bottom panel itself were spelled differently —
-//     GTK tested `el.terminal_h > 0.0` (a *height*, downstream of the rule),
-//     TUI `chrome.bottom_panel.height > 0`. [`bottom_panel_is_drawn`] is now
-//     the rule itself, stated once.
+//     GTK tested `el.terminal_h > 0.0`, TUI `chrome.bottom_panel.height > 0`.
+//     [`bottom_panel_is_drawn`] is now the rule itself, stated once.
 //
-// **Why here and not in quadraui** (`CLAUDE.md`'s "check quadraui first"): the
-// same verdict slices 1–3 recorded, re-run for this band. quadraui *does* ship
-// a `BottomPanelController` — and `AppShellLayout::bottom_panel_bounds` with
-// it — but it models a single generic drawer, not vimcode's stack of five
-// independently-gated bands with a hover popup overhanging them; it is `None`
-// for the pre-#1434 TUI shell and unwired on GTK for exactly that reason (see
-// `bottom_chrome_rects_for_shell_content`'s doc comment). What vimcode stacks
-// below its editor column, and in what order, is vimcode's own app-level
-// composition. The *rasterisers* underneath every rung are already quadraui's
-// (`draw_list`, `draw_tab_bar`, `draw_terminal`, `draw_terminal_divider`,
-// `draw_text_display`, `draw_status_bar`, `draw_rich_text_popup`) — there is
-// no per-backend painting left to lift, only per-backend *sequencing*, which
-// is what this slice deletes.
+// **Why here and not in quadraui** (`CLAUDE.md`'s "check quadraui first"):
+// quadraui *does* ship a `BottomPanelController`, but it models a single
+// generic drawer, not vimcode's stack of five independently-gated bands with a
+// hover popup overhanging them. What vimcode stacks below its editor column,
+// and in what order, is vimcode's own app-level composition. The *rasterisers*
+// underneath every rung are already quadraui's — there is no per-backend
+// painting left to lift, only per-backend *sequencing*, which is what this
+// slice deletes.
 //
-// **Re-examined for #820** ("adopt `BottomPanelController` on GTK"), which
-// filed against a grep that read "0 uses in `src/app.rs`" as an unstarted
-// adoption. It isn't: both backends' zero call sites are deliberate (this
-// paragraph, `bottom_chrome_rects_for_shell_content`'s doc comment in
-// `tui_main/render_impl.rs`, and the pre-#1434 TUI shell's `render_content`'s own note by
-// `BottomChromeRects`'s construction all record the same verdict), and the
-// "3 mentions in the TUI" #820 read as partial progress are those three
-// rejection notes, not partial implementation. The blocker restated: `AppShell`
-// positions `BottomPanelController` as the last band before the content
-// area's bottom edge, so it cannot coexist with the debug toolbar and
-// separated-status rows vimcode stacks *below* the terminal/debug-output
-// panel — adopting it would need a `ShellConfig`/`AppShellLayout` capable of
-// more than one independently-gated bottom band, which does not exist
-// upstream today.
-//
-// **That upstream gap has since shipped.** quadraui#997 (`d1b1931`) added N
+// **That upstream gap has since shipped.** quadraui#997 added N
 // independently-gated stacked bottom bands, and vimcode's pinned rev carries
-// it (the "multi-band bottom chrome" draft in
-// `docs/PENDING_QUADRAUI_ISSUES.md` was struck 2026-09-22, #1259). The
-// "does not exist upstream" blocker above is therefore historical: moving this
-// band onto the shipped API is now an adoption question for vimcode, not a
-// missing quadraui capability.
+// it. Moving this band onto the shipped API is now an adoption question for
+// vimcode, not a missing quadraui capability.
 
 /// One rung of the shared **bottom band** — the stack of chrome vimcode carves
 /// out of the bottom of `AppShellLayout::main_content_bounds`.
@@ -509,12 +449,10 @@ pub enum BottomOp {
     SeparatedStatus,
     /// The sidebar-item dwell tooltip (`ScreenLayout::panel_hover`).
     ///
-    /// In the band rather than beside the sidebar body it describes, because
-    /// it is clamped against the *whole* content viewport and deliberately
-    /// overhangs rightward past the sidebar's own bounds — so it must be
-    /// composed after everything it can overhang, which is the entire stack
-    /// above. GTK used to nest it inside the sidebar rung instead; see the
-    /// module note for the stale-cache bug that caused.
+    /// Painted after everything it can overhang, in the band rather than beside
+    /// the sidebar body it describes, because it is clamped against the *whole*
+    /// content viewport and deliberately overhangs rightward past the sidebar's
+    /// own bounds.
     PanelHover,
 }
 
@@ -556,19 +494,12 @@ pub fn bottom_panel_is_drawn(engine: &Engine) -> bool {
 /// Is the sidebar-item hover popup painted this frame?
 ///
 /// `screen.panel_hover` is populated only while the pointer is dwelling on an
-/// item of a sidebar panel that has tooltips, so it already implies the
-/// "source control or extension panel" test TUI's call site used to spell out
-/// a second time — `render_panel_hover_popup` and [`panel_hover_popup_paint`]
-/// both return early on `None` regardless.
+/// item of a sidebar panel that has tooltips.
 ///
 /// `sidebar_open` is the one input that is not derivable from `screen` — the
-/// same shape as [`compose_editor_band`]'s `drag_active`. Both live backends
-/// pass `layout.sidebar_content_bounds.is_some()`: the popup is anchored to
-/// the sidebar's *right edge*, so an open sidebar is what gives it an anchor
-/// at all. Note this is deliberately **not** `app_shell.sidebar_visible()`,
-/// which the two backends disagreed about — TUI tested both, GTK only the
-/// bounds — and which is `false` for a default engine whose sidebar band the
-/// shell has nonetheless reserved.
+/// same shape as [`compose_editor_band`]'s `drag_active`. Both backends pass
+/// `layout.sidebar_content_bounds.is_some()`: the popup is anchored to the
+/// sidebar's *right edge*, so an open sidebar is what gives it an anchor.
 pub fn panel_hover_is_drawn(screen: &ScreenLayout, sidebar_open: bool) -> bool {
     sidebar_open && screen.panel_hover.is_some()
 }
@@ -657,11 +588,7 @@ pub(crate) fn bottom_band_fixture(panel_hover: bool) -> Vec<BottomOp> {
 /// on screen, given `visible_rows` rows of body (i.e. the panel height minus
 /// its one header row).
 ///
-/// GTK recomputes this statelessly every frame — it has no persistent
-/// `quickfix_scroll_top` to advance from key events, the way the pre-#1434 TUI shell
-/// does — so it lived inline in `render_content` as eight lines of arithmetic.
-/// Shared here so the two backends cannot disagree about what "keep the
-/// selection visible" means.
+/// Shared so both backends compute this the same way.
 pub fn quickfix_scroll_top(qf: &QuickfixPanel, visible_rows: usize) -> usize {
     if visible_rows == 0 {
         0
@@ -672,11 +599,7 @@ pub fn quickfix_scroll_top(qf: &QuickfixPanel, visible_rows: usize) -> usize {
 
 /// The [`BottomOp::Quickfix`] rung's whole body on both backends.
 ///
-/// One `quickfix_to_list_view` adapter call and one `Backend::draw_list`; the
-/// only thing the two call sites ever differed on was where `scroll_offset`
-/// came from, which stays the caller's (GTK recomputes it via
-/// [`quickfix_scroll_top`], TUI carries the pre-#1434 TUI shell's `quickfix_scroll_top`
-/// across frames so `:cnext` can advance it).
+/// One `quickfix_to_list_view` adapter call and one `Backend::draw_list`.
 pub fn paint_quickfix_rung(
     b: &mut dyn quadraui::Backend,
     qf: &QuickfixPanel,
@@ -694,11 +617,8 @@ pub fn paint_quickfix_rung(
 /// The [`BottomOp::SeparatedStatus`] rung's whole body on both backends.
 ///
 /// Returns the `StatusBarLayout` the paint resolved, so the caller can record
-/// its segment hit zones (#672) without a second no-paint measurement of the
-/// same bar — the #654/#703 desync shape [`PaintedTabBar`]'s doc comment
-/// describes. GTK used to `draw` and then call `backend.status_bar_layout` on
-/// the same rect, laying the row out twice per frame; that second call is what
-/// this returns instead.
+/// its segment hit zones without a second measurement. GTK used to measure
+/// twice, and a headless frame can resolve differently the second time.
 pub fn paint_separated_status_rung(
     b: &mut dyn quadraui::Backend,
     status: &WindowStatusLine,
@@ -710,26 +630,19 @@ pub fn paint_separated_status_rung(
 }
 
 /// Paint a plain, content-free fill behind the "real" status bar at
-/// `real_bg` — #1690's edge-to-edge VS Code parity backdrop, shared by
+/// `real_bg` — the edge-to-edge VS Code parity backdrop, shared by
 /// `App::paint_editor_windows_rung`'s single-window case and
 /// `App::compose_bottom_band_rungs`'s `SeparatedStatus` arm.
 ///
 /// Deliberately a *separate* paint rather than widening the real bar's own
 /// rect: AppShell's activity-bar/sidebar click hit-test runs before
-/// `App::handle` ever sees the event (quadraui's `ShellAdapter::handle`),
-/// so widening the real bar would move its segments' hit zones into screen
-/// positions a click can never actually reach — see [`status_bands`]'s doc
-/// for the longer version. This backdrop carries no segments of its own
-/// (so it is never stored in a click-hit map and can't be clicked), just
-/// the real bar's own fill colour, painted into `rect` — which callers
-/// widen to the real window/terminal width (`Backend::viewport().width`)
-/// while the real bar underneath stays window/main-content-bounded.
+/// `App::handle` ever sees the event, so widening the real bar would move its
+/// segments' hit zones into screen positions a click can never actually reach.
+/// This backdrop carries no segments of its own, just the real bar's own fill
+/// colour, painted into `rect`.
 ///
-/// `real_bg` is `None` when the real bar has no segments at all (nothing
-/// to colour-match), in which case this is a no-op — matching
-/// `status_bar.rs::paint`'s own "no segments → `theme.background`" default
-/// would risk painting a visibly different fill than whatever the real bar
-/// ends up using once it *does* have segments.
+/// `real_bg` is `None` when the real bar has no segments at all, in which case
+/// this is a no-op.
 pub fn paint_status_backdrop(
     b: &mut dyn quadraui::Backend,
     id: &str,
@@ -755,11 +668,10 @@ pub fn paint_status_backdrop(
 
 /// The unit system one backend composes [`paint_bottom_panel_rung`] in.
 ///
-/// Everything here is a genuine rasteriser difference #735 exists to preserve,
-/// not a behaviour knob: Cairo repaints the whole surface every frame so GTK
-/// needs no background pass, while ratatui coalesces cells and must blank the
-/// terminal body itself; and a scrollbar gutter is six *pixels* on GTK and
-/// nothing at all in a cell grid.
+/// Everything here is a genuine rasteriser difference: Cairo repaints the whole
+/// surface every frame so GTK needs no background pass, while ratatui coalesces
+/// cells and must blank the terminal body itself; and a scrollbar gutter is six
+/// *pixels* on GTK and nothing at all in a cell grid.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BottomPanelUnits {
     /// One line / one column, in the caller's units.
@@ -774,7 +686,7 @@ pub struct BottomPanelUnits {
 }
 
 impl BottomPanelUnits {
-    /// One terminal cell — what the pre-#1434 TUI shell's `render_content` composes in.
+    /// One terminal cell — what the TUI shell's `render_content` composes in.
     pub const CELL: Self = Self {
         metrics: FrameMetrics::CELL,
         terminal_scrollbar: None,
@@ -796,9 +708,6 @@ impl BottomPanelUnits {
 /// including the toolbar row, the split divider and both scroll surfaces.
 ///
 /// `rect` is the whole panel band in the caller's units, tab strip included.
-/// The three transcriptions of this that existed before #765 ran to ~170 lines
-/// on GTK and ~120 apiece in TUI's two composers, and the debug-output arm's
-/// scrollbar mapping was duplicated character-for-character between them.
 pub fn paint_bottom_panel_rung(
     b: &mut dyn quadraui::Backend,
     engine: &Engine,
@@ -853,14 +762,9 @@ pub fn paint_bottom_panel_rung(
                         &bar,
                         &quadraui::InteractionState::new(),
                     );
-                    // No raw `pango::Layout` is reachable from a `&mut dyn
-                    // Backend`-only signature (the #669 gap), so segment widths
-                    // are approximated by char count * `cw` rather than exact
-                    // glyph measurement — affects hit-region precision only,
-                    // not paint.
-                    // The two call sites spelled this gap `16.0` (GTK px) and
-                    // `2.0` (TUI cells); at GTK's ~8px char width those are the
-                    // same two-character gap, so it is `2.0 * cw` in both.
+                    // Segment widths are approximated by char count * `cw`
+                    // rather than exact glyph measurement — affects hit-region
+                    // precision only, not paint.
                     let layout = bar.layout(rect.width, lh, 2.0 * cw, |seg| {
                         quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32 * cw)
                     });
@@ -883,11 +787,8 @@ pub fn paint_bottom_panel_rung(
             let body = quadraui::Rect::new(rect.x, content_y, rect.width, content_h);
             let visible_rows = (content_h / lh) as usize;
 
-            // ratatui coalesces cells, so the body has to be blanked before
+            // ratatui coalesces cells, so the body must be blanked before
             // the grid lands on it; Cairo has already cleared the surface.
-            // `draw_status_bar`'s TUI rasteriser fills the *entire* row with
-            // the first segment's `bg` before painting text, so an empty-text
-            // segment reproduces a solid fill exactly (the #607 trick).
             if units.clear_terminal_bg {
                 let bg_bar = quadraui::StatusBar {
                     id: quadraui::WidgetId::new("terminal:bg"),
@@ -921,9 +822,7 @@ pub fn paint_bottom_panel_rung(
             );
             engine.terminal_split_layout.replace(td.split);
             if let Some(split) = &td.split {
-                // #635 (Stage 6b): `Backend::draw_terminal_divider`
-                // (JDonaghy/quadraui#533) closed the gap that used to keep the
-                // trait-only signature from painting a split at all.
+                // Both backends now support painting a split divider.
                 let left = td.left.as_ref().unwrap();
                 let right = td.right.as_ref().unwrap();
                 b.draw_terminal(split.left, left);
@@ -1031,19 +930,12 @@ pub fn paint_bottom_panel_rung(
 
 /// One tab bar as [`paint_tab_bars`] left it.
 ///
-/// `layout` is the geometry the rasteriser *actually resolved while
-/// painting*, not a second no-paint measurement of the same bar. That
-/// distinction is the #654/#703 desync in structural form: GTK used to paint
-/// with `draw_tab_bar_icons` and then re-measure with `tab_bar_layout_icons`,
-/// two calls that agree only as long as nobody changes the font, the icon
-/// sidecar or the chrome between them. `Backend::draw_tab_bar_icons_layout`
-/// already returns the same `TabBarLayout` type, so the paint's own answer
-/// is both cheaper and impossible to desync.
+/// `layout` is the geometry the rasteriser *actually resolved while painting*,
+/// not a second measurement of the same bar. The paint's own answer is both
+/// cheaper and impossible to desync from paint.
 ///
-/// `layout`'s own geometry (`visible_tabs`/`visible_segments`/`hit_regions`)
-/// is bar-**relative** (see that type's doc) — callers needing absolute
-/// screen coordinates add `rect`'s own origin back in (#1491; see
-/// `click::GroupTabBarLayoutMap`).
+/// `layout`'s own geometry is bar-**relative** — callers needing absolute
+/// screen coordinates add `rect`'s own origin back in.
 pub struct PaintedTabBar<'a> {
     pub group_id: GroupId,
     /// The rect the bar was painted into, in the caller's units.
@@ -1056,16 +948,10 @@ pub struct PaintedTabBar<'a> {
 /// body on both backends.
 ///
 /// `tab_row_h` / `reserved_h` are [`tab_bar_draw_targets`]'s, in the caller's
-/// units (GTK: `tab_row_height_px` / `tab_bar_height_px`; TUI: `1.0` and 1-or-2
-/// rows). `hovered_close` is the `(group, tab)` whose close glyph the pointer
-/// is over, so the rasteriser can tint it; TUI passes `None` (it has no
-/// close-glyph hover state).
+/// units. `hovered_close` is the `(group, tab)` whose close glyph the pointer
+/// is over, so the rasteriser can tint it; TUI passes `None`.
 ///
-/// Returns one [`PaintedTabBar`] per bar, in paint order. Both backends cache
-/// `rect`/`layout` per group (`click::GroupTabBarLayoutMap`) for hit-testing
-/// and the tab-drop/visible-column engine feedback that used to read
-/// `TabBarHits`; GTK also re-pushes `rect`/`bar` into the separate
-/// `ScreenLayout` it builds a `FrameHitMap` from.
+/// Returns one [`PaintedTabBar`] per bar, in paint order.
 pub fn paint_tab_bars<'a>(
     backend: &mut dyn quadraui::Backend,
     engine: &Engine,
@@ -1078,7 +964,7 @@ pub fn paint_tab_bars<'a>(
         .into_iter()
         .map(|target| {
             let hover = hovered_close.and_then(|(gid, i)| (gid == target.group_id).then_some(i));
-            // #703: `draw_tab_bar_icons_layout` with an empty sidecar is
+            // `draw_tab_bar_icons_layout` with an empty sidecar is
             // byte-identical to `draw_tab_bar_layout` (quadraui's
             // `draw_tab_bar_layout` literally forwards to it with `&[]`), so
             // the Nerd-Fonts-off path keeps today's geometry exactly.
@@ -1094,15 +980,12 @@ pub fn paint_tab_bars<'a>(
         .collect()
 }
 
-/// Paint every group's breadcrumb bar and stash each bar's draw-time layout —
-/// the [`EditorOp::Breadcrumbs`] rung's whole body on both backends.
+/// Paint every group's breadcrumb bar — the [`EditorOp::Breadcrumbs`] rung's
+/// whole body on both backends.
 ///
 /// The stashed `StatusBarLayout` is what `resolve_breadcrumb_click` hit-tests
-/// against later, and it is the value `draw_status_bar` *returned from the
-/// paint*, not a separate `status_bar_layout` re-measure of the same bar —
-/// same reasoning as [`PaintedTabBar::hits`]. GTK previously did make that
-/// second call; on a headless `GtkDriver` frame it can resolve differently
-/// from the paint, which is the class of measure/paint desync #654 was.
+/// against later, and it is the value `draw_status_bar` returned from the
+/// paint, not a separate re-measure of the same bar.
 pub fn paint_breadcrumb_bars(
     backend: &mut dyn quadraui::Backend,
     screen: &ScreenLayout,
@@ -1120,17 +1003,11 @@ pub fn paint_breadcrumb_bars(
 /// Generic over [`DividerGeometry`] so the same call serves both
 /// `ScreenLayout::window_dividers` (the `:split`/`:vsplit` boundaries inside a
 /// group, part of the [`EditorOp::Windows`] rung) and
-/// `ScreenLayout::group_dividers` (the [`EditorOp::GroupDividers`] rung) —
-/// `divider_to_split` already accepts either.
+/// `ScreenLayout::group_dividers` (the [`EditorOp::GroupDividers`] rung).
 ///
 /// This is GTK's rasterisation of both rungs. TUI paints its dividers cell by
-/// cell instead (`render_impl::render_group_dividers`), because it carries the
-/// #481 guard that suppresses a divider column immediately beside a
-/// neighbouring window's scrollbar — a coalescence problem that exists only in
-/// a character grid. Per [`FrameMetrics`]'s note, rect math and rasterisation
-/// stay per backend by design; what this slice shares is *which* dividers are
-/// painted and *when*, which is what had actually drifted (GTK painted the
-/// group set not at all).
+/// cell instead, because it carries a guard that suppresses a divider column
+/// immediately beside a neighbouring window's scrollbar.
 pub fn draw_dividers_as_splits<D: DividerGeometry>(
     backend: &mut dyn quadraui::Backend,
     dividers: &[D],
@@ -1143,76 +1020,23 @@ pub fn draw_dividers_as_splits<D: DividerGeometry>(
 }
 
 /// Which of `screen.group_dividers` [`EditorOp::GroupDividers`] actually
-/// paints a line for (#1586).
+/// paints a line for.
 ///
-/// A **stacked** (`SplitDirection::Horizontal` in vimcode's own naming —
-/// top/bottom) group divider's `position` sits exactly where
-/// `GroupLayout::calculate_group_rects` starts reserving `tab_bar_height`
-/// for the *lower* group's own tab row (`GroupLayout::dividers`/
-/// `calculate_group_rects` share one `quadraui::SplitTree::layout` pass, so
-/// the two can never disagree about where that boundary is). Painting a real
-/// divider line there — any thickness a backend chooses, TUI's 1-cell-thick
-/// renderer or a GTK/macOS/Win rasteriser's own independently-derived pixel
-/// width — necessarily overwrites part of that row: TUI's whole 1-cell-tall
-/// bar (#1586's reported symptom: "no tab row at all, just a divider line,
-/// then breadcrumbs"), or a GTK/macOS line through the tab labels.
+/// A **stacked** group divider's `position` sits exactly where a tab row
+/// begins. Painting a real divider line there necessarily overwrites part of
+/// that row.
 ///
-/// The fix is not to reserve extra space for the divider (the "Wanted"
-/// option this issue's body rejected): a backend's real divider-line
-/// thickness is picked entirely inside that backend's own `Split::layout`
-/// (e.g. quadraui's `pixel::DIVIDER` on GTK/macOS/Win), independent of
-/// whatever thickness vimcode's own core layer might reserve — so a fixed
-/// "reserve N logical units" number picked in `core::window` can never be
-/// guaranteed to cover what each backend actually paints. Instead, a
-/// stacked group divider is simply never painted: the lower group's own tab
-/// row is *already* a full-width, differently-styled band immediately below
-/// the boundary, so it already reads as the separator with nothing extra —
-/// exactly the affordance TUI's own hit-test tolerance already assumed
-/// (`DividerMetrics::group_horizontal`'s `(0.0, tab_bar_rows)` band reaches
-/// across the whole tab-bar block precisely because "there is no separate
-/// glyph to aim at" was already the intended design for this direction, see
-/// `DividerState::on_tab_bar`'s doc).
+/// The fix is not to reserve extra space for the divider: a backend's real
+/// divider-line thickness is picked entirely inside that backend's own
+/// `Split::layout`, independent of whatever thickness vimcode's own core
+/// layer might reserve. Instead, a stacked group divider is simply never
+/// painted: the lower group's own tab row already reads as the separator.
 ///
 /// Side-by-side (`Vertical`) group dividers are untouched — they run
-/// *alongside* a tab row, not *through* one, so nothing here changes for
-/// them (#1586's explicit "keep the side-by-side case exactly as it is
-/// today").
+/// *alongside* a tab row, not *through* one.
 ///
 /// `screen.group_dividers` itself is **not** filtered — only this paint-time
-/// view is. Hit-testing/drag (`route_divider_grab`/`apply_divider_drag`/
-/// `divider_ratio_from_pos`) still sees every divider, stacked or not, and
-/// resizing a stacked split by dragging its (now invisible, tab-row-shaped)
-/// boundary is unaffected.
-///
-/// ## #1586's macOS-GUI symptoms — which of them this fixes
-///
-/// The original report described *three* things wrong with the bottom
-/// group's tab row on macOS/GTK, not just one. This filter's single root
-/// cause — `draw_split` filling `theme.separator` as one *uniform* rect the
-/// full width of the row (`quadraui::primitives::split::
-/// native_surface_paint::paint`) — fully accounts for the first two:
-///
-/// - *"a horizontal line runs through the tab labels"* — the fill, wherever
-///   it lands over a low-contrast (inactive) tab's own background.
-/// - *"a dark block covers the first (active) tab"* — the exact same fill,
-///   at the exact same y, reads as a solid block rather than a thin line
-///   specifically where it happens to land over the *active* tab's own
-///   (higher-contrast, highlighted) background — no second mechanism
-///   needed, confirmed by reading `native_surface_paint::paint`: it issues
-///   one `surface_fill_rect` call over `layout.divider_bounds`, not two, and
-///   nothing there special-cases a tab's active state.
-///
-/// It does **not** explain the third: *"the top-left group's first tab...
-/// looks double-painted, with its label drawn over itself"* — an unrelated
-/// group, not adjacent to the stacked boundary at all. Traced and ruled
-/// out as sharing this cause: `divider_to_split`'s emitted `Rect` is
-/// confined to its own divider's `axis_start`/`cross_start` box (see its
-/// own tests, `divider_to_split_horizontal_maps_direction_ratio_and_bounds`
-/// et al. — the rect never reaches `y = 0`), so nothing this filter touches
-/// can reach the top-left group's own tab row under any input. Left
-/// unfixed and unexplained by this change; needs its own macOS-side
-/// reproduction (a screenshot/screen-recording artifact is also plausible
-/// and hasn't been ruled out) before a cause can be assigned.
+/// view is. Hit-testing and dragging still see every divider, stacked or not.
 pub fn painted_group_dividers(dividers: &[GroupDivider]) -> Vec<GroupDivider> {
     dividers
         .iter()
@@ -1249,7 +1073,7 @@ pub fn paint_tab_drop_overlay(
 pub(crate) mod tests {
     use super::*;
 
-    // ─── Frame composition (#735 slices 1-6, folded by #766) ──────────────
+    // ─── Frame composition ──────────────────────────────────────────────
 
     /// Pins the canonical z-order itself. Not a tautology: this is the *only*
     /// place the order is written down now, so the assertion is what a reviewer
@@ -1283,7 +1107,7 @@ pub(crate) mod tests {
 
         let pos = |op: FrameOp| FRAME_Z_ORDER.iter().position(|c| *c == op).unwrap();
 
-        // #766: the whole chrome half precedes the whole overlay half. This is
+        // The whole chrome half precedes the whole overlay half. This is
         // the invariant the fold has to preserve — before it, the two halves
         // were separate constants and "chrome below overlays" was only a
         // sentence in a doc comment.
@@ -1334,17 +1158,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// #751 acceptance: the order the *mouse* router arbitrates in must be the
-    /// exact inverse of the order the *paint* sequence composes in.
-    ///
-    /// They are the same fact stated twice — whatever paints on top is what the
-    /// user is aiming at — and #587/#592 are what happens when the two
-    /// disagree. Before #751 the two halves genuinely did: the paint order
-    /// put the context menu above the picker and find/replace, while TUI's
-    /// `handle_mouse` arbitrated the picker and find/replace ~1,100 lines
-    /// *before* it. Nothing could catch that because the mouse ladder was
-    /// straight-line control flow, not a value; `MOUSE_ARBITRATION_ORDER`
-    /// makes it one.
+    /// The order the *mouse* router arbitrates in must be the exact inverse of
+    /// the order the *paint* sequence composes in. They are the same fact
+    /// stated twice — whatever paints on top is what the user is aiming at.
     #[test]
     fn mouse_arbitration_is_the_inverse_of_the_paint_z_order() {
         let expected: Vec<FrameOp> = FRAME_Z_ORDER
@@ -1362,19 +1178,12 @@ pub(crate) mod tests {
         );
 
         // The rungs that carry *mouse* input must all be arbitrated: a painted
-        // rung missing from the router falls through to the editor beneath it,
-        // which is the tab-switcher bug #733 found. `MenuDropdown` /
-        // `CommandCenter` are the deliberate exceptions — `MenuSystem::handle`
-        // owns the title-bar band's own events before this router runs.
+        // rung missing from the router falls through to the editor beneath it.
         for op in FRAME_Z_ORDER.into_iter().filter(|op| op.is_overlay()) {
             let arbitrated = MOUSE_ARBITRATION_ORDER.contains(&op);
-            // `MenuDropdown` / `CommandCenter`: `MenuSystem::handle` owns the
-            // title-bar band's own events before this router runs.
-            // `FolderPicker`: shared on both backends since #815, but not
-            // folded into this ladder — see `route_folder_picker_click`'s
-            // doc comment for why it is checked directly instead.
-            // `ChangeReview` (#955): same policy — see
-            // `route_change_review_click`'s doc comment.
+            // `MenuDropdown` / `CommandCenter`: routed through `MenuSystem::handle`
+            // before this router runs. `FolderPicker` / `ChangeReview`: routed
+            // directly at their own call sites instead.
             let routed_elsewhere = matches!(
                 op,
                 FrameOp::MenuDropdown
@@ -1461,9 +1270,8 @@ pub(crate) mod tests {
         .is_ok());
     }
 
-    /// The exact pre-#735 GTK sequence, which is what this check exists to
-    /// reject. Keeps the regression legible: if someone hoists a rung back out
-    /// of the shared walk, this is the shape it produces.
+    /// This check rejects sequences where a rung appears out of order relative
+    /// to [`FRAME_Z_ORDER`].
     #[test]
     fn check_frame_order_rejects_the_gtk_dialog_context_menu_inversion() {
         let err = check_frame_order(&[FrameOp::Dialog, FrameOp::ContextMenu])
@@ -1471,7 +1279,7 @@ pub(crate) mod tests {
         assert!(err.contains("ContextMenu"), "{err}");
         assert!(err.contains("out of order"), "{err}");
 
-        // And the pre-#735 TUI one: title-bar chrome after the modal stack.
+        // And the pre-#735 TUI tail: title-bar chrome after the modal stack.
         assert!(check_frame_order(&[
             FrameOp::Dialog,
             FrameOp::MenuDropdown,
@@ -1480,7 +1288,7 @@ pub(crate) mod tests {
         ])
         .is_err());
 
-        // #766: chrome hoisted below the overlay tail is now the *same* check —
+        // Chrome hoisted below the overlay tail is now the *same* check —
         // before the fold these were two independent orders and this sequence
         // was accepted by both of them.
         assert!(check_frame_order(&[FrameOp::Dialog, FrameOp::CommandLine]).is_err());
@@ -1525,11 +1333,6 @@ pub(crate) mod tests {
 
     /// `FramePresence::from_screen`'s gates, in both unit systems, on the
     /// degenerate shapes the driver-level tests cannot construct.
-    ///
-    /// The two divergences #763 closes are here as facts: before it, GTK's
-    /// sidebar rung had **no** minimum-size check (it painted a whole panel
-    /// into a zero-height rect) and its menu-row rung checked only
-    /// `height > 0.0` with no width check at all. TUI checked both, in cells.
     #[test]
     fn compose_frame_gates_degenerate_bands_in_the_callers_units() {
         let compose = |screen: &ScreenLayout, layout: &quadraui::AppShellLayout, m| {
@@ -1557,9 +1360,7 @@ pub(crate) mod tests {
              the title bar drives all three of its rungs"
         );
 
-        // A band one pixel shorter than a text line is not a band. GTK's own
-        // `height > 0.0` gate accepted this. #766: this now also gates the
-        // *dropdown*, whose GTK arm checked nothing but `menu_bar_visible`.
+        // A band one pixel shorter than a text line is not a band.
         layout.title_bar_bounds = Some(quadraui::Rect::new(0.0, 0.0, 1400.0, 16.0));
         for op in [
             FrameOp::MenuRow,
@@ -1580,7 +1381,6 @@ pub(crate) mod tests {
         screen.menu_bar_visible = true;
 
         // A collapsed sidebar content rect: `Some`, but nothing fits in it.
-        // This is the shape GTK painted a whole panel into before #763.
         layout.sidebar_content_bounds = Some(quadraui::Rect::new(0.0, 17.0, 240.0, 0.0));
         assert!(!compose(&screen, &layout, px).contains(&FrameOp::SidebarPanel));
         layout.sidebar_content_bounds = None;
@@ -1603,23 +1403,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// #939: `FramePresence::from_screen` must split the Command Center's
-    /// liveness gate from the drawn menu row's. Before this fix, a single
-    /// `title_bar` bool (`screen.menu_bar_visible && title_bar_band_live`)
-    /// drove `menu_row`, `menu_dropdown` **and** `command_center` — so a
+    /// `FramePresence::from_screen` must split the Command Center's liveness
+    /// gate from the drawn menu row's. Before this fix, a single `title_bar`
+    /// bool drove `menu_row`, `menu_dropdown` **and** `command_center` — so a
     /// native-menu backend (macOS's `MacBackend`) setting
-    /// `menu_bar_visible = false` to suppress the redundant in-window
-    /// `File Edit View` row (#901) killed the Command Center along with it,
-    /// and the omnibar never painted on macOS at all.
+    /// `menu_bar_visible = false` to suppress the redundant in-window row killed
+    /// the Command Center along with it.
     ///
-    /// `menu_row` / `menu_dropdown` must stay coupled to `menu_bar_visible`
-    /// — no drawn menu means no drawn dropdown — but `command_center` must
-    /// depend only on the title-bar band existing.
-    ///
-    /// RED-verified against this fix: with `command_center` reverted to
-    /// `title_bar` (the pre-#939 expression) instead of
-    /// `title_bar_band_live`, the `assert!(presence.command_center, ...)`
-    /// below fails once `menu_bar_visible` is `false`.
+    /// `menu_row` / `menu_dropdown` must stay coupled to `menu_bar_visible`,
+    /// but `command_center` must depend only on the title-bar band existing.
     #[test]
     fn command_center_liveness_is_split_from_menu_bar_visible() {
         let mut screen = bare_screen_layout();
@@ -1692,9 +1484,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// The pre-#763 GTK chrome order, which is what this check exists to
-    /// reject. Keeps the regression legible: if someone hoists a rung back out
-    /// of the shared walk, this is the shape it produces.
+    /// This check rejects sequences where a rung appears out of order relative
+    /// to [`FRAME_Z_ORDER`].
     #[test]
     fn check_frame_order_rejects_the_gtk_status_wildmenu_inversion() {
         assert_eq!(
@@ -1709,8 +1500,7 @@ pub(crate) mod tests {
         assert!(err.contains("Wildmenu"), "{err}");
         assert!(err.contains("out of order"), "{err}");
 
-        // The pre-#763 GTK tail: the sidebar body composed after the command
-        // line.
+        // The pre-#763 GTK tail: the sidebar body composed after the command line.
         assert!(check_frame_order(&[FrameOp::CommandLine, FrameOp::SidebarPanel]).is_err());
 
         // A repeated rung is a double-composition, not a valid sequence.
@@ -1834,14 +1624,9 @@ pub(crate) mod tests {
         );
     }
 
-    // ── #1207: 'linebreak' wrap-point selection ─────────────────────────
-    //
-    // RED against unfixed `develop`: before #1207,
-    // `compute_word_wrap_segments` had no `linebreak` parameter at all and
-    // *always* sought a word boundary — i.e. it always did what
-    // `linebreak_off_hard_cuts_mid_word` asserts must NOT happen, so that
-    // test would have failed (the segment boundary would have fallen back
-    // to the space, not the viewport column).
+    // When linebreak is off, compute_word_wrap_segments cuts at the
+    // viewport column even if it falls mid-word, rather than seeking a
+    // word boundary.
 
     #[test]
     fn linebreak_off_hard_cuts_mid_word() {

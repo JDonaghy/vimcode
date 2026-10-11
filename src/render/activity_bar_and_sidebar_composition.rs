@@ -1,6 +1,6 @@
 use super::*;
 
-// ─── Activity bar adapter (#133) ─────────────────────────────────────────────
+// ─── Activity bar adapter ────────────────────────────────────────────────────
 
 /// Build a `quadraui::ActivityBar` primitive from engine state.
 ///
@@ -28,10 +28,10 @@ pub fn build_activity_bar(
         PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
     };
 
-    // #536: the keyboard ring is matched by *panel id*, not by re-deriving each
+    // The keyboard ring is matched by *panel id*, not by re-deriving each
     // item's numeric toolbar index at the paint site. `Engine` owns the single
     // index↔id table (`activity_bar_item_id`), and the stepping itself is
-    // quadraui's `AppShell` cursor (quadraui#386) — so the painted order and
+    // quadraui's `AppShell` cursor — so the painted order and
     // the navigable order cannot drift apart here.
     let kbd_sel_id = if engine.activity_bar_focused {
         engine.activity_bar_selected_item_id()
@@ -91,13 +91,9 @@ pub fn build_activity_bar(
         (PANEL_BOARD, icons::BOARD.s(), "Board", "activity:board"),
     ];
 
-    // #635 (Stage 6b): the pre-#1434 TUI shell's own `build_shell_config` derived
-    // its own middle-panel `PanelDefinition` order from
-    // `sidebar::FIXED_ACTIVITY_PANEL_IDS` rather than re-reading this array (it
-    // can't — `fixed` is a local, and the two arrays carry different metadata
-    // shapes), so this assertion is what actually keeps them from drifting
-    // apart: a reordering here without updating the shared constant now trips
-    // in any test that exercises `build_activity_bar` (every one does).
+    // This assertion keeps `fixed` in sync with
+    // `sidebar::FIXED_ACTIVITY_PANEL_IDS`, since the two arrays carry
+    // different metadata shapes and can't be derived from each other.
     debug_assert_eq!(
         fixed.map(|(panel_id, _, _, _)| panel_id),
         crate::core::engine::sidebar::FIXED_ACTIVITY_PANEL_IDS,
@@ -153,14 +149,14 @@ pub fn build_activity_bar(
             theme.cursor.b,
         )),
         // Signals to the quadraui backend that this bar owns the keyboard so
-        // it intercepts KeyPressed as ActivityBarEvent::KeyPressed (Q#368).
+        // it intercepts KeyPressed as ActivityBarEvent::KeyPressed.
         is_keyboard_focused: engine.activity_bar_focused,
     }
 }
 
 /// Adapt the engine-side `ExtPanelData` (extension-provided sidebar
 /// panel) into a `quadraui::TreeView` for rendering via the shared
-/// `draw_tree` primitive (#476).
+/// `draw_tree` primitive.
 ///
 /// Tree shape:
 /// - Path `[s]` — section `s` header (`Decoration::Header`, chevron
@@ -312,62 +308,35 @@ pub fn ext_panel_to_tree_view(panel: &ExtPanelData, theme: &Theme) -> quadraui::
     }
 }
 
-// ─── Sidebar-panel-body composition (quadraui#1041/#1059, vimcode#1389) ────
+// ─── Sidebar-panel-body composition ────────────────────────────────────────
 //
 // `quadraui::compose::sidebar_panel_body::SidebarPanelBody` composes
 // "background fill, optional header/search chrome, body, optional
-// scrollbar gutter" — the layer order sidebar-panel renderers used to
-// hand-roll per backend (`docs/TUI_AUDIT_R2.md` §2.9). Its `render()`
-// convenience method takes the body as `&dyn BackendWidget`, which
-// requires `Self: Send + 'static` — a bound vimcode's *stateful* sidebar
-// bodies (`TreeController`/`FormController`, `Rc<RefCell<_>>`-backed on
-// the `!Send` `Engine`) can't satisfy: they're mutated in place by
-// `populate_*` and read back through a live `&Engine` borrow, never
-// rebuilt as an owned value. quadraui#1059 added `SidebarPanelBody::
-// render_with`, which takes the body as `impl FnOnce(&mut dyn Backend,
-// Rect)` instead — no `Send`/`'static` bound — so those callers now pass
-// their stateful body as a closure directly (`App::paint_sidebar_panel_rung`
-// PANEL_EXPLORER, `panels::render_explorer_sidebar_content`), instead of the
-// hand-copied `paint_sidebar_panel_chrome` background+chrome half #1242
-// needed before #1059 existed (deleted by #1389). [`ExtPanelTreeBody`] is
-// the one rung with a genuinely owned per-frame body
-// (`ext_panel_to_tree_view`'s fresh `TreeView`), so it uses the
-// `SidebarPanelBody::render` (`&dyn BackendWidget`) path directly.
+// scrollbar gutter". Its `render()` method requires `Self: Send + 'static`,
+// which stateful sidebar bodies (`TreeController`/`FormController`,
+// `Rc<RefCell<_>>`-backed on `!Send` `Engine`) can't satisfy. Use
+// `SidebarPanelBody::render_with`, which takes the body as `impl
+// FnOnce(&mut dyn Backend, Rect)` instead — no `Send`/`'static` bound.
+// [`ExtPanelTreeBody`] is the one rung with a genuinely owned per-frame
+// body, so it uses the `SidebarPanelBody::render` path directly.
 pub use quadraui::compose::sidebar_panel_body::{
     SidebarPanelBody, SidebarPanelBodyLayout, SidebarPanelChrome,
 };
 
-/// Build the search-only chrome (`SidebarPanelChrome::Search`, quadraui#1061)
-/// for a sidebar panel whose header the shell's own `AppShell` already owns
-/// (#1343 — the #1258 items 2/3 convergence). Shared by GTK's
-/// `App::paint_sidebar_panel_rung` (`PANEL_SETTINGS`/`PANEL_EXTENSIONS`
-/// arms) and the shipped TUI's `tui_main::panels::render_settings_panel`/
-/// `render_ext_sidebar`, so the query/placeholder/active-tint look can't
-/// drift between them the way #1256 found it had (GTK painted no search row
-/// at all; the TUI painted both a search row *and* its own duplicate header
-/// underneath the shell's).
+/// Build the search-only chrome (`SidebarPanelChrome::Search`) for a
+/// sidebar panel whose header `AppShell` already owns. Shared by GTK's
+/// `App::paint_sidebar_panel_rung` and the TUI's `panels::render_settings_panel`/
+/// `render_ext_sidebar`, so the query/placeholder/active-tint look is
+/// consistent between them.
 ///
-/// Before quadraui#1061, this composed a bespoke single-row `StatusBar`
-/// directly (`paint_sidebar_search_row`, deleted by #1391) because
-/// `Backend::draw_settings_chrome` (behind [`SidebarPanelChrome::
-/// HeaderAndSearch`] above) paints its header row unconditionally — no rect
-/// made it paint a search-only strip without also painting a second header,
-/// exactly the double-header bug #1256 fixed. `SidebarPanelChrome::Search`
-/// is quadraui's own header-less variant of that composition (a single
-/// synthetic `StatusBar` segment through `Backend::
-/// draw_status_bar_interactive`), so this now just resolves the
-/// query/placeholder `fg` the same way the old bespoke row did — the
-/// `SidebarPanelBody`/`SidebarPanelChrome` composer pair above owns the
-/// actual paint.
+/// This composes a single synthetic `StatusBar` segment (a header-less
+/// variant of the full `HeaderAndSearch` chrome), resolving the
+/// query/placeholder `fg` per-frame the same way.
 ///
 /// `fg` is muted (`theme.line_number_fg`) while the placeholder is showing
 /// (`query` empty, not `active`), and full-strength (`theme.foreground`)
-/// otherwise — [`SidebarPanelChrome::Search`] takes one `fg` for both
-/// states (it has no theme of its own to consult), so callers resolve it
-/// per-frame the same way here. `bg` is always `theme.completion_bg`; the
-/// active-state tint (previously a discrete swap to `theme.fuzzy_selected_
-/// bg`) is now `SidebarPanelBody::render_with`'s own `bg.lighten(0.08)`
-/// while `active`.
+/// otherwise. `bg` is always `theme.completion_bg`; the active-state tint
+/// is `SidebarPanelBody::render_with`'s own `bg.lighten(0.08)` while `active`.
 pub fn search_only_chrome(
     query: &str,
     placeholder: &str,
@@ -650,43 +619,23 @@ pub fn populate_settings_form_controller(engine: &Engine) {
 /// `FormController::render_and_cache`, since `handle_cached` re-derives its
 /// row layout from it. Returns `true` when the event was consumed.
 ///
-/// This is the click twin of [`populate_settings_form_controller`], and it
+/// This is the click twin of [`populate_settings_form_controller`]. It
 /// exists so neither backend has to re-derive the panel's row geometry by
-/// hand: before #544 GTK computed `row_h = line_height * 1.4`, a header/search
-/// band and a scrollbar gutter from a `DrawingArea`'s own width/height, none of
-/// which survive the ShellApp migration (there is no per-panel DrawingArea any
-/// more, so every one of those numbers read back `0`). `FormController` already
-/// owns all of it and is the only thing that painted the rows.
+/// hand; `FormController` owns all of that geometry and is the only thing
+/// that painted the rows.
 ///
-/// Activation policy matches the keyboard path and the pre-migration GTK/TUI
-/// mouse paths: a `Toggle` field flips on a single click, a category header
-/// expands/collapses on a single click, and a value row selects on a single
-/// click but only *activates* (opens the inline editor / cycles an enum) on a
-/// double click.
+/// Activation policy: a `Toggle` field flips on a single click, a category
+/// header expands/collapses on a single click, and a value row selects on a
+/// single click but only *activates* (opens the inline editor / cycles an
+/// enum) on a double click.
 ///
-/// # Row geometry is not offset from the paint (#983 → #1028)
+/// # Row geometry is not offset from the paint
 ///
-/// #983 reported (v0.11.0) that a click low in a settings row selected the
-/// row *below* it, and blamed the `handle_cached` path below — the
-/// `backend: None` branch of `quadraui::FormController::click_inner`, which
-/// re-derives its row layout from `lh` alone instead of asking the backend.
-/// #1028 measured it on a real GTK frame rather than inferring it from
-/// glyph bounds, and there is no offset to fix: the `▼ LSP` category row's
-/// background is *painted* over `y ∈ [389, 421)` and this function resolves
-/// clicks to it over exactly `y ∈ [389, 421)`. Both paths agree because the
-/// row pitch is the same pure function of `lh` on both sides —
-/// `FormController`'s cached `row_height(lh)` and `GtkBackend::form_layout`'s
-/// `layout_metrics::form_row_height(lh)` are both `(lh * 1.4).round()`; the
-/// cached path only approximates the *horizontal* text measure, which row
-/// resolution does not use. The ext-panel/`SidebarSystem` rows behave the
-/// same way (`[741, 773)` painted, `[741, 773)` hit).
-///
-/// What #983's reporter actually clicked was the next row's own top padding
-/// — a row's band is ~32px tall around a ~23px glyph, so each row owns a
-/// ~4.5px strip of background above and below its label. Do **not** add a
-/// vimcode-side offset here to "fix" that; it would break the agreement
-/// above. `harness::row_click_in_its_painted_band_hits_its_own_row` locks
-/// the two bands together, on both panels and on both sides of the glyph.
+/// The `handle_cached` path re-derives its row layout from line height alone.
+/// Both `FormController`'s cached `row_height(lh)` and the backend's
+/// `form_row_height(lh)` are `(lh * 1.4).round()`, so the two agree on
+/// vertical geometry. Do not add a vimcode-side offset to "fix" click
+/// positioning; it would break the agreement between painted and hit bands.
 pub fn handle_settings_form_ui_event(
     engine: &mut Engine,
     event: &quadraui::UiEvent,

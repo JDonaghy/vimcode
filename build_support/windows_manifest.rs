@@ -1,4 +1,4 @@
-//! The Windows Common-Controls v6 application-manifest gate (#1554).
+//! The Windows Common-Controls v6 application-manifest gate.
 //!
 //! `include!`d by **two** places, deliberately:
 //!
@@ -28,21 +28,16 @@ pub const COMCTL_V6_DEPENDENCY: &str = "type='win32' name='Microsoft.Windows.Com
      version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'";
 
 /// Linker arguments the `vimcode` binary needs so the Windows loader binds
-/// `comctl32.dll` to the Common-Controls v6 side-by-side assembly (#1554).
+/// `comctl32.dll` to the Common-Controls v6 side-by-side assembly.
 ///
-/// Returns an empty vector for every target/feature combination that must stay
-/// byte-identical to its pre-#1554 output:
-///
-/// * non-Windows targets (Linux/macOS have no manifests at all),
-/// * `*-pc-windows-gnu` (links with `ld`, which rejects these MSVC flags),
-/// * Windows MSVC **without** the `win` feature — that is the `vcd.exe` TUI
-///   build (`Build (Windows TUI, vcd.exe)` in CI), which never links
-///   quadraui's `win` backend and so never imports `TaskDialogIndirect`.
+/// Returns an empty vector for non-Windows targets, `*-pc-windows-gnu`,
+/// or Windows MSVC without the `win` feature (the `vcd.exe` TUI build),
+/// which never imports `TaskDialogIndirect`.
 ///
 /// The inputs are the *target* cfg values cargo hands a build script
 /// (`CARGO_CFG_TARGET_OS` / `CARGO_CFG_TARGET_ENV` / `CARGO_FEATURE_WIN`),
-/// never `cfg!(…)`, which would describe the build **host** and so be wrong
-/// for every cross-compile — including the `cargo xwin` route in CLAUDE.md.
+/// never `cfg!(…)`, which would describe the build **host** and be wrong
+/// for cross-compilation.
 pub fn comctl_v6_link_args(target_os: &str, target_env: &str, win_feature: bool) -> Vec<String> {
     if target_os == "windows" && target_env == "msvc" && win_feature {
         vec![

@@ -1,27 +1,20 @@
 use super::*;
 
-// ─── Command-line click/selection geometry (#816) ───────────────────────────
+// ─── Command-line click/selection geometry ──────────────────────────────────
 //
-// quadraui#705 shipped `CommandLineLayout::hit_test` / `selection_bounds` —
-// the character-offset hit test the TUI-only inverted-cell read-back trick
-// used to get "for free" (and that GTK could never get at all, since it has
-// no such trick). These helpers are the ONE place both backends map a click
-// point to a command-line character offset, replacing `ee26268`'s hand-rolled
-// `col - editor_left` arithmetic in `tui_main::mouse` with a call into the
-// primitive.
-//
-// Both backends cache the painted row's ABSOLUTE bounds on
-// `Engine::command_line_rect` at paint time (mirrors `global_status_rect`) —
-// "cache what paint produced" rather than re-deriving the row's geometry at
-// click time. TUI's units are character cells (`char_width = 1.0`); GTK's are
-// pixels (`char_width = backend.char_width()`).
+// `CommandLineLayout::hit_test` and `selection_bounds` map click points to
+// command-line character offsets. Both backends cache the painted row's
+// ABSOLUTE bounds on `Engine::command_line_rect` at paint time (mirrors
+// `global_status_rect`) — "cache what paint produced" rather than
+// re-deriving the row's geometry at click time. TUI's units are character
+// cells (`char_width = 1.0`); GTK's are pixels (`char_width =
+// backend.char_width()`).
 
-/// Byte offset (quadraui's [`quadraui::CommandLineLayout::hit_test`] and
-/// `selection_bounds` contract) converted to a **character-count** offset —
-/// the unit `Engine::command_cursor` / `Engine::cmd_sel` use throughout
-/// (mirrors `cmd_char_to_byte`'s inverse in `core::engine::keys`). A no-op
-/// for ASCII-only command text (the overwhelming case); multibyte prefixes
-/// (the #503/#705 class of bug) are exactly where it matters.
+/// Byte offset converted to a **character-count** offset — the unit
+/// `Engine::command_cursor` / `Engine::cmd_sel` use throughout (mirrors
+/// `cmd_char_to_byte`'s inverse in `core::engine::keys`). A no-op for
+/// ASCII-only command text (the overwhelming case); multibyte prefixes are
+/// exactly where it matters.
 fn command_line_byte_to_char_idx(text: &str, byte_offset: usize) -> usize {
     text.get(..byte_offset)
         .map(|s| s.chars().count())
@@ -29,31 +22,9 @@ fn command_line_byte_to_char_idx(text: &str, byte_offset: usize) -> usize {
 }
 
 /// Whether `point` lands inside the painted command-line row, in the same
-/// ABSOLUTE units as `rect` (`Engine::command_line_rect`).
-///
-/// Pulled out as its own function (#816 review) because the inline version
-/// GTK's `MouseDown` handler originally wrote only compared `point.y` against
-/// `rect.y`/`rect.height` — never `point.x`. `command_line_rect`'s `x`/`width`
-/// come from `main_content_bounds` (after the activity bar + sidebar), so it
-/// does not span the full window width; a `y`-only check treats any click in
-/// the bottom `line_height`-px band as "over the command line" regardless of
-/// `x`, including clicks over the sidebar/activity bar or past the content
-/// area on the right. Since the GTK window is undecorated
-/// (`w.set_decorated(false)`), that band is also the *only* way to grab the
-/// window's South/SW/SE resize edges (`ctx.window_edge`), so the y-only
-/// version silently disabled all three, essentially always (the command line
-/// is basically always painted). Delegates to
-/// [`quadraui::Rect::contains`] — the shared point-in-rect primitive —
-/// instead of re-deriving both bounds by hand a second time.
-///
-/// #1528: the GTK `MouseDown` handler that used this to skip the whole
-/// command-line row before running `ctx.window_edge` no longer needs to —
-/// `render::WINDOW_RESIZE_GRIP_PX`'s thin margin already keeps `window_edge`
-/// from firing anywhere in the row except its own outermost sliver, so the
-/// guard's job (stop a full `line_height`-tall margin from eating the whole
-/// row) is now `window_edge`'s own margin's job instead. Kept as a public
-/// helper — still the correct both-axes point-in-`command_line_rect` check
-/// for anything that needs one — rather than deleted with its call site.
+/// ABSOLUTE units as `rect` (`Engine::command_line_rect`). Delegates to
+/// [`quadraui::Rect::contains`] rather than re-deriving both bounds by hand
+/// a second time.
 pub fn point_over_command_line(rect: quadraui::Rect, point: quadraui::Point) -> bool {
     rect.width > 0.0 && rect.contains(point)
 }
@@ -61,7 +32,7 @@ pub fn point_over_command_line(rect: quadraui::Rect, point: quadraui::Point) -> 
 /// Whether the command/message line accepts a mouse-driven text selection in
 /// `engine`'s current mode — the gate `ee26268` wrote twice (TUI's
 /// Command/Search press arm vs. its separate Normal-with-message arm) as one
-/// function, so GTK's press handler (#816) states the identical rule instead
+/// function, so GTK's press handler states the identical rule instead
 /// of re-deriving it.
 ///
 /// In `Normal`/`Visual`/`VisualLine`, this must agree with
@@ -73,7 +44,7 @@ pub fn point_over_command_line(rect: quadraui::Rect, point: quadraui::Point) -> 
 /// `!message.is_empty()` alone let a click there arm a selection whose
 /// indices were hit-tested against the painted count text but whose Ctrl+C
 /// copy read `engine.message` — a real, reachable text/geometry mismatch
-/// (#816 review), not a hypothetical.
+///, not a hypothetical.
 pub fn command_line_selection_allowed(engine: &Engine) -> bool {
     match engine.mode {
         Mode::Command | Mode::Search => true,
@@ -85,13 +56,10 @@ pub fn command_line_selection_allowed(engine: &Engine) -> bool {
 }
 
 /// Map a click/drag `point` to a **character-count** offset into `text`, via
-/// quadraui's `CommandLine::layout(rect, ..).hit_test(x)` (issue #705/#816).
-/// `rect` must be the ABSOLUTE bounds the line was painted into
-/// (`Engine::command_line_rect`); `point` outside its row, or left of its
-/// left edge, is not a hit. The primitive itself clamps `x` past the last
-/// character to `text.len()` (previously unclamped: `ee26268`'s raw
-/// `col - editor_left` could exceed the text and only `command_cursor`'s
-/// separate `.min(buf_len)` caught it — `cmd_sel` itself did not).
+/// quadraui's `CommandLine::layout(rect, ..).hit_test(x)`. `rect` must be
+/// the ABSOLUTE bounds the line was painted into (`Engine::command_line_rect`);
+/// `point` outside its row, or left of its left edge, is not a hit. The
+/// primitive itself clamps `x` past the last character to `text.len()`.
 pub fn command_line_click_char_idx(
     rect: quadraui::Rect,
     text: &str,
@@ -119,16 +87,10 @@ pub fn command_line_click_char_idx(
 
 /// Convert a mouse selection `sel` (character-count `(anchor, head)`,
 /// either order — the unit `Engine::cmd_sel` uses throughout, INCLUSIVE at
-/// both ends: `route_cmdline_selection_key`'s Ctrl+C copy keeps every char
-/// with `lo <= i <= hi`, and a bare click with no drag sets `(idx, idx)`
-/// to highlight that one character) into the byte-offset `(start, end)`
-/// pair [`quadraui::Backend::draw_command_line_selection`] expects, relative
-/// to `text`. That pair is EXCLUSIVE at `end` (same contract as
-/// `CommandLineLayout::selection_bounds`, which supplies its geometry) —
-/// hence the `hi + 1` below, not a straight per-endpoint byte conversion.
-/// Both backends' paint paths call this immediately before handing `cmd_sel`
-/// to that method (issue #1185 — the consume side of quadraui#1001, which
-/// shipped the primitive this function now feeds).
+/// both ends) into the byte-offset `(start, end)` pair
+/// [`quadraui::Backend::draw_command_line_selection`] expects, relative to
+/// `text`. That pair is EXCLUSIVE at `end` (same contract as
+/// `CommandLineLayout::selection_bounds`) — hence the `hi + 1` below.
 pub fn command_line_selection_bytes(text: &str, sel: (usize, usize)) -> (usize, usize) {
     let lo = sel.0.min(sel.1);
     let hi = sel.0.max(sel.1);
@@ -156,7 +118,7 @@ pub enum ClickTarget {
     /// Click was on a tab's close button: (group_id, tab_idx). The actual
     /// close (and dirty-buffer confirmation) is applied by the caller via
     /// `Engine::handle_tab_bar_click` — every other tab-bar target is applied
-    /// eagerly during resolution (#814), but a close needs to defer to a
+    /// eagerly during resolution, but a close needs to defer to a
     /// confirmation dialog before the engine mutates anything.
     CloseTab(GroupId, usize),
     /// Click was on a per-window status bar segment with an action.
@@ -164,14 +126,14 @@ pub enum ClickTarget {
     /// Click was on the editor action menu button.
     ActionMenuButton(GroupId),
     /// Click was on the code-overview minimap — the window has *already* been
-    /// scrolled to the clicked fraction of the file (#35), like `Gutter`'s
+    /// scrolled to the clicked fraction of the file, like `Gutter`'s
     /// "fold already toggled". Carries the buffer line seeked to.
     Minimap(WindowId, usize),
     /// Click was outside any actionable area.
     None,
 }
 
-// ─── Shared screen-level hit-test (#344) ─────────────────────────────────────
+// ─── Shared screen-level hit-test ────────────────────────────────────────────
 
 /// Top-level screen zone identified by a coordinate hit-test.
 ///
@@ -227,20 +189,11 @@ pub enum WindowZone {
         seg_col_offset: usize,
         text_rel_x: f64,
     },
-    /// The minimap strip's own column range, plus the scroll-affordance
-    /// gutter it always leaves clear alongside it (#1094 review). Neither
-    /// is text: real presses on the strip are resolved earlier by
-    /// `apply_minimap_click`, before `window_zone_hit_test` ever runs, so
-    /// every caller here treats this as a dead zone — the `_` arm in
-    /// `click.rs::pixel_to_click_target`'s match, and the `let ... else` /
-    /// `if let WindowZone::TextArea` patterns in `tui_main/mouse.rs`, both
-    /// already fall through to "not resolved" for any non-`TextArea`
-    /// variant without needing an explicit arm for this one. It exists so a
-    /// text-selection drag whose pointer sweeps over the strip's pixels
-    /// stops extending the selection there, matching the pre-#1094 outcome
-    /// (when the narrower `rect` made such a point fall outside the window
-    /// entirely) without re-narrowing `rect`, which #1094 deliberately
-    /// stopped doing.
+    /// The minimap strip's own column range, plus the scroll-affordance gutter
+    /// it leaves clear alongside it. Clicks directly on the strip are resolved
+    /// earlier by `apply_minimap_click`; a text-selection drag whose pointer
+    /// sweeps over the strip's pixels stops extending the selection there.
+    /// It exists so that sweep-over behavior matches the pre-#1094 outcome
     Minimap,
 }
 
@@ -256,13 +209,8 @@ pub enum GutterAction {
 
 /// One group's tab-bar hit band: the rectangle a click must land in for
 /// [`screen_zone_hit_test`] to report [`ScreenZone::TabBar`] for that group.
-///
-/// Deliberately mirrors [`TabBarDrawTarget`] on the *click* side (#553 — the
-/// counterpart of #549's draw-loop unification): both are "which groups have a
-/// tab bar this frame, and where is it?", so they must not be re-derived by two
-/// independently-drifting branches. `TabBarDrawTarget` can't just be reused
-/// here because it needs an `&Engine` and the backend's own single-group rect,
-/// neither of which a pure hit-test over a cached `ScreenLayout` has.
+/// Mirrors the draw-loop's [`TabBarDrawTarget`] (item #553): both track which
+/// groups have a tab bar this frame and where it is, so they must not drift.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabBarHitBand {
     pub group_id: GroupId,
@@ -281,38 +229,10 @@ impl TabBarHitBand {
 }
 
 /// The tab-bar hit bands for every group that drew a tab bar this frame.
-///
-/// Single-group and split-group layouts used to derive this inline in two
-/// separate `if let Some(split) = ... else { ... }` arms of
-/// [`screen_zone_hit_test`], and drifted: the single-group arm hardcoded the
-/// bar's top at `y >= 0.0` instead of deriving it from the window rects the way
-/// the split arm did, so once #552 gave GTK a persistent menu/title-bar band
-/// (`main_content_bounds.y > 0`) single-group tab clicks — activate *and* close
-/// — silently stopped matching, while split layouts kept working (#546
-/// FAILED-3, #553). Both arms now go through this one function so the two
-/// shapes cannot diverge again.
-///
-/// In both cases the band's top edge comes from the *window content* top edge
-/// minus `tab_bar_height`; the bar is drawn immediately above the content it
-/// belongs to. `single_tab_hidden` is `is_tab_bar_hidden(active_group)`, which
-/// can only be true in single-group mode (it requires `leaf_count() <= 1`), so
-/// the split arm needs no equivalent filter.
-///
-/// # How much of the live click path this actually covers
-///
-/// Worth being precise about, since the historical defect above predates the
-/// current routing: [`screen_zone_hit_test`] — and therefore this function —
-/// has exactly one caller, `gtk::click` (`pixel_to_click_target` /
-/// `resolve_tab_right_click`), and there it is the **fallback**. GTK resolves
-/// clicks first through the cached `quadraui::FrameHitMap` (#449), into which
-/// every TabBar surface is pushed on each `render_content` pass, so in steady
-/// state a tab click is answered by the hit map and never reaches here; this
-/// path serves hit-map misses and clicks arriving before the first paint. TUI
-/// does not call it at all — `tui_main::mouse` has its own hit-test. So the
-/// unification below is best read as removing the *shape* of divergence that
-/// produced #546/#553 (one derivation instead of two that can drift), plus
-/// correctness on the pre-paint/miss path — not as repairing an everyday
-/// break for GTK users, which #449's hit map already covers.
+/// Both single-group and split-group layouts derive the band's top edge from
+/// the window content top edge minus `tab_bar_height`; the bar is drawn
+/// immediately above the content it belongs to. One shared function prevents
+/// the two shapes from diverging again.
 pub fn tab_bar_hit_bands(
     layout: &ScreenLayout,
     tab_bar_height: f64,
@@ -388,10 +308,8 @@ pub fn screen_zone_hit_test(
     single_tab_hidden: bool,
     active_group: GroupId,
 ) -> ScreenZone {
-    // 1. Tab bars — check before windows because tab bars sit just above
-    //    the window content area within the same group bounds. Split and
-    //    single-group layouts share one derivation (`tab_bar_hit_bands`) so the
-    //    two can't drift apart again the way they did in #546/#553.
+    // 1. Tab bars — check before windows because tab bars sit just above the
+    //    window content area within the same group bounds.
     for band in tab_bar_hit_bands(layout, tab_bar_height, single_tab_hidden, active_group) {
         if band.contains(x, y) {
             return ScreenZone::TabBar {
@@ -415,7 +333,7 @@ pub fn screen_zone_hit_test(
     }
 
     // 3. Group dividers. Naturally a no-op in single-group mode —
-    // `group_dividers` is empty there (#551).
+    // `group_dividers` is empty there.
     {
         for div in &layout.group_dividers {
             let hit = match div.direction {
@@ -456,40 +374,20 @@ pub fn screen_zone_hit_test(
     ScreenZone::None
 }
 
-// ─── Divider hit-test / drag (shared by GroupLayout and WindowLayout, #582) ──
+// ─── Divider hit-test / drag (shared by GroupLayout and WindowLayout) ──
 //
-// #818 adopted `quadraui::SplitTree::layout` for the geometry *computation*
-// this hit-test code consumes — `GroupLayout`/`WindowLayout::calculate_rects`
-// and `::dividers` in `core/window.rs` used to re-derive the same split math
-// in two separate hand-rolled recursive passes (the exact "second source of
-// truth" risk `SplitTree`'s module docs call out); both now build a
-// `quadraui::SplitTree` and read leaf rects + divider geometry off one
-// `layout()` call.
-//
-// The hit-test/drag code below (`DividerGeometry`, `divider_hit_test`,
-// `divider_ratio_from_pos`, `DividerMetrics`/`GTK_DIVIDER_METRICS`,
-// `route_divider_grab`, `apply_divider_drag`) deliberately stays local
-// rather than also moving onto `quadraui::SplitTreeLayout::hit_test_divider`/
-// `hit_test_divider_cell`: those two methods only support a *symmetric*
-// tolerance band (continuous) or an *exact single-cell* match (quantized).
-// Neither can express the asymmetric multi-cell bands both backends need —
-// GTK asks for `(6.0, 6.0)` uniformly, but TUI's `tol_before`/`tol_after`
-// differ per divider (`(1.0, 1.0)` for most, `(0.0, tab_bar_rows)` for a
-// horizontal group divider, whose grabbable band *is* the neighbouring
-// group's whole tab-bar block — see `tui_main::mouse`'s call site). Faking
-// that through `SplitTreeDivider`'s `thickness` field would require
-// constructing a divider whose `thickness` differs from what was actually
-// painted, defeating the "one number describes what was drawn" contract
-// `cell_position()`'s doc comment relies on. This is the concrete gap #818
-// asks to be filed against quadraui (asymmetric/multi-cell tolerance bands
-// on `SplitTreeLayout::hit_test_divider`/`hit_test_divider_cell`) rather
-// than papered over here.
+// Divider hit-test and drag code (`DividerGeometry`, `divider_hit_test`,
+// `divider_ratio_from_pos`, `DividerMetrics`, `route_divider_grab`,
+// `apply_divider_drag`) stays local rather than moving onto quadraui, since
+// quadraui only supports symmetric tolerance bands or exact single-cell
+// matches. Both backends need asymmetric multi-cell bands — GTK asks for
+// `(6.0, 6.0)` uniformly, but TUI's `tol_before`/`tol_after` differ per
+// divider (`(1.0, 1.0)` for most, `(0.0, tab_bar_rows)` for a horizontal
+// group divider).
 
 /// Common geometry accessor so [`divider_hit_test`] and
-/// [`divider_ratio_from_pos`] work identically over `GroupDivider`
-/// (editor-group splits) and `WindowDivider` (in-group `:split`/`:vsplit`
-/// window splits) without duplicating the hit-test/drag math per divider
-/// kind (or, previously, per backend — see below).
+/// [`divider_ratio_from_pos`] work identically over `GroupDivider` and
+/// `WindowDivider` without duplicating the hit-test/drag math per divider kind.
 pub trait DividerGeometry {
     fn direction(&self) -> SplitDirection;
     fn position(&self) -> f64;
@@ -500,17 +398,11 @@ pub trait DividerGeometry {
 
     /// Screen space consumed by the divider itself, along the split axis —
     /// `axis_size() - divider_thickness()` is the *content* width/height the
-    /// split's `ratio` actually divides (see [`divider_ratio_from_pos`]).
-    /// Zero for every divider today except a `WindowDivider` in the
-    /// `Vertical` direction, which — unlike `GroupDivider`'s editor-group
-    /// splits, still `quadraui::SplitTreeMeasure::new(0.0)` — reserves one
-    /// screen column for Neovim's real vertical divider bar
-    /// (`WindowLayout::layout_snapped`, #1326). `position`/`axis_start`/
-    /// `axis_size` themselves are untouched by this (they describe what was
-    /// actually *painted*, which `divider_to_split`/`divider_hit_test` must
-    /// stay anchored to) — only the drag-to-ratio conversion needs to know
-    /// the reserved thickness, so it is its own method rather than folding
-    /// into `axis_size()`.
+    /// split's `ratio` actually divides. Zero for every divider today except a
+    /// `WindowDivider` in the `Vertical` direction, which reserves one screen
+    /// column for Neovim's real vertical divider bar (`WindowLayout::
+    /// layout_snapped`). `position`/`axis_start`/`axis_size` are untouched
+    /// by this — only the drag-to-ratio conversion needs the thickness.
     fn divider_thickness(&self) -> f64 {
         0.0
     }
@@ -570,22 +462,14 @@ pub type DividerTolerance = (f64, f64);
 
 /// Hit-test a point against a list of dividers. Returns the index *into
 /// `dividers`* (not `split_index`) so callers can recover any extra fields
-/// (e.g. `WindowDivider::group_id`) from the matched element.
-///
-/// A single divider list can mix vertical and horizontal splits (nested
-/// splits alternate direction), so tolerance is supplied per-direction:
-/// `vertical_tol`/`horizontal_tol`. GTK wants a symmetric pixel tolerance
-/// around the thin divider line in both directions (`before == after`),
-/// while TUI's editor-group horizontal divider is grabbable across the
-/// *second* group's whole tab-bar block rather than a single row
-/// (`before == 0`, `after == tab_bar_rows` — see the call site for why).
-///
-/// `quantize`: TUI must hit-test against the *same truncated* position the
-/// renderer draws at (`div.position as u16`), matching the renderer exactly
-/// so a click on the rendered glyph always hits (see #452 — using a plain
-/// tolerance window centered on the untruncated float position could match
-/// the wrong adjacent cell). GTK renders at the continuous pixel position, so
-/// it passes `false`.
+/// from the matched element. A single divider list can mix vertical and
+/// horizontal splits (nested splits alternate direction), so tolerance is
+/// supplied per-direction: `vertical_tol`/`horizontal_tol`. GTK wants a
+/// symmetric pixel tolerance around the divider line, while TUI's editor-group
+/// horizontal divider is grabbable across the second group's whole tab-bar
+/// block. `quantize`: TUI must hit-test against the same truncated position
+/// the renderer draws at to match exactly; GTK renders at the continuous
+/// pixel position, so it passes `false`.
 pub fn divider_hit_test<D: DividerGeometry>(
     dividers: &[D],
     x: f64,
@@ -620,7 +504,7 @@ pub fn divider_hit_test<D: DividerGeometry>(
 /// `GroupLayout` and `WindowLayout` already clamps to `0.1..0.9`).
 ///
 /// Divides by `axis_size() - divider_thickness()`, not raw `axis_size()`
-/// (#1326): `WindowLayout::layout_snapped` interprets a `Vertical` split's
+///: `WindowLayout::layout_snapped` interprets a `Vertical` split's
 /// `ratio` as a fraction of the *content* width (bounds width minus the
 /// reserved divider column), so a drag that instead divided by the full
 /// `axis_size()` would feed back a ratio the layout doesn't mean — a
@@ -638,23 +522,11 @@ pub fn divider_ratio_from_pos(div: &impl DividerGeometry, x: f64, y: f64) -> f64
 
 /// Convert a [`DividerGeometry`] divider into the `(quadraui::Split,
 /// quadraui::Rect)` pair a backend needs to paint it via the shared
-/// `backend.draw_split()` primitive (#582 follow-up).
-///
-/// `WindowLayout`/`GroupLayout` dividers had no dedicated visual — TUI
-/// vertical splits only looked divided by coincidence (the neighbouring
-/// window's own scrollbar/separator column), and GTK painted nothing at
-/// all for `:vsplit`. Rather than hand-roll a second per-backend line
-/// renderer, reuse quadraui's existing `Split` primitive (`primitives/
-/// split.rs`, already wired for `backend.draw_split` in both backends) —
-/// it draws exactly one divider line from a ratio + bounds, which is all
-/// a single `DividerGeometry` node needs (the fact that `WindowLayout` as
-/// a whole is an N-way tree doesn't matter here: each *divider* is always
-/// a 2-pane boundary).
-///
-/// `ratio` is back-derived from `position`/`axis_start`/`axis_size`
-/// (rather than threading the tree's own stored ratio through) so this
-/// works uniformly for both `GroupDivider` and `WindowDivider`, neither of
-/// which carries a ratio field.
+/// `backend.draw_split()` primitive. Both backends can reuse quadraui's
+/// existing `Split` primitive — it draws one divider line from a ratio +
+/// bounds. `ratio` is back-derived from `position`/`axis_start`/`axis_size`
+/// so this works uniformly for both `GroupDivider` and `WindowDivider`,
+/// neither of which carries a ratio field.
 pub fn divider_to_split(
     div: &impl DividerGeometry,
     id: quadraui::WidgetId,
@@ -731,16 +603,11 @@ pub fn window_zone_hit_test(
     let gutter_w = rw.gutter_char_width as f64 * char_width;
     let has_v_sb = rw.total_lines > viewport_lines;
     let sb_w = if has_v_sb { char_width } else { 0.0 };
-    // #1094 review: reuse `rw.text_viewport_cols` — already computed by
-    // `build_rendered_window` with the minimap strip's width (and any
-    // scrollbar overlay reserve) subtracted — instead of an independent
-    // recomputation from `rw.rect.width` that had no knowledge of the strip
-    // at all. `rw.rect` now reaches the pane's *true* right edge (#1094's
-    // own fix moved the scrollbar there), so re-deriving `viewport_cols`
-    // from it directly would silently include the strip's columns,
-    // undercounting how often `has_h_sb` should be true and letting a
-    // click on a visibly-painted horizontal scrollbar fall through to
-    // `TextArea` instead.
+    // Reuse `rw.text_viewport_cols` — already computed with the minimap strip's
+    // width and any scrollbar overlay reserve subtracted — instead of an
+    // independent recomputation from `rw.rect.width`. `rw.rect` now reaches the
+    // pane's true right edge, so re-deriving would silently include the strip's
+    // columns.
     let viewport_cols = rw.text_viewport_cols.max(1);
     let has_h_sb = rw.max_col > viewport_cols && viewport_lines > 1;
 
@@ -750,7 +617,7 @@ pub fn window_zone_hit_test(
     }
 
     // 3. Minimap strip, plus the scroll-affordance gutter it always leaves
-    // clear alongside it (#1094 review) — see `WindowZone::Minimap`'s doc
+    // clear alongside it — see `WindowZone::Minimap`'s doc
     // comment for why this has to be excluded here rather than relying on
     // `apply_minimap_click` alone (that resolver is skipped for
     // text-selection drag continuations). Checked after the vertical
@@ -821,7 +688,7 @@ pub enum EditorScrollbarClick {
 /// geometry units (`unit_w`/`unit_h` convention: pixels for GTK, whole
 /// cells for TUI).
 ///
-/// #1061: this exact three-way decision (page toward the click on the empty
+/// This exact three-way decision (page toward the click on the empty
 /// track either side of the thumb; begin a drag, with a grab offset that
 /// keeps the cursor's relative position on the thumb, when the click lands
 /// on the thumb itself) was hand-rolled four times — once per axis, once
@@ -863,7 +730,7 @@ pub fn resolve_editor_scrollbar_click(
 
 #[cfg(test)]
 mod editor_scrollbar_click_tests {
-    //! #1061: `resolve_editor_scrollbar_click` replaces four hand-rolled
+    //! `resolve_editor_scrollbar_click` replaces four hand-rolled
     //! copies (TUI v/h in `tui_main/mouse.rs`, GTK v/h in `app.rs`) of this
     //! same three-way decision. These pin the pure decision logic directly;
     //! `harness.rs`'s `issue_987_group_scrollbar_inert_and_click_resizes`
@@ -918,9 +785,8 @@ mod editor_scrollbar_click_tests {
 
     #[test]
     fn click_exactly_on_thumb_end_is_track_not_drag() {
-        // `thumb_end` is exclusive — this is the boundary #987's own
-        // negative-space case cares about: a click one unit past the
-        // thumb must not be swallowed as a drag.
+        // `thumb_end` is exclusive — a click one unit past the thumb must not be
+        // swallowed as a drag.
         let outcome = resolve_editor_scrollbar_click(50.0, 40.0, 50.0, 20, 80, 40);
         assert_eq!(outcome, EditorScrollbarClick::PageTo(60));
     }
@@ -952,21 +818,11 @@ pub fn resolve_gutter_action(
     }
 }
 
-/// Execute the engine-side effect of a resolved [`GutterAction`] for a
-/// gutter click. Shared by both backends (#823 item 3) — GTK's
-/// `execute_gutter_action` (`gtk/click.rs`) and TUI's inline match
-/// (`tui_main/mouse.rs`) were an identical 5-arm match on
-/// [`resolve_gutter_action`]'s result, except TUI additionally gated
-/// `ToggleFold` on `gutter_text` actually containing a `+`/`-` fold
-/// indicator glyph and GTK didn't. Folded in here rather than dropped: in
-/// practice `Engine::toggle_fold_at_line`'s own `detect_fold_range` no-ops
-/// when nothing is foldable at that line, so the two were never observed to
-/// diverge in a live-reachable case, but the guard is one line to keep and
-/// removing it would be a needless behavior narrowing for GTK to carry.
-///
-/// `gutter_text` is the resolved line's painted gutter glyphs — pass
-/// `rw.lines[view_row].gutter_text.as_str()` (both backends already look
-/// this row up before calling in).
+/// Execute the engine-side effect of a resolved [`GutterAction`]. Shared by
+/// both backends. `gutter_text` is the resolved line's painted gutter glyphs
+/// — pass `rw.lines[view_row].gutter_text.as_str()` (both backends already
+/// look this row up before calling in). Checks that `gutter_text` actually
+/// contains a `+`/`-` fold indicator glyph before `ToggleFold`.
 pub fn apply_gutter_action(
     engine: &mut Engine,
     rw: &RenderedWindow,
@@ -1058,11 +914,9 @@ pub fn compute_editor_layout(
         tab_bar_height_px(lh, engine.settings.breadcrumbs)
     };
     let debug_toolbar_h = debug_toolbar_height_px(lh, engine.debug_toolbar_visible);
-    // Shares one bottom "list rung" with the active window's location list
-    // (#1155) — see `quickfix_panel_rows`, the TUI-side equivalent of this
-    // same rule. #1307: a target with a real `WindowLayout` leaf takes its
-    // own space from the split tree, so this overlay band must not reserve
-    // rows for it too — see `quickfix_panel_rows`'s matching guard.
+    // Shares one bottom "list rung" with the active window's location list.
+    // A target with a real `WindowLayout` leaf takes its own space from the
+    // split tree, so this overlay band must not reserve rows for it too.
     let qf_or_loc_open = !engine.qf_has_real_window(None)
         && !engine.qf_has_real_window(Some(engine.active_window_id()))
         && ((engine.quickfix.open && !engine.quickfix.items.is_empty())
@@ -1139,28 +993,16 @@ pub fn compute_editor_layout(
 }
 
 /// Fixed tab-bar row height in pixels, matching VS Code's `35px` tab height.
-/// Used by GTK and Win-GUI backends.
-///
-/// #700: deliberately a constant, not derived from `line_height`. It used to
-/// be `ceil(line_height * 1.6)`, so raising `settings.font_size` inflated the
-/// tab-bar chrome right along with the editor text — VS Code's tab height is
-/// fixed regardless of the editor's font size.
+/// Used by GTK and Win-GUI backends. Deliberately a constant, not derived
+/// from `line_height` — it stays fixed regardless of `settings.font_size`.
 pub const TAB_ROW_HEIGHT_PX: f64 = 35.0;
 
 /// Fixed breadcrumb row height in pixels, matching VS Code's compact
-/// breadcrumb chrome. Used by GTK and Win-GUI backends.
-///
-/// #700: deliberately a constant, not `line_height` — same reasoning as
-/// [`TAB_ROW_HEIGHT_PX`]. Only the row's reserved *height* is decoupled here;
-/// the breadcrumb text itself still paints through
-/// `Backend::draw_status_bar`, which has no per-call font override in the
-/// pinned quadraui rev (unlike `draw_dialog`/`draw_rich_text_popup`, which
-/// already take a `ui_font` description) — so breadcrumb text size still
-/// tracks `settings.font_size` until that quadraui gap is closed. A
-/// quadraui issue for a `draw_status_bar` font override must be filed —
-/// do not treat #700's "breadcrumb text size independent of font_size"
-/// acceptance bullet as satisfied until it lands; only the row height half
-/// is fixed here.
+/// breadcrumb chrome. Used by GTK and Win-GUI backends. Deliberately a
+/// constant, not `line_height` — same reasoning as [`TAB_ROW_HEIGHT_PX`].
+/// Only the row's reserved *height* is fixed here; the breadcrumb text
+/// itself still paints through `Backend::draw_status_bar` and tracks
+/// `settings.font_size` until quadraui adds a font override for that method.
 pub const BREADCRUMB_ROW_HEIGHT_PX: f64 = 22.0;
 
 /// Compute the tab bar row height in pixels (the row containing tab labels).
@@ -1170,10 +1012,10 @@ pub fn tab_row_height_px(_line_height: f64) -> f64 {
     TAB_ROW_HEIGHT_PX
 }
 
-/// Compute the full tab bar height including optional breadcrumb row.
-/// Used by GTK and Win-GUI backends. `line_height` is accepted for
-/// call-site stability but no longer affects the result — see
-/// [`TAB_ROW_HEIGHT_PX`]/[`BREADCRUMB_ROW_HEIGHT_PX`].
+/// Compute the full tab bar height including optional breadcrumb row. Used by
+/// GTK and Win-GUI backends. `line_height` is accepted for call-site stability
+/// but no longer affects the result — see [`TAB_ROW_HEIGHT_PX`]/
+/// [`BREADCRUMB_ROW_HEIGHT_PX`].
 pub fn tab_bar_height_px(_line_height: f64, breadcrumbs: bool) -> f64 {
     if breadcrumbs {
         TAB_ROW_HEIGHT_PX + BREADCRUMB_ROW_HEIGHT_PX
@@ -1182,26 +1024,13 @@ pub fn tab_bar_height_px(_line_height: f64, breadcrumbs: bool) -> f64 {
     }
 }
 
-/// One geometry unit [`crate::app::App`] paints in, chosen once by the
-/// caller that constructs it (#1426) — never inferred at runtime by `App`
-/// itself asking "am I GTK?", per the Platform-Neutrality Rule.
-///
-/// Before this struct existed, `App` hardcoded the pixel-flavoured half of
-/// every backend-specific sizing pair listed on each field below (the
-/// `gtk_*`/`GTK_*` name) directly in its own methods, which is correct for
-/// GTK/macOS/Win but wrong on a cell grid — e.g. `TAB_ROW_HEIGHT_PX` (35.0)
-/// read as 35 *rows* on an 80x24 terminal claims more rows than the terminal
-/// has, collapsing the entire editor content band. Every pair already had a
-/// `TUI_*`/cell-flavoured twin (built for the shipped the pre-#1434 TUI shell);
-/// `UnitProfile` just bundles "which half of each pair" into one value
-/// picked once, at construction, by code that already knows its own
-/// backend: [`Self::px`] for GTK/macOS/Win, [`Self::cell`] for the `tui`
-/// harness arm (`crate::tui_main::testing::conformance_harness` /
-/// `crate::harness::build_app_and_config`).
-///
-/// `#[derive(Clone, Copy)]`: every field is either a plain value/tuple or a
-/// capture-less `fn` pointer, so a whole profile is cheap to copy around
-/// (`App` stores one directly, no `Rc`/`Box` needed).
+/// One geometry unit [`crate::app::App`] paints in, chosen once at
+/// construction by the caller that knows its own backend — never inferred at
+/// runtime by `App` itself, per the Platform-Neutrality Rule. Bundles which
+/// half of each backend-specific sizing pair to use: GTK/macOS/Win use
+/// [`Self::px`], the TUI harness arm uses [`Self::cell`]. `#[derive(Clone,
+/// Copy)]`: every field is either a plain value or a capture-less `fn`
+/// pointer, so copying is cheap.
 #[derive(Clone, Copy)]
 pub struct UnitProfile {
     /// [`tab_row_height_px`] (GTK: fixed 35px regardless of `lh`) vs a
@@ -1232,111 +1061,47 @@ pub struct UnitProfile {
     /// every other band, so this needs the same `breadcrumbs` flag
     /// `App::render_content` already has in scope wherever it calls this.
     pub divider_metrics: fn(bool) -> DividerMetrics,
-    /// [`gui_sidebar_system_metrics`] vs the fixed metrics
-    /// the pre-#1434 TUI shell's `from_engine` seeds every `SidebarSystem` with once at
-    /// startup (a cell grid never changes `line_height`, so TUI's never
-    /// depends on the `f32`).
+    /// [`gui_sidebar_system_metrics`] vs the fixed metrics the pre-#1434 TUI
+    /// shell's `from_engine` seeds every `SidebarSystem` with once at startup.
     pub sidebar_system_metrics: fn(f32) -> quadraui::MsvLayoutMetrics,
     /// Divider/tab-close grab tolerance: `(6.0, 6.0)` device pixels on GTK,
-    /// `(1.0, 1.0)` cells on TUI — #1068's "irreducible" list.
+    /// `(1.0, 1.0)` cells on TUI.
     pub hit_tolerance: (f64, f64),
     /// [`quadraui::ShellConfig::with_activity_bar_width_px`]'s argument.
-    /// `Some(48.0)` on GTK/macOS/Win (VS Code parity, independent of line
-    /// height); `None` on TUI, which leaves
-    /// [`quadraui::ShellConfig::activity_bar_width`]'s own default (a
-    /// 3-line-height multiple) in charge — the same value
-    /// the pre-#1434 TUI shell's `build_shell_config` sets explicitly.
+    /// `Some(48.0)` on GTK/macOS/Win (VS Code parity); `None` on TUI, which
+    /// leaves [`quadraui::ShellConfig::activity_bar_width`]'s own default in charge.
     pub activity_bar_width_px: Option<f32>,
     /// [`quadraui::ShellConfig::with_title_bar`]'s `height_lh` argument.
     pub title_bar_lh: f32,
-    /// [`quadraui::ShellConfig::default_sidebar_width`] — the width the
-    /// sidebar opens at, in **line-height multiples** (quadraui's
-    /// `AppShell::compute_layout` multiplies it by `line_height`, so one unit
-    /// is one terminal row on TUI and ~23 device pixels on a GUI backend at
-    /// the default editor font).
-    ///
-    /// #1798: this has to differ per profile, because the unit it is
-    /// measured in differs by more than a factor of twenty. `App::
-    /// shell_config` used to leave it at `ShellConfig::new`'s generic
-    /// `20.0` on *every* backend. On TUI that is a 20-column sidebar beside
-    /// an 80-ish column terminal — fine. On a GUI backend it is a **~460px**
-    /// sidebar: next to the 48px activity bar, an 800x480 window had ~290px
-    /// left for the editor *and* its tab bar, i.e. room for exactly one tab.
-    /// That was the reported symptom — opening a second file moved the
-    /// breadcrumb, content and status bar to it, but the tab strip kept
-    /// reading only `sample.txt x`, because the second tab had nowhere to
-    /// paint.
-    ///
-    /// # Why `15.0` on the GUI profile, and not lower
-    ///
-    /// `15.0` is [`ALT_SIDEBAR_WIDTH_MIN`], the floor `App::shell_config`
-    /// *already* declares for the sidebar on every backend — so this makes
-    /// the opening width agree with the bound sitting two lines from it,
-    /// rather than inheriting an unrelated default. At ~345px it is in the
-    /// same range as [`crate::core::session::Session::sidebar_width`]'s own
-    /// persisted `260` default and VS Code's ~300px sidebar, and it leaves
-    /// ~400px of an 800px window for the editor band — enough for several
-    /// tabs (verified by the 800x480 driver test named below).
-    ///
-    /// It deliberately does **not** go below that floor, even though ~10
-    /// (~230px) would be closer still to the persisted 260. The floor is
-    /// shared with the Alt+Left/Right resize rung
-    /// ([`alt_resized_sidebar_width`], #759), so an opening width beneath it
-    /// makes the user's *first* Alt+Right jump discontinuously up to the
-    /// floor with no way back: measured at `10.0`, the painted sidebar went
-    /// 230px → 345px on Alt+Right and then stayed at 345px on Alt+Left
-    /// (`gtk::testing::alt_rung::alt_right_widens_the_painted_sidebar_on_gtk`
-    /// catches exactly this). Making that floor per-unit too is a change to
-    /// the *shared* Alt rung's cross-backend contract and wants its own
-    /// issue and its own two-backend coverage; it is not needed to fix the
-    /// tab bar, so this field is the whole of #1798's production change and
-    /// `min_sidebar_width`/`max_sidebar_width` stay shared and untouched.
-    ///
-    /// This is an `lh` multiple rather than a pixel value because
-    /// `App::shell_config` runs before the runner's first font measurement
-    /// (see the `#947`/`with_editor_font` comment at that call site), so it
-    /// could not convert pixels into multiples even if quadraui exposed a
-    /// `default_sidebar_width_px` to receive them — and an `lh` multiple is
-    /// the better unit anyway: it tracks `:set font_size` for free.
-    ///
-    /// Behavioural coverage: `gtk::testing`'s
-    /// `explorer_double_click_opens_second_file_in_a_second_tab_1798`, which
-    /// runs at the reported 800x480 and fails if this is `20.0`.
+    /// [`quadraui::ShellConfig::default_sidebar_width`] — the width the sidebar
+    /// opens at, in **line-height multiples**. Must differ per profile: TUI uses
+    /// cells (20 columns), while GUI backends use pixels (~460px at the old
+    /// default made the sidebar too wide, leaving no room for multiple tabs).
+    /// `15.0` is [`ALT_SIDEBAR_WIDTH_MIN`], keeping the opening width agreeing
+    /// with the resize floor, and leaves ~400px for the editor band in an 800px
+    /// window — enough for several tabs. Deliberately does not go below that
+    /// floor to avoid discontinuous Alt+Right jumps. An `lh` multiple rather
+    /// than pixels because it runs before the first font measurement.
     pub sidebar_width_lh: f32,
     /// Whether [`crate::app::App::shell_config`] should also request
     /// [`quadraui::ShellConfig::with_client_side_titlebar`].
     pub client_side_titlebar: bool,
     /// [`crate::icons::set_gui_backend`]'s argument.
     pub is_gui_backend: bool,
-    /// The explorer tree's own per-row pixel/cell pitch, given the
-    /// current line height — GTK: `quadraui::gtk::tree`'s own
-    /// `item_height = (line_height * 1.4).round()` (no public accessor;
-    /// duplicated here rather than re-derived from a `TreeController` hit
-    /// test, since building the `TreeView` its layout needs is a private
-    /// method — see `apply_explorer_drag_move`'s doc for the #1429
-    /// consumer this feeds and the upstream gap this constant is a
-    /// stand-in for). TUI: one whole cell (`|lh| lh`) — `quadraui::tui::
-    /// tree`'s own doc states `TreeStyle::row_height` is "a GUI-pixel"
-    /// concept only.
+    /// The explorer tree's own per-row pixel/cell pitch — GTK:
+    /// `(line_height * 1.4).round()` per `quadraui::gtk::tree`. TUI: one whole
+    /// cell (`|lh| lh`), a GUI-pixel concept only per `quadraui::tui::tree`.
     pub explorer_row_h: fn(f64) -> f64,
-    /// `(pad_x, pad_y)` the editor hover popup insets its content by,
-    /// matching whichever rasteriser actually painted it:
-    /// `quadraui::gtk::rich_text_popup`'s fixed 4px border/inset on GTK,
-    /// `quadraui::tui::rich_text_popup`'s 2-cell-x/1-cell-y frame on TUI.
-    /// `App::route_and_apply_editor_hover_popup` (press) and
-    /// `handle_mouse_drag_msg`'s `HoverPopupSelection` arm (drag) both
-    /// need the same value, or the two disagree about which content cell
-    /// a given pixel/cell maps to (#1429: found hardcoded to the GTK pair
-    /// in both places, which is why a TUI-native `App`, the `tui` harness
-    /// arm, resolved a drag one row short of wherever the press itself
-    /// had already been landing).
+    /// `(pad_x, pad_y)` the editor hover popup insets its content by:
+    /// `quadraui::gtk::rich_text_popup`'s fixed 4px on GTK,
+    /// `quadraui::tui::rich_text_popup`'s 2-cell-x/1-cell-y on TUI. Both the
+    /// press and drag handlers need the same value for consistent hit-testing.
     pub hover_popup_pad: (f32, f32),
 }
 
 impl UnitProfile {
-    /// GTK/macOS/Win: every value `App` used to hardcode as a `gtk_*`/
-    /// `GTK_*` constant or function, unchanged — #1426's own acceptance bar
-    /// is "no behaviour change on GTK/macOS/Win".
+    /// GTK/macOS/Win: every value `App` used to hardcode as a `gtk_*`/`GTK_*`
+    /// constant, unchanged.
     pub fn px() -> Self {
         UnitProfile {
             tab_row_h: tab_row_height_px,
@@ -1352,7 +1117,7 @@ impl UnitProfile {
             hit_tolerance: (6.0, 6.0),
             activity_bar_width_px: Some(48.0),
             title_bar_lh: 2.0,
-            // #1798: ~345px at the default editor font, down from the
+            // ~345px at the default editor font, down from the
             // inherited `20.0`'s ~460px — see the field doc for why this is
             // exactly `ALT_SIDEBAR_WIDTH_MIN` and not lower.
             sidebar_width_lh: ALT_SIDEBAR_WIDTH_MIN as f32,
@@ -1364,12 +1129,8 @@ impl UnitProfile {
     }
 
     /// The `tui` harness arm: `App` painted through
-    /// `quadraui::tui::TuiBackend`, whose `Backend::line_height`/
-    /// `char_width` are always `1.0` (one terminal cell) — see that
-    /// backend's own impl. Every value here is the cell-flavoured twin
-    /// `px()` reads instead, matching the constant the shipped
-    /// the pre-#1434 TUI shell already paints with (named in each field's own doc
-    /// above).
+    /// `quadraui::tui::TuiBackend`, whose `line_height`/`char_width` are always
+    /// `1.0` (one terminal cell). Every value here is the cell-flavoured twin.
     pub fn cell() -> Self {
         UnitProfile {
             tab_row_h: |lh| lh,
@@ -1396,10 +1157,7 @@ impl UnitProfile {
             hit_tolerance: (1.0, 1.0),
             activity_bar_width_px: None,
             title_bar_lh: 1.0,
-            // #1798: unchanged from what the TUI already shipped — `20.0` is
-            // `ShellConfig::new`'s own default, which `App::shell_config`
-            // used to leave untouched on every backend. In *cells* 20 is the
-            // right number; only the GUI profile was mis-scaled.
+            // Unchanged from the pre-#1434 TUI shell — `20.0` is the right number in cells.
             sidebar_width_lh: 20.0,
             client_side_titlebar: false,
             is_gui_backend: false,
@@ -1409,54 +1167,14 @@ impl UnitProfile {
     }
 }
 
-/// #1877: undo `AppShellLayout::main_content_bounds`'s shrink from
+/// Undo `AppShellLayout::main_content_bounds`'s shrink from
 /// `App::shell_config`'s `with_command_line()`/`with_status_bar()`
-/// reservation, recovering the full content height `render_content`'s own
-/// `compute_editor_layout`/status-bar/command-line math was already
-/// written against (that math independently — and correctly — subtracts
-/// vimcode's own *dynamic* bottom-chrome height from whatever `h` it is
-/// given; it must not also inherit a second, *static* subtraction the
-/// shell performed first, or every bottom row ends up reserved twice,
-/// leaving a blank gap between the command line and the window's true
-/// bottom edge).
-///
-/// `shell_config`'s reservation exists purely so
-/// `AppShellLayout::activity_bar_bounds` (and
-/// `sidebar_header_bounds`/`sidebar_content_bounds`) stop short of the
-/// window's bottom edge — see that call site's doc. Everything
-/// `render_content` paints into `main_content_bounds` keeps using this
-/// recovered height instead, so the one reservation shrinks only the
-/// activity bar/sidebar's painted height, never where the editor, status
-/// line or command line actually paint.
-///
-/// Only valid for an `AppShellLayout` produced by the one `ShellConfig`
-/// that actually opted into both bands — `App::shell_config`, today the
-/// sole legitimate producer. A layout built from a `ShellConfig` that
-/// skipped `with_command_line()`/`with_status_bar()` just adds back
-/// `0.0` for the missing band(s) (see the second half of this function's
-/// own test), so a mismatched layout is silently off by nothing, not
-/// silently off by two rows — there is nothing here for a mismatch to
-/// get wrong.
-///
-/// Review round 1 (#1877): clamped to `window_bounds`'s own true bottom
-/// edge, not just `main_content_bounds.height` plus both bands' heights
-/// unconditionally. `AppShell::compute_layout` clamps `band_h` with
-/// `.max(0.0)` *after* subtracting both rows from the viewport (quadraui
-/// `app_shell.rs:1253`), but still *returns* full-height
-/// `command_line_bounds`/`status_bar_bounds` rects even when the window is
-/// too short to hold them — so on, say, a 3-row terminal,
-/// `main_content_bounds.height` floors at `0.0` while the two bands still
-/// report `lh.round()` each, and this function would hand back `2 *
-/// lh.round()` for a window that cannot fit even one full row below the
-/// title bar. That slipped past `render_content`'s `w < 1.0 || h < 1.0`
-/// guard (previously the only thing standing between a too-short window
-/// and a negative/degenerate paint) and tripped
-/// `debug_assert_command_line_fits_viewport` instead — a debug-build panic
-/// where the pre-#1877 code silently bailed. Clamping to the window's own
-/// bottom edge restores that bail-out: a too-short window now reports a
-/// true height of `0.0` (or less, if `main_content_bounds.y` already
-/// exceeds the window), so the `h < 1.0` guard catches it exactly as
-/// before.
+/// reservation, recovering the full content height `render_content` computes
+/// against. The shell's reservation exists purely to stop the activity bar/
+/// sidebar's painted height before the window's bottom edge; everything
+/// `render_content` paints into `main_content_bounds` uses this recovered
+/// height instead, so the reservation shrinks only the activity bar/sidebar,
+/// never where the editor, status line or command line actually paint.
 pub fn main_content_true_height(layout: &quadraui::AppShellLayout) -> f32 {
     let reserved = layout.main_content_bounds.height
         + layout.command_line_bounds.map(|r| r.height).unwrap_or(0.0)
@@ -1465,37 +1183,13 @@ pub fn main_content_true_height(layout: &quadraui::AppShellLayout) -> f32 {
     reserved.min(window_bottom - layout.main_content_bounds.y)
 }
 
-/// #1877 review round 1 (blocking finding 1): the rect `shell_config`'s
-/// bottom-chrome reservation reclaims from `activity_bar_bounds`/
-/// `sidebar_header_bounds`/`sidebar_content_bounds`/`divider_bounds` but
-/// that nothing else paints — the bottom-left strip, `two rows tall ×
-/// (main_content_bounds.x - window_bounds.x)` wide, that used to be
-/// covered by the activity bar/sidebar/divider chrome quadraui's own
-/// `AppShell::render` paints (fully, edge to edge, before #1877) and now
-/// isn't, because that chrome is painted *into* the now-shrunk bounds
-/// only. Nothing downstream repaints the vacated strip: vimcode's own
-/// status-bar/command-line rows are anchored at `main_content_bounds.x`
-/// (`render_content`'s own `x`/`w` locals), not at the window's left
-/// edge, so they never reach left of the activity bar/sidebar column
-/// either. Left unpainted, a plain Cairo/CG/ratatui surface shows
-/// whatever the frame clear left there — `theme.background` on every
-/// backend — a visible notch against `theme.tab_bar_bg`'s activity-bar
-/// color on any theme where the two differ (onedark: `#1a1a1a` vs
-/// `#262633`).
-///
-/// Returns the reclaimed rect — `window_bounds.x` to `main_content_bounds
-/// .x`, from the bottom of `activity_bar_bounds` (the shrunk edge every
-/// one of the four reclaimed rects shares, by construction: `band_h` feeds
-/// all four at once, quadraui `app_shell.rs:1296-1349`) to
-/// `window_bounds`'s own true bottom edge — or `None` when there is
-/// nothing to reclaim (no reservation active, so `activity_bar_bounds`
-/// already runs flush to the window's bottom edge, or the window is too
-/// short for either dimension to be positive). The caller fills this with
-/// `theme.tab_bar_bg` — the same colour `AppShell::render` already uses
-/// for `activity_bar_bounds` itself (quadraui `primitives/activity_bar.rs
-/// :644-645`) and for `divider_bounds` (`theme.separator`, blended in by
-/// eye at this width) — so the strip reads as a continuation of the
-/// existing chrome instead of a second, differently-themed notch.
+/// The rect `shell_config`'s bottom-chrome reservation reclaims from
+/// `activity_bar_bounds`/`sidebar_*_bounds`/`divider_bounds`. Returns
+/// the reclaimed rect from the window's left edge to `main_content_bounds.x`,
+/// from `activity_bar_bounds`'s (shrunk) bottom edge to the window's true
+/// bottom edge, or `None` when there is nothing to reclaim. The caller fills
+/// this with `theme.tab_bar_bg` — the same colour used for `activity_bar_bounds`.
+/// itself — so the strip reads as a continuation of the existing chrome.
 pub fn bottom_chrome_reservation_fill_rect(
     layout: &quadraui::AppShellLayout,
 ) -> Option<quadraui::Rect> {
@@ -1560,12 +1254,9 @@ pub(crate) mod tests {
         assert_eq!(with_bc, TAB_ROW_HEIGHT_PX + BREADCRUMB_ROW_HEIGHT_PX);
     }
 
-    /// #700: raising `line_height` (a stand-in for `settings.font_size`
-    /// inflating editor text metrics) must NOT change the tab-bar or
-    /// breadcrumb row height — VS Code's chrome stays fixed regardless of
-    /// editor font size. RED-first check: reinstating the old
-    /// `ceil(line_height * 1.6)` formula makes this fail because `40.0` and
-    /// `20.0` no longer produce equal row heights.
+    /// Raising `line_height` (a stand-in for `settings.font_size`) must NOT
+    /// change the tab-bar or breadcrumb row height — VS Code's chrome stays fixed
+    /// regardless of editor font size.
     #[test]
     fn test_tab_bar_height_px_independent_of_font_size() {
         let small = tab_row_height_px(14.0);
@@ -1579,7 +1270,7 @@ pub(crate) mod tests {
         assert_eq!(small_bc, TAB_ROW_HEIGHT_PX + BREADCRUMB_ROW_HEIGHT_PX);
     }
 
-    /// #1877: `main_content_true_height` adds the shell's own
+    /// `main_content_true_height` adds the shell's own
     /// `command_line_bounds`/`status_bar_bounds` heights back onto
     /// `main_content_bounds.height`, recovering the pre-reservation value
     /// — and is `0.0`-safe (treats either/both as absent) for callers that
@@ -1600,22 +1291,18 @@ pub(crate) mod tests {
         };
         assert_eq!(main_content_true_height(&layout), 828.0 + 18.0 + 18.0);
 
-        // Neither band reserved — the common, pre-#1877 shape — is a no-op.
+        // Neither band reserved — the common case — is a no-op.
         layout.command_line_bounds = None;
         layout.status_bar_bounds = None;
         assert_eq!(main_content_true_height(&layout), 828.0);
     }
 
-    /// #1877 review round 1 (non-blocking finding 1): a window too short
-    /// to hold the reservation must clamp to the window's own true bottom
-    /// edge, not blindly add both bands' full (un-`.max(0.0)`-clamped-at-
-    /// this-layer) heights back onto a `main_content_bounds.height` that
-    /// `AppShell::compute_layout` already floored at `0.0`. Pre-fix this
-    /// returned `2 * lh.round()` for a window with zero rows available
-    /// below the title bar — enough to slip past `render_content`'s own
-    /// `h < 1.0` bail-out and reach `debug_assert_command_line_fits_
-    /// viewport` instead, a debug-build panic where the pre-#1877 code
-    /// silently returned with nothing painted.
+    /// A window too short to hold the reservation must clamp to the window's own
+    /// true bottom edge. `AppShell::compute_layout` clamps `band_h` after
+    /// subtracting both rows, but still returns full-height rects; blindly adding
+    /// full band heights back onto zero `main_content_bounds.height` would exceed
+    /// the window. Clamping restores the pre-#1877 behavior: a too-short window
+    /// reports zero height so the `h < 1.0` guard catches it.
     #[test]
     fn main_content_true_height_clamps_to_the_window_when_too_short_to_reserve() {
         let layout = quadraui::AppShellLayout {
@@ -1641,12 +1328,9 @@ pub(crate) mod tests {
         assert_eq!(main_content_true_height(&layout), 0.0);
     }
 
-    /// #1877 review round 1 (blocking finding 1): the rect `shell_config`'s
-    /// reservation vacates from `activity_bar_bounds` (and `sidebar_*_
-    /// bounds`/`divider_bounds`) — nothing else in `render_content` paints
-    /// it, so it must be reported precisely: from `activity_bar_bounds`'s
-    /// (shrunk) bottom edge down to the window's true bottom edge, as wide
-    /// as everything left of `main_content_bounds.x`.
+    /// The rect `shell_config`'s reservation vacates: from `activity_bar_bounds`'s
+    /// (shrunk) bottom edge down to the window's true bottom edge, as wide as
+    /// everything left of `main_content_bounds.x`. Nothing else paints it.
     #[test]
     fn bottom_chrome_reservation_fill_rect_reports_the_vacated_strip() {
         let layout = quadraui::AppShellLayout {
@@ -1722,10 +1406,7 @@ pub(crate) mod tests {
 
     // ── #755: the shared editor hover popup rung ────────────────────────
     //
-    // The behaviours below are what the two backends' bespoke copies
-    // *disagreed* about. Black-box coverage lives in
-    // `src/tui_main/shell_app.rs` and `src/gtk/testing.rs`; these pin the
-    // arbitration itself, which neither driver can isolate.
+    // The tests below pin behaviours the backends' bespoke copies disagreed about.
 
     fn hover_state<'a>(
         links: &'a [(quadraui::Rect, String)],
@@ -1746,7 +1427,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// #504: abutting link rects must each be individually reachable. GTK's
+    /// Abutting link rects must each be individually reachable. GTK's
     /// arm hit-tested with `<=` on the right and bottom edges, so rect *n*
     /// and rect *n+1* overlapped by a pixel on their shared boundary and
     /// `find()` could only ever return the earlier one. The shared router
@@ -1772,7 +1453,7 @@ pub(crate) mod tests {
 
     /// A `command:` URI routes to `Command`, not `Link` — the apply pass
     /// navigates and dismisses rather than handing the string to the
-    /// backend's clipboard/browser (#272, #491).
+    /// backend's clipboard/browser.
     #[test]
     fn hover_popup_command_uri_routes_to_command_not_link() {
         let links = vec![(
@@ -1979,19 +1660,13 @@ pub(crate) mod tests {
         ));
     }
 
-    // ─── window_zone_hit_test / minimap click-drag routing (#1094 review) ──
+    // ─── window_zone_hit_test / minimap click-drag routing ──
     //
-    // `window_zone_hit_test` is the shared classifier both `click.rs`'s
-    // `pixel_to_click_target` (GTK) and `tui_main/mouse.rs` (TUI) route
-    // through. #1094's own fix widened `RenderedWindow.rect` back out to
-    // the pane's true right edge (so the scrollbar paints there, past the
-    // strip) but initially left this function computing its own
-    // `viewport_cols` straight from that wider `rect.width`, with no idea
-    // the minimap strip eats into it. The two tests below pin the two
-    // resulting drifts: a real horizontal-scrollbar click misclassified as
-    // `TextArea`, and — worse — a text-selection drag whose pointer sweeps
-    // over the strip's own pixels extending the selection underneath
-    // painted minimap content instead of being treated as a miss.
+    // `window_zone_hit_test` classifies clicks for both `click.rs`'s
+    // `pixel_to_click_target` (GTK) and `tui_main/mouse.rs` (TUI). The minimap
+    // strip eats into viewport width; the tests below pin drifts where the
+    // pre-fix formula didn't account for it, misclassifying scrollbar clicks and
+    // extending selection drags into minimap pixels.
 
     /// Minimal `RenderedWindow` fixture with every field controllable,
     /// mirroring `build_rendered_window`'s own `empty` closure (this
@@ -2077,16 +1752,10 @@ pub(crate) mod tests {
     }
 
     /// A point over the minimap strip's own column range must not resolve
-    /// to `TextArea` — pre-#1094, `RenderedWindow.rect` was narrowed by the
-    /// strip's width, so such a point fell outside the window entirely
-    /// (`find_window_at` never even reached this function for it). Post-
-    /// #1094, `rect` reaches the pane's true right edge instead, so
-    /// `window_zone_hit_test` has to exclude the strip's columns
-    /// explicitly or a text-selection drag whose pointer sweeps over the
-    /// strip's pixels (`apply_tui_editor_text_drag`, and
-    /// `pixel_to_click_target`'s `mutate_focus == false` continuation path)
-    /// would extend the selection underneath the painted strip instead of
-    /// being treated as a miss.
+    /// to `TextArea` — `window_zone_hit_test` must exclude the strip's columns
+    /// explicitly, so a text-selection drag whose pointer sweeps over the
+    /// strip's pixels would extend the selection underneath the painted strip
+    /// instead of being treated as a miss.
     #[test]
     fn window_zone_hit_test_excludes_the_minimap_strip_from_text_area() {
         let rect = WindowRect::new(0.0, 0.0, 40.0, 10.0);
@@ -2113,39 +1782,22 @@ pub(crate) mod tests {
         );
     }
 
-    /// vimcode#1696: `to_q_editor`'s `editor.rect` is `rw.rect` verbatim —
-    /// the *pane's* full-width rect, by #1094's own design (the minimap
-    /// strip and quadraui's own drawn v/h scrollbar both have to sit
-    /// somewhere inside that wide rect, past the narrower text; see that
-    /// function's own doc comment and `build_screen_layout_with_breadcrumb_
-    /// row`'s "#1094" section above). `RenderedWindow.minimap_reserved_w`
-    /// never reaches `editor.rect`, so nothing then re-narrows the viewport
-    /// `quadraui::Editor::layout` computes `EditorLayout::text_bounds` from
-    /// — the exact value both backends' rasterisers size their glyph-
-    /// drawing budget off (Win-GUI's `visible_cols`-bounded
-    /// `win::editor::paint_line_text`; GTK's Cairo clip set to
-    /// `text_bounds.width`). This test pins that gap numerically rather
-    /// than by reading the source, so it is a **concrete regression target**
-    /// for the missing quadraui capability `docs/PENDING_QUADRAUI_ISSUES.md`'s
-    /// matching #1696 entry asks for (a way to reserve trailing content
-    /// width independently of where the v/h scrollbar anchors): once that
-    /// lands and vimcode adopts it, `text_bounds`'s right edge below should
-    /// land at `rect.width - minimap_reserved_w`, not `rect.width` itself.
+    /// `to_q_editor`'s `editor.rect` is `rw.rect` verbatim —
+    /// the *pane's* full-width rect (the minimap strip and quadraui's own
+    /// drawn v/h scrollbar both sit inside that wide rect, past the narrower
+    /// text). `RenderedWindow.minimap_reserved_w` never reaches `editor.rect`,
+    /// so nothing re-narrows the viewport `quadraui::Editor::layout` computes
+    /// `EditorLayout::text_bounds` from — the exact value both backends'
+    /// rasterisers size their glyph-drawing budget off. This test pins that
+    /// gap numerically as a concrete regression target for the missing quadraui
+    /// capability to reserve trailing content width independently of where the
+    /// v/h scrollbar anchors: once that lands and vimcode adopts it,
+    /// `text_bounds`'s right edge below should land at
+    /// `rect.width - minimap_reserved_w`, not `rect.width` itself.
     ///
-    /// Deliberately **not** "fixed" by narrowing `to_q_editor`'s `rect`
-    /// directly — doing so moves `EditorLayout::v_scrollbar_bounds`/
-    /// `h_scrollbar_bounds` (both anchored to `viewport.x + viewport.width`)
-    /// in to sit flush against the now-narrower text instead of past the
-    /// strip at the pane's true right edge, which is the exact regression
-    /// #1094's own fix (and `window_zone_hit_test_h_scrollbar_click_
-    /// accounts_for_the_minimap_strip` above) was written to prevent. A
-    /// correct fix needs `Editor`/`EditorPaintOptions` to let a caller
+    /// A correct fix needs `Editor`/`EditorPaintOptions` to let a caller
     /// reserve extra trailing width for content layout alone, leaving the
-    /// scrollbar anchor at the full `viewport.width` untouched — which does
-    /// not exist upstream today (confirmed by reading `layout_with_options`
-    /// at the pinned rev: `text_w`/`visible_cols` and
-    /// `v_scrollbar_bounds`/`h_scrollbar_bounds` are both derived from the
-    /// one `viewport.width`, with no second parameter to decouple them).
+    /// scrollbar anchor at the full `viewport.width` untouched.
     #[test]
     fn to_q_editor_does_not_narrow_the_viewport_for_the_minimap_strip_1696() {
         let rect = WindowRect::new(0.0, 0.0, 40.0, 10.0);
@@ -2175,17 +1827,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// #722 acceptance (narrowed by #989): below the point where
-    /// `MINIMAP_TARGET_COLS_TUI` becomes affordable, the reserved width is
-    /// still a proportion of the *pane's* width, so widening a genuinely
-    /// narrow pane must still widen the strip. `char_width == 1.0`
-    /// (TUI-shaped) keeps `resolve_width`'s column-normalisation a no-op, so
-    /// both widths land `want = width * MINIMAP_WIDTH_FRACTION` strictly
-    /// inside `[MINIMAP_MIN_COLS, MINIMAP_MAX_COLS]` (6 and 10.5, against a
-    /// 6..30 band) and below `MINIMAP_TARGET_COLS_TUI` (12) — both widths
-    /// stay in the pre-#989 proportional regime, unlike an *ordinary*
-    /// terminal width (see `minimap_reserved_width_holds_steady_across_ordinary_pane_widths`
-    /// below for the #989 fix itself, where the strip stops scaling).
+    /// Below the point where `MINIMAP_TARGET_COLS_TUI` becomes affordable,
+    /// the reserved width is still a proportion of the *pane's* width, so
+    /// widening a genuinely narrow pane must still widen the strip.
+    /// `char_width == 1.0` (TUI-shaped) keeps `resolve_width`'s
+    /// column-normalisation a no-op, so both widths land `want = width *
+    /// MINIMAP_WIDTH_FRACTION` strictly inside `[MINIMAP_MIN_COLS,
+    /// MINIMAP_MAX_COLS]` and below `MINIMAP_TARGET_COLS_TUI`, staying in
+    /// the proportional regime.
     #[test]
     fn minimap_reserved_width_scales_with_a_narrow_pane_width() {
         let e = minimap_engine();
@@ -2201,13 +1850,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// #989 fix: on ordinary terminal widths (80..200 cols) the TUI minimap
+    /// On ordinary terminal widths (80..200 cols) the TUI minimap
     /// must hold steady at `MINIMAP_TARGET_COLS_TUI`, not scale with the
-    /// pane. RED against the pre-#989 shape (`TUI_MINIMAP_SIZING` reusing
-    /// the pixel-flavoured `MINIMAP_TARGET_COLS` = 120, which can never bind
-    /// in columns): at those same three widths this would have returned
-    /// `15`, `22.5` and `30` (the `fraction`-driven, then max-clamped,
-    /// values) respectively — three different widths instead of one.
+    /// pane.
     #[test]
     fn minimap_reserved_width_holds_steady_across_ordinary_pane_widths() {
         let e = minimap_engine();
@@ -2227,18 +1872,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// #1869 acceptance (updated from the pre-#1869
-    /// `minimap_reserved_width_is_unchanged_by_font_size`, which pinned the
-    /// *opposite* of VS Code's real behaviour — see `MINIMAP_WIDTH_FRACTION`'s
-    /// doc comment for why that premise was wrong): below the 120-column
-    /// cap, VS Code's own minimap width formula genuinely divides by the
-    /// editor's real character width, so a wider editor font must narrow
-    /// the strip at the same pane width, not leave it unchanged.
-    ///
-    /// RED against the pre-#1869 shape (`resolve_width` with a forced
-    /// `char_width` of `1.0`): both font sizes would have resolved to the
-    /// same `pane_width * MINIMAP_WIDTH_FRACTION`-derived number regardless
-    /// of the `8.0`/`16.0` passed here.
+    /// Below the 120-column cap, VS Code's own minimap width formula
+    /// divides by the editor's real character width, so a wider editor font
+    /// must narrow the strip at the same pane width.
     #[test]
     fn minimap_reserved_width_scales_with_char_width_per_vs_code_formula() {
         let e = minimap_engine();
@@ -2266,7 +1902,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Direct unit coverage of [`vs_code_minimap_width_px`] itself (#1869),
+    /// Direct unit coverage of [`vs_code_minimap_width_px`] itself,
     /// below the cap — the acceptance bullet "the minimap width equals the
     /// VS Code formula's result, which is less than 120 at a pane narrow
     /// enough to be under the cap". Hand-computed independently of the
@@ -2283,7 +1919,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// [`vs_code_minimap_width_px`]'s true floor (#1869): once the pane is
+    /// [`vs_code_minimap_width_px`]'s true floor: once the pane is
     /// narrow enough that the division term itself would go negative, the
     /// formula clamps it to `0` before adding the gutter — so the result
     /// bottoms out at exactly [`MINIMAP_GUTTER_WIDTH_PX`] (8px), regardless
@@ -2305,13 +1941,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// #728/#1869 acceptance: an ordinary wide GTK/macOS/Win pane must cap
-    /// at VS Code's 120-column minimap width — exactly, not approximately —
-    /// across more than one editor font size, rather than scaling up with
-    /// the pane the way the pre-#728 `rect_width * MINIMAP_WIDTH_FRACTION`
-    /// formula did (caught at ~240px by
-    /// `gtk::testing::minimap::minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane`,
-    /// driven through the real paint path).
+    /// An ordinary wide GTK/macOS/Win pane must cap at VS Code's 120-column
+    /// minimap width — exactly, not approximately — across more than one
+    /// editor font size.
     #[test]
     fn minimap_reserved_width_caps_at_exactly_120_on_a_wide_pane_across_font_sizes() {
         let e = minimap_engine();
@@ -2327,12 +1959,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// #728 acceptance, still pinned at the exact scenario #728 originally
-    /// caught (a 1600px pane at an 8px character width): under #1869's real
-    /// formula this also happens to land exactly on the 120-column cap
-    /// (`floor((1600 - 16) / 9) + 8 == 184`, `min(120, 184) == 120`), so
-    /// the historical regression scenario stays covered without this test
-    /// needing to change at all.
+    /// An ordinary wide pane at an 8px character width lands exactly on the
+    /// 120-column cap (`floor((1600 - 16) / 9) + 8 == 184`,
+    /// `min(120, 184) == 120`).
     #[test]
     fn minimap_reserved_width_matches_vs_code_parity_on_a_wide_pane() {
         let e = minimap_engine();
@@ -2344,9 +1973,9 @@ pub(crate) mod tests {
         );
     }
 
-    // ── Command-line click/selection geometry (#816) ────────────────────
+    // ── Command-line click/selection geometry ───────────────────────────
 
-    /// #816 review: GTK's `MouseDown` handler used a hand-rolled guard that
+    /// GTK's `MouseDown` handler used a hand-rolled guard that
     /// compared only `point.y` against the command line's rect, never
     /// `point.x`. Since `command_line_rect`'s `x`/`width` come from
     /// `main_content_bounds` (after the activity bar + sidebar), that guard
@@ -2397,8 +2026,6 @@ pub(crate) mod tests {
             quadraui::Point::new(0.0, 0.0)
         ));
     }
-
-    // ── divider_to_split (#582 follow-up) ───────────────────────────────────
 
     #[test]
     fn divider_to_split_vertical_maps_direction_ratio_and_bounds() {
@@ -2451,15 +2078,10 @@ pub(crate) mod tests {
         assert_eq!(rect, quadraui::Rect::new(10.0, 0.0, 20.0, 50.0));
     }
 
-    /// #582 iteration-2 regression: GTK's `:vsplit` divider was unhittable
-    /// because the hit-test rebuilt its bounds at origin `(0, 0)` while
-    /// `render_content` painted from `main_content_bounds` — origin offset
-    /// right by the activity bar/sidebar. The press then missed and fell
-    /// through to text-selection.
-    ///
-    /// Pins the invariant the GTK fix relies on: a divider's hit band tracks
-    /// its `axis_start`, so an origin-shifted (`0.0`) recomputation of the
-    /// same split is NOT interchangeable with the painted one. If this ever
+    /// GTK's `:vsplit` divider hit-test must rebuild its bounds from
+    /// `axis_start`, so an origin-shifted recomputation of the same split
+    /// tracks the painted position. Pins the invariant that a divider's
+    /// hit band follows its `axis_start`, not screen origin: if this ever
     /// passes at both positions, the two frames have been conflated again.
     #[test]
     fn divider_hit_test_follows_axis_start_not_screen_origin() {
@@ -2483,8 +2105,7 @@ pub(crate) mod tests {
             Some(0),
         );
         // The position an origin-at-zero recomputation would have painted
-        // (0 + 600*0.5 = 300) is NOT the divider — this is the exact
-        // displacement that made #582's `:vsplit` fall through.
+        // (0 + 600*0.5 = 300) is NOT the divider.
         assert_eq!(
             divider_hit_test(&dividers, 300.0, 300.0, (6.0, 6.0), (6.0, 6.0), false),
             None,
@@ -2525,24 +2146,17 @@ pub(crate) mod tests {
         assert_eq!(rect, quadraui::Rect::new(300.0, 40.0, 600.0, 500.0));
     }
 
-    /// #1586 (the "unit test on group geometry" acceptance bullet): for a
-    /// stacked (`Ctrl+W s`) group split, no *painted* divider rect may
-    /// intersect either group's own tab-row band.
+    /// For a stacked (`Ctrl+W s`) group split, no *painted* divider rect
+    /// may intersect either group's own tab-row band.
     ///
-    /// `GroupLayout::calculate_group_rects`/`dividers` are unchanged by
-    /// #1586 (`GroupDivider::position` for a stacked split still coincides
-    /// exactly with the lower group's tab-row top — see
-    /// [`painted_group_dividers`]'s doc for why that geometry is fine to
-    /// leave alone) — so this pins the *paint-time* invariant instead: after
-    /// [`painted_group_dividers`] filters `GroupLayout::dividers`'s raw
-    /// output, nothing left in the result can ever land inside a tab-row
-    /// band, because a stacked entry never survives the filter at all.
+    /// After [`painted_group_dividers`] filters the raw group dividers,
+    /// nothing left in the result can intersect a tab-row band, because a
+    /// stacked entry never survives the filter at all.
     ///
     /// Asserts both halves, so this cannot pass vacuously: (1) the *raw*
     /// divider genuinely does intersect the lower group's tab-row band —
-    /// proving the filter is doing real work, not filtering nothing — and
-    /// (2) the *painted* (filtered) set is empty, so no rect from it can
-    /// intersect anything.
+    /// proving the filter is doing real work — and (2) the *painted*
+    /// (filtered) set is empty.
     #[test]
     fn painted_group_dividers_excludes_stacked_entries_that_intersect_tab_rows_1586() {
         use crate::core::window::{GroupId, GroupLayout, WindowRect};

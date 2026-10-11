@@ -2,14 +2,13 @@ use super::construction::dialog_btn_index;
 use super::*;
 
 impl App {
-    /// Compose the **bottom band** (#765, #735 slice 4): the chrome vimcode
-    /// stacks below the editor column — quickfix, the terminal/debug bottom
-    /// panel, the debug toolbar, the separated status line and the sidebar
-    /// hover popup.
+    /// Compose the **bottom band**: the chrome vimcode stacks below the
+    /// editor column — quickfix, the terminal/debug bottom panel, the debug
+    /// toolbar, the separated status line and the sidebar hover popup.
     ///
     /// Walks `render::compose_bottom_band`; geometry stays here, in pixels,
     /// mirroring `compute_editor_layout`'s `unit_h = line_height` convention.
-    /// Extracted out of `render_content` (#766) so that function reads as the
+    /// Extracted out of `render_content` so that function reads as the
     /// frame's *order* and nothing else. `main` is
     /// `AppShellLayout::main_content_bounds`.
     #[allow(clippy::too_many_arguments)]
@@ -28,7 +27,7 @@ impl App {
         let (lh, cw) = metrics;
         let _ = cw;
 
-        // ══ Bottom band (#765, #735 slice 4) ═════════════════════════════════
+        // ══ Bottom band ════════════════════════════════════════════════════════
         //
         // Composed from `render::compose_bottom_band` — the single ordered
         // artefact both backends walk for the chrome stacked below the editor
@@ -36,11 +35,8 @@ impl App {
         // and `CHROME_Z_ORDER` (below) for the surrounding chrome. Geometry
         // stays here, in pixels, mirroring `compute_editor_layout`'s
         // `unit_h = line_height` convention; only the *order* and the *gates*
-        // moved. `BOTTOM_Z_ORDER`'s doc comment records the five divergences
-        // this convergence closed — including the two this backend owned: the
-        // panel-hover popup nested inside the sidebar rung where it could not
-        // clear its own click-routing cache, and the debug output's body
-        // starting a row too low.
+        // moved. `BOTTOM_Z_ORDER`'s doc comment records the convergences that
+        // unified the backends' bottom-band logic.
         //
         // `editor_area_h` above (`el.editor_bottom`) already reserves the whole
         // stack, so these bands sit directly below it with no gap and no
@@ -49,8 +45,6 @@ impl App {
         // Caches whose owning rung may be gated off are cleared *here*, before
         // the walk, never from an `else` arm inside it: `compose_bottom_band`
         // returns only the live rungs, so an absent rung has no arm to run.
-        // Clearing from inside the walk is precisely the mistake that left this
-        // backend routing clicks at a popup it had stopped painting.
         engine.bottom_panel_geometry.replace(None);
         self.debug_toolbar_y_offset.set(0.0);
         self.debug_toolbar_height.set(0.0);
@@ -71,12 +65,9 @@ impl App {
                     let Some(ref qf) = screen.quickfix else {
                         continue;
                     };
-                    // GTK has no persistent `quickfix_scroll_top` to advance
-                    // from key events (unlike TUI's the pre-#1434 TUI shell), so the
-                    // "keep the selection visible" offset is recomputed
-                    // statelessly each frame — through the shared
-                    // `quickfix_scroll_top`, so the two backends cannot
-                    // disagree about what that means.
+                    // The "keep the selection visible" offset is recomputed statelessly
+                    // each frame through the shared `quickfix_scroll_top`, so the two
+                    // backends cannot disagree about what that means.
                     let visible_rows = ((el.quickfix_h / lh) as usize).saturating_sub(1);
                     render::paint_quickfix_rung(
                         backend,
@@ -131,7 +122,7 @@ impl App {
                         main.width,
                         el.separated_status_h as f32,
                     );
-                    // #1690: backdrop fill, full window/terminal width (not
+                    // Backdrop fill, full window/terminal width (not
                     // `main.width` — main-content-column-only), painted
                     // *before* the real, window-bounded bar below — see
                     // `render::paint_status_backdrop`'s doc (the same
@@ -155,7 +146,7 @@ impl App {
                         backdrop_rect,
                         real_bg,
                     );
-                    // #672: segment hit-zone recovery keyed by
+                    // Segment hit-zone recovery keyed by
                     // `active_window_id` — the separated line shows the active
                     // window's status, so that's the id `pixel_to_click_target`
                     // looks its zones up under. The layout comes back from the
@@ -234,7 +225,7 @@ impl App {
         let mut slots_abs = self.cached_tab_slots_abs.borrow_mut();
         let mut visible_counts = self.tab_visible_counts.borrow_mut();
         for bar in painted {
-            // #1165/#1491: the engine-feedback "how many columns of tab
+            // The engine-feedback "how many columns of tab
             // strip fit" number `Engine::set_tab_visible_count` budgets
             // against — see `click::tab_bar_available_cols`'s doc for why
             // this reads the paint's own rect/layout instead of the
@@ -243,18 +234,10 @@ impl App {
                 bar.group_id,
                 tab_bar_available_cols(bar.rect, &bar.layout, char_width),
             ));
-            // Recover the exact pixel geometry the rasteriser just drew and
-            // cache it for hit-testing and tab-drop geometry.
-            //
-            // #764: `bar.layout` is what the *paint* returned, not a separate
-            // re-measure this used to make. The icon reservation widens
-            // every decorated tab, so an icon-less or differently-fonted
-            // twin reports slot and close bounds shifted left of the
-            // painted glyphs — i.e. the close × of tab N lands inside tab
-            // N+1's painted slot, and clicking it closes the wrong tab.
-            // Exactly the measure/paint desync of #654; reading the paint's
-            // own answer makes it unreachable rather than merely fixed
-            // (#703).
+            // Cache the exact pixel geometry the rasteriser just drew for
+            // hit-testing and tab-drop geometry. The painted layout already has
+            // the correct icon-adjusted widths, so reading the paint's own
+            // answer avoids measure/paint desync.
             slots_abs.insert(
                 bar.group_id.0,
                 abs_slot_positions_from_layout(bar.rect, bar.bar, &bar.layout),
@@ -276,13 +259,9 @@ impl App {
     /// computation.
     ///
     /// Origin convention: `gtb.bounds` are always absolute (built from absolute
-    /// window rects), so there is no origin offset to apply — adding the editor
-    /// column's `(x, y)` again would double-count it and shift the highlight
-    /// off the group (the prior "covers half the group" bug, #515). This used
-    /// to branch on `editor_group_split.is_some()` because the single-group arm
-    /// of `screen_to_drop_group_bounds` derived its rect from a caller-supplied
-    /// origin/size instead; `group_tab_bars` now covers one group too, so both
-    /// the branch and the parameters it fed are gone (#551).
+    /// window rects), so there is no origin offset to apply. `group_tab_bars`
+    /// covers tab-bar geometry directly, so both branches and the parameters
+    /// they fed are unified.
     pub(crate) fn cache_tab_drop_geometry(
         &self,
         screen: &render::ScreenLayout,
@@ -293,7 +272,7 @@ impl App {
         // Per-tab slot x-positions (absolute) are captured by the `TabBars`
         // rung while drawing. Feeding them here makes a drag inside a group's
         // own tab bar resolve to a `TabReorder` (insertion bar) instead of
-        // falling through to a new-split/center overlay. (#515)
+        // falling through to a new-split/center overlay.
         let slots_abs = self.cached_tab_slots_abs.borrow();
         let ctx = render::build_tab_drop_ctx(&bounds, engine, tab_bar_h as f32, &slots_abs);
         drop(slots_abs);
@@ -346,10 +325,10 @@ impl App {
         Some((gid, tidx))
     }
 
-    /// Resolve the modal-overlay rung (#733) for one point/action against
+    /// Resolve the modal-overlay rung for one point/action against
     /// the layouts the last frame actually painted
     /// (`dialog_layout`, `tab_switcher_popup_rect`, `completion_layout`,
-    /// `Engine::toast_layout`), never freshly recomputed ones (#582/#646).
+    /// `Engine::toast_layout`), never freshly recomputed ones.
     ///
     /// Shared by every mouse-button path that needs to know whether a
     /// modal overlay owns the event — left-click dispatch
@@ -374,7 +353,7 @@ impl App {
         let lh = self.painted_line_height() as f32;
         // Both geometries come from what the last frame PAINTED — the picker's
         // own published rect, and the `FindReplacePanel` the frame was built
-        // from — never a re-derivation off the drawing-area size (#555/#582).
+        // from — never a re-derivation off the drawing-area size.
         let picker = self.picker_popup_rect.get().map(|rect| {
             render::PickerHitGeometry::new(
                 rect,
@@ -426,12 +405,8 @@ impl App {
     ///
     /// The verdict itself — which result row, thumb vs. track, inside vs.
     /// outside — is `render::PickerHitGeometry`'s, shared with TUI's
-    /// `handle_mouse`. Before #751 each backend resolved it from its own
-    /// re-derivation of the popup geometry, and the two had already drifted:
-    /// GTK jumped the offset proportionally on a track click and grabbed the
-    /// thumb at zero, TUI paged the track and grabbed with an offset, and
-    /// clicking an already-selected row confirmed it on TUI but did nothing on
-    /// GTK.
+    /// `handle_mouse`. Both backends now resolve it from the same router,
+    /// so their hit-test logic no longer drifts.
     pub(crate) fn apply_picker_route(
         &mut self,
         backend: &dyn quadraui::Backend,
@@ -454,7 +429,6 @@ impl App {
         };
         // Keep the stack in step: the drag guard in `handle_mouse_drag_msg`
         // consults it to stop a gesture leaking to the editor behind the modal
-        // (#192).
         backend
             .modal_stack_handle()
             .borrow_mut()
@@ -479,7 +453,7 @@ impl App {
             }
             render::PickerRoute::Consume => {}
             render::PickerRoute::Dismiss => {
-                // #1630 review: clicking away from a `vimcode.picker.open`
+                // Clicking away from a `vimcode.picker.open`
                 // picker is a user-initiated cancel exactly like Escape —
                 // use the same helper so `on_cancel` fires and the plugin's
                 // registration is released instead of leaking forever.
@@ -543,7 +517,7 @@ impl App {
 
     /// Resolve a press against one editor scrollbar axis — thumb-drag vs.
     /// track page-jump — shared between the horizontal and vertical rungs
-    /// of `handle_mouse_click_msg` (#1493). Returns `true` when the point
+    /// of `handle_mouse_click_msg`. Returns `true` when the point
     /// landed on a scrollbar and the click was consumed (either scrolled
     /// immediately or armed a drag); the caller should `return` without
     /// falling through to the next rung.
@@ -554,11 +528,7 @@ impl App {
     /// recompute from the drawing area's raw `width`/`height`, which always
     /// assumes the editor area starts at `x = 0`. That only holds with the
     /// activity bar/sidebar at zero width; with either painted, the real
-    /// left edge is `AppShellLayout::main_content_bounds.x`, so a rect
-    /// rebuilt from `(0, 0, width, height)` lands columns off from what was
-    /// actually drawn (this is what made the pre-#1493 horizontal-only copy
-    /// of this method resolve against a phantom rect once the sidebar/
-    /// activity bar reserved real width).
+    /// left edge is `AppShellLayout::main_content_bounds.x`.
     pub(crate) fn editor_scrollbar_press(
         &mut self,
         backend: &dyn quadraui::Backend,
@@ -571,11 +541,9 @@ impl App {
         };
         let lh = self.cached_line_height;
         let cw = self.cached_char_width;
-        // #1891: thread the backend's own vertical-scrollbar-width override
-        // (GTK/macOS/Win's 14px, `None` on TUI) through so hit-testing
-        // agrees with whatever width paint actually drew — see
-        // `editor_scrollbar_layout`'s doc for why passing `None` here would
-        // silently reintroduce the paint↔hit-test divergence #1891 fixed.
+        // Hit-testing must use the backend's own scrollbar-width override
+        // (GTK/macOS/Win's 14px, `None` on TUI) so it agrees with whatever
+        // width paint actually drew.
         let v_scrollbar_w = backend.editor_v_scrollbar_width();
         let engine = self.engine.borrow();
         let (rects, _dividers) = engine.calculate_group_window_rects(content_bounds, tab_bar_h);
@@ -595,12 +563,8 @@ impl App {
             return false;
         };
         let max_scroll = scroll_range.round() as usize;
-        // #1061: `resolve_editor_scrollbar_click` below is the shared
-        // click-vs-drag resolver used by this (now axis-parameterised, #1493)
-        // press handler — the standalone TUI `tui_main/mouse.rs` module this
-        // comment used to reference was deleted by #1434 once #1433 flipped
-        // TUI's `run` onto this same shared `App` dispatch; see that
-        // function's doc for the full click/drag rationale.
+        // `resolve_editor_scrollbar_click` below is the shared click-vs-drag
+        // resolver. See that function's doc for the full click/drag rationale.
         let (click_pos, track_visible, track_start, track_length) = match axis {
             ScrollbarAxis::Horizontal => (
                 x as f32,
@@ -678,7 +642,7 @@ impl App {
         width: f64,
         alt: bool,
     ) {
-        // ── Folder picker mouse handling (#815) ─────────────────────────
+        // ── Folder picker mouse handling ────────────────────────────────
         // Checked before every other rung: like a modal dialog, the picker
         // swallows every click while open rather than competing for z-order
         // through `route_modal_overlay_click` / `MOUSE_ARBITRATION_ORDER` —
@@ -689,7 +653,7 @@ impl App {
             return;
         }
 
-        // ── Change-review surface mouse handling (#955, shared with #525) ─
+        // ── Change-review surface mouse handling ──────────────────────────
         // Same "checked before every other rung, swallows every click"
         // policy as the folder picker above — see
         // `render::route_change_review_click`'s doc comment. TUI's
@@ -701,14 +665,11 @@ impl App {
 
         self.reconcile_editor_hover_modal(backend);
 
-        // ── Modal-overlay rung (#733) ─────────────────────────────────────
+        // ── Modal-overlay rung ────────────────────────────────────────────
         //
         // Toast → dialog → tab switcher → completion, sequenced ONCE in
         // `render::route_modal_overlay_click` and shared verbatim with
-        // TUI's `handle_mouse`. This backend used to hand-roll the order
-        // (toast, then tab switcher, then completion, with the dialog
-        // ~600 lines further down, *below* find/replace) while TUI ran a
-        // different one — the precedence drift #733 exists to kill.
+        // TUI's `handle_mouse`.
         let modal_route = self.route_modal_overlay(x, y, render::ModalMouseAction::LeftPress);
         match modal_route {
             render::ModalOverlayRoute::Toast(hit) => {
@@ -775,20 +736,20 @@ impl App {
             render::ModalOverlayRoute::None => {}
         }
 
-        // ── Editor hover popup rung (#755) ────────────────────────────────
+        // ── Editor hover popup rung ───────────────────────────────────────
         //
         // Link click, scrollbar grab, focus-or-select and dismiss-on-outside,
         // sequenced ONCE in `render::route_editor_hover_popup_click` and
         // shared verbatim with TUI's `handle_mouse`. The ~100 lines this
         // replaced sat *below* the scroll-surface dispatch, so a press aimed
         // at the popup's own scrollbar was consumed by the surface painted
-        // behind it (#229/#486). It runs above that dispatch now — where TUI
+        // behind it. It runs above that dispatch now — where TUI
         // always had it — because the popup paints on top of the editor.
         if self.route_and_apply_editor_hover_popup(backend, x, y) {
             return;
         }
 
-        // ── Panel-hover popup link click (#1067) ──────────────────────────
+        // ── Panel-hover popup link click ──────────────────────────────────
         //
         // Shared with TUI's `mouse::handle_mouse` via `render::
         // route_panel_hover_popup_click` + `render::
@@ -821,8 +782,8 @@ impl App {
             for cev in &click_events {
                 match cev {
                     quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } => {
-                        // #825: shared with TUI's click table and the drag
-                        // path (#756) — `render::apply_scroll_offset` is the
+                        // Shared with TUI's click table and the drag
+                        // path — `render::apply_scroll_offset` is the
                         // union of every id either backend emits here. GTK
                         // only ever registers `debug_output`/
                         // `terminal_scrollback` into `scroll_surfaces`
@@ -851,48 +812,30 @@ impl App {
             }
         }
 
-        // #751: the context-menu, find/replace and unified-picker rungs that
-        // used to be transcribed here — ~370 lines — are now decided by
-        // `render::route_modal_overlay_click` at the top of this handler and
-        // applied by `apply_context_menu_route` / `apply_picker_route`. The
-        // shared router also fixed their order: this backend arbitrated the
-        // context menu *below* find/replace and the picker, while
-        // `render::FRAME_Z_ORDER` paints it above both.
+        // The context-menu, find/replace and unified-picker rungs are now
+        // decided by `render::route_modal_overlay_click` at the top of this
+        // handler and applied by `apply_context_menu_route` / `apply_picker_route`.
+        // The shared router sequences them consistently across backends.
 
-        // ── Chrome rung (#752) ────────────────────────────────────────────
+        // ── Chrome rung ───────────────────────────────────────────────────
         //
         // Breadcrumbs → status bands → global status bar, sequenced ONCE in
         // `render::route_chrome_click` and shared verbatim with TUI's
-        // `handle_mouse`. What used to live here was the breadcrumb arm, and
-        // ~60 lines further down a git-branch hit test that re-derived
-        // `build_status_line`'s formatting by hand and measured it in UTF-8
-        // bytes against a character column. Both are gone.
+        // `handle_mouse`.
         if self.route_and_apply_chrome_click(x, y, render::ChromeMouseAction::LeftPress) {
             return;
         }
 
-        // ── Command line click — start text selection (#816) ─────────────
-        // TUI's twin rung (`mouse::handle_mouse`) has done this since #194;
-        // GTK never could, for lack of a character-offset hit test on its
-        // pixel-painted command line. quadraui#705's `CommandLineLayout`
-        // closed that gap — `render::command_line_click_char_idx` hit-tests
+        // ── Command line click — start text selection ────────────────────
+        // `render::command_line_click_char_idx` hit-tests
         // `engine.command_line_rect` (cached at paint time, just above) the
         // same way TUI's press rung does, so this is thin wiring, not a new
         // GTK-specific selection implementation.
         if render::command_line_selection_allowed(&self.engine.borrow()) {
             let data = render::build_command_line(&self.engine.borrow());
-            // #947: was `self.backend.borrow().char_width()` — the click
-            // backend's OWN `current_char_width`, which nothing here ever
-            // seeded (it stays at `GtkBackend::new()`'s hardcoded default,
-            // 8.0px), not the width this frame actually painted the command
-            // line with. That silently drifted from the real painted
-            // `painted_char_width()` (#751's fix for the identical class of
-            // bug elsewhere) — masked before #947 because the old
-            // hardcoded-11pt paint's char width (~8.8px) was close enough to
-            // the stale 8.0px default not to cross a column boundary at
-            // small click offsets; #947 wiring the real (larger) default
-            // `settings.font_size` (14pt, ~11px) through to paint widened
-            // the gap enough to resolve clicks one column off.
+            // Use the real painted char width, not a stale default: this frame's
+            // `painted_char_width()` matches what the command line was actually
+            // drawn with.
             let char_width = self.painted_char_width() as f32;
             let rect = self.engine.borrow().command_line_rect.get();
             let point = quadraui::Point::new(x as f32, y as f32);
@@ -915,7 +858,7 @@ impl App {
             }
         }
 
-        // Debug toolbar click: resolve via cached ToolbarLayout on engine (#510).
+        // Debug toolbar click: resolve via cached ToolbarLayout on engine.
         {
             let dbg_y = self.debug_toolbar_y_offset.get();
             let dbg_h = self.debug_toolbar_height.get();
@@ -933,39 +876,23 @@ impl App {
             }
         }
 
-        // #733: the dialog rung moved to the shared modal-overlay router
+        // The dialog rung moved to the shared modal-overlay router
         // at the top of this handler (`render::route_modal_overlay_click`),
         // which TUI's `handle_mouse` calls too. Control only reaches here
-        // when no dialog is open, so what used to be the `else` arm of the
-        // dialog block is now unconditional. The `ModalStack` push/pop dance
-        // that arm maintained is gone with it: `DialogHit::Outside` already
-        // answers the inside/outside question the stack round-trip was
-        // recomputing.
+        // when no dialog is open.
         {
-            // #752: the git-branch hit test that used to open this block —
-            // ~60 lines re-deriving `build_status_line`'s own formatting, then
-            // comparing a `cached_char_width`-derived column against a UTF-8
-            // *byte* range — is now the global-status-bar rung of
+            // The git-branch hit test is now the global-status-bar rung of
             // `render::route_chrome_click`, called at the top of this handler.
             //
             // Clicking in the editor clears every sidebar's keyboard focus.
             // Without this, focus stays on whichever sidebar grabbed it last
-            // (Source Control, Extensions, Settings, AI, DAP, …) and the
-            // editor key handler keeps routing keys to that sidebar's
-            // handler — so the editor "can't be interacted with" until the
-            // user explicitly Escapes out of the sidebar. The DAP-only
-            // version of this clear was incomplete; tracked all fields via
-            // `clear_sidebar_focus()` instead.
+            // and the editor key handler keeps routing keys to that sidebar.
             self.engine.borrow_mut().clear_sidebar_focus();
-            // ── Bottom panel (tab strip / toolbar / terminal content) — #754 ──
+            // ── Bottom panel (tab strip / toolbar / terminal content) ──────────
             // Zone, split hit-test and pane-cell translation are all
             // `render::route_bottom_panel_click`, shared verbatim with TUI's
-            // `handle_mouse`. What this replaced computed the pane column as a
-            // bare `x / cached_char_width` against a *window-absolute* `x`,
-            // while `render_content` paints the panel at the editor's left
-            // edge — so with the sidebar open every terminal click landed
-            // roughly `(activity_bar + sidebar) / char_width` columns right of
-            // the glyph aimed at. `panel_left` is now a required input.
+            // `handle_mouse`. `panel_left` is now a required input to ensure the
+            // hit-test uses the same offset the paint used.
             let route = render::route_bottom_panel_click(
                 &self.engine.borrow(),
                 x,
@@ -980,7 +907,7 @@ impl App {
                     self.terminal_resize_dragging = false;
                 }
                 let ctx = crate::core::engine::UiEventContext {
-                    // #1058: was `self.terminal_cols()` (pinned at 80) — this
+                    // Was `self.terminal_cols()` (pinned at 80) — this
                     // handler already has the real live panel width, so use
                     // it. This is what feeds `ToggleSplit`'s initial
                     // full_cols when opening a split.
@@ -1007,33 +934,13 @@ impl App {
                 // widget (which has can_target=true while a menu is open).
                 // If we reach here, no menu is open and we proceed with normal handling.
 
-                // ── H/V scrollbar hit-test (before divider) — #1026/#987/#1493 ──
+                // ── H/V scrollbar hit-test (before divider) ──────────────────────
                 // If the click lands on either editor scrollbar:
                 //   - on the thumb → start a DragTarget::ScrollbarX/Y drag.
                 //   - on the empty track → page-jump toward the click.
-                // Either way, consume the click *before* the divider hit-test
-                // below gets a look. Without a vertical rung here,
-                // `handle_mouse_click_msg` had no vertical-scrollbar hit-test
-                // at all, so a click on a window's own scrollbar column (the
-                // last `cell_width` before its edge, painted since
-                // quadraui#968) fell straight through to `route_divider_grab`
-                // — inert on any window, and silently resizing the split for
-                // any window whose scrollbar-adjacent side happened to sit
-                // inside the divider's own grab margin.
-                //
-                // Horizontal tried first (matches the pre-#1493 ordering);
-                // shared axis-parameterised `App::editor_scrollbar_press`
-                // (#1493) — was two hand-rolled ~85-line copies here, one per
-                // axis, which had already drifted: the horizontal copy
-                // rebuilt window rects via `compute_editor_window_rects`'s
-                // `width`/`height` recompute, which always assumes the
-                // editor area starts at `x = 0`, while the vertical copy had
-                // already been fixed (this rung's own prior comment) to read
-                // `self.painted_editor_bounds()` instead — the real left
-                // edge, `AppShellLayout::main_content_bounds.x`, once the
-                // activity bar/sidebar reserves real width. Both axes now go
-                // through the same method, so that offset can never
-                // re-diverge per axis again.
+                // Either way, consume the click before the divider hit-test below
+                // gets a look. Shared axis-parameterised `App::editor_scrollbar_press`
+                // prevents per-axis divergence.
                 if self.editor_scrollbar_press(backend, x, y, ScrollbarAxis::Horizontal) {
                     return;
                 }
@@ -1041,15 +948,12 @@ impl App {
                     return;
                 }
 
-                // ── Divider hit-test (#753 shared rung) ───────────────────────
+                // ── Divider hit-test ──────────────────────────────────────────────
                 // Editor-group boundaries then `:split`/`:vsplit` boundaries
-                // (#582), sequenced by `render::route_divider_grab`. This
-                // backend's only contribution is its own painted geometry and
-                // its own grab margin — `self.units.divider_metrics`, a
-                // symmetric 6px around the thin drawn line on GTK
-                // (`quantize: false`) vs TUI's cell metrics (`quantize:
-                // true`, `group_horizontal` reaching across the tab bar's
-                // row count) — the ordering does not differ.
+                // sequenced by `render::route_divider_grab`. This backend's only
+                // contribution is its own painted geometry and grab margin —
+                // `self.units.divider_metrics`, a symmetric 6px around the thin
+                // drawn line on GTK (`quantize: false`) vs TUI's cell metrics.
                 if let Some((group_dividers, window_dividers, on_tab_bar)) =
                     self.painted_divider_geometry(x, y)
                 {
@@ -1069,7 +973,7 @@ impl App {
                     }
                 }
 
-                // ── Editor-tab-hosted plugin view click (#1627, #1631) ─────
+                // ── Editor-tab-hosted plugin view click ────────────────────
                 //
                 // A `vimcode.ui.register_view` view opened as an editor-area
                 // tab (`Engine::open_plugin_view_tab`) paints either a
@@ -1154,7 +1058,7 @@ impl App {
                             // Create the terminal tab immediately (not via
                             // the deferred `DeferredAction::ToggleTerminal`)
                             // so the panel appears on this same draw cycle.
-                            // #1421: `width` is this handler's own live panel
+                            // `width` is this handler's own live panel
                             // width — prefer it over the cached one.
                             let cols = self.terminal_panel_cols(width);
                             let rows = engine.session.terminal_panel_rows;
@@ -1179,7 +1083,7 @@ impl App {
                             // Engine-drawn action menu is already opened with the
                             // correct anchor by click.rs::handle_mouse_click. The
                             // engine-drawn renderer at draw.rs:906 + click dispatch
-                            // at line ~6022 take over from here (#395).
+                            // at line ~6022 take over from here.
                             if engine.context_menu.as_ref().is_some_and(|cm| {
                                 matches!(
                                     cm.target,
@@ -1213,7 +1117,7 @@ impl App {
     /// `setup()`-seeded `cached_line_height` before the first frame.
     ///
     /// Every click hit-test that measures *painted* geometry must use this
-    /// rather than `cached_line_height` (#555) — see the note where
+    /// rather than `cached_line_height` — see the note where
     /// `render_content` publishes it.
     pub(crate) fn painted_line_height(&self) -> f64 {
         self.painted_line_height
@@ -1228,16 +1132,13 @@ impl App {
     ///
     /// Every rect fed in here is a *painted* one — `status_segment_map` and
     /// `separated_status_bar_rect` are filled by `render_content` from the
-    /// same `Surface::StatusBar` rects it draws, `global_status_rect` likewise
-    /// (#752), and the breadcrumb bars carry their own draw-time layout. That
-    /// is the #555 rule: never hit-test against freshly recomputed geometry.
+    /// same `Surface::StatusBar` rects it draws, `global_status_rect` likewise,
+    /// and the breadcrumb bars carry their own draw-time layout. Never hit-test
+    /// against freshly recomputed geometry.
     ///
-    /// #1250: the `StatusBand` assembly itself — separated line, then each
-    /// window's own line, then the global bar — is [`render::status_bands`],
-    /// shared with TUI's `mouse::route_and_apply_chrome_click` now that TUI
-    /// caches its own paint-time layouts the same way this backend always
-    /// has, rather than each backend walking `screen.windows` and rebuilding
-    /// the band rects independently.
+    /// The `StatusBand` assembly — separated line, then each window's own
+    /// line, then the global bar — is [`render::status_bands`], shared with
+    /// TUI's `mouse::route_and_apply_chrome_click`.
     pub(crate) fn route_and_apply_chrome_click(
         &mut self,
         x: f64,
@@ -1254,7 +1155,7 @@ impl App {
         let segment_map = self.status_segment_map.borrow();
         let global_status_zones = self.global_status_zones.borrow();
 
-        // #1250: the separated/per-window/global assembly (in that
+        // The separated/per-window/global assembly (in that
         // arbitration order — see `render::status_bands`'s own doc comment
         // for why) is now the one shared builder both backends call, rather
         // than this loop and TUI's near-identical twin in
@@ -1273,7 +1174,7 @@ impl App {
 
         // The same shared hit test, with the same tolerances, the window-split
         // divider rung in `handle_mouse_click_msg` runs — see
-        // `render::ChromeState::on_window_divider` (#582/#752).
+        // `render::ChromeState::on_window_divider`.
         let on_window_divider =
             self.painted_editor_bounds()
                 .is_some_and(|(content_bounds, tab_bar_h)| {
@@ -1334,7 +1235,7 @@ impl App {
 
     /// Character-cell advance the last frame actually painted with — the
     /// horizontal twin of [`Self::painted_line_height`]. See the field's doc
-    /// for why `cached_char_width` is the wrong number at click time (#751).
+    /// for why `cached_char_width` is the wrong number at click time.
     pub(crate) fn painted_char_width(&self) -> f64 {
         self.painted_char_width
             .get()
@@ -1350,7 +1251,7 @@ impl App {
     /// (`picker_popup_rect`), and only re-derives from `width`/`height` when
     /// no frame has painted the picker yet.
     ///
-    /// #555: re-deriving was wrong on two counts, and together they put the
+    /// Re-deriving was wrong on two counts, and together they put the
     /// hit rect in a different place than the pixels. `render_content` centres
     /// the popup in `backend.viewport()` (the whole window) at
     /// `self.units.picker`'s own sizing, whereas both callers here pass the
@@ -1379,15 +1280,11 @@ impl App {
         quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h)
     }
 
-    // ── Drag-follow-through rung (#756, mouse-ladder slice 6) ────────────────
+    // ── Drag-follow-through rung ──────────────────────────────────────
     //
     // Which gesture owns a move-with-the-button-held is
     // `render::route_mouse_drag`, sequenced ONCE and shared verbatim with TUI's
-    // `handle_mouse`. This backend used to state its own order here — armed
-    // scrollbar → hover popup → modal swallow → tab drag → divider → split →
-    // resize → terminal → editor — while TUI stated a different one, and each
-    // knew scrollbar widget ids the other did not. See the rung's banner in
-    // `render.rs`.
+    // `handle_mouse`. See the rung's banner in `render.rs`.
     pub(crate) fn handle_mouse_drag_msg(
         &mut self,
         backend: &dyn quadraui::Backend,
@@ -1437,17 +1334,10 @@ impl App {
                         y: y as f32,
                     })
                     .is_some(),
-                // GTK has no canvas sidebar separator: it's a `gtk::Paned`.
-                // Explorer drag-and-drop *is* shared now (#1429) — see
-                // `explorer_dnd_active` below; this used to read `false`
-                // unconditionally, the App-side gap that issue closes.
-                //
-                // Command-line selection *is* shared now (#816):
-                // `engine.cmd_dragging` is armed by `handle_mouse_click_msg`'s
-                // press rung the same way TUI's `mouse::handle_mouse` arms its
-                // local `cmd_dragging` — quadraui#705's `CommandLineLayout`
-                // closed the "no character hit test" gap the old comment here
-                // recorded.
+                // Explorer drag-and-drop and command-line selection are shared now.
+                // `engine.cmd_dragging` is armed by `handle_mouse_click_msg`'s press
+                // rung the same way TUI's `mouse::handle_mouse` does, and
+                // `explorer_drag_src` tracks an active explorer DnD gesture.
                 sidebar_resizing: false,
                 explorer_dnd_active: self.explorer_drag_src.is_some()
                     || self.explorer_drag_active.is_some(),
@@ -1457,7 +1347,7 @@ impl App {
                 divider_grabbed: self.divider_grab.is_some(),
                 terminal_split_dragging: self.terminal_split_dragging,
                 terminal_panel_resizing: self.terminal_resize_dragging,
-                // #756 review: mirrors TUI's guard — see the field's doc
+                // Mirrors TUI's guard — see the field's doc
                 // comment in `render.rs`. GTK's `EditorText` arm doesn't run
                 // through the shared `DragState`, but it drives the same
                 // `Engine::mouse_drag`, so `mouse_drag_active` is just as
@@ -1502,7 +1392,7 @@ impl App {
                 };
                 for ev in &events {
                     if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
-                        // #756: the widget-id → scroll-state table is
+                        // The widget-id → scroll-state table is
                         // `render::apply_scroll_offset`, shared with TUI. The
                         // copy this replaced knew `picker` and `editor:h_sb:N`
                         // and nothing else — see the rung's banner in
@@ -1525,7 +1415,7 @@ impl App {
                 {
                     let px = px as f64;
                     let py = py as f64;
-                    // #1429: same `units.hover_popup_pad` the press rung
+                    // Same `units.hover_popup_pad` the press rung
                     // (`route_and_apply_editor_hover_popup`) now reads —
                     // was hardcoded `4.0`/`4.0` here too, which is why a
                     // TUI-native `App` (`tui` harness arm) picked a
@@ -1555,7 +1445,7 @@ impl App {
                     render::TabDragMove::Tracking => {
                         // Cursor and the cached per-group bounds are both in
                         // absolute surface coordinates, so the hit-test matches
-                        // what the overlay draws (#515).
+                        // what the overlay draws.
                         if let Some(source) = self.tab_drag.source() {
                             let ctx = self.cached_drop_ctx.borrow();
                             let zone =
@@ -1631,7 +1521,7 @@ impl App {
                 }
             }
             render::MouseDragRoute::Minimap => {
-                // #1187: a real minimap drag now arms a `DragTarget::ScrollbarY`
+                // A real minimap drag now arms a `DragTarget::ScrollbarY`
                 // on press (`click::pixel_to_click_target`'s minimap rung), so a
                 // following move routes to `MouseDragRoute::ArmedTarget` above,
                 // never here — re-running `apply_minimap_click` (an absolute
@@ -1641,7 +1531,7 @@ impl App {
                 // still be reached at all.
             }
             render::MouseDragRoute::TerminalContent => {
-                // #533: shared drag handler — tries forward_mouse(Move) when the
+                // Shared drag handler — tries forward_mouse(Move) when the
                 // child has mouse reporting, falls back to local selection.
                 render::apply_terminal_content_drag(
                     &mut self.engine.borrow_mut(),
@@ -1660,19 +1550,9 @@ impl App {
                         backend,
                         x,
                         y,
-                        // #947/#555: was `self.cached_line_height`/
-                        // `self.cached_char_width` — those are seeded once
-                        // in `setup()` (before the runner's first real
-                        // font-metrics measurement ever runs) and only
-                        // refreshed by `tick_dispatch`/`WindowResized`, so a
-                        // driver that never fires a tick between `setup()`
-                        // and a drag (every headless `GtkDriver` test) reads
-                        // them permanently stale. `painted_line_height()`/
-                        // `painted_char_width()` are #555's fix for exactly
-                        // this class of bug — set fresh every
-                        // `render_content` frame — and every OTHER
-                        // painted-geometry hit-test in this file already
-                        // uses them; this arm was the one holdout.
+                        // Use the real painted metrics: `painted_line_height()` and
+                        // `painted_char_width()` are fresh every `render_content` frame,
+                        // whereas the cached versions may be stale before the first tick.
                         self.painted_line_height(),
                         self.painted_char_width(),
                         layout,
@@ -1684,13 +1564,13 @@ impl App {
                 }
             }
             render::MouseDragRoute::CommandLine => {
-                // #816: same `command_line_click_char_idx` helper the press
+                // Same `command_line_click_char_idx` helper the press
                 // rung uses — extends `cmd_sel`'s head via
                 // `CommandLineLayout::hit_test`, mirroring TUI's identical
                 // drag arm in `mouse::handle_mouse`.
                 if let Some(mut sel) = self.engine.borrow().cmd_sel.get() {
                     let data = render::build_command_line(&self.engine.borrow());
-                    // #947: same fix as the press rung above — use the real
+                    // Same fix as the press rung above — use the real
                     // painted char width, not the click backend's never-seeded
                     // `current_char_width` default.
                     let char_width = self.painted_char_width() as f32;
@@ -1705,17 +1585,9 @@ impl App {
                 }
             }
             render::MouseDragRoute::ExplorerDnd => {
-                // #1429: shared with TUI's `mouse::handle_mouse` — the row
-                // under the pointer is resolved against `explorer_tree_rect`
-                // (the rect this frame's `paint_sidebar_panel_rung` painted
-                // the tree into) and the row's own pixel/cell pitch
-                // (`units.explorer_row_h`, GTK: `quadraui::gtk::tree`'s
-                // `item_height = (line_height * 1.4).round()`; TUI: one
-                // whole cell) applied to `cached_explorer_metrics`'s
-                // paint-time line-height (#540's re-apply, same value the
-                // press rung already uses). Plain `cached_explorer_metrics`
-                // alone under-counts every row past the first on GTK — its
-                // row pitch is *not* the bare line height.
+                // Shared with TUI's `mouse::handle_mouse` — the row under the pointer
+                // is resolved against `explorer_tree_rect` and the row's own pixel/cell
+                // pitch applied to get the correct row in the tree.
                 let rect = self.engine.borrow().explorer_tree_rect.get();
                 let row_height = (self.units.explorer_row_h)(self.cached_explorer_metrics.get().0);
                 render::apply_explorer_drag_move(
@@ -1728,7 +1600,7 @@ impl App {
                     &mut self.explorer_drag_active,
                 );
             }
-            // #192: a drag inside an open modal with nothing armed is swallowed
+            // A drag inside an open modal with nothing armed is swallowed
             // so it cannot leak to the editor underneath.
             render::MouseDragRoute::ModalSwallow
             | render::MouseDragRoute::SidebarResize
@@ -1742,9 +1614,9 @@ impl App {
     /// `ctx.layout.main_content_bounds.width` `UiEvent::MouseMoved` already
     /// threads into `handle_mouse_drag_msg` — needed to finalize a
     /// terminal-split divider drag with the real pixel→cell conversion
-    /// instead of a fixed guess (#1058).
+    /// instead of a fixed guess.
     pub(crate) fn handle_mouse_up_msg(&mut self, backend: &dyn quadraui::Backend, width: f64) {
-        // Clear debug toolbar pressed state (#510).
+        // Clear debug toolbar pressed state.
         if self.engine.borrow().debug_button_pressed.is_some() {
             self.engine.borrow_mut().debug_button_pressed = None;
             self.draw_needed.set(true);
@@ -1769,17 +1641,12 @@ impl App {
             }
         }
 
-        // Tab drag drop (#753 — the same `handle_release` TUI calls; it also
-        // clears any armed-but-never-dragged press, which is what the bare
-        // `tab_drag_start = None` this replaced was for).
+        // Tab drag drop — shared `handle_release` that both backends call.
         if self.tab_drag.handle_release(&mut self.engine.borrow_mut()) {
             self.draw_needed.set(true);
         }
-        // Explorer drag-and-drop: execute the move on release (#1429 —
-        // shared with TUI's identical `mouse.rs` release arm). Also clears
-        // `sidebar_pointer_captured` — `try_route_sidebar_mouse_event` left
-        // it set (it stopped resetting it once a DnD gesture bypassed that
-        // function to reach here) and a future unrelated press must not
+        // Explorer drag-and-drop: execute the move on release. Also clears
+        // `sidebar_pointer_captured` so a future unrelated press does not
         // start out already "dragging".
         if self.explorer_drag_src.take().is_some() || self.explorer_drag_active.is_some() {
             self.sidebar_pointer_captured.set(false);
@@ -1802,7 +1669,7 @@ impl App {
                 let rows = engine.session.terminal_panel_rows;
                 drop(engine);
                 if left_cols > 0 {
-                    // #1058: was `let da_w = 800.0;` — a fixed guess that
+                    // Was `let da_w = 800.0;` — a fixed guess that
                     // only produced the right column count in a window that
                     // happened to be exactly 800px wide. `width` is the real
                     // live panel width the caller (`UiEvent::MouseUp`) reads
@@ -1820,7 +1687,7 @@ impl App {
         if self.terminal_resize_dragging {
             self.terminal_resize_dragging = false;
             let rows = self.engine.borrow().session.terminal_panel_rows;
-            // #1421: `width` is this handler's own live panel width.
+            // `width` is this handler's own live panel width.
             let cols = self.terminal_panel_cols(width);
             self.engine.borrow_mut().terminal_resize(cols, rows);
             let _ = self.engine.borrow().session.save();
@@ -1831,7 +1698,7 @@ impl App {
             let mut engine = self.engine.borrow_mut();
             engine.mouse_drag_active = false;
             engine.mouse_drag_origin_window = None;
-            // #533: auto-copy terminal selection on mouse-release, mirroring
+            // Auto-copy terminal selection on mouse-release, mirroring
             // TUI.  terminal_autocopy_selection() is a no-op when the
             // terminal isn't focused or has no selection.
             engine.terminal_autocopy_selection();

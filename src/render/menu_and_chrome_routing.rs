@@ -1,6 +1,6 @@
 use super::*;
 
-// ─── Menu-action `EngineAction` applier rung (#1063) ────────────────────────
+// ─── Menu-action `EngineAction` applier rung ────────────────────────────────
 //
 // `Engine::dispatch_menu_action` (`core/engine/vscode.rs`) turns a fired
 // `quadraui::MenuEvent::Activated` id into an `EngineAction` the caller still
@@ -12,28 +12,14 @@ use super::*;
 // pane's column/row count, a dialog needs to write into backend-local dialog
 // state, quitting needs the backend's own shutdown sequence.
 //
-// Before this rung, GTK's `App::handle_menu_action` restated a *subset* of
-// this match by hand — five variants named explicitly behind a bare `_ =>
-// {}` catch-all — instead of reusing `App::dispatch_engine_action`, its own
-// already-exhaustive general-purpose applier (used by the keyboard/macro
-// paths). That catch-all is exactly the shape that hid #984 for months: a
-// future menu item wired to a variant nobody had added an arm for would
-// silently no-op instead of failing to compile. TUI's menu arm
-// (`tui_main/shell_app.rs`) already routed through its own general-purpose
-// applier (`dispatch_post_key_action`) — exhaustive, but a *different*
-// function from GTK's, so the two could still drift independently even
-// though neither, on its own, had a reachability gap today.
-//
-// #1499: [`apply_engine_action`] used to take a `host: &mut impl
+// [`apply_engine_action`] used to take a `host: &mut impl
 // EngineActionHost` seam — a per-backend struct implementing eleven hook
 // methods — for the dozen or so effects `Engine` cannot finish alone. With
 // the TUI backend gone, `App` is the only implementation left, so those
 // eleven hooks are inlined directly into the match arms below, reading/
 // mutating `engine` and `app`'s fields exactly as `GtkEngineActionHost` (the
 // old per-backend host struct) used to. `open_terminal`/`open_workspace_dialog`
-// used to be `App::new_terminal_tab`/`App::open_workspace_dialog` verbatim,
-// until #1063 left both with no other caller (menu, key and macro dispatch
-// all go through here now) and deleted them rather than ship dead code —
+// used to be `App::new_terminal_tab`/`App::open_workspace_dialog` verbatim —
 // this fold does not resurrect them.
 
 /// Apply the [`crate::core::engine::EngineAction`] produced by
@@ -62,15 +48,8 @@ pub(crate) fn apply_engine_action(
             app.quit_and_save_session(engine);
             true
         }
-        // Matches the former inline `EngineAction::QuitWithError` arm in
-        // `App::dispatch_engine_action` exactly — no `save_session_state`
-        // (unlike `Quit`/`SaveQuit` above). This asymmetry is GTK-specific,
-        // not something `tui_main::handle_action` itself used to do: the
-        // pre-#1434 TUI shell's `Quit`/`SaveQuit` and `QuitWithError` arms
-        // both called `save_session`, i.e. TUI treated the two variants
-        // *symmetrically*. The divergence was cross-backend (GTK skipped the
-        // save on `QuitWithError`, TUI didn't); preserved here exactly as it
-        // behaved pre-#1063 rather than changed as a side effect of this fold.
+        // `Quit`/`SaveQuit` above save the session; `QuitWithError` does not.
+        // This asymmetry is preserved as it behaved before this consolidation.
         EngineAction::QuitWithError => {
             engine.cleanup_all_swaps();
             engine.lsp_shutdown();
@@ -166,7 +145,7 @@ pub(crate) fn apply_engine_action(
             false
         }
         EngineAction::OpenUrl(url) => {
-            // #1134: queue rather than shell out here — `apply_engine_action`
+            // Queue rather than shell out here — `apply_engine_action`
             // has no `backend` handle of its own. `App::tick_dispatch` (GTK) /
             // the pre-#1434 TUI shell's `tick` (TUI) drain `pending_platform_actions`
             // through `PlatformServices` (`is_safe_url` was already applied
@@ -179,54 +158,25 @@ pub(crate) fn apply_engine_action(
     }
 }
 
-// ─── Explorer context-menu applier (#1418) ─────────────────────────────────
+// ─── Explorer context-menu applier ─────────────────────────────────────────
 //
-// The explorer context menu's *decision* — which item is highlighted, which
+// The explorer context menu's decision — which item is highlighted, which
 // key/click confirms it — was already shared (`Engine::handle_context_menu_key`
-// / `Engine::context_menu_target_path`), but what happened with the
-// confirmed action *string* was written once per backend: TUI's
-// `handle_explorer_context_action` (`tui_main/mod.rs`) and GTK's
-// `App::dispatch_explorer_ctx_action` (`app.rs`). They had already drifted —
-// TUI's `"delete"` used the context menu's own explicit target path
-// (`Engine::confirm_delete_file`); GTK's routed through
-// `dispatch_explorer_crud(Delete)`, which acts on the explorer tree's
-// *selected* row instead, picking the wrong file whenever a right-click
-// target and the tree's selection disagree. `"find_in_folder"` was worse:
-// TUI opened the (workspace-wide, not folder-scoped) Grep picker, GTK just
-// focused the Search sidebar panel — a different feature entirely, despite
-// both being wired to a menu item labelled "Find in Folder...".
-//
-// [`apply_explorer_context_action`] is the one function both backends now
-// call. It picks TUI's explicit-target behavior for `"delete"`/`"move_file"`
-// (`Engine::confirm_delete_file`/`Engine::start_move_file_dialog` take the
-// path directly — no tree-selection ambiguity possible), and gives
-// `"find_in_folder"` one real behavior on both backends:
-// `Engine::open_grep_picker_scoped`, a live-grep search restricted to the
-// clicked folder (#1418), matching the menu label for the first time on
-// either backend.
+// / `Engine::context_menu_target_path`). This function is the one shared body
+// both backends call for the confirmed action. It uses `Engine::confirm_delete_file`
+// and `Engine::start_move_file_dialog` (explicit-target-based), and
+// `Engine::open_grep_picker_scoped` for `"find_in_folder"` (live-grep search
+// restricted to the clicked folder).
 //
 // `new_file`/`new_folder`/`rename` keep routing through
 // `dispatch_explorer_crud` (selected-row-based) — both backends already
-// agreed on that subset before this issue, so it is not a divergence this
-// rung needs to resolve, only preserve.
+// agreed on that subset, so it is not a divergence this function needs to
+// resolve, only preserve.
 //
 // `open_terminal_at` covers the one action that genuinely needs
 // backend-specific plumbing: `"open_terminal"` needs the live terminal
-// pane's column count, which only each backend's own runner has in scope.
-// Every other action is a plain `Engine` call with no backend seam —
-// including the caller's own post-action redraw/refresh bookkeeping
-// (`explorer_needs_refresh`, `draw_needed`), which stays at each call site
-// exactly as before since it is generic "something changed" plumbing
-// already shared across far more than context-menu actions, not specific to
-// this rung.
-//
-// #1499: this used to be a `host: &mut impl ExplorerContextHost` one-method
-// trait, so a second backend (the pre-#1434 TUI shell) could supply its own
-// terminal-opening plumbing. With that backend gone, `open_terminal_at`
-// (a plain `FnMut`) is enough: `App` passes a closure over its own `&mut
-// self`; the test-only caller in `core::engine::picker` passes a no-op —
-// no trait, no per-backend struct, and no dependency from `core`'s test code
-// onto `crate::app::App`.
+// pane's column count. Every other action is a plain `Engine` call with no
+// backend seam.
 
 /// Resolve the "open_terminal"/"find_in_folder" target directory: `target`
 /// itself when it is already a directory, its parent otherwise (falling
@@ -288,26 +238,11 @@ pub fn apply_explorer_context_action(
     }
 }
 
-// ─── Native file-dialog rung (#1125) ────────────────────────────────────────
+// ─── Native file-dialog rung ────────────────────────────────────────────────
 //
-// TUI's `save_workspace_as_dialog` used to hardcode `engine.cwd.join(
-// ".vimcode-workspace")` and write it unconditionally — no prompt, no way to
-// cancel, and silently ignoring whatever path the user actually wanted. GTK
-// already did this right (`App::run_pending_file_dialog`, driven by
-// `PendingFileDialog`/`tick()` because its `backend` handle is only reachable
-// there — see that type's doc comment for why). quadraui#965 shipped the TUI
-// half of the same primitive — `TuiPlatformServices::show_file_open_dialog` /
-// `show_file_save_dialog`, a nested draw-and-read loop over
-// `FilePickerController` — so TUI can call it too.
-//
-// TUI doesn't need GTK's `tick()` deferral: the pre-#1434 TUI shell's `handle` already has
-// `backend: &mut dyn quadraui::Backend` in scope at both call sites that can
-// open one of these dialogs (the `open_file_dialog` menu action, and
-// `EngineAction::SaveWorkspaceAsDialog` via `TuiEngineActionHost`, which now
-// carries a `backend` field for exactly this). [`run_open_file_dialog`] and
-// [`run_save_workspace_as_dialog`] are the one shared body both GTK's
-// deferred call site and TUI's synchronous ones call — the point of this rung
-// is one implementation, two thin call sites, not a parallel TUI-only copy.
+// [`run_open_file_dialog`] and [`run_save_workspace_as_dialog`] are the one
+// shared body both backends call — the point of this rung is one
+// implementation, two thin call sites.
 
 /// Show a native "Open File" dialog via `backend`'s `PlatformServices` and
 /// open the chosen file in `engine`. Returns the opened path (`None` if the
@@ -336,7 +271,7 @@ pub fn run_open_file_dialog(
 
 /// Show a native "Save Workspace As" dialog via `backend`'s
 /// `PlatformServices` and save the workspace to the chosen path. Does
-/// nothing when the user cancels — the #1125 fix.
+/// nothing when the user cancels.
 pub fn run_save_workspace_as_dialog(engine: &mut Engine, backend: &mut dyn quadraui::Backend) {
     if let Some(path) = backend
         .services()
@@ -352,39 +287,20 @@ pub fn run_save_workspace_as_dialog(engine: &mut Engine, backend: &mut dyn quadr
     }
 }
 
-// ─── Shell-event shadow-sync rung (#1062) ────────────────────────────────────
+// ─── Shell-event shadow-sync rung ────────────────────────────────────────────
 //
 // `AppShellEvent::PanelChanged`/`SidebarHidden`/`SidebarResized` all report a
-// decision the *runner's* own `AppShell` already made — an activity-bar
-// click, a divider drag. Both backends mirror that decision into
-// `engine.app_shell`, the "shadow" copy every engine-side consumer actually
-// reads (`render_sidebar_content`'s panel dispatch, `active_panel_is`,
-// `sidebar_visible()` hit-test gates, session persistence): the runner's own
-// `AppShell` is what the *paint* geometry comes from, but `Engine` itself
-// never consults it directly.
+// decision the *runner's* own `AppShell` already made. Both backends mirror
+// that decision into `engine.app_shell`, the "shadow" copy every engine-side
+// consumer reads.
 //
-// #988 was one of these three forgetting the mirror entirely:
-// `PanelChanged { hamburger }` returned early, before any shadow-sync
-// statement ran, because the sync was spelled out fresh at each call site
-// instead of owned by one function every call site is required to reach.
-// [`sync_shell_event_shadow`] is that one function. `App::on_shell_event`
-// calls it unconditionally, as the first thing it does, before any of its
-// own id-specific branching — so the shadow mutation itself can no longer be
-// skipped by an early `return` reached before it.
-//
-// #1499: this used to take a `host: &impl ShellShadowSyncHost` with one
-// hook, `panel_absent_from_shadow`, so a second backend (the pre-#1434 TUI
-// shell) could answer it differently. With that backend gone, `App`'s own
-// answer is the only one left, so the predicate is inlined below instead of
-// asked through a trait: the shadow `engine.app_shell` never gets a
-// `PanelDefinition` for the hamburger panel (`App::shell_config` only
-// registers it in the runner's own `AppShell`, on the `cell` profile, and
-// even there it's runner-only — see
-// [`reclaim_hamburger_sidebar_reservation`]'s doc), so a `PanelChanged` for
-// it must always skip the generic sync below.
+// [`sync_shell_event_shadow`] mirrors a runner-decided event onto the shadow
+// `engine.app_shell`. `App::on_shell_event` calls it unconditionally, as the
+// first thing it does, before any of its own id-specific branching — so the
+// shadow mutation itself can never be skipped by an early `return`.
 
 /// Mirror a runner-decided [`quadraui::AppShellEvent`] onto the shadow
-/// `engine.app_shell` (#1062). Called by `App::on_shell_event` first,
+/// `engine.app_shell`. Called by `App::on_shell_event` first,
 /// unconditionally, before any of the event's other id-specific handling —
 /// see the rung's header comment above for why the call must come first.
 pub fn sync_shell_event_shadow(event: &quadraui::AppShellEvent, engine: &mut Engine) {
@@ -411,27 +327,19 @@ pub fn sync_shell_event_shadow(event: &quadraui::AppShellEvent, engine: &mut Eng
     }
 }
 
-// ─── Shared menu-bar reveal/hide routing (#1427) ────────────────────────────
+// ─── Shared menu-bar reveal/hide routing ────────────────────────────────────
 //
-// A backend whose menu bar can be fully hidden (`Engine::menu_bar_toggleable`
-// — pre-#1427 only the pre-#1434 TUI shell's `setup` ever set this; now also `App::setup`
-// on any backend whose `BackendCaps::window_chrome` is `false`, i.e. no real
-// window chrome to double as the titlebar the way GTK's does — #901/#552)
-// needs three pieces of behaviour a permanently-visible menu bar
-// (GTK/macOS/Win) never does: an Alt+<letter> shim so a hidden bar's
-// accelerators still work (#318), a one-shot guard that hides the bar again
-// on the stale click a hamburger reveal leaves behind (#988/#1029), and a
-// hamburger `PanelDefinition` click that reveals the bar instead of
-// switching the (nonexistent) "Menu" sidebar panel. All five functions below
-// were the pre-#1434 TUI shell's private methods before #1427; they are pure
-// `&mut Engine` (plus, where a hit-test needs one, `&dyn Backend`/
-// `&ShellContext`) so both `App` and the pre-#1434 TUI shell can call the same body.
-// Every one is a documented no-op on a backend that never sets
-// `menu_bar_toggleable`/never registers the hamburger panel (GTK/macOS/Win
-// today) — see each function's own doc — so callers wire them in
-// unconditionally rather than branching on `BackendCaps` themselves.
+// A backend whose menu bar can be fully hidden needs three pieces of
+// behaviour a permanently-visible menu bar never does: an Alt+<letter> shim
+// so a hidden bar's accelerators still work, a one-shot guard that hides the
+// bar again on the stale click a hamburger reveal leaves behind, and a
+// hamburger `PanelDefinition` click that reveals the bar instead of switching
+// a sidebar panel. The functions below are pure `&mut Engine` (plus, where a
+// hit-test needs one, `&dyn Backend` / `&ShellContext`) so callers wire them
+// in unconditionally. Every one is a documented no-op on a backend that never
+// sets `menu_bar_toggleable` (GTK/macOS/Win today).
 
-/// #1029: one-shot spend of [`Engine::hamburger_stale_click_guard`] for
+/// One-shot spend of [`Engine::hamburger_stale_click_guard`] for
 /// `event`, on the *direct-dispatch* path (`ShellApp::handle`/
 /// `handle_dispatch`) — call at the very top, before any early exit, so the
 /// guard is spent for exactly one event no matter which arm of the caller's
@@ -466,7 +374,7 @@ pub fn consume_hamburger_stale_click_guard(engine: &mut Engine, event: &quadraui
     }
 }
 
-/// #1029: spend [`Engine::hamburger_stale_click_guard`] on the
+/// Spend [`Engine::hamburger_stale_click_guard`] on the
 /// *shell-consumed* path — the half [`consume_hamburger_stale_click_guard`]
 /// can never see, because `ShellAdapter` hit-tests the activity bar itself
 /// and reports a real panel click as a semantic `AppShellEvent` without ever
@@ -482,52 +390,28 @@ pub fn disarm_hamburger_stale_click_guard(engine: &mut Engine) {
     engine.hamburger_stale_click_guard = false;
 }
 
-/// #318/#1029: the Alt+<letter> reveal shim plus the stale-hamburger-corner
-/// hide. Takes `stale_hamburger_corner_click` — the result of
+/// The Alt+<letter> reveal shim plus the stale-hamburger-corner hide.
+/// Takes `stale_hamburger_corner_click` — the result of
 /// [`consume_hamburger_stale_click_guard`] — as a parameter rather than
-/// calling it internally, because that consume has to happen at the very
-/// top of `handle`/`handle_dispatch`, before *any* early exit (including
-/// ones this function's caller can't see, e.g. the pre-#1434 TUI shell's `handle`'s
-/// panel-accelerator dispatch), while this function itself is called later,
-/// immediately before the caller's own `MenuSystem` intercept — see
-/// `consume_hamburger_stale_click_guard`'s own doc for why the two calls
-/// can't be merged into one without narrowing that guarantee.
+/// calling it internally, because that consume must happen at the very
+/// top of `handle`/`handle_dispatch`, before any early exit.
 ///
 /// 1. **Alt+<letter> shim** — when the bar is hidden, Alt+<letter> must
-///    still reveal *and* activate the matching menu (otherwise the bare
-///    letter falls through to `Engine::handle_key`, which ignores Alt, and
-///    triggers a Vim motion instead — Alt+T → t-motion). Sets
+///    still reveal *and* activate the matching menu. Sets
 ///    `engine.menu_bar_visible = true` and lets the event keep flowing: the
-///    caller's own `MenuSystem` intercept, called immediately after this
-///    returns `None`, is what actually opens the menu using the
-///    just-flipped flag. #1764: gated on the same
-///    [`alt_mnemonic_open_allowed`] predicate the caller's intercept uses,
-///    so the reveal and the open stay in lock-step — a mode this predicate
-///    refuses (mid-text-entry on the toggleable profile) never reveals the
-///    bar in the first place, rather than revealing it and then having the
-///    caller refuse to open anything into it.
+///    caller's own `MenuSystem` intercept is what actually opens the menu.
 /// 2. **Stale hamburger-corner click** — revealing the bar shifts the whole
-///    activity bar (hamburger included) down one row; a second click at the
-///    *exact screen position* that revealed it (muscle memory) lands one row
-///    too high, on the title-bar band, where it would otherwise open
-///    whatever menu happens to paint at that column (`File`, at the default
-///    sidebar width — the #988 symptom). Recognised structurally (a
-///    `MouseDown` inside the title-bar band whose column still falls within
-///    the activity bar's own width) and bounded to the one click immediately
-///    following a reveal by `stale_hamburger_corner_click`'s one-shot
-///    source, so a later, deliberate click on `File` falls through to the
+///    activity bar down one row; a second click at the *exact screen position*
+///    that revealed it lands one row too high, on the title-bar band. Recognised
+///    structurally and bounded by `stale_hamburger_corner_click`'s one-shot
+///    source, so a later, deliberate click on a menu item falls through to the
 ///    caller's `MenuSystem` intercept like any other menu click.
 ///
 /// Returns `Some(Reaction::Redraw)` only for case 2 — the caller must return
-/// immediately, without running its own dispatch for this event. `None`
-/// means "not consumed" (including case 1's reveal — see above).
+/// immediately. `None` means "not consumed" (including case 1's reveal).
 ///
-/// A no-op on a backend that never sets `menu_bar_toggleable` (so
-/// `menu_bar_visible` is always already `true` — GTK/macOS/Win): the shim's
-/// `!menu_bar_visible` gate never opens, and the guard this reads is only
-/// ever armed by a hamburger panel click, which those backends never
-/// register (`App::shell_config`'s `px` profile has no hamburger
-/// `PanelDefinition` — see that method's own doc).
+/// A no-op on a backend that never sets `menu_bar_toggleable`: the shim's
+/// `!menu_bar_visible` gate never opens.
 pub fn route_menu_bar_reveal(
     engine: &mut Engine,
     event: &quadraui::UiEvent,
@@ -537,7 +421,7 @@ pub fn route_menu_bar_reveal(
 ) -> Option<quadraui::Reaction> {
     if !engine.menu_bar_visible {
         if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
-            // #1764 (review finding, round 1): this shim and the caller's
+            // This shim and the caller's
             // own `MenuSystem` intercept are two halves of one action (see
             // this function's own doc, point 1) — gating only the intercept
             // and not this reveal left the bar *half*-opened: a fused pty
@@ -578,28 +462,13 @@ pub fn route_menu_bar_reveal(
     None
 }
 
-/// #695/#1029: resolve the rect [`quadraui::MenuSystem::handle`]/`::render`
-/// should hit-test/paint against for a toggleable-menu-bar backend, given
-/// this frame's cached title-bar-band rect (`App::menu_items_rect`/
-/// `Engine::menu_bar_rect`, both written once per paint).
+/// Resolve the rect [`quadraui::MenuSystem::handle`]/`::render` should use
+/// for a toggleable-menu-bar backend, given this frame's cached title-bar-band
+/// rect. Falls back to a full-viewport-width, one-row rect when the cache
+/// holds an empty rect from a just-revealed-but-not-yet-painted frame.
 ///
-/// [`route_menu_bar_reveal`]'s Alt+<letter> shim can flip `menu_bar_visible`
-/// from `false` to `true` and the caller's `MenuSystem` intercept can fire
-/// in that *same* dispatch — before `render_content` ever runs again to
-/// refresh the cache, so it can still hold the empty/never-painted rect
-/// from the last frame the bar was hidden. Handing `MenuSystem::handle` that
-/// rect makes it lay out zero visible items and then index into that empty
-/// list assuming at least one fits — a panic, not a no-op. Falls back to a
-/// full-viewport-width, one-row rect (matching every toggleable profile's
-/// `title_bar_height_lh == 1.0`) for exactly that one just-revealed-but-not-
-/// yet-painted frame; checks both `width` and `height` against the cached
-/// rect, not `height` alone, so a viewport whose computed width collapses to
-/// zero can't sneak a real-but-zero-width rect past this guard either.
-///
-/// `toggleable` gates the whole fallback: `false` (GTK/macOS/Win, whose
-/// `menu_bar_visible` is pinned before this can ever matter) always returns
-/// `cached` unchanged, byte-for-byte the pre-#1427 behaviour on those
-/// backends.
+/// `toggleable` gates the whole fallback: `false` always returns `cached`
+/// unchanged.
 pub fn menu_bar_intercept_rect(
     toggleable: bool,
     cached: quadraui::Rect,
@@ -612,7 +481,7 @@ pub fn menu_bar_intercept_rect(
     }
 }
 
-/// #635 (Stage 6b item A): keep the runner's `AppShell` title-bar row
+/// Keep the runner's `AppShell` title-bar row
 /// reservation in sync with `engine.menu_bar_visible` — that flag can flip
 /// via [`route_menu_bar_reveal`] above, `render::dispatch_panel_accelerator`,
 /// `:set menu`, or (for the hamburger specifically) [`route_hamburger_panel_
@@ -622,7 +491,7 @@ pub fn menu_bar_intercept_rect(
 /// out of every dispatch (`handle`/`handle_dispatch`'s tail,
 /// `on_shell_event_ctx`'s tail) rather than only from the specific arms that
 /// change the flag, per `AppShell::set_title_bar_visible`'s own doc
-/// (quadraui#532): "toggling this and calling [layout/render] next is
+///: "toggling this and calling [layout/render] next is
 /// sufficient". A no-op whenever the flag hasn't changed since the last
 /// call.
 pub fn sync_menu_bar_title_row(ctx: &quadraui::ShellContext<'_>, engine: &Engine) {
@@ -630,7 +499,7 @@ pub fn sync_menu_bar_title_row(ctx: &quadraui::ShellContext<'_>, engine: &Engine
         .set_title_bar_visible(engine.menu_bar_visible);
 }
 
-/// #1029: the hamburger's own `AppShellEvent::PanelChanged` — reveals the
+/// The hamburger's own `AppShellEvent::PanelChanged` — reveals the
 /// menu bar and, on a genuine reveal (the `false -> true` transition, not a
 /// `take_requested_panel` echo of an already-open bar), arms the stale-click
 /// guard [`route_menu_bar_reveal`] later reads. Returns `true` when
@@ -650,7 +519,7 @@ pub fn route_hamburger_panel_changed(engine: &mut Engine, panel_id: &quadraui::W
     true
 }
 
-/// #1029 (defect 2 of #988): the hamburger's own second click — reported as
+/// The hamburger's own second click — reported as
 /// `AppShellEvent::SidebarHidden` for whichever panel the runner's `AppShell`
 /// currently has active — hides the menu bar again. Only `ctx.shell()`, the
 /// *runner's* own state, can tell "this `SidebarHidden` is the hamburger
@@ -667,7 +536,7 @@ pub fn route_hamburger_sidebar_hidden(engine: &mut Engine, ctx: &quadraui::Shell
     ctx.shell_mut().set_title_bar_visible(false);
 }
 
-/// #1029: correct a frame's [`quadraui::AppShellLayout`] for the hamburger's
+/// Correct a frame's [`quadraui::AppShellLayout`] for the hamburger's
 /// own phantom sidebar reservation. The hamburger is a top-row
 /// `PanelDefinition` in the *runner's* `AppShell` (so a click on it produces
 /// a real `PanelChanged`/hit-testable activity-bar icon) but has no matching
@@ -716,51 +585,13 @@ pub fn reclaim_hamburger_sidebar_reservation(
     }
 }
 
-/// #634 smoke retry (widened #1427): keep the runner `AppShell`'s sidebar
-/// *visibility* in sync with the shadow `engine.app_shell`'s. Every keyboard
-/// path (Ctrl+B-style toggles, `toggle_sidebar_panel` via panel
-/// accelerators, autohide, Ctrl+W overflow) mutates the shadow, while the
-/// *runner's* own `AppShell` owns whether `sidebar_content_bounds` exists at
-/// all in the painted layout — so this has to be pushed through explicitly.
-/// The active-*panel* half of this sync lives in `ShellApp::
-/// take_requested_panel` (also covers tick-driven switches, which never
-/// reach here); this is the visibility half, with no adapter hook of its
-/// own, so callers push it unconditionally and idempotently on the way out
-/// of every dispatch.
-///
-/// #1029 (defect 2 of #988, widened #1427): the hamburger is special-cased
-/// out of this sync entirely while it's the reveal actually in effect. The
-/// shadow has no hamburger `PanelDefinition` at all (see
-/// [`sync_shell_event_shadow`]'s `PanelChanged` arm), so
-/// `shadow_visible` can never reflect a hamburger reveal — it's always
-/// whatever the last *real* panel click left behind. Without the
-/// `runner_shows_hamburger` guard, the very next dispatch after a hamburger
-/// click (a `WindowFocused` pump, or any other unrelated keypress) would
-/// read that stale `false` and force-hide the runner's own sidebar in
-/// response — leaving `active_panel == Some(hamburger)` but
-/// `sidebar_visible == false` by the time a second click lands. That
-/// permanently blocks `AppShell::handle_activity_click`'s "already active +
-/// visible → hide" branch for the hamburger: every click, first or Nth,
-/// resolves as a fresh `PanelChanged` reveal, never a `SidebarHidden` — the
-/// second click that's supposed to hide the menu bar again does nothing
-/// (#988).
-///
-/// Gated on `engine.menu_bar_visible` too, not just "is the runner showing
-/// the hamburger" — `AppShell::new` defaults `active_panel` to index 0,
-/// which the hamburger occupies (`App::shell_config`'s `cell`-profile
-/// branch / the pre-#1434 TUI shell's `build_shell_config` both put it first), so a
-/// *fresh* runner starts "showing the hamburger" before any click ever
-/// happens. `menu_bar_visible` is what distinguishes an actual, user-driven
-/// reveal from that construction-time default — without it, this guard
-/// would also suppress the very first dispatch's correction of
-/// `AppShell::new`'s own `sidebar_visible: true` default, leaving a phantom
-/// "Menu" sidebar pane reserved forever (and, on the toggleable-menu-bar
-/// profile specifically, permanently blocking the very first hamburger
-/// click from ever registering as a reveal in the first place — the
-/// runner's own construction-time default already reads "active +
-/// visible", so without this correction running once, unconditionally,
-/// before the first real click, that click would resolve as the toggle-hide
-/// branch instead).
+/// Keep the runner `AppShell`'s sidebar visibility in sync with the shadow
+/// `engine.app_shell`'s. The shadow is mutated by every keyboard path, while
+/// the runner's `AppShell` owns whether `sidebar_content_bounds` exists at all
+/// in the painted layout. The hamburger is special-cased out of this sync
+/// entirely while it's the reveal actually in effect, since the shadow has no
+/// hamburger `PanelDefinition`. Also gated on `engine.menu_bar_visible` to
+/// distinguish an actual, user-driven reveal from the construction-time default.
 pub fn sync_runner_sidebar_visibility(engine: &Engine, ctx: &quadraui::ShellContext<'_>) {
     let shadow_visible = engine.app_shell.sidebar_visible();
     let runner_visible = ctx.shell().sidebar_visible();
@@ -772,7 +603,7 @@ pub fn sync_runner_sidebar_visibility(engine: &Engine, ctx: &quadraui::ShellCont
             == Some(HAMBURGER_PANEL_ID);
     if runner_visible != shadow_visible && !runner_shows_hamburger {
         if shadow_visible {
-            // #557: while a plugin panel is open the shadow's active-panel
+            // While a plugin panel is open the shadow's active-panel
             // id still names the built-in that preceded it (extension
             // panels never touch it), so reveal *that* panel and the
             // runner's highlight jumps off the extension icon — same
@@ -799,43 +630,20 @@ pub fn sync_runner_sidebar_visibility(engine: &Engine, ctx: &quadraui::ShellCont
     }
 }
 
-// ─── Shared tick-chore rung (#1248) ──────────────────────────────────────────
+// ─── Shared tick-chore rung ──────────────────────────────────────────────────
 //
-// `App::handle_poll_tick`/`tick_dispatch` (GTK) and the pre-#1434 TUI shell's `tick` (TUI)
-// each ran the *same* dozen-item background chore list every frame, written
-// out twice: sync each window's viewport from the last paint, re-check
-// tab-bar scroll offsets against what that paint measured, clear an expired
-// yank highlight, poll LSP/DAP/search idle work, refresh source control on a
-// timer, finish a deferred format-then-quit, run a queued terminal command,
-// focus a just-revealed extension panel, drain queued platform actions, and
-// sync the OS window title — a byte-identical `format!("VimCode \u{2014}
-// {}", ...)` on both sides. [`run_shared_tick_chores`] is the one function
-// both `tick()`s now call for all of it.
-//
-// The handful of effects that genuinely differ per backend — how each stores
-// its "last paint" cache (`RefCell<Option<ScreenLayout>>` under two different
-// field names), how quitting actually ends the process (GTK sets a
-// `Cell<bool>` the runner polls next frame; TUI returns `Reaction::Exit`
-// directly), whether a terminal command needs a live `backend` handle for
-// sizing — used to live behind a `host: &mut impl TickHost` seam, following
-// [`PanelAcceleratorHost`]/[`EngineActionHost`]'s established shape (#1499: a
-// small per-backend host struct holding `&mut App`/its own fields plus
-// `backend`, constructed fresh at each call site). With the TUI backend
-// gone, `App` is the only implementation left, so [`run_shared_tick_chores`]
-// takes `app: &mut App` and `backend: &mut dyn quadraui::Backend` directly
-// and inlines what used to be `GtkTickHost`'s method bodies. The two
-// TUI-only hooks the old trait gave a no-op default for on GTK —
-// `tab_switcher_gate` (skip the rest of the chore list while TUI's
-// tab-switcher popup is mid-cycle) and `on_sidebar_refresh_tick` (rebuild
-// TUI's explorer row cache on the periodic sidebar tick) — are simply gone
-// below rather than inlined as always-no-op calls: `App` never overrode
-// either, so dropping them changes nothing observable.
+// [`run_shared_tick_chores`] is the one function both backends' tick()
+// implementations call for the shared dozen-item background chore list:
+// viewport sync, tab-bar scroll offsets, yank highlight expiry, LSP/DAP/
+// search idle work, source control refresh, deferred format-then-quit,
+// queued terminal commands, extension panel focus, queued platform actions,
+// and OS window title.
 
 /// The OS/taskbar window title vimcode uses everywhere — `"VimCode —
 /// <buffer name>"`, or the bare app name with none open. Used to be
 /// formatted identically, and independently, in `App::handle_poll_tick` and
 /// the pre-#1434 TUI shell's `tick`; now the one string
-/// [`run_shared_tick_chores`]'s window-title chore formats (#1248).
+/// [`run_shared_tick_chores`]'s window-title chore formats.
 pub fn window_title(engine: &Engine) -> String {
     engine
         .active_buffer_name()
@@ -844,9 +652,7 @@ pub fn window_title(engine: &Engine) -> String {
 }
 
 /// Carry out a queued [`crate::core::engine::PendingPlatformAction`] (open
-/// URL / reveal in file manager) via `backend`'s `PlatformServices`. Was
-/// `App::run_pending_platform_action` / the pre-#1434 TUI shell's `run_pending_platform_action`
-/// — two copies differing only in how each reaches its `Engine` (#1248).
+/// URL / reveal in file manager) via `backend`'s `PlatformServices`.
 pub fn run_pending_platform_action(
     engine: &mut Engine,
     action: crate::core::engine::PendingPlatformAction,
@@ -867,21 +673,12 @@ pub fn run_pending_platform_action(
     }
 }
 
-/// Editor mode → hardware caret shape (#1109, moved here from
-/// the pre-#1434 TUI shell's `caret_shape_for_mode` by #1428 so `App` can share it):
-/// block for Normal/Visual, bar for Insert, underline for a pending
-/// replace-char (`r`) command — the same three-way mapping the old
-/// hand-rolled crossterm cursor-style write used, now feeding
-/// `Backend::set_caret_shape` (quadraui#1015) instead.
+/// Editor mode → hardware caret shape: block for Normal/Visual, bar for
+/// Insert, underline for a pending replace-char (`r`) command.
 ///
 /// `sidebar_has_focus` is the caller's own "is a sidebar panel, not the
-/// editor, holding keyboard focus" answer — the pre-#1434 TUI shell passes
-/// `self.sidebar.has_focus`, `App` passes `engine.sidebar_has_focus()` (see
-/// each caller). Pure function, deliberately separate from either caller's
-/// `self.live`/no-op-by-default write gate right after it — see
-/// `Backend::set_caret_shape`'s own doc for why the write itself is
-/// unobservable from a `TestBackend`-driven test (a real terminal write,
-/// no test-mode guard of its own) while this *decision* is.
+/// editor, holding keyboard focus" answer — pure function, deliberately
+/// separate from the caller's write gate so the *decision* can be unit-tested.
 pub fn caret_shape_for_mode(
     engine: &Engine,
     sidebar_has_focus: bool,
@@ -895,8 +692,7 @@ pub fn caret_shape_for_mode(
     }
 }
 
-/// Run the tick-time background chore list `App::handle_poll_tick` shares
-/// with the pre-#1434 TUI shell's `tick` (#1248) — see the rung's header
+/// Run the shared tick-time background chore list — see the rung's header
 /// comment above for the full list. Returns `true` when anything changed
 /// this tick that warrants a redraw.
 pub(crate) fn run_shared_tick_chores(
@@ -910,7 +706,7 @@ pub(crate) fn run_shared_tick_chores(
     // `ensure_cursor_visible` uses real geometry rather than a whole-screen
     // approximation that can't see splits.
     //
-    // `rw.visible_line_capacity`, not `rw.lines.len()` (#1779): the latter
+    // `rw.visible_line_capacity`, not `rw.lines.len()`: the latter
     // is how many rows the *buffer* had content for last frame, which on a
     // buffer shorter than the window is less than the window's actual row
     // capacity — `RenderedWindow::lines`'s own doc has the full case this
@@ -931,61 +727,39 @@ pub(crate) fn run_shared_tick_chores(
     }
 
     // Re-check every group's active tab is still on-screen against the
-    // widths this frame's `TabBars` rung actually painted (#1165).
+    // widths this frame's `TabBars` rung actually painted.
     let counts = app.tab_visible_counts.borrow().clone();
     if !counts.is_empty() && engine.post_draw_apply_widths(&counts) {
         needs_redraw = true;
     }
 
-    // Sync the OS window title before any chore below could plausibly change
-    // the active buffer name (mirrors the legacy TUI ordering). Routed
-    // through `Backend::window()` (quadraui#950, #1124) rather than the old
-    // GTK-only `self.window`/`PlatformWindowHandle` title setter (deleted
-    // #1234) — that seam was `None` on macOS/Win-GUI, so this used to be a
-    // silent no-op there; `WindowControl` is backed on every windowed
-    // backend.
+    // Sync the OS window title. Routed through `Backend::window()`
+    // rather than a backend-specific title setter — this is backed on
+    // every windowed backend.
     let win_title = window_title(engine);
     if let Some(w) = backend.window() {
-        // #1634: only write when the title actually changed since the last
-        // tick — see `App::last_window_title`'s own doc (including its "not
-        // confirmed as the flicker cause" caveat). `window_title` is stable
-        // at idle (derived only from the active buffer's name), so before
-        // this guard every idle tick re-issued the identical `WindowControl
-        // ::set_title` call for no reason; on TUI that is a real OSC 0/2
-        // escape sequence written straight to `std::io::stdout()`
-        // (`TuiBackend::set_title` bypasses the `ratatui::Terminal`'s
-        // buffered `Write` entirely) — invisible to #1583's in-process
-        // idle-stability test, which only inspects the `TestBackend`/vt100
-        // sink `Terminal::draw` writes to. The decision itself is
-        // `crate::app::dedup_window_title`, a free function so it's
-        // directly unit-tested without a `Backend` — see that function's
-        // own doc for why a `Backend`-call-count driver test isn't
-        // achievable here.
+        // Only write when the title actually changed since the last tick.
+        // `window_title` is stable at idle, so without this guard every
+        // idle tick re-issues the identical `WindowControl::set_title` call.
         if crate::app::dedup_window_title(&mut app.last_window_title, &win_title) {
             let _ = w.set_title(&win_title);
         }
-        // Refresh the session-restore maximized cache (#1529) unconditionally
+        // Refresh the session-restore maximized cache unconditionally
         // — unlike size/position below, this is exactly the one moment those
         // freeze, so it must always be current.
         let maximized = w.is_maximized();
         if let Ok(m) = maximized {
             app.cached_window_maximized.set(m);
         }
-        // Refresh the session-restore size/position cache (#1234, extended
-        // #1529 for position) — see `App::cached_window_width`'s doc for why
-        // this is cached here rather than read live from
-        // `App::save_session_and_exit`, and why it's gated on
-        // `!is_maximized()`.
+        // Refresh the session-restore size/position cache — see
+        // `App::cached_window_width`'s doc for why this is cached here,
         if matches!(maximized, Ok(false)) {
             if let Ok(bounds) = w.bounds() {
                 app.cached_window_width.set(bounds.width.round() as i32);
                 app.cached_window_height.set(bounds.height.round() as i32);
-                // `WindowControl::bounds`'s own doc: GTK/Wayland always
-                // reports `x: 0.0, y: 0.0` here, meaning "unknown", not "at
-                // the screen origin" — skip caching that sentinel rather than
-                // saving a fake position a `set_bounds`-capable backend
-                // could later misapply; see `App::cached_window_x`/`y`'s own
-                // doc for the #1529 review finding this closes.
+                // `WindowControl::bounds` always reports `x: 0.0, y: 0.0`
+                // on GTK/Wayland (meaning "unknown", not "at the screen
+                // origin") — skip caching that sentinel.
                 if bounds.x != 0.0 || bounds.y != 0.0 {
                     app.cached_window_x.set(Some(bounds.x.round() as i32));
                     app.cached_window_y.set(Some(bounds.y.round() as i32));
@@ -994,7 +768,7 @@ pub(crate) fn run_shared_tick_chores(
         }
     }
 
-    // Poll the yank-highlight deadline armed by `run_post_key_epilogue` (#813).
+    // Poll the yank-highlight deadline armed by `run_post_key_epilogue`.
     if let Some(deadline) = app.yank_hl_deadline.get() {
         if std::time::Instant::now() >= deadline {
             engine.clear_yank_highlight();
@@ -1013,33 +787,14 @@ pub(crate) fn run_shared_tick_chores(
     }
 
     // Auto-refresh source control periodically, gated on sidebar visibility
-    // and the active panel actually being one SC touches — resolved through
-    // `sidebar_owner` rather than a bare panel-id string compare so an
-    // extension panel shown over Git/Explorer doesn't spuriously re-trigger
-    // this (mirrors the legacy GTK gate exactly; TUI's own prior gate missed
-    // the ext-panel-priority case `sidebar_owner` already handles).
+    // and the active panel being one SC touches. The elapsed check only resets
+    // `last_sc_refresh` while the sidebar is actually visible, so while hidden
+    // the 2s timer is never reset and fires once the first tick after showing.
     //
-    // The elapsed check only resets `last_sc_refresh` while the sidebar is
-    // actually visible — matching the old `host.sidebar_refresh_due()`
-    // hook's short-circuited-`&&` evaluation exactly: while the sidebar is
-    // hidden, the 2s timer is never reset, so it fires once (and resets)
-    // the first tick after the sidebar is shown again, no matter how long
-    // it was hidden for.
-    //
-    // #1650: kicking off `sc_refresh_async` here must NOT by itself set
-    // `needs_redraw` — spawning a background thread has no visible effect
-    // of its own, and this block runs every 2s indefinitely while the
-    // Explorer/Git sidebar is visible (the default startup state). This
-    // used to force a real `ratatui::Terminal::draw` call every single
-    // time regardless of whether `git status`/`log`/`worktree list`
-    // actually changed, and every one of those draws writes an invisible
-    // SGR-reset + cursor-hide escape burst (`ratatui-crossterm`'s
-    // `CrosstermBackend::draw`/`hide_cursor` do this unconditionally, even
-    // for a zero-cell diff) — exactly the non-silent idle byte stream
-    // `tests/smoke-spec/tui.yaml`'s `idle-truly-silent` step caught. The
-    // only thing that should trigger a redraw is `poll_sc_refresh`
-    // actually finding changed data (see its own doc), once the async
-    // fetch below completes.
+    // Spawning a background thread has no visible effect of its own, so this
+    // must NOT set `needs_redraw`. The only thing that should trigger a redraw
+    // is `poll_sc_refresh` actually finding changed data, once the async
+    // fetch completes.
     if engine.app_shell.sidebar_visible()
         && app.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2)
     {
@@ -1082,7 +837,7 @@ pub(crate) fn run_shared_tick_chores(
 
     // Drain platform actions (open URL / reveal in file manager) queued by
     // engine logic this frame — needs `backend`'s `PlatformServices`, which
-    // `core/engine/` has no handle to (#1134).
+    // `core/engine/` has no handle to.
     let actions = std::mem::take(&mut engine.pending_platform_actions);
     if !actions.is_empty() {
         for action in actions {
@@ -1094,7 +849,7 @@ pub(crate) fn run_shared_tick_chores(
     needs_redraw
 }
 
-// ─── Menu-bar app icon (#720) ───────────────────────────────────────────────
+// ─── Menu-bar app icon ──────────────────────────────────────────────────────
 
 /// The VimCode app icon's encoded bytes.
 ///
@@ -1120,13 +875,11 @@ const APP_ICON_INTRINSIC_SIZE: (u32, u32) = (1024, 1024);
 /// the app icon, so the glyph doesn't touch the window edge or the tab bar.
 const APP_ICON_INSET_FRACTION: f32 = 0.18;
 
-/// Width reserved at the leading edge of the GTK menu row for the app icon.
+/// Width reserved at the leading edge of the menu row for the app icon.
 ///
-/// Deliberately derived from the **menu row's own height**, not from
-/// `settings.font_size` / the editor line height — the icon is window chrome
-/// and must not grow when the user bumps the editor font, the same lesson
-/// #719 applied to the activity bar's width. A square slot (`width == row
-/// height`) is what VS Code uses for the logo left of `File`.
+/// Deliberately derived from the menu row's own height, not from
+/// `settings.font_size` — the icon is window chrome and must not grow when
+/// the user bumps the editor font.
 pub fn menu_bar_app_icon_slot_width_px(menu_row_height: f32) -> f32 {
     if menu_row_height <= 0.0 {
         0.0
@@ -1140,11 +893,11 @@ pub fn menu_bar_app_icon_slot_width_px(menu_row_height: f32) -> f32 {
 /// past the row's own trailing edge (a pathologically large inset yields a
 /// zero-width row, not a wrapped/negative one).
 ///
-/// Shared (#940 review) by [`split_menu_row_for_app_icon`] — which uses it to
+/// Shared by [`split_menu_row_for_app_icon`] — which uses it to
 /// carve the drawn-menu-row's icon/items split clear of the backend's own
 /// controls — and `App::render_content`'s native-menu-row path, which insets
 /// the *whole* row the same way when the drawn menu row itself is suppressed
-/// (#901) and there is no icon/items split to compute. Extracted so those two
+/// and there is no icon/items split to compute. Extracted so those two
 /// call sites can't compute the same clamp arithmetic two different ways.
 pub fn inset_titlebar_row_leading_edge(row: quadraui::Rect, leading_inset: f32) -> quadraui::Rect {
     let leading_inset = leading_inset.max(0.0).min(row.width);
@@ -1156,66 +909,33 @@ pub fn inset_titlebar_row_leading_edge(row: quadraui::Rect, leading_inset: f32) 
     )
 }
 
-/// True when the backend already draws its own titlebar window controls in
-/// this band — macOS's native traffic lights, reported via a non-default
-/// [`quadraui::Backend::titlebar_control_inset`] once a capable backend has
-/// opted into [`quadraui::shell::ShellConfig::client_side_titlebar`] (#940,
-/// quadraui#947).
-///
-/// `control_inset` is [`quadraui::Rect::default()`] — all-zero — on every
-/// backend before a window exists to query (GTK, Win-GUI, TUI forever; macOS
-/// too until `MacBackend::set_window` runs), so this is `false` there and
-/// every #940 code path that guards on it is a no-op, exactly as it behaved
-/// before #940.
+/// True when the backend already draws its own titlebar window controls
+/// in this band — macOS's native traffic lights, reported via a non-default
+/// [`quadraui::Backend::titlebar_control_inset`]. `control_inset` is
+/// [`quadraui::Rect::default()`] on every backend that has not opted into
+/// [`quadraui::shell::ShellConfig::client_side_titlebar`], so this is `false`
 pub fn backend_draws_own_window_controls(control_inset: quadraui::Rect) -> bool {
     control_inset.width > 0.0 || control_inset.height > 0.0
 }
 
-/// True when vimcode's own drawn window controls (`render::window_controls_status_bar`)
-/// should paint into the title-bar band this frame.
-///
-/// `menu_row_present` is `presence.menu_row` — vimcode never drew inline
-/// controls without also drawing the menu row itself, on any backend, before
-/// #940. `control_inset` adds the second condition #940 introduces: even
-/// with the menu row present, a backend that reports it draws its own
-/// controls (`backend_draws_own_window_controls`) must never *also* get
-/// vimcode's — two sets of window controls is exactly the bug #940 exists to
-/// prevent. See the module doc's "keeps the native traffic lights" section
-/// for why vimcode does not just draw over/instead of them on a capable
-/// backend.
+/// True when vimcode's own drawn window controls should paint into the
+/// title-bar band this frame. When both `menu_row_present` and a backend's
+/// native controls are true, the native controls must win — never paint both.
 pub fn should_draw_window_controls(menu_row_present: bool, control_inset: quadraui::Rect) -> bool {
     menu_row_present && !backend_draws_own_window_controls(control_inset)
 }
 
-/// Split the full menu row band into `(icon_rect, items_rect)`.
-///
-/// `items_rect` is the rect the menu *items* live in — it is what must be
-/// handed to `MenuSystem::render` **and** `MenuSystem::handle`, and to any
-/// `Backend::menu_bar_layout` measurement, so paint geometry and hit-test
-/// geometry cannot drift. That drift is the actual regression risk of adding a
-/// leading element (quadraui's `MenuBar::layout_with_leading` doc calls out the
-/// same #552 `TabBar` bug class); vimcode goes through `MenuSystem`, which owns
-/// its own `MenuBar::layout` call and exposes no leading-width parameter, so
-/// this function is vimcode's equivalent single source of the offset.
+/// Split the full menu row band into `(icon_rect, items_rect)`. `items_rect`
+/// is what must be handed to `MenuSystem::render` and `MenuSystem::handle`.
 ///
 /// `icon_rect` is a square inset vertically inside the slot by
 /// [`APP_ICON_INSET_FRACTION`], horizontally centred in the reserved slot.
 ///
-/// `leading_inset` (#940) shifts where the band effectively *starts*,
-/// without moving its trailing edge — the region
-/// [`quadraui::Backend::titlebar_control_inset`] reports as occupied by the
-/// backend's own drawn controls (macOS's native traffic lights, floating
-/// over the leading edge of the client-side titlebar; see
-/// [`quadraui::shell::ShellConfig::client_side_titlebar`]'s doc for why a
-/// non-empty inset there means "AppKit owns these pixels", not "the app must
-/// draw here"). `0.0` on every backend before #940, and on GTK/Win-GUI
-/// forever until they grow the same opt-in — `Backend::titlebar_control_inset`
-/// defaults to `Rect::default()` there. Clamped to `menu_row_rect.width` so a
+/// `leading_inset` shifts where the band effectively starts without moving its
+/// trailing edge — the region occupied by the backend's own drawn controls
+/// (macOS's native traffic lights). `0.0` on every backend without the
+/// client-side-titlebar opt-in. Clamped to `menu_row_rect.width` so a
 /// pathologically large inset cannot produce a negative-width row.
-///
-/// A zero/negative-height row (menu bar hidden) yields an empty icon rect and
-/// an unchanged (inset-adjusted) items rect, so callers can split
-/// unconditionally.
 pub fn split_menu_row_for_app_icon(
     menu_row_rect: quadraui::Rect,
     leading_inset: f32,
@@ -1231,7 +951,7 @@ pub fn split_menu_row_for_app_icon(
     // from height alone) could extend past `items`' left edge. Not
     // reachable with any real window -- row height is always far smaller
     // than window width -- but keeping the icon inside its own reserved
-    // slot is a one-line invariant worth holding regardless (#720 review).
+    // slot is a one-line invariant worth holding regardless.
     let side = (row.height - 2.0 * inset).max(1.0).min(slot);
     let icon = quadraui::Rect::new(
         row.x + ((slot - side) / 2.0).max(0.0),
@@ -1243,20 +963,9 @@ pub fn split_menu_row_for_app_icon(
     (icon, items)
 }
 
-/// The app icon as a `quadraui::Image`, backed by the raw SVG.
-///
-/// `fallback_text` is empty on purpose: the icon is purely decorative chrome,
-/// so a backend that cannot rasterise (TUI) or a decode failure (no SVG
-/// gdk-pixbuf loader installed) should leave the slot blank rather than paint
-/// a placeholder string where a logo belongs.
-///
-/// Painting code wants `crate::app`'s `app_icon_image_for_paint()`, which
-/// currently just forwards here — kept as a separate name so the paint site
-/// documents *why* it's safe to hand `Backend::draw_image` the raw SVG
-/// directly rather than pre-rasterising it itself: quadraui#1014 added a
-/// decode cache inside `Backend::draw_image` (GTK and macOS so far), so this
-/// function no longer needs a per-backend wrapper to dodge re-decoding the
-/// 1024×1024 SVG through librsvg on every frame (#1102).
+/// The app icon as a `quadraui::Image`, backed by the raw SVG. `fallback_text`
+/// is empty by design: the icon is purely decorative chrome, so a backend
+/// that cannot rasterise or a decode failure should leave the slot blank.
 pub fn app_icon_image() -> quadraui::Image {
     quadraui::Image {
         id: quadraui::WidgetId::new("app-icon"),
@@ -1271,46 +980,14 @@ pub fn app_icon_image() -> quadraui::Image {
 mod tests {
     use super::*;
 
-    // ── Outer window resize grip (#1528) ─────────────────────────────────
+    // ── Outer window resize grip ─────────────────────────────────────────
     //
-    // Black-box coverage note (#1528 review, blocking finding #1/#2): this
-    // section is unit tests, not a `GtkDriver` black-box test, and that is a
-    // deliberate, stated exemption — not an oversight or a substitute chosen
-    // for convenience. `src/gtk/testing.rs`'s own module doc says "No
-    // window": `App::new_headless` never captures a `gtk4::Window`, so the
-    // pinned quadraui rev's `GtkBackend::begin_window_resize`,
-    // `begin_window_drag`, and `set_cursor` all early-return `false`/no-op on
-    // `self.window.is_none()` before touching anything a test could observe.
-    // Worse, `begin_window_resize`/`begin_window_drag` also require a
-    // `self.pending_window_press` captured from a *real* GDK press event
-    // (device/button/x/y/time) — something only `gtk/run.rs`'s live event
-    // controllers populate, never `GtkDriver::dispatch`'s synthesised
-    // `UiEvent`s. So in headless mode the resize-press block in
-    // `App::handle` never actually consumes the event either way (old
-    // full-row-height grip or this PR's thin grip) — both silently no-op
-    // and fall through — which means the specific real-world regression
-    // #1528 describes (a live window's resize arming and swallowing the
-    // press before the scrollbar/minimap/command-line ever sees it) cannot
-    // be reproduced through the existing harness at all, in either
-    // direction. This mirrors commit `4e2bd1e` ("wire GTK window
-    // edge-resize + resize cursor"), which shipped no test for the same
-    // reason ("Needs a real WM to smoke (Xvfb has no compositor)").
-    //
-    // What IS extracted and unit-tested below, because it doesn't need a
-    // window at all: `WINDOW_RESIZE_GRIP_PX`'s value (a regression guard on
-    // the constant, not the dispatch order) and
-    // `resize_edge_overlaps_change_review_band` (the actual decision
-    // function `App::handle` calls for blocking finding #3's fix, tested
-    // directly against its own inputs/outputs — this one *is* production
-    // logic, not just a constant, and the test fails if the logic
-    // regresses).
-    //
-    // Manual smoke test (see this fix's `SMOKE_TESTS` in the commit/PR):
-    // drag from each outer edge and corner of a live GTK window, with and
-    // without a change-review surface open, and confirm the cursor and
-    // resize both behave as the acceptance criteria describe.
+    // Unit tests extracted because they don't need a window at all:
+    // `WINDOW_RESIZE_GRIP_PX`'s value (a regression guard on the constant)
+    // and `resize_edge_overlaps_change_review_band` (the decision function
+    // `App::handle` calls).
 
-    /// #1528: the grip must be thin — a handful of pixels, VS Code/Electron
+    /// The grip must be thin — a handful of pixels, VS Code/Electron
     /// style — not `backend.line_height()` (16-22px). A full row-height grip
     /// is exactly what made North/South resize dead: it made the grip band as
     /// tall as the title bar / command-line rows, so those rows' own
@@ -1332,18 +1009,10 @@ mod tests {
         );
     }
 
-    /// #1528: the grip must stay inside the vertical scrollbar's own gutter
-    /// (`scroll_gutter_width`, `scrollbar_reserve.max(char_width)`) rather
-    /// than reach past it into the minimap strip, which paints a further
-    /// full gutter-width in from the pane's true right edge (see the doc
-    /// comment above `render_engine`'s `minimap_widths`/`minimap`
-    /// construction, #1094) — i.e. the minimap's rightmost column is always
-    /// safely beyond the grip as long as the grip doesn't exceed the
-    /// scrollbar's own column width. Checked across a realistic range of GTK
-    /// char widths — from a small readable font up to a very large one —
-    /// with `scrollbar_reserve` at its common `0.0` (overlay-scrollbar,
-    /// #828/quadraui#776) so the gutter collapses to `char_width` alone, the
-    /// tightest case.
+    /// The grip must stay inside the vertical scrollbar's own gutter rather
+    /// than reach past it into the minimap strip. Checked across a realistic
+    /// range of GTK char widths with `scrollbar_reserve` at its common `0.0`
+    /// (overlay-scrollbar) so the gutter collapses to `char_width` alone.
     #[test]
     fn window_resize_grip_stays_inside_the_scrollbar_gutter() {
         for char_width in [6.0_f64, 7.0, 8.8, 11.0, 16.0, 24.0] {
@@ -1358,22 +1027,11 @@ mod tests {
         }
     }
 
-    /// #1528 review (blocking finding #3): the change-review guard on the
-    /// edge-resize press must cover only the edges that actually overlap the
-    /// change-review surface's own first row — `North`/`NorthEast`/
-    /// `NorthWest` — and must NOT cover `South`/`SouthEast`/`SouthWest`/
-    /// `East`/`West`. A regression that widened the guard back to "every
-    /// edge" (the bug this test pins) would silently make a user unable to
-    /// resize from any edge at all while a change-review surface is open,
-    /// which is exactly the scope-creep the review caught.
-    ///
-    /// RED against the reverted fix: if `resize_edge_overlaps_change_review_
-    /// band` unconditionally returned `true` (i.e. `App::handle` gated ALL
-    /// edges on `change_review_open`, as this PR did before the fix), every
-    /// `assert!(!...)` below would fail. Verified by hand: with the function
-    /// body swapped for a bare `true`, `cargo test --lib resize_edge_overlaps`
-    /// fails at the `!resize_edge_overlaps_change_review_band(ResizeEdge::
-    /// South)` assertion.
+    /// The change-review guard must cover only the edges that actually
+    /// overlap the change-review surface's first row — `North`/`NorthEast`/
+    /// `NorthWest` — and must NOT cover other edges. A regression that
+    /// widened the guard would silently make resizing impossible while a
+    /// change-review surface is open.
     #[test]
     fn resize_edge_overlaps_change_review_band_only_covers_the_top() {
         use quadraui::ResizeEdge;
@@ -1418,17 +1076,10 @@ mod tests {
         );
     }
 
-    /// #816 review: `core::engine::keys`'s digit-accumulation arm sets both
-    /// `count = Some(10_000)` AND `message = "Count limited to 10,000"` in
-    /// the same keypress once the cap is hit, so a live count and a
-    /// non-empty message ARE simultaneously reachable in `Mode::Normal` —
-    /// not a hypothetical the reviewer raised for nothing. In that state
-    /// `build_command_line` paints the count, not the message (see its
-    /// `Mode::Normal | Visual | VisualLine` arm), so a selection gate that
-    /// only checked `!message.is_empty()` would arm `cmd_sel` against text
-    /// nobody painted — the click hit-tests the count string while Ctrl+C's
-    /// copy reads `engine.message`. This must stay disallowed until the
-    /// count is consumed/cleared.
+    /// When a count and message are both present — a valid state when the
+    /// digit-accumulation cap is hit — `build_command_line` paints the count,
+    /// not the message. A selection gate checking only `!message.is_empty()`
+    /// would arm selection against text nobody painted.
     #[test]
     fn command_line_selection_allowed_false_when_count_shadows_message() {
         let mut e = Engine::new();
@@ -1508,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    // ── Menu-bar app icon geometry (#720) ────────────────────────────────
+    // ── Menu-bar app icon geometry ───────────────────────────────────────
     #[test]
     fn app_icon_slot_shifts_menu_items_by_exactly_its_width() {
         let row = quadraui::Rect::new(10.0, 5.0, 800.0, 30.0);
@@ -1526,10 +1177,8 @@ mod tests {
         );
     }
 
-    /// The icon is chrome: its size must track the *menu row height* and
-    /// nothing else, so bumping `settings.font_size` (which changes the
-    /// editor line height, not this row) cannot grow it. Same lesson #719
-    /// applied to the activity bar's width.
+    /// The icon is chrome: its size must track the menu row height and nothing
+    /// else, so bumping `settings.font_size` cannot grow it.
     #[test]
     fn app_icon_size_tracks_row_height_only() {
         let short = split_menu_row_for_app_icon(quadraui::Rect::new(0.0, 0.0, 800.0, 24.0), 0.0).0;
@@ -1574,7 +1223,7 @@ mod tests {
         assert_eq!(items.width, 0.0);
     }
 
-    /// #720 review: a row narrower than it is tall must not let the
+    /// A row narrower than it is tall must not let the
     /// height-derived `side` spill past the reserved `slot` (`slot =
     /// height.min(width)`) into, or past, `items`' left edge. Not reachable
     /// with any real window (row height is always far smaller than window
@@ -1596,20 +1245,10 @@ mod tests {
         );
     }
 
-    // ── Client-side titlebar leading-edge inset (#940) ──────────────────
+    // ── Client-side titlebar leading-edge inset ─────────────────────────
 
-    /// A non-zero `leading_inset` (what `Backend::titlebar_control_inset`
-    /// reports on a capable backend, e.g. macOS's native traffic lights)
-    /// must push both the icon and the items strip clear of it, without
-    /// moving the band's trailing edge.
-    ///
-    /// RED against the pre-#940 signature (no `leading_inset` parameter at
-    /// all — every caller started the icon flush with `menu_row_rect.x`
-    /// regardless of a reported control inset, which is exactly the "app
-    /// icon collides with the traffic lights" bug this issue exists to
-    /// prevent). With the parameter threaded through but ignored (e.g. a
-    /// stub `let _ = leading_inset;`), this assertion fails because `icon.x`
-    /// would still equal `row.x` instead of `row.x + inset`.
+    /// A non-zero `leading_inset` must push both the icon and the items
+    /// strip clear of it, without moving the band's trailing edge.
     #[test]
     fn leading_inset_pushes_icon_and_items_clear_of_native_controls() {
         let row = quadraui::Rect::new(10.0, 5.0, 800.0, 30.0);
@@ -1654,10 +1293,9 @@ mod tests {
 
     /// `inset_titlebar_row_leading_edge` is the shared clamp arithmetic
     /// `split_menu_row_for_app_icon` and `App::render_content`'s
-    /// native-menu-row (`presence.menu_row == false`) path both need (#940
-    /// review — the two were duplicating the same three lines). Pins the
-    /// exact contract both callers depend on: leading edge moves in by
-    /// `leading_inset`, trailing edge never moves, y/height untouched.
+    /// native-menu-row path both need. Pins the exact contract both
+    /// callers depend on: leading edge moves in by `leading_inset`,
+    /// trailing edge never moves, y/height untouched.
     #[test]
     fn inset_titlebar_row_leading_edge_moves_only_the_leading_edge() {
         let row = quadraui::Rect::new(10.0, 5.0, 800.0, 30.0);
@@ -1684,17 +1322,11 @@ mod tests {
         assert!(inset.x <= row.x + row.width);
     }
 
-    /// `backend_draws_own_window_controls` is the pure predicate
-    /// `App::render_content` reads `Backend::titlebar_control_inset()`
-    /// through (#940 review — extracted so it has a driver-independent
-    /// unit test; see the app.rs review note on why an actual `MacDriver`
-    /// can't drive a non-default inset today). `Rect::default()` — the
-    /// value every backend without the client-side-titlebar opt-in reports,
-    /// forever on GTK/Win-GUI/TUI and on macOS before a window exists — must
-    /// read as "no native controls"; any non-zero width *or* height must
-    /// read as "yes", since either alone is what
-    /// `MacBackend::titlebar_control_inset` can report depending on which
-    /// dimension AppKit's own button-cluster container constrains.
+    /// `backend_draws_own_window_controls` is the pure predicate for whether
+    /// the backend reports it draws its own window controls. `Rect::default()`
+    /// — reported by every backend without the client-side-titlebar opt-in —
+    /// must read as "no native controls"; any non-zero width or height must
+    /// read as "yes".
     #[test]
     fn backend_draws_own_window_controls_reads_either_nonzero_dimension() {
         assert!(!backend_draws_own_window_controls(quadraui::Rect::default()));
@@ -1710,14 +1342,8 @@ mod tests {
     }
 
     /// `should_draw_window_controls` is the exact "exactly one set of window
-    /// controls" decision #940 exists to get right — extracted so all four
-    /// combinations of (`menu_row_present`, `has_native_controls`) have a
-    /// direct, fast, deterministic test independent of any backend/driver
-    /// (#940 review). Native controls always win: they must suppress
-    /// vimcode's drawn controls regardless of `menu_row_present`, since a
-    /// backend reporting a control inset is macOS today, which also always
-    /// reports `menu_row_present == false` (#901) — but the function must
-    /// not rely on that correlation to be correct.
+    /// controls" decision. Native controls always win: they must suppress
+    /// vimcode's drawn controls regardless of `menu_row_present`.
     #[test]
     fn should_draw_window_controls_covers_all_four_combinations() {
         let none = quadraui::Rect::default();
@@ -1746,8 +1372,7 @@ mod tests {
     }
 
     /// The icon painted in the menu row and the icon installed into the
-    /// desktop icon theme are the same artwork, by construction (#716/#720
-    /// "do not add a third copy of the SVG").
+    /// desktop icon theme are the same artwork.
     #[test]
     fn app_icon_image_carries_the_shipped_svg_and_its_viewbox_size() {
         let img = app_icon_image();

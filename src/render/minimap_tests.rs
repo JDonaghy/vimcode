@@ -1,6 +1,6 @@
 use super::*;
 
-// ─── Minimap (#35, #722) ────────────────────────────────────────────
+// ─── Minimap ────────────────────────────────────────────────────────
 
 /// A file with a distinctive indentation shape — deep on the inside,
 /// flush at the edges — so a transposed dot grid would be obvious.
@@ -12,30 +12,28 @@ pub(crate) fn minimap_engine() -> Engine {
         text.push_str(&format!("line {i} content\n"));
     }
     let mut e = test_engine(&text);
-    // #1858: the minimap is experimental and off by default on every
+    // The minimap is experimental and off by default on every
     // backend now — this fixture exists specifically to exercise it, so
     // turn it on explicitly rather than lean on the (now-off) default.
     e.settings.minimap = true;
     e
 }
 
-/// A large, syntax-free buffer used to force the strip into #1093's
-/// genuine sliding-window regime even under #1186's compression: `n` is
+/// A large, syntax-free buffer to force the strip into a genuine
+/// sliding-window regime even when compression is applied: `n` is
 /// picked per call site to comfortably exceed
 /// `MINIMAP_MAX_COMPRESSION * target_lines` for that call's own strip
 /// geometry, so `build_minimap_data` cannot show the whole file no
-/// matter how generous `K_max` is. Tests using this fixture are
-/// specifically about the windowed case (file too large to ever fully
-/// fit), as distinct from the compressed-but-whole-file case #1186
-/// introduced — see `minimap_scale_grows_to_show_the_whole_file_when_it_fits_the_compression_ceiling`
-/// for that one.
+/// matter how generous `K_max` is. Tests using this fixture exercise
+/// the windowed case (file too large to ever fully fit), as distinct
+/// from the compressed-but-whole-file case.
 pub(crate) fn windowed_minimap_engine(n: usize) -> Engine {
     let mut text = String::with_capacity(n * 14);
     for i in 0..n {
         text.push_str(&format!("line {i} content\n"));
     }
     let mut e = test_engine(&text);
-    // #1858: the minimap is experimental and off by default on every
+    // The minimap is experimental and off by default on every
     // backend now — this fixture exists specifically to exercise it, so
     // turn it on explicitly rather than lean on the (now-off) default.
     e.settings.minimap = true;
@@ -43,20 +41,15 @@ pub(crate) fn windowed_minimap_engine(n: usize) -> Engine {
 }
 
 /// A synthetic file large enough to make an O(buffer) per-frame cost
-/// visible: `n_lines` lines, none of them trivially short (so a full
-/// buffer-wide `String` materialisation actually does real allocation
-/// work, not just touch thousands of empty strings).
+/// visible: `n_lines` lines, none trivially short (so a full
+/// buffer-wide `String` materialisation does real allocation work).
 ///
-/// #1096 (repairing the #728 guard's blind spot 2): installs a real
-/// `Syntax` and forces a full reparse, so `buffer_state.highlights` is
-/// actually populated — `test_engine` alone leaves `syntax: None` (no
-/// filetype), which is exactly how the #1096 regression (an unbounded
-/// per-highlighted-line `String` cache in `build_minimap_data`'s
-/// highlight-mapping loop) went unexercised by every test using this
-/// fixture: with `highlights` empty, that loop's body never ran at all.
-/// The text itself (`fn line_N() { do_something(N); }`) was already
-/// valid enough tree-sitter-Rust input to produce dense, realistic
-/// highlight spans once a language is actually attached.
+/// Installs a real `Syntax` and forces a full reparse, so
+/// `buffer_state.highlights` is actually populated — `test_engine`
+/// alone leaves `syntax: None` (no filetype). The text itself
+/// (`fn line_N() { do_something(N); }`) is valid tree-sitter-Rust
+/// input to produce dense, realistic highlight spans with a language
+/// attached.
 pub(crate) fn large_minimap_engine(n_lines: usize) -> Engine {
     let mut text = String::with_capacity(n_lines * 24);
     for i in 0..n_lines {
@@ -104,60 +97,27 @@ fn time_minimap_frames(e: &mut Engine, n_lines: usize, frames: usize) -> std::ti
     total
 }
 
-/// #728 performance acceptance: wheel-scrolling a big file must not cost
-/// O(buffer) per frame. `build_minimap_data` used to allocate a `String`
-/// for *every* line in the buffer on every call regardless of how many
-/// it actually samples (`quadraui::sample_lines` only keeps
-/// ~`target_lines`, but the old code built the whole buffer as
-/// candidates first).
+/// Performance acceptance: wheel-scrolling a big file must not cost
+/// O(buffer) per frame. `build_minimap_data` only samples
+/// ~`target_lines`, not the whole buffer.
 ///
 /// **This asserts on a *ratio*, not a wall-clock ceiling.** The same
 /// scroll workload is run over a 1,000-line buffer and a 10,000-line
 /// one — 10x the buffer, identical strip geometry, so identical
 /// `target_lines` — and the per-frame costs are compared. The two
-/// measurements are *interleaved* frame-by-frame so a burst of CPU
-/// contention (the full suite runs these tests in parallel with ~2,300
-/// others) inflates both sides equally and cancels out of the ratio.
-///
-/// The earlier version of this test pinned a 500ms absolute budget for
-/// 300 frames; the fixed cost on an idle box is ~405ms, so the margin
-/// was ~20% and it flaked at 517–586ms under full-suite contention
-/// while passing in isolation. Absolute timings cannot be made
-/// contention-proof; the ratio can, and it is what the test name
-/// actually claims.
+/// measurements are *interleaved* frame-by-frame so CPU contention
+/// inflates both sides equally and cancels out of the ratio.
 ///
 /// Measured on this machine (debug `cargo test --no-default-features
 /// --bin vcd`), per-frame cost over a 10,000-line file:
-///   - before (whole-buffer `owned: Vec<String>` every frame):
-///     **~80.8ms/frame** — unusable under sustained wheel scroll,
-///     matching the issue's report, and ~10x the 1,000-line cost
-///     because the work is linear in buffer size.
-///   - after (index-first sampling, only ~`target_lines` lines fetched
-///     from the rope per frame): **~1.34ms/frame**, i.e. ~1x the
-///     1,000-line cost — the cost tracks `target_lines` (the strip's
-///     own display rows), not the buffer.
+///   - expected (cost tracks `target_lines`, not buffer size):
+///     ~1x the 1,000-line cost
 ///
-/// So the discriminator is ~1x (fixed) vs ~10x (linear); the 4x
+/// The discriminator is ~1x (fixed) vs ~10x (linear); the 4x
 /// threshold below sits between them with generous room on both sides.
 ///
-/// #1096 repaired this guard's own blind spot: `large_minimap_engine`
-/// now installs real Rust highlights (see that fixture's doc comment),
-/// so this same measurement now also covers the highlight-mapping loop
-/// — which is exactly where #1096's regression lived, and which the
-/// unhighlighted fixture used to skip entirely. Re-measured after that
-/// fix, same machine/build, same 1,000- vs 10,000-line/150-frame setup:
-///   - #1096 regression, allocation only removed (highlight loop still
-///     scans every entry in `buffer_state.highlights`, itself O(buffer)):
-///     up to **~3,167ms/frame** at 10,000 lines, ratio up to ~9.9x —
-///     failed this guard outright.
-///   - #1096 fix (binary-search each sampled line directly into the
-///     sorted `highlights` vec, `partition_point`, instead of scanning
-///     it): **~34-44ms/frame**, ratio ~1.3x. The residual ~22ms/frame
-///     floor (measured with `highlights` forced empty, same fixture) is
-///     #1085's own block-aggregation cost — inherent to that issue's
-///     correctness fix, unrelated to highlighting, and out of this
-///     issue's scope (see #1093, which replaces this whole sampling
-///     strategy, and #1097, the separate non-minimap CPU cost).
+/// After fixing the highlight-mapping loop to use binary-search
+/// instead of scanning: ~34-44ms/frame, ratio ~1.3x.
 #[test]
 fn minimap_scroll_does_not_scale_with_buffer_size() {
     const SMALL_LINES: usize = 1_000;
@@ -202,40 +162,17 @@ fn minimap_scroll_does_not_scale_with_buffer_size() {
     );
 }
 
-/// #1096 regression guard, repairing both of the #728 guard's blind
-/// spots at once:
-///
-/// - **Blind spot 1** (`minimap_scroll_does_not_scale_with_buffer_size`
-///   asserts a *ratio*, not a ceiling): a same-geometry constant-factor
-///   regression multiplies both sides of that ratio equally and cancels
-///   out exactly — which is what let #1096 land invisibly (8x more line
-///   reads, ~20x more surviving highlight spans, at unchanged
-///   `target_lines`). This test instead counts real work
-///   (`MINIMAP_LINE_FETCH_COUNT`, incremented once per
-///   `minimap_line_text` call) and checks it against a formula derived
-///   from `target_lines`, not against a sibling run's own — possibly
-///   also regressed — cost.
-/// - **Blind spot 2** (that test's fixture never set a filetype, so
-///   `highlights` stayed empty and the loop #1096 regressed never ran):
-///   `large_minimap_engine` now installs a real `Syntax` and asserts
-///   its own highlights are non-empty (see that fixture's doc comment).
+/// Regression guard: a same-geometry constant-factor regression
+/// multiplies both sides of the scroll ratio equally and cancels
+/// out exactly. This test instead counts real work
+/// (`MINIMAP_LINE_FETCH_COUNT`) and checks it against a formula
+/// derived from `target_lines`, not against a sibling run's cost.
 ///
 /// Both buffers use blocks large enough to saturate
-/// `quadraui::primitives::minimap::BLOCK_LINE_SAMPLE_CAP` (`n_lines /
-/// target_lines` well over the cap in both cases), so both should hit
-/// the exact same fetch
-/// ceiling regardless of the 10x difference in buffer size — the #728
-/// invariant this test exists to pin, stated as a number instead of a
-/// ratio.
-///
-/// **RED against the unfixed highlight-mapping loop:** confirmed by
-/// hand — reinstating the per-call `line_text_cache: HashMap<usize,
-/// String>` the loop used before this fix makes `large_fetches` grow
-/// with the highlighted line count (~buffer size) instead of staying
-/// pinned to the block-sampling ceiling, so `large_fetches >
-/// small_fetches` (and both blow past `ceiling`) once `n_lines` is
-/// large enough that most highlighted lines aren't themselves block
-/// starts. Reverted before landing this test.
+/// `quadraui::primitives::minimap::BLOCK_LINE_SAMPLE_CAP`, so both
+/// should hit the exact same fetch ceiling regardless of the 10x
+/// difference in buffer size — the invariant that fetch count tracks
+/// `target_lines`, not buffer size.
 #[test]
 fn minimap_line_fetch_count_tracks_target_lines_not_buffer_size() {
     const SMALL_LINES: usize = 2_000;
@@ -290,11 +227,9 @@ fn minimap_line_fetch_count_tracks_target_lines_not_buffer_size() {
 
 /// Acceptance: `:set nominimap` must widen the editor text area by
 /// *exactly* the reserved width, and `:set minimap` must give it back.
-/// Asserted on the rendered `text_viewport_cols`, not on the setting.
-/// The expected delta is computed through `minimap_reserved_width`
-/// itself (the single source of truth `build_screen_layout` also
-/// reads) rather than a hardcoded column count, since #722 made that
-/// width a function of pane width instead of a fixed constant.
+/// Asserted on the rendered `text_viewport_cols`. The expected delta
+/// is computed through `minimap_reserved_width` itself (the single
+/// source of truth `build_screen_layout` also reads).
 #[test]
 fn nominimap_widens_the_editor_by_exactly_the_reserved_width() {
     let mut e = minimap_engine();
@@ -307,13 +242,13 @@ fn nominimap_widens_the_editor_by_exactly_the_reserved_width() {
         1,
         "the minimap must be present when the setting is on"
     );
-    // #1094: `render_engine` is TUI-shaped (`scrollbar_reserve == 0.0`,
+    // `render_engine` is TUI-shaped (`scrollbar_reserve == 0.0`,
     // `char_width == 1.0`), so the strip now also claims the one-column
     // gutter that keeps its own boundary clear of the pane's outermost
     // (scroll) column — see `scroll_gutter_width`'s doc comment. Turning
     // the minimap off reclaims that sliver along with the strip itself.
     //
-    // `.ceil()`, not a bare `as usize` truncation (#1326 review): a
+    // `.ceil()`, not a bare `as usize` truncation: a
     // 120-wide pane's `minimap_reserved_width` happens to be exactly
     // `18.0` here (`120 * MINIMAP_WIDTH_FRACTION`), so truncating vs.
     // ceiling this specific fixture's width was never distinguishable —
@@ -344,9 +279,8 @@ fn nominimap_widens_the_editor_by_exactly_the_reserved_width() {
     );
 }
 
-/// #722 acceptance: `:set nominimap` reclaims exactly the reserved width
-/// in *every* pane of a split, not just a single active one — extending
-/// the test above to `:vsplit`.
+/// Acceptance: `:set nominimap` reclaims exactly the reserved width
+/// in *every* pane of a split, not just a single active one.
 #[test]
 fn nominimap_widens_every_pane_in_a_split_by_exactly_its_reserved_width() {
     let mut e = minimap_engine();
@@ -378,23 +312,12 @@ fn nominimap_widens_every_pane_in_a_split_by_exactly_its_reserved_width() {
             .iter()
             .find(|w| w.window_id == w_with.window_id)
             .expect("window set must be identical with/without the minimap");
-        // #1094: `w_with.rect.width`/`w_without.rect.width` are now the
-        // pane's own (un-narrowed either way) width — the strip no
-        // longer narrows `rect` itself, only the text-column count — so
-        // either carries the same pane width `minimap_reserved_width`
-        // expects. The expected reclaim adds `scroll_gutter_width`'s
-        // one-column TUI gutter to the strip's own raw width, same as
-        // the single-window test above — `.ceil()`'d for the same
-        // reason (#1326 review, see that test's doc comment): a
-        // `:vsplit`'s two panes need not split evenly (#1326 reserves
-        // one column for the divider bar itself, so a fresh 160-wide
-        // `<C-w>v` here is 80/79, not 80/80), and an odd pane width
-        // like 79 gives `minimap_reserved_width` a genuinely
-        // fractional result (`79 * MINIMAP_WIDTH_FRACTION = 11.85`) —
-        // this is the fixture that first exercises that fractional
-        // case, where truncating instead of ceiling disagreed with
-        // `build_screen_layout`'s real reclaimed width by exactly one
-        // column.
+        // The pane's own width remains unchanged; the strip narrows
+        // only the text-column count. The expected reclaim adds
+        // `scroll_gutter_width`'s one-column TUI gutter to the strip's
+        // own raw width. An odd pane width (e.g. 79) gives
+        // `minimap_reserved_width` a fractional result; ceiling ensures
+        // consistency with `build_screen_layout`'s real width.
         let expected_cols =
             (minimap_reserved_width(&e, w_without.rect.width, 1.0, TUI_MINIMAP_SIZING, 0.0)
                 + scroll_gutter_width(0.0, 1.0))
@@ -411,13 +334,9 @@ fn nominimap_widens_every_pane_in_a_split_by_exactly_its_reserved_width() {
     }
 }
 
-/// #722 review follow-up (non-blocking finding): clicking a
-/// **background** pane's minimap must focus that pane, not just
-/// scroll/reposition its cursor while leaving focus (and keyboard
-/// input) on whichever pane was already active. Before #722 this could
-/// never come up — only the active pane had a minimap at all — so
-/// there was no "click a strip that isn't the focused pane's" case to
-/// get wrong until every pane got its own strip.
+/// Acceptance: clicking a **background** pane's minimap must focus
+/// that pane, not just scroll/reposition its cursor while leaving
+/// focus on the already-active pane.
 #[test]
 fn minimap_click_on_a_background_pane_focuses_that_pane() {
     let mut e = minimap_engine();
@@ -457,21 +376,11 @@ fn minimap_click_on_a_background_pane_focuses_that_pane() {
     );
 }
 
-/// #1292 review (blocking finding): `apply_gutter_action`'s `DiffPeek`,
-/// `DiagnosticHover` and `CodeAction` arms used to assign
-/// `engine.active_tab_mut().active_window = window_id` directly instead
-/// of routing through `Tab::focus_window`, so clicking a gutter icon
-/// (diagnostic squiggle, code-action lightbulb, or diff-peek marker) on
-/// a *background* split pane moved focus there but left
-/// `Tab::prev_window` stale — a following `CTRL-W p` would then recall
-/// whatever was previously active before the click, not the pane the
-/// click itself came from, diverging from Neovim's `prevwin`.
-///
-/// **Verified RED against the pre-fix shape:** reverting the three
-/// `apply_gutter_action` arms back to a direct `active_window =`
-/// assignment makes this fail — `prev_window` stays `None` (or
-/// whatever it held before the click) instead of recording
-/// `active_before`.
+/// Gutter actions (`DiffPeek`, `DiagnosticHover`, `CodeAction`) must
+/// route through `Tab::focus_window` rather than directly assigning
+/// `active_window`, so that clicking a gutter icon on a background
+/// pane records `prev_window` correctly — a following `CTRL-W p`
+/// recalls the pane the click came from, matching Neovim's `prevwin`.
 #[test]
 fn gutter_diagnostic_hover_on_a_background_pane_focuses_it_and_records_prev_window() {
     let mut e = Engine::new_for_test();
@@ -525,21 +434,11 @@ fn minimap_reserved_width_is_zero_when_the_setting_is_off() {
     );
 }
 
-/// #828 acceptance (updated for #1869's real formula, not deleted):
-/// `sizing` is an explicit parameter, honored exactly as given — not
-/// re-derived from `char_width` via the old `if char_width > 1.0 { ... }
-/// else { ... }` convention this file used to hardcode inside
-/// `minimap_reserved_width` itself.
-///
-/// RED against that pre-#828 shape: there was no `sizing` parameter to
-/// pass at all — the function *always* picked its constant set from
-/// `char_width`, so a caller could never say "use GTK's own policy"
-/// while passing a TUI-shaped `char_width`. This pins that passing
-/// `gtk_minimap_sizing()` alongside `char_width == 1.0` (TUI's own real
-/// metric) still resolves via [`vs_code_minimap_width_px`] — the real
-/// VS Code pixel formula — rather than TUI's `resolve_width`-based
-/// column policy, by checking the result against the formula computed
-/// by hand, not merely against *some* non-TUI-shaped number.
+/// Acceptance: `sizing` is an explicit parameter, honored exactly as
+/// given — not re-derived from `char_width`. This pins that passing
+/// `gtk_minimap_sizing()` alongside `char_width == 1.0` (TUI's own
+/// real metric) still resolves via [`vs_code_minimap_width_px`]
+/// rather than TUI's column policy.
 #[test]
 fn minimap_reserved_width_uses_the_explicit_sizing_not_char_width() {
     let e = minimap_engine();
@@ -575,31 +474,19 @@ fn minimap_suppresses_itself_in_a_narrow_window() {
     );
 }
 
-/// #1094 acceptance ("A narrow pane still resolves to a sane layout
-/// rather than squeezing the text out"): `minimap_reserved_width`'s own
-/// affordability check only knows about the *pane's* width — it has no
-/// notion of the scroll gutter that now sits beyond the strip too (see
-/// `scroll_gutter_width`), so a pane that can afford the strip *alone*
-/// can still be too narrow to afford the strip *and* the gutter without
-/// squeezing the text below `MINIMAP_MIN_TEXT_COLS`. `build_screen_
-/// layout` has to re-check with the gutter folded in and self-suppress
-/// the same way a pane too narrow for the strip alone already does —
-/// this is that interaction, driven through the real entry point
-/// rather than `minimap_reserved_width` in isolation (which cannot see
-/// `scrollbar_reserve` at all).
-///
-/// RED against a `build_screen_layout` that never re-checks
-/// (equivalently, against reverting this fix): at `scrollbar_reserve =
-/// 10.0`, the strip still shows and squeezes the pane's 40 columns down
-/// to `40 - 6 (strip) - 10 (reserve) = 24` — below `MINIMAP_MIN_TEXT_
-/// COLS` (30) — instead of self-suppressing. Confirmed by hand against
-/// the pre-fix `render.rs`.
+/// Acceptance: `minimap_reserved_width`'s affordability check only
+/// knows about the *pane's* width, not the scroll gutter beyond the
+/// strip. A pane that can afford the strip alone can still be too
+/// narrow to afford the strip *and* the gutter without squeezing the
+/// text below `MINIMAP_MIN_TEXT_COLS`. `build_screen_layout` must
+/// re-check with the gutter folded in and self-suppress the same way
+/// a pane too narrow for the strip alone does.
 #[test]
 fn minimap_suppresses_itself_when_the_pane_cannot_afford_both_the_strip_and_the_scroll_gutter() {
     let mut engine = test_engine(
         "a line of text long enough to fill the whole pane width and then some more text",
     );
-    // #1858: minimap is experimental and off by default — this test is
+    // Minimap is experimental and off by default — this test is
     // specifically about the minimap's self-suppression, so turn it on
     // explicitly.
     engine.settings.minimap = true;
@@ -657,48 +544,16 @@ fn minimap_suppresses_itself_when_the_pane_cannot_afford_both_the_strip_and_the_
     );
 }
 
-// ── #1085/#1098: point-sample → block-aggregation ───────────────────
-//
-// The white-box test that used to live here
-// (`a_stride_skipped_distinctive_line_still_shows_up`) drove
-// `minimap_block_bounds`/`minimap_block_sample_indices`/
-// `minimap_block_text` directly — pure block-partitioning and
-// dither-aggregation arithmetic, with no highlight/vimcode-specific
-// logic in it at all. #1098 lifted that arithmetic into quadraui
-// (quadraui#1012), which already carries the equivalent case
-// (`sample_blocks_no_line_in_a_block_is_ever_fully_discarded`, same
-// "a rare long line surrounded by short ones must not be discarded"
-// property) in its own suite, so keeping a second copy of the same
-// expectations here would just be a duplicate to keep in sync. The
-// sibling test below stays: it drives the full `build_minimap_data`
-// pipeline, which is where vimcode's own half (window/highlight
-// mapping) still lives.
-
-/// #1085 acceptance criterion 2: the viewport highlight band's own
-/// *content* must differ between a blank run and a dense block of the
-/// same file — not just which rows are highlighted (already covered
-/// by `minimap_click_at_the_middle_seeks_to_half_the_file` and
-/// friends), but what the aggregation actually painted into those
-/// rows. A fix that only stops saturating (quadraui#1007's rasteriser
-/// half) without also making vimcode's own sampling represent every
-/// line would still show a band that doesn't track *where* on screen
-/// the editor actually is.
+/// Acceptance criterion: the viewport highlight band's *content* must
+/// differ between a blank run and a dense block of the same file.
+/// A fix that only stops saturating without also making sampling
+/// represent every line would still show a band that doesn't track
+/// *where* on screen the editor actually is.
 ///
-/// The dense region's every 5th line (`j % 5 == 2`, never `== 0`) is
-/// the only non-blank content, deliberately never a block boundary
-/// (`HALF` is itself a multiple of the stride, so a block boundary is
-/// always `≡ 0 (mod 5)`, absolute or region-relative) — a fixture
+/// The dense region's every 5th line (`j % 5 == 2`) is the only
+/// non-blank content, deliberately never a block boundary — a fixture
 /// where the dense region's content sat *on* the sampled point would
-/// pass under the pre-#1085 point-sampler too and prove nothing about
-/// this issue.
-///
-/// **RED against unfixed `develop`:** confirmed by hand with the same
-/// `block_sample_indices` → `vec![start]` revert #1085's own
-/// (now-removed) white-box test used — the point-sampler only ever
-/// reads each block's first line, which is blank in *both* regions by
-/// construction here, so `dense_dots` collapses to `0` too and
-/// `dense_dots > blank_dots * 4` (`0 > 0`) fails. Reverted before
-/// landing this test.
+/// pass even under point-sampling and prove nothing about this issue.
 #[test]
 fn viewport_band_content_differs_between_a_blank_run_and_a_dense_block() {
     const HALF: usize = 400;
@@ -753,30 +608,16 @@ fn viewport_band_content_differs_between_a_blank_run_and_a_dense_block() {
     );
 }
 
-/// #1186 acceptance: the viewport-highlight band (`Minimap::visible_row_start`/
-/// `visible_row_count`, painted as a background band by both backends'
-/// rasterisers — see `quadraui::tui::minimap`'s module doc) must shrink
-/// and reposition correctly once blocks start covering more than one
-/// real buffer line, not stay pinned to the pre-#1186 per-line shape.
+/// Acceptance: the viewport-highlight band (`Minimap::visible_row_start`/
+/// `visible_row_count`) must shrink and reposition correctly once
+/// blocks cover more than one real buffer line.
 ///
 /// A `viewport_lines`-tall editor viewport spans `viewport_lines` real
-/// buffer lines, which now maps to `ceil(viewport_lines / block_width)`
+/// buffer lines, which maps to `ceil(viewport_lines / block_width)`
 /// **blocks** (clamped to at least 1) rather than `viewport_lines`
-/// blocks — since each block covers `block_width` real lines. This
-/// checks that relationship directly against a compressed window
-/// (`block_width > 1`), and that `visible_row_start` lands on the block
-/// that actually contains `scroll_top`, not the next one after it (the
-/// off-by-one the old `position(|l| l.line_idx >= scroll_top)` formula
-/// would hit once a block's own range no longer starts exactly at
-/// `scroll_top`).
-///
-/// **RED against unfixed `develop`:** confirmed by hand — reverting
-/// `visible_row_start`'s `partition_point` formula back to
-/// `position(|l| l.line_idx >= scroll_top)` (the pre-#1186 formula) at
-/// this test's compression skips the block that actually contains
-/// `scroll_top`, landing one block later than expected and failing the
-/// `visible_row_start` assertion below. Reverted before landing this
-/// test.
+/// blocks — since each block covers `block_width` real lines.
+/// `visible_row_start` must land on the block that actually contains
+/// `scroll_top`, not the next one after it.
 #[test]
 fn viewport_band_scales_down_and_repositions_under_compression() {
     const N_LINES: usize = 20_000;
@@ -808,10 +649,7 @@ fn viewport_band_scales_down_and_repositions_under_compression() {
              (block_width={block_width})"
     );
 
-    // Height: a `EDITOR_VISIBLE_ROWS`-line viewport must cover roughly
-    // `EDITOR_VISIBLE_ROWS / block_width` blocks (clamped to >= 1) —
-    // never the pre-#1186 `EDITOR_VISIBLE_ROWS` blocks a compressed
-    // window would wildly overshoot to.
+    // Height: a `EDITOR_VISIBLE_ROWS`-line viewport covers roughly
     let expected_rows = (EDITOR_VISIBLE_ROWS / block_width).max(1);
     assert!(
         mm.visible_row_count <= expected_rows + 1 && mm.visible_row_count >= 1,
@@ -838,15 +676,12 @@ fn viewport_band_scales_down_and_repositions_under_compression() {
     );
 }
 
-/// #722 acceptance: in a `:vsplit`, both panes show their own minimap
-/// over their own buffer — not a single strip pinned to the active
-/// pane. Each buffer gets distinct content so a transposed or
-/// cross-wired sample (pane A showing pane B's file) would show up as a
-/// mismatched `total_buffer_lines`.
+/// Acceptance: in a `:vsplit`, both panes show their own minimap over
+/// their own buffer — not a single strip pinned to the active pane.
 #[test]
 fn split_gives_every_pane_its_own_minimap_over_its_own_buffer() {
     let mut e = test_engine("");
-    // #1858: minimap is experimental and off by default — this test is
+    // Minimap is experimental and off by default — this test is
     // specifically about the minimap, so turn it on explicitly.
     e.settings.minimap = true;
     e.buffer_mut().insert(0, &"left\n".repeat(50));
@@ -889,11 +724,9 @@ fn split_gives_every_pane_its_own_minimap_over_its_own_buffer() {
     );
 }
 
-/// #722 acceptance: switching focus between panes must not change
-/// either pane's text width. Before the fix, the width reclaim was
-/// gated on `is_active`, so *both* panes reflowed every time focus
-/// moved — assert the window rects (hence `text_viewport_cols`) are
-/// bit-identical across a focus change with the minimap on.
+/// Acceptance: switching focus between panes must not change either
+/// pane's text width. The width reclaim applies to all panes, not just
+/// the active one.
 #[test]
 fn focus_change_does_not_move_either_panes_text_width() {
     let mut e = minimap_engine();
@@ -1070,10 +903,8 @@ fn test_screen_layout_cursor_position() {
 #[test]
 fn test_screen_layout_split_windows() {
     let mut e = test_engine("file one\n");
-    // This test is about general split geometry, not the minimap — turn
-    // it off so its per-pane width reservation (#722: every pane reserves
-    // its own strip now, not just the active one) doesn't confound the
-    // "windows divide the available width" assertion below.
+    // This test is about general split geometry; turn off the minimap
+    // so its per-pane width reservation doesn't affect the geometry.
     e.settings.minimap = false;
     // Open a vertical split
     e.open_editor_group(SplitDirection::Vertical);

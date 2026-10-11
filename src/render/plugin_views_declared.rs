@@ -1,19 +1,18 @@
 use super::*;
 use crate::core::engine::PluginViewHost;
 
-// ─── Plugin-declared UI views (#146) ────────────────────────────────────────
+// ─── Plugin-declared UI views ───────────────────────────────────────────────
 
 /// Adapt a plugin-declared [`crate::core::plugin_ui::PluginView`] into a
 /// `quadraui::Form`.
 ///
-/// This function is the *entire* translation layer between the vimcode-owned
-/// widget vocabulary plugins author (see `core::plugin_ui`'s module doc for why
-/// the ABI is vimcode-owned rather than quadraui's serde shape) and the
-/// primitive both backends paint. A breaking change to `quadraui::Form` is
-/// absorbed here and nowhere else — no plugin has to be rewritten for it.
+/// This function translates between the vimcode-owned widget vocabulary
+/// plugins author (see `core::plugin_ui`'s module doc) and the primitive
+/// both backends paint. A breaking change to `quadraui::Form` is absorbed
+/// here and nowhere else — no plugin has to be rewritten for it.
 ///
-/// Widget ids are namespaced (`plugin:<view>:<field>`, #146 invariant 4) so two
-/// plugins that both name a button `"send"` cannot collide, and so
+/// Widget ids are namespaced (`plugin:<view>:<field>`) so two plugins that
+/// both name a button `"send"` cannot collide, and so
 /// [`handle_plugin_view_ui_event`] can tell a plugin field from a Settings one.
 ///
 /// `selected` / `scroll_top` / `has_focus` are vimcode-owned interaction state
@@ -22,11 +21,10 @@ use crate::core::engine::PluginViewHost;
 ///
 /// `text_edit` is `Engine::plugin_view_text_edit` — when it names a field in
 /// `view`, that field's *live* (possibly uncommitted) value/cursor/selection
-/// paint instead of the plugin's declared value, with a real caret
-/// (`cursor: Some(_)`, #1627). Every other field — including every field when
-/// `text_edit` is `None` — keeps painting read-only (`cursor: None`), exactly
-/// as before #1627: the plugin's declared value is authoritative whenever
-/// vimcode isn't actively editing it.
+/// paint instead of the plugin's declared value, with a real caret. Every
+/// other field — including every field when `text_edit` is `None` — keeps
+/// painting read-only, exactly as before: the plugin's declared value is
+/// authoritative whenever vimcode isn't actively editing it.
 pub fn plugin_view_to_form(
     view_name: &str,
     view: &crate::core::plugin_ui::PluginView,
@@ -53,7 +51,7 @@ pub fn plugin_view_to_form(
                 ViewFieldKind::Text { value, placeholder } => {
                     // `cursor: None` renders read-only (no caret) — the
                     // plugin's own declared value, whenever vimcode isn't
-                    // actively editing this field. `Some(live)` (#1627) paints
+                    // actively editing this field. `Some(live)` paints
                     // the live buffer with a real caret instead.
                     match live(&f.id) {
                         Some(e) => FieldKind::TextInput {
@@ -283,7 +281,7 @@ pub fn handle_plugin_view_ui_event(
     };
     // Selection follows the click, so j/k continues from where the user
     // clicked, and a click on a `Text`/`Password`/`TextArea` field primes it
-    // for typing (#1627) exactly as keyboard navigation does.
+    // for typing exactly as keyboard navigation does.
     if let Some(view) = engine.plugin_views.get(&view_name) {
         // `field_id` may name a sub-widget (a `buttons`/`toggles` entry) that is
         // not itself a row; only move the selection when it *is* a row.
@@ -311,7 +309,7 @@ pub fn handle_plugin_view_ui_event(
 }
 
 /// Route a pointer event over an editor-tab-hosted plugin view — the tab
-/// twin of [`handle_plugin_view_ui_event`] (#1627). `name` is the view name
+/// twin of [`handle_plugin_view_ui_event`]. `name` is the view name
 /// (`RenderedWindow::plugin_view`), since a tab has no `ext_panel_active` to
 /// resolve it from; `rect` must be the same rect
 /// `App::paint_editor_windows_rung` last painted this window's `Form` into
@@ -386,7 +384,7 @@ pub fn handle_plugin_view_tab_ui_event(
 
 /// Route a `UiEvent` over a body-kind (`List`/`Tree`/`Table`/`TextView`)
 /// plugin view at `host`, through the matching primitive's click/scroll
-/// resolution instead of `FormController` (#1631). `rect` is the rect the
+/// resolution instead of `FormController`. `rect` is the rect the
 /// view was last painted into for this host — only the `Tree` arm needs it
 /// live (a `TreeController` needs a real rect + backend to `handle` against);
 /// `List`/`Table` resolve through their own cached layouts

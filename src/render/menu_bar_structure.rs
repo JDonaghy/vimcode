@@ -45,7 +45,7 @@ pub struct DebugToolbarData {
     pub session_active: bool,
 }
 
-/// Build the debug action-button toolbar as a `quadraui::Toolbar` (#510).
+/// Build the debug action-button toolbar as a `quadraui::Toolbar`.
 /// Button ids come from [`crate::core::engine::DEBUG_BUTTON_IDS`] so
 /// click dispatch can map the hit-test result back to a button index and
 /// action string. A `ToolbarButton::Separator` is inserted between the
@@ -134,7 +134,7 @@ pub fn debug_toolbar(engine: &Engine) -> quadraui::Toolbar {
 }
 
 /// Draw the debug action-button toolbar through backend `b` and cache its
-/// layout on `engine` for click/hover dispatch (#510). Both backends call
+/// layout on `engine` for click/hover dispatch. Both backends call
 /// this inside their frame scope; the only per-backend input is `rect`
 /// (cell units for TUI, pixels for GTK). Mouse hover → `debug_button_hovered`,
 /// visual press → `debug_button_pressed`, both read from the engine.
@@ -152,21 +152,18 @@ pub fn draw_debug_toolbar(b: &mut dyn quadraui::Backend, engine: &Engine, rect: 
     engine.debug_toolbar_layout.replace(Some(layout));
 }
 
-/// Build the debug sidebar's `SidebarPanelChrome::StatusBars` (quadraui#1061,
-/// issue #1392) — row 0 = title ("DEBUG | config_name"), row 1 = the
-/// Run/Stop/Continue action button. Both backends now paint this chrome
-/// through `SidebarPanelBody::render_with` (`tui_main::panels::
-/// render_debug_sidebar`, `App::paint_sidebar_panel_rung`'s `PANEL_DEBUG`
-/// arm) instead of slicing two rows off `area` by hand and calling
-/// `Backend::draw_status_bar` on each directly — `StatusBars` reserves one
-/// row per bar and paints each through the same rasteriser the old code
-/// called separately for each row, and surfaces its hit regions on
-/// `SidebarPanelBodyLayout::
-/// status_bar_hit_regions` in the same absolute space the caller's `rect`
-/// was in — the caller stores that directly on `Engine::
-/// dap_sidebar_action_hits` (see its doc) rather than re-deriving the
-/// action row's rect as a second, independently-computed value the way
-/// `cached_dap_action_rect` used to (paint and click could disagree).
+/// Build the debug sidebar's `SidebarPanelChrome::StatusBars` — row 0 = title
+/// ("DEBUG | config_name"), row 1 = the Run/Stop/Continue action button. Both
+/// backends paint this chrome through `SidebarPanelBody::render_with`
+/// (`tui_main::panels::render_debug_sidebar`, `App::paint_sidebar_panel_rung`'s
+/// `PANEL_DEBUG` arm) instead of slicing two rows off `area` by hand and calling
+/// `Backend::draw_status_bar` on each directly — `StatusBars` reserves one row
+/// per bar and paints each through the same rasteriser the old code called
+/// separately for each row, and surfaces its hit regions on
+/// `SidebarPanelBodyLayout::status_bar_hit_regions` in the same absolute space
+/// the caller's `rect` was in — the caller stores that directly on `Engine::
+/// dap_sidebar_action_hits` (see its doc) rather than re-deriving the action
+/// row's rect as a second, independently-computed value.
 pub fn debug_sidebar_chrome(sidebar: &DebugSidebarData, theme: &Theme) -> SidebarPanelChrome {
     let (title, action) = debug_sidebar_status_bars(sidebar, theme);
     SidebarPanelChrome::StatusBars(vec![title, action])
@@ -230,7 +227,7 @@ fn debug_sidebar_status_bars(
     (title, action)
 }
 
-/// Build the Explorer header's view-actions toolbar row (#1693): New File,
+/// Build the Explorer header's view-actions toolbar row: New File,
 /// New Folder, Refresh, Collapse All, and a "..." overflow menu — mirrors
 /// VS Code's Explorer view-actions row. Returned as `SidebarPanelChrome::
 /// StatusBars(vec![...])`'s single bar so `paint_sidebar_panel_rung`'s
@@ -243,7 +240,7 @@ fn debug_sidebar_status_bars(
 /// text of its own: the shell's own sidebar header already titles this
 /// panel "EXPLORER" (`sidebar.rs`'s `fixed_panel_title_tooltip`), and a
 /// second title row here would be the exact double-header shape
-/// `sc_sidebar_panel`'s doc warns against (#1256).
+/// `sc_sidebar_panel`'s doc warns against.
 pub fn explorer_toolbar_status_bar(theme: &Theme) -> quadraui::StatusBar {
     let bg = theme.status_bg;
     let fg = theme.status_fg;
@@ -268,7 +265,7 @@ pub fn explorer_toolbar_status_bar(theme: &Theme) -> quadraui::StatusBar {
 }
 
 /// Resolve a press against the Explorer header's view-actions toolbar row
-/// (#1693), given `pos` in the same absolute space `SidebarPanelBody::
+///, given `pos` in the same absolute space `SidebarPanelBody::
 /// render_with` painted the chrome into — the same contract
 /// `dap_sidebar_action_click_at` follows for the Debug sidebar's own
 /// chrome row (see that function's doc). `engine.explorer_toolbar_hits` is
@@ -304,17 +301,7 @@ pub const WINDOW_MAXIMIZE_ACTION: &str = "window:maximize";
 pub const WINDOW_CLOSE_ACTION: &str = "window:close";
 
 /// Width, in pixels, of the outer-window resize grip passed to
-/// [`quadraui::AppShell::window_edge`] (#1528).
-///
-/// The grip used to be `backend.line_height()` — 16-22px, the full height of
-/// the title bar and command-line rows. That made the grip band as tall as
-/// those rows, so it always ran *underneath* them: the top-row title-bar drag
-/// check and the bottom-row command-line click always resolved first, and
-/// North/South resize was dead everywhere except the corners the title bar
-/// or command line didn't cover. The same oversized band on the East edge
-/// also swallowed the vertical scrollbar and the minimap's rightmost column
-/// with a single editor group, where both sit within that many pixels of the
-/// window's true right edge.
+/// [`quadraui::AppShell::window_edge`].
 ///
 /// A few pixels — VS Code/Electron frameless windows use a comparable
 /// margin — is still comfortably grabbable with a mouse, is thinner than one
@@ -324,17 +311,13 @@ pub const WINDOW_CLOSE_ACTION: &str = "window:close";
 /// the edge grip can win only in that sliver and fall through to the
 /// row/scrollbar/minimap hit-test everywhere else in the row.
 ///
-/// Caveat (#1528 acceptance criteria, stated explicitly so a reader of
-/// `window_resize_grip_stays_inside_the_scrollbar_gutter` below doesn't read
-/// it as proving *zero* overlap): the acceptance bar is "a press in the
-/// outermost ~4 px still resizes (E)", i.e. some overlap with the
-/// scrollbar/minimap gutter's own outermost pixels is expected and accepted
-/// — the fix's job is shrinking that overlap from a full row-height band down
-/// to this margin, not eliminating it.
+/// Note: some overlap with the scrollbar/minimap gutter's own outermost pixels
+/// is expected and accepted — the goal is shrinking that overlap from a full
+/// row-height band down to this margin, not eliminating it.
 pub const WINDOW_RESIZE_GRIP_PX: f32 = 4.0;
 
 /// Does an outer-window resize press at `edge` land inside the band the
-/// change-review surface's own first row occupies (#1528 review of #955)?
+/// change-review surface's own first row occupies?
 ///
 /// The change-review surface is genuinely full-viewport, and its first diff
 /// row paints underneath the (visually hidden but still logically live) CSD
@@ -345,12 +328,10 @@ pub const WINDOW_RESIZE_GRIP_PX: f32 = 4.0;
 /// first diff row: `North`, and the two corners that include it
 /// (`NorthEast`/`NorthWest`).
 ///
-/// Extracted to a pure function (rather than left as an inline `matches!` at
-/// the one call site in `App::handle`) so the *decision* — which edges a
+/// Extracted to a pure function so the *decision* — which edges a
 /// change-review surface may steal from resize — is unit-testable on its
 /// own, independent of `quadraui::gtk::testing::GtkDriver`'s inability to
-/// arm a real resize headlessly (no `gtk4::Window`, no captured GDK press —
-/// see `src/gtk/testing.rs`'s module doc "No window").
+/// arm a real resize headlessly.
 pub fn resize_edge_overlaps_change_review_band(edge: quadraui::ResizeEdge) -> bool {
     matches!(
         edge,
@@ -361,14 +342,14 @@ pub fn resize_edge_overlaps_change_review_band(edge: quadraui::ResizeEdge) -> bo
 }
 
 /// Build the inline minimize/maximize/close window-control buttons for the
-/// GTK client-side titlebar (#552).
+/// GTK client-side titlebar.
 ///
 /// quadraui's `run_with_shell` GTK runner creates an undecorated-chrome-free
-/// window with no native titlebar hosting (single-DA architecture, #217) —
-/// GTK draws its own CSD-style controls at the right edge of the menu-bar
-/// row using the same `StatusBar` primitive already used for the debug
-/// sidebar's action row, so the click hit-testing reuses the existing
-/// `StatusBarHit::Segment` mechanism rather than any new backend API.
+/// window with no native titlebar hosting — GTK draws its own CSD-style
+/// controls at the right edge of the menu-bar row using the same `StatusBar`
+/// primitive already used for the debug sidebar's action row, so the click
+/// hit-testing reuses the existing `StatusBarHit::Segment` mechanism rather
+/// than any new backend API.
 ///
 /// TUI has no window-chrome equivalent (a terminal has no window to
 /// minimize/maximize) — this is GTK-only, called from `src/gtk/mod.rs`.
@@ -376,13 +357,9 @@ pub fn window_controls_status_bar(theme: &Theme, maximized: bool) -> quadraui::S
     let bg = theme.tab_bar_bg;
     // `tab_inactive_fg` — NOT `status_fg` — pairs with `tab_bar_bg` by theme
     // design (it's what `draw_menu_bar` already uses for the File/Edit/...
-    // labels painted immediately to the left, against this exact
-    // background). `status_fg` is paired with `status_bg` (the bottom
-    // status line's own background) instead; at least one shipped theme
-    // (`vs_light`: `tab_bar_bg` #ececec, `status_fg` #ffffff) renders
-    // near-invisible white-on-near-white glyphs with that mismatched
-    // pairing — a real, reproducible cause of the #552 round-2 "buttons
-    // render with zero visible pixels" report.
+    // labels painted immediately to the left, against this exact background).
+    // `status_fg` is paired with `status_bg` (the bottom status line's own
+    // background) instead.
     let fg = theme.tab_inactive_fg;
     let maximize_icon = if maximized {
         icons::WINDOW_RESTORE.s()
@@ -451,7 +428,7 @@ pub fn debug_output_to_text_display(
 mod tests {
     use super::*;
 
-    // ─── Debug toolbar tests (#510) ──────────────────────────────────────────
+    // ─── Debug toolbar tests ─────────────────────────────────────────────────
 
     /// Helper: return an engine with DAP session state as specified.
     fn engine_with_dap(session_active: bool, stopped_thread: Option<u64>) -> Engine {
@@ -787,20 +764,16 @@ mod tests {
 
     #[test]
     fn test_try_from_hex_non_ascii_returns_none_instead_of_panicking() {
-        // #1494: "日本" is 6 *bytes* (two 3-byte UTF-8 chars) but not
-        // ASCII, so it used to match the `6 | 8` byte-length arm and then
-        // panic slicing `&s[0..2]` — byte offset 2 lands inside the first
-        // character, not on a UTF-8 char boundary. Also cover an 8-byte
-        // non-ASCII string, matching `try_from_hex_over`'s `8 =>` arm.
+        // "日本" is 6 *bytes* (two 3-byte UTF-8 chars) but not ASCII, and
         assert_eq!(try_from_hex("日本"), None);
         assert_eq!(try_from_hex_over("日本é", Color::from_rgb(0, 0, 0)), None);
     }
 
-    /// #1494 CI: the band-clamp that stops the Command Center's
-    /// overflowing search box from eating the window-control buttons'
-    /// clicks. Built from the real primitive (`CommandCenter::layout`)
-    /// rather than a hand-written `CommandCenterLayout` literal, so the
-    /// overflow this guards against is the one quadraui actually produces.
+    /// The band-clamp that stops the Command Center's overflowing search
+    /// box from eating the window-control buttons' clicks. Built from the
+    /// real primitive (`CommandCenter::layout`) rather than a hand-written
+    /// `CommandCenterLayout` literal, so the overflow this guards against is
+    /// the one quadraui actually produces.
     #[test]
     fn command_center_hit_in_band_ignores_the_overflowing_search_box() {
         let cc = build_command_center_view(true, true, "vimcode");
@@ -940,7 +913,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #1547: `activityBar.activeBorder` is VS Code's own colour key for
+    /// `activityBar.activeBorder` is VS Code's own colour key for
     /// the active-item accent line (`activity_active_accent`'s doc). When
     /// an imported theme sets it explicitly to something other than
     /// `activityBar.foreground`, the explicit value must win — the two are
@@ -974,7 +947,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #1547: VS Code's own default for `activityBar.activeBorder` is
+    /// VS Code's own default for `activityBar.activeBorder` is
     /// `activityBar.foreground` (see `ACTIVITY_BAR_ACTIVE_BORDER`'s
     /// `dark`/`light` entries in VS Code's `colorRegistry`) — so an
     /// imported theme that sets only `activityBar.foreground` must have
@@ -1008,24 +981,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #1547: `build_activity_bar`'s `active_accent` must come from the
-    /// dedicated `theme.activity_active_accent` colour, not `theme.cursor`
-    /// (the field it silently borrowed before this issue introduced a
-    /// colour dedicated to the activity-bar accent — see that field's own
-    /// doc). `vscode_light`'s `cursor` (`#000000`) and
-    /// `activity_active_accent` (`#646e6e`) are deliberately different, so
-    /// a regression back to `theme.cursor` fails loudly here rather than
-    /// only looking wrong on screen.
+    /// `build_activity_bar`'s `active_accent` must come from the dedicated
+    /// `theme.activity_active_accent` colour, not `theme.cursor`.
+    /// `vscode_light`'s `cursor` (`#000000`) and `activity_active_accent`
+    /// (`#646e6e`) are deliberately different, so a regression fails loudly
+    /// here rather than only looking wrong on screen.
     ///
-    /// Note: as of #1434, `render::build_activity_bar` itself has no
-    /// production caller — `App` renders through
-    /// `quadraui::compose::app_shell::AppShell::build_activity_bar`
-    /// instead, which hardcodes `active_accent: None` pending a quadraui
-    /// hook (that function's own doc cites quadraui#381). This test pins
-    /// the adapter's own field-mapping correctness so it's ready the
-    /// moment such a hook lands and vimcode wires this function (or its
-    /// theme field) back in; it does not claim the accent line paints in
-    /// the shipped app today.
+    /// Note: as of the pending quadraui hook, `render::build_activity_bar`
+    /// itself has no production caller — `App` renders through
+    /// `quadraui::compose::app_shell::AppShell::build_activity_bar` instead,
+    /// which hardcodes `active_accent: None`. This test pins the adapter's own
+    /// field-mapping correctness so it's ready the moment such a hook lands and
+    /// this function (or its theme field) is wired back in; it does not claim
+    /// the accent line paints in the shipped app today.
     #[test]
     fn build_activity_bar_active_accent_uses_activity_active_accent_not_cursor() {
         let engine = crate::core::Engine::new_for_test();
@@ -1046,18 +1014,15 @@ mod tests {
         assert_eq!(bar.active_accent, Some(expected));
     }
 
-    /// #1688: the *descriptor* boundary for the editor tab-bar accent line.
+    /// The *descriptor* boundary for the editor tab-bar accent line.
     /// `build_screen_layout`'s per-group loop sets `accent = Some(theme.
     /// tab_active_accent)` only for `gid == engine.active_group`, so this
     /// pins that the `quadraui::TabBar` handed to every backend already
     /// carries the right `active_accent` for both the active and inactive
     /// group of a split — before any backend rasteriser gets a chance to
-    /// drop it. #1688 found Win-GUI painting zero accent pixels anywhere in
-    /// the tab strip; this test rules out "the descriptor itself is wrong"
-    /// as the cause, narrowing the bug to the Win-GUI rasteriser (tracked
-    /// upstream, see `docs/PENDING_QUADRAUI_ISSUES.md`'s "Seven Win-GUI
-    /// rasterisers" entry / quadraui#1261) rather than anything in this
-    /// file.
+    /// drop it. This test rules out "the descriptor itself is wrong" as a
+    /// cause when a backend fails to paint the accent, narrowing the bug to
+    /// the backend rasteriser rather than anything in this file.
     #[test]
     fn build_screen_layout_sets_tab_bar_active_accent_only_on_active_group() {
         use crate::core::engine::Engine;
@@ -1103,7 +1068,7 @@ mod tests {
         assert!(saw_active_some, "exactly one group must be active");
     }
 
-    /// #1127: `themes_dir()` must derive from the cross-platform
+    /// `themes_dir()` must derive from the cross-platform
     /// `core::paths::vimcode_config_dir()` (which handles `APPDATA` on
     /// Windows), not read `$HOME` directly — reading `$HOME` raw would put
     /// custom VS Code theme JSON files in the wrong directory on Windows.
@@ -1226,7 +1191,7 @@ mod tests {
         assert_eq!(first_line.spell_errors[0].end_col, 8);
     }
 
-    // ── RenderedWindow::visible_line_capacity (#1779) ────────────────────────
+    // ── RenderedWindow::visible_line_capacity ────────────────────────────────
 
     /// A one-line buffer in a 24-row window must report a row *capacity*
     /// of 24 even though only 1 row of actual content was painted —
@@ -1236,19 +1201,10 @@ mod tests {
     /// lines) trusts that number to decide whether the viewport is tall
     /// enough to show the cursor's line without scrolling.
     ///
-    /// This is a supplementary unit test pinning the new field's *value*,
-    /// not the black-box coverage for #1779 — that is the real-pty
-    /// end-to-end test (`tests/pty_open_line_below_paints_all_lines.rs`)
-    /// and the in-process `TuiDriver` regression test
-    /// (`src/tui_main/app_on_tui_tests.rs`'s
-    /// `opening_a_line_below_the_last_line_paints_every_line_in_order_1779`),
-    /// both of which assert on painted screen content, not on this field.
-    ///
-    /// RED against the pre-fix shape (`visible_line_capacity` not a field;
-    /// callers read `lines.len()` instead): `lines.len()` here is `1`, not
-    /// `24` — exactly the stale-viewport value that made `ensure_cursor_visible`
-    /// believe a 24-row window could show only one line, and scroll line 0
-    /// out of view the moment `o<text><Esc>` grew the buffer to two lines.
+    /// This is a supplementary unit test pinning the new field's *value*:
+    /// `lines.len()` here is `1`, not `24`, the value that would make
+    /// `ensure_cursor_visible` believe a 24-row window could show only one
+    /// line and scroll line 0 out of view when the buffer grows to two lines.
     #[test]
     fn visible_line_capacity_is_the_window_row_capacity_not_the_painted_line_count() {
         use crate::core::Engine;
@@ -1290,7 +1246,7 @@ mod tests {
         );
     }
 
-    // ── status_bar_zone_hit_test (#672) ──────────────────────────────────────
+    // ── status_bar_zone_hit_test ─────────────────────────────────────────────
 
     #[test]
     fn status_bar_zone_hit_test_resolves_the_segment_a_point_lands_in() {
@@ -1390,26 +1346,14 @@ mod tests {
         );
     }
 
-    /// #1541 established the rule this test covers; #1690 temporarily
-    /// moved the ruler to the *leftmost* of the right group (VS Code
-    /// parity) which made `sidebar_toggle_seg` the accidental right-most
-    /// segment by default; #1760 moved the ruler (`Ln N, Col N`) back to
-    /// being the bar's unconditional right-most segment — not for visual
-    /// parity this time, but because that is the only position
-    /// `StatusBar::layout`'s priority-drop (quadraui's `fit_right_start`/
-    /// `layout_padded`) treats as undroppable, and #1760 reported the
-    /// ruler silently vanishing once other optional segments competed for
-    /// space. Its text must not carry a trailing space — quadraui#1155
-    /// reserves that outer-edge margin on pixel backends (GTK/Win/macOS),
-    /// and TUI has never had a scrollbar-style gutter to hide a trailing
-    /// blank column in. A stray trailing space here would double the gap
-    /// on the backends that already get one and would be a visible
-    /// dangling blank on TUI, which gets none.
-    ///
-    /// RED against the pre-#1541 body (`format!(" Ln {}, Col {} ", ...)`,
-    /// trailing space included): `last.text` ends in `" "`, and the second
-    /// assertion fails — confirmed by reverting just `cursor_seg`'s format
-    /// string and re-running.
+    /// The ruler (`Ln N, Col N`) is the bar's unconditional right-most
+    /// segment — `StatusBar::layout`'s priority-drop (`fit_right_start`/
+    /// `layout_padded`) treats this position as undroppable. Its text must
+    /// not carry a trailing space — this reserves that outer-edge margin on
+    /// pixel backends (GTK/Win/macOS), and TUI has never had a scrollbar-style
+    /// gutter to hide a trailing blank column in. A stray trailing space here
+    /// would double the gap on the backends that already get one and would be
+    /// a visible dangling blank on TUI, which gets none.
     #[test]
     fn test_window_status_line_right_most_segment_has_no_trailing_space() {
         use crate::core::engine::Engine;
@@ -1422,9 +1366,7 @@ mod tests {
         let wid = engine.active_window_id();
         let status = build_window_status_line(&engine, &theme, wid, true);
 
-        // #1760: the ruler is the bar's unconditional right-most segment —
-        // see this test's own doc for why that is no longer a VS-Code-
-        // visual-parity claim but a drop-priority one.
+        // The ruler is the bar's unconditional right-most segment.
         let last = status
             .right_segments
             .last()
@@ -1471,14 +1413,10 @@ mod tests {
         }
     }
 
-    /// #1541: same claim as
+    /// Same claim as
     /// [`test_window_status_line_ruler_segment_has_no_trailing_space`], for
     /// the inactive-window bar's own (differently-formatted, no leading
-    /// space) ruler segment.
-    ///
-    /// RED against the pre-#1541 body (`format!("Ln {}, Col {} ", ...)`):
-    /// the segment ends in `" "` and this assertion fails — confirmed by
-    /// reverting just this segment's format string and re-running.
+    /// space) ruler segment: its text must not carry a trailing space.
     #[test]
     fn test_window_status_line_inactive_ruler_segment_has_no_trailing_space() {
         use crate::core::engine::Engine;
@@ -1551,7 +1489,7 @@ mod tests {
         assert!(status.left_segments[0].text.contains("INSERT"));
         // Mode color used as text tint, not background
         assert_eq!(status.left_segments[0].fg, theme.status_mode_insert_bg);
-        // #1690: background comes straight from the theme's own
+        // Background comes straight from the theme's own
         // `status_bg` key now, not a `background.lighten(0.10)` offset.
         assert_eq!(status.left_segments[0].bg, theme.status_bg);
     }

@@ -2,7 +2,7 @@ use super::*;
 
 // ─── Color ───────────────────────────────────────────────────────────────────
 //
-// #829 / quadraui#775: vimcode's own 24-bit `Color` type (plus its
+// Vimcode's own 24-bit `Color` type (plus its
 // `from_hex` / `try_from_hex_over` / `lighten` / `darken`) was generic
 // colour math with zero editor-specific meaning, so it was lifted verbatim
 // into `quadraui::Color` upstream. We re-export that type directly instead
@@ -74,32 +74,29 @@ impl ColorExt for Color {
     }
 }
 
-/// Parse a `#rrggbb` hex string, panicking on invalid input. All ~670
-/// call sites are compile-time-constant literals in this file's preset
-/// syntax-colour tables (kept local per #829 — editor-specific presets,
-/// not a quadraui concern), so panicking here rather than threading
-/// `Option` through every table entry is the same trade-off vimcode's
-/// pre-#775 local `Color::from_hex` made. A free function, not a method,
-/// because `quadraui::Color::from_hex` already exists under this name
-/// with `Option`-returning (non-panicking) semantics.
+/// Parse a `#rrggbb` hex string, panicking on invalid input.
+/// All ~670 call sites are compile-time-constant literals in this
+/// file's preset syntax-colour tables, so panicking here rather than
+/// threading `Option` through every table entry is acceptable. A free
+/// function, not a method, because `quadraui::Color::from_hex` already
+/// exists under this name with `Option`-returning (non-panicking)
+/// semantics.
 pub(crate) fn hex(s: &str) -> Color {
     quadraui::Color::from_hex(s).unwrap_or_else(|| panic!("invalid hex color literal: {s:?}"))
 }
 
-/// Try to parse a hex colour string. Accepts `#rrggbb`, `#rrggbbaa` (alpha
-/// is discarded), and `#rgb` shorthand, with or without the leading `#`.
-/// Returns `None` on failure. Kept local rather than delegating to
-/// `quadraui::Color::from_hex`: that upstream function requires the
-/// leading `#` and doesn't accept 3-digit shorthand, both of which
-/// vimcode's settings / custom-theme-file parsing relies on.
+/// Try to parse a hex colour string. Accepts `#rrggbb`, `#rrggbbaa`
+/// (alpha is discarded), and `#rgb` shorthand, with or without the
+/// leading `#`. Returns `None` on failure.
 ///
-/// #1494: `s.len()` counts bytes, not chars, and the slices below
-/// (`&s[0..2]`, etc.) are byte-index slices — both fine for a genuine hex
-/// string (ASCII-only by definition), but a non-ASCII 6-or-8-byte theme
-/// colour string (e.g. from a corrupt/hostile theme file) used to match
-/// the `6 | 8` arm on byte length alone and then panic slicing mid
-/// UTF-8-char-boundary. Guard on `is_ascii()` first so non-ASCII input
-/// takes the `_ => None` fallback instead.
+/// This function requires the leading `#` to be optional and accepts
+/// 3-digit shorthand, both of which the settings and custom-theme-file
+/// parsing relies on.
+///
+/// Note: `s.len()` counts bytes, and the slices below (`&s[0..2]`,
+/// etc.) are byte-index slices — fine for genuine hex strings
+/// (ASCII-only by definition). Non-ASCII input is rejected with
+/// `is_ascii()` to avoid panicking on mid-UTF-8-char-boundary slices.
 pub(crate) fn try_from_hex(s: &str) -> Option<Color> {
     let s = s.trim_start_matches('#');
     if !s.is_ascii() {
@@ -310,22 +307,12 @@ pub struct SelectionRange {
 /// Display information for a single tab-bar entry.
 #[derive(Debug, Clone)]
 pub struct TabInfo {
-    /// Display label, e.g. `"main.rs "` (#700: no ordinal prefix, matching
-    /// VS Code — but see the single trailing space). Checked against the
-    /// pinned quadraui rev's `tui::tab_bar::draw_tab_bar` (#700 review
-    /// nit): the TUI rasteriser paints the close glyph immediately after
-    /// the label's own measured width, with its reserved `TAB_CLOSE_COLS`
-    /// separator cell trailing the glyph, not leading it — so any
-    /// breathing room before `×` has to come from the label text itself.
-    /// Before #700 item 4 that space existed incidentally, baked into the
-    /// old `" {i+1}: {name} "` ordinal prefix's own trailing space; the
-    /// sole `TabInfo` builder for the editor tab bar
-    /// (`build_tab_bar_for_group_by_id`) now adds it back deliberately.
-    /// It has to live there rather than downstream at the
-    /// `quadraui::TabItem` conversion, because [`tab_hit_width`] measures
-    /// `t.name` directly — padding added only at the `TabItem` step would
-    /// paint one column wider than the hit-test math expects, the exact
-    /// measure/paint mismatch class #654 documents at length.
+    /// Display label, e.g. `"main.rs "` with a trailing space. The space
+    /// ensures breathing room before the close glyph (`×`): the TUI rasteriser
+    /// paints the close glyph immediately after the label's measured width,
+    /// so any space must come from the label text itself. The label is measured
+    /// directly by [`tab_hit_width`], so padding must be included here rather
+    /// than downstream to avoid measure/paint mismatches.
     pub name: String,
     /// Whether this is the currently active tab.
     pub active: bool,
@@ -339,14 +326,13 @@ pub struct TabInfo {
 mod tests {
     use super::*;
 
-    // ─── Visual selection painting (#1788 review) ──────────────────────────
+    // ─── Visual selection painting ─────────────────────────────────────────
     //
     // `build_selection`'s `end_col` must agree with what Ctrl+C/Ctrl+X
     // actually copy/delete — otherwise the highlighted span and the
-    // clipboard payload disagree (non-blocking note on the #1788 review:
-    // quadraui always paints `SelectionKind::Char` as `end_col + 1`, so an
-    // *exclusive*-end selection's raw cursor column needs to be backed off
-    // by one before being handed to `SelectionRange`).
+    // clipboard payload disagree. For `SelectionKind::Char`, an
+    // exclusive-end selection's raw cursor column must be backed off
+    // by one before being handed to `SelectionRange`.
 
     /// A VSCode-mode Shift+Right x6 selection (`visual_end_exclusive`,
     /// cursor one past the last selected char) must paint exactly 6 cells,
@@ -372,7 +358,7 @@ mod tests {
 
     /// Plain Vim-style / mouse / Ctrl+D selections are inclusive-end
     /// (`visual_end_exclusive` is `false`) — `end_col` must stay exactly the
-    /// cursor's own column, unchanged from before #1788.
+    /// cursor's own column.
     #[test]
     fn build_selection_leaves_inclusive_end_unchanged_for_char_kind() {
         let mut engine = Engine::new_for_test();

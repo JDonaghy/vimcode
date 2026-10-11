@@ -1,6 +1,6 @@
 use super::*;
 
-// ─── Sidebar panel body dispatch (#754) ───────────────────────────────────────
+// ─── Sidebar panel body dispatch ──────────────────────────────────────────────
 //
 // The rung the issue names by line count: "who owns the sidebar body"
 // (`sidebar_owner`, above) was already shared, but what each owner's press
@@ -70,7 +70,7 @@ pub fn route_explorer_tree_event(
     Some(tree_event)
 }
 
-// ─── Explorer drag-and-drop (#1429) ────────────────────────────────────────
+// ─── Explorer drag-and-drop ────────────────────────────────────────────────
 //
 // TUI has carried this since before `App` existed (`explorer_drag_src`/
 // `explorer_drag_active` in `tui_main/shell_app.rs`, applied by hand-rolled
@@ -182,27 +182,21 @@ pub fn apply_explorer_drop(engine: &mut Engine, src_row: usize, target_row: Opti
     engine.confirm_move_file(&src_path, &dest_dir);
 }
 
-/// Right-click fallback for empty tree space below the explorer's last row
-/// (#1429). Temporary shared workaround for quadraui#1045 item 4 (upstream:
-/// `TreeController::right_click` resolving a `TreeViewHit::Empty` to a
-/// container-level `ContextMenuRequested` instead of plain `Consumed`) —
-/// delete this function and its two call sites (`tui_main::mouse`,
-/// `App::explorer_ui_event`) once that lands, per this repo's
-/// Platform-Neutrality Rule (shared code now, not per-backend, but still a
-/// stopgap for a gap that belongs upstream).
+/// Right-click fallback for empty tree space below the explorer's last row.
+/// Resolves a [`TreeViewHit::Empty`] to a container-level `ContextMenuRequested`
+/// instead of plain `Consumed`.
 ///
-/// #1025 intentionally dropped the pre-existing "right-click below the last
-/// row opens the root folder's context menu" fallback when it moved the
-/// row/chevron case onto `route_explorer_tree_event` (which only resolves
-/// `Row`/`Chevron` hits — an `Empty` hit reaches here instead, on both
-/// backends alike, restoring the fallback without re-diverging them).
+/// The pre-existing "right-click below the last row opens the root folder's
+/// context menu" fallback is restored here for both backends alike (an `Empty`
+/// hit reaches here instead of [`route_explorer_tree_event`], which only resolves
+/// `Row`/`Chevron` hits).
 ///
-/// `rect`/`metrics`/`pos` share `route_explorer_tree_event`'s own contract:
+/// `rect`/`metrics`/`pos` share [`route_explorer_tree_event`]'s own contract:
 /// `rect` is the tree's last painted rect, `metrics` is `(line_height,
 /// char_width)` in the caller's native unit, `pos` is in that same space.
 /// Returns `true` if the fallback fired (opened the cwd/root context menu);
 /// `false` for a hit that either missed `rect` entirely or landed on a real
-/// row (`route_explorer_tree_event` already owns that case).
+/// row ([`route_explorer_tree_event`] already owns that case).
 pub fn route_tree_empty_space_context_menu(
     engine: &mut Engine,
     rect: quadraui::Rect,
@@ -250,14 +244,11 @@ pub fn dispatch_dap_sidebar_body_event(
 /// row, given `pos` in the same absolute space `SidebarPanelBody::
 /// render_with` painted the chrome into — i.e. whatever space the `rect`
 /// passed to that call was in (TUI cell coordinates, GTK pixels). Both
-/// backends now store that same space on `Engine::dap_sidebar_action_hits`
+/// backends store that same space on `Engine::dap_sidebar_action_hits`
 /// (populated straight from `SidebarPanelBodyLayout::status_bar_hit_regions`
 /// — see that field's doc), so there is no per-backend translation step left
-/// here (issue #1392; GTK used to subtract its own separately-cached
-/// `action_rect`'s origin, which is exactly the "paint and click can
-/// disagree" risk the issue called out). Returns whether a segment was
-/// actually hit — the caller claims the whole chrome row regardless,
-/// matching both backends' pre-#754 behaviour.
+/// here. Returns whether a segment was actually hit — the caller claims the
+/// whole chrome row regardless, matching both backends' behaviour.
 pub fn dap_sidebar_action_click_at(engine: &mut Engine, pos: quadraui::Point) -> bool {
     let matched = {
         let hits = engine.dap_sidebar_action_hits.borrow();
@@ -330,15 +321,12 @@ pub fn route_sc_sidebar_click(
 }
 
 /// Dispatch a mouse/scroll/keyboard [`quadraui::UiEvent`] to the AI assistant
-/// sidebar's `ChatController` (#819 — the adoption that replaced the
-/// hand-painted `draw_ai_sidebar_panel`/`route_ai_sidebar_click` pair this
-/// function and [`populate_ai_chat_controller`] took over from). Shared by
-/// GTK and TUI, mirroring [`route_explorer_tree_event`] and
-/// [`dispatch_dap_sidebar_body_event`]: `rect` must be the same rect the
-/// caller's last `ai_chat.borrow().render(backend, rect)` used (both
-/// backends cache it in `Engine::ai_chat_rect`), so `ChatController::handle`
-/// re-derives the identical layout `render()` painted rather than risking
-/// the #544/#582/#646 drift a second hand-rolled geometry pass invites.
+/// sidebar's `ChatController`. Shared by GTK and TUI, mirroring
+/// [`route_explorer_tree_event`] and [`dispatch_dap_sidebar_body_event`]:
+/// `rect` must be the same rect the caller's last `ai_chat.borrow().render(
+/// backend, rect)` used (both backends cache it in `Engine::ai_chat_rect`), so
+/// `ChatController::handle` re-derives the identical layout `render()` painted
+/// rather than risking drift a second hand-rolled geometry pass invites.
 ///
 /// Returns whether the panel should keep keyboard focus — see
 /// [`Engine::dispatch_ai_chat_event`], which this delegates the semantic
@@ -351,11 +339,8 @@ pub fn route_sc_sidebar_click(
 /// re-apply the metrics `render()` painted this panel with (GTK's `App`
 /// caches them in `cached_ai_chat_metrics` for exactly this) *before*
 /// calling this function, the same way [`route_explorer_tree_event`]'s
-/// callers re-apply `cached_explorer_metrics`. Skipping this doesn't panic
-/// or misroute the event — it silently feeds `ChatController::handle` a
-/// different `total_rows`/`visible_rows` than `render()` computed, which
-/// desyncs the scrollbar clamp from the very first scroll notch (caught by
-/// `ai_panel_scrolls_transcript`, #819 review).
+/// callers re-apply `cached_explorer_metrics`. Skipping this desyncs the
+/// scrollbar clamp from the scrollbar position.
 pub fn route_ai_chat_event(
     engine: &mut Engine,
     event: &quadraui::UiEvent,
@@ -368,7 +353,7 @@ pub fn route_ai_chat_event(
     }
     populate_ai_chat_controller(engine, theme, backend);
 
-    // #1511: plain `Enter` while a transcript turn (not the input) has
+    // Plain `Enter` while a transcript turn (not the input) has
     // keyboard focus is the "keyboard toggle without a mouse" the issue
     // asks for — `quadraui::ChatController::handle` already implements
     // exactly this gesture (see its module doc's Enter arm), but it acts on
@@ -396,7 +381,7 @@ pub fn route_ai_chat_event(
         }
     }
 
-    // #1507: the `<leader>ai` focus-toggle gesture (see
+    // The `<leader>ai` focus-toggle gesture (see
     // `Engine::ai_leader_toggle_key`'s doc for why this has to be
     // intercepted here, ahead of the ordinary `ChatController::handle`
     // call, rather than reusing `Engine::handle_leader_key`). Checked before
@@ -436,7 +421,7 @@ pub fn route_ai_chat_event(
         }
     }
 
-    // #956 (ACP-5): while the slash-command completion popup is showing,
+    // While the slash-command completion popup is showing,
     // steal Tab (cycle selection) and Enter (accept) before handing the
     // event to `ChatController::handle` — the same "intercept the
     // accept/cycle keys, let everything else fall through unchanged" shape
@@ -458,7 +443,7 @@ pub fn route_ai_chat_event(
                 }
                 _ => {}
             }
-        // #1449: same intercept, for the `@`-mention popup — mutually
+        // Same intercept, for the `@`-mention popup — mutually
         // exclusive with the slash-command one above (a slash command only
         // ever occupies the *whole* input, a mention only the trailing
         // word, so `ai_command_completions` being `Some` already claims

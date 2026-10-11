@@ -338,12 +338,11 @@ pub(crate) fn compute_search_matches_for_buffer(
     matches
 }
 
-// ─── Decoration paint helpers (#1653, Native API P5) ─────────────────────────
-//
-// Shared by both backends (called only from `build_rendered_window` above,
-// well before the GTK/TUI split) — per the Platform-Neutrality Rule, a
-// decoration's colours/splice land in `RenderedLine`'s existing `raw_text`/
-// `spans` here, not in new `src/gtk/` or `src/tui_main/` code.
+// Decoration paint helpers — shared by both backends (called only from
+// `build_rendered_window` above, well before the GTK/TUI split). Per the
+// Platform-Neutrality Rule, a decoration's colours/splice land in
+// `RenderedLine`'s existing `raw_text`/`spans` here, not in new `src/gtk/`
+// or `src/tui_main/` code.
 
 /// The `[start_col, end_col)` character range `m`'s highlight paints on
 /// `line_idx` — `None` when `m` doesn't touch `line_idx` at all (shouldn't
@@ -373,11 +372,11 @@ pub(crate) fn decor_highlight_cols(
 }
 
 /// Combine a `vimcode.buf.annotate_line` blame-style annotation with
-/// #1810's decor-sourced eol virtual text, both of which paint through the
+/// decor-sourced eol virtual text, both of which paint through the
 /// same `RenderedLine::annotation` field. `blame` keeps its existing
 /// position (first) so a line with only blame text is byte-for-byte
-/// unchanged from before #1810; eol text (already space-joined across
-/// marks by the caller) follows, separated by one more space.
+/// unchanged; eol text (already space-joined across marks by the caller)
+/// follows, separated by one more space.
 pub(crate) fn join_annotation(blame: Option<String>, eol: Option<&str>) -> Option<String> {
     let eol = eol.filter(|s| !s.is_empty());
     match (blame, eol) {
@@ -393,14 +392,13 @@ pub(crate) fn join_annotation(blame: Option<String>, eol: Option<&str>) -> Optio
 /// `fg`) isn't registered — e.g. a group that only sets `bg` still gets a
 /// readable foreground instead of defaulting to black.
 ///
-/// #1653 scope item 6: a group's `link` is first chased one hop against
-/// other *plugin* groups by `DecorState::resolve_hl` (unchanged); when the
-/// link target isn't a registered plugin group at all, it's treated as a
-/// `Theme` role name instead (`Theme::scope_color_opt`, matched
-/// case-insensitively against Neovim's own built-in group spelling, e.g.
-/// `link = "Comment"`) — resolved fresh on every call rather than frozen at
-/// `set_hl` time, so it keeps tracking the live theme across `ColorScheme`
-/// switches, same as every other colour here.
+/// A group's `link` is first chased one hop against other *plugin* groups
+/// by `DecorState::resolve_hl`; when the link target isn't a registered
+/// plugin group at all, it's treated as a `Theme` role name instead
+/// (`Theme::scope_color_opt`, matched case-insensitively against Neovim's
+/// built-in group spelling, e.g. `link = "Comment"`). The link is resolved
+/// fresh on every call rather than frozen at `set_hl` time, so it keeps
+/// tracking the live theme across `ColorScheme` switches.
 pub(crate) fn resolve_decor_style(engine: &Engine, theme: &Theme, hl_group: Option<&str>) -> Style {
     let def = hl_group.and_then(|g| engine.decor.resolve_hl(g));
     let theme_role_fg = def
@@ -642,14 +640,11 @@ pub(crate) fn build_selection(
     let (start_col, end_col) = match kind {
         SelectionKind::Block => (anchor.col.min(cursor.col), anchor.col.max(cursor.col)),
         SelectionKind::Char if engine.visual_end_exclusive && end.col > 0 => {
-            // quadraui paints `SelectionKind::Char` as inclusive
-            // (`end_col + 1`, quadraui `primitives/editor.rs`), but an
-            // exclusive-end selection's `end.col` already sits one past the
-            // last selected char — back off by one so highlight, copy and
-            // delete agree (#1788 review non-blocking note). When `end.col`
-            // is 0 (the exclusive end wrapped to the next line's start)
-            // there's no single-line column to back off to; left as-is,
-            // matching this function's pre-existing behavior for that case.
+            // An exclusive-end selection's `end.col` already sits one past the
+            // last selected char, but quadraui paints `SelectionKind::Char` as
+            // inclusive, so back off by one so highlight, copy and delete agree.
+            // When `end.col` is 0 (the exclusive end wrapped to the next line's
+            // start) there's no single-line column to back off to; left as-is.
             (start.col, end.col - 1)
         }
         _ => (start.col, end.col),
@@ -699,7 +694,7 @@ fn line_indent_of(buffer: &Buffer, line_idx: usize) -> usize {
 /// `-` is only shown when the current line is a **block opener**: non-blank
 /// and whose trimmed text ends with `{` or `:`.
 ///
-/// `controls` is the `fold_controls` setting (#1544, VS Code's
+/// `controls` is the `fold_controls` setting (VS Code's
 /// `editor.showFoldingControls`): `Never` blanks every marker regardless of
 /// fold state; `Mouseover`/`Always` always show a closed fold's `+` (VS
 /// Code never hides an already-collapsed region's marker, even under
@@ -844,20 +839,10 @@ pub fn calculate_gutter_cols(
 
 /// The global status bar's three pieces: `(prefix, branch, right)`.
 ///
-/// #752: `branch` used to be concatenated into a single `left` blob, with a
-/// separate `Option<(start, end)>` range measured in **UTF-8 bytes** telling
-/// the one interested caller where inside that blob the git decoration sat.
-/// That range was then compared against a *character column* derived from a
-/// stale `cached_char_width`, so on any repo ahead of or behind its remote
-/// (`↑`/`↓` are three bytes each) or any file with a non-ASCII name, the
-/// clickable branch drifted right of the painted one.
-///
-/// Returning the branch as its own string lets `build_global_status_bar` emit
-/// it as a real `StatusBarSegment` with an `action_id`, so its hit region
-/// comes from the same `StatusBar::layout` the rasteriser paints with — no
-/// hand-measured range, no assumed cell width, and correct in a proportional
-/// font too. Left segments lay out contiguously, so the painted result is
-/// byte-identical to the old single blob.
+/// The branch is returned as its own string so `build_global_status_bar` can
+/// emit it as a real `StatusBarSegment` with an `action_id`, allowing its hit
+/// region to come from the same `StatusBar::layout` the rasteriser paints
+/// with — ensuring correct positioning in all font styles and sizes.
 fn build_status_line(engine: &Engine) -> (String, String, String) {
     let mode_str = engine.mode_str();
 
@@ -904,7 +889,7 @@ fn build_status_line(engine: &Engine) -> (String, String, String) {
     } else {
         String::new()
     };
-    // 'ruler' (#1190): the cursor-position/line-count segment is the part
+    // 'ruler': the cursor-position/line-count segment is the part
     // Vim's `'ruler'` option gates (`:h 'ruler'`) — diagnostics are a
     // vimcode-only addition with no Vim equivalent, so they stay visible
     // either way.
@@ -922,7 +907,7 @@ fn build_status_line(engine: &Engine) -> (String, String, String) {
         String::new()
     };
 
-    // 'showcmd' (#1190): the partially-typed Normal-mode command, shown
+    // 'showcmd': the partially-typed Normal-mode command, shown
     // immediately left of the ruler like Vim's own showcmd area (`:h
     // 'showcmd'`).
     let showcmd_str = if engine.settings.showcmd {
@@ -953,7 +938,7 @@ pub fn build_global_status_bar(engine: &Engine, theme: &Theme) -> quadraui::Stat
         action_id,
     };
     let mut left_segments = vec![seg(prefix, None)];
-    // #752: the branch is its own **clickable** segment rather than a
+    // The branch is its own **clickable** segment rather than a
     // hand-measured span inside one blob, so `StatusBar::layout` produces its
     // hit region from the same measurement pass that positions its glyphs.
     // `status_action_from_id` maps this id back to `StatusAction::SwitchBranch`,
@@ -972,10 +957,9 @@ pub fn build_global_status_bar(engine: &Engine, theme: &Theme) -> quadraui::Stat
 }
 
 /// Build a `quadraui::ToastOverlay` from `engine.toasts` for the
-/// bottom-right corner (#1577 — was `quadraui::ToastStack`, single-action
-/// only). Backends call `quadraui::*::draw_toast_overlay` with the
-/// result. Returns None when there are no toasts so callers can skip the
-/// draw entirely. Also used, with no painting involved, by
+/// bottom-right corner. Backends call `quadraui::*::draw_toast_overlay`
+/// with the result. Returns None when there are no toasts so callers can
+/// skip the draw entirely. Also used, with no painting involved, by
 /// `Engine::focus_toast_stack` to hand focus to
 /// `ToastStackController::give_focus`.
 pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastOverlay> {
@@ -994,8 +978,7 @@ pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastOverlay> {
                 body: t.body.clone(),
                 severity: t.severity,
                 // Widget ids carry the button's index within `t.actions`
-                // (#1577 — `Engine::run_toast_action`'s doc explains why:
-                // a toast can now have more than one action button).
+                // so `Engine::run_toast_action` can identify which button was
                 actions: t
                     .actions
                     .iter()
@@ -1014,7 +997,7 @@ pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastOverlay> {
 }
 
 /// Format the LSP status segment text when the server is still
-/// indexing (#221). Renders `name • Indexing: 319/320` when the
+/// indexing. Renders `name • Indexing: 319/320` when the
 /// server is publishing `$/progress`; falls back to the dimmed
 /// `name… ` placeholder when no progress data is available.
 ///
@@ -1090,7 +1073,7 @@ fn extract_xy_prefix(msg: &str) -> Option<&str> {
 /// Map an internal LSP language id (`crate::core::lsp::language_id_from_path`'s
 /// return value, e.g. `"rust"`, `"typescriptreact"`) to the display name a
 /// user actually recognizes (`"Rust"`, `"TypeScript React"`) — VS Code's
-/// status bar language segment shows the latter, never the raw id (#1548).
+/// status bar language segment shows the latter, never the raw id.
 ///
 /// Every id in [`crate::core::lsp::all_known_language_ids`] has an explicit
 /// entry below; anything else (a future id this list hasn't caught up with
@@ -1176,18 +1159,11 @@ pub fn build_window_status_line(
         .and_then(|p| crate::core::lsp::language_id_from_path(p))
         .unwrap_or_default();
 
-    // #1690: the active window's status bar reads its background from the
-    // theme's own dedicated status-bar key (`theme.status_bg` — the same
-    // field `build_global_status_bar`/the sidebar header/the source-control
-    // header already read) rather than a `lighten`/`darken` offset computed
-    // from the editor background. The offset always *increased* contrast
-    // against a dark background, which is what made the bar read as a
-    // lighter slab instead of a footer (vimcode#1690's Win-GUI report:
-    // `#303030` fill against a `#14161e` editor, both sampled from a real
-    // window) — every color-scheme author already has a considered
-    // `status_bg` value (down to "equal to `background`", VS Code's own
-    // convention under several of its built-in themes) and this is the one
-    // place that value should come from.
+    // The active window's status bar reads its background from the
+    // theme's dedicated status-bar key (`theme.status_bg`) rather than a
+    // `lighten`/`darken` offset computed from the editor background.
+    // Every color-scheme author already has a considered `status_bg` value
+    // and this is the one place that value should come from.
     // Inactive windows keep their own dedicated key (`status_inactive_bg`),
     // unaffected by this change.
     let bar_bg = theme.status_bg;
@@ -1266,12 +1242,9 @@ pub fn build_window_status_line(
                 }
                 branch_text = format!("{} {}", branch_text, parts.join(" "));
             }
-            // #1548: prefix with the branch glyph via the shared `Icon`
-            // constant (`.s()` picks nerd vs ASCII fallback per
-            // `nerd_fonts_enabled()`) rather than a raw literal — a raw PUA
-            // literal here would bypass `tests/icon_font_coverage.rs`'s
-            // bundled-subset-font check entirely, the exact failure mode
-            // that shipped tofu for the status-bar toggles before #1540.
+            // Prefix with the branch glyph via the shared `Icon` constant
+            // (`.s()` picks nerd vs ASCII fallback per `nerd_fonts_enabled()`)
+            // so raw PUA literals don't bypass bundled-font checks.
             left.push(StatusSegment {
                 text: format!("  {} {}", crate::icons::GIT_BRANCH.s(), branch_text),
                 fg: bar_fg,
@@ -1286,43 +1259,19 @@ pub fn build_window_status_line(
         let lsp_status = window
             .map(|w| engine.lsp_status_for_buffer(w.buffer_id))
             .unwrap_or(crate::core::lsp_manager::LspStatus::None);
-        // #221: when indexing is in flight, format `name • Indexing: 319/320`
+        // When indexing is in flight, format `name • Indexing: 319/320`
         // from the latest $/progress snapshot. Falls back to the plain
         // `name…` placeholder when the server isn't reporting progress.
         let lsp_progress = window.and_then(|w| engine.lsp_progress_for_buffer(w.buffer_id));
 
-        // #1690 established VS Code's left/right split for this bar: the
-        // problems counter at the **far left** (with the remote-indicator/
-        // workspace-trust segments vimcode has no equivalent of), and on
-        // the right, `Ln N, Col N` · `Spaces: N` · `UTF-8` · `LF` ·
-        // language · notification bell, in that left-to-right order.
-        //
-        // #1760: that visual order is **not** the order these segments are
-        // pushed into `right` below anymore. `right`/`left` are plain
-        // vectors `StatusBar::layout`'s priority-drop (quadraui's
-        // `fit_right_start`/`layout_padded`) reads left-to-right — a
-        // narrow bar drops from the *front* of `right_segments` and always
-        // preserves the *last* element, even if it alone overflows (see
-        // that primitive's own doc). So vector order doubles as both the
-        // right group's visual position *and* its drop priority: #1690
-        // pushed `cursor_seg` (Ln/Col) first because that's where it sits
-        // visually in VS Code's own order, which made it the first
-        // segment *dropped* the moment a dirty marker / git branch /
-        // EDIT-mode hint ate into the left side's width budget — reported
-        // as "Ln/Col silently vanishes" even though plenty of lower-value
-        // segments (the layout toggles, LSP status) survived. quadraui's
-        // `StatusBar` has no field to decouple "visual position" from
-        // "drop priority" (a vector is both at once — #164 flagged this
-        // exact coupling as unresolved), so until it does, vimcode cannot
-        // have Ln/Col both leftmost-of-the-group *and* undroppable. This
-        // fix picks undroppable: `cursor_seg` is pushed **last**, after
-        // every other right-side segment, which is the only way
-        // `fit_right_start`'s "always keep the last segment" rule can
-        // guarantee it never disappears. Vimcode's own extras with no VS
-        // Code counterpart (LSP status, the layout toggles, notifications)
-        // are the least important and go first/leftmost of the group;
-        // `showcmd` — prominent exactly when the user is mid-command —
-        // stays pushed just ahead of `cursor_seg`, as before.
+        // Right-side segments are pushed in drop-priority order (least
+        // important first). Segments with no VS Code counterpart (LSP status,
+        // notifications, layout toggles) go first/leftmost since they're least
+        // essential and first to drop under tight width. VS Code's segments
+        // (filetype, line ending, encoding, indent) follow; `showcmd` sits just
+        // ahead of `cursor_seg`; `cursor_seg` (Ln/Col) is pushed last to
+        // guarantee it survives via quadraui's "always keep the last right
+        // segment" rule.
         let mut right = Vec::new();
 
         // Build each segment optionally; push at the end in priority order.
@@ -1411,14 +1360,9 @@ pub fn build_window_status_line(
             action: Some(StatusAction::TogglePanel),
         };
 
-        // #1760: this used to be (almost) the right-most segment of the
-        // bar — only `showcmd` ever pushed after it, and that's almost
-        // always empty/absent — so it carried a trailing-space-free
-        // #1541/quadraui#1155 treatment matching `cursor_seg`'s. Now that
-        // `cursor_seg` (Ln/Col) is always the true right-most segment (see
-        // the `right` push-order comment below), this one needs its own
-        // trailing space back so it doesn't touch whichever segment ends
-        // up directly after it.
+        // Now that `cursor_seg` (Ln/Col) is always the true right-most segment,
+        // this one needs its own trailing space so it doesn't touch whichever
+        // segment ends up directly after it.
         let sidebar_toggle_seg = StatusSegment {
             text: format!(" {} ", crate::icons::STATUS_SIDEBAR_TOGGLE.s()),
             fg: toggle_fg(engine.session.explorer_visible),
@@ -1427,14 +1371,14 @@ pub fn build_window_status_line(
             action: Some(StatusAction::ToggleSidebar),
         };
 
-        // Problems counter (#1548): always visible, even at zero, matching
+        // Problems counter: always visible, even at zero, matching
         // VS Code's convention — a `0`/`0` count is itself useful signal
         // ("no problems", not "we don't know"), and hiding the segment at
         // zero is what the previous (non-window) status line did. Two
         // segments sharing one action so a click anywhere in the counter
         // opens the workspace Problems (quickfix) list.
         //
-        // #1690: pushed onto `left`, not `right` — VS Code puts the
+        // Pushed onto `left`, not `right` — VS Code puts the
         // problems counter at the **far left** of the bar (after its own
         // remote-indicator/workspace-trust segments, which vimcode has no
         // counterpart for), not mixed into the right-hand encoding/
@@ -1521,10 +1465,8 @@ pub fn build_window_status_line(
             })
         };
 
-        // 'ruler' (#1190): `:h 'ruler'` gates exactly this segment. This is
-        // the right-most segment of the bar, so no trailing space here
-        // (quadraui#1155 gives pixel backends their own outer edge inset —
-        // a manual trailing space here would double it; see #1541).
+        // 'ruler': `:h 'ruler'` gates exactly this segment. This is the
+        // right-most segment of the bar, so no trailing space here.
         let cursor_seg = if engine.settings.ruler {
             cursor.map(|c| StatusSegment {
                 text: format!(" Ln {}, Col {}", c.line + 1, c.col + 1),
@@ -1537,11 +1479,11 @@ pub fn build_window_status_line(
             None
         };
 
-        // 'showcmd' (#1190): the partially-typed Normal-mode command (`:h
+        // 'showcmd': the partially-typed Normal-mode command (`:h
         // 'showcmd'`). Only present in the *active* window's bar — an
         // inactive window's pane never has pending Normal-mode input.
         //
-        // #1690: no VS Code counterpart, so it is pushed last — the
+        // No VS Code counterpart, so it is pushed last — the
         // right-most of vimcode's own appended extras, past VS Code's own
         // six segments. When present it is therefore the bar's true
         // right-most segment (ahead of it, `sidebar_toggle_seg` is the
@@ -1565,26 +1507,19 @@ pub fn build_window_status_line(
             None
         };
 
-        // #1690: the problems counter is a *left*-side segment now (VS
+        // The problems counter is a *left*-side segment now (VS
         // Code parity — see the comment above `diag_errors`), pushed right
         // after the branch so the far-left order reads `NORMAL · filename
         // [+] [branch] · ⊗ N  ⚠ N`.
         left.push(errors_seg);
         left.push(warnings_seg);
 
-        // Right side, in drop-priority order (least important first — see
-        // the `right` doc comment above for why this is no longer VS
-        // Code's own visual left-to-right order, #1760): vimcode's own
-        // extras with no VS Code counterpart (LSP status, notifications,
-        // the layout toggles) go first/leftmost, since they are the least
-        // essential and the first to be dropped under a tight width
-        // budget; VS Code's remaining status segments (filetype, line
-        // ending, encoding, indent) follow; `showcmd` — prominent exactly
-        // when the user is mid-command — sits just ahead of `cursor_seg`;
-        // `cursor_seg` (Ln/Col) is pushed **last**, unconditionally the
-        // bar's true right-most segment, so quadraui's "always keep the
-        // last right segment" priority-drop rule guarantees it, and only
-        // it, survives no matter how little width remains.
+        // Right side, in drop-priority order (least important first): vimcode's
+        // extras (LSP status, notifications, layout toggles) go first/leftmost
+        // since they are least essential; VS Code's segments (filetype, line
+        // ending, encoding, indent) follow; `showcmd` sits just ahead of
+        // `cursor_seg`; `cursor_seg` (Ln/Col) is pushed last, unconditionally
+        // the bar's true right-most segment.
         if let Some(s) = lsp_seg {
             right.push(s);
         }
@@ -1635,8 +1570,7 @@ pub fn build_window_status_line(
 
         let right = if engine.settings.ruler {
             if let Some(c) = cursor {
-                // Right-most segment — no trailing space (see the active-
-                // window cursor_seg comment above; quadraui#1155 / #1541).
+                // Right-most segment — no trailing space.
                 vec![StatusSegment {
                     text: format!("Ln {}, Col {}", c.line + 1, c.col + 1),
                     fg: theme.status_inactive_fg,
@@ -1662,10 +1596,8 @@ pub fn build_window_status_line(
 mod tests {
     use super::*;
 
-    // ─── #221: LSP progress segment formatter ───────────────────────
     #[test]
     fn test_lsp_progress_segment_no_progress() {
-        // Pre-#221 behaviour: no progress data → dimmed `name… `.
         assert_eq!(
             format_lsp_progress_segment("rust-analyzer", None),
             "rust-analyzer… "

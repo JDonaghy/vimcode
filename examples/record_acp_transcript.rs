@@ -1,5 +1,5 @@
 //! Dev tool: record a fresh ACP transcript for the `tests/fixtures/
-//! acp_transcripts/` corpus (#1461).
+//! acp_transcripts/` corpus.
 //!
 //! Drives a fixed, generic session — `initialize` -> `session/new` ->
 //! `session/prompt "hi"` -> drain events until `PromptStopped`/agent exit,
@@ -11,7 +11,7 @@
 //! ## Re-recording against the real `claude-agent-acp` adapter
 //!
 //! This repo's CI (and this sandbox) has no Node.js and no authenticated
-//! agent login (#951), so the corpus actually committed under
+//! agent login, so the corpus actually committed under
 //! `tests/fixtures/acp_transcripts/` was generated against the checked-in
 //! `tests/fixtures/fake_acp_agent.sh` fixture, in scripted branches
 //! (`ACP_FAKE_TOOL_CALL`, `ACP_FAKE_NO_TOOL_REQUEST`) chosen to match the

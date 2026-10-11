@@ -38,7 +38,7 @@ pub fn quickfix_to_list_view(qf: &QuickfixPanel) -> quadraui::ListView {
     }
 }
 
-/// Build [`BoardData`] from engine state (#521). Always builds so backends
+/// Build [`BoardData`] from engine state. Always builds so backends
 /// can check `has_focus` even when there's nothing to paint yet.
 pub(crate) fn build_board_data(engine: &Engine) -> Option<BoardData> {
     // A status banner is only shown in place of the board, never over it —
@@ -147,27 +147,20 @@ fn span_carries_styling(span: &quadraui::StyledSpan) -> bool {
 /// doc for why length is a sufficient staleness check here. Written as a
 /// free function (rather than calling `push_turn_markdown` itself) because
 /// [`populate_ai_chat_controller`] builds a whole `Vec<ChatTurn>` to hand to
-/// `set_transcript` in one shot, not one turn at a time onto the live
-/// controller.
+/// `set_transcript` in one shot, not one turn at a time.
 ///
 /// # Plain content keeps the word-wrapped flat path
 ///
 /// When the render comes back with *nothing to style* — every line at
-/// scale `1.0` and every span carrying no fg/bg/bold/italic/underline,
-/// i.e. the message contained no markdown at all — this returns the
-/// rendered text as a single unstyled span and an **empty** `line_scales`.
-/// That is not a micro-optimisation: `ChatController::
-/// build_transcript_rows` picks its wrap policy off exactly that field —
-/// turns with per-line scales wrap with `WrapPolicy::Char` (mid-word, at
-/// the display-width budget), turns without them go down the flat path and
-/// word-wrap via `text_util::word_wrap`. Handing quadraui styled rows for
-/// a message that has no styling would therefore turn *every* plain agent
-/// reply in a narrow AI panel into mid-word breaks (`"Hello world ANSWE"`
-/// / `"RED1519"`) for zero rendering gain. Messages that genuinely carry
-/// markdown still take the styled/char-wrapped path — word-wrapping those
-/// is a quadraui-side follow-up (`ChatController`'s own doc flags the
-/// policy switch at that call site as quadraui#821), not something vimcode
-/// may fix with per-backend code here.
+/// scale `1.0` and every span carrying no fg/bg/bold/italic/underline —
+/// this returns the rendered text as a single unstyled span and an
+/// **empty** `line_scales`. `ChatController::build_transcript_rows` picks
+/// its wrap policy off exactly that field — turns with per-line scales wrap
+/// with `WrapPolicy::Char` (mid-word, at the display-width budget), turns
+/// without them go down the flat path and word-wrap via `text_util::word_wrap`.
+/// Handing quadraui styled rows for a message with no styling would turn
+/// *every* plain agent reply in a narrow AI panel into mid-word breaks for
+/// zero rendering gain.
 fn markdown_turn_styled_cached(
     cache: &std::cell::RefCell<
         std::collections::HashMap<usize, crate::core::acp_session::MarkdownTurnCacheEntry>,
@@ -214,36 +207,20 @@ fn markdown_turn_styled_cached(
 /// True if `ai_messages[idx]` (an `"assistant-thought"`-role turn) is
 /// genuine agent reasoning (`AcpChunkKind::Thought`, streamed by
 /// `Engine::acp_append_chunk`) rather than one of the one-shot system/error
-/// notices *also* pushed under that same role string — agent-failed-to-
-/// start, protocol-version-mismatch, turn-stopped-early, cancelled-by-user
-/// (see `AiMessage`'s own doc on this pre-existing role conflation, and
-/// `Engine::acp_cancel_turn`/`poll_acp`'s various pushes).
+/// notices *also* pushed under that same role string — agent-failed-to-start,
+/// protocol-version-mismatch, turn-stopped-early, cancelled-by-user.
 ///
 /// Genuine thought chunks are always followed, **within the same turn**, by
-/// a real `"assistant"`-role reply; every notice case above is pushed as
-/// (and then stays) the *last message of its turn* — nothing about a
-/// terminal/error condition produces a further assistant reply before the
-/// conversation's next user prompt. Crucially, this only scans forward
+/// a real `"assistant"`-role reply; every notice case is pushed as
+/// (and stays) the *last message of its turn*. This only scans forward
 /// *up to the next `"user"`-role message* (exclusive) rather than the rest
 /// of `ai_messages` — every real prompt turn starts with a fresh `"user"`
-/// push (see `poll_acp`'s `SessionCreated`/`RequestFailed` arms and
-/// `ai_send_message_via_acp`), so a later, unrelated turn's assistant reply
-/// can never be mistaken for this turn's own reply. Review regression
-/// (#1510): the previous "scan to the end of `ai_messages`" version let a
-/// turn cancelled/stopped/failed mid-conversation get permanently
-/// re-collapsed into "Thinking…" the moment the *next* prompt in the same
-/// session got a normal reply — `Engine::acp_cancel_turn`/`PromptStopped`
-/// (non-`end_turn`)/`RequestFailed` none tear down the session, so the
-/// conversation carries on and that later reply used to satisfy the old,
-/// unscoped "any later assistant message" check.
+/// push, so a later, unrelated turn's assistant reply can never be mistaken
+/// for this turn's own reply.
 ///
-/// A thought chunk still streaming in with no reply yet (the brief window
-/// between `agent_thought_chunk` and the first `agent_message_chunk`) reads
-/// as `false` here too — shown in full rather than collapsed for that one
-/// frame or two, self-correcting the moment the reply arrives within the
-/// same turn. That false-negative is a far safer failure mode than the
-/// reverse: permanently hiding a cancellation/error notice behind a
-/// "Thinking..." summary.
+/// A thought chunk still streaming in with no reply yet reads as `false`
+/// here too — shown in full rather than collapsed for that one frame or two,
+/// self-correcting the moment the reply arrives within the same turn.
 pub(crate) fn is_genuine_thought_chunk(
     ai_messages: &[crate::core::ai::AiMessage],
     idx: usize,
@@ -275,7 +252,7 @@ pub fn populate_ai_chat_controller(
     backend: &dyn quadraui::Backend,
 ) {
     let user_fg = theme.keyword;
-    // ACP-1 (#952): agent "thought" chunks (`session/update`'s
+    // ACP-1: agent "thought" chunks (`session/update`'s
     // `agent_thought_chunk`, role "assistant-thought" — see
     // `Engine::acp_append_chunk`) render under `ChatRole::System`, not
     // `Assistant` — `ChatController::build_transcript_rows` gives `System`
@@ -284,30 +261,27 @@ pub fn populate_ai_chat_controller(
     // distinct from message chunks, not merely a different tint on the same
     // "AI" label.
     let thought_fg = theme.comment;
-    // #1510: assistant/thought turns render as markdown
-    // (`render_markdown_to_styled`) so fences, headings, lists, and inline
-    // code paint as such instead of raw source text; user turns stay plain
-    // (`StyledText::colored`) since a user's own words are never markdown
-    // *content* to re-render, just text they typed. The per-role colour
-    // that used to tint the whole message body is no longer the mechanism
-    // that keeps thought turns visually distinct from assistant turns —
-    // `ChatRole::System` (vs `Assistant`) already earns that on its own via
-    // `ChatController::build_transcript_rows`'s role-header label/colour
-    // (see the comment above), and thought turns additionally collapse to a
-    // one-line summary below.
+    // Assistant/thought turns render as markdown (`render_markdown_to_styled`)
+    // so fences, headings, lists, and inline code paint as such instead of
+    // raw source text; user turns stay plain (`StyledText::colored`) since a
+    // user's own words are never markdown *content* to re-render. The
+    // per-role colour is no longer the mechanism that keeps thought turns
+    // visually distinct from assistant turns — `ChatRole::System`
+    // (vs `Assistant`) already earns that via `ChatController::
+    // build_transcript_rows`'s role-header label/colour, and thought turns
+    // additionally collapse to a one-line summary below.
     let q_theme = to_quadraui_theme(theme);
     let acp = engine.acp();
     let ai_messages = &acp.ai_messages;
 
-    // #1511: tool calls interleave chronologically instead of all landing
-    // after the whole conversation (the pre-#1511 behaviour, and this
-    // issue's core complaint — see `AcpSession::tool_call_anchor`'s doc).
-    // Bucket every call by its recorded anchor once, up front, so the
-    // per-index interleave loop below is a plain lookup rather than an
-    // O(messages × tool_calls) scan. `anchor` ranges `0..=ai_messages.len()`
-    // by construction (`Engine::acp_upsert_tool_call` stamps it from
-    // `ai_messages.len()` at the moment the call first appeared), so a
-    // `Vec` indexed directly by anchor needs no `HashMap` at all.
+    // Tool calls interleave chronologically instead of all landing
+    // after the whole conversation. Bucket every call by its recorded
+    // anchor once, up front, so the per-index interleave loop below is a
+    // plain lookup rather than an O(messages × tool_calls) scan. `anchor`
+    // ranges `0..=ai_messages.len()` by construction (`Engine::
+    // acp_upsert_tool_call` stamps it from `ai_messages.len()` at the
+    // moment the call first appeared), so a `Vec` indexed directly by anchor
+    // needs no `HashMap` at all.
     let mut tool_calls_by_anchor: Vec<Vec<&crate::core::acp::AcpToolCall>> =
         vec![Vec::new(); ai_messages.len() + 1];
     for call in &acp.tool_calls {
@@ -323,13 +297,12 @@ pub fn populate_ai_chat_controller(
     let mut turns: Vec<quadraui::ChatTurn> = Vec::new();
     let mut kinds: Vec<crate::core::acp_session::TranscriptTurnKind> = Vec::new();
 
-    // #955 (ACP-4) / #1511: one card per tool call — collapsed by default
-    // (`turn_summary_line` below is `tool_call_title_line`'s single-line
-    // `{glyph} {kind}: {title}`), expanded on demand into the full body
-    // `tool_call_expanded_text` builds (locations, content blocks,
-    // rawInput/rawOutput). `set_turn_collapsed`/`set_turn_summary` calls
-    // for these land after `set_transcript` below, once `kinds` (built
-    // here) is known to line up with the transcript it describes.
+    // One card per tool call — collapsed by default (the summary is a
+    // single-line `{glyph} {kind}: {title}`), expanded on demand into the
+    // full body `tool_call_expanded_text` builds (locations, content blocks,
+    // rawInput/rawOutput). `set_turn_collapsed`/`set_turn_summary` calls for
+    // these land after `set_transcript` below, once `kinds` (built here) is
+    // known to line up with the transcript it describes.
     let push_tool_calls_at =
         |anchor: usize,
          turns: &mut Vec<quadraui::ChatTurn>,
@@ -337,17 +310,13 @@ pub fn populate_ai_chat_controller(
             for call in &tool_calls_by_anchor[anchor] {
                 let expanded = acp.tool_call_expanded.contains(&call.id);
                 // Deliberately plain (`StyledText::colored`), never markdown
-                // — unlike assistant/thought turns (#1510). Routing this
-                // through `render_markdown_to_styled` would flip the whole
-                // card onto quadraui's char-wrapped `WrapPolicy::Char` path
-                // the moment *any* line in it carries styling (the fenced
-                // ```json``` blocks always do), which would mid-word-break
-                // the plain `-> path:line` header/location lines too —
-                // exactly the "Hello world ANSWE"/"RED1519" failure mode
-                // `markdown_turn_styled_cached`'s own doc warns about,
-                // just triggered by this card's own content instead of an
-                // unrelated later message. Plain text keeps the whole card
-                // on the word-wrapped flat path, same as before #1511.
+                // — unlike assistant/thought turns. Routing this through
+                // `render_markdown_to_styled` would flip the whole card onto
+                // quadraui's char-wrapped `WrapPolicy::Char` path the moment
+                // *any* line carries styling (the fenced ```json``` blocks
+                // always do), which would mid-word-break the plain
+                // `-> path:line` header/location lines too. Plain text keeps
+                // the whole card on the word-wrapped flat path.
                 let text = if expanded {
                     quadraui::StyledText::colored(
                         crate::core::acp::tool_call_expanded_text(call, |terminal_id| {
@@ -385,7 +354,7 @@ pub fn populate_ai_chat_controller(
                 timestamp_unix: None,
                 line_scales: Vec::new(),
             },
-            // #1512: a message submitted while a turn was already in
+            // A message submitted while a turn was already in
             // flight — queued rather than dropped (`Engine::
             // ai_queue_message`). Dimmed (`thought_fg`, the same tone
             // `assistant-thought` turns use) and literally prefixed
@@ -441,17 +410,17 @@ pub fn populate_ai_chat_controller(
     // that triggered them).
     push_tool_calls_at(ai_messages.len(), &mut turns, &mut kinds);
 
-    // #956/#1513: the agent's current plan no longer appends as a synthetic
-    // trailing transcript turn — see `ai_plan_multi_section_view`'s doc for
-    // why (streaming text used to push it around and scroll it away, #1513's
-    // whole complaint). It paints as its own pinned block above the
-    // transcript instead; `ai_messages`/`turns`/`kinds` here are untouched
-    // by `engine.acp().plan`.
+    // The agent's current plan paints as its own pinned block above the
+    // transcript (painted by `paint_ai_plan_band`, in a rect carved out of
+    // the panel *before* `ChatController::render` ever sees the remainder)
+    // rather than as a synthetic trailing transcript turn. It renders
+    // via `ai_plan_multi_section_view`. `ai_messages`/`turns`/`kinds` here
+    // are untouched by `engine.acp().plan`.
     *acp.transcript_turn_kinds.borrow_mut() = kinds;
 
     let mut chat = engine.ai_chat.borrow_mut();
     chat.set_transcript(turns);
-    // #1510/#1511: thought turns and tool-call cards each collapse to a
+    // Thought turns and tool-call cards each collapse to a
     // one-line summary by default; a user click/`Tab`+`Enter` toggle
     // (`Engine::dispatch_ai_chat_event`'s `TurnClicked`/`KeyPressed` arms)
     // records the override in `AcpSession::thought_expanded`/
@@ -508,14 +477,14 @@ pub fn populate_ai_chat_controller(
         }
     }
     chat.set_busy(engine.acp().ai_streaming);
-    // #1509: plumb the `ai_chat_submit_on_enter` setting straight through to
+    // Plumb the `ai_chat_submit_on_enter` setting straight through to
     // `ChatController` every call — cheap enough to set unconditionally
     // (`ChatController::set_submit_on_enter` is a plain field write) and
     // this is the one place both backends already funnel through before
     // every `render()`/`handle()` pass, so a `:set` toggle takes effect on
     // the very next frame without either backend needing its own wiring.
     chat.set_submit_on_enter(engine.settings.ai_chat_submit_on_enter);
-    // #1508: advance the status-strip's `Spinner` primitive to the frame
+    // Advance the status-strip's `Spinner` primitive to the frame
     // `Engine::tick_ai_spinner` last stamped (`poll_idle`, ≥4 Hz while busy
     // — see `App::tick_dispatch`'s `request_frame_in` re-arm). Harmless to
     // call every frame regardless of `busy`: `ChatController::render` only
@@ -532,18 +501,14 @@ pub fn populate_ai_chat_controller(
     } else {
         format!(" {ai_chat_icon} AI ASSISTANT")
     };
-    // #1463: the session tab strip. Folded into this same always-repainted
-    // header line — exactly like the mode/usage suffix below — rather than
-    // a bespoke widget in either backend, per the Platform-Neutrality Rule:
-    // both backends already paint this one string with zero backend-
-    // specific code, so a second session is "more text in the string
-    // that's already shared", not new GTK/TUI paint logic. Only shown once
-    // a second tab actually exists — the common single-session case looks
-    // exactly as it did before #1463. The active tab is marked `*`; a tab
-    // with a `session/request_permission` parked while backgrounded (see
-    // `Engine::acp_handle_permission_request`'s doc) is marked `!` — the
-    // badge #1463 asks for, painted, not just an engine flag (`Engine::
-    // acp_session_tabs` is the one source both this and the flag read).
+    // The session tab strip, folded into this same always-repainted header
+    // line rather than a bespoke widget in either backend: both backends
+    // already paint this one string with zero backend-specific code, so a
+    // second session is "more text in the string that's already shared".
+    // Only shown once a second tab actually exists. The active tab is marked
+    // `*`; a tab with a `session/request_permission` parked while backgrounded
+    // is marked `!` — painted from `Engine::acp_session_tabs`, the one source
+    // both this and the flag read.
     let tabs = engine.acp_session_tabs();
     if tabs.len() > 1 {
         let strip: Vec<String> = tabs
@@ -556,7 +521,7 @@ pub fn populate_ai_chat_controller(
             .collect();
         header.push_str(&format!("  [{}]", strip.join(" | ")));
     }
-    // #1513: "Plan n/m" progress folds into this same always-repainted
+    // "Plan n/m" progress folds into this same always-repainted
     // header line — the pinned plan block below (`ai_plan_multi_section_
     // view`) carries the full checklist, but a quick "how far along" glance
     // shouldn't require expanding it, same reasoning as every other chip/
@@ -570,12 +535,12 @@ pub fn populate_ai_chat_controller(
             .count();
         header.push_str(&format!("  \u{b7} Plan {done}/{total}"));
     }
-    // #956 (ACP-5): current mode + usage telemetry both fold into this one
+    // Current mode + usage telemetry both fold into this one
     // existing status line rather than a new widget — "unobtrusive status
     // indicator" per the issue, and by construction can't steal focus or
     // churn layout since the header is already repainted every frame at a
     // fixed position.
-    // #1520: `configOptions`' `category: "model"` entry is ACP v1's only
+    // `configOptions`' `category: "model"` entry is ACP v1's only
     // model picker (no dedicated `session/set_mode`-style method for a
     // model) — prefer showing it here over the older `modes` segment
     // below when both are present, rather than showing both for the same
@@ -606,25 +571,24 @@ pub fn populate_ai_chat_controller(
             header.push_str(&format!("  \u{b7} {summary}"));
         }
     }
-    // #1450 point 4: a staged Visual-selection/`:{range}AI` attachment's
-    // `⧉`-chip rides on this same always-repainted, focus-safe status line
-    // — visible until it's sent (or removed with Ctrl+R,
-    // `Engine::dispatch_ai_chat_event`) — rather than a new widget, same
-    // reasoning as the mode/usage lines above it.
+    // A staged Visual-selection/`:{range}AI` attachment's `⧉`-chip rides
+    // on this same always-repainted, focus-safe status line — visible until
+    // it's sent or removed with Ctrl+R (`Engine::dispatch_ai_chat_event`) —
+    // rather than a new widget, same reasoning as the mode/usage lines above.
     if let Some(attachment) = &engine.acp_pending_attachment {
         header.push_str(&format!(
             "  \u{b7} {}",
             attachment.chip(&engine.acp_workspace_cwd())
         ));
     }
-    // #1464: every manually attached file/image gets its own chip on this
+    // Every manually attached file/image gets its own chip on this
     // same always-repainted, focus-safe status line — same reasoning as
     // the range attachment's chip immediately above, extended to a list
     // since more than one file can be attached at once.
     for attachment in &engine.acp_manual_attachments {
         header.push_str(&format!("  \u{b7} {}", attachment.chip()));
     }
-    // #1513: every staged `@symbol` mention gets its own chip on this same
+    // Every staged `@symbol` mention gets its own chip on this same
     // always-repainted, focus-safe status line — same reasoning as the
     // manual-attachment chips immediately above.
     for symbol in &engine.acp_pending_symbol_mentions {
@@ -633,7 +597,7 @@ pub fn populate_ai_chat_controller(
             symbol.chip(&engine.acp_workspace_cwd())
         ));
     }
-    // #1512: "queued (1)" while a message submitted mid-turn is waiting to
+    // "queued (1)" while a message submitted mid-turn is waiting to
     // be sent (`AcpSession::queued_prompt`) — same always-repainted,
     // focus-safe status line as every other chip/suffix here. Only ever
     // one slot (`Engine::ai_queue_message` replaces rather than stacks),
@@ -642,13 +606,10 @@ pub fn populate_ai_chat_controller(
     if engine.acp().queued_prompt.is_some() {
         header.push_str("  \u{b7} queued (1)");
     }
-    // #1515: `badge` mode's "Edited N files · +a -r" segment — the
-    // replacement for the pre-#1515 always-auto-open full-viewport turn
-    // review (`acp_review_on_turn_end` setting, `Engine::acp_end_turn`).
-    // Folds into this same always-repainted, focus-safe status line, same
-    // reasoning as every other chip/suffix above it. `:AiReview`
-    // (`Engine::cmd_ai_review`) opens the same modal this segment
-    // summarises.
+    // `badge` mode's "Edited N files · +a -r" segment — the replacement for
+    // the pre-#1515 always-auto-open full-viewport turn review. Folds into
+    // this same always-repainted, focus-safe status line. `:AiReview`
+    // (`Engine::cmd_ai_review`) opens the same modal this segment summarises.
     if engine.settings.acp_review_on_turn_end == crate::core::settings::AcpReviewOnTurnEnd::Badge {
         if let Some((files, added, removed)) = engine.acp_turn_review_badge() {
             header.push_str(&format!(
@@ -668,29 +629,20 @@ pub fn populate_ai_chat_controller(
     )));
 }
 
-// ── #1513: pinned, collapsible plan block ────────────────────────────────
-
 /// Build the `quadraui::MultiSectionView` for the AI panel's pinned plan
 /// block, or `None` while `engine.acp().plan` is empty (nothing to pin).
 ///
-/// One section, not the whole `ChatController` transcript: pre-#1513 the
-/// plan rendered as a synthetic *trailing* transcript turn
-/// (`populate_ai_chat_controller` used to push one, see that function's git
-/// history) — streaming assistant text kept appending turns after it, so
-/// the plan drifted down and off the visible viewport the moment a reply
-/// started streaming, exactly the issue's complaint. Pinning it in its own
-/// band above `ChatController` (painted by `paint_ai_plan_band`, in a rect
-/// carved out of the panel *before* `ChatController::render` ever sees the
-/// remainder) means it can never move regardless of how much transcript
-/// text streams in below it.
+/// One section, not the whole `ChatController` transcript. The plan paints
+/// as its own pinned band above `ChatController` (in a rect carved out of
+/// the panel *before* `ChatController::render` ever sees the remainder) so
+/// it never moves regardless of how much transcript text streams in below.
 ///
 /// Collapsed (the default, `!engine.ai_plan_expanded`) shows only the
 /// header: `"Plan n/m: <in-progress entry>"` (or "All steps complete" once
 /// `n == m`) — enough to see what the agent is doing right now without
-/// spending any vertical space on the rest of the list. Expanded shows the
-/// full checklist as the section body, one line per entry with the same
-/// status glyphs `plan_to_checklist_text` uses, so a reader who already
-/// knows that convention doesn't have to learn a second one.
+/// spending vertical space on the rest. Expanded shows the full checklist
+/// as the section body, one line per entry with the same status glyphs
+/// `plan_to_checklist_text` uses.
 pub fn ai_plan_multi_section_view(
     engine: &Engine,
     theme: &Theme,
@@ -851,7 +803,7 @@ pub fn route_ai_plan_band_click(engine: &mut Engine, pos: quadraui::Point) -> bo
     }
 }
 
-/// Braille spinner frame table (#1508) — the same 10-glyph rotation
+/// Braille spinner frame table — the same 10-glyph rotation
 /// quadraui's own GTK/TUI/macOS `Spinner` rasterisers use internally
 /// (`gtk::spinner`/`macos::spinner`'s private `FRAMES` const), duplicated
 /// here because neither is a public quadraui export: this one is embedded
@@ -867,32 +819,24 @@ fn spinner_glyph(frame_idx: usize) -> char {
     SPINNER_GLYPHS[frame_idx % SPINNER_GLYPHS.len()]
 }
 
-/// The AI-panel status strip's busy-state text (#1508) — what used to be
-/// the frozen literal `"(thinking\u{2026})"` — built fresh every
+/// The AI-panel status strip's busy-state text, built fresh every
 /// `populate_ai_chat_controller` call so it reflects the current instant.
-/// Only ever called while `engine.acp().ai_streaming` is true (see the one
-/// call site).
+/// Only ever called while `engine.acp().ai_streaming` is true.
 ///
 /// Precedence, most specific first:
 /// 1. A `session/request_permission` parked on the *active* session
-///    (`AcpSession::has_pending_permission`) — the turn is not
-///    progressing at all until a human answers, so naming the one
-///    in-progress tool call here would be misleading (that call is the
-///    one the permission is blocking, but nothing about it is actually
-///    executing right now).
+///    (`AcpSession::has_pending_permission`) — the turn is not progressing
+///    until a human answers.
 /// 2. The most recently announced still-running tool call (searched from
-///    the end of `tool_calls` — an upserted `Vec`, not append-order for
-///    updates — so a later call's `in_progress` status wins over an
-///    earlier one still shown as `pending`/`in_progress` from a prior
-///    step of the same turn).
+///    the end of `tool_calls` — an upserted `Vec` — so a later call's
+///    `in_progress` status wins over an earlier one still shown as
+///    `pending`/`in_progress`).
 /// 3. A generic "thinking" fallback — covers both the direct-curl
-///    transport (which never populates `tool_calls` at all) and the ACP
-///    gap between "turn started" and "first tool_call announced".
+///    transport (which never populates `tool_calls`) and the ACP gap
+///    between "turn started" and "first tool_call announced".
 ///
-/// Every branch is prefixed with the same animated glyph and suffixed
-/// with the same elapsed-time reading, so the busy indicator always
-/// carries both pieces of information the issue asks for regardless of
-/// which branch fires.
+/// Every branch is prefixed with an animated glyph and suffixed with
+/// elapsed-time reading.
 fn ai_busy_status_text(engine: &Engine) -> String {
     let glyph = spinner_glyph(engine.ai_spinner_frame);
     let elapsed = engine
@@ -916,47 +860,36 @@ fn ai_busy_status_text(engine: &Engine) -> String {
 }
 
 /// The persistent one-line hint `populate_ai_chat_controller` pins to
-/// [`quadraui::ChatController::set_hint`] (#1507) — unlike the built-in
+/// [`quadraui::ChatController::set_hint`] — unlike the built-in
 /// `TextInput` placeholder it replaces, this stays visible once the user
-/// starts typing (`ChatController`'s own *Persistent hint line* doc), which
-/// is the whole point: the send/stop/leave keys were previously only
-/// discoverable in the empty-input state.
+/// starts typing, which is the whole point: the send/stop/leave keys are
+/// otherwise only discoverable in the empty-input state.
 ///
 /// The send-key list is adapted to what actually works on the live
 /// backend rather than a single hardcoded string:
 ///
 /// - GTK (`backend_caps().generic_font_families` — true only for a real
-///   font-resolving GUI backend, `false` on every terminal backend per
-///   that field's own doc) reliably delivers a distinct `Ctrl+Enter`, so
-///   that's the one binding shown.
-/// - TUI always has `Alt+Enter` and `Ctrl+S` (`ChatController::handle`'s
-///   module doc: `Ctrl+S` "works on all terminals in both submit_on_enter
-///   modes"). `Ctrl+Enter` is only added when `backend_caps().
-///   kitty_keyboard` is actually active — that field's own doc says
-///   exactly this: "check this before relying on a gesture that needs the
-///   protocol (e.g. Ctrl+Enter distinct from Enter) and fall back to an
-///   always-available binding (Alt+Enter) when it's false" — so a hint
+///   font-resolving GUI backend, `false` on every terminal backend)
+///   reliably delivers a distinct `Ctrl+Enter`, so that's the one shown.
+/// - TUI always has `Alt+Enter` and `Ctrl+S`. `Ctrl+Enter` is only added
+///   when `backend_caps().kitty_keyboard` is actually active — so a hint
 ///   promising a chord the detected terminal can't deliver never ships.
 ///
 /// `Esc` and `<leader>ai` both return focus to the editor — the latter
 /// toggles when the panel already has focus and its input is empty (see
-/// [`Engine::ai_leader_toggle_key`], called from this same
-/// `route_ai_chat_event`) — so both are named rather than just `Esc` alone,
-/// closing the discoverability gap #1507 reports for the focus toggle too.
+/// [`Engine::ai_leader_toggle_key`]) — so both are named rather than just
+/// `Esc` alone.
 ///
-/// `submit_on_enter` (#1509, `Settings::ai_chat_submit_on_enter`) flips which
-/// key does what, per [`quadraui::ChatController`]'s own *Keyboard
-/// behaviour* doc: when `true` (the default, Zed parity) plain `Enter` sends
-/// and `Shift+Enter`/`Alt+Enter` insert a newline instead; when `false`
-/// (the pre-#1509 default) `Enter` always inserts a newline and the
-/// `send_keys` chord below sends. Either way `Ctrl+S`/`Ctrl+Enter` (when
-/// available) still send, matching `ChatController::handle`'s "in both
-/// modes" bindings — but the hint only needs to name the *primary* gesture
-/// for whichever mode is active, not every equivalent chord.
+/// `submit_on_enter` flips which key does what: when `true` (the default)
+/// plain `Enter` sends and `Shift+Enter`/`Alt+Enter` insert a newline;
+/// when `false` `Enter` always inserts a newline and the `send_keys`
+/// chord below sends. Either way `Ctrl+S`/`Ctrl+Enter` (when available)
+/// still send, but the hint only needs to name the *primary* gesture for
+/// whichever mode is active.
 fn ai_chat_hint_line(
     backend: &dyn quadraui::Backend,
     submit_on_enter: bool,
-    // #1512: whether a message is currently queued
+    // Whether a message is currently queued
     // (`AcpSession::queued_prompt`) — when it is, the hint grows the
     // `^G send now \u{b7} ^R discard` pair so the two new gestures are
     // discoverable exactly while they're actually relevant, rather than
@@ -990,7 +923,7 @@ fn ai_chat_hint_line(
 
 /// Paint the slash-command or `@`-mention completion popup above the AI
 /// panel's input box, whichever [`Engine::ai_command_completions`] /
-/// [`Engine::ai_mention_completions`] (#1449) currently has a match — the
+/// [`Engine::ai_mention_completions`] currently has a match — the
 /// two are mutually exclusive by construction (see
 /// `route_ai_chat_event`'s intercept). Reuses
 /// [`completion_menu_to_quadraui_completions`] and the

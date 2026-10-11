@@ -20,7 +20,7 @@ use super::*;
 ///   it never decides what the value is, so it carries no backend identity
 ///   of its own.
 /// - `minimap_sizing` — the caller's own [`TUI_MINIMAP_SIZING`] or
-///   [`gtk_minimap_sizing`] (#828/quadraui#776), forwarded verbatim to
+///   [`gtk_minimap_sizing`], forwarded verbatim to
 ///   `minimap_reserved_width` — again supplied, not decided, here.
 ///
 /// This function is intentionally *pure* — no side effects, no GTK/Cairo calls.
@@ -38,7 +38,7 @@ pub fn build_screen_layout(
     // Breadcrumb row height defaults to `line_height` — correct for TUI's
     // row-based model (`line_height` is always `1.0`, i.e. exactly one row)
     // and for any GTK call site that hasn't opted into the fixed-pixel
-    // breadcrumb row via `build_screen_layout_with_breadcrumb_row` (#700).
+    // breadcrumb row via `build_screen_layout_with_breadcrumb_row`.
     build_screen_layout_with_breadcrumb_row(
         engine,
         theme,
@@ -53,7 +53,7 @@ pub fn build_screen_layout(
 }
 
 /// Like [`build_screen_layout`], but lets the caller decouple the breadcrumb
-/// bar's own height/position from `line_height` (#700).
+/// bar's own height/position from `line_height`.
 ///
 /// GTK's tab-bar and breadcrumb rows are fixed-pixel chrome
 /// (`tab_row_height_px`/`BREADCRUMB_ROW_HEIGHT_PX`) independent of
@@ -89,16 +89,14 @@ pub fn build_screen_layout_with_breadcrumb_row(
     // window — they're naturally above the terminal by being part of the editor area.
     let separate_status =
         per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
-    // Single source of truth for "does this window paint its own bottom-row
-    // status line" (#728). #1128: GTK's h-scrollbar geometry no longer
-    // consults this — see `window_status_row_reserved`'s doc for why.
+    // Single source of truth for "does this window paint its own bottom-row status line".
     let own_status_row = window_status_row_reserved(engine);
 
-    // Window-split dividers (#582) — independent of the `n >= 2` editor-group
+    // Window-split dividers — independent of the `n >= 2` editor-group
     // check below, since `:split`/`:vsplit` panes exist within a single group.
     let window_dividers = engine.calculate_window_dividers(window_rects);
 
-    // Minimap strip (#35, #722). Reserved off *every* window's right edge —
+    // Minimap strip. Reserved off *every* window's right edge —
     // not just the active one — and subtracted from that same window's text
     // width before it's laid out, so each pane reclaims exactly its own
     // strip's width when `:set nominimap` turns the strip off. Keyed per
@@ -106,7 +104,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
     // is a function of that window's own rect width, so unevenly split
     // panes legitimately get differently-sized strips.
     //
-    // #1094: VS Code's order is text, then the strip, then the scroll
+    // VS Code's order is text, then the strip, then the scroll
     // column at the pane's outermost edge — but both backends' scrollbars
     // anchor to *their own painted rect's* right edge (quadraui's TUI
     // `draw_editor` always reserves one inline column at `area.right - 1`
@@ -116,7 +114,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
     // land past the strip rather than immediately before it is for the rect
     // this module hands to the paint path (`RenderedWindow.rect`, below) to
     // reach the pane's *true* right edge — not a copy narrowed by the
-    // strip's width, as it used to be. The strip itself is then positioned
+    // strip's width. The strip itself is then positioned
     // in the gap that opens up between the (now-narrower) text and that
     // rect's edge — see `scroll_gutter_width` and the strip's own `x` below.
     //
@@ -158,10 +156,9 @@ pub fn build_screen_layout_with_breadcrumb_row(
             }
             let is_active = *window_id == active_window_id;
             let raw_minimap_w = minimap_widths.get(window_id).copied().unwrap_or(0.0);
-            // `rect` reaches the pane's true right edge unmodified (#1094,
-            // see the doc comment above) — `build_rendered_window` takes a
-            // `minimap_w` to keep the text-column count excluding the strip
-            // without narrowing the rect it's painted into.
+            // `rect` reaches the pane's true right edge unmodified —
+            // `build_rendered_window` takes a `minimap_w` to keep the text-column
+            // count excluding the strip without narrowing the rect it's painted into.
             //
             // The strip's own `x` (below) sits a full `scroll_gutter_width`
             // in from that edge, not just `raw_minimap_w` — so when a strip
@@ -172,7 +169,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
             // line). No-op when there's no strip (`raw_minimap_w == 0.0`,
             // off or self-suppressed) — nothing to leave room *for* then,
             // and reserving it anyway would cost the minimap-off case a
-            // column it doesn't owe (acceptance criterion 2).
+            // column it doesn't owe.
             let minimap_w = if raw_minimap_w > 0.0 {
                 raw_minimap_w
                     + (scroll_gutter_width(scrollbar_reserve, char_width) - scrollbar_reserve)
@@ -211,7 +208,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
     // independent strips, each over its own pane's buffer, instead of one
     // that migrates with focus.
     //
-    // #1094: positioned one `scroll_gutter_width` in from the pane's right
+    // Positioned one `scroll_gutter_width` in from the pane's right
     // edge rather than flush against it, so the scroll column painted at
     // that edge (see the doc comment above `minimap_widths`) lands outside
     // the strip instead of colliding with its last column.
@@ -230,9 +227,9 @@ pub fn build_screen_layout_with_breadcrumb_row(
             // The editor pane's own visible row count — the same
             // computation the `windows` map above runs over the same
             // `window_rects` entry — handed to `build_minimap_data`
-            // separately from the strip's own `rect`/`line_height` (#1085:
-            // see that function's doc comment for why these must not be
-            // conflated).
+            // separately from the strip's own `rect`/`line_height`.
+            // See `build_minimap_data` doc comment for why these must not be
+            // conflated.
             let mut editor_visible_rows = (r.height / line_height).floor() as usize;
             if own_status_row && editor_visible_rows > 1 {
                 editor_visible_rows -= 1;
@@ -313,10 +310,10 @@ pub fn build_screen_layout_with_breadcrumb_row(
 
     // The global quickfix list takes priority over the active window's
     // location list when both happen to be open — matching how `:copen`
-    // and `:lopen` share this one bottom "list rung" (#1155;
-    // `QuickfixPanel::title` doc comment has the full rationale).
+    // and `:lopen` share this one bottom "list rung".
+    // `QuickfixPanel::title` doc comment has the full rationale.
     //
-    // #1307: this overlay is superseded for any target that already has a
+    // This overlay is superseded for any target that already has a
     // real `WindowLayout` leaf — that leaf paints through the ordinary
     // per-window content path (`windows`, below) like any other window, so
     // painting it *again* here would double it up. `qf_has_real_window` is
@@ -359,7 +356,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
     // Build the debug sidebar data (always present). The item lists
     // themselves (variables/watch/frames/breakpoints) are painted by
     // `populate_dap_sidebar_system`'s `build_dap_*_rows` helpers directly
-    // into `engine.dap_sidebar_system`, not through this struct (#1489) —
+    // into `engine.dap_sidebar_system`, not through this struct —
     // only the chrome fields and the Debug Output tab's lines live here.
     let debug_sidebar = {
         // Output lines for the Debug Output tab (up to 200, oldest-first).
@@ -404,18 +401,16 @@ pub fn build_screen_layout_with_breadcrumb_row(
     });
 
     let n = engine.group_layout.leaf_count();
-    // ── Per-group chrome, built uniformly for EVERY group count (#551) ────────
-    // `group_tab_bars` and `group_dividers` used to live inside an
-    // `if n >= 2 { .. } else { None }` block, which forced every backend to
-    // carry a parallel hand-written "exactly one group" draw path beside the
-    // generic N-group one. A single group is just a split of one: the same
-    // bounding-box math produces the identical full-width tab bar rect, and
+    // ── Per-group chrome, built uniformly for EVERY group count ───────────────
+    // `group_tab_bars` and `group_dividers` are built for all groups.
+    // A single group is just a split of one: the same bounding-box math
+    // produces the identical full-width tab bar rect, and
     // `GroupLayout::Leaf::dividers()` already returns `vec![]`, so the generic
-    // path covers N=1 with no special case. `editor_group_split` below is now
-    // only a *marker* for "2 or more groups" (it still gates the hit-test
-    // paths that legitimately differ), and no longer the storage for this data
-    // — one source of truth, so a single-group calculation can't silently
-    // drift from the N-group one the way #547's breadcrumb y-offset did.
+    // path covers N=1 with no special case. `editor_group_split` below is only
+    // a *marker* for "2 or more groups" (it gates hit-test paths that
+    // legitimately differ), and is not the storage for this data — one source
+    // of truth ensures a single-group calculation doesn't drift from the
+    // N-group one.
     let group_ids = engine.group_layout.group_ids();
     // Compute group bounds from the window_rects: each group's bounds is
     // the bounding box of its windows (the tab bar is drawn just above it).
@@ -482,7 +477,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
             // cells); GTK passes pixel bounds + real char_width, so divide to
             // recover cells. Without this, GTK's right-aligned button regions
             // (split/diff/action) would land at pixel columns and never match
-            // a cell-converted click. (#515)
+            // a cell-converted click.
             let bar_width = (bounds.width / char_width).round() as u16;
             let has_diff_toolbar = diff_toolbar.is_some();
             let diff_label_cols = diff_toolbar
@@ -492,7 +487,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 .unwrap_or(0);
             let is_active = gid == engine.active_group;
             let has_split = is_active || engine.is_in_diff_view();
-            // #703: built once and reused for measurement *and* paint — the
+            // Built once and reused for measurement *and* paint — the
             // sidecar the backend hands to `tab_bar_layout_icons` is the same
             // one it hands to `draw_tab_bar_icons`.
             let tab_icons = build_tab_bar_icons(&tabs);
@@ -531,7 +526,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
         .collect();
     // Collect dividers — use the total content bounds from window_rects.
     // `GroupLayout::Leaf::dividers()` returns an empty vec, so this is
-    // naturally empty in single-group mode (#551).
+    // naturally empty in single-group mode.
     let content_bounds = if !window_rects.is_empty() {
         let min_x = window_rects.iter().map(|r| r.1.x).fold(f64::MAX, f64::min);
         let min_y = window_rects
@@ -584,7 +579,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
                     max_x = 0.0;
                 }
                 // Place bounds at the actual breadcrumb row, `breadcrumb_row_h`
-                // above the window content top — NOT `line_height` (#700):
+                // above the window content top — NOT `line_height`:
                 // GTK's breadcrumb row is fixed-pixel and can differ from the
                 // editor's text line height.
                 let bc_y = (min_y - breadcrumb_row_h).max(0.0);
@@ -608,16 +603,15 @@ pub fn build_screen_layout_with_breadcrumb_row(
         vec![]
     };
 
-    // The single-group / active tab bar's layout, in char-cells. #551 made
-    // `group_tab_bars` populated for every group count (a single group is a
+    // The single-group / active tab bar's layout, in char-cells.
+    // `group_tab_bars` is populated for every group count (a single group is a
     // split of one), so when `n < 2` it holds exactly one entry built from
-    // the same tabs/scroll-offset/bar-width inputs this mirror used to
-    // recompute independently. Cloning that entry's layout — rather than
-    // calling `compute_tab_bar_layout` a second time — means this field is
-    // always byte-for-byte what `GroupTabBar::bar` painted (#822,
-    // `feedback_cache_paint_layout`: hit-testing must read what paint
-    // produced, never re-derive it). Empty in multi-group mode (handled
-    // per-group on each `GroupTabBar`). (#515)
+    // the same tabs/scroll-offset/bar-width inputs this mirror uses.
+    // Cloning that entry's layout — rather than calling
+    // `compute_tab_bar_layout` again — means this field is always byte-for-byte
+    // what `GroupTabBar::bar` painted. Hit-testing must read what paint
+    // produced, never re-derive it. Empty in multi-group mode (handled
+    // per-group on each `GroupTabBar`).
     let tab_bar_hit_regions = if n >= 2 || window_rects.is_empty() {
         empty_tab_bar_layout()
     } else {
@@ -647,10 +641,10 @@ pub fn build_screen_layout_with_breadcrumb_row(
         picker: engine.picker_open.then(|| {
             use crate::core::engine::PickerSource;
             // `PickerSource::Custom` also covers `vimcode.picker.open`
-            // (#1630) — a plugin item may declare a file/buffer preview
+            // — a plugin item may declare a file/buffer preview
             // (`Engine::picker_load_preview`'s plugin branch), and gating it
             // out here would leave that state populated but never painted,
-            // the exact "state vs. paint" bug class #587/#592 warn about.
+            // the exact "state vs. paint" bug class to avoid.
             let has_preview = matches!(
                 engine.picker_source,
                 PickerSource::Files | PickerSource::Grep | PickerSource::Custom(_)

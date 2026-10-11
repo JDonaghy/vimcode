@@ -12,10 +12,8 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
         &[
             MenuItemData {
                 label: "New Tab",
-                // #1789: see `core::engine::mod::PALETTE_COMMANDS`'s
-                // "File: New Tab" entry — this used to mirror its stale
-                // "Ctrl+T" claim, but that chord is live-bound to the
-                // integrated terminal toggle, not `tabnew`.
+                // The shortcut field in PALETTE_COMMANDS does not reflect the
+                // actual keybinding, which is live-bound to the terminal toggle.
                 shortcut: "",
                 vscode_shortcut: "",
                 action: "tabnew",
@@ -192,7 +190,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
     ),
     (
         // VS Code's menu bar is File · Edit · Selection · View · Go · Run ·
-        // Terminal · Help (#1697) — `Selection` sits here, between `Edit`
+        // Terminal · Help — `Selection` sits here, between `Edit`
         // and `View`. Only entries with a backing engine command are
         // listed; VS Code's Expand/Shrink Selection, Copy Line Up/Down,
         // Duplicate Selection, Add Cursors to Line Ends, Add Previous
@@ -243,7 +241,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 separator: true,
             },
             MenuItemData {
-                // #1744: the real VS Code chord for this command is
+                // The real VS Code chord for this command is
                 // Ctrl+Alt+Up, not Alt+Shift+Up — that chord now duplicates
                 // the line instead (`render::route_alt_key`'s `ctrl`
                 // parameter; see `Engine::vscode_copy_line_up`).
@@ -617,23 +615,9 @@ pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
         .iter()
         .map(|(name, _alt, items)| quadraui::MenuDef {
             id: quadraui::WidgetId::new(*name),
-            // #700/#705 item 5: VS Code only reveals menu-bar mnemonic
-            // underlines while Alt is held. quadraui's GTK menu bar used to
-            // underline unconditionally — `alt_char_byte_range` fell back to
-            // underlining char 0 whenever a label had no `&` at all, so
-            // dropping the `&` here (#700) didn't stop the first letter of
-            // every menu from underlining regardless. quadraui#625 part (1)
-            // fixed that fallback: `alt_char_byte_range`/`alt_char_index` now
-            // return `None` (no underline) when the label carries no `&`, so
-            // dropping the `&` here is now sufficient — no menu item
-            // underlines unconditionally.
-            //
-            // quadraui#625 part (2) — a `MenuBar::show_mnemonics` flag so a
-            // host can gate underlines on Alt-held state, for menus that DO
-            // want a mnemonic — is a separate, not-yet-landed follow-up
-            // (breaking pub-struct-field addition, deferred per that issue's
-            // commit message). Nothing here needs Alt-state wiring until
-            // that ships, since every label in `MENU_STRUCTURE` is `&`-free.
+            // Labels have no `&` because menu-bar mnemonics should only underline
+            // while Alt is held. quadraui's alt_char_byte_range now returns None
+            // when a label carries no `&`, preventing unconditional underlining.
             label: name.to_string(),
             disabled: false,
             items: items
@@ -656,7 +640,7 @@ pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
                             Some(quadraui::StyledText::plain(shortcut.to_string()))
                         },
                         disabled: !item.enabled,
-                        // #901: every `shortcut`/`vscode_shortcut` in
+                        // Every `shortcut`/`vscode_shortcut` in
                         // `MENU_STRUCTURE` is already plus-style
                         // (`"Ctrl+S"`) — exactly what
                         // `quadraui::parse_key_binding` accepts — so this
@@ -687,7 +671,7 @@ pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
 }
 
 /// Convert [`build_menu_defs`]'s output into a [`quadraui::MenuBar`] for
-/// [`quadraui::Backend::install_menu_bar`] (#901).
+/// [`quadraui::Backend::install_menu_bar`].
 ///
 /// Pure and backend-neutral: any backend that declares
 /// `BackendCaps::native_menu` (macOS's `MacBackend` today) can hand its

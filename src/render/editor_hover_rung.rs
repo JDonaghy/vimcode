@@ -1,38 +1,25 @@
 use super::*;
 
-// ─── Editor hover popup rung (#755 slice 5) ──────────────────────────────────
+// ─── Editor hover popup rung ──────────────────────────────────────────────────────
 //
-// Four consecutive rungs used to be transcribed into *both* backends —
-// "click a link", "click the scrollbar", "focus or start a selection", and
-// "click outside → dismiss". They had drifted apart in six separate ways, and
-// the drift is the whole open-bug cluster this slice closes:
+// Four consecutive rungs arbitrate clicks in the hover popup. Both backends had
+// independent implementations that drifted in several ways:
 //
-//  * **Order.** TUI tested the *link* rects first and the scrollbar second;
-//    GTK tested the scrollbar first. The scrollbar is painted on top of the
-//    content, so scrollbar-first (GTK's order) is the one that matches what
-//    the user sees, and it is what this router does (#229).
-//  * **Where the rung sits in the ladder.** TUI ran it *above* the
-//    scroll-surface dispatch; GTK ran it *below*, so on GTK a click aimed at
-//    the popup's scrollbar was eaten by whatever scroll surface sat behind it
-//    (#486). Both backends now call this router before their scroll surfaces.
-//  * **Thumb grab offset.** TUI preserved the cursor's offset within the
-//    thumb; GTK hardcoded `0.0`, so grabbing a thumb anywhere but its top
-//    teleported it under the cursor.
-//  * **Track click.** TUI armed a drag and let the shared drag-apply seek;
-//    GTK computed a *second*, ratio-based offset of its own first. One seek,
-//    computed once, now.
-//  * **Link hit-test.** TUI ignored the rect's height and required an exact
-//    row match; GTK used `<=` on the right and bottom edges, so adjacent link
-//    rects overlapped by a pixel and `find()` could only ever return the
-//    first one (#504). This router uses the half-open `[x, x+w) × [y, y+h)`
-//    convention every other hit test in this file uses.
-//  * **`command:` links.** TUI ran `execute_hover_goto` and left the popup
-//    up, covering the definition it had just jumped to; GTK dismissed. Both
-//    dismiss now (#272, #491).
+//  * **Order.** TUI tested link rects first, GTK tested scrollbar first. The
+//    scrollbar is painted on top, so scrollbar-first matches what the user sees.
+//  * **Position in the ladder.** TUI ran this above the scroll-surface dispatch;
+//    GTK ran it below, so scrollbar clicks were eaten by scroll surfaces behind.
+//  * **Thumb grab offset.** TUI preserved cursor offset within the thumb; GTK
+//    hardcoded 0.0, teleporting the thumb under the cursor.
+//  * **Track click.** TUI armed a drag; GTK computed a separate ratio-based
+//    offset. One seek, computed once, now.
+//  * **Link hit-test.** TUI required exact row match; GTK used <= on edges,
+//    causing adjacent rects to overlap. Uses half-open [x, x+w) × [y, y+h).
+//  * **command: links.** TUI left popup up covering the jumped-to definition;
+//    GTK dismissed it. Both dismiss now.
 //
-// Only two steps are genuinely per-backend and stay outside the router: what
-// "open a plain URL" means (clipboard on TUI, browser on GTK), and the drag
-// registration, which each backend owns a different handle to.
+// Only two steps are genuinely per-backend: what "open a plain URL" means
+// (clipboard on TUI, browser on GTK), and drag registration.
 
 /// The content-box metrics of the painted hover popup: how far the text is
 /// inset from the popup's own top-left, and the cell size it is laid out on.
@@ -101,7 +88,7 @@ fn rect_contains(r: quadraui::Rect, x: f32, y: f32) -> bool {
 /// Called by TUI's `handle_mouse` and GTK's `handle_mouse_click_msg` /
 /// `handle_mouse_double_click_msg` **before** either backend's scroll
 /// surfaces, so the popup — which paints on top of the editor — also wins the
-/// click that lands on it (#229, #486).
+/// click that lands on it.
 ///
 /// Reads only `visible` (`Engine::editor_hover.is_some()`) and the caller's
 /// painted geometry, so it is directly unit-testable without an `Engine`.
@@ -202,7 +189,7 @@ pub fn apply_editor_hover_popup_route(
         EditorHoverPopupRoute::Command(uri) => {
             engine.execute_hover_goto(&uri);
             // Leaving the popup up would cover the definition just jumped to
-            // (#272/#491) — TUI's old copy did exactly that.
+            // — TUI's old copy did exactly that.
             engine.dismiss_editor_hover();
         }
         EditorHoverPopupRoute::Link(url) => {
@@ -236,17 +223,8 @@ pub fn panel_hover_link_is_native(panel_name: &str) -> bool {
     panel_name == "source_control"
 }
 
-/// What a left-press on a painted panel-hover-popup link means (the
-/// sidebar-item dwell tooltip — source-control / extension-panel item
-/// hover, [`panel_hover_popup_paint`]).
-///
-/// #1067: TUI hand-rolled this hit test inline in `mouse.rs`; GTK never
-/// wired one at all after the #540 Relm4->ShellApp migration retired
-/// `Msg::PanelHoverClick` (see `panel_hover_popup_paint`'s doc for the two
-/// retired branches) — clicking a link in the panel-hover popup was a
-/// complete no-op on GTK. This is the shared rung both now call, the same
-/// shape as [`route_editor_hover_popup_click`] minus the scrollbar/focus/
-/// selection arms the panel-hover popup (a pure tooltip) never had.
+/// What a left-press on a painted panel-hover-popup link means: run a command
+/// (with code: URI) or open a URL, and dismiss the popup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PanelHoverPopupRoute {
     /// A `command:` URI link — run it, then dismiss.
@@ -318,7 +296,7 @@ pub fn apply_panel_hover_popup_route(
 pub struct DividerState<'a> {
     /// Boundaries between editor groups, as painted.
     pub group_dividers: &'a [GroupDivider],
-    /// `:split`/`:vsplit` boundaries within each group, as painted (#582).
+    /// `:split`/`:vsplit` boundaries within each group, as painted.
     pub window_dividers: &'a [WindowDivider],
     /// The caller's grab tolerances.
     pub metrics: DividerMetrics,
@@ -438,27 +416,12 @@ pub enum TabDragMove {
     Tracking,
 }
 
-/// The arm → threshold → track → commit state machine behind tab
-/// drag-and-drop, held as a single field by both backends.
+/// The arm → threshold → track → commit state machine behind tab drag-and-drop,
+/// held as a single field by both backends.
 ///
-/// Five parallel fields per backend became one, which is what makes the
-/// invariants checkable: a `source` can only exist while `dragging`, and
-/// `press` and `dragging` are never both set.
-///
-/// **#822 asked this to be replaced by `quadraui::compose::TabGroupController`
-/// wholesale.** That adoption was investigated and correctly declined:
-/// `TabGroupController` owns its own `Vec<Pane>`/`GroupLayout` model, and
-/// vimcode already owns the authoritative model in `Engine` — adopting it
-/// as-is would mean mirroring `Engine`'s editor-group state into a second
-/// source of truth, which this state machine still deliberately does not do.
-/// #1370 landed the upstream gap that made a *partial* adoption possible
-/// instead: `quadraui::compose::resolve_tab_drop` (quadraui#998) takes the
-/// host's own drag-source indices and geometry and returns a position-based
-/// `TabDropInstruction`, with no owned `Vec<Pane>` on either side. This
-/// struct still owns the arm → threshold → track → commit sequencing (that
-/// part has no quadraui equivalent to adopt), but the *geometry resolution*
-/// step in the middle now goes through `resolve_tab_drop_zone`, which calls
-/// straight into `resolve_tab_drop` — see that function's doc comment.
+/// Five parallel fields per backend became one, which makes the invariants
+/// checkable: a `source` can only exist while `dragging`, and `press` and
+/// `dragging` are never both set.
 #[derive(Debug, Clone)]
 pub struct TabDragState {
     /// Where the left button went down inside a tab bar, until either the
@@ -468,11 +431,8 @@ pub struct TabDragState {
     source: Option<(GroupId, usize)>,
     /// Latest pointer position, for the drag ghost.
     cursor: Option<(f64, f64)>,
-    /// Latest computed drop zone, for the commit. #1370: no longer read by
-    /// the drop *overlay* — that's now a pure query recomputed fresh from
-    /// painted geometry each frame ([`tab_drop_overlay`]), independent of
-    /// this cached, mutation-only value (see that function's doc comment
-    /// for why the two must not share one cache).
+    /// Latest computed drop zone, for the commit. No longer read by the drop
+    /// *overlay* — recomputed fresh from painted geometry each frame.
     zone: crate::core::window::DropZone,
     dragging: bool,
 }
@@ -593,55 +553,35 @@ impl TabDragState {
     }
 }
 
-// ═══ Drag-follow-through rung (#756, mouse-ladder slice 6) ═══════════════════
+// ═══ Drag-follow-through rung ═════════════════════════════════════════════════════
 //
-// Everything above arbitrates a *press*. This rung arbitrates the events that
-// come after one: pointer moves with the left button still held. Both backends
-// had a complete, independently-ordered copy of that ladder —
-// `MouseEventKind::Drag(Left)` in `src/tui_main/mouse.rs` and
-// `App::handle_mouse_drag_msg` in `src/gtk/mod.rs` — and they had drifted in
-// three ways that no amount of reading either one in isolation would reveal:
+// This rung arbitrates events after a press: pointer moves with the left button
+// still held. Both backends had independent, separately-ordered copies that drifted
+// in three ways:
 //
-//  1. **The minimap had no TUI drag arm at all.** GTK checks
-//     `apply_minimap_click` first thing in `handle_mouse_drag`, so holding the
-//     button on the strip keeps seeking. TUI's minimap arm sits *below* an
-//     `if ev.kind != Down(Left) { return }` gate, so its `Down | Drag` match was
-//     unreachable for `Drag`: press-and-hold on a TUI minimap scrolled once and
-//     then froze. The arm was written to handle both; the ladder order silently
-//     took the drag half away. That is exactly the "one backend arbitrates a
-//     rung and the other does not" failure #756 exists to end.
+//  1. **The minimap had no TUI drag arm.** GTK checks `apply_minimap_click` first
+//     in `handle_mouse_drag`, so holding the button keeps seeking. TUI's minimap
+//     arm sat below an `if ev.kind != Down(Left)` gate, making its `Drag` match
+//     unreachable — press-and-hold scrolled once and froze.
 //
-//  2. **The armed-scrollbar table was two disjoint half-tables.** Both run
-//     `quadraui::dispatch_mouse_drag` and then switch on the emitted
-//     `ScrollOffsetChanged { widget, .. }`. TUI's switch knew `explorer:sb`,
+//  2. **The armed-scrollbar table was split.** Both run `quadraui::dispatch_mouse_drag`
+//     and switch on `ScrollOffsetChanged`. TUI's switch knew `explorer:sb`,
 //     `ext_panel:sb`, `tui:search_results`, `debug_sidebar:*` and
-//     `tui:editor:N:vsb|hsb`; GTK's knew `picker` and `editor:h_sb:N`; each was
-//     missing every id the other had, and the three ids they *did* share
-//     (`editor_hover`, `terminal_scrollback`, `debug_output`) were written out
-//     twice. Today each missing id names a surface only the other backend
-//     registers, so nothing is visibly broken — but the failure mode is a
-//     silent one: register an existing surface on the second backend and its
-//     thumb tracks (quadraui does that) over content that never scrolls,
-//     because nothing on that side applies the offset. [`apply_scroll_offset`]
-//     is the union, once, so registering the surface is the whole of the work.
+//     `tui:editor:N:vsb|hsb`; GTK's knew `picker` and `editor:h_sb:N`; the three
+//     ids they shared were written out twice. Today each missing id names a surface
+//     only the other backend registers, making the failure mode silent.
+//     [`apply_scroll_offset`] is the union, once.
 //
-//  3. **The orders disagreed on which gesture wins.** TUI ran
-//     sidebar-resize → hover-popup-selection → sidebar-body → explorer-DnD →
-//     tab-drag → command-line → armed-scrollbar → …; GTK ran
-//     armed-scrollbar → hover-popup-selection → modal-swallow → tab-drag →
-//     divider → …. Most pairs are spatially disjoint so the divergence was
-//     invisible until a surface overlapped — which is precisely how it will
-//     re-fork the next time someone adds one. [`route_mouse_drag`] states the
-//     order once; `render::mouse_drag_router_tests` pins it, and the parity test
-//     in that module drives the same `ScreenLayout` and point through both
-//     backends' unit conventions and asserts they land on the same rung.
+//  3. **Orders disagreed on which gesture wins.** TUI ran sidebar-resize →
+//     hover-popup-selection → sidebar-body → explorer-DnD → tab-drag →
+//     command-line → armed-scrollbar; GTK ran armed-scrollbar →
+//     hover-popup-selection → modal-swallow → tab-drag → divider. Divergence
+//     becomes visible when surfaces overlap. [`route_mouse_drag`] states the
+//     order once; tests pin it and verify both backends land on the same rung.
 //
-// **Deliberately still per backend**: the *apply* half of the rungs whose
-// arithmetic is genuinely in the backend's own units — the terminal panel's
-// resize clamp (TUI counts rows off the bottom chrome, GTK divides pixels by
-// `cached_line_height`) and the split divider's column clamp. Those are unit
-// conversions, not policy, and the policy — which gesture owns the event — is
-// what this rung moved.
+// Per backend: the *apply* half for gestures whose arithmetic is in the backend's
+// units — terminal-panel resize clamp and split-divider column clamp. Policy
+// (which gesture owns the event) moved here; unit conversion stays per backend.
 
 /// Which rung of the pointer-drag ladder owns a move-with-button-held event.
 ///
@@ -654,22 +594,20 @@ pub enum MouseDragRoute {
     /// The caller runs `dispatch_mouse_drag` and feeds the resulting
     /// `ScrollOffsetChanged` ids to [`apply_scroll_offset`].
     ArmedTarget,
-    /// The editor hover popup is mid text-selection (#216).
+    /// The editor hover popup is mid text-selection.
     HoverPopupSelection,
     /// The point is inside an open modal and nothing is armed — swallow it so
-    /// the drag cannot leak to the editor underneath (#192).
+    /// the drag cannot leak to the editor underneath.
     ModalSwallow,
     /// The sidebar separator is being dragged to resize the sidebar.
     SidebarResize,
     /// The sidebar body owns the gesture: the search / settings form
     /// controllers' own drag handling.
     SidebarBody,
-    /// An explorer drag-and-drop is in flight (#1429) — a file/folder row
-    /// was picked up and the gesture tracks the row under the pointer until
-    /// release, wherever the pointer strays. See [`apply_explorer_drag_move`]
-    /// for the apply and [`apply_explorer_drop`] for the release. Split out
-    /// of [`Self::SidebarBody`] (which used to carry this too) so the two
-    /// gestures are independently testable and neither can shadow the other.
+    /// An explorer drag-and-drop is in flight — a file/folder row was picked up
+    /// and the gesture tracks the row under the pointer until release. See
+    /// [`apply_explorer_drag_move`] and [`apply_explorer_drop`]. Split out of
+    /// [`Self::SidebarBody`] so the two gestures are independently testable.
     ExplorerDnd,
     /// The tab drag machine ([`TabDragState`]) is armed or already tracking.
     TabDrag,
@@ -681,14 +619,10 @@ pub enum MouseDragRoute {
     TerminalSplitDivider,
     /// The bottom panel's top edge is being dragged (panel resize).
     TerminalPanelResize,
-    /// The pointer is over a minimap strip with nothing armed. #1187: this
-    /// used to re-run `apply_minimap_click` (an absolute seek) on every
-    /// move, which is the bug this issue fixes — a real minimap drag now
-    /// always arms a `DragTarget::ScrollbarY` on press
-    /// ([`minimap_press`]/[`minimap_drag_widget`]), so subsequent moves hit
-    /// the [`Self::ArmedTarget`] rung above instead and this arm is a no-op.
-    /// Still reachable in principle for a drag that never pressed on the
-    /// strip at all (started elsewhere, swept over it with nothing armed).
+    /// The pointer is over a minimap strip with nothing armed. Continues armed as
+    /// a scroll drag on press ([`minimap_press`]), so subsequent moves hit
+    /// [`Self::ArmedTarget`] instead; this arm is a no-op for drags that started
+    /// elsewhere and swept over the minimap.
     Minimap,
     /// The pointer is inside the terminal's content rows — extend the
     /// terminal's own selection (or forward the move to the child).
@@ -700,22 +634,14 @@ pub enum MouseDragRoute {
 }
 
 /// Whether `drag_state` is armed with the rung [`MouseDragRoute::ArmedTarget`]
-/// means: a scrollbar or picker thumb.
+/// means: a scrollbar or picker thumb, not a text selection.
 ///
-/// **Not** the same as `quadraui::DragState::is_active()`. TUI's editor click
-/// path (#565) arms the *same* shared `DragState` with
-/// `DragTarget::TextSelection` so a later `Drag` event can recover which
-/// window the selection started in — but that gesture belongs to the
-/// [`MouseDragRoute::EditorText`] rung, not `ArmedTarget`, whose handler
-/// (`apply_scrollbar_drag` / GTK's `dispatch_mouse_drag` arm) only reacts to
-/// `UiEvent::ScrollOffsetChanged` and silently drops `TextSelectionChanged`.
-/// Feeding `is_active()` straight into `armed_target` therefore made
-/// `route_mouse_drag` resolve *every* text-selection drag to `ArmedTarget`,
-/// making the `EditorText` rung unreachable for the whole gesture (#756
-/// review). GTK never arms `TextSelection` on its shared `DragState` (it
-/// drives `EditorText` through its own `handle_mouse_drag`), so this is a
-/// no-op there today — called from both backends anyway so the exclusion is
-/// stated once, not re-derived if that ever changes.
+/// TUI's editor click path arms the shared `DragState` with
+/// `DragTarget::TextSelection` so a later `Drag` event can recover which window
+/// the selection started in. That gesture belongs to [`MouseDragRoute::EditorText`],
+/// not `ArmedTarget`, whose handler only reacts to `ScrollOffsetChanged`.
+/// GTK never arms `TextSelection` on its shared `DragState`, so this is a no-op
+/// there today — called from both backends anyway so the exclusion is stated once.
 pub fn drag_state_arms_scrollbar(drag_state: &quadraui::DragState) -> bool {
     drag_state.is_active()
         && !matches!(
@@ -746,10 +672,8 @@ pub struct MouseDragState<'a> {
     pub sidebar_resizing: bool,
     /// The sidebar body's painted bounds, when that body wants drag events
     /// (the search / settings form controllers). `None` when the sidebar is
-    /// hidden or its panel has no drag behaviour. Explorer DnD used to be
-    /// folded in here too (armed rather than geometric) — see
-    /// [`Self::explorer_dnd_active`], which replaced it (#1429) so the two
-    /// gestures route to distinct [`MouseDragRoute`] variants.
+    /// hidden or its panel has no drag behaviour. Explorer DnD used to be armed
+    /// here too; see [`Self::explorer_dnd_active`] for why it split.
     pub sidebar_body: Option<quadraui::Rect>,
     /// [`TabDragState`] is armed or dragging.
     pub tab_dragging: bool,
@@ -761,7 +685,7 @@ pub struct MouseDragState<'a> {
     pub terminal_split_dragging: bool,
     /// The bottom panel is being resized.
     pub terminal_panel_resizing: bool,
-    /// An explorer drag-and-drop is in flight (#1429). Armed rather than
+    /// An explorer drag-and-drop is in flight. Armed rather than
     /// geometric, for the same reason [`Self::tab_dragging`]/
     /// `text_selection_active` are: once a row has been picked up the
     /// gesture belongs to the tree even while the pointer is outside the
@@ -770,22 +694,13 @@ pub struct MouseDragState<'a> {
     /// panel. Callers compute this as
     /// `explorer_drag_src.is_some() || explorer_drag_active.is_some()`.
     pub explorer_dnd_active: bool,
-    /// `Engine::mouse_drag_active` — a previous move in this same gesture
-    /// already extended the editor's visual selection.
-    ///
-    /// Armed rather than geometric, for the same reason `explorer_dnd_active`
-    /// is: once a selection has started extending, a later move that strays over
-    /// the minimap strip or the terminal-panel rect must not get stolen by
-    /// that geometry — it must keep extending the selection, exactly like
-    /// dragging a native text selection past a window's edge. Set from the
-    /// engine's own state (shared by both backends) rather than from
-    /// `armed_target`/`quadraui::DragState` because [`drag_state_arms_scrollbar`]
-    /// deliberately excludes `DragTarget::TextSelection` from `armed_target` —
-    /// this field is what keeps that exclusion from re-opening the same
-    /// "geometry steals an in-progress gesture" bug one rung down (#756
-    /// review: an editor-text drag whose pointer strays into the terminal
-    /// panel used to get re-routed to [`MouseDragRoute::TerminalContent`]
-    /// once `armed_target` no longer swallowed it).
+    /// `Engine::mouse_drag_active` — a previous move in this gesture already
+    /// extended the editor's visual selection. Armed (not geometric) so a later
+    /// move straying over the minimap or terminal panel keeps extending the
+    /// selection instead of being stolen by geometry, like a native text-selection
+    /// drag past a window's edge. Set from engine state (shared by both backends)
+    /// rather than from `armed_target` because this field ensures that exclusion
+    /// keeps a geometry-steals-gesture bug from re-opening.
     pub text_selection_active: bool,
     /// `true` when the point is inside a painted terminal pane's content cells
     /// — ask [`in_terminal_pane_content`], which both backends call so the
@@ -891,9 +806,7 @@ pub fn route_mouse_drag(state: &MouseDragState<'_>, x: f64, y: f64) -> MouseDrag
         return MouseDragRoute::TerminalContent;
     }
     // The editor area needs no left-edge gate: `layout.windows` holds only the
-    // painted editor windows, so a point over the activity bar or sidebar
-    // simply matches none of them. (TUI used to carry an `editor_left` guard
-    // here; it was a second, hand-maintained statement of the same fact.)
+    // painted editor windows, so a point outside them simply matches none.
     if let Some(layout) = state.layout {
         if let Some(idx) = find_window_at(layout, x, y) {
             let rw = &layout.windows[idx];
@@ -935,15 +848,8 @@ pub fn in_terminal_pane_content(
     )
 }
 
-/// Apply a pointer *drag* inside the bottom panel's content rows.
-///
-/// Resolves through the same [`route_bottom_panel_click`] the press path uses,
-/// so a terminal selection drag reads the same pane-local cell the press
-/// anchored it to. This replaces two hand-rolled translations: TUI reconstructed
-/// the strip's top row and the active pane's x from `terminal_split_layout` by
-/// hand, and GTK did a bare `x / char_width` against a window-absolute `x`
-/// (bug 2 of the `#754` banner, which the press path fixed and the drag path
-/// kept). Returns `true` when the drag was consumed.
+/// Apply a pointer *drag* inside the bottom panel's content rows, reading the
+/// same pane-local cell the press path resolved. Returns `true` when consumed.
 pub fn apply_terminal_content_drag(
     engine: &mut Engine,
     x: f64,
@@ -1036,12 +942,9 @@ pub fn apply_scroll_offset(
         // Owned by quadraui's `SidebarSystem` — consume without applying.
         "tui:search_results" => true,
         other if other.starts_with("debug_sidebar:") => true,
-        // Editor window scrollbars. TUI's production `mouse.rs` drag path
-        // encodes both axes as `tui:editor:<window_id>:<vsb|hsb>`; the
-        // shared `crate::app::App` dispatch (both backends, via
-        // `handle_mouse_click_msg`'s h/v-scrollbar rungs — #825/#1026)
-        // encodes them as `editor:h_sb:<window_id>` / `editor:v_sb:<window_id>`
-        // instead, one arm per axis below.
+        // Editor window scrollbars. TUI encodes both axes as
+        // `tui:editor:<window_id>:<vsb|hsb>`; the shared dispatch encodes them as
+        // `editor:h_sb:<window_id>` / `editor:v_sb:<window_id>`.
         other if other.starts_with("tui:editor:") => {
             let Some((wid_str, axis)) = other["tui:editor:".len()..].split_once(':') else {
                 return false;
@@ -1070,7 +973,7 @@ pub fn apply_scroll_offset(
             engine.set_scroll_left_for_window(crate::core::WindowId(wid), new_offset);
             true
         }
-        // GTK's own v-scrollbar rung (#1026/#987) — mirrors `editor:h_sb:`
+        // GTK's own v-scrollbar rung — mirrors `editor:h_sb:`
         // immediately above, one id per axis.
         other if other.starts_with("editor:v_sb:") => {
             let Ok(wid) = other["editor:v_sb:".len()..].parse::<usize>() else {
@@ -1081,11 +984,9 @@ pub fn apply_scroll_offset(
             engine.sync_scroll_binds();
             true
         }
-        // The minimap's own viewport-highlight thumb (#1187) —
-        // `minimap_press`/`minimap_drag_widget` arm this on press; every
-        // continued drag-move applies here exactly like the editor's own
-        // v-scrollbar, never re-running `apply_minimap_click`'s #1093
-        // centring jump (that only ever happens once, at press time).
+        // The minimap's viewport-highlight thumb. Armed on press; continued
+        // drag-moves apply here like the editor's v-scrollbar, never re-running
+        // the centring jump that only happens at press.
         other if other.starts_with("minimap:") => {
             let Ok(wid) = other["minimap:".len()..].parse::<usize>() else {
                 return false;
@@ -1099,57 +1000,38 @@ pub fn apply_scroll_offset(
     }
 }
 
-// ═══ Panels rung (#754, mouse-ladder slice 4) ════════════════════════════════
+// ═══ Panels rung ══════════════════════════════════════════════════════════════════
 //
-// The rung beneath the divider rung above: once no modal, no chrome band and no
-// resize handle has claimed the point, the *panels* get a look — the bottom
-// panel (terminal / debug output and the tab strip above them), the activity
-// bar's sidebar band, and the sidebar's own hover feedback.
+// The rung beneath the divider rung: once no modal, chrome band or resize handle
+// claims the point, the *panels* get a look — the bottom panel (terminal / debug
+// output), the activity bar's sidebar band, and the sidebar's hover feedback.
 //
 // What was wrong with the two transcriptions this replaces:
 //
-//  1. **The quickfix band height had three different rules in one binary.**
-//     The painter reserves rows only for a quickfix that has something in it
-//     (`compute_editor_layout`: `quickfix.open && !quickfix.items.is_empty()`),
-//     but TUI's mouse handler asked `if engine.quickfix.open { 6 }` in **four**
-//     separate places. `:copen` on an empty list therefore moved every band
-//     *below* the editor — the terminal strip, the separated status line, the
-//     terminal-resize clamp — six rows away from where they were painted, so
-//     clicks in the bottom sixth of the screen hit the wrong surface entirely.
-//     [`quickfix_panel_rows`] is now the one rule, and it is the painter's.
+//  1. **The quickfix band height had three different rules.** The painter reserves
+//     rows only for a quickfix with items, but TUI's handler asked `if
+//     engine.quickfix.open` in four places. `:copen` on an empty list moved every
+//     band below the editor six rows away, so clicks hit the wrong surface.
+//     [`quickfix_panel_rows`] is the one rule, from the painter.
 //
-//  2. **GTK measured the terminal pane's columns from the wrong origin.**
-//     `render_content` paints the bottom panel at the *editor's* left edge
-//     (right of the activity bar and sidebar), and TUI's handler duly did
-//     `col.saturating_sub(editor_left)` before calling
-//     `Engine::handle_terminal_pane_press`. GTK's arm did a bare
-//     `x / cached_char_width` against a window-absolute `x`, so with the
-//     sidebar open every click in the terminal landed ~`(activity_bar +
-//     sidebar) / char_width` columns to the right of the glyph the user aimed
-//     at — and the further right you clicked, the further the terminal's own
-//     selection anchor drifted. [`BottomPanelMetrics::panel_left`] makes the
-//     origin an input the caller must state, so it cannot be forgotten again.
+//  2. **GTK measured the terminal pane's columns from the wrong origin.** The
+//     bottom panel is painted at the editor's left edge (right of activity bar
+//     and sidebar), and TUI duly did `col.saturating_sub(editor_left)`. GTK did
+//     a bare `x / cached_char_width` against window-absolute `x`, so every click
+//     with the sidebar open landed columns to the right of what the user aimed at.
+//     [`BottomPanelMetrics::panel_left`] makes the origin an input.
 //
-//  3. **The `terminal_open` gate disagreed.** TUI refused to route Toolbar /
-//     Content presses unless `engine.terminal_open`, GTK routed them whenever
-//     geometry existed. `Engine::resolve_bottom_panel_zone` already returns
-//     `None` when the panel is not painted, which is the question both gates
-//     were badly approximating, so the converged router asks only that.
+//  3. **The `terminal_open` gate disagreed.** TUI refused to route unless
+//     `engine.terminal_open`, GTK whenever geometry existed. The router asks
+//     only what `Engine::resolve_bottom_panel_zone` returns.
 //
-//  4. **The sidebar hover rung existed on TUI and was blank on GTK** — the
-//     mechanism behind #499/#484. `sc_panel_layout` is populated by the
-//     *shared* painter (`draw_sc_sidebar_panel`), so the geometry a hover needs
-//     was already cross-backend; only the ~78 lines that read it were
-//     TUI-only. [`route_sidebar_hover`] is that code, once, in the caller's own
-//     units.
+//  4. **The sidebar hover rung existed on TUI and was blank on GTK** (#499/#484).
+//     Geometry was cross-backend; only the ~78 lines that read it were TUI-only.
+//     [`route_sidebar_hover`] is that code, once, in caller units.
 //
-// **Deliberately still per backend**: TUI's terminal scrollback scrollbar.
-// `TerminalSplitHit::Scrollbar` is resolved by the shared split layout, but
-// only the TUI paints a scrollback track, so only the TUI arms a drag for it.
-// The *geometry* of that drag is stated here anyway
-// ([`terminal_scrollback_drag_target`]) so the day GTK grows a track it reads
-// the same numbers, rather than re-deriving them from `bottom_panel_geometry`
-// by hand the way both backends historically did with everything else.
+// Per backend: TUI's terminal scrollback scrollbar. Only TUI paints a track and
+// arms a drag for it. Geometry ([`terminal_scrollback_drag_target`]) is stated
+// here so GTK reads the same numbers when it grows one.
 
 /// Rows the quickfix/location-list panel occupies, as the **painter**
 /// reserves them.
@@ -1162,7 +1044,7 @@ pub fn apply_scroll_offset(
 /// location list — the two share one bottom "list rung"
 /// ([`QuickfixPanel::title`]).
 pub fn quickfix_panel_rows(engine: &Engine) -> u16 {
-    // #1307: a target with a real `WindowLayout` leaf reserves its own
+    // A target with a real `WindowLayout` leaf reserves its own
     // space via the split tree, exactly like any other window — this
     // overlay band must not *also* reserve rows for it, or the two would
     // double up. `qf_has_real_window` is `false` for every existing caller
@@ -1306,9 +1188,7 @@ pub struct BottomPanelEffect {
 /// Apply a resolved [`BottomPanelRoute`].
 ///
 /// `toolbar_ctx` is the caller's terminal sizing context, used only by the
-/// `Toolbar` arm. Focus bookkeeping (`terminal_has_focus`) is done here so both
-/// backends agree on it — TUI used to set it only in the `Toolbar` arm and GTK
-/// for every zone but `TabBar`.
+/// `Toolbar` arm. Focus bookkeeping is done here so both backends agree on it.
 pub fn apply_bottom_panel_route(
     engine: &mut Engine,
     route: BottomPanelRoute,
@@ -1333,7 +1213,7 @@ pub fn apply_bottom_panel_route(
         }
         BottomPanelRoute::Split(hit) => {
             engine.terminal_has_focus = true;
-            // #533: the button/mods are passed so a split-pane click can
+            // The button/mods are passed so a split-pane click can
             // `forward_mouse(Press)` to a child that has mouse reporting on.
             effect.split_drag = engine.handle_terminal_split_click(
                 hit,
@@ -1372,7 +1252,7 @@ pub enum SidebarOwner {
     Extensions,
     Settings,
     Ai,
-    /// The Board panel (#521).
+    /// The Board panel.
     Board,
     /// A plugin-provided panel, by bare name (no `ext:` prefix).
     ExtPanel(String),
@@ -1399,20 +1279,10 @@ impl SidebarOwner {
         })
     }
 
-    /// The full engine panel-id string this owner was resolved from — same
-    /// as [`Self::panel_id`] but also covers `ExtPanel` (reconstructing its
-    /// `"ext:{name}"` form) and `Unknown` (the empty string; unreachable in
-    /// practice, since `app_shell.active_panel_id()` only ever holds one of
-    /// the seven fixed panels — ext panels bypass `app_shell` registration
-    /// entirely, per this type's own doc comment).
-    ///
-    /// #823 item 7: GTK stated this exact `ext_panel_active` /
-    /// `app_shell.active_panel_id()` resolution three times —
-    /// `App::current_active_panel_id`, `App::paint_sidebar_panel_rung`, and
-    /// the real `sidebar_owner` call a few hundred lines below both — for
-    /// callers that still need the id as a string to match against the
-    /// `PANEL_*` constants rather than this enum. This is that shared
-    /// string form.
+    /// The full engine panel-id string this owner was resolved from — covers
+    /// `ExtPanel` (reconstructing its `"ext:{name}"` form) and `Unknown` (the
+    /// empty string). Used by callers that need the id as a string to match
+    /// against the `PANEL_*` constants rather than this enum.
     pub fn panel_id_string(&self) -> String {
         match self {
             SidebarOwner::ExtPanel(name) => format!("ext:{name}"),
@@ -1460,31 +1330,19 @@ pub struct ActivityPanelSwitch {
     pub ext_panel: Option<String>,
 }
 
-/// Activate the activity-bar item for `panel_id` — the click-on-an-icon
-/// behaviour, stated once.
+/// Activate the activity-bar item for `panel_id` — click-on-an-icon behaviour.
 ///
-/// `panel_id` is either a built-in `PANEL_*` id or an `ext:{name}` plugin
-/// panel; the two need different bookkeeping because plugin panels bypass
-/// `AppShell` entirely (there is no dynamic `PanelDefinition` to `show_panel`),
-/// and *that* asymmetry is the whole reason both backends had grown their own
-/// copy — TUI in the `ActivityBarTarget` match inside `handle_mouse`, GTK in
-/// `App::switch_panel`. The two copies had drifted on both halves:
+/// `panel_id` is either a built-in `PANEL_*` id or an `ext:{name}` plugin panel.
+/// Plugin panels bypass `AppShell` entirely, creating asymmetry both backends had
+/// grown their own copy to handle. The two copies had drifted:
 ///
-///   * **#637's focus clear was TUI-only.** A plugin panel taking over the
-///     sidebar body must drop whatever panel's focus flag was left set, because
-///     `app_shell`'s active-panel id is deliberately *not* moved for a plugin
-///     panel and so nothing else clears it. Without it a stale
-///     `ext_sidebar_has_focus` from an earlier visit to the Extensions
-///     marketplace keeps `active_panel_is(PANEL_EXTENSIONS)`'s `SidebarSystem`
-///     intercept looking focused while a completely different panel is on
-///     screen — GTK had that bug for as long as it had `switch_panel`.
-///   * **the re-entry guard was GTK-only.** TUI reset `ext_panel_selected` to 0
-///     and re-fired `plugin_event("panel_focus", …)` on *every* activation,
-///     including one that merely re-showed the panel already active, so
-///     clicking a plugin icon twice scrolled its list back to the top and made
-///     the plugin see a spurious second focus event.
-///
-/// Both are fixed here, in the one copy.
+///   * **Focus clear was TUI-only.** A plugin panel taking over the sidebar must
+///     drop whatever panel's focus flag was left set (since `app_shell`'s
+///     active-panel id is deliberately *not* moved for plugins). Without it a
+///     stale focus flag keeps old sidebar focus state showing.
+///   * **Re-entry guard was GTK-only.** TUI re-fired the plugin-focus event on
+///     *every* activation, including re-showing the already-active panel, so
+///     clicking twice scrolled the list back to the top.
 pub fn apply_activity_panel_switch(engine: &mut Engine, panel_id: &str) -> ActivityPanelSwitch {
     match panel_id.strip_prefix("ext:") {
         Some(name) => {
@@ -1524,14 +1382,9 @@ pub fn apply_activity_panel_switch(engine: &mut Engine, panel_id: &str) -> Activ
 
 /// The painted sidebar body, in the caller's own units.
 ///
-/// `row_h`/`header_rows` used to back a uniform-row-height hit-test
-/// (`content_row`, removed by #1236) for the `ExtPanel` owner; that arm now
-/// routes through [`ext_panel_hit_flat_index`]'s cached `Backend::tree_layout`
-/// instead, since a real multi-section panel has no single row height a
-/// linear formula can hit-test against (see `Engine::ext_panel_tree_layout`'s
-/// doc). The fields stay — both backends still compute them from the frame
-/// that was actually painted, and a future uniform-pitch owner can reuse them
-/// — but only `bounds` (via [`Self::contains_x`]) is read today.
+/// `row_h`/`header_rows` backed a uniform-row-height hit-test; that arm now routes
+/// through the cached tree layout instead. The fields stay for future uniform-pitch
+/// owners, but only `bounds` (via [`Self::contains_x`]) is read today.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SidebarBodyGeometry {
     pub bounds: quadraui::Rect,
@@ -1557,7 +1410,6 @@ impl SidebarBodyGeometry {
 /// Reads `Engine::ext_panel_tree_layout` — the `Backend::tree_layout` cached
 /// by whichever paint arm ran this frame — rather than re-deriving row
 /// geometry from a uniform `row_h`; see that field's own doc for why
-/// (#1089).
 pub fn ext_panel_hit_flat_index(engine: &Engine, pos: quadraui::Point) -> Option<usize> {
     let cached = engine.ext_panel_tree_layout.borrow();
     let (body_rect, layout) = cached.as_ref()?;
@@ -1574,26 +1426,16 @@ pub fn ext_panel_hit_flat_index(engine: &Engine, pos: quadraui::Point) -> Option
     }
 }
 
-/// Apply a press at `pos` to the plugin panel: select the row it landed on
-/// and perform the same select/toggle action a real `Enter` press (or a
-/// double-click) would. Shared by TUI's `tui_main::mouse::handle_mouse` and
-/// the cross-backend `App::try_route_sidebar_mouse_event` (GTK/macOS/Win)
-/// so the two backends' plugin-panel click geometry can't drift apart the
-/// way their *paint* geometry used to (#1089) — both derive `pos`'s
-/// resolution from [`ext_panel_hit_flat_index`], never a hand-rolled
-/// per-backend formula.
+/// Apply a press at `pos` to the plugin panel: select the row and perform the
+/// select/toggle action a real `Enter` press (or double-click) would.
 ///
-/// A no-op (selection unchanged) when `pos` doesn't land on a row, or when
-/// the resolved index is past the end of the flat row list (stale cache).
-/// Route a click at `pos` (sidebar-local, same units the last frame painted
-/// the Board with) against the [`quadraui::BoardLayout`] cached at paint
-/// time. Phase 0 (#521) only handles selection + open — a double-click (or
-/// Enter, via [`Engine::dispatch_board_key_unified`]) opens the card, a
-/// single click selects it. A column-header click and a miss are both
-/// no-ops; there is nothing to collapse/expand yet.
+/// Shared by TUI and the cross-backend `App::try_route_sidebar_mouse_event`,
+/// so the two backends' plugin-panel click geometry can't drift apart the way
+/// their *paint* geometry used to. Both resolve `pos` from [`ext_panel_hit_flat_index`].
 ///
-/// Returns whether the click landed on something the panel owns — the same
-/// "consumed" contract [`route_ext_panel_click`]'s callers use.
+/// A no-op when `pos` doesn't land on a row or index is past the end of the flat
+/// row list. Phase 0 only handles selection + open — single click selects, double
+/// opens. Returns whether the click landed on something the panel owns.
 pub fn route_board_click(engine: &mut Engine, pos: quadraui::Point, is_double_click: bool) -> bool {
     let hit = engine
         .board_layout
@@ -1615,7 +1457,7 @@ pub fn route_board_click(engine: &mut Engine, pos: quadraui::Point, is_double_cl
 
 /// Resolve a right-click at `pos` (board-native units, same convention as
 /// [`route_board_click`]) against the cached [`quadraui::BoardLayout`] to
-/// the card it landed on, if any (#523). A column-header or empty-space
+/// the card it landed on, if any. A column-header or empty-space
 /// right-click isn't a context-menu trigger. Callers convert `pos` to the
 /// cell units `Engine::open_board_context_menu` expects — mirroring
 /// `App::handle_tab_right_click`/`handle_editor_right_click`'s own
@@ -1660,20 +1502,15 @@ pub fn route_ext_panel_click(engine: &mut Engine, pos: quadraui::Point, is_doubl
     } else {
         // Single-click toggles sections/expandable items — suppressed on a
         // double-click so the second `Down` doesn't un-toggle what the
-        // first one just toggled (#484).
+        // first one just toggled.
         engine.handle_ext_panel_key("Return", false, None);
     }
 }
 
-/// Update [`Engine::gutter_hover_window`] from the pointer position against
-/// the last-painted `ScreenLayout` (#1544's `fold_controls = "mouseover"`).
-///
-/// Routes through the exact same [`find_window_at`] + [`window_zone_hit_test`]
-/// pair every pixel→click-target resolver in `src/click.rs` already uses, so
-/// a gutter-hover decision can never drift from what a real click at the
-/// same point would resolve to. Both backends call this from the same
-/// shared `MouseMoved` arm in `App::handle_dispatch` — no per-backend hover
-/// geometry.
+/// Update [`Engine::gutter_hover_window`] from the pointer position against the
+/// last-painted `ScreenLayout`. Routes through the same [`find_window_at`] +
+/// [`window_zone_hit_test`] pair every click-target resolver uses, so a gutter
+/// decision can never drift from what a real click would resolve to.
 pub fn route_gutter_hover(
     engine: &mut Engine,
     layout: &ScreenLayout,
@@ -1691,30 +1528,15 @@ pub fn route_gutter_hover(
     });
 }
 
-/// Hover feedback for the sidebar — the Source Control toolbar buttons and
-/// section rows, and plugin ext-panel rows.
+/// Hover feedback for the sidebar — Source Control toolbar buttons and section
+/// rows, and plugin ext-panel rows.
 ///
-/// This is the rung the issue calls out as "blank on GTK": the code below ran
-/// only on TUI, so #499/#484's ext-panel hover cards and the SC button
-/// highlight simply did not exist in the GUI, and any fix to one side was
-/// invisible on the other.
+/// `mouse_on_popup` is the caller's answer to "is the pointer over the hover card
+/// itself" — dismissing while on the card prevents reading it.
 ///
-/// `mouse_on_popup` is the caller's own answer to "is the pointer over the
-/// hover card itself" — dismissing while the pointer is on the card is what
-/// makes a hover card impossible to read.
-///
-/// Returns `true` when this call actually changed something this function
-/// paints synchronously — today that's only `engine.sc_button_hovered` (the
-/// SC toolbar hover highlight), since every other mutation here
-/// (`panel_hover_mouse_move`/`dismiss_panel_hover`) only arms a dwell/dismiss
-/// *timer*; the popup itself (`engine.panel_hover`, what paint actually
-/// reads) only flips later, from the tick loop's own `poll_panel_hover`,
-/// which already reports its own redraw need independently. Do **not** read
-/// this as "pointer is inside the sidebar body" — #1722 review: it used to
-/// return `geometry.contains_x(x)` regardless of whether any hover state
-/// changed, so every `MouseMoved` whose X falls in the sidebar column (most
-/// of the left strip whenever the sidebar is open) forced a full repaint,
-/// even two consecutive moves to the same pixel.
+/// Returns `true` when this call actually changed something this function paints
+/// synchronously — today that's only `engine.sc_button_hovered` (SC hover
+/// highlight); other mutations only arm timers.
 pub fn route_sidebar_hover(
     engine: &mut Engine,
     owner: &SidebarOwner,
@@ -1728,7 +1550,7 @@ pub fn route_sidebar_hover(
     let sc_button_hovered_before = engine.sc_button_hovered;
     match owner {
         SidebarOwner::Git if inside => {
-            // Route via the cached `SidebarPanelLayout` (#509) — no per-frame
+            // Route via the cached `SidebarPanelLayout` — no per-frame
             // arithmetic, and it hit-tests in the same absolute space the
             // shared painter built it in, which is why this works unchanged on
             // both backends.
@@ -1770,7 +1592,7 @@ pub fn route_sidebar_hover(
             // panel pitches header rows and item rows differently on
             // GTK/macOS/Win (`Engine::ext_panel_tree_layout`'s own doc), so a
             // linear formula resolves the wrong row near a section boundary
-            // (#1236). `ext_panel_hit_flat_index` already returns an absolute
+            //. `ext_panel_hit_flat_index` already returns an absolute
             // flat index (matching `ext_panel_to_tree_view`'s own numbering),
             // so no `ext_panel_scroll_top` offset is added here — adding one
             // would double-count the scroll the cached layout already baked
@@ -1803,14 +1625,14 @@ pub fn route_sidebar_hover(
 mod tests {
     use super::*;
 
-    // ── editor_hover_to_quadraui_rich_text adapter tests (#488) ──────────────
+    // ── editor_hover_to_quadraui_rich_text adapter tests ─────────────────────
 
     /// Build a minimal `EditorHoverPopupData` with a known link on line 0 so
     /// we can verify that `editor_hover_to_quadraui_rich_text` maps it into
     /// `RichTextPopup.links` with the correct byte offsets.  These offsets are
     /// exactly what the GTK `link_widths` closure indexes into via
     /// `pango_layout.index_to_pos(start_byte)` — wrong offsets would shift the
-    /// hit-rect even if the Pango measurement itself is accurate (#488).
+    /// hit-rect even if the Pango measurement itself is accurate.
     #[test]
     fn test_editor_hover_to_quadraui_rich_text_link_offsets() {
         let line = "See https://example.com for details";

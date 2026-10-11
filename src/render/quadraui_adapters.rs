@@ -5,10 +5,10 @@ use super::*;
 /// The `WidgetId` every editor tab bar paints under.
 ///
 /// Backends cache a resolved `quadraui::TabBarLayout` per `WidgetId` at paint
-/// time, and quadraui#594's `GtkDriver::tab_center` / `tab_close_center` look
-/// the layout back up by that id — so a test aiming a click at a specific tab
-/// needs this exact string. Named here rather than spelled out at each call
-/// site so the harness and the primitive cannot drift apart (#659).
+/// time, and `GtkDriver::tab_center` / `tab_close_center` look the layout back
+/// up by that id — so a test aiming a click at a specific tab needs this exact
+/// string. Named here rather than spelled out at each call site so the harness
+/// and the primitive cannot drift apart.
 ///
 /// Note this is a *per-bar* id, not a per-group one: in a split every group's
 /// tab bar paints under the same id, so the cached layout is whichever group
@@ -178,7 +178,7 @@ pub fn build_bottom_panel_tab_bar(
     }
 }
 
-// ─── Terminal toolbar adapter (#305) ─────────────────────────────────────────
+// ─── Terminal toolbar adapter ────────────────────────────────────────────────
 
 /// The terminal toolbar is either a find bar or a tab strip.
 pub enum TerminalToolbar {
@@ -299,21 +299,18 @@ pub fn to_quadraui_theme(theme: &Theme) -> quadraui::Theme {
     to_quadraui_theme_editor(theme, chrome)
 }
 
-/// #1574: this literal is **exhaustive on purpose** — no
+/// This literal is **exhaustive on purpose** — no
 /// `..quadraui::Theme::default()` spread. Every `quadraui::Theme` field
 /// vimcode's rasterisers paint with must come from vimcode's own themed
 /// palette; a spread here would let a newly-added quadraui `Theme` field
-/// silently fall back to quadraui's hardcoded dark default (exactly how
-/// `inactive_selected_bg` shipped unmapped, painting `#333` text on a dark
-/// navy `(35,40,58)` unfocused-selection row under `vscode-light`) instead
-/// of failing the build with `error[E0063]: missing field`. quadraui's own
-/// `theme.rs` uses the identical exhaustive-literal technique for exactly
-/// this reason — that one guards quadraui's downstream consumers (e.g. the
-/// unmapped `tab_active_border_top` it caught in quadraui#620) rather than a
-/// consumer's own mapping, but the compile-time guarantee is the same one
-/// this literal now gives vimcode. Adding a field to `quadraui::Theme` is
-/// a compile error here until it's mapped (or deliberately assigned a
-/// documented vimcode-side value below) — that is the point.
+/// silently fall back to quadraui's hardcoded dark default instead of failing
+/// the build with `error[E0063]: missing field`. quadraui's own `theme.rs`
+/// uses the identical exhaustive-literal technique for exactly this reason —
+/// that one guards quadraui's downstream consumers rather than a consumer's
+/// own mapping, but the compile-time guarantee is the same one this literal
+/// now gives vimcode. Adding a field to `quadraui::Theme` is a compile error
+/// here until it's mapped (or deliberately assigned a documented vimcode-side
+/// value below) — that is the point.
 ///
 /// Some fields below (`editor_active_background` through `ghost_text_fg`)
 /// are immediately re-asserted by [`to_quadraui_theme_editor`]'s own
@@ -334,7 +331,7 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         surface_bg: theme.fuzzy_bg,
         surface_fg: theme.fuzzy_fg,
         selected_bg: theme.fuzzy_selected_bg,
-        // #1574: was missing entirely (fell through to quadraui's dark
+        // Was missing entirely (fell through to quadraui's dark
         // `Theme::default()` navy) — this is the Explorer's
         // unfocused-selected-row background (`sidebar_sel_bg_inactive`,
         // e4e6f1 under vscode-light).
@@ -361,13 +358,13 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         completion_border: theme.completion_border,
         completion_selected_bg: theme.completion_selected_bg,
         accent_bg: theme.tab_active_accent,
-        // #1574: was `theme.separator` — vimcode has its own dedicated
+        // Was `theme.separator` — vimcode has its own dedicated
         // `scrollbar_track` field (distinct from `separator` in every
         // colourscheme); using it directly is both more correct and
         // consistent with `scrollbar_thumb` just below.
         scrollbar_track: theme.scrollbar_track,
         scrollbar_thumb: theme.scrollbar_thumb,
-        // #1185: quadraui's `command_line_{bg,fg}` default to its own
+        // Quadraui's `command_line_{bg,fg}` default to its own
         // hardcoded colours (`Theme::default()`'s `bg`/`fg`, unrelated to
         // this literal's `background`/`foreground` override above) unless
         // mapped explicitly. Both backends now paint the command line
@@ -414,13 +411,15 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         annotation_fg: theme.annotation_fg,
         ghost_text_fg: theme.ghost_text_fg,
 
-        // ── Board / kanban (#362) — vimcode's `PANEL_BOARD` /
-        // `Backend::draw_board` (#521) were never given their own theme
-        // mapping (#1574 audit); reuse the closest existing semantic
-        // colour rather than leaving them on quadraui's dark default.
-        // Board's selected-card / column-header look like a ListView
-        // selection / a flat header strip respectively, so the same
-        // source fields as `selected_bg`/`header_bg` above apply.
+        // ── Board / kanban — vimcode's `PANEL_BOARD` / `Backend::draw_board`
+        // have no vimcode-native theme mapping; reuse the closest existing
+        // semantic colour rather than leaving them on quadraui's dark default.
+        // Board's selected-card / column-header look like a ListView selection /
+        // a flat header strip respectively, so the same source fields as
+        // `selected_bg`/`header_bg` above apply.
+        // `BadgeStatus` has no vimcode-native equivalent; map onto the nearest
+        // existing semantic colour rather than inventing new theme fields (one per
+        // colourscheme) for a status vocabulary vimcode doesn't otherwise have:
         board_selected_card_bg: theme.fuzzy_selected_bg,
         board_col_header_bg: theme.status_bg,
         // `BadgeStatus` has no vimcode-native equivalent; map onto the
@@ -478,7 +477,7 @@ fn to_quadraui_theme_editor(theme: &Theme, chrome: quadraui::Theme) -> quadraui:
     }
 }
 
-// ─── quadraui::Editor adapter (#276 Stage 1C) ────────────────────────────────
+// ─── quadraui::Editor adapter ────────────────────────────────────────
 //
 // Convert a vimcode `RenderedWindow` (engine-side IR) into a
 // `quadraui::Editor` for the lifted TUI / GTK rasterisers. Field-for-
@@ -491,14 +490,14 @@ fn to_quadraui_theme_editor(theme: &Theme, chrome: quadraui::Theme) -> quadraui:
 /// window using **exactly** the same construction paint uses
 /// (`to_q_editor` + `Editor::layout(editor.rect, ...)`), so click-column
 /// resolution and paint derive from one shared geometry computation
-/// instead of two independently reconstructed ones (#560). Callers pass
+/// instead of two independently reconstructed ones. Callers pass
 /// the resulting `&Editor`/`&EditorLayout` straight into
 /// `quadraui::Backend::editor_col_at_x` (GTK: exact Pango `xy_to_index`
 /// against the same per-span-attributed layout `draw_editor` painted
 /// with; TUI: `EditorLayout::col_at_x`'s uniform monospace division) —
 /// neither backend hand-rolls its own text-column inverse anymore.
 ///
-/// **GTK-correct, TUI-unsafe (#1040).** For GTK, `rw.rect` *is* the exact
+/// **GTK-correct, TUI-unsafe.** For GTK, `rw.rect` *is* the exact
 /// sub-pixel float geometry Cairo paints into, so `editor.rect` genuinely
 /// matches paint here. For TUI it does not: `rw.rect` comes from
 /// continuous float split math (`quadraui::SplitTree::layout`, zero
@@ -512,10 +511,9 @@ fn to_quadraui_theme_editor(theme: &Theme, chrome: quadraui::Theme) -> quadraui:
 /// `Editor` struct. Calling this function directly from TUI click code
 /// therefore resolves columns against a viewport that was never actually
 /// painted, landing one column left of the real one (clamped to 0 at the
-/// pane's first column, so it "sometimes" doesn't — exactly the #1040
-/// report). TUI click/drag/hover call sites must use
-/// [`tui_editor_text_layout`] instead, which resolves against
-/// [`tui_window_paint_rect`]'s whole-cell-truncated viewport.
+/// pane's first column, so it "sometimes" doesn't). TUI click/drag/hover
+/// call sites must use [`tui_editor_text_layout`] instead, which resolves
+/// against [`tui_window_paint_rect`]'s whole-cell-truncated viewport.
 pub fn editor_text_layout(
     rw: &RenderedWindow,
     char_width: f64,
@@ -536,7 +534,7 @@ pub fn editor_text_layout(
 /// rects are produced by continuous float split math and are not
 /// integer-valued in general, so click resolution must snap to the same
 /// grid paint already snapped to, or it silently resolves against
-/// geometry that was never painted (#1040).
+/// geometry that was never painted.
 ///
 /// TUI-only — GTK rects are real sub-pixel float geometry that Cairo
 /// paints exactly as given; do not call this from `gtk/click.rs`.
@@ -557,7 +555,7 @@ pub fn tui_window_paint_rect(rect: &WindowRect) -> WindowRect {
 /// argument for geometry (never the `Editor.rect` field itself), so this
 /// does not disturb anything else `to_q_editor`'s `editor.rect` is used
 /// for. Every TUI click/drag/hover call site that resolves a text column
-/// must use this, not `editor_text_layout` (#1040).
+/// must use this, not `editor_text_layout`.
 pub fn tui_editor_text_layout(rw: &RenderedWindow) -> (quadraui::Editor, quadraui::EditorLayout) {
     let editor = to_q_editor(rw);
     let viewport = quadraui::Rect::from(tui_window_paint_rect(&rw.rect));
@@ -852,10 +850,9 @@ pub fn window_status_line_to_status_bar(
 /// Paint the tab-hover tooltip (the small popup shown when the mouse
 /// hovers a tab and lingers, naming the buffer under the cursor) through
 /// `Backend::draw_status_bar` — the same "single-segment `StatusBar` stands
-/// in for a plain text row" trick TUI's now-retired `draw_rule_row_q` used
-/// (#609), generalized with an explicit `unit_w`/`unit_h` scale (#671)
-/// mirroring the convention `editor_hover_popup_paint` /
-/// `hover_popup_to_quadraui_tooltip` established in #669: `1.0`/`1.0` for
+/// in for a plain text row" technique generalized with an explicit
+/// `unit_w`/`unit_h` scale mirroring the convention `editor_hover_popup_paint`
+/// / `hover_popup_to_quadraui_tooltip` established: `1.0`/`1.0` for
 /// TUI's cell-native space, `char_width`/`line_height` in pixels for GTK.
 /// `x`/`y`/`max_width` are in the *same* native units as `unit_w`/`unit_h`
 /// (cells for TUI, pixels for GTK).
@@ -945,15 +942,9 @@ pub fn build_command_line(engine: &Engine) -> CommandLineData {
         _ => (engine.message.clone(), false, false, String::new()),
     };
 
-    // Safety: strip newlines so the command line never exceeds one row.
-    // A message that *starts* with a blank line (Neovim's `:digraphs`, no
-    // bang, deliberately leads with one to mirror `listdigraphs` —
-    // `format_digraph_table`, #1302) would otherwise make `.lines().next()`
-    // yield `""` and paint nothing at all, even though the message holds
-    // real content on its second line — so skip past any leading empty
-    // lines first and show the first line that actually has something in
-    // it. `trim_start_matches` only strips a *leading* run, so a message
-    // that never had a blank line (every other caller) is unaffected.
+    // Strip newlines so the command line never exceeds one row. Skip any leading
+    // empty lines so the first non-empty line displays (some messages deliberately
+    // lead with blank lines).
     let text = text
         .trim_start_matches('\n')
         .lines()

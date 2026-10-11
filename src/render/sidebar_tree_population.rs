@@ -19,7 +19,7 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
     let staged = engine.sc_section_files(SC_SECTION_STAGED);
     let unstaged = engine.sc_section_files(SC_SECTION_CHANGES);
     let show_worktrees = engine.sc_worktrees.len() > 1;
-    // #991: the Merge Changes section is only shown when the tree actually
+    // The Merge Changes section is only shown when the tree actually
     // has a conflict, so a clean repo still paints exactly two file
     // sections (the "not always-on" half of this issue).
     let show_merge = !merge.is_empty();
@@ -34,11 +34,7 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
         let ch = kind.map(|k| k.label()).unwrap_or('?');
         let color = match ch {
             'A' => add_fg,
-            // #1051: VS Code paints Untracked the same green family as
-            // Added — distinct from Modified's orange/yellow. Falling
-            // through to `mod_fg` here (the pre-#1051 behavior, back when
-            // this arm was still '?') left the badge miscolored even after
-            // the letter itself was corrected.
+            // Untracked uses the same color as Added, not Modified.
             'U' => add_fg,
             'D' => del_fg,
             '!' => del_fg,
@@ -112,7 +108,7 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
     sidebar.set_has_focus(engine.sc_has_focus);
     if engine.sc_has_focus && sidebar.active_section().is_none() {
         // Never land on the (possibly hidden) Merge Changes section by
-        // default — its actions resolve conflicts (#991).
+        // default — its actions resolve conflicts.
         sidebar.set_active_section(Some(SC_SECTION_STAGED));
     }
 
@@ -318,7 +314,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                     spans: vec![
                         StyledSpan {
                             text: line_prefix,
-                            // #1574: was a hard-coded `rgb(100, 100, 100)`
+                            // Was a hard-coded `rgb(100, 100, 100)`
                             // literal — unreadable on light colourschemes.
                             // Use the same muted tone the gutter's own line
                             // numbers paint with.
@@ -417,13 +413,13 @@ pub(crate) fn build_explorer_tree_rows(
                 icons::FOLDER.fallback.to_string(),
             ))
         } else {
-            // #992: filename-matched first (`Dockerfile`, `.gitignore`, ...
+            // Filename-matched first (`Dockerfile`, `.gitignore`, ...
             // -- `Path::extension()` is `None` for both a no-dot filename
             // and a leading-dot dotfile, so an extension-only lookup can
             // never badge either), falling back to the extension table.
             let glyph = icons::file_icon_for_name(&row.name).to_string();
             let file_icon = QIcon::new(glyph, ".".to_string());
-            // #1381: match the tab bar's filetype colour (`build_tab_bar_icons`
+            // Match the tab bar's filetype colour (`build_tab_bar_icons`
             // / `tab_icon_color`) so the same file gets the same glyph colour
             // in both places. Gated on Nerd Fonts the same way the tab bar
             // gates its icons entirely (`build_tab_bar_icons` returns `&[]`

@@ -1,9 +1,9 @@
 use super::*;
 
-// ─── Overlay tail: the history the fold preserves (#735 slice 1, #766) ───────
+// ─── Overlay tail: the history the fold preserves ───────────────────
 //
 // The paint twin of `route_modal_overlay_click` / `route_modal_key` above, and
-// the first rung ladder of #735 to be stated once instead of twice.
+// the first rung ladder to be stated once instead of twice.
 //
 // Frame *content* has been shared for a long time (`build_screen_layout` and
 // the ~30 builders around it); frame *composition* — which surface is laid
@@ -42,7 +42,7 @@ use super::*;
 //     icon nor in-canvas window controls. The app icon and window controls are
 //     painted from the [`FrameOp::MenuDropdown`] arm, because
 //     `MenuSystem::render` repaints the whole title-bar band and would erase
-//     anything laid down before it (#676/#712).
+//     anything laid down before it.
 //
 // **Why here and not in quadraui** (`CLAUDE.md`'s "check quadraui first"):
 // quadraui already owns the *shell* composition — `compose::app_shell::AppShell`
@@ -60,21 +60,17 @@ use super::*;
 /// status lines on, and a context menu + an in-canvas modal dialog open
 /// together.
 ///
-/// **This is #735's headline acceptance criterion made runnable.** Both
-/// backends drive an equivalent engine state and assert their recorded
+/// Both backends drive an equivalent engine state and assert their recorded
 /// `composed_frame` equals *this* value, so the two sequences are equal to each
 /// other by construction. A single test cannot drive both backends (the GTK
-/// `App` lives in the `vimcode` bin target, the pre-#1434 TUI shell in `vcd`), so "both
+/// `App` lives in the `vimcode` bin target, the TUI shell in `vcd`), so "both
 /// backends emit the same `FrameOp` sequence for a given `ScreenLayout`" is
 /// expressed as two tests sharing one expected value — a single `#[cfg(test)]`
 /// fn compiled into both bin targets, so the compiler keeps them in step
 /// instead of comment discipline.
 ///
-/// It could not be written before #766: until the chrome and overlay halves
-/// were one sequence there was no single artefact to compare, only two that a
-/// backend could get individually right and jointly wrong. Nine of the
-/// fifteen rungs are live and six are not, which is what keeps it
-/// *discriminating* — it must never degenerate into "whatever
+/// Nine of the fifteen rungs are live and six are not, which keeps this
+/// discriminating — it must never degenerate into "whatever
 /// [`FRAME_Z_ORDER`] contains".
 #[cfg(test)]
 pub(crate) fn frame_sequence_fixture() -> Vec<FrameOp> {
@@ -104,7 +100,7 @@ pub(crate) fn frame_sequence_fixture() -> Vec<FrameOp> {
 /// (`overlay_band_holds_only_the_title_bar_when_no_overlay_is_open_via_gtk_driver`
 /// / `overlay_band_is_empty_when_no_overlay_is_open_via_shell_app`'s GTK twin).
 ///
-/// GTK pins the title bar visible unconditionally (#552), so its "nothing open"
+/// GTK pins the title bar visible unconditionally, so its "nothing open"
 /// tail still has `MenuDropdown`/`CommandCenter` live; TUI's, with no title bar
 /// reserved, is empty. Both are read off the same `composed_frame` field,
 /// filtered to [`FrameOp::is_overlay`].
@@ -138,7 +134,7 @@ pub struct QuickfixPanel {
     /// Whether the quickfix panel has keyboard focus.
     pub has_focus: bool,
     /// `"QUICKFIX"` for the global list, `"LOCATION LIST"` when this panel
-    /// is showing the active window's `:l*` list instead (#1155).
+    /// is showing the active window's `:l*` list instead.
     pub title: &'static str,
 }
 
@@ -201,7 +197,7 @@ pub struct SourceControlData {
     pub ahead: u32,
     /// Number of commits behind the upstream.
     pub behind: u32,
-    /// Unmerged (conflicted) files — the "Merge Changes" section (#991).
+    /// Unmerged (conflicted) files — the "Merge Changes" section.
     /// Empty in a conflict-free tree, which is what keeps that section
     /// from being always-on.
     pub merge: Vec<ScFileItem>,
@@ -236,7 +232,7 @@ pub struct SourceControlData {
     pub help_open: bool,
     /// Y coordinate (in native units) where the sections area begins —
     /// the top of `SidebarPanelLayout.content_bounds` from the last paint
-    /// (#509). TUI: terminal rows. GTK: pixels. `None` until first paint.
+    ///. TUI: terminal rows. GTK: pixels. `None` until first paint.
     pub sc_sections_start_y: Option<f32>,
 }
 
@@ -253,16 +249,13 @@ pub struct BranchPickerData {
     pub create_input: String,
 }
 
-// #1489: `ExtSidebarItem`/`ExtSidebarData`, `ext_sidebar_to_multi_section_view`
-// and `build_ext_sidebar_data` used to live here as a second, entirely dead
-// data pipeline for the Extensions sidebar — nothing ever read
-// `ScreenLayout.ext_sidebar` (removed alongside them). The live path is
-// `Engine::populate_ext_sidebar_system` (`core/engine/ext_panel.rs`), which
-// paints straight into `engine.ext_sidebar_system` (`quadraui::SidebarSystem`).
+// The live path is `Engine::populate_ext_sidebar_system`
+// (`core/engine/ext_panel.rs`), which paints straight into
+// `engine.ext_sidebar_system` (`quadraui::SidebarSystem`).
 
 // ─── BoardData ─────────────────────────────────────────────────────────────────
 
-/// Rendering data for the Board panel (#521) — a generic host for the shared
+/// Rendering data for the Board panel — a generic host for the shared
 /// `quadraui::Board` component. `model` comes straight from vimcode's board
 /// contract (`Engine::board_model`, populated via the #522 `ToolClient`
 /// seam); this type adds only what the panel's own chrome needs on top of
@@ -311,7 +304,7 @@ pub struct ExtPanelSectionData {
 #[derive(Debug, Clone)]
 pub struct PanelHoverPopupData {
     /// Raw markdown source. Styled at paint time with the active theme —
-    /// see `EditorHoverPopupData::markdown`'s doc (#821).
+    /// see `EditorHoverPopupData::markdown`'s doc.
     pub markdown: String,
     /// Plain per-line text (markdown syntax stripped).
     pub line_text: Vec<String>,
@@ -368,10 +361,7 @@ pub fn panel_hover_to_quadraui_rich_text(
 /// for an ext-panel hover's flat `item_index` — the inverse of
 /// `route_sidebar_hover`'s `SidebarOwner::ExtPanel` arm, which sets
 /// `flat_idx = engine.ext_panel_scroll_top + row` (`render.rs`, just above
-/// [`route_sidebar_hover`]). #1087: the anchor code used to skip this
-/// subtraction entirely and anchor to the flat index as if it were a screen
-/// row, so anything scrolled past the first screenful painted dozens of rows
-/// below the viewport.
+/// [`route_sidebar_hover`]).
 ///
 /// Returns `None` when `item_index` is behind the current scroll offset,
 /// which can happen for one stale frame immediately after a scroll (the
@@ -385,7 +375,7 @@ pub(crate) fn ext_panel_hover_screen_row(panel: &ExtPanelData, item_index: usize
 /// plus the search-input row when it's visible. Mirrors `render_ext_panel`'s
 /// own `chrome_h` (`tui_main/panels.rs`) — the same condition
 /// `mouse.rs`'s `SidebarOwner::ExtPanel` click arm uses for
-/// `SidebarBodyGeometry::header_rows` (#1086) — so hover and click can't
+/// `SidebarBodyGeometry::header_rows` — so hover and click can't
 /// drift on what counts as chrome, *except* in the degenerate case
 /// `render_ext_panel` guards and this doesn't: its `chrome_h` is
 /// `.min(area.height)`, clamped to whatever the panel's viewport actually
@@ -394,7 +384,7 @@ pub(crate) fn ext_panel_hover_screen_row(panel: &ExtPanelData, item_index: usize
 /// unusably narrow sidebar), where a hover anchor could drift by a row
 /// from what was actually painted — not worth threading `area.height`
 /// through the hover path for that corner case today, but a future
-/// `SidebarBodyGeometry`-style unification (#1086) should derive both from
+/// `SidebarBodyGeometry`-style unification should derive both from
 /// one place.
 pub(crate) fn ext_panel_chrome_rows(panel: &ExtPanelData) -> usize {
     if panel.input_active || !panel.input_text.is_empty() {
@@ -405,19 +395,12 @@ pub(crate) fn ext_panel_chrome_rows(panel: &ExtPanelData) -> usize {
 }
 
 /// Vertical anchor (top of the hovered row, in the caller's line units) for
-/// [`panel_hover_popup_paint`]. Lifted from the now-dead
-/// `src/gtk/draw.rs::draw_panel_hover_popup`'s source-control section walk
-/// (#670) so both backends can share it instead of GTK re-deriving its own
-/// copy. The non-source-control branch is generalized to take an explicit
-/// `sidebar_top_y` rather than assuming the sidebar starts at row/pixel 0 —
-/// true in the pre-#552 single-DA GTK architecture that dead code was
-/// written against, no longer true now that a title-bar row can sit above
-/// the sidebar.
+/// [`panel_hover_popup_paint`]. The non-source-control branch takes an explicit
+/// `sidebar_top_y` to account for panels that don't start at row/pixel 0.
 ///
-/// Returns `None` when the anchor can't be computed this frame (#1087's
-/// scroll-underflow guard, or no `screen.ext_panel` yet) — callers should
-/// skip painting the popup for that frame rather than clamp to a garbage
-/// position.
+/// Returns `None` when the anchor can't be computed this frame (scroll
+/// underflow, or no `screen.ext_panel` yet) — callers should skip painting
+/// the popup for that frame rather than clamp to a garbage position.
 fn panel_hover_anchor_y(
     screen: &ScreenLayout,
     hover: &PanelHoverPopupData,
@@ -425,11 +408,10 @@ fn panel_hover_anchor_y(
     unit_h: f32,
 ) -> Option<f32> {
     if hover.panel_name != "source_control" {
-        // #1087: `hover.item_index` is a flat index across the whole panel
-        // list, not a screen row — subtract the scroll offset back out, and
-        // use the chrome rows this panel actually painted (1 or 2,
-        // depending on whether the search input row is showing) instead of
-        // the literal `1` this used to hardcode.
+        // `hover.item_index` is a flat index across the whole panel list, not a
+        // screen row — subtract the scroll offset to get the visible row, and use
+        // the chrome rows this panel actually painted (1 or 2, depending on whether
+        // the search input row is showing).
         let panel = screen.ext_panel.as_ref()?;
         let screen_row = ext_panel_hover_screen_row(panel, hover.item_index)?;
         let chrome_rows = ext_panel_chrome_rows(panel);
@@ -468,7 +450,7 @@ fn panel_hover_anchor_y(
     };
     let show_worktrees = sc.worktrees.len() > 1;
     let mut sections: Vec<(usize, bool)> = Vec::new();
-    // #991: Merge Changes sits above Staged and is present only when the
+    // Merge Changes sits above Staged and is present only when the
     // tree has conflicts — mirrors `Engine::sc_visible_sections`.
     if !sc.merge.is_empty() {
         sections.push((sc.merge.len(), sc.sections_expanded[SC_SECTION_MERGE]));
@@ -507,11 +489,8 @@ fn panel_hover_anchor_y(
 /// Paint the sidebar-item hover popup (source-control / extension-panel item
 /// dwell tooltip, rendered markdown) through the shared
 /// `quadraui::RichTextPopup` primitive — the panel-hover twin of
-/// [`editor_hover_popup_paint`] (#670). GTK previously hand-rolled this in
-/// raw Cairo/Pango (`src/gtk/draw.rs::draw_panel_hover_popup`, no live
-/// callers since the #540 Relm4->ShellApp migration); this instead reuses
-/// the same `RichTextPopup` / `Backend::draw_rich_text_popup` path TUI's
-/// `tui_main::panels::render_panel_hover_popup` already routes through, so
+/// [`editor_hover_popup_paint`]. This reuses the same `RichTextPopup` /
+/// `Backend::draw_rich_text_popup` path that both backends route through, so
 /// the two backends can't drift on the markdown rendering itself — only the
 /// anchor geometry (source-control section walk vs. uniform per-row offset)
 /// is backend-specific, and that's shared too via [`panel_hover_anchor_y`].
@@ -526,8 +505,7 @@ fn panel_hover_anchor_y(
 /// Returns `(link_rects, popup_bounds)` in the caller's units. Link rects
 /// carry a trailing `is_native` flag — `true` for the source-control panel's
 /// trusted links (open directly), `false` for extension-provided ones
-/// (confirm before opening) — mirroring GTK's retired `Msg::PanelHoverClick`'s two
-/// branches.
+/// (confirm before opening).
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn panel_hover_popup_paint(
     backend: &mut dyn quadraui::Backend,
@@ -557,7 +535,7 @@ pub fn panel_hover_popup_paint(
     let content_w = ((max_len + 2.0) * unit_w)
         .max(10.0 * unit_w)
         .min((avail_w - 2.0 * unit_w).max(10.0 * unit_w));
-    // #1087: `None` means the anchor can't be trusted this frame (e.g. the
+    // `None` means the anchor can't be trusted this frame (e.g. the
     // scroll-underflow guard in `ext_panel_hover_screen_row`) — skip
     // painting rather than fall back to a stale/garbage position.
     let Some(anchor_y) = panel_hover_anchor_y(screen, hover, sidebar_top_y, unit_h) else {
@@ -615,7 +593,6 @@ pub fn panel_hover_popup_paint(
 /// read survive here; the item lists (variables/watch/frames/breakpoints)
 /// were a dead second pipeline — the live rows come from
 /// `build_dap_{var,watch,stack,bp}_rows` → `populate_dap_sidebar_system`
-/// (#1489).
 #[derive(Debug, Clone)]
 pub struct DebugSidebarData {
     pub session_active: bool,

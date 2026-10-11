@@ -1,14 +1,9 @@
 use super::*;
 
-// ─── Test-only geometry/key helpers (#812) ────────────────────────────
+// Test-only geometry/key helpers
 //
-// These four were `pub fn` in the production body of this file with zero
-// callers outside `mod tests` — every backend routes the real thing
-// through the click/keymap paths instead. #812 moved them here rather
-// than deleting them: the tests below are the only consumers, and they
-// pin behaviour (tab-expansion, close-button hit box, `<C-S-x>` parsing)
-// that is still worth asserting. If a backend ever needs one, lift it
-// back out — do not add a second copy.
+// These functions are used only by tests below to verify behaviour
+// (tab-expansion, close-button hit box, `<C-S-x>` parsing).
 
 /// Compute the scrollbar-to-scroll-top mapping from a click position.
 /// Returns the new `scroll_top` value.
