@@ -101,84 +101,100 @@ jobs:
         echo "BIN_NAME=vimcode-linux-x86_64" >> $GITHUB_ENV
         echo "TUI_BIN_NAME=vcd-linux-x86_64" >> $GITHUB_ENV
 
-    # ── Publish to GitHub Releases ────────────────────────────────────────────
+    # The GitHub release body is this static preamble (status + install
+    # instructions) plus CHANGELOG.md's `## [<version>]` section, extracted
+    # by scripts/release_notes.py (ported from quadraui's
+    # scripts/release_decide.py `notes` subcommand, #1919). Fails here if
+    # that section is missing or empty -- a version bump with no changelog
+    # entry stops the release rather than publishing stale or absent notes.
+    - name: Build release notes body
+      run: |
+        python3 scripts/release_notes.py \
+          --changelog CHANGELOG.md \
+          --version "${VERSION}" \
+          --out "${RUNNER_TEMP}/changelog-section.md"
+        cat > "${RUNNER_TEMP}/release-body.md" <<'PREAMBLE'
+        ## Status: use the TUI
+
+        - **TUI (`vcd`) is the recommended way to use VimCode.** Usable on **Linux** and **macOS**. **Windows:** usable, with known rough edges (for example, the minimap viewport thumb is not visible in Windows Terminal, #1828).
+        - **GUI builds (`vimcode`) are not ready for use on any platform.** GUI artifacts are attached **for testing only**: GTK4 on Linux and macOS, and (new) the native Windows and native macOS GUIs.
+
+        PREAMBLE
+        cat "${RUNNER_TEMP}/changelog-section.md" >> "${RUNNER_TEMP}/release-body.md"
+        cat >> "${RUNNER_TEMP}/release-body.md" <<INSTALL
+
+        ## Installation
+
+        ### Linux
+
+        **Recommended: TUI-only binary (no GTK required, statically linked)**
+        ```
+        chmod +x vcd-linux-x86_64
+        ./vcd-linux-x86_64
+        ```
+        Statically linked with musl — runs on any Linux (Ubuntu 20.04+, CentOS 7+, Alpine, etc.). No GTK4 or other libraries needed.
+
+        **GUI — testing only, not ready for use**
+
+        .deb package:
+        ```
+        sudo dpkg -i ${{ env.DEB_NAME }}
+        sudo apt -f install    # installs any missing GTK4 runtime libraries
+        ```
+
+        Raw binary:
+        ```
+        # First install runtime dependencies:
+        sudo apt install libgtk-4-1 libglib2.0-0 libpango-1.0-0 libcairo2
+        # Then run:
+        chmod +x vimcode-linux-x86_64
+        ./vimcode-linux-x86_64
+        ```
+
+        > GUI binary requires GTK 4.10+. Ubuntu 22.04 ships GTK 4.6 which is too old; Ubuntu 24.04+ recommended.
+
+        ### macOS (Apple Silicon)
+
+        **Recommended: TUI**
+        ```
+        brew tap JDonaghy/vimcode
+        brew install vcd        # TUI only (no GTK4 dependency)
+        ```
+        or download `vcd-macos-arm64.tar.gz`, extract, and run:
+        ```
+        tar xzf vcd-macos-arm64.tar.gz
+        xattr -d com.apple.quarantine vcd   # binaries are ad-hoc signed, not notarized
+        ./vcd
+        ```
+
+        **GUI — testing only, not ready for use**
+        - **Native (AppKit, no dependencies):** download `vimcode-macos-native-arm64.tar.gz`, then `tar xzf vimcode-macos-native-arm64.tar.gz && xattr -d com.apple.quarantine vimcode && ./vimcode`. Launch it from a normal Terminal window: launched from a tmux server that predates your login session, macOS won't let it come to the front.
+        - **GTK4:** `brew install vimcode` (GTK4 GUI + TUI), or download `vimcode-macos-arm64.tar.gz`; requires GTK4 via Homebrew (`brew install gtk4`).
+
+        ### Windows
+
+        **TUI-only binary (no installer needed)**
+        Download `vcd-windows-x86_64.exe`, place anywhere on your PATH, and run:
+        ```
+        vcd-windows-x86_64.exe
+        ```
+        Or rename to `vcd.exe` for convenience. Works in Windows Terminal, PowerShell, and cmd.exe.
+
+        **GUI — testing only, not ready for use**
+        Download `vimcode-windows-x86_64.exe` (native Win32 + Direct2D, no installer) and run it. Known rough edges: activity-bar icons can render as letters if your settings have `"use_nerd_fonts": false` (#1855), and the tab-bar toolbar is clipped at the right edge (#1696).
+
+        <!-- Flatpak install section lives in git history (pre-v0.11.0
+             revisions of this file). Restore it when RELEASE_FLATPAK is
+             turned on (#975), so the notes match the attached assets. -->
+        INSTALL
+        echo "RELEASE_BODY_PATH=${RUNNER_TEMP}/release-body.md" >> "$GITHUB_ENV"
+
     - name: Publish GitHub Release
       uses: softprops/action-gh-release@v2
       with:
         tag_name: v${{ env.VERSION }}
         name: "VimCode v${{ env.VERSION }}"
-        body: |
-          ## Status: use the TUI
-
-          - **TUI (`vcd`) is the recommended way to use VimCode.** Usable on **Linux** and **macOS**. **Windows:** usable, with known rough edges (for example, the minimap viewport thumb is not visible in Windows Terminal, #1828).
-          - **GUI builds (`vimcode`) are not ready for use on any platform.** GUI artifacts are attached **for testing only**: GTK4 on Linux and macOS, and (new) the native Windows and native macOS GUIs.
-
-          <!-- Update this section every release: highlights since the previous tag. -->
-          **Since v0.15.0:** **The minimap is now off by default and marked experimental** (#1858) — enable it with `:set minimap` or `"minimap": true` in `settings.json`. Also: VimCode now builds against [quadraui](https://crates.io/crates/quadraui) from crates.io (0.1.2); the TUI in macOS Terminal.app no longer shows runs of dimmed text (quadraui#1366); the GTK GUI on macOS now shows its icons instead of tofu boxes (quadraui#1367); the native macOS GUI's editor rows now use VS Code's 1.5× line height (18px for Menlo 12), configurable with the new `line_height` setting (#1864); the bundled icon font is the full Symbols Nerd Font, so extension panel icons (e.g. Git Insights) no longer render as `?` in the GUIs (#1853); the native Windows GUI minimap now shows a real miniature instead of a dark strip (quadraui#1354), and the native Windows and native macOS GUIs are attached as testing-only downloads.
-
-          ## Installation
-
-          ### Linux
-
-          **Recommended: TUI-only binary (no GTK required, statically linked)**
-          ```
-          chmod +x vcd-linux-x86_64
-          ./vcd-linux-x86_64
-          ```
-          Statically linked with musl — runs on any Linux (Ubuntu 20.04+, CentOS 7+, Alpine, etc.). No GTK4 or other libraries needed.
-
-          **GUI — testing only, not ready for use**
-
-          .deb package:
-          ```
-          sudo dpkg -i ${{ env.DEB_NAME }}
-          sudo apt -f install    # installs any missing GTK4 runtime libraries
-          ```
-
-          Raw binary:
-          ```
-          # First install runtime dependencies:
-          sudo apt install libgtk-4-1 libglib2.0-0 libpango-1.0-0 libcairo2
-          # Then run:
-          chmod +x vimcode-linux-x86_64
-          ./vimcode-linux-x86_64
-          ```
-
-          > GUI binary requires GTK 4.10+. Ubuntu 22.04 ships GTK 4.6 which is too old; Ubuntu 24.04+ recommended.
-
-          ### macOS (Apple Silicon)
-
-          **Recommended: TUI**
-          ```
-          brew tap JDonaghy/vimcode
-          brew install vcd        # TUI only (no GTK4 dependency)
-          ```
-          or download `vcd-macos-arm64.tar.gz`, extract, and run:
-          ```
-          tar xzf vcd-macos-arm64.tar.gz
-          xattr -d com.apple.quarantine vcd   # binaries are ad-hoc signed, not notarized
-          ./vcd
-          ```
-
-          **GUI — testing only, not ready for use**
-          - **Native (AppKit, no dependencies):** download `vimcode-macos-native-arm64.tar.gz`, then `tar xzf vimcode-macos-native-arm64.tar.gz && xattr -d com.apple.quarantine vimcode && ./vimcode`. Launch it from a normal Terminal window: launched from a tmux server that predates your login session, macOS won't let it come to the front.
-          - **GTK4:** `brew install vimcode` (GTK4 GUI + TUI), or download `vimcode-macos-arm64.tar.gz`; requires GTK4 via Homebrew (`brew install gtk4`).
-
-          ### Windows
-
-          **TUI-only binary (no installer needed)**
-          Download `vcd-windows-x86_64.exe`, place anywhere on your PATH, and run:
-          ```
-          vcd-windows-x86_64.exe
-          ```
-          Or rename to `vcd.exe` for convenience. Works in Windows Terminal, PowerShell, and cmd.exe.
-
-          **GUI — testing only, not ready for use**
-          Download `vimcode-windows-x86_64.exe` (native Win32 + Direct2D, no installer) and run it. Known rough edges: activity-bar icons can render as letters if your settings have `"use_nerd_fonts": false` (#1855), and the tab-bar toolbar is clipped at the right edge (#1696).
-
-          <!-- Flatpak install section lives in git history (pre-v0.11.0
-               revisions of this file). Restore it when RELEASE_FLATPAK is
-               turned on (#975), so the notes match the attached assets. -->
+        body_path: ${{ env.RELEASE_BODY_PATH }}
         prerelease: false
         make_latest: true
         files: |
