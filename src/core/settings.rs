@@ -836,6 +836,16 @@ pub struct Settings {
     /// Sort explorer entries case-insensitively (default: true).
     #[serde(default = "default_true")]
     pub explorer_sort_case_insensitive: bool,
+    /// Automatically expand the active file's ancestor folders, select its
+    /// row and scroll it into view in the Explorer sidebar whenever the
+    /// active editor changes (opening a file, switching tabs, restoring a
+    /// session, …). Mirrors VS Code's `explorer.autoReveal`. Default
+    /// **true**. Read by `Engine::explorer_reveal_path` /
+    /// `Engine::explorer_reveal_active_file` — every call site is an
+    /// automatic "active file changed" trigger, so turning this off simply
+    /// makes those calls no-ops rather than needing to be removed one by one.
+    #[serde(default = "default_true")]
+    pub explorer_auto_reveal: bool,
     /// Glob patterns for entries the file explorer always hides, regardless
     /// of `show_hidden_files` — VS Code's `files.exclude`. Default
     /// `["**/.git", "**/.svn", "**/.hg", "**/.DS_Store", "**/Thumbs.db"]`,
@@ -1839,6 +1849,7 @@ impl Default for Settings {
             acp_terminal_enabled: default_true(),
             show_hidden_files: default_true(),
             explorer_sort_case_insensitive: true,
+            explorer_auto_reveal: true,
             explorer_exclude: default_explorer_exclude(),
             swap_file: default_swap_file(),
             updatetime: default_updatetime(),
@@ -2878,6 +2889,7 @@ impl Settings {
             "formatonsave" | "fos" => self.format_on_save = enable,
             "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
             "explorersortcaseinsensitive" | "esci" => self.explorer_sort_case_insensitive = enable,
+            "explorerautoreveal" | "ear" => self.explorer_auto_reveal = enable,
             "swapfile" => self.swap_file = enable,
             "undofile" | "udf" => {
                 self.undofile = enable;
@@ -3453,6 +3465,11 @@ impl Settings {
             } else {
                 "noexplorersortcaseinsensitive".to_string()
             }),
+            "explorerautoreveal" | "ear" => Ok(if self.explorer_auto_reveal {
+                "explorerautoreveal".to_string()
+            } else {
+                "noexplorerautoreveal".to_string()
+            }),
             "swapfile" => Ok(if self.swap_file {
                 "swapfile".to_string()
             } else {
@@ -3869,6 +3886,9 @@ impl Settings {
             "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
                 self.explorer_sort_case_insensitive.to_string()
             }
+            "explorerautoreveal" | "ear" | "explorer_auto_reveal" => {
+                self.explorer_auto_reveal.to_string()
+            }
             "swapfile" | "swap_file" => self.swap_file.to_string(),
             "updatetime" | "ut" => self.updatetime.to_string(),
             "undolevels" | "ul" => self.undolevels.to_string(),
@@ -4054,6 +4074,9 @@ impl Settings {
             }
             "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
                 self.explorer_sort_case_insensitive = value == "true"
+            }
+            "explorerautoreveal" | "ear" | "explorer_auto_reveal" => {
+                self.explorer_auto_reveal = value == "true"
             }
             "swapfile" | "swap_file" => self.swap_file = value == "true",
             "updatetime" | "ut" => {
@@ -4561,6 +4584,16 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Entries the file explorer always hides regardless of Show Hidden Files, as \"**/name\" globs (comma-separated; default: **/.git, **/.svn, **/.hg, **/.DS_Store, **/Thumbs.db)",
         category: "Workspace",
         setting_type: SettingType::StringVal,
+    },
+    SettingDef {
+        key: "explorer_auto_reveal",
+        label: "Explorer Auto Reveal",
+        description: "Automatically expand, select and scroll to the active \
+                       file in the Explorer sidebar whenever the active \
+                       editor changes (default: on, matching VS Code's \
+                       \"explorer.autoReveal\")",
+        category: "Workspace",
+        setting_type: SettingType::Bool,
     },
     SettingDef {
         key: "board_tick_enabled",

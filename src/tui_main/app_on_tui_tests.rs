@@ -5117,6 +5117,233 @@ mod tests {
                 },
             );
         }
+
+        /// Locate `needle` painted as the Explorer sidebar's *own* row —
+        /// not the tab bar's label (row 0) and not the status bar's
+        /// "current file" segment (the second-to-last row), both of which
+        /// also paint the bare filename as an exact, standalone text run.
+        ///
+        /// Built on [`quadraui::testing::ConformanceDriver::inventory`]'s
+        /// `text_runs()` rather than a bare `driver.find(needle)`: once the
+        /// Explorer reveals the active file, its name paints in *three*
+        /// places at once (tab label, status bar, Explorer row), and
+        /// `find` always returns the first (tab-bar) hit — never the
+        /// sidebar one this helper's callers need. Filtering runs to
+        /// `text == needle` (the sidebar paints the filename as its own
+        /// `StyledText` segment, separate from its icon — see
+        /// `build_explorer_tree_rows` in `src/render/sidebar_tree_population.rs`)
+        /// plus a row range that excludes the tab bar (`y == 0`) and the
+        /// status/command-line rows at the bottom of this module's fixed
+        /// `(80, 24)` harness leaves only a genuine sidebar match.
+        fn find_below_tab_bar(
+            h: &crate::harness::ConformanceHarness<
+                quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            >,
+            needle: &str,
+        ) -> Option<(u16, u16)> {
+            h.driver
+                .inventory()
+                .text_runs()
+                .iter()
+                .find(|r| {
+                    // Row 0 is the tab bar itself (its own label is an exact
+                    // match too); rows 22-23 are the status line and
+                    // command line, where the status bar's "current file"
+                    // segment paints the bare filename as its own run, just
+                    // like the Explorer's filename-only run does. Only a
+                    // match strictly between those — inside the sidebar's
+                    // body rows — is a genuine Explorer reveal.
+                    r.text == needle && r.bounds.y > 0.5 && r.bounds.y < 21.5
+                })
+                .map(|r| (r.bounds.x.round() as u16, r.bounds.y.round() as u16))
+        }
+
+        /// #1903: VS Code's `explorer.autoReveal` (default on) expands the
+        /// active file's ancestor folders, selects its row and scrolls it
+        /// into view in the Explorer sidebar whenever the active editor
+        /// changes — including a plain tab-bar click, not just opening a
+        /// file for the first time. Before this fix, `Engine::goto_tab`
+        /// already called `explorer_reveal_active_file()` on every switch,
+        /// but there was no way to turn that off, and no driver-level test
+        /// proved a *real click on the tab bar* (as opposed to a direct
+        /// `explorer_reveal_path` call) drives it end to end.
+        ///
+        /// Reads the sidebar's painted background colour back via
+        /// [`find_below_tab_bar`] + `style_at`, the same proof
+        /// `explorer_unfocused_selected_row_paints_sidebar_sel_bg_inactive_via_shell_app`
+        /// (`mod sidebar_panels`) uses for a direct `explorer_reveal_path`
+        /// call — this test's only difference is the trigger: a genuine
+        /// `driver.click` on the tab bar's own painted label.
+        #[test]
+        fn tab_bar_click_reveals_and_highlights_active_file_in_explorer_1903() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1903_tab_click_reveal_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let sub = dir.join("sub");
+            std::fs::create_dir_all(&sub).unwrap();
+            let main_rs = dir.join("main.rs");
+            let nested = sub.join("nested.rs");
+            std::fs::write(&main_rs, "fn main() {}\n").unwrap();
+            std::fs::write(&nested, "// nested\n").unwrap();
+
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            engine.settings.breadcrumbs = false; // one-row tab bar, simplest geometry
+            engine.cwd = dir.clone();
+            engine.open_file_in_tab(&main_rs);
+            // `open_file_in_tab` appends rather than reusing `plain_engine`'s
+            // pristine `[No Name]` scratch tab — close it so the tab bar
+            // only shows the two tabs this test cares about, same as
+            // `explorer_double_click_opens_second_file_in_a_second_tab_1798`.
+            engine.goto_tab(0);
+            engine.close_tab();
+            // Opening `nested` makes it the active tab and auto-reveals it
+            // (expanding `sub`); immediately undo both so the click below
+            // is the thing that re-expands/re-selects it, not a leftover
+            // from setup.
+            engine.open_file_in_tab(&nested);
+            engine.goto_tab(0);
+            engine.explorer_expanded.remove(&sub);
+            engine.explorer_rebuild_rows();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            engine.session.explorer_visible = true;
+            engine.explorer_has_focus = false;
+            let active_group = engine.active_group;
+            let mut h = harness(engine);
+
+            let precondition_row = active_group_tab_bar_row(&h, active_group);
+            assert!(
+                precondition_row.contains("main.rs") && precondition_row.contains("nested.rs"),
+                "precondition: both tabs must already be painted on the tab \
+                 bar; tab bar row:\n{precondition_row}"
+            );
+            assert!(
+                find_below_tab_bar(&h, "nested.rs").is_none(),
+                "precondition: `sub` must start collapsed, so nested.rs \
+                 does not yet paint anywhere below the tab bar; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let driver = &mut h.driver;
+            let (x, y) = driver
+                .find("nested.rs")
+                .expect("nested.rs's tab label must paint on the tab bar");
+            driver.click(x, y);
+            driver.render();
+
+            assert_eq!(
+                h.engine.borrow().file_path(),
+                Some(&nested),
+                "clicking nested.rs's tab must make it the active file"
+            );
+
+            let (rx, ry) = find_below_tab_bar(&h, "nested.rs").unwrap_or_else(|| {
+                panic!(
+                    "clicking nested.rs's tab must auto-reveal it in the \
+                     Explorer sidebar (expanding `sub`); screen:\n{}",
+                    h.driver.screen()
+                )
+            });
+            let style = h
+                .driver
+                .style_at(rx, ry)
+                .expect("the revealed row must paint a styled cell");
+            let expected_bg = quadraui::tui::ratatui_color(
+                crate::render::Theme::vscode_light().sidebar_sel_bg_inactive,
+            );
+            assert_eq!(
+                style.bg,
+                expected_bg,
+                "the revealed row must be selected/highlighted with \
+                 `sidebar_sel_bg_inactive`; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #1903: `explorer_auto_reveal` (default on, mirroring VS Code's
+        /// `explorer.autoReveal`) must be possible to turn off — with it
+        /// off, the same tab-bar click as
+        /// `tab_bar_click_reveals_and_highlights_active_file_in_explorer_1903`
+        /// must still switch the active tab (that behaviour predates and is
+        /// independent of this setting) but must leave the Explorer sidebar
+        /// alone: `sub` stays collapsed and nested.rs never paints there.
+        #[test]
+        fn tab_bar_click_does_not_reveal_when_explorer_auto_reveal_is_off_1903() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1903_tab_click_noreveal_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let sub = dir.join("sub");
+            std::fs::create_dir_all(&sub).unwrap();
+            let main_rs = dir.join("main.rs");
+            let nested = sub.join("nested.rs");
+            std::fs::write(&main_rs, "fn main() {}\n").unwrap();
+            std::fs::write(&nested, "// nested\n").unwrap();
+
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            engine.settings.breadcrumbs = false;
+            engine.cwd = dir.clone();
+            engine.open_file_in_tab(&main_rs);
+            engine.goto_tab(0);
+            engine.close_tab();
+            engine.open_file_in_tab(&nested);
+            engine.goto_tab(0);
+            engine.explorer_expanded.remove(&sub);
+            engine.explorer_rebuild_rows();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            engine.session.explorer_visible = true;
+            engine.explorer_has_focus = false;
+            engine.settings.explorer_auto_reveal = false;
+            let active_group = engine.active_group;
+            let mut h = harness(engine);
+
+            let precondition_row = active_group_tab_bar_row(&h, active_group);
+            assert!(
+                precondition_row.contains("main.rs") && precondition_row.contains("nested.rs"),
+                "precondition: both tabs must already be painted on the tab \
+                 bar; tab bar row:\n{precondition_row}"
+            );
+            assert!(
+                find_below_tab_bar(&h, "nested.rs").is_none(),
+                "precondition: `sub` must start collapsed; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let driver = &mut h.driver;
+            let (x, y) = driver
+                .find("nested.rs")
+                .expect("nested.rs's tab label must paint on the tab bar");
+            driver.click(x, y);
+            driver.render();
+
+            assert_eq!(
+                h.engine.borrow().file_path(),
+                Some(&nested),
+                "clicking nested.rs's tab must still switch the active \
+                 file — only the Explorer reveal is suppressed"
+            );
+            assert!(
+                find_below_tab_bar(&h, "nested.rs").is_none(),
+                "with `explorer_auto_reveal` off, clicking the tab must \
+                 NOT expand `sub` or reveal nested.rs in the Explorer \
+                 sidebar; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
