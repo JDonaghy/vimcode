@@ -95,6 +95,47 @@ pub fn vimcode_config_dir() -> PathBuf {
     }
 }
 
+/// Structural backstop for [`vimcode_config_dir()`] writers: panics if `path`
+/// is about to be written to without any test isolation in effect, naming
+/// the offending path in the message.
+///
+/// `cfg(test)` is only true when this crate is compiled as its own `--lib`
+/// test binary; a `tests/*.rs` integration-test binary links the library as
+/// an ordinary dependency, so `test_home_override()` is unreachable from it
+/// even though the test itself clearly runs under `cargo test`. The
+/// `test-build-guard` feature (see its doc comment in `Cargo.toml`) is
+/// activated for *both* kinds of test binary via a self-referential
+/// `[dev-dependencies]` entry, so `cfg!(feature = "test-build-guard")` is
+/// the one signal visible to each: `false` only for the real production
+/// `cargo build --bin vimcode`.
+///
+/// A call site passes this function the exact path it is about to write so
+/// a developer who hits the panic can go straight to the file instead of
+/// guessing which save path forgot to isolate its home directory.
+pub(crate) fn guard_real_config_write(path: &Path) {
+    if !cfg!(feature = "test-build-guard") {
+        // Production build: nothing to guard against.
+        return;
+    }
+    if test_home_override().is_some() {
+        // `--lib` test explicitly sandboxed via `set_test_home()`.
+        return;
+    }
+    if !cfg!(test) && crate::core::session::saves_suppressed() {
+        // Integration test opted out via `tests/common::engine_with()` (or
+        // an equivalent direct `session::suppress_disk_saves()` call).
+        return;
+    }
+    panic!(
+        "refusing to write to the real vimcode config dir at {}: this test \
+         never isolated its home directory. Use `tests/common::engine_with()` \
+         (which calls `session::suppress_disk_saves()`) in a `tests/*.rs` \
+         integration test, or `paths::set_test_home()` in a `--lib` unit \
+         test, before touching anything under `vimcode_config_dir()`.",
+        path.display()
+    );
+}
+
 /// Return the user's home directory in a cross-platform way.
 ///
 /// - **Linux / macOS**: `$HOME`
@@ -287,6 +328,17 @@ mod tests {
     fn home_dir_is_not_empty() {
         let dir = home_dir();
         assert!(!dir.as_os_str().is_empty());
+    }
+
+    /// Proves the backstop fires in a `--lib` test build: deliberately skips
+    /// `set_test_home()` so `test_home_override()` is `None`, which must make
+    /// `guard_real_config_write` panic naming the offending path rather than
+    /// let the caller write to the real `~/.config/vimcode`.
+    #[test]
+    #[should_panic(expected = "refusing to write to the real vimcode config dir")]
+    fn guard_real_config_write_panics_without_isolation() {
+        let path = vimcode_config_dir().join("probe.json");
+        guard_real_config_write(&path);
     }
 
     // `VIMCODE_TEST_DATA_HOME` is process-global env state, shared by tests
