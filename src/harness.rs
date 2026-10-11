@@ -2204,11 +2204,12 @@ mod issue_983_row_click_selects_the_row_below {
     use super::*;
     use crate::core::engine::sidebar::PANEL_SETTINGS;
 
-    /// The Settings panel, scrolled so the "LSP" category — flat row 47 of
-    /// 62, well below row 0 per this issue's own instruction not to reuse
-    /// `settings_panel_click_toggles_the_clicked_category`'s row-0 target —
-    /// paints inside a normal 1400x900 viewport instead of needing an
-    /// oversized window. LSP's own first two settings ("Enable LSP",
+    /// The Settings panel, scrolled so the "LSP" category — far below row 0,
+    /// so as not to reuse `settings_panel_click_toggles_the_clicked_category`'s
+    /// row-0 target — sits near the top of a normal 1400x900 viewport with its
+    /// settings painted below it. The scroll offset is derived from LSP's real
+    /// flat-list index, so adding or removing settings above it can't push its
+    /// children off-screen. LSP's own first two settings ("Enable LSP",
     /// "Format on Save") are both `Bool`, chosen deliberately: collapsing
     /// LSP hides both their labels outright, giving a clean, unambiguous
     /// painted signal that the *category* row (not the row below it) was
@@ -2220,7 +2221,18 @@ mod issue_983_row_click_selects_the_row_below {
         engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
-        engine.settings_scroll_top = 40;
+        let lsp_cat = crate::core::settings::setting_categories()
+            .iter()
+            .position(|&c| c == "LSP")
+            .expect("an \"LSP\" settings category");
+        let lsp_row = engine
+            .settings_flat_list()
+            .iter()
+            .position(
+                |r| matches!(r, crate::core::engine::SettingsRow::CoreCategory(i) if *i == lsp_cat),
+            )
+            .expect("the LSP category header in the settings flat list");
+        engine.settings_scroll_top = lsp_row.saturating_sub(2);
         engine
     }
 
