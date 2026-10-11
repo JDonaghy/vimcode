@@ -42,7 +42,8 @@
     "Build (Windows TUI, vcd.exe)",
     "Build (Windows GUI, vimcode.exe)",
     "Validate Tier-2 smoke specs",
-    "Comment-history lint"
+    "Comment-history lint",
+    "Test (Linux, test-support feature)"
   ],
 
   "branches": {

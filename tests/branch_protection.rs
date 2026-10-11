@@ -186,13 +186,13 @@ fn required_contexts_match_ci_job_names() {
     let jobs = ci_job_names(&workflow);
 
     // Anti-vacuity: a parser that silently returned nothing would make the
-    // equality below pass against an empty config. The CI workflow has seven lanes:
-    // all seven are load bearing, so anything other than seven named jobs means the
+    // equality below pass against an empty config. The CI workflow has eight lanes:
+    // all eight are load bearing, so anything other than eight named jobs means the
     // scan drifted from the file it is meant to read.
     assert_eq!(
         jobs.len(),
-        7,
-        "expected 7 jobs parsed from .github/workflows/ci.yml, got {jobs:?}"
+        8,
+        "expected 8 jobs parsed from .github/workflows/ci.yml, got {jobs:?}"
     );
     assert!(
         jobs.iter().all(|n| !n.trim().is_empty()),
