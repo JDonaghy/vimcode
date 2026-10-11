@@ -138,6 +138,17 @@ class NotesCommandTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertFalse(out.exists())
 
+    def test_notes_fails_cleanly_on_missing_changelog_file(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            changelog = tmp / "does-not-exist.md"
+            out = tmp / "notes.md"
+            result = self._run(changelog, "0.15.1", out)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("::error::", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertFalse(out.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

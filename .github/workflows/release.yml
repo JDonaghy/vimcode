@@ -121,7 +121,7 @@ jobs:
 
         PREAMBLE
         cat "${RUNNER_TEMP}/changelog-section.md" >> "${RUNNER_TEMP}/release-body.md"
-        cat >> "${RUNNER_TEMP}/release-body.md" <<INSTALL
+        cat >> "${RUNNER_TEMP}/release-body.md" <<'INSTALL'
 
         ## Installation
 

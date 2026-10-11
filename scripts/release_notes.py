@@ -50,7 +50,11 @@ def changelog_section(text: str, version: str) -> str:
 
 def cmd_notes(args: argparse.Namespace) -> int:
     changelog_path = Path(args.changelog)
-    text = changelog_path.read_text(encoding="utf-8")
+    try:
+        text = changelog_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print(f"::error::{changelog_path} not found", file=sys.stderr)
+        return 1
     section = changelog_section(text, args.version)
     if not section.strip():
         print(
