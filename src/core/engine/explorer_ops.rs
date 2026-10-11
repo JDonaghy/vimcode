@@ -85,8 +85,15 @@ impl Engine {
     }
 
     /// Expand every ancestor of `target`, rebuild the flattened row list,
-    /// select `target`'s row and scroll it into view.
+    /// select `target`'s row and scroll it into view. Every call site is an
+    /// automatic "the active file/workspace changed" trigger (no distinct
+    /// explicit "reveal" user command exists), so a no-op here when
+    /// `explorer_auto_reveal` is off — VS Code's `explorer.autoReveal` —
+    /// is sufficient to suppress all of them, with nothing to special-case.
     pub fn explorer_reveal_path(&mut self, target: &Path) {
+        if !self.settings.explorer_auto_reveal {
+            return;
+        }
         let root = self.cwd.clone();
         if let Ok(rel) = target.strip_prefix(&root) {
             self.explorer_expanded.insert(root.clone());
