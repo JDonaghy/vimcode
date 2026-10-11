@@ -140,6 +140,7 @@ impl HistoryState {
         #[cfg_attr(test, allow(unreachable_code))]
         {
             let path = Self::history_path();
+            super::paths::guard_real_config_write(&path);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -266,6 +267,7 @@ impl ExtensionState {
         #[cfg_attr(test, allow(unreachable_code))]
         {
             let path = Self::extensions_path();
+            super::paths::guard_real_config_write(&path);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -541,6 +543,8 @@ impl SessionState {
 
         #[cfg_attr(test, allow(unreachable_code))]
         let path = Self::session_path();
+        #[cfg_attr(test, allow(unreachable_code))]
+        super::paths::guard_real_config_write(&path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -599,6 +603,8 @@ impl SessionState {
 
         #[cfg_attr(test, allow(unreachable_code))]
         let path = Self::session_path_for_workspace(root);
+        #[cfg_attr(test, allow(unreachable_code))]
+        super::paths::guard_real_config_write(&path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

@@ -2297,6 +2297,7 @@ impl Engine {
                 .join("extensions")
                 .join(ext_name)
                 .join("settings.json");
+            paths::guard_real_config_write(&path);
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -4634,7 +4635,8 @@ mod ai_mention_completions_exclude_tests {
     fn does_not_surface_git_internals_as_at_file_completions() {
         let mut engine = Engine::new_for_test();
         let workspace = std::env::temp_dir().join(format!(
-            "vc1545_ext_panel_mention_exclude_{:?}",
+            "vc1545_ext_panel_mention_exclude_{}-{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&workspace);
@@ -4972,7 +4974,8 @@ mod save_ext_settings_guard_tests {
     #[test]
     fn set_ext_setting_does_not_write_to_disk() {
         let home = std::env::temp_dir().join(format!(
-            "vimcode_test_save_ext_settings_guard_{:?}",
+            "vimcode_test_save_ext_settings_guard_{}-{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&home);

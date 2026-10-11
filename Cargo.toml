@@ -186,6 +186,20 @@ macos = ["quadraui/macos"]
 # support this.
 win = ["quadraui/win"]
 
+# A structural backstop so a test that forgets to isolate its home
+# directory fails loudly instead of writing into the developer's real
+# `~/.config/vimcode`. `cfg(test)` is only ever true when this crate is
+# compiled as its OWN `--lib` test binary — a `tests/*.rs` integration-test
+# binary links the library as an ordinary dependency, so `cfg(test)` is false
+# there too, and `paths::test_home_override()` (the real escape hatch) is
+# unreachable from it. This feature gives `paths::guard_real_config_write`
+# something it CAN see from both kinds of test binary without leaking into a
+# normal `cargo build`/`cargo run --bin vimcode`: it is activated below, via
+# `[dev-dependencies.vimcode]`, which Cargo unifies into every target in this
+# package that pulls in dev-dependencies (`--lib` tests AND every `tests/*.rs`
+# binary), but never into the production `[[bin]]` build.
+test-build-guard = []
+
 [dependencies]
 # `quadraui/tui` enables the public `quadraui::tui::draw_*` rasterisers
 # (#223). vimcode's TUI binary always builds, so the feature is on by
@@ -306,6 +320,13 @@ base64 = "0.22"
 png = "0.18"
 
 [dev-dependencies]
+# Self-dependency that activates `test-build-guard` (see that feature's
+# doc comment above) for every `--lib` test and every `tests/*.rs`
+# integration-test binary, without touching the production `[[bin]]` build.
+# `default-features = false` is required: without it, this entry would pull
+# in `default = ["gui"]` (GTK4/pangocairo/gio) even for a
+# `--no-default-features` test run, defeating the point of that flag.
+vimcode = { path = ".", default-features = false, features = ["test-build-guard"] }
 insta = "1.39"
 # #1008: msgpack values for the `tests/nvim_conformance.rs` oracle, which
 # drives `nvim --embed` over msgpack-RPC with a UI attached (`nvim_ui_attach`)
