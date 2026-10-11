@@ -262,7 +262,17 @@ impl Engine {
     /// Map a panel ID to the correct engine focus flag.
     fn set_panel_focus(&mut self, panel_id: &str) {
         match panel_id {
-            PANEL_EXPLORER => self.explorer_has_focus = true,
+            PANEL_EXPLORER => {
+                self.explorer_has_focus = true;
+                // Bringing the Explorer to the front re-syncs it with the
+                // active editor, the Explorer's equivalent of the data
+                // refresh the Git/Extensions/Board arms below do:
+                // `explorer_expanded` is in-memory only, so a tree the user
+                // collapsed (or never expanded this session) would otherwise
+                // show a bare root with the active file hidden and nothing
+                // selected. A no-op when `explorer_auto_reveal` is off.
+                self.explorer_reveal_active_file();
+            }
             PANEL_SEARCH => self.search_set_focus(true),
             PANEL_DEBUG => self.dap_sidebar_has_focus = true,
             PANEL_GIT => {
