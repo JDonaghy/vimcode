@@ -5918,7 +5918,7 @@ mod tests {
         ek.delete = "x".to_string();
         assert_eq!(ek.resolve('x'), Some(ExplorerAction::Delete));
         assert_eq!(ek.resolve('D'), None);
-                                           // Other keys still work
+        // Other keys still work
         assert_eq!(ek.resolve('a'), Some(ExplorerAction::NewFile));
     }
 

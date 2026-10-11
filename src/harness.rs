@@ -1344,8 +1344,7 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: quadraui::Backend>(
 /// category (unit/caps/feature/quadraui/product) and target child are
 /// recorded next to it, not just its issue number, per that issue's own
 /// gate-labelling requirement.
-pub(crate) const KNOWN_BUGS: &[&str] = &[
-];
+pub(crate) const KNOWN_BUGS: &[&str] = &[];
 
 /// Empty as of #1432: every entry the App-on-TUI gap inventory added
 /// has been closed — either by a real fix or by correcting a scenario
