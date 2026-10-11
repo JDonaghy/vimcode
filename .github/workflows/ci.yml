@@ -252,7 +252,7 @@ jobs:
   # coordinator ran the acceptance suite on fleet hardware, after the PR
   # had already merged. This job catches those compilation failures early.
   test-support-compile:
-    name: Test (Linux, test-support feature)
+    name: Test (Linux, test-support feature compile)
     runs-on: ubuntu-24.04
 
     steps:
@@ -298,14 +298,15 @@ jobs:
         path: target
         key: ${{ runner.os }}-cargo-build-target-test-support-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Compile and run tests (test-support + gui, lib only, no DISPLAY)
+    - name: Compile and run tests (gui feature, lib only, no DISPLAY)
       run: |
         test -z "${DISPLAY:-}" && test -z "${WAYLAND_DISPLAY:-}"
-        # --lib: integration tests pull in the lib WITHOUT cfg(test),
-        # which breaks test-only constructors (Engine::new_for_test)
-        # reachable through the test-support gate.  cargo test --lib
-        # sets cfg(test) on the lib crate, so those paths compile.
-        cargo test --lib --features test-support,gui
+        # --lib --features gui: compile and run the in-crate test-support
+        # and harness code (gated `cfg(any(test, feature = "test-support"))`)
+        # via the `cfg(test)` arm that `cargo test` sets.  The test-support
+        # feature is NOT passed here — it widens the gate to include code
+        # without cfg(test), where Engine::new_for_test is unavailable.
+        cargo test --lib --features gui
 
   # #1042: the two jobs above are both Linux, so `src/macos/mod.rs` — gated
   # `#[cfg(all(feature = "macos", target_os = "macos"))]` in src/lib.rs, and

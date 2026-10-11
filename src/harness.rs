@@ -144,7 +144,7 @@ use quadraui::NamedKey;
 use crate::app::App;
 use crate::core::Engine;
 
-// ── Role-based locators (#1887) ────────────────────────────────────────
+// ── Role-based locators ───────────────────────────────────────────────
 //
 // Typed, stable names for each UI region. Maps 1:1 to `WidgetId` strings
 // `AppShell::render`'s `register_chrome_zones` already registers -- no
@@ -292,7 +292,7 @@ pub trait RoleRelations: RoleLocator {
 
 impl<D: RoleLocator> RoleRelations for D {}
 
-// ── Scenario registry (#1888) ──────────────────────────────────────────
+// ── Scenario registry ─────────────────────────────────────────────────
 
 /// Feature area a conformance scenario covers.
 #[non_exhaustive]
@@ -1102,6 +1102,62 @@ pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
         issue: None,
         description: "The '[+]' modified indicator appears on edit, clears on ':w', and reappears on the next edit",
     },
+    ScenarioMeta {
+        name: "panel_toolbar_round_trip_returns_to_the_same_panel_proof",
+        area: FeatureArea::Panels,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet {
+            gtk: true,
+            tui: true,
+            tui_prod: true,
+            macos: false,
+            win: false,
+        },
+        issue: Some(1919),
+        description: "Ctrl-W h then Ctrl-W l returns keyboard focus to the same panel",
+    },
+    ScenarioMeta {
+        name: "panel_toolbar_round_trip_uses_the_active_panel_not_the_toolbar_cursor_proof",
+        area: FeatureArea::Panels,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet {
+            gtk: true,
+            tui: true,
+            tui_prod: true,
+            macos: false,
+            win: false,
+        },
+        issue: Some(1919),
+        description: "Toolbar round-trip activates the panel the user came from, not the toolbar cursor's row",
+    },
+    ScenarioMeta {
+        name: "toolbar_ctrl_w_left_is_a_noop_proof",
+        area: FeatureArea::Panels,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet {
+            gtk: true,
+            tui: false,
+            tui_prod: true,
+            macos: false,
+            win: false,
+        },
+        issue: Some(1919),
+        description: "Ctrl-W left on the toolbar itself is a no-op",
+    },
+    ScenarioMeta {
+        name: "rebound_ctrl_h_ctrl_l_walk_the_same_chain_proof",
+        area: FeatureArea::Panels,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet {
+            gtk: true,
+            tui: true,
+            tui_prod: true,
+            macos: false,
+            win: false,
+        },
+        issue: Some(1919),
+        description: "Rebound Ctrl-H / Ctrl-L walk the same focus chain as Ctrl-W h/l",
+    },
 ];
 
 /// Print the human-readable scenario table to stdout.
@@ -1154,14 +1210,11 @@ mod registry_lint {
     /// `backend_conformance!` invocation, and vice versa.
     #[test]
     fn registry_covers_all_macro_invocations() {
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/harness.rs"
-        ))
-        .unwrap();
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness.rs"))
+                .unwrap();
 
-        let label_re =
-            regex::Regex::new(r"backend_conformance!\s*\{\s*label:\s*(\w+)").unwrap();
+        let label_re = regex::Regex::new(r"backend_conformance!\s*\{\s*label:\s*(\w+)").unwrap();
         let source_labels: std::collections::HashSet<&str> = label_re
             .captures_iter(&source)
             .map(|c| c.get(1).unwrap().as_str())
@@ -7206,7 +7259,6 @@ mod command_palette_click_confirms_the_filtered_command {
     }
 }
 
-
 // === Explorer + Sidebar (6 scenarios) ===
 
 /// Clicking each fixed activity-bar icon in turn must switch the sidebar
@@ -7519,11 +7571,7 @@ mod explorer_and_sidebar_conformance {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("chev612")).unwrap();
-        std::fs::write(
-            dir.join("chev612").join("ch612"),
-            b"",
-        )
-        .unwrap();
+        std::fs::write(dir.join("chev612").join("ch612"), b"").unwrap();
 
         let mut engine = crate::core::Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);
@@ -7569,7 +7617,11 @@ mod explorer_and_sidebar_conformance {
         },
     }
 
-    fn engine_with_two_explorer_files(tag: &str, file_a: &str, file_b: &str) -> crate::core::Engine {
+    fn engine_with_two_explorer_files(
+        tag: &str,
+        file_a: &str,
+        file_b: &str,
+    ) -> crate::core::Engine {
         let dir = scratch_dir(&format!("vimcode_test_explorer_sidebar_preview_tabs_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -7624,7 +7676,6 @@ mod explorer_and_sidebar_conformance {
         },
     }
 }
-
 
 // === Tab Bar + Window Splits (8 scenarios) ===
 #[cfg(test)]
@@ -8001,7 +8052,6 @@ mod area_tab_bar_and_window_splits {
     }
 }
 
-
 // === Search Panel + Vim Search (5 scenarios) ===
 #[cfg(test)]
 mod search_panel_and_vim_search_conformance {
@@ -8195,11 +8245,7 @@ mod search_panel_and_vim_search_conformance {
         let dir = scratch_dir("vimcode_test_search_panel_result_click");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("zqxw_jumpfile.txt"),
-            "one\nZQ_JMP\nthree\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join("zqxw_jumpfile.txt"), "one\nZQ_JMP\nthree\n").unwrap();
 
         let query = "ZQ_JMP";
         let opts = SearchOptions::default();
@@ -8250,7 +8296,6 @@ mod search_panel_and_vim_search_conformance {
         },
     }
 }
-
 
 // === Editor Operations (7 scenarios) ===
 
@@ -8310,9 +8355,7 @@ mod editor_visual_char_delete_removes_selection {
     fn engine_fixture() -> crate::core::Engine {
         let mut engine = crate::core::Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);
-        engine
-            .buffer_mut()
-            .insert(0, "EOPSVISDEL EOPSVISKEEP\n");
+        engine.buffer_mut().insert(0, "EOPSVISDEL EOPSVISKEEP\n");
         engine
     }
 
@@ -8388,10 +8431,9 @@ mod editor_visual_block_delete_removes_column {
     fn engine_fixture() -> crate::core::Engine {
         let mut engine = crate::core::Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);
-        engine.buffer_mut().insert(
-            0,
-            "AEOPSBLOCK_1\nAEOPSBLOCK_2\nAEOPSBLOCK_3\n",
-        );
+        engine
+            .buffer_mut()
+            .insert(0, "AEOPSBLOCK_1\nAEOPSBLOCK_2\nAEOPSBLOCK_3\n");
         engine
     }
 
@@ -8529,10 +8571,9 @@ mod editor_marks_jump_back_to_marked_line {
     fn engine_fixture() -> crate::core::Engine {
         let mut engine = crate::core::Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);
-        engine.buffer_mut().insert(
-            0,
-            "EOPSMARK_ONE\nEOPSMARK_TWO\nEOPSMARK_THREE\n",
-        );
+        engine
+            .buffer_mut()
+            .insert(0, "EOPSMARK_ONE\nEOPSMARK_TWO\nEOPSMARK_THREE\n");
         engine
     }
 
@@ -9395,9 +9436,7 @@ mod half_page_scroll_viewport {
             })
             .filter_map(|digits| digits.parse::<u32>().ok())
             .min()
-            .expect(
-                "at least one L%04d marker line must be painted",
-            )
+            .expect("at least one L%04d marker line must be painted")
     }
 
     crate::backend_conformance! {

@@ -43,7 +43,7 @@
     "Build (Windows GUI, vimcode.exe)",
     "Validate Tier-2 smoke specs",
     "Comment-history lint",
-    "Test (Linux, test-support feature)"
+    "Test (Linux, test-support feature compile)"
   ],
 
   "branches": {
