@@ -11258,6 +11258,102 @@ mod tests {
         }
     }
 
+    /// A project-pinned LSP binary (e.g. `rust-analyzer` via a
+    /// `rust-toolchain.toml` with no `rust-analyzer` component) that can't be
+    /// resolved must paint a status-line hint naming the workspace root the
+    /// install command needs to be run from — `rustup component add` only
+    /// picks up a pinned toolchain from inside that directory, not wherever
+    /// the editor's OS process cwd happens to be. Driver-tier coverage for
+    /// `lsp_manager::not_found_hint`'s workspace-root-naming behaviour,
+    /// asserting on `driver.screen()` rather than on `Engine`/`LspManager`
+    /// internal state the way `lsp_manager::tests::
+    /// not_found_hint_names_workspace_root` already does.
+    mod issue_1905_lsp_not_found_hint_names_workspace_root {
+        use super::*;
+
+        /// [`crate::core::Engine::new_for_test`] rooted at `workspace_root`,
+        /// with a fake, never-resolvable Rust extension manifest installed.
+        /// The manifest's `[lsp.install]` mirrors the real rust-analyzer
+        /// extension's `rustup component add rust-analyzer` so the hint
+        /// built by `lsp_manager::not_found_hint` takes the same branch
+        /// production code does. Wide (220 cols), sidebar-collapsed: the
+        /// full hint (binary name + workspace root path + install command)
+        /// is long enough to get truncated at the default 80-column width,
+        /// same reasoning as `issue_1719_prerequisite_detect_before_install`'s
+        /// `wide_harness_no_sidebar` above.
+        fn harness_with_unresolvable_rust_manifest(
+            workspace_root: &std::path::Path,
+        ) -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            use crate::core::extensions::{ExtensionManifest, LspConfig};
+
+            let mut engine = crate::core::Engine::new_for_test();
+            engine.cwd = workspace_root.to_path_buf();
+            let ext_name = "vc-tui-1905-rust";
+            engine.ext_registry = Some(vec![ExtensionManifest {
+                name: ext_name.to_string(),
+                display_name: "1905 TUI Rust test fixture".to_string(),
+                file_extensions: vec![".rs".to_string()],
+                language_ids: vec!["rust".to_string()],
+                lsp: LspConfig {
+                    binary: "vc-tui-1905-rust-analyzer".to_string(),
+                    install: "rustup component add vc-tui-1905-rust-analyzer".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }]);
+            engine.extension_state.mark_installed(ext_name);
+
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 24);
+            collapse_sidebar(&mut h.driver);
+            h
+        }
+
+        /// **Verified RED against unfixed `develop`:** before #1905,
+        /// `not_found_hint` built its text from the binary name alone
+        /// (`"{binary} not found. Run: {install_cmd}"`), with no workspace
+        /// root at all — this assertion fails against that text, since it
+        /// never contains `Run in <path>`.
+        #[test]
+        fn missing_pinned_lsp_binary_paints_workspace_root_in_hint() {
+            let workspace_root = std::env::temp_dir().join(format!(
+                "vimcode_test_1905_tui_root_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&workspace_root).expect("create fixture workspace root");
+            let rs_path = workspace_root.join("main.rs");
+            std::fs::write(&rs_path, "fn main() {}\n").expect("write fixture file");
+
+            let mut h = harness_with_unresolvable_rust_manifest(&workspace_root);
+            h.engine.borrow_mut().new_tab(Some(&rs_path));
+            h.driver.render();
+
+            let expected_root_hint = format!("Run in {}", workspace_root.display());
+            assert!(
+                h.driver.screen_contains(&expected_root_hint),
+                "a project-pinned LSP binary that can't be resolved must \
+                 name the workspace root (not just the install command) in \
+                 its status-line hint; painted: {:?}",
+                h.driver.screen()
+            );
+            assert!(
+                h.engine
+                    .borrow()
+                    .message
+                    .contains("vc-tui-1905-rust-analyzer not found"),
+                "engine.message should carry the hint: {:?}",
+                h.engine.borrow().message
+            );
+
+            let _ = std::fs::remove_dir_all(&workspace_root);
+        }
+    }
+
     /// An extension manifest's `requires_vimcode` semver requirement
     /// must be surfaced in the Extensions panel (so an incompatible
     /// extension reads as incompatible before the user tries to install
