@@ -11843,11 +11843,8 @@ mod tests {
             h
         }
 
-        /// **Verified RED against unfixed `develop`:** before #1905,
-        /// `not_found_hint` built its text from the binary name alone
-        /// (`"{binary} not found. Run: {install_cmd}"`), with no workspace
-        /// root at all — this assertion fails against that text, since it
-        /// never contains `Run in <path>`.
+        /// The hint must name the workspace root (`Run in <path>`), not just
+        /// the binary and its install command.
         #[test]
         fn missing_pinned_lsp_binary_paints_workspace_root_in_hint() {
             let workspace_root = std::env::temp_dir().join(format!(

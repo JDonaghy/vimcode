@@ -122,8 +122,8 @@ fn parse_official_toolchain_from_stderr(stderr: &str) -> Option<String> {
 
 /// If `binary` resolves to a broken rustup proxy in `~/.cargo/bin/` whose
 /// failure message names a pinned toolchain, return that toolchain's name.
-/// Used to offer the directory-independent `rustup component add --toolchain
-/// <ver> …` form alongside the primary hint (#1905).
+/// Supplies the directory-independent `rustup component add --toolchain
+/// <ver> …` form alongside the primary hint.
 fn pinned_toolchain_hint_for_binary(binary: &str) -> Option<String> {
     let candidate = super::paths::home_dir()
         .join(".cargo")
@@ -142,7 +142,7 @@ fn pinned_toolchain_hint_for_binary(binary: &str) -> Option<String> {
 /// component add` are resolved against the *current directory's* pinned
 /// toolchain, not the running process's), plus — when the binary is a broken
 /// rustup proxy for a pinned toolchain — an explicit `--toolchain <ver>` form
-/// that works from any directory (#1905).
+/// that works from any directory.
 fn not_found_hint(binary: &str, install_cmd: &str, workspace_root: &Path) -> String {
     let root_display = workspace_root.display();
     let mut hint = format!("{binary} not found. Run in {root_display}: {install_cmd}");
@@ -1098,7 +1098,7 @@ impl LspManager {
         let install_cmd = install_cmd.to_string();
         // Run in the workspace root (not whatever directory the process
         // happens to be in) so a command like `rustup component add
-        // rust-analyzer` picks up a pinned `rust-toolchain.toml` (#1905).
+        // rust-analyzer` picks up a pinned `rust-toolchain.toml`.
         let workspace_root = self.root_path.clone();
         std::thread::spawn(move || {
             install_log(&format!(
@@ -2105,7 +2105,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&counter_dir);
     }
 
-    // ─── #1905: "not found" hint names the workspace root + toolchain ──
+    // ─── "not found" hint names the workspace root + toolchain ──
 
     /// Build `<home>/.cargo/bin/<binary_name>` as a script that always exits
     /// non-zero and prints `stderr_msg` to stderr — simulating a rustup
@@ -2211,11 +2211,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// **Verified RED against unfixed `develop`:** before this fix, the hint
-    /// was just `"rust-analyzer not found. Run: rustup component add
-    /// rust-analyzer"` — correct content, but silent about *where* to run it,
-    /// which is wrong from any directory other than the pinned project's root
-    /// (#1905).
+    /// The hint must say *where* to run the install command: from any
+    /// directory other than the pinned project's root it installs into the
+    /// wrong toolchain.
     #[test]
     #[cfg(unix)]
     fn resolve_and_start_server_hint_names_root_and_toolchain() {
@@ -2270,10 +2268,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// **Verified RED against unfixed `develop`:** `run_install_command`
-    /// spawned the shell command with no `current_dir` at all, so it ran
-    /// wherever the process happened to be rather than the workspace root —
-    /// silently missing a pinned `rust-toolchain.toml` there (#1905).
+    /// `run_install_command` must run in the workspace root, or it misses a
+    /// pinned `rust-toolchain.toml` there.
     #[test]
     #[cfg(unix)]
     fn run_install_command_runs_in_workspace_root() {
