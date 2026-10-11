@@ -1,4 +1,4 @@
-//! Per-lane registration of #1090's plugin-panel scenarios.
+//! Per-lane registration of plugin-panel scenarios.
 //!
 //! Hand-written rather than `crate::backend_conformance!`-generated for
 //! three reasons the macro cannot serve:
@@ -6,10 +6,10 @@
 //! 1. Each arm needs its **own** `KNOWN_BUGS` label (`…::gtk`, `…::macos`,
 //!    …) baked into the body, and the macro expands one `$body` token
 //!    stream verbatim into every arm with no way for that body to know
-//!    which arm it is in — the same reason #984's chevron scenarios are
+//!    which arm it is in — the same reason chevron scenarios are
 //!    hand-written (see `crate::harness::KNOWN_BUGS`).
 //! 2. The `tui_prod` arm needs one `TuiDriver::tick()` before the first
-//!    assertion (to let the pre-#1434 TUI shell's `tick` consume
+//!    assertion (to let the TUI shell's `tick` consume
 //!    `ext_panel_focus_pending` and put the sidebar onto the plugin panel);
 //!    `tick` is inherent on `TuiDriver`, not on `ConformanceDriver`.
 //! 3. The macro has no `macos` arm.
@@ -37,11 +37,10 @@ const TUI_H: u16 = 30;
 
 // ── tui_prod: the one lane that paints a `PanelRegistration` today ──────
 //
-// the pre-#1434 TUI shell -> `tui_main::panels::render_ext_panel` ->
-// `render::ext_panel_to_tree_view` is the *only* path in this crate that
-// turns a plugin's own sections into painted rows. Everything else goes
-// through `App`'s `id.starts_with("ext:")` arm, which paints the
-// marketplace (#1089).
+// `tui_main::panels::render_ext_panel` -> `render::ext_panel_to_tree_view`
+// is the *only* path in this crate that turns a plugin's own sections
+// into painted rows. Everything else goes through `App`'s
+// `id.starts_with("ext:")` arm, which paints the marketplace.
 
 fn prod(
     fx: &PluginPanelFixture,
@@ -52,7 +51,7 @@ fn prod(
         TUI_W,
         TUI_H,
     );
-    // the pre-#1434 TUI shell's `tick` is what consumes `ext_panel_focus_pending` and
+    // The TUI shell's `tick` consumes `ext_panel_focus_pending` and
     // sets `sidebar.ext_panel_name` — the same handoff a live
     // `panel.reveal` / activity-bar click performs.
     h.driver.tick();
@@ -93,11 +92,8 @@ fn plugin_panel_fixture_paints_all_three_sections_on_tui_prod() {
     // `ext_panel_to_tree_view` composes into one right-aligned `Badge`
     // (`ROW_BRANCH_BADGE`) competing with the label for the same ~20-column
     // sidebar row. Asserting the whole label AND the whole badge run AND
-    // that they share a line with no `…` on it is what proves the two
-    // coexist rather than one eating the other — the failure mode that
-    // #1434 papered over with a two-character-prefix check (against a
-    // label the badge was overwriting) and that quadraui#1183 turned into
-    // a bare `…` (see `ROW_BRANCH_BADGE`'s doc for the full history).
+    // that they share a line with no `…` on it proves the two coexist
+    // rather than one eating the other.
     let branch_line = h
         .driver
         .screen()
@@ -187,8 +183,7 @@ fn plugin_panel_search_input_chrome_row_is_painted_on_tui_prod() {
 
 #[test]
 fn plugin_panel_hover_card_anchors_beside_the_row_on_tui_prod() {
-    // Hover the first commit while the panel is scrolled — the exact shape
-    // #1087 got wrong (flat index 16 vs on-screen row 4).
+    // Hover the first commit while the panel is scrolled.
     let h = prod(
         &PluginPanelFixture::new()
             .scrolled()
@@ -218,21 +213,26 @@ fn plugin_panel_reveal_selects_the_revealed_row_on_tui_prod() {
     });
 }
 
-// #1236's own `hover_resolves_to_the_row_under_the_pointer` needs a *live*
+// The `hover_resolves_to_the_row_under_the_pointer` scenario needs a *live*
 // `ConformanceHarness::engine` (it backdates `panel_hover_dwell` and calls
 // `poll_panel_hover` directly, in place of a real wall-clock wait) — the one
 // thing `conformance_harness_prod`'s own doc says its `engine` field cannot
-// give a scenario (the pre-#1434 TUI shell owns its `Engine` directly, not behind an
+// give a scenario (the TUI shell owns its `Engine` directly, not behind an
 // `Rc<RefCell<_>>`; see that function's "not live here" doc). So this
 // scenario is not registered on `tui_prod` at all — see the `tui shared app`
-// arm below, which uses `conformance_harness` (a live `Rc<RefCell<Engine>>`)
-// instead.
+// arm below, which uses `conformance_harness` (a live `Rc<RefCell<Engine>>`) instead.
+//
+// ── gtk / tui (shared `App`) / macos: red until #1089 ───────────────────
+//
+// See this module's parent doc. These are `known_bug_gate`d, not
+// `#[cfg]`-skipped: the gate fails the build the moment a listed body
+// starts passing, so the fix cannot land without promoting them.
 
 // ── gtk / tui (shared `App`) / macos: red until #1089 ───────────────────
 //
 // See this module's parent doc. These are `known_bug_gate`d, not
 // `#[cfg]`-skipped: the gate fails the build the moment a listed body
-// starts passing, so #1089's fix cannot land without promoting them.
+// starts passing, so the fix cannot land without promoting them.
 
 #[cfg(feature = "gui")]
 #[test]
@@ -326,7 +326,7 @@ fn plugin_panel_reveal_selects_the_revealed_row_on_gtk() {
         // Probe just left of the row's own glyph — inside the selection
         // band, clear of the text itself — so the colour read is the row's
         // background fill, the same technique `crate::harness`'s
-        // `probe_band` uses for #1028.
+        // `probe_band` uses.
         let px = |d: &mut quadraui::gtk::testing::GtkDriver<_>, r: quadraui::Rect| {
             d.pixel((r.x - 4.0).max(0.0) as i32, (r.y + r.height / 2.0) as i32)
         };
@@ -337,7 +337,7 @@ fn plugin_panel_reveal_selects_the_revealed_row_on_gtk() {
     });
 }
 
-/// #1236: `route_sidebar_hover`'s `ExtPanel` arm hit-tested through
+/// `route_sidebar_hover`'s `ExtPanel` arm hit-tested through
 /// `SidebarBodyGeometry::content_row`'s uniform-row-height formula, which
 /// GTK's own tree paints against (`Decoration::Header` rows at
 /// `line_height * 1.2`, every other row at `line_height * 1.4` —
@@ -364,7 +364,7 @@ fn plugin_panel_hover_resolves_to_the_row_under_the_pointer_on_gtk() {
 }
 
 // The `tui` control arm wraps the same shared `App` GTK does, so it fails
-// for the identical #1089 reason — kept so the shared shell's own regression
+// for the identical reason — kept so the shared shell's own regression
 // is visible on a lane that needs no GTK dev libs.
 #[test]
 fn plugin_panel_section_header_hit_band_on_tui_shared_app() {
@@ -391,16 +391,15 @@ fn plugin_panel_item_row_hit_band_on_tui_shared_app() {
 }
 
 /// #1236, the `tui` control-arm twin of `plugin_panel_hover_resolves_to_
-/// the_row_under_the_pointer_on_gtk`. Not `known_bug_gate`d and not red pre-
-/// fix (TUI's tree rows are uniformly one cell each — `quadraui::tui::tree`'s
-/// module doc — so `content_row`'s uniform-row-height formula never drifted
-/// here); registered because this arm, unlike `tui_prod`, wraps the same
-/// shared `App` GTK does and its `ConformanceHarness::engine` is a *live*
+/// the_row_under_the_pointer_on_gtk`. Not `known_bug_gate`d (TUI's tree
+/// rows are uniformly one cell each — `quadraui::tui::tree`'s module doc —
+/// so `content_row`'s uniform-row-height formula never drifted here).
+/// Registered because this arm, unlike `tui_prod`, wraps the same shared
+/// `App` GTK does and its `ConformanceHarness::engine` is a *live*
 /// `Rc<RefCell<Engine>>` (`conformance_harness`, not `conformance_harness_
-/// prod` — see that function's own "not live here" doc for why the scenario
-/// cannot run on `tui_prod` at all), so it is a real regression guard that
-/// the shared route still resolves correctly on the one backend that was
-/// never broken.
+/// prod` — see that function's "not live here" doc for why the scenario
+/// cannot run on `tui_prod` at all), so it is a regression guard that the
+/// shared route still resolves correctly on the one backend tested.
 #[test]
 fn plugin_panel_hover_resolves_to_the_row_under_the_pointer_on_tui_shared_app() {
     let mut h = crate::tui_main::testing::conformance_harness(

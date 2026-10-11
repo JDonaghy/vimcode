@@ -1,22 +1,17 @@
 //! Driver-tier black-box tests for the bundled `contrib/extensions/rest-client`
-//! extension (#147).
+//! extension.
 //!
 //! # Why this loads the real, shipped Lua
 //!
-//! Every other fixture under `src/harness/` writes synthetic Lua inline for
-//! the test ([`crate::harness::plugin_view`]'s own module doc explains why:
-//! a real [`crate::core::plugin::PluginManager`] load keeps the parse/paint/
-//! dispatch wiring in the measured path). This module goes one step
-//! further and loads the actual file the extension ships —
+//! This module loads the actual file the extension ships —
 //! `contrib/extensions/rest-client/rest_client.lua` — via
 //! [`crate::core::plugin::PluginManager::load_plugins_dir`] pointed straight
-//! at the on-disk directory, exactly as #147's acceptance criterion asks
-//! ("load `contrib/extensions/rest-client` from disk") and exactly the path
-//! `Engine::plugin_init` takes for a real installed extension (one `.lua`
-//! file per top-level entry in the extension's own directory, no `init.lua`
-//! wrapper — see that function's own doc). A regression in the shipped
-//! extension is caught here the way it would hit a user, not via a
-//! hand-rolled parallel fixture that could quietly drift from what ships.
+//! at the on-disk directory, exactly as the path `Engine::plugin_init` takes for
+//! a real installed extension (one `.lua` file per top-level entry in the
+//! extension's own directory, no `init.lua` wrapper — see that function's own
+//! doc). A regression in the shipped extension is caught here the way it would
+//! hit a user, not via a hand-rolled parallel fixture that could quietly drift
+//! from what ships.
 //!
 //! # Zero extension-specific Rust (epic #1403 / GOALS.md's Platform-
 //! Neutrality Rule)
@@ -24,9 +19,8 @@
 //! `rest_client.lua` is pure `vimcode.*` Lua — `vimcode.ui.register_view`,
 //! `vimcode.http.request`, `vimcode.json.{encode,decode}`,
 //! `vimcode.storage.{get,set}`, `vimcode.command`. Nothing in this module
-//! (or anywhere else in this PR) adds extension-specific code to
-//! `src/core/`; every API the extension calls already shipped (#146, #1627,
-//! #1631, #1632).
+//! adds extension-specific code to `src/core/`; every API the extension calls
+//! already shipped.
 //!
 //! # Six views, one hub
 //!
@@ -44,20 +38,17 @@
 //! Every scenario below opens a view's tab via [`open_tab`], which calls
 //! [`Engine::plugin_run_command`] directly on the harness's exposed
 //! `Rc<RefCell<Engine>>` rather than typing `:RestClient<Enter>` through the
-//! driver. That is deliberate, not a shortcut around #1627's in-panel text
-//! entry: several scenarios are still focused on a `text`/`text_area` field
-//! (URL, the Environment buffer) at the moment they need to switch views,
-//! and a literal `:` keystroke there would be inserted into the focused
-//! field's value instead of opening the command line — exactly as it
-//! should, since #1627 gives a focused field first claim on every printable
-//! key. `plugin_run_command` is the identical dispatch a real
+//! driver. That is deliberate: several scenarios are still focused on a
+//! `text`/`text_area` field (URL, the Environment buffer) at the moment they
+//! need to switch views, and a literal `:` keystroke there would be inserted
+//! into the focused field's value instead of opening the command line —
+//! exactly as it should, since a focused field has first claim on every
+//! printable key. `plugin_run_command` is the identical dispatch a real
 //! `:RestClient<Enter>` reaches once the ex-command parser has resolved the
 //! name (`PluginManager::call_command`), so the command registration and
 //! the view-opening wiring are still exercised end to end — only the literal
-//! keystrokes of the ex-command parser itself are skipped, and that parser
-//! is not part of what #147 adds. `ConformanceHarness::engine` is exposed
-//! for precisely this kind of "reach past painted text" need (its own doc
-//! comment says so).
+//! keystrokes of the ex-command parser itself are skipped. `ConformanceHarness::engine`
+//! is exposed for precisely this kind of "reach past painted text" need.
 //!
 //! Every *behaviour* under test — typing into fields, clicking buttons,
 //! editing table cells, the async HTTP round trip, cross-reload persistence
@@ -284,12 +275,12 @@ fn activate_send<D: ConformanceDriver>(driver: &mut D) {
 
 // ── Shared scenario bodies ──────────────────────────────────────────────
 
-/// #147 acceptance 1 — "fill the URL, send, and assert the painted status
-/// line and the pretty-printed JSON body."
+/// Fill the URL, send, and assert the painted status line and the
+/// pretty-printed JSON body.
 ///
 /// The Request view's `url` field is already focused when its tab opens
 /// (`first_focusable` skips the non-interactive header label), and every
-/// keystroke reaches the plugin as `TextChanged` (#1627), so no explicit
+/// keystroke reaches the plugin as `TextChanged`, so no explicit
 /// commit is needed before clicking Send.
 pub fn fill_url_send_and_paint_response<D: ConformanceDriver + DrivesIdle>(
     driver: &mut D,
@@ -320,7 +311,7 @@ pub fn fill_url_send_and_paint_response<D: ConformanceDriver + DrivesIdle>(
          painted runs were {:?}",
         painted(driver)
     );
-    // #147 review (headers-list finding): the fixture server always answers
+    // The fixture server always answers
     // with a `Content-Type` header (see `spawn_capturing_server`), so its
     // presence on the Response view's paint is direct evidence `resp.headers`
     // reached the view, not just the body.
@@ -333,11 +324,10 @@ pub fn fill_url_send_and_paint_response<D: ConformanceDriver + DrivesIdle>(
     );
 }
 
-/// #147 acceptance 2 — "add a header row and assert the server received
-/// it." Only the *painted* half (typing the key/value into the Headers
-/// table and confirming they're committed) lives here; the caller checks
-/// what the fixture server actually saw, since that is not something
-/// painted output can show at all.
+/// Add a header row and assert the server received it. Only the *painted*
+/// half (typing the key/value into the Headers table and confirming they're
+/// committed) lives here; the caller checks what the fixture server actually
+/// saw, since that is not something painted output can show at all.
 pub fn add_header_row_then_send<D: ConformanceDriver + DrivesIdle>(
     driver: &mut D,
     engine: &Rc<RefCell<Engine>>,
@@ -361,7 +351,7 @@ pub fn add_header_row_then_send<D: ConformanceDriver + DrivesIdle>(
     driver.type_text(header_name);
     driver.press_named(NamedKey::Enter);
     // Right moves the column selection to the second editable column
-    // ("Value" — `handle_plugin_view_table_key`'s review fix, #1631).
+    // ("Value").
     driver.press_named(NamedKey::Right);
     driver.press_named(NamedKey::Enter);
     driver.type_text(header_value);
@@ -383,8 +373,7 @@ pub fn add_header_row_then_send<D: ConformanceDriver + DrivesIdle>(
     );
 }
 
-/// #147 acceptance 3, first half — send one request, then confirm it shows
-/// up in the History view.
+/// Send one request, then confirm it shows up in the History view.
 pub fn send_then_open_history<D: ConformanceDriver + DrivesIdle>(
     driver: &mut D,
     engine: &Rc<RefCell<Engine>>,
@@ -403,12 +392,10 @@ pub fn send_then_open_history<D: ConformanceDriver + DrivesIdle>(
     );
 }
 
-/// #147 acceptance 3, second half — "survives a plugin reload": on a
-/// **freshly loaded** extension (a new `PluginManager`/`Lua` VM, built by
-/// the caller against the same `VIMCODE_TEST_DATA_HOME`), the History view
-/// must still show the entry the previous load persisted, with no request
-/// sent on this engine at all. Proves `vimcode.storage` round-trips through
-/// a real reload, not just "stayed in a Lua local that never got dropped."
+/// On a freshly loaded extension (a new `PluginManager`/`Lua` VM), the
+/// History view must still show an entry that was persisted by a previous
+/// load, with no request sent on this engine at all. Proves
+/// `vimcode.storage` round-trips through a real reload.
 pub fn open_history_without_sending<D: ConformanceDriver + DrivesIdle>(
     driver: &mut D,
     engine: &Rc<RefCell<Engine>>,
@@ -423,11 +410,11 @@ pub fn open_history_without_sending<D: ConformanceDriver + DrivesIdle>(
     );
 }
 
-/// #147 acceptance 4 — "`{{base}}` substitution": a variable typed into the
-/// Environment view resolves inside the Request view's URL before the
-/// request is sent. Asserted indirectly but unambiguously: `{{base}}` is
-/// not a resolvable host by itself, so the request only reaches (and gets
-/// a `200` from) the fixture server if the substitution actually ran.
+/// A variable typed into the Environment view resolves inside the Request
+/// view's URL before the request is sent. Asserted indirectly but
+/// unambiguously: `{{base}}` is not a resolvable host by itself, so the
+/// request only reaches (and gets a `200` from) the fixture server if the
+/// substitution actually ran.
 pub fn env_substitution_then_send<D: ConformanceDriver + DrivesIdle>(
     driver: &mut D,
     engine: &Rc<RefCell<Engine>>,
@@ -449,14 +436,13 @@ pub fn env_substitution_then_send<D: ConformanceDriver + DrivesIdle>(
     );
 }
 
-/// Not one of #147's four acceptance bullets, but cheap insurance for the
-/// three views none of them happen to open: a Lua error inside a `render()`
-/// callback is swallowed silently (`Engine::refresh_plugin_view_inner`'s
-/// `Err` arm leaves the view's last-good content in place rather than
-/// panicking), so a typo in the Params/Collections/Env views' `render()`
-/// would otherwise ship invisibly — the tab would just paint blank, and
-/// nothing above would ever open it to notice. Opens each and asserts its
-/// own declared title paints.
+/// Cheap insurance for the three views none of the acceptance scenarios
+/// happen to open: a Lua error inside a `render()` callback is swallowed
+/// silently (`Engine::refresh_plugin_view_inner`'s `Err` arm leaves the
+/// view's last-good content in place rather than panicking), so a typo in
+/// the Params/Collections/Env views' `render()` would otherwise ship
+/// invisibly — the tab would just paint blank, and nothing above would ever
+/// open it to notice. Opens each and asserts its own declared title paints.
 pub fn other_views_render_without_error<D: ConformanceDriver + DrivesIdle>(
     driver: &mut D,
     engine: &Rc<RefCell<Engine>>,
@@ -503,15 +489,14 @@ mod tests {
     #[cfg(feature = "gui")]
     const H: i32 = 1000;
 
-    // ── `VIMCODE_TEST_DATA_HOME` isolation (#147's "survives a plugin
-    // reload" scenario needs `vimcode.storage` to resolve to a throwaway
-    // directory, not a developer's real one) ───────────────────────────
+    // `VIMCODE_TEST_DATA_HOME` isolation: the "survives a plugin reload"
+    // scenario needs `vimcode.storage` to resolve to a throwaway directory,
+    // not a developer's real one.
     //
     // Mirrors `src/gtk/testing.rs`'s `acquire_status_paint_1345::EnvVarGuard`
-    // exactly — same lock (`VIMCODE_TEST_DATA_HOME_LOCK`'s own doc explains
-    // why every mutator of this one process-global env var shares it rather
-    // than each guarding separately), same restore-on-drop shape. Not
-    // reused directly: that struct is private to its own test module.
+    // exactly — same lock (shared by every mutator of this one process-global
+    // env var), same restore-on-drop shape. Not reused directly: that struct
+    // is private to its own test module.
 
     struct EnvVarGuard {
         key: &'static str,
@@ -557,11 +542,9 @@ mod tests {
 
     /// Spawn a one-shot loopback HTTP server: binds an ephemeral port,
     /// answers exactly one request with a fixed `200`/`body`, capturing the
-    /// request's method/path/headers along the way, then exits. Mirrors
-    /// `src/tui_main/app_on_tui_tests.rs`'s `spawn_one_shot_http_fixture` /
-    /// `tests/extensions.rs`'s `spawn_http_fixture_server`, extended with
-    /// header capture — #147's "assert the server received it" scenario is
-    /// the one consumer of that extra half.
+    /// request's method/path/headers along the way, then exits. Extended with
+    /// header capture to support the scenario that asserts the server
+    /// received a particular header.
     fn spawn_capturing_server(body: &'static str) -> (String, Arc<Mutex<Option<CapturedRequest>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral loopback port");
         let addr = listener.local_addr().expect("resolve bound local_addr");
