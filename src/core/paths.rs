@@ -48,13 +48,23 @@ pub(crate) fn set_test_home(dir: &Path) -> TestHomeGuard {
 
 /// The active thread-local home override, if any. Always `None` outside
 /// `--lib` test builds.
+///
+/// `pub(crate)` so call sites that spawn a real network write (extension
+/// install/update in `lsp_ops.rs`) can tell "this call is sandboxed under
+/// a test's own tempdir via [`set_test_home`]" apart from "this call has
+/// no sandbox at all" — the former is safe to let through even if the
+/// unrelated, process-global `session::saves_suppressed()` latch happens
+/// to be tripped by a different test earlier in the same `--lib` binary;
+/// the latter must still be blocked by that latch. See
+/// `core::engine::lsp_ops`'s download-guard comments for the full
+/// rationale.
 #[cfg(test)]
-fn test_home_override() -> Option<PathBuf> {
+pub(crate) fn test_home_override() -> Option<PathBuf> {
     TEST_HOME_OVERRIDE.with(|cell| cell.borrow().clone())
 }
 
 #[cfg(not(test))]
-fn test_home_override() -> Option<PathBuf> {
+pub(crate) fn test_home_override() -> Option<PathBuf> {
     None
 }
 

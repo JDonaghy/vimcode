@@ -549,11 +549,43 @@ impl Engine {
         // background thread has written anything. The thread signals
         // completion over a channel, and `poll_ext_scripts` reloads plugins
         // once the files are actually on disk.
+        //
+        // `session::saves_suppressed()` gates this the same way
+        // `Settings::save()` and `save_ext_settings()` are gated: an
+        // integration test that drives `:ExtInstall`/`ext_install_from_registry`
+        // through `tests/common::engine_with()` must not spawn a real
+        // network download of a real extension's scripts into the real
+        // `~/.config/vimcode/extensions/<name>/` — only the "mark
+        // installed" bookkeeping below should happen.
+        //
+        // `saves_suppressed()` is a process-global, never-reset latch
+        // (see its doc comment in `session.rs`), so a `--lib` unit test
+        // elsewhere in the same test binary that calls
+        // `suppress_disk_saves()` can leave it permanently tripped for
+        // every unit test that runs afterward in that process — including
+        // one that deliberately sandboxed itself with
+        // `paths::set_test_home` and genuinely needs this download to
+        // land inside its own tempdir. `paths::test_home_override()` tells
+        // the two cases apart: when this call runs under an active
+        // test-home override, `ext_dir` above already resolved under that
+        // override rather than the real `$HOME`, so the write is safe
+        // regardless of the unrelated global latch's state.
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
             .join(&ext_name);
         let base_url = self.resolve_registry_base_url(&manifest);
-        if !manifest.scripts.is_empty()
+        if std::env::var("VIMCODE_DEBUG_1890").is_ok() {
+            eprintln!(
+                "[1890-debug] site=install_with_runtime_check ext_name={ext_name:?} test_home={:?} saves_suppressed={} scripts_empty={} base_url={:?} ext_dir={:?}",
+                paths::test_home_override(),
+                crate::core::session::saves_suppressed(),
+                manifest.scripts.is_empty(),
+                base_url,
+                ext_dir,
+            );
+        }
+        if (paths::test_home_override().is_some() || !crate::core::session::saves_suppressed())
+            && !manifest.scripts.is_empty()
             && !base_url.is_empty()
             && std::fs::create_dir_all(&ext_dir).is_ok()
         {
@@ -1301,12 +1333,31 @@ impl Engine {
             return;
         }
 
-        // Re-download scripts (overwrite existing files)
+        // Re-download scripts (overwrite existing files). Gated the same
+        // way `ext_install_from_registry_with_runtime_check`'s download is:
+        // an integration test driving `:ExtUpdate` through `engine_with()`
+        // must not spawn a real network write into `~/.config/vimcode/extensions/`,
+        // but a `--lib` unit test sandboxed under its own tempdir via
+        // `paths::set_test_home` must not be blocked by the unrelated,
+        // process-global `saves_suppressed()` latch another unit test
+        // tripped earlier in the same test binary — see the matching
+        // comment on `ext_install_from_registry_with_runtime_check`.
         let ext_dir = paths::vimcode_config_dir()
             .join("extensions")
             .join(&ext_name);
         let base_url = self.resolve_registry_base_url(&manifest);
-        if !manifest.scripts.is_empty()
+        if std::env::var("VIMCODE_DEBUG_1890").is_ok() {
+            eprintln!(
+                "[1890-debug] site=update_one ext_name={ext_name:?} test_home={:?} saves_suppressed={} scripts_empty={} base_url={:?} ext_dir={:?}",
+                paths::test_home_override(),
+                crate::core::session::saves_suppressed(),
+                manifest.scripts.is_empty(),
+                base_url,
+                ext_dir,
+            );
+        }
+        if (paths::test_home_override().is_some() || !crate::core::session::saves_suppressed())
+            && !manifest.scripts.is_empty()
             && !base_url.is_empty()
             && std::fs::create_dir_all(&ext_dir).is_ok()
         {
@@ -1399,11 +1450,32 @@ impl Engine {
             actually_updated.push(name.clone());
         }
         for name in &actually_updated {
-            // Re-download scripts for each
+            // Re-download scripts for each. Gated the same way
+            // `ext_install_from_registry_with_runtime_check` and
+            // `ext_update_one`'s downloads are: an integration test driving
+            // `:ExtUpdate`/`ext_update_all` through `engine_with()` must not
+            // spawn a real network write into `~/.config/vimcode/extensions/`,
+            // but a `--lib` unit test sandboxed under its own tempdir via
+            // `paths::set_test_home` must not be blocked by the unrelated,
+            // process-global `saves_suppressed()` latch another unit test
+            // tripped earlier in the same test binary — see the matching
+            // comment on `ext_install_from_registry_with_runtime_check`.
             if let Some(manifest) = manifests.iter().find(|m| &m.name == name) {
                 let ext_dir = paths::vimcode_config_dir().join("extensions").join(name);
                 let base_url = self.resolve_registry_base_url(manifest);
-                if !manifest.scripts.is_empty()
+                if std::env::var("VIMCODE_DEBUG_1890").is_ok() {
+                    eprintln!(
+                        "[1890-debug] site=update_all ext_name={name:?} test_home={:?} saves_suppressed={} scripts_empty={} base_url={:?} ext_dir={:?}",
+                        paths::test_home_override(),
+                        crate::core::session::saves_suppressed(),
+                        manifest.scripts.is_empty(),
+                        base_url,
+                        ext_dir,
+                    );
+                }
+                if (paths::test_home_override().is_some()
+                    || !crate::core::session::saves_suppressed())
+                    && !manifest.scripts.is_empty()
                     && !base_url.is_empty()
                     && std::fs::create_dir_all(&ext_dir).is_ok()
                 {
