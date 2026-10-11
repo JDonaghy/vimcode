@@ -117,7 +117,11 @@ the Test stage's job.
   fix goes in the commit message and your final message, which is where reviewers read it. When
   you edit next to such a comment, rewrite it in the present tense or delete it. The only exception
   is a workaround to remove when an issue closes: `// TODO(#N): <what to remove>`. Enforcement is
-  the comment-history lint (#1896) once it lands.
+  the comment-history lint (`tools/comment_history_lint.py`, #1896), a per-module ratchet on CI. If
+  it blocks you, run `tools/comment_history_lint.py --fix` first (defaults to this branch's changed
+  files) — it mechanically strips the easy cases (a leading `#1234 review: ...` tag, a trailing
+  `(#1234)` aside, a ref-only line) for free. Whatever it leaves flagged is free-text history prose
+  or a `TODO`/`FIXME`/`SAFETY` line; hand-rewrite those in the present tense.
 
 ## Testing — black-box coverage is the acceptance bar (MANDATORY)
 
