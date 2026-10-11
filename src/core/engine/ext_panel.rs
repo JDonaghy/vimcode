@@ -2275,7 +2275,23 @@ impl Engine {
     }
 
     /// Save an extension's settings to disk.
+    ///
+    /// Mirrors `Settings::save()`'s guard against clobbering the user's real
+    /// `~/.config/vimcode/` during tests: unit tests (`#[cfg(test)]`) are a
+    /// no-op outright, and integration tests — which link this crate without
+    /// `cfg(test)` — are a no-op whenever `session::suppress_disk_saves()`
+    /// has been called (e.g. by `tests/common::engine_with()`).
+    #[cfg_attr(test, allow(unused_variables))]
     pub(crate) fn save_ext_settings(&self, ext_name: &str) {
+        #[cfg(test)]
+        return;
+
+        #[cfg_attr(test, allow(unreachable_code))]
+        if crate::core::session::saves_suppressed() {
+            return;
+        }
+
+        #[cfg_attr(test, allow(unreachable_code))]
         if let Some(values) = self.ext_settings.get(ext_name) {
             let path = paths::vimcode_config_dir()
                 .join("extensions")
