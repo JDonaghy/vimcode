@@ -13,6 +13,15 @@
 //! by the `no_display_guard_tests` module beside it in `src/gtk/mod.rs`,
 //! including the macOS/Windows "never trips" direction, so nothing is lost
 //! by not spawning the binary off-Linux.
+//!
+//! `gtk::run()`'s no-display guard calls `std::process::exit(1)` before the
+//! first-run icon/desktop-file install (`src/gtk/util.rs`) ever runs, so this
+//! scenario does not currently write under `$HOME`. Still, this test spawns
+//! the real binary, and nothing stops a future reordering of `gtk::run()`
+//! from moving a write ahead of the guard. Pin `$HOME` to a throwaway
+//! directory anyway, mirroring `tests/ext_install_cli.rs`'s real-binary-spawn
+//! pattern, so a spawned-binary test here can never land on the real
+//! developer home.
 
 #![cfg(not(any(target_os = "macos", target_os = "windows")))]
 
@@ -20,12 +29,19 @@ use std::process::Command;
 
 #[test]
 fn vimcode_with_no_display_prints_a_clear_error_and_exits_nonzero() {
+    let home = std::env::temp_dir().join(format!("vc-gtk-no-display-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create throwaway home dir");
+
     let exe = env!("CARGO_BIN_EXE_vimcode");
     let output = Command::new(exe)
+        .env("HOME", &home)
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
         .output()
         .expect("failed to run vimcode");
+
+    let _ = std::fs::remove_dir_all(&home);
 
     assert!(
         !output.status.success(),
