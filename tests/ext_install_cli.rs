@@ -74,6 +74,7 @@ dependencies = ["npm"]
         .arg(ext_name)
         .arg("--json")
         .env("HOME", &home)
+        .env("VIMCODE_TEST_HOME_ISOLATED", "1")
         .env("PATH", "/usr/bin:/bin")
         .env(
             "VIMCODE_TEST_HOMEBREW_PREFIXES",
@@ -145,6 +146,7 @@ display_name = "Unused"
         .arg("vc-test-totally-unknown-extension-1719")
         .arg("--json")
         .env("HOME", &home)
+        .env("VIMCODE_TEST_HOME_ISOLATED", "1")
         .env("PATH", "/usr/bin:/bin")
         .env(
             "VIMCODE_TEST_HOMEBREW_PREFIXES",
@@ -194,6 +196,7 @@ requires_vimcode = ">=9999.0.0"
         .arg(ext_name)
         .arg("--json")
         .env("HOME", &home)
+        .env("VIMCODE_TEST_HOME_ISOLATED", "1")
         .env("PATH", "/usr/bin:/bin")
         .env(
             "VIMCODE_TEST_HOMEBREW_PREFIXES",

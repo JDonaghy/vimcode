@@ -259,6 +259,7 @@ fn vcd_should_exit_promptly_once_its_pty_master_closes() {
         "VIMCODE_TEST_DATA_HOME",
         home.join(".local").join("share").join("vimcode"),
     );
+    cmd.env("VIMCODE_TEST_HOME_ISOLATED", "1");
     // Deliberately *not* a controlling terminal (`setsid`/`TIOCSCTTY`,
     // `portable_pty::CommandBuilder`'s default) — a real controlling
     // terminal's hangup kills the child via the default `SIGHUP`

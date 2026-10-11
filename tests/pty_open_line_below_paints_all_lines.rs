@@ -112,6 +112,7 @@ fn spawn_under_pty(file_path: &PathBuf, home: &PathBuf) -> SpawnedPty {
         "VIMCODE_TEST_DATA_HOME",
         home.join(".local").join("share").join("vimcode"),
     );
+    cmd.env("VIMCODE_TEST_HOME_ISOLATED", "1");
 
     let child = pair
         .slave
