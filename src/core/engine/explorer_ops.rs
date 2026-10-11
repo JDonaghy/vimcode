@@ -68,7 +68,17 @@ impl Engine {
     }
 
     pub fn explorer_reveal_active_file(&mut self) {
-        if let Some(path) = self.file_path().cloned() {
+        // Prefer the canonicalized path (cached at open time by
+        // `BufferState::with_file`) over the raw `file_path`: a file opened
+        // via a relative CLI argument or a symlinked path keeps that raw
+        // spelling in `file_path` forever, which `explorer_reveal_path`
+        // would otherwise have to re-resolve from scratch every call.
+        let state = self.active_buffer_state();
+        let path = state
+            .canonical_path
+            .clone()
+            .or_else(|| state.file_path.clone());
+        if let Some(path) = path {
             self.explorer_reveal_path(&path);
         }
     }
@@ -90,12 +100,40 @@ impl Engine {
     /// explicit "reveal" user command exists), so a no-op here when
     /// `explorer_auto_reveal` is off — VS Code's `explorer.autoReveal` —
     /// is sufficient to suppress all of them, with nothing to special-case.
+    ///
+    /// `target` is not assumed to already be absolute or canonical: the
+    /// single most common real-world call path (`cd myrepo && vimcode
+    /// src/main.rs`) hands this a path relative to `self.cwd`, and other
+    /// callers may hand in a differently-spelled-but-equivalent absolute
+    /// path (a symlinked launch path, `/tmp` vs `/private/tmp` on macOS). A
+    /// literal `PathBuf` comparison against `self.cwd`/`explorer_rows`
+    /// (which are always absolute, built by walking `self.cwd`) would
+    /// silently fail to expand or select anything in either case, so this
+    /// resolves `target` to an absolute path relative to `self.cwd` first,
+    /// then additionally tries the canonicalized (symlink-resolved) form —
+    /// falling back to the plain absolute join whenever canonicalization
+    /// fails, e.g. the path doesn't exist on disk yet or this is a
+    /// synthetic path in a test — so the common case never touches the
+    /// filesystem and still works.
     pub fn explorer_reveal_path(&mut self, target: &Path) {
         if !self.settings.explorer_auto_reveal {
             return;
         }
         let root = self.cwd.clone();
-        if let Ok(rel) = target.strip_prefix(&root) {
+        let absolute_target = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            root.join(target)
+        };
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        let canonical_target = absolute_target
+            .canonicalize()
+            .unwrap_or_else(|_| absolute_target.clone());
+        let rel = canonical_target
+            .strip_prefix(&canonical_root)
+            .ok()
+            .or_else(|| absolute_target.strip_prefix(&root).ok());
+        if let Some(rel) = rel {
             self.explorer_expanded.insert(root.clone());
             let mut accum = root.clone();
             for component in rel.parent().into_iter().flat_map(|p| p.components()) {
@@ -104,7 +142,18 @@ impl Engine {
             }
         }
         self.explorer_rebuild_rows();
-        if let Some(idx) = self.explorer_rows.iter().position(|r| r.path == target) {
+        let idx = rel
+            .and_then(|rel| {
+                self.explorer_rows
+                    .iter()
+                    .position(|r| r.path == root.join(rel))
+            })
+            .or_else(|| {
+                self.explorer_rows
+                    .iter()
+                    .position(|r| r.path == absolute_target)
+            });
+        if let Some(idx) = idx {
             let mut tree = self.explorer_tree.borrow_mut();
             tree.set_selected_path(Some(vec![idx as u16]));
             tree.scroll_to_visible(idx, self.explorer_viewport_rows.get());

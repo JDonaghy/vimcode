@@ -5162,11 +5162,17 @@ mod tests {
         /// active file's ancestor folders, selects its row and scrolls it
         /// into view in the Explorer sidebar whenever the active editor
         /// changes — including a plain tab-bar click, not just opening a
-        /// file for the first time. Before this fix, `Engine::goto_tab`
-        /// already called `explorer_reveal_active_file()` on every switch,
-        /// but there was no way to turn that off, and no driver-level test
-        /// proved a *real click on the tab bar* (as opposed to a direct
-        /// `explorer_reveal_path` call) drives it end to end.
+        /// file for the first time.
+        ///
+        /// Both tabs are opened through *relative* paths, with the process
+        /// working directory moved into the fixture, because that is the
+        /// shape a real `cd myrepo && vimcode sub/nested.rs` launch (and
+        /// every later relative `:e`) hands the engine: the buffer's
+        /// `file_path` stays relative while `engine.cwd` and
+        /// `explorer_rows` are absolute. [`crate::test_cwd::CwdGuard`] is
+        /// scoped to the setup block below — `harness` takes a
+        /// `CwdReadGuard`, and one thread must never hold both (see that
+        /// module's doc).
         ///
         /// Reads the sidebar's painted background colour back via
         /// [`find_below_tab_bar`] + `style_at`, the same proof
@@ -5174,6 +5180,15 @@ mod tests {
         /// (`mod sidebar_panels`) uses for a direct `explorer_reveal_path`
         /// call — this test's only difference is the trigger: a genuine
         /// `driver.click` on the tab bar's own painted label.
+        ///
+        /// Observed red against unfixed `develop`:
+        /// `explorer_reveal_active_file` there hands the buffer's raw
+        /// `file_path` (`sub/nested.rs`) to `explorer_reveal_path`, which
+        /// compares it against the always-absolute `self.cwd` and
+        /// `explorer_rows` without absolutizing it, so `rel` is `None`,
+        /// nothing is expanded or selected, and the `find_below_tab_bar`
+        /// lookup after the click panics with "must auto-reveal it".
+        /// Confirmed failing, then restored.
         #[test]
         fn tab_bar_click_reveals_and_highlights_active_file_in_explorer_1903() {
             let dir = std::env::temp_dir().join(format!(
@@ -5182,38 +5197,53 @@ mod tests {
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            // Canonical, so it compares equal to the `engine.cwd` the
+            // engine reads back out of the process below.
+            let dir = std::fs::canonicalize(&dir).unwrap();
             let sub = dir.join("sub");
-            std::fs::create_dir_all(&sub).unwrap();
-            let main_rs = dir.join("main.rs");
             let nested = sub.join("nested.rs");
-            std::fs::write(&main_rs, "fn main() {}\n").unwrap();
+            let nested_rel = std::path::PathBuf::from("sub").join("nested.rs");
+            std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
             std::fs::write(&nested, "// nested\n").unwrap();
 
-            let mut engine = plain_engine();
-            engine.settings.colorscheme = "vscode-light".to_string();
-            engine.settings.breadcrumbs = false; // one-row tab bar, simplest geometry
-            engine.cwd = dir.clone();
-            engine.open_file_in_tab(&main_rs);
-            // `open_file_in_tab` appends rather than reusing `plain_engine`'s
-            // pristine `[No Name]` scratch tab — close it so the tab bar
-            // only shows the two tabs this test cares about, same as
-            // `explorer_double_click_opens_second_file_in_a_second_tab_1798`.
-            engine.goto_tab(0);
-            engine.close_tab();
-            // Opening `nested` makes it the active tab and auto-reveals it
-            // (expanding `sub`); immediately undo both so the click below
-            // is the thing that re-expands/re-selects it, not a leftover
-            // from setup.
-            engine.open_file_in_tab(&nested);
-            engine.goto_tab(0);
-            engine.explorer_expanded.remove(&sub);
-            engine.explorer_rebuild_rows();
-            engine.app_shell.show_panel(&quadraui::WidgetId::new(
-                crate::core::engine::sidebar::PANEL_EXPLORER,
-            ));
-            engine.session.explorer_visible = true;
-            engine.explorer_has_focus = false;
-            let active_group = engine.active_group;
+            let (engine, active_group) = {
+                let _cwd = crate::test_cwd::CwdGuard::new();
+                std::env::set_current_dir(&dir).expect("chdir into the fixture directory");
+
+                let mut engine = plain_engine();
+                engine.settings.colorscheme = "vscode-light".to_string();
+                engine.settings.breadcrumbs = false; // one-row tab bar, simplest geometry
+                assert_eq!(
+                    engine.cwd, dir,
+                    "sanity: Engine::new_for_test must pick up the process \
+                     cwd this test just moved to, the same way Engine::new \
+                     would on a real `cd dir && vimcode ...` launch"
+                );
+                engine.open_file_in_tab(std::path::Path::new("main.rs"));
+                // `open_file_in_tab` appends rather than reusing
+                // `plain_engine`'s pristine `[No Name]` scratch tab — close
+                // it so the tab bar only shows the two tabs this test cares
+                // about, same as
+                // `explorer_double_click_opens_second_file_in_a_second_tab_1798`.
+                engine.goto_tab(0);
+                engine.close_tab();
+                // Opening `nested` makes it the active tab and auto-reveals
+                // it (expanding `sub`); immediately undo both so the click
+                // below is the thing that re-expands/re-selects it, not a
+                // leftover from setup.
+                engine.open_file_in_tab(&nested_rel);
+                engine.goto_tab(0);
+                engine.explorer_expanded.remove(&sub);
+                engine.explorer_rebuild_rows();
+                engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                    crate::core::engine::sidebar::PANEL_EXPLORER,
+                ));
+                engine.session.explorer_visible = true;
+                engine.explorer_has_focus = false;
+                let active_group = engine.active_group;
+                (engine, active_group)
+            };
             let mut h = harness(engine);
 
             let precondition_row = active_group_tab_bar_row(&h, active_group);
@@ -5238,8 +5268,9 @@ mod tests {
 
             assert_eq!(
                 h.engine.borrow().file_path(),
-                Some(&nested),
-                "clicking nested.rs's tab must make it the active file"
+                Some(&nested_rel),
+                "clicking nested.rs's tab must make it the active file, \
+                 still under the relative path it was opened with"
             );
 
             let (rx, ry) = find_below_tab_bar(&h, "nested.rs").unwrap_or_else(|| {
@@ -5274,6 +5305,19 @@ mod tests {
         /// must still switch the active tab (that behaviour predates and is
         /// independent of this setting) but must leave the Explorer sidebar
         /// alone: `sub` stays collapsed and nested.rs never paints there.
+        ///
+        /// Opens both files through absolute paths, unlike
+        /// `tab_bar_click_reveals_and_highlights_active_file_in_explorer_1903`
+        /// — the reveal has to be the thing the setting suppresses, so the
+        /// reveal must be capable of succeeding in the first place.
+        ///
+        /// Observed red against unfixed `develop` (`explorer_ops.rs`
+        /// restored, `settings.rs` kept so the field still compiles): with
+        /// no `explorer_auto_reveal` check in `explorer_reveal_path`,
+        /// `goto_tab`'s reveal runs regardless of the setting, `sub` is
+        /// expanded and nested.rs paints in the sidebar, so the final
+        /// `find_below_tab_bar(...).is_none()` assertion fails. Confirmed
+        /// failing, then restored.
         #[test]
         fn tab_bar_click_does_not_reveal_when_explorer_auto_reveal_is_off_1903() {
             let dir = std::env::temp_dir().join(format!(
@@ -5361,6 +5405,12 @@ mod tests {
         /// and the backend-neutral `render::apply_activity_panel_switch`
         /// rung, then reads the painted sidebar row's background back with
         /// `style_at`.
+        ///
+        /// Observed red against unfixed `develop`: showing a panel is not a
+        /// reveal trigger there at all, so the click brings up an Explorer
+        /// still collapsed to its root, `nested.rs` has no row to find and
+        /// the `find_below_tab_bar` lookup panics with "must auto-reveal the
+        /// active file". Confirmed failing, then restored.
         #[test]
         fn activity_bar_click_reveals_active_file_in_explorer_1903() {
             let dir = std::env::temp_dir().join(format!(
@@ -5447,6 +5497,15 @@ mod tests {
         /// `explorer_auto_reveal` like every other reveal trigger: with the
         /// setting off, showing the Explorer must leave the collapsed tree
         /// exactly as the user left it.
+        ///
+        /// Unfixed `develop` passes this one vacuously — nothing reveals on
+        /// panel show there, so there is nothing for the setting to
+        /// suppress. Its red-capability was observed the other way round,
+        /// against this branch with the `explorer_auto_reveal` check deleted
+        /// from `explorer_reveal_path`: the reveal then runs regardless of
+        /// the setting, `sub` is expanded and the final
+        /// `find_below_tab_bar(...).is_none()` assertion fails. Confirmed
+        /// failing, then restored.
         #[test]
         fn activity_bar_click_does_not_reveal_when_auto_reveal_is_off_1903() {
             let dir = std::env::temp_dir().join(format!(
@@ -5491,6 +5550,101 @@ mod tests {
                 find_below_tab_bar(&h, "nested.rs").is_none(),
                 "with `explorer_auto_reveal` off, showing the Explorer must \
                  not expand `sub` or reveal nested.rs; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #1903 regression: `Engine::explorer_reveal_path` is handed
+        /// whatever `target` the caller has, not necessarily an absolute
+        /// one. The single most common real launch — `cd myrepo && vimcode
+        /// src/main.rs` — hands `Engine::startup` a path relative to the
+        /// process's (and therefore `engine.cwd`'s) working directory, all
+        /// the way from `Args::parse` in `src/main.rs`.
+        /// [`crate::test_cwd::CwdGuard`] moves the *real* process working
+        /// directory (not just `engine.cwd`) into the fixture for the setup
+        /// block, so `plain_engine`'s `Engine::new_for_test` picks it up
+        /// exactly the way `Engine::new` would on a real launch, and
+        /// `startup_without_session_restore` is then driven with a genuinely
+        /// relative `file_path` — the same shape a real CLI argument has.
+        /// The guard is scoped to that block and dropped before `harness`,
+        /// which takes a `CwdReadGuard`: one thread must never hold both
+        /// (see `crate::test_cwd`'s module doc).
+        ///
+        /// Observed red against unfixed `develop`: with
+        /// `explorer_reveal_path` comparing `target` to `self.cwd`/
+        /// `explorer_rows` as literal `PathBuf`s (no absolutization), the
+        /// relative `target` never shares a prefix with the always-absolute
+        /// `self.cwd`, so `rel` is `None`, nothing gets expanded or
+        /// selected, and this test's `find_below_tab_bar` lookup below
+        /// fails with "must auto-reveal it". Confirmed failing, then
+        /// restored.
+        #[test]
+        fn startup_with_relative_file_path_reveals_it_in_explorer_1903() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1903_startup_relative_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("rel")).unwrap();
+            // Canonical, so it compares equal to the `engine.cwd` the engine
+            // reads back out of the process below.
+            let dir = std::fs::canonicalize(&dir).unwrap();
+            std::fs::write(dir.join("rel").join("relative.rs"), "// relative\n").unwrap();
+
+            let engine = {
+                let _cwd = crate::test_cwd::CwdGuard::new();
+                std::env::set_current_dir(&dir).expect("chdir into the fixture directory");
+
+                let mut engine = plain_engine();
+                engine.settings.colorscheme = "vscode-light".to_string();
+                engine.settings.breadcrumbs = false; // one-row tab bar, simplest geometry
+                assert_eq!(
+                    engine.cwd, dir,
+                    "sanity: Engine::new_for_test must pick up the process cwd \
+                     this test just moved to, the same way Engine::new would on \
+                     a real `cd dir && vimcode ...` launch"
+                );
+
+                engine
+                    .startup_without_session_restore(Some(std::path::Path::new("rel/relative.rs")));
+
+                engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                    crate::core::engine::sidebar::PANEL_EXPLORER,
+                ));
+                engine.session.explorer_visible = true;
+                engine
+            };
+            let h = harness(engine);
+
+            assert!(
+                h.driver.screen_has("relative.rs"),
+                "startup with a relative file_path must still open that \
+                 file (onto the tab bar); screen:\n{}",
+                h.driver.screen()
+            );
+
+            let (rx, ry) = find_below_tab_bar(&h, "relative.rs").unwrap_or_else(|| {
+                panic!(
+                    "startup with a relative file_path must auto-reveal it \
+                     in the Explorer sidebar (expanding `rel`); screen:\n{}",
+                    h.driver.screen()
+                )
+            });
+            let style = h
+                .driver
+                .style_at(rx, ry)
+                .expect("the revealed row must paint a styled cell");
+            let expected_bg = quadraui::tui::ratatui_color(
+                crate::render::Theme::vscode_light().sidebar_sel_bg_inactive,
+            );
+            assert_eq!(
+                style.bg,
+                expected_bg,
+                "the revealed row must be selected/highlighted with \
+                 `sidebar_sel_bg_inactive`; screen:\n{}",
                 h.driver.screen()
             );
 
