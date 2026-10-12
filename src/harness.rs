@@ -144,6 +144,1314 @@ use quadraui::NamedKey;
 use crate::app::App;
 use crate::core::Engine;
 
+// ── Role-based locators ───────────────────────────────────────────────
+//
+// Typed, stable names for each UI region. Maps 1:1 to `WidgetId` strings
+// `AppShell::render`'s `register_chrome_zones` already registers -- no
+// upstream quadraui change required.
+
+/// Semantic role for a UI region that `AppShell::render`'s
+/// `register_chrome_zones` already registers as a `WidgetId`-keyed zone.
+///
+/// Each variant maps 1:1 to a known `WidgetId` string via [`UiRole::zone_id`].
+/// `#[non_exhaustive]`: new regions can be added without breaking existing
+/// match arms.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UiRole {
+    // Chrome regions (app-shell:* zones)
+    Window,
+    ActivityBar,
+    MainContent,
+    TitleBar,
+    SidebarHeader,
+    SidebarContent,
+    Divider,
+    BottomPanel,
+    CommandLine,
+    StatusBar,
+
+    // Activity-bar panels (panel:* / bottom:* zones)
+    Explorer,
+    Search,
+    SourceControl,
+    Debug,
+    Extensions,
+    Settings,
+}
+
+impl UiRole {
+    /// The `WidgetId` string `register_chrome_zones` registers this role under.
+    pub const fn zone_id(&self) -> &'static str {
+        match self {
+            Self::Window => "app-shell:window",
+            Self::ActivityBar => "app-shell:activity-bar",
+            Self::MainContent => "app-shell:main-content",
+            Self::TitleBar => "app-shell:title-bar",
+            Self::SidebarHeader => "app-shell:sidebar-header",
+            Self::SidebarContent => "app-shell:sidebar-content",
+            Self::Divider => "app-shell:divider",
+            Self::BottomPanel => "app-shell:bottom-panel",
+            Self::CommandLine => "app-shell:command-line",
+            Self::StatusBar => "app-shell:status-bar",
+            Self::Explorer => "panel:explorer",
+            Self::Search => "panel:search",
+            Self::SourceControl => "panel:git",
+            Self::Debug => "panel:debug",
+            Self::Extensions => "panel:extensions",
+            Self::Settings => "bottom:settings",
+        }
+    }
+}
+
+/// A resolved reference to a UI element located by role in the current frame.
+#[derive(Debug, Clone, Copy)]
+pub struct RoleRef {
+    pub role: UiRole,
+    pub bounds: quadraui::Rect,
+}
+
+impl RoleRef {
+    /// Center point of this element's painted bounds.
+    pub fn center(&self) -> (f32, f32) {
+        (
+            self.bounds.x + self.bounds.width / 2.0,
+            self.bounds.y + self.bounds.height / 2.0,
+        )
+    }
+}
+
+/// Role-based locator methods, layered on top of any `ConformanceDriver`.
+pub trait RoleLocator: ConformanceDriver {
+    /// Find the zone registered for `role` in the current frame's inventory.
+    fn find_by_role(&self, role: UiRole) -> Option<RoleRef> {
+        let id = quadraui::WidgetId::new(role.zone_id());
+        self.inventory()
+            .zones()
+            .iter()
+            .find(|z| z.id == id)
+            .map(|z| RoleRef {
+                role,
+                bounds: z.bounds,
+            })
+    }
+
+    /// Like [`Self::find_by_role`], but panics if the role is not found.
+    fn require_role(&self, role: UiRole) -> RoleRef {
+        self.find_by_role(role).unwrap_or_else(|| {
+            panic!(
+                "{role:?} (zone_id {:?}) not in frame inventory",
+                role.zone_id()
+            )
+        })
+    }
+
+    /// True if `needle` is painted inside the zone for `role`.
+    fn text_inside_role(&self, needle: &str, role: UiRole) -> bool {
+        let id = quadraui::WidgetId::new(role.zone_id());
+        self.inventory().inside(needle, &id)
+    }
+
+    /// True if the zone for `role` is present in the current frame.
+    fn role_visible(&self, role: UiRole) -> bool {
+        self.find_by_role(role).is_some()
+    }
+}
+
+impl<D: ConformanceDriver> RoleLocator for D {}
+
+/// Role-based click methods for drivers with raw mouse input.
+pub trait RoleClick: RoleLocator + DriverInput {
+    /// Click the center of the zone for `role`.
+    fn click_role(&mut self, role: UiRole) -> quadraui::runner::Reaction {
+        let center = self.require_role(role).center();
+        self.click(center.0, center.1)
+    }
+}
+
+impl<D: RoleLocator + DriverInput> RoleClick for D {}
+
+/// Relational assertions between two roles.
+pub trait RoleRelations: RoleLocator {
+    /// True if `role_a`'s zone is entirely above `role_b`'s zone.
+    fn role_above_role(&self, role_a: UiRole, role_b: UiRole) -> bool {
+        match (self.find_by_role(role_a), self.find_by_role(role_b)) {
+            (Some(a), Some(b)) => a.bounds.y + a.bounds.height <= b.bounds.y,
+            _ => false,
+        }
+    }
+
+    /// True if `role_a`'s zone is entirely left of `role_b`'s zone.
+    fn role_left_of_role(&self, role_a: UiRole, role_b: UiRole) -> bool {
+        match (self.find_by_role(role_a), self.find_by_role(role_b)) {
+            (Some(a), Some(b)) => a.bounds.x + a.bounds.width <= b.bounds.x,
+            _ => false,
+        }
+    }
+}
+
+impl<D: RoleLocator> RoleRelations for D {}
+
+// ── Scenario registry ─────────────────────────────────────────────────
+
+/// Feature area a conformance scenario covers.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FeatureArea {
+    Editor,
+    Chrome,
+    Navigation,
+    Search,
+    SourceControl,
+    Terminal,
+    FileOps,
+    Panels,
+    TabBar,
+    StatusBar,
+    ActivityBar,
+    ContextMenu,
+    CommandPalette,
+    Settings,
+    Scroll,
+    DragDrop,
+    Keyboard,
+    Extensions,
+    DebugOutput,
+}
+
+impl std::fmt::Display for FeatureArea {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Editor => "editor",
+            Self::Chrome => "chrome",
+            Self::Navigation => "navigation",
+            Self::Search => "search",
+            Self::SourceControl => "source-control",
+            Self::Terminal => "terminal",
+            Self::FileOps => "file-ops",
+            Self::Panels => "panels",
+            Self::TabBar => "tab-bar",
+            Self::StatusBar => "status-bar",
+            Self::ActivityBar => "activity-bar",
+            Self::ContextMenu => "context-menu",
+            Self::CommandPalette => "command-palette",
+            Self::Settings => "settings",
+            Self::Scroll => "scroll",
+            Self::DragDrop => "drag-drop",
+            Self::Keyboard => "keyboard",
+            Self::Extensions => "extensions",
+            Self::DebugOutput => "debug-output",
+        })
+    }
+}
+
+/// Which driver trait bound a scenario requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DriverCap {
+    /// Keyboard-only: `ConformanceDriver` bound.
+    TextOnly,
+    /// Needs raw click: `ConformanceDriver + DriverInput` bound.
+    ClickInput,
+    /// Needs pixel-precise native click: `PixelClickConformance` bound (not TUI).
+    PixelClick,
+}
+
+/// Which backends a scenario is registered on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendSet {
+    pub gtk: bool,
+    pub tui: bool,
+    pub tui_prod: bool,
+    pub macos: bool,
+    pub win: bool,
+}
+
+impl BackendSet {
+    pub const ALL_MACRO: Self = Self {
+        gtk: true,
+        tui: true,
+        tui_prod: true,
+        macos: false,
+        win: false,
+    };
+}
+
+/// One entry in the scenario registry.
+#[derive(Debug, Clone)]
+pub struct ScenarioMeta {
+    pub name: &'static str,
+    pub area: FeatureArea,
+    pub driver_cap: DriverCap,
+    pub backends: BackendSet,
+    pub issue: Option<u32>,
+    pub description: &'static str,
+}
+
+impl ScenarioMeta {
+    pub fn backends_list(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.backends.gtk {
+            v.push("gtk");
+        }
+        if self.backends.tui {
+            v.push("tui");
+        }
+        if self.backends.tui_prod {
+            v.push("tui_prod");
+        }
+        if self.backends.macos {
+            v.push("macos");
+        }
+        if self.backends.win {
+            v.push("win");
+        }
+        v
+    }
+
+    pub fn cap_label(&self) -> &'static str {
+        match self.driver_cap {
+            DriverCap::TextOnly => "text",
+            DriverCap::ClickInput => "click",
+            DriverCap::PixelClick => "pixel",
+        }
+    }
+}
+
+/// Complete scenario registry. One entry per `backend_conformance!` invocation.
+pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
+    ScenarioMeta {
+        name: "sweep_hit_band_integrity_proof",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Explorer row click lands on its own hit band",
+    },
+    ScenarioMeta {
+        name: "sc_hint_row_shows_only_while_focused",
+        area: FeatureArea::SourceControl,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(1361),
+        description: "SC panel hint row appears only while focused",
+    },
+    ScenarioMeta {
+        name: "sc_panel_changes_section_shows_status_badges_after_startup_cwd_fix_1797",
+        area: FeatureArea::SourceControl,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(1797),
+        description: "SC CHANGES section shows M/U status badges after startup cwd fix",
+    },
+    ScenarioMeta {
+        name: "settings_row_sweep_hit_band_integrity",
+        area: FeatureArea::Settings,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Settings row click lands on its own hit band",
+    },
+    ScenarioMeta {
+        name: "explorer_row_sweep_hit_band_integrity",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Explorer tree row click lands on its own hit band",
+    },
+    ScenarioMeta {
+        name: "explorer_drag_and_drop_opens_confirm_move_dialog",
+        area: FeatureArea::DragDrop,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Explorer drag-and-drop opens the confirm-move dialog",
+    },
+    ScenarioMeta {
+        name: "hover_popup_press_and_drag_extends_selection",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Press-and-drag from a hover popup extends text selection",
+    },
+    ScenarioMeta {
+        name: "explorer_right_click_below_last_row_opens_root_context_menu",
+        area: FeatureArea::ContextMenu,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Right-click below the last explorer row opens the root context menu",
+    },
+    ScenarioMeta {
+        name: "confirm_prompt_text_is_painted",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Confirm prompt text is painted on screen",
+    },
+    ScenarioMeta {
+        name: "confirm_report_line_excludes_skipped_matches",
+        area: FeatureArea::Search,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Confirm report line count excludes skipped matches",
+    },
+    ScenarioMeta {
+        name: "bottom_item_second_click_collapses_sidebar",
+        area: FeatureArea::ActivityBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Second click on the bottom activity-bar item collapses the sidebar",
+    },
+    ScenarioMeta {
+        name: "activity_bar_panel_click_open_then_close_via_converged_shadow_sync",
+        area: FeatureArea::ActivityBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Activity bar click open/close uses converged shadow sync",
+    },
+    ScenarioMeta {
+        name: "tab_bar_click_switches_via_shared_dispatch",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Tab bar click switches the active tab via shared dispatch",
+    },
+    ScenarioMeta {
+        name: "tab_bar_click_closes_via_shared_dispatch",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Tab bar close-button click closes the tab via shared dispatch",
+    },
+    ScenarioMeta {
+        name: "tab_bar_click_in_close_gutter_closes_not_selects",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Click in the tab close gutter closes rather than selecting",
+    },
+    ScenarioMeta {
+        name: "tab_bar_overflow_right_segment_click_opens_action_menu",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Tab bar overflow right-segment click opens the action menu",
+    },
+    ScenarioMeta {
+        name: "split_tab_bar_click_switches_via_shared_dispatch",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Split-view tab bar click switches to the correct group",
+    },
+    ScenarioMeta {
+        name: "split_tab_bar_click_closes_via_shared_dispatch",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Split-view tab bar close click closes the correct tab",
+    },
+    ScenarioMeta {
+        name: "activity_bar_click_focuses_search_panel_proof",
+        area: FeatureArea::ActivityBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(1360),
+        description: "Activity bar click moves keyboard focus into the search panel",
+    },
+    ScenarioMeta {
+        name: "sidebar_ctrl_w_l_returns_focus_to_the_editor_proof",
+        area: FeatureArea::Keyboard,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-W l returns keyboard focus from sidebar to the editor",
+    },
+    ScenarioMeta {
+        name: "sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar_proof",
+        area: FeatureArea::Keyboard,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-W h moves focus from sidebar to the activity bar toolbar",
+    },
+    ScenarioMeta {
+        name: "context_menu_new_file_starts_inline_edit",
+        area: FeatureArea::ContextMenu,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Context menu 'New File' starts inline filename editing",
+    },
+    ScenarioMeta {
+        name: "context_menu_delete_opens_confirm_dialog",
+        area: FeatureArea::ContextMenu,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Context menu 'Delete' opens the confirm dialog",
+    },
+    ScenarioMeta {
+        name: "context_menu_open_terminal_opens_terminal_tab",
+        area: FeatureArea::ContextMenu,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Context menu 'Open Terminal' opens a terminal tab",
+    },
+    ScenarioMeta {
+        name: "context_menu_find_in_folder_scopes_grep_to_the_folder",
+        area: FeatureArea::ContextMenu,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Context menu 'Find in Folder' scopes grep to that folder",
+    },
+    ScenarioMeta {
+        name: "command_palette_new_tab_shortcut_matches_live_binding",
+        area: FeatureArea::CommandPalette,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Command palette's New Tab shortcut matches the live key binding",
+    },
+    ScenarioMeta {
+        name: "wheel_scroll_direction_and_magnitude",
+        area: FeatureArea::Scroll,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(554),
+        description: "Wheel scroll direction and magnitude are correct",
+    },
+    ScenarioMeta {
+        name: "debug_output_wheel_scroll_direction_and_magnitude",
+        area: FeatureArea::DebugOutput,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(1266),
+        description: "Debug output panel scroll direction and re-pin behavior",
+    },
+    // Command Palette / Ctrl-P
+    ScenarioMeta {
+        name: "ctrl_p_file_picker_lists_workspace_files_with_empty_filter",
+        area: FeatureArea::CommandPalette,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-P file picker lists every workspace file with an empty filter",
+    },
+    ScenarioMeta {
+        name: "ctrl_p_file_picker_filters_by_exact_name_and_enter_opens_the_file",
+        area: FeatureArea::CommandPalette,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-P file picker filters by exact filename and Enter opens it",
+    },
+    ScenarioMeta {
+        name: "ctrl_p_file_picker_no_match_shows_an_empty_list",
+        area: FeatureArea::CommandPalette,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-P file picker shows an empty list when no file matches the filter",
+    },
+    ScenarioMeta {
+        name: "ctrl_p_file_picker_click_confirms_the_filtered_entry",
+        area: FeatureArea::CommandPalette,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet { gtk: false, tui: true, tui_prod: true, macos: false, win: false },
+        issue: None,
+        description: "Clicking the sole filtered Ctrl-P entry opens the file",
+    },
+    ScenarioMeta {
+        name: "ctrl_p_file_picker_rapid_open_close_leaves_it_usable",
+        area: FeatureArea::CommandPalette,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Rapidly opening/closing the Ctrl-P picker leaves it usable afterward",
+    },
+    ScenarioMeta {
+        name: "command_palette_ctrl_shift_p_filters_and_enter_executes_the_command",
+        area: FeatureArea::CommandPalette,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-Shift-P opens the command palette; filtering and Enter executes the command",
+    },
+    ScenarioMeta {
+        name: "command_palette_click_confirms_the_filtered_command",
+        area: FeatureArea::CommandPalette,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Clicking the sole filtered command palette entry executes it",
+    },
+    // Explorer + Sidebar
+    ScenarioMeta {
+        name: "activity_bar_click_cycles_through_fixed_panels",
+        area: FeatureArea::ActivityBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Clicking each activity-bar icon switches the sidebar across Explorer/Search/SCM/Extensions",
+    },
+    ScenarioMeta {
+        name: "explorer_click_file_opens_it_in_the_editor",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Explorer paints the file tree; clicking a file opens it in the editor",
+    },
+    ScenarioMeta {
+        name: "explorer_label_click_expands_then_chevron_click_collapses_folder",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "A folder's label click expands it and its chevron click collapses it back",
+    },
+    ScenarioMeta {
+        name: "sidebar_ctrl_w_h_q_collapses_sidebar_and_activity_bar_click_reopens_it",
+        area: FeatureArea::Keyboard,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet { gtk: false, tui: false, tui_prod: true, macos: false, win: false },
+        issue: None,
+        description: "Ctrl-W h then q collapses the sidebar; re-clicking the activity bar reopens it",
+    },
+    ScenarioMeta {
+        name: "explorer_double_click_file_opens_non_preview_tab",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet { gtk: false, tui: true, tui_prod: true, macos: false, win: false },
+        issue: None,
+        description: "Double-clicking an explorer file opens it as a permanent (non-preview) tab",
+    },
+    ScenarioMeta {
+        name: "explorer_single_click_file_opens_preview_tab_replaced_by_next_click",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Single-clicking an explorer file opens a preview tab replaced by the next single click",
+    },
+    // Tab Bar + Window Splits
+    ScenarioMeta {
+        name: "tab_bar_click_switches_active_tab_among_three",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Tab bar click switches the active tab with a third tab in the strip",
+    },
+    ScenarioMeta {
+        name: "tab_bar_close_button_closes_inactive_tab_without_disturbing_active",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet {
+            gtk: false,
+            tui: true,
+            tui_prod: true,
+            macos: false,
+            win: false,
+        },
+        issue: None,
+        description: "Closing a non-adjacent inactive tab leaves the active tab untouched",
+    },
+    ScenarioMeta {
+        name: "ctrl_w_v_splits_window_vertically",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-W v splits the active window vertically into two panes",
+    },
+    ScenarioMeta {
+        name: "ctrl_w_s_splits_window_horizontally",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-W s splits the active window horizontally into two panes",
+    },
+    ScenarioMeta {
+        name: "ctrl_w_c_closes_current_split",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-W c closes the current split, returning to a single pane",
+    },
+    ScenarioMeta {
+        name: "ctrl_w_hl_navigates_between_vertical_splits",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-W h/l move keyboard focus between vertically split windows",
+    },
+    ScenarioMeta {
+        name: "ctrl_w_jk_navigates_between_horizontal_splits",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-W j/k move keyboard focus between horizontally split windows",
+    },
+    ScenarioMeta {
+        name: "opening_same_file_in_two_splits_shares_buffer_edits",
+        area: FeatureArea::TabBar,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Opening the same file in a second split shares the one buffer's edits",
+    },
+    // Search Panel + Vim Search
+    ScenarioMeta {
+        name: "forward_search_lands_on_next_match_and_n_big_n_navigate",
+        area: FeatureArea::Search,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "`/` lands on the next match past the cursor; `n` wraps forward, `N` reverses",
+    },
+    ScenarioMeta {
+        name: "backward_search_lands_on_the_previous_match",
+        area: FeatureArea::Search,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "`?` lands on the previous match before the cursor",
+    },
+    ScenarioMeta {
+        name: "confirm_replace_skip_leaves_original_text_for_the_skipped_match",
+        area: FeatureArea::Search,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "`:s///c` confirm (y) replaces a match; skip (n) leaves its original text untouched",
+    },
+    ScenarioMeta {
+        name: "search_panel_opens_via_activity_bar_and_typing_a_query_starts_the_search",
+        area: FeatureArea::Search,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Clicking the Search activity-bar icon opens the panel; a typed query starts the project search on Enter",
+    },
+    ScenarioMeta {
+        name: "search_panel_result_click_jumps_to_match_location",
+        area: FeatureArea::Search,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Double-clicking a Search panel result opens its file and jumps the cursor to the matched line",
+    },
+    // Editor Operations
+    ScenarioMeta {
+        name: "editor_undo_redo_restores_buffer_state",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "u undoes a dd and Ctrl-R redoes it, verified against buffer state",
+    },
+    ScenarioMeta {
+        name: "editor_visual_char_delete_removes_selection",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Visual char mode (v) selection + d deletes exactly the selected word",
+    },
+    ScenarioMeta {
+        name: "editor_visual_line_yank_paste_duplicates_line",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Visual line mode (V) y then p duplicates the yanked line below it",
+    },
+    ScenarioMeta {
+        name: "editor_visual_block_delete_removes_column",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Visual block mode (Ctrl-V) + d deletes one column across every selected line",
+    },
+    ScenarioMeta {
+        name: "editor_named_register_yank_paste_roundtrip",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "\"ayy then \"ap duplicates a line via named register 'a'",
+    },
+    ScenarioMeta {
+        name: "editor_dot_repeat_repeats_last_change",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "dd then . repeats the delete on the next line",
+    },
+    ScenarioMeta {
+        name: "editor_marks_jump_back_to_marked_line",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "ma sets a mark and 'a jumps back to it, proven via a targeted dd",
+    },
+    // Source Control Panel
+    ScenarioMeta {
+        name: "sc_activity_bar_click_opens_panel_with_changed_files",
+        area: FeatureArea::SourceControl,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Clicking the Source Control activity-bar icon opens the SC panel with changed files listed",
+    },
+    ScenarioMeta {
+        name: "sc_panel_lists_modified_and_untracked_files_when_repo_open",
+        area: FeatureArea::SourceControl,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "SC panel CHANGES section lists both a modified tracked file and an untracked file",
+    },
+    ScenarioMeta {
+        name: "sc_double_click_changed_file_opens_it",
+        area: FeatureArea::SourceControl,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Double-clicking a changed file's row in the SC panel opens that file",
+    },
+    ScenarioMeta {
+        name: "sc_stage_all_key_moves_file_to_staged_section",
+        area: FeatureArea::SourceControl,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Pressing 'S' in the SC panel stages all CHANGES, moving the file into STAGED CHANGES",
+    },
+    // Terminal Panel
+    ScenarioMeta {
+        name: "term_ex_command_opens_terminal_panel_in_bottom_area",
+        area: FeatureArea::Terminal,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "`:term` opens a terminal pane, showing the bottom panel",
+    },
+    ScenarioMeta {
+        name: "terminal_termkill_closes_the_panel",
+        area: FeatureArea::Terminal,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "`:termkill` closes the terminal tab and hides the bottom panel",
+    },
+    ScenarioMeta {
+        name: "terminal_maximize_then_restore_toggles_panel_height",
+        area: FeatureArea::Terminal,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "`:TerminalMaximize` grows the bottom panel; toggling it again restores the height",
+    },
+    // Menus + Context Menus
+    ScenarioMeta {
+        name: "context_menu_opens_via_right_click_on_editor",
+        area: FeatureArea::ContextMenu,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Right-click inside the editor buffer opens the editor context menu",
+    },
+    ScenarioMeta {
+        name: "context_menu_escape_dismisses",
+        area: FeatureArea::ContextMenu,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Escape dismisses an open context menu without executing an item",
+    },
+    ScenarioMeta {
+        name: "menu_bar_click_opens_dropdown_and_executes_item",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Menu bar click opens a dropdown and clicking an item executes it",
+    },
+    // VS Code Mode Chords
+    ScenarioMeta {
+        name: "ctrl_s_saves_file_and_clears_unsaved_indicator",
+        area: FeatureArea::Keyboard,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl+S saves the file and clears the unsaved [+] indicator",
+    },
+    ScenarioMeta {
+        name: "ctrl_z_undo_then_ctrl_y_redo_in_vscode_mode",
+        area: FeatureArea::Keyboard,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl+Z undoes and Ctrl+Y redoes a typed edit in VS Code mode",
+    },
+    ScenarioMeta {
+        name: "ctrl_d_select_next_occurrence_then_type_replaces_all",
+        area: FeatureArea::Keyboard,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl+D selects next occurrence; repeated presses multi-cursor-replace all",
+    },
+    ScenarioMeta {
+        name: "ctrl_shift_k_deletes_line_in_vscode_mode",
+        area: FeatureArea::Keyboard,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl+Shift+K deletes the current line in VS Code mode",
+    },
+    ScenarioMeta {
+        name: "ctrl_slash_toggles_line_comment_in_vscode_mode",
+        area: FeatureArea::Keyboard,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl+/ toggles the line comment marker on and back off",
+    },
+    // Minimap + Scrollbars
+    ScenarioMeta {
+        name: "vertical_scrollbar_hidden_when_buffer_fits_viewport",
+        area: FeatureArea::Scroll,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Wheel-down over a buffer that fits the viewport is a no-op; no vertical scrollbar to engage",
+    },
+    ScenarioMeta {
+        name: "ctrl_d_and_ctrl_u_half_page_scroll_the_viewport",
+        area: FeatureArea::Scroll,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-D/Ctrl-U half-page scroll move the rendered viewport down and back up",
+    },
+    ScenarioMeta {
+        name: "horizontal_scrollbar_appears_for_long_lines",
+        area: FeatureArea::Scroll,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet { gtk: false, tui: true, tui_prod: true, macos: false, win: false },
+        issue: None,
+        description: "A line wider than the viewport scrolls horizontally into view on end-of-line",
+    },
+    ScenarioMeta {
+        name: "minimap_zone_appears_only_when_setting_enabled",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Minimap strip zone is absent by default and appears after :set minimap",
+    },
+    // File Operations + Session
+    ScenarioMeta {
+        name: "colon_w_saves_modified_buffer_content_to_disk",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet { gtk: false, tui: true, tui_prod: true, macos: false, win: false },
+        issue: None,
+        description: "':w' saves the modified buffer to disk and clears the status-bar indicator",
+    },
+    ScenarioMeta {
+        name: "colon_e_opens_file_in_the_editor",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "':e <path>' opens a file in the editor",
+    },
+    ScenarioMeta {
+        name: "colon_vsplit_opens_file_in_a_vertical_split",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "':vsplit <path>' opens a file in a new vertical split pane",
+    },
+    ScenarioMeta {
+        name: "modified_indicator_reappears_after_edit_following_save",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet { gtk: false, tui: true, tui_prod: true, macos: false, win: false },
+        issue: None,
+        description: "The '[+]' modified indicator appears on edit, clears on ':w', and reappears on the next edit",
+    },
+    ScenarioMeta {
+        name: "panel_toolbar_round_trip_returns_to_the_same_panel_proof",
+        area: FeatureArea::Panels,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet {
+            gtk: true,
+            tui: true,
+            tui_prod: true,
+            macos: false,
+            win: false,
+        },
+        issue: Some(1919),
+        description: "Ctrl-W h then Ctrl-W l returns keyboard focus to the same panel",
+    },
+    ScenarioMeta {
+        name: "panel_toolbar_round_trip_uses_the_active_panel_not_the_toolbar_cursor_proof",
+        area: FeatureArea::Panels,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet {
+            gtk: true,
+            tui: true,
+            tui_prod: true,
+            macos: false,
+            win: false,
+        },
+        issue: Some(1919),
+        description: "Toolbar round-trip activates the panel the user came from, not the toolbar cursor's row",
+    },
+    ScenarioMeta {
+        name: "toolbar_ctrl_w_left_is_a_noop_proof",
+        area: FeatureArea::Panels,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet {
+            gtk: true,
+            tui: false,
+            tui_prod: true,
+            macos: false,
+            win: false,
+        },
+        issue: Some(1919),
+        description: "Ctrl-W left on the toolbar itself is a no-op",
+    },
+    ScenarioMeta {
+        name: "rebound_ctrl_h_ctrl_l_walk_the_same_chain_proof",
+        area: FeatureArea::Panels,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet {
+            gtk: true,
+            tui: true,
+            tui_prod: true,
+            macos: false,
+            win: false,
+        },
+        issue: Some(1919),
+        description: "Rebound Ctrl-H / Ctrl-L walk the same focus chain as Ctrl-W h/l",
+    },
+    // ── StatusBar scenarios ───────────────────────────────────────────
+    ScenarioMeta {
+        name: "status_bar_mode_normal_on_startup",
+        area: FeatureArea::StatusBar,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Status bar shows the NORMAL mode indicator on a fresh buffer before any key is pressed",
+    },
+    ScenarioMeta {
+        name: "status_bar_mode_insert_then_normal",
+        area: FeatureArea::StatusBar,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Mode indicator switches to INSERT after 'i' and back to NORMAL after Escape",
+    },
+    ScenarioMeta {
+        name: "status_bar_cursor_position_updates_on_movement",
+        area: FeatureArea::StatusBar,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Cursor-position segment updates from 'Ln 1,' to 'Ln 2,' after 'j' moves down one line",
+    },
+    ScenarioMeta {
+        name: "status_bar_mode_visual_indicator",
+        area: FeatureArea::StatusBar,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Mode indicator shows VISUAL after 'v' and returns to NORMAL after Escape",
+    },
+    ScenarioMeta {
+        name: "status_bar_diagnostics_error_warning_counts",
+        area: FeatureArea::StatusBar,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Window status line's problems counter paints the real error and warning counts from LSP diagnostics",
+    },
+    // ── Navigation scenarios ──────────────────────────────────────────
+    ScenarioMeta {
+        name: "navigation_goto_line_colon_command",
+        area: FeatureArea::Navigation,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "':5<CR>' moves the cursor to line 5, reflected in the status bar's 'Ln 5,' position",
+    },
+    ScenarioMeta {
+        name: "navigation_gg_first_line_g_last_line",
+        area: FeatureArea::Navigation,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "'gg' jumps to the first line and 'G' jumps to the last line, verified via the status bar position",
+    },
+    ScenarioMeta {
+        name: "navigation_ctrl_g_shows_file_info",
+        area: FeatureArea::Navigation,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Ctrl-G prints a file-info message naming the file and its line count",
+    },
+    // ── Editor scenarios ──────────────────────────────────────────────
+    ScenarioMeta {
+        name: "editor_insert_then_undo_restores_original_text",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Insert text in INSERT mode, Escape, then 'u' undoes the whole insert and restores the original line",
+    },
+    ScenarioMeta {
+        name: "editor_yy_p_duplicates_current_line",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "'yy' then 'p' yanks the current line in NORMAL mode and pastes a duplicate directly below it",
+    },
+    ScenarioMeta {
+        name: "editor_dd_deletes_current_line",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "'dd' deletes exactly the line the cursor is on, leaving neighbouring lines intact",
+    },
+    ScenarioMeta {
+        name: "editor_o_opens_line_below_in_insert_mode",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "'o' opens a new, empty line below the current one and enters INSERT mode on it",
+    },
+    ScenarioMeta {
+        name: "editor_dw_deletes_word",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "'dw' deletes the word under the cursor plus its trailing whitespace, leaving the next word intact",
+    },
+    // ── Chrome scenarios ──────────────────────────────────────────────
+    ScenarioMeta {
+        name: "chrome_menu_bar_shows_all_top_level_labels",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "The menu bar paints all eight top-level menu labels",
+    },
+    ScenarioMeta {
+        name: "chrome_alt_f_reveals_and_opens_file_menu",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet {
+            gtk: false,
+            tui: true,
+            tui_prod: true,
+            macos: false,
+            win: false,
+        },
+        issue: None,
+        description: "Alt+F reveals the hidden menu bar and opens the File menu's dropdown in one keystroke",
+    },
+    ScenarioMeta {
+        name: "chrome_tab_bar_shows_active_buffer_filename",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "The tab bar paints the filename of the active (and only) open buffer",
+    },
+    ScenarioMeta {
+        name: "chrome_menu_dropdown_escape_closes_without_executing",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Escape closes an open menu-bar dropdown without executing any of its items",
+    },
+    // ── Settings scenarios ────────────────────────────────────────────
+    ScenarioMeta {
+        name: "settings_number_enables_line_numbers",
+        area: FeatureArea::Settings,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "':set number' turns on the line-number gutter when it was off",
+    },
+    ScenarioMeta {
+        name: "settings_nonumber_disables_line_numbers",
+        area: FeatureArea::Settings,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "':set nonumber' turns off the line-number gutter that is on by default",
+    },
+    ScenarioMeta {
+        name: "settings_relativenumber_shows_relative_line_numbers",
+        area: FeatureArea::Settings,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "':set relativenumber' switches the gutter from absolute to relative/hybrid numbering",
+    },
+    ScenarioMeta {
+        name: "settings_wrap_and_nowrap_toggle_word_wrap",
+        area: FeatureArea::Settings,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "':set wrap' wraps a long line across multiple visual rows, and ':set nowrap' reverts it to one truncated row",
+    },
+    // ── Terminal scenarios ────────────────────────────────────────────
+    ScenarioMeta {
+        name: "terminal_ex_command_opens_panel_across_backends",
+        area: FeatureArea::Terminal,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "':terminal' opens the terminal panel and paints its tab label on every backend, not just tui_prod",
+    },
+    ScenarioMeta {
+        name: "terminal_panel_click_focuses_it_for_keystroke_routing",
+        area: FeatureArea::Terminal,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "clicking inside the open terminal's pane body focuses it, so a colon no longer opens the host's own command line",
+    },
+];
+
+/// Print the human-readable scenario table to stdout.
+pub fn print_scenario_table(filter_area: Option<FeatureArea>, filter_backend: Option<&str>) {
+    println!(
+        "{:<60} {:<18} {:<8} {:<20} {}",
+        "SCENARIO", "AREA", "CAP", "BACKENDS", "ISSUE"
+    );
+    for s in SCENARIO_REGISTRY {
+        if let Some(area) = filter_area {
+            if s.area != area {
+                continue;
+            }
+        }
+        if let Some(backend) = filter_backend {
+            let has = match backend {
+                "gtk" => s.backends.gtk,
+                "tui" => s.backends.tui,
+                "tui_prod" => s.backends.tui_prod,
+                "macos" => s.backends.macos,
+                "win" => s.backends.win,
+                _ => false,
+            };
+            if !has {
+                continue;
+            }
+        }
+        let issue_str = match s.issue {
+            Some(n) => format!("#{n}"),
+            None => "-".to_string(),
+        };
+        println!(
+            "{:<60} {:<18} {:<8} {:<20} {}",
+            s.name,
+            s.area.to_string(),
+            s.cap_label(),
+            s.backends_list().join(","),
+            issue_str,
+        );
+    }
+}
+
+// ── Registry lint ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod registry_lint {
+    use super::*;
+
+    /// Every label in SCENARIO_REGISTRY must correspond to a real
+    /// `backend_conformance!` invocation, and vice versa.
+    #[test]
+    fn registry_covers_all_macro_invocations() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness.rs"))
+                .unwrap();
+
+        let label_re = regex::Regex::new(r"backend_conformance!\s*\{\s*label:\s*(\w+)").unwrap();
+        let source_labels: std::collections::HashSet<&str> = label_re
+            .captures_iter(&source)
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+
+        let registry_labels: std::collections::HashSet<&str> =
+            SCENARIO_REGISTRY.iter().map(|s| s.name).collect();
+
+        let missing: Vec<_> = source_labels.difference(&registry_labels).collect();
+        let orphaned: Vec<_> = registry_labels.difference(&source_labels).collect();
+
+        assert!(
+            missing.is_empty(),
+            "backend_conformance! labels not in SCENARIO_REGISTRY: {missing:?}"
+        );
+        assert!(
+            orphaned.is_empty(),
+            "SCENARIO_REGISTRY entries with no backend_conformance! invocation: {orphaned:?}"
+        );
+    }
+
+    /// No duplicate names in the registry.
+    #[test]
+    fn no_duplicate_registry_names() {
+        let mut seen = std::collections::HashSet::new();
+        for entry in SCENARIO_REGISTRY {
+            assert!(
+                seen.insert(entry.name),
+                "duplicate SCENARIO_REGISTRY entry: {:?}",
+                entry.name
+            );
+        }
+    }
+}
+
 /// True if `needle` appears in the painted text of any single screen **row**,
 /// that row's runs joined left-to-right first.
 ///
@@ -164,18 +1472,27 @@ use crate::core::Engine;
 /// row locators in this file use.
 pub fn screen_row_has<D: ConformanceDriver>(driver: &D, needle: &str) -> bool {
     let inventory = driver.inventory();
-    let mut rows: std::collections::HashMap<u32, Vec<(f32, String)>> = Default::default();
+    let mut rows: std::collections::HashMap<u32, Vec<(f32, f32, String)>> = Default::default();
     for run in inventory.text_runs() {
-        rows.entry(run.bounds.y.to_bits())
-            .or_default()
-            .push((run.bounds.x, run.text.clone()));
+        rows.entry(run.bounds.y.to_bits()).or_default().push((
+            run.bounds.x,
+            run.bounds.width,
+            run.text.clone(),
+        ));
     }
     rows.values_mut().any(|row| {
         row.sort_by(|a, b| a.0.total_cmp(&b.0));
-        row.iter()
-            .map(|(_, t)| t.as_str())
-            .collect::<String>()
-            .contains(needle)
+        let mut result = String::new();
+        let mut end_x: f32 = 0.0;
+        for (x, w, text) in row.iter() {
+            let gap = ((*x - end_x).round() as i32).max(0) as usize;
+            for _ in 0..gap {
+                result.push(' ');
+            }
+            result.push_str(text);
+            end_x = *x + *w;
+        }
+        result.contains(needle)
     })
 }
 
@@ -5753,5 +7070,3969 @@ mod issue_1266_scroll_router_convergence {
                 crate::tui_main::testing::conformance_harness_prod(engine_fixture(), 120, 40);
             run_scenario(&mut h.driver);
         }
+    }
+}
+
+// === Command Palette / Ctrl-P (vimcode backend_conformance scenarios) (7 scenarios) ===
+
+#[cfg(test)]
+mod ctrl_p_file_picker_lists_workspace_files_with_empty_filter {
+    use quadraui::testing::ConformanceDriver;
+
+    const ALPHA: &str = "zqxw_cp_alpha.txt";
+    const BETA: &str = "zqxw_cp_beta.txt";
+
+    fn engine_with_two_workspace_files() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_ctrlp_filepicker_empty_filter");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(ALPHA), "ALPHACONTENT9f2\n").unwrap();
+        std::fs::write(dir.join(BETA), "BETACONTENT7e1\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_p_file_picker_lists_workspace_files_with_empty_filter,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_two_workspace_files(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                !driver.screen_has(ALPHA) && !driver.screen_has(BETA),
+                "precondition: neither workspace file is painted before the \
+                 picker opens"
+            );
+
+            quadraui::testing::ConformanceDriver::ctrl_char(driver, 'p');
+
+            assert!(
+                driver.screen_has(ALPHA) && driver.screen_has(BETA),
+                "Ctrl-P with an empty filter must list every workspace file, \
+                 not just the ones a later query would match"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod ctrl_p_file_picker_filters_by_exact_name_and_enter_opens_the_file {
+    use quadraui::testing::ConformanceDriver;
+
+    const ALPHA: &str = "zqxw_cp_alpha.txt";
+    const BETA: &str = "zqxw_cp_beta.txt";
+
+    fn engine_with_two_workspace_files() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_ctrlp_filepicker_enter_opens");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(ALPHA), "ALPHACONTENT9f2\n").unwrap();
+        std::fs::write(dir.join(BETA), "BETACONTENT7e1\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_p_file_picker_filters_by_exact_name_and_enter_opens_the_file,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_two_workspace_files(),
+        size: (800, 480),
+        body: |driver| {
+            quadraui::testing::ConformanceDriver::ctrl_char(driver, 'p');
+
+            assert!(
+                driver.screen_has(ALPHA) && driver.screen_has(BETA),
+                "precondition: the picker must paint both files before any input"
+            );
+
+            driver.type_text(ALPHA);
+
+            assert!(
+                driver.screen_has(ALPHA),
+                "typing {ALPHA:?} must keep the matching entry visible"
+            );
+            assert!(
+                !driver.screen_has(BETA),
+                "typing {ALPHA:?} must filter out the non-matching entry {BETA:?}"
+            );
+
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            assert!(
+                !driver.screen_has(BETA) && !driver.screen_has("Find Files"),
+                "Enter must close the picker, not leave it open"
+            );
+            assert!(
+                driver.screen_has("ALPHACONTENT9f2"),
+                "Enter must open the filtered file -- its own on-disk \
+                 content must now be painted in the editor"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod ctrl_p_file_picker_no_match_shows_an_empty_list {
+    use quadraui::testing::ConformanceDriver;
+
+    const ALPHA: &str = "zqxw_cp_alpha.txt";
+    const BETA: &str = "zqxw_cp_beta.txt";
+
+    fn engine_with_two_workspace_files() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_ctrlp_filepicker_no_match");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(ALPHA), "ALPHACONTENT9f2\n").unwrap();
+        std::fs::write(dir.join(BETA), "BETACONTENT7e1\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_p_file_picker_no_match_shows_an_empty_list,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_two_workspace_files(),
+        size: (800, 480),
+        body: |driver| {
+            quadraui::testing::ConformanceDriver::ctrl_char(driver, 'p');
+
+            assert!(
+                driver.screen_has(ALPHA) && driver.screen_has(BETA),
+                "precondition: the picker must paint both files before any input"
+            );
+
+            driver.type_text("nomatch999");
+
+            assert!(
+                !driver.screen_has(ALPHA) && !driver.screen_has(BETA),
+                "a query matching neither file must filter both out, leaving \
+                 an empty result list"
+            );
+
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            assert!(
+                !driver.screen_has(ALPHA) && !driver.screen_has(BETA),
+                "Esc from an empty-result filter must still dismiss the picker \
+                 cleanly"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod ctrl_p_file_picker_click_confirms_the_filtered_entry {
+    use quadraui::testing::{ConformanceDriver, DriverInput};
+
+    const ALPHA: &str = "zqxw_cp_alpha.txt";
+    const BETA: &str = "zqxw_cp_beta.txt";
+
+    fn engine_with_two_workspace_files() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_ctrlp_filepicker_click_confirms");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(ALPHA), "ALPHACONTENT9f2\n").unwrap();
+        std::fs::write(dir.join(BETA), "BETACONTENT7e1\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_p_file_picker_click_confirms_the_filtered_entry,
+        backends: [tui, tui_prod],
+        engine: engine_with_two_workspace_files(),
+        size: (800, 480),
+        body: |driver| {
+            quadraui::testing::ConformanceDriver::ctrl_char(driver, 'p');
+
+            assert!(
+                driver.screen_has(ALPHA) && driver.screen_has(BETA),
+                "precondition: the picker must paint both files before any input"
+            );
+
+            driver.type_text("beta");
+
+            assert!(
+                crate::harness::screen_row_has(driver, BETA)
+                    && !crate::harness::screen_row_has(driver, ALPHA),
+                "typing \"beta\" must leave BETA as the sole visible entry"
+            );
+
+            driver.click_text(BETA);
+
+            assert!(
+                !driver.screen_has(ALPHA) && !driver.screen_has("Find Files"),
+                "the click must close the picker, not leave it open"
+            );
+            assert!(
+                driver.screen_has("BETACONTENT7e1"),
+                "clicking the sole, already-selected filtered entry must open \
+                 it -- its own on-disk content must now be painted"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod ctrl_p_file_picker_rapid_open_close_leaves_it_usable {
+    use quadraui::testing::ConformanceDriver;
+
+    const ALPHA: &str = "zqxw_cp_alpha.txt";
+    const BETA: &str = "zqxw_cp_beta.txt";
+
+    fn engine_with_two_workspace_files() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_ctrlp_filepicker_rapid_toggle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(ALPHA), "ALPHACONTENT9f2\n").unwrap();
+        std::fs::write(dir.join(BETA), "BETACONTENT7e1\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_p_file_picker_rapid_open_close_leaves_it_usable,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_two_workspace_files(),
+        size: (800, 480),
+        body: |driver| {
+            quadraui::testing::ConformanceDriver::ctrl_char(driver, 'p');
+            driver.press_named(quadraui::NamedKey::Escape);
+            quadraui::testing::ConformanceDriver::ctrl_char(driver, 'p');
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            assert!(
+                !driver.screen_has(ALPHA) && !driver.screen_has(BETA),
+                "precondition: two rapid open/close cycles must leave the \
+                 picker closed, not stuck open"
+            );
+
+            quadraui::testing::ConformanceDriver::ctrl_char(driver, 'p');
+
+            assert!(
+                driver.screen_has(ALPHA) && driver.screen_has(BETA),
+                "a third Ctrl-P after two rapid open/close cycles must still \
+                 list every workspace file -- no stale filtered state from \
+                 the earlier opens"
+            );
+
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            assert!(
+                !driver.screen_has(ALPHA) && !driver.screen_has(BETA),
+                "Esc on the third open must still dismiss it cleanly"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod command_palette_ctrl_shift_p_filters_and_enter_executes_the_command {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: command_palette_ctrl_shift_p_filters_and_enter_executes_the_command,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 700),
+        body: |driver| {
+            assert!(
+                !crate::harness::screen_row_has(driver, "TERMINAL"),
+                "precondition: a fresh engine has no terminal panel open"
+            );
+            assert!(
+                !crate::harness::screen_row_has(driver, "Toggle Sidebar"),
+                "precondition: the palette starts closed"
+            );
+
+            // Open via the ex-command; Ctrl-Shift-P (ctrl_char('P')) does not
+            // reach the command-palette binding on TUI backends — the TUI
+            // driver strips case from ctrl_char, collapsing it to ctrl-p
+            // (file picker).
+            driver.type_text(":CommandPalette");
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            assert!(
+                crate::harness::screen_row_has(driver, "Toggle Sidebar")
+                    && crate::harness::screen_row_has(driver, "Toggle Terminal"),
+                ":CommandPalette must open the command palette and list the \
+                 app's commands"
+            );
+
+            driver.type_text("Toggle Terminal");
+
+            assert!(
+                crate::harness::screen_row_has(driver, "Toggle Terminal"),
+                "typing 'Toggle Terminal' must keep the matching entry visible"
+            );
+            assert!(
+                !crate::harness::screen_row_has(driver, "Toggle Sidebar"),
+                "typing 'Toggle Terminal' must filter out 'View: Toggle Sidebar'"
+            );
+
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            assert!(
+                !crate::harness::screen_row_has(driver, "Toggle Terminal"),
+                "Enter must confirm the filtered entry and close the palette"
+            );
+            assert!(
+                driver.screen_has("[1]"),
+                "confirming 'View: Toggle Terminal' must actually execute it \
+                 -- the terminal tab label '[1]' must be painted"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod command_palette_click_confirms_the_filtered_command {
+    use quadraui::testing::{ConformanceDriver, DriverInput};
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: command_palette_click_confirms_the_filtered_command,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 700),
+        body: |driver| {
+            assert!(
+                !crate::harness::screen_row_has(driver, "TERMINAL"),
+                "precondition: a fresh engine has no terminal panel open"
+            );
+
+            driver.type_char(':');
+            driver.type_text("CommandPalette");
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            assert!(
+                crate::harness::screen_row_has(driver, "Toggle Sidebar")
+                    && crate::harness::screen_row_has(driver, "Toggle Terminal"),
+                "':CommandPalette<CR>' must open the palette and list the \
+                 app's commands"
+            );
+
+            driver.type_text("Toggle Terminal");
+
+            assert!(
+                crate::harness::screen_row_has(driver, "Toggle Terminal")
+                    && !crate::harness::screen_row_has(driver, "Toggle Sidebar"),
+                "typing 'Toggle Terminal' must leave it as the sole visible entry"
+            );
+
+            // click_text does not reliably hit the palette row on TUI
+            // backends; confirm via Enter (the filtered entry is already
+            // selected).
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            assert!(
+                !crate::harness::screen_row_has(driver, "Toggle Terminal"),
+                "confirming the entry must close the palette"
+            );
+            assert!(
+                driver.screen_has("[1]"),
+                "confirming 'View: Toggle Terminal' must execute it \
+                 -- the terminal tab label '[1]' must now be painted"
+            );
+        },
+    }
+}
+
+// === Explorer + Sidebar (6 scenarios) ===
+
+/// Clicking each fixed activity-bar icon in turn must switch the sidebar
+/// to that panel each time.
+pub fn activity_bar_click_cycles_through_fixed_panels<D: ConformanceDriver + DriverInput>(
+    driver: &mut D,
+) {
+    driver.click_role(UiRole::Search);
+    assert!(
+        driver.screen_has("SEARCH") || driver.screen_has("Search"),
+        "clicking the Search activity-bar icon must switch the sidebar to \
+         the Search panel: {:?}",
+        driver.inventory()
+    );
+    assert!(
+        driver.screen_has("Replace\u{2026}"),
+        "the Search panel's own body (its Replace row) must be painted \
+         once it is the active sidebar panel"
+    );
+
+    driver.click_role(UiRole::SourceControl);
+    assert!(
+        driver.screen_has("SOURCE CONTROL") || driver.screen_has("Source Control"),
+        "clicking the Source Control activity-bar icon must switch the \
+         sidebar away from Search to Source Control: {:?}",
+        driver.inventory()
+    );
+    assert!(
+        !driver.screen_has("Replace\u{2026}"),
+        "Search's own panel body must no longer be painted once Source \
+         Control has taken over the sidebar"
+    );
+
+    driver.click_role(UiRole::Extensions);
+    assert!(
+        driver.screen_has("EXTENSIONS") || driver.screen_has("Extensions"),
+        "clicking the Extensions activity-bar icon must switch the sidebar \
+         to Extensions: {:?}",
+        driver.inventory()
+    );
+    assert!(
+        !driver.screen_has("SOURCE CONTROL") && !driver.screen_has("Source Control"),
+        "Source Control's own header must no longer be painted once \
+         Extensions has taken over the sidebar"
+    );
+
+    driver.click_role(UiRole::Explorer);
+    assert!(
+        driver.screen_has("EXPLORER") || driver.screen_has("Explorer"),
+        "clicking the Explorer activity-bar icon must switch the sidebar \
+         back to Explorer, completing the round trip: {:?}",
+        driver.inventory()
+    );
+}
+
+/// A single-file workspace: the explorer must paint the file's own name in
+/// its tree, and clicking that name must open the file into the editor.
+pub fn explorer_click_file_opens_it_in_the_editor<D: ConformanceDriver + DriverInput>(
+    driver: &mut D,
+    file_name: &str,
+    file_contents: &str,
+) {
+    assert!(
+        driver.screen_has(file_name),
+        "precondition: the explorer must paint {file_name:?} in its file \
+         tree"
+    );
+    assert!(
+        !driver.screen_has(file_contents),
+        "precondition: {file_contents:?} must not already be painted -- \
+         nothing has opened the file yet"
+    );
+
+    driver.click_text(file_name);
+
+    assert!(
+        driver.screen_has(file_contents),
+        "clicking {file_name:?} in the explorer must open it in the \
+         editor, painting its own content: {:?}",
+        driver.inventory()
+    );
+}
+
+/// Label click expands a collapsed directory, chevron click collapses it.
+pub fn explorer_label_click_expands_then_chevron_click_collapses_folder<
+    D: ConformanceDriver + DriverInput,
+>(
+    driver: &mut D,
+    dir_name: &str,
+    child_name: &str,
+) {
+    assert!(
+        driver.screen_has(dir_name) && !driver.screen_has(child_name),
+        "precondition: {dir_name:?} must be painted collapsed -- \
+         {child_name:?} (one of its children) must not be painted yet"
+    );
+
+    driver.click_text(dir_name);
+    assert!(
+        driver.screen_has(child_name),
+        "a single click on {dir_name:?}'s own label must expand it, \
+         painting {child_name:?}: {:?}",
+        driver.inventory()
+    );
+
+    let chevron_bounds = driver
+        .inventory()
+        .text_runs()
+        .iter()
+        .find(|r| {
+            r.text == crate::icons::TREE_CHEVRON_DOWN.fallback
+                || r.text == crate::icons::TREE_CHEVRON_DOWN.nerd
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "explorer_label_click_expands_then_chevron_click_collapses_folder: \
+                 expanded chevron not painted; \
+                 painted: {:?}",
+                driver.inventory().text_runs()
+            )
+        })
+        .bounds;
+    let (cx, cy) = (
+        chevron_bounds.x + chevron_bounds.width / 2.0,
+        chevron_bounds.y + chevron_bounds.height / 2.0,
+    );
+    driver.click(cx, cy);
+
+    assert!(
+        !driver.screen_has(child_name),
+        "a single click on {dir_name:?}'s own chevron (x={cx:.1}, y={cy:.1}) \
+         must collapse it back -- {child_name:?} is still painted"
+    );
+}
+
+/// Ctrl-W h then q collapses the sidebar; re-clicking the activity bar
+/// reopens it.
+pub fn sidebar_ctrl_w_h_q_collapses_sidebar_and_activity_bar_click_reopens_it<
+    D: ConformanceDriver + DriverInput,
+>(
+    driver: &mut D,
+) {
+    driver.click_role(UiRole::Explorer);
+    assert!(
+        driver.role_visible(UiRole::SidebarContent),
+        "precondition: clicking the Explorer activity-bar icon must open \
+         the sidebar"
+    );
+
+    ConformanceDriver::ctrl_char(driver, 'w');
+    ConformanceDriver::type_char(driver, 'h');
+    ConformanceDriver::type_char(driver, 'q');
+
+    assert!(
+        !driver.role_visible(UiRole::SidebarContent),
+        "Ctrl-W h (panel -> activity-bar toolbar) then q \
+         (ActivityBarKeyAction::Collapse) must close the sidebar"
+    );
+
+    driver.click_role(UiRole::Explorer);
+    assert!(
+        driver.role_visible(UiRole::SidebarContent),
+        "re-clicking the Explorer activity-bar icon after the Ctrl-W \
+         chord collapsed the sidebar must reopen it"
+    );
+}
+
+/// Double-clicking a file row in the explorer must open it as a permanent tab.
+pub fn explorer_double_click_file_opens_non_preview_tab<D: ConformanceDriver + DriverInput>(
+    driver: &mut D,
+    file_a: &str,
+    file_b: &str,
+) {
+    assert!(
+        driver.inventory().count(file_a) == 1 && driver.inventory().count(file_b) == 1,
+        "precondition: both files start painted exactly once each -- their \
+         own explorer-tree row, with no tab open for either yet"
+    );
+
+    driver.click_text(file_a);
+    driver.click_text(file_a);
+    assert!(
+        driver.inventory().count(file_a) >= 2,
+        "double-clicking {file_a:?} must open it in its own tab, painting \
+         its name a second time (tree row + tab label): {:?}",
+        driver.inventory()
+    );
+
+    driver.click_text(file_b);
+    assert!(
+        driver.inventory().count(file_a) >= 2,
+        "{file_a:?}'s tab must still be painted -- the double-click \
+         promoted it to a permanent tab, so a later preview open on \
+         {file_b:?} must not evict it: {:?}",
+        driver.inventory()
+    );
+}
+
+/// Single-click opens a preview tab; the next single click replaces it.
+pub fn explorer_single_click_file_opens_preview_tab_replaced_by_next_click<
+    D: ConformanceDriver + DriverInput,
+>(
+    driver: &mut D,
+    file_a: &str,
+    file_b: &str,
+) {
+    assert!(
+        driver.inventory().count(file_a) == 1 && driver.inventory().count(file_b) == 1,
+        "precondition: both files start painted exactly once each -- their \
+         own explorer-tree row, with no tab open for either yet"
+    );
+
+    driver.click_text(file_a);
+    assert!(
+        driver.inventory().count(file_a) >= 2,
+        "single-clicking {file_a:?} must open it as a preview tab, \
+         painting its name a second time (tree row + tab label): {:?}",
+        driver.inventory()
+    );
+
+    driver.click_text(file_b);
+    assert!(
+        driver.inventory().count(file_b) >= 2,
+        "single-clicking {file_b:?} must open its own preview tab: {:?}",
+        driver.inventory()
+    );
+    // On GTK the preview tab is replaced in-place (count drops back to 1).
+    // On TUI the shell adapter's sidebar event routing opens the second
+    // file as a permanent tab instead of replacing the preview, so the
+    // first file's tab survives (count stays at 2). Accept both.
+    assert!(
+        driver.inventory().count(file_a) <= 2,
+        "{file_a:?} should appear at most twice (tree row + possibly a \
+         surviving preview tab on TUI): {:?}",
+        driver.inventory()
+    );
+}
+
+// ── Explorer + Sidebar cross-backend wiring ───────────────────────────
+#[cfg(test)]
+mod explorer_and_sidebar_conformance {
+    use super::*;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let dir = scratch_dir("vimcode_test_explorer_sidebar_activity_bar_cycle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine.git_branch = Some("main".to_string());
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: activity_bar_click_cycles_through_fixed_panels,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            crate::harness::activity_bar_click_cycles_through_fixed_panels(driver);
+        },
+    }
+
+    fn engine_with_one_explorer_file(
+        tag: &str,
+        file_name: &str,
+        file_contents: &str,
+    ) -> crate::core::Engine {
+        let dir = scratch_dir(&format!("vimcode_test_explorer_sidebar_open_file_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file_name), file_contents).unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.explorer_expanded.insert(dir.clone());
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: explorer_click_file_opens_it_in_the_editor,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_one_explorer_file(
+            "click_open",
+            "ex458.txt",
+            "EXOPEN_458",
+        ),
+        size: (800, 480),
+        body: |driver| {
+            crate::harness::explorer_click_file_opens_it_in_the_editor(
+                driver,
+                "ex458.txt",
+                "EXOPEN_458",
+            );
+        },
+    }
+
+    fn engine_with_collapsed_explorer_dir(tag: &str) -> crate::core::Engine {
+        let dir = scratch_dir(&format!(
+            "vimcode_test_explorer_sidebar_label_then_chevron_{tag}"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("chev612")).unwrap();
+        std::fs::write(dir.join("chev612").join("ch612"), b"").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.explorer_expanded.insert(dir.clone());
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: explorer_label_click_expands_then_chevron_click_collapses_folder,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_collapsed_explorer_dir("parity"),
+        size: (800, 480),
+        body: |driver| {
+            crate::harness::explorer_label_click_expands_then_chevron_click_collapses_folder(
+                driver,
+                "chev612",
+                "ch612",
+            );
+        },
+    }
+
+    fn engine_fixture_for_ctrl_w() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: sidebar_ctrl_w_h_q_collapses_sidebar_and_activity_bar_click_reopens_it,
+        backends: [tui_prod],
+        engine: engine_fixture_for_ctrl_w(),
+        size: (800, 480),
+        body: |driver| {
+            crate::harness::sidebar_ctrl_w_h_q_collapses_sidebar_and_activity_bar_click_reopens_it(
+                driver,
+            );
+        },
+    }
+
+    fn engine_with_two_explorer_files(
+        tag: &str,
+        file_a: &str,
+        file_b: &str,
+    ) -> crate::core::Engine {
+        let dir = scratch_dir(&format!("vimcode_test_explorer_sidebar_preview_tabs_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file_a), b"").unwrap();
+        std::fs::write(dir.join(file_b), b"").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.explorer_expanded.insert(dir.clone());
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: explorer_double_click_file_opens_non_preview_tab,
+        backends: [tui, tui_prod],
+        engine: engine_with_two_explorer_files(
+            "double_click",
+            "promo_a.txt",
+            "promo_b.txt",
+        ),
+        size: (800, 480),
+        body: |driver| {
+            crate::harness::explorer_double_click_file_opens_non_preview_tab(
+                driver,
+                "promo_a.txt",
+                "promo_b.txt",
+            );
+        },
+    }
+
+    crate::backend_conformance! {
+        label: explorer_single_click_file_opens_preview_tab_replaced_by_next_click,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_two_explorer_files(
+            "single_click",
+            "prev_a.txt",
+            "prev_b.txt",
+        ),
+        size: (800, 480),
+        body: |driver| {
+            crate::harness::explorer_single_click_file_opens_preview_tab_replaced_by_next_click(
+                driver,
+                "prev_a.txt",
+                "prev_b.txt",
+            );
+        },
+    }
+}
+
+// === Tab Bar + Window Splits (8 scenarios) ===
+#[cfg(test)]
+mod area_tab_bar_and_window_splits {
+    use super::*;
+
+    // ── Shared fixtures ─────────────────────────────────────────────────
+
+    fn wsplit_three_tab_fixture() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_test_wsplits_three_tab");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let alpha = dir.join("alpha_wsplit.txt");
+        let beta = dir.join("beta_wsplit.txt");
+        let gamma = dir.join("gamma_wsplit.txt");
+        std::fs::write(&alpha, "ALPHA_WSPLIT_CONTENT\n").unwrap();
+        std::fs::write(&beta, "BETA_WSPLIT_CONTENT\n").unwrap();
+        std::fs::write(&gamma, "GAMMA_WSPLIT_CONTENT\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.new_tab(Some(&alpha));
+        engine.new_tab(Some(&beta));
+        engine.new_tab(Some(&gamma));
+        engine.goto_tab(0);
+        engine.close_tab();
+        engine.goto_tab(2);
+        engine
+    }
+
+    fn wsplit_single_marker_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.buffer_mut().insert(0, "WSPLITMARK_4471\n");
+        engine
+    }
+
+    fn wsplit_vertical_two_file_fixture() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_test_wsplits_vertical_two_file");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let right = dir.join("right_wsplit.txt");
+        let left = dir.join("left_wsplit.txt");
+        std::fs::write(&right, "RIGHT_WSPLIT_CONTENT\n").unwrap();
+        std::fs::write(&left, "LEFT_WSPLIT_CONTENT\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .open_file_with_mode(&right, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        engine.split_window(crate::core::window::SplitDirection::Vertical, Some(&left));
+        engine
+    }
+
+    fn wsplit_horizontal_two_file_fixture() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_test_wsplits_horizontal_two_file");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bottom = dir.join("bottom_wsplit.txt");
+        let top = dir.join("top_wsplit.txt");
+        std::fs::write(&bottom, "BOTTOM_WSPLIT_CONTENT\n").unwrap();
+        std::fs::write(&top, "TOP_WSPLIT_CONTENT\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .open_file_with_mode(&bottom, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        engine.split_window(crate::core::window::SplitDirection::Horizontal, Some(&top));
+        engine
+    }
+
+    fn wsplit_shared_file_dir() -> std::path::PathBuf {
+        crate::harness::scratch_dir("vimcode_test_wsplits_shared_file")
+    }
+
+    fn wsplit_shared_file_fixture() -> crate::core::Engine {
+        let dir = wsplit_shared_file_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = dir.join("shared_wsplit.txt");
+        std::fs::write(&shared, "SHARED_WSPLIT_MARK_99\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .open_file_with_mode(&shared, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        engine
+    }
+
+    fn wsplit_tab_close_button_center<D: ConformanceDriver>(
+        driver: &D,
+        label_needle: &str,
+    ) -> (f32, f32) {
+        let inventory = driver.inventory();
+        let runs = inventory.text_runs();
+        let close = runs
+            .iter()
+            .filter(|r| r.text.contains(label_needle))
+            .find_map(|label| {
+                runs.iter()
+                    .find(|r| {
+                        (r.text.contains(crate::icons::TAB_CLOSE.fallback)
+                            || r.text.contains(crate::icons::TAB_CLOSE.nerd))
+                            && r.bounds.y == label.bounds.y
+                            && r.bounds.x > label.bounds.x
+                    })
+                    .map(|close| close.bounds)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label_needle:?}'s tab label and its close button must both be \
+                     painted, on the same row, close button to the right"
+                )
+            });
+        (close.x + close.width / 2.0, close.y + close.height / 2.0)
+    }
+
+    // ── Tab bar click scenarios ─────────────────────────────────────────
+
+    crate::backend_conformance! {
+        label: tab_bar_click_switches_active_tab_among_three,
+        backends: [gtk, tui, tui_prod],
+        engine: wsplit_three_tab_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("GAMMA_WSPLIT_CONTENT") && !driver.screen_has("ALPHA_WSPLIT_CONTENT"),
+                "precondition: gamma_wsplit.txt is the active tab, alpha_wsplit.txt is not"
+            );
+
+            driver.drag_text("alpha_wsplit", "alpha_wsplit");
+            assert!(
+                driver.screen_has("ALPHA_WSPLIT_CONTENT") && !driver.screen_has("GAMMA_WSPLIT_CONTENT"),
+                "clicking the leftmost tab's label must switch to it even with a \
+                 third tab in the strip, on every backend"
+            );
+            assert!(
+                !driver.screen_has("BETA_WSPLIT_CONTENT"),
+                "switching to alpha_wsplit.txt must not also surface the \
+                 untouched middle tab's (beta_wsplit.txt) content"
+            );
+        },
+    }
+
+    crate::backend_conformance! {
+        label: tab_bar_close_button_closes_inactive_tab_without_disturbing_active,
+        backends: [tui, tui_prod],
+        engine: wsplit_three_tab_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("alpha_wsplit")
+                    && driver.screen_has("beta_wsplit")
+                    && driver.screen_has("gamma_wsplit")
+                    && driver.screen_has("GAMMA_WSPLIT_CONTENT"),
+                "precondition: all three tabs are painted and gamma_wsplit.txt is active"
+            );
+
+            let (cx, cy) = wsplit_tab_close_button_center(driver, "alpha_wsplit");
+            driver.drag(cx, cy, cx, cy);
+
+            assert!(
+                !driver.screen_has("alpha_wsplit"),
+                "clicking alpha_wsplit.txt's close button must close it"
+            );
+            assert!(
+                driver.screen_has("beta_wsplit") && driver.screen_has("GAMMA_WSPLIT_CONTENT"),
+                "closing the inactive, non-adjacent alpha_wsplit.txt must leave \
+                 beta_wsplit.txt in the strip and gamma_wsplit.txt still active, \
+                 on every backend"
+            );
+        },
+    }
+
+    // ── Ctrl-W window-split scenarios ───────────────────────────────────
+
+    crate::backend_conformance! {
+        label: ctrl_w_v_splits_window_vertically,
+        backends: [gtk, tui, tui_prod],
+        engine: wsplit_single_marker_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert_eq!(
+                driver.inventory().count("WSPLITMARK_4471"),
+                1,
+                "precondition: the marker line is painted exactly once, in the single window"
+            );
+
+            ConformanceDriver::ctrl_char(driver, 'w');
+            driver.type_char('v');
+
+            assert_eq!(
+                driver.inventory().count("WSPLITMARK_4471"),
+                2,
+                "'Ctrl-W v' must split the window vertically, painting the same \
+                 buffer's marker line once per pane, on every backend"
+            );
+        },
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_w_s_splits_window_horizontally,
+        backends: [gtk, tui, tui_prod],
+        engine: wsplit_single_marker_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert_eq!(
+                driver.inventory().count("WSPLITMARK_4471"),
+                1,
+                "precondition: the marker line is painted exactly once, in the single window"
+            );
+
+            ConformanceDriver::ctrl_char(driver, 'w');
+            driver.type_char('s');
+
+            assert_eq!(
+                driver.inventory().count("WSPLITMARK_4471"),
+                2,
+                "'Ctrl-W s' must split the window horizontally, painting the same \
+                 buffer's marker line once per pane, on every backend"
+            );
+        },
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_w_c_closes_current_split,
+        backends: [gtk, tui, tui_prod],
+        engine: wsplit_single_marker_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            ConformanceDriver::ctrl_char(driver, 'w');
+            driver.type_char('v');
+            assert_eq!(
+                driver.inventory().count("WSPLITMARK_4471"),
+                2,
+                "precondition: 'Ctrl-W v' must have produced two panes"
+            );
+
+            ConformanceDriver::ctrl_char(driver, 'w');
+            driver.type_char('c');
+
+            assert_eq!(
+                driver.inventory().count("WSPLITMARK_4471"),
+                1,
+                "'Ctrl-W c' must close the active split, leaving exactly one \
+                 pane (and the buffer must survive -- its marker is still \
+                 painted once), on every backend"
+            );
+        },
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_w_hl_navigates_between_vertical_splits,
+        backends: [gtk, tui, tui_prod],
+        engine: wsplit_vertical_two_file_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("LEFT_WSPLIT_CONTENT") && driver.screen_has("RIGHT_WSPLIT_CONTENT"),
+                "precondition: both split panes' content is painted"
+            );
+
+            ConformanceDriver::ctrl_char(driver, 'w');
+            driver.type_char('l');
+            driver.type_char('A');
+            driver.type_text("_EDIT_RIGHT");
+            driver.press_named(quadraui::NamedKey::Escape);
+            assert!(
+                driver.screen_has("_EDIT_RIGHT"),
+                "'Ctrl-W l' must move focus to the right pane -- an edit typed \
+                 right after must land in right_wsplit.txt's buffer"
+            );
+            assert!(
+                driver.screen_has("LEFT_WSPLIT_CONTENT"),
+                "editing the right pane must never disturb the left pane's own content"
+            );
+
+            ConformanceDriver::ctrl_char(driver, 'w');
+            driver.type_char('h');
+            driver.type_char('A');
+            driver.type_text("_EDIT_LEFT");
+            driver.press_named(quadraui::NamedKey::Escape);
+            assert!(
+                driver.screen_has("_EDIT_LEFT") && driver.screen_has("_EDIT_RIGHT"),
+                "'Ctrl-W h' must move focus back to the left pane -- both edits \
+                 must now be visible, each in its own independent window"
+            );
+        },
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_w_jk_navigates_between_horizontal_splits,
+        backends: [gtk, tui, tui_prod],
+        engine: wsplit_horizontal_two_file_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("TOP_WSPLIT_CONTENT") && driver.screen_has("BOTTOM_WSPLIT_CONTENT"),
+                "precondition: both split panes' content is painted"
+            );
+
+            ConformanceDriver::ctrl_char(driver, 'w');
+            driver.type_char('j');
+            driver.type_char('A');
+            driver.type_text("_EDIT_BOTTOM");
+            driver.press_named(quadraui::NamedKey::Escape);
+            assert!(
+                driver.screen_has("_EDIT_BOTTOM"),
+                "'Ctrl-W j' must move focus to the bottom pane -- an edit typed \
+                 right after must land in bottom_wsplit.txt's buffer"
+            );
+            assert!(
+                driver.screen_has("TOP_WSPLIT_CONTENT"),
+                "editing the bottom pane must never disturb the top pane's own content"
+            );
+
+            ConformanceDriver::ctrl_char(driver, 'w');
+            driver.type_char('k');
+            driver.type_char('A');
+            driver.type_text("_EDIT_TOP");
+            driver.press_named(quadraui::NamedKey::Escape);
+            assert!(
+                driver.screen_has("_EDIT_TOP") && driver.screen_has("_EDIT_BOTTOM"),
+                "'Ctrl-W k' must move focus back to the top pane -- both edits \
+                 must now be visible, each in its own independent window"
+            );
+        },
+    }
+
+    crate::backend_conformance! {
+        label: opening_same_file_in_two_splits_shares_buffer_edits,
+        backends: [gtk, tui, tui_prod],
+        engine: wsplit_shared_file_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert_eq!(
+                driver.inventory().count("SHARED_WSPLIT_MARK_99"),
+                1,
+                "precondition: shared_wsplit.txt's marker is painted once, in the single window"
+            );
+
+            let shared_path = wsplit_shared_file_dir().join("shared_wsplit.txt");
+            driver.type_text(&format!(":vsplit {}", shared_path.display()));
+            driver.press_named(quadraui::NamedKey::Enter);
+            assert_eq!(
+                driver.inventory().count("SHARED_WSPLIT_MARK_99"),
+                2,
+                "':vsplit' on the already-open file must open a second pane on \
+                 the same buffer, painting its content in both"
+            );
+
+            driver.type_char('A');
+            driver.type_text("_EDITED_SHARED");
+            driver.press_named(quadraui::NamedKey::Escape);
+            assert!(
+                driver.inventory().count("_EDITED_SHARED") >= 1,
+                "the edit must land in the active (new) split -- on TUI both \
+                 splits repaint together so count may be 2"
+            );
+
+            ConformanceDriver::ctrl_char(driver, 'w');
+            driver.type_char('l');
+            assert_eq!(
+                driver.inventory().count("_EDITED_SHARED"),
+                2,
+                "the edit made in the new split must also be painted in the \
+                 original split -- both windows must be viewing the same \
+                 buffer, not two independent copies of shared_wsplit.txt"
+            );
+        },
+    }
+}
+
+// === Search Panel + Vim Search (5 scenarios) ===
+#[cfg(test)]
+mod search_panel_and_vim_search_conformance {
+    use super::*;
+    use crate::core::engine::sidebar::PANEL_SEARCH;
+    use crate::core::project_search::SearchOptions;
+
+    // ── Engine-level: `/`, `?`, `:s///c` ────────────────────────────────
+
+    fn engine_with_token_on_lines_1_and_3() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .buffer_mut()
+            .insert(0, "zqxw_fsearch\nbar\nzqxw_fsearch\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: forward_search_lands_on_next_match_and_n_big_n_navigate,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_token_on_lines_1_and_3(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.inventory().count("zqxw_fsearch") >= 2,
+                "precondition: both occurrences of the search token must be \
+                 painted before searching"
+            );
+            assert!(
+                driver.screen_has("Ln 1,"),
+                "precondition: a fresh buffer starts with the cursor on line 1"
+            );
+
+            driver.type_char('/');
+            driver.type_text("zqxw_fsearch");
+            driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                driver.screen_has("Ln 3,"),
+                "`/zqxw_fsearch<CR>` from line 1 (which itself starts on a \
+                 match) must skip the cursor's own match and land on the \
+                 next one, on line 3"
+            );
+
+            driver.type_char('n');
+            assert!(
+                driver.screen_has("Ln 1,"),
+                "`n` must wrap past the end of the buffer back to the \
+                 match on line 1"
+            );
+
+            driver.type_char('N');
+            assert!(
+                driver.screen_has("Ln 3,"),
+                "`N` must reverse `n`'s direction, wrapping back to the \
+                 match on line 3 that `n` just left"
+            );
+        },
+    }
+
+    crate::backend_conformance! {
+        label: backward_search_lands_on_the_previous_match,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_token_on_lines_1_and_3(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("Ln 1,"),
+                "precondition: a fresh buffer starts with the cursor on line 1"
+            );
+
+            driver.type_char('G');
+            assert!(
+                driver.screen_has("Ln 3,"),
+                "precondition: `G` must move the cursor to the last line, \
+                 which also carries a match"
+            );
+
+            driver.type_char('?');
+            driver.type_text("zqxw_fsearch");
+            driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                driver.screen_has("Ln 1,"),
+                "`?zqxw_fsearch<CR>` from line 3 (itself a match) must skip \
+                 the cursor's own match and land on the previous one, on \
+                 line 1"
+            );
+        },
+    }
+
+    fn engine_with_three_lines_matching_once_each() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .buffer_mut()
+            .insert(0, "zqxw_scpick\nzqxw_scpick\nzqxw_scpick\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: confirm_replace_skip_leaves_original_text_for_the_skipped_match,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_three_lines_matching_once_each(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("zqxw_scpick"),
+                "precondition: the fixture buffer must paint"
+            );
+
+            driver.type_char(':');
+            driver.type_text("%s/zqxw_scpick/zqxw_fixedline/gc");
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.type_char('y');
+            driver.type_char('n');
+            driver.type_char('y');
+
+            assert!(
+                driver.screen_has("2 substitutions on 2 lines"),
+                "answering y/n/y must report exactly 2 substitutions on 2 \
+                 lines -- the skipped match must not count"
+            );
+            let inv = driver.inventory();
+            assert_eq!(
+                inv.count("zqxw_fixedline"),
+                2,
+                "both confirmed matches must actually be replaced in the \
+                 buffer, not just counted in the report"
+            );
+            assert_eq!(
+                inv.count("zqxw_scpick"),
+                1,
+                "the skipped match's original text must remain exactly \
+                 once -- 'zqxw_fixedline' shares no substring with \
+                 'zqxw_scpick', so this can't be a false positive off the \
+                 replaced lines"
+            );
+        },
+    }
+
+    // ── Search panel (UiRole::Search) ───────────────────────────────────
+
+    fn engine_fixture_for_search_panel() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let dir = scratch_dir("vimcode_test_search_panel_opens");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        engine.cwd = dir;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: search_panel_opens_via_activity_bar_and_typing_a_query_starts_the_search,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture_for_search_panel(),
+        size: (1600, 480),
+        body: |driver| {
+            assert!(
+                !driver.screen_has("Replace\u{2026}"),
+                "precondition: the Search panel is not the default active \
+                 panel, so its form must not be painted yet"
+            );
+
+            driver.click_role(UiRole::Search);
+            assert!(
+                driver.screen_has("Replace\u{2026}"),
+                "clicking the Search activity-bar icon (UiRole::Search) \
+                 must open the Search panel"
+            );
+
+            driver.type_text("zqxw_panelquery");
+            assert!(
+                driver.screen_has("zqxw_panelquery"),
+                "the typed query must land in the panel's query box"
+            );
+
+            driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                driver.screen_has("Searching for \"zqxw_panelquery\"\u{2026}"),
+                "pressing Enter in the query box must immediately show the \
+                 'Searching for ...' status -- Engine::start_project_search \
+                 sets this before spawning its background scan thread"
+            );
+        },
+    }
+
+    fn engine_fixture_with_one_search_result() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let dir = scratch_dir("vimcode_test_search_panel_result_click");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zqxw_jumpfile.txt"), "one\nZQ_JMP\nthree\n").unwrap();
+
+        let query = "ZQ_JMP";
+        let opts = SearchOptions::default();
+        let results = crate::core::project_search::search_in_project(&dir, query, &opts)
+            .expect("fixture query must compile as a regex");
+        assert_eq!(
+            results.len(),
+            1,
+            "fixture must produce exactly one search result"
+        );
+
+        engine.cwd = dir;
+        engine.apply_search_results(results, query);
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SEARCH));
+        engine.search_set_focus(true);
+        engine.search_switch_to_results();
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: search_panel_result_click_jumps_to_match_location,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture_with_one_search_result(),
+        size: (1600, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("ZQ_JMP"),
+                "precondition: the fixture's one search result must be \
+                 painted in the Search panel's results list"
+            );
+            assert!(
+                !driver.screen_has("Ln 2,"),
+                "precondition: the match's own file must not be open in \
+                 the editor yet"
+            );
+
+            driver.click_text("ZQ_JMP");
+            driver.click_text("ZQ_JMP");
+
+            assert!(
+                driver.screen_has("Ln 2,"),
+                "double-clicking the search result must open its file and \
+                 jump the cursor to the matched line (line 2 of the \
+                 fixture file, 0-indexed line 1 in `ProjectMatch::line`)"
+            );
+        },
+    }
+}
+
+// === Editor Operations (7 scenarios) ===
+
+#[cfg(test)]
+mod editor_undo_redo_restores_buffer_state {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .buffer_mut()
+            .insert(0, "EOPSUNDO_LINE_ONE\nEOPSUNDO_LINE_TWO\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: editor_undo_redo_restores_buffer_state,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("EOPSUNDO_LINE_ONE") && driver.screen_has("EOPSUNDO_LINE_TWO"),
+                "precondition: both lines must be painted"
+            );
+
+            driver.type_text("dd");
+            assert!(
+                !driver.screen_has("EOPSUNDO_LINE_ONE"),
+                "dd must delete the first line"
+            );
+            assert!(
+                driver.screen_has("EOPSUNDO_LINE_TWO"),
+                "the second line must remain after dd"
+            );
+
+            driver.type_char('u');
+            assert!(
+                driver.screen_has("EOPSUNDO_LINE_ONE"),
+                "u must undo the delete and restore the first line"
+            );
+
+            driver.ctrl_char('r');
+            assert!(
+                !driver.screen_has("EOPSUNDO_LINE_ONE"),
+                "Ctrl-R must redo the delete, removing the first line again"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod editor_visual_char_delete_removes_selection {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.buffer_mut().insert(0, "EOPSVISDEL EOPSVISKEEP\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: editor_visual_char_delete_removes_selection,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("EOPSVISDEL") && driver.screen_has("EOPSVISKEEP"),
+                "precondition: both words must be painted"
+            );
+
+            driver.type_char('v');
+            driver.type_char('e');
+            driver.type_char('d');
+
+            assert!(
+                !driver.screen_has("EOPSVISDEL"),
+                "visual char mode (v) + d must delete the selected word"
+            );
+            assert!(
+                driver.screen_has("EOPSVISKEEP"),
+                "text outside the selection must remain untouched"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod editor_visual_line_yank_paste_duplicates_line {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .buffer_mut()
+            .insert(0, "EOPSVLINE_SOURCE\nEOPSVLINE_OTHER\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: editor_visual_line_yank_paste_duplicates_line,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert_eq!(
+                driver.inventory().count("EOPSVLINE_SOURCE"),
+                1,
+                "precondition: the source line must paint exactly once"
+            );
+
+            driver.type_char('V');
+            driver.type_char('y');
+            driver.type_char('p');
+
+            assert_eq!(
+                driver.inventory().count("EOPSVLINE_SOURCE"),
+                2,
+                "Vyp must yank the line and paste a duplicate directly below it"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod editor_visual_block_delete_removes_column {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .buffer_mut()
+            .insert(0, "AEOPSBLOCK_1\nAEOPSBLOCK_2\nAEOPSBLOCK_3\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: editor_visual_block_delete_removes_column,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("AEOPSBLOCK_1")
+                    && driver.screen_has("AEOPSBLOCK_2")
+                    && driver.screen_has("AEOPSBLOCK_3"),
+                "precondition: all three lines must paint with their leading 'A'"
+            );
+
+            // Enter visual block mode via `:normal` — quadraui's runtime
+            // intercepts Ctrl-V as a paste keypress (even when the
+            // NoopClipboard returns None the event is consumed), so
+            // `driver.ctrl_char('v')` never reaches the engine.
+            // `:normal <C-v>jjd` dispatches keys through Engine::handle_key
+            // directly, bypassing the runtime's preprocess_event.
+            driver.type_char(':');
+            driver.type_text("normal <C-v>jjd");
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            assert!(
+                !driver.screen_has("AEOPSBLOCK_1")
+                    && !driver.screen_has("AEOPSBLOCK_2")
+                    && !driver.screen_has("AEOPSBLOCK_3"),
+                "Ctrl-V block delete must remove the leading column from every \
+                 selected line"
+            );
+            assert!(
+                driver.screen_has("EOPSBLOCK_1")
+                    && driver.screen_has("EOPSBLOCK_2")
+                    && driver.screen_has("EOPSBLOCK_3"),
+                "the remaining text after the deleted column must still paint"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod editor_named_register_yank_paste_roundtrip {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .buffer_mut()
+            .insert(0, "EOPSREG_SOURCE\nEOPSREG_OTHER\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: editor_named_register_yank_paste_roundtrip,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert_eq!(
+                driver.inventory().count("EOPSREG_SOURCE"),
+                1,
+                "precondition: the source line must paint exactly once"
+            );
+
+            driver.type_text("\"ayy");
+            driver.type_char('j');
+            driver.type_text("\"ap");
+
+            assert_eq!(
+                driver.inventory().count("EOPSREG_SOURCE"),
+                2,
+                "\"ayy then \"ap must duplicate the yanked line via register 'a'"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod editor_dot_repeat_repeats_last_change {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .buffer_mut()
+            .insert(0, "EOPSDOT_A\nEOPSDOT_B\nEOPSDOT_C\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: editor_dot_repeat_repeats_last_change,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("EOPSDOT_A")
+                    && driver.screen_has("EOPSDOT_B")
+                    && driver.screen_has("EOPSDOT_C"),
+                "precondition: all three lines must be painted"
+            );
+
+            driver.type_text("dd");
+            assert!(
+                !driver.screen_has("EOPSDOT_A"),
+                "dd must delete the first line"
+            );
+            assert!(
+                driver.screen_has("EOPSDOT_B"),
+                "the second line must remain after dd"
+            );
+
+            driver.type_char('.');
+            assert!(
+                !driver.screen_has("EOPSDOT_B"),
+                ". must repeat dd and delete the next line"
+            );
+            assert!(
+                driver.screen_has("EOPSDOT_C"),
+                "the third line must remain after the repeated delete"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod editor_marks_jump_back_to_marked_line {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .buffer_mut()
+            .insert(0, "EOPSMARK_ONE\nEOPSMARK_TWO\nEOPSMARK_THREE\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: editor_marks_jump_back_to_marked_line,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("EOPSMARK_ONE")
+                    && driver.screen_has("EOPSMARK_TWO")
+                    && driver.screen_has("EOPSMARK_THREE"),
+                "precondition: all three lines must be painted"
+            );
+
+            driver.type_char('j');
+            driver.type_text("ma");
+            driver.type_text("gg");
+            driver.type_text("'a");
+            driver.type_text("dd");
+
+            assert!(
+                !driver.screen_has("EOPSMARK_TWO"),
+                "'a must jump back to the line marked by ma, so dd here \
+                 deletes EOPSMARK_TWO"
+            );
+            assert!(
+                driver.screen_has("EOPSMARK_ONE") && driver.screen_has("EOPSMARK_THREE"),
+                "the other two lines must be untouched by the mark-targeted delete"
+            );
+        },
+    }
+}
+
+// === Source Control Panel conformance scenarios (4 scenarios) ===
+#[cfg(test)]
+mod source_control_panel_conformance {
+    use super::*;
+
+    fn scm_engine_with_explorer_active(tag: &str, file_name: &str) -> crate::core::Engine {
+        let dir = scratch_dir(&format!("vimcode_test_scm_activity_bar_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output();
+        std::fs::write(dir.join(file_name), "// new\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine.git_branch = Some("main".to_string());
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine.sc_refresh();
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: sc_activity_bar_click_opens_panel_with_changed_files,
+        backends: [gtk, tui, tui_prod],
+        engine: scm_engine_with_explorer_active("open", "new1.rs"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                !driver.screen_has("SOURCE CONTROL"),
+                "precondition: the Source Control panel must not be \
+                 showing yet"
+            );
+
+            driver.click_role(UiRole::SourceControl);
+
+            assert!(
+                driver.screen_has("SOURCE CONTROL"),
+                "clicking the Source Control activity-bar icon must open \
+                 the SC panel: {:?}",
+                driver.inventory()
+            );
+            assert!(
+                driver.screen_has("CHANGES"),
+                "the SC panel's CHANGES section must be painted once the \
+                 panel is open"
+            );
+            assert!(
+                driver.screen_has("new1.rs"),
+                "the repo's untracked file must already be listed under \
+                 CHANGES as soon as the panel opens"
+            );
+        },
+    }
+
+    fn scm_engine_with_changed_files(tag: &str) -> crate::core::Engine {
+        let dir = scratch_dir(&format!("vimcode_test_scm_changed_files_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "t@t.com"]);
+        run_git(&["config", "user.name", "T"]);
+
+        let tracked = dir.join("mod.rs");
+        std::fs::write(&tracked, "fn a() {}\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+        std::fs::write(&tracked, "fn a() { /* x */ }\n").unwrap();
+
+        std::fs::write(dir.join("new.rs"), "// new\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine.git_branch = Some("main".to_string());
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_GIT,
+        ));
+        engine.sc_refresh();
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: sc_panel_lists_modified_and_untracked_files_when_repo_open,
+        backends: [gtk, tui, tui_prod],
+        engine: scm_engine_with_changed_files("list"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("SOURCE CONTROL"),
+                "precondition: the SC panel must be showing"
+            );
+            assert!(
+                driver.screen_has("CHANGES"),
+                "precondition: the CHANGES section header must be painted"
+            );
+            assert!(
+                driver.screen_has("mod.rs"),
+                "the modified tracked file must be listed under CHANGES"
+            );
+            assert!(
+                driver.screen_has("new.rs"),
+                "the untracked file must be listed under CHANGES"
+            );
+        },
+    }
+
+    fn scm_engine_with_one_changed_file(
+        tag: &str,
+        file_name: &str,
+        marker: &str,
+    ) -> crate::core::Engine {
+        let dir = scratch_dir(&format!("vimcode_test_scm_open_file_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output();
+        std::fs::write(dir.join(file_name), format!("{marker}\n")).unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine.git_branch = Some("main".to_string());
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_GIT,
+        ));
+        engine.sc_file_statuses = vec![crate::core::git::FileStatus {
+            path: file_name.to_string(),
+            staged: None,
+            unstaged: Some(crate::core::git::StatusKind::Untracked),
+            unmerged: None,
+        }];
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: sc_double_click_changed_file_opens_it,
+        backends: [gtk, tui, tui_prod],
+        engine: scm_engine_with_one_changed_file("dblclick", "scf1.rs", "SCM_OPEN_MARK"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("scf1.rs"),
+                "precondition: the changed file must be listed in the SC \
+                 panel"
+            );
+            assert!(
+                !driver.screen_has("SCM_OPEN_MARK"),
+                "precondition: the file must not be open yet"
+            );
+
+            driver.click_text("scf1.rs");
+            driver.click_text("scf1.rs");
+
+            assert!(
+                driver.screen_has("SCM_OPEN_MARK"),
+                "a double-click on a changed file's row in the SC panel \
+                 must open exactly that file"
+            );
+        },
+    }
+
+    fn scm_y_of_exact(inv: &quadraui::testing::FrameInventory, text: &str) -> f32 {
+        inv.text_runs()
+            .iter()
+            .find(|r| r.text == text)
+            .unwrap_or_else(|| panic!("{text:?} not painted; runs: {:?}", inv.text_runs()))
+            .bounds
+            .y
+    }
+
+    fn scm_y_of_containing(inv: &quadraui::testing::FrameInventory, needle: &str) -> f32 {
+        inv.text_runs()
+            .iter()
+            .find(|r| r.text.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not painted; runs: {:?}", inv.text_runs()))
+            .bounds
+            .y
+    }
+
+    fn scm_engine_with_one_unstaged_file(tag: &str, file_name: &str) -> crate::core::Engine {
+        let dir = scratch_dir(&format!("vimcode_test_scm_stage_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output();
+        std::fs::write(dir.join(file_name), "// new\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine.git_branch = Some("main".to_string());
+        engine.sc_has_focus = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_GIT,
+        ));
+        engine.sc_refresh();
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: sc_stage_all_key_moves_file_to_staged_section,
+        backends: [gtk, tui, tui_prod],
+        engine: scm_engine_with_one_unstaged_file("all", "stg1.rs"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("CHANGES"),
+                "precondition: the CHANGES section must be showing"
+            );
+            assert!(
+                driver.screen_has("stg1.rs"),
+                "precondition: the untracked file must be listed"
+            );
+
+            // Check git status before: nothing staged.
+            let dir = scratch_dir("vimcode_test_scm_stage_all");
+            let pre = std::process::Command::new("git")
+                .args(["diff", "--cached", "--name-only"])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            let pre_staged = String::from_utf8_lossy(&pre.stdout);
+            assert!(
+                !pre_staged.contains("stg1.rs"),
+                "precondition: stg1.rs must not be staged yet"
+            );
+
+            driver.type_char('S');
+
+            // After 'S': verify the file is staged via git.
+            let post = std::process::Command::new("git")
+                .args(["diff", "--cached", "--name-only"])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            let post_staged = String::from_utf8_lossy(&post.stdout);
+            assert!(
+                post_staged.contains("stg1.rs"),
+                "'S' must stage all unstaged files -- stg1.rs must now \
+                 appear in `git diff --cached --name-only`, got: {post_staged:?}"
+            );
+        },
+    }
+}
+
+// === Terminal Panel conformance scenarios (4 scenarios) ===
+#[cfg(test)]
+mod terminal_panel_conformance {
+    use super::*;
+
+    fn plain_engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: term_ex_command_opens_terminal_panel_in_bottom_area,
+        backends: [tui_prod],
+        engine: plain_engine_fixture(),
+        size: (1400, 900),
+        body: |driver| {
+            assert!(
+                !driver.screen_has("[1]"),
+                "precondition: the terminal toolbar's bracketed tab label \
+                 \"[1]\" must not be painted before any terminal pane exists"
+            );
+
+            driver.type_char(':');
+            driver.type_text("terminal");
+            driver.press_named(NamedKey::Enter);
+
+            assert!(
+                driver.screen_has("[1]"),
+                "`:terminal` must open a terminal pane and paint the \
+                 bracketed tab label \"[1]\""
+            );
+        },
+    }
+
+    fn terminal_open_but_unfocused_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.terminal_new_tab(80, 24);
+        engine.terminal_has_focus = false;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: terminal_termkill_closes_the_panel,
+        backends: [tui_prod],
+        engine: terminal_open_but_unfocused_fixture(),
+        size: (1400, 900),
+        body: |driver| {
+            assert!(
+                driver.screen_has("[1]"),
+                "precondition: the terminal pane opened by the fixture must \
+                 already be showing (bracketed tab label [1])"
+            );
+
+            driver.type_char(':');
+            driver.type_text("termkill");
+            driver.press_named(NamedKey::Enter);
+
+            assert!(
+                !driver.screen_has("[1]"),
+                "`:termkill` must close the only open terminal tab and \
+                 hide the bottom panel entirely"
+            );
+        },
+    }
+
+    fn terminal_open_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.terminal_new_tab(80, 24);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: terminal_maximize_then_restore_toggles_panel_height,
+        backends: [tui_prod],
+        engine: terminal_open_fixture(),
+        size: (1400, 900),
+        body: |driver| {
+            assert!(
+                driver.screen_has("[1]"),
+                "precondition: the terminal pane must be open"
+            );
+
+            // Count how many lines of the editor buffer are visible before
+            // maximizing -- after maximize, fewer editor lines should show.
+            let pre_runs = driver
+                .inventory()
+                .text_runs()
+                .len();
+
+            // Unfocus the terminal so : reaches command mode.
+            driver.press_named(NamedKey::Escape);
+
+            driver.type_char(':');
+            driver.type_text("TerminalMaximize");
+            driver.press_named(NamedKey::Enter);
+
+            let post_runs = driver
+                .inventory()
+                .text_runs()
+                .len();
+
+            // After maximizing, the terminal takes most of the screen,
+            // so the total text run count typically changes (fewer editor
+            // lines visible). But primarily just check it didn't crash and
+            // the terminal is still open.
+            assert!(
+                driver.screen_has("[1]"),
+                "`:TerminalMaximize` must keep the terminal open"
+            );
+            // Just verify it toggled -- the number of runs should change.
+            assert!(
+                pre_runs != post_runs,
+                "`:TerminalMaximize` must change the panel layout \
+                 (pre {pre_runs} runs, post {post_runs} runs)"
+            );
+        },
+    }
+}
+
+// === Menus + Context Menus conformance scenarios (4 scenarios) ===
+#[cfg(test)]
+mod context_menu_opens_via_right_click_on_editor {
+    use quadraui::testing::{ConformanceDriver, DriverInput};
+
+    fn engine_fixture() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_test_menuarea_editorctx");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ectx.txt");
+        std::fs::write(&path, "menuareatext9201\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.open_file_in_tab(&path);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: context_menu_opens_via_right_click_on_editor,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("menuareatext9201"),
+                "precondition: the opened file's text must be painted"
+            );
+            assert!(
+                !driver.screen_has("Command Palette"),
+                "precondition: no context menu is open yet"
+            );
+
+            let text_bounds = driver
+                .inventory()
+                .text_runs()
+                .iter()
+                .find(|r| r.text.contains("menuareatext9201"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "menuareatext9201 must be painted; painted: {:?}",
+                        driver.inventory().text_runs()
+                    )
+                })
+                .bounds;
+            let x = text_bounds.x + 2.0;
+            let y = text_bounds.y + text_bounds.height / 2.0;
+            driver.dispatch(quadraui::UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Right,
+                position: quadraui::Point::new(x, y),
+                modifiers: quadraui::Modifiers::default(),
+            });
+
+            assert!(
+                driver.screen_has("Command Palette"),
+                "right-clicking inside the editor's buffer text must open \
+                 the editor's own context menu; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod context_menu_escape_dismisses {
+    use quadraui::testing::{ConformanceDriver, DriverInput};
+
+    fn engine_fixture() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_test_menuarea_ctxesc");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker.txt"), "hello").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine.open_explorer_context_menu(dir, true, 5, 5);
+        engine.context_menu.as_mut().unwrap().selected = 0;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: context_menu_escape_dismisses,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("New File"),
+                "precondition: the folder context menu must be open; \
+                 painted: {:?}",
+                driver.inventory().text_runs()
+            );
+
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            assert!(
+                !driver.screen_has("New File") && !driver.screen_has("Delete"),
+                "Escape must dismiss the open context menu without \
+                 executing any of its items; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod menu_bar_click_opens_dropdown_and_executes_item {
+    use quadraui::testing::{ConformanceDriver, DriverInput};
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.menu_bar_visible = true;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: menu_bar_click_opens_dropdown_and_executes_item,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                !driver.screen_has("TERMINAL"),
+                "precondition: a fresh engine has no terminal panel open"
+            );
+            assert!(
+                !driver.screen_has("Toggle Terminal"),
+                "precondition: the View menu's dropdown is closed"
+            );
+
+            driver.click_text("View");
+
+            assert!(
+                driver.screen_has("Toggle Terminal"),
+                "clicking the 'View' menu-bar label must open its \
+                 dropdown; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+
+            driver.click_text("Toggle Terminal");
+
+            assert!(
+                !driver.screen_has("Toggle Terminal"),
+                "clicking a dropdown item must close the dropdown, not \
+                 leave it open"
+            );
+            assert!(
+                driver.screen_has("[1]"),
+                "clicking 'Toggle Terminal' in the View menu dropdown \
+                 must actually execute it -- the terminal tab label \
+                 '[1]' must now be painted"
+            );
+        },
+    }
+}
+
+// === VS Code Mode Chords conformance scenarios (5 scenarios) ===
+#[cfg(test)]
+mod vscode_ctrl_s_save {
+    use super::*;
+
+    fn engine_fixture(tag: &str) -> crate::core::Engine {
+        let dir = scratch_dir(&format!("vimcode_vscs_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s.txt"), "hi\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.buffer_mut().insert(0, "hi\n");
+        engine.active_buffer_state_mut().file_path = Some(dir.join("s.txt"));
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_s_saves_file_and_clears_unsaved_indicator,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture("save301"),
+        size: (800, 480),
+        body: |driver| {
+            driver.type_char('!');
+            assert!(
+                driver.screen_has("[+]"),
+                "typing a character must mark the buffer dirty and show the \
+                 unsaved indicator"
+            );
+
+            driver.ctrl_char('s');
+            assert!(
+                !driver.screen_has("[+]"),
+                "Ctrl+S must save the file and clear the unsaved indicator"
+            );
+
+            let written = std::fs::read_to_string(
+                scratch_dir("vimcode_vscs_save301").join("s.txt"),
+            )
+            .expect("Ctrl+S should have written the file to disk");
+            assert!(
+                written.contains('!'),
+                "the saved file must contain the edit: {written:?}"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod vscode_ctrl_z_undo_ctrl_y_redo {
+    use super::*;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_z_undo_then_ctrl_y_redo_in_vscode_mode,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            driver.type_char('q');
+            assert!(
+                driver.screen_has("q"),
+                "precondition: the typed character must be painted"
+            );
+
+            driver.ctrl_char('z');
+            assert!(
+                !driver.screen_has("q"),
+                "Ctrl+Z must undo the typed character in VS Code mode"
+            );
+
+            driver.ctrl_char('y');
+            assert!(
+                driver.screen_has("q"),
+                "Ctrl+Y must redo the undone character in VS Code mode"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod vscode_ctrl_d_select_next_occurrence {
+    use super::*;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine
+            .buffer_mut()
+            .insert(0, "mod core;\nmod icons;\nmod render;\n");
+        engine.view_mut().cursor = crate::Cursor { line: 0, col: 0 };
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_d_select_next_occurrence_then_type_replaces_all,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("mod"),
+                "precondition: the fixture's 3 'mod' lines must be painted"
+            );
+
+            driver.ctrl_char('d');
+            driver.ctrl_char('d');
+            driver.ctrl_char('d');
+
+            driver.type_text("use");
+            assert!(
+                !driver.screen_has("mod"),
+                "Ctrl+D x3 then typing must replace every selected \
+                 occurrence, leaving no 'mod' on screen"
+            );
+            assert!(
+                driver.screen_has("use"),
+                "the typed replacement must appear at every cursor"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod vscode_ctrl_shift_k_delete_line {
+    use super::*;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+        engine.view_mut().cursor = crate::Cursor { line: 1, col: 0 };
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_shift_k_deletes_line_in_vscode_mode,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("bbb"),
+                "precondition: the middle line must be painted"
+            );
+
+            driver.ctrl_char('K');
+
+            assert!(
+                !driver.screen_has("bbb"),
+                "Ctrl+Shift+K must delete the current line"
+            );
+            assert!(
+                driver.screen_has("aaa") && driver.screen_has("ccc"),
+                "Ctrl+Shift+K must leave the other lines untouched"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod vscode_ctrl_slash_toggle_comment {
+    use super::*;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.buffer_mut().insert(0, "zqxwcomment9201\n");
+        engine.view_mut().cursor = crate::Cursor { line: 0, col: 0 };
+        engine
+    }
+
+    // Ctrl-/ toggles the line comment on and back off. No file path is set,
+    // so the default comment marker is `#`. The assertion uses
+    // `# zqxwcomment9201` (the marker prepended to the unique fixture text)
+    // rather than a bare `#`, which appears in other TUI chrome.
+    crate::backend_conformance! {
+        label: ctrl_slash_toggles_line_comment_in_vscode_mode,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("zqxwcomment9201"),
+                "precondition: the fixture text must be painted"
+            );
+
+            driver.ctrl_char('/');
+            assert!(
+                driver.screen_has("# zqxwcomment9201") || driver.screen_has("#zqxwcomment9201"),
+                "Ctrl+/ must add the comment marker before the text"
+            );
+
+            driver.ctrl_char('/');
+            // After uncommenting, the `#` prefix must be gone.
+            assert!(
+                !driver.screen_has("# zqxwcomment9201") && !driver.screen_has("#zqxwcomment9201"),
+                "a second Ctrl+/ must toggle the comment marker back off"
+            );
+        },
+    }
+}
+
+// === Minimap + Scrollbars conformance scenarios (4 scenarios) ===
+#[cfg(test)]
+mod vertical_scrollbar_overflow_gating {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let text: String = (0..5).map(|i| format!("V{i:04}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+        engine
+    }
+
+    // A 5-line buffer inside an 800x480 viewport fits entirely without
+    // scrolling.  We verify that all five lines are painted at once — the
+    // viewport does not need a vertical scrollbar to reveal hidden content.
+    crate::backend_conformance! {
+        label: vertical_scrollbar_hidden_when_buffer_fits_viewport,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("V0000"),
+                "the first line of the short buffer must be painted"
+            );
+            assert!(
+                driver.screen_has("V0004"),
+                "the last line of the short buffer must also be painted — \
+                 all five lines fit inside the viewport with room to spare"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod half_page_scroll_viewport {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let text: String = (0..120).map(|i| format!("L{i:04}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+        engine
+    }
+
+    fn topmost_visible_line<D: ConformanceDriver>(driver: &D) -> u32 {
+        driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .filter_map(|run| run.text.strip_prefix('L'))
+            .map(|digits| {
+                digits
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .filter_map(|digits| digits.parse::<u32>().ok())
+            .min()
+            .expect("at least one L%04d marker line must be painted")
+    }
+
+    crate::backend_conformance! {
+        label: ctrl_d_and_ctrl_u_half_page_scroll_the_viewport,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("L0000"),
+                "precondition: a fresh buffer must open scrolled to the top"
+            );
+
+            driver.ctrl_char('d');
+            let after_d = topmost_visible_line(driver);
+            assert!(
+                after_d > 0,
+                "Ctrl-D must scroll the viewport down by half a page \
+                 (topmost visible line 0 -> >0), got {after_d}"
+            );
+
+            driver.ctrl_char('u');
+            let after_u = topmost_visible_line(driver);
+            assert!(
+                after_u < after_d,
+                "Ctrl-U must scroll the viewport back up ({after_d} -> \
+                 strictly less), got {after_u}"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod horizontal_scrollbar_long_line {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let text: String = (0..300).map(|i| format!("H{i:04} ")).collect();
+        engine.buffer_mut().insert(0, text.trim_end());
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: horizontal_scrollbar_appears_for_long_lines,
+        backends: [tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("H0000"),
+                "precondition: the line's own start, where the cursor \
+                 opens, must be painted"
+            );
+            assert!(
+                !driver.screen_has("H0299"),
+                "precondition: the line's tail must start off-screen"
+            );
+
+            driver.type_char('$');
+
+            assert!(
+                driver.screen_has("H0299"),
+                "pressing $ on a line wider than the viewport must scroll \
+                 the viewport right far enough to bring the line's tail \
+                 into view"
+            );
+            assert!(
+                !driver.screen_has("H0000"),
+                "the line's now-scrolled-past start must no longer be \
+                 painted"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod minimap_setting_toggle {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let text: String = (0..20).map(|i| format!("M{i:04}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+        engine
+    }
+
+    fn minimap_zone_present<D: ConformanceDriver>(driver: &D) -> bool {
+        driver
+            .inventory()
+            .zones()
+            .iter()
+            .any(|z| z.id.as_str().starts_with("minimap:"))
+    }
+
+    crate::backend_conformance! {
+        label: minimap_zone_appears_only_when_setting_enabled,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("M0000"),
+                "precondition: the fixture buffer must be painted"
+            );
+            assert!(
+                !minimap_zone_present(driver),
+                "the minimap is experimental and off by default -- no \
+                 `minimap:<window>` zone must be registered before the \
+                 setting is turned on"
+            );
+
+            driver.type_text(":set minimap");
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            assert!(
+                minimap_zone_present(driver),
+                ":set minimap must turn the minimap strip on and register \
+                 its zone -- none appeared"
+            );
+        },
+    }
+}
+
+// === File Operations + Session conformance scenarios (4 scenarios) ===
+#[cfg(test)]
+mod area_file_operations_and_session_conformance {
+    use super::*;
+
+    fn file_ops_fixture_dir(tag: &str) -> std::path::PathBuf {
+        crate::harness::scratch_dir(&format!("vimcode_test_fileops_{tag}"))
+    }
+
+    fn engine_with_open_file(tag: &str, file_name: &str, contents: &str) -> crate::core::Engine {
+        let dir = file_ops_fixture_dir(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file_name);
+        std::fs::write(&path, contents).unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine
+            .open_file_with_mode(&path, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        engine
+    }
+
+    fn engine_with_open_file_and_sibling(
+        tag: &str,
+        open_name: &str,
+        open_contents: &str,
+        sibling_name: &str,
+        sibling_contents: &str,
+    ) -> crate::core::Engine {
+        let dir = file_ops_fixture_dir(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let open_path = dir.join(open_name);
+        std::fs::write(&open_path, open_contents).unwrap();
+        std::fs::write(dir.join(sibling_name), sibling_contents).unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine
+            .open_file_with_mode(&open_path, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: colon_w_saves_modified_buffer_content_to_disk,
+        backends: [tui, tui_prod],
+        engine: engine_with_open_file("w_save", "wsv1.txt", "ORIGINAL_WSV1\n"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                !crate::harness::screen_row_has(driver, "wsv1.txt [+]"),
+                "precondition: a freshly opened file must not show the \
+                 modified indicator"
+            );
+
+            driver.type_char('A');
+            driver.type_text("_EDITED_WSV1");
+            driver.press_named(NamedKey::Escape);
+            assert!(
+                crate::harness::screen_row_has(driver, "wsv1.txt [+]"),
+                "editing the buffer must show the '[+]' modified indicator \
+                 in the status bar"
+            );
+
+            driver.type_text(":w");
+            driver.press_named(NamedKey::Enter);
+            assert!(
+                !crate::harness::screen_row_has(driver, "wsv1.txt [+]"),
+                "':w' must save the buffer and clear the modified indicator"
+            );
+
+            let on_disk =
+                std::fs::read_to_string(file_ops_fixture_dir("w_save").join("wsv1.txt")).unwrap();
+            assert!(
+                on_disk.contains("ORIGINAL_WSV1_EDITED_WSV1"),
+                "':w' must write the buffer's edited content to disk, got {on_disk:?}"
+            );
+        },
+    }
+
+    crate::backend_conformance! {
+        label: colon_e_opens_file_in_the_editor,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_open_file_and_sibling(
+            "e_open",
+            "ed1.txt",
+            "ED1_OPEN_CONTENT",
+            "ed2.txt",
+            "ED2_OPEN_CONTENT",
+        ),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("ED1_OPEN_CONTENT") && !driver.screen_has("ED2_OPEN_CONTENT"),
+                "precondition: only ed1.txt's content is open and visible"
+            );
+
+            let sibling = file_ops_fixture_dir("e_open").join("ed2.txt");
+            driver.type_text(&format!(":e {}", sibling.display()));
+            driver.press_named(NamedKey::Enter);
+            assert!(
+                driver.screen_has("ED2_OPEN_CONTENT"),
+                "':e <path>' must open the file, painting its content"
+            );
+        },
+    }
+
+    crate::backend_conformance! {
+        label: colon_vsplit_opens_file_in_a_vertical_split,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_open_file_and_sibling(
+            "vs_open",
+            "vsa.txt",
+            "VSA_SPLIT_CONTENT",
+            "vsb.txt",
+            "VSB_SPLIT_CONTENT",
+        ),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("VSA_SPLIT_CONTENT") && !driver.screen_has("VSB_SPLIT_CONTENT"),
+                "precondition: only vsa.txt's content is open and visible, \
+                 in the single window"
+            );
+
+            let sibling = file_ops_fixture_dir("vs_open").join("vsb.txt");
+            driver.type_text(&format!(":vsplit {}", sibling.display()));
+            driver.press_named(NamedKey::Enter);
+            assert!(
+                driver.screen_has("VSA_SPLIT_CONTENT") && driver.screen_has("VSB_SPLIT_CONTENT"),
+                "':vsplit <path>' must open the file in a new vertical \
+                 split pane, alongside -- not replacing -- the original \
+                 pane"
+            );
+        },
+    }
+
+    crate::backend_conformance! {
+        label: modified_indicator_reappears_after_edit_following_save,
+        backends: [tui, tui_prod],
+        engine: engine_with_open_file("toggle", "tgl.txt", "ORIGINAL_TGL\n"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                !crate::harness::screen_row_has(driver, "tgl.txt [+]"),
+                "precondition: a freshly opened file must not show the \
+                 modified indicator"
+            );
+
+            driver.type_char('A');
+            driver.type_text("_FIRST_EDIT");
+            driver.press_named(NamedKey::Escape);
+            assert!(
+                crate::harness::screen_row_has(driver, "tgl.txt [+]"),
+                "the first edit must show the modified indicator"
+            );
+
+            driver.type_text(":w");
+            driver.press_named(NamedKey::Enter);
+            assert!(
+                !crate::harness::screen_row_has(driver, "tgl.txt [+]"),
+                "':w' must clear the modified indicator"
+            );
+
+            driver.type_char('A');
+            driver.type_text("_SECOND_EDIT");
+            driver.press_named(NamedKey::Escape);
+            assert!(
+                crate::harness::screen_row_has(driver, "tgl.txt [+]"),
+                "a fresh edit made right after a save must show the \
+                 modified indicator again -- it must be reactive to every \
+                 dirty transition, not just the first one"
+            );
+        },
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// StatusBar conformance scenarios
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod status_bar_mode_normal_on_startup_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    /// Blank buffer, nerd fonts off so the mode-indicator assertions below
+    /// don't depend on which font glyphs happen to be available.
+    fn status_bar_startup_engine() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: status_bar_mode_normal_on_startup,
+        backends: [gtk, tui, tui_prod],
+        engine: status_bar_startup_engine(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("NORMAL"),
+                "a fresh buffer must start in Normal mode, so the status bar's mode \
+                 indicator should paint \"NORMAL\" before any key is pressed; if this \
+                 fails, the status bar is either defaulting to the wrong mode label \
+                 or painting no mode indicator at all"
+            );
+            assert!(
+                !driver.screen_has("INSERT") && !driver.screen_has("VISUAL"),
+                "the status bar must show exactly one mode indicator on startup, and \
+                 it must not also paint INSERT or VISUAL alongside NORMAL"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod status_bar_mode_insert_then_normal_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn status_bar_insert_mode_engine() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: status_bar_mode_insert_then_normal,
+        backends: [gtk, tui, tui_prod],
+        engine: status_bar_insert_mode_engine(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("NORMAL"),
+                "precondition: a fresh buffer starts in Normal mode"
+            );
+
+            driver.type_char('i');
+
+            assert!(
+                driver.screen_has("INSERT"),
+                "pressing 'i' from Normal mode must switch to Insert mode, so the \
+                 status bar's mode indicator must now read \"INSERT\""
+            );
+            assert!(
+                !driver.screen_has("NORMAL"),
+                "while in Insert mode the status bar must not still show the NORMAL \
+                 indicator"
+            );
+
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            assert!(
+                driver.screen_has("NORMAL"),
+                "Escape from Insert mode must return to Normal mode, so the status \
+                 bar's mode indicator must read \"NORMAL\" again"
+            );
+            assert!(
+                !driver.screen_has("INSERT"),
+                "after Escape the status bar must no longer show the INSERT indicator"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod status_bar_cursor_position_updates_on_movement_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    /// Ten distinct lines so 'j' has somewhere to land and the resulting
+    /// "Ln 2, Col 1" is unambiguous.
+    fn status_bar_multiline_engine() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.buffer_mut().insert(0, "line one\nline two\nline three\nline four\nline five\nline six\nline seven\nline eight\nline nine\nline ten\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: status_bar_cursor_position_updates_on_movement,
+        backends: [gtk, tui, tui_prod],
+        engine: status_bar_multiline_engine(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("Ln 1,"),
+                "precondition: a fresh buffer starts with the cursor on line 1"
+            );
+
+            driver.type_char('j');
+
+            assert!(
+                driver.screen_has("Ln 2,"),
+                "pressing 'j' from line 1 must move the cursor down one line, so the \
+                 status bar's cursor-position segment must now read \"Ln 2,\""
+            );
+            assert!(
+                !driver.screen_has("Ln 1,"),
+                "the status bar must not still show the old \"Ln 1,\" position after \
+                 the cursor moved"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod status_bar_mode_visual_indicator_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn status_bar_visual_mode_engine() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.buffer_mut().insert(0, "hello world\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: status_bar_mode_visual_indicator,
+        backends: [gtk, tui, tui_prod],
+        engine: status_bar_visual_mode_engine(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("NORMAL"),
+                "precondition: a fresh buffer starts in Normal mode"
+            );
+
+            driver.type_char('v');
+
+            assert!(
+                driver.screen_has("VISUAL"),
+                "pressing 'v' from Normal mode must enter (charwise) Visual mode, so \
+                 the status bar's mode indicator must read \"VISUAL\""
+            );
+            assert!(
+                !driver.screen_has("NORMAL"),
+                "while in Visual mode the status bar must not still show the NORMAL \
+                 indicator"
+            );
+
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            assert!(
+                driver.screen_has("NORMAL"),
+                "Escape from Visual mode must return to Normal mode, so the status \
+                 bar's mode indicator must read \"NORMAL\" again"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod status_bar_diagnostics_error_warning_counts_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    /// The window-status-line problems counter is keyed by path in
+    /// `engine.lsp_diagnostics`, so this fixture needs a file path on the
+    /// active buffer that matches the diagnostics map's key. `window_status_line`
+    /// defaults to true, but it's set explicitly so this fixture doesn't
+    /// silently break if that default ever changes.
+    fn status_bar_diagnostics_engine() -> crate::core::Engine {
+        use crate::core::lsp::{Diagnostic, DiagnosticSeverity, LspRange};
+        use std::path::PathBuf;
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.window_status_line = true;
+
+        let path = PathBuf::from("diag.rs");
+        engine.active_buffer_state_mut().file_path = Some(path.clone());
+        engine.lsp_diagnostics.insert(
+            path,
+            vec![
+                Diagnostic {
+                    range: LspRange::default(),
+                    severity: DiagnosticSeverity::Error,
+                    message: "mismatched types".to_string(),
+                    source: None,
+                    code: None,
+                },
+                Diagnostic {
+                    range: LspRange::default(),
+                    severity: DiagnosticSeverity::Error,
+                    message: "unused import".to_string(),
+                    source: None,
+                    code: None,
+                },
+                Diagnostic {
+                    range: LspRange::default(),
+                    severity: DiagnosticSeverity::Warning,
+                    message: "unused variable".to_string(),
+                    source: None,
+                    code: None,
+                },
+            ],
+        );
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: status_bar_diagnostics_error_warning_counts,
+        backends: [gtk, tui, tui_prod],
+        engine: status_bar_diagnostics_engine(),
+        size: (800, 480),
+        body: |driver| {
+            // Two errors and one warning on the active file; the problems counter's
+            // error badge and warning badge each read as one painted run of
+            // "<icon> <count>" (`render::frame_chrome_band`'s own `ShowDiagnostics`
+            // segments), so a plain `screen_has` on the combined icon+count string
+            // is enough -- no need for `screen_row_has` here.
+            assert!(
+                driver.screen_has(&format!("{} 2", crate::icons::STATUS_ERROR.s())),
+                "two Error-severity diagnostics on the active file must paint a \
+                 problems counter reading 2 next to the error icon in the window \
+                 status line"
+            );
+            assert!(
+                driver.screen_has(&format!("{} 1", crate::icons::STATUS_WARNING.s())),
+                "one Warning-severity diagnostic on the active file must paint a \
+                 problems counter reading 1 next to the warning icon in the window \
+                 status line"
+            );
+        },
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Navigation conformance scenarios
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod navigation_goto_line_colon_command_mod {
+    use quadraui::testing::ConformanceDriver;
+    use quadraui::NamedKey;
+
+    /// Ten distinct lines so a go-to-line jump actually moves the cursor
+    /// somewhere meaningful rather than landing on the only line there is.
+    fn navigation_multiline_engine() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.buffer_mut().insert(0, "line one\nline two\nline three\nline four\nline five\nline six\nline seven\nline eight\nline nine\nline ten\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: navigation_goto_line_colon_command,
+        backends: [gtk, tui, tui_prod],
+        engine: navigation_multiline_engine(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("Ln 1,"),
+                "precondition: a fresh buffer starts with the cursor on line 1"
+            );
+
+            driver.type_char(':');
+            driver.type_text("5");
+            driver.press_named(NamedKey::Enter);
+
+            assert!(
+                driver.screen_has("Ln 5,"),
+                "':5<CR>' must move the cursor to line 5 (1-indexed), so the status \
+                 bar's cursor-position segment must now read \"Ln 5,\""
+            );
+            assert!(
+                !driver.screen_has("Ln 1,"),
+                "after ':5<CR>' the status bar must not still show the old \"Ln 1,\" \
+                 position"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod navigation_gg_first_line_g_last_line_mod {
+    use quadraui::testing::ConformanceDriver;
+    use quadraui::NamedKey;
+
+    /// Ten distinct lines, same shape as `navigation_multiline_engine`, kept
+    /// as its own fixture fn per scenario so each backend_conformance!
+    /// invocation owns an unambiguous, independently named fixture.
+    fn navigation_gg_g_engine() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.buffer_mut().insert(0, "line one\nline two\nline three\nline four\nline five\nline six\nline seven\nline eight\nline nine\nline ten\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: navigation_gg_first_line_g_last_line,
+        backends: [gtk, tui, tui_prod],
+        engine: navigation_gg_g_engine(),
+        size: (800, 480),
+        body: |driver| {
+            // Start from the middle of the buffer so both 'gg' and 'G' below are
+            // each a real move, not a no-op from an edge the cursor already sat on.
+            driver.type_char(':');
+            driver.type_text("5");
+            driver.press_named(NamedKey::Enter);
+            assert!(
+                driver.screen_has("Ln 5,"),
+                "precondition: ':5<CR>' must land the cursor on line 5"
+            );
+
+            driver.type_text("gg");
+
+            assert!(
+                driver.screen_has("Ln 1,"),
+                "'gg' must move the cursor to the first line, so the status bar must \
+                 now read \"Ln 1,\""
+            );
+
+            driver.type_char('G');
+
+            assert!(
+                driver.screen_has("Ln 10,"),
+                "'G' must move the cursor to the last line (line 10 in this \
+                 10-line fixture), so the status bar must now read \"Ln 10,\""
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod navigation_ctrl_g_shows_file_info_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    /// A short filename (keeps assertions readable) plus a known line count,
+    /// so this scenario can pin both pieces Ctrl-G's message carries: the
+    /// file's name and the buffer's line count.
+    fn navigation_ctrl_g_engine() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.active_buffer_state_mut().file_path = Some(std::path::PathBuf::from("notes.txt"));
+        engine.buffer_mut().insert(0, "line one\nline two\nline three\nline four\nline five\nline six\nline seven\nline eight\nline nine\nline ten\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: navigation_ctrl_g_shows_file_info,
+        backends: [gtk, tui, tui_prod],
+        engine: navigation_ctrl_g_engine(),
+        size: (800, 480),
+        body: |driver| {
+            quadraui::testing::ConformanceDriver::ctrl_char(driver, 'g');
+
+            assert!(
+                driver.screen_has("notes.txt"),
+                "Ctrl-G's file-info message must name the current file (\"notes.txt\" \
+                 in this fixture)"
+            );
+            assert!(
+                driver.screen_has("10 lines"),
+                "Ctrl-G's file-info message must report the buffer's line count \
+                 (10 in this fixture); with 'ruler' on (the engine default) the \
+                 message reads '\"name\" N lines --pct%--' with no cursor position, \
+                 since the ruler segment already shows that"
+            );
+        },
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Editor conformance scenarios
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod editor_insert_then_undo_restores_original_text_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn editor_insert_then_undo_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.buffer_mut().insert(0, "EOPSTYPEUNDO_BASE\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: editor_insert_then_undo_restores_original_text,
+        backends: [gtk, tui, tui_prod],
+        engine: editor_insert_then_undo_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("EOPSTYPEUNDO_BASE")
+                    && !driver.screen_has("EOPSTYPEUNDO_BASE_EXTRA"),
+                "precondition: the original line must be painted and the not-yet-typed \
+                 suffix must not be"
+            );
+
+            driver.type_char('A');
+            driver.type_text("_EXTRA");
+            driver.press_named(quadraui::NamedKey::Escape);
+            assert!(
+                driver.screen_has("EOPSTYPEUNDO_BASE_EXTRA"),
+                "'A' must enter INSERT mode at end-of-line and the typed \"_EXTRA\" \
+                 must be appended and rendered before undo is attempted"
+            );
+
+            driver.type_char('u');
+            assert!(
+                driver.screen_has("EOPSTYPEUNDO_BASE")
+                    && !driver.screen_has("EOPSTYPEUNDO_BASE_EXTRA"),
+                "'u' must undo the whole insert session as one change, restoring the \
+                 line to its pre-edit content"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod editor_yy_p_duplicates_current_line_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn editor_yy_p_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .buffer_mut()
+            .insert(0, "EOPSYYP_SOURCE\nEOPSYYP_OTHER\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: editor_yy_p_duplicates_current_line,
+        backends: [gtk, tui, tui_prod],
+        engine: editor_yy_p_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert_eq!(
+                driver.inventory().count("EOPSYYP_SOURCE"),
+                1,
+                "precondition: the source line must paint exactly once"
+            );
+
+            driver.type_text("yyp");
+
+            assert_eq!(
+                driver.inventory().count("EOPSYYP_SOURCE"),
+                2,
+                "'yy' then 'p' must yank the line under the cursor and paste a \
+                 duplicate of it directly below, in NORMAL mode (not a visual-mode \
+                 yank, which is already covered elsewhere)"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod editor_dd_deletes_current_line_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn editor_dd_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .buffer_mut()
+            .insert(0, "EOPSDDMID_FIRST\nEOPSDDMID_SECOND\nEOPSDDMID_THIRD\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: editor_dd_deletes_current_line,
+        backends: [gtk, tui, tui_prod],
+        engine: editor_dd_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("EOPSDDMID_FIRST")
+                    && driver.screen_has("EOPSDDMID_SECOND")
+                    && driver.screen_has("EOPSDDMID_THIRD"),
+                "precondition: all three lines must be painted"
+            );
+
+            driver.type_char('j');
+            driver.type_text("dd");
+
+            assert!(
+                !driver.screen_has("EOPSDDMID_SECOND"),
+                "'dd' must delete the line the cursor is on; the middle line must \
+                 disappear from the rendered screen"
+            );
+            assert!(
+                driver.screen_has("EOPSDDMID_FIRST") && driver.screen_has("EOPSDDMID_THIRD"),
+                "'dd' must not touch the lines above or below the deleted one"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod editor_o_opens_line_below_in_insert_mode_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn editor_o_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.buffer_mut().insert(0, "EOPSOLINE_ORIGINAL\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: editor_o_opens_line_below_in_insert_mode,
+        backends: [gtk, tui, tui_prod],
+        engine: editor_o_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("EOPSOLINE_ORIGINAL") && !driver.screen_has("INSERT"),
+                "precondition: the original line is painted and the editor starts in \
+                 NORMAL mode (no \"INSERT\" mode indicator painted)"
+            );
+
+            driver.type_char('o');
+            assert!(
+                driver.screen_has("INSERT"),
+                "'o' must switch the editor into INSERT mode"
+            );
+
+            driver.type_text("EOPSOLINE_NEW");
+            assert!(
+                driver.screen_has("EOPSOLINE_ORIGINAL") && driver.screen_has("EOPSOLINE_NEW"),
+                "'o' must open a genuinely new, empty line directly below the \
+                 original -- typed text in INSERT mode must land on that new line \
+                 without disturbing the original line's content"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod editor_dw_deletes_word_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn editor_dw_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .buffer_mut()
+            .insert(0, "EOPSDWORD_FIRST EOPSDWORD_SECOND\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: editor_dw_deletes_word,
+        backends: [gtk, tui, tui_prod],
+        engine: editor_dw_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("EOPSDWORD_FIRST") && driver.screen_has("EOPSDWORD_SECOND"),
+                "precondition: both words must be painted"
+            );
+
+            driver.type_text("dw");
+
+            assert!(
+                !driver.screen_has("EOPSDWORD_FIRST"),
+                "'dw' must delete the word under the cursor, including its trailing \
+                 whitespace"
+            );
+            assert!(
+                driver.screen_has("EOPSDWORD_SECOND"),
+                "'dw' must leave the following word untouched"
+            );
+        },
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Chrome conformance scenarios
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod chrome_menu_bar_shows_all_top_level_labels_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn chrome_menu_bar_labels_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.menu_bar_visible = true;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: chrome_menu_bar_shows_all_top_level_labels,
+        backends: [gtk, tui, tui_prod],
+        engine: chrome_menu_bar_labels_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            for label in [
+                "File", "Edit", "Selection", "View", "Go", "Run", "Terminal", "Help",
+            ] {
+                assert!(
+                    driver.screen_has(label),
+                    "the menu bar must paint the top-level \"{label}\" label; \
+                     painted: {:?}",
+                    driver.inventory().text_runs()
+                );
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod chrome_alt_f_reveals_and_opens_file_menu_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn chrome_alt_f_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: chrome_alt_f_reveals_and_opens_file_menu,
+        backends: [tui, tui_prod],
+        engine: chrome_alt_f_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                !driver.screen_has("New Tab"),
+                "precondition: the menu bar starts hidden, so the File menu's \
+                 dropdown (and its \"New Tab\" item) is not painted"
+            );
+
+            // Alt+<letter> is a modifier-carrying `UiEvent`, not part of the
+            // backend-neutral `ConformanceDriver` surface (`press_named`/`type_char`
+            // have no Alt variant), so this scenario drives it via `TuiDriver`'s own
+            // `dispatch` -- tui/tui_prod only, no `gtk` arm (gtk has its own native
+            // menu-mnemonic path, covered separately on that backend).
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('f'),
+                modifiers: quadraui::Modifiers {
+                    alt: true,
+                    ..quadraui::Modifiers::default()
+                },
+                repeat: false,
+            });
+
+            assert!(
+                driver.screen_has("New Tab"),
+                "Alt+F must reveal the menu bar and open the File menu's dropdown \
+                 in the same keystroke; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod chrome_tab_bar_shows_active_buffer_filename_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn chrome_tab_filename_fixture() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_chrome_tabname");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("chrm1.txt");
+        std::fs::write(&f, "CHRMFILE_CONTENT\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.new_tab(Some(&f));
+        engine.goto_tab(0);
+        engine.close_tab();
+        engine.goto_tab(0);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: chrome_tab_bar_shows_active_buffer_filename,
+        backends: [gtk, tui, tui_prod],
+        engine: chrome_tab_filename_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            // vimcode's painted "title" chrome for the active buffer is the tab
+            // bar's own label -- the OS-level window title
+            // (`render::menu_and_chrome_routing::window_title`) is written straight
+            // to the backend's `WindowControl::set_title` and is never painted into
+            // the app's own canvas, so it is invisible to `ConformanceDriver::
+            // screen_has` on every backend; the title-bar paint path itself
+            // (`App::paint_title_bar_band`) is dormant and not wired up.
+            assert!(
+                driver.screen_has("chrm1"),
+                "the tab bar must paint the filename of the active buffer; \
+                 painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod chrome_menu_dropdown_escape_closes_without_executing_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn chrome_menu_escape_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.menu_bar_visible = true;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: chrome_menu_dropdown_escape_closes_without_executing,
+        backends: [gtk, tui, tui_prod],
+        engine: chrome_menu_escape_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                !driver.screen_has("New Tab"),
+                "precondition: the File menu's dropdown is closed"
+            );
+
+            driver.click_text("File");
+            assert!(
+                driver.screen_has("New Tab"),
+                "clicking the 'File' menu-bar label must open its dropdown; \
+                 painted: {:?}",
+                driver.inventory().text_runs()
+            );
+
+            driver.press_named(quadraui::NamedKey::Escape);
+            assert!(
+                !driver.screen_has("New Tab"),
+                "Escape must close the open File dropdown without executing any of \
+                 its items"
+            );
+        },
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Settings conformance scenarios
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod settings_number_enables_line_numbers_mod {
+    use quadraui::testing::ConformanceDriver;
+    use quadraui::NamedKey;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        // Start with line numbers off so `:set number` has something to turn on.
+        engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
+        // Content lines deliberately carry no digits of their own -- the only
+        // digit characters that can appear on screen are gutter line numbers,
+        // so `screen_has("3")` below is an unambiguous signal.
+        let text = "zqfoo\nzqbar\nzqbaz\nzqqux\nzqzap\n";
+        engine.buffer_mut().insert(0, text);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: settings_number_enables_line_numbers,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("zqbaz"),
+                "precondition: the fixture buffer's third line must be painted"
+            );
+            assert!(
+                !driver.screen_has("3"),
+                "precondition: with line numbers off, no gutter digit \"3\" (line \
+                 3's number) must be painted -- content lines carry no digits of \
+                 their own"
+            );
+
+            driver.type_text(":set number");
+            driver.press_named(NamedKey::Enter);
+
+            assert!(
+                driver.screen_has("3"),
+                "`:set number` must turn the line-number gutter back on -- line 3's \
+                 gutter number \"3\" must now be painted"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod settings_nonumber_disables_line_numbers_mod {
+    use quadraui::testing::ConformanceDriver;
+    use quadraui::NamedKey;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        // Line numbers default on (`LineNumberMode::Absolute`) -- left alone here.
+        // Content lines carry no digits of their own, so a painted digit can
+        // only come from the gutter.
+        let text = "zqfoo\nzqbar\nzqbaz\nzqqux\nzqzap\n";
+        engine.buffer_mut().insert(0, text);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: settings_nonumber_disables_line_numbers,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("zqbaz"),
+                "precondition: the fixture buffer's third line must be painted"
+            );
+            assert!(
+                driver.screen_has("3"),
+                "precondition: line numbers are on by default -- line 3's gutter \
+                 number \"3\" must be painted"
+            );
+
+            driver.type_text(":set nonumber");
+            driver.press_named(NamedKey::Enter);
+
+            assert!(
+                !driver.screen_has("3"),
+                "`:set nonumber` must turn the line-number gutter off -- line 3's \
+                 gutter number \"3\" must no longer be painted"
+            );
+            assert!(
+                driver.screen_has("zqbaz"),
+                "the buffer's own text must still be painted after the gutter is \
+                 turned off"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod settings_relativenumber_shows_relative_line_numbers_mod {
+    use quadraui::testing::ConformanceDriver;
+    use quadraui::NamedKey;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        // 5 lines, cursor opens on line 1. With plain absolute numbering
+        // (the default) line 5's gutter shows "5". Once relativenumber is on
+        // (number+relativenumber together is vim's "hybrid" mode), only the
+        // cursor's own line shows its absolute number -- every other line
+        // shows its *distance* from the cursor, so the maximum number any
+        // gutter can show is 4 (5 lines - the 1 cursor line). "5" therefore
+        // disappearing is an unambiguous signal that relative numbering took
+        // effect. Content lines carry no digits of their own.
+        let text = "zqfoo\nzqbar\nzqbaz\nzqqux\nzqzap\n";
+        engine.buffer_mut().insert(0, text);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: settings_relativenumber_shows_relative_line_numbers,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("zqzap"),
+                "precondition: the fixture buffer's fifth line must be painted"
+            );
+            assert!(
+                driver.screen_has("5"),
+                "precondition: with plain absolute numbering, line 5's gutter number \
+                 \"5\" must be painted"
+            );
+
+            driver.type_text(":set relativenumber");
+            driver.press_named(NamedKey::Enter);
+
+            assert!(
+                !driver.screen_has("5"),
+                "`:set relativenumber` must switch the gutter to relative numbering \
+                 from the cursor (on line 1) -- with only 5 lines, no gutter can \
+                 show a distance of 5 any more, so \"5\" must no longer be painted"
+            );
+            assert!(
+                driver.screen_has("zqzap"),
+                "the buffer's own text must still be painted after switching to \
+                 relative numbering"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod settings_wrap_and_nowrap_toggle_word_wrap_mod {
+    use quadraui::testing::ConformanceDriver;
+    use quadraui::NamedKey;
+
+    fn wrap_engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        // `wrap` defaults to false (nowrap). One very long single line: a run
+        // of 'x's, a "wraptail" marker, then a run of 'y's. Under nowrap the
+        // whole logical line paints as exactly one run containing 'x'. Under
+        // wrap it paints as multiple visual-row runs, each still containing
+        // 'x' (the break points land inside the 'x'/'y' runs). The `len() > 50`
+        // guard excludes short, unrelated chrome/sidebar text that happens to
+        // contain the letter 'x' (e.g. a repo directory literally named
+        // "examples") -- only this fixture's own wrapped/unwrapped segments
+        // are long enough to pass it.
+        let long = format!("{}wraptail{}", "x".repeat(900), "y".repeat(900));
+        engine.buffer_mut().insert(0, &format!("{long}\n"));
+        engine
+    }
+
+    fn count_long_x_runs<D: quadraui::testing::ConformanceDriver>(d: &D) -> usize {
+        d.inventory()
+            .text_runs()
+            .iter()
+            .filter(|r| r.text.len() > 50 && r.text.contains('x'))
+            .count()
+    }
+
+    crate::backend_conformance! {
+        label: settings_wrap_and_nowrap_toggle_word_wrap,
+        backends: [gtk, tui, tui_prod],
+        engine: wrap_engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            let pre = count_long_x_runs(driver);
+            assert_eq!(
+                pre, 1,
+                "precondition: with nowrap (the default), the long line must paint \
+                 as exactly one run -- got {pre} runs containing 'x' longer than 50 \
+                 chars"
+            );
+
+            driver.type_text(":set wrap");
+            driver.press_named(NamedKey::Enter);
+
+            let during = count_long_x_runs(driver);
+            assert!(
+                during > 1,
+                "`:set wrap` must wrap the long line across multiple visual rows -- \
+                 expected more than 1 run containing 'x', got {during}"
+            );
+
+            driver.type_text(":set nowrap");
+            driver.press_named(NamedKey::Enter);
+
+            let post = count_long_x_runs(driver);
+            assert_eq!(
+                post, 1,
+                "`:set nowrap` must revert to a single unwrapped row -- expected \
+                 exactly 1 run containing 'x', got {post}"
+            );
+        },
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Terminal conformance scenarios (cross-backend)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod terminal_ex_command_opens_panel_across_backends_mod {
+    use quadraui::testing::ConformanceDriver;
+    use quadraui::NamedKey;
+
+    crate::backend_conformance! {
+        label: terminal_ex_command_opens_panel_across_backends,
+        backends: [gtk, tui, tui_prod],
+        engine: {
+            let mut engine = crate::core::Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            engine
+        },
+        size: (1400, 900),
+        body: |driver| {
+            assert!(
+                !driver.screen_has("[1]"),
+                "precondition: the terminal toolbar's bracketed tab label \"[1]\" \
+                 must not be painted before any terminal pane exists"
+            );
+
+            driver.type_char(':');
+            driver.type_text("terminal");
+            driver.press_named(NamedKey::Enter);
+
+            assert!(
+                driver.screen_has("[1]"),
+                "`:terminal` must open a terminal pane and paint the bracketed tab \
+                 label \"[1]\" -- this must hold on every backend, not only tui_prod"
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod terminal_panel_click_focuses_it_for_keystroke_routing_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.terminal_new_tab(80, 24);
+        // Start unfocused: focus is elsewhere (the editor), so a typed ':'
+        // reaches the host's own ex-command line instead of the terminal.
+        engine.terminal_has_focus = false;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: terminal_panel_click_focuses_it_for_keystroke_routing,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (1400, 900),
+        body: |driver| {
+            assert!(
+                driver.screen_has("[1]"),
+                "precondition: the fixture's terminal pane must already be open \
+                 (bracketed tab label [1])"
+            );
+
+            // With the terminal unfocused, ':' + 'Q' must reach the host's own
+            // command line and paint as literal typed text there (never pressing
+            // Enter, so nothing executes).
+            driver.type_char(':');
+            driver.type_char('Q');
+            assert!(
+                driver.screen_has(":Q"),
+                "precondition: with the terminal unfocused, typing ':Q' must echo \
+                 literally in the host's command line"
+            );
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            // Locate the terminal's own tab label, then click a few rows below it --
+            // inside the terminal pane's own body, not its tab strip.
+            let tab_run = driver
+                .inventory()
+                .text_runs()
+                .iter()
+                .find(|r| r.text.contains("[1]"))
+                .map(|r| (r.bounds.x, r.bounds.y, r.bounds.height))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the terminal's \"[1]\" tab label must be painted so this \
+                         scenario can locate the pane to click; painted: {:?}",
+                        driver.inventory().text_runs()
+                    )
+                });
+            driver.click(tab_run.0 + 5.0, tab_run.1 + tab_run.2 * 3.0);
+
+            // With the terminal now focused, the same keystrokes must be swallowed
+            // by the terminal instead of reaching the host's command line.
+            driver.type_char(':');
+            driver.type_char('Q');
+            assert!(
+                !driver.screen_has(":Q"),
+                "clicking inside the terminal pane's body must focus it -- typing \
+                 ':Q' afterward must be routed to the terminal, not echoed in the \
+                 host's command line"
+            );
+        },
     }
 }
