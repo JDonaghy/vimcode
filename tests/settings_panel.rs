@@ -221,17 +221,17 @@ fn settings_panel_cycle_colorscheme() {
 
     let cs_idx = find_core_setting(&e, "colorscheme");
     e.settings_selected = cs_idx;
-    assert_eq!(e.settings.colorscheme, "onedark");
+    assert_eq!(e.settings.colorscheme, "vscode-dark-modern");
 
     // Enter cycles forward
     e.handle_settings_key("Return", false, None);
-    assert_eq!(e.settings.colorscheme, "gruvbox-dark");
+    assert_eq!(e.settings.colorscheme, "vscode-dark-classic");
 
     // l cycles forward again
     e.handle_settings_key("l", false, None);
-    assert_eq!(e.settings.colorscheme, "tokyo-night");
+    assert_eq!(e.settings.colorscheme, "vscode-light");
 
     // h cycles backward
     e.handle_settings_key("h", false, None);
-    assert_eq!(e.settings.colorscheme, "gruvbox-dark");
+    assert_eq!(e.settings.colorscheme, "vscode-dark-classic");
 }

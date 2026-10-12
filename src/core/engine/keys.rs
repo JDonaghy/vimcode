@@ -9865,18 +9865,16 @@ impl Engine {
                     })
                     .unwrap_or_default(),
                 "colorscheme" => {
-                    // Complete theme names
-                    let mut names = vec![
-                        "onedark".to_string(),
-                        "gruvbox-dark".to_string(),
-                        "tokyo-night".to_string(),
-                        "solarized-dark".to_string(),
-                        "vscode-dark".to_string(),
-                        "vscode-light".to_string(),
+                    // Complete theme names: built-ins plus their short aliases
+                    let mut names = crate::core::settings::available_colorschemes();
+                    names.extend([
                         "gruvbox".to_string(),
                         "tokyonight".to_string(),
                         "solarized".to_string(),
-                    ];
+                        "vscode".to_string(),
+                        "dark+".to_string(),
+                        "light+".to_string(),
+                    ]);
                     names.extend(list_custom_theme_names());
                     names.sort();
                     names.dedup();

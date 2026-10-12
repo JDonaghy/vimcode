@@ -1006,6 +1006,164 @@ impl Theme {
         }
     }
 
+    /// VS Code Dark Modern colour scheme (the VS Code default since 2023).
+    ///
+    /// Syntax highlighting is pixel-identical to classic Dark+ (VS Code's
+    /// `dark_modern.json` adds no `tokenColors`, only UI chrome overrides), so
+    /// the token colours below match [`Self::vscode_dark`] field-for-field.
+    /// The UI chrome — status bar, title bar, sidebar, activity bar, tabs —
+    /// drops the saturated blue wash of Dark+ for a neutral dark grey, with
+    /// the blue accent reserved for focus borders and active tab/row markers.
+    pub fn vscode_dark_modern() -> Self {
+        let bg = hex("#1f1f1f");
+        Self {
+            background: bg,
+            active_background: hex("#202020"),
+            foreground: hex("#cccccc"),
+
+            keyword: hex("#569cd6"),      // blue (storage: let, fn, struct)
+            control_flow: hex("#c586c0"), // purple (if, else, for, return)
+            string_lit: hex("#ce9178"),   // salmon
+            comment: hex("#6a9955"),      // green
+            function: hex("#dcdcaa"),     // yellow
+            type_name: hex("#4ec9b0"),    // teal
+            variable: hex("#9cdcfe"),     // light blue
+            number: hex("#b5cea8"),       // light green
+            operator: hex("#d4d4d4"),
+            punctuation: hex("#d4d4d4"),
+            macro_call: hex("#dcdcaa"),
+            attribute: hex("#4ec9b0"),
+            lifetime: hex("#569cd6"),
+            constant: hex("#4fc1ff"),
+            escape: hex("#d7ba7d"),
+            boolean: hex("#569cd6"),
+            property: hex("#9cdcfe"),
+            parameter: hex("#9cdcfe"),
+            module: hex("#4ec9b0"),
+            default_fg: hex("#cccccc"),
+
+            selection: hex("#264f78"),
+            selection_alpha: 0.6,
+
+            cursor: hex("#aeafad"),
+            cursor_normal_alpha: 0.6,
+
+            search_match_bg: hex("#515c6a"),
+            search_current_match_bg: hex("#613214"),
+            search_match_fg: hex("#d4d4d4"),
+
+            tab_bar_bg: hex("#181818"),
+            tab_active_bg: hex("#1f1f1f"),
+            tab_active_fg: hex("#ffffff"),
+            tab_inactive_fg: hex("#9d9d9d"),
+            tab_preview_active_fg: hex("#cccccc"),
+            tab_preview_inactive_fg: hex("#7f7f7f"),
+            tab_active_accent: hex("#0078d4"),
+
+            status_bg: hex("#181818"),
+            status_fg: hex("#cccccc"),
+
+            status_mode_normal_bg: hex("#0078d4"),
+            status_mode_insert_bg: hex("#16825d"),
+            status_mode_visual_bg: hex("#68217a"),
+            status_mode_replace_bg: hex("#c72e0f"),
+            status_inactive_bg: hex("#1f1f1f"),
+            status_inactive_fg: hex("#808080"),
+
+            wildmenu_bg: hex("#202020"),
+            wildmenu_fg: hex("#cccccc"),
+            wildmenu_sel_bg: hex("#04395e"),
+            wildmenu_sel_fg: hex("#ffffff"),
+
+            command_bg: hex("#1f1f1f"),
+            command_fg: hex("#cccccc"),
+
+            line_number_fg: hex("#6e7681"),
+            line_number_active_fg: hex("#cccccc"),
+
+            separator: hex("#313131"),
+
+            git_added: hex("#2ea043"),
+            git_modified: hex("#0078d4"),
+            git_deleted: hex("#f85149"),
+
+            completion_bg: hex("#202020"),
+            completion_selected_bg: hex("#04395e"),
+            completion_fg: hex("#cccccc"),
+            completion_border: hex("#313131"),
+
+            diagnostic_error: hex("#f14c4c"),
+            diagnostic_warning: hex("#cca700"),
+            diagnostic_info: hex("#59a4f9"),
+            diagnostic_hint: hex("#b0b0b0"),
+            spell_error: hex("#4fc1ff"),
+            lightbulb: hex("#cca700"),
+
+            hover_bg: hex("#202020"),
+            hover_fg: hex("#cccccc"),
+            hover_border: hex("#313131"),
+
+            fuzzy_bg: hex("#202020"),
+            fuzzy_selected_bg: hex("#04395e"),
+            fuzzy_fg: hex("#cccccc"),
+            fuzzy_query_fg: hex("#4daafc"),
+            fuzzy_border: hex("#313131"),
+            fuzzy_title_fg: hex("#dcdcaa"),
+            fuzzy_match_fg: hex("#4daafc"),
+
+            // (bg #1f1f1f)
+            diff_added_bg: hex("#14541a"),
+            diff_removed_bg: hex("#541a1a"),
+            diff_padding_bg: hex("#2d2d2d"),
+
+            dap_stopped_bg: hex("#3a3000"),
+
+            cursorline_bg: hex("#1f1f1f").cursorline_tint(), // derived from background
+
+            yank_highlight_bg: hex("#dcdcaa"),
+            yank_highlight_alpha: 0.25,
+
+            annotation_fg: hex("#6e7681"),
+            ghost_text_fg: hex("#5a5a5a"),
+
+            md_heading1: hex("#dcdcaa"),
+            md_heading2: hex("#569cd6"),
+            md_heading3: hex("#c586c0"),
+            md_code: hex("#ce9178"),
+            md_link: hex("#4daafc"),
+
+            sidebar_sel_bg: hex("#04395e"), // focused: visible blue highlight
+            sidebar_sel_bg_inactive: hex("#2a2d2e"),
+            semantic_parameter: hex("#9cdcfe"),   // light blue
+            semantic_property: hex("#9cdcfe"),    // light blue
+            semantic_namespace: hex("#4ec9b0"),   // teal
+            semantic_enum_member: hex("#4fc1ff"), // bright blue
+            semantic_interface: hex("#4ec9b0"),   // teal
+            semantic_type_parameter: hex("#4ec9b0"),
+            semantic_decorator: hex("#dcdcaa"), // yellow
+            semantic_macro: hex("#dcdcaa"),     // yellow
+
+            breadcrumb_bg: hex("#1f1f1f"),
+            breadcrumb_fg: hex("#9d9d9d"),
+            breadcrumb_active_fg: hex("#cccccc"),
+
+            indent_guide_fg: hex("#404040"),
+            indent_guide_active_fg: hex("#707070"),
+            colorcolumn_bg: bg.colorcolumn_tint(),
+            bracket_match_bg: hex("#3a3d41"),
+
+            explorer_dir_fg: hex("#dcdcaa"), // warm yellow (like function names)
+            explorer_file_fg: hex("#cccccc"), // VS Code Dark Modern sidebar fg
+            explorer_active_bg: hex("#2a2d3e"), // current-file tint
+
+            scrollbar_thumb: hex("#434343"),
+            scrollbar_track: hex("#1f1f1f"),
+            terminal_bg: hex("#1f1f1f"),
+            activity_bar_fg: hex("#d7d7d7"),
+            activity_active_accent: hex("#0078d4"),
+        }
+    }
+
     /// VS Code Light+ (Default Light+) colour scheme.
     pub fn vscode_light() -> Self {
         let bg = hex("#ffffff");
@@ -1156,13 +1314,14 @@ impl Theme {
         }
     }
 
-    /// Return a theme by name. Falls back to `onedark` for unknown names.
+    /// Return a theme by name. Falls back to `vscode-dark-modern` for unknown names.
     pub fn from_name(name: &str) -> Self {
         match name {
             "gruvbox" | "gruvbox-dark" => Self::gruvbox_dark(),
             "tokyo-night" | "tokyonight" => Self::tokyo_night(),
             "solarized" | "solarized-dark" => Self::solarized_dark(),
-            "vscode-dark" | "vscode" | "dark+" => Self::vscode_dark(),
+            "vscode-dark-modern" | "vscode-dark" | "vscode" => Self::vscode_dark_modern(),
+            "dark+" | "vscode-dark-classic" => Self::vscode_dark(),
             "vscode-light" | "light+" => Self::vscode_light(),
             "onedark" => Self::onedark(),
             _ => {
@@ -1170,7 +1329,7 @@ impl Theme {
                 if let Some(theme) = Self::load_vscode_theme(name) {
                     theme
                 } else {
-                    Self::onedark()
+                    Self::vscode_dark_modern()
                 }
             }
         }
@@ -1194,7 +1353,8 @@ impl Theme {
             "gruvbox-dark".into(),
             "tokyo-night".into(),
             "solarized-dark".into(),
-            "vscode-dark".into(),
+            "vscode-dark-modern".into(),
+            "vscode-dark-classic".into(),
             "vscode-light".into(),
         ];
         // Append custom VSCode themes from the platform config dir's themes/
@@ -1894,5 +2054,88 @@ pub(crate) mod tests {
         assert_eq!(q.badge_blocked, theme.diagnostic_error);
         assert_eq!(q.card_hint_bg, theme.hover_bg);
         assert_eq!(q.card_hint_fg, theme.hover_fg);
+    }
+
+    // ─── VS Code Dark Modern default ────────────────────────────────────────
+
+    /// An unrecognised colorscheme name, and the bare `"vscode"`/`"vscode-dark"`
+    /// aliases, resolve to Dark Modern rather than classic Dark+ or `onedark`.
+    /// `Theme` has no `PartialEq`/`Debug`, so compare representative fields
+    /// rather than whole structs.
+    #[test]
+    fn from_name_default_and_vscode_aliases_resolve_to_dark_modern() {
+        let modern = Theme::vscode_dark_modern();
+        for name in [
+            "not-a-real-theme",
+            "vscode-dark-modern",
+            "vscode-dark",
+            "vscode",
+        ] {
+            let theme = Theme::from_name(name);
+            assert_eq!(theme.background, modern.background, "name={name}");
+            assert_eq!(theme.status_bg, modern.status_bg, "name={name}");
+            assert_eq!(
+                theme.activity_active_accent, modern.activity_active_accent,
+                "name={name}"
+            );
+        }
+    }
+
+    /// `"dark+"` and `"vscode-dark-classic"` still reach the saturated-blue
+    /// classic Dark+ palette (`vscode_dark`), unchanged by the new default.
+    #[test]
+    fn from_name_classic_aliases_resolve_to_dark_plus() {
+        let classic = Theme::vscode_dark();
+        for name in ["dark+", "vscode-dark-classic"] {
+            let theme = Theme::from_name(name);
+            assert_eq!(theme.background, classic.background, "name={name}");
+            assert_eq!(theme.status_bg, classic.status_bg, "name={name}");
+        }
+        assert_eq!(classic.status_bg, hex("#007acc"));
+    }
+
+    /// Spot-check Dark Modern's UI chrome against VS Code's own current
+    /// token values: a neutral dark-grey status bar/sidebar/activity bar
+    /// (no saturated blue wash) with the blue accent reserved for the tab
+    /// indicator, selection highlight and focus-style elements.
+    #[test]
+    fn vscode_dark_modern_chrome_matches_vs_code_tokens() {
+        let theme = Theme::vscode_dark_modern();
+
+        // statusBar.background / sideBarSectionHeader-adjacent chrome: dark
+        // grey, not Dark+'s saturated blue.
+        assert_eq!(theme.status_bg, hex("#181818"));
+        assert_eq!(theme.tab_bar_bg, hex("#181818"));
+        assert_ne!(theme.status_bg, hex("#007acc"));
+
+        // editor.background
+        assert_eq!(theme.background, hex("#1f1f1f"));
+
+        // Blue accent survives on the active tab border and list selection.
+        assert_eq!(theme.tab_active_accent, hex("#0078d4"));
+        assert_eq!(theme.activity_active_accent, hex("#0078d4"));
+        assert_eq!(theme.fuzzy_selected_bg, hex("#04395e"));
+
+        // scrollbarSlider.background at 40% opacity, composited over
+        // editor.background.
+        assert_eq!(theme.scrollbar_thumb, hex("#434343"));
+    }
+
+    /// Syntax token colours are untouched by the Dark Modern UI-chrome
+    /// refresh: VS Code's `dark_modern.json` carries no `tokenColors` of its
+    /// own, so highlighting must stay pixel-identical to classic Dark+.
+    #[test]
+    fn vscode_dark_modern_token_colors_match_dark_plus() {
+        let modern = Theme::vscode_dark_modern();
+        let classic = Theme::vscode_dark();
+
+        assert_eq!(modern.keyword, classic.keyword);
+        assert_eq!(modern.control_flow, classic.control_flow);
+        assert_eq!(modern.string_lit, classic.string_lit);
+        assert_eq!(modern.comment, classic.comment);
+        assert_eq!(modern.function, classic.function);
+        assert_eq!(modern.type_name, classic.type_name);
+        assert_eq!(modern.variable, classic.variable);
+        assert_eq!(modern.number, classic.number);
     }
 }

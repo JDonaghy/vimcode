@@ -636,8 +636,9 @@ pub struct Settings {
     #[serde(default, skip_serializing)]
     extension_registry_url: String,
 
-    /// Name of the active colour scheme. Built-in options: "onedark" (default),
-    /// "gruvbox-dark", "tokyo-night", "solarized-dark", "vscode-dark", "vscode-light".
+    /// Name of the active colour scheme. Built-in options: "vscode-dark-modern"
+    /// (default), "vscode-dark-classic" (a.k.a. "dark+"), "vscode-light", "onedark",
+    /// "gruvbox-dark", "tokyo-night", "solarized-dark".
     /// Select with `:colorscheme <name>`.
     #[serde(default = "default_colorscheme")]
     pub colorscheme: String,
@@ -1356,7 +1357,7 @@ fn default_iskeyword() -> String {
 }
 
 fn default_colorscheme() -> String {
-    "onedark".to_string()
+    "vscode-dark-modern".to_string()
 }
 
 fn default_ai_provider() -> String {
@@ -4206,7 +4207,8 @@ pub fn available_colorschemes() -> Vec<String> {
         "gruvbox-dark".into(),
         "tokyo-night".into(),
         "solarized-dark".into(),
-        "vscode-dark".into(),
+        "vscode-dark-modern".into(),
+        "vscode-dark-classic".into(),
         "vscode-light".into(),
     ];
     {
