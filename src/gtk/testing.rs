@@ -5084,7 +5084,10 @@ mod sidebar_panel_clicks {
             "precondition: the Terminal tab owns the panel body"
         );
 
-        // Locate the *second* painted tab slot (Terminal, then Debug Output).
+        // With both a terminal and debug output present, `build_bottom_panel_
+        // tab_bar` paints four slots in a fixed order: Problems, Output,
+        // Debug Console, Terminal (`src/render/quadraui_adapters.rs`). Debug
+        // Console is slot index 2.
         let (slot_x, strip_y) = {
             let engine = h.engine.borrow();
             let hits = engine.bottom_tab_bar_hits.borrow();
@@ -5093,8 +5096,8 @@ mod sidebar_panel_clicks {
                 .expect("the bottom panel must have painted a tab strip");
             let (cx, _cy) = hits
                 .layout
-                .tab_center(1)
-                .expect("Terminal + Debug Output are two painted slots");
+                .tab_center(2)
+                .expect("Problems, Output, Debug Console and Terminal are four painted slots");
             let geom = engine
                 .bottom_panel_geometry
                 .borrow()
@@ -5106,7 +5109,7 @@ mod sidebar_panel_clicks {
 
         assert!(
             h.driver.screen_contains("ZQXW754GTKDEBUGMARKER"),
-            "clicking the Debug Output tab must repaint the panel body with the \
+            "clicking the Debug Console tab must repaint the panel body with the \
              debug output (#754 `BottomPanelRoute::TabBar`)"
         );
     }

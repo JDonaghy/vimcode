@@ -5874,6 +5874,42 @@ mod tests {
             );
         }
 
+        /// A click on the "Problems" tab must switch which panel is
+        /// **painted**, through `App::handle_dispatch`'s shared
+        /// `render::route_bottom_panel_click` -> `render::apply_bottom_panel_
+        /// route` -> `Engine::handle_bottom_tab_bar_click` chain (the same
+        /// chain `gtk::testing::bottom_panel_tab_strip_click_switches_the_
+        /// painted_panel` drives on the other backend). With only a
+        /// terminal open (no debug output), `build_bottom_panel_tab_bar`
+        /// paints three slots: Problems, Output, Terminal — clicking
+        /// "Problems" must swap the terminal content for the Problems
+        /// placeholder.
+        #[test]
+        fn bottom_panel_tab_strip_click_switches_the_painted_panel_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                !driver.screen_has("No problems have been detected"),
+                "precondition: the Terminal tab owns the panel body; screen:\n{}",
+                driver.screen()
+            );
+
+            let (x, y) = driver
+                .find("Problems")
+                .expect("the bottom panel tab strip must paint a Problems tab");
+            driver.click(x, y);
+
+            assert!(
+                driver.screen_has("No problems have been detected"),
+                "clicking the Problems tab must repaint the panel body with the \
+                 Problems placeholder; screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// An **open but empty** quickfix list must reserve no rows — paint-
         /// only twin of `shell_app.rs`'s
         /// `empty_quickfix_does_not_displace_the_terminal_band_via_shell_app`:
