@@ -4012,6 +4012,61 @@ mod tests {
             );
         }
 
+        /// Opening the unified picker must darken the chrome behind it — a
+        /// corner cell outside the popup's own rect (top-left, where the
+        /// collapsed-sidebar tab bar paints) must switch to the dark scrim
+        /// background once the picker opens, and switch back once it's
+        /// dismissed. Without `paint_picker_rung`'s `draw_solid_fill` call
+        /// this cell's background never changes, so this test is red against
+        /// unfixed `develop`.
+        #[test]
+        fn picker_open_paints_a_backdrop_scrim_behind_it_via_shell_app() {
+            let engine = plain_engine();
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let before = driver
+                .style_at(0, 0)
+                .expect("top-left cell must be in bounds")
+                .bg;
+
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+                quadraui::Modifiers::default(),
+            ));
+
+            let scrim = crate::render::MODAL_SCRIM_COLOR;
+            let during = driver
+                .style_at(0, 0)
+                .expect("top-left cell must be in bounds")
+                .bg;
+            assert_eq!(
+                during,
+                ratatui::style::Color::Rgb(scrim.r, scrim.g, scrim.b),
+                "opening the command palette must dim the top-left corner cell \
+                 behind it to the scrim colour; screen:\n{}",
+                driver.screen()
+            );
+            assert_ne!(
+                before, during,
+                "the scrim must actually change the corner cell's background, \
+                 not merely repaint the same colour"
+            );
+
+            driver.press_named(quadraui::NamedKey::Escape);
+            let after = driver
+                .style_at(0, 0)
+                .expect("top-left cell must be in bounds")
+                .bg;
+            assert_eq!(
+                after,
+                before,
+                "dismissing the picker must remove the scrim and restore the \
+                 corner cell's original background; screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// Open the command palette through `render::ACC_COMMAND_PALETTE`
         /// and narrow it to the Save command, so the painted list's shortcut
         /// column is a single row.
