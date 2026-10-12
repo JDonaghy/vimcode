@@ -87,7 +87,12 @@ pub fn gtk_picker_sizing(line_height: f32) -> PickerSizing {
         header_h: 2.0 * line_height + 6.0,
         line_h: line_height,
         top_margin: line_height,
-        max_visible_ratio: 0.6,
+        // The viewport is the editor pane (not the full window), so 0.6
+        // was too tight — it left only ~15 rows on macOS and fewer on
+        // Linux headless.  0.85 of the editor pane ≈ 55-60 % of the
+        // full window, matching the old full-window 60 % behaviour;
+        // max_visible_cap (20) is the binding limit in practice.
+        max_visible_ratio: 0.85,
         max_visible_cap: 20,
         min_popup_h: line_height * 4.0,
     }
