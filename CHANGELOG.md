@@ -20,8 +20,10 @@ no matching section fails the release job before anything is published (see
   current default theme: a neutral dark-grey status bar, title bar and
   activity bar with no saturated blue chrome, with the blue accent reserved
   for the active tab indicator, selection highlight and focus states (#1904).
-  Classic Dark+ is still available as `dark+` / `vscode-dark-classic`.
-  Anyone who has already set `colorscheme` in their config is unaffected.
+  Classic Dark+ keeps its existing name, `vscode-dark` (also spellable as
+  `dark+` or `vscode-dark-classic`), so anyone who has already set
+  `colorscheme` in their config — including to `vscode-dark` — is unaffected;
+  only the unset default moves.
 
 ## [0.15.1] - 2026-10-11
 

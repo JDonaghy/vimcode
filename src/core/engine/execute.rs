@@ -2194,8 +2194,8 @@ impl Engine {
                 "gruvbox" => "gruvbox-dark",
                 "tokyonight" => "tokyo-night",
                 "solarized" => "solarized-dark",
-                "vscode" | "vscode-dark" => "vscode-dark-modern",
-                "dark+" => "vscode-dark-classic",
+                "vscode" => "vscode-dark-modern",
+                "dark+" | "vscode-dark-classic" => "vscode-dark",
                 "light+" => "vscode-light",
                 other => other,
             };

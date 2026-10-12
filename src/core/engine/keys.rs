@@ -9872,6 +9872,7 @@ impl Engine {
                         "tokyonight".to_string(),
                         "solarized".to_string(),
                         "vscode".to_string(),
+                        "vscode-dark-classic".to_string(),
                         "dark+".to_string(),
                         "light+".to_string(),
                     ]);
