@@ -4674,6 +4674,87 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+        /// `picker_panel_to_palette` must not duplicate preview text when a
+        /// line's tree-sitter captures overlap or coincide byte-for-byte —
+        /// which is the common case for a method call (`@property` and
+        /// `@method.call` both matching the same `field_identifier`) or an
+        /// escape sequence inside a string literal (`@escape` nesting inside
+        /// `@string`). A per-line builder that pushes a colored span for
+        /// every highlight entry unconditionally (instead of resolving each
+        /// byte to at most one scope) re-emits the overlapped text, so the
+        /// rendered line grows longer than the source line and later
+        /// characters shift off past where they belong.
+        ///
+        /// Confirmed red against the unfixed sequential-cursor builder: the
+        /// `push_str` call's `_str` suffix and the `s.push_str("x");` line's
+        /// trailing text were duplicated into the rendered row, so
+        /// `find_bounds` for the unique end-of-line marker below landed at
+        /// the wrong column (or the row's `str::chars().count()` exceeded
+        /// the source line's), making this assertion fail.
+        #[test]
+        fn quick_open_preview_pane_does_not_duplicate_overlapping_highlight_text() {
+            let dir = std::env::temp_dir().join(format!(
+                "vc1926_synhi_overlap_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            // Line 2: an escape sequence (`\n`) nests inside the string
+            // literal it's part of — `@escape` and `@string` both cover
+            // those two bytes. Line 3: `push_str` is a method call through
+            // a field expression, so its `field_identifier` is captured by
+            // both `@property` and `@method.call` with identical byte
+            // ranges.
+            std::fs::write(
+                dir.join("hello.rs"),
+                b"fn main() {\n    let s = \"a\\nb\";\n    s.push_str(\"END_MARK\");\n}\n",
+            )
+            .unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.open_picker(crate::core::engine::PickerSource::Files);
+            let h = harness(engine);
+            let driver = &h.driver;
+
+            let screen = driver.screen();
+            let call_line = screen
+                .lines()
+                .find(|l| l.contains("push_str"))
+                .unwrap_or_else(|| {
+                    panic!("preview must show the method-call line; screen:\n{screen}")
+                });
+            assert!(
+                call_line.contains("s.push_str(\"END_MARK\");"),
+                "overlapping @property/@method.call captures on the same \
+                 `push_str` field identifier must not duplicate any of the \
+                 line's text — got:\n{call_line}\nfull screen:\n{screen}"
+            );
+            assert_eq!(
+                call_line.matches("push_str").count(),
+                1,
+                "`push_str` must appear exactly once in its preview row, not \
+                 duplicated by overlapping highlight spans; got:\n{call_line}\n\
+                 full screen:\n{screen}"
+            );
+
+            let string_line = screen
+                .lines()
+                .find(|l| l.contains("a\\nb"))
+                .unwrap_or_else(|| {
+                    panic!("preview must show the string-literal line; screen:\n{screen}")
+                });
+            assert!(
+                string_line.contains("\"a\\nb\";"),
+                "a nested @escape capture inside the @string capture must \
+                 not duplicate the escape sequence's characters; got:\n{string_line}\n\
+                 full screen:\n{screen}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

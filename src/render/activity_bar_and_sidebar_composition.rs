@@ -389,12 +389,61 @@ pub use crate::core::engine::ExplorerRow;
 /// every backend via `Backend::draw_palette`.
 ///
 /// Each preview line is built from `picker.preview_highlights[i]` (byte
-/// ranges relative to that line's own text, sorted and non-overlapping) by
-/// emitting plain spans for the gaps and `theme.scope_color`-tinted spans
-/// for the highlighted ranges — the same tree-sitter-driven colors the main
-/// editor applies to its own buffer text.
+/// ranges relative to that line's own text) via [`styled_spans_for_line`],
+/// which tolerates overlapping/duplicate ranges (tree-sitter captures
+/// routinely nest or coincide, e.g. `@property`/`@method.call` both
+/// matching the same field identifier, or `@escape` nesting inside
+/// `@string`) by walking the text one character at a time and picking the
+/// first matching highlight at each byte — the same tree-sitter-driven
+/// colors the main editor applies to its own buffer text.
 pub fn picker_panel_to_palette(picker: &PickerPanel, theme: &Theme) -> quadraui::Palette {
     use quadraui::{Palette, PaletteItem, PalettePreview, StyledSpan, StyledText, WidgetId};
+
+    /// Build styled spans for one line of preview text from its
+    /// `(start_byte, end_byte, scope)` highlight ranges, tolerating
+    /// overlapping or duplicate ranges by resolving each byte to at most
+    /// one scope (the first highlight in `highlights` that covers it) and
+    /// flushing contiguous same-scope runs. Every byte of `text` ends up
+    /// in exactly one output span, so the text is never duplicated.
+    fn styled_spans_for_line(
+        text: &str,
+        highlights: &[(usize, usize, String)],
+        theme: &Theme,
+    ) -> Vec<StyledSpan> {
+        let scope_at = |byte_pos: usize| -> Option<&str> {
+            highlights
+                .iter()
+                .find(|(start, end, _)| byte_pos >= *start && byte_pos < *end)
+                .map(|(_, _, scope)| scope.as_str())
+        };
+
+        let mut spans = Vec::new();
+        let mut byte_pos = 0usize;
+        let mut current_text = String::new();
+        let mut current_scope: Option<&str> = None;
+        let flush = |text: &mut String, scope: Option<&str>, spans: &mut Vec<StyledSpan>| {
+            if text.is_empty() {
+                return;
+            }
+            let taken = std::mem::take(text);
+            spans.push(match scope {
+                Some(s) => StyledSpan::with_fg(taken, theme.scope_color(s)),
+                None => StyledSpan::plain(taken),
+            });
+        };
+
+        for ch in text.chars() {
+            let scope = scope_at(byte_pos);
+            if scope != current_scope {
+                flush(&mut current_text, current_scope, &mut spans);
+                current_scope = scope;
+            }
+            current_text.push(ch);
+            byte_pos += ch.len_utf8();
+        }
+        flush(&mut current_text, current_scope, &mut spans);
+        spans
+    }
 
     let items: Vec<PaletteItem> = picker
         .items
@@ -423,24 +472,7 @@ pub fn picker_panel_to_palette(picker: &PickerPanel, theme: &Theme) -> quadraui:
                         .get(i)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
-                    let mut cursor = 0usize;
-                    for (start, end, scope) in line_hls {
-                        let start = (*start).min(text.len());
-                        let end = (*end).min(text.len()).max(start);
-                        if start > cursor {
-                            spans.push(StyledSpan::plain(text[cursor..start].to_string()));
-                        }
-                        if end > start {
-                            spans.push(StyledSpan::with_fg(
-                                text[start..end].to_string(),
-                                theme.scope_color(scope),
-                            ));
-                        }
-                        cursor = end.max(cursor);
-                    }
-                    if cursor < text.len() {
-                        spans.push(StyledSpan::plain(text[cursor..].to_string()));
-                    }
+                    spans.extend(styled_spans_for_line(text, line_hls, theme));
                     StyledText { spans }
                 })
                 .collect(),
