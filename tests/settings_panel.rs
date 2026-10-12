@@ -225,7 +225,7 @@ fn settings_panel_cycle_colorscheme() {
 
     // Enter cycles forward
     e.handle_settings_key("Return", false, None);
-    assert_eq!(e.settings.colorscheme, "vscode-dark-classic");
+    assert_eq!(e.settings.colorscheme, "vscode-dark");
 
     // l cycles forward again
     e.handle_settings_key("l", false, None);
@@ -233,5 +233,5 @@ fn settings_panel_cycle_colorscheme() {
 
     // h cycles backward
     e.handle_settings_key("h", false, None);
-    assert_eq!(e.settings.colorscheme, "vscode-dark-classic");
+    assert_eq!(e.settings.colorscheme, "vscode-dark");
 }

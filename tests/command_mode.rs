@@ -244,6 +244,42 @@ fn test_colorscheme_unknown_returns_error() {
     );
 }
 
+/// `:colorscheme vscode-dark` is stored verbatim and keeps meaning classic
+/// Dark+, so a config written before Dark Modern existed keeps its palette.
+#[test]
+fn test_colorscheme_vscode_dark_still_selects_classic_dark_plus() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme vscode-dark");
+    assert_eq!(e.settings.colorscheme, "vscode-dark");
+
+    let theme = vimcode_core::render::Theme::from_name(&e.settings.colorscheme);
+    let classic = vimcode_core::render::Theme::vscode_dark();
+    assert_eq!(theme.background, classic.background);
+    assert_eq!(
+        theme.status_bg, classic.status_bg,
+        "'vscode-dark' must keep painting classic Dark+'s blue status bar"
+    );
+}
+
+/// The explicit `vscode-dark-classic` spelling and vim's `dark+` both land on
+/// the same stored name as `vscode-dark`.
+#[test]
+fn test_colorscheme_classic_aliases_normalize_to_vscode_dark() {
+    for alias in ["dark+", "vscode-dark-classic"] {
+        let mut e = engine_with("hello\n");
+        exec(&mut e, &format!("colorscheme {alias}"));
+        assert_eq!(e.settings.colorscheme, "vscode-dark", "alias '{alias}'");
+    }
+}
+
+/// The bare `vscode` alias follows the new default onto Dark Modern.
+#[test]
+fn test_colorscheme_alias_vscode_normalizes_to_dark_modern() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme vscode");
+    assert_eq!(e.settings.colorscheme, "vscode-dark-modern");
+}
+
 #[test]
 fn test_colorscheme_no_args_lists_themes() {
     let mut e = engine_with("hello\n");

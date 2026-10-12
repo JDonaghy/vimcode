@@ -1320,8 +1320,8 @@ impl Theme {
             "gruvbox" | "gruvbox-dark" => Self::gruvbox_dark(),
             "tokyo-night" | "tokyonight" => Self::tokyo_night(),
             "solarized" | "solarized-dark" => Self::solarized_dark(),
-            "vscode-dark-modern" | "vscode-dark" | "vscode" => Self::vscode_dark_modern(),
-            "dark+" | "vscode-dark-classic" => Self::vscode_dark(),
+            "vscode-dark-modern" | "vscode" => Self::vscode_dark_modern(),
+            "vscode-dark" | "vscode-dark-classic" | "dark+" => Self::vscode_dark(),
             "vscode-light" | "light+" => Self::vscode_light(),
             "onedark" => Self::onedark(),
             _ => {
@@ -1354,7 +1354,7 @@ impl Theme {
             "tokyo-night".into(),
             "solarized-dark".into(),
             "vscode-dark-modern".into(),
-            "vscode-dark-classic".into(),
+            "vscode-dark".into(),
             "vscode-light".into(),
         ];
         // Append custom VSCode themes from the platform config dir's themes/
@@ -2058,19 +2058,14 @@ pub(crate) mod tests {
 
     // ─── VS Code Dark Modern default ────────────────────────────────────────
 
-    /// An unrecognised colorscheme name, and the bare `"vscode"`/`"vscode-dark"`
-    /// aliases, resolve to Dark Modern rather than classic Dark+ or `onedark`.
+    /// An unrecognised colorscheme name, and the bare `"vscode"` alias,
+    /// resolve to Dark Modern rather than classic Dark+ or `onedark`.
     /// `Theme` has no `PartialEq`/`Debug`, so compare representative fields
     /// rather than whole structs.
     #[test]
     fn from_name_default_and_vscode_aliases_resolve_to_dark_modern() {
         let modern = Theme::vscode_dark_modern();
-        for name in [
-            "not-a-real-theme",
-            "vscode-dark-modern",
-            "vscode-dark",
-            "vscode",
-        ] {
+        for name in ["not-a-real-theme", "vscode-dark-modern", "vscode"] {
             let theme = Theme::from_name(name);
             assert_eq!(theme.background, modern.background, "name={name}");
             assert_eq!(theme.status_bg, modern.status_bg, "name={name}");
@@ -2081,17 +2076,32 @@ pub(crate) mod tests {
         }
     }
 
-    /// `"dark+"` and `"vscode-dark-classic"` still reach the saturated-blue
-    /// classic Dark+ palette (`vscode_dark`), unchanged by the new default.
+    /// `"vscode-dark"` — a name a user's `settings.json` can already hold,
+    /// written there by their own `:colorscheme vscode-dark` — keeps meaning
+    /// the saturated-blue classic Dark+ palette (`vscode_dark`), as do its
+    /// `"dark+"` and `"vscode-dark-classic"` aliases. Only the default and the
+    /// bare `"vscode"` alias move to Dark Modern.
     #[test]
     fn from_name_classic_aliases_resolve_to_dark_plus() {
         let classic = Theme::vscode_dark();
-        for name in ["dark+", "vscode-dark-classic"] {
+        let modern = Theme::vscode_dark_modern();
+        for name in ["vscode-dark", "dark+", "vscode-dark-classic"] {
             let theme = Theme::from_name(name);
             assert_eq!(theme.background, classic.background, "name={name}");
             assert_eq!(theme.status_bg, classic.status_bg, "name={name}");
+            assert_ne!(theme.status_bg, modern.status_bg, "name={name}");
         }
         assert_eq!(classic.status_bg, hex("#007acc"));
+    }
+
+    /// `"vscode-dark"` stays an offerable built-in name, so a user who set it
+    /// explicitly still sees it in `:colorscheme`'s list and the settings
+    /// panel's cycle, next to the new `"vscode-dark-modern"`.
+    #[test]
+    fn available_names_keeps_vscode_dark_alongside_dark_modern() {
+        let names = Theme::available_names();
+        assert!(names.iter().any(|n| n == "vscode-dark"), "{names:?}");
+        assert!(names.iter().any(|n| n == "vscode-dark-modern"), "{names:?}");
     }
 
     /// Spot-check Dark Modern's UI chrome against VS Code's own current

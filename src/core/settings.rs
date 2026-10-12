@@ -637,8 +637,9 @@ pub struct Settings {
     extension_registry_url: String,
 
     /// Name of the active colour scheme. Built-in options: "vscode-dark-modern"
-    /// (default), "vscode-dark-classic" (a.k.a. "dark+"), "vscode-light", "onedark",
-    /// "gruvbox-dark", "tokyo-night", "solarized-dark".
+    /// (default), "vscode-dark" (classic Dark+, a.k.a. "dark+" or
+    /// "vscode-dark-classic"), "vscode-light", "onedark", "gruvbox-dark",
+    /// "tokyo-night", "solarized-dark".
     /// Select with `:colorscheme <name>`.
     #[serde(default = "default_colorscheme")]
     pub colorscheme: String,
@@ -4208,7 +4209,7 @@ pub fn available_colorschemes() -> Vec<String> {
         "tokyo-night".into(),
         "solarized-dark".into(),
         "vscode-dark-modern".into(),
-        "vscode-dark-classic".into(),
+        "vscode-dark".into(),
         "vscode-light".into(),
     ];
     {
