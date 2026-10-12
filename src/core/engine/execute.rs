@@ -2183,17 +2183,7 @@ impl Engine {
 
         // Handle :colorscheme [name]
         if cmd == "colorscheme" {
-            let mut names: Vec<&str> = vec![
-                "onedark",
-                "gruvbox-dark",
-                "tokyo-night",
-                "solarized-dark",
-                "vscode-dark",
-                "vscode-light",
-            ];
-            let custom = list_custom_theme_names();
-            let custom_strs: Vec<&str> = custom.iter().map(|s| s.as_str()).collect();
-            names.extend(custom_strs);
+            let names = crate::core::settings::available_colorschemes();
             self.message = format!("Available themes: {}", names.join(", "));
             return EngineAction::None;
         }
@@ -2204,21 +2194,14 @@ impl Engine {
                 "gruvbox" => "gruvbox-dark",
                 "tokyonight" => "tokyo-night",
                 "solarized" => "solarized-dark",
-                "vscode" | "dark+" => "vscode-dark",
+                "vscode" | "vscode-dark" => "vscode-dark-modern",
+                "dark+" => "vscode-dark-classic",
                 "light+" => "vscode-light",
                 other => other,
             };
             // Verify the theme exists (built-in or custom VSCode JSON)
-            let builtin = [
-                "onedark",
-                "gruvbox-dark",
-                "tokyo-night",
-                "solarized-dark",
-                "vscode-dark",
-                "vscode-light",
-            ];
-            let custom = list_custom_theme_names();
-            let is_valid = builtin.contains(&canonical) || custom.iter().any(|n| n == canonical);
+            let builtin = crate::core::settings::available_colorschemes();
+            let is_valid = builtin.iter().any(|n| n == canonical);
             if is_valid {
                 self.settings.colorscheme = canonical.to_string();
                 if let Err(e) = self.settings.save() {
@@ -2230,12 +2213,7 @@ impl Engine {
                 // vim's own `<amatch>` convention for this autocmd).
                 self.plugin_event("ColorScheme", canonical);
             } else {
-                let mut available: Vec<String> = builtin.iter().map(|s| s.to_string()).collect();
-                available.extend(custom);
-                self.message = format!(
-                    "Unknown theme '{name}'. Available: {}",
-                    available.join(", ")
-                );
+                self.message = format!("Unknown theme '{name}'. Available: {}", builtin.join(", "));
                 return EngineAction::Error;
             }
             return EngineAction::None;

@@ -166,9 +166,9 @@ fn test_wq_clean_buffer() {
 // ── :colorscheme ──────────────────────────────────────────────────────────────
 
 #[test]
-fn test_colorscheme_default_is_onedark() {
+fn test_colorscheme_default_is_vscode_dark_modern() {
     let e = engine_with("hello\n");
-    assert_eq!(e.settings.colorscheme, "onedark");
+    assert_eq!(e.settings.colorscheme, "vscode-dark-modern");
 }
 
 #[test]
@@ -239,7 +239,7 @@ fn test_colorscheme_unknown_returns_error() {
         "unknown theme should return Error"
     );
     assert_eq!(
-        e.settings.colorscheme, "onedark",
+        e.settings.colorscheme, "vscode-dark-modern",
         "colorscheme unchanged after bad name"
     );
 }

@@ -15,6 +15,14 @@ no matching section fails the release job before anything is published (see
 
 ## [Unreleased]
 
+### Changed
+- The default colorscheme is now `vscode-dark-modern`, matching VS Code's
+  current default theme: a neutral dark-grey status bar, title bar and
+  activity bar with no saturated blue chrome, with the blue accent reserved
+  for the active tab indicator, selection highlight and focus states (#1904).
+  Classic Dark+ is still available as `dark+` / `vscode-dark-classic`.
+  Anyone who has already set `colorscheme` in their config is unaffected.
+
 ## [0.15.1] - 2026-10-11
 
 ### Changed
