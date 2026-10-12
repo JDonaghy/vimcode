@@ -84,7 +84,7 @@ pub fn gtk_picker_sizing(line_height: f32) -> PickerSizing {
     PickerSizing {
         width_clamp: (500.0, 900.0),
         left_pane_ratio: 0.40,
-        header_h: 2.0 * line_height + 2.0,
+        header_h: 2.0 * line_height + 6.0,
         line_h: line_height,
         top_margin: line_height,
         max_visible_ratio: 0.6,
