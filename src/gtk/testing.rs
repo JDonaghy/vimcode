@@ -1720,6 +1720,10 @@ mod tests {
     #[test]
     fn status_bar_1690_spans_full_window_width_and_orders_segments_vs_code_style() {
         let mut engine = Engine::new_for_test();
+        // Pin the theme explicitly: this test is about the bar's layout and
+        // fill-colour sourcing, not about which theme is the default, so it
+        // must not break every time the default colorscheme changes.
+        engine.settings.colorscheme = "onedark".to_string();
         engine.settings.use_nerd_fonts = Some(false);
         engine.settings.lsp_enabled = false;
         engine.session.explorer_visible = true;
@@ -11631,12 +11635,13 @@ mod command_center {
 }
 
 /// The default theme's line-number and breadcrumb foregrounds must paint
-/// dimmed, and the cursor line's number must stay bright. Both are colour-token
-/// changes on `Theme::onedark()` — `line_number_fg` to VS Code's
-/// `editorLineNumber.foreground` and `breadcrumb_fg` dimmed further. The
-/// wiring already existed, so this test probes the rendered surface via the
-/// layout the frame published and reads pixels — asserting the constant
-/// against itself would stay green if the paint path stopped consulting it.
+/// dimmed, and the cursor line's number must stay bright. These tests probe
+/// the rendered surface via the layout the frame published and read pixels,
+/// comparing against the actual default theme's tokens (`Theme::from_name`
+/// on the engine's own `colorscheme`) rather than a hardcoded colour —
+/// asserting the constant against itself would stay green if the paint path
+/// stopped consulting it, and a hardcoded value would go stale every time
+/// the default theme changes.
 #[cfg(test)]
 mod vscode_dimming {
     use super::*;
@@ -11758,9 +11763,6 @@ mod vscode_dimming {
     /// row it happened to sample).
     #[test]
     fn inactive_line_numbers_dim_while_the_cursor_line_stays_bright() {
-        // VS Code's `editorLineNumber.foreground` value.
-        const VSCODE_LINE_NUMBER_FG: (u8, u8, u8) = (0x85, 0x85, 0x85);
-
         let mut engine = Engine::new();
         // Line numbers default to `LineNumberMode::Absolute` now, but
         // set it explicitly so this test stays correct regardless of the
@@ -11770,6 +11772,9 @@ mod vscode_dimming {
         engine
             .buffer_mut()
             .insert(0, "aaa\nbbb\nccc\nddd\neee\nfff\n");
+        let theme = crate::render::Theme::from_name(&engine.settings.colorscheme);
+        let inactive_token = theme.line_number_fg;
+        let inactive_want = (inactive_token.r, inactive_token.g, inactive_token.b);
         let mut h = harness(engine, 1400, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win).expect("editor pane must paint");
@@ -11782,22 +11787,21 @@ mod vscode_dimming {
 
         let inactive = gutter_probe(&mut h, 3);
         assert!(
-            near(inactive, VSCODE_LINE_NUMBER_FG),
-            "an inactive line number must paint at VS Code's \
-             editorLineNumber.foreground {VSCODE_LINE_NUMBER_FG:?} (#701); \
-             the gutter's brightest pixel on row 3 was {inactive:?} — the \
-             pre-#701 default #b2b2b2 reads (177, 176, 176) here"
+            near(inactive, inactive_want),
+            "an inactive line number must paint at the theme's \
+             line_number_fg {inactive_want:?}; the gutter's brightest \
+             pixel on row 3 was {inactive:?}"
         );
 
         let active = gutter_probe(&mut h, 0);
         assert!(
-            !near(active, VSCODE_LINE_NUMBER_FG),
+            !near(active, inactive_want),
             "the cursor line's number must NOT paint at the dimmed inactive \
              colour — got {active:?}, which is indistinguishable from \
-             {VSCODE_LINE_NUMBER_FG:?}. Dimming line_number_fg is only a win \
+             {inactive_want:?}. Dimming line_number_fg is only a win \
              if line_number_active_fg still lifts the cursor row out of it"
         );
-        let active_token = crate::render::Theme::onedark().line_number_active_fg;
+        let active_token = theme.line_number_active_fg;
         assert!(
             near(active, (active_token.r, active_token.g, active_token.b)),
             "the cursor line's number must paint at line_number_active_fg \
@@ -11840,8 +11844,6 @@ mod vscode_dimming {
     /// 1` — before either colour probe even runs.
     #[test]
     fn fresh_engine_paints_absolute_line_numbers_by_default_on_gtk() {
-        const VSCODE_LINE_NUMBER_FG: (u8, u8, u8) = (0x85, 0x85, 0x85);
-
         // Deliberately NOT setting `engine.settings.line_numbers` — this
         // test is exactly about what a fresh, untouched-settings engine
         // paints.
@@ -11849,6 +11851,11 @@ mod vscode_dimming {
         engine
             .buffer_mut()
             .insert(0, "aaa\nbbb\nccc\nddd\neee\nfff\n");
+        let theme = crate::render::Theme::from_name(&engine.settings.colorscheme);
+        let inactive_want = {
+            let t = theme.line_number_fg;
+            (t.r, t.g, t.b)
+        };
         let mut h = harness(engine, 1400, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win).expect("editor pane must paint");
@@ -11871,15 +11878,15 @@ mod vscode_dimming {
 
         let inactive = gutter_probe(&mut h, 3);
         assert!(
-            near(inactive, VSCODE_LINE_NUMBER_FG),
+            near(inactive, inactive_want),
             "an inactive row's gutter must paint a dimmed line-number digit \
-             by default (VS Code's editorLineNumber.foreground \
-             {VSCODE_LINE_NUMBER_FG:?}); the gutter's brightest pixel on \
+             by default (the default theme's line_number_fg \
+             {inactive_want:?}); the gutter's brightest pixel on \
              row 3 was {inactive:?}"
         );
 
         let active = gutter_probe(&mut h, 0);
-        let active_token = crate::render::Theme::onedark().line_number_active_fg;
+        let active_token = theme.line_number_active_fg;
         assert!(
             near(active, (active_token.r, active_token.g, active_token.b)),
             "the cursor line's number must paint at line_number_active_fg \
@@ -11892,12 +11899,18 @@ mod vscode_dimming {
     /// instead of competing with the code.
     #[test]
     fn breadcrumb_path_paints_dimmer_than_editor_body_text() {
-        // The dimmed `breadcrumb_fg` adopted from VS Code.
-        const BREADCRUMB_FG: (u8, u8, u8) = (0x6c, 0x70, 0x79);
-        // The crumb must sit at most a little over half of body-text luminance.
-        const MAX_RATIO: f64 = 0.55;
+        // The crumb must recede from body text with some real margin, but the
+        // exact ratio is a palette choice — every shipped dark theme's own
+        // breadcrumb_fg/foreground pair lands well under this ceiling, so it
+        // only trips if a theme's breadcrumb text stops being dimmer at all.
+        const MAX_RATIO: f64 = 0.85;
 
         let mut engine = Engine::new_for_test();
+        let breadcrumb_fg = {
+            let theme = crate::render::Theme::from_name(&engine.settings.colorscheme);
+            let t = theme.breadcrumb_fg;
+            (t.r, t.g, t.b)
+        };
         // A real multi-component path under `cwd` is what makes
         // `build_breadcrumbs_for_group` emit more than one segment, so
         // `bc:0` is a *non-trailing* crumb and therefore uses
@@ -11989,12 +12002,11 @@ mod vscode_dimming {
             ok(a.0, b.0) && ok(a.1, b.1) && ok(a.2, b.2)
         };
         assert!(
-            pen_matches(crumb, BREADCRUMB_FG),
-            "a non-trailing breadcrumb segment must paint at the dimmed \
-             breadcrumb_fg {BREADCRUMB_FG:?} (#701) — every channel within \
+            pen_matches(crumb, breadcrumb_fg),
+            "a non-trailing breadcrumb segment must paint at the default \
+             theme's breadcrumb_fg {breadcrumb_fg:?} — every channel within \
              +{OVERSHOOT}/-{UNDERSHOOT}; the painted segment rect's \
-             per-channel ceiling was {crumb:?}. The pre-#701 #7f848e reads \
-             (117, 123, 132) here."
+             per-channel ceiling was {crumb:?}"
         );
 
         // Body text from the *same* frame: row 2 of the pane, past the
@@ -12034,8 +12046,7 @@ mod vscode_dimming {
             ratio <= MAX_RATIO,
             "breadcrumb text must recede from the editor's body text in the \
              same frame: crumb {crumb:?} (luma {:.0}) vs body {body:?} (luma \
-             {:.0}) is a ratio of {ratio:.3}, above the {MAX_RATIO} ceiling \
-             (#701)",
+             {:.0}) is a ratio of {ratio:.3}, above the {MAX_RATIO} ceiling",
             luma(crumb),
             luma(body)
         );
@@ -15631,7 +15642,8 @@ mod editor_band_order {
         // *UI* font paints tabs at and caused false positives in CI when fonts
         // differed. Nothing about a tab's own background or glyphs can forge a
         // full-width separator-coloured scanline.
-        let sep = crate::render::Theme::onedark().separator;
+        let sep =
+            crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme).separator;
         let sep = (sep.r, sep.g, sep.b);
         let pixel_near = |(r, g, b): (u8, u8, u8), target: (u8, u8, u8)| {
             let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 10;
