@@ -2353,7 +2353,7 @@ mod tests {
             driver.render();
 
             const ROWS: u16 = 24;
-            let theme = crate::render::Theme::from_name("onedark");
+            let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
             let expected_bg = quadraui::tui::ratatui_color(theme.tab_bar_bg);
             let background = quadraui::tui::ratatui_color(theme.background);
 
@@ -15465,12 +15465,16 @@ mod tests {
         /// registered plugin group must be resolved against the active
         /// `Theme`'s matching role instead of silently falling through to
         /// the default foreground — e.g. `link = "Comment"` tracks
-        /// `theme.comment` (here `onedark`'s `#5c6370`, i.e. `Rgb(92, 99, 112)`
-        /// — `plain_engine()` never overrides `colorscheme`, so this is
-        /// `Settings::default()`'s own theme).
+        /// `theme.comment` of whatever theme `Settings::default()` resolves
+        /// to (`plain_engine()` never overrides `colorscheme`).
         #[test]
         fn decor_set_hl_link_resolves_against_theme_role_via_app_on_tui() {
             let mut engine = plain_engine();
+            let comment_fg = {
+                let theme = crate::render::Theme::from_name(&engine.settings.colorscheme);
+                let t = theme.comment;
+                quadraui::tui::testing::Color::Rgb(t.r, t.g, t.b)
+            };
             engine.buffer_mut().insert(0, "ZQLINKEDHL\n");
             engine.decor.set_hl(
                 "ZqLinksToComment",
@@ -15501,11 +15505,11 @@ mod tests {
                 .style_at(x as u16, y as u16)
                 .expect("the matched cell must exist");
             assert_eq!(
-                style.fg,
-                quadraui::tui::testing::Color::Rgb(92, 99, 112),
+                style.fg, comment_fg,
                 "a group whose `link` isn't a registered plugin group must \
-                 resolve against the matching `Theme` role (onedark's \
-                 `comment`), not fall through to the default foreground"
+                 resolve against the matching `Theme` role (the active \
+                 theme's `comment`), not fall through to the default \
+                 foreground"
             );
         }
 
