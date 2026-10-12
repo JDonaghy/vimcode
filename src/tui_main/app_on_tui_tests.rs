@@ -3942,6 +3942,73 @@ mod tests {
             );
         }
 
+        /// Open the command palette through `render::ACC_COMMAND_PALETTE`
+        /// and narrow it to the Save command, so the painted list's shortcut
+        /// column is a single row.
+        fn open_palette_filtered_to_save(
+            driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        ) {
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+                quadraui::Modifiers::default(),
+            ));
+            for c in "File: Save".chars() {
+                driver.type_char(c);
+            }
+        }
+
+        /// On a macOS backend the palette must paint Apple's own chord
+        /// spelling (`⌘S`) in its shortcut column, never the `Ctrl+S` text
+        /// the other platforms use.
+        ///
+        /// `platform_name` is set *after* the harness is built: `ShellApp::
+        /// setup` writes the live backend's own name (`"tui"` here) into the
+        /// engine while the driver is constructed, so a fixture-time
+        /// assignment would be overwritten before the first frame.
+        #[test]
+        fn command_palette_paints_cmd_glyph_on_macos_via_shell_app() {
+            let mut h = harness_no_sidebar(plain_engine());
+            h.engine.borrow_mut().platform_name = "macos";
+            let driver = &mut h.driver;
+
+            open_palette_filtered_to_save(driver);
+
+            assert!(
+                driver.screen_has("⌘S"),
+                "the macOS palette must paint the Cmd glyph for Save; \
+                 screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                !driver.screen_has("Ctrl+S"),
+                "the macOS palette must not paint the Ctrl spelling of Save's \
+                 shortcut; screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// The twin of the test above on every other backend: the painted
+        /// shortcut column keeps the `Ctrl+S` text and grows no Cmd glyph.
+        #[test]
+        fn command_palette_paints_ctrl_text_off_macos_via_shell_app() {
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+
+            open_palette_filtered_to_save(driver);
+
+            assert!(
+                driver.screen_has("Ctrl+S"),
+                "a non-macOS palette must paint Save's shortcut as Ctrl+S; \
+                 screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                !driver.screen_has("⌘"),
+                "a non-macOS palette must paint no Cmd glyph; screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// A dialog (e.g. quit-with-unsaved-changes) must intercept keys: a
         /// key that would otherwise be a Normal-mode buffer edit must not
         /// reach the buffer while the dialog is open, and `Escape` must

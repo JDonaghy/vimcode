@@ -247,9 +247,35 @@ pub trait RoleLocator: ConformanceDriver {
     }
 
     /// True if `needle` is painted inside the zone for `role`.
+    ///
+    /// Resolves `needle` to the *first* matching text run in paint order, so a
+    /// needle painted in several places answers for that one run only. Use
+    /// [`Self::any_text_inside_role`] when the same needle can appear outside
+    /// the zone as well.
     fn text_inside_role(&self, needle: &str, role: UiRole) -> bool {
         let id = quadraui::WidgetId::new(role.zone_id());
         self.inventory().inside(needle, &id)
+    }
+
+    /// True if *any* text run containing `needle` is painted inside the zone
+    /// for `role`.
+    ///
+    /// The scan-every-run counterpart of [`Self::text_inside_role`]: a short
+    /// needle such as a single digit matches runs all over the frame (the
+    /// explorer's project name, status-bar counters), and only this form can
+    /// tell "painted in this zone" from "painted first somewhere else".
+    fn any_text_inside_role(&self, needle: &str, role: UiRole) -> bool {
+        let Some(zone) = self.find_by_role(role) else {
+            return false;
+        };
+        let z = zone.bounds;
+        self.inventory().text_runs().iter().any(|run| {
+            run.text.contains(needle)
+                && run.bounds.x >= z.x
+                && run.bounds.y >= z.y
+                && run.bounds.x + run.bounds.width <= z.x + z.width
+                && run.bounds.y + run.bounds.height <= z.y + z.height
+        })
     }
 
     /// True if the zone for `role` is present in the current frame.
@@ -10714,6 +10740,7 @@ mod chrome_menu_dropdown_escape_closes_without_executing_mod {
 
 #[cfg(test)]
 mod settings_number_enables_line_numbers_mod {
+    use crate::harness::{RoleLocator, UiRole};
     use quadraui::testing::ConformanceDriver;
     use quadraui::NamedKey;
 
@@ -10722,9 +10749,11 @@ mod settings_number_enables_line_numbers_mod {
         engine.settings.use_nerd_fonts = Some(false);
         // Start with line numbers off so `:set number` has something to turn on.
         engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
-        // Content lines deliberately carry no digits of their own -- the only
-        // digit characters that can appear on screen are gutter line numbers,
-        // so `screen_has("3")` below is an unambiguous signal.
+        // Content lines deliberately carry no digits of their own, so inside the
+        // main-content zone the only digits that can be painted are gutter line
+        // numbers. Digit probes below are zone-scoped rather than whole-screen:
+        // the explorer's project name (the CWD's basename, which can carry any
+        // digit) and the status bar's counters sit outside that zone.
         let text = "zqfoo\nzqbar\nzqbaz\nzqqux\nzqzap\n";
         engine.buffer_mut().insert(0, text);
         engine
@@ -10741,19 +10770,19 @@ mod settings_number_enables_line_numbers_mod {
                 "precondition: the fixture buffer's third line must be painted"
             );
             assert!(
-                !driver.screen_has("3"),
+                !driver.any_text_inside_role("3", UiRole::MainContent),
                 "precondition: with line numbers off, no gutter digit \"3\" (line \
-                 3's number) must be painted -- content lines carry no digits of \
-                 their own"
+                 3's number) must be painted in the main-content zone -- content \
+                 lines carry no digits of their own"
             );
 
             driver.type_text(":set number");
             driver.press_named(NamedKey::Enter);
 
             assert!(
-                driver.screen_has("3"),
+                driver.any_text_inside_role("3", UiRole::MainContent),
                 "`:set number` must turn the line-number gutter back on -- line 3's \
-                 gutter number \"3\" must now be painted"
+                 gutter number \"3\" must now be painted in the main-content zone"
             );
         },
     }
@@ -10761,6 +10790,7 @@ mod settings_number_enables_line_numbers_mod {
 
 #[cfg(test)]
 mod settings_nonumber_disables_line_numbers_mod {
+    use crate::harness::{RoleLocator, UiRole};
     use quadraui::testing::ConformanceDriver;
     use quadraui::NamedKey;
 
@@ -10768,8 +10798,10 @@ mod settings_nonumber_disables_line_numbers_mod {
         let mut engine = crate::core::Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);
         // Line numbers default on (`LineNumberMode::Absolute`) -- left alone here.
-        // Content lines carry no digits of their own, so a painted digit can
-        // only come from the gutter.
+        // Content lines carry no digits of their own, so inside the main-content
+        // zone a painted digit can only come from the gutter. Digit probes are
+        // zone-scoped: the explorer's project name and the status bar's counters
+        // paint digits of their own outside that zone.
         let text = "zqfoo\nzqbar\nzqbaz\nzqqux\nzqzap\n";
         engine.buffer_mut().insert(0, text);
         engine
@@ -10786,18 +10818,19 @@ mod settings_nonumber_disables_line_numbers_mod {
                 "precondition: the fixture buffer's third line must be painted"
             );
             assert!(
-                driver.screen_has("3"),
+                driver.any_text_inside_role("3", UiRole::MainContent),
                 "precondition: line numbers are on by default -- line 3's gutter \
-                 number \"3\" must be painted"
+                 number \"3\" must be painted in the main-content zone"
             );
 
             driver.type_text(":set nonumber");
             driver.press_named(NamedKey::Enter);
 
             assert!(
-                !driver.screen_has("3"),
+                !driver.any_text_inside_role("3", UiRole::MainContent),
                 "`:set nonumber` must turn the line-number gutter off -- line 3's \
-                 gutter number \"3\" must no longer be painted"
+                 gutter number \"3\" must no longer be painted in the main-content \
+                 zone"
             );
             assert!(
                 driver.screen_has("zqbaz"),
@@ -10810,6 +10843,7 @@ mod settings_nonumber_disables_line_numbers_mod {
 
 #[cfg(test)]
 mod settings_relativenumber_shows_relative_line_numbers_mod {
+    use crate::harness::{RoleLocator, UiRole};
     use quadraui::testing::ConformanceDriver;
     use quadraui::NamedKey;
 
@@ -10823,7 +10857,9 @@ mod settings_relativenumber_shows_relative_line_numbers_mod {
         // shows its *distance* from the cursor, so the maximum number any
         // gutter can show is 4 (5 lines - the 1 cursor line). "5" therefore
         // disappearing is an unambiguous signal that relative numbering took
-        // effect. Content lines carry no digits of their own.
+        // effect. Content lines carry no digits of their own, so the digit
+        // probes below are scoped to the main-content zone, outside which the
+        // explorer's project name and the status bar paint digits of their own.
         let text = "zqfoo\nzqbar\nzqbaz\nzqqux\nzqzap\n";
         engine.buffer_mut().insert(0, text);
         engine
@@ -10840,16 +10876,16 @@ mod settings_relativenumber_shows_relative_line_numbers_mod {
                 "precondition: the fixture buffer's fifth line must be painted"
             );
             assert!(
-                driver.screen_has("5"),
+                driver.any_text_inside_role("5", UiRole::MainContent),
                 "precondition: with plain absolute numbering, line 5's gutter number \
-                 \"5\" must be painted"
+                 \"5\" must be painted in the main-content zone"
             );
 
             driver.type_text(":set relativenumber");
             driver.press_named(NamedKey::Enter);
 
             assert!(
-                !driver.screen_has("5"),
+                !driver.any_text_inside_role("5", UiRole::MainContent),
                 "`:set relativenumber` must switch the gutter to relative numbering \
                  from the cursor (on line 1) -- with only 5 lines, no gutter can \
                  show a distance of 5 any more, so \"5\" must no longer be painted"
