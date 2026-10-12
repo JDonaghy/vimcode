@@ -10217,6 +10217,8 @@ mod tests {
                  process happened to start in; screen:\n{}",
                 driver.screen()
             );
+
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 

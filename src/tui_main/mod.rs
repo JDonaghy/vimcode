@@ -226,9 +226,16 @@ pub mod testing {
     /// `Rc<RefCell<Engine>>` directly, since `App` is `pub(crate)` and a
     /// public accessor would leak its shape.
     ///
-    /// Acquires the paint/cwd guards *before* constructing `App` (covering
-    /// `Engine::startup`'s own CWD reads) and returns them bundled via
-    /// [`TuiAppDriver`].
+    /// Construction runs under an exclusive [`crate::test_cwd::CwdGuard`],
+    /// not the shared [`crate::test_cwd::CwdReadGuard`] held for the
+    /// returned driver's lifetime: `Engine::startup` chdirs for real when
+    /// `file_path` names a directory (it routes through
+    /// `Engine::open_folder`, which calls `std::env::set_current_dir`), so
+    /// building `App` needs the writer lock both to serialize that move
+    /// against concurrent reader harnesses and to have the directory
+    /// restored on `Drop` before this function hands back a driver anyone
+    /// can render a frame with. `setup` runs inside the same scope, since a
+    /// caller's hook could chdir too (e.g. by driving `:cd` on the engine).
     pub fn tui_driver_with(
         file_path: Option<PathBuf>,
         width: u16,
@@ -236,11 +243,15 @@ pub mod testing {
         setup: impl FnOnce(&mut Engine),
     ) -> TuiAppDriver<TuiDriver<impl quadraui::AppLogic>> {
         let paint = crate::test_paint::PaintGuard::acquire();
-        let cwd = crate::test_cwd::CwdReadGuard::acquire();
         let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(TuiBackend::new())));
-        let app = App::new_portable_for_test(file_path, backend, UnitProfile::cell());
-        setup(&mut app.engine.borrow_mut());
+        let app = {
+            let _cwd = crate::test_cwd::CwdGuard::new();
+            let app = App::new_portable_for_test(file_path, backend, UnitProfile::cell());
+            setup(&mut app.engine.borrow_mut());
+            app
+        };
+        let cwd = crate::test_cwd::CwdReadGuard::acquire();
         let config = app.shell_config();
         let driver = driver_with_shell(app, config, width, height);
         TuiAppDriver {
