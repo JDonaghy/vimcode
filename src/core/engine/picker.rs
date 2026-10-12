@@ -396,6 +396,7 @@ impl Engine {
     /// Populate picker_all_items with command palette entries.
     fn picker_populate_commands(&mut self) {
         let use_vscode = self.is_vscode_mode();
+        let platform_name = self.platform_name;
         self.picker_all_items = PALETTE_COMMANDS
             .iter()
             .map(|cmd| {
@@ -404,6 +405,7 @@ impl Engine {
                 } else {
                     cmd.shortcut.to_string()
                 };
+                let sc = super::format_shortcut_for_platform(&sc, platform_name);
                 PickerItem {
                     display: cmd.label.to_string(),
                     filter_text: format!("{} {}", cmd.label, cmd.action),
@@ -1059,17 +1061,18 @@ impl Engine {
         } else if query.is_empty() {
             // Placeholder hints: show available modes when query is empty
             self.picker_title = "Search".to_string();
+            let platform_name = self.platform_name;
             self.picker_items = vec![
-                Self::hint_item("Go to File", "", "Type a file name"),
-                Self::hint_item("Show and Run Commands", ">", "Ctrl+Shift+P"),
-                Self::hint_item("Go to Symbol in Editor", "@", ""),
-                Self::hint_item("Go to Symbol in Workspace", "#", ""),
-                Self::hint_item("Go to Line", ":", "Ctrl+G"),
-                Self::hint_item("Search for Text", "%", "Ctrl+G (grep)"),
-                Self::hint_item("Start Debugging", "debug", "F5"),
-                Self::hint_item("Run Task", "task", ""),
-                Self::hint_item("Ask AI", "chat", ":AI"),
-                Self::hint_item("More Help", "?", ""),
+                Self::hint_item("Go to File", "", "Type a file name", platform_name),
+                Self::hint_item("Show and Run Commands", ">", "Ctrl+Shift+P", platform_name),
+                Self::hint_item("Go to Symbol in Editor", "@", "", platform_name),
+                Self::hint_item("Go to Symbol in Workspace", "#", "", platform_name),
+                Self::hint_item("Go to Line", ":", "Ctrl+G", platform_name),
+                Self::hint_item("Search for Text", "%", "Ctrl+G (grep)", platform_name),
+                Self::hint_item("Start Debugging", "debug", "F5", platform_name),
+                Self::hint_item("Run Task", "task", "", platform_name),
+                Self::hint_item("Ask AI", "chat", ":AI", platform_name),
+                Self::hint_item("More Help", "?", "", platform_name),
             ];
         } else {
             // Default: file search
@@ -1088,14 +1091,18 @@ impl Engine {
     }
 
     /// Create a placeholder hint item for the empty-query Command Center dropdown.
-    /// `label` is the mode name, `prefix` is the prefix to set, `shortcut` is the keyboard shortcut hint.
-    fn hint_item(label: &str, prefix: &str, shortcut: &str) -> PickerItem {
+    /// `label` is the mode name, `prefix` is the prefix to set, `shortcut` is the
+    /// keyboard shortcut hint, `platform_name` is the running backend's
+    /// `quadraui::PlatformServices::platform_name()`, which renders the
+    /// shortcut as `⌘` instead of `Ctrl+` on macOS.
+    fn hint_item(label: &str, prefix: &str, shortcut: &str, platform_name: &str) -> PickerItem {
         let action_prefix = if prefix.is_empty() {
             // "Go to File" — just clear the query (stay in file mode)
             String::new()
         } else {
             prefix.to_string()
         };
+        let shortcut = super::format_shortcut_for_platform(shortcut, platform_name);
         PickerItem {
             display: label.to_string(),
             filter_text: String::new(),
