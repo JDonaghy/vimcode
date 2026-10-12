@@ -12424,6 +12424,60 @@ fn test_picker_commands_confirm_executes() {
 }
 
 #[test]
+fn test_command_palette_shows_cmd_glyph_on_macos_1927() {
+    let mut engine = Engine::new();
+    engine.platform_name = "macos";
+    engine.open_picker(PickerSource::Commands);
+
+    let save = engine
+        .picker_all_items
+        .iter()
+        .find(|item| item.display == "File: Save")
+        .expect("File: Save command should be in the palette");
+    let detail = save.detail.as_deref().unwrap_or("");
+    assert_eq!(
+        detail, "⌘S",
+        "macOS palette hint should use Cmd glyph, got {detail:?}"
+    );
+    assert!(
+        !detail.contains("Ctrl"),
+        "macOS palette hint should not say Ctrl, got {detail:?}"
+    );
+}
+
+#[test]
+fn test_command_palette_shows_ctrl_text_on_non_macos() {
+    let mut engine = Engine::new();
+    engine.platform_name = "tui";
+    engine.open_picker(PickerSource::Commands);
+
+    let save = engine
+        .picker_all_items
+        .iter()
+        .find(|item| item.display == "File: Save")
+        .expect("File: Save command should be in the palette");
+    assert_eq!(save.detail.as_deref(), Some("Ctrl+S"));
+}
+
+#[test]
+fn test_command_palette_leaves_vim_motion_hints_untouched_on_macos_1927() {
+    // A bare vim motion key like "u" (undo) must never be reformatted —
+    // quadraui's accelerator renderer uppercases single-char keys, which
+    // would silently turn "u" into the unrelated "U" command.
+    assert_eq!(format_shortcut_for_platform("u", "macos"), "u");
+    assert_eq!(format_shortcut_for_platform("gd", "macos"), "gd");
+    assert_eq!(
+        format_shortcut_for_platform("Ctrl-W E", "macos"),
+        "Ctrl-W E"
+    );
+    assert_eq!(
+        format_shortcut_for_platform("<leader>sw", "macos"),
+        "<leader>sw"
+    );
+    assert_eq!(format_shortcut_for_platform("Ctrl++", "macos"), "Ctrl++");
+}
+
+#[test]
 fn test_f1_opens_commands_picker() {
     let mut engine = Engine::new();
     engine.handle_key("F1", None, false);

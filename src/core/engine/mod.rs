@@ -994,6 +994,38 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
     },
 ];
 
+/// Renders a shortcut string (as authored in [`PALETTE_COMMANDS`] or a
+/// picker hint, e.g. `"Ctrl+Shift+P"`) for display on `platform_name`
+/// (a `quadraui::PlatformServices::platform_name()` value: `"macos"`,
+/// `"gtk"`, `"win-gui"` or `"tui"`).
+///
+/// vimcode's shortcut strings always spell the app's primary modifier as
+/// `"Ctrl"`, even though `normalize_mac_cmd_as_ctrl` means that key is
+/// physically Cmd on macOS. For every backend except macOS this is already
+/// the correct on-screen label, so this is a no-op there. On macOS, a
+/// shortcut that quadraui recognises as carrying that Ctrl modifier has
+/// `"Ctrl"` substituted with `"Cmd"` and is re-rendered through quadraui's
+/// accelerator formatter, which knows macOS convention (e.g. `⌘S`, `⇧⌘P`).
+/// Anything else — a bare Vim motion like `"gd"` or `"u"`, a function key,
+/// a `"<leader>sw"` sequence, a multi-key chord like `"Ctrl-W E"` — has no
+/// recognised Ctrl modifier token and is returned unchanged, since
+/// uppercasing/reformatting those would change their meaning.
+pub(crate) fn format_shortcut_for_platform(shortcut: &str, platform_name: &str) -> String {
+    if platform_name != "macos" {
+        return shortcut.to_string();
+    }
+    let has_ctrl_modifier =
+        quadraui::parse_key_binding(shortcut).is_some_and(|parsed| parsed.modifiers.ctrl);
+    if !has_ctrl_modifier {
+        return shortcut.to_string();
+    }
+    let mac_spelling = shortcut.replace("Ctrl", "Cmd");
+    quadraui::render_binding(
+        &quadraui::KeyBinding::Literal(mac_spelling),
+        quadraui::Platform::Macos,
+    )
+}
+
 // ─── Unified Picker Types ────────────────────────────────────────────────────
 
 /// Identifies the data source backing a picker modal.
@@ -3595,6 +3627,13 @@ pub struct Engine {
     /// Original word boundaries from double-click (start_col, end_col, line).
     pub mouse_drag_word_origin: Option<(usize, usize, usize)>,
 
+    /// `quadraui::PlatformServices::platform_name()` of the running backend
+    /// (`"macos"`, `"gtk"`, `"win-gui"` or `"tui"`), set once by
+    /// `ShellApp::setup()` at startup. Defaults to `"tui"` — any non-"macos"
+    /// value — so headless/test construction keeps the cross-platform
+    /// `Ctrl+`-style shortcut display until a real backend overrides it.
+    pub platform_name: &'static str,
+
     // --- Menu bar / debug toolbar ---
     /// Whether the VSCode-style menu bar strip is visible.
     pub menu_bar_visible: bool,
@@ -5280,6 +5319,7 @@ impl Engine {
             mouse_drag_origin_window: None,
             mouse_drag_word_mode: false,
             mouse_drag_word_origin: None,
+            platform_name: "tui",
             terminal_panes: Vec::new(),
             pending_install_context: None,
             pending_terminal_command: None,

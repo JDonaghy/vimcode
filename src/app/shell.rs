@@ -11,6 +11,10 @@ impl quadraui::ShellApp for App {
         // TUI-only shell — `backend.backend_caps()` reads the same `TuiBackend`
         // state either way.
         self.keyboard_enhanced = backend.backend_caps().kitty_keyboard;
+        // Lets `Engine` render command-palette/picker shortcut hints in the
+        // running backend's convention (`⌘S` on macOS, `Ctrl+S` elsewhere) —
+        // see `format_shortcut_for_platform`.
+        self.engine.borrow_mut().platform_name = backend.services().platform_name();
         // VS Code's editor scrollbar is 14px wide; a
         // no-op on TUI, whose scrollbar is one cell.
         backend.set_editor_v_scrollbar_width(Some(14.0));
