@@ -419,17 +419,29 @@ pub fn paint_command_center_rung(
     engine.command_center_layout.replace(Some(layout));
 }
 
+/// The backdrop scrim colour painted behind modal overlays
+/// ([`paint_picker_rung`]): semi-transparent black, so the editor and sidebar
+/// behind the popup dim rather than vanish, signalling modality without
+/// hiding the popup's surroundings entirely.
+pub const MODAL_SCRIM_COLOR: quadraui::Color = quadraui::Color::rgba(0, 0, 0, 102);
+
 /// The [`FrameOp::UnifiedPicker`] rung's whole body on both backends.
 ///
 /// Returns the popup rect it resolved and painted into, so GTK can cache it
 /// for click/drag hit-testing; TUI recomputes the identical
 /// geometry cheaply at click time instead and ignores the return value.
+///
+/// Paints a full-viewport [`MODAL_SCRIM_COLOR`] scrim before the popup itself,
+/// via `Backend::draw_solid_fill` — the one rect-fill primitive every backend
+/// implements — so the editor/sidebar behind the picker dim on every backend
+/// with zero per-backend code here.
 pub fn paint_picker_rung(
     b: &mut dyn quadraui::Backend,
     picker: &PickerPanel,
     viewport: quadraui::Rect,
     sizing: &PickerSizing,
 ) -> quadraui::Rect {
+    b.draw_solid_fill(viewport, MODAL_SCRIM_COLOR);
     let has_preview = picker.preview.is_some();
     let geo = PickerGeometry::compute(viewport.width, viewport.height, has_preview, sizing);
     let palette = picker_panel_to_palette(picker);
