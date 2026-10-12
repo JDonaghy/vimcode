@@ -245,37 +245,42 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
             });
         }
 
+        // Build a 3-cell terminal toolbar button segment from an `Icon`,
+        // mirroring `tab_btn_segment` in the editor tab bar so the action
+        // icons render at the same size and hit-target width as other
+        // toolbar icons (~16×16 glyph in a ~24×24 hit area). Previously
+        // these were 2-cell segments with no leading space, which left the
+        // glyphs tiny and hard to distinguish (#1930).
+        let term_btn = |icon: &crate::icons::Icon, id: &str| -> quadraui::TabBarSegment {
+            let text = if crate::icons::nerd_fonts_enabled() {
+                format!(" {}", icon.s())
+            } else {
+                format!(" {} ", icon.s())
+            };
+            quadraui::TabBarSegment {
+                text,
+                width_cells: 3,
+                id: Some(quadraui::WidgetId::new(id)),
+                is_active: false,
+            }
+        };
+
         let maxicon = if panel.maximized {
-            crate::icons::TERM_UNMAXIMIZE.s()
+            &crate::icons::TERM_UNMAXIMIZE
         } else {
-            crate::icons::TERM_MAXIMIZE.s()
+            &crate::icons::TERM_MAXIMIZE
         };
 
         let right = vec![
             quadraui::TabBarSegment {
-                text: "+ ".to_string(),
-                width_cells: 2,
+                text: " + ".to_string(),
+                width_cells: 3,
                 id: Some(quadraui::WidgetId::new("term_toolbar:add")),
                 is_active: false,
             },
-            quadraui::TabBarSegment {
-                text: format!("{} ", crate::icons::TERM_SPLIT.s()),
-                width_cells: 2,
-                id: Some(quadraui::WidgetId::new("term_toolbar:split")),
-                is_active: false,
-            },
-            quadraui::TabBarSegment {
-                text: format!("{} ", maxicon),
-                width_cells: 2,
-                id: Some(quadraui::WidgetId::new("term_toolbar:maximize")),
-                is_active: false,
-            },
-            quadraui::TabBarSegment {
-                text: format!("{} ", crate::icons::TERM_CLOSE.s()),
-                width_cells: 2,
-                id: Some(quadraui::WidgetId::new("term_toolbar:close")),
-                is_active: false,
-            },
+            term_btn(&crate::icons::TERM_SPLIT, "term_toolbar:split"),
+            term_btn(maxicon, "term_toolbar:maximize"),
+            term_btn(&crate::icons::TERM_CLOSE, "term_toolbar:close"),
         ];
 
         TerminalToolbar::TabStrip(quadraui::TabBar {
@@ -287,6 +292,81 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
             show_tab_close: false,
             compact: true,
         })
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod terminal_toolbar_tests {
+    use super::*;
+
+    /// Minimal `TerminalPanel` for toolbar-construction tests.
+    fn stub_panel() -> TerminalPanel {
+        TerminalPanel {
+            rows: vec![],
+            content_rows: 24,
+            content_cols: 80,
+            has_focus: true,
+            scroll_offset: 0,
+            scrollback_rows: 0,
+            tab_count: 1,
+            active_tab: 0,
+            find_active: false,
+            find_query: String::new(),
+            find_match_count: 0,
+            find_selected_idx: 0,
+            split_left_rows: None,
+            split_left_cols: 0,
+            split_focus: 0,
+            maximized: false,
+        }
+    }
+
+    /// #1930: terminal toolbar action icons must use 3-cell-wide segments
+    /// (matching the editor tab bar's `tab_btn_segment`) with a leading
+    /// space so the glyph renders at the same visual weight as other
+    /// toolbar icons instead of as a tiny hard-to-distinguish glyph.
+    #[test]
+    fn terminal_toolbar_action_icons_are_three_cells_wide() {
+        let panel = stub_panel();
+        let theme = Theme::onedark();
+        let toolbar = build_terminal_toolbar(&panel, &theme);
+        let bar = match toolbar {
+            TerminalToolbar::TabStrip(ref bar) => bar,
+            _ => panic!("expected TabStrip, got FindBar"),
+        };
+
+        // Four right-aligned action segments: add, split, maximize, close.
+        assert_eq!(bar.right_segments.len(), 4, "expected 4 action segments");
+
+        let ids: Vec<&str> = bar
+            .right_segments
+            .iter()
+            .map(|s| s.id.as_ref().unwrap().as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            &[
+                "term_toolbar:add",
+                "term_toolbar:split",
+                "term_toolbar:maximize",
+                "term_toolbar:close",
+            ]
+        );
+
+        for seg in &bar.right_segments {
+            assert_eq!(
+                seg.width_cells, 3,
+                "segment {:?} must be 3 cells wide for a ~24px hit target (was {})",
+                seg.id, seg.width_cells,
+            );
+            assert!(
+                seg.text.starts_with(' '),
+                "segment {:?} text {:?} must start with a space for icon centering",
+                seg.id, seg.text,
+            );
+        }
     }
 }
 
