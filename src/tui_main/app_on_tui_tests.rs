@@ -5884,6 +5884,14 @@ mod tests {
         /// paints three slots: Problems, Output, Terminal — clicking
         /// "Problems" must swap the terminal content for the Problems
         /// placeholder.
+        ///
+        /// Confirmed RED against the pre-fix click-index mapping: reverting
+        /// `Engine::handle_bottom_tab_bar_click`'s tab order to the old
+        /// `[Terminal, DebugOutput]` list (while leaving the Problems/Output
+        /// rendering in place) makes index 0 resolve to `Terminal` instead of
+        /// `Problems`, so the click leaves the terminal content on screen and
+        /// the final assertion panics. Restoring the fixed lockstep order
+        /// turns it GREEN again.
         #[test]
         fn bottom_panel_tab_strip_click_switches_the_painted_panel_via_shell_app() {
             let mut engine = plain_engine();
