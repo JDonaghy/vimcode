@@ -637,7 +637,10 @@ impl App {
         // before computing editor/status/command-line geometry, so this
         // reservation affects only the activity bar/sidebar's painted
         // height, never where the editor or its chrome actually paint.
-        cfg = cfg.with_command_line().with_status_bar();
+        cfg = cfg
+            .with_status_bar_under_main_column()
+            .with_command_line()
+            .with_status_bar();
         cfg
     }
 
