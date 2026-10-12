@@ -45,28 +45,51 @@ pub struct PickerPanel {
 
 #[derive(Debug, Clone, Copy)]
 pub struct PickerSizing {
-    pub min_w: (f32, f32),
-    pub min_h: (f32, f32),
+    /// `(min, max)` clamp applied to the computed popup width.
+    pub width_clamp: (f32, f32),
+    /// Share of the popup width given to the results list when a preview
+    /// pane is shown.
     pub left_pane_ratio: f32,
+    /// Height of the header band (prompt + query) above the first result row.
     pub header_h: f32,
+    /// Height of one result row.
     pub line_h: f32,
+    /// Gap between the viewport's top edge and the popup's top edge, so the
+    /// popup floats near the top of the pane it is given instead of
+    /// covering it end to end.
+    pub top_margin: f32,
+    /// Fraction of the viewport height available for result rows.
+    pub max_visible_ratio: f32,
+    /// Hard cap on visible rows regardless of viewport size.
+    pub max_visible_cap: usize,
+    /// Smallest popup height the backend will actually paint into. Below
+    /// this, the backend's own `draw_palette` silently no-ops (it still
+    /// gets a rect, but nothing lands on screen), so a short result list
+    /// must never shrink the popup past this floor.
+    pub min_popup_h: f32,
 }
 
 pub const TUI_PICKER_SIZING: PickerSizing = PickerSizing {
-    min_w: (55.0, 60.0),
-    min_h: (16.0, 18.0),
+    width_clamp: (55.0, 110.0),
     left_pane_ratio: 0.35,
     header_h: 4.0,
     line_h: 1.0,
+    top_margin: 2.0,
+    max_visible_ratio: 0.6,
+    max_visible_cap: 20,
+    min_popup_h: 4.0,
 };
 
 pub fn gtk_picker_sizing(line_height: f32) -> PickerSizing {
     PickerSizing {
-        min_w: (500.0, 600.0),
-        min_h: (350.0, 400.0),
+        width_clamp: (500.0, 900.0),
         left_pane_ratio: 0.40,
         header_h: 2.0 * line_height + 2.0,
         line_h: line_height,
+        top_margin: line_height,
+        max_visible_ratio: 0.6,
+        max_visible_cap: 20,
+        min_popup_h: line_height * 4.0,
     }
 }
 
@@ -81,31 +104,40 @@ pub struct PickerGeometry {
 }
 
 impl PickerGeometry {
+    /// Resolve the popup rect inside `viewport` (the pane the picker floats
+    /// over, e.g. the editor area — never the whole window). Anchored
+    /// horizontally centred and near the top of `viewport`, with its height
+    /// driven by `item_count` rather than a fixed share of the viewport, so
+    /// a short result list gets a short popup instead of stretching to fill
+    /// the pane.
     pub fn compute(
-        viewport_w: f32,
-        viewport_h: f32,
+        viewport: quadraui::Rect,
+        item_count: usize,
         has_preview: bool,
         sizing: &PickerSizing,
     ) -> Self {
-        let popup_w = if has_preview {
-            (viewport_w * 0.8).max(sizing.min_w.1)
-        } else {
-            (viewport_w * 0.55).max(sizing.min_w.0)
-        };
-        let popup_h = if has_preview {
-            (viewport_h * 0.65).max(sizing.min_h.1)
-        } else {
-            (viewport_h * 0.60).max(sizing.min_h.0)
-        };
-        let popup_x = (viewport_w - popup_w) / 2.0;
-        let popup_y = (viewport_h - popup_h) / 2.0;
+        let width_ratio = if has_preview { 0.8 } else { 0.55 };
+        let popup_w = (viewport.width * width_ratio)
+            .clamp(sizing.width_clamp.0, sizing.width_clamp.1)
+            .min(viewport.width);
+        let row_budget = ((viewport.height * sizing.max_visible_ratio - sizing.header_h).max(0.0)
+            / sizing.line_h) as usize;
+        let max_visible = row_budget.min(sizing.max_visible_cap);
+        let visible_rows = item_count.min(max_visible);
+        // Even a 0- or 1-item result list must clear `min_popup_h`, or the
+        // backend's paint call is a no-op and nothing (not even the title
+        // or query box) reaches the screen.
+        let min_h = sizing.min_popup_h.max(sizing.header_h);
+        let popup_h = (sizing.header_h + visible_rows as f32 * sizing.line_h)
+            .max(min_h)
+            .min((viewport.height - sizing.top_margin).max(min_h));
+        let popup_x = viewport.x + (viewport.width - popup_w).max(0.0) / 2.0;
+        let popup_y = viewport.y + sizing.top_margin;
         let left_pane_w = if has_preview {
             popup_w * sizing.left_pane_ratio
         } else {
             0.0
         };
-        let results_h = (popup_h - sizing.header_h).max(0.0);
-        let visible_rows = (results_h / sizing.line_h) as usize;
         PickerGeometry {
             popup_x,
             popup_y,
