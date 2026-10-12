@@ -10186,6 +10186,10 @@ mod tests {
         /// so this exercises the actual startup path rather than poking
         /// `explorer_rows`/`explorer_expanded` directly the way other
         /// sidebar tests in this file do.
+        ///
+        /// RED-first: drop the `explorer_rebuild_rows()` call from
+        /// `Engine::open_folder` and the first frame paints the directory the
+        /// process started in, failing this.
         #[test]
         fn tui_driver_opening_a_directory_shows_that_directorys_contents_not_the_process_cwd() {
             let dir = std::env::temp_dir().join(format!(
