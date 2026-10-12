@@ -1192,7 +1192,7 @@ mod tests {
     /// independent causes, both fixed alongside this test:
     ///
     /// 1. `handle_mouse_scroll_msg` reads the pointer out of `App::last_editor_pointer`,
-    ///    which nothing assigned once the `EventControllerMotion` that used to
+    /// which nothing assigned once the `EventControllerMotion` that used to
     ///    write it was removed — so it was permanently `None`.
     /// 2. The hovered-window lookup was gated on `App::drawing_area`, which is
     ///    also never assigned under the ShellApp runner, and re-derived pane rects
@@ -13809,7 +13809,7 @@ mod app_icon {
             row.width > 0.0 && row.height > 0.0,
             "the menu row must have been laid out by the last frame; got {row:?}"
         );
-        // GTK never reports a non-empty `titlebar_control_inset` (#940), so its
+        // GTK never reports a non-empty `titlebar_control_inset`, so its
         // app icon always starts flush with the band's leading edge.
         crate::render::split_menu_row_for_app_icon(row, 0.0).0
     }
@@ -14148,6 +14148,67 @@ mod clipboard_paste {
         assert!(
             pw > 0.0 && ph > 0.0,
             "the painted picker popup must have a non-degenerate rect, got {pw}x{ph}"
+        );
+    }
+
+    /// The command palette's backdrop scrim must dim the editor band behind
+    /// it without touching the status bar, on GTK's real Cairo alpha-blend
+    /// compositing. `render::paint_picker_rung` is shared between both
+    /// backends, but `Backend::draw_solid_fill`'s actual pixel effect
+    /// differs enough between them (a true alpha blend here vs. a
+    /// destructive blank-glyph fill on TUI, which
+    /// `picker_open_leaves_status_bar_text_visible_via_shell_app` in
+    /// `src/tui_main/app_on_tui_tests.rs` covers) that this backend needs
+    /// its own black-box coverage of the same `scrim_rect` contract.
+    #[test]
+    fn opening_command_palette_dims_editor_without_touching_status_bar_via_gtk_driver() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        let mode_bounds = h
+            .driver
+            .find_bounds("NORMAL")
+            .expect("the mode badge must paint on the status bar's row");
+        let badge_mid = (
+            (mode_bounds.x + mode_bounds.width / 2.0) as i32,
+            (mode_bounds.y + mode_bounds.height / 2.0) as i32,
+        );
+        let status_colour_closed = h.driver.pixel(badge_mid.0, badge_mid.1);
+
+        h.driver.dispatch(UiEvent::Accelerator(
+            quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+            quadraui::Modifiers::default(),
+        ));
+        h.driver.render();
+
+        let (px, py, _pw, ph) = h
+            .picker_popup()
+            .expect("the command palette must actually paint, not just flip engine state");
+        // Just left of the popup's own left edge, vertically centred on it —
+        // inside the editor band `scrim_rect` covers, but outside the popup
+        // itself, so this samples the dimmed backdrop rather than the
+        // palette's own fill.
+        let editor_probe = ((px - 20.0).max(0.0) as i32, (py + ph / 2.0) as i32);
+        let editor_colour_open = h.driver.pixel(editor_probe.0, editor_probe.1);
+        let status_colour_open = h.driver.pixel(badge_mid.0, badge_mid.1);
+
+        assert_eq!(
+            status_colour_open, status_colour_closed,
+            "FRAME_Z_ORDER composes StatusBar before UnifiedPicker, so the \
+             scrim's rect must stop above it — the mode badge's colour must \
+             not shift when the command palette opens"
+        );
+
+        h.engine.borrow_mut().close_picker();
+        h.driver.render();
+        let editor_colour_closed = h.driver.pixel(editor_probe.0, editor_probe.1);
+
+        assert_ne!(
+            editor_colour_open, editor_colour_closed,
+            "opening the command palette must actually dim the editor band \
+             behind it (MODAL_SCRIM_COLOR over scrim_rect), not leave it \
+             unchanged while only the status bar is protected"
         );
     }
 }

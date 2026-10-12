@@ -425,23 +425,56 @@ pub fn paint_command_center_rung(
 /// hiding the popup's surroundings entirely.
 pub const MODAL_SCRIM_COLOR: quadraui::Color = quadraui::Color::rgba(0, 0, 0, 102);
 
+/// The rect [`paint_picker_rung`]'s scrim fill should cover: the full window
+/// width, from `content_top` down to `bottom_chrome_top` — the editor and
+/// sidebar band, excluding every chrome rung ([`FrameOp::MenuRow`],
+/// [`FrameOp::StatusBar`], [`FrameOp::CommandLine`]) that `FRAME_Z_ORDER`
+/// already composed earlier in this same frame.
+///
+/// Callers must pass `bottom_chrome_top` as the *static* reservation
+/// boundary (`layout.main_content_bounds.y + .height`, before any
+/// per-frame un-shrinking), never the dynamically recomputed one — a
+/// frame that needs fewer bottom-chrome rows than the shell statically
+/// reserved (e.g. a per-window status line instead of a global one) can
+/// let the editor band grow past that dynamic boundary, so using it here
+/// would let the scrim's destructive TUI fill (see [`paint_picker_rung`])
+/// bleed into chrome text that already painted this frame.
+pub fn modal_scrim_rect(
+    window_width: f32,
+    content_top: f32,
+    bottom_chrome_top: f32,
+) -> quadraui::Rect {
+    let height = (bottom_chrome_top - content_top).max(0.0);
+    quadraui::Rect::new(0.0, content_top, window_width, height)
+}
+
 /// The [`FrameOp::UnifiedPicker`] rung's whole body on both backends.
 ///
 /// Returns the popup rect it resolved and painted into, so GTK can cache it
 /// for click/drag hit-testing; TUI recomputes the identical
 /// geometry cheaply at click time instead and ignores the return value.
 ///
-/// Paints a full-viewport [`MODAL_SCRIM_COLOR`] scrim before the popup itself,
-/// via `Backend::draw_solid_fill` — the one rect-fill primitive every backend
+/// Paints [`MODAL_SCRIM_COLOR`] into `scrim_rect` before the popup itself, via
+/// `Backend::draw_solid_fill` — the one rect-fill primitive every backend
 /// implements — so the editor/sidebar behind the picker dim on every backend
-/// with zero per-backend code here.
+/// with zero per-backend code here. `scrim_rect` is the caller's own concern:
+/// it must cover only the editor/sidebar band, never a chrome rung
+/// ([`FrameOp::StatusBar`], [`FrameOp::CommandLine`], [`FrameOp::MenuRow`])
+/// that already painted earlier this frame — `FRAME_Z_ORDER` composes those
+/// first, and on TUI `Backend::draw_solid_fill` overwrites every cell in its
+/// rect with a blank glyph rather than blending an alpha channel, so handing
+/// it a chrome rung's rect would erase that rung's text instead of dimming
+/// it. `viewport` (the popup's own anchor rect) is unaffected by that and
+/// stays full-window, since `PickerGeometry::compute` centres the popup
+/// against the whole window regardless of how much of it the scrim covers.
 pub fn paint_picker_rung(
     b: &mut dyn quadraui::Backend,
     picker: &PickerPanel,
     viewport: quadraui::Rect,
+    scrim_rect: quadraui::Rect,
     sizing: &PickerSizing,
 ) -> quadraui::Rect {
-    b.draw_solid_fill(viewport, MODAL_SCRIM_COLOR);
+    b.draw_solid_fill(scrim_rect, MODAL_SCRIM_COLOR);
     let has_preview = picker.preview.is_some();
     let geo = PickerGeometry::compute(viewport.width, viewport.height, has_preview, sizing);
     let palette = picker_panel_to_palette(picker);
