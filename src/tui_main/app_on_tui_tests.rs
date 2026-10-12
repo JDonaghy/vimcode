@@ -10315,6 +10315,49 @@ mod tests {
                 driver.screen()
             );
         }
+
+        /// `Engine::new()` seeds its initial `explorer_rows` cache from
+        /// `std::env::current_dir()` before any CLI-supplied path is
+        /// applied; `build_portable_engine`'s `Engine::new()` →
+        /// `e.startup(file_path)` ordering is exactly what every real
+        /// backend runs, and `tui_driver_with` drives that same ordering,
+        /// so this exercises the actual startup path rather than poking
+        /// `explorer_rows`/`explorer_expanded` directly the way other
+        /// sidebar tests in this file do.
+        #[test]
+        fn tui_driver_opening_a_directory_shows_that_directorys_contents_not_the_process_cwd() {
+            let dir = std::env::temp_dir().join(format!(
+                "vc1924expl_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            // Short name, same reasoning as `render_content_paints_
+            // explorer_sidebar_content_via_shell_app`'s `mk1425.txt`: the
+            // narrow sidebar at this module's `(80, 24)` size truncates a
+            // longer filename before `screen_contains` would ever see it.
+            std::fs::write(dir.join("mk1924.txt"), b"").unwrap();
+
+            let mut driver = tui_driver_with(Some(dir.clone()), 80, 24, |engine| {
+                engine.session.explorer_visible = true;
+                engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                    crate::core::engine::sidebar::PANEL_EXPLORER,
+                ));
+            });
+            driver.render();
+
+            assert!(
+                driver.screen_contains("mk1924.txt"),
+                "opening a directory on the command line must show that \
+                 directory's own contents in the Explorer on the very \
+                 first rendered frame, not whatever directory the \
+                 process happened to start in; screen:\n{}",
+                driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     mod file_encoding {
