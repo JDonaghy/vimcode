@@ -2383,6 +2383,76 @@ mod tests {
             );
         }
 
+        /// A user who has never touched `:colorscheme` must see VS Code's
+        /// **Dark Modern** palette on screen, not One Dark.
+        ///
+        /// The oracle is deliberately spelled as raw RGB literals taken
+        /// straight from VS Code's `dark_modern.json`: `editor.background`
+        /// is `0x1f1f1f`, while `statusBar.background`,
+        /// `sideBar.background` and `editorGroupHeader.tabsBackground` all
+        /// share `0x181818`. Deriving them from
+        /// [`crate::render::Theme::from_name`] would have the test read
+        /// back the very default it exists to pin, so it could never fail.
+        /// One Dark's `0x282c34` and `0x21252b` are asserted *absent* from
+        /// the whole painted grid for the same reason: this test is red
+        /// whenever the default resolves to that palette instead.
+        #[test]
+        fn fresh_engine_paints_vs_code_dark_modern_chrome_via_shell_app() {
+            use quadraui::tui::testing::Color;
+
+            let mut h = harness(plain_engine());
+            let driver = &mut h.driver;
+            driver.render();
+
+            const COLS: u16 = 80;
+            const ROWS: u16 = 24;
+            const DARK_MODERN_EDITOR_BG: Color = Color::Rgb(0x1f, 0x1f, 0x1f);
+            const DARK_MODERN_CHROME_BG: Color = Color::Rgb(0x18, 0x18, 0x18);
+            const ONEDARK_EDITOR_BG: Color = Color::Rgb(0x28, 0x2c, 0x34);
+            const ONEDARK_CHROME_BG: Color = Color::Rgb(0x21, 0x25, 0x2b);
+
+            let mut saw_editor_bg = false;
+            let mut saw_chrome_bg = false;
+            for y in 0..ROWS {
+                for x in 0..COLS {
+                    let Some(style) = driver.style_at(x, y) else {
+                        continue;
+                    };
+                    saw_editor_bg |= style.bg == DARK_MODERN_EDITOR_BG;
+                    saw_chrome_bg |= style.bg == DARK_MODERN_CHROME_BG;
+                    assert_ne!(
+                        style.bg,
+                        ONEDARK_EDITOR_BG,
+                        "cell ({x}, {y}) paints One Dark's editor background; \
+                         the default colorscheme must be VS Code Dark Modern; \
+                         screen:\n{}",
+                        driver.screen()
+                    );
+                    assert_ne!(
+                        style.bg,
+                        ONEDARK_CHROME_BG,
+                        "cell ({x}, {y}) paints One Dark's chrome background; \
+                         the default colorscheme must be VS Code Dark Modern; \
+                         screen:\n{}",
+                        driver.screen()
+                    );
+                }
+            }
+
+            assert!(
+                saw_editor_bg,
+                "no cell painted Dark Modern's editor.background #1f1f1f; \
+                 screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                saw_chrome_bg,
+                "no cell painted Dark Modern's unified chrome background \
+                 #181818 (status bar / sidebar / tab strip); screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// The Extensions activity-bar icon must paint a header naming the
         /// panel — same assertion `crate::harness`'s
         /// `issue_1256_sidebar_chrome::extensions_header_is_painted` uses for
