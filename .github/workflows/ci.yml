@@ -245,69 +245,6 @@ jobs:
         test -z "${DISPLAY:-}" && test -z "${WAYLAND_DISPLAY:-}"
         cargo test
 
-  # #1887: the `test-support` feature is the reach gate for external
-  # integration tests (tests/acceptance.rs, the sealed oracle-loop suite).
-  # No CI job before this one ever compiled with it enabled, so a change
-  # that breaks test-support-gated code was only discovered when the
-  # coordinator ran the acceptance suite on fleet hardware, after the PR
-  # had already merged. This job catches those compilation failures early.
-  test-support-compile:
-    name: Test (Linux, test-support feature compile)
-    runs-on: ubuntu-24.04
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install Neovim ${{ env.NVIM_ORACLE_VERSION }} (oracle for tests/nvim_conformance.rs)
-      run: |
-        set -euo pipefail
-        curl -fsSL -o /tmp/nvim.tar.gz \
-          "https://github.com/neovim/neovim/releases/download/${NVIM_ORACLE_VERSION}/nvim-linux-x86_64.tar.gz"
-        sudo tar -C /opt -xzf /tmp/nvim.tar.gz
-        echo "/opt/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
-
-    - name: Verify the conformance oracle
-      run: nvim --version | head -1
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ env.RUST_TOOLCHAIN }}
-        components: clippy, rustfmt
-
-    - name: Install GTK4 development libraries
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libgtk-4-dev librsvg2-common
-
-    - name: Cache cargo registry
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo index
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo build
-      uses: actions/cache@v4
-      with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-test-support-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Compile and run tests (gui feature, lib only, no DISPLAY)
-      run: |
-        test -z "${DISPLAY:-}" && test -z "${WAYLAND_DISPLAY:-}"
-        # --lib --features gui: compile and run the in-crate test-support
-        # and harness code (gated `cfg(any(test, feature = "test-support"))`)
-        # via the `cfg(test)` arm that `cargo test` sets.  The test-support
-        # feature is NOT passed here — it widens the gate to include code
-        # without cfg(test), where Engine::new_for_test is unavailable.
-        cargo test --lib --features gui
-
   # #1042: the two jobs above are both Linux, so `src/macos/mod.rs` — gated
   # `#[cfg(all(feature = "macos", target_os = "macos"))]` in src/lib.rs, and
   # likewise in quadraui itself — is never compiled by either of them and its

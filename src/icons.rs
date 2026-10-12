@@ -263,6 +263,7 @@ pub const FIND_CLOSE: Icon = Icon::new("\u{ea76}", "\u{00d7}"); // × nf-cod-clo
 // ─── quadraui-painted glyphs ────────────────────────────────────────────────
 // Glyphs quadraui itself paints (not vimcode).
 
+pub const TREE_CHEVRON_DOWN: Icon = Icon::new("\u{eab4}", "\u{25be}"); // ▾ nf-cod-chevron_down
 pub const TREE_CHEVRON_RIGHT: Icon = Icon::new("\u{eab6}", "\u{25b8}"); // ▸ nf-cod-chevron_right
 pub const TAB_CLOSE: Icon = Icon::new("\u{ea76}", "\u{00d7}"); // × nf-cod-close
 
