@@ -708,27 +708,21 @@ impl quadraui::ShellApp for App {
                 render::FrameOp::UnifiedPicker => {
                     if let Some(ref picker) = screen.picker {
                         // Scoped to the editor+sidebar band only, never the
-                        // full window. The bottom bound is `main`'s own
-                        // static reservation (`main.y + main.height`, i.e.
-                        // `layout.main_content_bounds` before
-                        // `render::main_content_true_height`'s dynamic
-                        // un-shrink), not `status_y` — `status_y` tracks
-                        // however many rows *this frame's* settings
-                        // actually need for the status bar/command line,
-                        // which can be fewer than the shell reserved (e.g.
-                        // a per-window status line instead of the global
-                        // bar), so the editor band then grows to fill the
-                        // slack. `main.y + main.height` stays the one
-                        // boundary that is never below any chrome rung
-                        // `FRAME_Z_ORDER` painted earlier this frame
-                        // ([`FrameOp::StatusBar`], [`FrameOp::CommandLine`]),
-                        // on every settings combination. Only `viewport`
-                        // (the popup's own centring anchor) stays
-                        // full-window.
+                        // full window: `modal_scrim_rect` derives its bottom
+                        // edge from *this frame's* `el`, so it stops above
+                        // every row already painted by an earlier rung — the
+                        // bottom-chrome rungs `FRAME_Z_ORDER` composes first
+                        // (`FrameOp::StatusBar`, wildmenu row included,
+                        // `FrameOp::CommandLine`, quickfix, terminal) and the
+                        // active window's own status row inside the band.
+                        // Only `popup_viewport` (the popup's own centring
+                        // anchor) stays full-window.
                         let scrim_rect = render::modal_scrim_rect(
+                            &engine,
+                            &el,
                             popup_viewport.width,
                             y as f32,
-                            main.y + main.height,
+                            lh,
                         );
                         let rect = render::paint_picker_rung(
                             backend,

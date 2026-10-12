@@ -1188,15 +1188,15 @@ mod tests {
     /// A wheel event must scroll the pane **under the pointer**, not whichever
     /// pane happens to hold focus.
     ///
-    /// This was dead on GTK after the #540 Relm4→ShellApp migration. Two
-    /// independent causes, both fixed alongside this test:
+    /// Two pieces of GTK state have to be live for that to work, and this
+    /// test covers both:
     ///
-    /// 1. `handle_mouse_scroll_msg` reads the pointer out of `App::last_editor_pointer`,
-    /// which nothing assigned once the `EventControllerMotion` that used to
-    ///    write it was removed — so it was permanently `None`.
-    /// 2. The hovered-window lookup was gated on `App::drawing_area`, which is
-    ///    also never assigned under the ShellApp runner, and re-derived pane rects
-    ///    at a `(0, 0)` origin that ignores offsets.
+    /// 1. `handle_mouse_scroll_msg` reads the pointer out of
+    ///    `App::last_editor_pointer`, so something must keep that field
+    ///    populated under the ShellApp runner.
+    /// 2. The hovered-window lookup must not be gated on `App::drawing_area`,
+    ///    which the ShellApp runner never assigns, and must derive pane rects
+    ///    at the editor band's real origin rather than `(0, 0)`.
     ///
     /// Note the assertion that focus does *not* move: hovering must scroll
     /// without stealing focus.
@@ -14188,8 +14188,16 @@ mod clipboard_paste {
         // Just left of the popup's own left edge, vertically centred on it —
         // inside the editor band `scrim_rect` covers, but outside the popup
         // itself, so this samples the dimmed backdrop rather than the
-        // palette's own fill.
-        let editor_probe = ((px - 20.0).max(0.0) as i32, (py + ph / 2.0) as i32);
+        // palette's own fill. Asserted rather than clamped: a popup flush
+        // against the window's left edge would leave no backdrop to sample
+        // there, which must read as "fix the probe", not as a silent pass.
+        let gap = 20.0;
+        assert!(
+            px > gap,
+            "this probe needs a strip of backdrop left of the popup to sample; \
+             the palette starts at x={px}, within {gap}px of the window edge"
+        );
+        let editor_probe = ((px - gap) as i32, (py + ph / 2.0) as i32);
         let editor_colour_open = h.driver.pixel(editor_probe.0, editor_probe.1);
         let status_colour_open = h.driver.pixel(badge_mid.0, badge_mid.1);
 

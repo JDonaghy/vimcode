@@ -4103,6 +4103,53 @@ mod tests {
             );
         }
 
+        /// The tallest bottom-chrome frame: a global status bar *and* a live
+        /// wildmenu row, so `status_bar_height_px` reserves three rows where
+        /// the shell's static two-row reservation covers only two. Opening the
+        /// picker over that frame must leave both rows readable — a scrim
+        /// bounded by the shell's static reservation instead of this frame's
+        /// `EditorLayout::editor_bottom` would blank the wildmenu's row with
+        /// scrim-coloured cells.
+        ///
+        /// `open_picker` does not clear `wildmenu_items`, so the two really
+        /// can be live in the same frame.
+        #[test]
+        fn picker_over_an_open_wildmenu_leaves_both_chrome_rows_visible_via_shell_app() {
+            let mut engine = plain_engine();
+            // Explicit, not ambient: a global status bar exists only when
+            // per-window status lines are off, and the default is on.
+            engine.settings.window_status_line = false;
+            engine.wildmenu_items = vec!["ZQXWwildA".to_string(), "ZQXWwildB".to_string()];
+            engine.wildmenu_selected = Some(0);
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                driver.screen_has("ZQXWwildA") && driver.screen_has("NORMAL"),
+                "precondition: the wildmenu row and the status bar's mode \
+                 indicator both paint before the picker opens; screen:\n{}",
+                driver.screen()
+            );
+
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+                quadraui::Modifiers::default(),
+            ));
+
+            assert!(
+                driver.screen_has("ZQXWwildA"),
+                "the scrim must stop at this frame's editor-band bottom, which \
+                 is one row higher when the wildmenu is up; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_has("NORMAL"),
+                "the status bar below the wildmenu must stay readable too; \
+                 screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// Open the command palette through `render::ACC_COMMAND_PALETTE`
         /// and narrow it to the Save command, so the painted list's shortcut
         /// column is a single row.

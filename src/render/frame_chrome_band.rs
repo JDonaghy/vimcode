@@ -420,31 +420,53 @@ pub fn paint_command_center_rung(
 }
 
 /// The backdrop scrim colour painted behind modal overlays
-/// ([`paint_picker_rung`]): semi-transparent black, so the editor and sidebar
-/// behind the popup dim rather than vanish, signalling modality without
-/// hiding the popup's surroundings entirely.
+/// ([`paint_picker_rung`]): semi-transparent black, signalling modality by
+/// separating the popup from the editor band behind it. Backends that
+/// composite alpha (GTK) blend it into a dim tint; TUI's `draw_solid_fill`
+/// drops the alpha channel and fills the band with flat scrim-coloured cells
+/// instead, the terminal-idiomatic equivalent. Either way the fill is confined
+/// to [`modal_scrim_rect`], so the chrome around the editor band stays
+/// readable.
 pub const MODAL_SCRIM_COLOR: quadraui::Color = quadraui::Color::rgba(0, 0, 0, 102);
 
 /// The rect [`paint_picker_rung`]'s scrim fill should cover: the full window
-/// width, from `content_top` down to `bottom_chrome_top` — the editor and
-/// sidebar band, excluding every chrome rung ([`FrameOp::MenuRow`],
-/// [`FrameOp::StatusBar`], [`FrameOp::CommandLine`]) that `FRAME_Z_ORDER`
-/// already composed earlier in this same frame.
+/// width, from `content_top` down to the lowest row this frame paints *editor*
+/// content into — the editor and sidebar band, and nothing below or above it.
 ///
-/// Callers must pass `bottom_chrome_top` as the *static* reservation
-/// boundary (`layout.main_content_bounds.y + .height`, before any
-/// per-frame un-shrinking), never the dynamically recomputed one — a
-/// frame that needs fewer bottom-chrome rows than the shell statically
-/// reserved (e.g. a per-window status line instead of a global one) can
-/// let the editor band grow past that dynamic boundary, so using it here
-/// would let the scrim's destructive TUI fill (see [`paint_picker_rung`])
-/// bleed into chrome text that already painted this frame.
+/// `el` and `line_height` must be this frame's own
+/// [`compute_editor_layout`] result and metrics, and `content_top`
+/// `main_content_bounds.y`, because every row of bottom chrome is live or
+/// absent per frame. The bottom edge is [`EditorLayout::editor_bottom`] — which
+/// already excludes the status bar (the wildmenu's extra row included), the
+/// command line, quickfix, the terminal/debug panel, the debug toolbar and the
+/// terminal-separated status line — less the active window's own status row,
+/// which sits *inside* the band at its bottom edge whenever per-window status
+/// lines are on and the bottom panel has not moved it into its own band.
+///
+/// All of that precision is load-bearing: `FRAME_Z_ORDER` composes the chrome
+/// rungs *before* [`FrameOp::UnifiedPicker`] and the editor band earlier still,
+/// and on TUI the scrim fill is destructive (see [`paint_picker_rung`]), so a
+/// rect reaching one row too far erases text that already painted this frame.
+/// Neither the shell's *static* two-row reservation
+/// (`main_content_bounds.height`) nor the status bar's own top edge is a safe
+/// substitute: the first is one row short whenever the wildmenu is open, and
+/// the second sits below the quickfix/terminal/per-window-status rows.
 pub fn modal_scrim_rect(
+    engine: &Engine,
+    el: &EditorLayout,
     window_width: f32,
     content_top: f32,
-    bottom_chrome_top: f32,
+    line_height: f64,
 ) -> quadraui::Rect {
-    let height = (bottom_chrome_top - content_top).max(0.0);
+    // Zero when the bottom panel pushed the status line below it: that row is
+    // then `el.separated_status_h`, already outside `editor_bottom`.
+    let window_status_row = if el.separated_status_h == 0.0 && effective_window_status_line(engine)
+    {
+        line_height
+    } else {
+        0.0
+    };
+    let height = (el.editor_bottom - window_status_row).max(0.0) as f32;
     quadraui::Rect::new(0.0, content_top, window_width, height)
 }
 
@@ -1569,5 +1591,57 @@ mod tests {
         assert_eq!(LineEnding::detect("hello\r\nworld\r\n"), LineEnding::Crlf);
         assert_eq!(LineEnding::detect("no newline"), LineEnding::LF);
         assert_eq!(LineEnding::detect(""), LineEnding::LF);
+    }
+
+    /// `modal_scrim_rect` spans the full window width but stops above every
+    /// row an earlier rung already painted text into, so the destructive TUI
+    /// fill cannot erase chrome. With per-window status lines on (the default)
+    /// the lowest such row is the active window's own status line, *inside*
+    /// the band at `editor_bottom - line_height`.
+    #[test]
+    fn modal_scrim_rect_stops_above_the_active_window_status_row() {
+        let engine = Engine::new_for_test();
+        let lh = 20.0;
+        // Content 770 tall below a 30px title band.
+        let el = compute_editor_layout(&engine, 770.0, lh, false);
+        let r = super::modal_scrim_rect(&engine, &el, 1200.0, 30.0, lh);
+
+        assert!(
+            effective_window_status_line(&engine),
+            "fixture needs per-window status lines, the default"
+        );
+        assert_eq!((r.x, r.y, r.width), (0.0, 30.0, 1200.0));
+        assert_eq!(r.height as f64, el.editor_bottom - lh);
+    }
+
+    /// A global status bar with the wildmenu up is the tallest bottom-chrome
+    /// frame: `status_bar_height_px` reserves three rows where the shell's
+    /// static reservation covers two. The scrim stops above all three — and
+    /// subtracts no window status row, because there is none.
+    #[test]
+    fn modal_scrim_rect_clears_a_global_status_bar_under_an_open_wildmenu() {
+        let mut engine = Engine::new_for_test();
+        // A global status bar exists only when per-window status lines are off.
+        engine.settings.window_status_line = false;
+        engine.wildmenu_items = vec!["one".to_string(), "two".to_string()];
+        let lh = 20.0;
+        let el = compute_editor_layout(&engine, 770.0, lh, false);
+        let r = super::modal_scrim_rect(&engine, &el, 1200.0, 30.0, lh);
+
+        assert_eq!(el.status_bar_h, 3.0 * lh, "wildmenu + global bar + cmdline");
+        assert_eq!(r.height as f64, el.editor_bottom);
+        assert_eq!(r.height as f64, 770.0 - 3.0 * lh);
+    }
+
+    /// A degenerate band (chrome taller than the window, e.g. a window
+    /// squeezed to a couple of rows) yields an empty rect rather than a
+    /// negative-height one.
+    #[test]
+    fn modal_scrim_rect_clamps_an_inverted_band_to_empty() {
+        let engine = Engine::new_for_test();
+        let lh = 20.0;
+        let el = compute_editor_layout(&engine, 10.0, lh, false);
+        let r = super::modal_scrim_rect(&engine, &el, 1200.0, 0.0, lh);
+        assert_eq!(r.height, 0.0);
     }
 }
