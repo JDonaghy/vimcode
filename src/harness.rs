@@ -10779,6 +10779,15 @@ mod settings_number_enables_line_numbers_mod {
                 driver.screen_has("zqbaz"),
                 "precondition: the fixture buffer's third line must be painted"
             );
+            // Settle the sidebar before asserting on the *absence* of a digit.
+            // The runner's own `AppShell` starts with the sidebar visible and
+            // only learns the engine's hidden state on the first dispatch, so
+            // frame 1 still paints the file explorer -- rooted at the process's
+            // working directory, whose real file and directory names carry
+            // machine-dependent digits that would satisfy `screen_has("3")`
+            // with nothing to do with the gutter. Escape is a no-op in normal
+            // mode, so this only costs one dispatch.
+            driver.press_named(NamedKey::Escape);
             assert!(
                 !driver.any_text_inside_role("3", UiRole::MainContent),
                 "precondition: with line numbers off, no gutter digit \"3\" (line \
