@@ -245,12 +245,6 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
             });
         }
 
-        // Build a 3-cell terminal toolbar button segment from an `Icon`,
-        // mirroring `tab_btn_segment` in the editor tab bar so the action
-        // icons render at the same size and hit-target width as other
-        // toolbar icons (~16×16 glyph in a ~24×24 hit area). Previously
-        // these were 2-cell segments with no leading space, which left the
-        // glyphs tiny and hard to distinguish (#1930).
         let term_btn = |icon: &crate::icons::Icon, id: &str| -> quadraui::TabBarSegment {
             let text = if crate::icons::nerd_fonts_enabled() {
                 format!(" {}", icon.s())
@@ -295,13 +289,10 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
     }
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod terminal_toolbar_tests {
     use super::*;
 
-    /// Minimal `TerminalPanel` for toolbar-construction tests.
     fn stub_panel() -> TerminalPanel {
         TerminalPanel {
             rows: vec![],
@@ -323,10 +314,6 @@ mod terminal_toolbar_tests {
         }
     }
 
-    /// #1930: terminal toolbar action icons must use 3-cell-wide segments
-    /// (matching the editor tab bar's `tab_btn_segment`) with a leading
-    /// space so the glyph renders at the same visual weight as other
-    /// toolbar icons instead of as a tiny hard-to-distinguish glyph.
     #[test]
     fn terminal_toolbar_action_icons_are_three_cells_wide() {
         let panel = stub_panel();
@@ -337,7 +324,6 @@ mod terminal_toolbar_tests {
             _ => panic!("expected TabStrip, got FindBar"),
         };
 
-        // Four right-aligned action segments: add, split, maximize, close.
         assert_eq!(bar.right_segments.len(), 4, "expected 4 action segments");
 
         let ids: Vec<&str> = bar
@@ -364,7 +350,8 @@ mod terminal_toolbar_tests {
             assert!(
                 seg.text.starts_with(' '),
                 "segment {:?} text {:?} must start with a space for icon centering",
-                seg.id, seg.text,
+                seg.id,
+                seg.text,
             );
         }
     }
