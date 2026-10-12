@@ -1060,7 +1060,7 @@ impl Theme {
             tab_preview_inactive_fg: hex("#7f7f7f"),
             tab_active_accent: hex("#0078d4"),
 
-            status_bg: hex("#222222"),
+            status_bg: hex("#181818"),
             status_fg: hex("#cccccc"),
 
             status_mode_normal_bg: hex("#0078d4"),
@@ -2102,14 +2102,12 @@ pub(crate) mod tests {
     fn vscode_dark_modern_chrome_matches_vs_code_tokens() {
         let theme = Theme::vscode_dark_modern();
 
-        // statusBar.background / sideBarSectionHeader-adjacent chrome: dark
-        // grey, not Dark+'s saturated blue. `status_bg` is slightly lighter
-        // than `tab_bar_bg` so that the quadraui form header rows (which use
-        // `header_bg` derived from `status_bg`) are visually distinct from
-        // regular data rows (which use `tab_bar_bg`).
-        assert_eq!(theme.status_bg, hex("#222222"));
+        // statusBar.background / sideBar.background / tabsBackground: Dark
+        // Modern deliberately unifies all three on the same neutral dark
+        // grey, dropping Dark+'s saturated blue status bar.
+        assert_eq!(theme.status_bg, hex("#181818"));
         assert_eq!(theme.tab_bar_bg, hex("#181818"));
-        assert_ne!(theme.status_bg, theme.tab_bar_bg);
+        assert_eq!(theme.status_bg, theme.tab_bar_bg);
         assert_ne!(theme.status_bg, hex("#007acc"));
 
         // editor.background
