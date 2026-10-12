@@ -31695,6 +31695,15 @@ fn test_tick_git_branch_fires_plugin_event() {
 #[test]
 fn test_tick_git_branch_no_event_when_unchanged() {
     // When tick_git_branch sees no change, plugins must NOT be invoked.
+    //
+    // Both ticks read the branch of the *process* working directory —
+    // `Engine::git_dir` falls back to `std::env::current_dir()` for a buffer
+    // with no path — so "unchanged" only holds while the directory stays
+    // put. A shared claim on `crate::test_cwd::CWD_LOCK` keeps every
+    // `CwdGuard` writer (`open_folder`, `:cd`, the TUI driver's startup) out
+    // for the duration, so the second tick cannot find itself in a different
+    // repository, or outside one, and report a branch change.
+    let _cwd = crate::test_cwd::CwdReadGuard::acquire();
     let dir = write_plugin_lua(
         "test_git_branch_noevent",
         r#"vimcode.on("git_branch_changed", function(branch)

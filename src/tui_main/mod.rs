@@ -236,6 +236,12 @@ pub mod testing {
     /// restored on `Drop` before this function hands back a driver anyone
     /// can render a frame with. `setup` runs inside the same scope, since a
     /// caller's hook could chdir too (e.g. by driving `:cd` on the engine).
+    ///
+    /// One consequence for callers: a test must not already hold a
+    /// `CwdReadGuard` on this thread (a second live driver, a GTK
+    /// `Harness`, or an explicit `acquire()`) when it calls this, because
+    /// the exclusive acquisition would then wait on that same thread's
+    /// shared claim. Scope any such guard so it drops first.
     pub fn tui_driver_with(
         file_path: Option<PathBuf>,
         width: u16,
