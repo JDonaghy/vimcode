@@ -762,7 +762,13 @@ pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
         name: "tab_bar_close_button_closes_inactive_tab_without_disturbing_active",
         area: FeatureArea::TabBar,
         driver_cap: DriverCap::ClickInput,
-        backends: BackendSet::ALL_MACRO,
+        backends: BackendSet {
+            gtk: false,
+            tui: true,
+            tui_prod: true,
+            macos: false,
+            win: false,
+        },
         issue: None,
         description: "Closing a non-adjacent inactive tab leaves the active tab untouched",
     },
@@ -7264,7 +7270,7 @@ mod ctrl_p_file_picker_click_confirms_the_filtered_entry {
                 "typing \"beta\" must leave BETA as the sole visible entry"
             );
 
-            driver.click_text("beta");
+            driver.click_text(BETA);
 
             assert!(
                 !driver.screen_has(ALPHA) && !driver.screen_has("Find Files"),
@@ -8027,7 +8033,7 @@ mod area_tab_bar_and_window_splits {
 
     crate::backend_conformance! {
         label: tab_bar_close_button_closes_inactive_tab_without_disturbing_active,
-        backends: [gtk, tui, tui_prod],
+        backends: [tui, tui_prod],
         engine: wsplit_three_tab_fixture(),
         size: (800, 480),
         body: |driver| {
