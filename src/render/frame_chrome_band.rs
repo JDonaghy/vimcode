@@ -429,10 +429,11 @@ pub fn paint_picker_rung(
     picker: &PickerPanel,
     viewport: quadraui::Rect,
     sizing: &PickerSizing,
+    theme: &Theme,
 ) -> quadraui::Rect {
     let has_preview = picker.preview.is_some();
     let geo = PickerGeometry::compute(viewport.width, viewport.height, has_preview, sizing);
-    let palette = picker_panel_to_palette(picker);
+    let palette = picker_panel_to_palette(picker, theme);
     let rect = quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h);
     b.draw_palette(rect, &palette);
     rect

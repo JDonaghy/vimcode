@@ -680,6 +680,15 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 } else {
                     None
                 },
+                preview_highlights: if has_preview {
+                    engine
+                        .picker_preview
+                        .as_ref()
+                        .map(|p| p.highlights.clone())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
                 preview_scroll: engine.picker_preview_scroll,
             }
         }),

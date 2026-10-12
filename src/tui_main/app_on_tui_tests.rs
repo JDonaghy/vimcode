@@ -4604,6 +4604,76 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+        /// The quick-open preview pane must run the selected file's text
+        /// through the same syntax-highlighting pipeline as the main
+        /// editor, not paint it as one uniform color. `picker_populate_files`
+        /// -> `picker_load_preview` -> `syntax_highlights_for_path` feeds
+        /// `PickerPreview::highlights` from the real tree-sitter grammar for
+        /// `.rs`, and `picker_panel_to_palette` turns each highlighted byte
+        /// range into its own `StyledSpan::with_fg(..., theme.scope_color(..))`
+        /// — so a string-literal token's cell must carry a different `fg`
+        /// than a plain, unstyled cell elsewhere on screen (the picker's own
+        /// file-name entry, built with `StyledText::plain`).
+        ///
+        /// Confirmed red against the unfixed preview rendering, which built
+        /// every preview line with `StyledText::plain` regardless of
+        /// `highlights`: both cells then shared the same fallback
+        /// `theme.surface_fg`, so this `assert_ne!` failed.
+        #[test]
+        fn quick_open_preview_pane_syntax_highlights_source_text_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "vc1926_synhi_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            std::fs::write(
+                dir.join("hello.rs"),
+                b"fn main() {\n    let s = \"ZQX_MARK\";\n}\n",
+            )
+            .unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.open_picker(crate::core::engine::PickerSource::Files);
+            let h = harness(engine);
+            let driver = &h.driver;
+
+            let marker_bounds = driver.find_bounds("ZQX_MARK").unwrap_or_else(|| {
+                panic!(
+                    "preview pane must show the string literal's text; screen:\n{}",
+                    driver.screen()
+                )
+            });
+            let item_bounds = driver.find_bounds("hello.rs").unwrap_or_else(|| {
+                panic!(
+                    "picker list must show the plain file-name entry; screen:\n{}",
+                    driver.screen()
+                )
+            });
+
+            let marker_style = driver
+                .style_at(marker_bounds.x as u16, marker_bounds.y as u16)
+                .expect("marker cell must be on screen");
+            let item_style = driver
+                .style_at(item_bounds.x as u16, item_bounds.y as u16)
+                .expect("item cell must be on screen");
+
+            assert_ne!(
+                marker_style.fg,
+                item_style.fg,
+                "preview pane's string-literal token must render in a \
+                 different color than the plain, unstyled file-name entry \
+                 — got the same fg ({:?}) for both, meaning the preview \
+                 text is still painted as one uniform color; screen:\n{}",
+                marker_style.fg,
+                driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -385,18 +385,16 @@ pub use crate::core::engine::ExplorerRow;
 /// canonical path. Directories get a folder glyph; files get the
 /// extension-based icon from `icons::file_icon`.
 /// Adapt the picker panel's `PickerPanel` render data into a generic
-/// `quadraui::Palette` for rendering through the shared primitive.
+/// `quadraui::Palette` for rendering through the shared primitive, used by
+/// every backend via `Backend::draw_palette`.
 ///
-/// Phase A.4 scope: flat-list palettes only. Returns `None` when the
-/// caller should fall through to the legacy renderer:
-/// - `preview.is_some()` — file / symbol picker with right-side preview pane
-/// - any item has `depth > 0` or `expandable` — tree-structured picker
-///
-/// When `Some(Palette)` is returned, the backend can render the full
-/// modal via `quadraui_tui::draw_palette` (TUI) or `quadraui_gtk::draw_palette`
-/// (GTK, when A.4b ships).
-pub fn picker_panel_to_palette(picker: &PickerPanel) -> quadraui::Palette {
-    use quadraui::{Palette, PaletteItem, PalettePreview, StyledText, WidgetId};
+/// Each preview line is built from `picker.preview_highlights[i]` (byte
+/// ranges relative to that line's own text, sorted and non-overlapping) by
+/// emitting plain spans for the gaps and `theme.scope_color`-tinted spans
+/// for the highlighted ranges — the same tree-sitter-driven colors the main
+/// editor applies to its own buffer text.
+pub fn picker_panel_to_palette(picker: &PickerPanel, theme: &Theme) -> quadraui::Palette {
+    use quadraui::{Palette, PaletteItem, PalettePreview, StyledSpan, StyledText, WidgetId};
 
     let items: Vec<PaletteItem> = picker
         .items
@@ -417,7 +415,34 @@ pub fn picker_panel_to_palette(picker: &PickerPanel) -> quadraui::Palette {
         PalettePreview {
             lines: lines
                 .iter()
-                .map(|(line_num, text, _)| StyledText::plain(format!("{line_num:4}: {text}")))
+                .enumerate()
+                .map(|(i, (line_num, text, _))| {
+                    let mut spans = vec![StyledSpan::plain(format!("{line_num:4}: "))];
+                    let line_hls = picker
+                        .preview_highlights
+                        .get(i)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let mut cursor = 0usize;
+                    for (start, end, scope) in line_hls {
+                        let start = (*start).min(text.len());
+                        let end = (*end).min(text.len()).max(start);
+                        if start > cursor {
+                            spans.push(StyledSpan::plain(text[cursor..start].to_string()));
+                        }
+                        if end > start {
+                            spans.push(StyledSpan::with_fg(
+                                text[start..end].to_string(),
+                                theme.scope_color(scope),
+                            ));
+                        }
+                        cursor = end.max(cursor);
+                    }
+                    if cursor < text.len() {
+                        spans.push(StyledSpan::plain(text[cursor..].to_string()));
+                    }
+                    StyledText { spans }
+                })
                 .collect(),
             title: None,
             scroll_offset: picker.preview_scroll,
