@@ -4067,6 +4067,42 @@ mod tests {
             );
         }
 
+        /// The scrim behind the unified picker must stop above the
+        /// status-bar/command-line band, not blank it: `FRAME_Z_ORDER`
+        /// composes `StatusBar`/`CommandLine` before `UnifiedPicker`, so a
+        /// scrim fill that reaches into their rows would overwrite their
+        /// text with blank scrim-coloured cells on TUI (`draw_solid_fill`
+        /// fills every cell in its rect with a blank glyph, it does not
+        /// alpha-blend). Opening the command palette must leave the
+        /// "NORMAL" mode indicator on the status bar readable both before
+        /// and while the picker is open.
+        #[test]
+        fn picker_open_leaves_status_bar_text_visible_via_shell_app() {
+            let engine = plain_engine();
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                driver.screen_has("NORMAL"),
+                "precondition: a fresh engine starts in Vim Normal mode; \
+                 screen:\n{}",
+                driver.screen()
+            );
+
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+                quadraui::Modifiers::default(),
+            ));
+
+            assert!(
+                driver.screen_has("NORMAL"),
+                "opening the command palette must dim the editor/sidebar \
+                 behind it, not blank the status bar's mode indicator; \
+                 screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// Open the command palette through `render::ACC_COMMAND_PALETTE`
         /// and narrow it to the Save command, so the painted list's shortcut
         /// column is a single row.
