@@ -5844,6 +5844,36 @@ mod tests {
             );
         }
 
+        /// The bottom panel tab strip must offer more than a single bare
+        /// "Terminal" label: at minimum "Terminal" (active) and "Problems"
+        /// must both paint when the terminal is open, so the panel reads as
+        /// a switchable VS Code-style tab bar rather than a plain label.
+        #[test]
+        fn render_content_paints_bottom_panel_problems_tab_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+
+            known_bug_gate(
+                "app_on_tui::render_content_paints_bottom_panel_problems_tab_via_shell_app",
+                || {
+                    assert!(
+                        driver.screen_has("Terminal"),
+                        "bottom panel should still paint the active Terminal tab; \
+                         screen:\n{}",
+                        driver.screen()
+                    );
+                    assert!(
+                        driver.screen_has("Problems"),
+                        "bottom panel tab strip should also offer a Problems tab; \
+                         screen:\n{}",
+                        driver.screen()
+                    );
+                },
+            );
+        }
+
         /// An **open but empty** quickfix list must reserve no rows — paint-
         /// only twin of `shell_app.rs`'s
         /// `empty_quickfix_does_not_displace_the_terminal_band_via_shell_app`:

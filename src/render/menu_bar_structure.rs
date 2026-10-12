@@ -424,6 +424,35 @@ pub fn debug_output_to_text_display(
     }
 }
 
+/// Build a one-line `TextDisplay` for a bottom-panel placeholder tab
+/// (Problems / Output) that has no content wired up yet.
+pub fn bottom_panel_placeholder_to_text_display(
+    widget_id: &str,
+    message: &str,
+) -> quadraui::TextDisplay {
+    quadraui::TextDisplay {
+        id: quadraui::WidgetId::new(widget_id),
+        lines: vec![quadraui::TextDisplayLine {
+            spans: vec![quadraui::StyledSpan {
+                text: format!("  {message}"),
+                fg: None,
+                bg: None,
+                bold: false,
+                italic: false,
+                underline: false,
+            }],
+            decoration: quadraui::Decoration::Normal,
+            timestamp: None,
+        }],
+        scroll_offset: 0,
+        auto_scroll: false,
+        max_lines: 0,
+        has_focus: false,
+        title: None,
+        show_scrollbar: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

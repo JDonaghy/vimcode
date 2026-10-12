@@ -672,12 +672,15 @@ impl Engine {
                     Action::Close
                 }
                 quadraui::TabBarHit::Tab(idx) => {
-                    let mut kinds = Vec::new();
-                    if self.terminal_open {
-                        kinds.push(BottomPanelKind::Terminal);
-                    }
+                    // Mirrors `build_bottom_panel_tab_bar`'s left-to-right
+                    // order exactly: Problems, Output, Debug Console,
+                    // Terminal. The two must stay in lockstep.
+                    let mut kinds = vec![BottomPanelKind::Problems, BottomPanelKind::Output];
                     if !self.dap_output_lines.is_empty() {
                         kinds.push(BottomPanelKind::DebugOutput);
+                    }
+                    if self.terminal_open {
+                        kinds.push(BottomPanelKind::Terminal);
                     }
                     kinds.get(idx).cloned().map_or(Action::None, Action::Switch)
                 }

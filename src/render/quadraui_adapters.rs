@@ -132,28 +132,50 @@ pub fn build_tab_bar_primitive(
     }
 }
 
-/// Build a `quadraui::TabBar` for the bottom panel tab switcher
-/// (Terminal / Debug Output). The close button (×) is a right segment.
-/// Tabs with `close_width: 0.0` suppress per-tab close glyphs.
+/// Build a `quadraui::TabBar` for the bottom panel tab switcher, in the same
+/// left-to-right order VS Code uses: Problems, Output, Debug Console,
+/// Terminal. Problems and Output are always present (placeholders — neither
+/// has content wired up yet); Debug Console / Terminal only appear once
+/// there is something to show. The close button (×) is a right segment,
+/// shared across whichever tab is active, not per-tab.
+///
+/// The tab order here is load-bearing: `Engine::handle_bottom_tab_bar_click`
+/// maps a clicked tab index back to a `BottomPanelKind` by rebuilding this
+/// same sequence, so the two must stay in lockstep.
 pub fn build_bottom_panel_tab_bar(
     active: &BottomPanelKind,
     has_terminal: bool,
     has_debug_output: bool,
 ) -> quadraui::TabBar {
-    let mut tabs = Vec::new();
-    if has_terminal {
+    let mut tabs = vec![
+        quadraui::TabItem {
+            label: "Problems".to_string(),
+            is_active: *active == BottomPanelKind::Problems,
+            is_dirty: false,
+            is_preview: false,
+            is_closable: false,
+        },
+        quadraui::TabItem {
+            label: "Output".to_string(),
+            is_active: *active == BottomPanelKind::Output,
+            is_dirty: false,
+            is_preview: false,
+            is_closable: false,
+        },
+    ];
+    if has_debug_output {
         tabs.push(quadraui::TabItem {
-            label: "Terminal".to_string(),
-            is_active: *active == BottomPanelKind::Terminal,
+            label: "Debug Console".to_string(),
+            is_active: *active == BottomPanelKind::DebugOutput,
             is_dirty: false,
             is_preview: false,
             is_closable: true,
         });
     }
-    if has_debug_output {
+    if has_terminal {
         tabs.push(quadraui::TabItem {
-            label: "Debug Output".to_string(),
-            is_active: *active == BottomPanelKind::DebugOutput,
+            label: "Terminal".to_string(),
+            is_active: *active == BottomPanelKind::Terminal,
             is_dirty: false,
             is_preview: false,
             is_closable: true,

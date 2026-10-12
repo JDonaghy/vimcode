@@ -873,6 +873,34 @@ pub fn paint_bottom_panel_rung(
                     scrollbar,
                 });
         }
+        BottomPanelKind::Problems => {
+            if content_h <= 0.0 {
+                return;
+            }
+            // Placeholder content only — no diagnostics are wired up yet.
+            // Shares the debug-output arm's one-row-below-the-tab-strip
+            // geometry below since it carries no toolbar row either.
+            let body =
+                quadraui::Rect::new(rect.x, rect.y + lh, rect.width, (rect.height - lh).max(0.0));
+            let td = bottom_panel_placeholder_to_text_display(
+                "problems_panel",
+                "No problems have been detected in the workspace.",
+            );
+            b.draw_text_display(body, &td);
+        }
+        BottomPanelKind::Output => {
+            if content_h <= 0.0 {
+                return;
+            }
+            // Placeholder content only — no output channel is wired up yet.
+            let body =
+                quadraui::Rect::new(rect.x, rect.y + lh, rect.width, (rect.height - lh).max(0.0));
+            let td = bottom_panel_placeholder_to_text_display(
+                "output_panel",
+                "No output channels are available yet.",
+            );
+            b.draw_text_display(body, &td);
+        }
         BottomPanelKind::DebugOutput => {
             if content_h <= 0.0 {
                 return;
