@@ -256,6 +256,7 @@ impl App {
         let mut b = backend_rc.borrow_mut();
         quadraui::Backend::set_current_line_height(&mut **b, metrics.0 as f32);
         quadraui::Backend::set_current_char_width(&mut **b, metrics.1 as f32);
+        b.set_ui_font(&crate::app_support::UI_FONT());
         let tree_event = {
             let mut engine = self.engine.borrow_mut();
             render::route_explorer_tree_event(&mut engine, &ev, rect, metrics, &theme, &mut **b)
