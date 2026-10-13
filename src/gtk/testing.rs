@@ -3624,6 +3624,98 @@ mod tests {
         );
     }
 
+    /// `Explorer`/`Run and Debug`/`Source Control`/`Extensions` must paint
+    /// their new Font Awesome glyphs (`icons::EXPLORER`/`RUN_AND_DEBUG`/
+    /// `SOURCE_CONTROL`/`EXTENSIONS`), not the `nf-cod-*` Codicon-shaped
+    /// glyphs those constants held before the Nerd Font family swap.
+    /// Mirrors `activity_bar_search_icon_paints_the_shared_glyph_not_the_deleted_cod_variant`
+    /// (render the same app twice, diff the activity-bar column) but covers
+    /// the four chrome icons that moved to Font Awesome, by panel id.
+    #[test]
+    fn activity_bar_chrome_icons_paint_font_awesome_glyphs_not_the_deleted_nf_cod_variants() {
+        /// Comfortably inside the activity bar and below the title-bar band.
+        /// Starts higher than the search-icon test above's `100` because
+        /// Explorer is the topmost activity-bar icon (paints at y≈70, above
+        /// Search's row) rather than below it.
+        const STRIP_W: i32 = 40;
+        const STRIP_Y: std::ops::Range<i32> = 50..800;
+
+        fn activity_bar_strip(panel_id: &str, icon_override: Option<&str>) -> Vec<(u8, u8, u8)> {
+            // Same reasoning as the search-icon test's helper: patch
+            // `build_shell_config`'s output by hand between build and
+            // render, and acquire the paint/cwd guards in the same order
+            // (paint then cwd) so they drop last, after `driver`.
+            let _paint = crate::test_paint::PaintGuard::acquire();
+            let _cwd = crate::test_cwd::CwdReadGuard::acquire();
+            let mut engine = Engine::new();
+            engine.settings.use_nerd_fonts = Some(true);
+            let engine = Rc::new(RefCell::new(engine));
+            let app = App::new_headless(Rc::clone(&engine));
+            let mut config = crate::gtk::build_shell_config(&app);
+            if let Some(icon) = icon_override {
+                let panel = config
+                    .panels
+                    .iter_mut()
+                    .find(|p| p.id.as_str() == panel_id)
+                    .unwrap_or_else(|| panic!("fixture: shell_config must register {panel_id}"));
+                panel.icon = icon.to_string();
+            }
+            let mut driver = driver_with_shell(app, config, 1400, 900);
+            let mut px = Vec::new();
+            for y in STRIP_Y.step_by(2) {
+                for x in (0..STRIP_W).step_by(2) {
+                    px.push(driver.pixel(x, y));
+                }
+            }
+            px
+        }
+
+        // (panel id, the deleted nf-cod-* codepoint this constant held before
+        // its Font Awesome swap, label for the assertion message).
+        const CASES: &[(&str, &str, &str)] = &[
+            ("panel:explorer", "\u{eaf0}", "nf-cod-files (EXPLORER)"),
+            (
+                "panel:debug",
+                "\u{eb91}",
+                "nf-cod-debug_alt (RUN_AND_DEBUG)",
+            ),
+            (
+                "panel:git",
+                "\u{ea68}",
+                "nf-cod-source_control (SOURCE_CONTROL)",
+            ),
+            (
+                "panel:extensions",
+                "\u{eae6}",
+                "nf-cod-extensions (EXTENSIONS)",
+            ),
+        ];
+
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        crate::icons::set_nerd_fonts(true);
+
+        for (panel_id, old_glyph, label) in CASES {
+            let current = activity_bar_strip(panel_id, None);
+            let reverted = activity_bar_strip(panel_id, Some(old_glyph));
+
+            let differing = current
+                .iter()
+                .zip(reverted.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert!(
+                differing > 0,
+                "{panel_id}'s live rendering must differ from the deleted \
+                 {label} glyph it painted before its Font Awesome swap — \
+                 {differing}/{} sampled pixels differed; a revert of the \
+                 Font Awesome swap would make these two renders identical",
+                current.len()
+            );
+        }
+
+        crate::icons::set_nerd_fonts(prev_nf);
+    }
+
     /// The activity bar paints, top to bottom: Explorer · Search ·
     /// Source Control · Run and Debug · Extensions.
     ///
