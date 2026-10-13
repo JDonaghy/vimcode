@@ -4742,6 +4742,157 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+        /// The quick-open preview pane must run the selected file's text
+        /// through the same syntax-highlighting pipeline as the main
+        /// editor, not paint it as one uniform color. `picker_populate_files`
+        /// -> `picker_load_preview` -> `syntax_highlights_for_path` feeds
+        /// `PickerPreview::highlights` from the real tree-sitter grammar for
+        /// `.rs`, and `picker_panel_to_palette` turns each highlighted byte
+        /// range into its own `StyledSpan::with_fg(..., theme.scope_color(..))`
+        /// — so a string-literal token's cell must carry a different `fg`
+        /// than a plain, unstyled cell elsewhere on screen (the picker's own
+        /// file-name entry, built with `StyledText::plain`).
+        ///
+        /// Confirmed red against the unfixed preview rendering, which built
+        /// every preview line with `StyledText::plain` regardless of
+        /// `highlights`: both cells then shared the same fallback
+        /// `theme.surface_fg`, so this `assert_ne!` failed.
+        #[test]
+        fn quick_open_preview_pane_syntax_highlights_source_text_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "vc1926_synhi_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            std::fs::write(
+                dir.join("hello.rs"),
+                b"fn main() {\n    let s = \"ZQX_MARK\";\n}\n",
+            )
+            .unwrap();
+            // The popup's height tracks the result count, and the preview
+            // pane is only as tall as the list beside it — so the fixture
+            // needs enough entries for the marker on the file's second line
+            // to be painted. `hello.rs` sorts first, so it stays selected
+            // and its preview is the one shown.
+            for i in 0..6 {
+                std::fs::write(dir.join(format!("zpad{i}.txt")), b"pad\n").unwrap();
+            }
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.open_picker(crate::core::engine::PickerSource::Files);
+            let h = harness(engine);
+            let driver = &h.driver;
+
+            let marker_bounds = driver.find_bounds("ZQX_MARK").unwrap_or_else(|| {
+                panic!(
+                    "preview pane must show the string literal's text; screen:\n{}",
+                    driver.screen()
+                )
+            });
+            let item_bounds = driver.find_bounds("hello.rs").unwrap_or_else(|| {
+                panic!(
+                    "picker list must show the plain file-name entry; screen:\n{}",
+                    driver.screen()
+                )
+            });
+
+            let marker_style = driver
+                .style_at(marker_bounds.x as u16, marker_bounds.y as u16)
+                .expect("marker cell must be on screen");
+            let item_style = driver
+                .style_at(item_bounds.x as u16, item_bounds.y as u16)
+                .expect("item cell must be on screen");
+
+            assert_ne!(
+                marker_style.fg,
+                item_style.fg,
+                "preview pane's string-literal token must render in a \
+                 different color than the plain, unstyled file-name entry \
+                 — got the same fg ({:?}) for both, meaning the preview \
+                 text is still painted as one uniform color; screen:\n{}",
+                marker_style.fg,
+                driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `picker_panel_to_palette` must not duplicate preview text when a
+        /// line's tree-sitter captures overlap or coincide byte-for-byte —
+        /// which is the common case for a method call (`@property` and
+        /// `@method.call` both matching the same `field_identifier`) or an
+        /// escape sequence inside a string literal (`@escape` nesting inside
+        /// `@string`). A per-line builder that pushes a colored span for
+        /// every highlight entry unconditionally (instead of resolving each
+        /// byte to at most one scope) re-emits the overlapped text, so the
+        /// rendered line grows longer than the source line and later
+        /// characters shift off past where they belong.
+        ///
+        /// Confirmed red against the unfixed sequential-cursor builder: the
+        /// `push_str` call's `_str` suffix and the escape sequence's
+        /// characters were re-emitted into the rendered row, so the painted
+        /// line no longer matched the source line byte-for-byte and
+        /// `push_str` appeared twice.
+        #[test]
+        fn quick_open_preview_pane_does_not_duplicate_overlapping_highlight_text() {
+            let dir = std::env::temp_dir().join(format!(
+                "vc1926_synhi_overlap_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            // The second line packs both overlap shapes into one short row
+            // that fits the narrow preview pane: `push_str` is a method call
+            // through a field expression, so its `field_identifier` is
+            // captured by both `@property` and `@method.call` over identical
+            // byte ranges, and the `\n` escape nests inside the `@string`
+            // capture that spans it.
+            std::fs::write(
+                dir.join("hello.rs"),
+                b"fn f(s: &mut String) {\ns.push_str(\"a\\nEM\");\n}\n",
+            )
+            .unwrap();
+            // Pad the result list so the popup is tall enough to paint the
+            // second preview line. `hello.rs` sorts first and stays selected.
+            for i in 0..6 {
+                std::fs::write(dir.join(format!("zpad{i}.txt")), b"pad\n").unwrap();
+            }
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.open_picker(crate::core::engine::PickerSource::Files);
+            let h = harness(engine);
+            let driver = &h.driver;
+
+            let screen = driver.screen();
+            let call_line = screen
+                .lines()
+                .find(|l| l.contains("push_str"))
+                .unwrap_or_else(|| {
+                    panic!("preview must show the method-call line; screen:\n{screen}")
+                });
+            assert!(
+                call_line.contains("s.push_str(\"a\\nEM\");"),
+                "overlapping @property/@method.call captures on the same \
+                 `push_str` field identifier, and the nested @escape inside \
+                 the @string capture, must not duplicate any of the line's \
+                 text — got:\n{call_line}\nfull screen:\n{screen}"
+            );
+            assert_eq!(
+                call_line.matches("push_str").count(),
+                1,
+                "`push_str` must appear exactly once in its preview row, not \
+                 duplicated by overlapping highlight spans; got:\n{call_line}\n\
+                 full screen:\n{screen}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

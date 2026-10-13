@@ -37,6 +37,12 @@ pub struct PickerPanel {
     /// Preview lines: (1-based line number, text, is_highlighted).
     /// When `Some`, the picker is rendered in two-pane mode.
     pub preview: Option<Vec<(usize, String, bool)>>,
+    /// Syntax-highlight spans for each line in `preview`, parallel by
+    /// index: `preview_highlights[i]` lists `(start_byte, end_byte, scope)`
+    /// triples relative to `preview[i]`'s own text, from the same
+    /// tree-sitter pipeline the main editor uses. Empty when `preview` is
+    /// `None` or a line's language isn't recognised.
+    pub preview_highlights: Vec<Vec<(usize, usize, String)>>,
     /// Scroll offset for the preview pane.
     pub preview_scroll: usize,
 }

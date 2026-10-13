@@ -728,6 +728,7 @@ impl quadraui::ShellApp for App {
                             editor_viewport,
                             scrim_rect,
                             &(self.units.picker)(lh as f32),
+                            &theme,
                         );
                         // Hand the *painted* rect to the click/drag handlers.
                         self.picker_popup_rect.set(Some(rect));
