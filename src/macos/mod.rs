@@ -1237,10 +1237,7 @@ mod mac_driver_tests {
             let tree_rect = engine_rc.borrow().explorer_tree_rect.get();
             eprintln!(
                 "[diag:explorer_tree_rect] x={:.4} y={:.4} w={:.4} h={:.4}",
-                tree_rect.x,
-                tree_rect.y,
-                tree_rect.width,
-                tree_rect.height,
+                tree_rect.x, tree_rect.y, tree_rect.width, tree_rect.height,
             );
             // Dump all text runs to see the row y positions
             for (i, run) in runs.iter().enumerate() {
