@@ -3624,27 +3624,17 @@ mod tests {
         );
     }
 
-    /// VS Code's activity bar paints, top to bottom, Explorer ·
-    /// Search · Source Control · Run and Debug · Extensions — vimcode had
-    /// Source Control and Run and Debug swapped (debug third, git fourth)
-    /// and the wrong glyphs for three of the five (an open-folder icon for
-    /// Explorer, the plain `fa-bug` glyph for Run and Debug, and the
-    /// diamond-shaped `nf-dev-git`/`e702` glyph for Source Control).
+    /// The activity bar paints, top to bottom: Explorer · Search ·
+    /// Source Control · Run and Debug · Extensions.
     ///
     /// Reads real painted output, not `PanelDefinition` state: each
     /// assertion locates a glyph via `GtkDriver::find`, which only reports
     /// positions `GtkBackend::record_painted_text` recorded while actually
     /// rasterising a Pango layout this frame, then checks the Y-coordinates
-    /// come back in top-to-bottom order. The icon glyphs doubling as search
-    /// needles (`icons::SOURCE_CONTROL`/`icons::RUN_AND_DEBUG`, nf-cod
-    /// `\u{ea68}`/`\u{eb91}`) are themselves new in this issue — on
-    /// unfixed `develop`, `App::resolve_builtin_panel_icon` never emits
-    /// either codepoint at all (`"panel:git"` painted the old `GIT_BRANCH`
-    /// diamond glyph, `"panel:debug"` painted the plain bug glyph), so
-    /// `find` returns `None` and the `expect` below panics before the
-    /// ordering check is even reached — verified by reverting
-    /// `src/app.rs`'s two changed match arms locally and re-running this
-    /// test, which failed exactly that way.
+    /// come back in top-to-bottom order. Locating by `icons::SOURCE_CONTROL`/
+    /// `icons::RUN_AND_DEBUG` (constant reference, not a literal codepoint)
+    /// keeps this test agnostic to which font family's glyph those
+    /// constants currently resolve to.
     #[test]
     fn activity_bar_paints_vscode_order_and_glyphs() {
         let mut engine = Engine::new();
@@ -3675,8 +3665,7 @@ mod tests {
         assert!(
             source_control_y < run_and_debug_y,
             "Source Control ({source_control_y}) must paint above Run and \
-             Debug ({run_and_debug_y}) — VS Code order, vimcode used to \
-             have these two swapped"
+             Debug ({run_and_debug_y})"
         );
         assert!(
             run_and_debug_y < extensions_y,
