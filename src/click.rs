@@ -173,7 +173,7 @@ pub(crate) fn pixel_to_click_target(
                 engine.activate_window(press.window_id);
             }
             drag.begin(quadraui::DragTarget::ScrollbarY {
-                widget: render_mod::minimap_drag_widget(press.window_id),
+                widget: render_mod::minimap_drag_widget(press.window_id, press.base),
                 track_start: press.track_start,
                 track_length: press.track_length,
                 thumb_length: press.thumb_length,

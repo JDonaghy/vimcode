@@ -886,10 +886,14 @@ mod mouse_drag_router_tests {
         );
     }
 
-    /// `minimap:<window_id>` — armed by `minimap_press` on a strip
-    /// press — must move the *named window's* `scroll_top`, mirroring
-    /// `editor:v_sb:<window_id>`. Asserted on the window's own scroll
-    /// position, not just the table having an arm for the id.
+    /// `minimap:<window_id>:<base>` — armed by `minimap_press` on a
+    /// strip press — must move the *named window's* `scroll_top` to
+    /// `base + new_offset`, mirroring `editor:v_sb:<window_id>` except for
+    /// the trailing `base` fine-mode geometry resolves `new_offset`
+    /// relative to (see `minimap::fine_seek_geometry`). Asserted on the
+    /// window's own scroll position, not just the table having an arm for
+    /// the id. A non-zero `base` proves the rung adds it back rather than
+    /// applying `new_offset` as if it were already absolute.
     #[test]
     fn a_minimap_scrollbar_offset_moves_the_named_windows_scroll_top() {
         let mut engine = drag_engine();
@@ -897,15 +901,16 @@ mod mouse_drag_router_tests {
         assert_eq!(engine.windows.get(&win).unwrap().view.scroll_top, 0);
         assert!(apply_scroll_offset(
             &mut engine,
-            &format!("minimap:{}", win.0),
+            &format!("minimap:{}:{}", win.0, 50),
             123,
             ScrollApplyContext::default()
         ));
         assert_eq!(
             engine.windows.get(&win).unwrap().view.scroll_top,
-            123,
-            "applying a `minimap:<window_id>` offset must move that \
-             window's scroll_top, whichever backend's drag emitted it"
+            173,
+            "applying a `minimap:<window_id>:<base>` offset must move that \
+             window's scroll_top to base + new_offset, whichever backend's \
+             drag emitted it"
         );
     }
 }

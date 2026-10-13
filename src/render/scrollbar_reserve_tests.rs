@@ -357,12 +357,15 @@ fn minimap_press_returns_none_outside_the_strip() {
 /// Fixture for the [`fine_seek_geometry`] unit tests: a synthetic painted
 /// window (`base` 1000, `span` 401 — deliberately not a round multiple of
 /// the strip's height to avoid accidental correctness) inside a distinct
-/// `bounds`/`max_scroll` pair.
+/// `bounds`/`max_scroll` pair. `viewport_lines` is 1, so the window's own
+/// local scroll ceiling (`span - viewport_lines`) is 400 — comfortably
+/// under the fixture's whole-file `max_scroll` (40,000), which only acts
+/// as a defensive cap and plays no other role in these tests.
 ///
 /// The returned `thumb_length` is a non-zero stand-in for the real,
 /// already-painted `viewport_highlight.height` — it is threaded through
 /// unmodified into `track_length` and neither test depends on its value.
-fn fine_geometry_fixture() -> (quadraui::Rect, quadraui::Minimap, usize, f32) {
+fn fine_geometry_fixture() -> (quadraui::Rect, quadraui::Minimap, usize, usize, f32) {
     let bounds = quadraui::Rect::new(0.0, 10.0, 5.0, 20.0); // S0 = 10, Sh = 20
     let minimap = quadraui::Minimap {
         id: quadraui::WidgetId::new("mm"),
@@ -381,9 +384,10 @@ fn fine_geometry_fixture() -> (quadraui::Rect, quadraui::Minimap, usize, f32) {
         visible_row_count: 0,
         total_buffer_lines: 50_000,
     };
-    let max_scroll = 40_000; // M
+    let max_scroll = 40_000; // M, a defensive cap only
+    let viewport_lines = 1; // local ceiling = span - viewport_lines = 400
     let thumb_length = 1.5; // arbitrary; see doc comment above
-    (bounds, minimap, max_scroll, thumb_length)
+    (bounds, minimap, max_scroll, viewport_lines, thumb_length)
 }
 
 /// Drive a [`fine_seek_geometry`] result through the real,
@@ -426,100 +430,119 @@ fn dispatch_offset_at(
 /// `fine_seek_geometry`'s `grab_offset` is derived by requiring
 /// the mapping to be an **identity at the press point** — dispatching a
 /// drag-move at the exact pixel the press happened at, with no
-/// movement, must reproduce the current `scroll_top` exactly, not just
-/// "close to it". Picks a non-zero, non-round `scroll_top` so a formula
-/// that dropped the `(scroll_top / max_scroll) * effective_track` term
+/// movement, must reproduce the current `scroll_top` exactly (once its
+/// local result has `base` added back), not just "close to it". Picks a
+/// non-zero, non-round offset within the window so a formula that
+/// dropped the `(local_scroll / local_max) * effective_track` term
 /// (leaving `grab_offset` at, say, a hand-rolled `py - band.y`) would
 /// visibly miss.
 #[test]
 fn fine_seek_geometry_grab_offset_is_an_identity_at_the_press_point() {
-    let (bounds, minimap, max_scroll, fixture_thumb_length) = fine_geometry_fixture();
-    let scroll_top = 12_345;
+    let (bounds, minimap, max_scroll, viewport_lines, fixture_thumb_length) =
+        fine_geometry_fixture();
+    let base = minimap.lines.first().unwrap().line_idx;
+    let scroll_top = base + 234; // non-round local offset inside [0, local_max = 400]
     let py = 15.0; // inside [S0, S0 + Sh) = [10.0, 30.0)
 
-    let (track_start, track_length, thumb_length, grab_offset) = fine_seek_geometry(
-        &bounds,
-        &minimap,
-        max_scroll,
-        fixture_thumb_length,
-        scroll_top,
-        py,
-        true, // in_band: the identity derivation only applies here
-    )
-    .expect("span and max_scroll are both > 0 in the fixture");
+    let (track_start, track_length, thumb_length, grab_offset, local_max, returned_base) =
+        fine_seek_geometry(
+            &bounds,
+            &minimap,
+            max_scroll,
+            viewport_lines,
+            fixture_thumb_length,
+            scroll_top,
+            py,
+            true, // in_band: the identity derivation only applies here
+        )
+        .expect("span exceeds viewport_lines and max_scroll > 0 in the fixture");
+    assert_eq!(returned_base, base);
 
     let new_offset = dispatch_offset_at(
         track_start,
         track_length,
         thumb_length,
-        max_scroll,
+        local_max,
         grab_offset,
         py,
     );
     assert_eq!(
-        new_offset, scroll_top,
+        new_offset + base,
+        scroll_top,
         "dispatching at the exact press point (no movement) must \
-             reproduce the current scroll_top exactly — that is the \
-             identity `grab_offset` is solved for"
+             reproduce the current scroll_top exactly once base is added \
+             back — that is the identity `grab_offset` is solved for"
     );
 }
 
-/// The virtual track spans exactly the painted window — at the
-/// real strip's top (`y = S0`) the derived offset must be `base` (the
-/// painted window's first buffer line), and at the real strip's bottom
-/// (`y = S0 + Sh`) it must be `base + span` (one past its last line).
-/// A formula that fell back to (or leaked) the coarse, file-wide
-/// geometry would instead land near `0` and `max_scroll` respectively —
-/// visibly different from `base` (1000) and `base + span` (1401) here.
+/// The virtual track spans exactly the painted window's own *local*
+/// scroll ceiling — at the real strip's top (`y = S0`) the derived local
+/// offset must be `0` (absolute `base`, the painted window's first buffer
+/// line), and at the real strip's bottom (`y = S0 + Sh`) it must be
+/// `local_max = span - viewport_lines` (absolute `base + local_max`) — a
+/// literal, pixel-for-pixel sweep of the real strip's full height, not
+/// dampened by the whole file's size. A formula that used the whole
+/// file's `max_scroll` for `effective_track` (the bug this geometry
+/// fixes) would instead require dragging across only a small fraction of
+/// the strip to reach `local_max`, so the bottom endpoint would land well
+/// short of the strip's real bottom pixel.
 #[test]
-fn fine_seek_geometry_endpoints_span_exactly_the_painted_window() {
-    let (bounds, minimap, max_scroll, fixture_thumb_length) = fine_geometry_fixture();
+fn fine_seek_geometry_endpoints_span_exactly_the_local_window_ceiling() {
+    let (bounds, minimap, max_scroll, viewport_lines, fixture_thumb_length) =
+        fine_geometry_fixture();
     let base = minimap.lines.first().unwrap().line_idx;
     let span = minimap.lines.last().unwrap().line_idx + 1 - base;
+    let local_ceiling = span - viewport_lines;
 
     // `in_band: false` here only decides `grab_offset` (pinned to 0.0,
     // the track-click convention) — `track_start`/`track_length`/
     // `thumb_length` don't depend on it, so one call supplies the
     // geometry both endpoint checks below drive.
-    let (track_start, track_length, thumb_length, grab_offset) = fine_seek_geometry(
-        &bounds,
-        &minimap,
-        max_scroll,
-        fixture_thumb_length,
-        0,
-        bounds.y,
-        false,
-    )
-    .expect("span and max_scroll are both > 0 in the fixture");
+    let (track_start, track_length, thumb_length, grab_offset, local_max, returned_base) =
+        fine_seek_geometry(
+            &bounds,
+            &minimap,
+            max_scroll,
+            viewport_lines,
+            fixture_thumb_length,
+            0,
+            bounds.y,
+            false,
+        )
+        .expect("span exceeds viewport_lines and max_scroll > 0 in the fixture");
     assert_eq!(grab_offset, 0.0, "test setup: track press, not a band grab");
+    assert_eq!(local_max, local_ceiling);
+    assert_eq!(returned_base, base);
 
     let top_offset = dispatch_offset_at(
         track_start,
         track_length,
         thumb_length,
-        max_scroll,
+        local_max,
         grab_offset,
         bounds.y,
     );
     assert_eq!(
-        top_offset, base,
+        top_offset, 0,
         "the virtual track's own top (y = S0) must resolve to the \
-             painted window's first buffer line ({base})"
+             painted window's own first local offset (absolute {base})"
     );
 
     let bottom_offset = dispatch_offset_at(
         track_start,
         track_length,
         thumb_length,
-        max_scroll,
+        local_max,
         grab_offset,
         bounds.y + bounds.height,
     );
     assert_eq!(
-        bottom_offset,
-        base + span,
+        bottom_offset, local_ceiling,
         "the virtual track's own bottom (y = S0 + Sh) must resolve to \
-             one past the painted window's last buffer line ({base} + {span})"
+             the painted window's own local scroll ceiling \
+             ({local_ceiling}, absolute {base} + {local_ceiling}) — a \
+             full-strip drag covering the whole local window, not just a \
+             fraction of it"
     );
 }
 
