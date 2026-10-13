@@ -1210,6 +1210,13 @@ mod mac_driver_tests {
             driver.painted_texts()
         );
 
+        // The AppShell's sidebar geometry can shift between the
+        // construction frame and steady state (sidebar width settles on
+        // the second frame). One tick lets the layout converge so the
+        // sweep's absolute click positions stay within the same row
+        // across subsequent renders.
+        driver.tick();
+
         crate::harness::sweep_hit_band_integrity(&mut driver, "src", 5, |d| {
             ConformanceDriver::inventory(d).screen_has("core")
         });
