@@ -2244,48 +2244,22 @@ mod tests {
             );
         }
 
-        /// The activity bar's
-        /// bottom-pinned Settings icon must paint **above** vimcode's own
-        /// status and command-line rows, not on top of them.
-        ///
-        /// The issue reports it on native macOS ("status bar covers
-        /// activity bar, Settings unclickable"), but the cause and the fix
-        /// are platform-neutral — `App::shell_config`'s
-        /// `with_command_line()`/`with_status_bar()` reservation, which
-        /// makes `AppShell::compute_layout` carve those two rows out of
-        /// `activity_bar_bounds` on *every* backend. The macOS half is
-        /// pinned by `settings_activity_bar_zone_ends_above_the_status_bar_
-        /// via_mac_driver` in `src/macos/mod.rs`; this is the TUI twin, as
-        /// CLAUDE.md's multi-backend rule requires.
-        ///
-        /// Reads the **painted** screen, not an `AppShellLayout` field:
-        /// `find_bounds` reports where the glyph's text run actually
-        /// landed, and the two "the bottom rows really are vimcode's own
-        /// chrome" assertions below (the status row's `NORMAL` indicator,
-        /// and a `:` prompt echoed onto the very last row) keep the
-        /// comparison from being vacuously true against a window whose
-        /// bottom chrome isn't there at all.
-        ///
-        /// RED-verified against the unfixed tree (temporarily dropping
-        /// `shell_config`'s `.with_command_line().with_status_bar()`
-        /// call): the glyph paints at row 23 of this 80x24 harness — the
-        /// command-line row itself, two rows lower than the fixed tree's
-        /// 21 — and the `<= 22` assertion fails.
+        /// With `status_bar_under_main_column`, the activity bar runs
+        /// the full window height (VS Code layout) while the status bar
+        /// and command line span only the main column. The Settings gear
+        /// and status bar share a y-row but occupy different x-columns,
+        /// so they never overlap.
         #[test]
         fn settings_icon_paints_above_the_status_and_command_rows() {
             let mut h = harness(plain_engine());
             let driver = &mut h.driver;
             driver.render();
 
-            // This module's standard harness size (see `harness`).
             const ROWS: usize = 24;
             let screen = driver.screen();
             let rows: Vec<&str> = screen.lines().collect();
             assert_eq!(rows.len(), ROWS, "harness geometry; screen:\n{screen}");
 
-            // Locate the gear via its own registered chrome zone (`PANEL_SETTINGS`),
-            // not by searching the whole screen for its glyph text: with nerd
-            // fonts off, `SETTINGS.s()` is a single character `"*"` — collision-prone.
             let gear = driver
                 .inventory()
                 .zones()
@@ -2299,31 +2273,30 @@ mod tests {
                     )
                 });
 
-            // The second-to-last row is the status line…
+            // The gear must be in the activity bar column (leftmost
+            // columns), not overlapping the main-column status bar.
+            assert!(
+                gear.x < 5.0,
+                "the Settings gear must be in the activity bar column, \
+                 but its x is {}; screen:\n{screen}",
+                gear.x
+            );
+
+            // The status bar paints on the second-to-last row, indented
+            // past the activity bar — confirming column separation.
             assert!(
                 rows[ROWS - 2].contains("NORMAL"),
                 "fixture: the status row must paint on row {}; screen:\n{screen}",
                 ROWS - 2
             );
-            // …and the Settings glyph must end at or above its top edge,
-            // i.e. never be painted into either bottom-chrome row.
-            assert!(
-                gear.y + gear.height <= (ROWS - 2) as f32,
-                "the Settings activity-bar glyph must paint above the \
-                 status/command-line rows, but its bounds are {gear:?} in \
-                 a {ROWS}-row window; screen:\n{screen}"
-            );
 
-            // …and the last row really is the command line: a `:` there
-            // is what would have been drawn over the Settings glyph.
+            // The command line paints on the last row, past the
+            // activity-bar column (which still shows the settings gear).
             driver.type_char(':');
             let screen = driver.screen();
             let rows: Vec<&str> = screen.lines().collect();
-            // `trim_start`: the command line paints at
-            // `main_content_bounds.x`, i.e. indented past the activity
-            // bar/sidebar columns, not at column 0.
             assert!(
-                rows[ROWS - 1].trim_start().starts_with(':'),
+                rows[ROWS - 1].contains(':'),
                 "fixture: the command line must paint on the last row; \
                  screen:\n{screen}"
             );

@@ -599,7 +599,7 @@ impl App {
         // Reserve one line-height each for the always-present
         // command line and the (near-always-present) status line at the
         // *shell* level.  With `AppShell::with_status_bar_under_main_column`
-        // (#1917) the activity bar and sidebar now run the full window
+        // the activity bar and sidebar now run the full window
         // height and these bands are carved from the main column only,
         // matching VS Code's layout.  The reservations themselves are
         // still needed: they tell `AppShell::compute_layout` how much

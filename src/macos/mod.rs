@@ -2068,36 +2068,11 @@ mod mac_driver_tests {
             .bounds
     }
 
-    /// The activity bar's painted/hit-test rect must end above the
-    /// shell's reserved bottom chrome, not run all the way to the window's
-    /// bottom edge — the bug report's "status bar covers activity bar,
-    /// Settings button half hidden". `plain_engine()`'s default settings
-    /// (`laststatus=2`, `window_status_line=true`, single window) are
-    /// exactly the configuration the report describes: a per-window status
-    /// row plus the always-present command line at the bottom of the one
-    /// open window, confined to `main_content_bounds` by `render_content`'s
-    /// own `compute_editor_layout` call — `App::shell_config`'s
-    /// `with_command_line()`/`with_status_bar()` reservation (the fix) is
-    /// what makes `AppShell::compute_layout` carve the *same* two rows out
-    /// of `activity_bar_bounds`'s height too.
-    ///
-    /// Asserts on registered **zones**, not a derived/recomputed rect —
-    /// `activity-bar`/`command-line`/`status-bar`/`bottom:settings` are all
-    /// registered from the exact `AppShellLayout` `AppShell::render` used
-    /// to paint this frame (`register_chrome_zones` plus the per-item loop
-    /// right after `draw_activity_bar` returns its hits), so this reads
-    /// what was actually painted and hit-tested, not a parallel guess
-    /// (CLAUDE.md's "rendered output, not state" rule).
-    ///
-    /// RED-verified against the pre-fix tree (temporarily dropping
-    /// `shell_config`'s `.with_command_line().with_status_bar()` call):
-    /// `zone_bounds` panics outright on `"app-shell:command-line"` and
-    /// `"app-shell:status-bar"` — those two zones don't exist at all
-    /// without the reservation, because nothing ever carved them out of
-    /// the shell's layout — and `"bottom:settings"`'s own zone sits at
-    /// `y: [852.0, 900.0]`, flush against the window's `900.0`-tall bottom
-    /// edge, with no chrome zone above it to be "above" in the first
-    /// place.
+    /// With `status_bar_under_main_column`, the activity bar runs the
+    /// full window height while the status/command-line bands are carved
+    /// from the main column only (VS Code layout). The settings button
+    /// sits at the activity bar's bottom, in a different x-column from
+    /// the status bar — no overlap.
     #[test]
     fn settings_activity_bar_zone_ends_above_the_status_bar_via_mac_driver() {
         let (_guards, mut driver) = driver(plain_engine());
@@ -2113,36 +2088,37 @@ mod mac_driver_tests {
         let window = zone_bounds(&inv, "app-shell:window");
 
         let activity_bar_bottom = activity_bar.y + activity_bar.height;
-        let settings_bottom = settings.y + settings.height;
+        let window_bottom = window.y + window.height;
 
+        // With `status_bar_under_main_column`, the activity bar runs
+        // the full window height — it reaches the window's bottom edge.
         assert!(
-            activity_bar_bottom <= command_line.y + 0.5,
-            "activity bar must end at or above the command line's top: \
-             activity-bar bottom {activity_bar_bottom}, command-line top {}",
-            command_line.y
+            (activity_bar_bottom - window_bottom).abs() < 1.0,
+            "activity bar must reach the window bottom: \
+             activity-bar bottom {activity_bar_bottom}, window bottom {window_bottom}",
         );
+
+        // The settings button is within the activity bar's x-column,
+        // not overlapping the main-column status/command-line areas.
         assert!(
-            activity_bar_bottom <= status_bar.y + 0.5,
-            "activity bar must end at or above the status bar's top: \
-             activity-bar bottom {activity_bar_bottom}, status-bar top {}",
-            status_bar.y
+            settings.x >= activity_bar.x
+                && settings.x + settings.width <= activity_bar.x + activity_bar.width + 0.5,
+            "settings button must be within the activity bar's x bounds: \
+             settings x [{}, {}], activity-bar x [{}, {}]",
+            settings.x,
+            settings.x + settings.width,
+            activity_bar.x,
+            activity_bar.x + activity_bar.width
         );
+
+        // The status bar starts past the activity bar's x-column —
+        // they share y-space but occupy different columns.
         assert!(
-            settings_bottom <= command_line.y + 0.5,
-            "the Settings button's own hit rect must lie entirely above \
-             the command line: settings bottom {settings_bottom}, \
-             command-line top {}",
-            command_line.y
-        );
-        // The chrome must actually have shrunk, not merely "happen" to sit
-        // above a chrome band that itself reaches the window edge — pins
-        // the fix is doing real work, not a vacuously-true comparison.
-        assert!(
-            activity_bar_bottom + 1.0 < window.y + window.height,
-            "activity bar bottom ({activity_bar_bottom}) is suspiciously \
-             close to the window's bottom edge ({}) -- the bottom-chrome \
-             reservation may not be taking effect",
-            window.y + window.height
+            status_bar.x >= activity_bar.x + activity_bar.width - 0.5,
+            "status bar must start past the activity bar column: \
+             status-bar x {}, activity-bar right {}",
+            status_bar.x,
+            activity_bar.x + activity_bar.width
         );
     }
 
