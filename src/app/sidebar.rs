@@ -258,6 +258,12 @@ impl App {
         let metrics = self.cached_explorer_metrics.get();
         quadraui::Backend::set_current_line_height(backend, metrics.0 as f32);
         quadraui::Backend::set_current_char_width(backend, metrics.1 as f32);
+        // CI diagnostic — remove after #1917 is green
+        eprintln!(
+            "[diag:click] chrome_line_height={:.2}, rect=({:.1},{:.1},{:.1},{:.1})",
+            quadraui::Backend::chrome_line_height(&*backend),
+            rect.x, rect.y, rect.width, rect.height,
+        );
         let tree_event = {
             let mut engine = self.engine.borrow_mut();
             render::route_explorer_tree_event(&mut engine, &ev, rect, metrics, &theme, backend)

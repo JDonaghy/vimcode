@@ -1217,6 +1217,21 @@ mod mac_driver_tests {
         // across subsequent renders.
         driver.tick();
 
+        // ── CI diagnostic — remove after #1917 is green ──────────
+        {
+            let clh = quadraui::Backend::chrome_line_height(driver.backend());
+            let bounds = ConformanceDriver::inventory(&driver)
+                .text_runs()
+                .iter()
+                .find(|r| r.text.contains("src"))
+                .map(|r| r.bounds);
+            eprintln!(
+                "[diag:explorer_hit_band] chrome_line_height={clh:.2}, \
+                 src_bounds={bounds:?}"
+            );
+        }
+        // ──────────────────────────────────────────────────────────
+
         crate::harness::sweep_hit_band_integrity(&mut driver, "src", 5, |d| {
             ConformanceDriver::inventory(d).screen_has("core")
         });
