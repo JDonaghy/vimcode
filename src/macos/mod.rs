@@ -1201,7 +1201,8 @@ mod mac_driver_tests {
         use quadraui::testing::ConformanceDriver;
 
         let dir = scratch_explorer_dir("scenario1", 6);
-        let (_guards, mut driver) = driver(engine_with_expanded_explorer(&dir));
+        let (_guards, engine_rc, mut driver) =
+            driver_with_engine(engine_with_expanded_explorer(&dir));
 
         assert!(
             driver.screen_contains("src") && driver.screen_contains("core"),
@@ -1220,20 +1221,51 @@ mod mac_driver_tests {
         // ── CI diagnostic — remove after #1917 is green ──────────
         {
             let clh = quadraui::Backend::chrome_line_height(driver.backend());
-            let bounds = ConformanceDriver::inventory(&driver)
-                .text_runs()
+            let inv = ConformanceDriver::inventory(&driver);
+            let runs = inv.text_runs().clone();
+            let src_bounds = runs
                 .iter()
                 .find(|r| r.text.contains("src"))
                 .map(|r| r.bounds);
+            let src_idx = runs.iter().position(|r| r.text.contains("src"));
             eprintln!(
-                "[diag:explorer_hit_band] chrome_line_height={clh:.2}, \
-                 src_bounds={bounds:?}"
+                "[diag:explorer_hit_band] chrome_line_height={clh:.4}, \
+                 item_height={:.4}, src_bounds={src_bounds:?}, src_idx={src_idx:?}",
+                (clh as f64 * 1.4_f64).round(),
             );
+            // Dump explorer_tree_rect to compare against text run positions
+            let tree_rect = engine_rc.borrow().explorer_tree_rect.get();
+            eprintln!(
+                "[diag:explorer_tree_rect] x={:.4} y={:.4} w={:.4} h={:.4}",
+                tree_rect.x,
+                tree_rect.y,
+                tree_rect.width,
+                tree_rect.height,
+            );
+            // Dump all text runs to see the row y positions
+            for (i, run) in runs.iter().enumerate() {
+                eprintln!(
+                    "[diag:run {i}] text={:?} y={:.4} h={:.4}",
+                    &run.text[..run.text.len().min(20)],
+                    run.bounds.y,
+                    run.bounds.height,
+                );
+            }
         }
         // ──────────────────────────────────────────────────────────
 
+        let probe_count = std::cell::Cell::new(0usize);
         crate::harness::sweep_hit_band_integrity(&mut driver, "src", 5, |d| {
-            ConformanceDriver::inventory(d).screen_has("core")
+            let n = probe_count.get();
+            probe_count.set(n + 1);
+            let rect = engine_rc.borrow().explorer_tree_rect.get();
+            let has_core = ConformanceDriver::inventory(d).screen_has("core");
+            eprintln!(
+                "[diag:sweep probe {n}] has_core={has_core}, \
+                 tree_rect.y={:.4}",
+                rect.y,
+            );
+            has_core
         });
 
         let _ = std::fs::remove_dir_all(&dir);

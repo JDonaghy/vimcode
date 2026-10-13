@@ -262,7 +262,10 @@ impl App {
         eprintln!(
             "[diag:click] chrome_line_height={:.2}, rect=({:.1},{:.1},{:.1},{:.1})",
             quadraui::Backend::chrome_line_height(&*backend),
-            rect.x, rect.y, rect.width, rect.height,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
         );
         let tree_event = {
             let mut engine = self.engine.borrow_mut();
