@@ -3980,6 +3980,14 @@ impl Engine {
         self.explorer_expanded.clear();
         self.explorer_expanded.insert(canonical.clone());
 
+        // Rebuild `explorer_rows` against the new root right away. Without
+        // this, the cache built by `Engine::new_from_state`'s startup-time
+        // `explorer_rebuild_rows()` call still reflects whatever directory
+        // the process happened to start in, and nothing else repaints the
+        // sidebar before the first frame — the Explorer shows that stale
+        // root until some other path (e.g. opening a file) rebuilds it.
+        self.explorer_rebuild_rows();
+
         // Update git branch
         self.git_branch = git::current_branch(&canonical);
 

@@ -1188,15 +1188,15 @@ mod tests {
     /// A wheel event must scroll the pane **under the pointer**, not whichever
     /// pane happens to hold focus.
     ///
-    /// This was dead on GTK after the #540 Relm4→ShellApp migration. Two
-    /// independent causes, both fixed alongside this test:
+    /// Two pieces of GTK state have to be live for that to work, and this
+    /// test covers both:
     ///
-    /// 1. `handle_mouse_scroll_msg` reads the pointer out of `App::last_editor_pointer`,
-    ///    which nothing assigned once the `EventControllerMotion` that used to
-    ///    write it was removed — so it was permanently `None`.
-    /// 2. The hovered-window lookup was gated on `App::drawing_area`, which is
-    ///    also never assigned under the ShellApp runner, and re-derived pane rects
-    ///    at a `(0, 0)` origin that ignores offsets.
+    /// 1. `handle_mouse_scroll_msg` reads the pointer out of
+    ///    `App::last_editor_pointer`, so something must keep that field
+    ///    populated under the ShellApp runner.
+    /// 2. The hovered-window lookup must not be gated on `App::drawing_area`,
+    ///    which the ShellApp runner never assigns, and must derive pane rects
+    ///    at the editor band's real origin rather than `(0, 0)`.
     ///
     /// Note the assertion that focus does *not* move: hovering must scroll
     /// without stealing focus.
@@ -13809,7 +13809,7 @@ mod app_icon {
             row.width > 0.0 && row.height > 0.0,
             "the menu row must have been laid out by the last frame; got {row:?}"
         );
-        // GTK never reports a non-empty `titlebar_control_inset` (#940), so its
+        // GTK never reports a non-empty `titlebar_control_inset`, so its
         // app icon always starts flush with the band's leading edge.
         crate::render::split_menu_row_for_app_icon(row, 0.0).0
     }
@@ -14148,6 +14148,75 @@ mod clipboard_paste {
         assert!(
             pw > 0.0 && ph > 0.0,
             "the painted picker popup must have a non-degenerate rect, got {pw}x{ph}"
+        );
+    }
+
+    /// The command palette's backdrop scrim must dim the editor band behind
+    /// it without touching the status bar, on GTK's real Cairo alpha-blend
+    /// compositing. `render::paint_picker_rung` is shared between both
+    /// backends, but `Backend::draw_solid_fill`'s actual pixel effect
+    /// differs enough between them (a true alpha blend here vs. a
+    /// destructive blank-glyph fill on TUI, which
+    /// `picker_open_leaves_status_bar_text_visible_via_shell_app` in
+    /// `src/tui_main/app_on_tui_tests.rs` covers) that this backend needs
+    /// its own black-box coverage of the same `scrim_rect` contract.
+    #[test]
+    fn opening_command_palette_dims_editor_without_touching_status_bar_via_gtk_driver() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        let mode_bounds = h
+            .driver
+            .find_bounds("NORMAL")
+            .expect("the mode badge must paint on the status bar's row");
+        let badge_mid = (
+            (mode_bounds.x + mode_bounds.width / 2.0) as i32,
+            (mode_bounds.y + mode_bounds.height / 2.0) as i32,
+        );
+        let status_colour_closed = h.driver.pixel(badge_mid.0, badge_mid.1);
+
+        h.driver.dispatch(UiEvent::Accelerator(
+            quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+            quadraui::Modifiers::default(),
+        ));
+        h.driver.render();
+
+        let (px, py, _pw, ph) = h
+            .picker_popup()
+            .expect("the command palette must actually paint, not just flip engine state");
+        // Just left of the popup's own left edge, vertically centred on it —
+        // inside the editor band `scrim_rect` covers, but outside the popup
+        // itself, so this samples the dimmed backdrop rather than the
+        // palette's own fill. Asserted rather than clamped: a popup flush
+        // against the window's left edge would leave no backdrop to sample
+        // there, which must read as "fix the probe", not as a silent pass.
+        let gap = 20.0;
+        assert!(
+            px > gap,
+            "this probe needs a strip of backdrop left of the popup to sample; \
+             the palette starts at x={px}, within {gap}px of the window edge"
+        );
+        let editor_probe = ((px - gap) as i32, (py + ph / 2.0) as i32);
+        let editor_colour_open = h.driver.pixel(editor_probe.0, editor_probe.1);
+        let status_colour_open = h.driver.pixel(badge_mid.0, badge_mid.1);
+
+        assert_eq!(
+            status_colour_open, status_colour_closed,
+            "FRAME_Z_ORDER composes StatusBar before UnifiedPicker, so the \
+             scrim's rect must stop above it — the mode badge's colour must \
+             not shift when the command palette opens"
+        );
+
+        h.engine.borrow_mut().close_picker();
+        h.driver.render();
+        let editor_colour_closed = h.driver.pixel(editor_probe.0, editor_probe.1);
+
+        assert_ne!(
+            editor_colour_open, editor_colour_closed,
+            "opening the command palette must actually dim the editor band \
+             behind it (MODAL_SCRIM_COLOR over scrim_rect), not leave it \
+             unchanged while only the status bar is protected"
         );
     }
 }
@@ -16344,6 +16413,69 @@ mod modal_rung {
             "the dismissed popup's title must be gone from the painted \
              surface, not just the cached rect cleared; painted: {:?}",
             h.driver.painted_texts()
+        );
+    }
+
+    /// The picker popup floats over the editor pane only: it must start to
+    /// the right of the sidebar and sit near the top of the window rather
+    /// than spanning (or centering across) the full window height.
+    #[test]
+    fn picker_popup_floats_over_editor_pane_not_sidebar() {
+        let mut engine = small_engine();
+        engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+        let h = harness(engine, 1400, 900);
+
+        let sb = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("the sidebar paints by default and must publish its bounds");
+        let (px, py, _pw, ph) = h
+            .picker_popup()
+            .expect("fixture must actually paint the picker");
+
+        assert!(
+            px >= (sb.x + sb.width) as f64,
+            "the popup's left edge ({px}) must start at or right of the \
+             sidebar's right edge ({}, {}), not overlap it",
+            sb.x,
+            sb.width
+        );
+        assert!(
+            ph < 900.0 * 0.5,
+            "a 2-item picker (LineEndings) must paint a compact popup, not \
+             one spanning most of the 900px-tall window; painted height: {ph}"
+        );
+        assert!(
+            py < 900.0 * 0.25,
+            "the popup must anchor near the top of the window ({py}), not \
+             be vertically centred across it"
+        );
+    }
+
+    /// A picker with many more results (the command palette) paints a
+    /// taller popup than a picker with just a couple of entries
+    /// (line endings) — height tracks the result count instead of being a
+    /// fixed share of the viewport.
+    #[test]
+    fn picker_popup_height_scales_with_item_count() {
+        let mut few_engine = small_engine();
+        few_engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+        let h_few = harness(few_engine, 1400, 900);
+        let (_, _, _, few_h) = h_few
+            .picker_popup()
+            .expect("the line-endings picker must paint");
+
+        let mut many_engine = small_engine();
+        many_engine.open_picker(crate::core::engine::PickerSource::Commands);
+        let h_many = harness(many_engine, 1400, 900);
+        let (_, _, _, many_h) = h_many
+            .picker_popup()
+            .expect("the command palette must paint");
+
+        assert!(
+            many_h > few_h,
+            "the command palette (many results) must paint a taller popup \
+             ({many_h}) than the line-endings picker (two results, {few_h})"
         );
     }
 }

@@ -1248,35 +1248,24 @@ impl App {
     /// guard (to decide if a drag started inside the popup).
     ///
     /// Prefers the rect the last frame **actually painted**
-    /// (`picker_popup_rect`), and only re-derives from `width`/`height` when
-    /// no frame has painted the picker yet.
-    ///
-    /// Re-deriving was wrong on two counts, and together they put the
-    /// hit rect in a different place than the pixels. `render_content` centres
-    /// the popup in `backend.viewport()` (the whole window) at
-    /// `self.units.picker`'s own sizing, whereas both callers here pass the
-    /// `width`/`height` of `ctx.layout.main_content_bounds` — the editor area
-    /// only, minus activity bar / sidebar / title bar — anchored at `(0, 0)`,
-    /// and a `line_h: 1.0, header_h: 0.0` sizing. So with any shell chrome
-    /// present the modal rect pushed onto the `ModalStack` was both offset and
-    /// differently sized from the visible popup: clicks on the painted
-    /// dropdown either missed the modal entirely or resolved to the wrong
-    /// result row. That is what made the breadcrumb dropdown look inert once
-    /// it finally started painting.
-    pub(crate) fn compute_picker_popup_bounds(&self, width: f64, height: f64) -> quadraui::Rect {
+    /// (`picker_popup_rect`), and only re-derives from `viewport` when no
+    /// frame has painted the picker yet. `viewport` must be the same
+    /// editor-pane rect `render_content` paints the popup into, so the hit
+    /// rect pushed onto the `ModalStack` lands exactly where the pixels are.
+    pub(crate) fn compute_picker_popup_bounds(&self, viewport: quadraui::Rect) -> quadraui::Rect {
         if let Some(rect) = self.picker_popup_rect.get() {
             return rect;
         }
         let engine = self.engine.borrow();
         let has_preview = engine.picker_preview.is_some();
+        let item_count = engine.picker_items.len();
         drop(engine);
         let sizing = render::PickerSizing {
             header_h: 0.0,
             line_h: 1.0,
             ..(self.units.picker)(1.0)
         };
-        let geo =
-            render::PickerGeometry::compute(width as f32, height as f32, has_preview, &sizing);
+        let geo = render::PickerGeometry::compute(viewport, item_count, has_preview, &sizing);
         quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h)
     }
 
@@ -1290,9 +1279,12 @@ impl App {
         backend: &dyn quadraui::Backend,
         x: f64,
         y: f64,
-        width: f64,
-        height: f64,
+        viewport: quadraui::Rect,
     ) {
+        // Unrelated drag arms below (terminal split/panel resize) clamp
+        // against the pane's plain width/height, not its origin.
+        let width = viewport.width as f64;
+        let height = viewport.height as f64;
         // Keep the picker's modal-stack entry fresh before anything hit-tests
         // the stack: the popup's size depends on `has_preview`, which can change
         // mid-picker.
@@ -1302,7 +1294,7 @@ impl App {
             let stack_rc = backend.modal_stack_handle();
             let mut stack = stack_rc.borrow_mut();
             if picker_open {
-                let rect = self.compute_picker_popup_bounds(width, height);
+                let rect = self.compute_picker_popup_bounds(viewport);
                 stack.push(picker_id, rect);
             } else {
                 stack.pop(&picker_id);
@@ -1379,10 +1371,13 @@ impl App {
                 );
                 let picker_visible_rows = if picker_open {
                     let lh = self.cached_line_height.max(1.0);
-                    let has_preview = self.engine.borrow().picker_preview.is_some();
+                    let engine = self.engine.borrow();
+                    let has_preview = engine.picker_preview.is_some();
+                    let item_count = engine.picker_items.len();
+                    drop(engine);
                     render::PickerGeometry::compute(
-                        width as f32,
-                        height as f32,
+                        viewport,
+                        item_count,
                         has_preview,
                         &(self.units.picker)(lh as f32),
                     )
@@ -1465,7 +1460,7 @@ impl App {
                         } else {
                             self.tab_drag.disarm();
                             self.draw_needed.set(true);
-                            self.handle_mouse_drag_msg(backend, x, y, width, height);
+                            self.handle_mouse_drag_msg(backend, x, y, viewport);
                             return;
                         }
                     }

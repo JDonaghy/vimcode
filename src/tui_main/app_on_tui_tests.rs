@@ -4012,6 +4012,144 @@ mod tests {
             );
         }
 
+        /// Opening the unified picker must darken the chrome behind it — a
+        /// corner cell outside the popup's own rect (top-left, where the
+        /// collapsed-sidebar tab bar paints) must switch to the dark scrim
+        /// background once the picker opens, and switch back once it's
+        /// dismissed. Without `paint_picker_rung`'s `draw_solid_fill` call
+        /// this cell's background never changes, so this test is red against
+        /// unfixed `develop`.
+        #[test]
+        fn picker_open_paints_a_backdrop_scrim_behind_it_via_shell_app() {
+            let engine = plain_engine();
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let before = driver
+                .style_at(0, 0)
+                .expect("top-left cell must be in bounds")
+                .bg;
+
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+                quadraui::Modifiers::default(),
+            ));
+
+            let scrim = crate::render::MODAL_SCRIM_COLOR;
+            let during = driver
+                .style_at(0, 0)
+                .expect("top-left cell must be in bounds")
+                .bg;
+            assert_eq!(
+                during,
+                ratatui::style::Color::Rgb(scrim.r, scrim.g, scrim.b),
+                "opening the command palette must dim the top-left corner cell \
+                 behind it to the scrim colour; screen:\n{}",
+                driver.screen()
+            );
+            assert_ne!(
+                before, during,
+                "the scrim must actually change the corner cell's background, \
+                 not merely repaint the same colour"
+            );
+
+            driver.press_named(quadraui::NamedKey::Escape);
+            let after = driver
+                .style_at(0, 0)
+                .expect("top-left cell must be in bounds")
+                .bg;
+            assert_eq!(
+                after,
+                before,
+                "dismissing the picker must remove the scrim and restore the \
+                 corner cell's original background; screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// The scrim behind the unified picker must stop above the
+        /// status-bar/command-line band, not blank it: `FRAME_Z_ORDER`
+        /// composes `StatusBar`/`CommandLine` before `UnifiedPicker`, so a
+        /// scrim fill that reaches into their rows would overwrite their
+        /// text with blank scrim-coloured cells on TUI (`draw_solid_fill`
+        /// fills every cell in its rect with a blank glyph, it does not
+        /// alpha-blend). Opening the command palette must leave the
+        /// "NORMAL" mode indicator on the status bar readable both before
+        /// and while the picker is open.
+        #[test]
+        fn picker_open_leaves_status_bar_text_visible_via_shell_app() {
+            let engine = plain_engine();
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                driver.screen_has("NORMAL"),
+                "precondition: a fresh engine starts in Vim Normal mode; \
+                 screen:\n{}",
+                driver.screen()
+            );
+
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+                quadraui::Modifiers::default(),
+            ));
+
+            assert!(
+                driver.screen_has("NORMAL"),
+                "opening the command palette must dim the editor/sidebar \
+                 behind it, not blank the status bar's mode indicator; \
+                 screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// The tallest bottom-chrome frame: a global status bar *and* a live
+        /// wildmenu row, so `status_bar_height_px` reserves three rows where
+        /// the shell's static two-row reservation covers only two. Opening the
+        /// picker over that frame must leave both rows readable — a scrim
+        /// bounded by the shell's static reservation instead of this frame's
+        /// `EditorLayout::editor_bottom` would blank the wildmenu's row with
+        /// scrim-coloured cells.
+        ///
+        /// `open_picker` does not clear `wildmenu_items`, so the two really
+        /// can be live in the same frame.
+        #[test]
+        fn picker_over_an_open_wildmenu_leaves_both_chrome_rows_visible_via_shell_app() {
+            let mut engine = plain_engine();
+            // Explicit, not ambient: a global status bar exists only when
+            // per-window status lines are off, and the default is on.
+            engine.settings.window_status_line = false;
+            engine.wildmenu_items = vec!["ZQXWwildA".to_string(), "ZQXWwildB".to_string()];
+            engine.wildmenu_selected = Some(0);
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                driver.screen_has("ZQXWwildA") && driver.screen_has("NORMAL"),
+                "precondition: the wildmenu row and the status bar's mode \
+                 indicator both paint before the picker opens; screen:\n{}",
+                driver.screen()
+            );
+
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+                quadraui::Modifiers::default(),
+            ));
+
+            assert!(
+                driver.screen_has("ZQXWwildA"),
+                "the scrim must stop at this frame's editor-band bottom, which \
+                 is one row higher when the wildmenu is up; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_has("NORMAL"),
+                "the status bar below the wildmenu must stay readable too; \
+                 screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// Open the command palette through `render::ACC_COMMAND_PALETTE`
         /// and narrow it to the Save command, so the painted list's shortcut
         /// column is a single row.
@@ -6753,6 +6891,39 @@ mod tests {
                 driver.screen()
             );
         }
+
+        /// `:about` must paint the trademark disclaimer and codicon
+        /// attribution lines `execute.rs`'s `"about"` handler adds to the
+        /// dialog body, not just hold them in `engine.dialog.body`.
+        #[test]
+        fn about_dialog_shows_trademark_and_codicon_attribution_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.execute_command("about");
+            assert!(
+                engine.dialog.is_some(),
+                "fixture must actually open the dialog"
+            );
+            let h = crate::tui_main::testing::conformance_harness(engine, 100, 30);
+            let driver = &h.driver;
+
+            assert!(
+                driver.screen_contains("About VimCode"),
+                "the painted dialog must show its own title; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_contains("not affiliated with Microsoft"),
+                "the painted dialog must show the trademark disclaimer; \
+                 screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_contains("codicon"),
+                "the painted dialog must show the codicon attribution; \
+                 screen:\n{}",
+                driver.screen()
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -7915,6 +8086,92 @@ mod tests {
                  minimap's own painted window, not traverse virtually the \
                  whole file — landed on line {top} of {TOTAL_LINES}; \
                  screen:\n{screen}"
+            );
+        }
+
+        /// A plain (no-modifier) **click away from the thumb** — a "jump" to
+        /// a point near the bottom of the strip, not a drag of the highlight
+        /// itself — must not scroll past the painted window's own local
+        /// ceiling, `base + (span - viewport_lines)`: the highest
+        /// `scroll_top` that still shows a line within `[base, base + span)`
+        /// as the viewport's last visible row. The strip only ever paints
+        /// lines `[base, base + span)`, so letting a bottom-edge click push
+        /// `scroll_top` any higher scrolls past content the minimap never
+        /// represented. Reads `base`/`span`/`viewport_lines` back from the
+        /// actually-painted window instead of a hardcoded guess, so the
+        /// expectation always matches whatever window size the minimap
+        /// happens to choose.
+        #[test]
+        fn clicking_the_minimap_strip_near_its_bottom_edge_does_not_overshoot_the_window() {
+            const TOTAL_LINES: usize = 200_000;
+            let mut engine = plain_engine();
+            // Minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
+            let text: String = (0..TOTAL_LINES)
+                .map(|i| format!("line {i} content\n"))
+                .collect();
+            engine.buffer_mut().insert(0, &text);
+
+            let mut h = harness_no_sidebar(engine);
+            let win = h.engine.borrow().active_window_id();
+            h.driver.render();
+
+            let (strip, base, span) = {
+                let layout = h.screen_layout.borrow();
+                let mm = layout
+                    .as_ref()
+                    .expect("render_content must have painted a ScreenLayout")
+                    .minimap
+                    .iter()
+                    .find(|m| m.window_id == win)
+                    .expect("a 200,000-line buffer must publish a minimap strip");
+                let first = mm
+                    .minimap
+                    .lines
+                    .first()
+                    .expect("a painted window has at least one line");
+                let last = mm
+                    .minimap
+                    .lines
+                    .last()
+                    .expect("a painted window has at least one line");
+                let base = first.line_idx;
+                let span = last.line_idx + 1 - base;
+                (crate::render::minimap_strip_rect(mm), base, span)
+            };
+            let viewport_lines = h
+                .engine
+                .borrow()
+                .windows
+                .get(&win)
+                .unwrap()
+                .view
+                .viewport_lines;
+
+            let x = strip.x + strip.width / 2.0;
+            // The highlight band sits at the strip's own top (scroll_top
+            // starts at 0), so a press one row above the strip's bottom
+            // edge lands well outside the band — a jump, not a thumb
+            // drag — and a follow-up move to the same point exercises the
+            // armed scrollbar's own clamping instead of the jump's
+            // one-shot centring.
+            let py = strip.y + strip.height - 1.0;
+            h.driver.mouse_down(x, py);
+            h.driver.mouse_move(x, py);
+            h.driver.mouse_up(x, py);
+            h.driver.render();
+
+            let top = h.engine.borrow().windows.get(&win).unwrap().view.scroll_top;
+            let local_ceiling = base + span.saturating_sub(viewport_lines);
+
+            assert!(
+                top <= local_ceiling,
+                "a plain click near the minimap strip's bottom edge must \
+                 not scroll past the painted window's own local ceiling \
+                 (base {base}, span {span}, viewport_lines {viewport_lines}, \
+                 local ceiling {local_ceiling}) — landed on line {top} of \
+                 {TOTAL_LINES}"
             );
         }
     }
@@ -10327,6 +10584,49 @@ mod tests {
                 "seeded buffer text never reached the character grid:\n{}",
                 driver.screen()
             );
+        }
+
+        /// `Engine::new()` seeds its initial `explorer_rows` cache from
+        /// `std::env::current_dir()` before any CLI-supplied path is
+        /// applied; `build_portable_engine`'s `Engine::new()` →
+        /// `e.startup(file_path)` ordering is exactly what every real
+        /// backend runs, and `tui_driver_with` drives that same ordering,
+        /// so this exercises the actual startup path rather than poking
+        /// `explorer_rows`/`explorer_expanded` directly the way other
+        /// sidebar tests in this file do.
+        #[test]
+        fn tui_driver_opening_a_directory_shows_that_directorys_contents_not_the_process_cwd() {
+            let dir = std::env::temp_dir().join(format!(
+                "vc1924expl_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            // Short name, same reasoning as `render_content_paints_
+            // explorer_sidebar_content_via_shell_app`'s `mk1425.txt`: the
+            // narrow sidebar at this module's `(80, 24)` size truncates a
+            // longer filename before `screen_contains` would ever see it.
+            std::fs::write(dir.join("mk1924.txt"), b"").unwrap();
+
+            let mut driver = tui_driver_with(Some(dir.clone()), 80, 24, |engine| {
+                engine.session.explorer_visible = true;
+                engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                    crate::core::engine::sidebar::PANEL_EXPLORER,
+                ));
+            });
+            driver.render();
+
+            assert!(
+                driver.screen_contains("mk1924.txt"),
+                "opening a directory on the command line must show that \
+                 directory's own contents in the Explorer on the very \
+                 first rendered frame, not whatever directory the \
+                 process happened to start in; screen:\n{}",
+                driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
