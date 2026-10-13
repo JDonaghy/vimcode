@@ -1456,3 +1456,20 @@ src/                  (~168,600 lines total)
 ## License
 
 MIT
+
+### Third-party assets
+
+- `data/fonts/vimcode-icons.ttf` bundles the Symbols Nerd Font; see
+  [`data/fonts/LICENSE-NerdFonts`](data/fonts/LICENSE-NerdFonts) for its license.
+- VimCode links [quadraui](https://crates.io/crates/quadraui), which embeds
+  Microsoft's [codicon](https://github.com/microsoft/vscode-codicons) icon font
+  (`codicon.ttf`) to paint built-in chrome glyphs — tree chevrons, tab dirty/close
+  marks, the context-menu submenu arrow, data-table sort arrows. Codicon is
+  Copyright (c) Microsoft Corporation, licensed separately under Creative Commons
+  Attribution 4.0 International (CC-BY-4.0); the full license text ships at
+  [`quadraui/assets/CODICON_LICENSE`](https://github.com/JDonaghy/quadraui/blob/main/quadraui/assets/CODICON_LICENSE).
+
+### Trademarks
+
+VimCode is not affiliated with Microsoft Corporation. "Visual Studio Code" and
+"VS Code" are trademarks of Microsoft Corporation.

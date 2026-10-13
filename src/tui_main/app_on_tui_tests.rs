@@ -6740,6 +6740,39 @@ mod tests {
                 driver.screen()
             );
         }
+
+        /// `:about` must paint the trademark disclaimer and codicon
+        /// attribution lines `execute.rs`'s `"about"` handler adds to the
+        /// dialog body, not just hold them in `engine.dialog.body`.
+        #[test]
+        fn about_dialog_shows_trademark_and_codicon_attribution_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.execute_command("about");
+            assert!(
+                engine.dialog.is_some(),
+                "fixture must actually open the dialog"
+            );
+            let h = crate::tui_main::testing::conformance_harness(engine, 100, 30);
+            let driver = &h.driver;
+
+            assert!(
+                driver.screen_contains("About VimCode"),
+                "the painted dialog must show its own title; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_contains("not affiliated with Microsoft"),
+                "the painted dialog must show the trademark disclaimer; \
+                 screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_contains("codicon"),
+                "the painted dialog must show the codicon attribution; \
+                 screen:\n{}",
+                driver.screen()
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
