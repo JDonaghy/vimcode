@@ -16415,6 +16415,69 @@ mod modal_rung {
             h.driver.painted_texts()
         );
     }
+
+    /// The picker popup floats over the editor pane only: it must start to
+    /// the right of the sidebar and sit near the top of the window rather
+    /// than spanning (or centering across) the full window height.
+    #[test]
+    fn picker_popup_floats_over_editor_pane_not_sidebar() {
+        let mut engine = small_engine();
+        engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+        let h = harness(engine, 1400, 900);
+
+        let sb = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("the sidebar paints by default and must publish its bounds");
+        let (px, py, _pw, ph) = h
+            .picker_popup()
+            .expect("fixture must actually paint the picker");
+
+        assert!(
+            px >= (sb.x + sb.width) as f64,
+            "the popup's left edge ({px}) must start at or right of the \
+             sidebar's right edge ({}, {}), not overlap it",
+            sb.x,
+            sb.width
+        );
+        assert!(
+            ph < 900.0 * 0.5,
+            "a 2-item picker (LineEndings) must paint a compact popup, not \
+             one spanning most of the 900px-tall window; painted height: {ph}"
+        );
+        assert!(
+            py < 900.0 * 0.25,
+            "the popup must anchor near the top of the window ({py}), not \
+             be vertically centred across it"
+        );
+    }
+
+    /// A picker with many more results (the command palette) paints a
+    /// taller popup than a picker with just a couple of entries
+    /// (line endings) — height tracks the result count instead of being a
+    /// fixed share of the viewport.
+    #[test]
+    fn picker_popup_height_scales_with_item_count() {
+        let mut few_engine = small_engine();
+        few_engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+        let h_few = harness(few_engine, 1400, 900);
+        let (_, _, _, few_h) = h_few
+            .picker_popup()
+            .expect("the line-endings picker must paint");
+
+        let mut many_engine = small_engine();
+        many_engine.open_picker(crate::core::engine::PickerSource::Commands);
+        let h_many = harness(many_engine, 1400, 900);
+        let (_, _, _, many_h) = h_many
+            .picker_popup()
+            .expect("the command palette must paint");
+
+        assert!(
+            many_h > few_h,
+            "the command palette (many results) must paint a taller popup \
+             ({many_h}) than the line-endings picker (two results, {few_h})"
+        );
+    }
 }
 
 /// Adopting `quadraui::FolderPickerController` on GTK, replacing the
