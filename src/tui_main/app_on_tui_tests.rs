@@ -7937,6 +7937,92 @@ mod tests {
                  screen:\n{screen}"
             );
         }
+
+        /// A plain (no-modifier) **click away from the thumb** — a "jump" to
+        /// a point near the bottom of the strip, not a drag of the highlight
+        /// itself — must not scroll past the painted window's own local
+        /// ceiling, `base + (span - viewport_lines)`: the highest
+        /// `scroll_top` that still shows a line within `[base, base + span)`
+        /// as the viewport's last visible row. The strip only ever paints
+        /// lines `[base, base + span)`, so letting a bottom-edge click push
+        /// `scroll_top` any higher scrolls past content the minimap never
+        /// represented. Reads `base`/`span`/`viewport_lines` back from the
+        /// actually-painted window instead of a hardcoded guess, so the
+        /// expectation always matches whatever window size the minimap
+        /// happens to choose.
+        #[test]
+        fn clicking_the_minimap_strip_near_its_bottom_edge_does_not_overshoot_the_window() {
+            const TOTAL_LINES: usize = 200_000;
+            let mut engine = plain_engine();
+            // Minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
+            let text: String = (0..TOTAL_LINES)
+                .map(|i| format!("line {i} content\n"))
+                .collect();
+            engine.buffer_mut().insert(0, &text);
+
+            let mut h = harness_no_sidebar(engine);
+            let win = h.engine.borrow().active_window_id();
+            h.driver.render();
+
+            let (strip, base, span) = {
+                let layout = h.screen_layout.borrow();
+                let mm = layout
+                    .as_ref()
+                    .expect("render_content must have painted a ScreenLayout")
+                    .minimap
+                    .iter()
+                    .find(|m| m.window_id == win)
+                    .expect("a 200,000-line buffer must publish a minimap strip");
+                let first = mm
+                    .minimap
+                    .lines
+                    .first()
+                    .expect("a painted window has at least one line");
+                let last = mm
+                    .minimap
+                    .lines
+                    .last()
+                    .expect("a painted window has at least one line");
+                let base = first.line_idx;
+                let span = last.line_idx + 1 - base;
+                (crate::render::minimap_strip_rect(mm), base, span)
+            };
+            let viewport_lines = h
+                .engine
+                .borrow()
+                .windows
+                .get(&win)
+                .unwrap()
+                .view
+                .viewport_lines;
+
+            let x = strip.x + strip.width / 2.0;
+            // The highlight band sits at the strip's own top (scroll_top
+            // starts at 0), so a press one row above the strip's bottom
+            // edge lands well outside the band — a jump, not a thumb
+            // drag — and a follow-up move to the same point exercises the
+            // armed scrollbar's own clamping instead of the jump's
+            // one-shot centring.
+            let py = strip.y + strip.height - 1.0;
+            h.driver.mouse_down(x, py);
+            h.driver.mouse_move(x, py);
+            h.driver.mouse_up(x, py);
+            h.driver.render();
+
+            let top = h.engine.borrow().windows.get(&win).unwrap().view.scroll_top;
+            let local_ceiling = base + span.saturating_sub(viewport_lines);
+
+            assert!(
+                top <= local_ceiling,
+                "a plain click near the minimap strip's bottom edge must \
+                 not scroll past the painted window's own local ceiling \
+                 (base {base}, span {span}, viewport_lines {viewport_lines}, \
+                 local ceiling {local_ceiling}) — landed on line {top} of \
+                 {TOTAL_LINES}"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

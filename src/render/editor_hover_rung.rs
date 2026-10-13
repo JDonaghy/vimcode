@@ -986,13 +986,23 @@ pub fn apply_scroll_offset(
         }
         // The minimap's viewport-highlight thumb. Armed on press; continued
         // drag-moves apply here like the editor's v-scrollbar, never re-running
-        // the centring jump that only happens at press.
+        // the centring jump that only happens at press. The id carries a
+        // `base` line number alongside the window id: fine-mode geometry
+        // (see `minimap::fine_seek_geometry`) resolves `new_offset` relative
+        // to the strip's painted window rather than the whole file, so `base`
+        // (`0` in coarse mode, where the drag is already absolute) is added
+        // back here to recover the absolute `scroll_top`.
         other if other.starts_with("minimap:") => {
-            let Ok(wid) = other["minimap:".len()..].parse::<usize>() else {
+            let mut parts = other["minimap:".len()..].split(':');
+            let (Some(wid_part), Some(base_part)) = (parts.next(), parts.next()) else {
+                return false;
+            };
+            let (Ok(wid), Ok(base)) = (wid_part.parse::<usize>(), base_part.parse::<usize>())
+            else {
                 return false;
             };
             let window_id = crate::core::WindowId(wid);
-            engine.set_scroll_top_for_window(window_id, new_offset);
+            engine.set_scroll_top_for_window(window_id, base + new_offset);
             engine.sync_scroll_binds();
             true
         }
