@@ -4772,6 +4772,14 @@ mod tests {
                 b"fn main() {\n    let s = \"ZQX_MARK\";\n}\n",
             )
             .unwrap();
+            // The popup's height tracks the result count, and the preview
+            // pane is only as tall as the list beside it — so the fixture
+            // needs enough entries for the marker on the file's second line
+            // to be painted. `hello.rs` sorts first, so it stays selected
+            // and its preview is the one shown.
+            for i in 0..6 {
+                std::fs::write(dir.join(format!("zpad{i}.txt")), b"pad\n").unwrap();
+            }
 
             let mut engine = plain_engine();
             engine.cwd = dir.clone();
@@ -4825,11 +4833,10 @@ mod tests {
         /// characters shift off past where they belong.
         ///
         /// Confirmed red against the unfixed sequential-cursor builder: the
-        /// `push_str` call's `_str` suffix and the `s.push_str("x");` line's
-        /// trailing text were duplicated into the rendered row, so
-        /// `find_bounds` for the unique end-of-line marker below landed at
-        /// the wrong column (or the row's `str::chars().count()` exceeded
-        /// the source line's), making this assertion fail.
+        /// `push_str` call's `_str` suffix and the escape sequence's
+        /// characters were re-emitted into the rendered row, so the painted
+        /// line no longer matched the source line byte-for-byte and
+        /// `push_str` appeared twice.
         #[test]
         fn quick_open_preview_pane_does_not_duplicate_overlapping_highlight_text() {
             let dir = std::env::temp_dir().join(format!(
@@ -4839,17 +4846,22 @@ mod tests {
             ));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join(".git")).unwrap();
-            // Line 2: an escape sequence (`\n`) nests inside the string
-            // literal it's part of — `@escape` and `@string` both cover
-            // those two bytes. Line 3: `push_str` is a method call through
-            // a field expression, so its `field_identifier` is captured by
-            // both `@property` and `@method.call` with identical byte
-            // ranges.
+            // The second line packs both overlap shapes into one short row
+            // that fits the narrow preview pane: `push_str` is a method call
+            // through a field expression, so its `field_identifier` is
+            // captured by both `@property` and `@method.call` over identical
+            // byte ranges, and the `\n` escape nests inside the `@string`
+            // capture that spans it.
             std::fs::write(
                 dir.join("hello.rs"),
-                b"fn main() {\n    let s = \"a\\nb\";\n    s.push_str(\"END_MARK\");\n}\n",
+                b"fn f(s: &mut String) {\ns.push_str(\"a\\nEM\");\n}\n",
             )
             .unwrap();
+            // Pad the result list so the popup is tall enough to paint the
+            // second preview line. `hello.rs` sorts first and stays selected.
+            for i in 0..6 {
+                std::fs::write(dir.join(format!("zpad{i}.txt")), b"pad\n").unwrap();
+            }
 
             let mut engine = plain_engine();
             engine.cwd = dir.clone();
@@ -4865,29 +4877,17 @@ mod tests {
                     panic!("preview must show the method-call line; screen:\n{screen}")
                 });
             assert!(
-                call_line.contains("s.push_str(\"END_MARK\");"),
+                call_line.contains("s.push_str(\"a\\nEM\");"),
                 "overlapping @property/@method.call captures on the same \
-                 `push_str` field identifier must not duplicate any of the \
-                 line's text — got:\n{call_line}\nfull screen:\n{screen}"
+                 `push_str` field identifier, and the nested @escape inside \
+                 the @string capture, must not duplicate any of the line's \
+                 text — got:\n{call_line}\nfull screen:\n{screen}"
             );
             assert_eq!(
                 call_line.matches("push_str").count(),
                 1,
                 "`push_str` must appear exactly once in its preview row, not \
                  duplicated by overlapping highlight spans; got:\n{call_line}\n\
-                 full screen:\n{screen}"
-            );
-
-            let string_line = screen
-                .lines()
-                .find(|l| l.contains("a\\nb"))
-                .unwrap_or_else(|| {
-                    panic!("preview must show the string-literal line; screen:\n{screen}")
-                });
-            assert!(
-                string_line.contains("\"a\\nb\";"),
-                "a nested @escape capture inside the @string capture must \
-                 not duplicate the escape sequence's characters; got:\n{string_line}\n\
                  full screen:\n{screen}"
             );
 
