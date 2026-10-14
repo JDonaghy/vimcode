@@ -90,30 +90,45 @@ impl Icon {
 
 pub const HAMBURGER: Icon = Icon::new("\u{f035c}", "\u{2630}"); // ☰
 
-// VS Code's Explorer activity-bar icon is literally `Codicon.files`
-// (`explorerViewIcon` in `explorerViewlet.ts`) — nf-cod-files, a two-page
-// "files" glyph — not an open-folder glyph. `\u{f07c}` (nf-fa-folder_open,
-// still available as `FOLDER_OPEN` below) was a plausible-looking but wrong
-// stand-in.
-pub const EXPLORER: Icon = Icon::new("\u{eaf0}", "\u{229e}"); // nf-cod-files
+// ─── Chrome icon identity ────────────────────────────────────────────────
+//
+// Chrome glyphs (activity bar, status bar, tab actions, title bar) are
+// deliberately sourced from Font Awesome / Devicons / Material Design
+// Icons rather than Codicon (the font quadraui bundles for the chrome it
+// paints itself — tree chevrons, tab close/dirty marks, context-menu
+// check/arrow, data-table sort arrows). Nerd Fonts patches Codicon's own
+// glyph shapes into Codicon's own Private-Use-Area codepoints
+// (`U+EA60`–`U+EC1E`), so any vimcode constant that reused one of those
+// codepoints would render the same shape VS Code's chrome uses — the
+// opposite of a distinct identity. Picking from other Nerd Font families
+// below keeps chrome visually vimcode's own while still only requiring a
+// Nerd Font, the same dependency every other glyph in this module already
+// has. Editor-context icons (file-type glyphs below, diagnostics,
+// LSP symbol kinds) are unaffected: they already draw from the
+// Seti-UI-sourced range and were never Codicon-shaped, so there is no
+// VS-Code-identity concern there to fix.
+//
+// Tree chevrons, tab close/dirty, context-menu check/arrow and data-table
+// sort arrows stay Codicon-shaped regardless — quadraui 0.1.4 paints those
+// directly from its own bundled font with no app-facing override hook, so
+// changing them is quadraui's call, not a vimcode glyph choice. See
+// `TREE_CHEVRON_DOWN`/`TREE_CHEVRON_RIGHT`/`TAB_CLOSE` below.
+pub const EXPLORER: Icon = Icon::new("\u{f0c5}", "\u{229e}"); // nf-fa-files_o
 
 // Both backends share the same activity-bar icon for search.
 pub const SEARCH: Icon = Icon::new("\u{f002}", "/"); // /
 pub const DEBUG: Icon = Icon::new("\u{f188}", "!"); // !
-/// VS Code's Run & Debug activity-bar icon (`runViewIcon` in
-/// `debugIcons.ts`) is `Codicon.debugAlt` — a play triangle with a bug
-/// overlay — not the plain [`DEBUG`] bug glyph, which is used for the
-/// debug sidebar's own "DEBUG" title bar, a different context.
-pub const RUN_AND_DEBUG: Icon = Icon::new("\u{eb91}", "\u{25b6}"); // nf-cod-debug_alt
+/// The Run & Debug activity-bar icon — a play glyph, distinct from the
+/// plain [`DEBUG`] bug glyph used for the debug sidebar's own "DEBUG"
+/// title bar, a different context.
+pub const RUN_AND_DEBUG: Icon = Icon::new("\u{f01d}", "\u{25b6}"); // nf-fa-play_circle
 pub const GIT_BRANCH: Icon = Icon::new("\u{e702}", "Y"); // Y (branch shape)
 pub const GIT_BRANCH_ALT: Icon = Icon::new("\u{e725}", "Y"); // nf-dev-git_branch alt
-/// VS Code's Source Control activity-bar icon (`sourceControlViewIcon` in
-/// `scm.contribution.ts`) is `Codicon.sourceControl` — a branch-fork glyph —
-/// not [`GIT_BRANCH`]/[`GIT_BRANCH_ALT`] (devicon glyphs used for the
+/// The Source Control activity-bar icon — a branch-fork glyph, distinct
+/// from [`GIT_BRANCH`]/[`GIT_BRANCH_ALT`] (devicon glyphs used for the
 /// current-branch-name display elsewhere).
-pub const SOURCE_CONTROL: Icon = Icon::new("\u{ea68}", "Y"); // nf-cod-source_control
-pub const EXTENSIONS: Icon = Icon::new("\u{eae6}", "#"); // #
-pub const EXTENSIONS_ALT: Icon = Icon::new("\u{eb85}", "#"); // nf-cod-extensions alt (TUI)
+pub const SOURCE_CONTROL: Icon = Icon::new("\u{f126}", "Y"); // nf-fa-code_fork
+pub const EXTENSIONS: Icon = Icon::new("\u{f12e}", "#"); // nf-fa-puzzle_piece
 pub const AI_CHAT: Icon = Icon::new("\u{f0e5}", ">"); // >
 pub const SETTINGS: Icon = Icon::new("\u{f013}", "*"); // *
 /// Board activity-bar panel — a generic kanban/pipeline host, not

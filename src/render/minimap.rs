@@ -815,11 +815,14 @@ pub fn apply_minimap_click(
 }
 
 /// `quadraui::WidgetId` for a minimap strip's own thumb drag —
-/// `minimap:<window_id>`, parsed back out by [`apply_scroll_offset`].
-/// Shared by both backends' press rungs so the id can never drift from what
-/// the apply-side table matches on.
-pub fn minimap_drag_widget(window_id: WindowId) -> quadraui::WidgetId {
-    quadraui::WidgetId::new(format!("minimap:{}", window_id.0))
+/// `minimap:<window_id>:<base>`, parsed back out by [`apply_scroll_offset`].
+/// `base` is the first buffer line [`fine_seek_geometry`]'s virtual track is
+/// anchored to (`0` outside fine mode, where the drag is already absolute);
+/// the apply-side rung adds it back to the drag's `new_offset` to recover
+/// the absolute `scroll_top`. Shared by both backends' press rungs so the id
+/// can never drift from what the apply-side table matches on.
+pub fn minimap_drag_widget(window_id: WindowId, base: usize) -> quadraui::WidgetId {
+    quadraui::WidgetId::new(format!("minimap:{}:{}", window_id.0, base))
 }
 
 /// Outcome of resolving a **press** against a minimap strip — mirrors
@@ -845,10 +848,14 @@ pub struct MinimapPress {
     /// [`quadraui::DragTarget::ScrollbarY`] drags, whether or not the press
     /// itself landed inside it.
     pub thumb_length: f32,
-    /// The whole file's scroll ceiling: `total_buffer_lines -
-    /// viewport_lines`, the same arithmetic `View::ensure_cursor_visible`
-    /// clamps `scroll_top` against — never the strip's own (possibly much
-    /// smaller) painted window.
+    /// The ceiling this press's drag resolves `new_offset` against. In fine
+    /// mode (see [`fine_seek_geometry`]) this is the strip's own painted
+    /// window's local span, `(window_span - viewport_lines)`, so a full
+    /// strip-height drag tracks 1:1 with the pixels actually dragged rather
+    /// than being dampened by the whole file's size; [`Self::base`] is added
+    /// back downstream to recover the absolute `scroll_top`. Outside fine
+    /// mode this is the whole file's ceiling (`total_buffer_lines -
+    /// viewport_lines`) and `base` is `0`, so the drag is already absolute.
     pub max_scroll: usize,
     /// Offset from the band's own top edge, preserved so continued drag
     /// moves don't jump the band out from under the cursor. `0.0` when
@@ -857,6 +864,12 @@ pub struct MinimapPress {
     /// convention — the band's new top after the jump lands under the
     /// cursor by construction.
     pub grab_offset: f32,
+    /// The first buffer line [`Self::max_scroll`] is measured relative to —
+    /// the strip's currently painted window's first line in fine mode, `0`
+    /// otherwise. [`minimap_drag_widget`] carries this into the drag's
+    /// widget id so the apply-side rung can add it back to the drag's
+    /// `new_offset` and recover the absolute `scroll_top`.
+    pub base: usize,
     /// The press landed on the track *outside* the viewport-highlight band:
     /// the caller must call [`apply_minimap_click`] first (jump-to-position
     /// + cursor move) before arming the drag.
@@ -906,12 +919,13 @@ pub fn minimap_press(
             .map(|w| w.view.scroll_top)
             .unwrap_or(0);
 
-        let (track_start, track_length, thumb_length, grab_offset) = fine
+        let (track_start, track_length, thumb_length, grab_offset, max_scroll, base) = fine
             .then(|| {
                 fine_seek_geometry(
                     &bounds,
                     &mm.minimap,
                     max_scroll,
+                    viewport_lines,
                     band.height,
                     scroll_top,
                     py,
@@ -924,6 +938,8 @@ pub fn minimap_press(
                 bounds.height,
                 band.height,
                 if in_band { py - band.y } else { 0.0 },
+                max_scroll,
+                0,
             ));
 
         return Some(MinimapPress {
@@ -933,63 +949,87 @@ pub fn minimap_press(
             thumb_length,
             max_scroll,
             grab_offset,
+            base,
             jump: !in_band,
         });
     }
     None
 }
 
-/// Derive the **virtual track** #1271's fine seek arms in place of the
-/// real, file-wide one — remapping the same strip pixels onto the strip's
-/// *currently painted window* instead of the whole file, while still
-/// feeding `quadraui::dispatch_mouse_drag`'s unmodified `ScrollbarY`
-/// arithmetic. Let `S0`/`Sh` be the real strip's top/height, `M` the
-/// file-wide `max_scroll`, `base` the first buffer line the strip
-/// currently paints, and `span` its line extent. Then:
+/// Derive fine-seek geometry that maps the strip's real pixels onto the
+/// strip's *currently painted window* 1:1, instead of the whole file, while
+/// still feeding `quadraui::dispatch_mouse_drag`'s unmodified `ScrollbarY`
+/// arithmetic. Let `S0`/`Sh` be the real strip's top/height, `base` the
+/// first buffer line the strip currently paints, `span` its line extent,
+/// and `L = (span - viewport_lines)` the window's own local scroll ceiling
+/// (clamped against the whole file's `max_scroll` as a defensive cap).
+/// Then:
 /// ```text
-/// effective_track = Sh * M / span      // dispatch's own track_length - thumb_length
-/// track_start     = S0 - base * Sh / span
-/// track_length    = effective_track + thumb_length
+/// effective_track = Sh - thumb_length   // dispatch's own track_length - thumb_length
+/// track_start      = S0
+/// track_length     = effective_track + thumb_length   // == Sh
 /// ```
+/// so a drag spanning the strip's full real height sweeps `new_offset`
+/// across exactly `[0, L]` — a literal, undampened pixel-for-pixel mapping.
+/// Scaling `effective_track` by the whole-file `max_scroll` instead would
+/// inflate the track by the ratio of file size to window span, making a
+/// full-strip drag cover only a small fraction of the file. The
+/// result is *local* to the window: callers add `base` back (see
+/// [`MinimapPress::base`]) to recover the absolute `scroll_top`.
 /// `thumb_length` is taken straight from the caller's own, already-painted
 /// [`quadraui::MinimapLayout::viewport_highlight`] band height, not
 /// re-derived here — reusing the real band height keeps this virtual
 /// track's thumb bound to the one users actually see. `grab_offset` is
 /// derived by requiring the mapping to be an **identity at the press
 /// point** (dragging zero pixels must reproduce the current `scroll_top`)
-/// rather than hand-rolling band arithmetic. Returns `None` when the
-/// window has no line extent or the file already fits the viewport.
+/// rather than hand-rolling band arithmetic. Returns `None` when the window
+/// has no line extent, the file already fits the viewport, or the window
+/// itself leaves no local room to scroll (`L == 0`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fine_seek_geometry(
     bounds: &quadraui::Rect,
     minimap: &quadraui::Minimap,
     max_scroll: usize,
+    viewport_lines: usize,
     thumb_length: f32,
     scroll_top: usize,
     py: f32,
     in_band: bool,
-) -> Option<(f32, f32, f32, f32)> {
+) -> Option<(f32, f32, f32, f32, usize, usize)> {
     let first = minimap.lines.first()?;
     let last = minimap.lines.last()?;
-    let base = first.line_idx as f32;
-    let span = (last.line_idx + 1).saturating_sub(first.line_idx) as f32;
-    if span <= 0.0 || max_scroll == 0 {
+    let base = first.line_idx;
+    let span = (last.line_idx + 1).saturating_sub(first.line_idx);
+    if span == 0 || max_scroll == 0 {
         return None;
     }
-    let m = max_scroll as f32;
+    let local_max = span.saturating_sub(viewport_lines).min(max_scroll);
+    if local_max == 0 {
+        return None;
+    }
+    let local_scroll = scroll_top.saturating_sub(base).min(local_max) as f32;
+    let local_max_f = local_max as f32;
     let s0 = bounds.y;
     let sh = bounds.height;
 
-    let effective_track = sh * m / span;
-    let track_start = s0 - base * sh / span;
+    let effective_track = (sh - thumb_length).max(1.0);
+    let track_start = s0;
     let track_length = effective_track + thumb_length;
 
     let grab_offset = if in_band {
-        py - track_start - (scroll_top as f32 / m) * effective_track
+        py - track_start - (local_scroll / local_max_f) * effective_track
     } else {
         0.0
     };
 
-    Some((track_start, track_length, thumb_length, grab_offset))
+    Some((
+        track_start,
+        track_length,
+        thumb_length,
+        grab_offset,
+        local_max,
+        base,
+    ))
 }
 
 /// Buffer line a minimap click at `fraction` of the track should scroll to,

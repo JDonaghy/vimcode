@@ -2,6 +2,73 @@ use super::*;
 
 // ─── Unified Picker ───────────────────────────────────────────────────────────
 
+/// Run the same tree-sitter highlighting pipeline the main editor uses
+/// against `content`, with the language picked from `path`'s extension.
+/// Returns `None` when the extension isn't recognised (plain preview text,
+/// matching the main editor's own behaviour for unknown file types).
+/// The returned triples are `(start_byte, end_byte, scope)`, sorted by
+/// start byte, in absolute offsets against `content`.
+fn syntax_highlights_for_path(
+    path: Option<&str>,
+    content: &str,
+) -> Option<Vec<(usize, usize, String)>> {
+    let mut syntax = Syntax::new_from_path(path)?;
+    let mut highlights = syntax.parse(content);
+    highlights.sort_by_key(|h| h.0);
+    Some(highlights)
+}
+
+/// Split absolute-offset `highlights` (sorted by start byte, against the
+/// *full* `content`) into one highlight list per displayed preview line,
+/// covering lines `[first_line_idx, first_line_idx + line_count)`
+/// (0-indexed), with byte offsets in each returned list made relative to
+/// that line's own start. Line boundaries are found the same way
+/// `str::lines` finds them (`\n`, with an optional preceding `\r` stripped).
+fn highlights_by_line(
+    highlights: &[(usize, usize, String)],
+    content: &str,
+    first_line_idx: usize,
+    line_count: usize,
+) -> Vec<Vec<(usize, usize, String)>> {
+    let mut per_line = vec![Vec::new(); line_count];
+    if highlights.is_empty() || line_count == 0 {
+        return per_line;
+    }
+    let mut offset = 0usize;
+    let mut line_idx = 0usize;
+    let mut hl_idx = 0usize;
+    loop {
+        let newline_pos = content[offset..].find('\n').map(|p| offset + p);
+        let raw_end = newline_pos.unwrap_or(content.len());
+        let line_end = if raw_end > offset && content.as_bytes()[raw_end - 1] == b'\r' {
+            raw_end - 1
+        } else {
+            raw_end
+        };
+        if line_idx >= first_line_idx && line_idx < first_line_idx + line_count {
+            while hl_idx < highlights.len() && highlights[hl_idx].1 <= offset {
+                hl_idx += 1;
+            }
+            let mut j = hl_idx;
+            while j < highlights.len() && highlights[j].0 < line_end {
+                let (h_start, h_end, scope) = &highlights[j];
+                if *h_end > offset {
+                    let rel_start = h_start.saturating_sub(offset);
+                    let rel_end = (*h_end).min(line_end) - offset;
+                    per_line[line_idx - first_line_idx].push((rel_start, rel_end, scope.clone()));
+                }
+                j += 1;
+            }
+        }
+        if line_idx + 1 >= first_line_idx + line_count || newline_pos.is_none() {
+            break;
+        }
+        offset = raw_end + 1;
+        line_idx += 1;
+    }
+    per_line
+}
+
 impl Engine {
     /// Open the unified picker with a given source.
     pub fn open_picker(&mut self, source: PickerSource) {
@@ -1869,7 +1936,10 @@ impl Engine {
                     .enumerate()
                     .map(|(i, text)| (i + 1, text.to_string(), false))
                     .collect();
-                self.picker_preview = Some(PickerPreview { lines });
+                let file_highlights =
+                    syntax_highlights_for_path(abs.to_str(), &content).unwrap_or_default();
+                let highlights = highlights_by_line(&file_highlights, &content, 0, lines.len());
+                self.picker_preview = Some(PickerPreview { lines, highlights });
                 self.picker_preview_scroll = 0;
             }
             PickerAction::OpenFileAtLine(path, line) => {
@@ -1891,7 +1961,10 @@ impl Engine {
                         (lineno, text.to_string(), is_match)
                     })
                     .collect();
-                self.picker_preview = Some(PickerPreview { lines });
+                let file_highlights =
+                    syntax_highlights_for_path(path.to_str(), &content).unwrap_or_default();
+                let highlights = highlights_by_line(&file_highlights, &content, start, end - start);
+                self.picker_preview = Some(PickerPreview { lines, highlights });
                 // Scroll so the match line is visible near the top of the preview.
                 let match_offset = match_line.saturating_sub(start);
                 self.picker_preview_scroll = match_offset.saturating_sub(3);
@@ -1927,7 +2000,8 @@ impl Engine {
                 let Ok(content) = std::fs::read_to_string(&abs) else {
                     return;
                 };
-                self.load_preview_lines_from_text(&content, line);
+                let highlights = syntax_highlights_for_path(abs.to_str(), &content);
+                self.load_preview_lines_from_text(&content, line, highlights.as_deref());
             }
             plugin::PluginPickerPreview::Buffer(handle, line) => {
                 let Some(bid) = self.plugin_api_resolve_buf(handle) else {
@@ -1937,7 +2011,8 @@ impl Engine {
                     return;
                 };
                 let content = state.buffer.content.to_string();
-                self.load_preview_lines_from_text(&content, line);
+                let highlights = state.highlights.clone();
+                self.load_preview_lines_from_text(&content, line, Some(&highlights));
             }
         }
     }
@@ -1946,8 +2021,16 @@ impl Engine {
     /// branches of [`Self::load_plugin_picker_item_preview`]: with a target
     /// `line` (1-indexed), center a context window on it like
     /// `PickerAction::OpenFileAtLine`; without one, show the first 500
-    /// lines like `PickerAction::OpenFile`.
-    fn load_preview_lines_from_text(&mut self, content: &str, line: Option<usize>) {
+    /// lines like `PickerAction::OpenFile`. `highlights`, when present, must
+    /// already be sorted by start byte and expressed in absolute byte
+    /// offsets against the full `content` (as `Syntax::parse` and
+    /// `BufferState::highlights` both guarantee).
+    fn load_preview_lines_from_text(
+        &mut self,
+        content: &str,
+        line: Option<usize>,
+        highlights: Option<&[(usize, usize, String)]>,
+    ) {
         let all_lines: Vec<&str> = content.lines().collect();
         match line {
             Some(line) => {
@@ -1964,7 +2047,10 @@ impl Engine {
                         (lineno, text.to_string(), is_match)
                     })
                     .collect();
-                self.picker_preview = Some(PickerPreview { lines });
+                let highlights = highlights
+                    .map(|h| highlights_by_line(h, content, start, end - start))
+                    .unwrap_or_else(|| vec![Vec::new(); lines.len()]);
+                self.picker_preview = Some(PickerPreview { lines, highlights });
                 let match_offset = match_line.saturating_sub(start);
                 self.picker_preview_scroll = match_offset.saturating_sub(3);
             }
@@ -1975,7 +2061,10 @@ impl Engine {
                     .enumerate()
                     .map(|(i, text)| (i + 1, text.to_string(), false))
                     .collect();
-                self.picker_preview = Some(PickerPreview { lines });
+                let highlights = highlights
+                    .map(|h| highlights_by_line(h, content, 0, lines.len()))
+                    .unwrap_or_else(|| vec![Vec::new(); lines.len()]);
+                self.picker_preview = Some(PickerPreview { lines, highlights });
                 self.picker_preview_scroll = 0;
             }
         }

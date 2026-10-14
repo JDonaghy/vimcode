@@ -1248,6 +1248,12 @@ pub enum PickerAction {
 pub struct PickerPreview {
     /// Lines to display: (1-based line number, text, is_highlighted).
     pub lines: Vec<(usize, String, bool)>,
+    /// Syntax-highlight spans for each line in `lines`, parallel by index:
+    /// `highlights[i]` lists `(start_byte, end_byte, scope)` triples
+    /// relative to `lines[i]`'s own text, from the same tree-sitter
+    /// pipeline the main editor uses. Empty for a line whose file's
+    /// language isn't recognised.
+    pub highlights: Vec<Vec<(usize, usize, String)>>,
 }
 
 /// How a file should be opened: as a temporary preview or permanent buffer.

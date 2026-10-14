@@ -707,11 +707,28 @@ impl quadraui::ShellApp for App {
                 // the same generic helpers the legacy path used.
                 render::FrameOp::UnifiedPicker => {
                     if let Some(ref picker) = screen.picker {
+                        // Floats over the editor pane only, so it never spans
+                        // the sidebar or the activity bar.
+                        let editor_viewport =
+                            quadraui::Rect::new(x as f32, y as f32, w as f32, h as f32);
+                        // Scrim covers the editor+sidebar band to signal
+                        // modal state; `modal_scrim_rect` derives its bottom
+                        // edge from this frame's `el`, stopping above every
+                        // bottom-chrome rung already painted.
+                        let scrim_rect = render::modal_scrim_rect(
+                            &engine,
+                            &el,
+                            popup_viewport.width,
+                            y as f32,
+                            lh,
+                        );
                         let rect = render::paint_picker_rung(
                             backend,
                             picker,
-                            popup_viewport,
+                            editor_viewport,
+                            scrim_rect,
                             &(self.units.picker)(lh as f32),
+                            &theme,
                         );
                         // Hand the *painted* rect to the click/drag handlers.
                         self.picker_popup_rect.set(Some(rect));

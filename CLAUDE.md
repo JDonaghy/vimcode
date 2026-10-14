@@ -21,7 +21,8 @@ worker does not need to read it). The rule below stops *new* per-backend code.
 **Issues and acceptance are platform-neutral too.** If quadraui works as advertised, every vimcode behaviour is the same on every backend, so:
 
 - A vimcode issue's acceptance is a backend-neutral test (engine/`render.rs` unit test, or the TUI/headless driver), never "on macOS", "on Windows" or "verify on real hardware". Per-platform rendering and input are proven by quadraui's own conformance tests.
-- **Test on one platform: `vcd` (TUI) on Linux.** Assume a change that passes there works on every backend. Your verify loop and the Test stage run `cargo test --no-default-features` (plus a narrow filter while iterating); the GTK lane is GitHub CI's job, not yours.
+- **Test on TUI *and* GTK before push.** UI-touching changes must pass both `cargo test --no-default-features` (TUI) and `cargo test` (GTK, default features) locally before push. macOS and Windows are assumed to work — if they don't, that's a quadraui bug. Discovering assertion failures in CI wastes round-trips; both headless suites run in under two minutes locally.
+- **Update assertions alongside behaviour changes.** If your diff changes rendering geometry, layout bounds, scroll behaviour, or pixel positions, the same PR must update every existing test that asserts on the old values. A test that encodes the *old* behaviour as correct will fail in CI and block the release.
 - A bug that shows up on only one backend is a quadraui gap or bug: the fix is a quadraui issue, and the vimcode side is at most a version bump. If your issue asks you to fix a single-backend symptom inside vimcode, say so in your final message and stop rather than adding backend code.
 - Allowed per-platform differences are data, not code: e.g. default font per platform as a table the engine reads, and packaging/release plumbing.
 
@@ -95,7 +96,9 @@ Platform-Neutrality Rule); `src/main.rs` is a thin CLI dispatcher.
 **Workers: run narrow, relevant tests — not the whole suite.** Before committing:
 `cargo fmt`, `cargo clippy -- -D warnings`, and the tests for what you touched
 (`cargo test <filter>` or `cargo test --test <file>`). The full suite is CI's and
-the Test stage's job.
+the Test stage's job. **Exception:** UI-touching changes (layout, rendering,
+scroll, click geometry) must run both `cargo test --no-default-features` and
+`cargo test` (with GTK) before push — see the Platform-Neutrality Rule.
 
 - Plain `cargo` (default features = `gui` on) compiles `src/gtk/`;
   `--no-default-features` never does, so **a green `--no-default-features` run says

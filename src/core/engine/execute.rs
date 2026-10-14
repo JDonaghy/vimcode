@@ -3318,6 +3318,12 @@ impl Engine {
                         format!("VimCode {}", env!("CARGO_PKG_VERSION")),
                         String::new(),
                         "Vim-like code editor in Rust + GTK4".to_string(),
+                        String::new(),
+                        "Includes Microsoft's codicon icon font (CC-BY-4.0).".to_string(),
+                        String::new(),
+                        "VimCode is not affiliated with Microsoft Corporation.".to_string(),
+                        "\"Visual Studio Code\" and \"VS Code\" are trademarks of".to_string(),
+                        "Microsoft Corporation.".to_string(),
                     ],
                     vec![DialogButton {
                         label: "OK".to_string(),

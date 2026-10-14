@@ -1188,15 +1188,15 @@ mod tests {
     /// A wheel event must scroll the pane **under the pointer**, not whichever
     /// pane happens to hold focus.
     ///
-    /// This was dead on GTK after the #540 Relm4→ShellApp migration. Two
-    /// independent causes, both fixed alongside this test:
+    /// Two pieces of GTK state have to be live for that to work, and this
+    /// test covers both:
     ///
-    /// 1. `handle_mouse_scroll_msg` reads the pointer out of `App::last_editor_pointer`,
-    ///    which nothing assigned once the `EventControllerMotion` that used to
-    ///    write it was removed — so it was permanently `None`.
-    /// 2. The hovered-window lookup was gated on `App::drawing_area`, which is
-    ///    also never assigned under the ShellApp runner, and re-derived pane rects
-    ///    at a `(0, 0)` origin that ignores offsets.
+    /// 1. `handle_mouse_scroll_msg` reads the pointer out of
+    ///    `App::last_editor_pointer`, so something must keep that field
+    ///    populated under the ShellApp runner.
+    /// 2. The hovered-window lookup must not be gated on `App::drawing_area`,
+    ///    which the ShellApp runner never assigns, and must derive pane rects
+    ///    at the editor band's real origin rather than `(0, 0)`.
     ///
     /// Note the assertion that focus does *not* move: hovering must scroll
     /// without stealing focus.
@@ -3624,27 +3624,109 @@ mod tests {
         );
     }
 
-    /// VS Code's activity bar paints, top to bottom, Explorer ·
-    /// Search · Source Control · Run and Debug · Extensions — vimcode had
-    /// Source Control and Run and Debug swapped (debug third, git fourth)
-    /// and the wrong glyphs for three of the five (an open-folder icon for
-    /// Explorer, the plain `fa-bug` glyph for Run and Debug, and the
-    /// diamond-shaped `nf-dev-git`/`e702` glyph for Source Control).
+    /// `Explorer`/`Run and Debug`/`Source Control`/`Extensions` must paint
+    /// their new Font Awesome glyphs (`icons::EXPLORER`/`RUN_AND_DEBUG`/
+    /// `SOURCE_CONTROL`/`EXTENSIONS`), not the `nf-cod-*` Codicon-shaped
+    /// glyphs those constants held before the Nerd Font family swap.
+    /// Mirrors `activity_bar_search_icon_paints_the_shared_glyph_not_the_deleted_cod_variant`
+    /// (render the same app twice, diff the activity-bar column) but covers
+    /// the four chrome icons that moved to Font Awesome, by panel id.
+    #[test]
+    fn activity_bar_chrome_icons_paint_font_awesome_glyphs_not_the_deleted_nf_cod_variants() {
+        /// Comfortably inside the activity bar and below the title-bar band.
+        /// Starts higher than the search-icon test above's `100` because
+        /// Explorer is the topmost activity-bar icon (paints at y≈70, above
+        /// Search's row) rather than below it.
+        const STRIP_W: i32 = 40;
+        const STRIP_Y: std::ops::Range<i32> = 50..800;
+
+        fn activity_bar_strip(panel_id: &str, icon_override: Option<&str>) -> Vec<(u8, u8, u8)> {
+            // Same reasoning as the search-icon test's helper: patch
+            // `build_shell_config`'s output by hand between build and
+            // render, and acquire the paint/cwd guards in the same order
+            // (paint then cwd) so they drop last, after `driver`.
+            let _paint = crate::test_paint::PaintGuard::acquire();
+            let _cwd = crate::test_cwd::CwdReadGuard::acquire();
+            let mut engine = Engine::new();
+            engine.settings.use_nerd_fonts = Some(true);
+            let engine = Rc::new(RefCell::new(engine));
+            let app = App::new_headless(Rc::clone(&engine));
+            let mut config = crate::gtk::build_shell_config(&app);
+            if let Some(icon) = icon_override {
+                let panel = config
+                    .panels
+                    .iter_mut()
+                    .find(|p| p.id.as_str() == panel_id)
+                    .unwrap_or_else(|| panic!("fixture: shell_config must register {panel_id}"));
+                panel.icon = icon.to_string();
+            }
+            let mut driver = driver_with_shell(app, config, 1400, 900);
+            let mut px = Vec::new();
+            for y in STRIP_Y.step_by(2) {
+                for x in (0..STRIP_W).step_by(2) {
+                    px.push(driver.pixel(x, y));
+                }
+            }
+            px
+        }
+
+        // (panel id, the deleted nf-cod-* codepoint this constant held before
+        // its Font Awesome swap, label for the assertion message).
+        const CASES: &[(&str, &str, &str)] = &[
+            ("panel:explorer", "\u{eaf0}", "nf-cod-files (EXPLORER)"),
+            (
+                "panel:debug",
+                "\u{eb91}",
+                "nf-cod-debug_alt (RUN_AND_DEBUG)",
+            ),
+            (
+                "panel:git",
+                "\u{ea68}",
+                "nf-cod-source_control (SOURCE_CONTROL)",
+            ),
+            (
+                "panel:extensions",
+                "\u{eae6}",
+                "nf-cod-extensions (EXTENSIONS)",
+            ),
+        ];
+
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        crate::icons::set_nerd_fonts(true);
+
+        for (panel_id, old_glyph, label) in CASES {
+            let current = activity_bar_strip(panel_id, None);
+            let reverted = activity_bar_strip(panel_id, Some(old_glyph));
+
+            let differing = current
+                .iter()
+                .zip(reverted.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert!(
+                differing > 0,
+                "{panel_id}'s live rendering must differ from the deleted \
+                 {label} glyph it painted before its Font Awesome swap — \
+                 {differing}/{} sampled pixels differed; a revert of the \
+                 Font Awesome swap would make these two renders identical",
+                current.len()
+            );
+        }
+
+        crate::icons::set_nerd_fonts(prev_nf);
+    }
+
+    /// The activity bar paints, top to bottom: Explorer · Search ·
+    /// Source Control · Run and Debug · Extensions.
     ///
     /// Reads real painted output, not `PanelDefinition` state: each
     /// assertion locates a glyph via `GtkDriver::find`, which only reports
     /// positions `GtkBackend::record_painted_text` recorded while actually
     /// rasterising a Pango layout this frame, then checks the Y-coordinates
-    /// come back in top-to-bottom order. The icon glyphs doubling as search
-    /// needles (`icons::SOURCE_CONTROL`/`icons::RUN_AND_DEBUG`, nf-cod
-    /// `\u{ea68}`/`\u{eb91}`) are themselves new in this issue — on
-    /// unfixed `develop`, `App::resolve_builtin_panel_icon` never emits
-    /// either codepoint at all (`"panel:git"` painted the old `GIT_BRANCH`
-    /// diamond glyph, `"panel:debug"` painted the plain bug glyph), so
-    /// `find` returns `None` and the `expect` below panics before the
-    /// ordering check is even reached — verified by reverting
-    /// `src/app.rs`'s two changed match arms locally and re-running this
-    /// test, which failed exactly that way.
+    /// come back in top-to-bottom order. Locating by `icons::SOURCE_CONTROL`/
+    /// `icons::RUN_AND_DEBUG` (constant reference, not a literal codepoint)
+    /// keeps this test agnostic to which font family's glyph those
+    /// constants currently resolve to.
     #[test]
     fn activity_bar_paints_vscode_order_and_glyphs() {
         let mut engine = Engine::new();
@@ -3675,8 +3757,7 @@ mod tests {
         assert!(
             source_control_y < run_and_debug_y,
             "Source Control ({source_control_y}) must paint above Run and \
-             Debug ({run_and_debug_y}) — VS Code order, vimcode used to \
-             have these two swapped"
+             Debug ({run_and_debug_y})"
         );
         assert!(
             run_and_debug_y < extensions_y,
@@ -13812,7 +13893,7 @@ mod app_icon {
             row.width > 0.0 && row.height > 0.0,
             "the menu row must have been laid out by the last frame; got {row:?}"
         );
-        // GTK never reports a non-empty `titlebar_control_inset` (#940), so its
+        // GTK never reports a non-empty `titlebar_control_inset`, so its
         // app icon always starts flush with the band's leading edge.
         crate::render::split_menu_row_for_app_icon(row, 0.0).0
     }
@@ -14151,6 +14232,75 @@ mod clipboard_paste {
         assert!(
             pw > 0.0 && ph > 0.0,
             "the painted picker popup must have a non-degenerate rect, got {pw}x{ph}"
+        );
+    }
+
+    /// The command palette's backdrop scrim must dim the editor band behind
+    /// it without touching the status bar, on GTK's real Cairo alpha-blend
+    /// compositing. `render::paint_picker_rung` is shared between both
+    /// backends, but `Backend::draw_solid_fill`'s actual pixel effect
+    /// differs enough between them (a true alpha blend here vs. a
+    /// destructive blank-glyph fill on TUI, which
+    /// `picker_open_leaves_status_bar_text_visible_via_shell_app` in
+    /// `src/tui_main/app_on_tui_tests.rs` covers) that this backend needs
+    /// its own black-box coverage of the same `scrim_rect` contract.
+    #[test]
+    fn opening_command_palette_dims_editor_without_touching_status_bar_via_gtk_driver() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        let mode_bounds = h
+            .driver
+            .find_bounds("NORMAL")
+            .expect("the mode badge must paint on the status bar's row");
+        let badge_mid = (
+            (mode_bounds.x + mode_bounds.width / 2.0) as i32,
+            (mode_bounds.y + mode_bounds.height / 2.0) as i32,
+        );
+        let status_colour_closed = h.driver.pixel(badge_mid.0, badge_mid.1);
+
+        h.driver.dispatch(UiEvent::Accelerator(
+            quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+            quadraui::Modifiers::default(),
+        ));
+        h.driver.render();
+
+        let (px, py, _pw, ph) = h
+            .picker_popup()
+            .expect("the command palette must actually paint, not just flip engine state");
+        // Just left of the popup's own left edge, vertically centred on it —
+        // inside the editor band `scrim_rect` covers, but outside the popup
+        // itself, so this samples the dimmed backdrop rather than the
+        // palette's own fill. Asserted rather than clamped: a popup flush
+        // against the window's left edge would leave no backdrop to sample
+        // there, which must read as "fix the probe", not as a silent pass.
+        let gap = 20.0;
+        assert!(
+            px > gap,
+            "this probe needs a strip of backdrop left of the popup to sample; \
+             the palette starts at x={px}, within {gap}px of the window edge"
+        );
+        let editor_probe = ((px - gap) as i32, (py + ph / 2.0) as i32);
+        let editor_colour_open = h.driver.pixel(editor_probe.0, editor_probe.1);
+        let status_colour_open = h.driver.pixel(badge_mid.0, badge_mid.1);
+
+        assert_eq!(
+            status_colour_open, status_colour_closed,
+            "FRAME_Z_ORDER composes StatusBar before UnifiedPicker, so the \
+             scrim's rect must stop above it — the mode badge's colour must \
+             not shift when the command palette opens"
+        );
+
+        h.engine.borrow_mut().close_picker();
+        h.driver.render();
+        let editor_colour_closed = h.driver.pixel(editor_probe.0, editor_probe.1);
+
+        assert_ne!(
+            editor_colour_open, editor_colour_closed,
+            "opening the command palette must actually dim the editor band \
+             behind it (MODAL_SCRIM_COLOR over scrim_rect), not leave it \
+             unchanged while only the status bar is protected"
         );
     }
 }
@@ -16347,6 +16497,69 @@ mod modal_rung {
             "the dismissed popup's title must be gone from the painted \
              surface, not just the cached rect cleared; painted: {:?}",
             h.driver.painted_texts()
+        );
+    }
+
+    /// The picker popup floats over the editor pane only: it must start to
+    /// the right of the sidebar and sit near the top of the window rather
+    /// than spanning (or centering across) the full window height.
+    #[test]
+    fn picker_popup_floats_over_editor_pane_not_sidebar() {
+        let mut engine = small_engine();
+        engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+        let h = harness(engine, 1400, 900);
+
+        let sb = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("the sidebar paints by default and must publish its bounds");
+        let (px, py, _pw, ph) = h
+            .picker_popup()
+            .expect("fixture must actually paint the picker");
+
+        assert!(
+            px >= (sb.x + sb.width) as f64,
+            "the popup's left edge ({px}) must start at or right of the \
+             sidebar's right edge ({}, {}), not overlap it",
+            sb.x,
+            sb.width
+        );
+        assert!(
+            ph < 900.0 * 0.5,
+            "a 2-item picker (LineEndings) must paint a compact popup, not \
+             one spanning most of the 900px-tall window; painted height: {ph}"
+        );
+        assert!(
+            py < 900.0 * 0.25,
+            "the popup must anchor near the top of the window ({py}), not \
+             be vertically centred across it"
+        );
+    }
+
+    /// A picker with many more results (the command palette) paints a
+    /// taller popup than a picker with just a couple of entries
+    /// (line endings) — height tracks the result count instead of being a
+    /// fixed share of the viewport.
+    #[test]
+    fn picker_popup_height_scales_with_item_count() {
+        let mut few_engine = small_engine();
+        few_engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+        let h_few = harness(few_engine, 1400, 900);
+        let (_, _, _, few_h) = h_few
+            .picker_popup()
+            .expect("the line-endings picker must paint");
+
+        let mut many_engine = small_engine();
+        many_engine.open_picker(crate::core::engine::PickerSource::Commands);
+        let h_many = harness(many_engine, 1400, 900);
+        let (_, _, _, many_h) = h_many
+            .picker_popup()
+            .expect("the command palette must paint");
+
+        assert!(
+            many_h > few_h,
+            "the command palette (many results) must paint a taller popup \
+             ({many_h}) than the line-endings picker (two results, {few_h})"
         );
     }
 }
