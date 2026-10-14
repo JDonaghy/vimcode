@@ -2813,9 +2813,9 @@ mod tests {
     }
 
     /// The tab-bar row and the breadcrumb row are fixed-pixel chrome, not
-    /// `ceil(line_height * 1.6)` / `+ line_height`. This test pins that the
-    /// fixed pixel constants actually reach the live paint pipeline, and that
-    /// breadcrumbs add exactly [`crate::render::BREADCRUMB_ROW_HEIGHT_PX`] —
+    /// `ceil(line_height * 1.6)` / `+ line_height`. This test pins that those
+    /// pixel heights actually reach the live paint pipeline, and that
+    /// breadcrumbs add exactly [`crate::render::breadcrumb_row_height_px`] —
     /// not a whole `line_height`-tall row — above the window content.
     #[test]
     fn breadcrumb_row_adds_a_fixed_22px_not_a_whole_line_height() {
@@ -2864,15 +2864,52 @@ mod tests {
         assert_ne!(
             lh, 22.0,
             "test setup sanity: the harness's painted line_height must not \
-             coincidentally equal BREADCRUMB_ROW_HEIGHT_PX, or this test \
+             coincidentally equal the skin's breadcrumb row height, or this \
+             test \
              cannot distinguish the fix from the old `+ line_height` bug"
         );
         assert!(
-            (delta - crate::render::BREADCRUMB_ROW_HEIGHT_PX).abs() < 0.5,
-            "breadcrumbs must reserve exactly BREADCRUMB_ROW_HEIGHT_PX \
-             ({}) above the window content, not line_height ({lh}); got \
-             delta {delta} (on_top={on_top}, off_top={off_top})",
-            crate::render::BREADCRUMB_ROW_HEIGHT_PX
+            (delta - crate::render::breadcrumb_row_height_px()).abs() < 0.5,
+            "breadcrumbs must reserve exactly the skin's breadcrumb row \
+             height ({}) above the window content, not line_height ({lh}); \
+             got delta {delta} (on_top={on_top}, off_top={off_top})",
+            crate::render::breadcrumb_row_height_px()
+        );
+    }
+
+    /// A skin file's `[bars]` proportions reach the painted frame: raising
+    /// `tab_bar` pushes the breadcrumb text — and with it everything below —
+    /// down by exactly that many pixels, with no backend code involved. This
+    /// is the whole point of the skin being declarative: the same binary
+    /// paints different chrome proportions purely because a token changed.
+    #[test]
+    fn skin_bar_heights_move_the_painted_chrome() {
+        let baseline = {
+            let h = harness(engine_with_breadcrumb_path(), 1400, 900);
+            h.driver
+                .find_bounds("src")
+                .expect("the breadcrumb's \"src\" path segment must paint")
+                .y
+        };
+
+        let extra = 24.0_f32;
+        let mut taller = crate::render::Skin::default();
+        taller.bars.tab_bar += extra;
+        let shifted = {
+            let _skin = crate::render::push_scoped_skin(taller);
+            let h = harness(engine_with_breadcrumb_path(), 1400, 900);
+            h.driver
+                .find_bounds("src")
+                .expect("the breadcrumb's \"src\" path segment must paint")
+                .y
+        };
+
+        let delta = shifted - baseline;
+        assert!(
+            (delta - extra).abs() < 0.5,
+            "a skin with a {extra}px taller tab bar must paint the breadcrumb \
+             row {extra}px lower; got {delta} (baseline={baseline}, \
+             shifted={shifted})"
         );
     }
 
@@ -2881,8 +2918,8 @@ mod tests {
     /// in `gtk/mod.rs`) — not float at whatever font a previous draw call in
     /// the frame happened to leave on the shared Pango layout. Measures
     /// *width*, not height: `find_bounds`' recorded rect reports a fixed
-    /// row-slot height for status-bar segments (matching
-    /// `BREADCRUMB_ROW_HEIGHT_PX`) regardless of the font actually painted,
+    /// row-slot height for status-bar segments (matching the skin's
+    /// `[bars] breadcrumb_row`) regardless of the font actually painted,
     /// but glyph width scales with point size same as it does.
     #[test]
     fn breadcrumb_text_width_tracks_ui_font_size_not_editor_font_size() {

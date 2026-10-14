@@ -1090,26 +1090,6 @@ pub fn paint_tab_drop_overlay(
     Some(overlay)
 }
 
-/// The active skin's divider line width, in pixels.
-///
-/// Not yet consulted by [`draw_dividers_as_splits`] — a backend's real
-/// divider-line thickness is picked entirely inside that backend's own
-/// `Split::layout`, so wiring this in is a quadraui-side change (passing the
-/// skin's [`Spacing::divider_width`] through as that layout's thickness
-/// input), not a change to this pure module.
-pub fn skin_divider_width_px() -> f64 {
-    active_skin().spacing.divider_width as f64
-}
-
-/// The active skin's gutter width token, in pixels.
-///
-/// Distinct from this module's own per-window gutter math (line numbers,
-/// fold markers), which is sized from font metrics, not the skin — this is
-/// the flat chrome-gutter spacing token the skin file declares.
-pub fn skin_gutter_px() -> f64 {
-    active_skin().spacing.gutter as f64
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1698,27 +1678,5 @@ pub(crate) mod tests {
     fn linebreak_is_a_no_op_when_the_line_fits() {
         assert_eq!(compute_word_wrap_segments("short", 80, false), vec![(0, 5)]);
         assert_eq!(compute_word_wrap_segments("short", 80, true), vec![(0, 5)]);
-    }
-
-    // ─── Skin accessors ─────────────────────────────────────────────────
-
-    #[test]
-    fn skin_spacing_accessors_track_the_active_skin() {
-        let _guard = crate::render::skin::TEST_SKIN_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        crate::render::set_active_skin(crate::render::Skin {
-            spacing: crate::render::Spacing {
-                divider_width: 3.0,
-                gutter: 64.0,
-                ..crate::render::Spacing::default()
-            },
-            ..crate::render::Skin::default()
-        });
-
-        assert_eq!(skin_divider_width_px(), 3.0);
-        assert_eq!(skin_gutter_px(), 64.0);
-
-        crate::render::set_active_skin(crate::render::Skin::default());
     }
 }

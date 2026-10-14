@@ -75,7 +75,7 @@ mod tests {
     //! arm (chosen there specifically to give plenty of headroom). Running at
     //! a realistic size is what surfaces the **unit** category gap #1425's own
     //! diagnosis names: `App::render_content` reserves
-    //! `render::TAB_ROW_HEIGHT_PX`/`BREADCRUMB_ROW_HEIGHT_PX` (35/22) as if
+    //! `render::tab_row_height_px`/`breadcrumb_row_height_px` (35/22 px) as if
     //! they were cell-grid *rows* rather than pixels, so on an 80x24 terminal
     //! the tab bar alone claims more rows than exist and the editor content
     //! band collapses. That is exactly the gap this module exists to inventory
@@ -6322,8 +6322,8 @@ mod tests {
             let h = harness_no_sidebar(plain_engine());
             let driver = &h.driver;
 
-            // `App::render_content` reserves TAB_ROW_HEIGHT_PX/
-            // BREADCRUMB_ROW_HEIGHT_PX as cell-grid rows.
+            // `App::render_content` reserves the px profile's
+            // tab/breadcrumb row heights as cell-grid rows.
             assert!(
                 driver.screen_has("Ln 1,"),
                 "a fresh buffer's status bar must show the cursor on line \

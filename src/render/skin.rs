@@ -4,11 +4,14 @@
 //!
 //! A [`Skin`] is the foundation later issues reskin individual surfaces
 //! against: every bar height, spacing, shape and control-size token a
-//! backend currently might otherwise hardcode lives here instead, with one
-//! compiled-in [`Skin::default`] defining vimcode's own proportions —
-//! deliberately *not* a copy of VS Code's 48/35/22px activity-bar/tab-bar/
-//! status-bar metrics, so vimcode has its own visual identity from the
-//! first commit, not someone else's borrowed one.
+//! backend might otherwise hardcode lives here instead, with one
+//! compiled-in [`Skin::default`] carrying the proportions vimcode ships
+//! with. Changing a token — in a skin file or by calling
+//! [`set_active_skin`] — changes the chrome the GUI backends actually
+//! paint, because the shared render layer reads the active skin instead of
+//! its own constants (see [`super::tab_row_height_px`],
+//! [`super::breadcrumb_row_height_px`] and
+//! [`super::UnitProfile::px`]'s activity-bar width).
 //!
 //! This is **not** a replacement for VS Code theme JSON — [`super::Theme`]
 //! and its `from_vscode_json` loader keep doing syntax/UI colour mapping.
@@ -37,20 +40,27 @@
 //! [`active_skin`] / [`set_active_skin`] hold the process-wide skin every
 //! render call reads, mirroring the `OnceLock`/`Mutex`-backed globals
 //! already used for other process-wide, rarely-mutated state (e.g.
-//! `render::tab_bar`'s registered font family). Nothing reads this global
-//! yet from a live backend — wiring a per-frame `quadraui::Backend::set_style`
-//! call is left to the backend-specific follow-up this issue's own
-//! description calls out as later work.
+//! `render::tab_bar`'s registered font family). [`active_bar_heights`] is
+//! the allocation-free accessor the per-frame geometry helpers use.
+//! [`push_scoped_skin`] overrides the active skin for the calling thread
+//! only, for as long as its guard lives — how a test (or a live skin
+//! preview) swaps proportions without racing other threads against the
+//! process-wide slot.
+//!
+//! Mapping the shape/control tokens onto the fixed token set quadraui's own
+//! pixel backends read is [`Skin::to_quadraui_style`]; handing that to
+//! `quadraui::Backend::set_style` per frame is backend wiring left to a
+//! follow-up.
 
+use std::cell::RefCell;
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
 /// Heights, in logical pixels, of vimcode's horizontal chrome bars.
 ///
-/// Deliberately **not** VS Code's 48/35/22px activity-bar/tab-bar/
-/// status-bar metrics — see [`Skin::default`]'s own doc for vimcode's
-/// own values and why they differ.
+/// [`BarHeights::default`] carries the proportions the GUI backends paint
+/// with out of the box; a skin file overrides individual fields.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BarHeights {
@@ -72,11 +82,14 @@ pub struct BarHeights {
 }
 
 impl Default for BarHeights {
+    /// The heights the shared render layer hands the GUI backends when no
+    /// skin file is loaded. Picking *different* proportions is a visual
+    /// decision a skin file now expresses on its own, with no code change.
     fn default() -> Self {
         Self {
-            activity_bar: 40.0,
-            tab_bar: 30.0,
-            breadcrumb_row: 20.0,
+            activity_bar: 48.0,
+            tab_bar: 35.0,
+            breadcrumb_row: 22.0,
             status_bar: 22.0,
             title_bar: 32.0,
         }
@@ -202,10 +215,9 @@ pub struct Skin {
 }
 
 impl Default for Skin {
-    /// vimcode's own built-in proportions. Deliberately different from
-    /// VS Code's 48/35/22px activity-bar/tab-bar/status-bar metrics (see
-    /// [`BarHeights::default`]) — a skin file is an *override* of this
-    /// baseline, not a required file every install needs to carry.
+    /// vimcode's built-in proportions (see [`BarHeights::default`]) — a
+    /// skin file is an *override* of this baseline, not a required file
+    /// every install needs to carry.
     fn default() -> Self {
         Self {
             name: "vimcode-default".to_string(),
@@ -254,14 +266,69 @@ impl Skin {
 /// called — normally once, at startup, by `app::` resolution logic.
 static ACTIVE_SKIN: OnceLock<Mutex<Skin>> = OnceLock::new();
 
-/// The currently active [`Skin`] — [`Skin::default`] until
-/// [`set_active_skin`] has been called at least once.
+thread_local! {
+    /// Per-thread override of [`ACTIVE_SKIN`], installed by
+    /// [`push_scoped_skin`] and consulted ahead of the global by
+    /// [`active_skin`] / [`active_bar_heights`].
+    static SCOPED_SKIN: RefCell<Option<Skin>> = const { RefCell::new(None) };
+}
+
+/// The currently active [`Skin`] — the calling thread's
+/// [`push_scoped_skin`] override if one is live, otherwise the
+/// process-wide skin, which is [`Skin::default`] until [`set_active_skin`]
+/// has been called at least once.
+///
+/// Clones (a `Skin` owns its `name`). Per-frame geometry callers want
+/// [`active_bar_heights`] instead.
 pub fn active_skin() -> Skin {
+    if let Some(scoped) = SCOPED_SKIN.with(|slot| slot.borrow().clone()) {
+        return scoped;
+    }
     ACTIVE_SKIN
         .get_or_init(|| Mutex::new(Skin::default()))
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default()
+}
+
+/// The active skin's [`BarHeights`] without cloning the skin's name — the
+/// accessor the per-frame chrome geometry helpers in
+/// [`super::hit_test_geometry`] call.
+pub fn active_bar_heights() -> BarHeights {
+    if let Some(bars) = SCOPED_SKIN.with(|slot| slot.borrow().as_ref().map(|skin| skin.bars)) {
+        return bars;
+    }
+    ACTIVE_SKIN
+        .get_or_init(|| Mutex::new(Skin::default()))
+        .lock()
+        .map(|guard| guard.bars)
+        .unwrap_or_default()
+}
+
+/// Override the active skin for the calling thread until the returned
+/// guard drops, restoring whatever override was in place before.
+///
+/// Thread-scoped rather than global on purpose: swapping the process-wide
+/// [`ACTIVE_SKIN`] slot would change chrome geometry under every other
+/// thread — including, under a test runner, whichever sibling test happens
+/// to be painting a frame at that moment.
+pub fn push_scoped_skin(skin: Skin) -> ScopedSkinGuard {
+    let previous = SCOPED_SKIN.with(|slot| slot.borrow_mut().replace(skin));
+    ScopedSkinGuard { previous }
+}
+
+/// Restores the previous thread-scoped skin on drop. See
+/// [`push_scoped_skin`].
+#[must_use = "the scoped skin is restored as soon as this guard drops"]
+pub struct ScopedSkinGuard {
+    previous: Option<Skin>,
+}
+
+impl Drop for ScopedSkinGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        SCOPED_SKIN.with(|slot| *slot.borrow_mut() = previous);
+    }
 }
 
 /// Set the process-wide active skin. Later calls replace earlier ones;
@@ -274,12 +341,16 @@ pub fn set_active_skin(skin: Skin) {
     }
 }
 
-/// Serializes every test, in this file and in sibling `render::` test
-/// modules, that calls [`set_active_skin`] then asserts against
-/// [`active_skin`] — otherwise two such tests on different test-runner
-/// threads can interleave their `set`/`assert` pairs against the one
-/// process-wide [`ACTIVE_SKIN`] slot and fail nondeterministically. Hold the
-/// returned guard for the test's full set-then-assert span.
+/// Serializes every test that calls [`set_active_skin`] then asserts
+/// against [`active_skin`] — otherwise two such tests on different
+/// test-runner threads can interleave their `set`/`assert` pairs against
+/// the one process-wide [`ACTIVE_SKIN`] slot and fail nondeterministically.
+/// Hold the returned guard for the test's full set-then-assert span.
+///
+/// A test that needs a *geometry* token (anything [`active_bar_heights`]
+/// feeds) must use [`push_scoped_skin`] instead: the lock only serializes
+/// tests that take it, and a GUI driver test painting a frame on another
+/// thread does not.
 #[cfg(test)]
 pub(crate) static TEST_SKIN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -288,14 +359,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_skin_differs_from_vs_code_bar_heights() {
+    fn default_skin_drives_the_shared_chrome_geometry_helpers() {
         let bars = Skin::default().bars;
-        // VS Code's own activity bar / tab bar / status bar are 48 / 35 / 22px.
-        // vimcode's defaults must not silently match that triple.
-        assert_ne!(
-            (bars.activity_bar, bars.tab_bar, bars.status_bar),
-            (48.0, 35.0, 22.0)
+        // The render layer's fixed-pixel chrome helpers must agree with the
+        // built-in skin: loading no skin file at all has to leave the
+        // painted chrome exactly where the default skin puts it.
+        assert_eq!(
+            crate::render::tab_row_height_px(17.0) as f32,
+            bars.tab_bar,
+            "tab_row_height_px must come from the active skin"
         );
+        assert_eq!(
+            crate::render::breadcrumb_row_height_px() as f32,
+            bars.breadcrumb_row
+        );
+        assert_eq!(
+            crate::render::UnitProfile::px().activity_bar_width_px,
+            Some(bars.activity_bar)
+        );
+    }
+
+    #[test]
+    fn scoped_skin_overrides_the_active_skin_until_the_guard_drops() {
+        let mut custom = Skin::default();
+        custom.name = "scoped".to_string();
+        custom.bars.tab_bar = 61.0;
+
+        {
+            let _guard = push_scoped_skin(custom.clone());
+            assert_eq!(active_skin(), custom);
+            assert_eq!(active_bar_heights().tab_bar, 61.0);
+        }
+
+        assert_ne!(active_skin().name, "scoped");
+        assert_eq!(
+            active_bar_heights().tab_bar,
+            Skin::default().bars.tab_bar,
+            "dropping the guard must restore the unscoped skin"
+        );
+    }
+
+    #[test]
+    fn scoped_skins_nest() {
+        let mut outer = Skin::default();
+        outer.bars.tab_bar = 50.0;
+        let mut inner = Skin::default();
+        inner.bars.tab_bar = 70.0;
+
+        let _outer_guard = push_scoped_skin(outer);
+        {
+            let _inner_guard = push_scoped_skin(inner);
+            assert_eq!(active_bar_heights().tab_bar, 70.0);
+        }
+        assert_eq!(active_bar_heights().tab_bar, 50.0);
     }
 
     #[test]
@@ -394,6 +510,10 @@ mod tests {
         let _guard = TEST_SKIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut custom = Skin::default();
         custom.name = "custom-for-test".to_string();
+        // `status_bar` is the one bar token no geometry helper reads (the
+        // status bar is sized from `line_height`), so mutating the global
+        // here cannot shift chrome under a driver test painting concurrently
+        // on another thread.
         custom.bars.status_bar = 77.0;
 
         set_active_skin(custom.clone());
