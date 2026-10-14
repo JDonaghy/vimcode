@@ -992,35 +992,34 @@ pub fn compute_editor_layout(
     }
 }
 
-/// Fixed tab-bar row height in pixels, matching VS Code's `35px` tab height.
-/// Used by GTK and Win-GUI backends. Deliberately a constant, not derived
-/// from `line_height` — it stays fixed regardless of `settings.font_size`.
-pub const TAB_ROW_HEIGHT_PX: f64 = 35.0;
-
-/// Fixed breadcrumb row height in pixels, matching VS Code's compact
-/// breadcrumb chrome. Used by GTK and Win-GUI backends. Deliberately a
-/// constant, not `line_height` — same reasoning as [`TAB_ROW_HEIGHT_PX`].
-/// Only the row's reserved *height* is fixed here; the breadcrumb text
-/// itself still paints through `Backend::draw_status_bar` and tracks
-/// `settings.font_size` until quadraui adds a font override for that method.
-pub const BREADCRUMB_ROW_HEIGHT_PX: f64 = 22.0;
-
-/// Compute the tab bar row height in pixels (the row containing tab labels).
-/// Used by GTK and Win-GUI backends. `line_height` is accepted for call-site
-/// stability but no longer affects the result — see [`TAB_ROW_HEIGHT_PX`].
+/// Tab-bar row height in pixels — the active [`crate::render::Skin`]'s
+/// `bars.tab_bar` token. Used by GTK and Win-GUI backends. Fixed pixels,
+/// not derived from `line_height`: the row stays the size the skin asks for
+/// regardless of `settings.font_size`. `line_height` is accepted for
+/// call-site stability and does not affect the result.
 pub fn tab_row_height_px(_line_height: f64) -> f64 {
-    TAB_ROW_HEIGHT_PX
+    active_bar_heights().tab_bar as f64
+}
+
+/// Breadcrumb row height in pixels — the active [`crate::render::Skin`]'s
+/// `bars.breadcrumb_row` token. Only the row's reserved *height* comes from
+/// the skin; the breadcrumb text itself paints through
+/// `Backend::draw_status_bar` and tracks `settings.ui_font_size` until
+/// quadraui adds a font override for that method.
+pub fn breadcrumb_row_height_px() -> f64 {
+    active_bar_heights().breadcrumb_row as f64
 }
 
 /// Compute the full tab bar height including optional breadcrumb row. Used by
 /// GTK and Win-GUI backends. `line_height` is accepted for call-site stability
-/// but no longer affects the result — see [`TAB_ROW_HEIGHT_PX`]/
-/// [`BREADCRUMB_ROW_HEIGHT_PX`].
-pub fn tab_bar_height_px(_line_height: f64, breadcrumbs: bool) -> f64 {
+/// but does not affect the result — see [`tab_row_height_px`] /
+/// [`breadcrumb_row_height_px`].
+pub fn tab_bar_height_px(line_height: f64, breadcrumbs: bool) -> f64 {
+    let rows = tab_row_height_px(line_height);
     if breadcrumbs {
-        TAB_ROW_HEIGHT_PX + BREADCRUMB_ROW_HEIGHT_PX
+        rows + breadcrumb_row_height_px()
     } else {
-        TAB_ROW_HEIGHT_PX
+        rows
     }
 }
 
@@ -1033,14 +1032,16 @@ pub fn tab_bar_height_px(_line_height: f64, breadcrumbs: bool) -> f64 {
 /// pointer, so copying is cheap.
 #[derive(Clone, Copy)]
 pub struct UnitProfile {
-    /// [`tab_row_height_px`] (GTK: fixed 35px regardless of `lh`) vs a
-    /// single cell row (`|lh| lh`, TUI: `lh` is always `1.0`).
+    /// [`tab_row_height_px`] (GTK: the active skin's `[bars] tab_bar`
+    /// regardless of `lh`) vs a single cell row (`|lh| lh`, TUI: `lh` is
+    /// always `1.0`).
     pub tab_row_h: fn(f64) -> f64,
-    /// [`tab_bar_height_px`] (GTK: fixed 35/57px) vs `lh` or `2*lh` when
-    /// breadcrumbs are on (TUI: one or two cell rows).
+    /// [`tab_bar_height_px`] (GTK: the skin's tab row, plus its breadcrumb row
+    /// when breadcrumbs are on) vs `lh` or `2*lh` when breadcrumbs are on
+    /// (TUI: one or two cell rows).
     pub tab_bar_h: fn(f64, bool) -> f64,
-    /// [`BREADCRUMB_ROW_HEIGHT_PX`] (GTK: a fixed 22px regardless of `lh`)
-    /// vs one more full cell row (`|lh| lh`, TUI).
+    /// [`breadcrumb_row_height_px`] (GTK: the skin's `[bars] breadcrumb_row`
+    /// regardless of `lh`) vs one more full cell row (`|lh| lh`, TUI).
     pub breadcrumb_row_h: fn(f64) -> f64,
     /// [`gtk_minimap_sizing`] vs [`TUI_MINIMAP_SIZING`] — both plain values,
     /// not functions, since neither depends on `line_height`.
@@ -1067,9 +1068,10 @@ pub struct UnitProfile {
     /// Divider/tab-close grab tolerance: `(6.0, 6.0)` device pixels on GTK,
     /// `(1.0, 1.0)` cells on TUI.
     pub hit_tolerance: (f64, f64),
-    /// [`quadraui::ShellConfig::with_activity_bar_width_px`]'s argument.
-    /// `Some(48.0)` on GTK/macOS/Win (VS Code parity); `None` on TUI, which
-    /// leaves [`quadraui::ShellConfig::activity_bar_width`]'s own default in charge.
+    /// [`quadraui::ShellConfig::with_activity_bar_width_px`]'s argument. The
+    /// active skin's `[bars] activity_bar` on GTK/macOS/Win; `None` on TUI,
+    /// which leaves [`quadraui::ShellConfig::activity_bar_width`]'s own
+    /// default in charge.
     pub activity_bar_width_px: Option<f32>,
     /// [`quadraui::ShellConfig::with_title_bar`]'s `height_lh` argument.
     pub title_bar_lh: f32,
@@ -1106,7 +1108,7 @@ impl UnitProfile {
         UnitProfile {
             tab_row_h: tab_row_height_px,
             tab_bar_h: tab_bar_height_px,
-            breadcrumb_row_h: |_lh| BREADCRUMB_ROW_HEIGHT_PX,
+            breadcrumb_row_h: |_lh| breadcrumb_row_height_px(),
             minimap: gtk_minimap_sizing(),
             picker: gtk_picker_sizing,
             picker_rows: gtk_picker_rows,
@@ -1115,7 +1117,7 @@ impl UnitProfile {
             divider_metrics: |_breadcrumbs| GTK_DIVIDER_METRICS,
             sidebar_system_metrics: gui_sidebar_system_metrics,
             hit_tolerance: (6.0, 6.0),
-            activity_bar_width_px: Some(48.0),
+            activity_bar_width_px: Some(active_bar_heights().activity_bar),
             title_bar_lh: 2.0,
             // ~345px at the default editor font, down from the
             // inherited `20.0`'s ~460px — see the field doc for why this is
@@ -1250,8 +1252,11 @@ pub(crate) mod tests {
     fn test_tab_bar_height_px() {
         let no_bc = tab_bar_height_px(20.0, false);
         let with_bc = tab_bar_height_px(20.0, true);
-        assert_eq!(no_bc, TAB_ROW_HEIGHT_PX);
-        assert_eq!(with_bc, TAB_ROW_HEIGHT_PX + BREADCRUMB_ROW_HEIGHT_PX);
+        assert_eq!(no_bc, tab_row_height_px(20.0));
+        assert_eq!(
+            with_bc,
+            tab_row_height_px(20.0) + breadcrumb_row_height_px()
+        );
     }
 
     /// Raising `line_height` (a stand-in for `settings.font_size`) must NOT
@@ -1262,12 +1267,34 @@ pub(crate) mod tests {
         let small = tab_row_height_px(14.0);
         let large = tab_row_height_px(40.0);
         assert_eq!(small, large);
-        assert_eq!(small, TAB_ROW_HEIGHT_PX);
+        assert_eq!(small, active_bar_heights().tab_bar as f64);
 
         let small_bc = tab_bar_height_px(14.0, true);
         let large_bc = tab_bar_height_px(40.0, true);
         assert_eq!(small_bc, large_bc);
-        assert_eq!(small_bc, TAB_ROW_HEIGHT_PX + BREADCRUMB_ROW_HEIGHT_PX);
+        let bars = active_bar_heights();
+        assert_eq!(small_bc, (bars.tab_bar + bars.breadcrumb_row) as f64);
+    }
+
+    /// The px profile's chrome bands come from the active skin, so a scoped
+    /// skin with taller bars moves them without any backend code changing.
+    #[test]
+    fn px_chrome_bands_follow_the_active_skin() {
+        let mut skin = Skin::default();
+        skin.bars.tab_bar += 24.0;
+        skin.bars.breadcrumb_row += 6.0;
+        skin.bars.activity_bar += 10.0;
+        let taller = skin.bars;
+        let _guard = push_scoped_skin(skin);
+
+        let px = UnitProfile::px();
+        assert_eq!((px.tab_row_h)(17.0), taller.tab_bar as f64);
+        assert_eq!((px.breadcrumb_row_h)(17.0), taller.breadcrumb_row as f64);
+        assert_eq!(
+            (px.tab_bar_h)(17.0, true),
+            (taller.tab_bar + taller.breadcrumb_row) as f64
+        );
+        assert_eq!(px.activity_bar_width_px, Some(taller.activity_bar));
     }
 
     /// `main_content_true_height` adds the shell's own

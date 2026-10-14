@@ -5953,7 +5953,7 @@ mod issue_1360_activity_bar_click_focuses_panel {
 /// `quadraui::tui::TuiBackend`) must paint the buffer's first line directly
 /// below a 1-row tab bar, with the status bar on row 22 and the command line
 /// on row 23 — proof that `render::UnitProfile::cell()` reserves the tab bar
-/// as one cell row (not `TAB_ROW_HEIGHT_PX`'s pixel height) rather than
+/// as one cell row (not `tab_row_height_px`'s pixel height) rather than
 /// collapsing the whole editor content band.
 #[cfg(test)]
 mod issue_1426_app_on_tui_rows_match_shipped_tui {
