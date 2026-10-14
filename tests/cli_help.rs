@@ -1,37 +1,38 @@
-//! #979: `vimcode --help` used to initialize GTK before the flag was even
-//! looked at, so on any host with no `DISPLAY`/`WAYLAND_DISPLAY` (SSH, a
-//! container, CI) it panicked instead of printing usage — the exact repro
-//! from the v0.11.0 release smoke on `dellserver`.
+//! This test spawns the compiled `vimcode`/`vcd` binary with
+//! `DISPLAY`/`WAYLAND_DISPLAY` removed and asserts it prints usage
+//! and exits 0 rather than panicking or printing GTK's generic help.
+//! The `--help` flag must be processed before any GTK initialization.
 //!
-//! This spawns the actual compiled `vimcode`/`vcd` binaries (not the
-//! in-process `Args::parse` unit tests in `src/main.rs`, which only pin the
-//! parsing logic and can't observe GTK ever being touched) with
-//! `DISPLAY`/`WAYLAND_DISPLAY` removed — the one condition the original bug
-//! required — and asserts they print usage and exit 0 rather than crashing.
-//!
-//! Observed RED against unfixed `develop`: with the `--help` check removed
-//! from `src/main.rs`'s dispatcher (restoring the pre-fix ordering, where
-//! `--help` fell through to `launch_gui`),
-//! `vimcode_help_prints_usage_and_exits_0_with_no_display` failed — on the
-//! host that reproduced this locally, GTK's own `GApplication` argument
-//! parser intercepted `--help` and printed its generic `[OPTION…]` help
-//! instead of vimcode's usage (the `assert!(stdout.contains("Usage:
-//! vimcode"))` failed); on the release-smoke host in the original report,
-//! the same code path instead panicked in `gtk4::rt::init` ("Failed to
-//! initialize GTK") with a non-zero exit. Either way, `--help` never reaches
-//! the dispatcher's own usage text without the fix.
+//! `--help` itself exits before anything would read or write
+//! `$HOME/.config/vimcode`, but both tests still pin `$HOME` to a
+//! throwaway directory (mirroring `tests/ext_install_cli.rs`'s
+//! real-binary-spawn pattern) so that stays true even if `--help`
+//! handling ever moves later in startup.
 
 use std::process::Command;
 
+/// Build a throwaway, empty `$HOME` for a spawned binary and return its path.
+fn throwaway_home(label: &str) -> std::path::PathBuf {
+    let home =
+        std::env::temp_dir().join(format!("vc-cli-help-test-{}-{label}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create throwaway home dir");
+    home
+}
+
 #[test]
 fn vimcode_help_prints_usage_and_exits_0_with_no_display() {
+    let home = throwaway_home("vimcode");
     let exe = env!("CARGO_BIN_EXE_vimcode");
     let output = Command::new(exe)
         .arg("--help")
+        .env("HOME", &home)
+        .env("VIMCODE_TEST_HOME_ISOLATED", "1")
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
         .output()
         .expect("failed to run vimcode --help");
+    let _ = std::fs::remove_dir_all(&home);
 
     assert!(
         output.status.success(),
@@ -57,13 +58,17 @@ fn vimcode_help_prints_usage_and_exits_0_with_no_display() {
 
 #[test]
 fn vcd_help_prints_usage_and_exits_0() {
+    let home = throwaway_home("vcd");
     let exe = env!("CARGO_BIN_EXE_vcd");
     let output = Command::new(exe)
         .arg("--help")
+        .env("HOME", &home)
+        .env("VIMCODE_TEST_HOME_ISOLATED", "1")
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
         .output()
         .expect("failed to run vcd --help");
+    let _ = std::fs::remove_dir_all(&home);
 
     assert!(
         output.status.success(),

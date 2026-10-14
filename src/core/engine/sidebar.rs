@@ -13,7 +13,7 @@ impl Engine {
     /// the single formula both [`Self::sync_app_shell_sidebar_visibility`]
     /// and `Engine::new_from_state`'s construction-time bake-in apply.
     /// Pulled out on its own so there is exactly one place that formula
-    /// lives (#1117 review) — see [`Self::sync_app_shell_sidebar_visibility`]'s
+    /// lives — see [`Self::sync_app_shell_sidebar_visibility`]'s
     /// doc for why a *second*, independent copy of it went stale.
     pub fn derived_sidebar_visible(&self) -> bool {
         if self.settings.autohide_panels {
@@ -27,24 +27,20 @@ impl Engine {
     /// [`Self::derived_sidebar_visible`], regardless of which direction it
     /// currently disagrees in.
     ///
-    /// `self.app_shell` (the "shadow": see
-    /// `tui_main::shell_app`'s module doc for the runner-vs-shadow split
-    /// that only exists on TUI) is a fully independent [`quadraui::AppShell`]
+    /// `self.app_shell` is a fully independent [`quadraui::AppShell`]
     /// instance from the one the TUI runner actually paints through. It only
     /// gets to the right answer at construction time (`Engine::new_from_state`
     /// derives it there, once, before anything else can touch it) — a
     /// caller that mutates `self.session` on an already-built `Engine` (as
     /// `Engine::new_for_test`'s own doc warns against) leaves it behind.
-    /// That staleness is not just cosmetic: the pre-#1434 TUI shell's `handle`'s own
-    /// runner-vs-shadow resync (`shell_app.rs`, "#634 smoke retry") pushes
-    /// *this* shadow's `sidebar_visible()` onto the runner every dispatch,
-    /// so a stale shadow doesn't just mis-answer a query — it actively
-    /// hides a sidebar the runner had correctly showing (#1117).
+    /// That staleness is not just cosmetic: the TUI shell's `handle`'s own
+    /// resync pushes *this* shadow's `sidebar_visible()` onto the runner
+    /// every dispatch, so a stale shadow doesn't just mis-answer a query —
+    /// it actively hides a sidebar the runner had correctly showing.
     ///
-    /// Callers: `Engine::new_from_state` (construction) and
-    /// the pre-#1434 TUI shell's `from_engine` (picks up whatever a caller mutated on
-    /// the engine after construction but before the shell app takes
-    /// ownership of it — the only path this ever has real work to do on).
+    /// Called during construction (`Engine::new_from_state`) and when
+    /// picking up mutations made on the engine after construction but before
+    /// the shell app takes ownership of it.
     pub fn sync_app_shell_sidebar_visibility(&mut self) {
         let show_sidebar = self.derived_sidebar_visible();
         if show_sidebar != self.app_shell.sidebar_visible() {
@@ -63,13 +59,12 @@ pub const PANEL_DEBUG: &str = "panel:debug";
 pub const PANEL_GIT: &str = "panel:git";
 pub const PANEL_EXTENSIONS: &str = "panel:extensions";
 pub const PANEL_AI: &str = "panel:ai";
-/// The Board panel (#521) — a generic host for `quadraui::Board`, sourced
-/// from whatever provider an extension declares via the #522 seam. Named
-/// after the *component*, not any one provider — see
-/// `crate::core::tool_client`'s module doc for the placement rule
-/// (`src/core/` names no specific external provider) this satisfies.
+/// The Board panel — a generic host for `quadraui::Board`, sourced
+/// from whatever provider an extension declares. Named after the
+/// *component*, not any one provider — see `crate::core::tool_client`'s
+/// module doc for the placement rule this satisfies.
 pub const PANEL_BOARD: &str = "panel:board";
-/// #1698: VS Code pins two items at the bottom of the activity bar —
+/// VS Code pins two items at the bottom of the activity bar —
 /// Accounts (sign-in identity) and Manage (this `Settings` gear). vimcode
 /// has no account/sign-in concept anywhere in the engine (no OAuth, no
 /// stored identity, no "signed in as" state) to back an Accounts item with,
@@ -81,22 +76,19 @@ pub const PANEL_SETTINGS: &str = "bottom:settings";
 
 /// Activity-bar item id for the hamburger (menu) slot — keyboard index 0.
 ///
-/// The pre-#1434 TUI shell used to register this as `panels[0]` of its live
-/// [`quadraui::AppShell`] (its own `live_shell_config`), and
-/// `render::build_activity_bar` mints the same id for its hamburger
-/// `ActivityItem`, so it is the one activity-bar id that is *already* shared
-/// across the two id spaces described on [`EXT_PANEL_ID_PREFIX`]. Promoted
-/// out of the deleted `tui_main::shell_app` (#536) so
-/// [`Engine::activity_bar_item_id`] can name the slot without the core
-/// depending on a backend module.
+/// This slot is the one activity-bar id shared across both the fixed panel
+/// id space and the [`quadraui::AppShell`] instance's own id space.
+/// `render::build_activity_bar` mints this id for its hamburger
+/// `ActivityItem`, and the engine's shadow `AppShell` registers it as a
+/// panel.
 ///
 /// GTK paints no hamburger (`include_hamburger = false`), but the slot still
-/// exists in the keyboard sequence there — `k` from Explorer lands on it and
-/// `l`/Enter toggles the menu bar. That predates #536 and is preserved by it.
+/// exists in the keyboard sequence — navigation keys land on it and
+/// toggle the menu bar.
 pub const HAMBURGER_PANEL_ID: &str = "activity:menu";
 
 /// Panel-id prefix for plugin-provided ("extension") sidebar panels — e.g. the
-/// `git-insights` extension's panel is `"ext:git-insights"` (#557).
+/// `git-insights` extension's panel is `"ext:git-insights"`.
 ///
 /// This is the id both backends already synthesise by hand for extension
 /// panels (GTK's `current_active_panel_id`/`App::switch_panel`), promoted to a
@@ -123,16 +115,14 @@ pub fn ext_panel_name_from_id(id: &str) -> Option<&str> {
 }
 
 /// The single source of truth for the fixed (non-hamburger, non-settings,
-/// non-dynamic-extension) activity-bar panel order. `render::build_activity_bar`'s
-/// `fixed` array and the pre-#1434 TUI shell's `shell_config`'s
-/// `PanelDefinition` list both iterate this rather than hand-transcribing the
-/// order twice — a reordering here is now a one-line change both call sites
-/// pick up, instead of a silent drift only a snapshot test would catch.
+/// non-dynamic-extension) activity-bar panel order. `render::build_activity_bar`
+/// and the engine's shadow `AppShell` construction both iterate this rather
+/// than hand-transcribing the order twice — a reordering here is now a
+/// one-line change both call sites pick up.
 ///
-/// #1698: order matches VS Code's activity bar top-to-bottom (Explorer,
-/// Search, Source Control, Run and Debug, Extensions) — [`PANEL_GIT`] before
-/// [`PANEL_DEBUG`]. It used to be the other way around, with no VS Code
-/// counterpart for the swap.
+/// Order matches VS Code's activity bar top-to-bottom (Explorer,
+/// Search, Source Control, Run and Debug, Extensions) — [`PANEL_GIT`]
+/// before [`PANEL_DEBUG`].
 pub const FIXED_ACTIVITY_PANEL_IDS: [&str; 7] = [
     PANEL_EXPLORER,
     PANEL_SEARCH,
@@ -166,23 +156,14 @@ fn fixed_panel_title_tooltip(id: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// The engine's shadow `AppShell`'s panel list (#1166): [`FIXED_ACTIVITY_PANEL_IDS`]
+/// The engine's shadow `AppShell`'s panel list: [`FIXED_ACTIVITY_PANEL_IDS`]
 /// in order, then [`PANEL_SETTINGS`] last, each with an empty icon (the
 /// engine is backend-agnostic — see `App::shell_config`'s doc for who fills
 /// icons in) and title/tooltip from [`fixed_panel_title_tooltip`].
 ///
-/// Before this, `Engine::new_from_state` built `self.app_shell` from a
-/// hand-transcribed `vec![PanelDefinition { .. }, ..]` literal that
-/// happened to list the same six ids in the same order as
-/// [`FIXED_ACTIVITY_PANEL_IDS`] — a second, independent copy of the order
-/// this constant already exists to be the one source of truth for. GUI
-/// backends read that shadow shell's order straight through
-/// `App::shell_config` (`self.engine.app_shell.panels()`), so a reorder of
-/// `FIXED_ACTIVITY_PANEL_IDS` moved TUI's activity bar (which iterates the
-/// constant directly in the pre-#1434 TUI shell's `build_shell_config`) without moving
-/// GUI's — exactly the icon-table split #1107 fixed, one level up. Building
-/// this list *from* the constant instead of beside it closes that gap:
-/// there is now one order both backends' `ShellConfig`s ultimately trace
+/// GUI backends read the shadow shell's order straight through
+/// `App::shell_config` (`self.engine.app_shell.panels()`), so this list
+/// is the single order both backends' `ShellConfig`s ultimately trace
 /// back to.
 pub fn engine_app_shell_panel_definitions() -> Vec<quadraui::PanelDefinition> {
     FIXED_ACTIVITY_PANEL_IDS
@@ -204,14 +185,11 @@ pub fn engine_app_shell_panel_definitions() -> Vec<quadraui::PanelDefinition> {
 ///
 /// The activity bar's *painted* order is hamburger, the fixed panels, the
 /// dynamic extension panels, then Settings pinned to the bottom — but the
-/// legacy `activity_bar_selected` index space numbers Settings **before** the
-/// extension panels, because extension panels were added after the built-in
-/// indices had already been baked into call sites like
-/// `Engine::activity_bar_focus_in_at(7)`. That mismatch is exactly why the
-/// up/down stepping used to need bespoke arithmetic; since #536 the stepping
-/// is done by quadraui's `AppShell` cursor over the *painted* order and these
-/// two constants are all that remains of the index space — a lookup table,
-/// not a sequencing rule.
+/// legacy `activity_bar_selected` index space numbers Settings **before**
+/// the extension panels, a mismatch that predates the `AppShell` migration.
+/// Since the migration, stepping is done by `AppShell`'s cursor over the
+/// *painted* order and these constants are a lookup table rather than a
+/// sequencing rule.
 pub const TOOLBAR_IDX_SETTINGS: u16 = FIXED_ACTIVITY_PANEL_IDS.len() as u16 + 1;
 
 /// First keyboard (toolbar) index occupied by a dynamic extension panel.
@@ -221,20 +199,15 @@ pub const TOOLBAR_IDX_EXT_BASE: u16 = TOOLBAR_IDX_SETTINGS + 1;
 
 impl Engine {
     /// Activity-bar [`quadraui::PanelDefinition`]s for every plugin-registered
-    /// extension panel, sorted by name (#557).
+    /// extension panel, sorted by name.
     ///
-    /// Both backends' `ShellConfig` builders — the pre-#1434 TUI shell's own
-    /// `live_shell_config` and `gtk::build_shell_config` — append
-    /// this to their static panel list, and the TUI additionally re-syncs it
-    /// into the live `AppShell` after every dispatch so a plugin that
-    /// registers a panel *after* startup still gets an icon. Without it the
-    /// migrated `AppShell` activity bar renders only the built-in panels and
-    /// e.g. the Git Insights extension has no icon at all.
+    /// Both backends' `ShellConfig` builders append this to their static
+    /// panel list, and the TUI additionally re-syncs it into the live
+    /// `AppShell` after every dispatch so a plugin that registers a panel
+    /// *after* startup still gets an icon.
     ///
-    /// Sorted by name to match the order `render::build_activity_bar` (the
-    /// legacy `draw_frame` path) and `Engine::activity_bar_activate`'s `8 +
-    /// idx` extension arm both use, so keyboard index and painted position
-    /// agree on either path.
+    /// Sorted by name to match the order both the legacy rendering path and
+    /// keyboard navigation use, so keyboard index and painted position agree.
     ///
     /// The icon is [`crate::core::plugin::PanelRegistration::resolved_icon`],
     /// so it honours the caller thread's Nerd-Fonts flag; callers that rebuild
@@ -289,7 +262,17 @@ impl Engine {
     /// Map a panel ID to the correct engine focus flag.
     fn set_panel_focus(&mut self, panel_id: &str) {
         match panel_id {
-            PANEL_EXPLORER => self.explorer_has_focus = true,
+            PANEL_EXPLORER => {
+                self.explorer_has_focus = true;
+                // Bringing the Explorer to the front re-syncs it with the
+                // active editor, the Explorer's equivalent of the data
+                // refresh the Git/Extensions/Board arms below do:
+                // `explorer_expanded` is in-memory only, so a tree the user
+                // collapsed (or never expanded this session) would otherwise
+                // show a bare root with the active file hidden and nothing
+                // selected. A no-op when `explorer_auto_reveal` is off.
+                self.explorer_reveal_active_file();
+            }
             PANEL_SEARCH => self.search_set_focus(true),
             PANEL_DEBUG => self.dap_sidebar_has_focus = true,
             PANEL_GIT => {
@@ -304,7 +287,7 @@ impl Engine {
             }
             PANEL_AI => {
                 self.ai_has_focus = true;
-                // #1507 review: not every caller of `set_panel_focus` routes
+                // Not every caller of `set_panel_focus` routes
                 // through `clear_sidebar_focus` first (`handle_nav_overflow`
                 // doesn't), so reset the `<leader>ai` gesture buffer here
                 // too rather than relying on that ordering.
@@ -434,21 +417,18 @@ impl Engine {
     }
 
     /// The activity bar's items **in painted order**, as a throwaway
-    /// [`quadraui::AppShell`] whose keyboard cursor (quadraui#386) does the
-    /// stepping for [`Self::activity_bar_move_down`] / [`Self::activity_bar_move_up`].
+    /// [`quadraui::AppShell`] whose keyboard cursor does the stepping for
+    /// [`Self::activity_bar_move_down`] / [`Self::activity_bar_move_up`].
     ///
-    /// Panel list and bottom-item list mirror the TUI's live `ShellConfig`
-    /// (the pre-#1434 TUI shell's own `live_shell_config`) exactly:
+    /// Panel list and bottom-item list mirror the TUI's live `ShellConfig`:
     /// hamburger, the fixed panels, the dynamic extension panels sorted by
     /// name, then Settings pinned to the bottom. `AppShell`'s cursor spans
     /// `panels` then `bottom_items` as one sequence and saturates at both ends,
-    /// which *is* vimcode's ordering — so no vimcode-side arithmetic is left.
+    /// which is vimcode's ordering — no vimcode-side arithmetic is needed.
     ///
-    /// Built on demand rather than cached as a field: the ext-panel list is
-    /// derived from `self.ext_panels`, which a plugin can mutate at any point
-    /// in the session, so deriving it per keypress is what makes it impossible
-    /// for the nav sequence to go stale. It is a `Vec` of ~8 empty-metadata
-    /// `PanelDefinition`s built once per `j`/`k`, which is not worth caching.
+    /// Built on demand rather than cached: the ext-panel list is derived from
+    /// `self.ext_panels`, which a plugin can mutate at any point, so deriving
+    /// it per keypress keeps the nav sequence from going stale.
     ///
     /// Only ids matter here, so icon/tooltip/title are left empty — nothing
     /// paints this shell.
@@ -515,7 +495,7 @@ impl Engine {
     ///
     /// `render::build_activity_bar` compares each `ActivityItem`'s panel id
     /// against this to set `is_keyboard_selected`, instead of re-deriving the
-    /// item's numeric toolbar index at the paint site (#536).
+    /// item's numeric toolbar index at the paint site.
     pub fn activity_bar_selected_item_id(&self) -> Option<String> {
         self.activity_bar_item_id(self.activity_bar_selected)
     }
@@ -540,7 +520,7 @@ impl Engine {
 
     /// Step the activity-bar keyboard cursor by delegating to
     /// [`quadraui::AppShell`]'s `activity_select_next`/`activity_select_prev`
-    /// (quadraui#386) over [`Self::activity_nav_shell`].
+    /// over [`Self::activity_nav_shell`].
     ///
     /// Translates the stored `activity_bar_selected` index into the shell's
     /// painted-order cursor, steps, and translates the resulting *item id*
@@ -596,7 +576,7 @@ impl Engine {
     /// (e.g. setting `sidebar.has_focus`, closing TUI menu).
     pub fn activity_bar_activate(&mut self) -> ActivityBarActivation {
         self.activity_bar_focused = false;
-        // #536: dispatch on the item *id* rather than re-deriving `sel - 8`
+        // Dispatch on the item *id* rather than re-deriving `sel - 8`
         // here. `activity_bar_item_id` owns the one index↔id table, so an
         // out-of-range selection (stale extension index) yields `None` → NoOp,
         // exactly as the old `ext_idx < ext_names.len()` guard did.

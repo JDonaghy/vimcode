@@ -1,4 +1,4 @@
-//! #1701: real-pty regression test for "[bugbash:tui-pty] Sidebar header
+//! Real-pty regression test for "[bugbash:tui-pty] Sidebar header
 //! shows stale panel name for ~0.4-0.9s after clicking the Settings
 //! activity-bar icon".
 //!
@@ -11,7 +11,7 @@
 //! *wall-clock* lag between a real click and the real terminal's next
 //! paint, observed by re-reading an actual pty's byte stream at timestamped
 //! intervals — exactly what `TuiDriver` cannot reproduce. This mirrors
-//! `tests/conpty_activity_bar_click.rs` (#1636), the Windows/ConPTY twin of
+//! `tests/conpty_activity_bar_click.rs`, the Windows/ConPTY twin of
 //! this same class of test, but runs on a real Unix pty via
 //! `portable-pty`'s Unix backend (see the `[target.'cfg(unix)'.dev-
 //! dependencies]` block in `Cargo.toml` for why those two crates are
@@ -104,10 +104,10 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// fills in, and the pty writer used to send mouse reports.
 ///
 /// Answers `ESC [ 6 n` (the cursor-position query `ratatui::Terminal::new()`
-/// sends during startup) inline from the reader callback — unlike
-/// `conpty_activity_bar_click.rs`'s ConPTY twin, a plain Unix pty tolerates
-/// this fine (no cross-thread deadlock to route around; see that test's own
-/// module doc for the ConPTY-specific hazard this sidesteps).
+/// sends during startup) inline from the reader callback — a plain Unix pty
+/// tolerates this fine, unlike ConPTY which requires cross-thread routing
+/// to avoid deadlock.
+///
 /// `(child process, captured-bytes handle, pty writer, pty master)` — see
 /// [`spawn_under_pty`]'s own doc for what each piece is used for. A named
 /// alias rather than a four-tuple return type directly, per
@@ -139,6 +139,7 @@ fn spawn_under_pty(main_rs: &PathBuf, home: &PathBuf) -> SpawnedPty {
         "VIMCODE_TEST_DATA_HOME",
         home.join(".local").join("share").join("vimcode"),
     );
+    cmd.env("VIMCODE_TEST_HOME_ISOLATED", "1");
 
     let child = pair
         .slave

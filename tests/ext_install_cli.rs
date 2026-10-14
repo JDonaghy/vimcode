@@ -1,21 +1,23 @@
-//! #1719 acceptance criterion: "Black-box (via the headless entry point):
-//! with `npm` absent, `--ext-install yaml` reports `npm` missing and the
-//! platform instruction, exits non-zero, and runs no install."
+//! Acceptance criterion: with `npm` absent, `--ext-install yaml`
+//! reports `npm` missing and the platform instruction, exits
+//! non-zero, and runs no install.
 //!
-//! This spawns the actual compiled `vimcode` binary (not an in-process call
-//! into `Engine`) with a throwaway `$HOME` holding a local extension
-//! manifest (`ext_available_manifests` merges `$HOME/.config/vimcode/
-//! extensions/*/manifest.toml` — see `src/core/engine/lsp_ops.rs` — exactly
-//! the mechanism a developer uses to test an extension before publishing it
-//! to the registry, so no network access is needed for this test) and a
-//! `PATH` that cannot resolve `npm`, mirroring `tests/cli_help.rs`'s
-//! real-binary-spawn pattern (#979).
+//! This spawns the actual compiled `vimcode` binary (not an in-process
+//! call into `Engine`) with a throwaway `$HOME` holding a local
+//! extension manifest (`ext_available_manifests` merges
+//! `$HOME/.config/vimcode/extensions/*/manifest.toml` — see
+//! `src/core/engine/lsp_ops.rs` — exactly the mechanism a developer
+//! uses to test an extension before publishing it to the registry, so
+//! no network access is needed for this test) and a `PATH` that cannot
+//! resolve `npm`, mirroring `tests/cli_help.rs`'s real-binary-spawn
+//! pattern.
 //!
-//! `VIMCODE_TEST_HOMEBREW_PREFIXES` is pinned to a directory that does not
-//! exist so `resolve_command`'s Homebrew-prefix probe (#917) cannot
-//! accidentally find a real `npm` under `/opt/homebrew` or `/usr/local` on a
-//! macOS runner — see `lsp_manager::homebrew_prefixes`'s own doc for why
-//! this override exists.
+//! `VIMCODE_TEST_HOMEBREW_PREFIXES` is pinned to a directory that does
+//! not exist so `resolve_command`'s Homebrew-prefix probe cannot
+//! accidentally find a real `npm` under `/opt/homebrew` or
+//! `/usr/local` on a macOS runner — see
+//! `lsp_manager::homebrew_prefixes`'s own doc for why this override
+//! exists.
 
 use std::io::Write;
 use std::process::Command;
@@ -72,6 +74,7 @@ dependencies = ["npm"]
         .arg(ext_name)
         .arg("--json")
         .env("HOME", &home)
+        .env("VIMCODE_TEST_HOME_ISOLATED", "1")
         .env("PATH", "/usr/bin:/bin")
         .env(
             "VIMCODE_TEST_HOMEBREW_PREFIXES",
@@ -98,9 +101,7 @@ dependencies = ["npm"]
         "output must name the missing prerequisite (npm); got stdout: \
          {stdout}\nstderr: {stderr}"
     );
-    // The platform instruction (#918's actionable hint, not just a bare
-    // "install npm" — `extensions::prereq_install_cmd("npm")`) must be
-    // present verbatim, not merely implied.
+    // The platform instruction must be present verbatim, not merely
     #[cfg(target_os = "macos")]
     let expected_hint = "brew install node";
     #[cfg(target_os = "windows")]
@@ -145,6 +146,7 @@ display_name = "Unused"
         .arg("vc-test-totally-unknown-extension-1719")
         .arg("--json")
         .env("HOME", &home)
+        .env("VIMCODE_TEST_HOME_ISOLATED", "1")
         .env("PATH", "/usr/bin:/bin")
         .env(
             "VIMCODE_TEST_HOMEBREW_PREFIXES",
@@ -162,7 +164,7 @@ display_name = "Unused"
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// #1807: the headless `--ext-install` entry point must refuse an
+/// The headless `--ext-install` entry point must refuse an
 /// extension whose `requires_vimcode` constraint isn't met by the running
 /// vimcode — the same check the interactive marketplace applies
 /// (`Engine::ext_install_from_registry_with_runtime_check`) — rather than
@@ -194,6 +196,7 @@ requires_vimcode = ">=9999.0.0"
         .arg(ext_name)
         .arg("--json")
         .env("HOME", &home)
+        .env("VIMCODE_TEST_HOME_ISOLATED", "1")
         .env("PATH", "/usr/bin:/bin")
         .env(
             "VIMCODE_TEST_HOMEBREW_PREFIXES",

@@ -3,10 +3,7 @@
 //! of Cairo. No GTK/Cairo/Pango imports — editor logic is `core`'s,
 //! rendering data is `render`'s.
 //!
-//! #1433 flipped [`run`] onto the shared [`crate::app::App`]; #1434 deleted
-//! the independently hand-written production TUI shell this module used to
-//! build (see `docs/IRREDUCIBLE_SURFACE.md` §4, `GOALS.md`'s sizing table).
-//! What's left: `TuiBackend` construction, crash-recovery scaffolding around
+//! `TuiBackend` construction, crash-recovery scaffolding around
 //! `quadraui::tui::shell_runner::run_with_shell`, and the [`testing`] seam.
 
 use std::io::Write;
@@ -17,12 +14,10 @@ use std::sync::Mutex;
 mod app_on_tui_tests;
 mod backend;
 
-// #1497: the local `impl crate::app::TextMetricsBackend for
-// backend::TuiBackend` that used to live here is gone —
 // `quadraui::Backend::set_current_line_height`/`set_current_char_width`
-// (JDonaghy/quadraui#1086) already default to a no-op, which is exactly
-// what this impl's two bodies were: one ratatui cell is one row/column by
-// construction (#540/#819), so `TuiBackend` never needs to override them.
+// default to a no-op, which is what the local `impl crate::app::TextMetricsBackend`
+// was: one ratatui cell is one row/column by construction, so `TuiBackend`
+// never needs to override them.
 
 /// Global debug log file handle, set once at startup via `--debug <path>`.
 static DEBUG_LOG: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
@@ -73,7 +68,7 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     );
 
     let app = crate::app::App::new_portable(file_path, backend, crate::render::UnitProfile::cell());
-    // #557: `shell_config()` reads plugin-registered sidebar panels, so it
+    // `shell_config()` reads plugin-registered sidebar panels, so it
     // must run after `App::new_portable` and before `app` moves below.
     let config = app.shell_config();
 
@@ -104,13 +99,6 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
 /// Test/acceptance driver seam: what `app_on_tui_tests.rs` and the sealed
 /// `tests/acceptance.rs` (via `feature = "test-support"`) use to drive
 /// [`crate::app::App`] on a `quadraui::tui::TuiDriver`.
-///
-/// `crate::harness`'s `backend_conformance!` macro still registers two TUI
-/// arms, `tui` ([`conformance_harness`]) and `tui_prod`
-/// ([`conformance_harness_prod`]), which diverged before #1433/#1434 but now
-/// both build the identical `App`; `tui_prod` is a thin alias, kept only so
-/// existing `tui_prod`-suffixed scenarios and `KNOWN_BUGS` labels in
-/// `src/harness.rs` keep resolving unchanged.
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing {
     use std::cell::RefCell;
@@ -126,7 +114,7 @@ pub mod testing {
     use crate::render::UnitProfile;
 
     /// The `TuiDriver` instantiation of `crate::harness::ConformanceHarness`
-    /// (#982) — mirrors `crate::gtk::testing::conformance_harness`, modulo
+    /// — mirrors `crate::gtk::testing::conformance_harness`, modulo
     /// `TuiBackend` and cell (`u16`) vs pixel (`i32`) dimensions.
     ///
     /// `TuiDriver` doesn't implement `PixelClickConformance` (no ratatui
@@ -159,7 +147,7 @@ pub mod testing {
         width: u16,
         height: u16,
     ) -> ConformanceHarness<TuiDriver<impl quadraui::AppLogic>> {
-        // #1431: the TUI twin of `crate::gtk::testing::conformance_harness_
+        // The TUI twin of `crate::gtk::testing::conformance_harness_
         // with_folder_picker` — needed because the picker has to be seeded
         // on `App` before it is moved into `driver_with_shell`.
         let paint = crate::test_paint::PaintGuard::acquire();
@@ -177,11 +165,8 @@ pub mod testing {
         ConformanceHarness::new(driver, engine, paint, cwd)
     }
 
-    /// #1434: now a thin alias of [`conformance_harness`] — see this
-    /// module's own doc for why the `tui_prod` name survives rather than
-    /// being collapsed away. Kept `#[cfg(test)]`-only, matching its
-    /// pre-#1434 gate: every call site lives inside a `#[cfg(test)]`-gated
-    /// scenario module in `src/harness.rs`.
+    /// Alias of [`conformance_harness`] — both build the identical `App`.
+    /// The `tui_prod` name is kept for compatibility with existing test scenarios.
     #[cfg(test)]
     pub fn conformance_harness_prod(
         engine: Engine,
@@ -241,9 +226,22 @@ pub mod testing {
     /// `Rc<RefCell<Engine>>` directly, since `App` is `pub(crate)` and a
     /// public accessor would leak its shape.
     ///
-    /// Acquires the paint/cwd guards *before* constructing `App` (covering
-    /// `Engine::startup`'s own CWD reads) and returns them bundled via
-    /// [`TuiAppDriver`].
+    /// Construction runs under an exclusive [`crate::test_cwd::CwdGuard`],
+    /// not the shared [`crate::test_cwd::CwdReadGuard`] held for the
+    /// returned driver's lifetime: `Engine::startup` chdirs for real when
+    /// `file_path` names a directory (it routes through
+    /// `Engine::open_folder`, which calls `std::env::set_current_dir`), so
+    /// building `App` needs the writer lock both to serialize that move
+    /// against concurrent reader harnesses and to have the directory
+    /// restored on `Drop` before this function hands back a driver anyone
+    /// can render a frame with. `setup` runs inside the same scope, since a
+    /// caller's hook could chdir too (e.g. by driving `:cd` on the engine).
+    ///
+    /// One consequence for callers: a test must not already hold a
+    /// `CwdReadGuard` on this thread (a second live driver, a GTK
+    /// `Harness`, or an explicit `acquire()`) when it calls this, because
+    /// the exclusive acquisition would then wait on that same thread's
+    /// shared claim. Scope any such guard so it drops first.
     pub fn tui_driver_with(
         file_path: Option<PathBuf>,
         width: u16,
@@ -251,11 +249,15 @@ pub mod testing {
         setup: impl FnOnce(&mut Engine),
     ) -> TuiAppDriver<TuiDriver<impl quadraui::AppLogic>> {
         let paint = crate::test_paint::PaintGuard::acquire();
-        let cwd = crate::test_cwd::CwdReadGuard::acquire();
         let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(TuiBackend::new())));
-        let app = App::new_portable_for_test(file_path, backend, UnitProfile::cell());
-        setup(&mut app.engine.borrow_mut());
+        let app = {
+            let _cwd = crate::test_cwd::CwdGuard::new();
+            let app = App::new_portable_for_test(file_path, backend, UnitProfile::cell());
+            setup(&mut app.engine.borrow_mut());
+            app
+        };
+        let cwd = crate::test_cwd::CwdReadGuard::acquire();
         let config = app.shell_config();
         let driver = driver_with_shell(app, config, width, height);
         TuiAppDriver {

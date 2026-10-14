@@ -1,70 +1,19 @@
-//! Backend-neutral **plugin-panel** fixture + scenarios (#1090).
+//! Backend-neutral **plugin-panel** fixture + scenarios.
 //!
-//! # Why this module exists
+//! This module verifies that the row you click is the row that gets selected, and a hover
+//! anchors to the row you hovered — measured against the painted geometry, on every backend.
 //!
-//! Four defects in the `git-insights` sidebar panel — #1086 (every click
-//! landed one row low), #1087 (the hover card anchored off-viewport once
-//! the panel was scrolled), #1088 (`panel.reveal` selected the wrong row)
-//! and #1089 (three of four backends paint the extension *marketplace*
-//! instead of the plugin's own panel) — all shipped green. `tests/
-//! ext_panel.rs`'s 50 tests assert `Engine` state, which stayed correct
-//! throughout; and the GTK/macOS hit-band sweeps that *look* like they
-//! cover this panel
-//! (`gtk::testing::…::ext_panel_row_sweep_hit_band_integrity_gtk`,
-//! `macos::…::ext_panel_header_click_hit_band_matches_the_painted_row`)
-//! are pointed at `engine_with_marketplace_as_ext_panel` — a fixture whose
-//! rows come from `Engine::populate_ext_sidebar_system`, i.e. the
-//! marketplace manifest list, not from a `PanelRegistration` at all.
-//!
-//! The whole class collapses to one sentence:
-//!
-//! > **The row you click is the row that gets selected, and a hover
-//! > anchors to the row you hovered — measured against the painted
-//! > geometry, on every backend.**
-//!
-//! Everything below drives *that* property against a genuine
-//! plugin-registered panel, reading only painted output
-//! (`inventory().text_runs()` bounds, `screen_has`, popup bounds) — never
-//! `engine.ext_panel_selected`, which was already right while the paint
-//! step was wrong (CLAUDE.md's "rendered output, not state" rule, learned
-//! via #587/#592).
-//!
-//! # `KNOWN_BUGS`-gated GUI arms (#1089, resolved)
-//!
-//! Before #1089, `crate::app::App` — the cross-backend-shared shell `gtk`,
-//! `macos`, `win` **and** the `tui` control arm all wrap — painted every
-//! `ext:<name>` panel through `render::populate_ext_sidebar_system`, which
-//! built its rows from the marketplace manifest list regardless of which
-//! plugin id was active (`src/app.rs`, the `id if id.starts_with("ext:")`
-//! arm), while only `crate::tui_main::panels::render_ext_panel` — reached
-//! via the pre-#1434 TUI shell, i.e. the `tui_prod` arm — painted a
-//! `PanelRegistration`'s own sections through `render::ext_panel_to_tree_view`.
-//!
-//! So the scenarios here used to be green on `tui_prod` and red everywhere
-//! else, exactly as #1090 predicted. They are *not* `#[cfg]`-gated per
-//! backend — that would make them vacuously pass, the failure mode
-//! `scripts/platform-conformance.sh` exists to prevent (#645) — they were
-//! instead wrapped in [`crate::harness::known_bug_gate`] with their labels
-//! listed in [`crate::harness::KNOWN_BUGS`], which is the *opposite* of
-//! vacuous: that gate fails the build the moment a listed body starts
-//! passing, so a fix can't land without deleting the entry and turning the
-//! scenario into an ordinary, enforced conformance test. #1089 fixed the
-//! shared `gtk`/`tui`/`win` paint path; its three `::macos`-suffixed
-//! entries stayed gated only because no macOS runner existed yet to confirm
-//! them, and #1276 confirmed and deleted them once one did. `KNOWN_BUGS` is
-//! therefore empty today — every arm below takes the plain `Pass` path, not
-//! `ExpectedFail`.
+//! Everything below drives this property against a genuine plugin-registered panel, reading
+//! only painted output (`inventory().text_runs()` bounds, `screen_has`, popup bounds) — never
+//! `engine.ext_panel_selected`, which stays correct while the paint step can be wrong.
 //!
 //! # Where the arms live
 //!
-//! `gtk` / `tui` / `tui_prod` are registered in this file's own
-//! `#[cfg(test)]` module; the `macos` arm lives here too, behind
-//! `#[cfg(all(feature = "macos", target_os = "macos"))]`, driving
-//! `crate::macos::conformance_harness` (the `pub(crate)` constructor
-//! `src/macos/mod.rs` exposes for exactly this). `scripts/
-//! platform-conformance.sh` picks all four up without a script change:
-//! every lane it runs is a `cargo test` invocation over this crate's lib
-//! tests.
+//! `gtk` / `tui` / `tui_prod` are registered in this file's own `#[cfg(test)]` module; the
+//! `macos` arm lives here too, behind `#[cfg(all(feature = "macos", target_os = "macos"))]`,
+//! driving `crate::macos::conformance_harness`. `scripts/platform-conformance.sh` picks all
+//! four up without a script change: every lane it runs is a `cargo test` invocation over this
+//! crate's lib tests.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -114,27 +63,15 @@ pub const SEC_EMPTY: &str = "EmptZQXW1090";
 /// reserves room for at the right-hand edge of the same ~20-column sidebar
 /// row the label paints into. The budget is exact: the label gets
 /// `sidebar_width - badge_width - indent - 1` columns (the `-1` is the
-/// mandatory blank gap column), and anything longer is clamped with a `…`
-/// that `screen_has` cannot match — the column-budget trap this module's
-/// own header comment describes, hit for real during #1090's development
-/// and again during #1576's pin bump (see [`ROW_BRANCH_BADGE`]).
+/// mandatory blank gap column), and anything longer is clamped with a `…`.
 pub const ROW_BRANCH: &str = "mnZ1090";
 /// What `ext_panel_to_tree_view` composes from [`ROW_BRANCH`]'s one badge
 /// (`[HD]`) plus its hint (`a2`) — a single space-joined `Badge` string,
 /// right-aligned into the row by the tree primitive.
 ///
 /// Both halves are as terse as "a badge and a hint are both present" allows
-/// because the two compete with the label for the *same* row. Before
-/// quadraui#1183 (picked up by #1576's pin bump) the tree painted the label
-/// at full row width and then drew the badge **on top of it**, so an
-/// over-budget row silently lost its label's tail with no gap and no `…`
-/// — the fixture's old `"mainZ1090"` + `"[HEAD] ahead 2"` (4 indent + 9
-/// label + 1 gap + 14 badge = 28 columns of content, 8 over the
-/// 20-column sidebar's budget) showed up as a bare `"ma"` next to the
-/// badge, and the precondition test below asserted that overlap artifact as
-/// if it were the row. #1183 clamps and ellipsises instead, which turned
-/// the same row into a bare `"…"`; sizing the content to actually fit is
-/// what lets the assertion name the whole label again.
+/// because the two compete with the label for the *same* row. The tree clamps
+/// and ellipsises over-budget rows, sizing the content to actually fit.
 pub const ROW_BRANCH_BADGE: &str = "[HD] a2";
 /// Section 1's first commit — expandable, expanded by default.
 pub const ROW_COMMIT_A: &str = "c0ffZQXW1090";
@@ -154,22 +91,18 @@ pub const ID_COMMIT_A: &str = "c0ffee101090aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const REVEAL_QUERY: &str = "c0ffee10";
 
 /// How many filler rows section 0 carries. Chosen so `ROW_COMMIT_A` sits
-/// well below row 0 (the "#983 well below row 0" requirement, applied to a
-/// panel that can finally paint its own content rows) while the whole
-/// panel still fits a 30-row viewport unscrolled.
+/// well below row 0 while the whole panel still fits a 30-row viewport unscrolled.
 pub const FILLER_ROWS: usize = 12;
 
 /// Flat index of `SEC_COMMITS`' header: `SEC_SUMMARY` header (1) +
 /// `ROW_BRANCH` (1) + separator (1) + `FILLER_ROWS`.
 pub const FLAT_SEC_COMMITS: usize = 3 + FILLER_ROWS;
 /// Flat index of `ROW_COMMIT_A`: the `SEC_COMMITS` header, then that
-/// section's own leading empty-id separator (`git_log_panel.lua`'s real
-/// shape, and #1088's trap — see [`engine_with_plugin_panel`]).
+/// section's own leading empty-id separator (`git_log_panel.lua`'s real shape).
 pub const FLAT_COMMIT_A: usize = FLAT_SEC_COMMITS + 2;
 
 /// How the fixture's panel should be *positioned* and *decorated* before
-/// the first frame paints. Every field maps to one of #1090's six
-/// scenarios; `Default` is the unscrolled, chrome-minimal baseline.
+/// the first frame paints. Every field represents a different test scenario.
 #[derive(Clone, Debug, Default)]
 pub struct PluginPanelFixture {
     /// `ext_panel_scroll_top` — scenario 3 ("the current bugs are
@@ -185,15 +118,13 @@ pub struct PluginPanelFixture {
     /// also filtering rows out from under the assertions.
     pub search_input_visible: bool,
     /// Pre-seed a panel-hover popup on the item at this flat index, with
-    /// this markdown body — scenario 5.
+    /// this markdown body.
     ///
     /// Seeded rather than produced by a live 350 ms dwell: the popup only
     /// materialises from `Engine::poll_panel_hover`, which needs a
     /// wall-clock idle tick that `quadraui::testing::ConformanceDriver` does
-    /// not expose (`tick()` is inherent on `TuiDriver` alone). Same approach
-    /// the existing #1087 regression tests on both backends take; what this
-    /// scenario asserts is the half that was actually broken — where the
-    /// popup *paints* relative to the row it names.
+    /// not expose. What this scenario asserts is where the popup *paints*
+    /// relative to the row it names.
     pub hover: Option<(usize, String)>,
     /// Drive `Engine::ext_panel_reveal_item` for this query before the
     /// first frame — scenario 6. The `(section, query)` pair is what
@@ -209,9 +140,8 @@ impl PluginPanelFixture {
     }
 
     /// Scroll the panel so `SEC_COMMITS`' header and both commits sit near
-    /// the top of the viewport and `SEC_SUMMARY`'s header has scrolled off
-    /// — scenario 3, and #499's real complaint (only the *top* section
-    /// header ever toggled) re-stated as "section 2..n must work too".
+    /// the top of the viewport and `SEC_SUMMARY`'s header has scrolled off.
+    /// Tests that section toggle works for non-top sections.
     pub fn scrolled(mut self) -> Self {
         self.scroll_top = FLAT_SEC_COMMITS - 3;
         self
@@ -305,13 +235,10 @@ pub fn engine_with_plugin_panel(fx: &PluginPanelFixture) -> Engine {
 
     // ── Section 1: two expandable commits, one file child each. ─────────
     //
-    // The leading empty-id separator is `git_log_panel.lua`'s real shape
-    // and #1088's trap: `ext_panel_find_flat_index` used to accept
-    // `item_id.starts_with(&id)` as a match, and an empty id is a prefix of
-    // *every* hash — so every `panel.reveal` resolved to this row instead of
-    // the commit it named. It has to live in the section the reveal
-    // searches, not merely somewhere in the panel, or the trap is
-    // unreachable and `reveal_selects_the_revealed_row` cannot fail.
+    // The leading empty-id separator is `git_log_panel.lua`'s real shape:
+    // `ext_panel_find_flat_index` must not match a prefix of every hash.
+    // It must live in the section being searched, not merely somewhere in
+    // the panel, so `panel.reveal` resolves to the commit it names.
     engine.ext_panel_items.insert(
         (PANEL.to_string(), SEC_COMMITS.to_string()),
         vec![
@@ -361,9 +288,8 @@ pub fn engine_with_plugin_panel(fx: &PluginPanelFixture) -> Engine {
     engine.ext_panel_has_focus = true;
     engine.ext_panel_scroll_top = fx.scroll_top;
     engine.ext_panel_input_active = fx.search_input_visible;
-    // `ext_panel_focus_pending` is what the pre-#1434 TUI shell's `tick` consumes to put
-    // the sidebar onto this panel — the same handoff
-    // `Engine::apply_plugin_ctx` performs for a live `panel.reveal`.
+    // `ext_panel_focus_pending` is what the TUI shell's `tick` consumes to put
+    // the sidebar onto this panel.
     engine.ext_panel_focus_pending = Some(PANEL.to_string());
     // Raw `AppShell::toggle_sidebar`, never `Engine::toggle_sidebar` — the
     // latter persists to the developer's real session file (the same reason
@@ -374,23 +300,15 @@ pub fn engine_with_plugin_panel(fx: &PluginPanelFixture) -> Engine {
     // Start the shadow `AppShell` on a panel that is **not** the explorer.
     //
     // `AppShell::show_panel` is a silent no-op for an id that is not in its
-    // own `panels` list, and an `ext:` id never is (plugin panels bypass
-    // `AppShell` registration — `render::apply_activity_panel_switch`'s own
-    // doc), so asking for `ext:<name>` here would leave the explorer active
-    // and frame 0 would paint the explorer tree. That matters on the
-    // shipped TUI shell specifically: the pre-#1434 TUI shell's `handle_mouse_event`'s
-    // `TreeController` intercept claims any `MouseDown` inside the *cached*
-    // `explorer_tree_rect` while `active_panel_is(PANEL_EXPLORER)`, and that
-    // rect survives the switch to a plugin panel — so every click in this
-    // fixture's panel silently went to the explorer instead. Exactly the
-    // "not this test's bug to fix, just a trap it must not fall into" note
-    // `tui_ext_panel_double_click_on_a_section_header_does_not_toggle_it`
-    // already carries; mirrored here.
+    // own `panels` list, and an `ext:` id never is, so asking for `ext:<name>`
+    // here would leave the explorer active and frame 0 would paint the explorer
+    // tree. On the TUI shell specifically, the cached `explorer_tree_rect` and
+    // `active_panel_is(PANEL_EXPLORER)` check would cause clicks to route to the
+    // explorer instead.
     //
-    // Harmless for the `App`-based arms: `App::paint_sidebar_panel_rung`
-    // resolves *which* panel to paint through `render::sidebar_owner`, and
-    // an active `ext_panel_active` outranks `app_shell`'s own active id
-    // there — so those arms still route through the `ext:` paint arm.
+    // Harmless for the `App`-based arms: they resolve *which* panel to paint
+    // through `render::sidebar_owner`, and an active `ext_panel_active`
+    // outranks `app_shell`'s own active id there.
     engine.app_shell.show_panel(&quadraui::WidgetId::new(
         crate::core::engine::sidebar::PANEL_SETTINGS,
     ));
@@ -447,14 +365,11 @@ pub fn painted_bounds<D: ConformanceDriver>(driver: &D, needle: &str) -> quadrau
 /// backend's `DoubleClickDetector` position match before the next probe.
 ///
 /// Every backend folds two same-position `MouseDown`s in quick succession
-/// into a `DoubleClick` (quadraui#592), and `Engine::handle_ext_panel_
-/// double_click` has no section-header case — so without this, a sweep's
-/// restore click silently no-ops and later samples toggle from an unknown
-/// baseline. `crate::harness`'s own #971/#983 sweeps solve it the same way
-/// (they click a window corner); this aims at the panel's own *empty*
-/// section header instead, which is inside the surface under test, is
-/// guaranteed painted, and whose toggle changes nothing visible because the
-/// section has no rows.
+/// into a `DoubleClick`. Without this, a sweep's restore click silently
+/// no-ops and later samples toggle from an unknown baseline. This aims at
+/// the panel's own *empty* section header instead, which is inside the
+/// surface under test, is guaranteed painted, and whose toggle changes
+/// nothing visible because the section has no rows.
 fn break_double_click<D: ConformanceDriver + DriverInput>(driver: &mut D) {
     let b = painted_bounds(driver, SEC_EMPTY);
     driver.click(b.x + b.width / 2.0, b.y + b.height / 2.0);
@@ -497,8 +412,7 @@ pub fn sweep_row_hit_band<D: ConformanceDriver + DriverInput>(
 
     // Sanity: one centre click on the target must actually hide `probe`.
     // Without this a sweep whose probe does nothing at all passes exactly
-    // as cleanly as one that works — every sample agrees with the
-    // (unchanged) baseline either way. #971 learned this the expensive way.
+    // as cleanly as one that works — every sample agrees with the baseline either way.
     let centre = painted_bounds(driver, needle);
     driver.click(
         centre.x + centre.width / 2.0,
@@ -556,9 +470,8 @@ pub fn sweep_row_hit_band<D: ConformanceDriver + DriverInput>(
 /// Scenario 1 — every sample inside `SEC_COMMITS`' painted header band
 /// toggles *that* section.
 ///
-/// Targets section index 1, not 0: #499's report was that only the top
-/// section header ever responded, so a fixture that only ever probes the
-/// first header cannot see the bug it is meant to catch.
+/// Targets section index 1, not 0, to catch bugs where only the top
+/// section header responds.
 pub fn section_header_hit_band<D: ConformanceDriver + DriverInput>(driver: &mut D) {
     // Witness is the *next* section's header, not a row in the section
     // above: it is the one thing that stays painted whether or not
@@ -584,7 +497,7 @@ pub fn item_row_hit_band<D: ConformanceDriver + DriverInput>(driver: &mut D) {
 /// Scenario 5 — a hover card must paint *beside the row it names*, inside
 /// the viewport, with the panel scrolled.
 ///
-/// #1087: `hover.item_index` is a **flat** index across the whole panel
+/// `hover.item_index` is a **flat** index across the whole panel
 /// (`route_sidebar_hover`'s `ExtPanel` arm computes `ext_panel_scroll_top +
 /// row`); the anchor code added the scroll offset back in but never
 /// subtracted it out again, so a scrolled panel anchored the card dozens of
@@ -635,7 +548,7 @@ pub fn hover_card_anchors_beside_the_hovered_row<D: ConformanceDriver>(
 /// Asserting the *contrast* between the revealed row and an unrelated row
 /// (rather than a specific colour) keeps this theme-independent.
 ///
-/// #1088: `ext_panel_find_flat_index`'s three-way fuzzy id match treated
+/// `ext_panel_find_flat_index`'s three-way fuzzy id match treated
 /// the empty-id separator row as a prefix of every hash, so a reveal landed
 /// on the separator instead of the commit. The fixture keeps a leading
 /// empty-id separator at the head of `SEC_COMMITS` — the section the reveal
@@ -668,46 +581,27 @@ pub fn reveal_selects_the_revealed_row<D: ConformanceDriver>(
     );
 }
 
-/// Scenario 7 (#1236) — hovering a row near a section-header/item pitch
+/// Scenario 7 — hovering a row near a section-header/item pitch
 /// boundary resolves the hover card to the row **actually painted under the
 /// pointer**, not one a uniform-row-height formula guesses at.
 ///
-/// `route_sidebar_hover`'s `ExtPanel` arm used to hit-test through
-/// `SidebarBodyGeometry::content_row`, which divides by one `row_h` for the
-/// whole body. GTK/macOS/Win pitch a tree's `Decoration::Header` rows at
-/// `line_height * 1.2` and every other row at `line_height * 1.4`
-/// (`quadraui::gtk::tree`'s own doc; `Engine::ext_panel_tree_layout`'s doc
-/// restates it) — both taller than `content_row`'s assumed `row_h ==
-/// line_height` — so the per-row error compounds with every row above the
-/// probe point. By the time it reaches `target` (well below `SEC_COMMITS`'
-/// own header, past `FILLER_ROWS` other rows), the accumulated drift is
-/// large enough that the formula's row no longer matches the row painted at
-/// that pixel.
+/// GTK/macOS/Win pitch a tree's `Decoration::Header` rows at
+/// `line_height * 1.2` and every other row at `line_height * 1.4` — both
+/// taller than a uniform formula assumes — so the per-row error compounds
+/// with every row above the probe point. By the time it reaches `target`
+/// (well below `SEC_COMMITS`' own header, past `FILLER_ROWS` other rows),
+/// the accumulated drift is large enough that the formula's row no longer
+/// matches the row painted at that pixel.
 ///
 /// Drives a **real** `UiEvent::MouseMoved` at `target`'s own painted centre
-/// (never a hand-derived y) so the row-resolution logic under test —
-/// [`ext_panel_hit_flat_index`](crate::render::ext_panel_hit_flat_index) —
-/// runs for real. The 350ms dwell-to-paint delay itself is bypassed by
-/// backdating `Engine::panel_hover_dwell`'s own `Instant` (rather than
-/// hand-picking a flat index) and calling `Engine::poll_panel_hover`
-/// directly — the same "no wall clock on `ConformanceDriver`" constraint
-/// [`PluginPanelFixture::hover`] documents, applied without pre-seeding the
-/// *routed* row, so the row the dwell fires on is still whatever the real
-/// dispatch resolved. The popup is then painted by an explicit
-/// [`DriverRepaint::repaint`] — the harness stand-in for the runner's "the
-/// idle tick reported a redraw, so paint", and exactly what the real app
-/// does once `Engine::poll_idle` (which calls `poll_panel_hover`) returns
-/// `true`. Until #1722 this scenario instead got its frame from a second
-/// identical `MouseMoved`, which repainted only because *every* move inside
-/// the sidebar's X range forced a redraw whether or not a hover target
-/// changed; that spurious repaint was the bug #1722 fixed, so leaning on it
-/// here would have made this scenario a test that only passes against the
-/// bug.
+/// so the row-resolution logic under test — [`ext_panel_hit_flat_index`]
+/// — runs for real. The 350ms dwell-to-paint delay is bypassed by
+/// backdating `Engine::panel_hover_dwell`'s own `Instant` and calling
+/// `Engine::poll_panel_hover` directly. The popup is then painted by an
+/// explicit [`DriverRepaint::repaint`].
 ///
 /// Asserts only painted text (`screen_has`), never `engine.panel_hover`
-/// itself — the CLAUDE.md "rendered output, not state" rule (#587/#592):
-/// `panel_hover_dwell`/`poll_panel_hover`'s return value are read only to
-/// drive the popup into existence without a real sleep, not as the proof.
+/// itself — the rendered output, not internal state is the proof.
 pub fn hover_resolves_to_the_row_under_the_pointer<
     D: ConformanceDriver + DriverInput + DriverRepaint,
 >(
@@ -773,7 +667,7 @@ pub fn hover_resolves_to_the_row_under_the_pointer<
 
     // The frame the runner would paint on the back of that `poll_idle`
     // redraw. Not a second `MouseMoved`: a hover move that changes no
-    // hover target must *not* repaint (#1722).
+    // hover target must *not* repaint.
     driver.repaint();
 
     assert!(

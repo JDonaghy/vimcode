@@ -1,38 +1,23 @@
-//! #1636: real-ConPTY regression test for "Windows TUI: clicking
-//! activity-bar icons does nothing".
+//! Real-ConPTY regression test for activity-bar icon clicking.
 //!
 //! # Why this file, and why it only runs on Windows
 //!
-//! The existing in-process coverage,
-//! `src/tui_main/app_on_tui_tests.rs`'s
-//! `driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app`,
-//! drives `App`/`Engine` through a `quadraui::tui::testing::TuiDriver` —
+//! The existing in-process coverage in `src/tui_main/app_on_tui_tests.rs`
+//! drives `App`/`Engine` through a `quadraui::tui::testing::TuiDriver`,
 //! which injects already-decoded `UiEvent::MouseDown`/`Up` values directly
-//! into the dispatch pipeline. That test passes on unfixed `develop` and
-//! still passed while #1636 was reported live on `dell64`, because it can
-//! only ever exercise the *dispatch* half of the pipeline (chrome-zone hit
-//! test, `App::try_route_sidebar_mouse_event`) — never the *input-decoding*
-//! half (raw bytes off a real terminal -> `crossterm::event::MouseEvent` ->
-//! `UiEvent`), which is exactly where #1636's own issue body points
-//! ("input coordinates or glyph width, not panel dispatch").
+//! into the dispatch pipeline. That test exercises only the *dispatch* half
+//! of the pipeline (chrome-zone hit test, `App::try_route_sidebar_mouse_event`),
+//! never the *input-decoding* half (raw bytes off a real terminal ->
+//! `crossterm::event::MouseEvent` -> `UiEvent`).
 //!
-//! `quadraui::tui::vt_testing::TuiVtDriver` (issue #555/#1060) is the
-//! closest existing quadraui driver to a byte-level observer, but its own
-//! module doc says outright it is "scoped to output fidelity only" and
-//! explicitly defers real terminal-*input* decoding (raw-mode, SGR mouse)
-//! to a real-pty tier quadraui does not yet ship for a downstream consumer
-//! to reuse (quadraui#302 — see this repo's `CLAUDE.md` SMOKE_TESTS section,
-//! which names that exact gap). Proving anything about how a real terminal's
-//! raw mouse-click bytes decode on Windows needs the real thing: a genuine
-//! Win32 pseudo console (`CreatePseudoConsole` and friends), wrapped by
-//! `portable_pty`'s Windows backend the same way
-//! `tests/conpty_idle_flicker.rs` (#1634) already does — see that file's own
-//! module doc for the full "why ConPTY, why `portable_pty`, why this only
-//! ever runs on real Windows" rationale, which applies here unchanged. This
-//! file borrows that file's spawn/capture/quiescence helpers (duplicated
-//! locally rather than factored into a shared `tests/` module, to avoid
-//! touching #1634's already-landed, independently-reasoned-about file for
-//! an unrelated issue).
+//! `quadraui::tui::vt_testing::TuiVtDriver` is scoped to output fidelity only
+//! and explicitly defers real terminal-input decoding (raw-mode, SGR mouse) to
+//! a real-pty tier quadraui does not yet ship. Proving anything about how a
+//! real terminal's raw mouse-click bytes decode on Windows needs the real thing:
+//! a genuine Win32 pseudo console (`CreatePseudoConsole` and friends), wrapped
+//! by `portable_pty`'s Windows backend the same way
+//! `tests/conpty_idle_flicker.rs` already does — see that file's module doc
+//! for the full rationale, which applies here unchanged.
 //!
 //! # What this test actually proves
 //!
@@ -40,115 +25,18 @@
 //! settle, then for each activity-bar icon in turn:
 //!
 //! 1. Parses the *real* ANSI byte stream captured so far with the `vt100`
-//!    crate (the same crate `quadraui::tui::vt_testing::TuiVtDriver` uses)
-//!    to build a screen model, and locates that icon's fallback glyph at
+//!    crate to build a screen model, and locates that icon's fallback glyph at
 //!    the activity bar's icon column (`x = 1` — see the column-derivation
-//!    comment on [`ICON_COLUMN`] below) — never a hardcoded row, so this
-//!    does not encode this issue's own "glyph width" suspicion into the
-//!    test and self-invalidate it.
+//!    comment on [`ICON_COLUMN`] below) — never a hardcoded row.
 //! 2. Writes a **real SGR mouse-click escape sequence**
 //!    (`ESC [ < 0 ; col ; row M` / `...m`) straight into the ConPTY's
-//!    input side — exactly the bytes a real terminal emulator (Windows
-//!    Terminal included; ConPTY's whole purpose is bidirectional VT
-//!    translation, so this is not a Linux-only protocol) sends for a
+//!    input side — exactly the bytes a real terminal emulator sends for a
 //!    left-click, at the exact column/row the glyph actually rendered at.
 //! 3. Waits for the byte stream to settle again, then re-parses it and
 //!    asserts the expected panel's own content marker is now visible.
 //!
-//! This exercises the *entire* real path #1636 names as suspect —
-//! crossterm's Windows console-mode mouse decoding, ConPTY's VT-to-native
-//! input translation, and `App`'s dispatch — with nothing stubbed out.
-//!
-//! # RED/GREEN, actually confirmed on real Windows hardware (`dell64`)
-//!
-//! Unlike this file's first version, this one **was** built with `cargo
-//! xwin` and run to completion — RED and then GREEN — against a real
-//! Win32 ConPTY on `dell64`'s attached Windows 11 host (reached directly;
-//! no interop layer sits between this test binary and the `vcd.exe` child
-//! it spawns — both are ordinary native Windows processes talking over a
-//! native `CreatePseudoConsole` pty, confirmed via `tasklist`/`Get-Process`
-//! while a run was in flight). Four real, reproducible findings came out
-//! of getting it there, three of them purely in *this test's own harness
-//! code* rather than anything `vcd.exe` does:
-//!
-//! 1. **RED, unfixed test:** with no responder for the cursor-position
-//!    query (`ESC [ 6 n`) `ratatui::Terminal::new()` sends and blocks on
-//!    during startup, `vcd.exe` never proceeds past it — the very first
-//!    precondition check failed against a blank screen. This is a gap in
-//!    the test (see [`spawn_under_conpty`]'s doc), not evidence of
-//!    anything wrong in `vcd.exe` or `quadraui`.
-//! 2. **A genuine ConPTY-specific deadlock**, found while fixing (1):
-//!    answering the query *synchronously, inline, from within the reader
-//!    thread's read callback* (the same shape quadraui's own
-//!    `tui_pty_smoke.rs` uses for a plain Unix pty, with no issue there)
-//!    wedges the whole ConPTY session solid on real Windows hardware —
-//!    confirmed via `Get-Process ... | Select Threads`: every thread in
-//!    both processes sits in `Wait` state, zero CPU, indefinitely. Moving
-//!    the reply to an independently spawned thread (see
-//!    [`spawn_under_conpty`]'s doc) removes the deadlock with no other
-//!    behaviour change. This is a real Windows-ConPTY input/output-racing
-//!    hazard worth quadraui knowing about if it ever ships its own
-//!    Windows real-pty test tier (the quadraui#302 gap this file's first
-//!    version pointed at) — filing that as a quadraui issue is follow-up
-//!    work, not blocking this one.
-//! 3. **The sidebar is not open by default** when `vcd.exe` is opened
-//!    directly on a *file* (as this test does) — confirmed by hand, the
-//!    first real frame paints the editor and activity bar with an empty
-//!    sidebar column. This test's first version assumed Explorer was
-//!    already the active panel (mirroring the in-process
-//!    `driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app`
-//!    fixture's *shadow-engine-only* default, which that fixture's own
-//!    comment already flags as not shared by the real runner chrome) and
-//!    failed on that false precondition. Fixed by leading the click
-//!    sequence with Explorer itself, exercising and asserting on its own
-//!    click exactly like every other icon, rather than assuming it.
-//! 4. **Back-to-back synthetic clicks fold into a `DoubleClick`** on real
-//!    hardware, exactly the class `quadraui::tui::backend::TuiBackend`'s
-//!    `DoubleClickDetector` (400ms/1.5-cell window) already causes for the
-//!    in-process mirror fixture (that fixture works around it with a
-//!    test-only `set_double_click_folding(false)` hook with no real-
-//!    terminal equivalent — quadraui#1432). Two of this test's clicks
-//!    landing inside that window silently failed the second one's
-//!    assertion — a real, on-real-ConPTY reproduction of the #1432 class,
-//!    not a new bug. Fixed with an explicit [`DOUBLE_CLICK_MARGIN`] before
-//!    every synthetic click.
-//!
-//! None of the above required a change to `src/` or to `quadraui`. With
-//! all four fixed, this test passed **three consecutive real-hardware
-//! runs** (`dell64`, real ConPTY) — clicking Explorer, Search, Source
-//! Control, Extensions, and Settings each correctly switched the active
-//! panel, decoded from genuine SGR mouse bytes through crossterm's real
-//! Windows console-mode path, ConPTY's VT-to-native translation, and
-//! `App::try_route_sidebar_mouse_event` dispatch, with nothing stubbed.
-//!
-//! # What this means for #1636 itself
-//!
-//! **This is evidence the reported symptom does not reproduce when clicks
-//! are spaced apart**, not a confirmed root cause for what the operator
-//! saw on 2026-09-29. The most plausible innocent explanation this
-//! investigation turned up is finding (4) above: a real user clicking
-//! through several activity-bar icons in quick succession — exactly what
-//! "just trying each icon to see what happens" looks like — can hit the
-//! same double-click fold this test had to route around, and quadraui's
-//! `DoubleClickDetector` has no "activate panel" handler for a
-//! double-click on a plain activity-bar zone (quadraui#1432). That is an
-//! *already-tracked* class, not a new one this PR discovered from
-//! scratch — but this is the first confirmation it reproduces on a real
-//! terminal (ConPTY) rather than only the in-process `TestBackend`
-//! harness quadraui#1432 was filed against.
-//!
-//! **#1636 must stay open.** No production code changed in this PR — the
-//! click-dispatch path (input decoding through `App` dispatch) is
-//! confirmed working correctly end-to-end on real Windows hardware, which
-//! rules out a broken-dispatch explanation, but does not confirm what the
-//! operator actually experienced. Closing #1636 off the back of this PR
-//! would repeat the exact "issue closed, bug still there" failure mode
-//! this repo's own `CLAUDE.md` testing section calls out from the
-//! v0.11.0 `KNOWN_BUGS` incident. The concrete next step is operator
-//! re-confirmation — specifically, whether the icons that "did nothing"
-//! were clicked in quick succession — and, if so, treating #1636 as
-//! resolved by whatever fixes quadraui#1432 (or linking the two) rather
-//! than by anything in this PR.
+//! This exercises the entire real path for the input decoding through
+//! `App` dispatch with nothing stubbed out.
 #![cfg(windows)]
 
 use std::io::{Read, Write};
@@ -160,17 +48,11 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 /// Upper bound on how long this test will wait for any single expected
 /// screen change (startup paint, or a panel switching after a click)
-/// before giving up and failing outright. Generous on purpose: unlike
-/// `tests/conpty_idle_flicker.rs`'s fixed "quiet for 500ms" settle window
-/// (which this file used to mirror — see the module doc's RED/GREEN
-/// section for why that shape doesn't fit here), a cold real-hardware
-/// startup can legitimately *pause* mid-negotiation for longer than any
-/// fixed quiet window before its first real content paint arrives (walking
-/// the isolated home directory for Explorer's listing, loading tree-sitter
-/// grammars, …) — a fixed "no bytes for 500ms ⇒ done" heuristic reads that
-/// pause as completion and checks the screen before the real paint has
-/// happened, RED-verified by hand against this exact file (see the module
-/// doc).
+/// before giving up and failing outright. A cold real-hardware startup can
+/// legitimately pause mid-negotiation for longer than a fixed quiet window
+/// before its first real content paint arrives (loading files, tree-sitter
+/// grammars, …) — a fixed "no bytes for N ms ⇒ done" heuristic can read
+/// that pause as completion and check the screen before the real paint.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The pty grid this test opens `vcd.exe` on. Tall/wide enough to fit the
@@ -250,18 +132,13 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 ///
 /// The PTY *master* side plays the role a real terminal emulator plays for
 /// a normal interactive session — including answering the escape-sequence
-/// queries a real terminal answers. `ratatui`'s `Terminal::new()` (via
-/// `quadraui::tui::run::setup_terminal`, which every vimcode TUI entry
-/// point goes through) queries the cursor position (`ESC [ 6 n`, expects
-/// `ESC [ row ; col R` back) during startup and blocks on the reply; a
-/// dumb byte-in/byte-out pty with nothing on the master side to answer
-/// that query leaves `vcd.exe` hung before it ever paints a frame — this
-/// was RED-verified by hand against this exact file before this responder
-/// existed (see the module doc's "RED/GREEN" section). This mirrors
-/// quadraui's own `quadraui/tests/tui_pty_smoke.rs`'s `PtyExample::spawn`
-/// (its struct doc names the identical Ratatui/crossterm behaviour) —
-/// that file cannot be imported (private to quadraui's own crate), so the
-/// same minimal responder is reproduced here rather than pulled in as a
+/// queries a real terminal answers. `ratatui`'s `Terminal::new()` queries
+/// the cursor position (`ESC [ 6 n`, expects `ESC [ row ; col R` back)
+/// during startup and blocks on the reply. A dumb byte-in/byte-out pty with
+/// nothing on the master side to answer that query leaves `vcd.exe` hung
+/// before it ever paints a frame. This mirrors quadraui's own
+/// `quadraui/tests/tui_pty_smoke.rs`'s `PtyExample::spawn` — the same
+/// minimal responder is reproduced here rather than pulled in as a
 /// new dependency.
 fn spawn_under_conpty(
     main_rs: &PathBuf,
@@ -291,6 +168,7 @@ fn spawn_under_conpty(
     cmd.env("USERPROFILE", home);
     cmd.env("LOCALAPPDATA", &appdata);
     cmd.env("VIMCODE_TEST_DATA_HOME", home.join("data"));
+    cmd.env("VIMCODE_TEST_HOME_ISOLATED", "1");
 
     let child = pair
         .slave
@@ -484,18 +362,13 @@ fn wait_for_icon_row(
     }
 }
 
-/// Two clicks land closer together than this must fold into a single
+/// Two clicks landing closer together than this will fold into a single
 /// `DoubleClick` — `quadraui::tui::backend::TuiBackend`'s
-/// `DoubleClickDetector` window is documented as 400ms/1.5 cells
-/// (`quadraui/src/tui/testing.rs`'s doc comments on the same detector), and
-/// a double-click on a plain activity-bar icon zone has no "activate
-/// panel" handler (quadraui#1432 — see the in-process mirror fixture's own
-/// `set_double_click_folding(false)` comment for the identical failure
-/// mode there). A real terminal session has no such test-only override, so
-/// [`send_sgr_click`] pays this margin unconditionally instead — RED-
-/// verified by hand against this exact file: back-to-back clicks with no
-/// gap silently failed the very next icon's assertion, on real ConPTY,
-/// `dell64` hardware (see the module doc).
+/// `DoubleClickDetector` window is documented as 400ms/1.5 cells, and
+/// a double-click on a plain activity-bar icon zone has no handler to
+/// activate the panel (quadraui#1432). A real terminal session has no
+/// test-only override, so [`send_sgr_click`] waits this margin before
+/// every click.
 const DOUBLE_CLICK_MARGIN: Duration = Duration::from_millis(450);
 
 /// Write a real SGR mouse-click sequence (`CSI < Cb ; Cx ; Cy M` for the
@@ -536,16 +409,8 @@ fn click_on_each_activity_bar_icon_over_real_conpty_opens_its_panel() {
     // Wait for the first real frame — the status bar's mode indicator,
     // painted only once the whole chrome (activity bar, editor, status
     // line) has rendered at least once. `vcd.exe` starts with the sidebar
-    // *collapsed* when opened directly on a file (confirmed by hand,
-    // real ConPTY, `dell64`: the very first frame paints the editor and
-    // activity bar but an empty sidebar column — this test used to assume
-    // Explorer was the default active panel, mirroring the in-process
-    // `driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app`
-    // fixture's own *shadow-engine* default; that fixture's own comment
-    // already flags this as a shadow-engine-only default that the real
-    // runner chrome does not share — RED-verified by hand here), so the
-    // Explorer click right below is this test's first real assertion, not
-    // a precondition check.
+    // collapsed when opened directly on a file, so the Explorer click
+    // right below is this test's first real assertion.
     assert!(
         wait_for_screen_contains(&mut parser, &captured, &mut fed, "NORMAL", SETTLE_TIMEOUT),
         "vcd.exe never painted its first real frame (status bar's NORMAL \

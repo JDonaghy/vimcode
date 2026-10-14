@@ -263,15 +263,10 @@ fn test_visual_paste_preserves_ip_text_object() {
     assert_eq!(e.cursor().line, 1);
 }
 
-// ── #807: uppercase Visual operators + blockwise registers ───────────────────
+// `:h v_D` / `v_X` / `v_Y` / `v_C` / `v_S` / `v_R` — in charwise Visual these
 
 /// `:h v_D` / `v_X` / `v_Y` / `v_C` / `v_S` / `v_R` — in charwise Visual these
 /// all act **linewise** on the selected lines, and `s` is a synonym for `c`.
-///
-/// Every expectation here is the nvim oracle's (`vis:vjD`, `vis:vjX`,
-/// `vis:vjY p`, `vis:vjC`, `vis:vjS`, `vis:vjR`, `vis:v s` in
-/// `tests/nvim_conformance.rs`); before #807 none of these keys did anything
-/// at all in Visual mode, so each assertion below fails on unfixed `develop`.
 #[test]
 fn test_visual_uppercase_operators_are_linewise() {
     // D — delete the selected lines whole.
@@ -408,7 +403,7 @@ fn test_blockwise_delete_register_and_block_over_block() {
 }
 
 /// Visual `=` and `gJ` — the two rows `VIM_COMPATIBILITY.md` marked ✅ while
-/// the keys were in fact unbound (#807). Both assertions fail on unfixed
+/// the keys were in fact unbound. Both assertions fail on unfixed
 /// `develop`, where the buffer comes back untouched.
 #[test]
 fn test_visual_equal_and_gJ() {
@@ -428,10 +423,7 @@ fn test_visual_equal_and_gJ() {
 }
 
 /// Putting a **linewise** register over a **charwise** selection splits the
-/// line, rather than splicing the two halves back together (#807).
-///
-/// Oracle: `vis:vlp linewise reg`. Fails on unfixed `develop`, which produces
-/// `a\nb\na\nz` — the empty line where `xy` used to be is missing.
+/// line, rather than splicing the two halves back together.
 #[test]
 fn test_visual_put_linewise_register_over_charwise_selection() {
     let mut e = engine_with("a\nb\nxyz\n");
@@ -443,8 +435,7 @@ fn test_visual_put_linewise_register_over_charwise_selection() {
     assert_cursor(&e, 3, 0);
 }
 
-/// Linewise `r` covers whole lines, so the cursor lands in column 0
-/// (#807, oracle `vis:Vr-`).
+/// Linewise `r` covers whole lines, so the cursor lands in column 0.
 #[test]
 fn test_visual_line_replace_cursor_column() {
     let mut e = engine_with("abc\n");
@@ -458,7 +449,7 @@ fn test_visual_line_replace_cursor_column() {
 
 /// `gv` after a Visual delete reselects a *collapsed* region — Vim moves both
 /// `'<` and `'>` to the start of the deleted text — and `gv` pressed while
-/// already in Visual mode swaps to the previous selection (#807).
+/// already in Visual mode swaps to the previous selection.
 ///
 /// Oracle: `vis:gv after Vjd`, `vis:v then gv toggles`, `misc:gv after p`.
 #[test]

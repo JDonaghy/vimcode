@@ -60,7 +60,7 @@ pub fn crash_log_path() -> PathBuf {
 /// Append `msg` to the crash log file, creating it if necessary. Returns
 /// the path on success.
 ///
-/// Appends rather than truncating (#857): a `panic in a function that
+/// Appends rather than truncating: a `panic in a function that
 /// cannot unwind` abort runs the panic hook *twice* on the same crash —
 /// once for the originating panic, whose message names the actual bug,
 /// and again for the `panic_cannot_unwind` wrapper that aborts the
@@ -99,12 +99,7 @@ pub fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) -> Option<PathBuf> 
 /// Install the crash-recovery panic hook shared by every *GUI* entry point
 /// (GTK, macOS, Win-GUI): flush every dirty buffer to its swap file, write a
 /// crash log, print where to find it, then chain to whatever hook was
-/// already installed. `src/gtk/mod.rs::run`, `src/macos/mod.rs::run`, and
-/// `src/win/mod.rs::run` used to each carry an identical copy of this
-/// closure — one of the drift items #950 catalogued ("the panic hook copied
-/// four times"). Centralizing the three identical copies here means a
-/// change to the message or the flush/log call order only has to be made
-/// once, and it can never be made in only two of the three by accident.
+/// already installed.
 ///
 /// Thin wrapper over [`install_gui_crash_hook_with_sink`] with a no-op sink
 /// — every GUI entry point only needs `eprintln!`, which the sink'd variant
@@ -114,8 +109,7 @@ pub fn install_gui_crash_hook() {
 }
 
 /// [`install_gui_crash_hook`], plus an extra `sink` invoked with each of the
-/// three message lines the hook writes via `eprintln!` (#1433, closing
-/// #1423's item 1).
+/// three message lines the hook writes via `eprintln!`.
 ///
 /// This is the TUI entry point's (`tui_main::mod::run`) way of sharing this
 /// hook instead of carrying its own copy: a terminal backend runs in raw
@@ -248,7 +242,7 @@ pub fn delete_swap(swap_path: &Path) {
 
 /// Check whether a process with the given PID is still alive.
 ///
-/// No subprocess is spawned on any platform (#1105): the crash-recovery
+/// No subprocess is spawned on any platform: the crash-recovery
 /// path this feeds needs a fast, locale-independent liveness check, and a
 /// spawned process-listing helper is both slower and, on Windows, would
 /// depend on parsing locale-translated output text.
@@ -315,7 +309,7 @@ mod windows_ffi {
 }
 
 /// Check PID liveness via `OpenProcess` + `GetExitCodeProcess` — no
-/// subprocess spawn, no output parsing (see #1105).
+/// subprocess spawn, no output parsing.
 #[cfg(target_os = "windows")]
 fn windows_is_pid_alive(pid: u32) -> bool {
     use windows_ffi::*;
@@ -412,7 +406,7 @@ mod tests {
         assert_ne!(p1, p2);
     }
 
-    /// #857: `append_to_crash_log` must accumulate every call's report
+    /// `append_to_crash_log` must accumulate every call's report
     /// rather than each new call wiping out the previous one — the defect
     /// that made the double-panic-hook-invocation crash log for the
     /// titlebar-close abort name only "panic in a function that cannot
@@ -502,7 +496,7 @@ mod tests {
         // Spawn a short-lived child and wait() on it (reaping it), then
         // confirm we report the PID as dead. This exercises the "process
         // no longer exists" path that kill(pid, 0) / OpenProcess must
-        // report correctly with no subprocess spawn of our own (#1105).
+        // report correctly.
         #[cfg(windows)]
         let mut child = std::process::Command::new("cmd")
             .args(["/C", "exit", "0"])

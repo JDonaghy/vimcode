@@ -1,15 +1,11 @@
 /// Integration tests for the AI assistant panel (engine state machine).
 ///
-/// #819 adopted quadraui's `ChatController` for the AI sidebar's input
-/// buffer, cursor, history and transcript scroll — those are no longer
-/// hand-rolled `Engine` fields (`ai_input`/`ai_input_cursor`/
-/// `ai_input_active`/`ai_scroll_top`) but state owned by `Engine::ai_chat`
-/// (a `quadraui::ChatController`), whose own text-editing/cursor-movement
-/// behaviour is covered by quadraui's own test suite, not re-tested here.
-/// What stays here is the business logic `Engine` still owns: sending a
-/// message, polling the background response, clearing the conversation, and
-/// translating a `ChatControllerEvent` into those engine actions
-/// (`Engine::dispatch_ai_chat_event`).
+/// The `Engine` owns business logic for sending a message, polling the
+/// background response, clearing the conversation, and translating a
+/// `ChatControllerEvent` into those engine actions (`Engine::dispatch_ai_chat_event`).
+/// Text editing, cursor movement, input buffer, history, and scroll are managed
+/// by `Engine::ai_chat` (a `quadraui::ChatController`), whose behaviour is
+/// covered by quadraui's own test suite.
 use vimcode_core::core::engine::Engine;
 
 fn engine() -> Engine {
@@ -20,7 +16,7 @@ fn engine() -> Engine {
     e
 }
 
-/// #1446: `Engine::ai_send_message` now refuses to spawn the direct-provider
+/// `Engine::ai_send_message` now refuses to spawn the direct-provider
 /// `curl` transport when *neither* transport is configured (no ACP agent and
 /// no resolvable API key), so the tests below that assert the send path
 /// actually runs must configure a key. Doing it through `settings.ai_api_key`

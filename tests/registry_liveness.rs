@@ -1,20 +1,14 @@
-//! #1347: scheduled liveness check for `[lsp.acquire]`/`[dap.acquire]`
+//! Scheduled liveness check for `[lsp.acquire]`/`[dap.acquire]`
 //! download URLs.
 //!
-//! `tests/extensions.rs`'s #919 registry conformance gate only checks that
-//! every manifest *resolves a non-empty install command* per platform — it
-//! never touches the network, so a manifest whose `[lsp.acquire]` points at a
-//! release asset that has never existed (the terraform `install_linux` bug
-//! this issue is named after) sails through green. This file closes that gap
-//! the other direction: for every manifest that declares `[lsp.acquire]` /
-//! `[dap.acquire]`, resolve the concrete download URL for every
-//! `Platform::ALL` × `Arch::ALL` combination — reusing
-//! `tool_acquire::resolve_asset`, the *same* URL-construction code path
-//! `Engine::ext_install_from_registry` calls at real install time, not a
-//! reimplementation — and HEAD-request it. It never downloads or installs
-//! anything, so it can't collide with code-coordinator#3319's reasoning for
-//! rejecting real installs (6 manifests `brew install`, no Homebrew in CI by
-//! policy).
+//! The registry conformance check only verifies that every manifest
+//! resolves a non-empty install command per platform without touching
+//! the network. This file closes that gap by resolving the concrete
+//! download URL for every `Platform::ALL` × `Arch::ALL` combination,
+//! reusing `tool_acquire::resolve_asset` (the same URL-construction code
+//! path that `Engine::ext_install_from_registry` calls at real install
+//! time), and HEAD-requesting it. It never downloads or installs
+//! anything.
 //!
 //! This file is deliberately **not** part of the default `cargo test` run:
 //! the one test that fetches the live `registry.json` and HEAD-requests real
@@ -68,19 +62,18 @@ enum Coverage {
     /// at all) — no line is emitted.
     None,
     /// `[lsp.acquire]`/`[dap.acquire]` names one of the three archive-download
-    /// kinds (#1345) — this is the thing this check actually verifies.
+    /// kinds — this is the thing this check actually verifies.
     /// Boxed: `AcquireConfig` is far larger than this enum's other variants
     /// (clippy's `large_enum_variant`).
     Acquire(Box<AcquireConfig>),
     /// `[lsp.acquire]`/`[dap.acquire]` names one of the five package-manager
-    /// kinds (#1346, `npm`/`pip`/`go`/`cargo`/`dotnet-tool`) — no fixed
+    /// kinds (`npm`/`pip`/`go`/`cargo`/`dotnet-tool`) — no fixed
     /// download URL to HEAD-request (the package manager resolves its own),
     /// so it's reported, not silently skipped.
     PackageManagerAcquire,
     /// Only `install`/`install_linux`/`install_macos`/`install_windows` shell
-    /// strings are declared — exactly the class of bug #1347 is about
-    /// (a shell one-liner that silently rots), and exactly what this check
-    /// *cannot* verify statically. Reported so the coverage gap is visible.
+    /// strings are declared — no fixed download URL to verify statically.
+    /// Reported so the coverage gap is visible.
     ShellInstall,
 }
 
@@ -384,13 +377,9 @@ fn coverage_classifies_acquire_shell_install_package_manager_and_none() {
     ));
 }
 
-/// #1347 acceptance: "a deliberately bad fixture (asset name that doesn't
-/// exist) produces MISSING and exits non-zero." Confirmed RED first: with
-/// `check_one`'s `Ok(code) if (200..300).contains(&code) => Outcome::Ok`
-/// arm changed to always return `Outcome::Ok` regardless of status code,
-/// this test fails (`assert!(matches!(.., Outcome::Missing(_)))` sees `Ok`
-/// instead) — so this is a real regression guard, not a test that would
-/// stay green with the bug reinstated.
+/// A deliberately bad fixture (asset name that doesn't exist) produces
+/// MISSING and exits non-zero. The fixture server only serves the "amd64"
+/// path with 200; every other path gets a 404.
 #[test]
 fn bad_fixture_asset_name_produces_missing() {
     // The fixture server only serves the "amd64" path with 200; every other

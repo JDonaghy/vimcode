@@ -1,5 +1,537 @@
 # VimCode Project State
 
+**Last updated:** October 9, 2026 (#1831 review round 2 — untagged the one
+expected-GREEN `known_bug` step). One blocking finding fixed in
+`tests/smoke-spec/mac-gtk.yaml`:
+
+- **Removed `known_bug: vimcode#1825` from `no-tofu-terminal-panel-1831`.**
+  Round 1 applied the tag to every step from `launch-is-frontmost-1831`
+  onward, but `expect_no_tofu` is a NEGATIVE assertion:
+  `coord.native_pixels.looks_like_tofu` returns `(False, …)` — i.e. the step
+  PASSES — unless it finds a near-uniform interior *plus* a high-contrast
+  border, and its docstring says a fully-uniform region is explicitly not
+  tofu. Under #1825 no input reaches the app, the terminal panel never
+  opens, the mac-native runner's `run()` keeps iterating past failing steps,
+  so this step executed over a blank editor band and *passed*.
+  `classify_step` maps pass+`known_bug` to `GREEN_KNOWN_BUG_FIXED`, and
+  `process_nightly_step` acts on that with `issue comment … "appears fixed.
+  Closing."` + `issue close` — i.e. the first live nightly run of this lane
+  would have auto-closed #1825 while it is still broken (CLAUDE.md
+  "Testing (CRITICAL)" rules 3/4). No pixel-geometry change fixes it;
+  untagged, a pass is `GREEN_CLEAN`/silent and a real tofu box still files.
+
+Also, from the same review's non-blocking notes: added an explicit
+first-real-run operator check to `terminal-panel-not-uniform-1831` (its tag
+is only correct if its unconfirmed 1x band really is uniform in the unfixed
+state — otherwise it hits the same false-close path); documented that the
+trailing cleanup is skipped on the driver-level-timeout path (`run()` marks
+remaining steps failed without executing them), leaving the probe file on
+disk for the next run to pass against, with the manual `rm -f` an operator
+should do after seeing that abort message; documented the ~35 duplicate
+"appears fixed. Closing." comments the blanket tagging will produce the day
+#1825 is fixed, and why that is still the lesser evil; re-worded the
+`docs/PENDING_QUADRAUI_ISSUES.md` quotation in the spec header as explicitly
+historical, since this same PR rewrote that sentence out of the repo; and
+re-wrapped `tests/smoke-spec/catalogue.yaml`'s Tier-2 spec list to the
+block's own width. The header's tagging rationale now states the rule
+(`known_bug` only on steps expected RED) and lists all three classes of
+exception, instead of claiming blanket coverage. **Still UNRUN ON REAL
+HARDWARE.**
+
+---
+
+**Last updated:** October 9, 2026 (#1831 review round 1 — close-terminal
+bug fix, cross-run cleanup, `known_bug` gating). Fixed three blocking
+findings in `tests/smoke-spec/mac-gtk.yaml`:
+1. Dropped the "close the terminal panel" block before step 4 — it typed
+   `:term` a second time, which does not toggle (a typed `:term` always
+   normalizes to `EngineAction::OpenTerminal`; `toggle_terminal()` is only
+   reached when `is_macro` is true, which a driver-typed ex command is
+   not), so it typed `:term` into the live shell instead (keyboard focus
+   is inside the terminal pane) and left the panel open regardless. Step
+   4's clicks are all at y=16/46 — well above the panel's `y: 520` band —
+   so closing it first was never necessary; the comment now says so.
+2. Added a trailing `rm -f` cleanup (reusing the already-open terminal
+   pane) removing both `/tmp/vimcode-smoke-1831-macgtk.txt` and
+   `/tmp/vimcode-smoke-term-probe-1831-macgtk.txt`, so the two `expect_file`
+   probes in section 2 are genuinely cross-run self-invalidating instead of
+   passing against a leftover from a prior green run (CLAUDE.md /
+   #553) — same pattern as `gtk-gui.yaml`'s `cleanup-probe-1835`.
+3. Added `known_bug: vimcode#1825` to every step from
+   `launch-is-frontmost-1831` onward (confirmed, with `code-coordinator`
+   actually installed in this session, that `parse_native_spec` tolerates
+   the extra field and the whole file still parses clean — 37 steps).
+   `NativeRunner._require_frontmost` refuses all `key`/`click`/`type_text`
+   input while the pid isn't frontmost, so under #1825 the ENTIRE file is
+   red, not just the one check — the header now says this explicitly.
+
+Also: split the `:term` probe's `rm -f`/`echo` back onto separate
+`type_text` lines (consistency with `gtk-gui.yaml`'s own destructive-command
+split), added an `expect_no_tofu` check over the terminal panel band, fixed
+the "cross-compiled" claim (the macOS build is native, not cross-compiled),
+added the Retina 2x backing-scale-factor caveat to the header, spelled out
+the literal `coord app-drive run-spec` invocation, updated
+`tests/smoke-spec/catalogue.yaml` and `docs/PENDING_QUADRAUI_ISSUES.md`'s
+stale "nothing targets macOS-GTK" claim, and restored this file's own
+`**Last updated:**` heading convention on the #1835 entry below (a
+previous pass had renamed it to `(previous)`, breaking the file's one
+grep-able convention). **Still UNRUN ON REAL HARDWARE** — same
+environment constraint as before, unchanged by this fix round; see the
+spec file's own header.
+
+---
+
+**Last updated:** October 9, 2026 (#1831 — "first five minutes" smoke spec
+for the **shipped macOS GTK artifact** (`vimcode-macos-arm64.tar.gz`), run
+on `macmini`). New file `tests/smoke-spec/mac-gtk.yaml`, driven by the
+existing `mac-native` driver (`coord/mac_native_driver.py` — the same one
+`mac-gui.yaml` uses; its `CGEvent`/AX/`screencapture` calls are OS-level,
+not toolkit-specific, so no new coordinator-side driver was needed, just a
+new spec file pointed at the GTK tarball binary instead of the native
+`--features macos` one). Covers the issue's four steps: `expect_frontmost`
++ a typing/`:saveas`/bare-`:w` probe (gated on vimcode#1825 — expected RED
+until a person confirms the quadraui `activateIgnoringOtherApps`/
+`setActivationPolicy` fix from #1843 on real macOS hardware, per
+`docs/PENDING_QUADRAUI_ISSUES.md`'s struck "`quadraui::gtk::run` never
+activates..." entry, which explicitly named this exact missing lane in its
+own "Test" section), a `:term` probe + `expect_region_not_uniform` on the
+panel, and a `File → New Tab` click sequence + close-button
+`expect_closed`. Also added `mac-gtk.yaml` to
+`scripts/validate_smoke_specs.py`'s `SPECS` table.
+**UNRUN ON REAL HARDWARE — not done per this issue's own bar** ("the spec
+has actually run on the real host"). This worker's environment is a
+sandboxed Linux worktree with no macmini access and no Darwin host of any
+kind reachable from it; `coord.mac_native_driver`'s `MacOSCalls`
+construction requires real AppKit/Quartz (`pyobjc`) and is macOS-only by
+design, so `coord app-drive run-spec mac-native` cannot even start here.
+What WAS verified from this worktree: the file parses cleanly against the
+real, installed `coord.mac_native_driver.parse_native_spec` (confirmed via
+`python3 scripts/validate_smoke_specs.py` against `code-coordinator`
+0.5.620, above CI's `>=0.5.551` floor) — every step type the issue asked
+for (`type_text`/`expect_file`/`expect_frontmost`/
+`expect_region_not_uniform`) already exists in that driver, so none needed
+to be marked pending. Every pixel coordinate (the File-menu click, the
+dropdown's first-item position, the close button, the terminal-panel band)
+is a first-approximation guess derived from `src/render.rs`'s drawn-chrome
+constants, not a real `screencapture` capture — needs an operator with
+real macmini access to run this file for real, record pass/fail (including
+whether vimcode#1825 is still red), and correct any pixel geometry that
+misses, back into the file's own header. See that file's header for the
+full reasoning, including why no `expect_a11y` check was added for the
+File/New-Tab click (a GTK-via-quartz window's AX-tree shape on macOS is
+itself unconfirmed, so a role-string guess on top of that would compound
+two guesses rather than add real coverage).
+
+**Last updated:** October 9, 2026 (#1832 review round 1 — fix the "additive-
+only" violation in `tests/smoke-spec/mac-gui.yaml`). The original #1832 fix
+below (its own entry, unedited) rewrote several pre-existing comment
+paragraphs in place (the "menu-bar/close-button checks are expected GREEN"
+tail, the `move_window` paragraph, the entire "UNLIKE win-gui.yaml... has
+NOT had a real run" paragraph, the "DELIBERATELY OMITTED" paragraph's tail,
+the "Real native traffic-light close button." line) and rewrote one step
+field (`click-file-menu-item`'s `x: 95` → `x: 150`), which review correctly
+flagged against #3509's additive-only policy for this file — the exact
+same class of finding #1833 review round 2 already fixed once in
+`win-terminal.yaml` (see that entry below). Fixed the same way: every
+pre-existing line (including the `x: 95` step field — the real-measured
+`x≈150` is recorded as new, additive commentary instead, with a note that
+updating the field itself is a separate, narrowly-scoped follow-up once
+#1824 clears) is restored to its exact original text/value, and every
+correction/new finding is appended as new, additive paragraphs and comment
+lines instead of edits in place. Confirmed via `git diff
+<merge-base>..HEAD -- tests/smoke-spec/mac-gui.yaml`: every line that diff
+shows as removed is present verbatim elsewhere in the new file (pure
+reordering around newly-inserted additive content, not a content change);
+zero step fields differ from before this issue's first commit. The 29-step
+spec, its real-run results, and `ISSUE_RESOLUTION` are otherwise unchanged
+from the entry below.
+
+**Last updated:** October 9, 2026 (#1832 — `tests/smoke-spec/mac-gui.yaml`'s
+first real run, on macmini, against a real `cargo build --no-default-features
+--features macos --bin vimcode` driven by `coord app-drive run-spec mac-native`
+(`code-coordinator` 0.5.620 — note `~/.coord-venv.blue` on this same host is a
+stale 0.5.617 that lacks every `#3650` step type this file now uses; `which
+coord` must resolve to the green venv). Added the five `#3650` driver steps
+this issue asked for (`expect_dock_icon`, `expect_frontmost`, the typing/
+`:w`/`expect_file` section, three `expect_no_tofu` checks on the activity
+bar) and ran the whole 29-step spec end to end once, clean, no manual
+intervention — full per-step pass/fail recorded in the file's own header
+(not duplicated here). Three findings worth a look from someone other than
+this worker:
+
+1. **#1824 reproduces exactly as documented Oct 6** — `expect_frontmost`
+   fails immediately after launch (actual frontmost stays the launching
+   terminal), and that one failure cascades through `_require_frontmost`
+   to block every later `click`/`key`/`type_text` step in the spec — not
+   independent bugs, one root cause. No new finding here, just a second,
+   independent real-hardware confirmation.
+2. **#1824 finding 2 ("Explorer/Source Control/Run&Debug show a generic
+   `?`-box placeholder") did NOT reproduce today** — all three
+   `expect_no_tofu` checks pass, confirmed via `coord.native_pixels.
+   looks_like_tofu`/`region_not_uniform` (the real heuristic, not eyeballed)
+   against two separate fresh launches. Do not read this as "#1824 is
+   fixed" — only this one sub-finding failed to reproduce; window
+   activation (finding 1) is still fully red. Keep #1824 open, but
+   whoever next touches it should re-confirm finding 2 before continuing
+   to treat it as live.
+3. **New, unfiled finding: `coord`'s `send_click` (`CGEventPostToPid`)
+   does not register against vimcode's window at all, even once the app
+   is made genuinely frontmost by hand** — confirmed by forcing frontmost
+   via `osascript ... set frontmost ... to true`, then clicking a
+   precisely-calibrated activity-bar icon coordinate: zero visible effect,
+   twice, across two different window positions. The identical coordinate
+   posted instead via a raw global `Quartz.CGEventPost(kCGHIDEventTap,
+   ...)` (bypassing `coord` entirely) opened the panel immediately.
+   `send_key`'s own `CGEventPostToPid` calls work reliably by contrast
+   (`i` flips the status bar to `INSERT` every time) — this is specific to
+   *mouse* event delivery via pid-addressed posting. Reproduces
+   independently of #1824's frontmost gate, so fixing #1824 alone will
+   NOT by itself unblock this spec's `click` steps. This is plausibly a
+   `coord`-side driver gap (`mac_native_driver.py` lives in the
+   `code-coordinator` package, not this repo — this worker cannot file
+   against it or fix it), not confirmed to be a vimcode/quadraui bug;
+   flagged here for whoever next touches that driver or re-runs this spec.
+   Also observed, separately: `move_window`'s requested `(0,0)` placement
+   was honored once (landed at `(0,30)`, Y clamped below the real menu
+   bar — expected) and not honored once (landed at `(332,677)`, no
+   interaction preceded either launch) across two consecutive fresh
+   launches — noted in the spec file's own header as a placement-
+   instability caveat on this file's window-relative click coordinates,
+   not independently investigated further here.
+
+No vimcode-repo production code changed — #1832 is a test/spec-only issue;
+the real bug most of this run's steps reproduce is already #1824 (open,
+separate, unaffected by this PR). #1832's own acceptance bar ("the spec
+has actually run on the real host, with the result — pass, or
+expected-red with its issue — recorded in the file header") is fully met:
+this is a real, clean, one-shot `coord app-drive run-spec` run with every
+step's real pass/fail recorded, every red step tagged `known_bug:
+vimcode#1824` and genuinely explained by that one root cause. Closing
+#1832 does not mean #1824 is fixed — #1824 stays open on its own, per the
+findings above (notably: its finding 2 did not reproduce today, worth a
+re-check, but finding 1 still fully does).
+
+**Last updated:** October 9, 2026 (#1833 review round 2 — restore the one
+pre-existing line review round 1 rewrote in `tests/smoke-spec/win-terminal.yaml`,
+per #3509's additive-only policy). Round 1's fix #4 below corrected the
+`open-second-tab` step's stale comment ("Ctrl+T opens a second editor tab" —
+it doesn't) by rewriting it in place, which review round 2 flagged as
+weakening/rewriting an existing line in this file's Tier-2 smoke-spec entry
+point, even though the rewrite was comment-only and changed no check. Fixed
+by reverting that paragraph to its exact original wording and appending the
+correction as new, additive lines immediately after it (the same "kept
+verbatim, corrected in a new paragraph" pattern this file's own header
+already uses for its #1829 update section) rather than editing text in
+place. No other line in this PR's diff pre-dates #1833 (confirmed via `git
+diff <merge-base>..HEAD -- tests/smoke-spec/win-terminal.yaml PROJECT_STATE.md`
+showing zero `-` lines against lines that existed before this issue's first
+commit); round 1's three other fixes and the minimap/stale-probe/`:term`-focus
+corrections they made are unchanged. `ISSUE_RESOLUTION: partial` still stands,
+for the same reasons round 1 recorded below.
+
+**Last updated:** October 9, 2026 (#1833 review round 1 — fix four blocking
+findings in `tests/smoke-spec/win-terminal.yaml`'s new step groups). **Fix,
+not reimplementation; no re-verification on real hardware was possible from
+this environment.** (1) The minimap is off by default (#1858) and the
+file's shared settings precondition never promised `minimap: true`, so
+`minimap-thumb-visible-1828` was not self-sufficient — it now enables the
+minimap itself via `:set minimap` immediately before the capture. (2) That
+same step's region sits entirely inside the viewport band on a short file
+(the whole strip IS the band), so it was measuring the strip's per-line
+marks, not band-vs-strip CONTRAST — the actual open half of #1828/#1842;
+`win_native_driver.py` has no two-point pixel-colour-comparison primitive
+to build a true contrast check, so the step is now tagged `known_bug:
+vimcode#1828` with a comment stating plainly it is a "strip paints
+something" proxy only, not a thumb-visibility confirmation. (3) Both
+`expect_file` probes, and the `sample.txt` write round trip, could be
+satisfied by a PREVIOUS run's leftover state (neither probe file is ever
+deleted; `sample.txt` accumulates a `from_1833` line every successful run
+and is never reverted) — fixed with `Remove-Item -ErrorAction
+SilentlyContinue` before each probe file write, plus a `Get-Content |
+Where-Object -notmatch | Set-Content` filter and a forced `:e!` buffer
+reload for `sample.txt` (the reload matters because vimcode's own
+in-memory buffer, loaded at `launch` time, can itself still carry a stale
+`from_1833` line that cleaning only the disk file wouldn't undo). This
+closes the common regression case but still can't distinguish "never
+executed" from "ran a no-op delete" on a host with zero prior runs and an
+unrelated stale file already at that exact path — a residual gap inherent
+to having no delete-file step, flagged in the YAML's own comment rather
+than silently left. (4) The `:term` probe steps were not actually
+exercising `:term`: the pre-existing `open-second-tab` step's `Ctrl+T` is
+`panel_keys.open_terminal` (same panel `:term` opens), so by the time the
+probe ran, a pre-existing terminal pane already held focus and the typed
+`":term\r"` went to that shell as a literal command, bypassing vimcode's
+own ex-command dispatch entirely — fixed with an explicit `click` into the
+editor's text area immediately before the probe, same pattern already used
+later in the file. Also applied the non-blocking review notes: restored
+`contains: MARKER` on the `:term` probe (via `Set-Content -Encoding utf8`,
+sidestepping the UTF-16LE `>`-default trap rather than dropping the
+content check), corrected the `open-second-tab` step's stale comment
+("Ctrl+T opens a second editor tab" — it doesn't; it's the terminal-panel
+toggle), and noted beside `copy-saved-file-to-probe-path` that it cannot
+pass through `coord app-drive run-spec` until the `_plan_staging` gap is
+fixed too. None of these four fixes has been re-verified on a real Windows
+host — this review round had no access to dell64 or any other Windows
+machine, so the corrected step shapes are reviewed-for-correctness only.
+`ISSUE_RESOLUTION: partial` stands — unchanged from before this round —
+pending both a real re-run and the still-unfiled coordinator-repo issues
+for the three `win_native_driver.py` launch bugs and the `_plan_staging`
+gap.
+
+**Last updated:** October 9, 2026 (#1833 — Windows TUI "first five minutes"
+smoke spec: `:term` probe, minimap thumb, typing round trip, all added to
+`tests/smoke-spec/win-terminal.yaml` and RUN FOR REAL on dell64). **New
+steps added and run on real hardware, not just parsed.** `coord app-drive
+run-spec`/`open` could not drive the actual run end to end: three real,
+reproducible `claude-coordinator`-side `win_native_driver.py` bugs block
+every `mode: terminal, terminal_app: windows-terminal` launch on this host
+(not vimcode bugs — flagged for a coordinator-repo issue, filing is outside
+a vimcode worker's reach): (1) `find_top_window`'s process-descendant walk
+can never find a `wt.exe`-hosted window, since `wt.exe` hands off to the
+real `WindowsTerminal.exe` via COM activation whose OS parent is a
+short-lived broker, never a true descendant; (2) `subprocess.Popen(...,
+shell=True)` unconditionally sets `wShowWindow=SW_HIDE` (CPython's own
+behaviour), so even a `conhost`-mode launch (a genuine descendant) produces
+a window `IsWindowVisible` can never confirm; (3) `launch_in_terminal`
+passes a bare relative `vcd.exe` token with no `-d <dir>`, which Windows
+Terminal cannot resolve against the launching process's own cwd (`[error
+2147942402 (0x80070002)] ... The system cannot find the file specified.`,
+confirmed on screen). Worked around with a direct Win32/`SendInput` harness
+reusing `coord.win_native_driver`'s own `Win32Calls`/`NativeRunner`/
+`parse_native_spec` (same "drive the real primitives by hand" methodology
+this file's own win-terminal.yaml header already used for the original
+#1634/#1635/#1636 confirmation) — every new step in the YAML file was then
+run twice, end to end, through the REAL `NativeRunner._run_step` dispatch
+(not a reimplementation) against a real, visible, foreground `vcd.exe`
+window built from this branch (`cargo xwin build --release --target
+x86_64-pc-windows-msvc --no-default-features --bin vcd`, quadraui 0.1.2).
+Both runs: all twelve new steps green. Headline results: **#1828** (minimap
+thumb) — `expect_region_not_uniform` over the strip's top band passed for
+real (max channel delta 57), the real-hardware confirmation
+PROJECT_STATE's own #1842 entry below named as the one thing a headless
+`TestBackend` run could not do. **#1829** (`:term` blank panel) — the
+terminal panel opened with a real, live `Windows PowerShell` prompt
+(screenshotted) and a typed `echo MARKER > ...` command actually ran;
+#1829's own symptom did NOT reproduce on this real host with this branch's
+quadraui pin, consistent with the #1843 entry below tracing the fix to
+quadraui#1327 and leaving only this real-hardware confirmation open. #1829
+is left OPEN on GitHub (closing it is a review decision, not this worker's
+call) and its spec step keeps `known_bug: vimcode#1829` — the bidirectional
+half of the known-bug gate is exactly "alert that a parked bug is now
+passing", not "silently declare it fixed". One probe-mechanism-only
+finding, NOT a vimcode defect: Windows PowerShell's `>` redirection writes
+UTF-16LE by default, so a literal `contains: MARKER` check (which decodes
+as UTF-8) against the issue's own literal `echo MARKER > ...` probe command
+reads a byte-correct file as not containing `MARKER` — confirmed by hand
+against the identical file (plain existence: passes; `contains: MARKER`:
+fails). The `:term` probe step therefore checks existence only; a second,
+unrelated probe (typing + `:w` + a `Get-Content | Set-Content -Encoding
+utf8` copy-out, since vimcode's `:w` has no save-as/filename-argument form)
+uses `contains:` safely. Also found and worked around (not a bug, a step-
+ordering gap in this new YAML): plain `Esc` alone does not return focus to
+the editor from a terminal panel the #1829 steps leave open — an explicit
+`click` into the editor's own text area is now step `click-back-into-
+editor` before the typing round trip. See `tests/smoke-spec/win-
+terminal.yaml`'s own header for the full, step-by-step record.
+
+**Last updated:** October 9, 2026 (#1835 — Linux "first five minutes"
+smoke: typing/`:term`/extension-install probes, through review round 2).
+Added a new
+`-1835`-suffixed section to both `tests/smoke-spec/tui.yaml` (`tui-pty`)
+and `tests/smoke-spec/gtk-gui.yaml` (`gtk-native`), using the
+`type_text`/`expect_file`/`expect_frontmost`/`expect_region_not_uniform`
+driver steps `claude-coordinator#3650` shipped for exactly this purpose —
+every step type the issue asked for was already available, so none needed
+to be marked pending. Each section covers: typing text, saving it to an
+explicit path (`:saveas <path>`, not a bare `:w <path>` — see below), a
+`:term` probe that echoes a marker into a file from inside the real nested
+shell (mirrors `tests/conpty_term_opens_shell_1829.rs`'s own ConPTY probe),
+and a local extension install (drop a `manifest.toml` under
+`~/.config/vimcode/extensions/<name>/`, the "can a user install plugins"
+check) — plus, GTK-only, `expect_frontmost` right after launch and
+`expect_region_not_uniform` on the terminal panel and minimap bands.
+**TUI: real-pty run, GREEN.** `coord app-drive run-spec tui-pty` against a
+locally-built `vcd` (isolated HOME, `lsp_enabled`/`use_nerd_fonts` off) —
+all three new probes passed, both standalone and appended to the full
+1800+-line file. Run from a macOS host (`UnixPtyChild` backs both Linux and
+macOS identically, per `tui_pty_driver.py`'s own module doc — no
+platform-conditional code in the driver or in vimcode's pty-handling path),
+not literally Linux; a Linux-hardware confirmation of this exact section is
+still outstanding. One real authoring finding, not a bug fix: vimcode's
+`:w`/`"write"` (`src/core/engine/execute.rs`) matches `cmd` *exactly*
+against the literal strings `"write"`/`"write!"`, so a trailing path
+argument makes the WHOLE command fall through to the catch-all "Not an
+editor command" arm — unlike real Vim's `:w {path}`, it is an
+unrecognized command and does not even save the current file (corrected
+from an earlier, less precise draft of this paragraph that said `:w`
+"ignores" the path, which wrongly implied the current file still gets
+saved). `:saveas <path>` is the command vimcode actually implements for that, and
+is what both new sections use; not filed as a bug since no documentation
+claims `:w {path}` is supported and fixing engine behavior is out of this
+issue's own scope (smoke-spec authoring only). The full-file run also
+surfaced ~45 pre-existing `FAIL`s scattered through the unrelated
+vim-journey section added by an earlier issue — none touch anything this
+PR changed (confirmed: every `-1835` step passed), and the file's own
+existing comments already document exactly this class of flakiness (mode-
+transition timing racing a just-passed `expect_within`); not investigated
+further here as out of this issue's scope, but worth a follow-up look if
+seen again on a real Linux run. **GTK: UNCONFIRMED — no real run.** This
+issue's worktree is a macOS host with no Linux box, container runtime, or
+fleet SSH access reachable from it, and `gtk_native_driver.py`'s own
+`LinuxGtkCalls` construction-time-raises `GtkNativeRuntimeError` on any
+non-Linux platform by design, so `coord app-drive run-spec gtk-native`
+cannot even start here. The new section's `type_text`/`key`/`expect_file`
+steps reuse the exact marker/echo/`:saveas` shapes the TUI section already
+ran clean (strong, not equivalent, evidence they're correct); the two
+`expect_region_not_uniform` pixel bands are first-approximation guesses
+derived from `src/render.rs`'s own layout constants, with no cross-check
+available at all. Per this issue's own bar ("the spec has actually run on
+the real host"), the GTK half is not done — needs a Linux/GTK operator (the
+fleet's `precision`/`dellserver`/`dell64` hosts per `coordinator.yml` are
+plausible candidates) to run `tests/smoke-spec/gtk-gui.yaml` and record
+pass/fail (and corrected pixel geometry if the two `-1835` uniform-region
+bands miss) back into that file's own header.
+
+**Review round 1 (self-invalidation fix).** All three filesystem probes
+in both files were permanent one-shot tests — a stale `/tmp` file or
+extension directory from a PRIOR successful run would satisfy
+`expect_file` even if `:term` never opened or the typed command was
+swallowed entirely THIS run. Fixed three ways: (a) the
+`:term`/extension-install shell commands now `rm` their own target
+before recreating it; (b) a new bare-`:w` probe pair (appends a fresh
+marker suffix, saves with plain `:w`, checks for the suffix) covers the
+issue's literal step-1 gesture in a way that's inherently
+self-invalidating; (c) a trailing cleanup block at the end of each
+`-1835` section removes every file/directory the section created, both
+so the next run starts clean and so the spec stops permanently
+installing a bogus extension into the operator's real
+`~/.config/vimcode/extensions/`. Re-verified on the real pty (same
+macOS-not-Linux caveat as above): `coord app-drive run-spec tui-pty`
+against this worktree's locally-built `vcd`, both the `-1835` section
+standalone and appended to the full 1800+-line file — every `-1835` step
+GREEN, and a manual sanity check confirmed the `rm -f X && echo … > X`
+compound commands and the trailing cleanup actually clear `/tmp` and the
+extension directory afterward (`ls` showed both gone).
+
+**Review round 2 (bare-`:w` adjacency bug + hardening).** Round 1's GTK
+bare-`:w` probe asserted `contains` on the two markers being *adjacent*
+in the saved file, but the GTK section (unlike its TUI twin) never
+clears the buffer first, so `A` (append-at-end-of-line) lands the
+`_WBARE` suffix after the launch file's own original line-1 text, not
+after the first marker — the assertion could never match on a real host.
+Fixed by typing the FULL second marker
+(`VIMCODE_SMOKE_SAVE_PROBE_1835_GTK_WBARE`) as one contiguous
+`type_text` instead of appending a bare `_WBARE` suffix, so the asserted
+string is exactly what was just typed in one shot and does not depend on
+what precedes it on the line — adjacency to the first marker is no
+longer required. Also, per review: (1) corrected the `1b.` comments in
+both files to stop claiming the suffix check is self-invalidating
+*across* runs — it is only self-invalidating *within* a run (vs. the
+`:saveas` probe above it); cross-run invalidation for the save probe
+rests entirely on the trailing cleanup block, and that limitation (the
+cleanup itself doesn't run, and can't be verified to have run, if an
+earlier step in the same section fails first) is now stated explicitly
+in both files' section headers instead of being implied away; (2) split
+the extension-install probe's destructive `rm -rf <extdir>` onto its own
+typed line/Enter, separate from the `mkdir -p`/`echo` that recreates it,
+in both files — a dropped character in the single long compound command
+could previously have let a truncated `rm -rf` resolve to a shorter real
+path (`~/.config/vimcode/extensions` or `~/.config/vimcode`) on the
+operator's own machine; isolating it to its own line makes that failure
+mode visibly wrong (nothing to recreate afterward) rather than silently
+destructive. Not changed, flagged instead: a per-run unique token (vs.
+reusing the same fixed `/tmp`/extension-dir names every run) would close
+the cleanup-didn't-run residual gap for good, but the spec format has no
+run-id primitive to build one from; the GTK `type_text`-lands-in-the-
+wrong-window false-pass vector (a vimcode#1825-class misrouting bug
+could let the `:term` probe's shell command execute in the launching
+terminal instead of the panel, same effect, same file, still a pass) has
+no cheap structural fix beyond the `expect_frontmost` gate already in
+place before any typed input; and the two `expect_region_not_uniform`
+bands remain unvalidated guesses pending a real GTK/Linux run, unchanged
+from round 1.
+
+`ISSUE_RESOLUTION: partial` — TUI half run (green, on a macOS pty, not
+the Linux host the issue names) and GTK half authored but still never
+run on a real GTK/Linux host; neither half meets the issue's own bar
+("the spec has actually run on the real host") yet.
+
+**Last updated:** October 8, 2026 (#1853 CI fix round 1 — register the
+bundled icon font **once per process**, and stop the new GTK glyph test
+measuring the host's font set). **Fix, not reimplementation.** Round 2's
+branch was CI-red on exactly one leg, `Test (Linux, headless, GUI feature
+on)`, while a full `cargo test` stayed green here under four different
+Fontconfig environments (full desktop set, no-Nerd-Font set, DejaVu-only,
+zero fonts) and under a 4-core `taskset`. The mechanism was a resource
+blowup the font swap turned from invisible into fatal: GTK registers
+`ICON_FONT_BYTES` through Fontconfig's `FcConfigAppFontAddFile`, which takes
+a *path*, so quadraui writes the bytes to a temp file per call and never
+deletes it — and `render::register_nerd_font_fallback` ran on **every**
+`App::setup`, i.e. once per `GtkDriver` harness. At 29 KB nobody noticed;
+at 2.5 MB one `cargo test` run wrote ~1.5 GB of temp files and appended
+~600 copies of a 10,627-codepoint `FcPattern` to the process's application
+font set (measured: 3,031 leaked copies = 7.3 GiB across one day's runs on
+this box, which has 126 GB free — a CI runner does not). Round 1 leaked
+identically and passed, because nothing asserted glyph resolution; round 2
+added the test that notices when a mid-run registration fails.
+`register_nerd_font_fallback` now remembers the family the first backend
+that *accepted* the font registered under and re-registers only for a
+backend that cannot already see it (`Backend::has_font_family` — `Some(true)`
+skips, `Some(false)` re-registers for Win-GUI's per-backend DirectWrite
+collection, `None` keeps TUI's no-op path unchanged). A full `cargo test`
+now leaks **1** temp file instead of ~600. The new GTK test also dropped its
+two host-dependent assumptions: it shapes through a freshly created Fc-backed
+`pangocairo::FontMap` instead of the **per-thread** default one (which is what
+the once-only registration makes mandatory — `notify_fontmap_config_changed`
+only nudges the registering thread's map), and it *discovers* its
+unknown-glyph control from 8 PUA candidates instead of hardcoding U+F8FF,
+which was an assertion about every font installed on the box it was written
+on. `app_setup_registers_the_bundled_icon_font_at_most_once_per_process`
+(`src/gtk/testing.rs`) is the named anchor — RED-verified by reinstating the
+unguarded registration (5 setups → 5 temp files), and the glyph test is still
+RED with the pre-#1853 subset font restored in all three font environments.
+`ISSUE_RESOLUTION: resolved`.
+
+**Last updated:** October 8, 2026 (#1853 review round 1 — bundle the
+**non-Mono** full Symbols Nerd Font, not `SymbolsNerdFontMono-Regular.ttf`).
+**Fix, not reimplementation.** Round 1's own diff (bundling the *entire*
+Symbols Nerd Font to close the Git Insights extension's U+F1D3 coverage
+gap) closed the actual bug but shipped the wrong variant: `SymbolsNerdFontMono-Regular.ttf`
+registers under `Symbols Nerd Font Mono`/`SymbolsNFM`, not the
+`Symbols Nerd Font`/`SymbolsNF` family `src/render.rs`'s
+`NERD_FONT_FALLBACK_FAMILY` (and upstream quadraui's own constant of the
+same name) hardcode, and Mono normalises every glyph to a fixed 1-em
+advance — changing metrics/outlines for 106/111 of the 114 pre-existing
+icons with no test catching it. Re-extracted the **proportional**
+`SymbolsNerdFont-Regular.ttf` from the same nerd-fonts v3.5.1
+`NerdFontsSymbolsOnly.zip` release and regenerated through the unmodified
+`_merge_legacy_glyphs` path; hand-verified (via a throwaway
+`fontTools`-in-a-venv checkout, this box doesn't have it installed) that
+all 114 shared codepoints are now byte-identical in both advance width and
+glyph outline to the pre-#1853 blob, the family name matches
+`NERD_FONT_FALLBACK_FAMILY`, and the new font still covers 10,627
+codepoints including U+F1D3 and the other `git_log_panel.lua` glyphs. Added
+a GTK driver-tier test
+(`extension_panel_file_type_glyph_outside_the_old_subset_resolves_through_the_bundled_font`,
+`src/gtk/testing.rs`) per the review's demand for painted-output coverage,
+not just a `cmap` assertion — two dead ends are recorded in its own doc
+comment before landing on checking `PANGO_GLYPH_UNKNOWN_FLAG` on the shaped
+`GlyphInfo`: a raw pixel diff and a "which font did Pango tag the run
+with" check were both defeated by this dev machine's system-installed
+`fonts-font-awesome` package, which happens to cover U+F1D3 (nerd-fonts
+patches it straight from FontAwesome) independently of whatever
+`data/fonts/vimcode-icons.ttf` bundles — confirmed by hand that both
+approaches gave a false green even with the pre-#1853 font restored. The
+glyph-unknown-flag check, and the choice of U+E74E (a `git_log_panel.lua`
+file-type glyph with no such collision, verified via a full `fc-list` cmap
+scan of every font on the box) instead of U+F1D3 as the test codepoint,
+sidesteps that: RED-verified against the pre-#1853 font, GREEN against the
+fix. `scripts/gen_icon_font.py`, `data/fonts/LICENSE-NerdFonts` and
+`tests/icon_font_coverage.rs`'s doc comments updated to say "proportional,
+not Mono" throughout; the `LEGACY_DROPPED_CODEPOINTS` auto-repair and
+`generate()` codepoint-count-printed nits from the same review round were
+also applied. `ISSUE_RESOLUTION: resolved`.
+
 **Last updated:** October 7, 2026 (#1843 — bump quadraui pin to `4e71a8b`,
 make the Windows `:term` CI test a required gate). **Pin bumped, no
 vimcode production code changed.** `4e71a8b` is 19 commits ahead of the
@@ -331,7 +863,7 @@ should close as a duplicate of #1780, not as new work merged.
 **Last updated:** October 6, 2026 (#1824 — macOS native real-screen smoke: Dock icon, window activation, icon font, text quality — investigation, no production fix). **Investigated on real macmini hardware this session; no vimcode-repo fix exists for any of the three confirmed/partially-confirmed findings.** Built `cargo build --release --bin vimcode --no-default-features --features macos` and drove it live (real `screencapture`, `osascript`/`System Events`, `lsappinfo`) rather than reading code alone. Findings, most to least confirmed:
 
 1. **Window activation (regression 2 of 4) — reproduced cleanly.** Launched from inside a real, frontmost Terminal.app window (not a detached automation harness — that path did *not* reproduce it, which mattered). Result: `lsappinfo` reports vimcode `(in front)`/`Foreground`, but `System Events`'s frontmost-process query still names `Terminal`, and the composited screenshot shows Terminal's window literally covering vimcode's. Root-caused to quadraui, not vimcode: `quadraui::macos::run::run_with` (`src/macos/run.rs:2082`) calls the *deprecated* `-[NSApplication activateIgnoringOtherApps:]` (Apple's own SDK note, visible in the pinned `objc2-app-kit` 0.3.2 binding, says "Use NSApp.activate instead" — and the non-deprecated `NSApplication::activate()` already exists in that same pinned crate, unused). `src/macos/mod.rs` is confirmed thin wiring with no activation seam of its own. Drafted as a quadraui issue in `docs/PENDING_QUADRAUI_ISSUES.md` (new entry, directly below the pre-existing #1825 GTK-activation draft — this finding is stronger evidence than that draft had, since the native backend already calls an activation API and still fails, where GTK calls none at all).
-2. **Icon-font glyphs (regression 3 of 4) — reproduced cleanly, root cause narrowed but not found.** Real painted activity bar: Explorer/Source Control/Run&Debug show a generic `?`-box placeholder; Search/Extensions/AI Chat show their correct Nerd-Font glyphs, same frame, same font registration. Hand-parsed `data/fonts/vimcode-icons.ttf`'s raw `cmap`(fmt 4 + fmt 12)/`glyf` tables (no `fontTools` — not installed, can't `pip install` per this session's tooling policy) for all six codepoints: **every one** has a valid GID in both cmap formats and non-empty `glyf` outline data (216-350 bytes) — the font asset is not the bug, contradicting the plausible "missing glyph in the subset" hypothesis before it could cause anyone to chase it. This is new, stronger evidence than vimcode#937 (closed) had — that issue's own test documented it *could not verify* real-hardware glyph resolution at all. Drafted as a quadraui issue (`MacBackend`'s Core Text fallback cascade, `macos/text.rs::font_with_fallback`) with the full per-codepoint table; root cause of *why* exactly these three and not the other three is left open for the next pass (candidates listed in the draft, none confirmed).
+2. **Icon-font glyphs (regression 3 of 4) — reproduced cleanly, root cause narrowed but not found.** Real painted activity bar: Explorer/Source Control/Run&Debug show a generic `?`-box placeholder; Search/Extensions/AI Chat show their correct Nerd-Font glyphs, same frame, same font registration. Hand-parsed `data/fonts/vimcode-icons.ttf`'s raw `cmap`(fmt 4 + fmt 12)/`glyf` tables (no `fontTools` — not installed, can't `pip install` per this session's tooling policy) for all six codepoints: **every one** has a valid GID in both cmap formats and non-empty `glyf` outline data (216-350 bytes) — the font asset is not the bug, contradicting the plausible "missing glyph in the subset" hypothesis before it could cause anyone to chase it. This is new, stronger evidence than vimcode#937 (closed) had — that issue's own test documented it *could not verify* real-hardware glyph resolution at all. Drafted as a quadraui issue (`MacBackend`'s Core Text fallback cascade, `macos/text.rs::font_with_fallback`) with the full per-codepoint table; root cause of *why* exactly these three and not the other three is left open for the next pass (candidates listed in the draft, none confirmed). *(Scoped by #1853, 2026-10-07: "the font asset is not the bug" above is true only for `src/icons.rs`'s own 114 codepoints — the ones this entry's six were drawn from. It does not generalize to codepoints a registry extension picks on its own; #1853 found exactly that gap (the Git Insights extension's U+F1D3 panel icon, absent from the then-114-codepoint subset) and closed it by bundling the entire Symbols Nerd Font rather than a subset. This entry's six activity-bar codepoints were vimcode's own all along, so #1853 doesn't change their diagnosis — just don't read "the font asset is not the bug" as covering extension-supplied codepoints too.)*
 3. **Dock icon (regression 1 of 4) — not reproduced on a clean launch.** Polled the Dock's UI-element list for 20+ seconds after a fresh launch; the tile was present throughout with the correct embedded icon. Did observe it absent once, but only right after this session's own `killall Dock` (used to defeat autohide for screenshotting) restarted Dock out from under an *already-running*, older instance — a plausible Dock-restart reconnection artifact, not evidence of #1824's reported "used to show, now doesn't" on an ordinary launch. Not drafted upstream; needs a clean re-test (fresh launch, no Dock-process interference) before concluding anything.
 4. **Text quality (regression 4 of 4, long-standing) — not investigated further.** `sips -z` nearest-neighbour upscaling (the only inspection tool available this session) makes any crop look blocky regardless of real on-screen rendering quality, so no credible new evidence either way. #1824 itself frames this as longstanding ("has always been poor"), not a new regression; #1069/#1542 already closed against the same complaint. Needs a native-resolution, non-upscaled capture method to make progress.
 

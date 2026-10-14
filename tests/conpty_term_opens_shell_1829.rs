@@ -1,5 +1,4 @@
-//! #1829: real-ConPTY regression test for "Windows TUI: `:term` opens a
-//! blank panel with no PowerShell prompt".
+//! Real-ConPTY regression test for the Windows terminal panel.
 //!
 //! # Why this file, and why it only runs on Windows
 //!
@@ -13,47 +12,37 @@
 //! set, every subsequent keystroke is forwarded to the PTY by
 //! `render::route_terminal_key` (`src/render.rs`), also shared.
 //! `TerminalSession::spawn`/`poll` is `quadraui::terminal_engine` — not
-//! vimcode source at all. So if the panel really does come up blank on
-//! Windows while working on Linux/macOS, the fault has to be below this
-//! line, in the Windows ConPTY leg of `portable_pty` that
-//! `quadraui::terminal_engine::TerminalSession` wraps — confirmed, not
-//! assumed: at this repo's pinned quadraui rev,
-//! `quadraui/src/terminal_engine.rs`'s own `#[cfg(test)] mod tests` is
-//! almost entirely `#[cfg(unix)]`-gated (`grep -c '#\[cfg(unix)\]'` finds
-//! dozens of hits, zero Windows-gated spawn/poll tests), so this exact path
-//! has essentially no automated coverage on the platform the bug was
-//! reported on.
+//! vimcode source at all. So the fault must be below this line, in the
+//! Windows ConPTY leg of `portable_pty` that
+//! `quadraui::terminal_engine::TerminalSession` wraps: at this repo's pinned
+//! quadraui rev, `quadraui/src/terminal_engine.rs`'s own `#[cfg(test)] mod
+//! tests` is almost entirely `#[cfg(unix)]`-gated, so this exact path has
+//! essentially no automated coverage on Windows.
 //!
 //! Proving anything about that leg needs the real thing: a genuine Win32
 //! pseudo console (`CreatePseudoConsole` and friends), wrapped by
 //! `portable_pty`'s Windows backend the same way
-//! `tests/conpty_idle_flicker.rs` (#1634) and
-//! `tests/conpty_activity_bar_click.rs` (#1636) already do — see those
-//! files' own module docs for the full "why ConPTY, why `portable_pty`, why
-//! this only ever runs on real Windows" rationale, which applies here
+//! `tests/conpty_idle_flicker.rs` and
+//! `tests/conpty_activity_bar_click.rs` already do — see those
+//! files' own module docs for the full rationale, which applies here
 //! unchanged. This file borrows their spawn/poll/capture helpers
 //! (duplicated locally rather than factored into a shared `tests/` module,
-//! matching those two files' own choice to do the same for an unrelated
-//! issue, to avoid touching their already-landed, independently-reasoned-
-//! about files).
+//! matching those two files' own choice to do the same).
 //!
 //! # What this test actually proves
 //!
-//! It spawns `vcd.exe` under a real ConPTY on a small text file (mirroring
-//! the issue's own repro: launched as if from a terminal, on a real file),
+//! It spawns `vcd.exe` under a real ConPTY on a small text file,
 //! waits for the first real frame, sends the literal keystrokes `:term` +
-//! Enter — exactly what a user types — waits for the terminal toolbar's own
-//! `[1]` tab label to actually paint (not a fixed sleep — see
-//! [`wait_for_screen_contains`]'s doc for why, and [`PANEL_OPEN_NEEDLE`]
-//! for why *that* string and not the panel's other chrome), then sends the issue's own
-//! acceptance probe: `echo <marker> > '<path>'` + Enter, straight into the
-//! PTY exactly as a real keystroke stream would arrive. It then polls the
-//! filesystem (not the screen — the probe's whole point is that it proves
-//! the shell actually *ran* a command, not merely that something painted)
-//! for that file to appear containing the marker.
+//! Enter, waits for the terminal toolbar's own `[1]` tab label to actually
+//! paint (see [`wait_for_screen_contains`]'s doc for why, and
+//! [`PANEL_OPEN_NEEDLE`] for why *that* string), then sends the acceptance
+//! probe: `echo <marker> > '<path>'` + Enter, straight into the PTY exactly
+//! as a real keystroke stream would arrive. It then polls the filesystem
+//! (not the screen — the probe's whole point is that it proves the shell
+//! actually *ran* a command, not merely that something painted) for that
+//! file to appear containing the marker.
 //!
-//! If `:term` really opens a dead/blank panel on Windows, the nested shell
-//! never receives (or never acts on) the echoed command, the probe file
+//! If the terminal panel does not receive the echoed command, the probe file
 //! never appears, and this test fails with the captured screen attached to
 //! the panic message for diagnosis — same shape as
 //! `tests/conpty_activity_bar_click.rs`'s own failure messages.
@@ -62,38 +51,31 @@
 //!
 //! `default_shell()` resolves to `"powershell.exe"` (Windows PowerShell
 //! 5.1) whenever `$SHELL` is unset, which is the case on a bare Windows
-//! host with no WSL/Git-Bash tab involved (the issue's own "What is ruled
-//! out" section). Windows PowerShell 5.1's `>` redirection (`Out-File`'s
+//! host. Windows PowerShell 5.1's `>` redirection (`Out-File`'s
 //! default encoding) writes UTF-16LE with a BOM, not UTF-8 — reading the
 //! probe file back as UTF-8 and doing a substring match would silently
 //! fail even when the command *did* run. [`contains_marker`] below accepts
-//! plain UTF-8/ASCII or UTF-16LE (the PowerShell 5.1 case above); it also
-//! accepts UTF-16BE defensively (neither PowerShell 5.1 nor pwsh 7, the
-//! only two shells `default_shell()` can select, ever emits big-endian
-//! UTF-16, so that branch is not expected to ever match in practice — it
-//! costs nothing to keep and avoids this test silently depending on which
-//! endianness happens to be in fashion).
+//! plain UTF-8/ASCII or UTF-16LE (the PowerShell 5.1 case); it also
+//! accepts UTF-16BE defensively (neither PowerShell 5.1 nor pwsh 7 ever
+//! emits big-endian UTF-16, so that branch is not expected to ever match
+//! in practice — it costs nothing to keep and avoids this test silently
+//! depending on endianness).
 //!
 //! # CI wiring
 //!
 //! `.github/workflows/ci.yml`'s `build-windows-tui` job runs this test
 //! explicitly so it actually executes somewhere: `#![cfg(windows)]` alone
 //! makes this file compile to zero tests on every Linux/macOS lane, and
-//! CI's own `windows-latest` runner hosts a real native ConPTY, so no
-//! attached physical Windows host is required to run it.
+//! CI's own `windows-latest` runner hosts a real native ConPTY.
 //!
-//! **As of vimcode#1843** (quadraui pin bumped to `4e71a8b`, which carries
-//! quadraui#1327's ConPTY VT handshake fix and `default_shell()` `$SHELL`
-//! gate — the upstream fix this file was originally written to detect the
-//! absence of), this step is a **required gate**, no longer
-//! `continue-on-error`: it ran RED (no probe file within 20s) against the
-//! prior `a536053` pin and GREEN (1.9s) against `4e71a8b`, both on dell64's
-//! real Windows hardware, before the `continue-on-error: true` was removed
-//! from `build-windows-tui`'s step for this file. A RED result from here on
-//! is a real regression signal, not expected noise.
+//! This test is a required gate: it ran RED against the prior quadraui pin
+//! and GREEN against the fixed pin on native Windows hardware, before the
+//! `continue-on-error: true` was removed from `build-windows-tui`'s step.
+//! A RED result from here on is a real regression signal, not expected
+//! noise.
 //!
 //! The precondition needle this test waits on ([`PANEL_OPEN_NEEDLE`]) is
-//! separately pinned down on Linux, with no Windows host at all, by
+//! separately pinned down on Linux by
 //! `src/tui_main/app_on_tui_tests.rs`'s
 //! `term_ex_command_paints_bracketed_tab_label_not_uppercase_terminal`, so
 //! "the needle is wrong" cannot masquerade as "ConPTY is broken" here.
@@ -235,6 +217,7 @@ fn spawn_under_conpty(main_rs: &Path, home: &Path) -> SpawnedConpty {
     cmd.env("USERPROFILE", home);
     cmd.env("LOCALAPPDATA", &appdata);
     cmd.env("VIMCODE_TEST_DATA_HOME", home.join("data"));
+    cmd.env("VIMCODE_TEST_HOME_ISOLATED", "1");
 
     let child = pair
         .slave
@@ -364,10 +347,8 @@ fn wait_for_probe_file(path: &Path, marker: &str, timeout: Duration) -> bool {
 /// RAII guard ensuring the spawned `vcd.exe` child, this test's isolated
 /// `%APPDATA%`/`%USERPROFILE%` tree, and the probe file are all cleaned up
 /// no matter how the test function exits — including unwinding past a
-/// failed `assert!`, which Rust still runs `Drop` for. Mirrors
-/// `tests/extensions.rs`'s `OrphanChildGuard` (#1822's "make the collision
-/// test leak-proof on any exit path") for the identical property: teardown
-/// must not depend on reaching the function's own final assertion.
+/// failed `assert!`. Teardown must not depend on reaching the function's
+/// own final assertion.
 struct TermTestGuard {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -458,17 +439,13 @@ fn term_command_opens_a_working_shell_over_real_conpty_1829() {
         w.flush().ok();
     }
 
-    // Wait for the terminal toolbar's own first tab label to actually
-    // paint, rather than sleeping a fixed duration — see
-    // [`wait_for_screen_contains`]'s doc for why a fixed settle window is
-    // flaky on real hardware, and [`PANEL_OPEN_NEEDLE`] for why this
-    // particular string. The label is drawn by vimcode's own shared panel
-    // chrome from `terminal_panes.len()`, not by anything the nested shell
-    // writes, so it paints even if the shell inside the panel is dead —
-    // which is exactly the distinction #1829 needs. This is a precondition
-    // check on `OpenTerminal` having dispatched and `TerminalSession::
-    // spawn` having returned `Ok`, not part of what #1829 is actually
-    // testing.
+    // Wait for the terminal toolbar's own first tab label to actually paint,
+    // rather than sleeping a fixed duration — see [`wait_for_screen_contains`]'s
+    // doc for why a fixed settle window is flaky on real hardware, and
+    // [`PANEL_OPEN_NEEDLE`] for why this particular string. The label is drawn
+    // by vimcode's own shared panel chrome from `terminal_panes.len()`, not by
+    // anything the nested shell writes, so it paints even if the shell inside
+    // the panel is dead — which is the distinction this test needs.
     assert!(
         wait_for_screen_contains(
             &mut parser,

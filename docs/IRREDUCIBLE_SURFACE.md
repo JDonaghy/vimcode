@@ -310,6 +310,36 @@ The five other paired sizing tables #828 flagged as "also worth folding in"
 build) were **not** audited in this pass — out of scope for the two sniffs #828
 requires; still open.
 
+**#1869 update:** the "forced `char_width` of `1.0`" half of the fix above described
+the *linear-fraction* formula's own requirement, not a timeless constraint — and the
+GTK/macOS/Win minimap width it protected was itself still wrong (a flat ~120px,
+~20% wider than VS Code's own ~100px at Menlo 12 on an ordinary pane, because the
+pre-#1869 doc comments mis-stated VS Code's `minimap.maxColumn` as the *width*
+rather than a *cap*). #1869 ported VS Code's real width formula
+(`EditorLayoutInfoComputer`, `vs_code_minimap_width_px` in `render.rs`) for GTK/macOS/
+Win, which **does** divide by the editor's real `char_width` — the thing the #828 fix
+above deliberately avoided for the old formula's sake. `minimap_reserved_width` now
+recognizes `gtk_minimap_sizing()`'s value (by its `target_cols` of 120, which never
+collides with TUI's 12) and routes to that formula with the real `char_width` instead
+of a forced `1.0`; TUI's own `sizing.resolve_width()` path — and its forced
+`char_width` of `1.0` — is unchanged (#1869 scoped `TUI_MINIMAP_SIZING` out). The
+*argument-forked* verdict above still holds — GTK/macOS/Win and TUI still use two
+distinct policies — only the GTK/macOS/Win side's own math changed.
+
+**#1869 review round 1 follow-up:** `remaining_width` is now genuinely VS Code's own
+`remainingWidth = editor outer width - gutter`, not the pane's raw rect width —
+`render::window_minimap_gutter_width_px` computes each window's own line-number/fold
+gutter (via `calculate_gutter_cols`) and `minimap_reserved_width` subtracts it before
+calling `vs_code_minimap_width_px`. `vs_code_minimap_width_px` itself still subtracts
+the *VS-Code-configured* 14px scrollbar width (`MINIMAP_VERTICAL_SCROLLBAR_WIDTH_PX`)
+regardless of what any backend's vertical scrollbar actually paints at — that is what
+VS Code's own formula does. Matching the *real painted* scrollbar to 14px is a genuine
+quadraui-gap (`quadraui::EditorLayout::layout_with_options`'s `v_scrollbar_w =
+cell_width`, no host override point) that vimcode cannot fix locally
+(Platform-Neutrality Rule); drafted as a fileable quadraui issue in
+`docs/PENDING_QUADRAUI_ISSUES.md` rather than only named here, so the gap survives
+past this file's own prose.
+
 ## 7. #1044: the full `ShellApp`/`mouse.rs` rung audit — irreducible residue
 
 vimcode#1044 asked for a rung-by-rung inventory of *every* decision in

@@ -29,7 +29,7 @@ pub fn saves_suppressed() -> bool {
 /// `~/.config/vimcode/` files. Companion to `SUPPRESS_SAVES` — that flag
 /// only stops *writes*, so `Engine::new()` in a test process still picked up
 /// whatever command history happened to be sitting in the developer
-/// machine's real config directory (#1304).
+/// machine's real config directory.
 static SUPPRESS_LOADS: AtomicBool = AtomicBool::new(false);
 
 /// Permanently suppress opted-in disk loads for the remaining lifetime of
@@ -86,19 +86,8 @@ impl HistoryState {
     /// Load history from history.json.
     /// If history.json is absent, attempts a one-time migration from session.json.
     pub fn load() -> Self {
-        // In-crate unit tests (`cargo test --lib`) never call
-        // `suppress_disk_loads()` — that runtime flag exists for *integration*
-        // tests, which are compiled without `#[cfg(test)]`. So the `#1304`
-        // hazard `save()` already guards against (below) still applied in the
-        // read direction here: `Engine::new()` inside a lib unit test seeded
-        // `engine.history` from whatever was sitting in the developer
-        // machine's real `~/.config/vimcode/history.json`. On a machine whose
-        // history had reached the 100-entry cap that made
-        // `q_colon_opens_a_split_not_a_new_tab_via_shell_app` fail: the marker
-        // command the test appends landed at line 101 of the `[Command
-        // History]` buffer and scrolled off the rendered cmdline window.
-        // Mirror `save()`'s `#[cfg(test)]` no-op so the in-crate lane is
-        // hermetic too, regardless of the host's config dir.
+        // Mirrors save()'s #[cfg(test)] to keep in-crate unit tests hermetic:
+        // they should not load the developer machine's real history.json.
         #[cfg(test)]
         return Self::default();
 
@@ -132,7 +121,7 @@ impl HistoryState {
     /// Save history to history.json using an atomic write.
     pub fn save(&self) -> std::io::Result<()> {
         // Unlike `SessionState::save()`/`ExtensionState::save()`, this used
-        // to have no `SUPPRESS_SAVES` guard at all (#1304): every `:command`
+        // to have no `SUPPRESS_SAVES` guard at all: every `:command`
         // or search that hit `handle_key`'s Enter path called this
         // unconditionally, so the *entire* test suite was silently
         // appending every test's typed commands to the real
@@ -151,6 +140,7 @@ impl HistoryState {
         #[cfg_attr(test, allow(unreachable_code))]
         {
             let path = Self::history_path();
+            super::paths::guard_real_config_write(&path);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -277,6 +267,7 @@ impl ExtensionState {
         #[cfg_attr(test, allow(unreachable_code))]
         {
             let path = Self::extensions_path();
+            super::paths::guard_real_config_write(&path);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -437,7 +428,6 @@ impl WindowGeometry {
     /// Clamp a saved `x`/`y`/`width`/`height` so a monitor that was
     /// unplugged (or swapped for a smaller one) since the geometry was
     /// saved can never strand the restored window off-screen or oversized
-    /// (#1529).
     ///
     /// Position: if `x`/`y` fall inside some connected display's `bounds`,
     /// that display becomes the clamp target and they pass through
@@ -552,15 +542,18 @@ impl SessionState {
         }
 
         #[cfg_attr(test, allow(unreachable_code))]
-        let path = Self::session_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        {
+            let path = Self::session_path();
+            super::paths::guard_real_config_write(&path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let json = serde_json::to_string_pretty(self)?;
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, &json)?;
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
         }
-        let json = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
     }
 
     fn session_path() -> PathBuf {
@@ -610,15 +603,18 @@ impl SessionState {
         }
 
         #[cfg_attr(test, allow(unreachable_code))]
-        let path = Self::session_path_for_workspace(root);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        {
+            let path = Self::session_path_for_workspace(root);
+            super::paths::guard_real_config_write(&path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let json = serde_json::to_string_pretty(self)?;
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, &json)?;
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
         }
-        let json = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
     }
 
     /// Add a workspace root to `recent_workspaces` (max 10, removes duplicates).
@@ -664,7 +660,7 @@ mod tests {
         assert!(!session.explorer_visible);
     }
 
-    /// #1529: `WindowGeometry`'s `x`/`y`/`maximized` must round-trip through
+    /// `WindowGeometry`'s `x`/`y`/`maximized` must round-trip through
     /// JSON, not just `width`/`height` (the fields `Default` already
     /// covered). Before this fix nothing ever wrote `x`/`y`/`maximized`, so
     /// a round-trip test against the un-fixed save path would have found
@@ -687,7 +683,7 @@ mod tests {
         assert!(restored.maximized);
     }
 
-    /// #1529: a saved position that falls inside a connected display's
+    /// A saved position that falls inside a connected display's
     /// bounds passes through `clamp_to_displays` unchanged.
     #[test]
     fn test_window_geometry_clamp_keeps_position_on_known_display() {
@@ -713,10 +709,7 @@ mod tests {
         assert!(!clamped.maximized);
     }
 
-    /// #1529: a saved position that no longer sits on *any* connected
-    /// display (the monitor it was saved on was unplugged, or moved) is
-    /// cleared to `None` rather than stranding the restored window
-    /// off-screen.
+    /// A saved position that no longer sits on any connected display is
     #[test]
     fn test_window_geometry_clamp_drops_offscreen_position() {
         let geo = WindowGeometry {
@@ -739,7 +732,7 @@ mod tests {
         assert_eq!(clamped.y, None);
     }
 
-    /// #1529: no connected displays at all (backend reports `Unsupported`,
+    /// No connected displays at all (backend reports `Unsupported`,
     /// surfaced here as an empty slice) also clears the position — there is
     /// nothing to validate it against, so trusting a stale saved
     /// coordinate would be no safer than trusting an actually-offscreen
@@ -758,7 +751,7 @@ mod tests {
         assert_eq!(clamped.y, None);
     }
 
-    /// #1529 review (non-blocking finding): a window saved at 1000x700 on
+    /// A window saved at 1000x700 on
     /// a display too small to hold it (a laptop's 1024x768 built-in panel,
     /// left behind after the bigger external monitor it was saved on was
     /// unplugged) must have its *size* shrunk to fit, not just its
@@ -788,11 +781,7 @@ mod tests {
         assert_eq!(clamped.height, 600);
     }
 
-    /// #1529 review: when the saved position no longer resolves to a
-    /// display (or there was never one to begin with — GTK, structurally),
-    /// size still gets clamped, against the *largest* connected display
-    /// rather than left unbounded — an unplugged-monitor window shouldn't
-    /// reopen bigger than anything the user has left connected.
+    /// When the saved position does not resolve to a display (or was never
     #[test]
     fn test_window_geometry_clamp_with_no_position_shrinks_size_to_largest_display() {
         let geo = WindowGeometry {

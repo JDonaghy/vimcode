@@ -9,30 +9,27 @@ pub(crate) mod click;
 mod events;
 mod explorer;
 mod services;
-// #657: also compiled under `test-support` so the sealed acceptance suite in
-// `tests/acceptance.rs` — a separate crate — can reach the #646 harness.
+// Compiled under `test-support` so the sealed acceptance suite in
+// `tests/acceptance.rs` — a separate crate — can reach the testing harness.
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 pub(crate) mod util;
 
 use util::*;
 
-// #785: `App` now lives in `crate::app`. Re-exported here so the GTK
+// `App` now lives in `crate::app`. Re-exported here so the GTK
 // backend's own submodules (`click`, `testing`, …) keep resolving it as
 // `super::App`, exactly as they did while the type was defined in this file.
 pub(crate) use crate::app::App;
 
-// #862: `is_ext_panel_id`, the UI-font helpers, the tab-bar pixel-geometry
-// types/functions, `StatusSegmentMap` and the (since #1493, axis-
-// parameterised) scrollbar geometry/hit-test functions all moved to the
-// backend-neutral
-// `crate::app_support` and `crate::click` — none of them named a `gtk4`/
-// `pango`/`gio` type, so nesting them in `crate::gtk` (behind the `gui`
-// feature) only blocked `crate::app` from resolving them without GTK. These
-// re-exports keep every existing reference in this module (and its `click`/
-// `testing` submodules) resolving unchanged. Only the `#[cfg(test)]`
-// submodules below and in `click.rs`/`testing.rs` reach them through `super::`
-// today, so a plain (non-test) build sees them as unused.
+// `is_ext_panel_id`, the UI-font helpers, the tab-bar pixel-geometry
+// types/functions, `StatusSegmentMap` and the scrollbar geometry/hit-test
+// functions all moved to the backend-neutral `crate::app_support` and
+// `crate::click` — none of them named a `gtk4`/`pango`/`gio` type, so
+// nesting them in `crate::gtk` (behind the `gui` feature) only blocked
+// `crate::app` from resolving them without GTK. These re-exports keep every
+// existing reference in this module (and its `click`/`testing` submodules)
+// resolving unchanged.
 #[allow(unused_imports)]
 pub(crate) use crate::app_support::*;
 #[allow(unused_imports)]
@@ -40,25 +37,14 @@ pub(crate) use crate::click::GroupTabBarLayoutMap;
 
 /// Entry point for GTK mode.
 ///
-/// `pub` rather than `pub(crate)` since #657: the caller is `src/main.rs`,
+/// `pub` rather than `pub(crate)` because the caller is `src/main.rs`,
 /// which is now a separate crate from this module's.
 pub fn run(file_path: Option<PathBuf>) {
-    // #1106: this used to silently invent `DISPLAY=:0` whenever neither
-    // `DISPLAY` nor `WAYLAND_DISPLAY` was set. That's a guess, not a
-    // fallback — `:0` is far from guaranteed to be the display anyone
-    // actually wants (Xvfb commonly picks `:99`, a second X session `:1`,
-    // etc.), and if it happens to be wrong `gtk4::init()` below still fails,
-    // just later and against a display name nobody chose, which is exactly
-    // the "surfaces later and less legibly" failure mode #979 hit for
-    // `--help`. Fail loudly here instead, before touching GTK at all, and
-    // name the actual problem: no display was configured. (Deliberately not
-    // an opt-in env var either — there is no way to guess a *correct*
-    // display, only a hardcoded one, so an opt-in would just move the same
-    // wrong guess behind a flag.)
-    //
-    // Only on platforms where GTK actually talks to X11/Wayland: on macOS
-    // (quartz) and Windows (win32) there is no display variable to set, so
-    // this guard would refuse to start a perfectly good GUI build.
+    // This fails loudly if neither `DISPLAY` nor `WAYLAND_DISPLAY` is set,
+    // before touching GTK at all. On platforms where GTK actually talks to
+    // X11/Wayland, a configured display is required; on macOS (quartz) and
+    // Windows (win32) there is no display variable to set, so this guard
+    // would refuse to start a perfectly good GUI build.
     if no_display_configured(
         std::env::var_os("WAYLAND_DISPLAY").is_some(),
         std::env::var_os("DISPLAY").is_some(),
@@ -85,7 +71,7 @@ pub fn run(file_path: Option<PathBuf>) {
     // with the ShellApp runner it happens inside gapp.run() which is called
     // by run_with_shell() — too late for either of those.
     gtk4::init().expect("Failed to initialize GTK");
-    // #1498: the one GTK-only step `App::new` (now folded into the shared
+    // The one GTK-only step `App::new` (now folded into the shared
     // `App::new_portable` every other GUI backend already used — see that
     // constructor's doc) can't do itself — quadraui has no portable
     // icon-theme search-path surface. Must run after `gtk4::init()`, same as
@@ -97,7 +83,7 @@ pub fn run(file_path: Option<PathBuf>) {
     //
     // The concrete backend is chosen here, at the GTK entry point, and
     // handed to `App::new_portable` rather than `App` constructing one
-    // itself (#861) — this is the seam a future non-GTK wrapper (#859) would
+    // itself — this is the seam a future non-GTK wrapper would
     // pass a different `quadraui::Backend` impl through.
     let concrete_backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> =
         std::rc::Rc::new(std::cell::RefCell::new(
@@ -114,32 +100,23 @@ pub fn run(file_path: Option<PathBuf>) {
 
 /// Derive the runner's [`quadraui::ShellConfig`] from an [`App`]'s engine state.
 ///
-/// Split out of [`run`] (#646) so the headless test harness
-/// (`crate::gtk::testing`) can hand `driver_with_shell` the *same* config the
-/// live runner uses, instead of a hand-written approximation that would drift
-/// from it silently (the failure mode the TUI side's `config()` test helper
-/// already has to work around).
+/// Split out of [`run`] so the headless test harness can hand `driver_with_shell`
+/// the same config the live runner uses.
 ///
-/// #866: used to carry its own full copy of the panel-icon-mapping/
-/// title-bar/sidebar-clamp logic — see [`App::shell_config`]'s doc comment
-/// for why that duplication existed and why it's gone now. This is a thin
-/// wrapper adding only the two builders that are genuinely X11/Wayland-WM
-/// concepts with no cross-platform meaning (a macOS/Windows app identifies
-/// itself to its WM/shell through a different mechanism entirely —
+/// This is a thin wrapper adding only the two builders that are genuinely
+/// X11/Wayland-WM concepts with no cross-platform meaning (a macOS/Windows app
+/// identifies itself to its WM/shell through a different mechanism entirely —
 /// `Info.plist` / the executable's embedded manifest, not a runtime string).
 /// `pub(crate)` (not private) so `src/win/mod.rs::run` and a future
-/// `src/win/testing.rs` harness can reach it without copying it a third
-/// time, even though today's Win-GUI/macOS entry points call
-/// `app.shell_config()` directly and never need the WM-only extras this
-/// adds.
+/// `src/win/testing.rs` harness can reach it without copying it, even though
+/// today's Win-GUI/macOS entry points call `app.shell_config()` directly.
 pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
     app.shell_config()
-        // #719: quadraui#656 builders — route the WM app id / icon name
-        // through the single `APP_ID` constant #716 introduced, rather than
-        // a fresh string literal, so there's exactly one identity string.
+        // Route the WM app id / icon name through the single `APP_ID` constant,
+        // rather than a fresh string literal, so there's exactly one identity string.
         .with_app_id(util::APP_ID)
         .with_icon_name(util::APP_ID)
-        // #1531/quadraui#1142: `with_app_icon` is a no-op on GTK today
+        // `with_app_icon` is a no-op on GTK today
         // (`ShellConfig::app_icon`'s own doc — GTK keeps using
         // `icon_name`/the desktop-theme icon `util::install_icon_and_desktop`
         // installs). Set anyway, alongside the other two identity builders
@@ -150,17 +127,6 @@ pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
             crate::app_support::APP_ICON_PNG.to_vec(),
         ))
 }
-
-// #731: the `native_scrollbar_placement_tests` module that used to live
-// here (#723) tested `native_scrollbar_margin_start`'s pure inset
-// arithmetic — that function guarded the native `gtk4::Scrollbar` overlay
-// path deleted by this issue (`sync_scrollbar`/`create_window_scrollbars`),
-// which never ran under the ShellApp runner in the first place (nothing
-// assigns `self.overlay`/`self.drawing_area`), so #723's fix was never
-// live on screen. See the doc comment above the `Surface::Editor` push in
-// `render_content` for where the minimap-inset decision needs to move
-// (quadraui's `gtk::editor::draw_editor`, mirroring TUI's inline
-// scrollbar column) and the quadraui issue that needs filing first.
 
 /// True when GTK needs an X11/Wayland display and none is configured.
 /// Always false on macOS and Windows, whose GTK backends (quartz, win32)
@@ -195,29 +161,17 @@ mod no_display_guard_tests {
 
 #[cfg(test)]
 mod editor_scrollbar_geometry_tests {
-    //! #1128: replaces the old `h_scrollbar_status_offset_tests` (#728) —
-    //! that module pinned a status-row offset in the pre-#1128 hand-rolled
-    //! h-scrollbar geometry helper this issue deleted. quadraui#968 taught
-    //! `quadraui::gtk::editor::draw_editor` to paint both editor scrollbars
-    //! itself via `Editor::layout`, laid out against the window's raw,
-    //! unshrunk rect — it never applies a status-row offset (see
-    //! `quadraui::gtk::editor`'s module doc, "Scrollbars" section) — so a
-    //! hit-test helper that still applied one would disagree with what's
-    //! actually painted: precisely the "hover and paint can disagree by
-    //! construction" bug #1128 fixed. These tests pin the replacement
-    //! helpers (`editor_scrollbar_layout`/`scrollbar_thumb_geometry`, the
-    //! latter axis-parameterised by #1493, replacing the former per-axis
-    //! `h_scrollbar_thumb_geometry`/`v_scrollbar_thumb_geometry` pair)
-    //! against that reality instead.
+    //! Tests for the scrollbar geometry helpers (`editor_scrollbar_layout` and
+    //! `scrollbar_thumb_geometry`) against the actual layout and painting
+    //! quadraui performs: both the hit-test and the painted result must agree.
     use super::{editor_scrollbar_layout, scrollbar_thumb_geometry, ScrollbarAxis};
     use crate::core::{Engine, WindowRect};
 
     /// A window whose longest line overflows a narrow viewport and whose
     /// buffer is long enough to need both a v-scrollbar and a multi-digit
-    /// (wide) line-number gutter — the exact combination the deleted
-    /// pre-#1128 helper got wrong: it ignored the gutter offset entirely
-    /// and hardcoded an 8px reserve for the v-scrollbar column instead of
-    /// reading the real `char_width`-wide one quadraui#968 reserves.
+    /// (wide) line-number gutter — the exact combination where a naive helper
+    /// would ignore the gutter offset and fail to reserve space for the
+    /// actual `char_width`-wide v-scrollbar column.
     fn engine_needing_h_scrollbar_with_wide_gutter() -> Engine {
         let mut e = Engine::new_for_test();
         e.settings.line_numbers = crate::core::settings::LineNumberMode::Absolute;
@@ -233,14 +187,14 @@ mod editor_scrollbar_geometry_tests {
         e
     }
 
-    /// #1128 regression — RED against the deleted pre-fix helper (verified
+    /// RED against the deleted pre-fix helper (verified
     /// while writing this fix: it returned `track_x` 0.0 — gutter ignored
     /// — `track_w` 992.0 and `sb_height` 7.0 — an independently guessed 8px
     /// v-scrollbar reserve and a 0.35×line_height bar height, neither of
     /// which is what quadraui actually paints). The h-scrollbar track must
     /// start after the gutter and stop exactly one `char_width` cell short
     /// of the pane's right edge — the v-scrollbar's own reserved column
-    /// (quadraui#968) — not span the full window width minus a hardcoded
+    /// — not span the full window width minus a hardcoded
     /// guess.
     #[test]
     fn track_starts_after_the_gutter_and_reserves_exactly_one_char_width_for_the_v_scrollbar() {
@@ -250,8 +204,9 @@ mod editor_scrollbar_geometry_tests {
         let char_width = 20.0;
         let line_height = 20.0;
 
-        let (editor, layout) = editor_scrollbar_layout(&e, wid, &rect, char_width, line_height)
-            .expect("window and buffer must resolve");
+        let (editor, layout) =
+            editor_scrollbar_layout(&e, wid, &rect, char_width, line_height, None)
+                .expect("window and buffer must resolve");
         let h_track = layout
             .h_scrollbar_bounds
             .expect("a 500-char line must overflow a 1000px-wide pane");
@@ -292,6 +247,7 @@ mod editor_scrollbar_geometry_tests {
             &rect,
             char_width,
             line_height,
+            None,
             ScrollbarAxis::Horizontal,
         )
         .expect("thumb geometry must resolve alongside the track");
@@ -314,14 +270,10 @@ mod editor_scrollbar_geometry_tests {
         e.terminal_maximized = true;
     }
 
-    /// #1128 regression: quadraui's real paint
-    /// (`quadraui::gtk::editor::draw_editor`) lays scrollbars out against
-    /// the window's raw rect and never shrinks it for a per-window status
-    /// line first — so the track must not move for any of
-    /// `window_status_line`, the "separated status" bottom-panel case, or a
-    /// maximized terminal. The deleted pre-#1128 helper offset the track by
-    /// a full `line_height` whenever `window_status_line` was on,
-    /// disagreeing with paint in every one of these configurations.
+    /// Quadraui's real paint lays scrollbars out against the window's raw rect
+    /// and never shrinks it for a per-window status line first — so the track
+    /// must not move for any of `window_status_line`, the "separated status"
+    /// bottom-panel case, or a maximized terminal.
     #[test]
     fn status_line_settings_never_move_the_track() {
         let rect = WindowRect::new(0.0, 0.0, 1000.0, 200.0);
@@ -331,8 +283,9 @@ mod editor_scrollbar_geometry_tests {
         let baseline_y = {
             let e = engine_needing_h_scrollbar_with_wide_gutter();
             let wid = e.active_window_id();
-            let (_, layout) = editor_scrollbar_layout(&e, wid, &rect, char_width, line_height)
-                .expect("an overflowing line needs an h-scrollbar");
+            let (_, layout) =
+                editor_scrollbar_layout(&e, wid, &rect, char_width, line_height, None)
+                    .expect("an overflowing line needs an h-scrollbar");
             layout.h_scrollbar_bounds.unwrap().y
         };
 
@@ -344,8 +297,9 @@ mod editor_scrollbar_geometry_tests {
             let mut e = engine_needing_h_scrollbar_with_wide_gutter();
             configure(&mut e);
             let wid = e.active_window_id();
-            let (_, layout) = editor_scrollbar_layout(&e, wid, &rect, char_width, line_height)
-                .expect("still overflowing under this configuration");
+            let (_, layout) =
+                editor_scrollbar_layout(&e, wid, &rect, char_width, line_height, None)
+                    .expect("still overflowing under this configuration");
             assert_eq!(
                 layout.h_scrollbar_bounds.unwrap().y,
                 baseline_y,
@@ -358,13 +312,9 @@ mod editor_scrollbar_geometry_tests {
 
 #[cfg(test)]
 mod shell_config_identity_tests {
-    //! #719: quadraui#656/#657 landed `ShellConfig::with_app_id()` /
-    //! `with_icon_name()` / `with_activity_bar_width_px()`, but a pin bump
-    //! alone doesn't prove `build_shell_config` actually calls them — a
-    //! headless build can't assert the WM taskbar/alt-tab icon (that's the
-    //! SMOKE_TESTS item), but it *can* assert the values reach the
-    //! `ShellConfig` GTK's toplevel is built from, which is the only part
-    //! of this fix source-level tests can reach.
+    //! Tests that `build_shell_config` actually calls the WM identity builders
+    //! (`with_app_id()`, `with_icon_name()`) — the values must reach the
+    //! `ShellConfig` GTK's toplevel is built from.
     use super::{build_shell_config, util, App};
     use crate::core::Engine;
     use std::cell::RefCell;
@@ -379,7 +329,7 @@ mod shell_config_identity_tests {
         assert_eq!(config.icon_name.as_deref(), Some(util::APP_ID));
     }
 
-    /// #1531/quadraui#1142: same reasoning as the identity test above —
+    /// Same reasoning as the identity test above —
     /// GTK ignores `ShellConfig::app_icon` at paint time (there is no
     /// headless "Dock"/taskbar to render into and assert on; that's the
     /// SMOKE_TESTS item), but a headless build *can* assert the bytes
@@ -418,7 +368,7 @@ mod shell_config_identity_tests {
 #[cfg(test)]
 mod chrome_paint_tests {
     //! Headless pixel-paint regression test for the CSD title bar's inline
-    //! window-control buttons (#552). A round-2 smoke test reported the
+    //! window-control buttons. A round-2 smoke test reported the
     //! minimize/maximize/close glyphs as completely invisible even though
     //! their click hit-regions were live. Paints
     //! `render::window_controls_status_bar` into an in-memory Cairo
@@ -471,25 +421,13 @@ mod chrome_paint_tests {
             cr.paint().ok();
 
             let pango_layout = pangocairo::functions::create_layout(&cr);
-            // #1652: `quadraui::gtk::draw_status_bar` (the positional free
-            // function this used to call directly) is deprecated in favor
-            // of `Backend::draw_status_bar_interactive` — go through a real
-            // `GtkBackend` the same way `click.rs`'s own headless paint
-            // tests do, rather than reaching for the shim.
+            // Use a real `GtkBackend` the same way `click.rs`'s own headless
+            // paint tests do, rather than calling the deprecated
+            // `quadraui::gtk::draw_status_bar` free function directly.
             //
-            // The bar's painted height comes from `rect.height` at the
-            // pinned quadraui rev (quadraui#1179 changed
-            // `GtkBackend::status_bar_paint_scaled` from
-            // `self.current_line_height` to `rect.height` so a caller
-            // handing it a rect taller than the line height no longer gets
-            // an unpainted strip). `set_current_line_height` is still set
-            // alongside `set_current_theme` — matching `click.rs`'s own
-            // headless-paint sequence — so the backend's per-frame line
-            // height agrees with the rect and this paint lands at `LINE_H`
-            // under *either* sourcing. `paints_the_bar_at_the_requested_line_height`
-            // below asserts that, so a future quadraui rev that reverts to
-            // the backend field (defaulting to 16px in `GtkBackend::new`)
-            // fails loudly instead of silently shrinking the bar.
+            // The bar's painted height comes from `rect.height` and `set_current_line_height`
+            // is set to match, so the backend's per-frame line height agrees with
+            // the rect.
             use quadraui::Backend as _;
             let mut backend = super::backend::GtkBackend::new();
             backend.set_current_theme(render::to_quadraui_theme(theme));
@@ -508,7 +446,7 @@ mod chrome_paint_tests {
         (data, stride, layout)
     }
 
-    /// #1652: the painted bar must be exactly `LINE_H` tall.
+    /// The painted bar must be exactly `LINE_H` tall.
     ///
     /// The migration off the deprecated `quadraui::gtk::draw_status_bar` free
     /// function (which took `line_height` as a positional argument) onto
@@ -546,7 +484,7 @@ mod chrome_paint_tests {
     /// bar's own background fill, found **within each button's own
     /// hit-region x-range** — keyed by the button's `action_id`.
     ///
-    /// #715: the original version of this helper measured the max delta
+    /// The original version of this helper measured the max delta
     /// found *anywhere in the whole row*. Three buttons share one row, so
     /// two glyphs painting fine was enough to clear the floor even though
     /// the third (minimize, `U+2500` — a hairline box-drawing rule with no
@@ -586,7 +524,7 @@ mod chrome_paint_tests {
                 let x1 = (rect.x + rect.width).round() as i32;
                 let mut max_delta = 0.0f64;
                 // Scan every row of the painted surface, not just one
-                // mid-line scanline (#715): a thin glyph like an em dash
+                // mid-line scanline: a thin glyph like an em dash
                 // sits at a specific baseline offset that a single sampled
                 // row can miss even though the glyph paints fine — that
                 // would be a false "invisible" failure caused by the test's
@@ -606,29 +544,11 @@ mod chrome_paint_tests {
             .collect()
     }
 
-    /// #552 round-2 smoke test: the minimize/maximize/close glyphs rendered
-    /// with zero visible pixels. Root cause: `window_controls_status_bar`
-    /// paired its glyph `fg` with `theme.status_fg` (designed to contrast
-    /// against `status_bg`, the *bottom* status line's background) instead
-    /// of a color actually paired with `tab_bar_bg` — the background this
-    /// row uses. The `vs_light` theme (`tab_bar_bg` #ececec, old `status_fg`
-    /// #ffffff) rendered white-on-near-white, which is as good as invisible
-    /// even though pixels technically get painted. Runs across every
-    /// built-in theme (not just the default) so a future contrast
-    /// regression on any one theme fails loudly instead of only surfacing
-    /// in a manual smoke test against a theme nobody happened to try.
+    /// Test that minimize/maximize/close glyphs are visible against the tab bar
+    /// background in every built-in theme, across every theme variant.
     ///
-    /// #715: checked **per button**, not row-max. On the reporter's real GTK
-    /// desktop the old minimize glyph (`U+2500`, a box-drawing hairline)
-    /// painted zero visible pixels while `□`/`✕` painted fine — a row-max
-    /// check only needs *one* of the three buttons visible to pass, so it
-    /// shipped anyway. (This headless Cairo/Pango environment happens to
-    /// have box-drawing coverage in its fallback font, so it can't reproduce
-    /// that exact zero-pixel case — verified instead by temporarily blanking
-    /// a segment's glyph entirely, which *is* reproducible headlessly and
-    /// exercises the identical "one button visible, one isn't" failure
-    /// shape.) Asserting on each of the three `action_id`s independently is
-    /// the only version of this check that can catch a single dead button.
+    /// Checked per button, not row-max: if any one of the three buttons becomes
+    /// invisible due to contrast, this test will catch it.
     #[test]
     fn window_control_buttons_are_visible_against_their_background_in_every_theme() {
         let expected_actions = [
@@ -650,23 +570,9 @@ mod chrome_paint_tests {
                         )
                     })
                     .1;
-                // WCAG-ish floor: anything much below this reads as "same
-                // color" at a glance, which is exactly the bug this test
-                // guards against.
-                //
-                // #934: the floor was 40.0, tuned against freetype's
-                // rasterisation. A Darwin/Quartz run measured 36.1 for
-                // solarized-dark's minimize glyph — Core Text's
-                // gamma-correct AA compositing produces measurably softer
-                // (lower-peak-luminance) glyph edges than freetype's for the
-                // same thin box-drawing-style pen, without the button being
-                // any less visible to a human. 25.0 keeps ~5x headroom
-                // above the #552 regression this test exists to catch
-                // (literally near-zero delta — white-on-near-white) while
-                // absorbing the observed rasteriser gap; it is not tuned
-                // against a full Darwin run across every theme/button, only
-                // the one reported data point, so treat it as a floor with
-                // margin rather than a measured-exact value.
+                // WCAG-ish floor: anything much below this reads as "same color"
+                // at a glance. The floor of 25.0 keeps headroom above near-zero
+                // contrast while absorbing observed rasteriser differences.
                 assert!(
                     delta > 25.0,
                     "theme {name:?}: window-control button {action:?} has only \

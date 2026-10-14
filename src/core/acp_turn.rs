@@ -1,13 +1,11 @@
 //! Per-turn change tracking + checkpoints for the ACP change-review surface
-//! (#1460), layered on top of #955/#1454's `crate::core::review`: #955's
-//! `ChangeReviewState` reviews whatever a `diff` content block *proposes*;
-//! this module instead tracks what an agent's turn actually *wrote* (every
-//! `fs/write_text_file` served, #954) so the whole turn can be reviewed and
-//! reverted after the fact, with a rollback point (`AcpTurnCheckpoint`) per
-//! turn that `:AiRestore` can pick.
+//! layered on top of `crate::core::review`: this module tracks what an agent's
+//! turn actually wrote (every `fs/write_text_file` served) so the whole turn
+//! can be reviewed and reverted after the fact, with a rollback point
+//! (`AcpTurnCheckpoint`) per turn that `:AiRestore` can pick.
 //!
-//! Deliberately free of any `Engine`/buffer/filesystem knowledge, same
-//! split as `crate::core::review` / `crate::core::engine::review_ops`:
+//! Deliberately free of any `Engine`/buffer/filesystem knowledge, same split as
+//! `crate::core::review` / `crate::core::engine::review_ops`:
 //! `crate::core::engine::acp_turn_ops` is the only bridge between this pure
 //! data model and the rest of the editor.
 
@@ -93,10 +91,9 @@ impl RestorePlanItem {
     }
 }
 
-/// Plan a checkpoint restore across `checkpoints` (oldest first, as
-/// [`crate::core::engine::Engine::acp_turn_checkpoints`] always keeps them)
-/// back to `target_id` — "revert every later agent write" (#1460's
-/// acceptance bar for `:AiRestore`).
+/// Plan a checkpoint restore back to `target_id` across `checkpoints`
+/// (oldest first, as [`crate::core::engine::Engine::acp_turn_checkpoints`]
+/// always keeps them) — revert every later agent write.
 ///
 /// For every path touched by `target_id` or any later checkpoint: plans a
 /// revert to the content it had *before the earliest of those turns first
@@ -147,12 +144,11 @@ pub fn plan_restore(
         .collect()
 }
 
-/// Per-line change classification for a turn-diff gutter overlay
-/// (`badge`/`off` mode, #1515) — `old` is a checkpoint entry's
-/// `pre_turn_content` (`None` meaning the agent created the path, so every
-/// line paints [`crate::core::git::GitLineStatus::Added`]), `new` is the
-/// path's *current* content. Line 0 of the result corresponds to line 0
-/// of `new` split on `'\n'` — the same convention `ropey::Rope::len_lines`
+/// Per-line change classification for a turn-diff gutter overlay —
+/// `old` is a checkpoint entry's `pre_turn_content` (`None` meaning the
+/// agent created the path, so every line is [`crate::core::git::GitLineStatus::Added`]),
+/// `new` is the path's *current* content. Line 0 of the result corresponds to
+/// line 0 of `new` split on `'\n'` — the same convention `ropey::Rope::len_lines`
 /// uses (a trailing `'\n'` yields one trailing empty line, matching
 /// `quadraui::compute_hunks`'s own `split('\n')`), so a caller indexing
 /// with a buffer's own `line_idx` needs no adjustment.
@@ -246,7 +242,7 @@ pub fn count_changed_lines(old: Option<&str>, new: &str) -> (usize, usize) {
 }
 
 /// Hunk-granularity version of [`plan_restore`]'s whole-file "edited since"
-/// check (#1516): whether the hunk identified by `left_start`/`rows` (as
+/// check: whether the hunk identified by `left_start`/`rows` (as
 /// painted from the *current* diff between a turn entry's
 /// `pre_turn_content` and its live content) still matches exactly what the
 /// agent's own last write (`agent_written`) produced there. `left_start` —
@@ -289,28 +285,14 @@ pub fn hunk_matches_agents_last_write(
     now_right == agent_right
 }
 
-// ── in-buffer inline review (#1517) ─────────────────────────────────────
+// ── in-buffer inline review ─────────────────────────────────────────────
 //
-// Zed-style "review in the normal editor": rather than a separate
-// full-viewport pass (`crate::core::review::ChangeReviewState`, #955/#1516),
-// an outstanding checkpoint entry's hunks can be kept/rejected directly
-// against the buffer, with the human free to edit in between. Deliberately
-// *not* built on `ChangeReviewState` — that struct's `hunk_decisions`
-// vector exists to drive the modal surface, and `Engine::change_review.
-// is_some()` is treated as "the modal is showing, swallow every key/click"
-// throughout the engine (`review_ops.rs`'s own module doc); reusing it here
-// would mean auditing and re-gating every one of those call sites just to
-// keep normal editing alive, for a feature whose entire point is that
-// normal editing *stays* alive. Instead: [`AcpTurnFileEntry::pre_turn_
-// content`] is the one piece of state a hunk decision needs, and it
-// already exists — "keep" advances it forward past the kept hunk's range
-// (that range stops diffing as changed), "reject" reverts the *current*
-// buffer content's range back to it (identical math the modal's `r` key
-// already uses, `crate::core::review::ChangeReviewEntry::content_with_
-// hunk_reverted`, just lifted to a free function so this module doesn't
-// need to depend on `crate::core::review` at all). No separate decision
-// vector, so no way for the two to disagree about what's still pending —
-// a hunk is pending exactly when [`hunks_for`] still returns it.
+// Per-turn hunks can be kept/rejected directly against the buffer, with the
+// human free to edit in between. A hunk is pending exactly when [`hunks_for`]
+// still returns it: "keep" advances `pre_turn_content` forward past the kept
+// hunk's range (that range stops diffing as changed), "reject" reverts the
+// *current* buffer content's range back to it (same math
+// `crate::core::review::ChangeReviewEntry::content_with_hunk_reverted` uses).
 
 /// Hunks still outstanding between `pre_turn_content` and `current` — the
 /// in-buffer review's "what's still pending for this file" query. `None`
@@ -400,18 +382,13 @@ pub fn revert_hunk(now: &str, hunk: &quadraui::DiffHunk) -> String {
     result.join("\n")
 }
 
-/// `a` (keep) on `hunk`: the file already holds the agent's write for it
-/// (same "pure decision, no buffer write" contract the modal's `a` key
-/// has, #1516), so keeping only needs to stop this range showing as
-/// pending — advance `pre` forward past it by splicing in the hunk's own
-/// right-side (current) text where its left-side (pre-turn) text used to
-/// be. `pre: None` (the agent created this path) always has exactly one
-/// hunk covering the whole file (see [`hunks_for`]'s doc) — keeping it
-/// means the file itself is no longer pending at all, so the new
-/// `pre_turn_content` becomes `current` verbatim rather than re-deriving
-/// it from the hunk's rows (avoids the phantom-empty-line hazard
-/// `crate::core::review`'s `pure_addition_hunks` doc warns a diff against
-/// a bare `""` left side has).
+/// On `hunk` (keep): the file already holds the agent's write for it, so
+/// keeping only needs to stop this range showing as pending — advance `pre`
+/// forward past it by splicing in the hunk's own right-side (current) text
+/// where its left-side (pre-turn) text used to be. `pre: None` (the agent
+/// created this path) always has exactly one hunk covering the whole file
+/// (see [`hunks_for`]'s doc) — keeping it means the file itself is no longer
+/// pending at all, so the new `pre_turn_content` becomes `current` verbatim.
 pub fn keep_hunk(pre: Option<&str>, current: &str, hunk: &quadraui::DiffHunk) -> String {
     let Some(pre) = pre else {
         return current.to_string();
@@ -465,7 +442,7 @@ mod tests {
         assert_eq!(cp.entries[0].agent_written_content, "v2");
     }
 
-    /// #1460 review (non-blocking finding): a path that did not exist
+    /// A path that did not exist
     /// before the agent's first write this turn must record `None`, not an
     /// empty string — the two are indistinguishable to a naive `String`
     /// "restore" (both mean "write back empty"), but only `None` correctly
@@ -585,7 +562,7 @@ mod tests {
         );
     }
 
-    /// #1460 review (non-blocking finding): a file the agent *created*
+    /// A file the agent *created*
     /// (no pre-turn content on disk) must plan a `None` restore — a
     /// delete — not `Some("")` — an empty-but-present file.
     #[test]
@@ -609,13 +586,9 @@ mod tests {
         );
     }
 
-    /// Review finding (#1515 fix iteration 1): two separate deletion runs
-    /// within a single diff hunk must each get their own `Deleted` marker
-    /// — not collapse into (at most) one at the position of the *last*
-    /// run, silently dropping the earlier one. `old` has 10 lines, `new`
-    /// deletes both "2" (right after line "1") and "9" (right before line
-    /// "10") — both within the same hunk since the two deletions are
-    /// close enough that quadraui's default context window merges them.
+    /// Multiple separate deletion runs within a single diff hunk must each
+    /// get their own `Deleted` marker — not collapse into (at most) one at
+    /// the position of the *last* run.
     #[test]
     fn line_status_marks_every_separate_deletion_run_in_a_single_hunk() {
         use crate::core::git::GitLineStatus;
@@ -677,7 +650,7 @@ mod tests {
         );
     }
 
-    // ── hunk_matches_agents_last_write (#1516) ──────────────────────────
+    // ── hunk_matches_agents_last_write ──────────────────────────────────
 
     fn only_hunk(pre_turn: &str, now: &str) -> (usize, Vec<quadraui::DiffRow>) {
         let hunk = quadraui::compute_hunks(pre_turn, now)
@@ -704,9 +677,9 @@ mod tests {
         ));
     }
 
-    /// The exact scenario #1516 names: a human hand-edits the same region
-    /// the agent last wrote, after the fact — the hunk's own right-side
-    /// text no longer agrees with what the agent produced there.
+    /// A human hand-edits the same region the agent last wrote, after the
+    /// fact — the hunk's own right-side text no longer agrees with what the
+    /// agent produced there.
     #[test]
     fn hunk_does_not_match_after_a_human_edit_on_top_of_the_agents_hunk() {
         let pre = "1\n2\n3\n";
@@ -758,7 +731,7 @@ mod tests {
         ));
     }
 
-    // ── in-buffer inline review (#1517) ─────────────────────────────────
+    // ── in-buffer inline review ─────────────────────────────────────────
 
     #[test]
     fn hunks_for_a_new_file_is_one_pure_addition_hunk() {
@@ -810,7 +783,6 @@ mod tests {
         let hunk = &hunks_for(Some(pre), now)[0];
         let new_pre = keep_hunk(Some(pre), now, hunk);
         // The kept hunk must no longer show up as pending against the new
-        // pre-turn baseline.
         assert!(hunks_for(Some(&new_pre), now).is_empty());
     }
 

@@ -9,9 +9,8 @@ fn win_count(e: &vimcode_core::Engine) -> usize {
 }
 
 /// Ratio of the active tab's root window split, or `None` if there's a
-/// single window (no split). Mirrors `vim_compat_batch.rs::get_split_ratio`,
-/// which reads `e.group_layout` instead — a *different* split tree (editor
-/// groups, not vim `:split`/`:vsplit` window panes) — see #582.
+/// single window (no split). Note: this reads the vim `:split`/`:vsplit`
+/// window panes tree, distinct from the editor groups split tree.
 fn window_split_ratio(e: &vimcode_core::Engine) -> Option<f64> {
     use vimcode_core::core::window::WindowLayout;
     match &e.active_tab().layout {
@@ -100,9 +99,7 @@ fn wincmd_equalize() {
     assert_eq!(win_count(&e), 2);
 }
 
-/// #582: `Ctrl-W =` (`:wincmd =`) previously only ever equalized editor-group
-/// splits (`self.group_layout`); it was a silent no-op for a plain `:vsplit`
-/// window pane like this one, since the active window is never a `GroupId`.
+/// `Ctrl-W =` (`:wincmd =`) equalizes window pane splits.
 #[test]
 fn wincmd_equalize_actually_resets_window_split_ratio() {
     let mut e = engine_with("hello\n");
@@ -132,13 +129,8 @@ fn wincmd_resize_with_count() {
     assert_eq!(win_count(&e), 2);
 }
 
-/// #582: `Ctrl-W >`/`<` previously never touched a plain `:vsplit` window
-/// pane's ratio at all (see `wincmd_resize_with_count` above, which predates
-/// this fix and only checked the windows didn't disappear/crash — it never
-/// asserted the resize actually happened). `+`/`-` target `Horizontal`
-/// splits so are exercised separately in `wincmd_vertical_resize_untouched`-
-/// adjacent coverage; this covers the `Vertical` (`</>`) direction that
-/// `:vsplit` itself produces.
+/// `Ctrl-W >`/`<` resizes window pane splits in the vertical direction,
+/// which is what `:vsplit` produces.
 #[test]
 fn wincmd_resize_actually_changes_window_split_ratio() {
     let mut e = engine_with("hello\n");
@@ -167,20 +159,10 @@ fn wincmd_maximize() {
     assert_eq!(win_count(&e), 2);
 }
 
-/// #582: `Ctrl-W |` (maximize width) previously only ever operated on
-/// `self.group_layout`, a no-op for a plain `:vsplit` window pane.
-///
-/// #1289: the expected ratio here used to be a flat `0.9` — a fixed 90/10
-/// split regardless of the window's actual size, which doesn't match
-/// Neovim's real behaviour (shrink the *other* window down to its
-/// `'winminwidth'` floor, 1 column by default). This test used to be
-/// vacuously green against that bug (a fixed-ratio implementation trivially
-/// produces a fixed ratio); it was observed RED — expecting `0.9875` while
-/// unfixed `develop` still produced `0.9` — before `maximize_window_split`
-/// was changed to compute the ratio from the split's actual raw column
-/// count. A fresh `vsplit` on this test's default 80-column engine gives
-/// each side 40 columns; maximizing the active (first) side should shrink
-/// the other side to exactly 1 column, i.e. give the active side 79 of 80.
+/// `Ctrl-W |` (maximize width) maximizes the active window's width by
+/// shrinking the other window to its `'winminwidth'` floor (1 column).
+/// A fresh `vsplit` on an 80-column engine gives each side 40 columns;
+/// maximizing the active side should leave it with 79 of 80 columns.
 #[test]
 fn wincmd_maximize_actually_widens_window_split() {
     let mut e = engine_with("hello\n");
@@ -197,16 +179,10 @@ fn wincmd_maximize_actually_widens_window_split() {
     );
 }
 
-/// #1289 regression guard: `CTRL-W _` (maximize height) was already a real,
-/// non-coincidental Neovim match before this fix on the `nvim_conformance.rs`
-/// oracle fixture (its 0.1-ratio floor happened to round down to the same
-/// 1-content-row `'winminheight'` floor Neovim uses there) — pin that here on
-/// a plain `:split` too, on this test's default 40-line engine, so a future
-/// change to `maximize_window_split`'s height math can't silently regress it
-/// the way `|` regressed for width. Default `viewport_lines=40` gives a raw
-/// axis size of 41 (`raw_axis_extent`'s `+1` status-line chrome); shrinking
-/// the other side to its 2-raw-unit (1 content row + chrome) floor leaves
-/// the active side 39 of 41.
+/// `Ctrl-W _` (maximize height) maximizes the active window's height by
+/// shrinking the other window to its `'winminheight'` floor (1 content row).
+/// On a 40-line engine with raw axis size 41, shrinking the other side to
+/// its 2-raw-unit floor leaves the active side 39 of 41.
 #[test]
 fn wincmd_maximize_actually_heightens_window_split() {
     let mut e = engine_with("hello\n");

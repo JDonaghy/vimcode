@@ -1,11 +1,10 @@
-//! Source-agnostic agent task-plan model (#529, Track A Phase 4 —
-//! observability: "plan preview").
+//! Source-agnostic agent task-plan model.
 //!
 //! A structured plan is an ordered checklist of steps with status. Two
 //! producers exist in this tree today — a live ACP session's
 //! `session/update` `plan` variant (`core::acp`), parsed inside that
-//! module's own envelope check — and #529's future Board/remote-worker
-//! plan preview, fed through a completely different transport
+//! module's own envelope check — and a future Board/remote-worker
+//! plan preview, fed through a different transport
 //! (`ToolClient`, not the ACP wire). Both need to render identically, so
 //! the *model* (this module) and its rendering (`plan_to_checklist_text`,
 //! consumed by `render::populate_ai_chat_controller`) live here, with
@@ -98,12 +97,10 @@ pub fn plan_to_checklist_text(entries: &[PlanEntry]) -> String {
 mod tests {
     use super::*;
 
-    /// #529's acceptance bar: the plan model must be usable with **no**
-    /// ACP envelope at all — a plain `{"entries": [...]}` object, the
-    /// shape a future Board/remote-worker plan-preview command would emit
-    /// on its own stdout via `ToolClient::run_json`, with no
-    /// `"sessionUpdate"` field anywhere. If this function secretly needed
-    /// ACP's wrapper it would return `None` here.
+    /// The plan model must be usable with **no** ACP envelope at all —
+    /// a plain `{"entries": [...]}` object, the shape a remote worker or
+    /// other tool preview command might emit on its own stdout via
+    /// `ToolClient::run_json`, with no `"sessionUpdate"` field anywhere.
     #[test]
     fn parse_plan_entries_has_no_acp_envelope_requirement() {
         let board_shaped = serde_json::json!({

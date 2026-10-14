@@ -3,7 +3,7 @@ use crate::core::digraphs;
 
 impl Engine {
     /// Look up a digraph, checking user-defined entries (`:digraph`) before
-    /// the builtin table (`:h digraphs`, #1160).
+    /// the builtin table.
     pub(crate) fn digraph_lookup(&self, c1: char, c2: char) -> Option<char> {
         digraphs::lookup(c1, c2, &self.custom_digraphs)
     }
@@ -11,8 +11,7 @@ impl Engine {
     /// `:digraphs` (`:h :digraphs`). No args: list every known digraph as
     /// Neovim's `:digraphs` (no bang) does — a column-wrapped grid, builtin
     /// table first and any custom (`:digraph`-defined) entries after (never
-    /// the other way; `listdigraphs` in Neovim's `digraph.c` always lists
-    /// the builtin `digraphdefault` table before `user_digraphs` — #1302).
+    /// the other way).
     /// With args of the form `{char1}{char2} {number} [{char1}{char2}
     /// {number} ...]`: define one or more custom digraphs (`:h
     /// digraph-usage`), each `{number}` a decimal Unicode codepoint.
@@ -63,7 +62,7 @@ impl Engine {
         EngineAction::None
     }
 
-    /// `<C-k>{c1}{c2}` in Insert mode (`:h i_CTRL-K`, #1160): look up the
+    /// `<C-k>{c1}{c2}` in Insert mode (`:h i_CTRL-K`): look up the
     /// digraph and insert its character, or ring the bell (no-op) if it's
     /// not a known pair.
     pub(crate) fn insert_digraph(&mut self, c1: char, c2: char, changed: &mut bool) {

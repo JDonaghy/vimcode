@@ -16,7 +16,7 @@ fn test_forward_search_moves_cursor() {
 fn test_search_n_next_match() {
     let mut e = engine_with("foo bar foo baz\n");
     search_fwd(&mut e, "foo");
-    // #801: `/` starts *after* the cursor, so the match under the cursor at
+    // `/` starts *after* the cursor, so the match under the cursor at
     // col 0 is skipped (verified against Neovim).
     assert_cursor(&e, 0, 8);
     // n wraps back round to the first match
@@ -175,14 +175,10 @@ fn test_search_escape_restores_cursor() {
     assert_mode(&e, Mode::Normal);
 }
 
-// ── #801: the Vim regex engine, offsets and n/N direction ────────────────────
-//
-// These are black-box: they drive the engine through the same `/` command line
-// a user types and assert on the resulting cursor. Every expectation below was
-// checked against `nvim --headless` (the oracle the conformance suite uses),
-// and every one of them fails against the pre-#801 `text.find(&query)` search —
-// which matched metacharacters literally, so `/^foo`, `/\<foo\>`, `/\d\+` and
-// friends simply found nothing and left the cursor where it was.
+// These tests drive the engine through the same `/` command line a user
+// types and assert on the resulting cursor position. The engine uses the
+// Vim regex syntax, which supports metacharacters like `^`, `\<`, `\d\+`,
+// and anchors that must be properly interpreted by the regex engine.
 
 #[test]
 fn test_regex_caret_anchor() {
@@ -349,16 +345,11 @@ fn test_star_sets_a_whole_word_pattern_reusable_by_sub() {
 
 #[test]
 fn test_invalid_pattern_is_rejected_not_matched_literally() {
-    // #801 acceptance: a pattern the engine cannot translate must produce an
-    // error, never a silent fall-back to literal matching.
-    //
-    // The untranslatable set keeps shrinking, so this test has to keep moving
-    // to an atom that is still in it: #1004 took back-references out (they
-    // compile via `fancy_regex`), and #1157 took look-around out for the same
-    // reason. `\&` (branch concat) stays — neither `regex` nor `fancy_regex`
-    // exposes a "match this branch but report the last one" primitive. The
-    // buffer contains the pattern verbatim, so a literal fall-back *would*
-    // find a match here.
+    // A pattern the engine cannot translate must produce an error, never a
+    // silent fall-back to literal matching. Some Vim regex atoms remain
+    // untranslatable: `\&` (branch concat) is not exposed by either `regex`
+    // or `fancy_regex`. The buffer contains the pattern verbatim, so a
+    // literal fall-back would find a match here.
     let mut e = engine_with("a foo\\&f b\n");
     search_fwd(&mut e, "foo\\&f");
     assert!(
@@ -372,11 +363,10 @@ fn test_invalid_pattern_is_rejected_not_matched_literally() {
 
 #[test]
 fn test_lookaround_pattern_is_no_longer_rejected() {
-    // #1157: the counterpart to the test above — look-around used to be in
-    // the untranslatable set, and now compiles via `fancy_regex`. `\@=` is
-    // zero-width, so `/foo\(bar\)\@=` lands on the 'f' of the "foo" that is
-    // followed by "bar" and nowhere else. Searching from col 0 skips the
-    // match under the cursor, so the qualifying "foo" here is the second one.
+    // Look-around patterns like `\@=` are zero-width, so `/foo\(bar\)\@=`
+    // lands on the 'f' of the "foo" that is followed by "bar". Searching
+    // from col 0 skips the match under the cursor, so the qualifying "foo"
+    // is the second one.
     let mut e = engine_with("foobaz x foobar\n");
     search_fwd(&mut e, "foo\\(bar\\)\\@=");
     assert_eq!(e.message, "match 1 of 1");
@@ -385,7 +375,7 @@ fn test_lookaround_pattern_is_no_longer_rejected() {
 
 #[test]
 fn test_search_pattern_backreference_matches_repeated_text() {
-    // #1004: `\1` inside a *pattern* back-references the text `\(foo\)`
+    // `\1` inside a *pattern* back-references the text `\(foo\)`
     // captured earlier in that same pattern, so `/\(foo\)\1` must land on
     // "foofoo" — not on the lone "foo" at col 0, and not on a literal "1".
     let mut e = engine_with("foo foofoo bar\n");
@@ -422,9 +412,8 @@ fn test_substitute_with_pattern_backreference() {
 
 #[test]
 fn test_substitute_confirm_flag_prompts_before_touching_the_buffer() {
-    // #1031 (#801 Phase 2): the `c` flag used to be rejected outright
-    // ("not implemented"). It now opens a confirm prompt — and, critically,
-    // nothing is substituted behind the user's back before they answer.
+    // The `c` flag opens a confirm prompt — and critically, nothing is
+    // substituted before the user answers.
     let mut e = engine_with("a a\n");
     exec(&mut e, "%s/a/b/gc");
     assert!(
@@ -460,16 +449,10 @@ fn test_substitute_confirm_y_and_n_replace_only_the_confirmed_matches() {
 
 #[test]
 fn test_substitute_confirm_y_applies_immediately_not_at_loop_end() {
-    // #1031 review (blocking): the confirm loop used to only fold each
-    // answer into an in-memory string, splicing every confirmed match into
-    // the real buffer in one shot only once the *whole* loop ended (`a`,
-    // `q`/`<Esc>`, or running off the end). That's backwards from the
-    // entire point of an interactive confirm prompt: real Vim/Neovim
-    // applies (and paints) each confirmed match right away, so the user
-    // watches it change before deciding on the next one. A test that only
-    // checks the buffer after the loop finishes can't tell "applied
-    // per-answer" from "applied all at once at the end" — this one asserts
-    // on the buffer *mid-loop*, between individual answers.
+    // The confirm prompt applies and paints each confirmed match right away,
+    // so the user watches it change before deciding on the next one. This test
+    // asserts on the buffer mid-loop to verify per-answer application rather
+    // than applying all matches at once at the end.
     let mut e = engine_with("a a a\n");
     exec(&mut e, "%s/a/b/gc");
     assert_eq!(
@@ -492,7 +475,7 @@ fn test_substitute_confirm_y_applies_immediately_not_at_loop_end() {
 
 #[test]
 fn test_substitute_confirm_next_prompt_cursor_tracks_earlier_length_change() {
-    // #1031 review: every candidate's position is precomputed once against
+    // Every candidate's position is precomputed once against
     // the *original*, unmodified buffer text, but each confirmed answer is
     // now spliced into the live buffer immediately (previous test). A
     // replacement that's a different length than what it replaced shifts
@@ -516,7 +499,7 @@ fn test_substitute_confirm_next_prompt_cursor_tracks_earlier_length_change() {
 
 #[test]
 fn test_substitute_confirm_loop_undoes_as_a_single_step() {
-    // #1031 review: applying each answer live (instead of one combined
+    // Applying each answer live (instead of one combined
     // splice at the end) must not turn `:s///gc` into several separate
     // undo steps -- `u` still undoes the whole confirm loop's worth of
     // confirmed substitutions at once, exactly like a plain `:s///g` would.
@@ -554,10 +537,10 @@ fn test_substitute_confirm_a_replaces_the_rest_and_q_stops() {
 
 #[test]
 fn test_substitute_confirm_ctrl_c_quits_like_escape() {
-    // #1031 review (non-blocking): `<C-c>`/`<C-[>` aren't in `:h :s_c`'s
+    // `<C-c>`/`<C-[>` aren't in `:h :s_c`'s
     // documented answer set, but they're the same "get me out of here"
     // aliases for `<Esc>` this codebase already recognizes in Insert mode
-    // (#804) -- a stuck confirm prompt should quit on them too, not
+    // -- a stuck confirm prompt should quit on them too, not
     // silently re-prompt the same candidate forever.
     let mut e = engine_with("a a a\n");
     exec(&mut e, "%s/a/b/gc");

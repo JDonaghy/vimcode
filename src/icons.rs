@@ -7,7 +7,7 @@
 //!
 //! Set the flag at startup via `set_nerd_fonts(bool)`.
 //!
-//! ## Why thread-local, not process-global (#618)
+//! ## Thread-local storage
 //!
 //! The flag is read on every `Icon::s()`/`Icon::c()` call to choose between
 //! the nerd glyph and the ASCII fallback, so it directly determines rendered
@@ -15,13 +15,9 @@
 //! and TUI backends set it once from `engine.settings.use_nerd_fonts` and
 //! then render synchronously on that same thread — there is no cross-thread
 //! rendering in this codebase. Storing it thread-local rather than
-//! process-global means a test that flips the flag (directly or via
-//! `Engine`/`ShellApp` startup) can only ever affect other tests scheduled
-//! on that *same* worker thread, never tests running concurrently on other
-//! threads in the shared `cargo test` process. That closes off the exact
-//! failure shape #615 turned out not to be: a render depending on ambient
-//! process-wide state, passing locally and failing non-deterministically in
-//! CI depending on core count and scheduling.
+//! process-global ensures that tests which flip the flag can only affect other
+//! tests scheduled on that same worker thread, never tests running concurrently
+//! on other threads in the shared `cargo test` process.
 use std::cell::Cell;
 
 thread_local! {
@@ -42,7 +38,7 @@ pub fn nerd_fonts_enabled() -> bool {
 /// Record whether the current thread belongs to a GUI backend (GTK, macOS,
 /// Win-GUI) as opposed to the TUI. Read by
 /// [`crate::core::settings::Settings::use_nerd_fonts`] to resolve its
-/// backend-derived default (issue #999) — GUI bundles the icon font and
+/// backend-derived default — GUI bundles the icon font and
 /// always has it available; TUI cannot detect its terminal's glyph coverage
 /// and keeps the conservative `target_os` guess.
 ///
@@ -51,11 +47,10 @@ pub fn nerd_fonts_enabled() -> bool {
 /// startup, in the same place it already calls `set_nerd_fonts(...)`. TUI
 /// entry points leave this at its default, `false`.
 ///
-/// Thread-local for the same reason `USE_NERD_FONTS` is (see the module
-/// doc's "#618" section): rendering never crosses threads in this
-/// codebase, so a test that flips this can only affect other tests
-/// scheduled on that same worker thread, never tests running concurrently
-/// on other threads in the shared `cargo test` process.
+/// Thread-local for the same reason `USE_NERD_FONTS` is: rendering never
+/// crosses threads in this codebase, so a test that flips this can only
+/// affect other tests scheduled on that same worker thread, never tests
+/// running concurrently on other threads in the shared `cargo test` process.
 pub fn set_gui_backend(val: bool) {
     IS_GUI_BACKEND.with(|f| f.set(val));
 }
@@ -95,41 +90,33 @@ impl Icon {
 
 pub const HAMBURGER: Icon = Icon::new("\u{f035c}", "\u{2630}"); // ☰
 
-// #1698: VS Code's Explorer activity-bar icon is literally `Codicon.files`
+// VS Code's Explorer activity-bar icon is literally `Codicon.files`
 // (`explorerViewIcon` in `explorerViewlet.ts`) — nf-cod-files, a two-page
 // "files" glyph — not an open-folder glyph. `\u{f07c}` (nf-fa-folder_open,
 // still available as `FOLDER_OPEN` below) was a plausible-looking but wrong
 // stand-in.
 pub const EXPLORER: Icon = Icon::new("\u{eaf0}", "\u{229e}"); // nf-cod-files
 
-// #950: GTK's `App::shell_config()` used to carry its own `SEARCH_COD`
-// (nf-cod-search, `\u{ea6d}`) instead of this constant, so the activity bar
-// showed a different search glyph per backend for no product reason — an
-// accidental fork, not a deliberate per-platform choice (nothing about a
-// search icon is GTK- or TUI-specific). Converged onto the one table both
-// backends already shared for every other activity-bar icon.
+// Both backends share the same activity-bar icon for search.
 pub const SEARCH: Icon = Icon::new("\u{f002}", "/"); // /
 pub const DEBUG: Icon = Icon::new("\u{f188}", "!"); // !
 /// VS Code's Run & Debug activity-bar icon (`runViewIcon` in
 /// `debugIcons.ts`) is `Codicon.debugAlt` — a play triangle with a bug
-/// overlay — not the plain [`DEBUG`] bug glyph above, which stays in use for
-/// the debug sidebar's own "DEBUG" title bar (`render.rs`'s
-/// `debug_sidebar_status_bars`), a different context VS Code doesn't use
-/// `debug-alt` for either. #1698.
+/// overlay — not the plain [`DEBUG`] bug glyph, which is used for the
+/// debug sidebar's own "DEBUG" title bar, a different context.
 pub const RUN_AND_DEBUG: Icon = Icon::new("\u{eb91}", "\u{25b6}"); // nf-cod-debug_alt
 pub const GIT_BRANCH: Icon = Icon::new("\u{e702}", "Y"); // Y (branch shape)
 pub const GIT_BRANCH_ALT: Icon = Icon::new("\u{e725}", "Y"); // nf-dev-git_branch alt
 /// VS Code's Source Control activity-bar icon (`sourceControlViewIcon` in
 /// `scm.contribution.ts`) is `Codicon.sourceControl` — a branch-fork glyph —
 /// not [`GIT_BRANCH`]/[`GIT_BRANCH_ALT`] (devicon glyphs used for the
-/// current-branch-name display elsewhere, e.g. the status bar's `"
-/// {branch} main"` segment). #1698.
+/// current-branch-name display elsewhere).
 pub const SOURCE_CONTROL: Icon = Icon::new("\u{ea68}", "Y"); // nf-cod-source_control
 pub const EXTENSIONS: Icon = Icon::new("\u{eae6}", "#"); // #
 pub const EXTENSIONS_ALT: Icon = Icon::new("\u{eb85}", "#"); // nf-cod-extensions alt (TUI)
 pub const AI_CHAT: Icon = Icon::new("\u{f0e5}", ">"); // >
 pub const SETTINGS: Icon = Icon::new("\u{f013}", "*"); // *
-/// Board activity-bar panel (#521) — a generic kanban/pipeline host, not
+/// Board activity-bar panel — a generic kanban/pipeline host, not
 /// tied to any one provider. nf-fa-columns.
 pub const BOARD: Icon = Icon::new("\u{f0db}", "\u{25a6}"); // ▦
 
@@ -142,7 +129,7 @@ pub const FILE_GENERIC: Icon = Icon::new("\u{f15b}", " "); // (space)
 pub const FILE_TEXT: Icon = Icon::new("\u{f0f6}", " "); // text file
 pub const TRASH: Icon = Icon::new("\u{f1f8}", "x"); // x
 
-// #1693: the Explorer header's view-actions row (New File / New Folder /
+// The Explorer header's view-actions row (New File / New Folder /
 // Refresh / Collapse All / "..." overflow) — mirrors VS Code's Explorer
 // toolbar. Fallback glyphs are deliberately distinct single characters so
 // a headless driver test can tell the buttons apart via `find_bounds`.
@@ -170,7 +157,7 @@ pub const FILE_CSS: Icon = Icon::new("\u{e749}", "#");
 pub const FILE_SHELL: Icon = Icon::new("\u{f489}", "$");
 pub const FILE_LUA: Icon = Icon::new("\u{e620}", "L");
 
-// #992: expanded extension coverage. Glyphs are nerd-fonts' `seti-*` range
+// Expanded extension coverage. Glyphs are nerd-fonts' `seti-*` range
 // (the actual Seti-UI icon glyphs, per `glyphnames.json` from the
 // ryanoasis/nerd-fonts release) except where noted; colours below are
 // Seti-UI's own (see the `ICON_*` doc comments and the design note above
@@ -218,12 +205,12 @@ pub const FILE_IMAGE: Icon = Icon::new("\u{e60d}", "I");
 pub const FILE_PDF: Icon = Icon::new("\u{e67d}", "D");
 pub const FILE_ARCHIVE: Icon = Icon::new("\u{e6aa}", "Z");
 
-// ─── Filename-Matched File Icons (#992) ─────────────────────────────────────
+// ─── Filename-Matched File Icons ────────────────────────────────────────────
 //
 // A handful of well-known files are badged by exact filename in VS Code/
 // Seti-UI, not by extension: `Dockerfile`, `Makefile`/`CMakeLists.txt`,
 // `LICENSE`, `README`, `.gitignore`/`.gitattributes`. See `filename_icon`/
-// `filename_icon_color` below and the module doc's #992 note.
+// `filename_icon_color` below.
 pub const FILE_DOCKER: Icon = Icon::new("\u{e650}", "D");
 pub const FILE_MAKEFILE: Icon = Icon::new("\u{e673}", "M");
 pub const FILE_LICENSE: Icon = Icon::new("\u{e60a}", "L");
@@ -273,12 +260,19 @@ pub const FIND_REPLACE_ALL: Icon = Icon::new("\u{eb3d}", "R*"); // nf-cod-replac
 pub const FIND_IN_SEL: Icon = Icon::new("\u{eb54}", "\u{2261}"); // ≡ nf-cod-selection
 pub const FIND_CLOSE: Icon = Icon::new("\u{ea76}", "\u{00d7}"); // × nf-cod-close
 
+// ─── quadraui-painted glyphs ────────────────────────────────────────────────
+// Glyphs quadraui itself paints (not vimcode).
+
+pub const TREE_CHEVRON_DOWN: Icon = Icon::new("\u{eab4}", "\u{25be}"); // ▾ nf-cod-chevron_down
+pub const TREE_CHEVRON_RIGHT: Icon = Icon::new("\u{eab6}", "\u{25b8}"); // ▸ nf-cod-chevron_right
+pub const TAB_CLOSE: Icon = Icon::new("\u{ea76}", "\u{00d7}"); // × nf-cod-close
+
 // ─── Window Controls (GTK client-side titlebar, #552) ───────────────────────
 // Plain Unicode glyphs — deliberately no nerd-font-only variant since these
 // draw at the very top of the window before any font capability probing is
 // meaningful, and the shapes read fine as monospace fallback text too.
 
-// #715: U+2500 BOX DRAWINGS LIGHT HORIZONTAL is a hairline rule, not a
+// U+2500 BOX DRAWINGS LIGHT HORIZONTAL is a hairline rule, not a
 // window-control glyph — at titlebar size it renders as a ~1px line, or
 // nothing at all if the resolved UI font has no box-drawing coverage (it
 // didn't, which is why minimize alone was invisible while □/✕ painted
@@ -297,7 +291,7 @@ pub const DIFF_FOLD: Icon = Icon::new("\u{F0233}", "=");
 pub const SPLIT_RIGHT: Icon = Icon::new("\u{F0932}", "|");
 pub const SPLIT_DOWN: Icon = Icon::new("\u{f0d7}", "_");
 
-// ─── Status Bar Toggles / Notification Bell (#1540) ────────────────────────
+// ─── Status Bar Toggles / Notification Bell ────────────────────────────────
 //
 // These lived as raw PUA literals directly in `render.rs` (`" 󰍜 "`,
 // `" 󰆍 "`, `" 󰘖 "`, `"󰂞"`) rather than `Icon::new` constants, which is why
@@ -319,7 +313,7 @@ pub const STATUS_SIDEBAR_TOGGLE: Icon = Icon::new("\u{f0616}", "[S]");
 /// notification completes.
 pub const STATUS_BELL_DONE: Icon = Icon::new("\u{f009e}", "*");
 
-/// Problems-counter icons (#1548): error/warning glyphs prefixing the
+/// Problems-counter icons: error/warning glyphs prefixing the
 /// always-on diagnostic-count segments. Ordinary BMP Unicode below the
 /// nerd-font PUA range — same reasoning as the "Window Controls" section
 /// below: these read fine as plain monospace glyphs on any system font, on
@@ -329,7 +323,7 @@ pub const STATUS_BELL_DONE: Icon = Icon::new("\u{f009e}", "*");
 pub const STATUS_ERROR: Icon = Icon::new("\u{2297}", "\u{2297}"); // ⊗
 pub const STATUS_WARNING: Icon = Icon::new("\u{26a0}", "\u{26a0}"); // ⚠
 
-// ─── Terminal Panel Toolbar (#1540) ─────────────────────────────────────────
+// ─── Terminal Panel Toolbar ─────────────────────────────────────────────────
 //
 // Same story as the status-bar toggles above: these were raw PUA literals
 // in `render.rs` (`NF_TERM_*` consts) with **no** ASCII fallback at all --
@@ -342,16 +336,11 @@ pub const TERM_SPLIT: Icon = Icon::new("\u{f093c}", "|");
 pub const TERM_MAXIMIZE: Icon = Icon::new("\u{f0297}", "\u{25a1}"); // □
 pub const TERM_UNMAXIMIZE: Icon = Icon::new("\u{f0293}", "\u{29c9}"); // ⧉
 
-// ─── LSP Symbol Kind Icons (#1540) ──────────────────────────────────────────
+// ─── LSP Symbol Kind Icons ──────────────────────────────────────────────────
 //
-// `src/core/lsp.rs`'s `SymbolKind::icon()` (outline view / breadcrumbs, via
-// `picker.rs`) had these as raw PUA literals too -- same bug class as the
-// status-bar/terminal-toolbar ones above, just a different call site the
-// original #1540 report didn't spot. `icon()` has never gated on
-// `nerd_fonts_enabled()` (most `SymbolKind` variants already render no
-// glyph at all, by design, predating this fix) so these are read via
-// `.nerd` directly rather than `.s()` -- moving the literal into `icons.rs`
-// without changing that existing behaviour.
+// `src/core/lsp.rs`'s `SymbolKind::icon()` reads these via `.nerd` directly
+// rather than `.s()` since most `SymbolKind` variants already render no
+// glyph at all by design.
 pub const SYM_FILE: Icon = Icon::new("\u{f0214}", "F"); // nf-md-file
 pub const SYM_MODULE: Icon = Icon::new("\u{f03d7}", "M"); // nf-md-package_variant_closed
 pub const SYM_FUNCTION: Icon = Icon::new("\u{f0295}", "f"); // nf-md-function
@@ -423,24 +412,11 @@ pub fn file_icon(ext: &str) -> &'static str {
 
 // ─── File Icon Colours ───────────────────────────────────────────────────────
 //
-// #703 design note — why these live here, next to `file_icon`, rather than as
-// `Theme` fields:
-//
-// The repo rule is "no hardcoded colours in rendering", and `tab_active_accent`
-// is the precedent for a theme-owned tab token. That rule is about *chrome*:
-// backgrounds, accents and text that must track the active colour scheme. A
-// language badge is not chrome — it is part of the icon's **identity**, the
-// same way the glyph is. VS Code's Seti icon theme keeps `.rs` orange and
-// `.ts` blue in every one of its built-in themes precisely because users
-// recognise files by that colour; making it theme-settable would let a theme
-// turn every badge the same shade and destroy the signal the badge exists for.
-//
-// So the colour is stored beside the glyph it belongs to, in one table, and no
+// A language badge is part of the icon's identity, the same way the glyph is.
+// The colour is stored beside the glyph it belongs to, in one table, so no
 // rendering call site ever names a hex value: `render.rs` asks for
 // `icons::file_icon_color(ext)` exactly as it already asks for
-// `icons::file_icon(ext)`, and the two can never drift apart. If a future issue
-// wants per-theme overrides, the right shape is a `Theme` map that *overrides*
-// this table, not a replacement for it.
+// `icons::file_icon(ext)`, and the two can never drift apart.
 //
 // Palette below is Seti-UI's, which is tuned for dark editor chrome (it is what
 // VS Code ships).
@@ -459,16 +435,14 @@ pub const ICON_YELLOW: (u8, u8, u8) = (0xcb, 0xcb, 0x41);
 pub const ICON_CYAN: (u8, u8, u8) = (0x51, 0xc9, 0xd4);
 /// Seti-UI off-white — plain text and unknown extensions.
 pub const ICON_NEUTRAL: (u8, u8, u8) = (0xd4, 0xd7, 0xd6);
-/// Seti-UI red (`@red` in `ui-variables.less`) — Java, Ruby, Scala, Svelte, PDF.
-/// #992: not present before because nothing in the pre-#992 table used it.
+/// Seti-UI red — Java, Ruby, Scala, Svelte, PDF.
 pub const ICON_RED: (u8, u8, u8) = (0xcc, 0x3e, 0x44);
-/// Seti-UI pink (`@pink`) — GraphQL, Sass/SCSS, SQL. #992.
+/// Seti-UI pink — GraphQL, Sass/SCSS, SQL.
 pub const ICON_PINK: (u8, u8, u8) = (0xf5, 0x53, 0x85);
-/// Seti-UI grey-light (`@grey-light`) — config/cfg/conf/ini, editorconfig,
-/// archives. #992.
+/// Seti-UI grey-light — config/cfg/conf/ini, editorconfig, archives.
 pub const ICON_GREY_LIGHT: (u8, u8, u8) = (0x6d, 0x80, 0x86);
-/// Seti-UI ignore (`@ignore`) — `.gitignore`/`.gitattributes` and other
-/// VCS-ignored-style files. #992.
+/// Seti-UI ignore — `.gitignore`/`.gitattributes` and other VCS-ignored-style
+/// files.
 pub const ICON_IGNORE: (u8, u8, u8) = (0x41, 0x53, 0x5b);
 
 /// Return the identity colour (24-bit RGB) for a given file extension's icon.
@@ -532,7 +506,7 @@ pub fn file_icon_color(ext: &str) -> (u8, u8, u8) {
     }
 }
 
-// ─── Filename-Matched Icon Lookup (#992) ────────────────────────────────────
+// ─── Filename-Matched Icon Lookup ───────────────────────────────────────────
 //
 // `Path::extension()` returns `None` for `Dockerfile` (no dot at all) *and*
 // for `.gitignore` (Rust treats a leading-dot name as having no extension,
@@ -610,7 +584,7 @@ mod tests {
     const SAMPLE: Icon = Icon::new("nerd", "fallback");
 
     /// New threads default to nerd fonts on, matching the old process-global
-    /// default — the thread-local swap (#618) must not change this default.
+    /// default — the thread-local swap must not change this default.
     #[test]
     fn defaults_to_nerd_fonts_enabled_on_a_fresh_thread() {
         let (enabled, s) = std::thread::spawn(|| (nerd_fonts_enabled(), SAMPLE.s()))
@@ -620,11 +594,8 @@ mod tests {
         assert_eq!(s, "nerd");
     }
 
-    /// The core #618 guarantee: flipping the flag on one thread must not
-    /// leak to a concurrently-running thread. With the old `AtomicBool`
-    /// this test would be flaky-by-construction (a race whose outcome
-    /// depends on scheduling); with thread-local storage each thread's
-    /// view is independent by construction, so it's deterministic.
+    /// With thread-local storage, each thread's view is independent by
+    /// construction, so changes on one thread do not affect concurrent threads.
     #[test]
     fn set_nerd_fonts_does_not_leak_across_threads() {
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -676,7 +647,7 @@ mod tests {
         .unwrap();
     }
 
-    // ─── #992: stop the extension/filename tables silently rotting ────────
+    // ─── File icon and color table consistency ──────────────────────────────────
 
     /// `include_str!`-based self-parse of this file's own source, mirroring
     /// `tests/icon_font_coverage.rs`'s approach of parsing `src/icons.rs`
@@ -721,11 +692,8 @@ mod tests {
         re.captures_iter(body).map(|c| c[1].to_string()).collect()
     }
 
-    /// `file_icon`'s doc comment (and the #703 design note above
-    /// `file_icon_color`) claims "every arm there has an arm here". Nothing
-    /// enforced that before this test: a future edit that adds an extension
-    /// to one table and forgets the other now fails loudly here instead of
-    /// silently shipping a badge with the generic colour (or vice versa).
+    /// `file_icon`'s doc comment claims "every arm there has an arm here".
+    /// This test ensures the extension and color tables stay synchronized.
     #[test]
     fn file_icon_and_file_icon_color_cover_the_same_extensions() {
         let icon_keys = match_arm_keys("file_icon");
@@ -745,7 +713,7 @@ mod tests {
         );
     }
 
-    /// Same invariant for the filename-matched table (#992).
+    /// Same invariant for the filename-matched table.
     #[test]
     fn filename_icon_and_filename_icon_color_cover_the_same_filenames() {
         let icon_keys = match_arm_keys("filename_icon");
@@ -762,7 +730,7 @@ mod tests {
         );
     }
 
-    /// #992: a fixed, human-readable list of extensions that must resolve
+    /// A fixed, human-readable list of extensions that must resolve
     /// to a non-generic icon. This is what actually catches the original
     /// bug report -- `.cs` and `.tf` silently falling through to
     /// `FILE_GENERIC` because no arm existed for them -- in a way the
@@ -785,10 +753,8 @@ mod tests {
         }
     }
 
-    /// #992 deliverable 2: filename-badged files resolve to a non-generic
-    /// icon via [`file_icon_for_name`] -- the function callers should
-    /// actually use (bare [`file_icon`] cannot see filenames at all; see the
-    /// dotfile regression test below).
+    /// Filename-badged files resolve to a non-generic icon via
+    /// [`file_icon_for_name`] — the function callers should actually use.
     #[test]
     fn filename_matched_files_get_non_generic_icons() {
         let names = [
@@ -811,13 +777,10 @@ mod tests {
         }
     }
 
-    /// #992, the actual regression this deliverable fixes: `Path::extension()`
-    /// is `None` for a leading-dot filename like `.gitignore` (Rust does not
-    /// treat a leading dot as separating an empty name from an extension),
-    /// so `file_icon("")` -- what a pre-#992 call site resolves a dotfile to
-    /// -- always returns the generic icon regardless of any extension-table
-    /// arm. `file_icon_for_name` must consult the filename table before
-    /// falling through to that empty-extension lookup.
+    /// `Path::extension()` is `None` for a leading-dot filename like `.gitignore`
+    /// (Rust does not treat a leading dot as separating an empty name from an
+    /// extension), so `file_icon_for_name` must consult the filename table before
+    /// falling through to the empty-extension lookup.
     #[test]
     fn dotfile_extension_is_empty_but_file_icon_for_name_still_resolves() {
         assert_eq!(extension_of(".gitignore"), "");

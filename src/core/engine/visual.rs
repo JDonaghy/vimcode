@@ -7,9 +7,7 @@ impl Engine {
 
     /// Length of `line` in characters, **excluding** its trailing newline.
     ///
-    /// `Rope::line()` includes the `\n`, and every Visual-Block site used to
-    /// count it — which made the block one column too wide at end-of-line and
-    /// made a genuinely-empty short line look one char long (#807).
+    /// `Rope::line()` includes the `\n`; this function strips it.
     pub(crate) fn line_text_len(&self, line: usize) -> usize {
         let raw = self.buffer().line_len_chars(line);
         if raw > 0
@@ -33,7 +31,7 @@ impl Engine {
     /// `end_col` is [`usize::MAX`] when `$` extended the block to end-of-line,
     /// so callers must clamp per line. The moving edge follows
     /// `visual_block_want` (Vim's `curswant`), not the cursor's clamped
-    /// column — see that field's docs (#807).
+    /// column — see that field's docs.
     pub(crate) fn visual_block_cols(&self) -> (usize, usize) {
         let cursor = self.view().cursor;
         let anchor = self.visual_anchor.unwrap_or(cursor);
@@ -83,7 +81,7 @@ impl Engine {
 
     /// Extract the text from the visual selection.
     /// Returns `(text, register type)` — Visual-Block yields
-    /// [`RegType::Blockwise`] so a later `p`/`P` re-inserts a rectangle (#807).
+    /// [`RegType::Blockwise`] so a later `p`/`P` re-inserts a rectangle.
     pub(crate) fn get_visual_selection_text(&self) -> Option<(String, RegType)> {
         let (start, end) = self.get_visual_selection_range()?;
 
@@ -114,17 +112,9 @@ impl Engine {
                 Some((text, RegType::Linewise))
             }
             Mode::Visual => {
-                // Character mode. Some selections (VSCode's Shift+arrow/Ctrl+A/
-                // Ctrl+L keyboard extension) leave the cursor *after* the last
-                // selected character (exclusive end); others (plain Vim visual
-                // mode, and — even in VSCode mode — mouse selection and Ctrl+D/
-                // Ctrl+Shift+L) put the cursor *on* the last selected character
-                // (inclusive end). This is NOT a function of editor mode — see
-                // `visual_end_exclusive`'s doc comment (#1788 review). Mixing the
-                // two conventions up here under-copies by one char for inclusive
-                // selections and over-copies by one char for exclusive
-                // selections: a 6-char Shift+Right selection of "hello " used to
-                // copy "hello w".
+                // Character mode: some selections have exclusive end (cursor after last
+                // selected character), others have inclusive end (cursor on last selected
+                // character). Adjust `end_char` to match the selection convention.
                 let start_char = self.buffer().line_to_char(start.line) + start.col;
                 let mut end_char = self.buffer().line_to_char(end.line) + end.col;
                 if !self.visual_end_exclusive {
@@ -218,14 +208,11 @@ impl Engine {
 
     /// Shared implementation behind [`delete_visual_selection`](Self::delete_visual_selection).
     ///
-    /// `finish_group` controls whether the undo group opened for the delete
-    /// is closed here. A plain `d`/`x`/`D` finishes it immediately (this is
-    /// the whole change). `c`/`s`/`C`/`S`/`R` delete then drop straight into
-    /// Insert mode to type the replacement — Vim's `u` afterwards undoes
-    /// *both* the deletion and the typed text as one step, so those callers
-    /// pass `false` and let Insert mode's own `Escape` handler close the
-    /// group once the typing is done (mirrors the Normal-mode `cw`/`ciw`
-    /// "don't finish_undo_group — let insert mode do it" pattern; #887).
+    /// `finish_group` controls whether the undo group is closed here.
+    /// Commands like `d`/`x`/`D` finish it immediately; commands like `c`/`s`/`C`/`S`/`R`
+    /// delete then enter Insert mode, so they pass `false` and let Insert mode's
+    /// `Escape` handler close the group, allowing `u` to undo both deletion and
+    /// typed text as one step.
     pub(crate) fn delete_visual_selection_impl(&mut self, changed: &mut bool, finish_group: bool) {
         if let Some((text, ty)) = self.get_visual_selection_text() {
             // Store in register
@@ -238,7 +225,7 @@ impl Engine {
 
             // `u` restores the cursor to the start of the deleted selection,
             // not wherever the (real) cursor was sitting when `d` was
-            // pressed — which, for a forward selection, is the end (#886).
+            // pressed — which, for a forward selection, is the end.
             self.start_undo_group_at(start);
 
             match self.mode {
@@ -253,9 +240,7 @@ impl Engine {
 
                     self.delete_with_undo(start_char, end_char);
 
-                    // Neovim's 'startofline' is OFF by default, so a linewise
-                    // delete keeps the cursor's column rather than jumping to
-                    // the first non-blank (#807, `vis:Vjd` / `vis:Vd cursor`).
+                    // Preserve the cursor's column after a linewise delete.
                     let want = self.view().cursor.col;
                     let last = self.buffer().len_lines().saturating_sub(1);
                     self.view_mut().cursor.line = start.line.min(last);
@@ -275,12 +260,7 @@ impl Engine {
 
                     self.delete_with_undo(start_char, end_char.min(self.buffer().len_chars()));
 
-                    // Position cursor at start — clamped to the (possibly
-                    // shrunk) line count: a charwise delete that consumes
-                    // every line at or after `start.line` (e.g. `vapd` on
-                    // the buffer's last paragraph) can leave `start.line`
-                    // pointing past the end of the buffer (#887, "vis:v ap
-                    // trailing").
+                    // Position cursor at start, clamped to the (possibly shrunk) line count.
                     let last = self.buffer().len_lines().saturating_sub(1);
                     self.view_mut().cursor = Cursor {
                         line: start.line.min(last),
@@ -309,9 +289,7 @@ impl Engine {
             }
             *changed = true;
             self.clamp_cursor_col();
-            // Vim collapses `'<`/`'>` onto the start of a Visual delete, so a
-            // later `gv` reselects one character/line rather than the extent
-            // that is no longer there (#807, `vis:gv after Vjd`).
+            // Collapse `'<`/`'>` onto the start of a Visual delete so later `gv` reselects.
             self.lock_visual_reselect(start, start);
         }
 
@@ -322,7 +300,7 @@ impl Engine {
     }
 
     /// Pin what a later `gv` will reselect, and stop `handle_key`'s generic
-    /// hook from overwriting it on the way out of Visual mode (#807).
+    /// hook from overwriting it on the way out of Visual mode.
     pub(crate) fn lock_visual_reselect(&mut self, anchor: Cursor, cursor: Cursor) {
         self.last_visual_mode = self.mode;
         self.last_visual_anchor = Some(anchor);
@@ -364,9 +342,8 @@ impl Engine {
         };
 
         if paste_type.is_blockwise() {
-            // A blockwise register replaces the selection with a rectangle
-            // anchored at the selection's own start column (#807,
-            // `vb:jjp block over block`).
+            // A blockwise register replaces the selection with a rectangle anchored at
+            // the selection's start column.
             self.view_mut().cursor.line = start.line;
             self.view_mut().cursor.col = start.col;
             self.paste_blockwise(&paste_content, 1, false, changed);
@@ -380,7 +357,7 @@ impl Engine {
             // Linewise paste: insert on its own line. Anchored on the
             // selection's own start line, not the cursor — deleting the last
             // lines of the buffer clamps the cursor upward, and the paste must
-            // still land where the selection was (#807).
+            // still land where the selection was.
             let line = start.line;
             let line_start = if line < self.buffer().len_lines() {
                 self.buffer().line_to_char(line)
@@ -397,11 +374,8 @@ impl Engine {
             self.view_mut().cursor.line = line;
             self.view_mut().cursor.col = 0;
         } else if paste_linewise {
-            // A LINEWISE register put over a CHARWISE selection splits the
-            // line in two at the deletion point and drops the register's
-            // lines between the halves — `yyjjvlp` on `a`/`b`/`xyz` gives
-            // `a`/`b`/``/`a`/`z`, with an empty line where `xy` used to be
-            // (#807; before, the two halves were spliced back together).
+            // A linewise register put over a charwise selection splits the line in two
+            // at the deletion point and drops the register's lines between the halves.
             let line = start.line;
             let col = start.col;
             let at = self.buffer().line_to_char(line) + col;
@@ -480,10 +454,8 @@ impl Engine {
                     // on its own (empty) line.
                     self.insert_with_undo(start_char, "\n");
                 }
-                // Deliberately not finished here: the group stays open so the
-                // Insert-mode typing that follows merges into it, and `u`
-                // undoes the delete and the typed replacement as one step,
-                // same as Normal-mode `cc`/`S` (#887, "vis:vjc then u").
+                // Leave the undo group open so Insert-mode typing merges into it,
+                // allowing `u` to undo the delete and typed replacement as one step.
                 *changed = true;
                 self.view_mut().cursor.line = start.line;
                 self.view_mut().cursor.col = 0;
@@ -508,19 +480,15 @@ impl Engine {
             } else {
                 None
             };
-            // `false`: keep the undo group open so the Insert-mode typing
-            // that follows merges into it (#887, "vis:vjc then u").
+            // `false`: keep the undo group open so Insert-mode typing merges into it.
             self.delete_visual_selection_impl(changed, false);
             if let Some((start_line, end_line, left_col)) = block_info {
                 self.visual_block_insert_info =
                     // `None` park column: a blockwise `c` leaves the cursor
-                    // after the typed text, unlike `I`/`A` (#807).
+                    // after the typed text, unlike `I`/`A`.
                     Some((start_line, end_line, left_col, false, false, None));
-                // `delete_visual_selection` clamps the cursor to the last
-                // *character* of the shortened line, but a blockwise change
-                // must resume typing at the block's own column — which is
-                // legally one past the end in Insert mode (#807, `vb:jlcX`
-                // pasted the typed text at column 0 without this).
+                // Blockwise change must resume typing at the block's own column, which may
+                // be one past the end of the shortened line.
                 self.view_mut().cursor.line = start_line;
                 self.view_mut().cursor.col = left_col.min(self.line_text_len(start_line));
             }
@@ -627,7 +595,7 @@ impl Engine {
     /// `>` inserts `shifts * 'shiftwidth'` spaces at the block's left column;
     /// `<` removes up to that many white-space characters *starting at* that
     /// column, which is why `<C-v>j<` with the block on the `a` of `    ab`
-    /// changes nothing (#807).
+    /// changes nothing.
     pub(crate) fn block_shift(&mut self, right: bool, shifts: usize, changed: &mut bool) {
         let Some((start, end)) = self.get_visual_selection_range() else {
             return;
@@ -678,7 +646,7 @@ impl Engine {
     /// changed; with `g_cmd` the amount grows by `count` for each line that
     /// actually changed (lines with no number do not advance the counter).  The
     /// cursor lands on the start of the *first* changed number, not on the last
-    /// line touched (#807).
+    /// line touched.
     pub(crate) fn visual_addsub(&mut self, sign: i64, g_cmd: bool, changed: &mut bool) {
         let base = self.take_count().max(1) as i64;
         let Some((start, end)) = self.get_visual_selection_range() else {
@@ -1019,7 +987,7 @@ impl Engine {
     }
 
     /// Insert a tabstop-aware indent at every cursor position (primary +
-    /// extra) simultaneously (#804 review). Unlike `mc_insert`, the text
+    /// extra) simultaneously. Unlike `mc_insert`, the text
     /// inserted can differ *per cursor* — each one advances to its own next
     /// tabstop/shiftwidth stop per `:h smarttab`, mirroring the single-
     /// cursor `"Tab"` arm in `handle_insert_key` instead of always inserting
@@ -1040,7 +1008,7 @@ impl Engine {
     /// count-prefixed inserts. Pushing each cursor's own (possibly
     /// differently sized) indent would make `.` insert the concatenation of
     /// all N cursors' indents. The caller pushes the returned *primary*
-    /// cursor's text exactly once instead (#804 review).
+    /// cursor's text exactly once instead.
     pub(crate) fn mc_insert_tab(&mut self) -> String {
         let extra = self.view().extra_cursors.clone();
         let primary = *self.cursor();
@@ -1068,9 +1036,7 @@ impl Engine {
             let cur = self.char_idx_to_cursor(idx);
             let text = if expand {
                 let line_start = self.buffer().line_to_char(cur.line);
-                // `:h smarttab` (#1001): only used to pick 'shiftwidth' vs
-                // 'tabstop' when 'smarttab' is on — see the single-cursor
-                // `Tab` handler in `keys.rs` for the full rule.
+                // `:h smarttab`: pick 'shiftwidth' vs 'tabstop' based on 'smarttab' setting.
                 let front_of_line = self.settings.smarttab
                     && (0..cur.col)
                         .all(|i| matches!(self.buffer().content.char(line_start + i), ' ' | '\t'));

@@ -6,7 +6,7 @@ use vimcode_core::Mode;
 // Ctrl-G: show file info
 // =============================================================================
 
-// #1282: Neovim's default `'ruler'` is on (`Settings::ruler`'s own doc
+// Neovim's default `'ruler'` is on (`Settings::ruler`'s own doc
 // comment), and with it on CTRL-G omits the cursor position — `:h CTRL-G`,
 // "the cursor position (unless the 'ruler' option is set)". Two cases, one
 // per setting, mirroring `src/core/engine/tests.rs`'s
@@ -289,10 +289,7 @@ fn test_g_apostrophe_mark_without_jumplist() {
 fn test_bracket_z_fold_start() {
     let mut e = engine_with("fn main() {\n    inner\n    code\n}\n");
     // Create a fold from line 0 to line 2 through the real API — `[z`/`]z`
-    // read the *defined* fold hierarchy (`fold_defs`, #1006), not just the
-    // closed-fold list, so a raw push onto `.folds` (bypassing
-    // `close_fold`) would leave that hierarchy empty and make this test
-    // vacuously fail to exercise anything.
+    // exercises the fold hierarchy, not just the closed-fold list.
     e.view_mut().close_fold(0, 2);
     // Reopen it — `[z`/`]z` land inside the *current open* fold (`:h [z`),
     // and a closed fold's body isn't reachable by the cursor at all.

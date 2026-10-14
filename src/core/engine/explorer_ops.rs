@@ -68,16 +68,25 @@ impl Engine {
     }
 
     pub fn explorer_reveal_active_file(&mut self) {
-        if let Some(path) = self.file_path().cloned() {
+        // Prefer the canonicalized path (cached at open time by
+        // `BufferState::with_file`) over the raw `file_path`: a file opened
+        // via a relative CLI argument or a symlinked path keeps that raw
+        // spelling in `file_path` forever, which `explorer_reveal_path`
+        // would otherwise have to re-resolve from scratch every call.
+        let state = self.active_buffer_state();
+        let path = state
+            .canonical_path
+            .clone()
+            .or_else(|| state.file_path.clone());
+        if let Some(path) = path {
             self.explorer_reveal_path(&path);
         }
     }
 
-    /// Collapse every expanded directory except the workspace root (#1693,
-    /// the Explorer header toolbar's "Collapse All" button/overflow-menu
-    /// item). Mirrors VS Code's own Collapse All: the root row stays
-    /// expanded — its immediate children remain visible — only *nested*
-    /// expansions reset, so the whole tree doesn't vanish under one row.
+    /// Collapse every expanded directory except the workspace root.
+    /// The root row stays expanded — its immediate children remain visible —
+    /// only *nested* expansions reset, so the whole tree doesn't vanish under
+    /// one row.
     pub fn explorer_collapse_all(&mut self) {
         let root = self.cwd.clone();
         self.explorer_expanded.clear();
@@ -86,43 +95,45 @@ impl Engine {
     }
 
     /// Expand every ancestor of `target`, rebuild the flattened row list,
-    /// select `target`'s row and scroll it into view.
+    /// select `target`'s row and scroll it into view. Every call site is an
+    /// automatic "the active file/workspace changed" trigger (no distinct
+    /// explicit "reveal" user command exists), so a no-op here when
+    /// `explorer_auto_reveal` is off — VS Code's `explorer.autoReveal` —
+    /// is sufficient to suppress all of them, with nothing to special-case.
     ///
-    /// # Why this still calls `TreeController::scroll_to_visible` (#659)
-    ///
-    /// #659 asked for the select-and-scroll half of this to be re-expressed on
-    /// top of the composition quadraui#595 promoted *from this function*. That
-    /// adoption is blocked, and the block is an altitude mismatch rather than
-    /// a missing bump: quadraui#595 landed `reveal` on
-    /// [`quadraui::SidebarSystem`] only —
-    /// `SidebarSystem::reveal(section, path, rect)` — and there is no
-    /// `TreeController::reveal`. `SidebarSystem::reveal` needs a
-    /// `SidebarSystem` with `set_backend_info` already called and a viewport
-    /// `Rect` to measure row capacity from; the explorer drives a bare
-    /// `TreeController` (`self.explorer_tree`) with a pre-computed
-    /// `self.explorer_viewport_rows`, and is not a `SidebarSystem` section at
-    /// all — unlike `ext_sidebar_system` / `sc_sidebar_system` /
-    /// `dap_sidebar_system`, which are.
-    ///
-    /// So the two ways to close this are: (a) quadraui factors the generic
-    /// half of `SidebarSystem::reveal` down onto `TreeController` — something
-    /// like `TreeController::reveal(&mut self, path: &TreePath, viewport_rows:
-    /// usize)`, with `SidebarSystem::reveal` then being "expand the section,
-    /// measure the viewport, delegate" — after which the three lines below
-    /// collapse into one call; or (b) vimcode migrates the explorer onto
-    /// `SidebarSystem`, which is a behaviour-bearing refactor #659 explicitly
-    /// puts out of scope. (a) is the one that matches the promotion's intent,
-    /// because the duplication quadraui#595 exists to remove is precisely
-    /// *this* select-then-scroll pair, not the section bookkeeping around it.
-    ///
-    /// Until then this stays as-is on purpose: it is the reference
-    /// composition, and rewriting it to *look* shared while still owning the
-    /// math would be worse than leaving it honestly local. Per CLAUDE.md the
-    /// next step is a quadraui issue for `TreeController::reveal`, not a
-    /// vimcode-side approximation.
+    /// `target` is not assumed to already be absolute or canonical: the
+    /// single most common real-world call path (`cd myrepo && vimcode
+    /// src/main.rs`) hands this a path relative to `self.cwd`, and other
+    /// callers may hand in a differently-spelled-but-equivalent absolute
+    /// path (a symlinked launch path, `/tmp` vs `/private/tmp` on macOS). A
+    /// literal `PathBuf` comparison against `self.cwd`/`explorer_rows`
+    /// (which are always absolute, built by walking `self.cwd`) would
+    /// silently fail to expand or select anything in either case, so this
+    /// resolves `target` to an absolute path relative to `self.cwd` first,
+    /// then additionally tries the canonicalized (symlink-resolved) form —
+    /// falling back to the plain absolute join whenever canonicalization
+    /// fails, e.g. the path doesn't exist on disk yet or this is a
+    /// synthetic path in a test — so the common case never touches the
+    /// filesystem and still works.
     pub fn explorer_reveal_path(&mut self, target: &Path) {
+        if !self.settings.explorer_auto_reveal {
+            return;
+        }
         let root = self.cwd.clone();
-        if let Ok(rel) = target.strip_prefix(&root) {
+        let absolute_target = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            root.join(target)
+        };
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        let canonical_target = absolute_target
+            .canonicalize()
+            .unwrap_or_else(|_| absolute_target.clone());
+        let rel = canonical_target
+            .strip_prefix(&canonical_root)
+            .ok()
+            .or_else(|| absolute_target.strip_prefix(&root).ok());
+        if let Some(rel) = rel {
             self.explorer_expanded.insert(root.clone());
             let mut accum = root.clone();
             for component in rel.parent().into_iter().flat_map(|p| p.components()) {
@@ -131,7 +142,18 @@ impl Engine {
             }
         }
         self.explorer_rebuild_rows();
-        if let Some(idx) = self.explorer_rows.iter().position(|r| r.path == target) {
+        let idx = rel
+            .and_then(|rel| {
+                self.explorer_rows
+                    .iter()
+                    .position(|r| r.path == root.join(rel))
+            })
+            .or_else(|| {
+                self.explorer_rows
+                    .iter()
+                    .position(|r| r.path == absolute_target)
+            });
+        if let Some(idx) = idx {
             let mut tree = self.explorer_tree.borrow_mut();
             tree.set_selected_path(Some(vec![idx as u16]));
             tree.scroll_to_visible(idx, self.explorer_viewport_rows.get());
@@ -196,7 +218,7 @@ impl Engine {
                 }
                 true
             }
-            // #1027 (fix for #984): a chevron-zone click resolves to
+            // A chevron-zone click resolves to
             // `RowToggleExpand`, a distinct variant from the `RowActivated`
             // a label-zone double-click (or Enter) produces. Before this
             // arm existed, `RowToggleExpand` fell through the catch-all
@@ -226,16 +248,10 @@ impl Engine {
             }
             quadraui::TreeControllerEvent::RowSelected { .. } => true,
             quadraui::TreeControllerEvent::Ignored => false,
-            // #1027 audit (per issue): the rest of `TreeControllerEvent`'s
-            // variants enumerated explicitly rather than behind a `_ => true`
-            // catch-all -- that catch-all is exactly what hid the missing
-            // `RowToggleExpand` arm above for two issues (#984 reported it,
-            // #1027 fixes it). Each of these is a legitimate no-op-beyond-
-            // redraw today (scrollbar interaction, drag/hover, a same-frame
-            // edit-buffer keystroke, and a context menu that
-            // `render::route_explorer_tree_event` already fully resolves
-            // before this function ever sees it) -- but naming them means a
-            // *new* quadraui variant is a compile error here, not another
+            // Each `TreeControllerEvent` variant is enumerated explicitly rather than
+            // caught by a `_ => true` catch-all. These are all legitimate no-ops today
+            // (scrollbar interaction, drag/hover, keystroke, context menu), but naming
+            // them means a new quadraui variant becomes a compile error here, not a
             // silent swallow.
             quadraui::TreeControllerEvent::ScrollChanged
             | quadraui::TreeControllerEvent::Consumed
@@ -576,7 +592,7 @@ impl Engine {
     }
 
     /// Activate a view-actions toolbar button by index: 0=New File,
-    /// 1=New Folder, 2=Refresh, 3=Collapse All (#1693). Index 4 (the "..."
+    /// 1=New Folder, 2=Refresh, 3=Collapse All. Index 4 (the "..."
     /// overflow button) is deliberately not handled here — unlike the
     /// other four, it needs the click's pixel position to anchor the popup
     /// (see `Engine::open_explorer_overflow_menu`), so the caller
@@ -598,10 +614,8 @@ impl Engine {
 }
 
 /// Stable `quadraui::WidgetId` strings for the Explorer header's
-/// view-actions toolbar row (#1693) — mirrors `source_control.rs`'s
-/// `SC_BUTTON_IDS` convention. Index 4 is the "..." overflow menu button;
-/// the acceptance bar for #1693 is that this id is reachable from the
-/// painted header, not that the menu it opens is exhaustive.
+/// view-actions toolbar row — mirrors `source_control.rs`'s
+/// `SC_BUTTON_IDS` convention. Index 4 is the "..." overflow menu button.
 pub const EXPLORER_TOOLBAR_ACTION_IDS: [&str; 5] = [
     "explorer:new_file",
     "explorer:new_folder",
@@ -670,7 +684,7 @@ pub fn build_explorer_rows(
 /// Shared by every file-listing surface, not just the explorer tree: the
 /// quick-open file picker ([`Engine::picker_populate_files`]), the ext-panel
 /// `@file` completion walk and the netrw directory listing all filter through
-/// this, so flipping `show_hidden_files` on by default (#1545) can't leak
+/// this, so flipping `show_hidden_files` on by default can't leak
 /// `.git/` internals into any of them.
 ///
 /// [`Engine::picker_populate_files`]: super::Engine
@@ -737,7 +751,7 @@ fn explorer_glob_matches(pattern: &str, name: &str) -> bool {
 /// name (respecting `case_insensitive`). Takes the directory-ness and name
 /// already resolved rather than a filesystem handle, so it never touches the
 /// filesystem and is a total order by construction -- see `collect_explorer_rows`
-/// for why that matters (#631).
+/// for why that matters.
 fn explorer_entry_cmp(
     a_is_dir: bool,
     a_name: &std::ffi::OsStr,
@@ -780,7 +794,7 @@ fn collect_explorer_rows(
     // If the directory mutates concurrently -- or an entry disappears, which
     // `is_dir()` silently reports as `false` -- the same entry can answer `true`
     // early in the sort and `false` later, breaking the total order `sort_by`
-    // requires and panicking (#631). Precomputing the key makes the comparator pure
+    // requires and panicking. Precomputing the key makes the comparator pure
     // and total by construction, and this also reuses the same value for the row's
     // `is_dir` below instead of stat-ing again.
     let mut entries: Vec<(bool, std::fs::DirEntry)> = entries
@@ -830,17 +844,11 @@ mod explorer_sort_tests {
     use std::cmp::Ordering;
     use std::ffi::OsStr;
 
-    // Regression coverage for #631: `explorer_entry_cmp` is the pure key
-    // comparator extracted from `collect_explorer_rows`'s sort. Because it takes
-    // an already-resolved `is_dir` bool instead of re-stat-ing the filesystem,
-    // it is total and transitive by construction -- unlike the old comparator,
-    // which could observe a directory mutate mid-sort and answer inconsistently,
-    // violating the total order `sort_by` requires and panicking.
-    //
-    // "Factoring the comparator out to take a precomputed `is_dir` and unit-
-    // testing its totality directly" is exactly the cheaper regression strategy
-    // the issue calls out as preferable to racing a second thread against the
-    // real sort.
+    // `explorer_entry_cmp` is the pure key comparator extracted from
+    // `collect_explorer_rows`'s sort. Because it takes an already-resolved
+    // `is_dir` bool instead of re-stat-ing the filesystem, it is total and
+    // transitive by construction. Testing the comparator directly against
+    // precomputed entries verifies this totality.
 
     #[derive(Clone, Copy)]
     struct Entry<'a> {
@@ -1068,14 +1076,10 @@ mod explorer_exclude_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #1693 acceptance item 1: "the tree's first row is the workspace
-    /// name" — asserted directly against [`build_explorer_rows`] (every
-    /// backend's `explorer_rows` field comes from exactly this function,
-    /// via `Engine::explorer_rebuild_rows`), rather than relying on it
-    /// holding only incidentally through some other test. Backend-neutral
-    /// by construction, so it covers Win-GUI equally even though there is
-    /// no Win-GUI driver harness to paint through yet (`src/win/mod.rs`'s
-    /// own doc covers why).
+    /// Asserts directly that the tree's first row is the workspace root name.
+    /// Tests [`build_explorer_rows`], which every backend's `explorer_rows`
+    /// field comes from via `Engine::explorer_rebuild_rows`. Backend-neutral
+    /// by construction.
     #[test]
     fn build_explorer_rows_first_row_is_the_workspace_root_name() {
         let dir = std::env::temp_dir().join(format!(
@@ -1131,10 +1135,8 @@ mod explorer_exclude_tests {
     }
 
     /// `walk_entry_is_excluded`'s `depth() == 0` root exemption: a project
-    /// directory literally named `.git` must not exclude itself (which
-    /// would make every walk starting there list empty) — only a *nested*
-    /// `.git` entry is pruned. Covers the edge case the reviewer flagged as
-    /// documented but untested.
+    /// directory literally named `.git` must not exclude itself — only a
+    /// *nested* `.git` entry is pruned.
     #[test]
     fn walk_entry_is_excluded_exempts_only_the_walk_root() {
         use super::walk_entry_is_excluded;

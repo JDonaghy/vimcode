@@ -24,7 +24,7 @@ pub enum StatusKind {
     Untracked,
     /// Merge conflict — git reports the path as *unmerged*. Never appears
     /// in [`FileStatus::staged`] / [`FileStatus::unstaged`]: a conflicted
-    /// path is carried by [`FileStatus::unmerged`] instead (see #991), and
+    /// path is carried by [`FileStatus::unmerged`] instead, and
     /// this variant exists so the Merge Changes rows have a label char
     /// from the same single source of truth as every other row.
     Unmerged,
@@ -43,7 +43,7 @@ impl StatusKind {
             // porcelain notation uses `?` here (see `parse_status_char`
             // below, which stays `?` — it parses `git status --porcelain`
             // output, a wire format this display label must not leak into
-            // and must not be confused with) (#1051).
+            // and must not be confused with).
             StatusKind::Untracked => 'U',
             // VS Code's conflict marker.
             StatusKind::Unmerged => '!',
@@ -65,7 +65,7 @@ impl StatusKind {
 }
 
 /// Which of git's seven *unmerged* `XY` porcelain codes a conflicted path
-/// is in (#991). These cannot be classified one character at a time — `AA`
+/// is in. These cannot be classified one character at a time — `AA`
 /// and `DD` are conflicts while a lone `A`/`D` on either side is an
 /// ordinary add/delete — so the pair is always classified as a pair by
 /// [`UnmergedKind::from_xy`], the single shared entry point used by both
@@ -131,7 +131,7 @@ impl UnmergedKind {
     }
 }
 
-/// The classification of one porcelain `XY` pair (#991).
+/// The classification of one porcelain `XY` pair.
 ///
 /// Exactly one shape is ever produced: either `unmerged` is `Some` and
 /// both `staged`/`unstaged` are `None` (a merge conflict, which belongs to
@@ -153,7 +153,7 @@ impl XyStatus {
     }
 }
 
-/// **The** classifier for a `git status --porcelain` `XY` pair (#991).
+/// **The** classifier for a `git status --porcelain` `XY` pair.
 ///
 /// Both the SC panel ([`status_detailed`]) and the `:Git status` buffer
 /// ([`status_text`]) route through this one function; the bug this replaced
@@ -193,7 +193,7 @@ pub struct FileStatus {
     /// conflict). Conflicted paths always carry `staged == unstaged ==
     /// None` so that every `staged.is_some()` / `unstaged.is_some()`
     /// filter in the SC panel excludes them by construction — they belong
-    /// to the Merge Changes section only (#991).
+    /// to the Merge Changes section only.
     pub unmerged: Option<UnmergedKind>,
 }
 
@@ -236,7 +236,7 @@ pub struct DiffHunkInfo {
 }
 
 /// Win32 `CREATE_NO_WINDOW` process creation flag value, used below to keep
-/// a spawned child from flashing a console window on Win-GUI (#1492). Kept
+/// a spawned child from flashing a console window on Win-GUI. Kept
 /// as a plain constant — not gated on `cfg(windows)` — so the numeric
 /// value itself is unit-testable without a Windows host, mirroring
 /// `windows_askpass_script`'s cfg-independence further down this file.
@@ -361,7 +361,7 @@ pub fn status_text(dir: &Path) -> Option<String> {
         ));
     }
 
-    // #991: classify through the *shared* `classify_xy` rather than a
+    // Classify through the *shared* `classify_xy` rather than a
     // second hand-rolled table. The old per-character filters here put
     // `AA`/`DD`/`AU`/`DU` under "Changes to be committed" and dropped `UU`
     // from every section — the same bug the SC panel had, twice over.
@@ -606,34 +606,23 @@ pub fn commit(dir: &Path, message: &str) -> Result<String, String> {
 /// prints an empty line (handles keys with empty passphrases or keys
 /// already loaded in ssh-agent).
 ///
-/// # Windows leg (#1105)
+/// # Windows leg
 ///
 /// On Windows this writes a `.bat` helper instead of a `#!/bin/sh` script.
-/// Investigation for #1105 found:
-///   - Git for Windows' own `git.exe` (native MinGW build) has its own
-///     shebang-parsing spawn layer (`compat/mingw.c`'s `parse_interpreter` /
-///     `try_shell_exec`) — but that layer only kicks in for programs *git
-///     itself* spawns (editor, pager, `GIT_ASKPASS`/`core.askpass`).
-///   - `SSH_ASKPASS` is instead invoked by whichever `ssh` binary git's
-///     transport resolves — normally Git for Windows' own bundled
-///     MSYS2-built `ssh.exe`, whose POSIX layer (derived from Cygwin, whose
-///     user guide documents `#!`-prefixed files as recognized-executable)
-///     likely *would* run a shebang script correctly. But if `ssh` instead
-///     resolves to Windows' native OpenSSH client (`System32\OpenSSH\ssh.exe`,
-///     a plain Win32 build with no shebang support), a `#!/bin/sh` file has
-///     no interpreter to run it and the askpass helper silently fails,
-///     leaving the fetch/push blocked on a prompt nobody can see — exactly
-///     the bug this issue reports. A `.bat` file sidesteps the ambiguity
-///     entirely: Windows dispatches `.bat` through `cmd.exe` regardless of
-///     which `ssh.exe` (MSYS or native Win32) ends up invoking it, and both
-///     the MSVC CRT spawn/exec family and Cygwin/MSYS's own exec layer are
-///     documented to recognize and dispatch `.bat`/`.cmd` targets that way.
-///   - This could not be exercised on an actual Windows host in this
-///     session (no Windows machine available); the `.bat` leg is the
-///     verifiable-by-construction choice rather than a bet on which `ssh`
-///     a given install resolves.
+/// Git for Windows' own `git.exe` (native MinGW build) has its own
+/// shebang-parsing spawn layer — but that layer only kicks in for programs
+/// *git itself* spawns (editor, pager, `GIT_ASKPASS`/`core.askpass`).
+/// `SSH_ASKPASS` is instead invoked by whichever `ssh` binary git's
+/// transport resolves — normally Git for Windows' own bundled
+/// MSYS2-built `ssh.exe`, whose POSIX layer likely *would* run a shebang
+/// script correctly. But if `ssh` instead resolves to Windows' native
+/// OpenSSH client (`System32\OpenSSH\ssh.exe`, a plain Win32 build with no
+/// shebang support), a `#!/bin/sh` file has no interpreter to run it and
+/// the askpass helper silently fails. A `.bat` file sidesteps the ambiguity
+/// entirely: Windows dispatches `.bat` through `cmd.exe` regardless of
+/// which `ssh.exe` (MSYS or native Win32) ends up invoking it.
 ///
-/// ## Passphrase delivery differs per leg (review fix, #1105)
+/// ## Passphrase delivery differs per leg
 ///
 /// The POSIX leg passes the passphrase through the `VIMCODE_ASKPASS_PHRASE`
 /// env var and echoes it with `echo "$VIMCODE_ASKPASS_PHRASE"` — safe,
@@ -641,20 +630,15 @@ pub fn commit(dir: &Path, message: &str) -> Result<String, String> {
 /// with no re-parsing.
 ///
 /// The `.bat` leg does **not** use `%VAR%` expansion for the passphrase,
-/// because cmd.exe expands `%VAR%` while it is still scanning the line for
+/// because cmd.exe expands `%VAR%` while scanning the line for
 /// `&`/`|`/`<`/`>`/`^`, so a passphrase containing any of those characters
 /// would be spliced into the batch file as a second command instead of
 /// printed literally — and an empty passphrase collapses `echo ` (no
-/// argument) into cmd printing its own echo-toggle state (`ECHO is off.`)
-/// instead of a blank line. Both are real, deterministic bugs, not edge
-/// cases: the first fires on every passphrase containing a cmd.exe
-/// metacharacter, the second on every no-passphrase / agent-loaded-key
-/// push. Instead, the Windows leg writes the passphrase to a sibling
+/// argument) into cmd printing its own echo-toggle state instead of a blank
+/// line. Instead, the Windows leg writes the passphrase to a sibling
 /// "phrase file" and has the `.bat` stream it with `type "<path>"`. `type`
 /// copies the file's bytes to stdout with no command-line re-parsing, so it
-/// has neither failure mode — the empty-passphrase file just produces an
-/// empty (newline-only) line, and any byte sequence in the passphrase file
-/// is passed through unparsed.
+/// handles both empty passphrases and any byte sequence in the passphrase.
 fn run_git_remote(
     dir: &Path,
     args: &[&str],
@@ -735,7 +719,7 @@ fn run_git_remote(
     }
 }
 
-/// Build the contents of the Windows askpass "phrase file" (#1105): the
+/// Build the contents of the Windows askpass "phrase file": the
 /// passphrase plus a trailing newline, matching the POSIX leg's
 /// `echo "$VIMCODE_ASKPASS_PHRASE"` output (which always terminates with a
 /// newline, including when the phrase is empty). Kept as a standalone,
@@ -807,7 +791,7 @@ pub fn unstage_all(dir: &Path) -> Result<(), String> {
     run_git_result(dir, &["restore", "--staged", "."])
 }
 
-// #991: the path-spec-wide `discard_all` (`git restore .`) was removed —
+// The path-spec-wide `discard_all` (`git restore .`) was removed —
 // it blew away the half-merged content of conflicted files along with the
 // ordinary changes. `sc_discard_all_unstaged` now passes an explicit,
 // conflict-free path list to [`discard_paths`].
@@ -1157,7 +1141,7 @@ fn parse_unified_diff(diff: &str, total_lines: usize) -> Vec<Option<GitLineStatu
 mod tests {
     use super::*;
 
-    // ── Win-GUI console-hiding (#1492) ──────────────────────────────────────
+    // ── Win-GUI console-hiding ──────────────────────────────────────────────
 
     /// Pin the raw `CREATE_NO_WINDOW` value to the documented Win32
     /// constant (`0x08000000`) so a future edit can't silently change the
@@ -1174,7 +1158,7 @@ mod tests {
     }
 
     /// `hidden_command` and `hidden_command_new_process_group` must apply
-    /// the *same* `CREATE_NO_WINDOW` bit — `shell_cmd` (#1492) is built on
+    /// the *same* `CREATE_NO_WINDOW` bit — `shell_cmd` is built on
     /// `hidden_command`, and every long-running child spawn (LSP/DAP) goes
     /// through the process-group variant; both must hide their console.
     #[test]
@@ -1193,7 +1177,7 @@ mod tests {
         let _ = hidden_command_new_process_group("cmd").creation_flags(CREATE_NO_WINDOW);
     }
 
-    // ── Windows askpass leg (#1105) ─────────────────────────────────────────
+    // ── Windows askpass leg ─────────────────────────────────────────────────
     // These exercise the pure string-building helpers directly so the two
     // review-flagged bugs (empty-passphrase mis-render, metacharacter
     // injection via %VAR% expansion) stay caught without needing a Windows
@@ -1683,7 +1667,7 @@ mod tests {
         );
     }
 
-    /// Review non-blocking finding (#525): `base`/`head` come straight from
+    /// Review non-blocking finding: `base`/`head` come straight from
     /// an external provider's JSON with no shell involved, but a value
     /// starting with `-` could still be parsed by git as a flag rather than
     /// a revision when joined into `base...head`. Guard rejects it before
@@ -1762,7 +1746,7 @@ pub fn status_detailed(dir: &Path) -> Vec<FileStatus> {
 
 /// Parse `git status --porcelain` output into [`FileStatus`] entries.
 ///
-/// Split out of [`status_detailed`] (#991) so a test can drive the whole
+/// Split out of [`status_detailed`] so a test can drive the whole
 /// parse→panel pipeline from a literal porcelain string — in particular
 /// one case per unmerged `XY` code — without needing seven separate real
 /// merge conflicts on disk.
@@ -1822,11 +1806,8 @@ pub fn stage_path(dir: &Path, path: &str) -> Result<(), String> {
 
 /// Stage an explicit list of paths (`git add -- <paths…>`).
 ///
-/// #991: the SC panel's "stage all" used to run `git add .`, which sweeps
-/// *conflicted* files in too — and `git add` on a conflicted file is how
-/// you mark it resolved, so a bulk stage silently resolved every conflict
-/// with the markers still in the files. Callers now pass the exact set of
-/// non-conflicted paths instead. Empty `paths` is a no-op.
+/// Callers pass the exact set of non-conflicted paths. Empty `paths` is a
+/// no-op.
 pub fn stage_paths(dir: &Path, paths: &[String]) -> Result<(), String> {
     if paths.is_empty() {
         return Ok(());
@@ -1838,7 +1819,7 @@ pub fn stage_paths(dir: &Path, paths: &[String]) -> Result<(), String> {
 
 /// Discard working-tree changes for an explicit list of paths
 /// (`git restore -- <paths…>`). Empty `paths` is a no-op. See
-/// [`stage_paths`] for why the bulk variants take explicit paths (#991).
+/// [`stage_paths`] for why the bulk variants take explicit paths.
 pub fn discard_paths(dir: &Path, paths: &[String]) -> Result<(), String> {
     if paths.is_empty() {
         return Ok(());
@@ -2110,7 +2091,7 @@ pub fn blame_line(
 
 /// Convert a Unix timestamp into a human-readable relative string
 /// (e.g. "just now", "3 hours ago", "2 days ago", "1 week ago", "Mar 2026").
-/// `pub(crate)` so `engine::picker`'s `:AiSessions` picker (#1459) can reuse
+/// `pub(crate)` so `engine::picker`'s `:AiSessions` picker can reuse
 /// it for each entry's "last used" detail instead of re-deriving the same
 /// bucketing.
 pub(crate) fn epoch_to_relative(ts: i64) -> String {
@@ -2500,25 +2481,17 @@ pub fn diff_against_ref(dir: &Path, ref_spec: &str) -> Option<String> {
 /// the right semantics for reviewing a feature branch against the branch
 /// it was cut from, since it ignores commits `base` has picked up in the
 /// meantime that `head` never saw. Both `base`/`head` must already be
-/// resolvable in the local repository (already pulled/checked out) — this
-/// is worktree-local, no fetch (#525's stated scope; the remote/ssh case
-/// is #530).
+/// resolvable in the local repository (already pulled/checked out).
 ///
 /// Returns `None` on any git failure — no repo, an unknown ref, or a
-/// `base`/`head` that looks like a flag (see below) — and `Some(vec![])`
-/// for a real, successful diff that just happens to contain no changes.
-/// Callers that only cared about "were there any changes" used to conflate
-/// the two (both were an empty `Vec`); keeping them apart lets
-/// `Engine::open_branch_review` report "no changes between X and Y"
-/// only when that's actually true, rather than also for a misconfigured
-/// provider's bogus branch name (review non-blocking finding, #525).
+/// `base`/`head` that looks like a flag — and `Some(vec![])` for a real,
+/// successful diff that just happens to contain no changes.
 ///
 /// `base`/`head` typically arrive from an external board provider's JSON
-/// (`BranchReviewTarget`, #522's seam) and are joined into a single
-/// `base...head` positional argument below with no shell involved — so
-/// this isn't classic injection, but a value starting with `-` could still
-/// be parsed by git as a flag rather than a revision ("flag-smuggling").
-/// Reject that case up front rather than let it reach git's argv.
+/// and are joined into a single `base...head` positional argument below with
+/// no shell involved — so a value starting with `-` could be parsed by git
+/// as a flag rather than a revision. This function rejects that case up
+/// front.
 pub fn changed_files_between(dir: &Path, base: &str, head: &str) -> Option<Vec<String>> {
     if base.starts_with('-') || head.starts_with('-') {
         return None;
@@ -2764,14 +2737,14 @@ mod sc_tests {
         assert_eq!(StatusKind::Deleted.label(), 'D');
         assert_eq!(StatusKind::Renamed.label(), 'R');
         assert_eq!(StatusKind::Copied.label(), 'C');
-        // #1051: VS Code's explorer/SC badge, not git's own '?' porcelain
+        // VS Code's explorer/SC badge, not git's own '?' porcelain
         // notation (`parse_status_char` above still parses that '?').
         assert_eq!(StatusKind::Untracked.label(), 'U');
-        // #991: VS Code's conflict marker.
+        // VS Code's conflict marker.
         assert_eq!(StatusKind::Unmerged.label(), '!');
     }
 
-    /// #991: unit coverage on the shared classifier for **all seven**
+    /// Unit coverage on the shared classifier for **all seven**
     /// unmerged XY codes. Each must come back as a conflict with *both*
     /// ordinary sides `None`, so every `staged.is_some()` /
     /// `unstaged.is_some()` filter in the SC panel excludes it.
@@ -2802,9 +2775,8 @@ mod sc_tests {
         }
     }
 
-    /// #991 regression guard: a lone `A`/`D` on one side is an ordinary
-    /// change, not a conflict — `AA`/`DD` are conflicts only *as pairs*,
-    /// which is why the classifier takes the pair.
+    /// A lone `A`/`D` on one side is an ordinary change, not a conflict —
+    /// `AA`/`DD` are conflicts only *as pairs*.
     #[test]
     fn classify_xy_keeps_ordinary_pairs_out_of_the_conflict_bucket() {
         let ordinary = ["A ", "M ", " M", "D ", " D", "R ", "MM", "AM", "??", "C "];

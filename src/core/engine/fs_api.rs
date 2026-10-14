@@ -1,30 +1,17 @@
 use super::*;
 
-// ─── `vimcode.fs.walk` / `vimcode.fs.grep` (#1806) ─────────────────────────
+// `vimcode.fs.walk` and `vimcode.fs.grep` expose in-process filesystem
+// walking to Lua, built on `project_search::walk_project_streaming` and
+// `grep_project_streaming`, so there is exactly one implementation of
+// "walk the project respecting gitignore/exclude rules".
 //
-// The native Files/Grep pickers (`src/core/engine/picker.rs`) and
-// `:grep`/project-search (`src/core/engine/search.rs`) all walk the
-// filesystem in-process with the `ignore` crate — no `rg`/`fd` needed. A
-// Lua extension could previously only reach the filesystem through
-// `vimcode.loop.spawn`, so a finder extension (the #1212 epic's
-// telescope-style replacement for the built-in pickers) would have
-// depended on `rg`/`fd` being installed — a regression on a fresh install
-// and on Windows. `vimcode.fs.walk`/`vimcode.fs.grep` expose the same
-// in-process walker to Lua instead, built on `project_search::
-// walk_project_streaming`/`grep_project_streaming` so there is exactly one
-// implementation of "walk the project respecting gitignore/exclude rules",
-// not two.
-//
-// Shape mirrors `vimcode.loop.spawn`/`vimcode.http.request` exactly: a
-// background thread does the (possibly slow) work and streams results
-// through an `mpsc` channel, polled from `poll_idle` via
-// `Engine::poll_plugin_fs` and delivered through the same `PluginCallContext`/
-// `EngineLoan` machinery every other stored callback uses. The difference
-// from `vimcode.http.request` is cardinality: an HTTP request delivers
-// exactly one result, a walk/grep delivers zero or more batches followed by
-// exactly one `on_done` (or, if cancelled, nothing further at all — a
-// finder re-queries on every keystroke, so cancelling the previous query
-// must stop delivery promptly, not just stop new work from starting).
+// A background thread does the work and streams results through an `mpsc`
+// channel, polled from `poll_idle` via `Engine::poll_plugin_fs` and
+// delivered through `PluginCallContext`/`EngineLoan`. Unlike
+// `vimcode.http.request` (which delivers exactly one result), a walk/grep
+// delivers zero or more batches followed by exactly one `on_done` (or, if
+// cancelled, nothing further — a finder re-queries on every keystroke, so
+// cancelling the previous query must stop delivery promptly).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -42,7 +29,7 @@ use project_search::{FsGrepMatch, FsGrepOptions, FsWalkOptions};
 /// batch) means `try_recv` keeps succeeding and this tick never returns
 /// until the whole walk finishes, stalling the UI thread for the walk's
 /// full duration. The cap bounds that worst case while still draining
-/// everything queued *so far* on every ordinary tick (#1806 review).
+/// everything queued *so far* on every ordinary tick.
 const FS_POLL_MAX_EVENTS_PER_TICK: usize = 32;
 
 /// One streamed event from a `vimcode.fs.walk`/`vimcode.fs.grep` background
@@ -55,7 +42,7 @@ pub(crate) enum FsEvent {
     Done,
 }
 
-/// Live state for one `vimcode.fs.walk`/`vimcode.fs.grep` handle (#1806):
+/// Live state for one `vimcode.fs.walk`/`vimcode.fs.grep` handle:
 /// the cancellation flag shared with the background thread (checked between
 /// every entry/batch — see `project_search::walk_project_streaming`/
 /// `grep_project_streaming`) and the batch/done event stream. Mirrors
@@ -79,13 +66,9 @@ impl Engine {
     ///
     /// Deliberately unconfined: an absolute `root` (e.g. `/`) or a relative
     /// one containing `..` is not rejected or normalised, so a walk/grep can
-    /// read anywhere the process can, not just under the workspace. Given
-    /// `vimcode.loop.spawn` already grants arbitrary process execution to
-    /// any loaded plugin, this doesn't change the trust model — plugins are
-    /// unrestricted by design (see the module doc at the top of
-    /// `plugin.rs`) — but it's worth stating explicitly so a future reader
-    /// doesn't assume a confinement that was never implemented (#1806
-    /// review).
+    /// read anywhere the process can, not just under the workspace. Plugins
+    /// are unrestricted by design (see the module doc in `plugin.rs`), and
+    /// `vimcode.loop.spawn` already grants arbitrary process execution.
     fn resolve_fs_root(&self, root: &str) -> std::path::PathBuf {
         if root.is_empty() {
             self.cwd.clone()
@@ -95,17 +78,15 @@ impl Engine {
     }
 
     /// `vimcode.fs.walk(root, opts, on_batch, on_done)`: list files under
-    /// `root` on a background thread, the same gitignore/exclude-aware walk
-    /// `Engine::picker_populate_files` uses — including that picker's
+    /// `root` on a background thread, using the same gitignore/exclude-aware
+    /// walk that `Engine::picker_populate_files` uses — including
     /// `Settings::explorer_exclude` pruning, filled into `opts` here since
     /// Lua can't set it directly — streaming paths to `on_batch` in batches.
     /// Returns the handle id, or `Err` with a human-readable reason if there
     /// is no live plugin manager or `opts`'s glob patterns don't parse (the
-    /// Lua binding surfaces it as a runtime error, matching `vimcode.loop.
-    /// spawn`'s "failed to start" convention — but with the actual
-    /// `SearchError` message included rather than a generic one, since the
-    /// main consumer of this API compiles user-typed glob patterns on every
-    /// call, #1806 review).
+    /// Lua binding surfaces it as a runtime error with the actual
+    /// `SearchError` message included, since the main consumer compiles
+    /// user-typed glob patterns on every call).
     pub(crate) fn plugin_api_fs_walk(
         &mut self,
         root: String,
@@ -121,10 +102,8 @@ impl Engine {
         opts.explorer_exclude = self.settings.explorer_exclude.clone();
         // Register the callbacks *before* validating the glob patterns, not
         // after — the reverse order drops `on_batch`/`on_done`'s
-        // `LuaRegistryKey`s on the ground on a bad-glob call, since nothing
-        // ever reaches `remove_fs_callbacks` to reclaim their registry slot
-        // (same mistake `plugin_api_http_request`'s doc comment calls out
-        // for #1632; #1806 review).
+        // `LuaRegistryKey`s without reclaiming their registry slot, since
+        // nothing ever reaches `remove_fs_callbacks`.
         let id = pm.register_fs_callbacks(on_batch, on_done);
         let overrides = match project_search::validate_fs_walk_options(&root, &opts) {
             Ok(overrides) => overrides,
@@ -186,7 +165,6 @@ impl Engine {
     /// compile as a regex (when `opts.use_regex`), or `opts`'s glob patterns
     /// don't parse — see `plugin_api_fs_walk`'s doc comment for why the
     /// actual `SearchError` text is surfaced rather than a generic message
-    /// (#1806 review).
     pub(crate) fn plugin_api_fs_grep(
         &mut self,
         root: String,
@@ -202,7 +180,7 @@ impl Engine {
         let root = self.resolve_fs_root(&root);
         let max_results = opts.max_results;
         // Register before validating — see `plugin_api_fs_walk`'s comment on
-        // the same ordering (#1806 review): an invalid regex/glob must still
+        // the same ordering: an invalid regex/glob must still
         // reclaim `on_batch`/`on_done`'s registry slots via
         // `remove_fs_callbacks` rather than dropping the keys unregistered.
         let id = pm.register_fs_callbacks(on_batch, on_done);

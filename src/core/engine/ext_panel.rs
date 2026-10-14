@@ -272,13 +272,12 @@ impl Engine {
             return true;
         }
 
-        // #146/#1627: a `vimcode.ui.register_view` panel paints a
+        // A `vimcode.ui.register_view` panel paints a
         // `quadraui::Form`, so navigation/activation/text-entry resolve
         // against its fields, not the tree rows below. Keys the view doesn't
         // own (`q`, `h`, `?`, …) fall through. `ctrl`/`unicode` are threaded
-        // through now that a focused `Text`/`Password`/`TextArea` field
-        // actually edits (#1627) — previously unused (`_ctrl`/`_unicode`)
-        // since navigation/activation only ever needed the key name.
+        // through so that a focused `Text`/`Password`/`TextArea` field
+        // can actually edit — navigation/activation only need the key name.
         if self.is_plugin_view(&panel_name)
             && self.handle_plugin_view_key(&panel_name, key, ctrl, unicode, PluginViewHost::Sidebar)
         {
@@ -877,7 +876,7 @@ impl Engine {
 
     /// File hover: show status and diff stats.
     pub(crate) fn sc_hover_file(&self, file: &git::FileStatus, staged: bool) -> Option<String> {
-        // #991: a conflicted file reports the conflict (and git's own
+        // A conflicted file reports the conflict (and git's own
         // wording for which side did what) rather than a staged/unstaged
         // change it isn't.
         let (status, where_) = match file.unmerged {
@@ -1183,8 +1182,7 @@ impl Engine {
 
         // Append "Go to" navigation links after actual LSP content (vim mode only).
         // Emitted as real `[label](url)` markdown — quadraui's renderer
-        // (adopted below, #821) parses these into clickable links itself,
-        // so no manual span bookkeeping is needed here.
+        // parses these into clickable links itself, so no manual span bookkeeping needed.
         if add_goto_links && !self.is_vscode_mode() {
             let goto = self.lsp_goto_links();
             if !goto.is_empty() {
@@ -1464,7 +1462,7 @@ impl Engine {
     /// Set the editor hover popup scroll offset directly (clamped to
     /// valid range). Used by scrollbar drag / track-click handlers
     /// in both backends — they translate a `UiEvent::ScrollOffsetChanged`
-    /// from `quadraui::dispatch_mouse_drag` into this call (#215).
+    /// from `quadraui::dispatch_mouse_drag` into this call.
     pub fn editor_hover_set_scroll(&mut self, new_offset: usize) -> bool {
         if let Some(hover) = &mut self.editor_hover {
             let max_scroll = hover.line_text.len().saturating_sub(20);
@@ -1623,7 +1621,7 @@ impl Engine {
     /// Open a URL in the default browser. Validates the URL scheme via
     /// `is_safe_url` and, if safe, queues a
     /// [`PendingPlatformAction::OpenUrl`] for the runner to carry out
-    /// through `PlatformServices` (#1134) — see
+    /// through `PlatformServices` — see
     /// `Engine::pending_platform_actions`'s doc for why this can't shell
     /// out directly from here.
     pub(crate) fn open_url(&mut self, url: &str) {
@@ -1644,18 +1642,17 @@ impl Engine {
     /// The key [`Engine::lsp_diagnostics`] is stored under for the active
     /// buffer.
     ///
-    /// That map is keyed by the **canonical** absolute path (#208: the LSP
+    /// That map is keyed by the **canonical** absolute path — the LSP
     /// flush derives its key from the server's `file://` URI, and
-    /// `panels.rs` re-keys notifications through `canonical_path`), and
+    /// `panels.rs` re-keys notifications through `canonical_path`, and
     /// `build_rendered_window` looks the gutter up through
     /// `BufferState::canonical_path` for the same reason. Every diagnostics
-    /// lookup on this side must use the same key or it silently misses
-    /// whenever the buffer was opened through a path that is not already
-    /// canonical — a symlinked directory, or any path carrying a `.`/`..`
-    /// segment. On macOS that is the *common* case, not an exotic one:
-    /// `std::env::temp_dir()` hands back `/var/folders/…`, a symlink to
+    /// lookup must use the same key or it silently misses when the buffer
+    /// was opened through a non-canonical path — a symlinked directory, or
+    /// any path carrying a `.`/`..` segment. On macOS that is the common
+    /// case: `std::env::temp_dir()` returns `/var/folders/…`, a symlink to
     /// `/private/var/folders/…`, so the diagnostic gutter painted a marker
-    /// that, when clicked, opened no hover at all.
+    /// that clicked but opened no hover.
     ///
     /// Falls back to the raw `file_path` for a buffer whose file does not
     /// exist on disk yet (`canonical_path` is `None` until the first
@@ -1765,7 +1762,7 @@ impl Engine {
                 self.ext_sidebar_input_active = false;
                 true
             }
-            // #971: `SidebarSystem::click` already flips `collapsed[section]`
+            // `SidebarSystem::click` already flips `collapsed[section]`
             // itself before returning this event — see
             // `Engine::dispatch_sc_sidebar_event`'s identical fix for the
             // full story (same double-toggle-cancels-out bug, same fix,
@@ -1813,7 +1810,7 @@ impl Engine {
                             available[idx].display_name.clone()
                         };
                         self.ext_install_from_registry(&name);
-                        // #1739: this was a second blocking `curl
+                        // This was a second blocking `curl
                         // --max-time 10` subprocess call right here on the
                         // key-dispatch path, on top of the install itself
                         // — see `ext_show_readme_or_fetch_async`'s doc for
@@ -1876,12 +1873,9 @@ impl Engine {
     pub fn populate_ext_sidebar_system(&self) {
         use quadraui::{Decoration, StyledText, TreeRow};
 
-        // #1489: installed/available filtering used to be inlined here a
-        // third time, alongside the identical filter in `ext_installed_items`
-        // / `ext_available_items` (used by `dispatch_ext_sidebar_action_key`)
-        // and a since-deleted dead copy in `render.rs::build_ext_sidebar_data`.
-        // Reuse those two so there is exactly one definition of "installed"
-        // and "matches the search query" left.
+        // Reuse `ext_installed_items` and `ext_available_items` — the same
+        // filters used by `dispatch_ext_sidebar_action_key` — so there is
+        // exactly one definition of "installed" and "matches the search query".
         let installed_rows: Vec<TreeRow> = self
             .ext_installed_items()
             .iter()
@@ -1893,7 +1887,7 @@ impl Engine {
                     &m.display_name
                 };
                 let has_update = self.ext_has_update(&m.name);
-                // #1807: an installed extension that's become incompatible
+                // An installed extension that's become incompatible
                 // with the running vimcode (e.g. after a downgrade — the
                 // same condition `Engine::plugin_init` skips its scripts
                 // for) must not read as a normal healthy install in the
@@ -1927,7 +1921,7 @@ impl Engine {
                 } else {
                     &m.display_name
                 };
-                // #1807: an extension whose `requires_vimcode` constraint
+                // An extension whose `requires_vimcode` constraint
                 // isn't met by the running vimcode shows that reason
                 // inline, so it reads as incompatible before the user
                 // ever tries (and is refused) an install.
@@ -1960,9 +1954,8 @@ impl Engine {
     fn ext_sidebar_navigate(&mut self, key: quadraui::Key) {
         self.populate_ext_sidebar_system();
         let rect = self.ext_sidebar_body_rect.get();
-        // Computed before `key` moves into the `UiEvent` below (#1739
-        // review nit — avoids the `key.clone()` the first version of this
-        // fix needed to keep a post-move copy around).
+        // Compute before `key` moves into the `UiEvent` below.
+        // This avoids cloning the key to keep a post-move copy.
         let forward = matches!(
             key,
             quadraui::Key::Named(quadraui::NamedKey::Down) | quadraui::Key::Char('j')
@@ -1980,30 +1973,17 @@ impl Engine {
             .ext_sidebar_system
             .borrow_mut()
             .handle_cached(&ev, rect);
-        // #1739: `SidebarSystem::move_selection_by` only moves the
-        // selection *within* the already-active section — at the bottom
-        // of a section (or while it's empty) it comes back `Consumed` (no
-        // row actually changed) or `Ignored` rather than crossing into the
-        // next section. A fresh install starts with an empty INSTALLED
-        // section, so without this, `active_section` is permanently stuck
-        // at 0 and Down can *never* reach AVAILABLE at all — the root
-        // cause of #1739's "pressing `i` is a silent no-op": the `i`
-        // handler reads `(in_installed: true, idx: 0)` indexing an empty
-        // list, and silently does nothing. Cross the boundary ourselves
-        // through `SidebarSystem`'s own public API — no quadraui change
-        // needed, matching the Platform-Neutrality Rule's "thin wiring"
-        // bar.
-        //
-        // Only `Down`/`j`/`Up`/`k` cross a boundary here; `PageUp`/
-        // `PageDown`/`Home`/`End` deliberately do not (#1739 review
-        // non-blocking note). Those are jump-by-many/jump-to-extreme
-        // commands with no well-defined "how far into the next section"
-        // semantics the way a single-row step has — e.g. `PageDown`
-        // overflowing INSTALLED by 3 rows has no obvious meaning in
-        // AVAILABLE's unrelated list. They still just stop at the section
-        // boundary rather than dead-ending permanently, since (unlike the
-        // single empty-INSTALLED-section case above) a user can always
-        // reach the far section with repeated `Down`/`j`/`Up`/`k` instead.
+        // `SidebarSystem::move_selection_by` only moves the selection within the
+        // already-active section — at the bottom of a section (or while empty)
+        // it returns `Consumed` (no row changed) or `Ignored` rather than crossing
+        // into the next section. A fresh install starts with an empty INSTALLED
+        // section, so Down can never reach AVAILABLE — a single-row Down/j/Up/k
+        // crossing a boundary must be handled here via `SidebarSystem`'s public API.
+        // `PageUp`/`PageDown`/`Home`/`End` deliberately do not cross: they are
+        // jump-by-many/jump-to-extreme commands with no well-defined semantics for
+        // "how far into the next section" — they still stop at the section boundary
+        // rather than dead-ending, allowing the single-row keys to reach the far
+        // section instead.
         let needs_cross_section = (forward || backward)
             && matches!(
                 sidebar_event,
@@ -2019,28 +1999,23 @@ impl Engine {
             // off `Consumed`/`Ignored` instead) — so without this, crossing
             // the boundary while `/` filter mode is active left it active,
             // and the very next `i` got appended to the filter query
-            // instead of installing (#1739 review).
+            // instead of installing.
             self.ext_sidebar_input_active = false;
         }
     }
 
-    /// See [`Self::ext_sidebar_navigate`]'s #1739 doc. `forward` (`Down`/
-    /// `j`) moves into the AVAILABLE section's first row when INSTALLED is
-    /// at its last row (or empty); backward (`Up`/`k`) moves into
-    /// INSTALLED's last row the same way. Only the two sections
-    /// `populate_ext_sidebar_system` ever builds ("installed" = 0,
-    /// "available" = 1), so the target index is a plain flip rather than a
-    /// general cycle. Returns whether a cross actually happened (target
-    /// section already active, or empty, are both no-ops).
+    /// See [`Self::ext_sidebar_navigate`]. `forward` (`Down`/`j`) moves into
+    /// the AVAILABLE section's first row when INSTALLED is at its last row (or
+    /// empty); backward (`Up`/`k`) moves into INSTALLED's last row. Only the
+    /// two sections `populate_ext_sidebar_system` builds are used ("installed" = 0,
+    /// "available" = 1), so the target index is a flip. Returns whether a cross
+    /// actually happened (target section already active or empty are no-ops).
     ///
-    /// Uses `SidebarSystem::reveal` rather than `set_selected_path` — this
-    /// sidebar has `set_allow_collapse(true)`, and plain `set_selected_path`
-    /// would happily select a row inside a *collapsed* target section
-    /// (invisible, but still actionable by `i`/`d`/`u`) and never scrolls
-    /// the crossed-to row into view. `reveal` un-collapses the section,
-    /// selects the row, and scrolls it on-screen in one call — the same
-    /// three things interactive nav already gets via `scroll_to_visible`
-    /// (#1739 review).
+    /// Uses `SidebarSystem::reveal` rather than `set_selected_path`: this sidebar
+    /// has `set_allow_collapse(true)`, and `set_selected_path` would select a row
+    /// inside a collapsed target section (invisible but actionable) without
+    /// scrolling it into view. `reveal` un-collapses the section, selects the row,
+    /// and scrolls it on-screen in one call.
     fn ext_sidebar_cross_section_on_edge(&mut self, forward: bool, rect: quadraui::Rect) -> bool {
         let target_section = if forward { 1usize } else { 0usize };
         let target_len = if target_section == 0 {
@@ -2131,10 +2106,8 @@ impl Engine {
                         "Down" => Some(Key::Named(NamedKey::Down)),
                         "Up" => Some(Key::Named(NamedKey::Up)),
                         "Tab" => Some(Key::Named(NamedKey::Tab)),
-                        // "ISO_Left_Tab" is TUI's (and, since #1060, GTK's
-                        // own) `render::engine_key_from_ui` spelling for
-                        // Shift+Tab; "BackTab" is kept for any caller still
-                        // on the pre-#1060 name.
+                        // `"ISO_Left_Tab"` is the TUI's name for Shift+Tab; `"BackTab"` is
+                        // kept for backward compatibility.
                         "BackTab" | "ISO_Left_Tab" => Some(Key::Named(NamedKey::BackTab)),
                         "Home" => Some(Key::Named(NamedKey::Home)),
                         "End" => Some(Key::Named(NamedKey::End)),
@@ -2302,12 +2275,29 @@ impl Engine {
     }
 
     /// Save an extension's settings to disk.
+    ///
+    /// Mirrors `Settings::save()`'s guard against clobbering the user's real
+    /// `~/.config/vimcode/` during tests: unit tests (`#[cfg(test)]`) are a
+    /// no-op outright, and integration tests — which link this crate without
+    /// `cfg(test)` — are a no-op whenever `session::suppress_disk_saves()`
+    /// has been called (e.g. by `tests/common::engine_with()`).
+    #[cfg_attr(test, allow(unused_variables))]
     pub(crate) fn save_ext_settings(&self, ext_name: &str) {
+        #[cfg(test)]
+        return;
+
+        #[cfg_attr(test, allow(unreachable_code))]
+        if crate::core::session::saves_suppressed() {
+            return;
+        }
+
+        #[cfg_attr(test, allow(unreachable_code))]
         if let Some(values) = self.ext_settings.get(ext_name) {
             let path = paths::vimcode_config_dir()
                 .join("extensions")
                 .join(ext_name)
                 .join("settings.json");
+            paths::guard_real_config_write(&path);
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -2817,7 +2807,7 @@ impl Engine {
         }
 
         // Neovim opens the command-line window as a horizontal split in the
-        // *current* tabpage (`:h cmdwin`), not a new tab (#1297) — push a
+        // *current* tabpage (`:h cmdwin`), not a new tab — push a
         // new window into the active tab's layout instead of a new `Tab`.
         // Per `:h cmdwin`, the window is "always ... positioned just above
         // the command-line" — i.e. always at the bottom, unlike an ordinary
@@ -2864,8 +2854,8 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Close the cmdline window — it's a split in the current tab
-        // (#1297), not a whole tab, so close just the window.
+        // Close the cmdline window — it's a split in the current tab,
+        // not a whole tab, so close just the window.
         self.close_window();
 
         if is_search {
@@ -3048,40 +3038,26 @@ impl Engine {
 
     // ── AI assistant panel ─────────────────────────────────────────────────────
 
-    /// Send `text` as a user message. Callers (`ChatControllerEvent::Submit`
-    /// dispatch, the `:AI` command, the palette's `chat_send:` action) own
-    /// clearing whatever input widget held the text — this only mutates the
-    /// conversation/request state.
+    /// Send `text` as a user message. Callers own clearing the input widget —
+    /// this only mutates the conversation/request state.
     ///
-    /// Transport is picked by whether any ACP agent is configured (#952,
-    /// ACP-1; #958, ACP-7): a non-empty `settings.acp_agents` registry or a
-    /// non-empty legacy `settings.acp_agent_command` both route through a
-    /// live ACP agent subprocess (`ai_send_message_via_acp`); neither
-    /// configured keeps the original direct-provider `curl` transport
-    /// (`ai_send_message_via_curl`, `crate::core::ai`) — kept as a
-    /// no-agent-binary escape hatch per #952's "Decide in this slice"
-    /// through ACP-7.
+    /// Transport is picked by configuration: a non-empty `settings.acp_agents`
+    /// registry or non-empty legacy `settings.acp_agent_command` route through a
+    /// live ACP agent subprocess; neither keeps the direct-provider `curl`
+    /// transport — kept as a no-agent-binary escape hatch.
     ///
-    /// #1446: when neither transport is usable — no ACP agent *and* no
-    /// resolvable API key for a provider that needs one — this fails
-    /// synchronously with an actionable message instead of spawning curl,
-    /// which used to surface as a bare "AI error: curl failed:" once the
-    /// doomed request predictably failed. The failure follows the same
-    /// shape as `ai_send_message_via_acp`'s spawn-failure arm: the user's
-    /// turn still lands in the transcript (the panel must not silently
-    /// swallow what was typed) and the explanation lands *in the
-    /// transcript* as an `assistant-thought`, not only on the status line
-    /// a chat user is not looking at.
+    /// When neither transport is usable — no ACP agent and no resolvable API key
+    /// — this fails synchronously with an actionable message instead of spawning
+    /// curl. The user's turn lands in the transcript (the panel must not swallow
+    /// what was typed) and the explanation lands in the transcript as an
+    /// `assistant-thought`, not only on the status line.
     pub fn ai_send_message(&mut self, text: String) {
         let text = text.trim().to_string();
-        // #1512: a message submitted while a turn is already in flight is
-        // queued rather than silently dropped — `quadraui::ChatController`
-        // itself swallows an empty `Submit` before it ever reaches this
-        // function (see `try_submit`'s doc), so an empty `text` here can
-        // only come from a call site other than the chat input's own
-        // Enter/Ctrl+S (there is none today) — kept as a no-op, matching
-        // the pre-#1512 behaviour for that case, rather than queuing an
-        // empty message.
+        // A message submitted while a turn is in flight is queued rather than
+        // silently dropped. `quadraui::ChatController` swallows an empty `Submit`
+        // before it reaches this function, so an empty `text` here can only come
+        // from a call site other than the chat input's Enter/Ctrl+S — kept as a
+        // no-op rather than queuing an empty message.
         if self.acp_mut().ai_streaming {
             if !text.is_empty() {
                 self.ai_queue_message(text);
@@ -3097,7 +3073,7 @@ impl Engine {
             self.ai_send_message_via_acp(text);
             return;
         }
-        // #1446: fail fast with an actionable message when neither transport
+        // Fail fast with an actionable message when neither transport
         // is usable, instead of spawning curl and reporting whatever (often
         // empty) stderr it produces once the request inevitably fails.
         let provider = self.settings.ai_provider.clone();
@@ -3136,15 +3112,12 @@ impl Engine {
         self.ai_dispatch_curl_request();
     }
 
-    /// Spawn the blocking `curl` background thread off whatever's
-    /// currently in `ai_messages` (`curl_transport_history` filters to
-    /// `"user"`/`"assistant"` turns, dropping ACP-only roles like
-    /// `"user-queued"`/`"assistant-thought"`). Split out from
-    /// `ai_send_message_via_curl` so #1512's queued-message dispatch
-    /// (`Engine::ai_dispatch_queued_message`) can reuse it without
-    /// pushing a second transcript turn for a message that's already
-    /// there — it just flips the existing dimmed `"user-queued"` turn
-    /// back to plain `"user"` first.
+    /// Spawn the blocking `curl` background thread from whatever's in
+    /// `ai_messages` (`curl_transport_history` filters to `"user"`/`"assistant"`
+    /// turns, dropping ACP-only roles). Split from `ai_send_message_via_curl`
+    /// so queued-message dispatch can reuse it without pushing a second
+    /// transcript turn for a message already there — it flips the existing
+    /// dimmed `"user-queued"` turn back to plain `"user"` first.
     fn ai_dispatch_curl_request(&mut self) {
         self.acp_begin_streaming();
 
@@ -3166,19 +3139,18 @@ impl Engine {
         });
     }
 
-    /// ACP transport (#952, ACP-1): spawns (or reuses) a live ACP agent
-    /// subprocess and drives it through `initialize` -> `session/new` ->
-    /// `session/prompt`. All of the session-update chunk streaming and
-    /// prompt-stop handling lives in `Engine::poll_acp`
-    /// (`src/core/engine/acp_ops.rs`), driven off the non-blocking
-    /// `AcpClient::poll` — nothing here blocks the tick.
+    /// ACP transport: spawns (or reuses) a live ACP agent subprocess and drives
+    /// it through `initialize` -> `session/new` -> `session/prompt`. All session
+    /// update chunk streaming and prompt-stop handling lives in
+    /// `Engine::poll_acp` (`src/core/engine/acp_ops.rs`), driven off the
+    /// non-blocking `AcpClient::poll` — nothing here blocks the tick.
     fn ai_send_message_via_acp(&mut self, text: String) {
-        // #1449/#1450: chip line(s) naming what got attached (if anything)
+        // Chip line(s) naming what got attached (if anything)
         // go on the *displayed* transcript message — the wire content built
         // below (`acp_prompt_content_blocks`) carries the actual
         // `resource_link`/`resource` blocks regardless of whether these
         // chips are shown, so the two never disagree about what was
-        // attached. The range/selection attachment (#1450) is only *read*
+        // attached. The range/selection attachment is only *read*
         // here (`.as_ref()`, not `.take()`) — `acp_prompt_content_blocks`
         // below is what consumes it, since a not-yet-connected session
         // defers that call to `poll_acp`'s `SessionCreated` handler instead.
@@ -3189,7 +3161,7 @@ impl Engine {
         if let Some(attachment) = self.acp_pending_attachment.as_ref() {
             chip_lines.push(attachment.chip(&self.acp_workspace_cwd()));
         }
-        // #1464: one chip line per manually attached file/image, same
+        // One chip line per manually attached file/image, same
         // "named on the displayed transcript, regardless of whether the
         // chip is also shown live in the header" contract as the two
         // attachments above.
@@ -3202,17 +3174,13 @@ impl Engine {
             format!("{}\n{text}", chip_lines.join("\n"))
         };
 
-        // #1459: on the very first `:AI`/message of the process, and only
-        // then, honour `acp_reopen_last_session` — resume the most recent
-        // recorded session for the about-to-launch agent/workspace instead
-        // of starting empty. `acp_client.is_none()` guards against this
-        // ever firing on a message sent to an agent that's already running
-        // (that's a continuation of a session already chosen, not a fresh
-        // start to redirect). #1459 review: also honours the learned
-        // `loadSession` capability the same way `acp_open_sessions_picker`
-        // does — an agent that has already told us it doesn't support
-        // resume must fall straight through to a fresh session below, not
-        // attempt one that can only fail on the wire.
+        // On the very first `:AI`/message of the process, honour
+        // `acp_reopen_last_session` — resume the most recent recorded session
+        // for the about-to-launch agent/workspace instead of starting empty.
+        // `acp_client.is_none()` guards against this firing on a message sent to
+        // an already-running agent (that's a session-continuation, not a fresh
+        // start). Also honour the learned `loadSession` capability — an agent
+        // that has told us it doesn't support resume must start fresh instead.
         let mut auto_resume_session_id: Option<String> = None;
         if !self.acp_startup_reopen_attempted {
             self.acp_startup_reopen_attempted = true;
@@ -3231,7 +3199,7 @@ impl Engine {
         }
 
         if let Some(session_id) = auto_resume_session_id {
-            // #1459 review: pushing the just-typed message immediately
+            // Pushing the just-typed message immediately
             // (like the no-resume branch below does) would put it *above*
             // the replayed history that's about to land after it — the
             // resumed session's `session/update` notifications append to
@@ -3271,13 +3239,13 @@ impl Engine {
             return;
         }
 
-        // #958 (ACP-7): the registry (if configured) or the legacy
+        // The registry (if configured) or the legacy
         // single-string setting — see `acp_resolve_agent_launch`'s doc for
         // why this is the one call site that knows the registry exists.
         let (argv, cwd, env, agent_label) = self.acp_resolve_agent_launch();
         let env_refs: Vec<(&str, &str)> =
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        // #1463: label this tab with the agent's registry *name* (e.g.
+        // Label this tab with the agent's registry *name* (e.g.
         // "claude"), not `agent_label` (the raw command string, used below
         // only for the spawn-failure message) — that's what the session
         // tab strip and `:AiNext`/`:AiPrev`'s status line show.
@@ -3289,12 +3257,12 @@ impl Engine {
                 self.acp_mut().pending_prompt = Some(text);
             }
             Err(e) => {
-                // Acceptance (#952): agent binary missing from PATH must be
+                // Acceptance: agent binary missing from PATH must be
                 // a clear, actionable panel message, not a crash or a
                 // silently empty panel — so this lands in the transcript
                 // itself, not just the status line.
                 self.acp_mut().ai_streaming = false;
-                // #1459: the auto-resume path deferred showing the user's
+                // The auto-resume path deferred showing the user's
                 // typed message until the resume finished — it never will
                 // now (there's no client to finish it), so show it here
                 // instead of silently dropping it.
@@ -3314,22 +3282,18 @@ impl Engine {
         }
     }
 
-    // ── #1512: queue a message typed while the agent is busy ────────────
-
-    /// Called from `ai_send_message` when a turn is already in flight
-    /// (`ai_streaming`) instead of the pre-#1512 silent no-op. Only one
-    /// message can be queued at a time — a second call while one is
-    /// already queued *replaces* its content in place (same dimmed
-    /// transcript turn, new text) rather than stacking a second one, so
-    /// the status strip's "queued (1)" segment (`render::
-    /// populate_ai_chat_controller`) never has to count higher than one.
+    /// Called from `ai_send_message` when a turn is already in flight instead
+    /// of the pre-#1512 silent no-op. Only one message can be queued at a time
+    /// — a second call replaces its content in place (same dimmed transcript
+    /// turn, new text) rather than stacking a second, so the status strip's
+    /// "queued (1)" segment never counts higher than one.
     fn ai_queue_message(&mut self, text: String) {
         if let Some(idx) = self.acp_mut().queued_prompt_idx {
             if let Some(m) = self.acp_mut().ai_messages.get_mut(idx) {
                 m.content = text.clone();
             }
         } else {
-            // #1512: rendered dimmed (`render::populate_ai_chat_controller`'s
+            // Rendered dimmed (`render::populate_ai_chat_controller`'s
             // `"user-queued"` arm) and prefixed `"(queued) "` on the
             // painted text itself, not just a colour — a colour alone
             // isn't something a black-box test (or a low-color terminal)
@@ -3430,11 +3394,9 @@ impl Engine {
             }
             return;
         }
-        // #1446: same fail-fast shape as `ai_send_message`'s no-transport
-        // branch — a queued message that can no longer be sent (agent
-        // process died, or no API key) must say so, not just silently
-        // vanish now that its dimmed turn has already flipped to plain
-        // "user".
+        // A queued message that can no longer be sent (agent process died, or no
+        // API key) must report the error, not silently vanish now that its dimmed
+        // turn has flipped to plain "user".
         let provider = self.settings.ai_provider.clone();
         if crate::core::ai::provider_needs_api_key(&provider)
             && crate::core::ai::resolve_api_key(&provider, &self.settings.ai_api_key).is_empty()
@@ -3480,7 +3442,7 @@ impl Engine {
                 self.message = format!("AI error: {e}");
             }
         }
-        // #1512: the curl transport's analogue of `AcpEvent::PromptStopped`
+        // The curl transport's analogue of `AcpEvent::PromptStopped`
         // — send whatever queued up while this request was in flight.
         self.ai_dispatch_queued_message();
         true
@@ -3495,12 +3457,12 @@ impl Engine {
     /// `initialize` -> `session/new` handshake, not a continuation of
     /// whatever context the old agent process held.
     pub fn ai_clear(&mut self) {
-        // #953 (ACP-2): a parked permission prompt must get its one reply
+        // A parked permission prompt must get its one reply
         // before the client (and its stdin) goes away below — the agent is
         // still alive at this point, only about to be killed.
         self.acp_cancel_pending_permission();
         self.acp_mut().remembered_decisions.clear();
-        // #957 (ACP-6): the auth-choice dialog holds no reply to send (unlike
+        // The auth-choice dialog holds no reply to send (unlike
         // `acp_pending_permission`, it isn't a parked agent request — see
         // `"acp_auth_choice"`'s `process_dialog_result` arm), so it just
         // needs closing before `acp_auth_methods` (which it reads by id)
@@ -3514,7 +3476,7 @@ impl Engine {
             self.dialog = None;
         }
         self.acp_mut().ai_messages.clear();
-        // #1510: drop cached markdown renders alongside the transcript they
+        // Drop cached markdown renders alongside the transcript they
         // describe — otherwise the next conversation's messages could land
         // at the same indices and (if a coincidentally equal content length
         // ever occurred) read a stale render meant for different text.
@@ -3524,20 +3486,20 @@ impl Engine {
         self.acp_mut().client = None;
         self.acp_mut().session_id = None;
         self.acp_mut().pending_prompt = None;
-        // #1459: an unconsumed resume request (`:AiSessions` picked a
+        // An unconsumed resume request (`:AiSessions` picked a
         // session, then the user ran `:AiClear` before the handshake
         // finished) must not resurface on whatever session starts next —
         // same for its deferred display line, if the auto-resume path had
         // queued one.
         self.acp_pending_resume = None;
         self.acp_mut().pending_prompt_display = None;
-        // #1512: a queued message belongs to the conversation being
+        // A queued message belongs to the conversation being
         // cleared — nothing left to send it to, or to un-dim once this
         // clear wipes the transcript it was queued into.
         self.acp_mut().queued_prompt = None;
         self.acp_mut().queued_prompt_idx = None;
         self.acp_mut().streaming_turn = None;
-        // #956 (ACP-5): plan/commands/modes/usage are all session-scoped —
+        // Plan/commands/modes/usage are all session-scoped —
         // clearing the conversation ends the session, so none of it should
         // survive into whatever session starts next (same reasoning as
         // `acp_remembered_decisions.clear()` above).
@@ -3547,36 +3509,35 @@ impl Engine {
         self.acp_mut().modes.clear();
         self.acp_mut().current_mode_id = None;
         self.acp_mut().usage = None;
-        // #957 (ACP-6): session-scoped, same as the rest above.
+        // Session-scoped, same as the rest above.
         self.acp_mut().auth_methods.clear();
         self.acp_mut().authenticated = false;
-        // #1449: `promptCapabilities` came off the same `initialize`
+        // `promptCapabilities` came off the same `initialize`
         // response as `authMethods` — reset alongside it.
         self.acp_mut().prompt_capabilities = crate::core::acp::AcpPromptCapabilities::default();
-        // #1487: same reasoning — `mcpCapabilities` came off that same
-        // response, and the MCP servers the (now-ending) session started
-        // with no longer apply to whatever session starts next.
+        // `mcpCapabilities` came off the same `initialize` response and applies
+        // only to the now-ending session — clear it alongside other session state.
         self.acp_mut().mcp_capabilities = crate::core::acp::AcpMcpCapabilities::default();
         self.acp_mut().active_mcp_servers.clear();
-        // #1450: a staged Visual-selection/`:{range}AI` attachment is
+        // A staged Visual-selection/`:{range}AI` attachment is
         // composed content the user hasn't sent yet — clearing the
         // conversation drops it too, same as clearing the typed-but-
         // unsubmitted input would (the input itself is `ChatController`'s
         // own state, untouched here, matching this function's existing
         // scope).
         self.acp_pending_attachment = None;
-        // #1464: manually attached files/images are composed content too,
+        // Manually attached files/images are composed content too,
         // same reasoning as `acp_pending_attachment` immediately above.
         self.acp_manual_attachments.clear();
-        // #1513: staged `@symbol` mentions are composed content too, same
+        // Staged `@symbol` mentions are composed content too, same
         // reasoning.
         self.acp_pending_symbol_mentions.clear();
-        // #955 (ACP-4): tool calls and any open change-review surface are
+        // Tool calls and any open change-review surface are
         // session-scoped too — closing the conversation without deciding
         // still discards the surface itself (same "closing the session
         // ends it" reasoning as everything else in this block).
         self.acp_mut().tool_calls.clear();
-        // #1511: the tool-call/thought expand state and the anchor/kind
+        // The tool-call/thought expand state and the anchor/kind
         // maps `populate_ai_chat_controller` builds them from are all
         // session-scoped too, same reasoning as `tool_calls` just above —
         // otherwise a fresh conversation's tool calls could reuse an id or
@@ -3586,7 +3547,7 @@ impl Engine {
         self.acp_mut().thought_expanded.clear();
         self.acp_mut().transcript_turn_kinds.get_mut().clear();
         self.change_review = None;
-        // #1460: the per-turn tracking + checkpoint history are session-
+        // The per-turn tracking + checkpoint history are session-
         // scoped too, same reasoning as `acp_tool_calls`/`change_review`
         // just above — clearing the conversation ends any restore point a
         // later `:AiRestore` could have picked from it.
@@ -3594,7 +3555,7 @@ impl Engine {
         self.acp_turn_checkpoints.clear();
         self.turn_review_checkpoint_id = None;
         self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
-        // #1463: clearing the tab's transcript must also clear its label,
+        // Clearing the tab's transcript must also clear its label,
         // or `AcpSession::is_blank` would keep reporting this tab as
         // "used" forever — `:AiClose`-ing the last remaining tab (which
         // resets it via this same function, see `Engine::
@@ -3605,17 +3566,14 @@ impl Engine {
         self.message = "AI conversation cleared.".to_string();
     }
 
-    /// Slash-command completions matching the AI panel input's current
-    /// text, if the agent has declared any via `available_commands_update`
-    /// and the input looks like a command still being typed (#956, ACP-5).
+    /// Slash-command completions matching the AI panel input's current text,
+    /// if the agent has declared any via `available_commands_update` and the
+    /// input looks like a command still being typed.
     ///
-    /// `None` — never an empty popup — when the input doesn't start with
-    /// `/`, already has a space after the command name (the user is past
-    /// the command name into its arguments/body), or nothing matches.
-    /// Reuses `render::CompletionMenu` — the same shape the editor's own
-    /// word-completion popup uses — per the issue's "prefer vimcode's
-    /// existing completion machinery" guidance; there is no bespoke widget
-    /// here, only a different feeder for one that already exists.
+    /// `None` — never an empty popup — when the input doesn't start with `/`,
+    /// already has a space after the command name, or nothing matches. Reuses
+    /// `render::CompletionMenu` — the same shape the editor's own
+    /// word-completion popup uses — with a different feeder.
     pub fn ai_command_completions(&self) -> Option<crate::render::CompletionMenu> {
         if self.acp().available_commands.is_empty() {
             return None;
@@ -3682,7 +3640,7 @@ impl Engine {
         true
     }
 
-    /// `@`-mention completions for the AI panel input (#1449): open
+    /// `@`-mention completions for the AI panel input: open
     /// buffers first, then workspace files, filtered by whatever's typed
     /// after the `@` in the trailing word currently under construction
     /// (see [`crate::core::acp::trailing_at_mention_query`] for why it's
@@ -3698,7 +3656,7 @@ impl Engine {
         let query_lower = query.to_lowercase();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // Open buffers first (#1449's ordering requirement).
+        // Open buffers first, then scan the filesystem.
         let mut buffer_matches: Vec<String> = self
             .buffer_manager
             .iter()
@@ -3720,7 +3678,7 @@ impl Engine {
         let mut file_matches: Vec<String> = Vec::new();
         if buffer_matches.len() < MAX_CANDIDATES {
             let show_hidden = self.settings.show_hidden_files;
-            // #1545: same `explorer_exclude` pruning `picker_populate_files`
+            // Same `explorer_exclude` pruning `picker_populate_files`
             // applies — with dotfiles shown by default the walk would burn
             // its `MAX_SCANNED` budget inside `.git/` and surface object
             // files as `@file` completions.
@@ -3741,7 +3699,7 @@ impl Engine {
                     break;
                 }
                 let Ok(entry) = entry else { continue };
-                // #1513: `@dir` mentions — a directory entry is a candidate
+                // `@dir` mentions — a directory entry is a candidate
                 // too, not just files, marked with a trailing `/` so it's
                 // unambiguous at accept/send time (`acp_mention_content_
                 // blocks` branches on exactly that suffix). Depth 0 is the
@@ -3766,7 +3724,7 @@ impl Engine {
             file_matches.sort();
         }
 
-        // #1513: `@symbol` candidates — from `self.ai_mention_symbol_cache`
+        // `@symbol` candidates — from `self.ai_mention_symbol_cache`
         // (last `workspace/symbol` response `Engine::ai_mention_tick`
         // fetched for this query; see that method's doc for why the
         // request itself can't happen from this `&self` method). Formatted
@@ -3852,7 +3810,7 @@ impl Engine {
             return false;
         };
         self.acp_mut().mention_completion_idx = 0;
-        // #1513: a `@symbol` candidate (`@path#Name`, see `ai_mention_
+        // A `@symbol` candidate (`@path#Name`, see `ai_mention_
         // completions`' doc for the format) stages an `AcpSymbolMention`
         // right now, while `ai_mention_symbol_cache` still has the entry
         // it was built from — `acp_mention_content_blocks` (send time)
@@ -3894,7 +3852,7 @@ impl Engine {
     }
 
     /// Keep `ai_mention_symbol_cache` fresh for `@symbol` completion
-    /// (#1513) — called once per frame from `poll_idle`, mirroring `tick_
+    /// — called once per frame from `poll_idle`, mirroring `tick_
     /// ai_completion`'s "debounce counter checked every tick" shape but
     /// simpler: no counter, just "did the trailing `@`-mention query
     /// change since the last fetch". `ai_mention_completions` is `&self`
@@ -3942,39 +3900,31 @@ impl Engine {
         }
     }
 
-    /// Intercept a plain, unmodified character key that might be starting,
-    /// continuing, or completing the `<leader>ai` focus-toggle gesture
-    /// (#1507) — checked by `render::route_ai_chat_event` *before* the key
-    /// reaches `ChatController::handle`'s ordinary text-insertion path,
-    /// exactly like that function's existing slash-command/`@`-mention Tab
-    /// and Enter intercepts above it.
+    /// Intercept a plain unmodified character key that might be starting,
+    /// continuing, or completing the `<leader>ai` focus-toggle gesture — checked
+    /// by `render::route_ai_chat_event` before the key reaches
+    /// `ChatController::handle`'s ordinary text-insertion path, exactly like
+    /// that function's existing slash-command/`@`-mention Tab and Enter
+    /// intercepts.
     ///
     /// Only engages while `self.ai_chat`'s input buffer is empty — the same
-    /// convention Vim's own `<leader>` sequences follow by only ever being
-    /// read from Normal mode's "nothing pending" state — chosen specifically
-    /// so this gesture can never eat characters out of a message the user is
-    /// actually composing: the moment the buffer holds anything, this
-    /// returns `false` unconditionally and every key goes back to being
-    /// ordinary typed text.
+    /// convention Vim's `<leader>` sequences follow — chosen so this gesture
+    /// never eats characters out of a message being composed: the moment the
+    /// buffer holds anything, this returns `false` and every key is ordinary
+    /// typed text.
     ///
     /// A separate small buffer ([`Engine::ai_leader_toggle_pending`]) tracks
-    /// the match rather than reusing the Normal-mode leader machinery
-    /// (`Engine::leader_partial`/`Engine::handle_leader_key`): that machinery
-    /// runs from `Engine::handle_key`'s own dispatch ladder, which
+    /// the match rather than reusing the Normal-mode leader machinery: that
+    /// machinery runs from `Engine::handle_key`'s dispatch ladder, which
     /// `render::route_focus_key` never reaches while `ai_has_focus` is set —
-    /// every keystroke goes straight to this panel instead (see
-    /// `render::route_focus_key`'s doc). There is no path left for the
-    /// existing "ai" arm in `Engine::handle_leader_key` to fire a *second*
-    /// time once the panel already has focus, which is exactly the gap
-    /// #1507 reports.
+    /// every keystroke goes straight to this panel instead. There is no path
+    /// for the existing "ai" arm in `Engine::handle_leader_key` to fire a
+    /// second time once the panel has focus.
     ///
-    /// Returns `true` when the key was consumed as part of the gesture
-    /// (still matching, or matched in full — either way the caller must not
-    /// also feed it to `ChatController::handle`). Returns `false` when the
-    /// key breaks a match: any previously-buffered prefix is first replayed
-    /// into the input verbatim (via `ChatController::input_insert_str`) so
-    /// nothing typed is silently dropped, then the caller is free to run the
-    /// *current* key through the normal path itself.
+    /// Returns `true` when the key was consumed as part of the gesture (still
+    /// matching, or matched in full). Returns `false` when the key breaks a
+    /// match: any previously-buffered prefix is replayed into the input
+    /// verbatim via `ChatController::input_insert_str` so nothing is dropped.
     pub fn ai_leader_toggle_key(&mut self, ch: char) -> bool {
         if !self.ai_chat.borrow().input_text().is_empty() {
             self.ai_leader_toggle_pending.clear();
@@ -4005,7 +3955,7 @@ impl Engine {
     }
 
     /// Replay any in-flight `<leader>ai` partial match back into the input
-    /// verbatim and clear the buffer (#1507 review).
+    /// verbatim and clear the buffer.
     ///
     /// `ai_leader_toggle_key` only ever sees a plain, unmodified
     /// [`quadraui::Key::Char`] — `render::route_ai_chat_event` calls this
@@ -4031,14 +3981,13 @@ impl Engine {
     }
 
     /// Apply a [`quadraui::ChatControllerEvent`] the AI panel's `ChatController`
-    /// (`self.ai_chat`) returned from `handle()`. Shared by GTK and TUI via
-    /// `render::route_ai_chat_event` (#819 — the ChatController adoption that
-    /// replaced this panel's hand-rolled `handle_ai_panel_key`/`ai_insert_text`).
+    /// returned from `handle()`. Shared by GTK and TUI via
+    /// `render::route_ai_chat_event`.
     ///
     /// Returns whether the panel should keep keyboard focus — `false` only on
-    /// `Cancelled` (Escape), mirroring every other panel's "Escape leaves the
-    /// panel" convention now that the always-focused `ChatController` input has
-    /// no separate "not editing" mode to fall back into.
+    /// `Cancelled` (Escape), mirroring every other panel's "Escape leaves"
+    /// convention now that the always-focused `ChatController` input has no
+    /// separate "not editing" mode.
     pub fn dispatch_ai_chat_event(&mut self, event: quadraui::ChatControllerEvent) -> bool {
         use quadraui::ChatControllerEvent as Ev;
         match event {
@@ -4049,7 +3998,7 @@ impl Engine {
             }
             Ev::Cancelled => {
                 self.ai_has_focus = false;
-                // #1507 review: an abandoned `<leader>ai` partial match must
+                // An abandoned `<leader>ai` partial match must
                 // not survive a focus-losing Escape — replaying it here
                 // would inject stray text into an input the user is walking
                 // away from, and leaving it buffered would let it resurface
@@ -4059,7 +4008,7 @@ impl Engine {
                 self.ai_leader_toggle_pending.clear();
                 false
             }
-            // #1509 (quadraui#1137): the clickable Send/Stop segment reads
+            // The clickable Send/Stop segment reads
             // "Stop" while `ChatController::set_busy(true)` — i.e. exactly
             // while `engine.acp().ai_streaming` — and clicking it there
             // emits this event instead of touching the input buffer.
@@ -4079,7 +4028,7 @@ impl Engine {
             // internally), so it falls to this app-hotkey escape hatch,
             // exactly as its own doc comment recommends.
             //
-            // #953 (ACP-2): while an ACP turn is actually in flight, Ctrl+C
+            // While an ACP turn is actually in flight, Ctrl+C
             // aborts *that turn* (`session/cancel`) instead of nuking the
             // whole session — "the user must be able to abort a running
             // turn from the panel" without losing the agent process and
@@ -4093,19 +4042,11 @@ impl Engine {
                 }
                 true
             }
-            // #1450 point 4 / #1464 / #1512: Ctrl+R drops the most-
-            // recently-staged "about to send" thing without sending it —
-            // "let the user remove it before sending". Checks the
-            // Visual-selection/`:{range}AI` range attachment first
-            // (unchanged #1450 behaviour), then falls through to popping
-            // the last manually attached file/image (#1464) once that's
-            // empty, then finally a message already queued while the
-            // agent was busy (#1512, `ai_discard_queued_message`) — one
-            // key, most-recent-first, across all three. Same escape-hatch
-            // shape as Ctrl+C above: `ChatController` doesn't bind Ctrl+R
-            // internally, so it reaches here as a plain `KeyPressed`. A
-            // no-op (still consumes the key) when nothing is staged at
-            // all.
+            // Ctrl+R drops the most-recently-staged "about to send" thing without
+            // sending it. Checks the Visual-selection/`:{range}AI` range attachment
+            // first, then falls through to popping the last manually attached
+            // file/image, then finally a queued message — one key, most-recent-first,
+            // across all three. A no-op (still consumes the key) when nothing is staged.
             Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('r')" => {
                 if self.acp_pending_attachment.take().is_some() {
                     self.message = "Attachment removed.".to_string();
@@ -4116,7 +4057,7 @@ impl Engine {
                 }
                 true
             }
-            // #1512: Ctrl+G ("go now") — cancel the in-flight turn and
+            // Ctrl+G ("go now") — cancel the in-flight turn and
             // immediately dispatch whatever's queued instead of waiting
             // for it to be sent automatically once the turn reaches
             // `PromptStopped` on its own. `ChatController` doesn't bind
@@ -4131,7 +4072,7 @@ impl Engine {
                 self.ai_send_queued_now();
                 true
             }
-            // #1511: a click landed on transcript turn `turn_idx`, row
+            // A click landed on transcript turn `turn_idx`, row
             // `row_in_turn` into it (`quadraui::ChatController`'s own doc:
             // row 0 is always the role-header row). See
             // `Self::ai_chat_turn_clicked` for what each turn kind does
@@ -4150,7 +4091,7 @@ impl Engine {
         }
     }
 
-    /// Apply a [`quadraui::ChatControllerEvent::TurnClicked`] (#1511): a
+    /// Apply a [`quadraui::ChatControllerEvent::TurnClicked`]: a
     /// click or the equivalent focused-turn `Enter` (see
     /// `render::route_ai_chat_event`'s Enter intercept, which resolves the
     /// same way this does before calling this method) landed on transcript
@@ -4213,7 +4154,7 @@ impl Engine {
         }
     }
 
-    /// Flip `turn_idx`'s persistent expand state (#1511) — the shared
+    /// Flip `turn_idx`'s persistent expand state — the shared
     /// bottom half of [`Self::ai_chat_turn_clicked`] and
     /// `render::route_ai_chat_event`'s focused-turn `Enter` intercept.
     /// Resolves `turn_idx` via `AcpSession::transcript_turn_kinds` (same as
@@ -4249,13 +4190,9 @@ impl Engine {
     }
 
     /// Open `path` (resolved against the ACP workspace root if relative) and
-    /// jump the active window's cursor to `line` (#1511, "jump to a
-    /// location" — a `tool_call`'s `locations` line is 1-based per the ACP
-    /// v1 schema, [`crate::core::acp::AcpToolCallInfo`]'s own doc; internal
-    /// cursor positions are 0-indexed, same conversion
-    /// `Engine::open_search_result` already does for project-search
-    /// results). `line: None` just opens the file without moving the
-    /// cursor.
+    /// jump the active window's cursor to `line` — a `tool_call`'s `locations`
+    /// line is 1-based per the ACP v1 schema; internal cursor positions are
+    /// 0-indexed. `line: None` just opens the file without moving the cursor.
     pub(crate) fn ai_open_tool_call_location(&mut self, path: &str, line: Option<u32>) {
         let p = std::path::Path::new(path);
         let p = if p.is_absolute() {
@@ -4612,19 +4549,14 @@ impl Engine {
     }
 }
 
-/// Filter an AI panel transcript down to the turns valid as conversation
+/// Filter an AI panel transcript down to turns valid as conversation
 /// history for the direct-provider (`curl`) transport — only `"user"` and
 /// `"assistant"` roles.
 ///
-/// Review regression (#952): if the panel previously talked over ACP
-/// (`Engine::ai_send_message_via_acp`), `self.acp_mut().ai_messages` can also contain
-/// ACP-only roles like `"assistant-thought"` (real `agent_thought_chunk`
-/// reasoning, and the system/error notices `Engine::poll_acp` appends — see
-/// `acp_ops.rs`). A user who switches transports mid-session by clearing
-/// `acp_agent_command` without running `:AiClear` would otherwise have
-/// those roles sent verbatim in the request body
-/// (`crate::core::ai::send_chat`'s `messages_to_json`/`send_ollama`), which
-/// none of Anthropic/OpenAI/Ollama recognise and will reject.
+/// The transcript can contain ACP-only roles like `"assistant-thought"` if
+/// the panel previously talked over ACP. A user who switches transports
+/// mid-session by clearing `acp_agent_command` would otherwise send these
+/// unrecognized roles in the request body, which providers reject.
 fn curl_transport_history(messages: &[AiMessage]) -> Vec<AiMessage> {
     messages
         .iter()
@@ -4689,7 +4621,7 @@ mod curl_transport_history_tests {
 mod ai_mention_completions_exclude_tests {
     use crate::core::Engine;
 
-    /// #1545: `ai_mention_completions`' workspace-file walk must prune
+    /// `ai_mention_completions`' workspace-file walk must prune
     /// `explorer_exclude` entries via `filter_entry`, same as
     /// `picker_populate_files` — otherwise, with `show_hidden_files`
     /// defaulting on, typing `@` would walk into `.git/` and could surface
@@ -4703,7 +4635,8 @@ mod ai_mention_completions_exclude_tests {
     fn does_not_surface_git_internals_as_at_file_completions() {
         let mut engine = Engine::new_for_test();
         let workspace = std::env::temp_dir().join(format!(
-            "vc1545_ext_panel_mention_exclude_{:?}",
+            "vc1545_ext_panel_mention_exclude_{}-{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&workspace);
@@ -4754,7 +4687,7 @@ mod ai_leader_toggle_key_tests {
     /// A full `<leader>ai` match (default leader: Space) while the chat
     /// input is empty toggles `ai_has_focus` off and leaves the pending
     /// buffer clean — the unit-level twin of the driver tests in
-    /// `tui_main::app_on_tui_tests`/`gtk::testing` (#1507).
+    /// `tui_main::app_on_tui_tests`/`gtk::testing`.
     #[test]
     fn full_match_toggles_focus_off() {
         let mut engine = Engine::new_for_test();
@@ -4815,7 +4748,7 @@ mod ai_leader_toggle_key_tests {
         );
     }
 
-    /// #1507 review: `ai_leader_toggle_flush` — the method
+    /// `ai_leader_toggle_flush` — the method
     /// `render::route_ai_chat_event` calls for every key shape
     /// `ai_leader_toggle_key` itself never sees (a modified `Char`, or any
     /// `Named` key) — must replay a buffered partial match into the input
@@ -4857,15 +4790,9 @@ mod ai_leader_toggle_key_tests {
         assert_eq!(engine.ai_chat.borrow().input_text(), "");
     }
 
-    /// #1507 review, "related" point: `Cancelled` (Escape) must discard —
-    /// not replay — a partial match still buffered when the panel loses
-    /// focus, so it can never resurface and wrongly complete against an
-    /// unrelated later message once the panel regains focus. The black-box
-    /// twin of this is
-    /// `leader_prefix_abandoned_via_escape_does_not_leak_into_next_session_via_shell_app`.
-    ///
-    /// RED verified: with the `self.ai_leader_toggle_pending.clear();` line
-    /// removed from `dispatch_ai_chat_event`'s `Cancelled` arm, this fails.
+    /// `Cancelled` (Escape) must discard — not replay — a partial match still
+    /// buffered when the panel loses focus, so it cannot resurface and wrongly
+    /// complete against an unrelated later message.
     #[test]
     fn cancelled_discards_a_buffered_partial_match() {
         let mut engine = Engine::new_for_test();
@@ -4895,7 +4822,7 @@ mod ai_leader_toggle_key_tests {
 mod issue_1513_at_symbol_and_at_dir_mentions {
     use crate::core::Engine;
 
-    /// #1513: a workspace-symbol candidate from `ai_mention_symbol_cache`
+    /// A workspace-symbol candidate from `ai_mention_symbol_cache`
     /// must show up in `ai_mention_completions` formatted `@path#Name`
     /// (the unambiguous-at-send-time convention `acp_mention_content_
     /// blocks`/`ai_mention_accept_selected` both rely on), filtered by the
@@ -4950,7 +4877,7 @@ mod issue_1513_at_symbol_and_at_dir_mentions {
         );
     }
 
-    /// #1513: accepting a `@path#Name` symbol candidate stages an
+    /// Accepting a `@path#Name` symbol candidate stages an
     /// `AcpSymbolMention` (`Engine::acp_pending_symbol_mentions`) carrying
     /// the exact line the cached `SymbolInfo` reported, and splices the
     /// literal `@path#Name ` text into the input — the same "chosen text
@@ -4997,7 +4924,7 @@ mod issue_1513_at_symbol_and_at_dir_mentions {
         assert_eq!(engine.acp_pending_symbol_mentions[0].line, 41);
     }
 
-    /// #1513: a directory entry is offered as an `@`-mention candidate too,
+    /// A directory entry is offered as an `@`-mention candidate too,
     /// marked with a trailing `/` — `ai_mention_completions`' unambiguous
     /// marker for "this resolves to a directory, not a file" that `acp_
     /// mention_content_blocks` branches on at send time.
@@ -5027,5 +4954,51 @@ mod issue_1513_at_symbol_and_at_dir_mentions {
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+}
+
+#[cfg(test)]
+mod save_ext_settings_guard_tests {
+    use crate::core::{paths, Engine};
+
+    /// `set_ext_setting` must never write to disk in a `--lib` unit test
+    /// build, mirroring `Settings::save()`'s `#[cfg(test)] return;` guard.
+    ///
+    /// RED verified: temporarily deleting the `#[cfg(test)] return;` line
+    /// at the top of `save_ext_settings` (leaving the `saves_suppressed()`
+    /// check in place) makes this fail — `settings.json` shows up under
+    /// the sandboxed home because `vimcode_config_dir()` already honours
+    /// `set_test_home` even without that guard, so only the explicit
+    /// `#[cfg(test)]` early return stops a plain unit test from reaching
+    /// `std::fs::write`.
+    #[test]
+    fn set_ext_setting_does_not_write_to_disk() {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_save_ext_settings_guard_{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create sandboxed home dir");
+        let _guard = paths::set_test_home(&home);
+
+        let mut engine = Engine::new_for_test();
+        engine.set_ext_setting("demo-ext", "some_key", "some_value");
+
+        let settings_path = home
+            .join(".config")
+            .join("vimcode")
+            .join("extensions")
+            .join("demo-ext")
+            .join("settings.json");
+        assert!(
+            !settings_path.exists(),
+            "save_ext_settings must be a no-op in #[cfg(test)] builds, \
+             mirroring Settings::save() — found an unexpected write at \
+             {settings_path:?}"
+        );
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

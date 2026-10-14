@@ -1,40 +1,63 @@
 #!/usr/bin/env python3
-"""Generate/verify the bundled vimcode-icons.ttf Nerd Font subset.
+"""Generate/verify the bundled vimcode-icons.ttf Nerd Font.
 
-Parses the nerd-font codepoints referenced by `Icon::new(...)` calls in
-`src/icons.rs`, then either subsets a source Nerd Font down to exactly those
-codepoints (default mode) or verifies an existing subset font covers them
-(`--verify` mode, no source font needed).
+Since #1853, this bundles the **entire** Symbols Nerd Font cmap, not a
+subset keyed off `src/icons.rs`. The previous 114-codepoint subset (built
+from exactly the codepoints `Icon::new(...)` references, see git history
+before #1853) covered every icon vimcode itself draws, but nothing else:
+any registry extension (`vimcode-ext`) that picks its own Nerd Font
+codepoint -- e.g. the Git Insights extension's panel icon, U+F1D3
+`nf-fa-git` -- rendered as tofu on any platform without a system-wide Nerd
+Font (native macOS/Windows, or GTK without one installed), because that
+codepoint was never vimcode's own and so never made it into the subset.
+Bundling the full font closes that whole class of bug: there is no longer a
+"wanted" codepoint list to fall behind.
+
+The source is the **proportional** `SymbolsNerdFont-Regular.ttf`, not
+`SymbolsNerdFontMono-Regular.ttf`. Both ship in the same
+`NerdFontsSymbolsOnly.zip` release; the Mono variant registers under a
+different family name (`Symbols Nerd Font Mono` / `SymbolsNFM`, vs. the
+proportional variant's `Symbols Nerd Font` / `SymbolsNF`) and rescales every
+glyph to a fixed 1-em advance width, which would have silently changed the
+painted size/offset of all 114 pre-#1853 icons and broken the family-name
+match `src/render.rs::NERD_FONT_FALLBACK_FAMILY` (and upstream quadraui's
+own `gtk::NERD_FONT_FALLBACK_FAMILY` / `gtk::activity_bar::ICON_FONT_DESC`)
+depend on. Using the proportional variant keeps all 114 pre-existing glyph
+outlines and advance widths byte-identical to the pre-#1853 font while still
+closing the coverage gap -- see `tests/icon_font_coverage.rs` for the
+regression anchor.
+
+`--verify` (and the Rust CI gate, `tests/icon_font_coverage.rs`) still check
+that every nerd codepoint `src/icons.rs` itself references is covered --
+that's a cheap, specific regression guard for vimcode's own icons, not an
+exhaustiveness check on the font (the font's whole job now is to be
+exhaustive).
 
 Only codepoints in the Private Use Area (>= U+E000) are treated as "nerd"
-codepoints that must come from the Nerd Font subset. A handful of
-`Icon::new` calls (the GTK client-side-titlebar window controls, #552/#715)
-intentionally use ordinary BMP Unicode below U+E000 and are covered by any
-system font instead -- they are deliberately excluded from both the subset
-and the coverage check. See `src/icons.rs`'s "Window Controls" section for
-why.
+codepoints for that `src/icons.rs` check. A handful of `Icon::new` calls
+(the GTK client-side-titlebar window controls, #552/#715) intentionally use
+ordinary BMP Unicode below U+E000 and are covered by any system font
+instead -- they are deliberately excluded. See `src/icons.rs`'s "Window
+Controls" section for why.
 
 Usage:
-    # Regenerate the bundled subset from a source Nerd Font. Get the source
-    # from https://github.com/ryanoasis/nerd-fonts releases
-    # (NerdFontsSymbolsOnly.zip -> SymbolsNerdFont-Regular.ttf) -- it is not
-    # vendored in this repo.
-    python3 scripts/gen_icon_font.py --source SymbolsNerdFont-Regular.ttf
-
-    # Adding glyphs to the *existing* subset (the usual case -- a new
-    # Icon::new call needs one more codepoint). Pass the currently-bundled
-    # font, copied somewhere outside data/fonts/ first so --output doesn't
-    # overwrite it mid-run, as --legacy-source: it already carries the
-    # three codepoints upstream dropped (see _merge_legacy_glyphs), so this
-    # avoids hunting down a nerd-fonts v2.1.0 release just to keep them.
-    # Match the bundled font's source release (`name` ID 5 reports it --
-    # 3.5.1 as of #1693) and the pre-existing glyph outlines come out
-    # byte-identical, leaving the diff to just the added codepoints.
+    # First, get a --legacy-source: it supplies three codepoints upstream
+    # nerd-fonts dropped (see LEGACY_DROPPED_CODEPOINTS / _merge_legacy_glyphs)
+    # that vimcode's own icons.rs still references (DBG_VARIABLES, FILE_JS,
+    # FILE_PYTHON). Copy the *currently bundled* font somewhere outside
+    # data/fonts/ first, so --output doesn't overwrite it mid-run -- it
+    # already carries all three, having been merged the same way before:
     cp data/fonts/vimcode-icons.ttf /tmp/legacy-vimcode-icons.ttf
+
+    # Then regenerate the bundled font from a source Nerd Font. Get the
+    # source from https://github.com/ryanoasis/nerd-fonts releases
+    # (NerdFontsSymbolsOnly.zip -> SymbolsNerdFont-Regular.ttf -- the
+    # proportional variant, NOT SymbolsNerdFontMono-Regular.ttf; see the
+    # module docstring above for why) -- it is not vendored in this repo.
     python3 scripts/gen_icon_font.py --source SymbolsNerdFont-Regular.ttf \
         --legacy-source /tmp/legacy-vimcode-icons.ttf
 
-    # Verify (used by hand, or CI) that the bundled subset covers every nerd
+    # Verify (used by hand, or CI) that the bundled font covers every nerd
     # codepoint referenced in src/icons.rs -- no source font needed. This is
     # a convenience CLI; the actual CI gate is the Rust test
     # tests/icon_font_coverage.rs, which runs as part of `cargo test` with no
@@ -142,6 +165,18 @@ def verify(font_path: Path) -> int:
     return 0
 
 
+# The three codepoints nerd-fonts renumbered away between v3.0.0 and v3.1.0
+# upstream (see `_merge_legacy_glyphs` below) that vimcode's own icons.rs
+# still references: U+F6A9 `DBG_VARIABLES`, U+F81D `FILE_JS`, U+F81F
+# `FILE_PYTHON`. Checked independently of `nerd_codepoints()` (which only
+# reflects icons.rs) because, since #1853, `generate()` bundles the *entire*
+# upstream cmap rather than a subset keyed off icons.rs -- these three are
+# the only gap between "entire current upstream cmap" and "entire cmap plus
+# the three codepoints a prior upstream release still had", so they're
+# listed explicitly rather than derived.
+LEGACY_DROPPED_CODEPOINTS = (0xF6A9, 0xF81D, 0xF81F)
+
+
 def _merge_legacy_glyphs(primary_path: Path, legacy_path: Path, missing: list[int]) -> Path:
     """Copy glyph outlines for `missing` codepoints from `legacy_path` into a
     copy of `primary_path`, returning the path to the patched copy.
@@ -211,24 +246,41 @@ def _merge_legacy_glyphs(primary_path: Path, legacy_path: Path, missing: list[in
 
 
 def generate(source: Path, output: Path, legacy_source: Path | None = None) -> int:
+    """Bundle the *entire* cmap of `source` as `output` (#1853), merging in
+    `LEGACY_DROPPED_CODEPOINTS` from `legacy_source` first if `source` is
+    missing any of them.
+
+    This used to subset `source` down to exactly `nerd_codepoints()` (the
+    codepoints `src/icons.rs` itself references) -- see git history before
+    #1853. That covered every icon vimcode draws but nothing a registry
+    extension might pick on its own (e.g. the Git Insights extension's
+    U+F1D3 panel icon), so any such codepoint rendered as tofu wherever the
+    host has no system Nerd Font. Passing `--unicodes=*` instead keeps every
+    codepoint `source` maps, closing that gap structurally rather than by
+    enumeration.
+    """
     from fontTools import subset
     from fontTools.ttLib import TTFont
 
     _self_check()
-    codepoints = nerd_codepoints()
 
     actual_source = source
     if legacy_source is not None:
         primary_cmap = TTFont(str(source)).getBestCmap()
-        missing = [cp for cp in codepoints if cp not in primary_cmap]
+        # Keyed off LEGACY_DROPPED_CODEPOINTS *and* every codepoint
+        # `nerd_codepoints()` (icons.rs) itself references, not just the
+        # hardcoded 3-tuple: if a future upstream release drops a 4th
+        # codepoint vimcode uses, this still catches and merges it instead
+        # of silently emitting a font missing it (#1853 review nit --
+        # `dict.fromkeys` dedupes while preserving order).
+        candidates = dict.fromkeys((*LEGACY_DROPPED_CODEPOINTS, *nerd_codepoints()))
+        missing = [cp for cp in candidates if cp not in primary_cmap]
         if missing:
             actual_source = _merge_legacy_glyphs(source, legacy_source, missing)
 
-    unicodes_arg = ",".join(f"U+{cp:04X}" for cp in codepoints)
-
     args = [
         str(actual_source),
-        f"--unicodes={unicodes_arg}",
+        "--unicodes=*",
         f"--output-file={output}",
         "--glyph-names",
         "--layout-features=*",
@@ -238,6 +290,9 @@ def generate(source: Path, output: Path, legacy_source: Path | None = None) -> i
         "--recommended-glyphs",
     ]
     subset.main(args)
+
+    bundled = len(TTFont(str(output)).getBestCmap())
+    print(f"{output}: {bundled} codepoint(s) bundled")
 
     return verify(output)
 
@@ -249,7 +304,9 @@ def main() -> int:
     parser.add_argument(
         "--source",
         type=Path,
-        help="Source Nerd Font to subset (e.g. SymbolsNerdFont-Regular.ttf)",
+        help="Source Nerd Font to bundle in full (e.g. "
+        "SymbolsNerdFont-Regular.ttf -- the proportional variant, not "
+        "SymbolsNerdFontMono-Regular.ttf; see the module docstring)",
     )
     parser.add_argument(
         "--output",
@@ -260,14 +317,14 @@ def main() -> int:
     parser.add_argument(
         "--verify",
         action="store_true",
-        help="Verify an existing subset covers all referenced codepoints; "
-        "no --source needed",
+        help="Verify an existing bundled font covers all nerd codepoints "
+        "src/icons.rs references; no --source needed",
     )
     parser.add_argument(
         "--legacy-source",
         type=Path,
         help="Fallback font to pull individual glyphs from when --source is "
-        "missing some referenced codepoint (see _merge_legacy_glyphs "
+        "missing one of LEGACY_DROPPED_CODEPOINTS (see _merge_legacy_glyphs "
         "docstring -- as of this writing, upstream nerd-fonts >= v3.1.0 "
         "dropped U+F6A9/U+F81D/U+F81F; v2.1.0's Hack Complete still has them)",
     )

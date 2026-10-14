@@ -8,3 +8,7 @@ build-dir/
 target2/
 # insta's pending-review artifacts — `.snap` files are the source of truth.
 **/*.snap.new
+
+# Python bytecode caches (scripts/validate_smoke_specs.py, its pytest suite)
+__pycache__/
+*.pyc

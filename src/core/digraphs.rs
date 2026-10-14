@@ -1,23 +1,17 @@
-//! Neovim-default-compatible digraph table (`:h digraphs`, `:h i_CTRL-K`,
-//! #1160, #1302) and the `:digraphs` grid-listing renderer.
+//! Neovim-default-compatible digraph table (`:h digraphs`, `:h i_CTRL-K`)
+//! and the `:digraphs` grid-listing renderer.
 //!
 //! A digraph is a two-character mnemonic (e.g. `a:`) that stands for one
-//! Unicode character (`ä`). Per #1170 ("Neovim compatibility as far as it
-//! goes without VimScript or the Neovim Lua API"), this table is Neovim's
-//! *default* digraph table (RFC 1345), not Vim's — the two lists differ, and
-//! #1302 found this one had been built against Vim's. The exact entries and
-//! order below were extracted from a live `nvim --headless -u NONE -i NONE`
-//! via `vim.fn.digraph_getlist(1)` (which returns the same `(mnemonic,
-//! result)` pairs `:digraphs` lists, filtered the same way — see
-//! `digraph_getlist_common` / `listdigraphs` in Neovim's `digraph.c`), so
-//! re-deriving it should reproduce this file byte-for-byte. It is data, not
-//! logic; `:h digraph-table` documents ~1400 entries, so this table can grow
-//! over time without touching the dispatch code in `engine/keys.rs`.
+//! Unicode character (`ä`). This table is Neovim's *default* digraph table
+//! (RFC 1345). The exact entries and order below were extracted from a live
+//! `nvim --headless -u NONE -i NONE` via `vim.fn.digraph_getlist(1)`, which
+//! returns the same `(mnemonic, result)` pairs `:digraphs` lists. It is data,
+//! not logic; `:h digraph-table` documents ~1400 entries, so this table can
+//! grow over time without touching the dispatch code in `engine/keys.rs`.
 //!
-//! Section comments mark the boundaries Neovim's own `header_table`
-//! (`digraph.c`) uses for the `:digraphs!` (bang) grouped/headered listing —
-//! kept here for readability even though vimcode's `:digraphs` (no bang,
-//! #1302's scope) doesn't render the headers.
+//! Section comments mark the boundaries Neovim's own `header_table` uses for
+//! the `:digraphs!` (bang) grouped/headered listing — kept here for
+//! readability even though vimcode's `:digraphs` doesn't render the headers.
 //!
 //! Lookup order for a typed pair `(c1, c2)` is: exact match, then the pair
 //! reversed — Vim accepts digraphs typed in either order for the ones where
@@ -1423,9 +1417,7 @@ pub const BUILTIN_DIGRAPHS: &[(char, char, char)] = &[
 ];
 
 /// The column-wrapped grid width Neovim's `:digraphs` listing uses
-/// (`printdigraph`'s `list_width` in `digraph.c`) and the terminal width it
-/// wraps against (`'columns'`'s default, matched here since `Engine` has no
-/// notion of the active display width for a plain message string — #1302).
+/// and the terminal width it wraps against (80 columns, Neovim's default).
 const DIGRAPH_LIST_WIDTH: usize = 13;
 const DIGRAPH_LIST_COLUMNS: usize = 80;
 
@@ -1462,7 +1454,7 @@ fn digraph_char_repr(result: char) -> String {
 /// caret notation (`< 0x20` or `DEL` — Neovim's `dy_escape_width` default),
 /// 4 for the `<xx>` hex notation (C1 controls), otherwise the real terminal
 /// cell width (narrow/wide) via the same `quadraui::text_util` helper
-/// `Engine::advance_one_cell` already uses for this classification (#1005)
+/// `Engine::advance_one_cell` already uses for this classification
 /// — reused rather than re-derived per the Platform-Neutrality Rule in
 /// `CLAUDE.md` — floored to 1: `utf_char2cells` never returns 0 (its
 /// fallback is `return 1`), so a zero-width *composing* result (which
@@ -1545,15 +1537,11 @@ fn format_digraph_entry(c1: char, c2: char, result: char) -> (String, usize) {
 
 /// Render `entries` as Neovim's `:digraphs` (no bang) does: a leading blank
 /// line, then each entry column-wrapped into a `DIGRAPH_LIST_WIDTH`-wide
-/// grid up to `DIGRAPH_LIST_COLUMNS` wide (`printdigraph`, `digraph.c`) —
-/// wrap to a new line once the current column would leave less than one
-/// full cell free, then pad forward to the next multiple of
-/// `DIGRAPH_LIST_WIDTH` before printing the entry. `:digraphs!`'s
-/// (bang) per-Unicode-block headers are out of scope (#1302 only covers the
-/// bare `:digraphs` the oracle case uses), so `entries` is a flat sequence:
-/// callers order it Neovim-native-table-then-custom to match
-/// `listdigraphs`, which always lists the builtin table before user-defined
-/// (`:digraph`) ones, never the other way around.
+/// grid up to `DIGRAPH_LIST_COLUMNS` wide — wrap to a new line once the
+/// current column would leave less than one full cell free, then pad forward
+/// to the next multiple of `DIGRAPH_LIST_WIDTH` before printing the entry.
+/// `entries` is a flat sequence ordered to match Neovim's behavior: builtin
+/// table entries before any user-defined ones.
 pub fn format_digraph_table(entries: impl Iterator<Item = (char, char, char)>) -> String {
     let mut out = String::from("\n");
     let mut col = 0usize;
@@ -1644,7 +1632,7 @@ mod tests {
         }
     }
 
-    // #1302: `format_digraph_table` reimplements Neovim's `printdigraph`
+    // `format_digraph_table` reimplements Neovim's `printdigraph`
     // grid layout; these pin the exact rendered bytes for representative
     // slices of `BUILTIN_DIGRAPHS`, each confirmed against a live
     // `nvim --headless -u NONE -i NONE` oracle (`:digraphs`, no bang) —
@@ -1687,7 +1675,7 @@ AK ^F   6    BL ^G   7    BS ^H   8    HT ^I   9    LF ^@  10    VT ^K  11";
         // *real* screen width is 0 even though the padding-decision width
         // is floored to 1 — the grid column math after one lands 1 cell
         // later than a naive char-count would predict. This is the subtlest
-        // part of the layout fix (#1302); without it, this exact row
+        // part of the layout fix; without it, this exact row
         // doesn't match.
         let out = format_digraph_table(BUILTIN_DIGRAPHS.iter().copied());
         assert!(out.contains(
@@ -1705,10 +1693,7 @@ AK ^F   6    BL ^G   7    BS ^H   8    HT ^I   9    LF ^@  10    VT ^K  11";
 
     #[test]
     fn ex_digraphs_lists_builtin_before_custom() {
-        // Neovim's `listdigraphs` always lists the builtin `digraphdefault`
-        // table before any `:digraph`-defined custom entries, never the
-        // other way (`digraph.c`) — `ex_digraphs` used to list custom
-        // entries first.
+        // Neovim's `listdigraphs` always lists the builtin table before
         let custom = [('z', 'z', '★')];
         let out = format_digraph_table(BUILTIN_DIGRAPHS.iter().copied().chain(custom));
         let nu_pos = out.find("NU ^@").expect("builtin entry present");

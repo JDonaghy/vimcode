@@ -1,6 +1,6 @@
 //! Integrated-terminal engine operations (panes, tabs, mouse, selection).
 //!
-//! ## Design note (#564): why terminal selection does *not* use
+//! ## Design note: why terminal selection does *not* use
 //! `quadraui::dispatch::TextRegion` / `DragTarget::TextSelection`
 //!
 //! #564 asked whether the integrated terminal's click-drag text selection
@@ -50,7 +50,7 @@
 //! own screen is the selectable surface, and it already has a
 //! purpose-built quadraui type for that. See also
 //! `docs/QUADRAUI_GUIDE.md` § "Terminal selection stays on
-//! `TerminalSelection`, not `TextRegion` (#564)".
+//! `TerminalSelection`, not `TextRegion`".
 //!
 //! No quadraui-side gap exists here, so no quadraui issue was filed for
 //! this half of #508's follow-up work. #565 (routing the *editor's*
@@ -119,7 +119,7 @@ impl Engine {
 
     /// Run a command in a new terminal pane (visible to the user).
     /// Used for extension installs so the user can see progress, errors, and enter
-    /// sudo passwords. `poll_terminal` finalizes the install (#1396) as soon as
+    /// sudo passwords. `poll_terminal` finalizes the install as soon as
     /// the wrapper records the command's exit code — it does not wait for the
     /// pane's shell to exit, so the "Installing…" spinner resolves even if the
     /// user never notices the pane or presses Enter at its "Press Enter to
@@ -144,11 +144,11 @@ impl Engine {
         // for Enter, then exits the shell so `TerminalSession::is_exited()` fires and
         // `poll_terminal` can call `finalize_install_from_terminal`. Keyed by the
         // install's `install_key` so the wrapper can hand the command's real exit
-        // status back across the PTY boundary (#1344) — falls back to a shared
+        // status back across the PTY boundary — falls back to a shared
         // "adhoc" key for terminal runs with no install context, whose exit code
         // nothing reads.
         let install_key = ctx.as_ref().map_or("adhoc", |c| c.install_key.as_str());
-        // #1396 review: `install_key` is deterministic per extension
+        // `install_key` is deterministic per extension
         // (`format!("ext:{ext_name}:lsp")`), so a leftover scratch file from an
         // earlier attempt under the same key (pane closed in the narrow window
         // after the wrapper wrote it but before this run started, or a crash)
@@ -160,17 +160,15 @@ impl Engine {
         // from this attempt.
         invalidate_install_exit_code(install_key);
         let wrapped = build_terminal_install_wrapper(command, is_powershell, install_key);
-        // #1712: never type `wrapped` itself into the PTY — a tty's
-        // canonical-mode line discipline caps a single input line at 1024
-        // bytes on macOS (4096 on Linux), and `wrapped` starts with `command`
-        // verbatim, which for e.g. the combined rust/cpp install
-        // (`rustup component add rust-analyzer ; <codelldb install command>`)
-        // routinely exceeds that. Anything past the cap — including the
-        // trailing newline — is silently dropped before the shell ever sees
-        // it, leaving the pane stuck at a half-typed prompt forever. Instead,
-        // write the full script to a temp file and type only a short
-        // `sh '<path>'` / `& '<path>'` launcher line, whose length no longer
-        // depends on `command` at all.
+        // A tty's canonical-mode line discipline caps a single input line at 1024
+        // bytes on macOS (4096 on Linux). The full wrapped script starting with
+        // `command` can exceed that (e.g. combined rust/cpp install with both
+        // `rustup component add rust-analyzer` and a codelldb install command).
+        // Anything past the cap — including the trailing newline — is silently
+        // dropped before the shell ever sees it, leaving the pane stuck at a
+        // half-typed prompt. Instead, write the full script to a temp file and
+        // type only a short `sh '<path>'` / `& '<path>'` launcher, whose length
+        // depends only on the temp-dir path, not on `command`.
         let script_path = install_script_path(install_key, is_powershell);
         if let Err(e) = std::fs::write(&script_path, &wrapped) {
             self.message = format!("terminal: failed to write install script: {e}");
@@ -199,49 +197,36 @@ impl Engine {
         }
     }
 
-    /// Launch the ACP agent's own command line, plus the chosen auth
-    /// method's own `args` (#1444), as an *interactive* process in a
-    /// visible terminal pane, for a `type: "terminal"` auth method (#957,
-    /// ACP-6). Terminal auth is not the `authenticate` RPC — per the ACP
-    /// spec's distinction (`core::acp`'s module doc), the client must run
-    /// the adapter attached to a real TTY so its own CLI can drive an
-    /// interactive login (a browser OAuth flow, a device code prompt, ...),
-    /// then re-initialize once that process exits
-    /// (`Engine::acp_finish_terminal_login`, called from `poll_terminal`
-    /// below / `terminal_close_active_tab`). This re-runs the exact same
-    /// command used for the NDJSON transport — resolved through
-    /// `acp_resolve_agent_launch` (the registry's active profile if one is
-    /// configured, else the legacy single-string `acp_agent_command`,
-    /// #958 ACP-7 / #1443) so terminal-auth login always launches whatever
-    /// agent the AI panel actually spawned, not a stale unconditional read
-    /// of `acp_agent_command`.
+    /// Launch the ACP agent's command plus the chosen auth method's `args`
+    /// as an interactive process in a visible terminal pane, for a
+    /// `type: "terminal"` auth method (ACP-6). The terminal auth
+    /// process is not the `authenticate` RPC — the client must run the
+    /// adapter attached to a real TTY so its CLI can drive an interactive
+    /// login (browser OAuth, device code prompt, etc.), then re-initialize
+    /// once it exits. The command is resolved through `acp_resolve_agent_launch`
+    /// (the active profile if configured, else the legacy `acp_agent_command`)
+    /// to ensure terminal-auth always launches the same agent the AI panel
+    /// actually spawned.
     ///
-    /// Running that resolved command *bare* is wrong: the reference Claude
-    /// ACP adapter starts its NDJSON server and waits on stdin when given no
-    /// arguments, even attached to a real TTY — no login flow ever runs, and
-    /// the pane just sits there until the user closes it (read as
-    /// "abandoned"). What actually selects *which* login this specific
-    /// method performs is `login_args`, taken verbatim from the chosen
-    /// [`crate::core::acp::AcpAuthMethod::args`] the agent advertised on the
-    /// wire (e.g. `["--cli", "auth", "login", "--claudeai"]`) and appended
-    /// after the resolved command — vimcode has no agent-specific knowledge
-    /// of what those args mean (nor should it, per the ACP track's
-    /// agent-neutral design); it only forwards what the agent itself said
+    /// Running the resolved command bare is wrong: the reference Claude ACP
+    /// adapter starts its NDJSON server and waits on stdin when given no
+    /// arguments, even on a real TTY — no login flow runs, and the pane sits
+    /// idle. What selects which login this method performs is `login_args`,
+    /// taken from the chosen [`crate::core::acp::AcpAuthMethod::args`] the
+    /// agent advertised (e.g. `["--cli", "auth", "login", "--claudeai"]`)
+    /// and appended after the resolved command — vimcode has no agent-specific
+    /// knowledge of these args' meaning and only forwards what the agent says
     /// this method needs.
     ///
-    /// `TerminalSession::spawn` takes a shell *path*, not an argv
-    /// (`quadraui::terminal_engine::TerminalSession::spawn`) — the same
-    /// constraint `terminal_run_command` above already works around: spawn
-    /// the user's interactive shell (in the resolved profile's `cwd`),
-    /// then inject the command (plus `login_args`) and its `env` as PTY
-    /// input (`build_acp_auth_wrapper`), reusing that existing pattern
+    /// `TerminalSession::spawn` takes a shell path, not argv — spawn the
+    /// user's interactive shell in the profile's `cwd`, then inject the
+    /// command plus `login_args` and its `env` as PTY input
+    /// (`build_acp_auth_wrapper`), reusing the same pattern as `terminal_run_command`
     /// rather than inventing a second one. `login_args` are shell-quoted
-    /// (`quote_shell_arg`) before being appended — they came off the wire,
-    /// not the operator's own keyboard, so unlike the base command string
-    /// itself (`parse_agent_command`'s doc comment) they get no benefit of
-    /// the doubt about containing shell metacharacters.
+    /// (`quote_shell_arg`) since they come off the wire, not the operator's
+    /// keyboard, and must be safe from shell metacharacter interpretation.
     pub fn acp_launch_terminal_login(&mut self, method_name: &str, login_args: &[String]) {
-        // #1443: route through the same registry-aware resolver the
+        // Route through the same registry-aware resolver the
         // NDJSON transport path uses (`ai_send_message_via_acp`), not
         // `settings.acp_agent_command` directly — that field is empty
         // whenever the agent came from `settings.acp_agents`, which made
@@ -305,7 +290,7 @@ impl Engine {
         if self.terminal_panes.is_empty() {
             return;
         }
-        // #957 (ACP-6): closing the pane before an ACP terminal-auth login
+        // Closing the pane before an ACP terminal-auth login
         // process exits on its own is "abandoned", not "succeeded" —
         // `acp_finish_terminal_login(None)` must run *before* the pane is
         // removed below reports it, matching `poll_terminal`'s exit-path
@@ -384,7 +369,7 @@ impl Engine {
         self.terminal_active = 1; // right pane gets focus
     }
 
-    /// Disable horizontal split view and return to single-pane / tab view.
+    /// Close split pane view and return to single-pane / tab view.
     /// Panes are kept alive as regular tabs; `full_cols` is used to resize the
     /// active pane back to the full panel width.
     pub fn terminal_close_split(&mut self, full_cols: u16, rows: u16) {
@@ -490,7 +475,7 @@ impl Engine {
     ///
     /// # Gold standard
     /// Mirrors `examples/common/terminal_app.rs` `UiEvent::MouseDown` arm
-    /// (quadraui#279/#365) — zero backend-specific code.
+    /// — zero backend-specific code.
     pub fn handle_terminal_pane_press(
         &mut self,
         col: u16,
@@ -667,10 +652,9 @@ impl Engine {
         }
     }
 
-    /// Dispatch a click on the bottom panel tab bar using the cached
-    /// [`BottomTabStripHits`] (`TabBarLayout::hit_test`, #1491) from the last
-    /// paint. Returns `true` if the click was consumed (tab switch or panel
-    /// close).
+    /// Dispatch a click on the bottom panel tab bar using cached hit data
+    /// from the last paint (`TabBarLayout::hit_test`). Returns `true` if the
+    /// click was consumed (tab switch or panel close).
     pub fn handle_bottom_tab_bar_click(&mut self, click_x: f64) -> bool {
         enum Action {
             Close,
@@ -717,8 +701,8 @@ impl Engine {
     /// Resolve a terminal toolbar click to an action using cached hit data.
     /// Both TUI (cell columns) and GTK (pixel positions) pass screen-absolute
     /// coordinates; each arm shifts by its own cached `origin_x` before
-    /// hit-testing its bar-relative `layout` (#1491 — both `StatusBarLayout`
-    /// and `TabBarLayout` share that bar-relative convention now).
+    /// hit-testing its bar-relative `layout` (both `StatusBarLayout` and
+    /// `TabBarLayout` share that bar-relative convention).
     pub fn resolve_terminal_toolbar_click(&self, click_x: f64) -> TerminalToolbarAction {
         let hits = self.terminal_toolbar_hits.borrow();
         let Some(ref hits) = *hits else {
@@ -855,7 +839,7 @@ impl Engine {
     /// Returns true if a redraw is needed.
     /// Exited sessions are automatically removed; closes the panel when the last one exits.
     ///
-    /// #1396: install panes finalize as soon as the command's exit-code scratch
+    /// Install panes finalize as soon as the command's exit-code scratch
     /// file appears (below), not only when the shell itself exits — the wrapper
     /// (`build_terminal_install_wrapper`) blocks on "Press Enter to close…"
     /// *after* the command finishes and *after* it has written that file, so
@@ -914,7 +898,7 @@ impl Engine {
                     }
                 }
                 self.terminal_panes.remove(i);
-                // #957 (ACP-6): call after `remove` so `acp_finish_terminal_login`
+                // Call after `remove` so `acp_finish_terminal_login`
                 // (which may itself touch `terminal_panes` indirectly via
                 // `acp_launch_terminal_login` on a later retry) never sees
                 // the just-exited pane still present.
@@ -945,13 +929,11 @@ impl Engine {
         got_data
     }
 
-    /// Called by `poll_terminal`, either as soon as the install command's exit
-    /// code is available (#1396 — the common case, well before the pane's
-    /// shell itself exits) or, as a fallback, when an unfinalized install pane's
-    /// shell exits (e.g. the pane was closed before the command finished).
-    /// Checks the install command's recorded exit status (#1344) and, if it
-    /// succeeded, whether the binary is now resolvable via the shared
-    /// `binary_on_path` lookup, registering the LSP/DAP server if so.
+    /// Called by `poll_terminal` when the install command's exit code is
+    /// available (either immediately after it exits, or when the pane's shell
+    /// exits if finalization was deferred). Checks the recorded exit status
+    /// and, if it succeeded, whether the binary is now resolvable via
+    /// `binary_on_path`, registering the LSP/DAP server if so.
     fn finalize_install_from_terminal(&mut self, ctx: &InstallContext) {
         self.lsp_installing.remove(&ctx.install_key);
         // Clear the "Installing …" spinner notification.
@@ -959,12 +941,10 @@ impl Engine {
 
         let ext_name = &ctx.ext_name;
 
-        // #1344: the wrapper script records the install command's real exit
-        // status to a scratch file (see `build_terminal_install_wrapper`)
-        // because a PTY only tells us the *shell* exited, not what the command
-        // it ran returned. A non-zero code is reported as a failure up front —
-        // previously this was invisible and surfaced only as a confusing
-        // "binary not found on PATH", which pointed at the wrong problem.
+        // The wrapper script records the install command's exit status to a scratch
+        // file because a PTY only tells us the shell exited, not what the command
+        // it ran returned. A non-zero code indicates failure upfront rather than
+        // surfacing later as a confusing "binary not found on PATH".
         if let Some(code) = read_install_exit_code(&ctx.install_key) {
             crate::core::lsp_manager::install_log(&format!(
                 "[ext-install] '{ext_name}' install (key={}) exited with code {code}",
@@ -987,15 +967,10 @@ impl Engine {
             None => return,
         };
 
-        // Collected rather than assigned straight into `self.message` (review
-        // finding on #1344): a manifest can declare both an LSP server and a
-        // DAP adapter (`sample_manifests()` in `src/core/extensions.rs` has a
-        // `rust` entry with both `lsp.binary` and `dap.adapter`/`dap.binary`
-        // set), and a successful LSP install followed by an unresolved DAP
-        // binary must not silently erase the LSP success message — a user
-        // who installed `rust-analyzer` but not `codelldb` should see both
-        // outcomes, not a lone "was not found" that reads like the whole
-        // install failed.
+        // A manifest can declare both an LSP server and a DAP adapter, and a
+        // successful LSP install followed by an unresolved DAP binary must not
+        // erase the LSP success message — collect outcomes so both are reported
+        // to the user.
         let mut outcomes: Vec<String> = Vec::new();
 
         // Check if LSP binary is now resolvable and register it.
@@ -1062,11 +1037,9 @@ impl Engine {
     /// lands in the frame the caller is about to paint.
     ///
     /// Delegates the bracketed-paste decision to quadraui's
-    /// `TerminalSession::paste` (quadraui#343/#415), which wraps in
-    /// `ESC[200~ … ESC[201~` only when the child has actually enabled DEC
-    /// private mode 2004. Both call sites used to hand-roll an
-    /// *unconditional* wrap, which leaked literal `[200~` bytes into programs
-    /// that do not strip them (`cat`, `less`, a shell without a line editor).
+    /// `TerminalSession::paste`, which wraps in `ESC[200~ … ESC[201~` only
+    /// when the child has actually enabled DEC private mode 2004. This avoids
+    /// leaking literal `[200~` bytes into programs that do not strip them.
     pub fn terminal_paste(&mut self, text: &str) {
         if let Some(term) = self.active_terminal_mut() {
             term.paste(text);
@@ -1083,14 +1056,8 @@ impl Engine {
 
     /// Return selected terminal text from the active pane for clipboard copy.
     ///
-    /// #732: GTK's only caller was the `Msg::TerminalCopySelection` arm, which
-    /// had no producer left after the #540 Relm4→ShellApp cutover (the
-    /// per-DrawingArea key controller that used to send it went with it), and
-    /// TUI has never called it — so the `vimcode` bin, which compiles `core` as
-    /// a private module, now reports it dead. Kept (rather than deleted with
-    /// the orphaned arm) because it is part of `vimcode_core`'s public surface
-    /// and is what a re-wired terminal-copy binding on either backend will
-    /// call; `#[allow]` documents that it is currently unreached, not unwanted.
+    /// Currently unreached (no caller after backend refactors), but kept as
+    /// part of `vimcode_core`'s public surface for use by terminal-copy bindings.
     #[allow(dead_code)]
     pub fn terminal_copy_selection(&mut self) -> Option<String> {
         self.active_terminal()?.selected_text()
@@ -1130,7 +1097,7 @@ impl Engine {
     /// Backends call this in **one line** from their
     /// `"terminal_scrollback"` dispatch arm — no per-backend step
     /// computation, sign reversal, or forwarding logic needed.  When
-    /// quadraui ships `TerminalSession::handle_wheel` (quadraui#365) this
+    /// quadraui ships `TerminalSession::handle_wheel` this
     /// method will thin further to a single delegation.
     pub fn handle_terminal_scroll(&mut self, delta_y: f32) {
         if delta_y == 0.0 {
@@ -1151,7 +1118,7 @@ impl Engine {
     ///
     /// Mirrors quadraui's `examples/common/terminal_app.rs` scroll handler,
     /// which composes `forward_mouse()` + `scroll_up/down` the same way.
-    /// The longer-term goal (quadraui#365) is to lift this into
+    /// The longer-term goal is to lift this into
     /// `TerminalSession::handle_wheel`.
     pub fn terminal_wheel(&mut self, up: bool, step: usize) {
         if !self.terminal_forward_wheel(up) {
@@ -1172,13 +1139,12 @@ impl Engine {
     /// [`terminal_scroll_up`](Self::terminal_scroll_up) /
     /// [`terminal_scroll_down`](Self::terminal_scroll_down).
     ///
-    /// quadraui gates this through `TerminalSession::should_forward_wheel()`
-    /// (#514 stress-test: a stray wheel must never leak the previous command's
-    /// output into the shell's scrollback while an app owns the alt-screen).
+    /// quadraui gates this through `TerminalSession::should_forward_wheel()`,
+    /// ensuring a stray wheel does not leak the previous command's output into
+    /// the shell's scrollback while an app owns the alt-screen.
     ///
-    /// Wheel events report at cell `(0, 0)`.  The pointer position for wheels
-    /// is not yet passed through — this is tracked as part of the full
-    /// `UiEvent` unification (quadraui#365).
+    /// Wheel events report at cell `(0, 0)`. The pointer position for wheels
+    /// is not yet passed through — tracked as part of the full `UiEvent` unification.
     pub fn terminal_forward_wheel(&mut self, up: bool) -> bool {
         use quadraui::terminal_engine::TerminalMouseKind;
         if let Some(term) = self.active_terminal_mut() {
@@ -1343,7 +1309,7 @@ impl Engine {
         }
     }
 
-    /// Shared terminal key dispatch (#351). The engine decides what a
+    /// Shared terminal key dispatch. The engine decides what a
     /// keypress means; the backend only needs to execute the returned
     /// action (clipboard I/O, PTY write). `key_name` uses the same
     /// canonical names as `handle_key` (e.g. "Return", "Escape", "Up").
@@ -1451,7 +1417,7 @@ impl Engine {
     }
 }
 
-/// Path to the per-install exit-code scratch file for `install_key` (#1344).
+/// Path to the per-install exit-code scratch file for `install_key`.
 ///
 /// A PTY only tells `TerminalSession::is_exited()` that the *shell* exited —
 /// not what exit status the command it ran returned. `build_terminal_install_wrapper`
@@ -1486,7 +1452,7 @@ pub(crate) fn install_exit_code_path(install_key: &str) -> PathBuf {
 /// Read back the exit code `build_terminal_install_wrapper` recorded for
 /// `install_key`, consuming (deleting) the scratch file so a stale code left
 /// over from an earlier install under the same key is never mistaken for the
-/// current one (#1344).
+/// current one.
 ///
 /// Returns `None` when the wrapper never got as far as writing the file —
 /// e.g. the pane was closed before the command finished, or the run had no
@@ -1500,7 +1466,7 @@ fn read_install_exit_code(install_key: &str) -> Option<i32> {
 }
 
 /// Non-consuming check for whether the wrapper has written the exit-code
-/// scratch file for `install_key` yet (#1396). `poll_terminal` uses this on
+/// scratch file for `install_key` yet. `poll_terminal` uses this on
 /// every idle tick to finalize an install as soon as the *command* finishes,
 /// rather than waiting for the shell to exit (which requires the user to
 /// notice the pane and press Enter at its "Press Enter to close…" prompt).
@@ -1511,25 +1477,20 @@ fn install_exit_code_ready(install_key: &str) -> bool {
     install_exit_code_path(install_key).exists()
 }
 
-/// Delete any leftover exit-code scratch file for `install_key` (#1396 review
-/// finding). `terminal_run_command` calls this right before injecting the
-/// wrapped command into the new pane's PTY, so a file left behind by an
-/// earlier attempt under the same (deterministic, per-extension) `install_key`
-/// can never be mistaken by `poll_terminal`'s eager `install_exit_code_ready`
-/// check for the current run's result. Without this, a leftover from a pane
-/// closed between the wrapper writing the file and the shell actually exiting
-/// (or a crash in that window) would finalize the *new* install on its very
-/// first idle tick with the *old* exit code, and — because finalization is
-/// idempotent per pane — permanently discard the real outcome once it lands.
-/// Best-effort: if the file doesn't exist, or can't be removed, there is
-/// nothing stale to worry about (a fresh write by this run's wrapper will
-/// simply create/overwrite it later).
+/// Delete any leftover exit-code scratch file for `install_key`. Called
+/// right before injecting the wrapped command into the pane's PTY, so a
+/// file left behind by an earlier attempt under the same deterministic
+/// `install_key` cannot be mistaken for the current run's result. Without
+/// this, a leftover from a pane closed between the wrapper writing the file
+/// and the shell exiting would finalize the new install with the old exit
+/// code. Best-effort: if the file doesn't exist or can't be removed, the
+/// wrapper will simply create or overwrite it later.
 fn invalidate_install_exit_code(install_key: &str) {
     let _ = std::fs::remove_file(install_exit_code_path(install_key));
 }
 
-/// Path to the per-install **wrapper script** file for `install_key`
-/// (#1712), sibling to [`install_exit_code_path`]. `terminal_run_command`
+/// Path to the per-install **wrapper script** file for `install_key`,
+/// sibling to [`install_exit_code_path`]. `terminal_run_command`
 /// writes [`build_terminal_install_wrapper`]'s output here rather than
 /// typing it into the PTY directly — see that call site's doc comment for
 /// why. Sanitizes `install_key` the same way `install_exit_code_path` does
@@ -1553,29 +1514,22 @@ pub(crate) fn install_script_path(install_key: &str, is_powershell: bool) -> Pat
 }
 
 /// Build the short line actually typed into the PTY to run an extension
-/// install (#1712). `terminal_run_command` writes the full
-/// [`build_terminal_install_wrapper`] script to `script_path` first, then
-/// types only this line — its length depends solely on `script_path` (an OS
-/// temp-dir path plus a short fixed-format filename), never on the command
-/// being installed, so it can't hit a tty's canonical-mode line-length cap
-/// (1024 bytes on macOS, 4096 on Linux) the way typing the full script would.
+/// install. The full wrapper script is written to `script_path` first,
+/// then only this line is typed — its length depends solely on `script_path`
+/// (OS temp-dir path plus fixed-format filename), never on the command
+/// being installed, so it cannot hit a tty's canonical-mode line-length cap.
 ///
 /// `sh '<path>'` for POSIX; `& '<path>'` for PowerShell — both quoted via
-/// [`quote_shell_arg`] since a temp-dir path can itself contain spaces or
-/// other shell metacharacters on some systems.
+/// [`quote_shell_arg`] since a temp-dir path can contain spaces or other
+/// shell metacharacters on some systems.
 ///
-/// **Ends with its own `; exit` / `; Exit`**, and must keep doing so: the
-/// wrapper's trailing `exit` (step 5 of [`build_terminal_install_wrapper`])
-/// was written to exit the *pane's interactive shell*, which is what makes
-/// `TerminalSession::is_exited()` fire so `poll_terminal` removes the
-/// pane's `TerminalSlot` once the user presses Enter at "Press Enter to
-/// close…". Now that the wrapper runs as a child `sh`/`&` invocation rather
-/// than being typed into that shell directly, its `exit` only ends the
-/// child — so the launcher line has to carry the interactive shell's own
-/// exit itself, or the pane would return to its PS1 prompt and stay open
-/// (and unremovable) forever. The install's *result* no longer depends on
-/// this (#1396 finalizes off the exit-code scratch file), only the pane's
-/// lifecycle does.
+/// **Ends with its own `; exit` / `; Exit`**: the wrapper's trailing `exit`
+/// was written to exit the pane's interactive shell. Now the wrapper runs
+/// as a child `sh`/`&` invocation, so its `exit` only ends the child — the
+/// launcher line must carry the interactive shell's own exit, or the pane
+/// returns to its PS1 prompt and cannot be closed. The install's result is
+/// recorded separately via the exit-code scratch file, only the pane's
+/// lifecycle depends on this exit.
 pub(crate) fn build_terminal_install_launch_line(
     script_path: &Path,
     is_powershell: bool,
@@ -1592,20 +1546,13 @@ pub(crate) fn build_terminal_install_launch_line(
 ///
 /// Wraps `command` in a shell fragment that:
 /// 1. Runs the command.
-/// 2. Records its exit status to the `install_exit_code_path(install_key)` scratch
-///    file (#1344) so `finalize_install_from_terminal` can tell a failed install
-///    apart from a successful one whose binary just isn't resolvable.
+/// 2. Records its exit status to `install_exit_code_path(install_key)` so
+///    failures can be distinguished from successes whose binary isn't resolvable.
 /// 3. Prints a colour-coded success/failure banner.
 /// 4. Prints "Press Enter to close…" and waits for the user.
-/// 5. **Exits the shell** after "Press Enter to close…" — since #1396,
-///    `poll_terminal` finalizes as soon as the exit-code scratch file appears
-///    (step 2), *without* waiting for this exit, so the LSP/DAP registration no
-///    longer depends on it. This final `exit` / `Exit` still matters for a
-///    second, narrower reason: it's what makes `TerminalSession::is_exited()`
-///    eventually fire so the pane closes and its `TerminalSlot` is removed
-///    once the user is done reading the output and presses Enter — without
-///    it, the shell would return to its PS1 prompt and the pane would stay
-///    open (and unremovable) forever.
+/// 5. **Exits the shell** — since finalization occurs when the exit-code
+///    scratch file appears, this exit ensures `TerminalSession::is_exited()`
+///    fires so the pane closes once the user presses Enter.
 ///
 /// Extracted as a pure function so both the exit-suffix invariant and the
 /// exit-code handoff can be tested without spawning a real PTY.
@@ -1645,29 +1592,21 @@ pub fn build_terminal_install_wrapper(
 }
 
 /// Build the PTY-injected wrapper for an ACP terminal-auth login pane
-/// (#957, ACP-6). Unlike [`build_terminal_install_wrapper`], there is no
+/// (ACP-6). Unlike [`build_terminal_install_wrapper`], there is no
 /// scratch-file exit-code handoff and no "press Enter to close" pause —
 /// `exit $?` / `Exit $LASTEXITCODE` runs immediately after the command,
-/// with nothing in between to disturb `$?`/`$LASTEXITCODE`, so the outer
-/// interactive shell's own exit status *is* the login command's exit
-/// status directly. The pane is expected to close itself the moment the
-/// login command finishes: `poll_terminal`'s exit handling reads
+/// preserving the command's exit status. The pane is expected to close
+/// itself the moment the login command finishes: `poll_terminal` reads
 /// `TerminalSession::exit_code()` straight off the session it just
-/// detected exited, no scratch file needed.
+/// detected exited.
 ///
 /// Extracted as a pure function, same rationale as
 /// [`build_terminal_install_wrapper`]: testable without a real PTY.
 ///
-/// `env` carries the active agent profile's extra environment variables
-/// (`AcpAgentProfile::env` / `acp_resolve_agent_launch`, #958 ACP-7,
-/// #1443). Unlike the NDJSON transport path (`AcpClient::spawn_with_env`,
-/// a real subprocess `env` map), these vars are injected as shell
-/// statements ahead of the command since the whole wrapper is text typed
-/// into an interactive shell, not argv — `export KEY=VALUE` for POSIX,
-/// `$env:KEY = "VALUE"` for PowerShell. Values are not shell-quoted
-/// beyond that: same "operator-configured, not attacker input" posture
-/// `parse_agent_command`'s doc comment already accepts for the command
-/// string itself.
+/// `env` carries the active agent profile's extra environment variables.
+/// These vars are injected as shell statements ahead of the command since
+/// the wrapper is text typed into an interactive shell, not argv —
+/// `export KEY=VALUE` for POSIX, `$env:KEY = "VALUE"` for PowerShell.
 pub fn build_acp_auth_wrapper(
     command: &str,
     env: &[(String, String)],
@@ -1689,15 +1628,10 @@ pub fn build_acp_auth_wrapper(
 }
 
 /// Shell-quote a single argv word for injection into the interactive shell
-/// wrapper `build_acp_auth_wrapper` builds — used for a `type: "terminal"`
-/// auth method's own `args` (#1444, [`crate::core::acp::AcpAuthMethod::
-/// args`]), which arrive off the wire rather than from the operator's own
-/// keyboard, unlike the base command string (`parse_agent_command`'s doc
-/// comment explains that string's own, more permissive, posture). POSIX
-/// gets single-quoting with the standard `'\''`-splice for an embedded
-/// single quote; PowerShell gets double-quoting with backtick-escaped
-/// backticks and double quotes, matching `build_acp_auth_wrapper`'s own
-/// per-shell split.
+/// wrapper — used for a `type: "terminal"` auth method's own `args`,
+/// which arrive off the wire rather than from the operator's keyboard.
+/// POSIX gets single-quoting with `'\''` for embedded quotes; PowerShell
+/// gets double-quoting with backtick-escaped backticks and quotes.
 fn quote_shell_arg(arg: &str, is_powershell: bool) -> String {
     if is_powershell {
         format!("\"{}\"", arg.replace('`', "``").replace('"', "`\""))
@@ -1707,11 +1641,11 @@ fn quote_shell_arg(arg: &str, is_powershell: bool) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// ACP `terminal/create` (#1522) — served via the same "interactive shell +
+// ACP `terminal/create` — served via the same "interactive shell +
 // injected PTY input" technique the two wrappers above already use.
 // ---------------------------------------------------------------------------
 
-/// `"cmd arg1 arg2"` for the live tool-call card header (#1522) — plain
+/// `"cmd arg1 arg2"` for the live tool-call card header — plain
 /// space-joining, purely for display; never re-executed, unlike
 /// [`build_acp_terminal_wrapper`]'s shell-quoted splice.
 pub fn acp_terminal_command_display(command: &str, args: &[String]) -> String {
@@ -1723,7 +1657,7 @@ pub fn acp_terminal_command_display(command: &str, args: &[String]) -> String {
 }
 
 /// Build the PTY-injected wrapper for an ACP-served `terminal/create`
-/// terminal (#1522) — the same "spawn an interactive shell via
+/// terminal — the same "spawn an interactive shell via
 /// `TerminalSession::spawn`, then inject the real command as PTY input"
 /// technique [`build_acp_auth_wrapper`]/[`build_terminal_install_wrapper`]
 /// already use (`TerminalSession::spawn` takes a shell *path*, not an
@@ -1872,7 +1806,7 @@ pub fn truncate_terminal_output(output: &str, limit: Option<usize>) -> (String, 
 }
 
 impl Engine {
-    /// Serve `terminal/create` (#1522): spawn `command`/`args` via
+    /// Serve `terminal/create`: spawn `command`/`args` via
     /// [`build_acp_terminal_wrapper`]'s injected-shell technique and
     /// register a fresh `AcpTerminalRecord` in the *active* session's
     /// `AcpSession::acp_terminals` (`Engine::acp_mut`, already pointed at
@@ -1970,7 +1904,7 @@ impl Engine {
         }
     }
 
-    /// Best-effort interrupt for `terminal/kill` (#1522): writes Ctrl-C
+    /// Best-effort interrupt for `terminal/kill`: writes Ctrl-C
     /// (`0x03`) to the terminal's PTY — the same byte a person pressing
     /// Ctrl+C in an interactive shell sends. There is no hard-kill
     /// primitive to reach for instead: `quadraui::terminal_engine::
@@ -1996,7 +1930,7 @@ impl Engine {
         }
     }
 
-    /// Serve `terminal/release` (#1522): freeze the card's elapsed-time
+    /// Serve `terminal/release`: freeze the card's elapsed-time
     /// snapshot and drop the live `TerminalSession`/PTY, while keeping the
     /// `AcpTerminalRecord` itself — and its last captured output/exit
     /// status — around, per this issue's "persists after release"
@@ -2020,7 +1954,7 @@ impl Engine {
     }
 }
 
-/// Translate a key event to PTY input bytes. Shared by both backends (#351).
+/// Translate a key event to PTY input bytes. Shared by both backends.
 pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Vec<u8> {
     if ctrl {
         if let Some(ch) = unicode {
@@ -2094,7 +2028,7 @@ mod tests {
     /// macOS's tty line discipline caps a single canonical-mode input line at
     /// this many bytes (`MAX_CANON`); Linux allows 4096. Anything past it,
     /// including the trailing newline, is silently dropped before the shell
-    /// ever sees it (#1712).
+    /// ever sees it.
     const MACOS_MAX_CANON: usize = 1024;
 
     /// Verify that the POSIX wrapper ends with `\nexit\n` so the shell process
@@ -2120,16 +2054,12 @@ mod tests {
         );
     }
 
-    /// #1712 kept the two tests above honest: the wrapper's own trailing
-    /// `exit` now runs in a *child* `sh`/`&` invocation, so it no longer
-    /// ends the pane's interactive shell — the launcher line typed into
-    /// that shell has to carry the exit itself, or `TerminalSession::
-    /// is_exited()` never fires and `poll_terminal` never removes the
-    /// pane's `TerminalSlot` (the pane just returns to its PS1 prompt and
-    /// can't be closed). Dropping the `; exit` / `; Exit` suffix from
-    /// `build_terminal_install_launch_line` makes this test fail while
-    /// `posix_wrapper_ends_with_exit` above keeps passing, which is exactly
-    /// the gap it covers.
+    /// The wrapper's trailing `exit` now runs in a child `sh`/`&` invocation,
+    /// so it no longer ends the pane's interactive shell — the launcher line
+    /// must carry the exit itself, or `TerminalSession::is_exited()` never
+    /// fires and the pane returns to its PS1 prompt. Dropping the exit suffix
+    /// makes this test fail while `posix_wrapper_ends_with_exit` passes,
+    /// covering the gap.
     #[test]
     fn install_launch_line_exits_the_pane_shell_after_the_script_returns() {
         let posix = build_terminal_install_launch_line(
@@ -2168,7 +2098,7 @@ mod tests {
         );
     }
 
-    /// #1712: the line actually typed into the PTY for an extension install
+    /// The line actually typed into the PTY for an extension install
     /// must stay under the tty canonical-mode cap regardless of how long the
     /// command being installed is — reproducing the real rust/cpp DAP
     /// install shape (`rustup component add rust-analyzer ; <codelldb
@@ -2219,7 +2149,7 @@ mod tests {
         }
     }
 
-    /// #957 (ACP-6): unlike the install wrapper, the ACP auth-login wrapper
+    /// Unlike the install wrapper, the ACP auth-login wrapper
     /// must end with `exit $?` / `Exit $LASTEXITCODE` *immediately* after
     /// the command — no scratch-file write, no "press Enter" pause — so
     /// the outer shell's own exit status is the login command's exit
@@ -2244,7 +2174,7 @@ mod tests {
         );
     }
 
-    /// #1443: a registry profile's `env` must reach the terminal-auth
+    /// A registry profile's `env` must reach the terminal-auth
     /// login pane, not just the NDJSON transport's `spawn_with_env` — the
     /// wrapper injects it as `export KEY=VALUE` ahead of the command since
     /// the whole thing is typed into an interactive POSIX shell.
@@ -2271,7 +2201,7 @@ mod tests {
         );
     }
 
-    /// #1344: the POSIX wrapper must write the command's `$?` to the scratch
+    /// The POSIX wrapper must write the command's `$?` to the scratch
     /// file `finalize_install_from_terminal` reads back via
     /// `read_install_exit_code`, using the exact path `install_exit_code_path`
     /// computes for the same key — otherwise the writer and reader would silently
@@ -2290,7 +2220,7 @@ mod tests {
         );
     }
 
-    /// #1344: same handoff, PowerShell flavour — `$LASTEXITCODE` written via
+    /// Same handoff, PowerShell flavour — `$LASTEXITCODE` written via
     /// `Set-Content` to the same path `install_exit_code_path` computes.
     #[test]
     fn powershell_wrapper_writes_exit_code_to_expected_path() {
@@ -2317,9 +2247,9 @@ mod tests {
         assert_ne!(lsp_path, dap_path);
     }
 
-    /// #1344 core acceptance case: a wrapper-recorded non-zero exit code round-trips
-    /// through `read_install_exit_code`, and reading consumes (deletes) the scratch
-    /// file so a stale code can never leak into a later install reusing the same key.
+    /// A wrapper-recorded non-zero exit code must round-trip through
+    /// `read_install_exit_code`, and reading must consume (delete) the scratch
+    /// file so a stale code cannot leak into a later install reusing the same key.
     #[test]
     fn read_install_exit_code_round_trips_and_consumes_file() {
         let key = "test:round-trip-nonzero";
@@ -2344,7 +2274,7 @@ mod tests {
         assert_eq!(read_install_exit_code(key), None);
     }
 
-    /// #1396: `install_exit_code_ready` is `poll_terminal`'s eager-finalize
+    /// `install_exit_code_ready` is `poll_terminal`'s eager-finalize
     /// gate — it must be false before the wrapper has written anything, and
     /// true once the scratch file exists, without consuming it (unlike
     /// `read_install_exit_code`, a second `_ready` check right after must
@@ -2373,7 +2303,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// #1396 review (blocking finding): a leftover scratch file from an
+    /// A leftover scratch file from an
     /// earlier attempt under the same `install_key` (e.g. the pane was closed
     /// in the narrow window after the wrapper wrote it but before the shell
     /// exited, or the app crashed) must not survive into a new attempt —
@@ -2416,7 +2346,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // #1344: one shared tool lookup — install-time check, finalize, and server
+    // One shared tool lookup — install-time check, finalize, and server
     // launch all agree on where a tool lives.
     // -----------------------------------------------------------------------
     //
@@ -2457,22 +2387,17 @@ mod tests {
         (home, binary_path)
     }
 
-    /// A binary present only in a fake `~/.local/bin` (never on `PATH`) is found
-    /// by the shared install-time check (`binary_on_path`) — the exact scenario
-    /// #1344 reports as broken pre-fix (successful install into `~/.local/bin`
-    /// reported as "not found on PATH").
+    /// A binary present only in a fake `~/.local/bin` (not on `PATH`) must be
+    /// found by the shared install-time check (`binary_on_path`).
     #[test]
     fn binary_on_path_finds_binary_in_local_bin_when_not_on_path() {
         let binary_name = "vimcode-test-fake-lsp-1344-check";
         let (home, _binary_path) = fake_home_with_local_bin_binary("check", binary_name);
 
-        // Thread-local, *not* `set_var("HOME", …)` — see
-        // `core::paths::TEST_HOME_OVERRIDE` for the cross-test corruption
-        // the process-global version caused (#957 smoke). No `PATH` guard
-        // is needed alongside it: every binary name below is a
-        // `vimcode-test-…` literal that cannot exist on a real `PATH`, so
-        // the fake `~/.local/bin` probe is still the only way any of them
-        // can resolve.
+        // Thread-local home override (not process-global `set_var`) to avoid
+        // cross-test corruption. No `PATH` guard is needed: every binary name
+        // is a `vimcode-test-…` literal that cannot exist on a real `PATH`, so
+        // the fake `~/.local/bin` probe is the only way any can resolve.
         let _home_guard = crate::core::paths::set_test_home(&home);
 
         assert!(
@@ -2483,22 +2408,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// #1344 core acceptance case: same fake `~/.local/bin` binary, but driven
-    /// through `finalize_install_from_terminal` end-to-end — it must register
-    /// and start an LSP server for the extension's language, not report
-    /// "not found on PATH" for a tool that plainly *is* findable.
+    /// A fake `~/.local/bin` binary driven through `finalize_install_from_terminal`
+    /// end-to-end must register and start an LSP server for the extension's
+    /// language, not report "not found on PATH".
     #[test]
     fn finalize_install_from_terminal_registers_server_for_binary_in_local_bin() {
         let binary_name = "vimcode-test-fake-lsp-1344-finalize";
         let (home, _binary_path) = fake_home_with_local_bin_binary("finalize", binary_name);
 
-        // Thread-local, *not* `set_var("HOME", …)` — see
-        // `core::paths::TEST_HOME_OVERRIDE` for the cross-test corruption
-        // the process-global version caused (#957 smoke). No `PATH` guard
-        // is needed alongside it: every binary name below is a
-        // `vimcode-test-…` literal that cannot exist on a real `PATH`, so
-        // the fake `~/.local/bin` probe is still the only way any of them
-        // can resolve.
+        // Thread-local home override (not process-global `set_var`) to avoid
+        // cross-test corruption. No `PATH` guard is needed: every binary name
+        // is a `vimcode-test-…` literal that cannot exist on a real `PATH`, so
+        // the fake `~/.local/bin` probe is the only way any can resolve.
         let _home_guard = crate::core::paths::set_test_home(&home);
 
         let mut engine = Engine::new();
@@ -2546,11 +2467,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// #1344: a non-zero recorded exit code must be reported as an install
-    /// failure — even though the binary is findable — and must NOT claim
-    /// "not found on PATH", which is exactly the misleading message this issue
-    /// reports (a failed install command, e.g. vimcode-ext's broken terraform
-    /// installer, used to surface only as a PATH-lookup miss).
+    /// A non-zero recorded exit code must be reported as an install failure,
+    /// even if the binary is findable, and must not claim "not found on PATH".
     #[test]
     fn finalize_install_from_terminal_reports_failure_for_nonzero_exit_code() {
         // Deliberately give the binary a `~/.local/bin` home so it WOULD
@@ -2561,13 +2479,10 @@ mod tests {
         let binary_name = "vimcode-test-fake-lsp-1344-failure";
         let (home, _binary_path) = fake_home_with_local_bin_binary("failure", binary_name);
 
-        // Thread-local, *not* `set_var("HOME", …)` — see
-        // `core::paths::TEST_HOME_OVERRIDE` for the cross-test corruption
-        // the process-global version caused (#957 smoke). No `PATH` guard
-        // is needed alongside it: every binary name below is a
-        // `vimcode-test-…` literal that cannot exist on a real `PATH`, so
-        // the fake `~/.local/bin` probe is still the only way any of them
-        // can resolve.
+        // Thread-local home override (not process-global `set_var`) to avoid
+        // cross-test corruption. No `PATH` guard is needed: every binary name
+        // is a `vimcode-test-…` literal that cannot exist on a real `PATH`, so
+        // the fake `~/.local/bin` probe is the only way any can resolve.
         let _home_guard = crate::core::paths::set_test_home(&home);
 
         let mut engine = Engine::new();
@@ -2617,16 +2532,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// #1344 blocking review finding, pure-function-level companion to
-    /// `extension_install_lsp_success_survives_dap_not_found_via_shell_app`
-    /// (`src/tui_main/shell_app.rs`, the driver-tier black-box version): a
-    /// manifest with both an LSP server and a DAP adapter — the realistic
-    /// shape `extensions::sample_manifests()`'s `rust` entry has — must not
-    /// have a successful LSP install message erased by a DAP binary that
-    /// isn't resolvable. Fast, in-crate coverage of the exact
-    /// `Engine::message` value `finalize_install_from_terminal` produces,
-    /// alongside the slower end-to-end version that proves the same text
-    /// actually reaches the painted screen.
+    /// A manifest with both an LSP server and a DAP adapter must not have a
+    /// successful LSP install message erased by a DAP binary that isn't
+    /// resolvable. This test covers the exact `Engine::message` value
+    /// `finalize_install_from_terminal` produces at the unit level.
     #[test]
     fn finalize_install_from_terminal_keeps_lsp_success_alongside_dap_not_found() {
         // LSP binary resolvable via the fake `~/.local/bin`; DAP binary never
@@ -2635,13 +2544,10 @@ mod tests {
         let (home, _binary_path) =
             fake_home_with_local_bin_binary("combined-unit", lsp_binary_name);
 
-        // Thread-local, *not* `set_var("HOME", …)` — see
-        // `core::paths::TEST_HOME_OVERRIDE` for the cross-test corruption
-        // the process-global version caused (#957 smoke). No `PATH` guard
-        // is needed alongside it: every binary name below is a
-        // `vimcode-test-…` literal that cannot exist on a real `PATH`, so
-        // the fake `~/.local/bin` probe is still the only way any of them
-        // can resolve.
+        // Thread-local home override (not process-global `set_var`) to avoid
+        // cross-test corruption. No `PATH` guard is needed: every binary name
+        // is a `vimcode-test-…` literal that cannot exist on a real `PATH`, so
+        // the fake `~/.local/bin` probe is the only way any can resolve.
         let _home_guard = crate::core::paths::set_test_home(&home);
 
         let mut engine = Engine::new();
@@ -2688,7 +2594,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    // ── ACP `terminal/create` helpers (#1522) ────────────────────────────
+    // ── ACP `terminal/create` helpers ────────────────────────────────────
 
     #[test]
     fn acp_terminal_command_display_joins_args_with_spaces_and_bare_for_no_args() {
@@ -2745,7 +2651,7 @@ mod tests {
         assert!(script.contains("Write-Host \"__end__:$__ec\"\n"));
     }
 
-    // ── ACP `terminal/create` env injection hardening (#1522 review) ─────
+    // ── ACP `terminal/create` env injection hardening ────────────────────
 
     #[test]
     fn build_acp_terminal_wrapper_shell_quotes_env_values_posix() {

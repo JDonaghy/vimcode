@@ -3,25 +3,16 @@ use super::*;
 /// Stable `quadraui::WidgetId` strings for the SC action-button toolbar,
 /// in button-index order: 0=Commit, 1=Push, 2=Pull, 3=Sync. Shared by the
 /// `render::sc_button_toolbar` adapter and the click/hover hit-test so the
-/// id↔index mapping has a single source of truth (#505).
+/// id↔index mapping has a single source of truth.
 pub const SC_BUTTON_IDS: [&str; 4] = ["sc:commit", "sc:push", "sc:pull", "sc:sync"];
 
-// ─── SC panel section indices (#991) ──────────────────────────────────────
+// ─── SC panel section indices ─────────────────────────────────────────────
 //
-// The SC panel's sections are addressed *positionally* by a long tail of
-// call sites — `sc_flat_len`, `sc_visual_row_to_flat`,
-// `sc_flat_to_section_idx`, `sc_stage_selected`, `sc_activate_row`,
-// `sc_hover_markdown`, `populate_sc_sidebar_system`, the `Tab`
-// expand/collapse handler and `Engine::sc_sections_expanded`. #991 added
-// MERGE CHANGES *above* STAGED (matching VS Code), shifting every one of
-// those by one, so the indices live here as named constants rather than
-// as bare integers scattered across four files.
-//
-// Note these are **absolute** section indices into the `SidebarSystem`'s
+// The SC panel's sections are addressed positionally by call sites throughout
+// the codebase. Section indices are absolute into the `SidebarSystem`'s
 // section list — they do not shift when a section is hidden.
 // `SidebarSystem::set_section_visible` keeps indices stable and simply
-// skips invisible sections when rendering and when cycling focus, which
-// is exactly how the optional WORKTREES section has always worked.
+// skips invisible sections when rendering and when cycling focus.
 
 /// Merge Changes — unmerged (conflicted) paths. Only visible when the
 /// working tree actually has a conflict.
@@ -92,29 +83,9 @@ impl Engine {
 
     /// Check whether the background `sc_refresh_async` thread has
     /// delivered a snapshot and, if so, apply it to the engine state.
-    /// Returns `true` only when the applied snapshot actually *differs*
+    /// Returns `true` only when the applied snapshot actually differs
     /// from what was already cached, so the UI redraws exactly when
     /// there is new content to show.
-    ///
-    /// #1650: this used to return `true` unconditionally whenever a
-    /// snapshot arrived, regardless of whether `git status`/`log`/
-    /// `worktree list` actually changed since the last poll. Paired with
-    /// `render::run_shared_tick_chores`'s 2s auto-refresh timer (gated
-    /// only on the sidebar being visible, not on anything actually having
-    /// changed), an idle `vcd` with the Explorer or Source Control sidebar
-    /// open — the default startup state — kicked off a fresh
-    /// `sc_refresh_async` every 2 seconds, and every single one of those
-    /// forced a real repaint on arrival even though a quiescent git repo's
-    /// status/log/worktree list is byte-for-byte identical each time. Each
-    /// of those repaints is one real `ratatui::Terminal::draw` call, and
-    /// `Backend::draw`/`hide_cursor` (`ratatui-crossterm`'s
-    /// `CrosstermBackend`) unconditionally emits an SGR-reset + cursor-hide
-    /// escape burst on *every* `draw`, even when the content diff is
-    /// empty — that is exactly the invisible, periodic byte stream
-    /// `tests/smoke-spec/tui.yaml`'s `idle-truly-silent` step caught. Only
-    /// `invalidate_explorer_indicators` (and the `true` return driving a
-    /// redraw) when something genuinely changed turns the periodic kickoff
-    /// back into the true no-op it should be at idle.
     pub fn poll_sc_refresh(&mut self) -> bool {
         let Some(ref rx) = self.sc_refresh_rx else {
             return false;
@@ -154,7 +125,7 @@ impl Engine {
     /// The three file sections partition `sc_file_statuses` cleanly:
     /// a conflicted path always carries `staged == unstaged == None`
     /// (see [`git::FileStatus::unmerged`]), so it appears in Merge
-    /// Changes and nowhere else (#991).
+    /// Changes and nowhere else.
     pub fn sc_section_files(&self, section: usize) -> Vec<git::FileStatus> {
         self.sc_file_statuses
             .iter()
@@ -182,7 +153,7 @@ impl Engine {
     }
 
     /// True when the working tree has at least one merge conflict — the
-    /// condition that makes the Merge Changes section visible (#991). A
+    /// condition that makes the Merge Changes section visible. A
     /// conflict-free repo therefore still renders exactly two file
     /// sections, matching VS Code.
     pub fn sc_has_conflicts(&self) -> bool {
@@ -195,7 +166,7 @@ impl Engine {
     ///   - CHANGES header → stage all
     ///   - MERGE CHANGES header → nothing (see below)
     ///
-    /// #991 — **staging a conflicted file from the panel**: `git add` on a
+    /// **staging a conflicted file from the panel**: `git add` on a
     /// conflicted path is exactly how git marks the conflict resolved, so
     /// this stays allowed, but only as a *deliberate* per-file action taken
     /// from the Merge Changes section (and it reports "Marked resolved: …"
@@ -261,13 +232,7 @@ impl Engine {
         self.sc_refresh();
     }
 
-    /// Stage all unstaged/untracked files.
-    ///
-    /// #991: this used to run `git add .`, which sweeps conflicted paths
-    /// in as well — and `git add` on a conflicted path marks it resolved,
-    /// so "stage all" silently resolved every conflict with the markers
-    /// still in the files. It now stages an explicit list of the
-    /// non-conflicted working-tree changes instead.
+    /// Stage all unstaged/untracked files, excluding conflicted paths.
     pub fn sc_stage_all(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         let paths: Vec<String> = self
@@ -296,11 +261,8 @@ impl Engine {
 
     /// Discard all unstaged working-tree changes (called after dialog confirmation).
     ///
-    /// #991: like [`sc_stage_all`](Self::sc_stage_all), this used to run a
-    /// path-spec-wide `git restore .`, which would blow away the
-    /// half-merged content of conflicted files along with the ordinary
-    /// changes. Conflicted paths are now excluded — resolving a conflict
-    /// is an explicit, per-file action from the Merge Changes section.
+    /// Conflicted paths are excluded — resolving a conflict is an explicit,
+    /// per-file action from the Merge Changes section.
     pub fn sc_discard_all_unstaged(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         let paths: Vec<String> = self
@@ -312,13 +274,10 @@ impl Engine {
             .map(|f| f.path.clone())
             .collect();
         let _ = git::discard_paths(&dir, &paths);
-        // #189: reload any open buffer whose file just got discarded on
-        // disk. Without this the editor keeps showing the pre-discard
-        // rope contents + stale `git_diff` hunks, so the diff-peek
-        // popup offers to stage changes that no longer exist. Iterate
-        // every buffer with a file_path — `git discard_all` doesn't
-        // tell us which files actually changed, so reload them all
-        // and let `refresh_git_diff` no-op on unchanged ones.
+        // Reload buffers whose files were just discarded, since the editor
+        // would otherwise show stale rope contents and `git_diff` hunks.
+        // Reload all buffers with file paths and let `refresh_git_diff` no-op
+        // on unchanged ones.
         self.reload_all_buffers_from_disk();
         self.sc_refresh();
     }
@@ -672,7 +631,7 @@ impl Engine {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         match git::discard_path(&dir, path) {
             Ok(()) => {
-                // #189: if this file is currently open in a buffer,
+                // If this file is currently open in a buffer,
                 // reload from disk so the editor reflects the post-
                 // discard state. Without the reload, the buffer keeps
                 // the pre-discard content + stale git_diff hunks and
@@ -705,13 +664,10 @@ impl Engine {
                 state.buffer.content = ropey::Rope::from_str(&contents);
             }
             self.refresh_git_diff(bid);
-            // Notify the LSP that the buffer contents changed — without
-            // this, the server keeps the pre-discard text in its
-            // internal model and the gutter keeps showing stale
-            // diagnostics even though the buffer rope + file on disk
-            // both no longer have the offending code. `lsp_flush_changes`
-            // (driven from the UI poll loop) picks this up and sends
-            // `textDocument/didChange` + clears cached diagnostics.
+            // Notify the LSP that the buffer contents changed so it updates its
+            // internal model and cached diagnostics. Also send `didSave` since
+            // servers configured with `check on save` won't re-run diagnostics
+            // until they see a save; discarding from disk is effectively a save.
             self.lsp_dirty_buffers.insert(bid, true);
             // Also send `didSave`: rust-analyzer (and other servers
             // configured with `check on save`) won't re-run diagnostics
@@ -737,7 +693,7 @@ impl Engine {
     pub fn sc_confirm_discard_selected(&mut self) {
         let (section, idx) = self.sc_selected_from_sidebar_system();
         // Only the Changes section: discarding a *conflicted* file is not
-        // offered here (#991) — it would throw away the merge in progress.
+        // offered here — it would throw away the merge in progress.
         if section != SC_SECTION_CHANGES || idx == usize::MAX {
             return;
         }
@@ -1053,19 +1009,11 @@ impl Engine {
     /// The SC panel's sections **in painted order**, as `(section_index,
     /// item_count)` pairs, with hidden sections omitted.
     ///
-    /// Two sections are conditional: MERGE CHANGES appears only when the
-    /// working tree actually has a conflict, and WORKTREES only when there
-    /// are linked worktrees (`sc_worktrees.len() > 1` — the main worktree
-    /// is always present). The returned indices are the absolute
-    /// `SC_SECTION_*` values, which do **not** shift when a section is
-    /// hidden — the same contract `SidebarSystem::set_section_visible`
+    /// MERGE CHANGES appears only when the working tree has a conflict;
+    /// WORKTREES only when there are linked worktrees. The returned indices
+    /// are the absolute `SC_SECTION_*` values, which do not shift when a
+    /// section is hidden — the same contract `SidebarSystem::set_section_visible`
     /// keeps on the rendering side.
-    ///
-    /// #991: this is the single source of truth for [`Self::sc_flat_len`],
-    /// [`Self::sc_visual_row_to_flat`] and
-    /// [`Self::sc_flat_to_section_idx`]. Those three used to walk the
-    /// section list by hand, which is exactly how inserting a section
-    /// above all the others ships an off-by-one.
     pub fn sc_visible_sections(&self) -> Vec<(usize, usize)> {
         let mut out: Vec<(usize, usize)> = Vec::with_capacity(SC_SECTION_COUNT);
         let merge_count = self.sc_section_file_count(SC_SECTION_MERGE);
@@ -1196,7 +1144,7 @@ impl Engine {
     }
 
     /// Resolve which SC button (if any) sits under absolute point `(x, y)`,
-    /// using the `SidebarPanelLayout` cached at paint time (#509).
+    /// using the `SidebarPanelLayout` cached at paint time.
     /// Returns `None` for clicks in the toolbar's empty gutter, the content
     /// area, or outside the panel.
     pub fn sc_button_hit(&self, x: f32, y: f32) -> Option<usize> {
@@ -1208,7 +1156,7 @@ impl Engine {
     }
 
     /// Map a content-local row index (row 0 = first section header) to a
-    /// flat `(index, is_header)` pair for the SC panel sections area (#509).
+    /// flat `(index, is_header)` pair for the SC panel sections area.
     ///
     /// This is the content-coordinate variant of [`Self::sc_visual_row_to_flat`]:
     /// callers that receive content-local y from `SidebarPanelLayout::hit_test`
@@ -1228,7 +1176,7 @@ impl Engine {
     /// the `SC_SECTION_*` constants (0=merge, 1=staged, 2=changes,
     /// 3=worktrees, 4=log). Returns `(SC_SECTION_STAGED, usize::MAX)` if
     /// nothing is selected — Merge Changes is never the implicit default,
-    /// since its actions resolve conflicts (#991).
+    /// since its actions resolve conflicts.
     pub fn sc_selected_from_sidebar_system(&self) -> (usize, usize) {
         let sidebar = self.sc_sidebar_system.borrow();
         let section = sidebar.active_section().unwrap_or(SC_SECTION_STAGED);
@@ -1262,7 +1210,7 @@ impl Engine {
                 true
             }
             quadraui::SidebarEvent::RowSelected { .. } => true,
-            // #971: `SidebarSystem::click` already flips `collapsed[section]`
+            // `SidebarSystem::click` already flips `collapsed[section]`
             // itself before returning this event (when `allow_collapse` is
             // set, which `Engine::new`'s `sc_sidebar_system` does) —
             // `HeaderActivated` is a *notification*, not an instruction to
@@ -1306,7 +1254,7 @@ impl Engine {
     /// so the two cannot drift. Conflicted files (Merge Changes) always
     /// take the plain-open path — the useful view of a conflict is the
     /// working-tree file *with* its conflict markers, not a diff of it
-    /// against HEAD (#991).
+    /// against HEAD.
     fn sc_open_section_file(&mut self, section: usize, idx: usize) {
         let files = self.sc_section_files(section);
         let Some(f) = files.get(idx) else {
@@ -1455,9 +1403,8 @@ impl Engine {
             "Page_Up" => Some(Key::Named(NamedKey::PageUp)),
             "Page_Down" => Some(Key::Named(NamedKey::PageDown)),
             "Tab" => Some(Key::Named(NamedKey::Tab)),
-            // "ISO_Left_Tab" is TUI's (and, since #1060, GTK's own)
-            // `render::engine_key_from_ui` spelling for Shift+Tab;
-            // "BackTab" is kept for any caller still on the pre-#1060 name.
+            // "ISO_Left_Tab" is the spelling for Shift+Tab; "BackTab" is kept
+            // for compatibility with older code.
             "BackTab" | "ISO_Left_Tab" => Some(Key::Named(NamedKey::BackTab)),
             _ => None,
         };
@@ -1503,37 +1450,11 @@ impl Engine {
 
 #[cfg(test)]
 mod poll_sc_refresh_tests {
-    //! #1650: direct coverage for [`Engine::poll_sc_refresh`]'s
-    //! change-detection — the decision `render::run_shared_tick_chores`'s
-    //! 2s auto-refresh timer relies on to stay a true no-op at idle. See
-    //! that method's own doc for the full chain this closes: an unchanged
-    //! `poll_sc_refresh` result used to still report "redraw needed" on
-    //! every arrival, which (via `App::tick_dispatch` /
-    //! `quadraui::tui::TuiRunner`'s `needs_redraw` gate) forced a real
-    //! `ratatui::Terminal::draw` call every ~2 seconds indefinitely while
-    //! the Explorer/Git sidebar was visible — the default startup state —
-    //! and every one of those draws writes an SGR-reset + cursor-hide
-    //! escape burst regardless of whether the diff was empty
-    //! (`ratatui-crossterm`'s `CrosstermBackend::draw`/`hide_cursor`, not
-    //! this crate's code, so there is no in-crate seam to assert on the
-    //! byte stream itself — `tests/smoke-spec/tui.yaml`'s
-    //! `idle-truly-silent` step, run under a real pty by the external
-    //! smoke-test harness, is the black-box oracle for *that* half; this
-    //! module covers the pure decision feeding it, exactly the pattern
-    //! `App::dedup_window_title`/`dedup_caret_shape` already established
-    //! for #1634's sibling bug).
-    //!
-    //! The driver-tier half of this fix's coverage lives in
-    //! `tui_main::app_on_tui_tests::tests::idle_stability_1650` — a
-    //! `TuiDriver` with the Explorer sidebar actually painted, asserting
-    //! the `Reaction` every idle tick returns across several of those 2s
-    //! boundaries is `Continue`, not `Redraw` (the redraw signal the
-    //! runner turns into the real `draw` call, i.e. into the escape
-    //! burst), plus that the painted screen text never changes.
-    //!
-    //! RED-verified: reverting [`Engine::poll_sc_refresh`] to always
-    //! `return true` on `Ok(..)` (the pre-fix behavior) makes
-    //! `poll_sc_refresh_returns_false_when_snapshot_is_unchanged` fail.
+    //! Direct coverage for [`Engine::poll_sc_refresh`]'s change-detection.
+    //! The method returns `false` when a snapshot arrives but is unchanged,
+    //! so the UI redraws only when there is actual new content — this
+    //! prevents unnecessary redraws every ~2 seconds when the Explorer/Git
+    //! sidebar is visible and the repository is idle.
     use crate::core::engine::Engine;
     use crate::core::git::{FileStatus, GitLogEntry, StatusKind, WorktreeEntry};
 

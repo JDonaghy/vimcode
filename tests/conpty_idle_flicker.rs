@@ -1,4 +1,4 @@
-//! #1634: raw-output ConPTY idle regression test for the Windows TUI ~1Hz
+//! Raw-output ConPTY idle regression test for the Windows TUI ~1Hz
 //! foreground-colour flicker that survived #1583.
 //!
 //! # Why this file, and why it only runs on Windows
@@ -8,7 +8,7 @@
 //! drives `vcd`'s `App`/`Engine` through a `quadraui::tui::TuiDriver` and
 //! asserts the `TestBackend`/vt100 cell buffer stays byte-identical across
 //! idle ticks. That test still passes on unfixed `develop` — the operator
-//! kept seeing the flicker anyway (#1634) — because it can only see bytes
+//! kept seeing the flicker anyway — because it can only see bytes
 //! that flow through the `ratatui::Terminal`'s own `Write` sink. Anything a
 //! backend writes to `std::io::stdout()` directly, bypassing that sink
 //! entirely, is invisible to it: `quadraui::tui::TuiBackend::set_title`
@@ -153,24 +153,15 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 /// splits this test drives).
 const QUIET_FOR: Duration = Duration::from_millis(1000);
 
-/// Upper bound on how long settling itself may take before this test gives
-/// up and fails outright (a session that never goes quiet is itself a bug,
-/// just not the one #1634 is about).
+/// Upper bound on how long settling itself may take before this test gives up and fails
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The idle observation window — #1634 asks for "≥5s"; this uses a bit more
-/// margin so a scheduler hiccup on a loaded CI runner can't produce a false
-/// green.
+/// The idle observation window — needs sufficient duration to detect spurious output;
 const OBSERVE_WINDOW: Duration = Duration::from_secs(7);
 
-/// The idle observation window for
-/// [`idle_with_explorer_sidebar_open_produces_no_further_output`] (#1650).
-/// That bug's periodic burst only fires on the *second* and later 2-second
-/// `render::run_shared_tick_chores` auto-refresh ticks (the first one
-/// always applies real data against an empty cache and legitimately
-/// redraws — see `Engine::poll_sc_refresh`'s own doc), so this window is
-/// longer than [`OBSERVE_WINDOW`] to comfortably contain several of those
-/// 2-second ticks — #1650's own issue text asks for "≥10s".
+/// The idle observation window for [`idle_with_explorer_sidebar_open_produces_no_further_output`].
+/// The Explorer sidebar refresh fires every 2 seconds, so this window is longer than
+/// [`OBSERVE_WINDOW`] to comfortably contain several refresh cycles.
 const OBSERVE_WINDOW_SIDEBAR: Duration = Duration::from_secs(12);
 
 /// Shared state the reader thread updates: every byte it has ever seen, and
@@ -180,10 +171,7 @@ struct Captured {
     last_read_at: Instant,
 }
 
-/// Comment-heavy fixture content — mirrors #1583's own repro file (a real
-/// server/session is more likely to be idle-stable on a file with plenty of
-/// syntax-highlighted comment spans, which is exactly what the operator's
-/// original report described flickering).
+/// Content with plenty of syntax-highlighted comment spans to match idle-stability scenarios.
 fn comment_heavy_rust(marker: &str) -> String {
     let mut text = String::new();
     for i in 0..40 {
@@ -195,13 +183,9 @@ fn comment_heavy_rust(marker: &str) -> String {
     text
 }
 
-/// Build an isolated `%APPDATA%`/`%USERPROFILE%` for the spawned `vcd.exe`
-/// so it never reads (or writes) the real operator's `settings.json`/
-/// session state, and seed `lsp_enabled: false` — this test's whole point
-/// is watching the *idle* byte stream, and a real language server spawn
-/// (rust-analyzer, if it happens to be on this Windows host's `PATH`) would
-/// be exactly the kind of "extra redraw trigger" #1634's own hypothesis (a)
-/// describes, and isn't what this test is isolating.
+/// Build an isolated `%APPDATA%`/`%USERPROFILE%` for the spawned `vcd.exe` so it never
+/// reads the real operator's `settings.json`/session state, and seed `lsp_enabled: false`
+/// to avoid language server spawns that would introduce extra redraw triggers.
 fn isolated_home() -> PathBuf {
     let home = std::env::temp_dir().join(format!(
         "vimcode_conpty_1634_{}_{}",
@@ -221,9 +205,8 @@ fn isolated_home() -> PathBuf {
     home
 }
 
-/// Spawn `vcd.exe` under a real ConPTY, opened on `main.rs`. Returns the
-/// child, the `Captured` handle the background reader thread fills in, and
-/// the pty writer used to send keystrokes.
+/// Spawn `vcd.exe` under a real ConPTY, opened on `main.rs`. Returns the child, the
+/// `Captured` handle the background reader thread fills, the pty writer for keystrokes,
 fn spawn_under_conpty(
     main_rs: &PathBuf,
     home: &PathBuf,
@@ -252,6 +235,7 @@ fn spawn_under_conpty(
     cmd.env("USERPROFILE", home);
     cmd.env("LOCALAPPDATA", &appdata);
     cmd.env("VIMCODE_TEST_DATA_HOME", home.join("data"));
+    cmd.env("VIMCODE_TEST_HOME_ISOLATED", "1");
 
     let child = pair
         .slave
@@ -324,11 +308,7 @@ fn snapshot_from(captured: &Arc<Mutex<Captured>>, start: usize) -> Vec<u8> {
     c.bytes[start..].to_vec()
 }
 
-/// Render the tail of `bytes` as a debuggable string — printable ASCII
-/// as-is, everything else as `\xHH` — so a red run's failure message shows
-/// exactly which escape sequence kept arriving (#1634's own "decode which
-/// rows or cells are rewritten" ask), without dragging in a VT/ANSI parser
-/// dependency just for a test's diagnostic output.
+/// Render the tail of `bytes` as a debuggable string — printable ASCII as-is, everything
 fn escape_for_display(bytes: &[u8]) -> String {
     let mut out = String::new();
     for &b in bytes {
@@ -361,7 +341,7 @@ fn idle_after_settle_produces_no_further_output() {
         escape_for_display(&tail_snapshot(&captured, 400))
     );
 
-    // Reproduce the operator's report (#1634): a tab group on the right,
+    // Reproduce the operator's report: a tab group on the right,
     // split horizontally into two groups stacked one above the other.
     // `:vsplit` focuses the new (right) window; `:split` then stacks that
     // window into top/bottom.
@@ -381,10 +361,7 @@ fn idle_after_settle_produces_no_further_output() {
         escape_for_display(&tail_snapshot(&captured, 400))
     );
 
-    // The actual #1634 assertion: once settled, with no further input, a
-    // real ConPTY must forward *nothing* for a sustained window. Record
-    // where we are, sleep through the whole observation window, then check
-    // whether anything at all arrived during it.
+    // Once settled with no further input, a real ConPTY must forward nothing for a
     let (byte_count_before, last_read_before) = {
         let c = captured.lock().unwrap();
         (c.bytes.len(), c.last_read_at)
@@ -414,39 +391,18 @@ fn idle_after_settle_produces_no_further_output() {
     );
 }
 
-/// #1650: a sibling of [`idle_after_settle_produces_no_further_output`]
-/// covering the scenario that test's own `:vsplit`/`:split` layout does
-/// *not* exercise — the Explorer/Source Control sidebar open.
+/// A variant of [`idle_after_settle_produces_no_further_output`] covering the scenario
+/// where the Explorer/Source Control sidebar is open. `render::run_shared_tick_chores`
+/// re-runs `Engine::sc_refresh_async` every 2 seconds while
+/// `engine.app_shell.sidebar_visible()` is true to pick up external git changes.
+/// `Engine::poll_sc_refresh` must not report "redraw needed" when the cached snapshot
+/// is byte-for-byte identical to the new one.
 ///
-/// `render::run_shared_tick_chores` re-runs `Engine::sc_refresh_async`
-/// every 2 seconds while `engine.app_shell.sidebar_visible()` is true, to
-/// pick up external `git` changes (another shell running `git commit`,
-/// `git checkout`, …). Before this fix, `Engine::poll_sc_refresh` reported
-/// "redraw needed" unconditionally every time that refresh's background
-/// thread delivered a snapshot — even when the snapshot was byte-for-byte
-/// identical to the cached one, which is every single time in a quiescent
-/// repo. Confirmed on a real Linux pty (not ConPTY — see this file's own
-/// `#![cfg(windows)]` gate) by hand against this exact binary: reverting
-/// the fix reproduces the issue's own reported byte sequence,
-/// `\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?25l` (SGR fg/bg/underline-colour
-/// reset + SGR reset + hide-cursor — `ratatui-crossterm`'s
-/// `CrosstermBackend::draw`/`Terminal::flush`'s unconditional end-of-draw
-/// writes), repeating roughly every 2 seconds indefinitely once the
-/// sidebar is open; restoring the fix makes that same repro go silent.
-/// This test is the ConPTY-side sibling of that manual repro, run with the
-/// fix in place — see #1650's own PR description for the full RED/GREEN
-/// trail against the real Linux-pty repro, since (per this module's own
-/// "RED/GREEN note for reviewers" above) a `#![cfg(windows)]`-gated file
-/// cannot itself be RED-verified from a non-Windows session.
-///
-/// Opens the Explorer panel with a real SGR mouse click at the activity
-/// bar's Explorer icon — row 1, col 1 (0-based), matching
-/// `tests/smoke-spec/tui.yaml`'s own `click-explorer-icon` step and
-/// `tests/conpty_activity_bar_click.rs`'s `ICON_COLUMN` — then observes
-/// for [`OBSERVE_WINDOW_SIDEBAR`] (≥10s, per #1650's own acceptance
-/// criteria) rather than [`OBSERVE_WINDOW`], since the bug's periodic tick
-/// is 2s and this window needs several of them to elapse to be a
-/// meaningful check.
+/// Opens the Explorer panel with a real SGR mouse click at the activity bar's Explorer
+/// icon — row 1, col 1 (0-based), matching `tests/smoke-spec/tui.yaml`'s
+/// `click-explorer-icon` step and `tests/conpty_activity_bar_click.rs`'s `ICON_COLUMN` —
+/// then observes for [`OBSERVE_WINDOW_SIDEBAR`] (≥10s) rather than [`OBSERVE_WINDOW`],
+/// since the periodic refresh tick is 2s and this window needs several to elapse.
 #[test]
 fn idle_with_explorer_sidebar_open_produces_no_further_output() {
     let home = isolated_home();
@@ -462,12 +418,7 @@ fn idle_with_explorer_sidebar_open_produces_no_further_output() {
         escape_for_display(&tail_snapshot(&captured, 400))
     );
 
-    // Real SGR mouse press+release (button 0, 1-based col=2/row=2 — the
-    // activity bar's Explorer icon at 0-based row 1, col 1) to open the
-    // sidebar, exactly the byte shape a real terminal emulator sends and
-    // `tests/conpty_activity_bar_click.rs`'s own `send_sgr_click` already
-    // proved necessary to reproduce (#1636's "in-process dispatch isn't
-    // enough" finding applies equally here).
+    // Send SGR mouse press+release (button 0, 1-based col=2/row=2 — the activity bar's
     writer
         .write_all(b"\x1b[<0;2;2M\x1b[<0;2;2m")
         .expect("send SGR click on the Explorer activity-bar icon");
@@ -510,12 +461,8 @@ fn idle_with_explorer_sidebar_open_produces_no_further_output() {
     );
 }
 
-/// Sanity check on the harness itself: a freshly spawned session, before
-/// any settling, must actually produce *some* output (the startup paint).
-/// Without this, a broken spawn (wrong binary path, ConPTY never wired up,
-/// reader thread never started) would make
-/// [`idle_after_settle_produces_no_further_output`] pass vacuously — the
-/// #553/#2192 trap this whole test class exists to avoid.
+/// Sanity check: a freshly spawned session must produce startup output. Without this,
+/// a broken spawn (wrong binary path, ConPTY never wired, reader thread never started)
 #[test]
 fn harness_actually_observes_startup_output() {
     let home = isolated_home();

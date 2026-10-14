@@ -1,4 +1,4 @@
-//! #1735: deterministic, vcd-free regression test for "[bugbash:tui-pty] 51
+//! Deterministic, vcd-free regression test for "[bugbash:tui-pty] 51
 //! orphaned vcd processes busy-spin at ~24% CPU each on a deleted pty".
 //!
 //! # Why this isn't a full end-to-end `vcd`-over-a-real-pty test
@@ -95,7 +95,7 @@
 //! a background thread (since the bug, if present, means it never
 //! returns) while the main thread samples this process's own CPU ticks.
 //!
-//! RED-verified (#1735) against the pinned quadraui rev's own transitive
+//! RED-verified against the pinned quadraui rev's own transitive
 //! `crossterm` 0.29.0: the background `poll` call never returns and this
 //! process's CPU-tick delta over the sample window matches a tight loop
 //! (measured at 100% of one core over the 300ms sample, consistently
@@ -107,7 +107,7 @@
 //! `quadraui::tui::backend::TuiBackend::wait_events` — not in vimcode; per
 //! this repo's Platform-Neutrality Rule, no vimcode-side workaround is
 //! added here. Mirrors the precedent in `src/gtk/testing.rs`'s
-//! `tab_close_center`-click test (#659/#679): a test that exposes a real
+//! `tab_close_center`-click test: a test that exposes a real
 //! upstream defect gets `#[ignore]`d with a doc comment, not deleted and
 //! not left to fail every `cargo test` run until the fix lands. Un-ignore
 //! this test (no other change should be needed) once `Cargo.toml`'s
@@ -264,9 +264,7 @@ fn clock_ticks_per_sec() -> f64 {
 /// `crossterm::terminal::sys::file_descriptor::tty_fd` does) sees `fd`,
 /// not whatever cargo's test harness originally wired fd 0 to. Safe to do
 /// unconditionally here because each file under `tests/` is its own
-/// separate process (cargo integration test convention) with exactly one
-/// `#[test]` in it — there is no sibling test in this binary whose own fd
-/// 0 this could clobber.
+/// separate process with exactly one `#[test]`.
 fn redirect_stdin_to(fd: RawFd) {
     // SAFETY: `fd` is a valid, open fd for this process's whole lifetime
     // (owned by `RawPty`, which outlives every use of it below);

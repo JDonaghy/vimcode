@@ -128,10 +128,9 @@ fn multiple_keymaps_coexist() {
 
 #[test]
 fn invalid_keymap_definitions_ignored() {
-    // These should be silently ignored (bad format). Since #1151, "x" is a
-    // valid mode letter (Visual-only) and a bare (non-`:`-prefixed) rhs like
-    // "join" is a valid key-to-keys mapping ("map K to j,o,i,n"), so neither
-    // of those is invalid anymore — an unrecognised mode letter is.
+    // These should be silently ignored. An unrecognised mode letter is invalid.
+    // "x" is a valid mode letter (Visual-only) and a bare (non-`:`-prefixed) rhs
+    // like "join" is a valid key-to-keys mapping (K maps to j,o,i,n).
     let e = engine_with_keymaps(
         "hello\n",
         &[
@@ -188,13 +187,10 @@ fn keymap_buf_cleared_on_exact_match() {
     );
 }
 
-// ── :map family — vim per-mode ex commands (#1151) ──────────────────────────
+// ── :map family — vim per-mode ex commands ──────────────────────────────────
 //
-// Before #1151, vimcode's only mapping command was `:map <mode> <keys>
-// :<excmd>` — mode as a positional argument, target always an ex command.
-// That is not vim's `:map`. These tests exercise vim's real syntax: mode
-// comes from the *command name* (`:nnoremap`, `:imap`, …), and `{rhs}` can be
-// a raw key sequence, not just `:excmd`.
+// Vim's `:map` family uses mode from the command name (`:nnoremap`, `:imap`, …),
+// and `{rhs}` can be a raw key sequence or an ex command.
 
 #[test]
 fn nnoremap_command_adds_keymap() {
@@ -226,7 +222,7 @@ fn nnoremap_command_no_duplicates() {
 
 #[test]
 fn redefining_a_mapping_replaces_the_stale_entry() {
-    // #1151 review: redefining `jk` in normal mode with a different rhs must
+    // Redefining `jk` in normal mode with a different rhs must
     // *replace* the existing entry for that (mode, lhs), not accumulate a
     // second, conflicting one — vim's :nnoremap-family semantics. Before the
     // fix, `settings.keymaps` grew a stale `"n! jk <Esc>"` alongside the new
@@ -320,7 +316,7 @@ fn nunmap_command_removes_keymap() {
     assert_eq!(e.settings.keymaps.len(), 1);
     assert_eq!(e.settings.keymaps[0], "n J :delete");
     assert!(e.message.contains("Unmapped"));
-    // K should no longer fire the keymap (falls through to built-in)
+    // K no longer fires the keymap (falls through to built-in)
     assert_eq!(e.user_keymaps.len(), 1);
 }
 
@@ -379,10 +375,10 @@ fn bang_mapclear_targets_insert_and_cmdline_only() {
     );
 }
 
-// ── Key-to-keys remapping (#1151) ────────────────────────────────────────────
+// ── Key-to-keys remapping ────────────────────────────────────────────────────
 //
-// The single most common line in any vimrc, `inoremap jk <Esc>`, was
-// unexpressible before #1151 — every `UserKeymap` target was an ex command.
+// Maps raw keys to other keys: e.g. `inoremap jk <Esc>`, where the target
+// rhs is not an ex command.
 
 #[test]
 fn inoremap_jk_expands_to_escape() {
@@ -413,7 +409,7 @@ fn inoremap_jk_single_j_falls_through_to_insert() {
     assert_eq!(get_lines(&e)[0], "jx");
 }
 
-// ── noremap vs map: recursion semantics + depth guard (#1151) ───────────────
+// ── noremap vs map: recursion semantics + depth guard ───────────────────────
 
 #[test]
 fn nmap_recurses_into_a_second_mapping() {
@@ -460,7 +456,7 @@ fn recursive_mapping_cycle_hits_maxmapdepth_guard() {
     assert_eq!(get_lines(&e)[0], "hello");
 }
 
-// ── <leader> expansion (#1151) ───────────────────────────────────────────────
+// ── <leader> expansion ───────────────────────────────────────────────────────
 
 #[test]
 fn leader_expands_in_lhs() {
@@ -490,7 +486,7 @@ fn leader_expansion_rebuilds_on_settings_change() {
     assert_eq!(get_lines(&e)[0], "aaa bbb");
 }
 
-// ── Operator-pending (`o`) maps (#1151) ──────────────────────────────────────
+// ── Operator-pending (`o`) maps ──────────────────────────────────────────────
 
 #[test]
 fn operator_pending_map_extends_a_motion() {
@@ -525,7 +521,7 @@ fn operator_pending_map_does_not_fire_in_plain_normal_mode() {
     assert_eq!(get_lines(&e)[0], "foo(bar)baz");
 }
 
-// ── <C-Space> / <C-Tab> case preservation (#1151 review) ────────────────────
+// ── <C-Space> / <C-Tab> case preservation ───────────────────────────────────
 //
 // `encode_keypress` (the format a live keypress is turned into for keymap
 // matching) special-cases these two named keys with a mixed-case spelling

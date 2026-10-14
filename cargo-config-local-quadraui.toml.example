@@ -1,23 +1,26 @@
-# #691: opt-in local co-development override.
+# #691: opt-in local co-development override. (#1848: the pin this protects
+# against moved from a git rev to a crates.io version requirement; this
+# override still works the same way — see below.)
 #
-# Cargo.toml pins `quadraui` to a git rev (protects vimcode builds/CI from an
-# in-flight quadraui change on `~/src/quadraui` — a checkout shared by every
-# concurrently-running agent on this machine, so one agent's checkout used to
-# be another agent's broken build; see Cargo.toml's `quadraui` dependency
-# comment and CLAUDE.md's "Wrong quadraui checkout" section). To build
-# vimcode against your local `~/src/quadraui` checkout instead — e.g. while
-# co-developing a quadraui feature vimcode depends on — copy this file to
-# `.cargo/config.toml` (untracked; git-ignored) and adjust the path if your
-# checkout lives somewhere else:
+# Cargo.toml pins `quadraui` to a version requirement (protects vimcode
+# builds/CI from an in-flight quadraui change on `~/src/quadraui` — a
+# checkout shared by every concurrently-running agent on this machine, so one
+# agent's checkout used to be another agent's broken build; see Cargo.toml's
+# `quadraui` dependency comment and CLAUDE.md's "Wrong quadraui checkout"
+# section). To build vimcode against your local `~/src/quadraui` checkout
+# instead — e.g. while co-developing a quadraui feature vimcode depends on —
+# copy this file to `.cargo/config.toml` (untracked; git-ignored) and adjust
+# the path if your checkout lives somewhere else:
 #
 #   mkdir -p .cargo
 #   cp cargo-config-local-quadraui.toml.example .cargo/config.toml
 #
-# Cargo's `paths` override matches the local package by name + version (not
-# by rev/source), so this works regardless of what rev is pinned in
-# Cargo.toml and regardless of what branch/commit is checked out locally — no
-# Cargo.toml edit required. Delete `.cargo/config.toml` to go back to
-# building against the pinned rev.
+# Cargo's `paths` override matches the local package by name + version, so
+# this works regardless of what version requirement is pinned in Cargo.toml
+# and regardless of what branch/commit is checked out locally, as long as the
+# local checkout's own `Cargo.toml` version satisfies that requirement — no
+# Cargo.toml edit required. Delete `.cargo/config.toml` to go back to building
+# against the pinned crates.io release.
 #
 # This replaces the old `VIMCODE_QUADRAUI_UNPINNED=1` escape hatch from the
 # sibling-path-dep era (#638), which downgraded a mismatch to a warning but

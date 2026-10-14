@@ -89,19 +89,14 @@ fn explore_defaults_to_file_dir() {
     cleanup(&dir);
 }
 
-// ── :Explore survives a directory mutating mid-listing (#631) ───────────
+// ── :Explore survives a directory mutating mid-listing ──────────────────
 
-// Regression test for #631: `collect_explorer_rows` used to sort with a
-// comparator that re-`stat`'d the filesystem on every comparison
-// (`DirEntry::path().is_dir()`), which is not a cached property. If the
-// directory being listed mutated concurrently -- exactly what the other
-// netrw tests do to `/tmp` in parallel -- the same entry could answer
-// `true` early in the sort and `false` later, breaking the total order
-// `sort_by` requires and panicking the whole app. The fix precomputes each
-// entry's directory-ness once before sorting so the comparator never
-// touches the filesystem. This test drives `:Explore` against a directory
-// while a second thread concurrently creates and removes entries in it,
-// asserting the run completes without panicking.
+// Regression test: `collect_explorer_rows` precomputes each entry's
+// directory-ness before sorting to ensure the comparator does not
+// re-stat the filesystem, which would be broken by concurrent mutations.
+// This test drives `:Explore` against a directory while a second thread
+// concurrently creates and removes entries, asserting the run completes
+// without panicking.
 #[test]
 fn explore_survives_concurrent_directory_churn() {
     let dir = make_test_dir();
@@ -248,7 +243,6 @@ fn enter_on_file_opens_file() {
     let content = buf(&e);
     assert_eq!(content, "alpha content\n", "should open the file content");
 
-    // Should no longer be a netrw buffer
     assert!(
         e.active_buffer_state().netrw_dir.is_none(),
         "should not be netrw anymore"

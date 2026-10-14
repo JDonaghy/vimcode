@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # #1918: auto-open the vimcode quadraui version-bump PR. quadraui only —
+  # the rest of Cargo.lock stays hand-managed, so this is scoped tightly
+  # with `allow` rather than tracking every crate in the dependency graph.
+  - package-ecosystem: cargo
+    directory: "/"
+    target-branch: develop
+    schedule:
+      interval: daily
+    allow:
+      - dependency-name: quadraui
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: "Bump"

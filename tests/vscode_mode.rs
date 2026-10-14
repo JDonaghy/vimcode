@@ -70,15 +70,9 @@ fn test_vscode_move_line_up_with_selection() {
     assert_eq!(buf(&e), "bbb\nccc\naaa\nddd\n");
 }
 
-// #1744: Shift+Alt+Up/Down is VS Code's `copyLinesUpAction`/
-// `copyLinesDownAction` (duplicate the line) — it used to be misbound to
-// add-a-cursor, which is Ctrl+Alt+Up/Down's real chord (`insertCursorAbove`/
-// `insertCursorBelow`, see the "Multi-cursor" section below).
-//
-// Verified RED against unfixed `develop` for both tests below: reverting
-// `handle_vscode_key`'s `"Alt_Shift_Up"`/`"Alt_Shift_Down"` arms to call
-// `vscode_add_cursor_above`/`_below` instead reproduces both assertion
-// failures (buffer unchanged, `extra_cursors` gains an entry).
+// Shift+Alt+Up/Down duplicates the line (VS Code's `copyLinesUpAction`/
+// `copyLinesDownAction`). This is distinct from Ctrl+Alt+Up/Down, which
+// adds a cursor above/below (see the "Multi-cursor" section below).
 
 #[test]
 fn test_vscode_alt_shift_down_duplicates_line_down() {
@@ -179,17 +173,10 @@ fn test_vscode_select_line_extends() {
 // Phase 2: Multi-Cursor + Indentation
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// #1744: Ctrl+Alt+Up/Down (`"Alt_Up"`/`"Alt_Down"` with `ctrl: true` — the
-// exact spelling `render::route_alt_key` now forwards) is VS Code's real
-// `insertCursorAbove`/`insertCursorBelow`. Plain Alt+Up/Down (no ctrl) still
-// moves the line (see Phase 1 above); Alt+Shift+Up/Down duplicates it.
-//
-// Verified RED against unfixed `develop` for the three tests below:
-// `handle_vscode_key` used to have no `"Alt_Up"/"Alt_Down" if ctrl` arm at
-// all (and `route_alt_key` had no `ctrl` parameter to forward one with), so
-// Ctrl+Alt+Up/Down ran the move-line arm instead — these assertions'
-// `extra_cursors` checks fail and the buffer-unchanged checks fail against
-// that code.
+// Ctrl+Alt+Up/Down (`"Alt_Up"`/`"Alt_Down"` with `ctrl: true`) adds a
+// cursor above/below (VS Code's `insertCursorAbove`/`insertCursorBelow`).
+// Plain Alt+Up/Down (no ctrl) moves the line (see Phase 1 above);
+// Alt+Shift+Up/Down duplicates it.
 
 #[test]
 fn test_vscode_ctrl_alt_down_adds_cursor_below() {
@@ -245,18 +232,10 @@ fn test_vscode_ctrl_d_selects_word() {
     assert_eq!(e.cursor().col, 4); // cursor at last char of "hello" (inclusive)
 }
 
-/// #1788 review regression guard: `vscode_ctrl_d`'s word selection is
-/// inclusive-end (cursor lands *on* the last char of the word, see
-/// `test_vscode_ctrl_d_selects_word` above) — unlike the Shift+arrow
-/// keyboard-extended selection, which is exclusive-end. A fix for #1788 that
-/// discriminates on `is_vscode_mode()` instead of the selection's own
-/// end-bound convention (`visual_end_exclusive`) regresses exactly this
-/// case: Ctrl+D then Ctrl+C would copy "hell" (4 chars) instead of "hello"
-/// (5 chars).
-///
-/// **Verified RED without the `visual_end_exclusive` fix** (i.e. against a
-/// version of the #1788 fix that branches on `is_vscode_mode()` alone): the
-/// final assertion fails with `"hell"` instead of `"hello"`.
+/// `vscode_ctrl_d`'s word selection is inclusive-end (cursor lands *on*
+/// the last char of the word), unlike the Shift+arrow keyboard-extended
+/// selection, which is exclusive-end. This affects copy operations:
+/// Ctrl+D then Ctrl+C must copy the entire word including the last char.
 #[test]
 fn test_vscode_ctrl_d_then_ctrl_c_copies_whole_word() {
     let mut e = engine_with("hello world\n");
@@ -788,7 +767,7 @@ fn test_vscode_ctrl_d_then_backspace_deletes_all() {
 
 #[test]
 fn test_vscode_select_all_after_multicursor_edit_then_type_replaces_buffer() {
-    // #1785: regression for a crash where typing after Ctrl+A, following a
+    // Regression for a crash where typing after Ctrl+A, following a
     // multi-cursor Ctrl+D edit, panicked inside ropey instead of replacing
     // the whole buffer. Exact repro from the bug report: "foo bar foo",
     // cursor at start, Ctrl+D Ctrl+D (selects both "foo"s), type "X" (->
@@ -807,8 +786,7 @@ fn test_vscode_select_all_after_multicursor_edit_then_type_replaces_buffer() {
     // (this is the bug's actual precondition — Ctrl+A only crashes if a
     // stale extra cursor is still here afterwards).
     assert_eq!(e.view().extra_cursors.len(), 1);
-    // Ctrl+A: select all. This used to leave the stale extra cursor in
-    // place, which crashed the very next keystroke.
+    // Ctrl+A: select all. This must clear any stale extra cursors.
     e.handle_key("a", Some('a'), true);
     // Typing now must not panic, and must replace the *entire* buffer
     // (rendered content), same as the single-cursor case.
@@ -894,12 +872,9 @@ fn test_vscode_progressive_fold_parent() {
 #[test]
 fn test_vscode_progressive_unfold() {
     // Fold a region, progressively fold its parent, then unfold just the
-    // parent. #1006 fixed `close_fold` to stop discarding an
-    // already-closed nested fold when a bigger fold closes over it (the
-    // "flat fold model merges nested folds into one" this test used to
-    // document was itself the bug — opening only the outer fold must leave
-    // an independently-closed inner fold still closed, matching real
-    // nested-fold semantics in both Vim and VSCode).
+    // parent. When a larger fold closes over an already-closed nested fold,
+    // the nested fold must remain independently closed, matching real
+    // nested-fold semantics in both Vim and VSCode.
     let src = "fn outer() {\n    fn inner() {\n        let x = 1;\n    }\n}\n";
     let mut e = engine_with(src);
     vscode_mode(&mut e);
@@ -911,7 +886,7 @@ fn test_vscode_progressive_unfold() {
     e.handle_key("Shift_bracketleft", None, true);
     assert_eq!(e.cursor().line, 0);
     assert!(e.view().fold_at(0).is_some(), "outer fold exists");
-    // The inner fold is still independently closed (#1006) — it's only
+    // The inner fold is still independently closed — it's only
     // hidden from *view* right now because the outer fold also covers it.
     assert!(e.view().fold_at(1).is_some(), "inner fold stays defined");
     // Unfold just the outer fold — the still-closed inner fold keeps its

@@ -1,16 +1,10 @@
-//! Insert-mode completion popup candidates (#1805).
-//!
-//! `Engine::completion_candidates` used to be a bare `Vec<String>` — buffer-
-//! word and LSP completion never needed anything richer than "text to
-//! insert". A `vimcode.completion.register` plugin source (#1805) can supply
-//! an icon/kind, right-aligned detail text and a documentation string, so
-//! the popup needs a real item shape to carry them.
+//! Insert-mode completion popup candidates.
 //!
 //! [`CompletionItemKind`] is vimcode's own vocabulary, not quadraui's —
 //! mirrors the rule in `plugin_ui`'s module doc ("a vimcode-owned vocabulary,
 //! converted to quadraui primitives in one place"): the Lua-facing strings
 //! and this enum are pinned by `from_str_lenient` below, independent of
-//! whatever quadraui's `CompletionKind` looks like today. `render.rs`'s
+//! whatever quadraui's `CompletionKind` looks like. `render.rs`'s
 //! `completion_menu_to_quadraui_completions` is the one place that maps one
 //! to the other.
 
@@ -52,7 +46,7 @@ impl CompletionItemKind {
     /// Parse a `vimcode.completion.register`/`:complete()` item's `kind`
     /// string. Case-insensitive; an unrecognised value falls back to
     /// `Text` rather than erroring the whole call — the same leniency
-    /// `vimcode.picker.open`'s `icon` field documents (#1630 review): a
+    /// `vimcode.picker.open`'s `icon` field documents: a
     /// cosmetic field should not be able to break a plugin on a typo.
     pub fn from_str_lenient(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
@@ -86,10 +80,9 @@ impl CompletionItemKind {
 }
 
 /// One completion-popup candidate. Buffer-word and LSP completion populate
-/// only `label`/`insert_text` (default `kind`/`detail`/`documentation`,
-/// `priority` 0) — unchanged behaviour from before #1805. A
-/// `vimcode.completion.register` source can also set `kind`/`detail`/
-/// `documentation`/`priority`.
+/// only `label`/`insert_text` with default `kind`/`detail`/`documentation`
+/// and `priority` 0. A `vimcode.completion.register` source can also set
+/// `kind`/`detail`/`documentation`/`priority`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct CompletionCandidate {
     /// Display label (what the user sees in the popup).
@@ -102,16 +95,13 @@ pub struct CompletionCandidate {
     pub detail: Option<String>,
     pub documentation: Option<String>,
     /// Sort weight relative to buffer-word/LSP candidates, which are always
-    /// priority `0`. Only a plugin source sets this to non-zero — higher
-    /// sorts earlier in the popup (#1805's "priority relative to
-    /// buffer/LSP candidates" requirement).
+    /// priority `0`. Higher priority sorts earlier in the popup.
     pub priority: i32,
 }
 
 impl CompletionCandidate {
-    /// A plain string candidate — what every buffer-word/LSP completion
-    /// was before #1805 (`kind = Text`, no detail/documentation, priority
-    /// `0`).
+    /// A plain string candidate with default `kind` (Text),
+    /// no detail/documentation, and priority `0`.
     pub fn plain(text: String) -> Self {
         Self {
             label: text.clone(),
@@ -121,10 +111,8 @@ impl CompletionCandidate {
     }
 }
 
-// `c == "foobar"` comparisons against the *insert text* let the existing
-// buffer-word/LSP completion tests (predating #1805) keep comparing plain
-// string literals instead of constructing a `CompletionCandidate` at every
-// assertion site.
+// Compares against the *insert text* to allow existing tests to compare
+// plain string literals instead of constructing a `CompletionCandidate`.
 impl PartialEq<str> for CompletionCandidate {
     fn eq(&self, other: &str) -> bool {
         self.insert_text == other

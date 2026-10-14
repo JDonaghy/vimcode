@@ -15,7 +15,7 @@ pub fn save_revision() -> u64 {
     SAVE_REVISION.load(Ordering::Acquire)
 }
 
-/// Test-only seam (#949 review) — see [`Settings::settings_file_path`]'s
+/// Test-only seam — see [`Settings::settings_file_path`]'s
 /// doc for why this is a thread-local rather than a `$HOME` mutation.
 #[cfg(test)]
 thread_local! {
@@ -70,7 +70,7 @@ pub enum EditorMode {
 /// describe as controlling "the menu style ... for context menus on
 /// macOS" specifically — the macOS menu *bar* is always native and has no
 /// such setting (see `native_menu`/`install_menu_bar`, vimcode#901). Maps
-/// 1:1 onto [`quadraui::MenuStyle`] (quadraui#1187) — see
+/// 1:1 onto [`quadraui::MenuStyle`] — see
 /// [`crate::render::to_quadraui_menu_style`] for the translation and
 /// [`Engine`](crate::core::Engine) callers of that for where it reaches
 /// the backend. This setting only ever changes anything on a backend that
@@ -84,13 +84,10 @@ pub enum MenuStyle {
     /// Native where the backend can do it (macOS today), painted
     /// everywhere else (GTK, Win-GUI, and always TUI) — quadraui's own
     /// framework-level default (`quadraui::MenuStyle::Auto`) and this
-    /// setting's default too. `#[serde(alias = "inherit")]`: a
-    /// settings.json written before #1580 (or a `:set menu_style=inherit`
-    /// typed out of habit) still parses — `Inherit` meant "follow the
-    /// title-bar style, which vimcode has none of, so behave like
-    /// `Native`" and `Auto` is that same capability-gated resolution
-    /// under quadraui's own name. Never the *serialized* form: a fresh
-    /// save always writes `"auto"` (see `get_value_str`).
+    /// setting's default too. `#[serde(alias = "inherit")]` for backwards
+    /// compatibility: `Auto` replaces the earlier `Inherit` semantics under
+    /// quadraui's own name. Never the *serialized* form: a fresh save always
+    /// writes `"auto"` (see `get_value_str`).
     #[default]
     #[serde(alias = "inherit")]
     Auto,
@@ -116,7 +113,7 @@ pub enum LineNumberMode {
 }
 
 /// When gutter fold-control markers paint — `fold_controls` setting, VS
-/// Code's `editor.showFoldingControls` equivalent (#1544).
+/// Code's `editor.showFoldingControls` equivalent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum FoldControlsMode {
     /// Only while the pointer is over the gutter. Collapsed-fold (`+`)
@@ -124,8 +121,7 @@ pub enum FoldControlsMode {
     /// is a fold you can't discover how to reopen.
     #[default]
     Mouseover,
-    /// Always paint every fold-control marker (open `-` and closed `+`),
-    /// matching pre-#1544 vimcode behavior.
+    /// Always paint every fold-control marker (open `-` and closed `+`).
     Always,
     /// Never paint fold-control markers at all (the gutter's fold-indicator
     /// column always renders blank).
@@ -133,7 +129,7 @@ pub enum FoldControlsMode {
 }
 
 /// How a completed ACP turn that wrote files is surfaced —
-/// `acp_review_on_turn_end` setting (#1515). Before this setting existed,
+/// `acp_review_on_turn_end` setting. Before this setting existed,
 /// `AcpEvent::PromptStopped` -> `Engine::acp_end_turn`
 /// (`crate::core::engine::acp_turn_ops`) always auto-opened the combined
 /// turn-review surface full-viewport over the whole editor
@@ -143,8 +139,7 @@ pub enum FoldControlsMode {
 #[serde(rename_all = "lowercase")]
 pub enum AcpReviewOnTurnEnd {
     /// Auto-open the full-viewport [`crate::core::review::ChangeReviewState`]
-    /// modal the instant a turn that wrote files ends — the pre-#1515
-    /// behaviour, unchanged.
+    /// modal the instant a turn that wrote files ends.
     Auto,
     /// Never auto-open the modal. Instead an "Edited N files · +a -r"
     /// segment rides the AI panel's already-shared status-strip header
@@ -153,7 +148,7 @@ pub enum AcpReviewOnTurnEnd {
     /// the turn checkpoint's `pre_turn_content`, not `git diff HEAD` — a
     /// file can be turn-dirty without being git-dirty, and vice versa).
     /// `:AiReview` opens the same modal `Auto` would have opened
-    /// automatically. Default (#1515) — the whole point of this setting:
+    /// automatically. Default — the whole point of this setting:
     /// a turn that wrote files shouldn't yank the user out of what they
     /// were doing to look at it.
     #[default]
@@ -166,8 +161,7 @@ pub enum AcpReviewOnTurnEnd {
 
 /// Default answer for a `session/request_permission` prompt before any
 /// per-kind session memory or dialog is consulted — `acp_permission_default`
-/// setting (#1518, Zed's `tool_permissions.default`). Checked in
-/// `Engine::acp_handle_permission_request` *after*
+/// setting. Checked in `Engine::acp_handle_permission_request` *after*
 /// `AcpSession::remembered_decisions` (an explicit human choice made
 /// earlier in this session is a stronger signal than a static config
 /// default) but before opening the dialog, so it only ever *skips* asking
@@ -175,9 +169,8 @@ pub enum AcpReviewOnTurnEnd {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AcpPermissionDefault {
-    /// Always ask — the pre-#1518 behaviour, unchanged. Every request
-    /// still opens the dialog unless a per-kind `remembered_decisions`
-    /// entry already answers it.
+    /// Always ask. Every request still opens the dialog unless a per-kind
+    /// `remembered_decisions` entry already answers it.
     #[default]
     Ask,
     /// Auto-select the first `allow_*` option for an `edit`-kind tool call
@@ -225,6 +218,17 @@ pub struct Settings {
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: u8,
 
+    /// Editor row pitch, as a multiplier of `font_size` — VS Code's
+    /// `editor.lineHeight` convention. `0.0` (the default)
+    /// means "auto": resolve to this backend's own platform-native ratio via
+    /// [`Self::effective_line_height_multiplier`] (VS Code's macOS
+    /// `GOLDEN_LINE_HEIGHT_RATIO`, 1.5, for the native macOS GUI today — GTK/
+    /// Win-GUI parity at VS Code's non-mac ratio, 1.35, is a follow-up).
+    /// Any other positive value is taken as an explicit multiplier on every
+    /// backend `effective_line_height_multiplier` recognises.
+    #[serde(default = "default_line_height")]
+    pub line_height: f64,
+
     /// Show file explorer sidebar on startup
     #[serde(default = "default_explorer_visible")]
     pub explorer_visible_on_startup: bool,
@@ -242,8 +246,8 @@ pub struct Settings {
     /// a line whose first non-blank character is `}`, and put a `#`
     /// preprocessor line at column 0 unconditionally. Corresponds to Vim's
     /// `'smartindent'` / `'si'`. Superseded by `'cindent'` when both are set
-    /// (`:h 'cindent'`: "'cindent' ... overrules 'smartindent'"). Default
-    /// off, matching Vim. #1207.
+    /// (`:h 'cindent'`: "'cindent' ... overrules 'smartindent'"). Default off,
+    /// matching Vim.
     #[serde(default)]
     pub smartindent: bool,
 
@@ -252,7 +256,7 @@ pub struct Settings {
     /// implementation is a simplified subset: indent after `{`, dedent a
     /// line whose first non-blank character is `}`, `#` to column 0,
     /// otherwise copy the previous non-blank line's indent. Corresponds to
-    /// Vim's `'cindent'` / `'cin'`. Default off, matching Vim. #1207.
+    /// Vim's `'cindent'` / `'cin'`. Default off, matching Vim.
     #[serde(default)]
     pub cindent: bool,
 
@@ -261,7 +265,7 @@ pub struct Settings {
     /// Corresponds to Vim's `'showmatch'` / `'sm'`. `'matchtime'` (how long
     /// the cursor stays on the match) is a value option and out of scope —
     /// see [`crate::core::engine::Engine::showmatch_flash`]. Default off,
-    /// matching Vim. #1207.
+    /// matching Vim.
     #[serde(default)]
     pub showmatch: bool,
 
@@ -286,7 +290,7 @@ pub struct Settings {
     #[serde(default)]
     pub format_on_save: bool,
 
-    /// Opt-in freshness (#523): periodically run the Board panel's
+    /// Opt-in freshness: periodically run the Board panel's
     /// provider-declared `tick_command` (`BoardProviderConfig`,
     /// `crate::core::extensions`) so a daemon-less provider's pipeline
     /// doesn't stall just because vimcode is the only client with the
@@ -350,9 +354,8 @@ pub struct Settings {
     /// When `'wrap'` is also on, break a soft-wrapped line at a word
     /// boundary (whitespace) at or before the wrap column instead of
     /// splitting mid-word. Purely a display-time choice of wrap point —
-    /// never touches what's stored in the buffer. No-op when `'wrap'` is
-    /// off. Corresponds to Vim's `'linebreak'` / `'lbr'`. Default off,
-    /// matching Vim. #1207.
+    /// never touches what's stored in the buffer. No-op when `'wrap'` is off.
+    /// Corresponds to Vim's `'linebreak'` / `'lbr'`. Default off, matching Vim.
     #[serde(default)]
     pub linebreak: bool,
 
@@ -381,14 +384,11 @@ pub struct Settings {
     /// sequence (`gcc`, `gc`), in vim key notation.
     /// Rhs: either an ex command prefixed with `:` (`":Commentary"`), or a
     /// raw key sequence fed back through the normal key path (`"<Esc>"`,
-    /// `"<C-w>h"`) — vim's key-to-keys remapping (#1151).
+    /// `"<C-w>h"`) — vim's key-to-keys remapping.
     ///
     /// This array is populated by the `:map` family of ex commands
     /// (`:nnoremap`, `:imap`, `:vnoremap`, …), which parse vim's own
-    /// `:{cmd} {lhs} {rhs}` syntax and translate it into this storage
-    /// format — the format itself, and pre-#1151 entries written in it
-    /// (`"n keys :command"`, always non-`noremap`, always an ex-command
-    /// rhs), keep parsing and working unmigrated.
+    /// `:{cmd} {lhs} {rhs}` syntax and translate it into this storage format.
     /// Example: `["i! jk <Esc>", "n <C-/> :Commentary"]`
     #[serde(default)]
     pub keymaps: Vec<String>,
@@ -423,7 +423,7 @@ pub struct Settings {
     /// regain their special meaning ([`crate::core::vim_regex::Magic::NoMagic`]).
     /// A pattern's own inline `\v`/`\V`/`\m`/`\M` override always wins over
     /// this setting, exactly as it wins over a literal `:h /magic` line in
-    /// real Vim. #1207.
+    /// real Vim.
     #[serde(default = "default_true")]
     pub magic: bool,
 
@@ -483,7 +483,7 @@ pub struct Settings {
     /// including it. Default `"@,48-57,_,192-255"`, matching Neovim's UTF-8
     /// default (`:h 'iskeyword'`) — every Unicode letter, digit, underscore,
     /// and the Latin-1 supplement block. `w`/`b`/`e`/etc. are ASCII-only
-    /// before this option is consulted (#1191); this also fixes that,
+    /// before this option is consulted; this also fixes that,
     /// because the default already includes `@`.
     #[serde(default = "default_iskeyword")]
     pub iskeyword: String,
@@ -491,11 +491,10 @@ pub struct Settings {
     /// How folds are found: `"manual"` (only `zf`-created folds — nothing is
     /// closeable until the user explicitly folds a range), `"indent"`
     /// (folds are derived from indentation and recomputed on demand), or
-    /// `"marker"` (folds are derived from the literal `'foldmarker'` pair,
-    /// #1159). Corresponds to Vim's `'foldmethod'` / `'fdm'`. Default
-    /// `"manual"`, matching Vim (`:h 'foldmethod'`) — a fresh buffer has no
-    /// folds at all until one is created. `"syntax"`/`"expr"`/`"diff"` are
-    /// not implemented (#1159 scoped them out — see the issue).
+    /// `"marker"` (folds are derived from the literal `'foldmarker'` pair).
+    /// Corresponds to Vim's `'foldmethod'` / `'fdm'`. Default `"manual"`,
+    /// matching Vim (`:h 'foldmethod'`) — a fresh buffer has no folds at all
+    /// until one is created. `"syntax"`/`"expr"`/`"diff"` are not implemented.
     #[serde(default = "default_foldmethod")]
     pub foldmethod: String,
 
@@ -513,8 +512,7 @@ pub struct Settings {
     /// matching Vim. A following digit on a marker in the text (Vim's
     /// explicit-fold-level refinement, e.g. `{{{2`) is not parsed specially
     /// here — the marker is still found as a literal-prefix match, but the
-    /// digit doesn't set an explicit level (#1159 scoped that out: marker
-    /// folding's core value is "a scan for a literal pair").
+    /// digit doesn't set an explicit level.
     #[serde(default = "default_foldmarker")]
     pub foldmarker: String,
 
@@ -535,11 +533,11 @@ pub struct Settings {
     /// VS Code's `mouseover` behavior of never hiding an already-collapsed
     /// region's marker), `"always"`, or `"never"`. No Vim equivalent — this
     /// mirrors VS Code's `editor.showFoldingControls`, default `"mouseover"`
-    /// there too (#1544).
+    /// there too.
     #[serde(default)]
     pub fold_controls: FoldControlsMode,
 
-    /// Sticky scroll (#1546): pin the header lines of the buffer's
+    /// Sticky scroll: pin the header lines of the buffer's
     /// enclosing scopes (e.g. `impl Foo {`, `fn bar() {`) at the top of the
     /// editor pane while scrolling, VS Code's `editor.stickyScroll.enabled`
     /// (on by default there too). No Vim equivalent, so no `:set`
@@ -638,8 +636,10 @@ pub struct Settings {
     #[serde(default, skip_serializing)]
     extension_registry_url: String,
 
-    /// Name of the active colour scheme. Built-in options: "onedark" (default),
-    /// "gruvbox-dark", "tokyo-night", "solarized-dark", "vscode-dark", "vscode-light".
+    /// Name of the active colour scheme. Built-in options: "vscode-dark-modern"
+    /// (default), "vscode-dark" (classic Dark+, a.k.a. "dark+" or
+    /// "vscode-dark-classic"), "vscode-light", "onedark", "gruvbox-dark",
+    /// "tokyo-night", "solarized-dark".
     /// Select with `:colorscheme <name>`.
     #[serde(default = "default_colorscheme")]
     pub colorscheme: String,
@@ -670,26 +670,23 @@ pub struct Settings {
     pub ai_completions: bool,
 
     /// Attach the active buffer's path as a `resource_link` content block
-    /// on every ACP `session/prompt` (#1449) — a baseline ACP v1 content
-    /// kind every agent must accept, no `promptCapabilities` check needed.
-    /// Skipped for an unnamed/scratch buffer (nothing on disk to link) and
-    /// only relevant to the ACP transport (`ai_send_message_via_acp`); the
-    /// direct-provider `curl` transport has no content-block concept.
-    /// Default: true — the whole point of #1449 is that the agent already
-    /// knows the workspace and can read files itself (#954), it just
-    /// doesn't know *which* file the user is looking at without this.
+    /// on every ACP `session/prompt` — a baseline ACP v1 content kind every
+    /// agent must accept, no `promptCapabilities` check needed. Skipped for an
+    /// unnamed/scratch buffer (nothing on disk to link) and only relevant to
+    /// the ACP transport (`ai_send_message_via_acp`); the direct-provider
+    /// `curl` transport has no content-block concept. Default: true — the
+    /// agent knows the workspace and can read files itself; this indicates
+    /// which file the user is looking at.
     #[serde(default = "default_true")]
     pub ai_attach_current_buffer: bool,
 
     /// Whether plain `Enter` submits the AI panel's input (Zed-style), or
-    /// inserts a newline like today's default (#1509, quadraui#1137).
+    /// inserts a newline.
     /// Plumbed straight through to
     /// [`quadraui::ChatController::set_submit_on_enter`] every
     /// `populate_ai_chat_controller` call (`crate::render`) — see that
     /// method's own doc for the full keybinding table in each mode.
-    /// Default: true (Zed parity) — set to `false` to keep the pre-#1509
-    /// behaviour where `Enter` always inserts a newline and
-    /// `Ctrl+S`/`Alt+Enter`/`Ctrl+Enter` submit.
+    /// Default: true (Zed parity).
     #[serde(default = "default_true")]
     pub ai_chat_submit_on_enter: bool,
 
@@ -697,13 +694,12 @@ pub struct Settings {
     /// `"claude-code-acp"` — parsed into argv via
     /// `crate::core::acp::parse_agent_command`. The agent is spawned with
     /// the workspace root (falling back to the CWD vimcode was started in)
-    /// as its `session/new` `cwd` (#952, ACP-1).
+    /// as its `session/new` `cwd`.
     ///
     /// Empty (the default) means "no live agent configured": the AI panel
     /// falls back to `ai_provider`/`ai_api_key`'s direct-provider `curl`
     /// transport (`crate::core::ai`), kept as a no-agent-binary-required
-    /// escape hatch per #952's "Decide in this slice" — through ACP-7, at
-    /// which point a follow-up issue retires it.
+    /// escape hatch.
     ///
     /// Superseded (never read) once `acp_agents` below is non-empty — see
     /// that field's doc for the multi-agent registry this single-string
@@ -740,18 +736,16 @@ pub struct Settings {
     /// Name of the currently active entry in `acp_agents`, matched
     /// case-insensitively. Empty, or naming a profile no longer present,
     /// falls back to `acp_agents[0]`. Changed only by `:AiAgent <name>`
-    /// (`Engine::acp_switch_agent`) — never optimistically elsewhere —
-    /// which also ends whatever session is currently live (a different
-    /// agent process shares no context with the old one, so continuing to
-    /// show its transcript next to a new agent's replies would be
-    /// actively misleading; same reasoning `:AiClear` already documents).
+    /// (`Engine::acp_switch_agent`) — never optimistically elsewhere — which
+    /// also ends whatever session is currently live, since a different agent
+    /// process shares no context with the old one.
     #[serde(default)]
     pub acp_active_agent: String,
 
     /// Automatically resume the most recently used ACP session for the
     /// active agent and workspace (`:AiSessions`' local index,
     /// `crate::core::acp_sessions::AcpSessionIndex`) on the *first*
-    /// `:AI`/message of the process (#1459), instead of always starting
+    /// `:AI`/message of the process, instead of always starting
     /// empty. Only ever applies once per run
     /// (`Engine::acp_startup_reopen_attempted`) — a later `:AiClear` or
     /// manual `:AiSessions` pick is never second-guessed by this. Silently
@@ -791,71 +785,71 @@ pub struct Settings {
     #[serde(default)]
     pub acp_mcp_servers: Vec<crate::core::acp::AcpMcpServerConfig>,
 
-    /// How a completed ACP turn that wrote files is surfaced (#1515):
-    /// `"auto"` (pre-#1515 full-viewport modal, unchanged), `"badge"`
-    /// (default: a status-strip segment + gutter markers, `:AiReview`
-    /// opens the same modal), or `"off"` (no automatic nudge at all,
-    /// `:AiReview` only). See [`AcpReviewOnTurnEnd`]'s own doc for the
-    /// full behaviour each value gives.
+    /// How a completed ACP turn that wrote files is surfaced: `"auto"`
+    /// (full-viewport modal), `"badge"` (default: a status-strip segment +
+    /// gutter markers, `:AiReview` opens the same modal), or `"off"` (no
+    /// automatic nudge at all, `:AiReview` only). See [`AcpReviewOnTurnEnd`]'s
+    /// own doc for the full behaviour each value gives.
     #[serde(default)]
     pub acp_review_on_turn_end: AcpReviewOnTurnEnd,
 
-    /// "Follow the agent" (#1514, Zed-style): when on, every file an ACP
-    /// agent touches — a served `fs/read_text_file`/`fs/write_text_file`
-    /// request, or a `tool_call`/`tool_call_update`'s `locations` — is
-    /// revealed at its line in the last-used editor window
-    /// (`Engine::acp_follow_reveal`), so the user doesn't have to chase
-    /// `→ path:line` text in the transcript. Never steals keyboard focus
-    /// from the chat input — it only moves the *editor* cursor/viewport,
-    /// leaving `ai_has_focus`/`sidebar_focus_requested` untouched. **Default
-    /// off**: an agent that reads dozens of files while exploring would
-    /// otherwise yank the visible editor around on every one of them.
-    /// Toggled via `:AiFollow`.
+    /// "Follow the agent": when on, every file an ACP agent touches — a
+    /// served `fs/read_text_file`/`fs/write_text_file` request, or a
+    /// `tool_call`/`tool_call_update`'s `locations` — is revealed at its line
+    /// in the last-used editor window (`Engine::acp_follow_reveal`), so the
+    /// user doesn't have to chase `→ path:line` text in the transcript. Never
+    /// steals keyboard focus from the chat input — it only moves the *editor*
+    /// cursor/viewport, leaving `ai_has_focus`/`sidebar_focus_requested`
+    /// untouched. **Default off**: an agent that reads dozens of files while
+    /// exploring would otherwise yank the visible editor around on every one
+    /// of them. Toggled via `:AiFollow`.
     #[serde(default)]
     pub acp_follow_agent: bool,
 
-    /// Default answer for a `session/request_permission` prompt (#1518,
-    /// Zed's `tool_permissions.default`) — `"ask"` (default, unchanged
-    /// behaviour), `"allow_edits"` (auto-allow `edit`-kind tool calls
-    /// only), or `"allow_all"` (auto-allow every kind). See
-    /// [`AcpPermissionDefault`]'s own doc for exactly where this is
-    /// consulted relative to the existing per-kind session memory
+    /// Default answer for a `session/request_permission` prompt — `"ask"`
+    /// (default, unchanged behaviour), `"allow_edits"` (auto-allow `edit`-kind
+    /// tool calls only), or `"allow_all"` (auto-allow every kind). See
+    /// [`AcpPermissionDefault`]'s own doc for exactly where this is consulted
+    /// relative to the existing per-kind session memory
     /// (`AcpSession::remembered_decisions`).
     #[serde(default)]
     pub acp_permission_default: AcpPermissionDefault,
 
-    /// Advertise `clientCapabilities.terminal` (#1522) so an ACP agent may
-    /// call `terminal/create`/`terminal/output`/`terminal/wait_for_exit`/
-    /// `terminal/kill`/`terminal/release` and embed live `{type:
-    /// "terminal"}` content in its tool calls, instead of falling back to
-    /// opaque in-agent execution with no visible output. Default **true**
-    /// — unlike `acp_follow_agent`'s "off by default, would otherwise yank
-    /// the editor around" caution, an agent must *already* declare an
-    /// `execute`-kind tool call to reach this at all, and rendering that
-    /// tool call's live output is strictly more informative than the
-    /// pre-#1522 alternative (a one-line "(terminal output omitted)"
-    /// placeholder). Read by `AcpClient::initialize` (whether to send the
-    /// capability at all) and `Engine::acp_dispatch_events` (whether to
-    /// actually serve `terminal/*` if an agent calls it regardless).
+    /// Advertise `clientCapabilities.terminal` so an ACP agent may call
+    /// `terminal/create`/`terminal/output`/`terminal/wait_for_exit`/
+    /// `terminal/kill`/`terminal/release` and embed live `{type: "terminal"}`
+    /// content in its tool calls, instead of falling back to opaque in-agent
+    /// execution with no visible output. Default **true**: an agent must
+    /// *already* declare an `execute`-kind tool call to reach this at all, and
+    /// rendering that tool call's live output is strictly more informative.
+    /// Read by `AcpClient::initialize` (whether to send the capability at all)
+    /// and `Engine::acp_dispatch_events` (whether to actually serve `terminal/*`
+    /// if an agent calls it regardless).
     #[serde(default = "default_true")]
     pub acp_terminal_enabled: bool,
 
     // ── Explorer ──────────────────────────────────────────────────────────────
-    /// Show hidden files (dotfiles) in the file explorer. Default **true**
-    /// (#1545), matching VS Code — dotfiles like `.vscode`, `.github` and
-    /// `.cargo` are legitimate project files most users want to see; only
-    /// the noise VS Code's own `files.exclude` hides by default
-    /// (`explorer_exclude`, below) stays hidden. A pre-#1545 `settings.json`
-    /// with this explicitly written out (including an explicit `false`) is
-    /// untouched — `#[serde(default = ...)]` only ever supplies the value
-    /// for a *missing* key.
+    /// Show hidden files (dotfiles) in the file explorer. Default **true**,
+    /// matching VS Code — dotfiles like `.vscode`, `.github` and `.cargo` are
+    /// legitimate project files most users want to see; only the entries in
+    /// `explorer_exclude` stay hidden.
     #[serde(default = "default_true")]
     pub show_hidden_files: bool,
     /// Sort explorer entries case-insensitively (default: true).
     #[serde(default = "default_true")]
     pub explorer_sort_case_insensitive: bool,
+    /// Automatically expand the active file's ancestor folders, select its
+    /// row and scroll it into view in the Explorer sidebar whenever the
+    /// active editor changes (opening a file, switching tabs, restoring a
+    /// session, …). Mirrors VS Code's `explorer.autoReveal`. Default
+    /// **true**. Read by `Engine::explorer_reveal_path` /
+    /// `Engine::explorer_reveal_active_file` — every call site is an
+    /// automatic "active file changed" trigger, so turning this off simply
+    /// makes those calls no-ops rather than needing to be removed one by one.
+    #[serde(default = "default_true")]
+    pub explorer_auto_reveal: bool,
     /// Glob patterns for entries the file explorer always hides, regardless
-    /// of `show_hidden_files` — VS Code's `files.exclude` (#1545). Default
+    /// of `show_hidden_files` — VS Code's `files.exclude`. Default
     /// `["**/.git", "**/.svn", "**/.hg", "**/.DS_Store", "**/Thumbs.db"]`,
     /// VS Code's own default list.
     ///
@@ -877,7 +871,7 @@ pub struct Settings {
     #[serde(default = "default_updatetime")]
     pub updatetime: u32,
 
-    // ── Undo persistence (#1156) ─────────────────────────────────────────────
+    // ── Undo persistence ─────────────────────────────────────────────────────
     /// Maximum number of live undo-tree states kept per buffer, across every
     /// branch. Corresponds to Vim's `'undolevels'` / `'ul'`. Once exceeded,
     /// the globally-oldest branch tip not on the buffer's active path is
@@ -920,15 +914,16 @@ pub struct Settings {
     pub indent_guides: bool,
 
     /// Show the code-overview minimap on the right edge of each editor pane.
+    ///
+    /// **Experimental, off by default**: enables it with `:set minimap` for
+    /// the session, or `"minimap": true` in `settings.json` to persist it.
     #[serde(default = "default_minimap")]
     pub minimap: bool,
 
-    /// Render VS Code-parity miniature characters in the minimap
-    /// (`editor.minimap.renderCharacters`) instead of density dots/blocks,
-    /// on backends where quadraui's `MinimapRenderMode::Characters` is
-    /// reachable (issue #1532, consuming quadraui#1143's `MinimapScale` +
-    /// glyph atlas). Default on, matching VS Code. TUI's braille rasteriser
-    /// has no font to scale and never overrides
+    /// Render VS Code-parity miniature characters in the minimap instead of
+    /// density dots/blocks, on backends where quadraui's
+    /// `MinimapRenderMode::Characters` is reachable. Default on, matching VS
+    /// Code. TUI's braille rasteriser has no font to scale and never overrides
     /// `Backend::minimap_scale`/`set_minimap_scale`, so this setting is a
     /// no-op there — see [`Settings::resolved_minimap_scale`] for how the
     /// shared code tells GUI and TUI apart without a per-backend branch.
@@ -936,14 +931,12 @@ pub struct Settings {
     pub minimap_render_characters: bool,
 
     /// VS Code-parity minimap character-cell scale (`editor.minimap.scale`)
-    /// — `1` resolves to quadraui's pre-#1143 `MinimapScale::One` (a bare
-    /// density dot), `2` (the default, matching VS Code's own
-    /// `minimap.scale`) resolves to `MinimapScale::Two`, the smallest cell
-    /// an atlas-blitted glyph tile reads back as a real shape rather than a
-    /// blob. quadraui does not yet ship a `Three`; a `3` here is accepted
-    /// and clamped to `2` (the largest scale currently available) by
-    /// [`Settings::resolved_minimap_scale`] rather than rejected outright —
-    /// see that method's doc comment.
+    /// — `1` resolves to quadraui's `MinimapScale::One` (a bare density dot),
+    /// `2` (the default, matching VS Code) resolves to `MinimapScale::Two`,
+    /// the smallest cell an atlas-blitted glyph tile reads back as a real
+    /// shape rather than a blob. quadraui does not yet ship a `Three`; a `3`
+    /// here is accepted and clamped to `2` by [`Settings::resolved_minimap_scale`]
+    /// rather than rejected outright — see that method's doc comment.
     #[serde(default = "default_minimap_scale")]
     pub minimap_scale: u8,
 
@@ -968,28 +961,21 @@ pub struct Settings {
 
     /// Use Nerd Font icons in the UI (activity bar, file explorer, panels).
     ///
-    /// Backend-derived (issue #999): `None` means "inherit from the running
-    /// backend" and is resolved live by the [`Settings::use_nerd_fonts`]
-    /// accessor method — GTK and macOS bundle Symbols Nerd Font 3.5.1 and
-    /// register it in-process at startup (`render::register_nerd_font_
-    /// fallback`, #1130), so the glyphs are guaranteed
-    /// available regardless of what the user has installed, on every OS —
-    /// those two backends therefore inherit `true` unconditionally. Win-GUI
-    /// shares the same bundled font in principle but has two open,
-    /// unverified bugs (vimcode#178, vimcode#161) suggesting its font
-    /// resolution path may not actually work yet, and there is no Windows
-    /// host in this project's fleet to check — so it keeps the conservative
-    /// guess until those are confirmed fixed. The TUI renders through the
-    /// user's terminal emulator, which uses its own configured font; there
-    /// is no reliable way to detect that font's glyph coverage from inside
-    /// the terminal (a CSI-6n width probe measures advance, not whether a
-    /// real glyph painted — see the issue), so the TUI also keeps the
-    /// previous conservative `target_os`-based guess and offers
-    /// `:CheckNerdFonts` for the user to check by eye instead. `Some(_)` is
-    /// an explicit user override that always wins, including across a
-    /// later backend change, and persists across restarts. Never read this
-    /// field directly; call the accessor method
-    /// (`self.settings.use_nerd_fonts()`).
+    /// Backend-derived: `None` means "inherit from the running backend" and
+    /// is resolved live by the [`Settings::use_nerd_fonts`] accessor method.
+    /// GTK and macOS bundle Symbols Nerd Font 3.5.1 and register it
+    /// in-process at startup, so the glyphs are guaranteed available
+    /// regardless of what the user has installed on every OS. Win-GUI shares
+    /// the same bundled font in principle but has two open bugs suggesting its
+    /// font resolution path may not work yet, and there is no Windows host in
+    /// this project's fleet to check — so it keeps the conservative guess until
+    /// those are confirmed fixed. The TUI renders through the user's terminal
+    /// emulator, which uses its own configured font; there is no reliable way
+    /// to detect that font's glyph coverage from inside the terminal, so the
+    /// TUI also keeps the conservative guess and offers `:CheckNerdFonts` for
+    /// the user to check by eye instead. `Some(_)` is an explicit user override
+    /// that always wins. Never read this field directly; call the accessor
+    /// method (`self.settings.use_nerd_fonts()`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_nerd_fonts: Option<bool>,
 
@@ -1025,50 +1011,40 @@ pub struct Settings {
     /// Default **on** — historical Vim defaults this off, but Neovim (this
     /// repo's oracle, per `tests/nvim_conformance.rs`) defaults it on;
     /// confirmed by hand with `nvim --headless -u NONE -c 'set hidden?'`.
-    /// #1190.
     #[serde(default = "default_true")]
     pub hidden: bool,
 
     /// Show a partially-typed Normal-mode command (count/register/operator
     /// prefix, e.g. `"a2d`) in the last line while it's being typed.
-    /// Corresponds to Vim's `'showcmd'` / `'sc'`. Default on, matching
-    /// Neovim. #1190.
+    /// Corresponds to Vim's `'showcmd'` / `'sc'`. Default on, matching Neovim.
     #[serde(default = "default_true")]
     pub showcmd: bool,
 
-    /// Show the cursor's line/column (and file percentage) in the status
-    /// line. Corresponds to Vim's `'ruler'` / `'ru'`. Default on, matching
-    /// Neovim. #1190.
+    /// Show the cursor's line/column (and file percentage) in the status line.
+    /// Corresponds to Vim's `'ruler'` / `'ru'`. Default on, matching Neovim.
     #[serde(default = "default_true")]
     pub ruler: bool,
 
     /// Render unprintable characters as glyphs instead of their normal
-    /// whitespace effect: a tab displays as literal `^I` instead of
-    /// expanding to `'tabstop'` width, and the true end of each line gets
-    /// a trailing `$`. Corresponds to Vim's `'list'`. This is the on/off
-    /// switch only — the exact glyphs are hardcoded to Vim's own
-    /// no-`'listchars'`-item fallback (`:h 'listchars'`) until `'listchars'`
-    /// itself lands (sibling value-option tranche). Default off, matching
-    /// Vim. #1190.
+    /// whitespace effect: a tab displays as literal `^I` instead of expanding
+    /// to `'tabstop'` width, and the true end of each line gets a trailing `$`.
+    /// Corresponds to Vim's `'list'`. This is the on/off switch only — the
+    /// exact glyphs are hardcoded to Vim's own no-`'listchars'`-item fallback
+    /// (`:h 'listchars'`) until `'listchars'` itself lands. Default off,
+    /// matching Vim.
     #[serde(default)]
     pub list: bool,
 
     /// Which characters `'list'` mode uses for otherwise-invisible glyphs.
     /// Corresponds to Vim's `'listchars'` / `'lcs'`. Comma-separated
-    /// `item:chars` pairs. Recognised-and-wired items: `eol`, `tab`
-    /// (two or three characters), `trail`, `nbsp`, `space` (each a single
-    /// character). Recognised-and-*validated*-but-not-painted:
-    /// `extends`/`precedes` (`'wrap'`-off horizontal-scroll clipping isn't
-    /// glyph-annotated here) and `multispace`/`lead`/`leadmultispace`/
-    /// `leadtab`/`conceal` (real Vim items with no vimcode rendering path
-    /// yet — accepted so a pasted vimrc line doesn't read as a typo, exactly
-    /// like `UNIMPLEMENTED_VALUE_OPTIONS`, but scoped per-item rather than
-    /// per-option since the *option* itself is otherwise fully implemented).
-    /// Default `"tab:> ,trail:-,nbsp:+"`, matching Neovim (`:h 'listchars'`)
-    /// — note this has no `eol` item, so `'list'` does **not** show a
-    /// trailing `$` out of the box (#1190's hardcoded always-`$`/`^I`
-    /// fallback only matched classic Vim's *empty*-`'listchars'` behavior,
-    /// not Neovim's real default).
+    /// `item:chars` pairs. Recognised-and-wired items: `eol`, `tab` (two or
+    /// three characters), `trail`, `nbsp`, `space` (each a single character).
+    /// Recognised-and-*validated*-but-not-painted: `extends`/`precedes`
+    /// (horizontal-scroll clipping isn't glyph-annotated) and
+    /// `multispace`/`lead`/`leadmultispace`/`leadtab`/`conceal` (real Vim
+    /// items with no vimcode rendering path yet — accepted so a pasted vimrc
+    /// line doesn't read as a typo). Default `"tab:> ,trail:-,nbsp:+"`,
+    /// matching Neovim (`:h 'listchars'`) — note this has no `eol` item.
     #[serde(default = "default_listchars")]
     pub listchars: String,
 
@@ -1099,7 +1075,7 @@ pub struct Settings {
     pub backspace: String,
 
     /// Milliseconds to wait, after typing a keystroke that's an ambiguous
-    /// prefix of a key-to-keys mapping (#1151), for a further keystroke that
+    /// prefix of a key-to-keys mapping, for a further keystroke that
     /// resolves it before giving up and replaying the buffered keys as
     /// typed. `0` disables the wait — the buffered keys are replayed as soon
     /// as nothing else could still match, matching vimcode's pre-existing
@@ -1108,24 +1084,18 @@ pub struct Settings {
     #[serde(default = "default_timeoutlen")]
     pub timeoutlen: u32,
 
-    /// Command-line completion behavior for repeated `<Tab>`. Corresponds
-    /// to Vim's `'wildmode'` / `'wim'`. Validated against Vim's documented
-    /// comma/colon grammar (`full`/`longest`/`list`/`longest:full`/etc, `:h
-    /// 'wildmode'`) and — as of #1206 — drives real, observably different
-    /// Tab-completion behavior per [`WildmodeStage`]/`wildmode_stage_at`:
-    /// `longest` fills only the common prefix without selecting an item,
-    /// `list`-only leaves the command line untouched (the item list is
-    /// shown either way — vimcode's wildmenu is unconditionally on, see
-    /// `'wildmenu'` in `set_bool_option`), and stages advance one per
-    /// `<Tab>` press the way `:h 'wildmode'` describes. The bare default
-    /// value `"full"` is the one exception: it keeps vimcode's
-    /// pre-existing UX (common-prefix on the first press, full-match
-    /// cycling from the second press on) rather than switching to Vim's
-    /// literal "select the first full match immediately" `full` semantics,
-    /// so the already-covered `tests/wildmenu.rs` suite keeps passing
-    /// unchanged — see `Settings::wildmode_is_plain_full`'s doc comment.
-    /// `noselect`/`lastused` parse but are not distinctly wired (see
-    /// `WildmodeStage`). Default `"full"`, matching Neovim.
+    /// Command-line completion behavior for repeated `<Tab>`. Corresponds to
+    /// Vim's `'wildmode'` / `'wim'`. Validated against Vim's documented
+    /// comma/colon grammar and drives real, observably different Tab-completion
+    /// behavior per [`WildmodeStage`]/`wildmode_stage_at`: `longest` fills only
+    /// the common prefix without selecting an item, `list`-only leaves the
+    /// command line untouched (the item list is shown either way — vimcode's
+    /// wildmenu is unconditionally on), and stages advance one per `<Tab>`
+    /// press the way `:h 'wildmode'` describes. The bare default value `"full"`
+    /// keeps vimcode's pre-existing UX (common-prefix on the first press,
+    /// full-match cycling from the second press on) rather than switching to
+    /// Vim's literal "select the first full match immediately" `full` semantics.
+    /// Default `"full"`, matching Neovim.
     #[serde(default = "default_wildmode")]
     pub wildmode: String,
 
@@ -1157,7 +1127,7 @@ pub struct Settings {
 
     /// Lazily-parsed form of `iskeyword`, keyed by the spec string it was
     /// parsed from. `is_keyword_char` is called in tight loops — the
-    /// nearby-buffer word scan behind completion (#1721) calls it once per
+    /// nearby-buffer word scan behind completion calls it once per
     /// character scanned, which re-parsed and re-allocated the
     /// comma-separated `iskeyword` spec on every single call. Not real
     /// settings state (derived, rebuildable from `iskeyword` alone), so it's
@@ -1194,8 +1164,10 @@ fn default_indent_guides() -> bool {
     true
 }
 
+/// The minimap is experimental and off by default on every backend —
+/// see [`Settings::minimap`]'s doc comment for why.
 fn default_minimap() -> bool {
-    true
+    false
 }
 
 fn default_minimap_render_characters() -> bool {
@@ -1228,33 +1200,26 @@ fn default_hover_delay() -> u32 {
 /// [`Settings::use_nerd_fonts`].
 ///
 /// `gui` is `crate::icons::is_gui_backend()`, set once at startup by every
-/// GUI entry point (`App::new`, `App::new_portable`,
-/// `App::new_headless_with_backend`) right where they already call
-/// `icons::set_nerd_fonts(...)`; it defaults to `false` (the conservative,
-/// TUI assumption) so a caller that forgets to opt in gets today's
-/// behavior rather than a false "glyphs available".
+/// GUI entry point right where they already call `icons::set_nerd_fonts(...)`.
+/// It defaults to `false` (the conservative, TUI assumption) so a caller
+/// that forgets to opt in gets today's behavior rather than a false
+/// "glyphs available".
 ///
 /// GUI is uniform across GTK/macOS/Win-GUI *except* on Windows itself:
 /// `App`'s `impl quadraui::ShellApp` is the one shared implementation all
-/// three GUI backends run (`src/app.rs`), so there is no per-backend hook
-/// to special-case just Win-GUI without adding per-backend code — this
-/// `cfg!(target_os = "windows")` check lives here in core, mirroring the
-/// TUI branch below, rather than in `src/gtk/`/`src/tui_main/`, so it does
-/// not run afoul of this repo's Platform-Neutrality Rule. The reason it
-/// exists at all: vimcode#178 (diff toolbar arrows render as `?`) and
-/// vimcode#161 (tree-sized icon font) are open evidence that Win-GUI's
-/// DirectWrite fallback path may not fully resolve the bundled font yet,
-/// and there is no Windows host anywhere in this project's fleet to verify
-/// it either way. Per the issue: "if Win-GUI genuinely can't resolve it
-/// yet, leave it off and say so" — so Win-GUI keeps the pre-#999
-/// conservative guess until #178/#161 confirm the font path actually
-/// works, while GTK/macOS (verified to bundle and resolve the font) get
-/// the new `true` default on every OS they run on.
+/// three GUI backends run, so there is no per-backend hook to special-case
+/// just Win-GUI without adding per-backend code — this `cfg!(target_os =
+/// "windows")` check lives here in core, mirroring the TUI branch below.
+/// The reason it exists: vimcode#178 and vimcode#161 are open evidence
+/// that Win-GUI's DirectWrite fallback path may not fully resolve the
+/// bundled font yet, and there is no Windows host to verify it. Win-GUI
+/// keeps the pre-#999 conservative guess until those issues confirm the
+/// font path works, while GTK/macOS (verified to bundle and resolve the
+/// font) get the new `true` default.
 fn default_use_nerd_fonts(gui: bool) -> bool {
     if gui && cfg!(target_os = "windows") {
-        // Win-GUI: see the doc comment above — #178/#161 are open,
-        // unverified evidence that the bundled font may not resolve here,
-        // so don't claim it's available until they're confirmed fixed.
+        // Win-GUI: unverified evidence suggests the bundled font may not
+        // resolve here; keep the conservative guess until confirmed fixed.
         false
     } else if gui {
         // GTK/macOS bundle the font (`app_support::ICON_FONT_BYTES`) and
@@ -1393,7 +1358,7 @@ fn default_iskeyword() -> String {
 }
 
 fn default_colorscheme() -> String {
-    "onedark".to_string()
+    "vscode-dark-modern".to_string()
 }
 
 fn default_ai_provider() -> String {
@@ -1427,37 +1392,22 @@ pub enum ExplorerAction {
 }
 
 impl ExplorerAction {
-    /// Resolve an explorer context-menu/keyboard-shortcut action id string
-    /// to the `ExplorerAction` both backends dispatch through
+    /// Resolve an explorer context-menu/keyboard-shortcut action id string to
+    /// the `ExplorerAction` both backends dispatch through
     /// `Engine::dispatch_explorer_crud`.
     ///
-    /// #823 item 6: GTK's `App::explorer_action` (`app.rs`) and TUI's
-    /// `handle_explorer_context_action` (`tui_main/mod.rs`) map this same
-    /// 5-string table, but they are no longer safe to fully collapse — they
-    /// were re-verified against current `HEAD` per this issue's own
-    /// instruction, not just the line numbers recorded when the issue was
-    /// filed, and the two functions have drifted past what a mechanical
-    /// merge could do without changing behavior:
+    /// GTK's `App::explorer_action` and TUI's `handle_explorer_context_action`
+    /// map a 5-string table: `new_file`, `new_folder`, `rename`, `delete`,
+    /// `move_file`. The two functions differ in their deletion and move semantics:
     ///
-    /// * TUI's "delete" arm calls `Engine::confirm_delete_file` directly
-    ///   with the context menu's explicit target path; GTK's routes
-    ///   through `dispatch_explorer_crud(Delete)`, which acts on
-    ///   `explorer_tree`'s *selected row* instead — forcing GTK onto TUI's
-    ///   explicit-path behavior (or vice versa) is a real behavior change,
-    ///   not a refactor, and picks the wrong file if a context-menu click
-    ///   and the tree's selection ever disagree.
-    /// * TUI's match has no `"move_file"` arm at all — it silently no-ops
-    ///   today. Wiring it up via this table would be a new capability, not
-    ///   a dedup, and needs its own test/issue.
+    /// * TUI's delete call acts on the context menu's explicit target path;
+    ///   GTK acts on `explorer_tree`'s *selected row* instead.
+    /// * TUI's match has no `"move_file"` arm at all — it silently no-ops.
     ///
-    /// What both sides still agree on byte-for-byte is the `new_file` /
-    /// `new_folder` / `rename` subset, both feeding the identical
-    /// `dispatch_explorer_crud` call — that's what this function shares.
-    /// `delete` / `move_file` are included for GTK's benefit (its own
-    /// `explorer_action` handles all five through one call to
-    /// `dispatch_explorer_crud`) but TUI's caller never reaches this
-    /// function for those two strings — its own arms handle `"delete"`
-    /// first and it has no `"move_file"` arm to reach here at all.
+    /// This function shares the `new_file` / `new_folder` / `rename` subset;
+    /// `delete` / `move_file` are included for GTK's benefit but TUI's caller
+    /// never reaches this function for those two strings — its own arms handle
+    /// them first.
     pub fn from_action_str(s: &str) -> Option<Self> {
         Some(match s {
             "new_file" => Self::NewFile,
@@ -1523,18 +1473,15 @@ fn pk_toggle_sidebar() -> String {
     "<C-b>".to_string()
 }
 fn pk_focus_explorer() -> String {
-    // <A-e> moved off in #318 — clashed with menu bar Alt+E (Edit menu).
     "<C-S-e>".to_string()
 }
 fn pk_focus_search() -> String {
-    // <A-f> moved off in #318 — clashed with menu bar Alt+F (File menu).
     "<C-S-f>".to_string()
 }
 fn pk_fuzzy_finder() -> String {
     "<C-p>".to_string()
 }
 fn pk_live_grep() -> String {
-    // Moved off <C-S-f> in #318 to free that combo for focus_search.
     "<C-S-g>".to_string()
 }
 fn pk_command_palette() -> String {
@@ -1605,7 +1552,7 @@ pub struct PanelKeys {
     /// Navigate forward in tab history. Default: `<C-A-Right>`
     #[serde(default = "pk_nav_forward")]
     pub nav_forward: String,
-    /// Give the toast/notification stack keyboard focus (#1577) —
+    /// Give the toast/notification stack keyboard focus —
     /// Tab/Shift+Tab/Left/Right/Up/Down/Enter/Escape then navigate its
     /// buttons via `quadraui::compose::ToastStackController`. Same effect
     /// as `:Notifications`. Default: `<C-S-n>` — doesn't collide with any
@@ -1724,25 +1671,17 @@ pub fn parse_key_binding(s: &str) -> Option<(bool, bool, bool, char)> {
 /// Extended key binding parser that returns the key name as a string.
 /// Supports named keys like `Tab`, `Space`, `Escape`, etc.
 ///
-/// #1495: delegates the actual `<...>` grammar to
+/// Delegates the actual `<...>` grammar to
 /// [`quadraui::accelerator::parse_key_binding`] rather than re-implementing
-/// vim-style parsing here — that was the shadow copy this function used to
-/// carry. Two vimcode-specific rules are layered on top, kept because
-/// deleting them would be a behaviour change (this is a pure consolidation,
-/// not a parser upgrade):
+/// vim-style parsing here. Two vimcode-specific rules are layered on top:
 ///
-/// - **An explicit modifier is required.** vimcode's config format has
-///   never accepted a bare vim-style binding like `<t>` or `<F5>` (config
-///   authors write unmodified keys as plain `t` elsewhere); quadraui's
-///   parser is more permissive and accepts those. Rejected before
-///   delegating by requiring a `-` inside the brackets.
+/// - **An explicit modifier is required.** vimcode's config format rejects
+///   bare vim-style bindings like `<t>` or `<F5>` (authors write unmodified
+///   keys as plain `t` elsewhere); quadraui's parser is more permissive.
+///   Rejected before delegating by requiring a `-` inside the brackets.
 /// - **No Cmd modifier.** quadraui's `D`/`M` modifier letters map to
-///   `Modifiers::cmd`, a concept vimcode's Linux/Windows backends have no
-///   equivalent for; `<D-s>`-style bindings are rejected here same as
-///   before, where `D` was simply an unrecognised modifier letter.
-///
-/// Both are genuine divergences between the two parsers, not just
-/// implementation detail — see #1495.
+///   `Modifiers::cmd`, a concept vimcode's Linux/Windows backends lack;
+///   `<D-s>`-style bindings are rejected here same as before.
 pub fn parse_key_binding_named(s: &str) -> Option<(bool, bool, bool, String)> {
     let trimmed = s.trim();
     // Note: this checks for a `-` anywhere in `trimmed`, not strictly
@@ -1765,47 +1704,17 @@ pub fn parse_key_binding_named(s: &str) -> Option<(bool, bool, bool, String)> {
     ))
 }
 
-/// #1069 branched this on `target_os == "macos"` via `cfg!` ("Menlo" on
-/// macOS, "Monospace" everywhere else) because `"Monospace"` is a fontconfig
-/// *generic alias* — GTK/Pango on Linux resolves it, and Win-GUI's
-/// DirectWrite has an equivalent, but at the time CoreText had no such
-/// alias and `MacBackend::set_editor_font` -> `make_font_exact` rejected
-/// it outright, leaving `current_font` at `None` and the editor painting
-/// at quadraui's placeholder metrics (`current_char_width: 8.0pt`,
-/// `current_line_height: 16.0pt`) forever on macOS.
-///
-/// #1129: removed once quadraui#1023 added [`quadraui::GenericFamily`]
-/// and taught `MacBackend::set_editor_font` to resolve the Pango alias
-/// `"Monospace"` straight to `system_monospace_font` (CoreText's
-/// `kCTFontUserFixedPitchFontType`) instead of routing it through
-/// `make_font_exact`'s installed-family lookup — so one shared value
-/// now resolves a real face on every backend and the `cfg!` branch is
-/// no longer needed (Platform-Neutrality Rule; matches the `UI_FONT_FAMILY`
-/// fix in `src/app_support.rs`).
-///
-/// #1542: this literal (and [`default_font_size`]'s) now serves a second
-/// purpose besides "the value a bare `Settings::default()` gets and the
-/// value `serde`'s `#[serde(default = ...)]` fills in for a legacy config
-/// missing the key" — it is also the **sentinel** [`Self::effective_editor_font`]
-/// compares against to decide whether the user has ever customized their
-/// font at all. `font_family`/`font_size` stay plain `String`/`i32` rather
-/// than growing an `Option`/enum "auto" wrapper specifically so this stays
-/// the *only* place that fact is encoded — every other reader
-/// (`get_value_str`, `set_value_str`, `zoomin`/`zoomout` in
-/// `core::engine::execute`) keeps working against a concrete value
-/// unchanged; only `effective_editor_font`'s callers see backend-resolved
-/// per-platform behaviour.
-///
-/// #1562 re-checked this literal against Win-GUI specifically (that issue
-/// reported Windows chrome painting in the monospace editor font instead
-/// of a real UI face) and confirmed `quadraui::win::backend::
-/// parse_ui_font_desc`/`WinBackend::set_editor_font`/`set_ui_font` already
-/// resolve this exact `"Monospace"` alias (and the `"Sans"`/`"system-ui"`
-/// chrome tokens `UI_FONT_FAMILY` in `src/app_support.rs` leads with) to
-/// real DirectWrite faces (`"Consolas"`/`"Segoe UI"`) via `GenericFamily`,
-/// same mechanism as the #1129 macOS fix this doc already describes — no
-/// further change needed here for Windows. See `src/win/mod.rs`'s `#1562`
-/// doc section for the full investigation.
+/// The editor font family defaults to `"Monospace"` because that name
+/// resolves to the system monospace font on every backend (via quadraui's
+/// `GenericFamily` and per-platform font resolution). This literal also
+/// serves as the **sentinel** that [`Self::effective_editor_font`] uses to
+/// detect whether the user has customized their font: exactly equal to
+/// this default means "never customized", so `effective_editor_font`
+/// resolves to the backend's platform-native convention; anything else
+/// means the user explicitly chose it and that literal value always wins.
+/// `font_family`/`font_size` stay plain `String`/`i32` rather than growing
+/// an `Option` wrapper specifically so this stays the only place that fact
+/// is encoded — every other reader keeps working with concrete values.
 fn default_font_family() -> String {
     "Monospace".to_string()
 }
@@ -1814,10 +1723,17 @@ fn default_font_size() -> i32 {
     14
 }
 
-/// #1542: see [`default_font_family`]'s doc — this literal is
+/// See [`default_font_family`]'s doc — this literal is
 /// [`Settings::effective_ui_font_size`]'s "never customized" sentinel too.
 fn default_ui_font_size() -> u8 {
     10
+}
+
+/// `0.0` is [`Settings::effective_line_height_multiplier`]'s "auto"
+/// sentinel — the same "never customized" convention
+/// [`default_ui_font_size`]'s doc describes for `ui_font_size`.
+fn default_line_height() -> f64 {
+    0.0
 }
 
 fn default_listchars() -> String {
@@ -1855,6 +1771,7 @@ impl Default for Settings {
             font_family: default_font_family(),
             font_size: default_font_size(),
             ui_font_size: default_ui_font_size(),
+            line_height: default_line_height(),
             explorer_visible_on_startup: default_explorer_visible(),
             incremental_search: default_incremental_search(),
             auto_indent: default_auto_indent(),
@@ -1934,6 +1851,7 @@ impl Default for Settings {
             acp_terminal_enabled: default_true(),
             show_hidden_files: default_true(),
             explorer_sort_case_insensitive: true,
+            explorer_auto_reveal: true,
             explorer_exclude: default_explorer_exclude(),
             swap_file: default_swap_file(),
             updatetime: default_updatetime(),
@@ -1970,18 +1888,10 @@ impl Default for Settings {
     }
 }
 
-/// Real vim **boolean** options `:set` recognises by name (so a vimrc line
-/// naming one doesn't read as an unrecognised typo) but does not yet wire to
-/// any behaviour. `(long_name, short_name)`. #1153 — extend this table (and
-/// implement) as each is picked up; see the issue for the full missing-option
-/// audit and rough priority order.
-///
-/// Empty as of #1207, which implemented the last five entries (`magic`,
-/// `showmatch`, `linebreak`, `smartindent`, `cindent` — #1190's tranche
-/// before it cleared `hidden`, `list`, `showcmd`, `ruler`). Kept as `&[]`
-/// rather than removed, per #1207's own note: the "recognised but not
-/// implemented" mechanism (#1153) is meant to be reused by the next Vim
-/// option that lands here recognised-but-unwired.
+/// Real vim **boolean** options `:set` recognises by name but does not yet
+/// wire to any behaviour. `(long_name, short_name)`. Extend this table as
+/// each is picked up; the mechanism is meant to be reused for future Vim
+/// options that land here recognised-but-unwired.
 const UNIMPLEMENTED_BOOL_OPTIONS: &[(&str, &str)] = &[];
 
 /// Real vim **value** options `:set` recognises by name but does not yet
@@ -1990,14 +1900,14 @@ const UNIMPLEMENTED_BOOL_OPTIONS: &[(&str, &str)] = &[];
 const UNIMPLEMENTED_VALUE_OPTIONS: &[(&str, &str)] = &[("clipboard", "cb")];
 
 /// Shared "recognised, not implemented" message for both option tables
-/// (#1153) — deliberately distinct wording from `"Unknown option: {opt}"` so
+/// — deliberately distinct wording from `"Unknown option: {opt}"` so
 /// a user (or a vimrc author) can tell "this is a typo" from "this is a real
 /// vim option vimcode hasn't wired up yet" at a glance.
 fn not_implemented_message(opt: &str) -> String {
     format!("Option '{opt}' is recognised but not implemented yet")
 }
 
-// ── 'iskeyword' (#1191) ──────────────────────────────────────────────────
+// ── 'iskeyword' ──────────────────────────────────────────────────────────
 //
 // Vim's char-list grammar, shared (per `:h 'isfname'`) by 'iskeyword',
 // 'isident', 'isprint' and 'isfname': a comma-separated list of items, each
@@ -2192,7 +2102,7 @@ enum ListOp {
 
 /// Apply `op` with `value` (a comma-separated list of items) to `current`
 /// (also comma-separated), returning the new combined string. Used for
-/// `:set iskeyword+=X` / `-=X` / `^=X`, and (#1206) every other list-style
+/// `:set iskeyword+=X` / `-=X` / `^=X`, and every other list-style
 /// value option (`'whichwrap'`, `'backspace'`, `'wildmode'`, `'listchars'`).
 fn combine_csv_list(current: &str, value: &str, op: ListOp) -> String {
     match op {
@@ -2294,21 +2204,19 @@ fn parse_wildmode(spec: &str) -> Result<(), String> {
 }
 
 /// One comma-separated stage of `'wildmode'` — the behavior flags active on
-/// a single `<Tab>` press (`:h 'wildmode'`, #1206). Multiple colon-joined
-/// flags in the same stage combine (`"longest:full"` sets both); per the
-/// docs, when `longest` and `full` are both set on the *same* stage,
-/// `longest` wins and the stage does not cycle full matches — callers
-/// implement that by checking `longest` before `full`.
+/// a single `<Tab>` press (`:h 'wildmode'`). Multiple colon-joined flags in
+/// the same stage combine (`"longest:full"` sets both); when both `longest`
+/// and `full` are set on the same stage, `longest` wins and the stage does
+/// not cycle full matches — callers implement that by checking `longest`
+/// before `full`.
 ///
-/// `lastused` (sort buffer-name matches by recency) and `noselect` (show
-/// the menu without preselecting the first item) parse as valid stage
-/// tokens but have no vimcode-side hook to attach to: this codebase's
-/// wildmenu list is unconditionally shown regardless of `'wildmode'` (see
-/// `'wildmenu'`'s `set_bool_option` arm), so `noselect`'s distinction from
-/// plain `full` has nothing to change, and there is no buffer-name
-/// completion sort order to key off `lastused`. Both are accepted rather
-/// than rejected (matching real Vim's grammar) but produce the same
-/// behavior as the stage's other flags alone.
+/// `lastused` (sort buffer-name matches by recency) and `noselect` (show the
+/// menu without preselecting the first item) parse as valid stage tokens but
+/// have no vimcode-side effect: the wildmenu list is unconditionally shown
+/// regardless of `'wildmode'`, so `noselect`'s distinction from plain `full`
+/// has nothing to change, and there is no buffer-name completion sort order
+/// to key off `lastused`. Both are accepted to match real Vim's grammar but
+/// produce the same behavior as the stage's other flags alone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct WildmodeStage {
     /// `""` — an empty stage: complete the first match once, then stop
@@ -2522,7 +2430,7 @@ impl Settings {
     }
 
     /// Resolve the effective `use_nerd_fonts`: an explicit override if set,
-    /// otherwise the backend-derived default (issue #999) — see the field
+    /// otherwise the backend-derived default — see the field
     /// doc on [`Settings::use_nerd_fonts`]. Unlike `ctrl_f_action`/
     /// `auto_pairs`, which are derived from `self.editor_mode` (a stored,
     /// user-configurable field), the dimension here — GUI vs TUI — isn't a
@@ -2538,17 +2446,13 @@ impl Settings {
 
     /// Resolve `minimap_scale`/`minimap_render_characters` to the quadraui
     /// [`quadraui::primitives::minimap::MinimapScale`] a backend should
-    /// paint the minimap strip at right now (issue #1532, consuming
-    /// quadraui#1143's `MinimapScale` + glyph atlas). TUI's braille
-    /// rasteriser has no font to scale, so this resolves to
-    /// `MinimapScale::One` — quadraui's own pre-#1143 default, which every
-    /// backend that never calls `Backend::set_minimap_scale` already paints
-    /// at — unconditionally there, via the same GUI-vs-TUI backend-derived
-    /// split [`Self::use_nerd_fonts`] already uses (#999) rather than a
-    /// second stored field. `minimap_scale == 1` or `minimap_render_characters
-    /// == false` also resolve to `One`; any other stored `minimap_scale`
-    /// (`2`, or the accepted-but-clamped `3`) resolves to `MinimapScale::Two`
-    /// — quadraui does not yet ship a `Three` to resolve to instead.
+    /// paint the minimap strip at right now. TUI's braille rasteriser has
+    /// no font to scale, so this resolves to `MinimapScale::One` — the
+    /// default that every backend that never calls `Backend::set_minimap_scale`
+    /// already paints at — unconditionally there. `minimap_scale == 1` or
+    /// `minimap_render_characters == false` also resolve to `One`; any other
+    /// stored `minimap_scale` (`2`, or the accepted-but-clamped `3`) resolves
+    /// to `MinimapScale::Two`.
     pub fn resolved_minimap_scale(&self) -> quadraui::MinimapScale {
         if crate::icons::is_gui_backend()
             && self.minimap_render_characters
@@ -2563,7 +2467,7 @@ impl Settings {
     /// Does `'virtualedit'` include the "one column past the last character"
     /// effect (`"all"` or `"onemore"`)? The only subset of `'virtualedit'`
     /// vimcode implements — see the field doc comment on
-    /// [`Settings::virtualedit`] (#1153).
+    /// [`Settings::virtualedit`].
     pub(crate) fn virtualedit_allows_onemore(&self) -> bool {
         self.virtualedit
             .split(',')
@@ -2573,8 +2477,8 @@ impl Settings {
     /// The `'wildmode'` flags active on the `press`'th `<Tab>` press of the
     /// current command-line completion round (0-indexed). Clamps to the
     /// last configured stage once `press` runs past the configured list,
-    /// matching Vim holding on the last stage for every press beyond it
-    /// (#1206). See [`WildmodeStage`] for which flags are distinctly wired.
+    /// matching Vim holding on the last stage for every press beyond it.
+    /// See [`WildmodeStage`] for which flags are distinctly wired.
     pub(crate) fn wildmode_stage_at(&self, press: usize) -> WildmodeStage {
         let stages = wildmode_stages(&self.wildmode);
         match stages.len() {
@@ -2616,14 +2520,14 @@ impl Settings {
         self.backspace.split(',').any(|t| t.trim() == token)
     }
 
-    /// Is `c` a "word" character per `'iskeyword'` (#1191)? Drives
+    /// Is `c` a "word" character per `'iskeyword'`? Drives
     /// `w`/`b`/`e`/`ge`, `*`/`#`/`g*`/`g#`, and the `iw`/`aw` text objects —
     /// and, less obviously, the nearby-buffer word scan behind completion
     /// (`Engine::word_completions_nearby`), which calls this once per
     /// character scanned and is itself called on every insert-mode
     /// keystroke. That path turned "re-parse the spec per call" from a
     /// cold corner into ~3-4% of per-keystroke CPU on a large file
-    /// (#1721) — `self.iskeyword_cache` now parses the spec once and
+    /// — `self.iskeyword_cache` now parses the spec once and
     /// reuses the result until the spec string itself changes (`:set
     /// iskeyword+=...` etc.), invalidated by simple string comparison so
     /// there's no separate "dirty" bit to forget to set. Falls back to the
@@ -2767,24 +2671,13 @@ impl Settings {
             let raw_name = arg[..eq_pos].trim();
             let value = arg[eq_pos + 1..].trim();
 
-            // `+=`/`-=`/`^=` (#1191, generalised #1206): Vim's option-modify
-            // syntax. For a comma-separated list-style option, append,
-            // remove, or prepend items rather than replacing the whole
-            // value (`:h :set`, "List of items"). For a number option, add,
-            // subtract, or multiply (same section, "For number options").
-            //
-            // #1191 handled only 'iskeyword'; every other base fell through
-            // to the plain `=` path *with the operator still attached to its
-            // name* (`raw_name` was e.g. `"whichwrap+"`), so
-            // `set_value_option` did an exact-name match against that and
-            // reported "Unknown option: whichwrap+" instead of recognising
-            // the real option. Stripping the suffix unconditionally here —
-            // for every base, not just the ones with a combine helper below
-            // — fixes that: an option with no list/numeric handling still
-            // falls through to `set_value_option(base, value)`, which now
-            // sees the real name and reports its real status (implemented,
-            // "recognised but not implemented" for 'clipboard', or a genuine
-            // "Unknown option" for an actual typo).
+            // `+=`/`-=`/`^=` combine mode for list-style or numeric
+            // options: for comma-separated lists, append/remove/prepend
+            // items; for numbers, add/subtract/multiply. Strip the operator
+            // suffix unconditionally here — for every option, not just ones
+            // with combine helpers below — so an option with no list/numeric
+            // handling still falls through to `set_value_option(base, value)`
+            // seeing the real name and reporting its actual status.
             for (suffix, combine) in [
                 ('+', ListOp::Append),
                 ('-', ListOp::Remove),
@@ -2998,6 +2891,7 @@ impl Settings {
             "formatonsave" | "fos" => self.format_on_save = enable,
             "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
             "explorersortcaseinsensitive" | "esci" => self.explorer_sort_case_insensitive = enable,
+            "explorerautoreveal" | "ear" => self.explorer_auto_reveal = enable,
             "swapfile" => self.swap_file = enable,
             "undofile" | "udf" => {
                 self.undofile = enable;
@@ -3038,9 +2932,9 @@ impl Settings {
             // gated by any setting, so unlike the genuinely-missing options
             // below, rejecting `set wildmenu` as "not implemented" would be
             // the wrong lie: the requested behavior is already there. Accept
-            // both spellings as a no-op (#1153 review).
+            // both spellings as a no-op.
             "wildmenu" | "wmnu" => {}
-            // #1153: real vim boolean options vimcode recognises but does not
+            // Real vim boolean options vimcode recognises but does not
             // yet implement. Accepted (never "Unknown option") so a pasted
             // vimrc line doesn't read as a typo, but rejected rather than
             // silently no-op'd, per the issue's "reject with a 'recognised
@@ -3153,6 +3047,12 @@ impl Settings {
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.ui_font_size = n.clamp(6, 32) as u8;
             }
+            "line_height" | "lh" => {
+                let n: f64 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.line_height = n.clamp(0.0, 5.0);
+            }
             "minimapscale" => {
                 let n: u32 = value
                     .parse()
@@ -3252,7 +3152,7 @@ impl Settings {
                 }
                 self.foldnestmax = n;
             }
-            // #1191: validate eagerly (rather than storing an unparsable
+            // Validate eagerly (rather than storing an unparsable
             // spec and only failing later, per-character, in
             // `is_keyword_char`) so a typo'd vimrc line is rejected the way
             // Vim rejects it, not silently downgraded to the ASCII default.
@@ -3266,7 +3166,6 @@ impl Settings {
                 })?;
                 self.iskeyword = value.to_string();
             }
-            // #1206
             "whichwrap" | "ww" => {
                 parse_whichwrap(value).map_err(|e| {
                     format!(
@@ -3332,7 +3231,7 @@ impl Settings {
                 })?;
                 self.listchars = value.to_string();
             }
-            // #1153: see `UNIMPLEMENTED_BOOL_OPTIONS`'s doc comment — same
+            // See `UNIMPLEMENTED_BOOL_OPTIONS`'s doc comment — same
             // rationale, value-option side.
             _ if UNIMPLEMENTED_VALUE_OPTIONS
                 .iter()
@@ -3356,7 +3255,7 @@ impl Settings {
 
     /// The current value of `base` as an `i64`, if `base` names a numeric
     /// value option — used by `parse_set_option`'s `+=`/`-=`/`^=` handling
-    /// (#1206) to compute add/subtract/multiply without a second, parallel
+    /// to compute add/subtract/multiply without a second, parallel
     /// name-to-field match. Deliberately narrow: only options whose
     /// `set_value_option` arm does a plain integer parse belong here — a
     /// list-style option (even one that happens to look numeric, like the
@@ -3383,13 +3282,17 @@ impl Settings {
             "laststatus" | "ls" => Some(self.laststatus as i64),
             "sidescrolloff" | "siso" => Some(self.sidescrolloff as i64),
             "scrolljump" | "sj" => Some(self.scrolljump as i64),
+            // `line_height`/`lh` deliberately has no arm here — this
+            // helper is `i64`-only (see its own doc) and `line_height` is an
+            // `f64` multiplier (`1.25`, not `1`), so `:set lh+=0.5` can't go
+            // through the same add/subtract path `font_size+=1` does.
             _ => None,
         }
     }
 
     /// The current value of `base` as a raw comma-separated string, if
     /// `base` names a list-style value option — used by
-    /// `parse_set_option`'s `+=`/`-=`/`^=` handling (#1206) the same way
+    /// `parse_set_option`'s `+=`/`-=`/`^=` handling the same way
     /// [`Self::current_numeric_value`] is. `'clipboard'` deliberately has no
     /// arm: it's list-shaped in real Vim, but vimcode has no stored value to
     /// combine against (it's in `UNIMPLEMENTED_VALUE_OPTIONS`) — leaving it
@@ -3402,12 +3305,10 @@ impl Settings {
             "whichwrap" | "ww" => Some(self.whichwrap.clone()),
             "wildmode" | "wim" => Some(self.wildmode.clone()),
             "listchars" | "lcs" => Some(self.listchars.clone()),
-            // Pre-existing list-style options #1206 didn't add but whose
-            // `+=`/`-=`/`^=` this same generalisation now has to get right
-            // too — without an arm here, the generic strip above would
-            // silently reinterpret e.g. `:set nrformats+=octal` as `:set
-            // nrformats=octal` (replacing, not appending), which is a worse
-            // outcome than #1191's old "Unknown option: nrformats+" error.
+            // Pre-existing list-style options whose `+=`/`-=`/`^=` must be
+            // handled correctly — without an arm here, the generic strip above
+            // would silently reinterpret e.g. `:set nrformats+=octal` as
+            // `:set nrformats=octal` (replacing, not appending).
             "nrformats" | "nf" => Some(self.nrformats.join(",")),
             "explorerexclude" | "explorer_exclude" => Some(self.explorer_exclude.join(",")),
             "colorcolumn" | "cc" => Some(self.colorcolumn.clone()),
@@ -3566,6 +3467,11 @@ impl Settings {
             } else {
                 "noexplorersortcaseinsensitive".to_string()
             }),
+            "explorerautoreveal" | "ear" => Ok(if self.explorer_auto_reveal {
+                "explorerautoreveal".to_string()
+            } else {
+                "noexplorerautoreveal".to_string()
+            }),
             "swapfile" => Ok(if self.swap_file {
                 "swapfile".to_string()
             } else {
@@ -3701,7 +3607,6 @@ impl Settings {
             "iskeyword" | "isk" => Ok(format!("iskeyword={}", self.iskeyword)),
             // Always on — see the `set_bool_option` "wildmenu" | "wmnu" arm.
             "wildmenu" | "wmnu" => Ok("wildmenu".to_string()),
-            // #1206
             "whichwrap" | "ww" => Ok(format!("whichwrap={}", self.whichwrap)),
             "backspace" | "bs" => Ok(format!("backspace={}", self.backspace)),
             "timeoutlen" | "tm" => Ok(format!("timeoutlen={}", self.timeoutlen)),
@@ -3745,69 +3650,57 @@ impl Settings {
             return Ok(());
         }
 
-        let path = Self::settings_file_path();
+        #[cfg_attr(test, allow(unreachable_code))]
+        {
+            let path = Self::settings_file_path();
+            // Structural backstop: panics loudly if this call reaches here
+            // without any test isolation in effect (see `guard_real_config_write`'s
+            // doc comment). Matches the pattern already applied to
+            // `HistoryState::save`, `ExtensionState::save` and `SessionState::save`.
+            crate::core::paths::guard_real_config_write(&path);
 
-        // Create config directory if it doesn't exist
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            // Create config directory if it doesn't exist
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let contents = serde_json::to_string_pretty(self)?;
+            fs::write(&path, contents)?;
+
+            // Bump the save revision so the TUI mtime watcher knows this write
+            // came from us and can suppress its "Settings reloaded" message.
+            SAVE_REVISION.fetch_add(1, Ordering::AcqRel);
+
+            Ok(())
         }
-
-        let contents = serde_json::to_string_pretty(self)?;
-        fs::write(&path, contents)?;
-
-        // Bump the save revision so the TUI mtime watcher knows this write
-        // came from us and can suppress its "Settings reloaded" message.
-        SAVE_REVISION.fetch_add(1, Ordering::AcqRel);
-
-        Ok(())
     }
 
-    /// Effective editor font family + size in points (issue #1542).
+    /// Effective editor font family + size in points.
     ///
-    /// `font_family`/`font_size` still store plain `String`/`i32` — see
-    /// `default_font_family`/`default_font_size`'s own doc — so there is no
-    /// separate "auto" sentinel type to plumb through `get_value_str`/
-    /// `set_value_str`/`Settings::save` (which always serialises the whole
-    /// struct, so an untouched field round-trips through disk as its
-    /// compile-time default, indistinguishable at the type level from a
-    /// user explicitly choosing that same literal string). This method
-    /// resolves that ambiguity the same way `quadraui::PlatformFontDefaults`'s
-    /// own doc recommends: **still exactly equal to the compile-time
-    /// default** means "never customized" — resolve to `defaults` (this
-    /// backend's platform-native convention, e.g. `Menlo 12` on macOS,
-    /// `Consolas 14` on Win-GUI); anything else means the user (via `:set
-    /// guifont`/`:set font_size=N`, or `zoomin`/`zoomout`) chose it on
-    /// purpose, and that literal value always wins, verbatim, forever —
-    /// `defaults` never overrides it again on a later launch even if a
-    /// future quadraui release changes this backend's own convention.
+    /// `font_family`/`font_size` still store plain `String`/`i32` with no
+    /// separate "auto" sentinel type, so the compile-time defaults of
+    /// `"Monospace"` and `14` serve as sentinels: exactly equal means
+    /// "never customized" — resolve to the backend's platform-native
+    /// convention; anything else means the user chose it and that literal
+    /// value always wins, verbatim, forever.
     ///
     /// `font_family` and `font_size` are resolved **independently of each
-    /// other**, each against its own sentinel (`default_font_family()`/
-    /// `default_font_size()`) — never jointly. `zoomin`/`zoomout`
-    /// (`src/core/engine/execute.rs`) mutate only `font_size`, so a joint
-    /// "both still at their sentinel" check would make the very first zoom
-    /// keystroke desync `font_family` back to the raw stored literal on any
-    /// backend whose native family differs from vimcode's compile-time
-    /// `"Monospace"`/`14` (macOS `Menlo`/`12`, Windows `Consolas`/`14`) —
-    /// see #1542's review history for the exact repro.
+    /// other**, each against its own sentinel — never jointly. `zoomin`/
+    /// `zoomout` mutate only `font_size`, so a joint check would make the
+    /// first zoom keystroke desync `font_family` back to the raw stored
+    /// literal on any backend whose native family differs from the
+    /// compile-time defaults.
     ///
     /// `default_family`/`default_size_pt` are read straight off
     /// `Backend::default_fonts()` — [`quadraui::PlatformFontDefaults`] is
-    /// `#[non_exhaustive]` with no public constructor (deliberately: a
-    /// consumer is meant to obtain one only from a real backend), so this
-    /// method takes the two plain fields it needs rather than the whole
-    /// struct — that also keeps this module free of any `quadraui::gtk`/
-    /// `quadraui::macos` backend type, and lets its own unit tests below
-    /// exercise the resolution logic with plain literals instead of
-    /// constructing a fake backend just to get a `PlatformFontDefaults`
-    /// value.
+    /// `#[non_exhaustive]` with no public constructor, so this method takes
+    /// the two plain fields it needs; that also keeps this module free of
+    /// any backend-specific types and lets unit tests below exercise the
+    /// resolution logic with plain literals.
     ///
-    /// `default_family` empty or `default_size_pt <= 0.0` is TUI's (or any
-    /// future fixed-cell backend's) all-sentinel answer — a terminal cell
-    /// grid has no font concept at all — in which case this returns the
-    /// stored fields unresolved (harmless: TUI's `Backend::set_editor_font`
-    /// is already a no-op, so nothing reads the unresolved literal string
-    /// as an actual paint parameter).
+    /// `default_family` empty or `default_size_pt <= 0.0` indicates TUI
+    /// (or any future fixed-cell backend) — a terminal cell grid has no
+    /// font concept — in which case this returns the stored fields unresolved.
     pub fn effective_editor_font(
         &self,
         default_family: &str,
@@ -3832,10 +3725,10 @@ impl Settings {
     /// Effective UI/chrome font size in points — `ui_font_size`'s twin of
     /// [`Self::effective_editor_font`] above, same "still at its compile-time
     /// default means never customized" test and the same TUI all-sentinel
-    /// bypass (`default_size_pt <= 0.0`) (issue #1542). Editor/UI chrome
+    /// bypass (`default_size_pt <= 0.0`). Editor/UI chrome
     /// font *family* is deliberately **not** resolved through a backend's
     /// `ui_family` here — `src/app_support.rs`'s `UI_FONT_FAMILY` is already
-    /// a hand-tuned per-backend candidate list (#704) that already beats a
+    /// a hand-tuned per-backend candidate list that already beats a
     /// bare backend-native family name (GTK's own convention is literally
     /// the fontconfig alias `"Sans"`, which `UI_FONT_FAMILY`'s
     /// Cantarell/Ubuntu-first ordering was built specifically to avoid
@@ -3859,21 +3752,40 @@ impl Settings {
         }
     }
 
+    /// Effective editor row-pitch multiplier for the live backend named
+    /// `backend_platform_name`.
+    ///
+    /// `None` means "leave this backend's own natural font-metric line
+    /// height (ascent + descent + leading) alone" — every backend except the
+    /// native macOS GUI (`"macos"`, matching
+    /// [`quadraui::PlatformServices::platform_name`]'s convention) until GTK/
+    /// Win-GUI parity lands as a follow-up. A runtime `platform_name()` check
+    /// rather than `cfg!(target_os = "macos")` ensures GTK running on macOS
+    /// does not pick up a macOS-only override by virtue of the build machine.
+    ///
+    /// `0.0` (this field's default — "auto") resolves to VS Code's macOS
+    /// default, 1.5 (18px for Menlo 12). Any other positive value is taken
+    /// as an explicit multiplier of the font's point size.
+    pub fn effective_line_height_multiplier(&self, backend_platform_name: &str) -> Option<f64> {
+        if backend_platform_name != "macos" {
+            return None;
+        }
+        if self.line_height <= 0.0 {
+            Some(1.5)
+        } else {
+            Some(self.line_height)
+        }
+    }
+
     /// Where `settings.json` lives — `~/.config/vimcode/settings.json`
-    /// (or the platform equivalent, see [`super::paths::vimcode_config_dir`]).
+    /// (or the platform equivalent).
     ///
     /// Under `#[cfg(test)]`, a per-thread override installed via
-    /// [`TestSettingsPathGuard::install`] takes priority when set (#949
-    /// review).
-    /// This is a `thread_local`, not a `$HOME` env-var mutation, precisely
-    /// because `std::env::set_var` is process-global: Rust's default test
-    /// runner executes tests in parallel on multiple threads within the
-    /// same process, so mutating `$HOME` from one test would race every
-    /// other concurrently-running test that (transitively, via
-    /// `Engine::new`/`check_settings_reload`) also resolves this path.
-    /// A thread-local override carries no such risk — each test thread
-    /// gets its own slot — and needs no `serial_test`/lock discipline this
-    /// codebase doesn't otherwise have.
+    /// [`TestSettingsPathGuard::install`] takes priority when set. This is a
+    /// `thread_local`, not a `$HOME` env-var mutation, because `std::env::
+    /// set_var` is process-global and would race concurrent tests; a
+    /// thread-local override carries no such risk — each test thread gets
+    /// its own slot.
     pub fn settings_file_path() -> PathBuf {
         #[cfg(test)]
         {
@@ -3893,6 +3805,7 @@ impl Settings {
             "font_family" => self.font_family.clone(),
             "font_size" => self.font_size.to_string(),
             "ui_font_size" => self.ui_font_size.to_string(),
+            "line_height" => self.line_height.to_string(),
             "line_numbers" => match self.line_numbers {
                 LineNumberMode::None => "none".to_string(),
                 LineNumberMode::Absolute => "absolute".to_string(),
@@ -3983,6 +3896,9 @@ impl Settings {
             "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
                 self.explorer_sort_case_insensitive.to_string()
             }
+            "explorerautoreveal" | "ear" | "explorer_auto_reveal" => {
+                self.explorer_auto_reveal.to_string()
+            }
             "swapfile" | "swap_file" => self.swap_file.to_string(),
             "updatetime" | "ut" => self.updatetime.to_string(),
             "undolevels" | "ul" => self.undolevels.to_string(),
@@ -4025,6 +3941,12 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid ui_font_size: {value}"))?;
                 self.ui_font_size = n;
+            }
+            "line_height" => {
+                let n: f64 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid line_height: {value}"))?;
+                self.line_height = n.clamp(0.0, 5.0);
             }
             "line_numbers" => {
                 self.line_numbers = match value {
@@ -4163,6 +4085,9 @@ impl Settings {
             "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
                 self.explorer_sort_case_insensitive = value == "true"
             }
+            "explorerautoreveal" | "ear" | "explorer_auto_reveal" => {
+                self.explorer_auto_reveal = value == "true"
+            }
             "swapfile" | "swap_file" => self.swap_file = value == "true",
             "updatetime" | "ut" => {
                 self.updatetime = value
@@ -4241,14 +4166,13 @@ impl Settings {
     pub fn ensure_exists() -> Result<(), std::io::Error> {
         let path = Self::settings_file_path();
 
-        // Only create if file doesn't exist
+        // Only create if file doesn't exist. Directory creation and the
+        // write itself happen inside `save()`, which runs the
+        // `guard_real_config_write` backstop before touching disk — don't
+        // duplicate `fs::create_dir_all` here, or an un-isolated test would
+        // create the real config directory before `save()` ever gets a
+        // chance to panic.
         if !path.exists() {
-            // Create parent directories
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            // Write default settings
             Self::default().save()?;
         }
 
@@ -4263,8 +4187,7 @@ impl Settings {
 pub enum SettingType {
     Bool,
     /// `min`/`max` encode the valid range — kept for future range-aware
-    /// Form widgets (Slider, etc., per issue #143). Currently unread by
-    /// any backend now that GTK no longer renders a `SpinButton`.
+    /// form widgets (Slider, etc.). Currently unread by any backend.
     #[allow(dead_code)]
     Integer {
         min: i32,
@@ -4285,6 +4208,7 @@ pub fn available_colorschemes() -> Vec<String> {
         "gruvbox-dark".into(),
         "tokyo-night".into(),
         "solarized-dark".into(),
+        "vscode-dark-modern".into(),
         "vscode-dark".into(),
         "vscode-light".into(),
     ];
@@ -4346,6 +4270,19 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Font size for menus, sidebars, dialogs, and hover popups",
         category: "Appearance",
         setting_type: SettingType::Integer { min: 6, max: 32 },
+    },
+    SettingDef {
+        key: "line_height",
+        label: "Line Height",
+        description: "Editor row-pitch multiplier of font_size, VS Code's \
+                       editor.lineHeight convention (0 = auto: this \
+                       platform's own native ratio)",
+        category: "Appearance",
+        // No `SettingType` variant takes a float (`Integer`'s
+        // `min`/`max` are `i32`) — `StringVal` round-trips through
+        // `get_value_str`/`set_value_str` exactly like `font_family` above,
+        // just parsed as `f64` rather than taken verbatim.
+        setting_type: SettingType::StringVal,
     },
     SettingDef {
         key: "use_nerd_fonts",
@@ -4659,6 +4596,16 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::StringVal,
     },
     SettingDef {
+        key: "explorer_auto_reveal",
+        label: "Explorer Auto Reveal",
+        description: "Automatically expand, select and scroll to the active \
+                       file in the Explorer sidebar whenever the active \
+                       editor changes (default: on, matching VS Code's \
+                       \"explorer.autoReveal\")",
+        category: "Workspace",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
         key: "board_tick_enabled",
         label: "Board Auto-Tick",
         description: "Periodically run the Board panel's provider-declared \
@@ -4812,7 +4759,8 @@ pub static SETTING_DEFS: &[SettingDef] = &[
     SettingDef {
         key: "minimap",
         label: "Minimap",
-        description: "Show the code-overview minimap on the right edge of each editor pane",
+        description: "Show the code-overview minimap on the right edge of each editor pane \
+                      (experimental, off by default)",
         category: "Editor",
         setting_type: SettingType::Bool,
     },
@@ -4904,24 +4852,22 @@ mod tests {
     #[test]
     fn test_settings_default() {
         let settings = Settings::default();
-        // #1543: VS Code/Neovim hybrid default — absolute line numbers on,
+        // VS Code/Neovim hybrid default — absolute line numbers on,
         // matching VS Code's out-of-the-box gutter. Vim users can still
         // `:set nonumber` / `:set relativenumber`.
         assert_eq!(settings.line_numbers, LineNumberMode::Absolute);
-        // #1129: one value on every platform now that quadraui#1023
-        // resolves the `"Monospace"` generic alias per-backend (see
-        // `default_font_family`'s doc comment) — no more macOS special case.
+        // Monospace is one value on every platform now that backends
+        // resolve the generic alias per-platform (see
+        // `default_font_family`'s doc comment).
         assert_eq!(settings.font_family, "Monospace");
         assert_eq!(settings.font_size, 14);
-        // #700 item 6: VS Code draws indent guides by default; nothing
-        // previously pinned this, so a future edit to
-        // `default_indent_guides()` could silently flip it back off with no
-        // test catching it.
+        // VS Code draws indent guides by default; lock this so the default
+        // doesn't drift with a future edit to `default_indent_guides()`.
         assert!(
             settings.indent_guides,
             "indent guides must default on, matching VS Code"
         );
-        // #1545: dotfiles show by default (VS Code-style), with only a
+        // Dotfiles show by default (VS Code-style), with only a
         // small exclude list — VS Code's own `files.exclude` — staying
         // hidden regardless.
         assert!(
@@ -4969,7 +4915,7 @@ mod tests {
         assert_eq!(s.get_value_str("explorer_exclude"), "**/.hg");
     }
 
-    /// #1542: an un-customized `font_family`/`font_size` (still exactly the
+    /// An un-customized `font_family`/`font_size` (still exactly the
     /// compile-time sentinel `default_font_family()`/`default_font_size()`)
     /// must resolve to the backend's own convention (e.g. macOS's `Menlo
     /// 12`), not the sentinel itself.
@@ -4990,8 +4936,7 @@ mod tests {
 
     /// An explicit `:set guifont`/`:set font_size=N` (anything other than
     /// the compile-time sentinel) must win verbatim, even when a backend's
-    /// own convention is available — #1542's core "explicit user values
-    /// still win" contract.
+    /// own convention is available.
     #[test]
     fn effective_editor_font_keeps_explicit_user_value() {
         let mut settings = Settings::default();
@@ -5002,19 +4947,10 @@ mod tests {
         assert_eq!(size_pt, 16.0);
     }
 
-    /// #1542 review fix: `font_family` and `font_size` must resolve
-    /// **independently**, not jointly. `zoomin`/`zoomout`
-    /// (`src/core/engine/execute.rs`) mutate only `font_size`, so simulate
-    /// that here — a customized `font_size` alone must not knock a still
-    /// un-customized `font_family` back to the raw stored sentinel
-    /// (`"Monospace"`). Before this fix, the joint `&&` check made this
-    /// return `("Monospace", 15.0)` instead of `("Menlo", 15.0)` — i.e. the
-    /// macOS zoomin bug from the review.
-    ///
-    /// RED-verified against the pre-fix joint check: reverting the
-    /// independent per-field resolution back to `if self.font_family ==
-    /// default_font_family() && self.font_size == default_font_size()`
-    /// makes this assertion fail (`family` comes back `"Monospace"`).
+    /// `font_family` and `font_size` must resolve **independently**, not
+    /// jointly. `zoomin`/`zoomout` mutate only `font_size`, so a customized
+    /// `font_size` alone must not knock a still un-customized `font_family`
+    /// back to the raw stored sentinel (`"Monospace"`).
     #[test]
     fn effective_editor_font_resolves_family_and_size_independently() {
         let mut settings = Settings::default();
@@ -5079,46 +5015,120 @@ mod tests {
         assert_eq!(settings.effective_ui_font_size(0.0), settings.ui_font_size);
     }
 
-    // ── `minimap` option (#35) ───────────────────────────────────────────
+    // ── `line_height` option ──────────────────────────────────────────────
+
+    #[test]
+    fn effective_line_height_multiplier_defaults_to_vs_code_macos_ratio() {
+        let settings = Settings::default();
+        assert_eq!(
+            settings.effective_line_height_multiplier("macos"),
+            Some(1.5)
+        );
+    }
+
+    #[test]
+    fn effective_line_height_multiplier_honours_an_explicit_override() {
+        let mut settings = Settings::default();
+        settings.line_height = 1.2;
+        assert_eq!(
+            settings.effective_line_height_multiplier("macos"),
+            Some(1.2)
+        );
+    }
+
+    /// Scoped to macOS for this issue (GTK/Win-GUI parity is a follow-up) —
+    /// a non-macOS `platform_name()` must get no override at all, even with
+    /// an explicit `line_height` set, so `resolve_editor_line_height_px`'s
+    /// caller leaves that backend's natural font metrics untouched.
+    #[test]
+    fn effective_line_height_multiplier_is_none_on_non_macos_backends() {
+        let mut settings = Settings::default();
+        settings.line_height = 1.2;
+        assert_eq!(settings.effective_line_height_multiplier("gtk"), None);
+        assert_eq!(settings.effective_line_height_multiplier("win-gui"), None);
+        assert_eq!(settings.effective_line_height_multiplier("tui"), None);
+    }
+
+    #[test]
+    fn line_height_round_trips_through_set_value_str_and_get_value_str() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.get_value_str("line_height"), "0");
+        settings.set_value_str("line_height", "1.25").unwrap();
+        assert_eq!(settings.line_height, 1.25);
+        assert_eq!(settings.get_value_str("line_height"), "1.25");
+    }
+
+    #[test]
+    fn parse_set_option_line_height_clamps_to_a_sane_range() {
+        let mut settings = Settings::default();
+        settings.parse_set_option("line_height=100").unwrap();
+        assert_eq!(settings.line_height, 5.0);
+        settings.parse_set_option("lh=-3").unwrap();
+        assert_eq!(settings.line_height, 0.0);
+    }
+
+    /// `docs/PATTERNS.md`'s "Adding a setting" step 5, same precedent as
+    /// `minimap_appears_in_the_settings_registry` — without an entry here
+    /// `line_height` is wired through `:set`/`settings.json` (the tests
+    /// above) but invisible and uneditable in the Settings sidebar form.
+    #[test]
+    fn line_height_appears_in_the_settings_registry() {
+        let def = SETTING_DEFS
+            .iter()
+            .find(|d| d.key == "line_height")
+            .expect("`line_height` must appear in SETTING_DEFS so the settings UI lists it");
+        assert_eq!(def.category, "Appearance");
+        assert!(matches!(def.setting_type, SettingType::StringVal));
+        assert!(!def.label.is_empty());
+        assert!(!def.description.is_empty());
+    }
+
+    // ── `minimap` option ─────────────────────────────────────────────────
     // The option is plumbed through eight separate sites; miss one and it
     // works from `:set` but not the settings UI (or vice versa). One test
     // per site so a regression names the site it broke.
 
+    /// Real-hardware testing (2026-10-06/07) found the minimap not
+    /// ready to default on, on any backend — see `Settings::minimap`'s doc
+    /// comment for the specific failures. It is now experimental and off by
+    /// default everywhere; `:set minimap` / `"minimap": true` still turn it
+    /// on, covered by the sibling tests below.
     #[test]
-    fn minimap_defaults_on() {
+    fn minimap_defaults_off() {
         assert!(
-            Settings::default().minimap,
-            "minimap must default on, matching VS Code"
+            !Settings::default().minimap,
+            "the minimap is experimental (#1858) and must default off on \
+             every backend"
         );
     }
 
     #[test]
     fn set_minimap_and_nominimap_both_parse() {
         let mut s = Settings::default();
-        s.parse_set_option("nominimap").expect("nominimap");
-        assert!(!s.minimap, "`:set nominimap` must turn the minimap off");
         s.parse_set_option("minimap").expect("minimap");
-        assert!(s.minimap, "`:set minimap` must turn it back on");
+        assert!(s.minimap, "`:set minimap` must turn the minimap on");
+        s.parse_set_option("nominimap").expect("nominimap");
+        assert!(!s.minimap, "`:set nominimap` must turn it back off");
     }
 
     #[test]
     fn set_minimap_query_form_reports_both_states() {
         let mut s = Settings::default();
-        assert_eq!(s.parse_set_option("minimap?").unwrap(), "minimap");
-        s.minimap = false;
         assert_eq!(s.parse_set_option("minimap?").unwrap(), "nominimap");
+        s.minimap = true;
+        assert_eq!(s.parse_set_option("minimap?").unwrap(), "minimap");
     }
 
     #[test]
     fn minimap_round_trips_through_get_set_by_key() {
         // The settings UI reads/writes by key string, not by field.
         let mut s = Settings::default();
-        assert_eq!(s.get_value_str("minimap"), "true");
-        s.set_value_str("minimap", "false").expect("set");
-        assert!(!s.minimap);
         assert_eq!(s.get_value_str("minimap"), "false");
         s.set_value_str("minimap", "true").expect("set");
         assert!(s.minimap);
+        assert_eq!(s.get_value_str("minimap"), "true");
+        s.set_value_str("minimap", "false").expect("set");
+        assert!(!s.minimap);
     }
 
     #[test]
@@ -5136,17 +5146,18 @@ mod tests {
     #[test]
     fn minimap_round_trips_through_the_settings_file() {
         let mut s = Settings::default();
-        s.minimap = false;
+        s.minimap = true;
         let json = serde_json::to_string(&s).expect("serialize");
         let back: Settings = serde_json::from_str(&json).expect("deserialize");
-        assert!(!back.minimap, "`minimap: false` must survive a save/load");
+        assert!(back.minimap, "`minimap: true` must survive a save/load");
 
-        // …and an older settings file with no `minimap` key at all must come
-        // back with the default (on), not `false` from `bool::default()`.
+        // A settings file with no `minimap` key at all (legacy, or
+        // simply never touched) must come back with the default (off).
         let legacy: Settings = serde_json::from_str("{}").expect("deserialize legacy");
         assert!(
-            legacy.minimap,
-            "a settings file predating #35 must default the minimap on"
+            !legacy.minimap,
+            "a settings file with no `minimap` key must default the \
+             (experimental, #1858) minimap off"
         );
     }
 
@@ -5308,8 +5319,6 @@ mod tests {
         assert_eq!(s.tabstop, 8);
     }
 
-    // ── #1156: 'undolevels' / 'undofile' / 'undodir' ────────────────────────
-
     #[test]
     fn test_set_undolevels_and_alias() {
         let mut s = Settings::default();
@@ -5361,11 +5370,9 @@ mod tests {
         assert!(SETTING_DEFS.iter().any(|d| d.key == "undodir"));
     }
 
-    /// #523's opt-in freshness setting: default off, round-trips through
-    /// `get_value_str`/`set_value_str` (the Settings sidebar's contract,
-    /// `explorer_visible_on_startup`'s sibling — no vim abbreviation to
-    /// exercise here since there's no vim precedent for it), and appears in
-    /// `SETTING_DEFS` so the sidebar actually lists it.
+    /// An opt-in setting that defaults off, round-trips through
+    /// `get_value_str`/`set_value_str` (the Settings sidebar's contract),
+    /// and appears in `SETTING_DEFS` so the sidebar lists it.
     #[test]
     fn board_tick_enabled_defaults_off_and_round_trips_via_settings_ui() {
         let mut s = Settings::default();
@@ -5379,9 +5386,8 @@ mod tests {
         assert!(SETTING_DEFS.iter().any(|d| d.key == "board_tick_enabled"));
     }
 
-    /// #1459's opt-in "reopen last AI session on startup" setting: same
-    /// default-off/round-trip/registry contract as `board_tick_enabled`
-    /// above.
+    /// An opt-in "reopen last AI session on startup" setting with the same
+    /// default-off/round-trip/registry contract as similar opt-in settings.
     #[test]
     fn acp_reopen_last_session_defaults_off_and_round_trips_via_settings_ui() {
         let mut s = Settings::default();
@@ -5397,8 +5403,8 @@ mod tests {
             .any(|d| d.key == "acp_reopen_last_session"));
     }
 
-    /// #1514's "follow the agent" setting: same default-off/round-trip/
-    /// registry contract as `acp_reopen_last_session` above.
+    /// A "follow the agent" setting with the same default-off/round-trip/
+    /// registry contract as similar opt-in settings.
     #[test]
     fn acp_follow_agent_defaults_off_and_round_trips_via_settings_ui() {
         let mut s = Settings::default();
@@ -5412,10 +5418,9 @@ mod tests {
         assert!(SETTING_DEFS.iter().any(|d| d.key == "acp_follow_agent"));
     }
 
-    /// #1518's `acp_permission_default` setting: defaults to `"ask"` (the
-    /// pre-#1518 always-ask behaviour, unchanged) and round-trips all
-    /// three values via the same `:set` / Settings-UI seam every other
-    /// enum setting here uses.
+    /// The `acp_permission_default` setting: defaults to `"ask"` (the
+    /// default behavior unchanged) and round-trips all three values via
+    /// the same `:set` / Settings-UI seam every other enum setting uses.
     #[test]
     fn acp_permission_default_defaults_to_ask_and_round_trips_via_settings_ui() {
         let mut s = Settings::default();
@@ -5439,10 +5444,9 @@ mod tests {
             .any(|d| d.key == "acp_permission_default"));
     }
 
-    /// #1522's `acp_terminal_enabled` setting: defaults to `true` (unlike
-    /// `acp_follow_agent`'s off-by-default caution — see the field's own
-    /// doc for why) and round-trips via the same `:set` / Settings-UI seam
-    /// every other bool setting here uses.
+    /// The `acp_terminal_enabled` setting: defaults to `true` and
+    /// round-trips via the same `:set` / Settings-UI seam every other
+    /// bool setting uses.
     #[test]
     fn acp_terminal_enabled_defaults_to_true_and_round_trips_via_settings_ui() {
         let mut s = Settings::default();
@@ -5456,10 +5460,9 @@ mod tests {
         assert!(SETTING_DEFS.iter().any(|d| d.key == "acp_terminal_enabled"));
     }
 
-    /// #1515's `acp_review_on_turn_end` setting: defaults to `"badge"` (not
-    /// the pre-#1515 always-auto-open behaviour) and round-trips all three
-    /// values via the same `:set` / Settings-UI seam every other enum
-    /// setting here uses (`fold_controls`, `line_numbers`, ...).
+    /// The `acp_review_on_turn_end` setting: defaults to `"badge"` and
+    /// round-trips all three values via the same `:set` / Settings-UI seam
+    /// every other enum setting uses.
     #[test]
     fn acp_review_on_turn_end_defaults_to_badge_and_round_trips_via_settings_ui() {
         let mut s = Settings::default();
@@ -5481,12 +5484,11 @@ mod tests {
             .any(|d| d.key == "acp_review_on_turn_end"));
     }
 
-    /// #1546's `sticky_scroll` setting (VS Code's
-    /// `editor.stickyScroll.enabled`): defaults **on** (unlike
-    /// `board_tick_enabled`'s default-off — sticky scroll dispatches no
-    /// work, it's a pure display aid, matching VS Code's own default),
-    /// round-trips through `get_value_str`/`set_value_str`, and appears in
-    /// `SETTING_DEFS`.
+    /// The `sticky_scroll` setting (VS Code's
+    /// `editor.stickyScroll.enabled`): defaults **on** (sticky scroll
+    /// dispatches no work, it's a pure display aid, matching VS Code's
+    /// own default), round-trips through `get_value_str`/`set_value_str`,
+    /// and appears in `SETTING_DEFS`.
     #[test]
     fn sticky_scroll_defaults_on_and_round_trips_via_settings_ui() {
         let mut s = Settings::default();
@@ -5500,11 +5502,10 @@ mod tests {
         assert!(SETTING_DEFS.iter().any(|d| d.key == "sticky_scroll"));
     }
 
-    /// #1544's `fold_controls` setting (VS Code's `showFoldingControls`):
+    /// The `fold_controls` setting (VS Code's `showFoldingControls`):
     /// defaults to `"mouseover"`, round-trips through `get_value_str`/
-    /// `set_value_str` (the Settings sidebar's contract), rejects an unknown
-    /// value, and appears in `SETTING_DEFS` so the sidebar actually lists
-    /// it.
+    /// `set_value_str`, rejects an unknown value, and appears in
+    /// `SETTING_DEFS`.
     #[test]
     fn fold_controls_defaults_to_mouseover_and_round_trips_via_settings_ui() {
         let mut s = Settings::default();
@@ -5620,7 +5621,7 @@ mod tests {
         assert!(s.parse_set_option("foo=42").is_err());
     }
 
-    // ── 'iskeyword' (#1191) ──────────────────────────────────────────────────
+    // ── 'iskeyword' ──────────────────────────────────────────────────────────
 
     #[test]
     fn test_iskeyword_default_and_isk_alias_readback() {
@@ -5640,11 +5641,8 @@ mod tests {
 
     #[test]
     fn test_iskeyword_rejects_malformed_value() {
-        // Before #1191, `iskeyword` was in `UNIMPLEMENTED_VALUE_OPTIONS`, so
-        // *every* value (valid or not) was rejected with the same
-        // "recognised but not implemented" message. Now a well-formed value
-        // is accepted (see the other tests in this section) and only a
-        // genuinely malformed one is rejected — with a different message.
+        // Now a well-formed value is accepted and only a genuinely
+        // malformed one is rejected — with a different message.
         let mut s = Settings::default();
         let err = s.parse_set_option("iskeyword=abc-").unwrap_err();
         assert!(err.contains("Invalid value for iskeyword"), "{err}");
@@ -5654,9 +5652,7 @@ mod tests {
 
     #[test]
     fn test_iskeyword_plus_equals_appends() {
-        // Before #1191 this failed outright — `iskeyword` (in any spelling,
-        // any operator) was unconditionally "recognised but not
-        // implemented", so `+=` could never even be attempted.
+        // With `+=` support for this option, attempting this now succeeds.
         let mut s = Settings::default();
         let msg = s.parse_set_option("iskeyword+=-").unwrap();
         assert_eq!(msg, "iskeyword=@,48-57,_,192-255,-");
@@ -5679,7 +5675,7 @@ mod tests {
 
     #[test]
     fn test_iskeyword_is_keyword_char_default_is_unicode_aware() {
-        // #1191: the underlying motion/regex bug this issue exists to fix —
+        // The underlying motion/regex bug this issue exists to fix —
         // before it, word-char classification for anything beyond the
         // hardcoded ASCII set was wrong for `\k`/`\K` (see vim_regex.rs's
         // `keyword_class_is_unicode_aware_with_the_default_iskeyword`).
@@ -5749,7 +5745,7 @@ mod tests {
         s.parse_set_option("window_status_line!").unwrap();
         assert!(s.window_status_line);
 
-        // #174 reproducer: :set status_line_above_terminal.
+        // Reproducer: `:set status_line_above_terminal`.
         s.parse_set_option("status_line_above_terminal").unwrap();
         assert!(s.status_line_above_terminal);
         s.parse_set_option("nostatus_line_above_terminal").unwrap();
@@ -5768,7 +5764,7 @@ mod tests {
     fn test_display_all() {
         let s = Settings::default();
         let display = s.display_all();
-        // #1543: default line numbers are now absolute ("number"), not "nonumber".
+        // Default line numbers are now absolute ("number"), not "nonumber".
         // `"nonumber".contains("number")` is also true, so assert the exact
         // "number nornu" phrase (and the absence of "nonumber") to actually
         // distinguish `LineNumberMode::Absolute` from the other variants.
@@ -5836,15 +5832,7 @@ mod tests {
         assert!(!s.wrap);
     }
 
-    // ── #1207: the last five `UNIMPLEMENTED_BOOL_OPTIONS` (#1190 tranche 2) ──
-    //
-    // RED against unfixed `develop`: before #1207, every one of `magic`,
-    // `showmatch`, `linebreak`, `smartindent`, `cindent` was listed in
-    // `UNIMPLEMENTED_BOOL_OPTIONS`, so `parse_set_option` rejected all of
-    // them with "recognised but not implemented yet" instead of setting the
-    // field — every assertion below that a field flips would have failed
-    // (the `unwrap()` on `parse_set_option` would have panicked on the
-    // `Err`).
+    // ── These vim bool options now set fields ──────────────────────────
 
     #[test]
     fn test_settings_magic_defaults_on_and_round_trips() {
@@ -5913,9 +5901,8 @@ mod tests {
 
     #[test]
     fn test_unimplemented_bool_options_is_now_empty() {
-        // #1207 implemented the last five entries #1190 left behind
-        // (`magic`, `showmatch`, `linebreak`, `smartindent`, `cindent`).
-        // Kept as `&[]` rather than removed — see the constant's own doc.
+        // The last five entries were implemented — kept as `&[]` rather
+        // than removed, per the constant's own doc.
         assert!(UNIMPLEMENTED_BOOL_OPTIONS.is_empty());
     }
 
@@ -5973,8 +5960,8 @@ mod tests {
         let mut ek = ExplorerKeys::default();
         ek.delete = "x".to_string();
         assert_eq!(ek.resolve('x'), Some(ExplorerAction::Delete));
-        assert_eq!(ek.resolve('D'), None); // old key no longer works
-                                           // Other keys still work
+        assert_eq!(ek.resolve('D'), None);
+        // Other keys still work
         assert_eq!(ek.resolve('a'), Some(ExplorerAction::NewFile));
     }
 
@@ -6042,15 +6029,9 @@ mod tests {
         assert_eq!(parse_key_binding(""), None);
     }
 
-    /// #1495 review finding: `parse_key_binding_named`'s doc comment claims
-    /// two genuine divergences from quadraui's more permissive
-    /// `parse_key_binding` — rejecting Cmd (`<D-...>`/`<M-...>`) and
-    /// rejecting bracket bindings with no explicit modifier (`<t>`,
-    /// `<F5>`). Neither was exercised by a test before this; lock both in
-    /// so the invariant doesn't rest on doc comments alone, and so a
-    /// future quadraui pin bump that changes that grammar fails loudly
-    /// here instead of surfacing as a silent behaviour change at a call
-    /// site like `Engine::register_accelerator`.
+    /// `parse_key_binding_named` rejects Cmd (`<D-...>`/`<M-...>`) and
+    /// rejects bracket bindings with no explicit modifier (`<t>`, `<F5>`).
+    /// Test both so the invariants don't rest on doc comments alone.
     #[test]
     fn test_parse_key_binding_named_rejects_cmd_modifier() {
         assert_eq!(parse_key_binding_named("<D-s>"), None);
@@ -6096,7 +6077,7 @@ mod tests {
         assert_eq!(s.panel_keys.toggle_sidebar, "<C-b>");
     }
 
-    // ── Mode-derived contested defaults (#800) ──────────────────────────────
+    // ── Mode-derived contested defaults ─────────────────────────────────────
     // `ctrl_f_action`, `auto_pairs`, `completion_keys.accept` derive their
     // default from `editor_mode` when unset (`None`), but an explicit
     // `Some(_)` override always wins — including across a later mode
@@ -6153,10 +6134,8 @@ mod tests {
 
     #[test]
     fn auto_pairs_explicit_override_survives_mode_switch() {
-        // The scenario called out by #800: `:set mode=vim` + `:set
-        // auto_pairs=true` keeps autopairs on; a later `:set mode=vscode`
-        // must not clobber that explicit `true` (nor, symmetrically, an
-        // explicit `false`).
+        // With an explicit `:set mode=vscode`, any previously-set explicit
+        // value must be preserved.
         let mut s = Settings::default();
         s.editor_mode = EditorMode::Vim;
         s.auto_pairs = Some(true);
@@ -6285,15 +6264,10 @@ mod tests {
         assert_eq!(s2.use_nerd_fonts, Some(false));
     }
 
-    // ── Backend-derived contested default: `use_nerd_fonts` (#999) ──────────
-    // Unlike the mode-derived trio above, this one derives from which
-    // *backend* is running (GUI vs TUI) rather than `editor_mode` — see the
-    // field doc on `Settings::use_nerd_fonts`. `crate::icons::
-    // is_gui_backend`/`set_gui_backend` is thread-local (it sits next to
-    // `nerd_fonts_enabled`/`set_nerd_fonts`, for the same #618 reason), so
-    // each test here saves and restores the ambient value to avoid leaking
-    // into whatever other test Rust's runner schedules next on the same
-    // worker thread.
+    // ── Backend-derived default: `use_nerd_fonts` ─────────────────────
+    // This one derives from the running backend (GUI vs TUI) rather than
+    // `editor_mode`. `crate::icons::is_gui_backend`/`set_gui_backend` is
+    // thread-local, so each test saves and restores the ambient value.
 
     #[test]
     fn use_nerd_fonts_unset_is_true_on_gui_backend() {
@@ -6345,15 +6319,15 @@ mod tests {
         crate::icons::set_gui_backend(prev);
     }
 
-    /// #1580: `menu_style` defaults to `Auto`, matching quadraui's own
-    /// `MenuStyle::default()` (quadraui#1187) and VS Code's
+    /// `menu_style` defaults to `Auto`, matching quadraui's own
+    /// `MenuStyle::default()` and VS Code's
     /// `window.menuStyle` default.
     #[test]
     fn menu_style_defaults_to_auto() {
         assert_eq!(Settings::default().menu_style, MenuStyle::Auto);
     }
 
-    /// #1580: `get_value_str`/`set_value_str` round-trip every `MenuStyle`
+    /// `get_value_str`/`set_value_str` round-trip every `MenuStyle`
     /// variant, the same contract every other `SETTING_DEFS` `Enum` entry
     /// (e.g. `editor_mode`, `line_numbers`) already has to hold for the
     /// Settings sidebar UI to read/write it.
@@ -6373,7 +6347,7 @@ mod tests {
         assert!(s.set_value_str("menu_style", "bogus").is_err());
     }
 
-    /// #1580: the retired `inherit` value — still accepted by
+    /// The retired `inherit` value — still accepted by
     /// `:set menu_style=inherit` and in a settings.json saved before this
     /// issue — parses to `Auto` rather than erroring. `get_value_str` never
     /// produces `"inherit"` again (a fresh save always round-trips through
@@ -6387,7 +6361,7 @@ mod tests {
         assert_eq!(s.menu_style, MenuStyle::Auto);
     }
 
-    /// #1580: a settings.json written before this issue (`"menu_style":
+    /// A settings.json written before this issue (`"menu_style":
     /// "inherit"`) still deserializes, via `#[serde(alias = "inherit")]` on
     /// `MenuStyle::Auto` — the JSON-load counterpart to
     /// `menu_style_inherit_parses_to_auto` above, which only covers the
@@ -6398,13 +6372,12 @@ mod tests {
         assert_eq!(style, MenuStyle::Auto);
     }
 
-    // ── #1206: generic `+=`/`-=`/`^=` strip ──────────────────────────────
+    // ── `+=`/`-=`/`^=` operator support ──────────────────────────────
 
-    /// RED against unfixed `develop`: before #1206, only `'iskeyword'` had
-    /// its `+=`/`-=`/`^=` suffix stripped before the name lookup — every
-    /// other option's raw name still carried the operator into
-    /// `set_value_option`'s exact-name match, so `whichwrap+` (not
-    /// `whichwrap`) is what got looked up and reported as unknown.
+    /// Before generic operator support, only `'iskeyword'` had its suffix
+    /// stripped before name lookup — every other option's raw name carried
+    /// the operator into `set_value_option`'s exact-name match, so `whichwrap+`
+    /// (not `whichwrap`) is what got looked up and reported as unknown.
     #[test]
     fn plus_equals_on_a_list_option_other_than_iskeyword_no_longer_names_the_option_wrong() {
         let mut s = Settings::default();
@@ -6438,8 +6411,8 @@ mod tests {
     }
 
     /// Numeric options also take `+=`/`-=`/`^=` in real Vim (add/subtract/
-    /// multiply) — #1206 generalised the same strip loop to cover them too,
-    /// not just list options.
+    /// multiply) — support was generalized to cover them too, not just
+    /// list options.
     #[test]
     fn plus_equals_on_a_numeric_option_adds() {
         let mut s = Settings::default();
@@ -6466,10 +6439,9 @@ mod tests {
         assert_eq!(s.timeoutlen, 300);
     }
 
-    /// A pre-existing list option #1206 didn't add (`'nrformats'`) must
-    /// also get real list append/remove, not silent overwrite — see the
-    /// `current_list_value` doc comment for why this would otherwise be a
-    /// worse regression than the bug #1206 fixes.
+    /// When a pre-existing list option gets `+=`, the values must append
+    /// rather than overwrite. See the `current_list_value` doc comment for
+    /// why this invariant prevents a worse regression.
     #[test]
     fn plus_equals_on_a_pre_existing_list_option_appends_not_overwrites() {
         let mut s = Settings::default();
@@ -6477,8 +6449,6 @@ mod tests {
         s.parse_set_option("nrformats+=octal").unwrap();
         assert_eq!(s.nrformats, vec!["bin", "hex", "octal"]);
     }
-
-    // ── #1206: 'whichwrap' ───────────────────────────────────────────────
 
     #[test]
     fn whichwrap_default_matches_neovim() {
@@ -6498,8 +6468,6 @@ mod tests {
         s.parse_set_option("ww=b,s,h,l,<,>,~,[,]").unwrap();
         assert_eq!(s.whichwrap, "b,s,h,l,<,>,~,[,]");
     }
-
-    // ── #1206: 'backspace' ───────────────────────────────────────────────
 
     #[test]
     fn backspace_default_matches_neovim() {
@@ -6526,8 +6494,6 @@ mod tests {
         assert_eq!(s.backspace, "indent,eol,nostop");
     }
 
-    // ── #1206: 'timeoutlen' ──────────────────────────────────────────────
-
     #[test]
     fn timeoutlen_default_matches_neovim() {
         assert_eq!(Settings::default().timeoutlen, 1000);
@@ -6540,8 +6506,6 @@ mod tests {
         assert_eq!(msg, "timeoutlen=250");
         assert_eq!(s.parse_set_option("tm?").unwrap(), "timeoutlen=250");
     }
-
-    // ── #1206: 'wildmode' ────────────────────────────────────────────────
 
     #[test]
     fn wildmode_default_matches_neovim() {
@@ -6561,8 +6525,6 @@ mod tests {
         let err = s.parse_set_option("wildmode=bogus").unwrap_err();
         assert!(err.contains("Invalid value for wildmode"), "{err}");
     }
-
-    // ── #1206: 'laststatus' ──────────────────────────────────────────────
 
     #[test]
     fn laststatus_default_matches_neovim() {
@@ -6584,8 +6546,6 @@ mod tests {
             assert_eq!(s.laststatus, n);
         }
     }
-
-    // ── #1206: 'sidescrolloff' / 'scrolljump' ────────────────────────────
 
     #[test]
     fn sidescrolloff_and_scrolljump_defaults_match_neovim() {
@@ -6613,8 +6573,6 @@ mod tests {
         s.parse_set_option("sj=0").unwrap();
         assert_eq!(s.scrolljump, 0);
     }
-
-    // ── #1206: 'listchars' ───────────────────────────────────────────────
 
     #[test]
     fn listchars_default_matches_neovim() {

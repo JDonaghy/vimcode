@@ -1,12 +1,7 @@
-//! Re-export of the GDK ↔ `UiEvent` translators that vimcode
-//! references externally. The canonical implementations live in
-//! `quadraui::gtk::events` after the lift (#270).
+//! Re-export of the GDK ↔ `UiEvent` translators.
 //!
-//! These were called from draw-area event callbacks wired in the
-//! Relm4 `fn init` block (#448-A/B). After #448-C flips the main loop
-//! to the quadraui ShellApp runner the runner owns all input
-//! translators; these re-exports are preserved for sidebar-panel DAs
-//! that will be re-wired in a follow-on task.
+//! The canonical implementations live in `quadraui::gtk::events`.
+//! These re-exports support sidebar-panel draw areas that use them.
 
 #[allow(unused_imports)]
 pub use quadraui::gtk::events::{

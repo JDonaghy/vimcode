@@ -1060,7 +1060,7 @@ fn test_dk_at_first_line_is_noop() {
     assert_cursor(&e, 0, 0);
 }
 
-// ── Issue #802: operator-pending / motion edge cases (Vim compat 4/9) ──────
+// Operator-pending / motion edge cases
 
 #[test]
 fn test_x_on_empty_line_is_noop() {

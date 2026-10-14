@@ -12,7 +12,7 @@ pub struct BufferId(pub usize);
 
 impl fmt::Display for BufferId {
     /// Renders as the bare numeric id — used as the opaque document id
-    /// handed to quadraui's `WorkspaceController` preview tier (#658).
+    /// handed to quadraui's `WorkspaceController` preview tier.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -44,7 +44,7 @@ impl Buffer {
     /// Load buffer contents from a file. Returns an io::Error if reading fails.
     ///
     /// Reads raw bytes rather than `fs::read_to_string` and sniffs a BOM
-    /// first (#1560): Windows text editors (Notepad, PowerShell `Out-File`,
+    /// first: Windows text editors (Notepad, PowerShell `Out-File`,
     /// etc.) routinely write UTF-16LE-with-BOM, and some tools write
     /// UTF-8-with-BOM. A bare `read_to_string` rejects both with an opaque
     /// "stream did not contain valid UTF-8" and — because the error bubbles
@@ -113,7 +113,7 @@ impl Buffer {
 }
 
 /// Read a whole file from `path` and decode it to a `String`, transcoding
-/// the BOM'd encodings that Windows text tools commonly emit (#1560). Shared
+/// the BOM'd encodings that Windows text tools commonly emit. Shared
 /// by `Buffer::from_file` and `BufferState::reload_from_disk` (`:e!` and the
 /// idle file-watcher's silent-reload path) so every read of a file's
 /// contents — initial open or later reload — goes through the same
@@ -125,7 +125,7 @@ pub(crate) fn read_file_to_string(path: &Path) -> Result<String, io::Error> {
 }
 
 /// Decode a whole file's bytes to a `String`, transcoding the BOM'd
-/// encodings that Windows text tools commonly emit (#1560):
+/// encodings that Windows text tools commonly emit:
 ///
 /// - UTF-8 with BOM (`EF BB BF`) — strip the BOM, decode the rest as UTF-8.
 /// - UTF-16LE with BOM (`FF FE`) — Notepad's and PowerShell `Out-File`'s
@@ -196,18 +196,18 @@ impl fmt::Display for Buffer {
 
 // ─── Decorations: namespaces, extmarks, highlights, virtual text, signs ────
 //
-// #1653 (Native API P5). Lives alongside `Buffer`/`BufferId` rather than in
-// its own module because every decoration is anchored to a `BufferId` and
-// shifted by the same line-insert/line-delete events `Buffer` already models
-// — see `Engine::shift_marks_for_line_insert`/`shift_marks_for_line_delete`
-// in `engine/buffers.rs`, which call the `DecorState` methods below right
+// Lives alongside `Buffer`/`BufferId` rather than in its own module because
+// every decoration is anchored to a `BufferId` and shifted by the same
+// line-insert/line-delete events `Buffer` already models — see
+// `Engine::shift_marks_for_line_insert`/`shift_marks_for_line_delete` in
+// `engine/buffers.rs`, which call the `DecorState` methods below right
 // alongside the pre-existing vim-mark (`Engine::marks`) shift.
 //
 // Deliberately NOT a reimplementation of `Engine::line_annotations` /
-// `annotate_line` — those keep their existing, unchanged behaviour (frozen
-// by `tests/extensions.rs`). This is the new, richer mechanism
-// `vimcode.decor.*` exposes: namespaced, range-capable, tracked through
-// undo/redo, with named highlight groups and gutter signs.
+// `annotate_line` — those keep their existing, unchanged behaviour. This is
+// the new, richer mechanism `vimcode.decor.*` exposes: namespaced,
+// range-capable, tracked through undo/redo, with named highlight groups and
+// gutter signs.
 //
 // Colour/theme resolution deliberately does NOT live here: `core/` has no
 // `Theme` (that's `render.rs`, outside `core/` by design), so `HlGroupDef`
@@ -309,9 +309,7 @@ pub struct HlGroupDef {
 /// Every decoration mark for one buffer, indexed two ways so
 /// [`marks_touching`](Self::marks_touching) costs O(visible range +
 /// overlapping marks) rather than a per-frame scan of everything above the
-/// viewport — satisfying #1653's "off-screen lines must cost nothing per
-/// frame" requirement for real (see that method's doc comment for why a
-/// single start-row index alone can't do this):
+/// viewport:
 ///
 /// - `by_row`, keyed by each mark's *starting* row, answers "marks that
 ///   start inside the visible window" via a `BTreeMap::range(start..=end)`
@@ -323,8 +321,7 @@ pub struct HlGroupDef {
 ///   it, so it's redundant to index those twice), answers "a multi-row mark
 ///   that started above the window but still reaches into it". Keying on
 ///   `end_row` means `range(start_row..)` skips every spanning mark that
-///   already *ended* above the window in the same `O(log n)` step — a mark
-///   that finished scrolling past 10,000 rows ago is never visited either.
+///   already *ended* above the window in the same `O(log n)` step.
 #[derive(Debug, Clone, Default)]
 pub struct BufferDecorations {
     marks: HashMap<MarkId, DecorMark>,
@@ -519,8 +516,7 @@ impl BufferDecorations {
     /// inside the common prefix are untouched, marks strictly inside the
     /// common suffix shift by the old/new line-count delta, and any mark
     /// touching the changed middle section collapses — its surrounding text
-    /// no longer reads the same, so there's no sound position left to claim
-    /// (same "whole range gone" collapse rule as `shift_delete`).
+    /// no longer reads the same, so there's no sound position left to claim.
     pub fn shift_for_text_replace(&mut self, old_text: &str, new_text: &str) {
         if old_text == new_text {
             return;
@@ -709,29 +705,14 @@ mod tests {
     use super::*;
 
     /// A scratch path for this file's encoding fixtures that is unique per
-    /// *process* as well as per thread — [`crate::harness::scratch_dir`] (the
-    /// #1498 helper) with the `.txt` extension preserved, exactly as
-    /// `engine/tests.rs`'s `test_temp_path` does.
+    /// *process* as well as per thread — [`crate::harness::scratch_dir`]
+    /// with the `.txt` extension preserved, exactly as `engine/tests.rs`'s
+    /// `test_temp_path` does.
     ///
-    /// These tests used to each hardcode a single fixed name in the shared
-    /// system temp dir (`vimcode_buffer_test_<case>.txt`). That is unique
-    /// *within* one `cargo test` run (libtest gives every `#[test]` its own
-    /// thread) but byte-identical across *processes*, so two concurrent runs
-    /// on one machine — two git worktrees, the coordinator running several
-    /// workers, a local run racing CI on a shared box — derive the same
-    /// absolute path. Each fixture then interleaves its `fs::write` (which
-    /// truncates first) and its closing `remove_file` with the other run's
-    /// `from_file`, so a test reads a deleted, zero-length or half-written
-    /// file and sees a bogus result. This is the same collision #1498/#1732
-    /// were filed for, in two more files that never adopted the helper.
-    ///
-    /// RED against the fixed-name form: restore the literal
-    /// `std::env::temp_dir().join("vimcode_buffer_test_<case>.txt")` paths and
-    /// run the lib test binary 8-way concurrently — 14 of 24 runs fail, with
-    /// `from_file` returning `NotFound` ("No such file or directory") for the
-    /// decode cases and the `is_err()` cases (invalid-UTF-8, UTF-32LE BOM)
-    /// going green-to-red because an empty or 2-byte truncation decodes
-    /// successfully instead of erroring. With this helper, 0 of 8 fail.
+    /// Each fixture derives a unique path per process, preventing concurrent
+    /// runs from interleaving file operations like truncating writes and
+    /// deletes that would cause tests to read deleted, zero-length, or
+    /// half-written files.
     fn unique_temp_path(tag: &str) -> std::path::PathBuf {
         crate::harness::scratch_dir(&format!("vimcode_buffer_test_{tag}")).with_extension("txt")
     }
@@ -790,7 +771,7 @@ mod tests {
         assert_eq!(buffer.to_string(), "Hello");
     }
 
-    /// #1560: opening a UTF-16LE-with-BOM file (Notepad's/PowerShell's
+    /// Opening a UTF-16LE-with-BOM file (Notepad's/PowerShell's
     /// "Unicode" default on Windows) must decode correctly instead of
     /// erroring with "stream did not contain valid UTF-8". Against the old
     /// `fs::read_to_string`-based `from_file`, this test observably fails:
@@ -811,7 +792,7 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// #1560: mirror of the LE case for a UTF-16BE-with-BOM file.
+    /// Mirror of the LE case for a UTF-16BE-with-BOM file.
     #[test]
     fn test_from_file_utf16be_bom() {
         let path = unique_temp_path("utf16be-bom");
@@ -827,7 +808,7 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// #1560: a UTF-8-with-BOM file (`EF BB BF` prefix) must decode with
+    /// A UTF-8-with-BOM file (`EF BB BF` prefix) must decode with
     /// the BOM stripped rather than surfacing it as a stray character (or,
     /// under a stricter reader, an error) in the buffer content.
     #[test]
@@ -892,7 +873,7 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// #1653 review: `BufferDecorations::marks_touching` must not walk
+    /// `BufferDecorations::marks_touching` must not walk
     /// every mark whose starting row sits above the visible window — the
     /// old `by_row.range(..=end_row)` did exactly that (always starting
     /// from the very first key), which costs O(marks above the viewport)

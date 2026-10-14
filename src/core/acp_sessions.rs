@@ -1,4 +1,4 @@
-//! Local index of past ACP sessions (#1459).
+//! Local index of past ACP sessions.
 //!
 //! The agent-client-protocol has no `session/list` method — an agent can
 //! only be asked to *resume* a session it already knows the id of
@@ -44,10 +44,10 @@ pub struct AcpSessionRecord {
     /// The literal text of the first `session/prompt` sent on this session
     /// — shown in the picker as the entry's identifying detail, since a raw
     /// session id means nothing to a human. Superseded by `title`, when
-    /// present, as the picker's display text (#1519).
+    /// present, as the picker's display text.
     pub first_prompt: String,
     /// Agent-assigned session title, learned from a `session_info_update`
-    /// `session/update` notification (#1519) — the ACP-native "this
+    /// `session/update` notification — the ACP-native "this
     /// conversation is about X" the agent itself derives, as opposed to
     /// `first_prompt`'s "whatever the human happened to type first".
     /// `None` until (if ever) the agent sends one; `:AiSessions`'s picker
@@ -167,7 +167,7 @@ impl AcpSessionIndex {
     }
 
     /// Record a `session_info_update`-learned title against an already-
-    /// recorded session (#1519). A no-op if `session_id` isn't recorded —
+    /// recorded session. A no-op if `session_id` isn't recorded —
     /// this can happen for a session update that races `record_session`'s
     /// own call in `SessionCreated`'s handler, and there is nothing to
     /// title yet in that case; the next `session_info_update` (agents that

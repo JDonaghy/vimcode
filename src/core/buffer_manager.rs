@@ -8,7 +8,7 @@ use super::buffer::{read_file_to_string, Buffer, BufferId};
 use super::cursor::Cursor;
 use super::syntax::{Syntax, SyntaxReparseOutcome};
 
-/// Binds a scratch buffer to a provider document (#524): the id (if the
+/// Binds a scratch buffer to a provider document: the id (if the
 /// document already exists on the provider — `None` for the new-document
 /// flow) plus the write/follow-up argv templates captured at open time, so
 /// `:w` can push edits back without re-resolving the provider (which may
@@ -20,7 +20,7 @@ pub struct ToolDocumentBinding {
     pub write_follow_up: Vec<String>,
 }
 
-/// Binds a scratch buffer to a review-verdict-in-progress (#526): the
+/// Binds a scratch buffer to a review-verdict-in-progress: the
 /// reviewed card's id plus the provider's declared verdict-command argv
 /// template (still carrying its `{id}`/`{body_file}` tokens, substituted
 /// at save time) — same "capture at open time so `:w` doesn't need to
@@ -83,26 +83,19 @@ impl LineEnding {
 }
 
 // =============================================================================
-// Undo/Redo Data Structures — Undo Tree (#1156)
+// Undo/Redo Data Structures — Undo Tree
 // =============================================================================
 //
-// Undo used to be three parallel linear structures (`undo_stack`,
-// `redo_stack`, `undo_timeline`) that each threw away data the others still
-// needed: `redo_stack` was cleared on every edit, so an edit made after `u`
-// permanently discarded the branch it moved off, and `undo_timeline` (which
-// backed `g-`/`g+`) was `truncate`d at the same moment, so those couldn't
-// reach the discarded branch either. This module replaces all three with a
-// single tree: every edit becomes a *child* of the node you were on, so an
-// edit after `u` starts a new branch instead of destroying the old one — the
-// old branch stays reachable via `g-`/`g+`/`:earlier`/`:later` for as long as
-// `undolevels` keeps it around.
+// The undo system uses a tree structure where every edit becomes a child of the
+// node you were on. An edit after `u` starts a new branch instead of destroying
+// the old one — the old branch stays reachable via `g-`/`g+`/`:earlier`/`:later`
+// for as long as `undolevels` keeps it around.
 //
-// Every node stores the *full* buffer text (like the old `undo_timeline`
-// did), not a diff/op-list (like the old `undo_stack` did): reconstructing
+// Every node stores the full buffer text (not a diff/op-list), so reconstructing
 // an arbitrary node's content — needed for `g-`/`g+` to jump straight across
-// branches — is then just "copy the text", with no op-replay math that has
-// to be re-derived per branch. `undolevels` bounds the memory cost by
-// pruning the globally-oldest branch tip that isn't on the active path.
+// branches — is just "copy the text", with no op-replay math. `undolevels`
+// bounds the memory cost by pruning the globally-oldest branch tip that isn't
+// on the active path.
 
 mod undo_time {
     //! `serde` can't derive `SystemTime` directly; store it as milliseconds
@@ -313,17 +306,10 @@ impl UndoTree {
     /// globally — crossing branches, unlike a plain `u`. `None` if already
     /// at the oldest live state.
     ///
-    /// #1280: returns the target node's `cursor_before` (where *its own*
-    /// edit started), not `cursor_after` (where it finished) — matching
-    /// `undo()` just above, and verified against Neovim: `g-`/`g+` restore
-    /// the cursor to the start of the change the same way plain `u` does,
-    /// regardless of which direction you're navigating from. Landing on a
-    /// state via `cursor_after` instead only coincidentally matched the one
-    /// case this had a corpus test for (`undo:g- crosses a branch abandoned
-    /// by u then edit`, #1156) — that case's final state is the tree root,
-    /// where `cursor_before == cursor_after` by construction — so a
-    /// non-root landing (as the new `g:g+` case here does) was never
-    /// exercised until now.
+    /// Returns the target node's `cursor_before` (where its own edit started),
+    /// not `cursor_after` (where it finished) — matching `undo()` just above.
+    /// The cursor is restored to the start of the change the same way plain `u`
+    /// does, regardless of which direction you're navigating from.
     pub fn older(&mut self) -> Option<(String, Cursor)> {
         let cur_seq = self.current_seq();
         let idx = self
@@ -352,7 +338,7 @@ impl UndoTree {
     /// cutoff` (`:earlier {N}[smhd]`). Falls back to the oldest live node if
     /// every one postdates `cutoff`.
     ///
-    /// #1294 (#1280 follow-up): returns the target node's `cursor_before`,
+    /// Returns the target node's `cursor_before`,
     /// not `cursor_after` — same fix and same reasoning as `older`/`newer`,
     /// just above. Verified by hand against a live `nvim --headless`
     /// `--listen`/`--remote-send` session (not replayable through this
@@ -405,15 +391,12 @@ impl UndoTree {
         (pos, total)
     }
 
-    /// `:undojoin` / the internal "these sub-command undo steps are one
-    /// Vim-visible step" merge (`execute_global_command`, `execute_norm_range`,
-    /// `execute_folddo_command` — each used to hand-roll this against the
-    /// old linear `undo_stack` by draining and re-pushing `UndoEntry`s;
-    /// #1156). Folds every node on the direct path from the node with `seq
-    /// == mark_seq` (exclusive) to the current node (inclusive) into one
-    /// node, reparented directly onto `mark_seq`'s node. A no-op if
-    /// `mark_seq`'s node isn't a live ancestor of the current node (e.g. it
-    /// was itself already folded away, or nothing happened since the mark).
+    /// `:undojoin` and the internal "these sub-command undo steps are one
+    /// Vim-visible step" merge. Folds every node on the direct path from
+    /// the node with `seq == mark_seq` (exclusive) to the current node
+    /// (inclusive) into one node, reparented directly onto `mark_seq`'s node.
+    /// A no-op if `mark_seq`'s node isn't a live ancestor of the current node
+    /// (e.g. it was itself already folded away, or nothing happened since the mark).
     pub fn merge_since(&mut self, mark_seq: usize) {
         if self.current_seq() <= mark_seq {
             return;
@@ -534,11 +517,9 @@ impl UndoTree {
             .collect()
     }
 
-    /// Live nodes, oldest first, in the shape `vimcode.undo.tree` (#1654 P6)
-    /// hands to a plugin: `parent` is the parent's **`seq`**, not its arena
-    /// index — a plugin has no business knowing this crate's arena layout,
-    /// and `seq` is the portable handle [`Self::jump_to_seq`] (and
-    /// `vimcode.undo.jump`) consumes.
+    /// Live nodes, oldest first, in plugin-facing shape: `parent` is the
+    /// parent's **`seq`**, not its arena index — a portable handle that
+    /// [`Self::jump_to_seq`] consumes.
     pub fn tree_for_plugin(&self) -> Vec<UndoTreeNode> {
         let current = self.current;
         self.live_indices_sorted()
@@ -555,12 +536,11 @@ impl UndoTree {
             .collect()
     }
 
-    /// `vimcode.undo.jump(buf, seq)` (#1654 P6): go straight to the live
-    /// node carrying `seq`, unlike [`Self::older`]/[`Self::newer`] which
-    /// step one chronological position at a time. Lands on the node's
-    /// `cursor_after` — the same convention [`Self::redo`] uses for a node
-    /// reached by moving onto it directly rather than stepping through it.
-    /// `None` if no live node carries `seq`.
+    /// Go straight to the live node carrying `seq`, unlike [`Self::older`]/
+    /// [`Self::newer`] which step one chronological position at a time. Lands
+    /// on the node's `cursor_after` — the same convention [`Self::redo`] uses
+    /// for a node reached by moving onto it directly rather than stepping through
+    /// it. `None` if no live node carries `seq`.
     pub fn jump_to_seq(&mut self, seq: usize) -> Option<(String, Cursor)> {
         let idx = self.nodes.iter().position(|n| !n.removed && n.seq == seq)?;
         self.current = idx;
@@ -569,9 +549,8 @@ impl UndoTree {
     }
 }
 
-/// One undo-tree node as handed to a plugin by `vimcode.undo.tree` (#1654
-/// P6) — a flattened, arena-index-free view of [`UndoNode`]. See
-/// [`UndoTree::tree_for_plugin`].
+/// One undo-tree node as handed to a plugin — a flattened, arena-index-free
+/// view of [`UndoNode`]. See [`UndoTree::tree_for_plugin`].
 #[derive(Debug, Clone)]
 pub struct UndoTreeNode {
     /// This node's own sequence number.
@@ -642,7 +621,7 @@ pub struct BufferState {
     pub syntax_stale: bool,
     /// When the syntax was last marked stale (for debounced re-parse in insert mode).
     pub syntax_stale_since: Option<std::time::Instant>,
-    /// This buffer's full undo history (#1156).
+    /// This buffer's full undo history.
     pub undo_tree: UndoTree,
     /// Undo group currently being accumulated (during Insert mode or a
     /// multi-op Normal command).
@@ -659,7 +638,7 @@ pub struct BufferState {
     /// Recomputed in `update_syntax` so renders don't need to scan every line.
     pub max_col: usize,
     /// Row index of the line that produced `max_col`. Internal
-    /// bookkeeping for `update_max_col_incremental` (#1721) — lets a
+    /// bookkeeping for `update_max_col_incremental` — lets a
     /// keystroke-sized edit tell whether it could have invalidated the
     /// cached max without rescanning every other line.
     max_col_line: usize,
@@ -673,8 +652,8 @@ pub struct BufferState {
     /// buffer content (even if the response was empty). Distinguishes
     /// "haven't responded yet" from "responded with zero tokens" — without
     /// this, `lsp_status_for_buffer` would keep the indicator pinned to
-    /// `Initializing` forever on files where the server returns no tokens
-    /// (#230). Cleared in `lsp_flush_changes` when re-requesting after an
+    /// `Initializing` forever on files where the server returns no tokens.
+    /// Cleared in `lsp_flush_changes` when re-requesting after an
     /// edit so the indicator can briefly reflect the new pending request.
     pub semantic_tokens_received: bool,
     /// For netrw buffers: the directory currently being listed.
@@ -690,11 +669,11 @@ pub struct BufferState {
     /// Display name for plugin-created scratch buffers (shown in tab bar).
     pub scratch_name: Option<String>,
     /// Set when this buffer is a provider document opened for editing
-    /// (#524) — `:w` pushes the title/body back through the bound
+    /// — `:w` pushes the title/body back through the bound
     /// provider's write command instead of writing to disk. `None` for
     /// every ordinary buffer.
     pub tool_document: Option<ToolDocumentBinding>,
-    /// Set when this buffer is composing a review verdict body (#526) —
+    /// Set when this buffer is composing a review verdict body —
     /// `:w` reports the verdict through the bound provider's verdict
     /// command instead of writing to disk. `None` for every ordinary
     /// buffer (including a `tool_document` one; the two are mutually
@@ -714,17 +693,14 @@ pub struct BufferState {
     pub detected_indent: Option<u8>,
     /// Line ending format (LF or CRLF). Detected on file open, default LF.
     pub line_ending: LineEnding,
-    /// Set when this buffer's window hosts a `vimcode.ui.register_view` view
-    /// as an editor-area tab (`Engine::open_plugin_view_tab`, #1627), naming
-    /// the view. `None` for every ordinary buffer. The buffer's own content
-    /// is never read for such a window — `render::build_rendered_window`
-    /// short-circuits before touching it, and `App::paint_editor_windows_rung`
-    /// paints the view's `Form` in the window's rect instead of buffer text —
-    /// so it exists only to piggyback on the pre-existing `Tab`/`Window`/
-    /// `BufferId` lifecycle (open, close, split, move-between-groups) rather
-    /// than inventing a parallel one; `scratch_name` (set alongside this,
-    /// `Engine::open_plugin_view_tab`) is the pre-existing tab-title mechanism
-    /// this reuses rather than adds a second.
+    /// Set when this buffer's window hosts a plugin view as an editor-area tab,
+    /// naming the view. `None` for every ordinary buffer. The buffer's own content
+    /// is never read for such a window — rendering short-circuits before touching it,
+    /// and the view's `Form` is painted in the window's rect instead of buffer text —
+    /// so it exists only to piggyback on the pre-existing `Tab`/`Window`/`BufferId`
+    /// lifecycle (open, close, split, move-between-groups) rather than inventing a
+    /// parallel one; `scratch_name` (set alongside this) is the pre-existing tab-title
+    /// mechanism this reuses rather than adds a second.
     pub plugin_view: Option<String>,
 }
 
@@ -948,7 +924,7 @@ impl BufferState {
     /// Exists separately from `update_syntax` so tests can exercise the gate
     /// without racing on the process-wide [`SYNTAX_MAX_LINES`] atomic.
     ///
-    /// Called on every keystroke (#1721), so the three expensive parts are
+    /// Called on every keystroke, so the three expensive parts are
     /// all either incremental or skipped when nothing changed:
     /// `Syntax::reparse_incremental` reuses the previous parse tree instead
     /// of a full reparse, `patch_highlights` re-extracts highlights only
@@ -1034,7 +1010,7 @@ impl BufferState {
 
     /// Splice freshly-extracted highlights for `[rehighlight_start,
     /// rehighlight_end)` (new-text byte offsets) into the existing cached
-    /// `self.highlights`, instead of re-extracting the whole file (#1721).
+    /// `self.highlights`, instead of re-extracting the whole file.
     ///
     /// Cached entries are bare byte-range tuples in *old*-text
     /// coordinates, so they're first partitioned in that coordinate
@@ -1113,7 +1089,7 @@ impl BufferState {
     }
 
     /// Update `self.max_col` from just the lines the edit touched, instead
-    /// of rescanning every line (#1721).
+    /// of rescanning every line.
     ///
     /// Safe without reading any line outside the touched span because
     /// `self.max_col_line` remembers *which* line last produced the cached
@@ -1123,27 +1099,23 @@ impl BufferState {
     /// resolve locally is the edit touching `max_col_line` itself without
     /// growing past the old max — that line may have shrunk, and nothing
     /// here tracks the length of every other line to know what the new
-    /// true max is, so it falls back to a full rescan (same cost as
-    /// before #1721, just no longer paid on every keystroke).
+    /// true max is, so it falls back to a full rescan.
     ///
     /// `max_col_line` is a row index, and rows are old/new-text-coordinate
     /// sensitive exactly like highlight byte offsets are: an edit that
     /// adds or removes a line *anywhere before* `max_col_line` shifts
-    /// every row number after it, the same way an edit shifts byte
-    /// offsets after it in `patch_highlights`. Forgetting to shift it
-    /// (confirmed by the randomised oracle test below, not just
-    /// inference) leaves `max_col_line` pointing at the wrong row —
-    /// harmless until some *other*, later edit shrinks whatever line now
-    /// actually occupies that row, which this function then wrongly
-    /// trusts as "the max line wasn't touched" and leaves `max_col`
-    /// stuck too high.
+    /// every row number after it. Forgetting to shift it leaves
+    /// `max_col_line` pointing at the wrong row — harmless until some
+    /// *other*, later edit shrinks whatever line now actually occupies
+    /// that row, which this function then wrongly trusts as "the max line
+    /// wasn't touched" and leaves `max_col` stuck too high.
     fn update_max_col_incremental(&mut self, text: &str, edit: tree_sitter::InputEdit) {
         // The `&str` range-indexing below panics on an offset that isn't a
         // UTF-8 char boundary. `compute_edit` guarantees both offsets are
         // (by snapping them *outwards* to one — see its comment); state
         // the dependency here so a future change there surfaces as this
         // named assertion rather than a bare "byte index N is not a char
-        // boundary" from the middle of a max-col calculation (#1721).
+        // boundary" from the middle of a max-col calculation.
         debug_assert!(
             text.is_char_boundary(edit.start_byte) && text.is_char_boundary(edit.new_end_byte),
             "InputEdit offsets must be char boundaries in the new text: \
@@ -1352,9 +1324,8 @@ impl BufferState {
     /// `'undofile'` is on and a matching undofile exists. Called once, right
     /// after a file is opened — the buffer's freshly-read content must
     /// exactly match the undofile's `current` node's text, or `u`/`g-` would
-    /// silently swap in text unrelated to what's on screen (a stale
-    /// undofile from before an external edit, say), so a mismatch discards
-    /// the loaded tree instead of installing it.
+    /// silently swap in text unrelated to what's on screen, so a mismatch
+    /// discards the loaded tree instead of installing it.
     fn load_undofile_if_enabled(&mut self) {
         if !crate::core::undofile::enabled() {
             return;
@@ -1395,7 +1366,7 @@ impl BufferState {
     /// Re-read the file from disk, replacing all buffer content.
     /// Resets dirty flag, undo/redo stacks, and updates mtime.
     ///
-    /// Goes through the same BOM-aware decode as `Buffer::from_file` (#1560):
+    /// Goes through the same BOM-aware decode as `Buffer::from_file`:
     /// this is reachable from `:e[dit]!` and from the idle file-watcher's
     /// silent-reload path, and a bare `fs::read_to_string` here reproduces
     /// the exact "stream did not contain valid UTF-8" error for a
@@ -1494,16 +1465,11 @@ impl BufferState {
     /// Total number of undo-tree nodes ever committed for this buffer,
     /// across every branch — unlike [`Self::undo_seq`], this only ever
     /// grows: `u`/`<C-r>`/`g-`/`g+`/`:earlier`/`:later` all just move the
-    /// buffer's position among *existing* nodes, none of them call
-    /// `UndoTree::commit`. Callers that used to compare `undo_stack.len()`
-    /// before/after an operation to answer "did this commit a new edit"
-    /// (not just "did the visible buffer change") compare this instead —
-    /// using `undo_seq` there would wrongly count `u` itself as an edit,
-    /// since undo *lowers* the current `seq` (#1156 regression: `x u .` on
-    /// `"abc"` produced `"abc"` instead of Neovim's `"bc"`, because `u`'s
-    /// `seq` drop was misread as "a new change happened", finalizing `u`
-    /// itself as the next `.` target instead of leaving `x`'s recorded
-    /// target alone).
+    /// buffer's position among existing nodes, none of them call
+    /// `UndoTree::commit`. Callers that detect "did this commit a new edit"
+    /// (not just "did the visible buffer change") compare this instead.
+    /// Using `undo_seq` would wrongly count `u` itself as an edit,
+    /// since undo lowers the current `seq`.
     pub fn undo_commit_count(&self) -> usize {
         self.undo_tree.next_seq
     }
@@ -1513,14 +1479,11 @@ impl BufferState {
     /// command completes, or when leaving Insert mode. `cursor_after` is the
     /// cursor position once the group's edits are done — restored by a later
     /// `<C-r>` (redo) or a time-spec `:later {N}[smhd]` landing on this node.
-    /// (#1280: `g+`/count-based `:later N` land on `cursor_before` instead —
-    /// see `newer`'s doc comment, just below `older`'s, for why.)
+    /// `g+`/count-based `:later N` land on `cursor_before` instead — see
+    /// `newer`'s doc comment, just below `older`'s, for why.
     ///
     /// Returns `true` if a node was actually committed — callers use this to
-    /// skip work that's only meaningful when something actually changed
-    /// (#804: this used to unconditionally snapshot the *entire buffer
-    /// text* on every call, including no-op calls made by insert-mode
-    /// cursor movement).
+    /// skip work that's only meaningful when something actually changed.
     pub fn finish_undo_group(&mut self, cursor_after: Cursor) -> bool {
         if let Some(group) = self.current_undo_group.take() {
             if group.dirty {
@@ -1624,16 +1587,15 @@ impl BufferState {
         self.undo_tree.position()
     }
 
-    /// `vimcode.undo.tree(buf)` (#1654 P6) — the full live undo tree, in
-    /// plugin-facing shape. See [`UndoTree::tree_for_plugin`].
+    /// The full live undo tree, in plugin-facing shape. See
+    /// [`UndoTree::tree_for_plugin`].
     pub fn undo_tree_for_plugin(&self) -> Vec<UndoTreeNode> {
         self.undo_tree.tree_for_plugin()
     }
 
-    /// `vimcode.undo.jump(buf, seq)` (#1654 P6) — the one mutation the P6
-    /// read API ships, and it goes entirely through the existing undo
-    /// machinery ([`UndoTree::jump_to_seq`]) rather than hand-rolling a
-    /// buffer swap.
+    /// Jump to a specific undo node by its `seq`. The one mutation the undo
+    /// read API ships, going entirely through the existing undo machinery
+    /// ([`UndoTree::jump_to_seq`]) rather than hand-rolling a buffer swap.
     pub fn undo_jump(&mut self, seq: usize) -> Option<Cursor> {
         let result = self.undo_tree.jump_to_seq(seq);
         self.apply_undo_nav_result(result)
@@ -1655,9 +1617,9 @@ impl BufferState {
 
     /// Discard all undo history — used by `:e!`/file-reload and by
     /// applying an on-disk replace result that bypassed the undo tree
-    /// entirely (both cases: the new content has no relationship to any
-    /// recorded state, so keeping stale nodes around would let `u`/`g-`
-    /// "restore" text that no longer corresponds to anything on disk).
+    /// entirely. The new content has no relationship to any recorded state,
+    /// so keeping stale nodes would let `u`/`g-` "restore" text that no
+    /// longer corresponds to anything on disk.
     pub fn reset_undo_history(&mut self) {
         self.undo_tree = UndoTree::new();
         self.current_undo_group = None;
@@ -1811,9 +1773,9 @@ impl BufferManager {
 
     /// True if `path` (canonicalized) is already open under some `BufferId`.
     /// Mirrors the dedup check `open_file` does internally, exposed so
-    /// callers can decide reuse-vs-create *before* calling it (#1298: `:edit`
+    /// callers can decide reuse-vs-create *before* calling it — `:edit`
     /// reusing the pristine scratch buffer must lose to an already-open
-    /// buffer for the same path, matching Neovim).
+    /// buffer for the same path, matching Neovim.
     pub fn is_path_open(&self, path: &Path) -> bool {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         self.buffers.values().any(|state| {
@@ -1867,7 +1829,7 @@ impl BufferManager {
     /// Rewrite `id`'s buffer in place to open `path`, keeping the same
     /// `BufferId` instead of allocating a new one — Neovim's `:edit` reuses
     /// the still-pristine startup scratch buffer this way rather than
-    /// leaving it behind as a numbered phantom (#1298). Caller
+    /// leaving it behind as a numbered phantom. Caller
     /// (`Engine::open_file_with_mode_impl`) is responsible for checking that
     /// `id` is actually still-pristine and that `path` isn't already open
     /// under a different id; this just performs the in-place replace.
@@ -2140,7 +2102,7 @@ mod tests {
         );
     }
 
-    /// #1721 integration test: `update_syntax_with_limit`'s incremental
+    /// Integration test: `update_syntax_with_limit`'s incremental
     /// path (`patch_highlights` + `update_max_col_incremental`) must agree
     /// with a from-scratch full parse / full line-length rescan after
     /// every edit — not just on average, exactly. The sequence below
@@ -2197,9 +2159,9 @@ mod tests {
         state.update_syntax_with_limit(usize::MAX);
         assert_matches_full_rescan(&mut state);
 
-        // 3. Shrink the line that currently holds the max back down —
-        //    forces the full-rescan fallback, since the touched line
-        //    *was* the max and no longer grows past it.
+        // Shrink the line that currently holds the max back down —
+        // forces the full-rescan fallback, since the touched line
+        // *was* the max and no longer grows past it.
         let text = state.buffer.to_string();
         let start = text
             .find("really_long_identifier_name_0123456789_")
@@ -2220,16 +2182,12 @@ mod tests {
         assert_matches_full_rescan(&mut state);
     }
 
-    /// #1721 review regression: replacing a CJK character with a sibling
-    /// that shares its leading UTF-8 bytes (`字` = `E5 AD 97`, `存` =
-    /// `E5 AD 98`) through the real buffer-mutation path must not panic.
-    /// `compute_edit`'s byte-level common-prefix/suffix scan used to stop
-    /// mid-codepoint for exactly this pair, producing an `InputEdit` whose
-    /// `start_byte`/`new_end_byte` weren't char boundaries — the very next
-    /// use of them, `update_max_col_incremental`'s `&str` range-indexing,
-    /// panicked with "byte index N is not a char boundary" on every such
-    /// keystroke (an everyday CJK `r`-replace or IME correction, not an
-    /// adversarial case).
+    /// Replacing a CJK character with a sibling that shares its leading
+    /// UTF-8 bytes (`字` = `E5 AD 97`, `存` = `E5 AD 98`) through the real
+    /// buffer-mutation path must not panic. `compute_edit`'s byte-level
+    /// common-prefix/suffix scan must snap offsets outwards to ensure
+    /// they are char boundaries for `update_max_col_incremental`'s `&str`
+    /// range-indexing to not panic with "byte index N is not a char boundary".
     #[test]
     fn test_update_syntax_with_limit_cjk_shared_prefix_substitution_no_panic() {
         use crate::core::syntax::{Syntax, SyntaxLanguage};
@@ -2252,20 +2210,12 @@ mod tests {
         assert_eq!(state.max_col, want_max);
     }
 
-    /// #1721 review round 2 regression: the *suffix*-side counterpart of
-    /// the test above. 'җ' (U+0497, `D2 97`) and '字' (U+5B57,
-    /// `E5 AD 97`) share their *trailing* byte and have *different* byte
-    /// lengths, so `compute_edit`'s byte-level common-*suffix* scan stops
-    /// mid-codepoint at a different depth in each text.
-    ///
-    /// The first fix snapped `old_end_byte` inwards against the old text
-    /// and transferred the same numeric delta to `new_end_byte`, which
-    /// left `new_end_byte` on a continuation byte of the new text for the
-    /// `җ` → `字` direction — so `update_max_col_incremental`'s
-    /// `text[edit.new_end_byte..]` panicked with "byte index N is not a
-    /// char boundary", exactly the crash class the round-1 fix was meant
-    /// to close. Both substitution directions are driven here, at the end
-    /// of the buffer (nothing following to force a safe ASCII stop).
+    /// The suffix-side counterpart of shared-prefix cases. 'җ' (U+0497,
+    /// `D2 97`) and '字' (U+5B57, `E5 AD 97`) share their trailing byte
+    /// and have different byte lengths, so `compute_edit`'s byte-level
+    /// common-suffix scan must snap offsets to ensure they are char
+    /// boundaries in both old and new text. Both substitution directions
+    /// are driven here, at the end of the buffer.
     #[test]
     fn test_update_syntax_with_limit_cjk_shared_suffix_substitution_no_panic() {
         use crate::core::syntax::{Syntax, SyntaxLanguage};
@@ -2292,16 +2242,11 @@ mod tests {
         }
     }
 
-    /// #1721 oracle, randomised: a long sequence of random inserts/deletes
+    /// Oracle, randomised: a long sequence of random inserts/deletes
     /// (multi-byte UTF-8, newlines, random positions) plus simulated
-    /// undo/redo, driven through the *real* `update_syntax_with_limit`
-    /// path (not `Syntax` directly — this is what caught a real bug the
-    /// hand-written scenario above didn't: `extract_highlights_range`
-    /// can return a capture whose own span lies outside the queried byte
-    /// range, entirely because an enclosing node happened to overlap it;
-    /// trusting that capture to widen the "drop zone" discarded unrelated,
-    /// still-valid cached highlights). After every step, `highlights` and
-    /// `max_col` must match a from-scratch full parse / full rescan.
+    /// undo/redo, driven through the real `update_syntax_with_limit`
+    /// path. After every step, `highlights` and `max_col` must match a
+    /// from-scratch full parse / full rescan.
     #[test]
     fn test_update_syntax_with_limit_fuzz_matches_full_rescan() {
         use crate::core::syntax::{Syntax, SyntaxLanguage};
@@ -2325,7 +2270,7 @@ mod tests {
         }
 
         fn apply_random_edit(chars: &mut Vec<char>, rng: &mut Lcg) {
-            // Two deliberately-colliding pairs (#1721 review), because
+            // Two deliberately-colliding pairs, because
             // every other char in the original list had a distinct
             // leading *and* trailing byte from every other, which made
             // both classes of bug invisible to the fuzz corpus:
@@ -2347,20 +2292,12 @@ mod tests {
                 'җ', '🙂',
             ];
             let len = chars.len();
-            // In-place *substitution* (#1721 review round 2) is what makes
-            // the colliding pairs above actually collide: an insert or
-            // delete shifts everything after it, so the byte-level
-            // common-prefix/suffix scan meets its first differing byte on
-            // a character boundary almost every time. Only replacing one
-            // character with another pits two encodings against each
-            // other byte-for-byte.
-            //
-            // And the substitution is *biased* towards the colliding
-            // partner rather than left to chance: hitting a pair randomly
-            // needs the chosen position to already hold one of them and
-            // the random replacement to be its exact partner, a
-            // ~0.1%-per-step coincidence that (measured against the
-            // round-1-broken `compute_edit`) 300 steps did not produce.
+            // In-place substitution is what makes the colliding pairs
+            // actually collide: an insert or delete shifts everything after it,
+            // so the byte-level common-prefix/suffix scan meets its first
+            // differing byte on a character boundary almost every time. Only
+            // replacing one character with another pits two encodings against
+            // each other byte-for-byte.
             let partner = |c: char, rng: &mut Lcg| match c {
                 // '字' collides on its leading bytes with '存' and on its
                 // trailing byte with 'җ' — pick either at random.
@@ -2444,7 +2381,7 @@ mod tests {
     // `update_syntax_with_limit`; the production sync is a single-line
     // `set_syntax_max_lines(...)` call in `Engine::new` and `set_value_str`.
 
-    /// #1560 (review finding): `reload_from_disk` — the sibling read path
+    /// `reload_from_disk` — the sibling read path
     /// used by `:e[dit]!` and the idle file-watcher's silent-reload — has
     /// its own `fs::read_to_string` call that reproduces the exact "stream
     /// did not contain valid UTF-8" error for a UTF-16LE-BOM file. This
@@ -2455,13 +2392,10 @@ mod tests {
     /// decoded, not error out.
     #[test]
     fn test_reload_from_disk_utf16le_bom() {
-        // Per-process scratch path (#1498's `harness::scratch_dir`): the fixed
-        // shared name this used to hardcode is byte-identical across test
-        // *processes*, so any other concurrent `cargo test` on the machine (a
-        // second worktree, the coordinator running several workers) truncated
-        // or deleted the file between this test's own write and reload — see
-        // `buffer.rs`'s `unique_temp_path` for the full mechanism and its RED
-        // reproduction.
+        // Use a per-process scratch path: a fixed shared name is byte-identical
+        // across test processes, so any other concurrent `cargo test` on the
+        // machine truncates or deletes the file between this test's own write
+        // and reload.
         let path = crate::harness::scratch_dir("vimcode_buffer_manager_test_reload_utf16le")
             .with_extension("txt");
         std::fs::write(&path, "old content").unwrap();

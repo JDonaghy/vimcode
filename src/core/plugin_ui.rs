@@ -1,4 +1,4 @@
-//! Plugin-declared UI views — the `vimcode.ui.*` widget vocabulary (#146).
+//! Plugin-declared UI views — the `vimcode.ui.*` widget vocabulary.
 //!
 //! A Lua plugin registers a *view* (`vimcode.ui.register_view`) whose `render`
 //! callback returns a declarative widget tree. Vimcode converts that tree into
@@ -7,14 +7,12 @@
 //! panel, and routes the resulting widget events back to the plugin's
 //! `on_event` callback.
 //!
-//! # ABI decision: a vimcode-owned vocabulary, not quadraui's serde shape
+//! # ABI design: a vimcode-owned vocabulary, not quadraui's serde shape
 //!
-//! #1403 asks which wire format plugins author against. This module is the
-//! answer: **a small vimcode-owned vocabulary**, versioned by
+//! This module defines **a small vimcode-owned vocabulary**, versioned by
 //! [`VIEW_SCHEMA_VERSION`], converted to quadraui primitives in one place.
 //! Feeding quadraui's own `Serialize`/`Deserialize` impls straight from Lua
-//! ("verbatim quadraui serde") was rejected for three concrete reasons, all
-//! visible in `quadraui::Form` as pinned today:
+//! is avoided for three concrete reasons, all visible in `quadraui::Form`:
 //!
 //! 1. **quadraui primitives carry app-owned *interaction* state, not just a
 //!    declaration.** `FieldKind::TextInput` has `cursor: Option<usize>` and
@@ -31,13 +29,11 @@
 //!    next `rev = "..."` bump; here a breaking upstream change is absorbed by
 //!    [`crate::render::plugin_view_to_form`] and nothing else.
 //!
-//! The design invariants #146 lists are still honoured, because this vocabulary
-//! keeps them rather than because quadraui's structs are used directly: ids are
-//! owned `String`s allocated at runtime (1), events are plain data
-//! ([`PluginViewEvent`]) with no closures crossing the Rust/Lua boundary (2),
-//! every type here is `Serialize + Deserialize` (3), ids are namespaced per
-//! plugin by [`namespaced_widget_id`] (4), every event names its widget (5),
-//! and nothing borrows from engine state (6).
+//! The design ensures ids are owned `String`s allocated at runtime,
+//! events are plain data ([`PluginViewEvent`]) with no closures crossing the
+//! Rust/Lua boundary, every type here is `Serialize + Deserialize`, ids are
+//! namespaced per plugin by [`namespaced_widget_id`], every event names its
+//! widget, and nothing borrows from engine state.
 //!
 //! # Schema version
 //!
@@ -51,7 +47,7 @@ use serde::{Deserialize, Serialize};
 /// The widget-vocabulary version this build understands.
 pub const VIEW_SCHEMA_VERSION: u32 = 1;
 
-/// Prefix reserved for plugin-owned widget ids (#146 invariant 4).
+/// Prefix reserved for plugin-owned widget ids.
 pub const WIDGET_ID_PREFIX: &str = "plugin:";
 
 /// Build the namespaced `quadraui::WidgetId` string for a plugin field, so two
@@ -76,18 +72,15 @@ fn default_schema_version() -> u32 {
     VIEW_SCHEMA_VERSION
 }
 
-/// One plugin-declared view: either a vertical stack of fields (the
-/// original #146 shape) or a single [`ViewBody`] widget (#1631).
+/// One plugin-declared view: either a vertical stack of fields or a single
+/// [`ViewBody`] widget.
 ///
-/// A view with `body: None` is a field stack — `fields` is the whole tree,
-/// as in schema version 1. Nested containers inside a field stack are still
-/// a deliberate non-goal — `quadraui::Form` is itself a flat field stack.
-/// A view with `body: Some(_)` is instead one list/tree/table/text-view
-/// widget filling the whole panel; `fields` is ignored in that case. The
-/// two are mutually exclusive per view (a Lua `render()` returns one shape
-/// or the other), not layered — #147's headers/params table and response
-/// text view are two *separate* registered views, not two widgets sharing
-/// one panel.
+/// A view with `body: None` is a field stack — `fields` is the whole tree.
+/// Nested containers inside a field stack are not supported; `quadraui::Form`
+/// is itself a flat field stack. A view with `body: Some(_)` is instead one
+/// list/tree/table/text-view widget filling the whole panel; `fields` is
+/// ignored in that case. The two are mutually exclusive per view (a Lua
+/// `render()` returns one shape or the other), not layered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginView {
     /// Plugin-chosen id for the tree as a whole (used as the form's id).
@@ -97,8 +90,8 @@ pub struct PluginView {
     pub schema_version: u32,
     #[serde(default)]
     pub fields: Vec<ViewField>,
-    /// #1631: an alternative single-widget body. `None` keeps the original
-    /// #146 field-stack shape; additive, so no `VIEW_SCHEMA_VERSION` bump.
+    /// An alternative single-widget body. `None` keeps the original field-stack
+    /// shape; additive and does not require a schema version bump.
     #[serde(default)]
     pub body: Option<ViewBody>,
 }
@@ -129,10 +122,9 @@ impl PluginView {
     }
 }
 
-// ─── List / Tree / Table / TextView bodies (#1631) ──────────────────────────
+// ─── List / Tree / Table / TextView bodies ──────────────────────────────────
 
-/// A single-widget view body: what #1631 adds on top of #146's field stack
-/// to cover "lists, trees, tables, text views" (#1403's Phase 1 goal).
+/// A single-widget view body covering lists, trees, tables, and text views.
 ///
 /// The serde tag is the Lua-facing `kind = "..."` key on the table a
 /// `render()` callback returns, exactly like [`ViewFieldKind`]'s `type` tag.
@@ -221,8 +213,8 @@ impl ViewTreeNode {
 
     /// Resolve a `quadraui::TreePath` (`Vec<u16>`) index chain back to the
     /// node it addresses, or `None` if the path is stale (out of range).
-    /// Takes `&[u16]` rather than re-exporting `quadraui::TreePath` here —
-    /// this module stays free of quadraui types (#146's ABI decision).
+    /// Takes `&[u16]` rather than re-exporting `quadraui::TreePath` here.
+    /// This module stays free of quadraui types to isolate the ABI.
     pub fn resolve<'a>(nodes: &'a [ViewTreeNode], path: &[u16]) -> Option<&'a ViewTreeNode> {
         let (&first, rest) = path.split_first()?;
         let node = nodes.get(first as usize)?;
@@ -239,8 +231,8 @@ impl ViewTreeNode {
 pub struct ViewTableColumn {
     #[serde(default)]
     pub title: String,
-    /// Whether cells in this column may be edited in place (#1627's
-    /// text-entry model, keyed by `"r{row}c{col}"` instead of a field id).
+    /// Whether cells in this column may be edited in place.
+    /// Editable cells are keyed by `"r{row}c{col}"` address.
     #[serde(default)]
     pub editable: bool,
 }
@@ -400,8 +392,8 @@ pub struct ViewToggle {
 
 // ─── Events ──────────────────────────────────────────────────────────────────
 
-/// What happened to a widget. Plain data — no closures cross the Rust/Lua
-/// boundary (#146 invariant 2).
+/// What happened to a widget. Plain data with no closures crossing the
+/// Rust/Lua boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ViewEventKind {
     ButtonClicked,
@@ -421,7 +413,7 @@ pub enum ViewEventKind {
         value: String,
     },
     FocusChanged,
-    // ── ViewBody events (#1631) ──────────────────────────────────────────
+    // ── ViewBody events ──────────────────────────────────────────────────
     /// A `List`/`Table` row moved into selection (index into
     /// `items`/`rows`).
     ItemSelected {
@@ -457,8 +449,7 @@ pub enum ViewEventKind {
 }
 
 impl ViewEventKind {
-    /// The `event.kind` string handed to Lua. Matches #146's illustrative API
-    /// (`event.kind == "ButtonClicked"`).
+    /// The `event.kind` string handed to Lua.
     pub fn kind_name(&self) -> &'static str {
         match self {
             ViewEventKind::ButtonClicked => "ButtonClicked",
@@ -479,9 +470,8 @@ impl ViewEventKind {
     }
 }
 
-/// Encode a `(row, col)` table-cell address as the `field_id` carried on
-/// [`PluginViewTextEditState`], so an editable table cell reuses #1627's
-/// text-entry model verbatim instead of a parallel one.
+/// Encode a `(row, col)` table-cell address as the `field_id` for an
+/// editable table cell, reusing the text-entry model instead of a parallel one.
 pub fn table_cell_field_id(row: usize, col: usize) -> String {
     format!("r{row}c{col}")
 }
@@ -501,23 +491,21 @@ pub struct PluginViewEvent {
     /// The registered view name (the `ext:` panel name).
     pub view: String,
     /// The plugin-authored field id — *not* the namespaced `quadraui::WidgetId`.
-    /// Plugins see the ids they wrote (#146's `event.widget_id == "send"`).
+    /// Plugins see the ids they wrote.
     pub widget_id: String,
     pub kind: ViewEventKind,
 }
 
-// ─── In-panel text entry (#1627) ────────────────────────────────────────────
+// ─── In-panel text entry ────────────────────────────────────────────────────
 
 /// vimcode-owned edit state for whichever `Text`/`Password`/`TextArea` field
 /// currently has keyboard focus, in either the sidebar or an editor-area tab.
 ///
 /// This is `Engine`-side interaction state, never serialized across the
 /// Rust/Lua boundary — plugins see only the committed value, via
-/// [`ViewEventKind::TextChanged`]/[`ViewEventKind::TextCommitted`]. That split
-/// is exactly what #146's ABI decision (this module's doc comment, reason 1)
-/// exists to make possible: a plugin cannot park the cursor mid-codepoint or
-/// otherwise corrupt vimcode's own interaction state, because it never has a
-/// handle to it.
+/// [`ViewEventKind::TextChanged`]/[`ViewEventKind::TextCommitted`]. Plugins
+/// cannot park the cursor mid-codepoint or corrupt vimcode's interaction state,
+/// because they never have a handle to uncommitted state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginViewTextEditState {
     /// The view that owns the focused field.
@@ -648,7 +636,7 @@ mod tests {
         assert_eq!(view.field_index("go"), Some(2));
     }
 
-    // ── ViewBody (#1631) ────────────────────────────────────────────────
+    // ── ViewBody ────────────────────────────────────────────────────────
 
     #[test]
     fn view_body_list_round_trips_and_tags_as_list() {

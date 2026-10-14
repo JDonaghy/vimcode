@@ -32,13 +32,13 @@ const MAX_DEFERRED_DRAIN_ROUNDS: usize = 8;
 
 /// Upper bound on [`Engine::PluginSpawnEvent`]s drained per
 /// `poll_plugin_spawns` tick, across every live `vimcode.loop.spawn` handle
-/// combined (#1624 review, non-blocking). Without this, a child that
-/// produces output faster than its `on_stdout` Lua callback can be invoked
-/// (e.g. a plugin spawning `yes`, or any high-throughput producer) could
-/// make a single tick drain an unbounded backlog, starving the main thread —
-/// same reasoning as [`MAX_DEFERRED_DRAIN_ROUNDS`] above. Any events left in
-/// a handle's channel past the cap are simply picked up on the next tick —
-/// nothing is dropped, only deferred.
+/// combined. Without this, a child that produces output faster than its
+/// `on_stdout` Lua callback can be invoked (e.g. a plugin spawning `yes`, or
+/// any high-throughput producer) could make a single tick drain an unbounded
+/// backlog, starving the main thread — same reasoning as
+/// [`MAX_DEFERRED_DRAIN_ROUNDS`] above. Any events left in a handle's channel
+/// past the cap are simply picked up on the next tick — nothing is dropped,
+/// only deferred.
 const MAX_SPAWN_EVENTS_PER_TICK: usize = 256;
 
 /// Upper bound on `Engine::async_shell_last_exit`'s size — see
@@ -46,7 +46,7 @@ const MAX_SPAWN_EVENTS_PER_TICK: usize = 256;
 const MAX_ASYNC_SHELL_LAST_EXIT_ENTRIES: usize = 256;
 
 /// The form of a workspace root that is safe to hand to
-/// [`std::process::Command::current_dir`] for a plugin-spawned shell (#1751).
+/// [`std::process::Command::current_dir`] for a plugin-spawned shell.
 ///
 /// `Engine::cwd` is frequently a `canonicalize()` result, which on Windows is
 /// the verbatim `\\?\C:\...` extended-length form. Every plugin shell command
@@ -101,18 +101,18 @@ impl Engine {
 
     /// Install a plugin manager. Wraps it in the `Rc` the dispatch path needs:
     /// dispatch clones the `Rc` out rather than `take()`ing the manager, so the
-    /// field stays populated for the duration of a Lua call (#1214) — that is
+    /// field stays populated for the duration of a Lua call — that is
     /// what lets nested code still see "there is a plugin manager" and what
     /// makes loaning `&mut Engine` to Lua sound (no outstanding borrow of
     /// `self.plugin_manager` is held across the call).
     pub fn set_plugin_manager(&mut self, mut mgr: plugin::PluginManager) {
-        // #146: seed `plugin_views` so a `vimcode.ui.register_view` panel is
+        // Seed `plugin_views` so a `vimcode.ui.register_view` panel is
         // recognisable as view-backed before its `render` callback has ever run
         // (the sidebar has to pick a body *shape* on the first frame it paints).
         for name in mgr.view_names() {
             self.plugin_views.entry(name).or_default();
         }
-        // #1623: merge load-time `vimcode.keymap.set` registrations into
+        // Merge load-time `vimcode.keymap.set` registrations into
         // `user_keymaps` so they are consulted through the same
         // before-built-ins path as a config keymap (`Engine::try_user_keymap`).
         // `<leader>` is expanded here — the free-standing harvest inside
@@ -138,7 +138,7 @@ impl Engine {
     /// synchronously from [`Self::set_plugin_manager`], right after
     /// installing the new manager and dropping the old one.
     ///
-    /// #1624 review (blocking): `PluginManager::next_handle_id` restarts at
+    /// `PluginManager::next_handle_id` restarts at
     /// 0 for every fresh manager, while `plugin_timers`/`plugin_spawns` are
     /// single `HashMap`s that persist across manager generations. Cleanup
     /// used to be entirely lazy — done only inside `poll_plugin_timers`/
@@ -171,7 +171,7 @@ impl Engine {
                 }
             }
         }
-        // #1630: same staleness pattern for `vimcode.picker.open` — a picker
+        // Same staleness pattern for `vimcode.picker.open` — a picker
         // whose owning manager just went away is closed (if it's the one
         // currently open) without calling into the dead Lua state, the same
         // "clean up, don't call back" rule the spawns loop above follows.
@@ -190,7 +190,7 @@ impl Engine {
                 self.close_picker();
             }
         }
-        // #1632: same staleness pattern for `vimcode.http.request` — an
+        // Same staleness pattern for `vimcode.http.request` — an
         // in-flight request whose owning manager just went away is killed
         // (its `curl` child) and dropped without ever calling into the dead
         // Lua state, same reasoning as the spawns loop above.
@@ -207,7 +207,7 @@ impl Engine {
                 }
             }
         }
-        // #1806: same staleness pattern for `vimcode.fs.walk`/`vimcode.fs.
+        // Same staleness pattern for `vimcode.fs.walk`/`vimcode.fs.
         // grep` — a handle whose owning manager just went away is cancelled
         // (stopping the background walk promptly, same as an explicit
         // `:cancel()`) and dropped without calling into the dead Lua state.
@@ -226,7 +226,7 @@ impl Engine {
         }
     }
 
-    // ── Plugin-declared UI views (#146) ────────────────────────────────────
+    // ── Plugin-declared UI views ───────────────────────────────────────────
 
     /// Whether `name` names a `vimcode.ui.register_view` view.
     pub fn is_plugin_view(&self, name: &str) -> bool {
@@ -272,7 +272,7 @@ impl Engine {
                 if changed {
                     // A shorter field stack must not leave the selection past
                     // its end. `view.body.is_none()` guards this to
-                    // field-stack views only (#1631 review) — a body-kind
+                    // field-stack views only — a body-kind
                     // view's `fields` is *always* empty
                     // (`Some(body)` ⟹ `fields: Vec::new()`, `core::plugin::
                     // parse_view_body`), so `ext_panel_selected >= view.
@@ -309,8 +309,8 @@ impl Engine {
     ///
     /// Fires the `panel_focus` hook (how a `vimcode.panel.register` panel learns
     /// to populate its sections) and, for a `vimcode.ui.register_view` panel,
-    /// re-runs its `render` callback so the form painted this frame is current
-    /// (#146). Both activation paths — the activity-bar click router in
+    /// re-runs its `render` callback so the form painted this frame is current.
+    /// Both activation paths — the activity-bar click router in
     /// `render.rs` and `Engine::activate_activity_bar_item` — go through here so
     /// the two cannot drift.
     pub(crate) fn on_ext_panel_focused(&mut self, name: &str) {
@@ -327,7 +327,7 @@ impl Engine {
         }
     }
 
-    // ── In-panel text entry / editor-tab hosting (#1627) ────────────────────
+    // ── In-panel text entry / editor-tab hosting ────────────────────────────
 
     /// Whether `name` names the view currently hosted as an editor-area tab
     /// in the *active* window, if any (`Engine::open_plugin_view_tab`).
@@ -338,7 +338,7 @@ impl Engine {
 
     /// Open `name` (a `vimcode.ui.register_view` view) as a new tab in the
     /// active editor group, the way `vimcode.ui.open_view(name, {location =
-    /// "tab"})` is wired (#1627).
+    /// "tab"})` is wired.
     ///
     /// Reuses `Engine::new_tab`'s existing scratch-buffer-in-a-new-tab
     /// machinery verbatim — the resulting tab is a genuine `Tab`/`Window`/
@@ -427,8 +427,8 @@ impl Engine {
         }
     }
 
-    /// Read the raw selected-column index for `host`'s `Table`-kind view
-    /// (#1631). "Raw" — callers that need it clamped to an actually-
+    /// Read the raw selected-column index for `host`'s `Table`-kind view.
+    /// "Raw" — callers that need it clamped to an actually-
     /// editable column (`render::handle_plugin_view_table_key`'s
     /// `current_col`) do that themselves, the same "read-time clamp"
     /// contract `Engine::plugin_view_selected` uses for a stale row index.
@@ -453,7 +453,7 @@ impl Engine {
     ///
     /// `pub(crate)` (not just used from this module) since `render::
     /// navigate_flat_selection` — the `List`/`Table` body-kind keyboard
-    /// navigation (#1631) — calls this after every selection move, the same
+    /// navigation — calls this after every selection move, the same
     /// way the field-stack navigation just below does; without it a
     /// `Down`/`End`/`G` press could move `selected` out of the visible
     /// scroll window with nothing to compensate.
@@ -576,7 +576,7 @@ impl Engine {
     /// view is never a keyboard trap) is handed to
     /// [`Self::handle_plugin_view_text_key`] instead — typed characters must
     /// insert into the field rather than double as `j`/`k` navigation once a
-    /// field can actually take text (#1627).
+    /// field can actually take text.
     pub(crate) fn handle_plugin_view_key(
         &mut self,
         name: &str,
@@ -591,7 +591,7 @@ impl Engine {
             return false;
         };
 
-        // #1631: a `ViewBody`-kind view routes through its own kind's
+        // A `ViewBody`-kind view routes through its own kind's
         // keyboard handling instead of the field-stack navigation below —
         // see `render::paint_plugin_view_list`'s sibling doc comment for why
         // this is "one sibling translation per kind" rather than a scattered
@@ -780,7 +780,7 @@ impl Engine {
 
     /// Keyboard handling for a focused `Text`/`Password`/`TextArea` row —
     /// insert/delete, cursor movement, selection and clipboard paste, all
-    /// vimcode-owned (#1627). Mirrors `Engine::handle_explorer_rename_key`'s
+    /// vimcode-owned. Mirrors `Engine::handle_explorer_rename_key`'s
     /// shape (byte-offset cursor/selection, the same key set) since that is
     /// the existing precedent for a vimcode-owned inline text editor; kept as
     /// a separate implementation rather than a shared helper because that
@@ -1125,7 +1125,7 @@ impl Engine {
         // plugin's immediate edits collapse into one undo step per buffer —
         // matching the single batch the queued replay path produces.
         self.finish_plugin_undo_groups();
-        // #1627: now that depth is genuinely back to `0`, it's safe to run
+        // Now that depth is genuinely back to `0`, it's safe to run
         // any `Engine::open_plugin_view_tab` refresh that had to defer
         // itself while nested inside this very call — see
         // `plugin_view_tab_pending_refresh`'s doc for why it can't just run
@@ -1292,7 +1292,7 @@ impl Engine {
         }
         state.dirty = true;
         state.mark_syntax_stale();
-        // #1653: `set_lines` is a line-range splice — a delete of `[s, e)`
+        // `set_lines` is a line-range splice — a delete of `[s, e)`
         // followed by an insert of the new lines at `s` — so decoration
         // marks shift exactly like the `d`/`O` paths in `engine/buffers.rs`,
         // even though this immediate API bypasses `insert_with_undo`/
@@ -1361,7 +1361,7 @@ impl Engine {
             None => return false,
         };
         if switched {
-            // #1623: BufLeave for the window's previous buffer, delivering
+            // BufLeave for the window's previous buffer, delivering
             // its handle — fired before BufEnter, same ordering vim uses.
             if let Some(old) = old_buf_id {
                 self.plugin_event("BufLeave", &old.0.to_string());
@@ -1548,7 +1548,7 @@ impl Engine {
     }
 
     // =========================================================================
-    // Native API P6 (#1654) — read-only syntax tree / undo tree / diagnostics.
+    // Native API P6 — read-only syntax tree / undo tree / diagnostics.
     // Thin buffer-handle-resolution wrappers; the actual tree-sitter work
     // lives on `crate::core::syntax::Syntax` (`node_at`/`query_captures`),
     // the undo-tree work on `BufferState`/`UndoTree` (`buffer_manager.rs`),
@@ -1760,7 +1760,7 @@ impl Engine {
                 // Only load extensions that are in extension_state.installed
                 // (or disabled_plugins for the skip check).  Extensions whose
                 // scripts exist on disk but are not marked installed are ignored.
-                // #1807: an extension can become incompatible with the
+                // An extension can become incompatible with the
                 // running vimcode *after* it was installed — most commonly
                 // a vimcode downgrade, or `:ExtUpdate` pulling a newer
                 // manifest that raises `requires_vimcode`. Resolve
@@ -1792,7 +1792,7 @@ impl Engine {
                             if !self.extension_state.is_installed(&ext_name) {
                                 continue;
                             }
-                            // #1807: skip this extension's scripts (not its
+                            // Skip this extension's scripts (not its
                             // LSP/DAP config) when its `requires_vimcode`
                             // constraint is no longer met by the running
                             // vimcode, instead of letting a script error out
@@ -1841,7 +1841,7 @@ impl Engine {
                 self.populate_highlight_overrides();
                 // Fire VimEnter event after plugin initialization is complete
                 self.plugin_event("VimEnter", "");
-                // #1807: surface which installed extensions were skipped for
+                // Surface which installed extensions were skipped for
                 // being incompatible with the running vimcode, naming each
                 // extension and its required version — after `VimEnter` so a
                 // plugin's own startup message doesn't clobber this one.
@@ -1907,7 +1907,7 @@ impl Engine {
 
         // Registers snapshot
         // The plugin ABI predates blockwise registers and still exposes a plain
-        // `is_linewise` bool (#807); flatten at the boundary.
+        // `is_linewise` bool; flatten at the boundary.
         let registers_snapshot = self
             .registers
             .iter()
@@ -2191,14 +2191,14 @@ impl Engine {
             self.feed_keys(&keys);
         }
         // Launch async shell requests, built on the same `spawn_piped` core
-        // `vimcode.loop.spawn` uses (#1624) — see `execute::AsyncShellTask`
+        // `vimcode.loop.spawn` uses — see `execute::AsyncShellTask`
         // and `Self::poll_async_shells` for how the streamed events are
         // accumulated back into `async_shell`'s frozen single-string,
         // deliver-at-exit contract.
         //
-        // #948 review (non-blocking): no dedicated regression test for this
+        // No dedicated regression test for this
         // call site specifically — it goes through the shared `shell_cmd()`
-        // construction point (#1492) already covered by `:!`'s tests
+        // construction point already covered by `:!`'s tests
         // (`tests/new_vim_features.rs`'s `test_bang_command_honours_shell_
         // env_var` and `src/tui_main/shell_app.rs`'s `bang_command_shell_
         // output_paints_on_command_line_via_shell_app`), so a future
@@ -2207,7 +2207,7 @@ impl Engine {
         for req in ctx.async_shell_requests {
             let mut cmd = crate::core::terminal::shell_cmd(&req.command);
             // Default to the engine's own workspace `cwd` when the plugin
-            // didn't pass one (#1751). Without it, an omitted `cwd` falls
+            // didn't pass one. Without it, an omitted `cwd` falls
             // through to `std::process::Command`'s default — the *OS
             // process's* current directory, which only matches the open
             // workspace by convention (a terminal that `cd`ed there first).
@@ -2396,14 +2396,14 @@ impl Engine {
         for url in ctx.open_urls {
             self.open_url(&url);
         }
-        // #146: honour `vimcode.ui.refresh(name)`. Bounded by
+        // Honour `vimcode.ui.refresh(name)`. Bounded by
         // `plugin_view_render_depth` inside `refresh_plugin_view`, so a `render`
         // callback that asks to refresh itself settles instead of recursing.
         for name in ctx.plugin_view_refresh {
             self.refresh_plugin_view(&name);
         }
         // A dispatch's queued output is now applied, so this is the end of that
-        // dispatch: flush any event that fired from inside it (#1214). Doing it
+        // dispatch: flush any event that fired from inside it. Doing it
         // here rather than at each of the four dispatch entry points keeps the
         // "deferred events run once the outer callback's effects have landed"
         // ordering in one place.
@@ -2417,7 +2417,7 @@ impl Engine {
     /// only once `Exit` arrives — preserving `async_shell`'s frozen "deliver
     /// the whole output at exit" contract even though the underlying process
     /// is now spawned through the same streaming core `vimcode.loop.spawn`
-    /// uses (#1624). `Engine::async_shell_last_exit` is updated first, so a
+    /// uses. `Engine::async_shell_last_exit` is updated first, so a
     /// handler reading `vimcode.async_shell_exit_code(event)` from inside the
     /// very callback this fires sees the code that just landed.
     ///
@@ -2469,7 +2469,7 @@ impl Engine {
         self.async_shell_last_exit.insert(event, code);
     }
 
-    // ─── `vimcode.loop.timer`/`vimcode.schedule`/`vimcode.defer` (#1624) ────
+    // ─── `vimcode.loop.timer`/`vimcode.schedule`/`vimcode.defer` ────────────
 
     /// Register a timer/schedule/defer callback, due `ms` milliseconds from
     /// now (repeating every `ms` if `repeat`). Returns the handle id as an
@@ -2582,7 +2582,7 @@ impl Engine {
         fired
     }
 
-    // ─── `vimcode.loop.spawn` (#1624) ───────────────────────────────────────
+    // ─── `vimcode.loop.spawn` ───────────────────────────────────────────────
 
     /// `vimcode.loop.spawn(cmd, args, opts)`: launch a child process and wire
     /// its streamed stdout/stderr and exit status to the given (optional)
@@ -2707,7 +2707,7 @@ impl Engine {
                 continue;
             }
             loop {
-                // Bounded per-tick drain (#1624 review): check the budget
+                // Bounded per-tick drain: check the budget
                 // *before* touching the channel. `try_recv()` removes the
                 // message the moment it returns `Ok`, so testing the cap
                 // after the receive would pop an event and then drop it on
@@ -2756,7 +2756,7 @@ impl Engine {
         redraw
     }
 
-    // ─── `vimcode.http` (#1632) ─────────────────────────────────────────────
+    // ─── `vimcode.http` ─────────────────────────────────────────────────────
 
     /// `vimcode.http.request(opts, cb)`: launch an async HTTP request on a
     /// background thread and wire its eventual response (or error) to `cb`.
@@ -2769,7 +2769,7 @@ impl Engine {
     /// `curl`, deregistering it again if the spawn fails — the reverse order
     /// (spawn first, register only on success) leaked `on_response`'s
     /// `LuaRegistryKey` slot on the "curl failed to start" path, since it was
-    /// dropped without ever reaching `remove_http_callback` (#1632 review).
+    /// dropped without ever reaching `remove_http_callback`.
     pub(crate) fn plugin_api_http_request(
         &mut self,
         method: String,
@@ -2882,7 +2882,7 @@ impl Engine {
         redraw
     }
 
-    // ─── `vimcode.completion` (#1805) ───────────────────────────────────────
+    // ─── `vimcode.completion` ───────────────────────────────────────────────
 
     /// `vimcode.completion.register(...)`'s runtime path — `id` was
     /// already minted by the Lua binding (`next_completion_source_id`)
@@ -3119,7 +3119,7 @@ impl Engine {
         }
     }
 
-    // ─── `vimcode.picker` (#1630) ───────────────────────────────────────────
+    // ─── `vimcode.picker` ───────────────────────────────────────────────────
 
     /// `vimcode.picker.open(...)`: open the unified picker fed by plugin
     /// data. Returns the handle id, or `None` if there is no live plugin
@@ -3133,7 +3133,7 @@ impl Engine {
         on_query: Option<mlua::RegistryKey>,
     ) -> Option<u64> {
         let pm = self.plugin_manager.clone()?;
-        // #1630 review: a plugin re-invoking `vimcode.picker.open` while a
+        // A plugin re-invoking `vimcode.picker.open` while a
         // previous handle is still registered (the natural telescope-style
         // pattern — a command re-run on every keypress) must not leak the
         // old registration. `open_picker` below unconditionally clears
@@ -3147,7 +3147,7 @@ impl Engine {
         let id = pm.register_picker(on_select, on_cancel, on_query);
         self.plugin_pickers.insert(id, std::rc::Rc::downgrade(&pm));
         self.open_picker(PickerSource::Custom(format!("plugin:{id}")));
-        // #1630 review: don't let a title-less `open()` call blank out
+        // Don't let a title-less `open()` call blank out
         // `open_picker`'s own `format!("{:?}", source)` fallback with an
         // empty header.
         self.picker_title = if title.is_empty() {
@@ -3320,7 +3320,7 @@ impl Engine {
     /// `Engine::picker_filter`. Does *not* tear the picker down; it stays
     /// open regardless of what (if anything) `on_query` does.
     ///
-    /// **Reentrancy note (#1630 review):** this goes through
+    /// **Reentrancy note:** this goes through
     /// `with_plugin_dispatch`, which is a silent no-op while a dispatch is
     /// already in flight (`plugin_dispatch_depth > 0`). If `:append`/
     /// `:set_items` is called from *inside* an already-running plugin
@@ -3384,7 +3384,7 @@ impl Engine {
 
     /// Fire an event hook (e.g. "save", "open") for all registered listeners.
     ///
-    /// **Reentrancy (#1214).** An event that fires *while a plugin callback is
+    /// **Reentrancy.** An event that fires *while a plugin callback is
     /// running* — e.g. a plugin's own immediate `vimcode.buffer.set_lines`
     /// triggering a buffer-change event — cannot dispatch straight away,
     /// because Lua must not be re-entered while `&mut Engine` is loaned to it.
@@ -3469,7 +3469,7 @@ impl Engine {
     }
 
     /// Fire `CursorMoved` (or `CursorMovedI` in Insert/Replace mode) for the
-    /// active window (#1623). Arg is the active window handle, matching the
+    /// active window. Arg is the active window handle, matching the
     /// immediate API's integer-handle convention (a plugin reads the actual
     /// position back via `vimcode.window.get_cursor`).
     fn fire_cursor_moved_event(&mut self) {
@@ -3482,7 +3482,7 @@ impl Engine {
         self.plugin_event(event, &win);
     }
 
-    /// Flush the `CursorMoved`/`CursorMovedI` debounce (#1623) — a sibling of
+    /// Flush the `CursorMoved`/`CursorMovedI` debounce — a sibling of
     /// [`Self::flush_cursor_move_hook`], kept on its own timestamp
     /// (`cursor_moved_event_pending`) precisely so it cannot alter that
     /// method's legacy Normal-mode-only firing scope. Called from the same
@@ -3499,7 +3499,7 @@ impl Engine {
         true
     }
 
-    /// Fire `WinLeave`/`WinEnter` for a window-focus change (#1623). Handles
+    /// Fire `WinLeave`/`WinEnter` for a window-focus change. Handles
     /// are the (decimal) window id, matching the immediate API's convention.
     /// No-op — including no event-hook lookup — when the window didn't
     /// actually change, so callers can call this unconditionally after every
@@ -3521,7 +3521,7 @@ mod spawn_cwd_tests {
 
     /// A plain absolute workspace root is handed through untouched on every
     /// platform — this is the overwhelmingly common case for `async_shell`'s
-    /// `cwd` default (#1751).
+    /// `cwd` default.
     #[test]
     fn plain_absolute_path_is_unchanged() {
         #[cfg(windows)]
@@ -3563,7 +3563,7 @@ mod spawn_cwd_tests {
 
 #[cfg(test)]
 mod requires_vimcode_loader_gate_tests {
-    //! #1807 (fix round 1): `Engine::plugin_init`'s loader-tier gate — the
+    //! `Engine::plugin_init`'s loader-tier gate — the
     //! half of the issue deferred in the original commit over a live
     //! file-overlap concern with #1806's branch. An installed extension
     //! whose `requires_vimcode` constraint is unmet by the running
@@ -3689,7 +3689,7 @@ mod requires_vimcode_loader_gate_tests {
 mod settings_snapshot_tests {
     use crate::core::engine::Engine;
 
-    /// Review regression (#952): the VSCode-extension-settings bridge
+    /// Review regression: the VSCode-extension-settings bridge
     /// whitelist listed `ai_provider`/`ai_model`/`ai_base_url`/
     /// `ai_completions` but not the newer `acp_agent_command` setting, so a
     /// plugin/extension reading `vimcode.settings` (backed by this
