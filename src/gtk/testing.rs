@@ -1755,31 +1755,38 @@ mod tests {
         let mut h = harness(engine, 1400, 900);
         h.driver.render();
 
-        // ---- (1) full-width fill, capping the activity bar/sidebar ----
+        // ---- (1) main-column fill, sidebar/activity bar run to bottom ----
+        // With `status_bar_under_main_column` enabled, the status bar is
+        // confined to the main column — x=0 should show the activity bar's
+        // own fill, not status_bg. The status bar fill must start at the
+        // mode badge's own left edge (within the main column bounds).
         let mode_bounds = h
             .driver
             .find_bounds("NORMAL")
             .expect("the mode badge must paint on the status bar's row");
         let bar_y = (mode_bounds.y + mode_bounds.height / 2.0) as i32;
-        let (r, g, b) = h.driver.pixel(0, bar_y);
         let theme = crate::render::Theme::onedark();
+
+        // The activity bar / sidebar run through the status bar row at x=0.
+        let (r0, g0, b0) = h.driver.pixel(0, bar_y);
+        assert_ne!(
+            (r0, g0, b0),
+            (theme.status_bg.r, theme.status_bg.g, theme.status_bg.b),
+            "with status_bar_under_main_column, x=0 at the status bar's \
+             row must NOT be status_bg — the activity bar / sidebar run \
+             to the window bottom; sampled {:?} at y={bar_y}",
+            (r0, g0, b0)
+        );
+
+        // The status bar itself must be present inside the main column.
+        let bar_x = mode_bounds.x as i32;
+        let (r, g, b) = h.driver.pixel(bar_x, bar_y);
         assert_eq!(
             (r, g, b),
             (theme.status_bg.r, theme.status_bg.g, theme.status_bg.b),
-            "the status bar's fill must reach the window's left edge \
-             (x=0) — capping the activity bar and sidebar instead of \
-             letting them run through its row — and come from \
-             theme.status_bg, not whatever colour the activity bar/\
-             sidebar/background paint; sampled {:?} at y={bar_y}",
+            "the status bar fill must be present inside the main column \
+             (at x={bar_x}); sampled {:?} at y={bar_y}",
             (r, g, b)
-        );
-        // Sanity: this is a real colour switch, not a coincidence — the
-        // activity bar's own fill (`theme.tab_bar_bg` on this backend) is
-        // a distinctly different value.
-        assert_ne!(
-            (r, g, b),
-            (theme.tab_bar_bg.r, theme.tab_bar_bg.g, theme.tab_bar_bg.b),
-            "the x=0 sample must not still be the activity bar's own fill"
         );
 
         // ---- (2) segment order: VS Code's left/right split ----
@@ -12168,7 +12175,10 @@ mod minimap {
         // Replicate `build_rendered_window`'s `total_chars` formula exactly to
         // verify the real column delta matches.
         let char_width = h_on.painted_char_width();
-        const SCROLLBAR_RESERVE_PX: f64 = 8.0; // mirrors `GtkBackend::scrollbar_reserve()`
+        // The effective scrollbar reserve is now
+        // max(editor_v_scrollbar_width, backend.scrollbar_reserve()),
+        // i.e. max(16.0, 8.0) = 16.0, not the backend's raw 8.0.
+        const SCROLLBAR_RESERVE_PX: f64 = 16.0;
         let gutter = crate::render::scroll_gutter_width(SCROLLBAR_RESERVE_PX, char_width);
         let minimap_w_for_build = strip.width + (gutter - SCROLLBAR_RESERVE_PX);
         let total_chars_off = ((off_w - SCROLLBAR_RESERVE_PX) / char_width).floor();
@@ -12625,15 +12635,12 @@ mod minimap {
         );
     }
 
-    /// Acceptance: the plain (no-modifier) minimap thumb drag must map within
-    /// the minimap's own scale — the same sliding window the viewport paints —
-    /// not jump proportionally across the whole file like the real scrollbar
-    /// handle does. Same gesture, fixture and geometry as the sibling Alt-held
-    /// test above (full top-to-bottom drag on a 200,000-line buffer) — only the
-    /// modifier differs — so a regression that left the Alt-gating dead would
-    /// fail this test while the sibling kept passing.
+    /// Acceptance: a plain (no-modifier) minimap thumb drag uses file-wide
+    /// geometry — the full strip maps to the full file, identical to VS Code.
+    /// Same gesture, fixture and geometry as the sibling Alt-held test above
+    /// (full top-to-bottom drag on a 200,000-line buffer).
     #[test]
-    fn dragging_the_minimap_viewport_highlight_scrolls_within_its_own_scale_by_default_on_gtk() {
+    fn dragging_the_minimap_viewport_highlight_traverses_the_whole_file_on_gtk() {
         const TOTAL_LINES: usize = 200_000;
         fn engine_with_very_long_buffer() -> Engine {
             let mut engine = Engine::new();
@@ -12695,11 +12702,11 @@ mod minimap {
         });
 
         assert!(
-            top < TOTAL_LINES / 10,
+            top > TOTAL_LINES * 9 / 10,
             "a plain (no-modifier) drag from the highlight's top edge to \
-             the strip's bottom row must stay within roughly the minimap's \
-             own painted window, not traverse virtually the whole file — \
-             landed on line {top} of {TOTAL_LINES}"
+             the strip's bottom row must traverse virtually the whole file \
+             (file-wide geometry, matching VS Code) — landed on line \
+             {top} of {TOTAL_LINES}"
         );
     }
 

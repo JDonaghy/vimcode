@@ -7818,12 +7818,11 @@ mod tests {
             );
         }
 
-        /// The **plain** (no-modifier) minimap thumb drag must map within the
-        /// minimap's own scale — the sliding window — not jump proportionally
-        /// across the whole file the way the real scrollbar handle does. TUI
+        /// A plain (no-modifier) minimap thumb drag uses file-wide geometry —
+        /// the full strip maps to the full file, matching VS Code. TUI
         /// counterpart of the GTK test.
         #[test]
-        fn dragging_the_minimap_viewport_highlight_scrolls_within_its_own_scale_by_default() {
+        fn dragging_the_minimap_viewport_highlight_traverses_the_whole_file() {
             const TOTAL_LINES: usize = 200_000;
             let mut engine = plain_engine();
             // Minimap is experimental and off by default — this test
@@ -7869,11 +7868,11 @@ mod tests {
             });
 
             assert!(
-                top < TOTAL_LINES / 10,
+                top > TOTAL_LINES * 9 / 10,
                 "a plain (no-modifier) drag from the highlight's top edge \
-                 to the strip's bottom row must stay within roughly the \
-                 minimap's own painted window, not traverse virtually the \
-                 whole file — landed on line {top} of {TOTAL_LINES}; \
+                 to the strip's bottom row must traverse virtually the \
+                 whole file (file-wide geometry, matching VS Code) — \
+                 landed on line {top} of {TOTAL_LINES}; \
                  screen:\n{screen}"
             );
         }
