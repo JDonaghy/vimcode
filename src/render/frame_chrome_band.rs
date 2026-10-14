@@ -1032,6 +1032,29 @@ pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
     }
 }
 
+// ─── skin-driven chrome tokens ───────────────────────────────────────────────
+//
+// Pure accessors onto the process-wide [`active_skin`]'s title-bar height and
+// chrome padding. Distinct from [`TITLE_BAR_CONTROLS_MIN_GAP_PX`] and
+// [`TITLE_BAR_CONTROLS_SLACK_PX`] above, which restate quadraui's own
+// internal `StatusBar::layout_padded` min-gap convention and must track that
+// convention, not the skin.
+
+/// The active skin's title bar height, in pixels.
+pub fn skin_title_bar_height_px() -> f64 {
+    active_skin().bars.title_bar as f64
+}
+
+/// The active skin's horizontal/vertical chrome padding, in pixels, as
+/// `(horizontal, vertical)`.
+pub fn skin_chrome_padding_px() -> (f64, f64) {
+    let spacing = active_skin().spacing;
+    (
+        spacing.chrome_padding_h as f64,
+        spacing.chrome_padding_v as f64,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1647,5 +1670,29 @@ mod tests {
         let el = compute_editor_layout(&engine, 10.0, lh, false);
         let r = super::modal_scrim_rect(&engine, &el, 1200.0, 0.0, lh);
         assert_eq!(r.height, 0.0);
+    }
+
+    #[test]
+    fn skin_chrome_accessors_track_the_active_skin() {
+        let _guard = crate::render::skin::TEST_SKIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::render::set_active_skin(crate::render::Skin {
+            bars: crate::render::BarHeights {
+                title_bar: 44.0,
+                ..crate::render::BarHeights::default()
+            },
+            spacing: crate::render::Spacing {
+                chrome_padding_h: 12.0,
+                chrome_padding_v: 8.0,
+                ..crate::render::Spacing::default()
+            },
+            ..crate::render::Skin::default()
+        });
+
+        assert_eq!(skin_title_bar_height_px(), 44.0);
+        assert_eq!(skin_chrome_padding_px(), (12.0, 8.0));
+
+        crate::render::set_active_skin(crate::render::Skin::default());
     }
 }

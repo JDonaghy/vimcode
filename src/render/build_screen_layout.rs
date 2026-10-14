@@ -839,3 +839,66 @@ pub fn build_screen_layout_with_breadcrumb_row(
         separated_status_line,
     }
 }
+
+// ─── skin-driven bar heights ─────────────────────────────────────────────────
+//
+// Pure accessors onto the process-wide [`active_skin`]'s [`BarHeights`],
+// expressed in the same pixel unit `build_screen_layout`'s own
+// `breadcrumb_row_h`/`line_height` parameters use. These do not yet feed
+// `build_screen_layout`/`build_screen_layout_with_breadcrumb_row` — those
+// callers still take their row heights as explicit parameters (`line_height`,
+// `breadcrumb_row_h`) supplied by each backend, consistent with this module's
+// "pure, no side effects" contract. Backend call sites adopt these in a
+// later change once each one's own fixed-pixel constants (e.g. GTK's
+// `BREADCRUMB_ROW_HEIGHT_PX`) are ready to defer to the skin instead.
+
+/// The active skin's breadcrumb row height, in pixels.
+pub fn skin_breadcrumb_row_height_px() -> f64 {
+    active_skin().bars.breadcrumb_row as f64
+}
+
+/// The active skin's status bar height, in pixels.
+pub fn skin_status_bar_height_px() -> f64 {
+    active_skin().bars.status_bar as f64
+}
+
+/// The active skin's tab bar height, in pixels.
+pub fn skin_tab_bar_height_px() -> f64 {
+    active_skin().bars.tab_bar as f64
+}
+
+/// The active skin's activity bar height (or, on a vertical activity bar,
+/// width), in pixels.
+pub fn skin_activity_bar_size_px() -> f64 {
+    active_skin().bars.activity_bar as f64
+}
+
+#[cfg(test)]
+mod skin_accessor_tests {
+    use super::*;
+    use crate::render::{set_active_skin, BarHeights, Skin};
+
+    #[test]
+    fn skin_bar_height_accessors_track_the_active_skin() {
+        let _guard = crate::render::skin::TEST_SKIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_active_skin(Skin {
+            bars: BarHeights {
+                breadcrumb_row: 99.0,
+                status_bar: 77.0,
+                tab_bar: 55.0,
+                activity_bar: 33.0,
+                ..BarHeights::default()
+            },
+            ..Skin::default()
+        });
+
+        assert_eq!(skin_breadcrumb_row_height_px(), 99.0);
+        assert_eq!(skin_status_bar_height_px(), 77.0);
+        assert_eq!(skin_tab_bar_height_px(), 55.0);
+        assert_eq!(skin_activity_bar_size_px(), 33.0);
+
+        set_active_skin(Skin::default());
+    }
+}
