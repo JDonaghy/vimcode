@@ -5885,13 +5885,12 @@ mod tests {
         /// "Problems" must swap the terminal content for the Problems
         /// placeholder.
         ///
-        /// Confirmed RED against the pre-fix click-index mapping: reverting
-        /// `Engine::handle_bottom_tab_bar_click`'s tab order to the old
-        /// `[Terminal, DebugOutput]` list (while leaving the Problems/Output
-        /// rendering in place) makes index 0 resolve to `Terminal` instead of
-        /// `Problems`, so the click leaves the terminal content on screen and
-        /// the final assertion panics. Restoring the fixed lockstep order
-        /// turns it GREEN again.
+        /// The index-to-kind mapping inside
+        /// `Engine::handle_bottom_tab_bar_click` is the load-bearing half:
+        /// it rebuilds the very sequence `build_bottom_panel_tab_bar` paints,
+        /// so slot 0 resolves to `Problems`. Any drift between those two
+        /// orders leaves the terminal content on screen after the click and
+        /// trips the final assertion.
         #[test]
         fn bottom_panel_tab_strip_click_switches_the_painted_panel_via_shell_app() {
             let mut engine = plain_engine();
@@ -5914,6 +5913,39 @@ mod tests {
                 driver.screen_has("No problems have been detected"),
                 "clicking the Problems tab must repaint the panel body with the \
                  Problems placeholder; screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// The same click-to-switch chain, driven onto the *second* always-
+        /// present slot: with only a terminal open the strip paints
+        /// Problems, Output, Terminal, so "Output" is slot 1 and clicking it
+        /// must paint the Output placeholder instead of the terminal body.
+        /// Covers the index arithmetic one step past slot 0 — an off-by-one
+        /// in either half of the lockstep order would land on Problems or
+        /// Terminal here.
+        #[test]
+        fn bottom_panel_tab_strip_click_switches_to_the_output_panel_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                !driver.screen_has("No output channels are available"),
+                "precondition: the Terminal tab owns the panel body; screen:\n{}",
+                driver.screen()
+            );
+
+            let (x, y) = driver
+                .find("Output")
+                .expect("the bottom panel tab strip must paint an Output tab");
+            driver.click(x, y);
+
+            assert!(
+                driver.screen_has("No output channels are available"),
+                "clicking the Output tab must repaint the panel body with the \
+                 Output placeholder; screen:\n{}",
                 driver.screen()
             );
         }

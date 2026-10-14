@@ -728,7 +728,7 @@ pub fn paint_bottom_panel_rung(
             content_row_h: lh as f64,
         }));
 
-    // Row 1: the Terminal / Debug Output tab strip.
+    // Row 1: the Problems / Output / Debug Console / Terminal tab strip.
     let tab_bar = build_bottom_panel_tab_bar(
         &screen.bottom_tabs.active,
         engine.terminal_open,
@@ -873,32 +873,25 @@ pub fn paint_bottom_panel_rung(
                     scrollbar,
                 });
         }
-        BottomPanelKind::Problems => {
+        BottomPanelKind::Problems | BottomPanelKind::Output => {
             if content_h <= 0.0 {
                 return;
             }
-            // Placeholder content only — no diagnostics are wired up yet.
-            // Shares the debug-output arm's one-row-below-the-tab-strip
-            // geometry below since it carries no toolbar row either.
+            // Placeholder content: neither diagnostics nor output channels
+            // are wired up yet. Like the debug-output arm below, these tabs
+            // own no toolbar row, so the body starts one line under the tab
+            // strip rather than two.
+            let (widget_id, message) = if screen.bottom_tabs.active == BottomPanelKind::Problems {
+                (
+                    "problems_panel",
+                    "No problems have been detected in the workspace.",
+                )
+            } else {
+                ("output_panel", "No output channels are available yet.")
+            };
             let body =
                 quadraui::Rect::new(rect.x, rect.y + lh, rect.width, (rect.height - lh).max(0.0));
-            let td = bottom_panel_placeholder_to_text_display(
-                "problems_panel",
-                "No problems have been detected in the workspace.",
-            );
-            b.draw_text_display(body, &td);
-        }
-        BottomPanelKind::Output => {
-            if content_h <= 0.0 {
-                return;
-            }
-            // Placeholder content only — no output channel is wired up yet.
-            let body =
-                quadraui::Rect::new(rect.x, rect.y + lh, rect.width, (rect.height - lh).max(0.0));
-            let td = bottom_panel_placeholder_to_text_display(
-                "output_panel",
-                "No output channels are available yet.",
-            );
+            let td = bottom_panel_placeholder_to_text_display(widget_id, message);
             b.draw_text_display(body, &td);
         }
         BottomPanelKind::DebugOutput => {
