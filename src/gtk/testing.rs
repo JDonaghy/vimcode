@@ -4867,10 +4867,10 @@ mod sidebar_panel_clicks {
     ///
     /// Verified RED against unfixed code (`background: None`): this exact
     /// probe point read `rgb(120, 121, 124)`, a mid-grey nothing like
-    /// `vscode-light`'s `tab_bar_bg` (`#ececec`); the tolerant assertion
-    /// below only passes once the fix is restored (probed `rgb(206, 206,
-    /// 206)` — close to, not identical to, `tab_bar_bg` because the
-    /// scrollbar overlay still blends its own partial opacity on top).
+    /// `light`'s `tab_bar_bg` (`#e3eeec`); the tolerant assertion
+    /// below only passes once the fix is restored (close to, not identical
+    /// to, `tab_bar_bg` because the scrollbar overlay still blends its own
+    /// partial opacity on top).
     #[test]
     fn settings_panel_scrollbar_gutter_paints_theme_tab_bar_bg() {
         let mut engine = Engine::new();
@@ -4889,7 +4889,7 @@ mod sidebar_panel_clicks {
         let probe_y = (sb.y + 200.0) as i32;
         let (r, g, b) = h.driver.pixel(probe_x, probe_y);
 
-        let bg = crate::render::Theme::vscode_light().tab_bar_bg;
+        let bg = crate::render::Theme::light().tab_bar_bg;
         const TOL: i32 = 40; // the scrollbar overlay's own blending, not AA noise
         let close = |c: u8, target: u8| (c as i32 - target as i32).abs() <= TOL;
         assert!(
@@ -4905,7 +4905,7 @@ mod sidebar_panel_clicks {
     /// painted by quadraui's `AppShell::render`) must come from vimcode's own
     /// theme on GTK too. Before quadraui#1180, `AppShell::render` painted a
     /// hard-coded `Color::rgb(37, 37, 38)` regardless of theme; under
-    /// `vscode-light` that read as a dark band behind a light sidebar.
+    /// `light` that read as a dark band behind a light sidebar.
     /// `to_quadraui_theme_chrome` has mapped `header_bg`/`header_fg` from
     /// `theme.status_bg`/`theme.status_fg`, but the mapping had no effect
     /// because `AppShell::render` never read those fields.
@@ -4945,7 +4945,7 @@ mod sidebar_panel_clicks {
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let (r, g, b) = ranked[0].0;
 
-        let theme = crate::render::Theme::vscode_light();
+        let theme = crate::render::Theme::light();
         let expected = (theme.status_bg.r, theme.status_bg.g, theme.status_bg.b);
         assert_eq!(
             (r, g, b),

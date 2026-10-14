@@ -423,7 +423,7 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         // Was missing entirely (fell through to quadraui's dark
         // `Theme::default()` navy) — this is the Explorer's
         // unfocused-selected-row background (`sidebar_sel_bg_inactive`,
-        // e4e6f1 under vscode-light).
+        // e3ece9 under light).
         inactive_selected_bg: theme.sidebar_sel_bg_inactive,
         border_fg: theme.fuzzy_border,
         title_fg: theme.fuzzy_title_fg,

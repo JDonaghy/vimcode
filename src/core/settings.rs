@@ -636,10 +636,9 @@ pub struct Settings {
     #[serde(default, skip_serializing)]
     extension_registry_url: String,
 
-    /// Name of the active colour scheme. Built-in options: "vscode-dark-modern"
-    /// (default), "vscode-dark" (classic Dark+, a.k.a. "dark+" or
-    /// "vscode-dark-classic"), "vscode-light", "onedark", "gruvbox-dark",
-    /// "tokyo-night", "solarized-dark".
+    /// Name of the active colour scheme. Built-in options: "dark" (default),
+    /// "vscode-dark" (classic Dark+, a.k.a. "dark+" or "vscode-dark-classic"),
+    /// "light", "onedark", "gruvbox-dark", "tokyo-night", "solarized-dark".
     /// Select with `:colorscheme <name>`.
     #[serde(default = "default_colorscheme")]
     pub colorscheme: String,
@@ -1358,7 +1357,7 @@ fn default_iskeyword() -> String {
 }
 
 fn default_colorscheme() -> String {
-    "vscode-dark-modern".to_string()
+    "dark".to_string()
 }
 
 fn default_ai_provider() -> String {
@@ -4208,9 +4207,9 @@ pub fn available_colorschemes() -> Vec<String> {
         "gruvbox-dark".into(),
         "tokyo-night".into(),
         "solarized-dark".into(),
-        "vscode-dark-modern".into(),
+        "dark".into(),
         "vscode-dark".into(),
-        "vscode-light".into(),
+        "light".into(),
     ];
     {
         let dir = super::paths::vimcode_config_dir().join("themes");

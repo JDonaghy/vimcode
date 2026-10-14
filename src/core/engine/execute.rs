@@ -2194,9 +2194,9 @@ impl Engine {
                 "gruvbox" => "gruvbox-dark",
                 "tokyonight" => "tokyo-night",
                 "solarized" => "solarized-dark",
-                "vscode" => "vscode-dark-modern",
+                "vscode" | "vscode-dark-modern" => "dark",
                 "dark+" | "vscode-dark-classic" => "vscode-dark",
-                "light+" => "vscode-light",
+                "light+" | "vscode-light" => "light",
                 other => other,
             };
             // Verify the theme exists (built-in or custom VSCode JSON)

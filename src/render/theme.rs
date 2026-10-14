@@ -1006,15 +1006,15 @@ impl Theme {
         }
     }
 
-    /// VS Code Dark Modern colour scheme (the VS Code default since 2023).
+    /// vimcode's default dark colour scheme.
     ///
-    /// Syntax highlighting is pixel-identical to classic Dark+ (VS Code's
-    /// `dark_modern.json` adds no `tokenColors`, only UI chrome overrides), so
-    /// the token colours below match [`Self::vscode_dark`] field-for-field.
-    /// The UI chrome — status bar, title bar, sidebar, activity bar, tabs —
-    /// drops the saturated blue wash of Dark+ for a neutral dark grey, with
-    /// the blue accent reserved for focus borders and active tab/row markers.
-    pub fn vscode_dark_modern() -> Self {
+    /// Syntax highlighting matches classic VS Code Dark+ field-for-field (see
+    /// [`Self::vscode_dark`]), but the UI chrome — status bar, title bar,
+    /// tab bar, sidebar, activity bar — uses a teal-tinted charcoal instead of
+    /// VS Code's neutral grey, with a teal accent (instead of VS Code's blue)
+    /// reserved for focus borders, active tab/row markers and the Normal-mode
+    /// status badge.
+    pub fn dark() -> Self {
         let bg = hex("#1f1f1f");
         Self {
             background: bg,
@@ -1052,18 +1052,18 @@ impl Theme {
             search_current_match_bg: hex("#613214"),
             search_match_fg: hex("#d4d4d4"),
 
-            tab_bar_bg: hex("#181818"),
+            tab_bar_bg: hex("#171b1b"),
             tab_active_bg: hex("#1f1f1f"),
             tab_active_fg: hex("#ffffff"),
             tab_inactive_fg: hex("#9d9d9d"),
             tab_preview_active_fg: hex("#cccccc"),
             tab_preview_inactive_fg: hex("#7f7f7f"),
-            tab_active_accent: hex("#0078d4"),
+            tab_active_accent: hex("#2cc9a3"),
 
-            status_bg: hex("#181818"),
+            status_bg: hex("#171b1b"),
             status_fg: hex("#cccccc"),
 
-            status_mode_normal_bg: hex("#0078d4"),
+            status_mode_normal_bg: hex("#2cc9a3"),
             status_mode_insert_bg: hex("#16825d"),
             status_mode_visual_bg: hex("#68217a"),
             status_mode_replace_bg: hex("#c72e0f"),
@@ -1072,7 +1072,7 @@ impl Theme {
 
             wildmenu_bg: hex("#202020"),
             wildmenu_fg: hex("#cccccc"),
-            wildmenu_sel_bg: hex("#04395e"),
+            wildmenu_sel_bg: hex("#1d5c4e"),
             wildmenu_sel_fg: hex("#ffffff"),
 
             command_bg: hex("#1f1f1f"),
@@ -1088,7 +1088,7 @@ impl Theme {
             git_deleted: hex("#f85149"),
 
             completion_bg: hex("#202020"),
-            completion_selected_bg: hex("#04395e"),
+            completion_selected_bg: hex("#1d5c4e"),
             completion_fg: hex("#cccccc"),
             completion_border: hex("#313131"),
 
@@ -1104,12 +1104,12 @@ impl Theme {
             hover_border: hex("#313131"),
 
             fuzzy_bg: hex("#202020"),
-            fuzzy_selected_bg: hex("#04395e"),
+            fuzzy_selected_bg: hex("#1d5c4e"),
             fuzzy_fg: hex("#cccccc"),
-            fuzzy_query_fg: hex("#4daafc"),
+            fuzzy_query_fg: hex("#4dd9b8"),
             fuzzy_border: hex("#313131"),
             fuzzy_title_fg: hex("#dcdcaa"),
-            fuzzy_match_fg: hex("#4daafc"),
+            fuzzy_match_fg: hex("#4dd9b8"),
 
             // (bg #1f1f1f)
             diff_added_bg: hex("#14541a"),
@@ -1132,8 +1132,8 @@ impl Theme {
             md_code: hex("#ce9178"),
             md_link: hex("#4daafc"),
 
-            sidebar_sel_bg: hex("#04395e"), // focused: visible blue highlight
-            sidebar_sel_bg_inactive: hex("#2a2d2e"),
+            sidebar_sel_bg: hex("#1d5c4e"), // focused: visible teal highlight
+            sidebar_sel_bg_inactive: hex("#223330"),
             semantic_parameter: hex("#9cdcfe"),   // light blue
             semantic_property: hex("#9cdcfe"),    // light blue
             semantic_namespace: hex("#4ec9b0"),   // teal
@@ -1153,19 +1153,25 @@ impl Theme {
             bracket_match_bg: hex("#3a3d41"),
 
             explorer_dir_fg: hex("#dcdcaa"), // warm yellow (like function names)
-            explorer_file_fg: hex("#cccccc"), // VS Code Dark Modern sidebar fg
+            explorer_file_fg: hex("#cccccc"), // vimcode dark sidebar fg
             explorer_active_bg: hex("#2a2d3e"), // current-file tint
 
-            scrollbar_thumb: hex("#434343"),
+            scrollbar_thumb: hex("#3f4a47"),
             scrollbar_track: hex("#1f1f1f"),
             terminal_bg: hex("#1f1f1f"),
             activity_bar_fg: hex("#d7d7d7"),
-            activity_active_accent: hex("#0078d4"),
+            activity_active_accent: hex("#2cc9a3"),
         }
     }
 
-    /// VS Code Light+ (Default Light+) colour scheme.
-    pub fn vscode_light() -> Self {
+    /// vimcode's default light colour scheme.
+    ///
+    /// Syntax highlighting matches VS Code Light+ field-for-field, but the UI
+    /// chrome — status bar, title bar, tab bar, sidebar, activity bar — swaps
+    /// VS Code's signature blue for a vimcode teal accent, carried through
+    /// the status bar background, active tab/activity-bar markers and list
+    /// selection highlights.
+    pub fn light() -> Self {
         let bg = hex("#ffffff");
         Self {
             background: bg,
@@ -1203,18 +1209,18 @@ impl Theme {
             search_current_match_bg: hex("#a8ac94"),
             search_match_fg: hex("#000000"),
 
-            tab_bar_bg: hex("#ececec"),
+            tab_bar_bg: hex("#e3eeec"),
             tab_active_bg: hex("#ffffff"),
             tab_active_fg: hex("#333333"),
             tab_inactive_fg: hex("#8e8e8e"),
             tab_preview_active_fg: hex("#555555"),
             tab_preview_inactive_fg: hex("#999999"),
-            tab_active_accent: hex("#005fb8"),
+            tab_active_accent: hex("#1d7a6c"),
 
-            status_bg: hex("#007acc"),
+            status_bg: hex("#1d7a6c"),
             status_fg: hex("#ffffff"),
 
-            status_mode_normal_bg: hex("#007acc"),
+            status_mode_normal_bg: hex("#1d7a6c"),
             status_mode_insert_bg: hex("#16825d"),
             status_mode_visual_bg: hex("#68217a"),
             status_mode_replace_bg: hex("#c72e0f"),
@@ -1223,7 +1229,7 @@ impl Theme {
 
             wildmenu_bg: hex("#f3f3f3"),
             wildmenu_fg: hex("#333333"),
-            wildmenu_sel_bg: hex("#0060c0"),
+            wildmenu_sel_bg: hex("#1d7a6c"),
             wildmenu_sel_fg: hex("#ffffff"),
 
             command_bg: hex("#ffffff"),
@@ -1239,7 +1245,7 @@ impl Theme {
             git_deleted: hex("#e51400"),
 
             completion_bg: hex("#f3f3f3"),
-            completion_selected_bg: hex("#0060c0"),
+            completion_selected_bg: hex("#1d7a6c"),
             completion_fg: hex("#333333"),
             completion_border: hex("#c8c8c8"),
 
@@ -1255,12 +1261,12 @@ impl Theme {
             hover_border: hex("#c8c8c8"),
 
             fuzzy_bg: hex("#ffffff"),
-            fuzzy_selected_bg: hex("#0060c0"),
+            fuzzy_selected_bg: hex("#1d7a6c"),
             fuzzy_fg: hex("#333333"),
-            fuzzy_query_fg: hex("#0066bf"),
-            fuzzy_border: hex("#007acc"),
+            fuzzy_query_fg: hex("#0f6b59"),
+            fuzzy_border: hex("#1d7a6c"),
             fuzzy_title_fg: hex("#795e26"),
-            fuzzy_match_fg: hex("#0066bf"),
+            fuzzy_match_fg: hex("#0f6b59"),
 
             diff_added_bg: hex("#dfffdf"),
             diff_removed_bg: hex("#ffdede"),
@@ -1282,8 +1288,8 @@ impl Theme {
             md_code: hex("#a31515"),
             md_link: hex("#0066bf"),
 
-            sidebar_sel_bg: hex("#b4d9ff"), // focused: visible blue highlight
-            sidebar_sel_bg_inactive: hex("#e4e6f1"),
+            sidebar_sel_bg: hex("#cfe8e3"), // focused: visible teal highlight
+            sidebar_sel_bg_inactive: hex("#e3ece9"),
             semantic_parameter: hex("#001080"),   // dark blue
             semantic_property: hex("#001080"),    // dark blue
             semantic_namespace: hex("#267f99"),   // teal
@@ -1303,33 +1309,38 @@ impl Theme {
             bracket_match_bg: hex("#dddddd"),
 
             explorer_dir_fg: hex("#795e26"),    // warm brown dirs
-            explorer_file_fg: hex("#3b3b3b"),   // VSCode light sidebar fg
+            explorer_file_fg: hex("#3b3b3b"),   // vimcode light sidebar fg
             explorer_active_bg: hex("#dce5f0"), // current-file tint
 
-            scrollbar_thumb: hex("#b0b0b0"),
+            scrollbar_thumb: hex("#a3b3b0"),
             scrollbar_track: hex("#f3f3f3"),
             terminal_bg: hex("#ffffff"),
             activity_bar_fg: hex("#646e6e"),
-            activity_active_accent: hex("#646e6e"),
+            activity_active_accent: hex("#1d7a6c"),
         }
     }
 
-    /// Return a theme by name. Falls back to `vscode-dark-modern` for unknown names.
+    /// Return a theme by name. Falls back to `dark` for unknown names.
+    ///
+    /// `"vscode-dark-modern"` and `"vscode"` are deprecated aliases for
+    /// `"dark"`; `"vscode-light"` and `"light+"` are deprecated aliases for
+    /// `"light"`. They resolve correctly for existing user config files;
+    /// [`Self::available_names`] omits them from the offered list.
     pub fn from_name(name: &str) -> Self {
         match name {
             "gruvbox" | "gruvbox-dark" => Self::gruvbox_dark(),
             "tokyo-night" | "tokyonight" => Self::tokyo_night(),
             "solarized" | "solarized-dark" => Self::solarized_dark(),
-            "vscode-dark-modern" | "vscode" => Self::vscode_dark_modern(),
+            "dark" | "vscode-dark-modern" | "vscode" => Self::dark(),
             "vscode-dark" | "vscode-dark-classic" | "dark+" => Self::vscode_dark(),
-            "vscode-light" | "light+" => Self::vscode_light(),
+            "light" | "vscode-light" | "light+" => Self::light(),
             "onedark" => Self::onedark(),
             _ => {
                 // Try loading a VSCode theme from ~/.config/vimcode/themes/
                 if let Some(theme) = Self::load_vscode_theme(name) {
                     theme
                 } else {
-                    Self::vscode_dark_modern()
+                    Self::dark()
                 }
             }
         }
@@ -1353,9 +1364,9 @@ impl Theme {
             "gruvbox-dark".into(),
             "tokyo-night".into(),
             "solarized-dark".into(),
-            "vscode-dark-modern".into(),
+            "dark".into(),
             "vscode-dark".into(),
-            "vscode-light".into(),
+            "light".into(),
         ];
         // Append custom VSCode themes from the platform config dir's themes/
         // subdirectory (see `core::paths::vimcode_config_dir`).
@@ -1921,11 +1932,11 @@ pub(crate) mod tests {
     /// quadraui's dark `Theme::default()`, `rgb(35, 40, 58)`, unreadable),
     /// and `scrollbar_track` was mapped to `theme.separator` instead of
     /// vimcode's own dedicated `theme.scrollbar_track` field. Both are
-    /// asserted against `vscode_light`, whose values for these fields are
+    /// asserted against `light`, whose values for these fields are
     /// nothing like quadraui's dark defaults.
     #[test]
     fn to_quadraui_theme_maps_inactive_selected_bg_and_scrollbar_track_from_vimcode_theme() {
-        let theme = Theme::vscode_light();
+        let theme = Theme::light();
         let q = to_quadraui_theme(&theme);
         let default = quadraui::Theme::default();
 
@@ -1941,7 +1952,7 @@ pub(crate) mod tests {
     /// `inactive_selected_bg` did.
     #[test]
     fn to_quadraui_theme_maps_badge_board_and_card_hint_keys_from_vimcode_theme() {
-        let theme = Theme::vscode_light();
+        let theme = Theme::light();
         let q = to_quadraui_theme(&theme);
         let default = quadraui::Theme::default();
 
@@ -1954,7 +1965,7 @@ pub(crate) mod tests {
         assert_eq!(q.card_hint_bg, theme.hover_bg);
         assert_eq!(q.card_hint_fg, theme.hover_fg);
 
-        // None of these six keys' `vscode_light` values happen to coincide
+        // None of these six keys' `light` values happen to coincide
         // with quadraui's own dark default — if they ever silently fell
         // back to it (e.g. a future field addition landing behind a
         // reintroduced `..Theme::default()` spread), this would catch it.
@@ -1974,8 +1985,8 @@ pub(crate) mod tests {
     /// so a future field added upstream is a compile error until mapped,
     /// rather than a silent dark leak discovered by eye later.
     #[test]
-    fn to_quadraui_theme_maps_every_field_from_vscode_light() {
-        let theme = Theme::vscode_light();
+    fn to_quadraui_theme_maps_every_field_from_light() {
+        let theme = Theme::light();
         let q = to_quadraui_theme(&theme);
 
         assert_eq!(q.background, theme.background);
@@ -2056,98 +2067,149 @@ pub(crate) mod tests {
         assert_eq!(q.card_hint_fg, theme.hover_fg);
     }
 
-    // ─── VS Code Dark Modern default ────────────────────────────────────────
+    // ─── vimcode default theme branding ─────────────────────────────────────
 
-    /// An unrecognised colorscheme name, and the bare `"vscode"` alias,
-    /// resolve to Dark Modern rather than classic Dark+ or `onedark`.
+    /// An unrecognised colorscheme name, and the deprecated `"vscode-dark-modern"`
+    /// / `"vscode"` aliases, all resolve to vimcode's default dark theme.
     /// `Theme` has no `PartialEq`/`Debug`, so compare representative fields
     /// rather than whole structs.
     #[test]
-    fn from_name_default_and_vscode_aliases_resolve_to_dark_modern() {
-        let modern = Theme::vscode_dark_modern();
-        for name in ["not-a-real-theme", "vscode-dark-modern", "vscode"] {
+    fn from_name_default_and_deprecated_vscode_aliases_resolve_to_dark() {
+        let default_dark = Theme::dark();
+        for name in ["not-a-real-theme", "dark", "vscode-dark-modern", "vscode"] {
             let theme = Theme::from_name(name);
-            assert_eq!(theme.background, modern.background, "name={name}");
-            assert_eq!(theme.status_bg, modern.status_bg, "name={name}");
+            assert_eq!(theme.background, default_dark.background, "name={name}");
+            assert_eq!(theme.status_bg, default_dark.status_bg, "name={name}");
             assert_eq!(
-                theme.activity_active_accent, modern.activity_active_accent,
+                theme.activity_active_accent, default_dark.activity_active_accent,
                 "name={name}"
             );
+        }
+    }
+
+    /// `"light"`, and the deprecated `"vscode-light"` / `"light+"` aliases a
+    /// user's `settings.json` may already hold, all resolve to vimcode's
+    /// default light theme.
+    #[test]
+    fn from_name_light_and_deprecated_vscode_aliases_resolve_to_light() {
+        let default_light = Theme::light();
+        for name in ["light", "vscode-light", "light+"] {
+            let theme = Theme::from_name(name);
+            assert_eq!(theme.background, default_light.background, "name={name}");
+            assert_eq!(theme.status_bg, default_light.status_bg, "name={name}");
         }
     }
 
     /// `"vscode-dark"` — a name a user's `settings.json` can already hold,
     /// written there by their own `:colorscheme vscode-dark` — keeps meaning
     /// the saturated-blue classic Dark+ palette (`vscode_dark`), as do its
-    /// `"dark+"` and `"vscode-dark-classic"` aliases. Only the default and the
-    /// bare `"vscode"` alias move to Dark Modern.
+    /// `"dark+"` and `"vscode-dark-classic"` aliases. It is unaffected by the
+    /// `"dark"`/`"light"` rebrand.
     #[test]
     fn from_name_classic_aliases_resolve_to_dark_plus() {
         let classic = Theme::vscode_dark();
-        let modern = Theme::vscode_dark_modern();
+        let default_dark = Theme::dark();
         for name in ["vscode-dark", "dark+", "vscode-dark-classic"] {
             let theme = Theme::from_name(name);
             assert_eq!(theme.background, classic.background, "name={name}");
             assert_eq!(theme.status_bg, classic.status_bg, "name={name}");
-            assert_ne!(theme.status_bg, modern.status_bg, "name={name}");
+            assert_ne!(theme.status_bg, default_dark.status_bg, "name={name}");
         }
         assert_eq!(classic.status_bg, hex("#007acc"));
     }
 
-    /// `"vscode-dark"` stays an offerable built-in name, so a user who set it
+    /// `"vscode-dark"` stays an offerable built-in name, so a user who sets it
     /// explicitly still sees it in `:colorscheme`'s list and the settings
-    /// panel's cycle, next to the new `"vscode-dark-modern"`.
+    /// panel's cycle, alongside the `"dark"` default. The deprecated
+    /// `"vscode-dark-modern"`/`"vscode-light"` spellings stay absent from
+    /// this offered list, though `from_name` still resolves them.
     #[test]
-    fn available_names_keeps_vscode_dark_alongside_dark_modern() {
+    fn available_names_keeps_vscode_dark_alongside_dark_and_light() {
         let names = Theme::available_names();
         assert!(names.iter().any(|n| n == "vscode-dark"), "{names:?}");
-        assert!(names.iter().any(|n| n == "vscode-dark-modern"), "{names:?}");
+        assert!(names.iter().any(|n| n == "dark"), "{names:?}");
+        assert!(names.iter().any(|n| n == "light"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n == "vscode-dark-modern"),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|n| n == "vscode-light"), "{names:?}");
     }
 
-    /// Spot-check Dark Modern's UI chrome against VS Code's own current
-    /// token values: a neutral dark-grey status bar/sidebar/activity bar
-    /// (no saturated blue wash) with the blue accent reserved for the tab
+    /// vimcode's default dark theme's UI chrome diverges from VS Code's own
+    /// token values: a teal-tinted neutral status bar/tab bar (not VS Code
+    /// Dark Modern's plain neutral grey, and not Dark+'s saturated blue),
+    /// with a teal accent (not VS Code's blue) reserved for the tab
     /// indicator, selection highlight and focus-style elements.
     #[test]
-    fn vscode_dark_modern_chrome_matches_vs_code_tokens() {
-        let theme = Theme::vscode_dark_modern();
+    fn dark_chrome_diverges_from_vs_code_tokens() {
+        let theme = Theme::dark();
 
-        // statusBar.background / sideBar.background / tabsBackground: Dark
-        // Modern deliberately unifies all three on the same neutral dark
-        // grey, dropping Dark+'s saturated blue status bar.
-        assert_eq!(theme.status_bg, hex("#181818"));
-        assert_eq!(theme.tab_bar_bg, hex("#181818"));
+        // statusBar.background / tabsBackground share a teal-tinted neutral:
+        // neither VS Code Dark Modern's plain grey `181818` nor Dark+'s
+        // saturated blue `007acc`.
+        assert_eq!(theme.status_bg, hex("#171b1b"));
+        assert_eq!(theme.tab_bar_bg, hex("#171b1b"));
         assert_eq!(theme.status_bg, theme.tab_bar_bg);
+        assert_ne!(theme.status_bg, hex("#181818"));
         assert_ne!(theme.status_bg, hex("#007acc"));
 
-        // editor.background
+        // editor.background is unchanged from VS Code Dark Modern.
         assert_eq!(theme.background, hex("#1f1f1f"));
 
-        // Blue accent survives on the active tab border and list selection.
-        assert_eq!(theme.tab_active_accent, hex("#0078d4"));
-        assert_eq!(theme.activity_active_accent, hex("#0078d4"));
-        assert_eq!(theme.fuzzy_selected_bg, hex("#04395e"));
+        // Teal accent, not VS Code's blue, on the active tab border, activity
+        // bar marker and list selection.
+        assert_eq!(theme.tab_active_accent, hex("#2cc9a3"));
+        assert_eq!(theme.activity_active_accent, hex("#2cc9a3"));
+        assert_eq!(theme.fuzzy_selected_bg, hex("#1d5c4e"));
+        assert_ne!(theme.tab_active_accent, hex("#0078d4"));
+        assert_ne!(theme.activity_active_accent, hex("#0078d4"));
 
-        // scrollbarSlider.background at 40% opacity, composited over
-        // editor.background.
-        assert_eq!(theme.scrollbar_thumb, hex("#434343"));
+        assert_eq!(theme.scrollbar_thumb, hex("#3f4a47"));
     }
 
-    /// Syntax token colours are untouched by the Dark Modern UI-chrome
-    /// refresh: VS Code's `dark_modern.json` carries no `tokenColors` of its
-    /// own, so highlighting must stay pixel-identical to classic Dark+.
+    /// vimcode's default light theme's UI chrome diverges from VS Code's own
+    /// Light+ token values the same way `dark` diverges from Dark
+    /// Modern/Dark+: a teal accent in place of VS Code's signature blue.
     #[test]
-    fn vscode_dark_modern_token_colors_match_dark_plus() {
-        let modern = Theme::vscode_dark_modern();
-        let classic = Theme::vscode_dark();
+    fn light_chrome_diverges_from_vs_code_tokens() {
+        let theme = Theme::light();
 
-        assert_eq!(modern.keyword, classic.keyword);
-        assert_eq!(modern.control_flow, classic.control_flow);
-        assert_eq!(modern.string_lit, classic.string_lit);
-        assert_eq!(modern.comment, classic.comment);
-        assert_eq!(modern.function, classic.function);
-        assert_eq!(modern.type_name, classic.type_name);
-        assert_eq!(modern.variable, classic.variable);
-        assert_eq!(modern.number, classic.number);
+        assert_eq!(theme.tab_bar_bg, hex("#e3eeec"));
+        assert_ne!(theme.tab_bar_bg, hex("#ececec"));
+
+        assert_eq!(theme.status_bg, hex("#1d7a6c"));
+        assert_eq!(theme.tab_active_accent, hex("#1d7a6c"));
+        assert_eq!(theme.activity_active_accent, hex("#1d7a6c"));
+        assert_ne!(theme.status_bg, hex("#007acc"));
+        assert_ne!(theme.tab_active_accent, hex("#005fb8"));
+        assert_ne!(theme.activity_active_accent, hex("#646e6e"));
+
+        assert_eq!(theme.fuzzy_selected_bg, hex("#1d7a6c"));
+        assert_ne!(theme.fuzzy_selected_bg, hex("#0060c0"));
+    }
+
+    /// Syntax token colours are untouched by the chrome rebrand: `dark`'s
+    /// highlighting stays pixel-identical to classic Dark+, and `light`'s
+    /// stays pixel-identical to VS Code Light+.
+    #[test]
+    fn dark_and_light_token_colors_match_vs_code_classic() {
+        let dark = Theme::dark();
+        let classic_dark = Theme::vscode_dark();
+
+        assert_eq!(dark.keyword, classic_dark.keyword);
+        assert_eq!(dark.control_flow, classic_dark.control_flow);
+        assert_eq!(dark.string_lit, classic_dark.string_lit);
+        assert_eq!(dark.comment, classic_dark.comment);
+        assert_eq!(dark.function, classic_dark.function);
+        assert_eq!(dark.type_name, classic_dark.type_name);
+        assert_eq!(dark.variable, classic_dark.variable);
+        assert_eq!(dark.number, classic_dark.number);
+
+        let light = Theme::light();
+        assert_eq!(light.keyword, hex("#0000ff"));
+        assert_eq!(light.string_lit, hex("#a31515"));
+        assert_eq!(light.comment, hex("#008000"));
+        assert_eq!(light.function, hex("#795e26"));
     }
 }
