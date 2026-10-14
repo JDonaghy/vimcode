@@ -15,6 +15,7 @@ no matching section fails the release job before anything is published (see
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-10-14
 ### Added
 - The bottom panel's tab strip now always shows PROBLEMS and OUTPUT tabs
   alongside TERMINAL and DEBUG CONSOLE (when open), instead of a plain
