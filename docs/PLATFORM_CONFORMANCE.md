@@ -181,6 +181,33 @@ an **error**, not a silent skip — it exits non-zero and prints the probe's
 reason. This matters because it's the only way to *insist* a lane run when you
 know better than the default policy (e.g. forcing `gtk` on Darwin — see below).
 
+## Developer iteration — `scripts/regress`
+
+`platform-conformance.sh` is the whole-matrix release gate. `scripts/regress` is
+its single-backend counterpart for iterating on one scenario or one feature
+area:
+
+```bash
+scripts/regress --backend tui                    # every scenario, tui backend
+scripts/regress --backend gtk --area tab-bar     # narrow to a feature area
+scripts/regress --backend tui --list             # what would run, run nothing
+scripts/regress --backend tui --json             # machine-readable results
+```
+
+It prints a per-scenario table (`pass` / `fail` / `skip (not matched by
+filter …)`), the path of the **retained** full cargo log, and one greppable
+`REGRESS_SUMMARY backend=… passed=… failed=… total=… verdict=… exit=…` line.
+The table and summary are derived from cargo's own per-test verdicts, so they
+cannot disagree with the run they describe.
+
+Exit contract, same shape as the matrix runner: `0` all pass, `1` failures (or
+**zero tests ran** — the vacuous-green guard), `2` backend not available on
+this host, `3` bad invocation. Cargo's raw `101` never leaks out, so a caller
+can gate on the exit code alone.
+
+Like the matrix runner, it is on-demand only: not a per-PR CI job, not wired
+into the coordinator's Test stage.
+
 ## The three fleet routes (all verified)
 
 ### Linux + GTK — `precision` or `dellserver`

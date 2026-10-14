@@ -15,8 +15,7 @@
 //!   and only the binary holding the harness tests reports a nonzero count.
 //!   Reading just the last line reports `0 passed; 0 failed` and then trips
 //!   the zero-test guard on a run that was genuinely green.
-//! * Zero tests executed is a failure, not a pass (the #645 vacuous-green
-//!   trap).
+//! * Zero tests executed is a failure, not a pass — the vacuous-green trap.
 //! * The full cargo log survives the run and its path is printed, so the
 //!   short table is never the only record of what happened.
 //! * The exit status follows the documented contract (0 pass / 1 fail /
@@ -361,7 +360,7 @@ fn totals_sum_every_test_result_line_not_just_the_last() {
     );
 }
 
-/// The #645 vacuous-green guard: a run where cargo executed zero tests is a
+/// The vacuous-green guard: a run where cargo executed zero tests is a
 /// failure, however cleanly cargo itself exited.
 #[test]
 fn zero_tests_executed_is_a_failure_not_a_pass() {
@@ -386,6 +385,10 @@ fn zero_tests_executed_is_a_failure_not_a_pass() {
     assert_eq!(
         code, 1,
         "zero tests must fail with the documented exit 1\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("zero tests ran"),
+        "the operator must be told why a cleanly-exiting run failed:\n{stdout}"
     );
     assert_eq!(summary_field(&stdout, "total"), "0", "{stdout}");
     assert_eq!(summary_field(&stdout, "verdict"), "fail", "{stdout}");
