@@ -125,6 +125,9 @@ struct Args {
     /// `--json`: with `--ext-install`, print the result as one JSON object
     /// instead of plain text.
     json: bool,
+    /// `--skin <FILE>`: load chrome proportions and visual tokens from this
+    /// TOML skin file instead of vimcode's built-in ones.
+    skin: Option<String>,
     /// First positional argument: the file to open.
     file_path: Option<PathBuf>,
 }
@@ -145,17 +148,20 @@ impl Args {
         let ext_install = ext_install_flag.and_then(|i| argv.get(i + 1)).cloned();
         let json = argv.iter().any(|a| a == "--json");
 
-        // First positional argument (not starting with '-', not a --debug
-        // or --ext-install value)
+        // --skin <file>: load chrome proportions from a TOML skin file
+        let skin_flag = argv.iter().position(|a| a == "--skin");
+        let skin = skin_flag.and_then(|i| argv.get(i + 1)).cloned();
+
+        // First positional argument (not starting with '-', not a --debug,
+        // --ext-install or --skin value)
         let skip_args: std::collections::HashSet<usize> = {
             let mut s = std::collections::HashSet::new();
-            if let Some(i) = debug_flag {
-                s.insert(i);
-                s.insert(i + 1);
-            }
-            if let Some(i) = ext_install_flag {
-                s.insert(i);
-                s.insert(i + 1);
+            for flag in [debug_flag, ext_install_flag, skin_flag]
+                .into_iter()
+                .flatten()
+            {
+                s.insert(flag);
+                s.insert(flag + 1);
             }
             s
         };
@@ -173,6 +179,7 @@ impl Args {
             debug_log,
             ext_install,
             json,
+            skin,
             file_path,
         }
     }
@@ -195,7 +202,9 @@ fn usage_text() -> String {
          \x20\x20    --debug <FILE>  Write a debug log to FILE\n\
          \x20\x20    --ext-install <NAME>  Headless prerequisite check (and install) \
 for one extension, no GUI/TUI\n\
-         \x20\x20    --json          With --ext-install, print the result as JSON\n\n\
+         \x20\x20    --json          With --ext-install, print the result as JSON\n\
+         \x20\x20    --skin <FILE>   Load chrome proportions and visual tokens from a \
+TOML skin file\n\n\
          Arguments:\n\
          \x20\x20[FILE]              File to open on startup\n",
         env!("CARGO_PKG_VERSION"),
@@ -469,6 +478,17 @@ fn main() -> ExitCode {
         return run_ext_install(name, args.json);
     }
 
+    // Install the skin before any backend starts, so the first painted frame
+    // already uses its proportions. One call site for every backend: the
+    // shared render layer reads the active skin, so no backend knows a skin
+    // file exists.
+    if let Some(path) = &args.skin {
+        if let Err(e) = vimcode_core::render::activate_skin_file(std::path::Path::new(path)) {
+            eprintln!("vimcode: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     if args.tui {
         vimcode_core::tui_main::run(args.file_path, args.debug_log);
         return ExitCode::SUCCESS;
@@ -554,6 +574,46 @@ mod arg_parsing_tests {
         let a = Args::parse(&argv(&["--ext-install", "yaml", "notes.txt"]));
         assert_eq!(a.ext_install.as_deref(), Some("yaml"));
         assert_eq!(a.file_path, Some(PathBuf::from("notes.txt")));
+    }
+
+    /// `--skin <FILE>` takes its value, and that value — a bare path, the
+    /// same shape as the file to open — must not be taken as the positional
+    /// file argument.
+    #[test]
+    fn skin_value_is_not_mistaken_for_the_file_path() {
+        let a = Args::parse(&argv(&["--skin", "compact.toml", "notes.txt"]));
+        assert_eq!(a.skin.as_deref(), Some("compact.toml"));
+        assert_eq!(a.file_path, Some(PathBuf::from("notes.txt")));
+    }
+
+    /// Several valued flags at once: each keeps its own value and none of
+    /// them swallows another's.
+    #[test]
+    fn skin_parses_alongside_the_other_valued_flags() {
+        let a = Args::parse(&argv(&[
+            "--debug",
+            "/tmp/vc.log",
+            "--skin",
+            "/etc/vimcode/skin.toml",
+            "main.rs",
+        ]));
+        assert_eq!(a.debug_log.as_deref(), Some("/tmp/vc.log"));
+        assert_eq!(a.skin.as_deref(), Some("/etc/vimcode/skin.toml"));
+        assert_eq!(a.file_path, Some(PathBuf::from("main.rs")));
+    }
+
+    #[test]
+    fn dangling_skin_flag_does_not_panic() {
+        let a = Args::parse(&argv(&["--skin"]));
+        assert_eq!(a.skin, None);
+        assert_eq!(a.file_path, None);
+    }
+
+    /// `--skin` is advertised in the usage text, so `--help` tells a user
+    /// the flag exists.
+    #[test]
+    fn usage_text_documents_the_skin_flag() {
+        assert!(usage_text().contains("--skin <FILE>"));
     }
 }
 
