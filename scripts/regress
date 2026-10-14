@@ -20,6 +20,17 @@
 #   2  the selected backend is not available on this host
 #   3  internal error (bad arguments, missing cargo, etc.)
 #
+# Testing hooks (used by tests/regress_script.rs; not part of the documented
+# interface, no compatibility promise beyond that suite):
+#   REGRESS_CMD_<BACKEND>="<shell command>"  replaces the `cargo test`
+#       invocation for that backend. The command's stdout+stderr is parsed
+#       exactly as cargo's would be, and its exit status is the run's.
+#   REGRESS_OVERRIDE_<BACKEND>=1|0           replaces that backend's real
+#       availability probe (1 = available, 0 = not available).
+#   REGRESS_HARNESS_FILE=<path>              replaces src/harness.rs as the
+#       source of the `backend_conformance!` label set.
+# <BACKEND> is the upper-cased backend name (TUI, GTK, MACOS, WIN).
+#
 set -euo pipefail
 
 # -- Constants ---------------------------------------------------------------
@@ -116,7 +127,22 @@ fi
 # -- Backend availability probe ---------------------------------------------
 # Mirrors platform-conformance.sh's probe logic.
 
+backend_upper() {
+    printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
+}
+
 probe_backend() {
+    local override_var
+    override_var="REGRESS_OVERRIDE_$(backend_upper "$1")"
+    local override="${!override_var:-}"
+    if [[ -n "$override" ]]; then
+        if [[ "$override" == "1" ]]; then
+            return 0
+        fi
+        echo "$1 backend: unavailable (probe overridden)" >&2
+        return 1
+    fi
+
     case "$1" in
         tui)
             return 0
@@ -159,7 +185,8 @@ probe_backend() {
 # leading `$`).
 all_labels() {
     cd "$REPO_DIR"
-    grep -E '^[[:space:]]+label: ' src/harness.rs 2>/dev/null \
+    local harness_file="${REGRESS_HARNESS_FILE:-src/harness.rs}"
+    grep -E '^[[:space:]]+label: ' "$harness_file" 2>/dev/null \
         | grep -v '//' | grep -v '"' | grep -v '\$' \
         | sed 's/.*label: *//' | sed 's/,.*//' || true
 }
@@ -172,7 +199,7 @@ if $LIST; then
     LABELS=$(all_labels)
 
     if [[ -z "$LABELS" ]]; then
-        echo "No backend_conformance! scenarios found in src/harness.rs" >&2
+        echo "No backend_conformance! scenarios found in ${REGRESS_HARNESS_FILE:-src/harness.rs}" >&2
         exit $EXIT_ERROR
     fi
 
@@ -268,6 +295,12 @@ case "$BACKEND" in
         cargo_test_filter="win::"
         ;;
 esac
+
+CMD_OVERRIDE_VAR="REGRESS_CMD_$(backend_upper "$BACKEND")"
+CMD_OVERRIDE="${!CMD_OVERRIDE_VAR:-}"
+if [[ -n "$CMD_OVERRIDE" ]]; then
+    cargo_cmd=(bash -c "$CMD_OVERRIDE" regress-stub)
+fi
 
 # -- Area filter -> cargo test name filter ----------------------------------
 
@@ -410,6 +443,15 @@ fi
 
 VERDICT="$([ $TEST_EXIT -eq 0 ] && echo "pass" || echo "fail")"
 
+# Normalise to the documented exit contract. `cargo test` signals a test
+# failure with 101, and a caller gating on this script must be able to tell
+# "scenarios failed" (1) from "backend unavailable" (2) and "bad invocation"
+# (3) by exit code alone, so any nonzero cargo status collapses to EXIT_FAIL.
+EXIT_CODE=$EXIT_PASS
+if [[ $TEST_EXIT -ne 0 ]]; then
+    EXIT_CODE=$EXIT_FAIL
+fi
+
 echo ""
 echo "=== regress: per-scenario results ==="
 printf "%-70s %-10s %s\n" "SCENARIO" "BACKEND" "RESULT"
@@ -434,7 +476,7 @@ if $JSON; then
   "failed": $FAILED,
   "total": $TOTAL,
   "verdict": "$VERDICT",
-  "exit": $TEST_EXIT,
+  "exit": $EXIT_CODE,
   "log": "$OUTFILE"
 }
 ENDJSON
@@ -445,13 +487,13 @@ else
     echo "Failed:   $FAILED"
     echo "Total:    $TOTAL"
     echo "Log:      $OUTFILE"
-    if [[ $TEST_EXIT -eq 0 ]]; then
+    if [[ $EXIT_CODE -eq 0 ]]; then
         echo "Verdict:  PASS"
     else
         echo "Verdict:  FAIL"
     fi
 fi
 
-echo "REGRESS_SUMMARY backend=$BACKEND area=${AREA:-all} passed=$PASSED failed=$FAILED total=$TOTAL verdict=$VERDICT exit=$TEST_EXIT log=$OUTFILE"
+echo "REGRESS_SUMMARY backend=$BACKEND area=${AREA:-all} passed=$PASSED failed=$FAILED total=$TOTAL verdict=$VERDICT exit=$EXIT_CODE log=$OUTFILE"
 
-exit $TEST_EXIT
+exit $EXIT_CODE
