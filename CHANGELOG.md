@@ -15,6 +15,11 @@ no matching section fails the release job before anything is published (see
 
 ## [Unreleased]
 
+### Added
+- The bottom panel's tab strip now always shows PROBLEMS and OUTPUT tabs
+  alongside TERMINAL and DEBUG CONSOLE (when open), instead of a plain
+  "Terminal" label with no tab chrome (#1928).
+
 ### Changed
 - The default colorscheme is now `vscode-dark-modern`, matching VS Code's
   current default theme: a neutral dark-grey status bar, title bar and

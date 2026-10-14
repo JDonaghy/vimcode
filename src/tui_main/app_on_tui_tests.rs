@@ -6133,6 +6133,112 @@ mod tests {
             );
         }
 
+        /// The bottom panel tab strip must offer more than a single bare
+        /// "Terminal" label: at minimum "Terminal" (active) and "Problems"
+        /// must both paint when the terminal is open, so the panel reads as
+        /// a switchable VS Code-style tab bar rather than a plain label.
+        #[test]
+        fn render_content_paints_bottom_panel_problems_tab_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+
+            known_bug_gate(
+                "app_on_tui::render_content_paints_bottom_panel_problems_tab_via_shell_app",
+                || {
+                    assert!(
+                        driver.screen_has("Terminal"),
+                        "bottom panel should still paint the active Terminal tab; \
+                         screen:\n{}",
+                        driver.screen()
+                    );
+                    assert!(
+                        driver.screen_has("Problems"),
+                        "bottom panel tab strip should also offer a Problems tab; \
+                         screen:\n{}",
+                        driver.screen()
+                    );
+                },
+            );
+        }
+
+        /// A click on the "Problems" tab must switch which panel is
+        /// **painted**, through `App::handle_dispatch`'s shared
+        /// `render::route_bottom_panel_click` -> `render::apply_bottom_panel_
+        /// route` -> `Engine::handle_bottom_tab_bar_click` chain (the same
+        /// chain `gtk::testing::bottom_panel_tab_strip_click_switches_the_
+        /// painted_panel` drives on the other backend). With only a
+        /// terminal open (no debug output), `build_bottom_panel_tab_bar`
+        /// paints three slots: Problems, Output, Terminal — clicking
+        /// "Problems" must swap the terminal content for the Problems
+        /// placeholder.
+        ///
+        /// The index-to-kind mapping inside
+        /// `Engine::handle_bottom_tab_bar_click` is the load-bearing half:
+        /// it rebuilds the very sequence `build_bottom_panel_tab_bar` paints,
+        /// so slot 0 resolves to `Problems`. Any drift between those two
+        /// orders leaves the terminal content on screen after the click and
+        /// trips the final assertion.
+        #[test]
+        fn bottom_panel_tab_strip_click_switches_the_painted_panel_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                !driver.screen_has("No problems have been detected"),
+                "precondition: the Terminal tab owns the panel body; screen:\n{}",
+                driver.screen()
+            );
+
+            let (x, y) = driver
+                .find("Problems")
+                .expect("the bottom panel tab strip must paint a Problems tab");
+            driver.click(x, y);
+
+            assert!(
+                driver.screen_has("No problems have been detected"),
+                "clicking the Problems tab must repaint the panel body with the \
+                 Problems placeholder; screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// The same click-to-switch chain, driven onto the *second* always-
+        /// present slot: with only a terminal open the strip paints
+        /// Problems, Output, Terminal, so "Output" is slot 1 and clicking it
+        /// must paint the Output placeholder instead of the terminal body.
+        /// Covers the index arithmetic one step past slot 0 — an off-by-one
+        /// in either half of the lockstep order would land on Problems or
+        /// Terminal here.
+        #[test]
+        fn bottom_panel_tab_strip_click_switches_to_the_output_panel_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                !driver.screen_has("No output channels are available"),
+                "precondition: the Terminal tab owns the panel body; screen:\n{}",
+                driver.screen()
+            );
+
+            let (x, y) = driver
+                .find("Output")
+                .expect("the bottom panel tab strip must paint an Output tab");
+            driver.click(x, y);
+
+            assert!(
+                driver.screen_has("No output channels are available"),
+                "clicking the Output tab must repaint the panel body with the \
+                 Output placeholder; screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// An **open but empty** quickfix list must reserve no rows — paint-
         /// only twin of `shell_app.rs`'s
         /// `empty_quickfix_does_not_displace_the_terminal_band_via_shell_app`:

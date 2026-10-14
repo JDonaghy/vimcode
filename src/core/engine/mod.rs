@@ -1508,12 +1508,19 @@ pub enum DebugSidebarSection {
     Breakpoints,
 }
 
-/// Which panel is shown in the bottom area (Terminal or Debug Output).
+/// Which panel is shown in the bottom area. The tab strip always offers
+/// `Problems` and `Output` as placeholders (no diagnostics/channel content
+/// is wired up yet); `DebugOutput` and `Terminal` only appear once there is
+/// something to show (a running debug session / an open terminal).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BottomPanelKind {
+    /// Placeholder — no diagnostics content is wired up yet.
+    Problems,
+    /// Placeholder — no output-channel content is wired up yet.
+    Output,
+    DebugOutput,
     #[default]
     Terminal,
-    DebugOutput,
 }
 
 /// Cached hit-test data from the last paint of the terminal toolbar.
@@ -1570,7 +1577,7 @@ pub struct BottomPanelGeometry {
 /// [`Engine::resolve_bottom_panel_zone`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BottomPanelZone {
-    /// Row 0 — the shared "TERMINAL / DEBUG CONSOLE" tab strip.
+    /// Row 0 — the shared "PROBLEMS / OUTPUT / DEBUG CONSOLE / TERMINAL" tab strip.
     TabBar,
     /// Row 1 — the per-terminal toolbar (tab strip or find bar).
     Toolbar,
