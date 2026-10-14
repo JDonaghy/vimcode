@@ -15,6 +15,8 @@ no matching section fails the release job before anything is published (see
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-10-14
+
 ### Changed
 - The default colorscheme is now `vscode-dark-modern`, matching VS Code's
   current default theme: a neutral dark-grey status bar, title bar and
@@ -24,6 +26,19 @@ no matching section fails the release job before anything is published (see
   `dark+` or `vscode-dark-classic`), so anyone who has already set
   `colorscheme` in their config — including to `vscode-dark` — is unaffected;
   only the unset default moves.
+
+### Fixed
+- Status bar, command line, and wildmenu now confined to the main column
+  when `status_bar_under_main_column` is enabled — the backdrop no longer
+  overspills into the sidebar and activity bar rows (#1959).
+- The scroll gutter between the minimap and pane edge now matches the
+  editor scrollbar width (16 px on GUI backends) instead of collapsing to
+  one character width (~8 px) on macOS (#1960, refs #723, #1869).
+- Minimap thumb drag now uses file-wide geometry — dragging the thumb
+  traverses the entire buffer like VS Code, instead of drifting within the
+  minimap's painted window.
+- `pre_render` hook synchronises per-frame backend state (font metrics,
+  scrollbar widths) before layout, eliminating a one-frame convergence lag.
 
 ## [0.15.1] - 2026-10-11
 
