@@ -2395,6 +2395,12 @@ mod tests {
         /// One Dark's `0x282c34` and `0x21252b` are asserted *absent* from
         /// the whole painted grid for the same reason: this test is red
         /// whenever the default resolves to that palette instead.
+        ///
+        /// **Verified RED against unfixed `develop`:** with
+        /// `Theme::dark()`'s `tab_bar_bg`/`status_bg` temporarily reverted
+        /// to VS Code Dark Modern's `#181818`, the `VSCODE_DARK_MODERN_CHROME_BG`
+        /// assertion below failed at cell (0, 0) with `left: Rgb(24, 24, 24)
+        /// / right: Rgb(24, 24, 24)`; restoring `#171b1b` makes it pass.
         #[test]
         fn fresh_engine_paints_vimcode_dark_chrome_via_shell_app() {
             use quadraui::tui::testing::Color;

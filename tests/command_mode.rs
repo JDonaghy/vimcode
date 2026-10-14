@@ -281,6 +281,20 @@ fn test_colorscheme_alias_vscode_normalizes_to_dark() {
 }
 
 #[test]
+fn test_colorscheme_alias_vscode_dark_modern_normalizes_to_dark() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme vscode-dark-modern");
+    assert_eq!(e.settings.colorscheme, "dark");
+}
+
+#[test]
+fn test_colorscheme_alias_vscode_light_normalizes_to_light() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme vscode-light");
+    assert_eq!(e.settings.colorscheme, "light");
+}
+
+#[test]
 fn test_colorscheme_no_args_lists_themes() {
     let mut e = engine_with("hello\n");
     exec(&mut e, "colorscheme");
