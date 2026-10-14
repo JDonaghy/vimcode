@@ -465,8 +465,10 @@ impl App {
                     .first()
                     .or(win_bar.right_segments.first())
                     .map(|s| s.bg);
-                let backdrop_rect =
-                    quadraui::Rect::new(0.0, bar_y as f32, backend.viewport().width, lh as f32);
+                // In `status_bar_under_main_column` mode, the sidebar
+                // runs full height — the backdrop must stay within
+                // the window bounds, not extend under the sidebar.
+                let backdrop_rect = sb_rect;
                 render::paint_status_backdrop(
                     backend,
                     &format!("status-backdrop:{}", rw.window_id.0),
@@ -565,16 +567,6 @@ impl App {
                 let layout = panel.render_with(backend, q_sb, |backend, body_rect| {
                     engine.explorer_tree_rect.set(body_rect);
                     engine.explorer_viewport_rows.set(body_rect.height as usize);
-                    // CI diagnostic — remove after #1917 is green
-                    eprintln!(
-                        "[diag:paint] chrome_line_height={:.2}, \
-                         body_rect=({:.1},{:.1},{:.1},{:.1})",
-                        quadraui::Backend::chrome_line_height(backend),
-                        body_rect.x,
-                        body_rect.y,
-                        body_rect.width,
-                        body_rect.height,
-                    );
                     engine.explorer_tree.borrow().render(backend, body_rect);
                 });
                 engine

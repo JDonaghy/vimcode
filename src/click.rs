@@ -134,13 +134,9 @@ pub(crate) fn pixel_to_click_target(
     // could in principle thread a scratch `DragState`; every real call site
     // threads its own backend's live one.
     drag: &mut quadraui::DragState,
-    // Alt held at press time — inverted and threaded into
-    // `render::minimap_press`'s `fine` parameter below (`!alt`, see its
-    // doc). A plain minimap drag maps within the minimap's own scale by
-    // default, matching VS Code — holding Alt opts into the file-wide fast-scroll
-    // mapping instead. Irrelevant to every other rung below the minimap, so
-    // callers with no Alt context pass `false`.
-    alt: bool,
+    // Unused for the minimap (file-wide geometry is always used), but kept
+    // in the signature for callers that thread it through to other rungs.
+    _alt: bool,
 ) -> ClickTarget {
     // The separated status line and per-window status line are now walked by
     // `render::route_chrome_click`, which `App::handle_mouse_click_msg` runs
@@ -156,10 +152,9 @@ pub(crate) fn pixel_to_click_target(
     // *every* pane's strip and reports which one it hit — never assumed to be
     // the active window, since a split can have a strip on an inactive pane too.
     if mutate_focus {
-        // A plain press/drag defaults to the minimap's own scale, matching
-        // VS Code; Alt held opts into the file-wide mapping instead. See
-        // `render::minimap_press`'s doc.
-        if let Some(press) = render_mod::minimap_press(engine, cached_layout, x, y, !alt) {
+        // File-wide geometry: dragging the minimap thumb from top to bottom
+        // scrolls through the entire file, matching VS Code. Alt is unused.
+        if let Some(press) = render_mod::minimap_press(engine, cached_layout, x, y, false) {
             if press.jump {
                 render_mod::apply_minimap_click(engine, cached_layout, x, y);
             } else {

@@ -1201,8 +1201,7 @@ mod mac_driver_tests {
         use quadraui::testing::ConformanceDriver;
 
         let dir = scratch_explorer_dir("scenario1", 6);
-        let (_guards, engine_rc, mut driver) =
-            driver_with_engine(engine_with_expanded_explorer(&dir));
+        let (_guards, mut driver) = driver(engine_with_expanded_explorer(&dir));
 
         assert!(
             driver.screen_contains("src") && driver.screen_contains("core"),
@@ -1211,64 +1210,10 @@ mod mac_driver_tests {
             driver.painted_texts()
         );
 
-        // AppShell::render() reads chrome_line_height BEFORE
-        // sync_per_frame_backend_state updates it, so the first
-        // render's shell layout uses the seed lh while the sidebar
-        // body uses the real lh (~7 px gap on CI).  A click forces
-        // handle() to read the now-current lh, and the subsequent
-        // tick re-renders with a converged layout.
-        driver.tick();
-        driver.click(0.0, 0.0);
         driver.tick();
 
-        // ── CI diagnostic — remove after #1917 is green ──────────
-        {
-            let clh = quadraui::Backend::chrome_line_height(driver.backend());
-            let inv = ConformanceDriver::inventory(&driver);
-            let runs = inv.text_runs().clone();
-            let src_bounds = runs
-                .iter()
-                .find(|r| r.text.contains("src"))
-                .map(|r| r.bounds);
-            let src_idx = runs.iter().position(|r| r.text.contains("src"));
-            eprintln!(
-                "[diag:explorer_hit_band] chrome_line_height={clh:.4}, \
-                 item_height={:.4}, src_bounds={src_bounds:?}, src_idx={src_idx:?}",
-                (clh as f64 * 1.4_f64).round(),
-            );
-            // Dump explorer_tree_rect to compare against text run positions
-            let tree_rect = engine_rc.borrow().explorer_tree_rect.get();
-            eprintln!(
-                "[diag:explorer_tree_rect] x={:.4} y={:.4} w={:.4} h={:.4}",
-                tree_rect.x, tree_rect.y, tree_rect.width, tree_rect.height,
-            );
-            // Dump all text runs to see the row y positions
-            for (i, run) in runs.iter().enumerate() {
-                eprintln!(
-                    "[diag:run {i}] text={:?} y={:.4} h={:.4}",
-                    run.text
-                        .char_indices()
-                        .nth(20)
-                        .map_or(&*run.text, |(i, _)| &run.text[..i]),
-                    run.bounds.y,
-                    run.bounds.height,
-                );
-            }
-        }
-        // ──────────────────────────────────────────────────────────
-
-        let probe_count = std::cell::Cell::new(0usize);
         crate::harness::sweep_hit_band_integrity(&mut driver, "src", 5, |d| {
-            let n = probe_count.get();
-            probe_count.set(n + 1);
-            let rect = engine_rc.borrow().explorer_tree_rect.get();
-            let has_core = ConformanceDriver::inventory(d).screen_has("core");
-            eprintln!(
-                "[diag:sweep probe {n}] has_core={has_core}, \
-                 tree_rect.y={:.4}",
-                rect.y,
-            );
-            has_core
+            ConformanceDriver::inventory(d).screen_has("core")
         });
 
         let _ = std::fs::remove_dir_all(&dir);
