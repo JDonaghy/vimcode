@@ -1243,7 +1243,10 @@ mod mac_driver_tests {
             for (i, run) in runs.iter().enumerate() {
                 eprintln!(
                     "[diag:run {i}] text={:?} y={:.4} h={:.4}",
-                    &run.text[..run.text.len().min(20)],
+                    run.text
+                        .char_indices()
+                        .nth(20)
+                        .map_or(&*run.text, |(i, _)| &run.text[..i]),
                     run.bounds.y,
                     run.bounds.height,
                 );
