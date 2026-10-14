@@ -1211,12 +1211,14 @@ mod mac_driver_tests {
             driver.painted_texts()
         );
 
-        // The AppShell's render() reads chrome_line_height BEFORE
-        // sync_per_frame_backend_state updates it.  The first tick
-        // therefore uses the seed lh for the shell layout but the real
-        // lh for the sidebar body — a ~7 px disagreement.  A second
-        // tick lets the shell layout catch up.
+        // AppShell::render() reads chrome_line_height BEFORE
+        // sync_per_frame_backend_state updates it, so the first
+        // render's shell layout uses the seed lh while the sidebar
+        // body uses the real lh (~7 px gap on CI).  A click forces
+        // handle() to read the now-current lh, and the subsequent
+        // tick re-renders with a converged layout.
         driver.tick();
+        driver.click(0.0, 0.0);
         driver.tick();
 
         // ── CI diagnostic — remove after #1917 is green ──────────
