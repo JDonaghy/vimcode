@@ -121,6 +121,12 @@ impl quadraui::ShellApp for App {
         render::register_panel_accelerators(backend, &self.engine.borrow().settings.panel_keys);
     }
 
+    fn pre_render(&self, backend: &mut dyn quadraui::Backend) {
+        let engine = self.engine.borrow();
+        let theme = Theme::from_name(&engine.settings.colorscheme);
+        self.sync_per_frame_backend_state(backend, &engine, &theme);
+    }
+
     fn render_content(
         &self,
         backend: &mut dyn quadraui::Backend,
@@ -128,7 +134,6 @@ impl quadraui::ShellApp for App {
     ) {
         let engine = self.engine.borrow();
         let theme = Theme::from_name(&engine.settings.colorscheme);
-        self.sync_per_frame_backend_state(backend, &engine, &theme);
 
         // Resolved here (cheap — `resolve_editor_font` is a pure lookup over
         // `settings`/`backend.default_fonts()`), so the `FrameOp::SidebarPanel`

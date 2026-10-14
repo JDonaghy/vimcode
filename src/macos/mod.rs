@@ -1210,6 +1210,8 @@ mod mac_driver_tests {
             driver.painted_texts()
         );
 
+        driver.tick();
+
         crate::harness::sweep_hit_band_integrity(&mut driver, "src", 5, |d| {
             ConformanceDriver::inventory(d).screen_has("core")
         });
