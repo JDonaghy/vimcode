@@ -17593,6 +17593,14 @@ mod editor_mouse_rungs {
         h.driver.press_named(quadraui::NamedKey::Down);
         h.driver.render();
 
+        // Re-probe: moving the selection loads that item's preview, so the
+        // popup widens and `PickerGeometry::compute` re-centres it. The
+        // frame-1 probe points land deep inside the list column after the
+        // shift and no longer read a row's left-edge background, so the row
+        // geometry has to be read back from the frame that just painted.
+        let (p0x, p0y) = h.picker_row_probe(0).expect("row 0 must be painted");
+        let (p1x, p1y) = h.picker_row_probe(1).expect("row 1 must be painted");
+
         assert_eq!(
             h.driver.pixel(p1x, p1y),
             selected_bg,
