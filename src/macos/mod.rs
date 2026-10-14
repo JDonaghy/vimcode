@@ -478,7 +478,7 @@ mod mac_driver_tests {
         let probe_y = (bounds.y + bounds.height / 2.0) as u32;
         let (r, g, b, _a) = driver.pixel(probe_x, probe_y);
 
-        let theme = crate::render::Theme::vscode_light();
+        let theme = crate::render::Theme::light();
         let expected = (theme.status_bg.r, theme.status_bg.g, theme.status_bg.b);
         assert_eq!(
             (r, g, b),

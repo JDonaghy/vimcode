@@ -1085,7 +1085,7 @@ mod win_driver_tests {
         // to an unrelated, already-settled claim.
         h.driver.render();
 
-        let theme = crate::render::Theme::vscode_light();
+        let theme = crate::render::Theme::light();
 
         // ── `win::editor::draw_editor`'s background ──────────────────
         let probe_line = h

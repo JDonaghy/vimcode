@@ -3830,10 +3830,9 @@ mod issue_983_row_click_selects_the_row_below {
     /// column of painted pixels outward from the category header's own fill,
     /// which only resolves a band when that header is painted in a colour its
     /// neighbouring data rows do not share. `onedark` separates the two
-    /// (`status_bg` ≠ `tab_bar_bg`); the default `vscode-dark-modern` unifies
-    /// them, matching VS Code's own Dark Modern tokens. The row-pitch and
-    /// hit-band geometry under test here are theme-independent, so which
-    /// palette paints them is incidental.
+    /// (`status_bg` ≠ `tab_bar_bg`); the default `dark` theme unifies them.
+    /// The row-pitch and hit-band geometry under test here are
+    /// theme-independent, so which palette paints them is incidental.
     fn engine_settings_scrolled_to_lsp() -> Engine {
         let mut engine = Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);

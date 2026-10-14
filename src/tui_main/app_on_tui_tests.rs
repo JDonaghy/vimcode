@@ -1979,9 +1979,8 @@ mod tests {
                 .style_at(x as u16, y as u16)
                 .expect("the revealed row must paint a styled cell");
 
-            let expected_bg = quadraui::tui::ratatui_color(
-                crate::render::Theme::vscode_light().sidebar_sel_bg_inactive,
-            );
+            let expected_bg =
+                quadraui::tui::ratatui_color(crate::render::Theme::light().sidebar_sel_bg_inactive);
             assert_eq!(
                 style.bg,
                 expected_bg,
@@ -2046,7 +2045,7 @@ mod tests {
                 .style_at(x as u16, y as u16)
                 .expect("the header title must paint a styled cell");
 
-            let theme = crate::render::Theme::vscode_light();
+            let theme = crate::render::Theme::light();
             let expected_bg = quadraui::tui::ratatui_color(theme.status_bg);
             let expected_fg = quadraui::tui::ratatui_color(theme.status_fg);
             // quadraui's old hard-coded header literal, `#252526` /
@@ -2112,7 +2111,7 @@ mod tests {
                 .expect("the line-number prefix must paint a styled cell");
 
             let expected_fg =
-                quadraui::tui::ratatui_color(crate::render::Theme::vscode_light().line_number_fg);
+                quadraui::tui::ratatui_color(crate::render::Theme::light().line_number_fg);
             assert_eq!(
                 style.fg,
                 expected_fg,
@@ -2383,21 +2382,21 @@ mod tests {
             );
         }
 
-        /// A user who has never touched `:colorscheme` must see VS Code's
-        /// **Dark Modern** palette on screen, not One Dark.
+        /// A user who has never touched `:colorscheme` must see vimcode's
+        /// own **`dark`** palette on screen — not One Dark, and not VS
+        /// Code's own Dark Modern chrome colour.
         ///
-        /// The oracle is deliberately spelled as raw RGB literals taken
-        /// straight from VS Code's `dark_modern.json`: `editor.background`
-        /// is `0x1f1f1f`, while `statusBar.background`,
-        /// `sideBar.background` and `editorGroupHeader.tabsBackground` all
-        /// share `0x181818`. Deriving them from
-        /// [`crate::render::Theme::from_name`] would have the test read
-        /// back the very default it exists to pin, so it could never fail.
+        /// The oracle is deliberately spelled as raw RGB literals rather than
+        /// derived from [`crate::render::Theme::from_name`], so the test
+        /// cannot just read back the very default it exists to pin. `dark`
+        /// keeps VS Code Dark Modern's `editor.background` (`0x1f1f1f`)
+        /// but repaints the unified status-bar/sidebar/tab-strip chrome in
+        /// vimcode's own teal-tinted `0x171b1b`, never VS Code's `0x181818`.
         /// One Dark's `0x282c34` and `0x21252b` are asserted *absent* from
         /// the whole painted grid for the same reason: this test is red
         /// whenever the default resolves to that palette instead.
         #[test]
-        fn fresh_engine_paints_vs_code_dark_modern_chrome_via_shell_app() {
+        fn fresh_engine_paints_vimcode_dark_chrome_via_shell_app() {
             use quadraui::tui::testing::Color;
 
             let mut h = harness(plain_engine());
@@ -2406,8 +2405,9 @@ mod tests {
 
             const COLS: u16 = 80;
             const ROWS: u16 = 24;
-            const DARK_MODERN_EDITOR_BG: Color = Color::Rgb(0x1f, 0x1f, 0x1f);
-            const DARK_MODERN_CHROME_BG: Color = Color::Rgb(0x18, 0x18, 0x18);
+            const VIMCODE_DARK_EDITOR_BG: Color = Color::Rgb(0x1f, 0x1f, 0x1f);
+            const VIMCODE_DARK_CHROME_BG: Color = Color::Rgb(0x17, 0x1b, 0x1b);
+            const VSCODE_DARK_MODERN_CHROME_BG: Color = Color::Rgb(0x18, 0x18, 0x18);
             const ONEDARK_EDITOR_BG: Color = Color::Rgb(0x28, 0x2c, 0x34);
             const ONEDARK_CHROME_BG: Color = Color::Rgb(0x21, 0x25, 0x2b);
 
@@ -2418,13 +2418,13 @@ mod tests {
                     let Some(style) = driver.style_at(x, y) else {
                         continue;
                     };
-                    saw_editor_bg |= style.bg == DARK_MODERN_EDITOR_BG;
-                    saw_chrome_bg |= style.bg == DARK_MODERN_CHROME_BG;
+                    saw_editor_bg |= style.bg == VIMCODE_DARK_EDITOR_BG;
+                    saw_chrome_bg |= style.bg == VIMCODE_DARK_CHROME_BG;
                     assert_ne!(
                         style.bg,
                         ONEDARK_EDITOR_BG,
                         "cell ({x}, {y}) paints One Dark's editor background; \
-                         the default colorscheme must be VS Code Dark Modern; \
+                         the default colorscheme must be vimcode's own 'dark'; \
                          screen:\n{}",
                         driver.screen()
                     );
@@ -2432,8 +2432,16 @@ mod tests {
                         style.bg,
                         ONEDARK_CHROME_BG,
                         "cell ({x}, {y}) paints One Dark's chrome background; \
-                         the default colorscheme must be VS Code Dark Modern; \
+                         the default colorscheme must be vimcode's own 'dark'; \
                          screen:\n{}",
+                        driver.screen()
+                    );
+                    assert_ne!(
+                        style.bg,
+                        VSCODE_DARK_MODERN_CHROME_BG,
+                        "cell ({x}, {y}) paints VS Code Dark Modern's own \
+                         chrome background #181818; vimcode's 'dark' theme \
+                         must repaint it with its own #171b1b; screen:\n{}",
                         driver.screen()
                     );
                 }
@@ -2441,14 +2449,14 @@ mod tests {
 
             assert!(
                 saw_editor_bg,
-                "no cell painted Dark Modern's editor.background #1f1f1f; \
+                "no cell painted 'dark's editor.background #1f1f1f; \
                  screen:\n{}",
                 driver.screen()
             );
             assert!(
                 saw_chrome_bg,
-                "no cell painted Dark Modern's unified chrome background \
-                 #181818 (status bar / sidebar / tab strip); screen:\n{}",
+                "no cell painted 'dark's unified chrome background #171b1b \
+                 (status bar / sidebar / tab strip); screen:\n{}",
                 driver.screen()
             );
         }
@@ -3611,7 +3619,7 @@ mod tests {
         }
     }
 
-    // Mode-toggle regression test (#1780)
+    // Mode-toggle regression test
     /// A mode-toggle regression test does not belong inside
     /// `vscode_mode_alt_rung_1744` — that module is scoped to the five
     /// brand-new VS Code-mode chords, not mode-toggle chrome — so it
@@ -5710,9 +5718,8 @@ mod tests {
                 .driver
                 .style_at(rx, ry)
                 .expect("the revealed row must paint a styled cell");
-            let expected_bg = quadraui::tui::ratatui_color(
-                crate::render::Theme::vscode_light().sidebar_sel_bg_inactive,
-            );
+            let expected_bg =
+                quadraui::tui::ratatui_color(crate::render::Theme::light().sidebar_sel_bg_inactive);
             assert_eq!(
                 style.bg,
                 expected_bg,
@@ -5900,7 +5907,7 @@ mod tests {
             // the faint `inactive_selected_bg` an unfocused Explorer paints
             // (see `explorer_unfocused_selected_row_paints_sidebar_sel_bg_
             // inactive_via_shell_app`).
-            let qtheme = crate::render::to_quadraui_theme(&crate::render::Theme::vscode_light());
+            let qtheme = crate::render::to_quadraui_theme(&crate::render::Theme::light());
             assert_eq!(
                 style.bg,
                 quadraui::tui::ratatui_color(qtheme.selected_bg),
@@ -6063,9 +6070,8 @@ mod tests {
                 .driver
                 .style_at(rx, ry)
                 .expect("the revealed row must paint a styled cell");
-            let expected_bg = quadraui::tui::ratatui_color(
-                crate::render::Theme::vscode_light().sidebar_sel_bg_inactive,
-            );
+            let expected_bg =
+                quadraui::tui::ratatui_color(crate::render::Theme::light().sidebar_sel_bg_inactive);
             assert_eq!(
                 style.bg,
                 expected_bg,

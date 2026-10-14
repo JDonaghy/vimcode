@@ -37,8 +37,7 @@
 //!   [`strip_non_code_runs`] is what makes this allowlist entry actually
 //!   hold.
 //! - **The theme-constructor bodies** (`Theme::onedark`, `gruvbox_dark`,
-//!   `tokyo_night`, `solarized_dark`, `vscode_dark`, `vscode_dark_modern`,
-//!   `vscode_light`).
+//!   `tokyo_night`, `solarized_dark`, `vscode_dark`, `dark`, `light`).
 //!   These functions ARE the palette: something has to spell out
 //!   `hex("#61afef")` once, in one place, to define what "the theme" means.
 //!   Every other call site in the codebase is expected to read a `Theme`
@@ -66,8 +65,8 @@ const ALLOWLISTED_THEME_FNS: &[&str] = &[
     "tokyo_night",
     "solarized_dark",
     "vscode_dark",
-    "vscode_dark_modern",
-    "vscode_light",
+    "dark",
+    "light",
 ];
 
 /// `Color::rgb(...)`/`Color::from_rgb(...)` (also matches the
