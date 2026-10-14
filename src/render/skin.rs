@@ -47,6 +47,11 @@
 //! preview) swaps proportions without racing other threads against the
 //! process-wide slot.
 //!
+//! At startup, `vimcode --skin <FILE>` resolves to one call to
+//! [`activate_skin_file`], which loads the file and installs it as the
+//! process-wide skin before any backend paints. That is the only entry
+//! point a binary needs: no backend reads a skin file itself.
+//!
 //! Mapping the shape/control tokens onto the fixed token set quadraui's own
 //! pixel backends read is [`Skin::to_quadraui_style`]; handing that to
 //! `quadraui::Backend::set_style` per frame is backend wiring left to a
@@ -341,6 +346,17 @@ pub fn set_active_skin(skin: Skin) {
     }
 }
 
+/// Load a skin file and install it as the process-wide active skin.
+///
+/// The one startup entry point: a backend-neutral `Result<(), String>` that
+/// the binary's `--skin <FILE>` handling turns into an error message, so no
+/// backend ever reads a skin file itself. The returned error is already
+/// user-facing prose from [`Skin::load_from_file`].
+pub fn activate_skin_file(path: &std::path::Path) -> Result<(), String> {
+    set_active_skin(Skin::load_from_file(path)?);
+    Ok(())
+}
+
 /// Serializes every test that calls [`set_active_skin`] then asserts
 /// against [`active_skin`] — otherwise two such tests on different
 /// test-runner threads can interleave their `set`/`assert` pairs against
@@ -523,5 +539,39 @@ mod tests {
         // observe the documented starting state.
         set_active_skin(Skin::default());
         assert_eq!(active_skin(), Skin::default());
+    }
+
+    #[test]
+    fn activate_skin_file_installs_the_file_as_the_active_skin() {
+        let path = std::env::temp_dir().join("vimcode_activate_skin_file.toml");
+        // Same reasoning as the test above: only `status_bar` may move,
+        // because it is the one bar token no geometry helper reads, so this
+        // global mutation cannot shift chrome under a concurrent driver test.
+        std::fs::write(&path, "name = \"from-file\"\n\n[bars]\nstatus_bar = 41.0\n")
+            .expect("the temp dir must be writable");
+
+        let _guard = TEST_SKIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        activate_skin_file(&path).expect("a well-formed skin file must load");
+
+        let active = active_skin();
+        assert_eq!(active.name, "from-file");
+        assert_eq!(active.bars.status_bar, 41.0);
+        // Sections the file omits keep the built-in baseline.
+        assert_eq!(active.bars.tab_bar, Skin::default().bars.tab_bar);
+
+        set_active_skin(Skin::default());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn activate_skin_file_reports_a_missing_file_without_changing_the_skin() {
+        let missing = std::env::temp_dir().join("vimcode_no_such_skin_file.toml");
+        let _ = std::fs::remove_file(&missing);
+
+        let err = activate_skin_file(&missing).expect_err("a missing skin file must be an error");
+        assert!(
+            err.contains("Failed to read skin file"),
+            "the error must name the unreadable file; got {err}"
+        );
     }
 }
