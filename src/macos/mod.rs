@@ -1211,11 +1211,12 @@ mod mac_driver_tests {
             driver.painted_texts()
         );
 
-        // The AppShell's sidebar geometry can shift between the
-        // construction frame and steady state (sidebar width settles on
-        // the second frame). One tick lets the layout converge so the
-        // sweep's absolute click positions stay within the same row
-        // across subsequent renders.
+        // The AppShell's render() reads chrome_line_height BEFORE
+        // sync_per_frame_backend_state updates it.  The first tick
+        // therefore uses the seed lh for the shell layout but the real
+        // lh for the sidebar body — a ~7 px disagreement.  A second
+        // tick lets the shell layout catch up.
+        driver.tick();
         driver.tick();
 
         // ── CI diagnostic — remove after #1917 is green ──────────
