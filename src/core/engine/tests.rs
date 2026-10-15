@@ -8137,6 +8137,99 @@ fn test_prev_visible_line_skips_outermost_nested_closed_fold() {
     );
 }
 
+// ── zc/za/zo/zM auto-detect a block from indentation without `zf` ──────────
+//
+// The gutter's hover fold marker (`fold_indicator_char`) already shows `-`
+// on a Rust block header purely from indentation, with no `zf` involved.
+// These cover the z-commands agreeing with that marker under the default
+// `'foldmethod'` `"manual"`, instead of reporting `E490`.
+
+#[test]
+fn test_zc_closes_rust_block_without_zf() {
+    let mut engine = make_indented_engine();
+    engine.view_mut().cursor.line = 0; // "fn foo() {"
+    engine.feed_keys("zc");
+    assert!(
+        engine.view().fold_at(0).is_some(),
+        "zc should auto-detect and close the fn block from indentation alone"
+    );
+    let fold = engine.view().fold_at(0).unwrap();
+    assert_eq!(fold.end, 3, "fold should span the whole indented body");
+    assert!(!engine.message.contains("E490"));
+}
+
+#[test]
+fn test_zo_reopens_auto_detected_fold() {
+    let mut engine = make_indented_engine();
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("zc");
+    assert!(engine.view().fold_at(0).is_some());
+    engine.feed_keys("zo");
+    assert!(
+        engine.view().fold_at(0).is_none(),
+        "zo should reopen the fold zc auto-detected"
+    );
+}
+
+#[test]
+fn test_za_closes_rust_block_without_zf() {
+    let mut engine = make_indented_engine();
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("za");
+    assert!(
+        engine.view().fold_at(0).is_some(),
+        "za should auto-detect and close the fn block from indentation alone"
+    );
+}
+
+#[test]
+fn test_zc_from_inside_body_without_zf() {
+    let mut engine = make_indented_engine();
+    engine.view_mut().cursor.line = 2; // "    let y = 2;" — inside the body
+    engine.feed_keys("zc");
+    assert!(
+        engine.view().fold_at(0).is_some(),
+        "zc inside an undefined block's body should find and close its enclosing header"
+    );
+    assert_eq!(
+        engine.view().cursor.line,
+        0,
+        "cursor should be pulled up to the fold header"
+    );
+}
+
+#[test]
+fn test_zm_closes_rust_blocks_without_zf() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(
+        0,
+        "fn main() {\n    let x = 1;\n}\nfn foo() {\n    bar();\n}\n",
+    );
+    engine.feed_keys("zM");
+    assert!(
+        engine.view().fold_at(0).is_some(),
+        "zM should auto-detect and close the first fn block"
+    );
+    assert!(
+        engine.view().fold_at(3).is_some(),
+        "zM should auto-detect and close the second fn block"
+    );
+}
+
+#[test]
+fn test_zc_still_reports_e490_on_flat_text() {
+    // No indentation change anywhere — `detect_fold_range` finds nothing,
+    // so `zc` still has no fold to close.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+    engine.feed_keys("zc");
+    assert!(
+        engine.message.contains("E490"),
+        "flat text has no foldable block, unexpected message: {}",
+        engine.message
+    );
+}
+
 // ── Auto-indent tests ─────────────────────────────────────────────────────
 
 #[test]
