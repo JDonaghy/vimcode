@@ -4136,7 +4136,8 @@ mod tests {
                 .expect("top-left cell must be in bounds")
                 .bg;
             assert_eq!(
-                during, before,
+                during,
+                before,
                 "TUI must not overwrite the corner cell's background with a \
                  scrim fill — the popup's own chrome is enough; screen:\n{}",
                 driver.screen()
@@ -4148,7 +4149,8 @@ mod tests {
                 .expect("top-left cell must be in bounds")
                 .bg;
             assert_eq!(
-                after, before,
+                after,
+                before,
                 "dismissing the picker must leave the corner cell unchanged; \
                  screen:\n{}",
                 driver.screen()
