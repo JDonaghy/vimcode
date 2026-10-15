@@ -424,6 +424,35 @@ pub fn debug_output_to_text_display(
     }
 }
 
+/// Build a one-line `TextDisplay` for a bottom-panel placeholder tab
+/// (Problems / Output) that has no content wired up yet.
+pub fn bottom_panel_placeholder_to_text_display(
+    widget_id: &str,
+    message: &str,
+) -> quadraui::TextDisplay {
+    quadraui::TextDisplay {
+        id: quadraui::WidgetId::new(widget_id),
+        lines: vec![quadraui::TextDisplayLine {
+            spans: vec![quadraui::StyledSpan {
+                text: format!("  {message}"),
+                fg: None,
+                bg: None,
+                bold: false,
+                italic: false,
+                underline: false,
+            }],
+            decoration: quadraui::Decoration::Normal,
+            timestamp: None,
+        }],
+        scroll_offset: 0,
+        auto_scroll: false,
+        max_lines: 0,
+        has_focus: false,
+        title: None,
+        show_scrollbar: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,8 +1012,8 @@ mod tests {
 
     /// `build_activity_bar`'s `active_accent` must come from the dedicated
     /// `theme.activity_active_accent` colour, not `theme.cursor`.
-    /// `vscode_light`'s `cursor` (`#000000`) and `activity_active_accent`
-    /// (`#646e6e`) are deliberately different, so a regression fails loudly
+    /// `light`'s `cursor` (hex `000000`) and `activity_active_accent`
+    /// (hex `1d7a6c`) are two distinct colours, so a regression fails loudly
     /// here rather than only looking wrong on screen.
     ///
     /// Note: as of the pending quadraui hook, `render::build_activity_bar`
@@ -997,7 +1026,7 @@ mod tests {
     #[test]
     fn build_activity_bar_active_accent_uses_activity_active_accent_not_cursor() {
         let engine = crate::core::Engine::new_for_test();
-        let theme = Theme::vscode_light();
+        let theme = Theme::light();
         assert_ne!(
             theme.cursor, theme.activity_active_accent,
             "fixture must use a theme where the two colours differ, or this \

@@ -20,6 +20,17 @@
 #   2  the selected backend is not available on this host
 #   3  internal error (bad arguments, missing cargo, etc.)
 #
+# Testing hooks (used by tests/regress_script.rs; not part of the documented
+# interface, no compatibility promise beyond that suite):
+#   REGRESS_CMD_<BACKEND>="<shell command>"  replaces the `cargo test`
+#       invocation for that backend. The command's stdout+stderr is parsed
+#       exactly as cargo's would be, and its exit status is the run's.
+#   REGRESS_OVERRIDE_<BACKEND>=1|0           replaces that backend's real
+#       availability probe (1 = available, 0 = not available).
+#   REGRESS_HARNESS_FILE=<path>              replaces src/harness.rs as the
+#       source of the `backend_conformance!` label set.
+# <BACKEND> is the upper-cased backend name (TUI, GTK, MACOS, WIN).
+#
 set -euo pipefail
 
 # -- Constants ---------------------------------------------------------------
@@ -116,7 +127,22 @@ fi
 # -- Backend availability probe ---------------------------------------------
 # Mirrors platform-conformance.sh's probe logic.
 
+backend_upper() {
+    printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
+}
+
 probe_backend() {
+    local override_var
+    override_var="REGRESS_OVERRIDE_$(backend_upper "$1")"
+    local override="${!override_var:-}"
+    if [[ -n "$override" ]]; then
+        if [[ "$override" == "1" ]]; then
+            return 0
+        fi
+        echo "$1 backend: unavailable (probe overridden)" >&2
+        return 1
+    fi
+
     case "$1" in
         tui)
             return 0
@@ -148,21 +174,32 @@ probe_backend() {
     esac
 }
 
+# -- Scenario label collection ------------------------------------------------
+# Collect all backend_conformance! labels from source. This is the single
+# source of truth for "which scenarios exist" -- both --list and the
+# per-scenario run-mode table below read from it, so the scenario set can
+# never drift between the two.
+#
+# Matches indented `label: <ident>,` lines that are not inside comments
+# or strings (the macro definition's `$label:ident` is filtered by the
+# leading `$`).
+all_labels() {
+    cd "$REPO_DIR"
+    local harness_file="${REGRESS_HARNESS_FILE:-src/harness.rs}"
+    grep -E '^[[:space:]]+label: ' "$harness_file" 2>/dev/null \
+        | grep -v '//' | grep -v '"' | grep -v '\$' \
+        | sed 's/.*label: *//' | sed 's/,.*//' || true
+}
+
 # -- List mode ---------------------------------------------------------------
 
 if $LIST; then
     cd "$REPO_DIR"
 
-    # Collect all backend_conformance! labels from source.
-    # Matches indented `label: <ident>,` lines that are not inside comments
-    # or strings (the macro definition's `$label:ident` is filtered by the
-    # leading `$`).
-    LABELS=$(grep -E '^[[:space:]]+label: ' src/harness.rs 2>/dev/null \
-        | grep -v '//' | grep -v '"' | grep -v '\$' \
-        | sed 's/.*label: *//' | sed 's/,.*//' || true)
+    LABELS=$(all_labels)
 
     if [[ -z "$LABELS" ]]; then
-        echo "No backend_conformance! scenarios found in src/harness.rs" >&2
+        echo "No backend_conformance! scenarios found in ${REGRESS_HARNESS_FILE:-src/harness.rs}" >&2
         exit $EXIT_ERROR
     fi
 
@@ -259,6 +296,12 @@ case "$BACKEND" in
         ;;
 esac
 
+CMD_OVERRIDE_VAR="REGRESS_CMD_$(backend_upper "$BACKEND")"
+CMD_OVERRIDE="${!CMD_OVERRIDE_VAR:-}"
+if [[ -n "$CMD_OVERRIDE" ]]; then
+    cargo_cmd=(bash -c "$CMD_OVERRIDE" regress-stub)
+fi
+
 # -- Area filter -> cargo test name filter ----------------------------------
 
 if [[ -n "$AREA" ]]; then
@@ -288,8 +331,10 @@ echo "=== regress: backend=$BACKEND area=${AREA:-all} ==="
 echo "Command: ${cargo_cmd[*]} -- $cargo_test_filter"
 echo ""
 
-OUTFILE=$(mktemp)
-trap 'rm -f "$OUTFILE"' EXIT
+# The full cargo output is kept on disk (never deleted) and its path is
+# always printed, so the operator can inspect the complete log after the
+# short table below.
+OUTFILE="$(mktemp -t "vimcode-regress.${BACKEND}.XXXXXX.log")"
 
 set +e
 "${cargo_cmd[@]}" -- "$cargo_test_filter" 2>&1 | tee "$OUTFILE"
@@ -297,10 +342,17 @@ TEST_EXIT=${PIPESTATUS[0]}
 set -e
 
 # -- Parse results ----------------------------------------------------------
+#
+# `cargo test` runs one "test result:" line *per test binary* (the lib
+# unittests, each integration-test file, each bin target), not one for the
+# whole invocation. Only the binary that actually contains harness::/macos::/
+# win:: tests reports a nonzero count; the rest report "0 passed; 0 failed"
+# for that binary. Summing across every "test result:" line (rather than
+# reading just the last one) gives the true total regardless of how many
+# binaries cargo happened to run.
 
-TOTAL_LINE=$(grep -E '^test result: ' "$OUTFILE" | tail -1 || true)
-PASSED=$(echo "$TOTAL_LINE" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || echo "0")
-FAILED=$(echo "$TOTAL_LINE" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo "0")
+PASSED=$(grep -E '^test result: ' "$OUTFILE" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')
+FAILED=$(grep -E '^test result: ' "$OUTFILE" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')
 
 # The #645 vacuous-green guard: if zero tests ran, that is a failure.
 TOTAL=$((PASSED + FAILED))
@@ -311,10 +363,107 @@ if [[ $TOTAL -eq 0 && $TEST_EXIT -eq 0 ]]; then
     TEST_EXIT=1
 fi
 
+# -- Per-scenario table -------------------------------------------------
+# Build one row per scenario per backend variant actually reported by
+# cargo's own test harness, so this table can never disagree with
+# `cargo test`'s own verdict for the scenario it describes. For tui/gtk,
+# scenario names are cross-referenced against the full label set from
+# src/harness.rs so a scenario that didn't run at all (e.g. filtered out
+# by --area) is still shown, as a skip, rather than silently omitted.
+
+declare -a TABLE_ROWS=()
+
+parse_backend_suffix() {
+    case "$1" in
+        *::tui_prod) echo "tui_prod" ;;
+        *::tui)      echo "tui" ;;
+        *::gtk)      echo "gtk" ;;
+        *)           echo "" ;;
+    esac
+}
+
+# Lines look like: "test harness::tests::some_label::tui ... ok". Some
+# driver tests write a raw terminal title-set escape sequence straight to
+# the fd with no trailing newline, which can land immediately before the
+# next test's result line and shift it off column 0 -- so the match below
+# is not anchored to the start of the line, only to "test <path> ... ".
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    test_path=$(echo "$line" | sed -E 's/.*test ([^ ]+) \.\.\..*/\1/')
+    outcome=$(echo "$line" | sed -E 's/.*test [^ ]+ \.\.\. (ok|FAILED|ignored).*/\1/')
+    suffix=$(parse_backend_suffix "$test_path")
+    if [[ -n "$suffix" ]]; then
+        # harness::...::<label>::<suffix> -> <label> is the segment before the suffix.
+        label=$(echo "$test_path" | sed -E "s/::${suffix}\$//" | sed -E 's/.*:://')
+    else
+        label="$test_path"
+        suffix="$BACKEND"
+    fi
+    case "$outcome" in
+        ok)      result="pass" ;;
+        FAILED)  result="fail" ;;
+        ignored) result="skip (cargo test marked #[ignore])" ;;
+        *)       result="unknown" ;;
+    esac
+    TABLE_ROWS+=("${label}\t${suffix}\t${result}")
+done < <(grep -E 'test [^ ]+ \.\.\. (ok|FAILED|ignored)' "$OUTFILE" || true)
+
+# For tui/gtk, add a skip row for every registered scenario that produced
+# no row at all (most commonly: filtered out by --area).
+#
+# The lookup below is a plain associative array built with a non-piped
+# `for` loop, not a `printf ... | grep -q` pipeline. Under `set -o
+# pipefail` (part of `set -euo pipefail` above), a `grep -q` that matches
+# and exits early can SIGPIPE the still-writing `printf`, and pipefail then
+# reports that SIGPIPE as the pipeline's exit status even though the grep
+# match itself succeeded -- turning a real match into a spurious "not
+# matched" skip row for a scenario that actually ran and passed. That
+# failure mode is data-dependent (it only shows up when a match lands
+# early enough in a large TABLE_ROWS to let the writer get SIGPIPE'd), so
+# it does not reproduce on every run with every label.
+if [[ "$BACKEND" == "tui" || "$BACKEND" == "gtk" ]]; then
+    declare -A SEEN_LABELS=()
+    for row in "${TABLE_ROWS[@]:-}"; do
+        [[ -z "$row" ]] && continue
+        row_label="${row%%\\t*}"
+        SEEN_LABELS["$row_label"]=1
+    done
+
+    ALL_LABELS=$(all_labels)
+    while IFS= read -r label; do
+        [[ -z "$label" ]] && continue
+        if [[ -z "${SEEN_LABELS[$label]:-}" ]]; then
+            reason="not matched by filter '$cargo_test_filter'"
+            TABLE_ROWS+=("${label}\t${BACKEND}\tskip (${reason})")
+        fi
+    done <<< "$ALL_LABELS"
+fi
+
 # -- Output -----------------------------------------------------------------
 
 VERDICT="$([ $TEST_EXIT -eq 0 ] && echo "pass" || echo "fail")"
 
+# Normalise to the documented exit contract. `cargo test` signals a test
+# failure with 101, and a caller gating on this script must be able to tell
+# "scenarios failed" (1) from "backend unavailable" (2) and "bad invocation"
+# (3) by exit code alone, so any nonzero cargo status collapses to EXIT_FAIL.
+EXIT_CODE=$EXIT_PASS
+if [[ $TEST_EXIT -ne 0 ]]; then
+    EXIT_CODE=$EXIT_FAIL
+fi
+
+echo ""
+echo "=== regress: per-scenario results ==="
+printf "%-70s %-10s %s\n" "SCENARIO" "BACKEND" "RESULT"
+printf "%-70s %-10s %s\n" "--------" "-------" "------"
+for row in "${TABLE_ROWS[@]:-}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r r_label r_backend r_result <<< "$(echo -e "$row")"
+    printf "%-70s %-10s %s\n" "$r_label" "$r_backend" "$r_result"
+done
+
+echo ""
+echo "Full log: $OUTFILE"
 echo ""
 echo "=== regress summary ==="
 
@@ -327,7 +476,8 @@ if $JSON; then
   "failed": $FAILED,
   "total": $TOTAL,
   "verdict": "$VERDICT",
-  "exit": $TEST_EXIT
+  "exit": $EXIT_CODE,
+  "log": "$OUTFILE"
 }
 ENDJSON
 else
@@ -336,13 +486,14 @@ else
     echo "Passed:   $PASSED"
     echo "Failed:   $FAILED"
     echo "Total:    $TOTAL"
-    if [[ $TEST_EXIT -eq 0 ]]; then
+    echo "Log:      $OUTFILE"
+    if [[ $EXIT_CODE -eq 0 ]]; then
         echo "Verdict:  PASS"
     else
         echo "Verdict:  FAIL"
     fi
 fi
 
-echo "REGRESS_SUMMARY backend=$BACKEND area=${AREA:-all} passed=$PASSED failed=$FAILED total=$TOTAL verdict=$VERDICT exit=$TEST_EXIT"
+echo "REGRESS_SUMMARY backend=$BACKEND area=${AREA:-all} passed=$PASSED failed=$FAILED total=$TOTAL verdict=$VERDICT exit=$EXIT_CODE log=$OUTFILE"
 
-exit $TEST_EXIT
+exit $EXIT_CODE

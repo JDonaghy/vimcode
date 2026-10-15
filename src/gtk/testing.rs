@@ -2820,9 +2820,9 @@ mod tests {
     }
 
     /// The tab-bar row and the breadcrumb row are fixed-pixel chrome, not
-    /// `ceil(line_height * 1.6)` / `+ line_height`. This test pins that the
-    /// fixed pixel constants actually reach the live paint pipeline, and that
-    /// breadcrumbs add exactly [`crate::render::BREADCRUMB_ROW_HEIGHT_PX`] —
+    /// `ceil(line_height * 1.6)` / `+ line_height`. This test pins that those
+    /// pixel heights actually reach the live paint pipeline, and that
+    /// breadcrumbs add exactly [`crate::render::breadcrumb_row_height_px`] —
     /// not a whole `line_height`-tall row — above the window content.
     #[test]
     fn breadcrumb_row_adds_a_fixed_22px_not_a_whole_line_height() {
@@ -2871,15 +2871,52 @@ mod tests {
         assert_ne!(
             lh, 22.0,
             "test setup sanity: the harness's painted line_height must not \
-             coincidentally equal BREADCRUMB_ROW_HEIGHT_PX, or this test \
+             coincidentally equal the skin's breadcrumb row height, or this \
+             test \
              cannot distinguish the fix from the old `+ line_height` bug"
         );
         assert!(
-            (delta - crate::render::BREADCRUMB_ROW_HEIGHT_PX).abs() < 0.5,
-            "breadcrumbs must reserve exactly BREADCRUMB_ROW_HEIGHT_PX \
-             ({}) above the window content, not line_height ({lh}); got \
-             delta {delta} (on_top={on_top}, off_top={off_top})",
-            crate::render::BREADCRUMB_ROW_HEIGHT_PX
+            (delta - crate::render::breadcrumb_row_height_px()).abs() < 0.5,
+            "breadcrumbs must reserve exactly the skin's breadcrumb row \
+             height ({}) above the window content, not line_height ({lh}); \
+             got delta {delta} (on_top={on_top}, off_top={off_top})",
+            crate::render::breadcrumb_row_height_px()
+        );
+    }
+
+    /// A skin file's `[bars]` proportions reach the painted frame: raising
+    /// `tab_bar` pushes the breadcrumb text — and with it everything below —
+    /// down by exactly that many pixels, with no backend code involved. This
+    /// is the whole point of the skin being declarative: the same binary
+    /// paints different chrome proportions purely because a token changed.
+    #[test]
+    fn skin_bar_heights_move_the_painted_chrome() {
+        let baseline = {
+            let h = harness(engine_with_breadcrumb_path(), 1400, 900);
+            h.driver
+                .find_bounds("src")
+                .expect("the breadcrumb's \"src\" path segment must paint")
+                .y
+        };
+
+        let extra = 24.0_f32;
+        let mut taller = crate::render::Skin::default();
+        taller.bars.tab_bar += extra;
+        let shifted = {
+            let _skin = crate::render::push_scoped_skin(taller);
+            let h = harness(engine_with_breadcrumb_path(), 1400, 900);
+            h.driver
+                .find_bounds("src")
+                .expect("the breadcrumb's \"src\" path segment must paint")
+                .y
+        };
+
+        let delta = shifted - baseline;
+        assert!(
+            (delta - extra).abs() < 0.5,
+            "a skin with a {extra}px taller tab bar must paint the breadcrumb \
+             row {extra}px lower; got {delta} (baseline={baseline}, \
+             shifted={shifted})"
         );
     }
 
@@ -2888,8 +2925,8 @@ mod tests {
     /// in `gtk/mod.rs`) — not float at whatever font a previous draw call in
     /// the frame happened to leave on the shared Pango layout. Measures
     /// *width*, not height: `find_bounds`' recorded rect reports a fixed
-    /// row-slot height for status-bar segments (matching
-    /// `BREADCRUMB_ROW_HEIGHT_PX`) regardless of the font actually painted,
+    /// row-slot height for status-bar segments (matching the skin's
+    /// `[bars] breadcrumb_row`) regardless of the font actually painted,
     /// but glyph width scales with point size same as it does.
     #[test]
     fn breadcrumb_text_width_tracks_ui_font_size_not_editor_font_size() {
@@ -3631,27 +3668,109 @@ mod tests {
         );
     }
 
-    /// VS Code's activity bar paints, top to bottom, Explorer ·
-    /// Search · Source Control · Run and Debug · Extensions — vimcode had
-    /// Source Control and Run and Debug swapped (debug third, git fourth)
-    /// and the wrong glyphs for three of the five (an open-folder icon for
-    /// Explorer, the plain `fa-bug` glyph for Run and Debug, and the
-    /// diamond-shaped `nf-dev-git`/`e702` glyph for Source Control).
+    /// `Explorer`/`Run and Debug`/`Source Control`/`Extensions` must paint
+    /// their new Font Awesome glyphs (`icons::EXPLORER`/`RUN_AND_DEBUG`/
+    /// `SOURCE_CONTROL`/`EXTENSIONS`), not the `nf-cod-*` Codicon-shaped
+    /// glyphs those constants held before the Nerd Font family swap.
+    /// Mirrors `activity_bar_search_icon_paints_the_shared_glyph_not_the_deleted_cod_variant`
+    /// (render the same app twice, diff the activity-bar column) but covers
+    /// the four chrome icons that moved to Font Awesome, by panel id.
+    #[test]
+    fn activity_bar_chrome_icons_paint_font_awesome_glyphs_not_the_deleted_nf_cod_variants() {
+        /// Comfortably inside the activity bar and below the title-bar band.
+        /// Starts higher than the search-icon test above's `100` because
+        /// Explorer is the topmost activity-bar icon (paints at y≈70, above
+        /// Search's row) rather than below it.
+        const STRIP_W: i32 = 40;
+        const STRIP_Y: std::ops::Range<i32> = 50..800;
+
+        fn activity_bar_strip(panel_id: &str, icon_override: Option<&str>) -> Vec<(u8, u8, u8)> {
+            // Same reasoning as the search-icon test's helper: patch
+            // `build_shell_config`'s output by hand between build and
+            // render, and acquire the paint/cwd guards in the same order
+            // (paint then cwd) so they drop last, after `driver`.
+            let _paint = crate::test_paint::PaintGuard::acquire();
+            let _cwd = crate::test_cwd::CwdReadGuard::acquire();
+            let mut engine = Engine::new();
+            engine.settings.use_nerd_fonts = Some(true);
+            let engine = Rc::new(RefCell::new(engine));
+            let app = App::new_headless(Rc::clone(&engine));
+            let mut config = crate::gtk::build_shell_config(&app);
+            if let Some(icon) = icon_override {
+                let panel = config
+                    .panels
+                    .iter_mut()
+                    .find(|p| p.id.as_str() == panel_id)
+                    .unwrap_or_else(|| panic!("fixture: shell_config must register {panel_id}"));
+                panel.icon = icon.to_string();
+            }
+            let mut driver = driver_with_shell(app, config, 1400, 900);
+            let mut px = Vec::new();
+            for y in STRIP_Y.step_by(2) {
+                for x in (0..STRIP_W).step_by(2) {
+                    px.push(driver.pixel(x, y));
+                }
+            }
+            px
+        }
+
+        // (panel id, the deleted nf-cod-* codepoint this constant held before
+        // its Font Awesome swap, label for the assertion message).
+        const CASES: &[(&str, &str, &str)] = &[
+            ("panel:explorer", "\u{eaf0}", "nf-cod-files (EXPLORER)"),
+            (
+                "panel:debug",
+                "\u{eb91}",
+                "nf-cod-debug_alt (RUN_AND_DEBUG)",
+            ),
+            (
+                "panel:git",
+                "\u{ea68}",
+                "nf-cod-source_control (SOURCE_CONTROL)",
+            ),
+            (
+                "panel:extensions",
+                "\u{eae6}",
+                "nf-cod-extensions (EXTENSIONS)",
+            ),
+        ];
+
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        crate::icons::set_nerd_fonts(true);
+
+        for (panel_id, old_glyph, label) in CASES {
+            let current = activity_bar_strip(panel_id, None);
+            let reverted = activity_bar_strip(panel_id, Some(old_glyph));
+
+            let differing = current
+                .iter()
+                .zip(reverted.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert!(
+                differing > 0,
+                "{panel_id}'s live rendering must differ from the deleted \
+                 {label} glyph it painted before its Font Awesome swap — \
+                 {differing}/{} sampled pixels differed; a revert of the \
+                 Font Awesome swap would make these two renders identical",
+                current.len()
+            );
+        }
+
+        crate::icons::set_nerd_fonts(prev_nf);
+    }
+
+    /// The activity bar paints, top to bottom: Explorer · Search ·
+    /// Source Control · Run and Debug · Extensions.
     ///
     /// Reads real painted output, not `PanelDefinition` state: each
     /// assertion locates a glyph via `GtkDriver::find`, which only reports
     /// positions `GtkBackend::record_painted_text` recorded while actually
     /// rasterising a Pango layout this frame, then checks the Y-coordinates
-    /// come back in top-to-bottom order. The icon glyphs doubling as search
-    /// needles (`icons::SOURCE_CONTROL`/`icons::RUN_AND_DEBUG`, nf-cod
-    /// `\u{ea68}`/`\u{eb91}`) are themselves new in this issue — on
-    /// unfixed `develop`, `App::resolve_builtin_panel_icon` never emits
-    /// either codepoint at all (`"panel:git"` painted the old `GIT_BRANCH`
-    /// diamond glyph, `"panel:debug"` painted the plain bug glyph), so
-    /// `find` returns `None` and the `expect` below panics before the
-    /// ordering check is even reached — verified by reverting
-    /// `src/app.rs`'s two changed match arms locally and re-running this
-    /// test, which failed exactly that way.
+    /// come back in top-to-bottom order. Locating by `icons::SOURCE_CONTROL`/
+    /// `icons::RUN_AND_DEBUG` (constant reference, not a literal codepoint)
+    /// keeps this test agnostic to which font family's glyph those
+    /// constants currently resolve to.
     #[test]
     fn activity_bar_paints_vscode_order_and_glyphs() {
         let mut engine = Engine::new();
@@ -3682,8 +3801,7 @@ mod tests {
         assert!(
             source_control_y < run_and_debug_y,
             "Source Control ({source_control_y}) must paint above Run and \
-             Debug ({run_and_debug_y}) — VS Code order, vimcode used to \
-             have these two swapped"
+             Debug ({run_and_debug_y})"
         );
         assert!(
             run_and_debug_y < extensions_y,
@@ -4756,10 +4874,10 @@ mod sidebar_panel_clicks {
     ///
     /// Verified RED against unfixed code (`background: None`): this exact
     /// probe point read `rgb(120, 121, 124)`, a mid-grey nothing like
-    /// `vscode-light`'s `tab_bar_bg` (`#ececec`); the tolerant assertion
-    /// below only passes once the fix is restored (probed `rgb(206, 206,
-    /// 206)` — close to, not identical to, `tab_bar_bg` because the
-    /// scrollbar overlay still blends its own partial opacity on top).
+    /// `light`'s `tab_bar_bg` (`#e3eeec`); the tolerant assertion
+    /// below only passes once the fix is restored (close to, not identical
+    /// to, `tab_bar_bg` because the scrollbar overlay still blends its own
+    /// partial opacity on top).
     #[test]
     fn settings_panel_scrollbar_gutter_paints_theme_tab_bar_bg() {
         let mut engine = Engine::new();
@@ -4778,7 +4896,7 @@ mod sidebar_panel_clicks {
         let probe_y = (sb.y + 200.0) as i32;
         let (r, g, b) = h.driver.pixel(probe_x, probe_y);
 
-        let bg = crate::render::Theme::vscode_light().tab_bar_bg;
+        let bg = crate::render::Theme::light().tab_bar_bg;
         const TOL: i32 = 40; // the scrollbar overlay's own blending, not AA noise
         let close = |c: u8, target: u8| (c as i32 - target as i32).abs() <= TOL;
         assert!(
@@ -4794,7 +4912,7 @@ mod sidebar_panel_clicks {
     /// painted by quadraui's `AppShell::render`) must come from vimcode's own
     /// theme on GTK too. Before quadraui#1180, `AppShell::render` painted a
     /// hard-coded `Color::rgb(37, 37, 38)` regardless of theme; under
-    /// `vscode-light` that read as a dark band behind a light sidebar.
+    /// `light` that read as a dark band behind a light sidebar.
     /// `to_quadraui_theme_chrome` has mapped `header_bg`/`header_fg` from
     /// `theme.status_bg`/`theme.status_fg`, but the mapping had no effect
     /// because `AppShell::render` never read those fields.
@@ -4834,7 +4952,7 @@ mod sidebar_panel_clicks {
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let (r, g, b) = ranked[0].0;
 
-        let theme = crate::render::Theme::vscode_light();
+        let theme = crate::render::Theme::light();
         let expected = (theme.status_bg.r, theme.status_bg.g, theme.status_bg.b);
         assert_eq!(
             (r, g, b),
@@ -5091,7 +5209,10 @@ mod sidebar_panel_clicks {
             "precondition: the Terminal tab owns the panel body"
         );
 
-        // Locate the *second* painted tab slot (Terminal, then Debug Output).
+        // With both a terminal and debug output present, `build_bottom_panel_
+        // tab_bar` paints four slots in a fixed order: Problems, Output,
+        // Debug Console, Terminal (`src/render/quadraui_adapters.rs`). Debug
+        // Console is slot index 2.
         let (slot_x, strip_y) = {
             let engine = h.engine.borrow();
             let hits = engine.bottom_tab_bar_hits.borrow();
@@ -5100,8 +5221,8 @@ mod sidebar_panel_clicks {
                 .expect("the bottom panel must have painted a tab strip");
             let (cx, _cy) = hits
                 .layout
-                .tab_center(1)
-                .expect("Terminal + Debug Output are two painted slots");
+                .tab_center(2)
+                .expect("Problems, Output, Debug Console and Terminal are four painted slots");
             let geom = engine
                 .bottom_panel_geometry
                 .borrow()
@@ -5113,7 +5234,7 @@ mod sidebar_panel_clicks {
 
         assert!(
             h.driver.screen_contains("ZQXW754GTKDEBUGMARKER"),
-            "clicking the Debug Output tab must repaint the panel body with the \
+            "clicking the Debug Console tab must repaint the panel body with the \
              debug output (#754 `BottomPanelRoute::TabBar`)"
         );
     }
@@ -16422,6 +16543,69 @@ mod modal_rung {
             h.driver.painted_texts()
         );
     }
+
+    /// The picker popup floats over the editor pane only: it must start to
+    /// the right of the sidebar and sit near the top of the window rather
+    /// than spanning (or centering across) the full window height.
+    #[test]
+    fn picker_popup_floats_over_editor_pane_not_sidebar() {
+        let mut engine = small_engine();
+        engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+        let h = harness(engine, 1400, 900);
+
+        let sb = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("the sidebar paints by default and must publish its bounds");
+        let (px, py, _pw, ph) = h
+            .picker_popup()
+            .expect("fixture must actually paint the picker");
+
+        assert!(
+            px >= (sb.x + sb.width) as f64,
+            "the popup's left edge ({px}) must start at or right of the \
+             sidebar's right edge ({}, {}), not overlap it",
+            sb.x,
+            sb.width
+        );
+        assert!(
+            ph < 900.0 * 0.5,
+            "a 2-item picker (LineEndings) must paint a compact popup, not \
+             one spanning most of the 900px-tall window; painted height: {ph}"
+        );
+        assert!(
+            py < 900.0 * 0.25,
+            "the popup must anchor near the top of the window ({py}), not \
+             be vertically centred across it"
+        );
+    }
+
+    /// A picker with many more results (the command palette) paints a
+    /// taller popup than a picker with just a couple of entries
+    /// (line endings) — height tracks the result count instead of being a
+    /// fixed share of the viewport.
+    #[test]
+    fn picker_popup_height_scales_with_item_count() {
+        let mut few_engine = small_engine();
+        few_engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+        let h_few = harness(few_engine, 1400, 900);
+        let (_, _, _, few_h) = h_few
+            .picker_popup()
+            .expect("the line-endings picker must paint");
+
+        let mut many_engine = small_engine();
+        many_engine.open_picker(crate::core::engine::PickerSource::Commands);
+        let h_many = harness(many_engine, 1400, 900);
+        let (_, _, _, many_h) = h_many
+            .picker_popup()
+            .expect("the command palette must paint");
+
+        assert!(
+            many_h > few_h,
+            "the command palette (many results) must paint a taller popup \
+             ({many_h}) than the line-endings picker (two results, {few_h})"
+        );
+    }
 }
 
 /// Adopting `quadraui::FolderPickerController` on GTK, replacing the
@@ -17452,6 +17636,14 @@ mod editor_mouse_rungs {
 
         h.driver.press_named(quadraui::NamedKey::Down);
         h.driver.render();
+
+        // Re-probe: moving the selection loads that item's preview, so the
+        // popup widens and `PickerGeometry::compute` re-centres it. The
+        // frame-1 probe points land deep inside the list column after the
+        // shift and no longer read a row's left-edge background, so the row
+        // geometry has to be read back from the frame that just painted.
+        let (p0x, p0y) = h.picker_row_probe(0).expect("row 0 must be painted");
+        let (p1x, p1y) = h.picker_row_probe(1).expect("row 1 must be painted");
 
         assert_eq!(
             h.driver.pixel(p1x, p1y),

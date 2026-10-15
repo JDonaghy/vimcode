@@ -3830,10 +3830,9 @@ mod issue_983_row_click_selects_the_row_below {
     /// column of painted pixels outward from the category header's own fill,
     /// which only resolves a band when that header is painted in a colour its
     /// neighbouring data rows do not share. `onedark` separates the two
-    /// (`status_bg` ≠ `tab_bar_bg`); the default `vscode-dark-modern` unifies
-    /// them, matching VS Code's own Dark Modern tokens. The row-pitch and
-    /// hit-band geometry under test here are theme-independent, so which
-    /// palette paints them is incidental.
+    /// (`status_bg` ≠ `tab_bar_bg`); the default `dark` theme unifies them.
+    /// The row-pitch and hit-band geometry under test here are
+    /// theme-independent, so which palette paints them is incidental.
     fn engine_settings_scrolled_to_lsp() -> Engine {
         let mut engine = Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);
@@ -5953,7 +5952,7 @@ mod issue_1360_activity_bar_click_focuses_panel {
 /// `quadraui::tui::TuiBackend`) must paint the buffer's first line directly
 /// below a 1-row tab bar, with the status bar on row 22 and the command line
 /// on row 23 — proof that `render::UnitProfile::cell()` reserves the tab bar
-/// as one cell row (not `TAB_ROW_HEIGHT_PX`'s pixel height) rather than
+/// as one cell row (not `tab_row_height_px`'s pixel height) rather than
 /// collapsing the whole editor content band.
 #[cfg(test)]
 mod issue_1426_app_on_tui_rows_match_shipped_tui {
@@ -10779,6 +10778,15 @@ mod settings_number_enables_line_numbers_mod {
                 driver.screen_has("zqbaz"),
                 "precondition: the fixture buffer's third line must be painted"
             );
+            // Settle the sidebar before asserting on the *absence* of a digit.
+            // The runner's own `AppShell` starts with the sidebar visible and
+            // only learns the engine's hidden state on the first dispatch, so
+            // frame 1 still paints the file explorer -- rooted at the process's
+            // working directory, whose real file and directory names carry
+            // machine-dependent digits that would satisfy `screen_has("3")`
+            // with nothing to do with the gutter. Escape is a no-op in normal
+            // mode, so this only costs one dispatch.
+            driver.press_named(NamedKey::Escape);
             assert!(
                 !driver.any_text_inside_role("3", UiRole::MainContent),
                 "precondition: with line numbers off, no gutter digit \"3\" (line \

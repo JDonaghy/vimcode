@@ -166,9 +166,9 @@ fn test_wq_clean_buffer() {
 // ── :colorscheme ──────────────────────────────────────────────────────────────
 
 #[test]
-fn test_colorscheme_default_is_vscode_dark_modern() {
+fn test_colorscheme_default_is_dark() {
     let e = engine_with("hello\n");
-    assert_eq!(e.settings.colorscheme, "vscode-dark-modern");
+    assert_eq!(e.settings.colorscheme, "dark");
 }
 
 #[test]
@@ -239,7 +239,7 @@ fn test_colorscheme_unknown_returns_error() {
         "unknown theme should return Error"
     );
     assert_eq!(
-        e.settings.colorscheme, "vscode-dark-modern",
+        e.settings.colorscheme, "dark",
         "colorscheme unchanged after bad name"
     );
 }
@@ -272,12 +272,26 @@ fn test_colorscheme_classic_aliases_normalize_to_vscode_dark() {
     }
 }
 
-/// The bare `vscode` alias follows the new default onto Dark Modern.
+/// The bare `vscode` alias follows the default onto vimcode's `dark` theme.
 #[test]
-fn test_colorscheme_alias_vscode_normalizes_to_dark_modern() {
+fn test_colorscheme_alias_vscode_normalizes_to_dark() {
     let mut e = engine_with("hello\n");
     exec(&mut e, "colorscheme vscode");
-    assert_eq!(e.settings.colorscheme, "vscode-dark-modern");
+    assert_eq!(e.settings.colorscheme, "dark");
+}
+
+#[test]
+fn test_colorscheme_alias_vscode_dark_modern_normalizes_to_dark() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme vscode-dark-modern");
+    assert_eq!(e.settings.colorscheme, "dark");
+}
+
+#[test]
+fn test_colorscheme_alias_vscode_light_normalizes_to_light() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "colorscheme vscode-light");
+    assert_eq!(e.settings.colorscheme, "light");
 }
 
 #[test]

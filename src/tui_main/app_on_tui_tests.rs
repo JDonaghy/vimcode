@@ -75,7 +75,7 @@ mod tests {
     //! arm (chosen there specifically to give plenty of headroom). Running at
     //! a realistic size is what surfaces the **unit** category gap #1425's own
     //! diagnosis names: `App::render_content` reserves
-    //! `render::TAB_ROW_HEIGHT_PX`/`BREADCRUMB_ROW_HEIGHT_PX` (35/22) as if
+    //! `render::tab_row_height_px`/`breadcrumb_row_height_px` (35/22 px) as if
     //! they were cell-grid *rows* rather than pixels, so on an 80x24 terminal
     //! the tab bar alone claims more rows than exist and the editor content
     //! band collapses. That is exactly the gap this module exists to inventory
@@ -1979,9 +1979,8 @@ mod tests {
                 .style_at(x as u16, y as u16)
                 .expect("the revealed row must paint a styled cell");
 
-            let expected_bg = quadraui::tui::ratatui_color(
-                crate::render::Theme::vscode_light().sidebar_sel_bg_inactive,
-            );
+            let expected_bg =
+                quadraui::tui::ratatui_color(crate::render::Theme::light().sidebar_sel_bg_inactive);
             assert_eq!(
                 style.bg,
                 expected_bg,
@@ -2046,7 +2045,7 @@ mod tests {
                 .style_at(x as u16, y as u16)
                 .expect("the header title must paint a styled cell");
 
-            let theme = crate::render::Theme::vscode_light();
+            let theme = crate::render::Theme::light();
             let expected_bg = quadraui::tui::ratatui_color(theme.status_bg);
             let expected_fg = quadraui::tui::ratatui_color(theme.status_fg);
             // quadraui's old hard-coded header literal, `#252526` /
@@ -2112,7 +2111,7 @@ mod tests {
                 .expect("the line-number prefix must paint a styled cell");
 
             let expected_fg =
-                quadraui::tui::ratatui_color(crate::render::Theme::vscode_light().line_number_fg);
+                quadraui::tui::ratatui_color(crate::render::Theme::light().line_number_fg);
             assert_eq!(
                 style.fg,
                 expected_fg,
@@ -2356,21 +2355,27 @@ mod tests {
             );
         }
 
-        /// A user who has never touched `:colorscheme` must see VS Code's
-        /// **Dark Modern** palette on screen, not One Dark.
+        /// A user who has never touched `:colorscheme` must see vimcode's
+        /// own **`dark`** palette on screen — not One Dark, and not VS
+        /// Code's own Dark Modern chrome colour.
         ///
-        /// The oracle is deliberately spelled as raw RGB literals taken
-        /// straight from VS Code's `dark_modern.json`: `editor.background`
-        /// is `0x1f1f1f`, while `statusBar.background`,
-        /// `sideBar.background` and `editorGroupHeader.tabsBackground` all
-        /// share `0x181818`. Deriving them from
-        /// [`crate::render::Theme::from_name`] would have the test read
-        /// back the very default it exists to pin, so it could never fail.
+        /// The oracle is deliberately spelled as raw RGB literals rather than
+        /// derived from [`crate::render::Theme::from_name`], so the test
+        /// cannot just read back the very default it exists to pin. `dark`
+        /// keeps VS Code Dark Modern's `editor.background` (`0x1f1f1f`)
+        /// but repaints the unified status-bar/sidebar/tab-strip chrome in
+        /// vimcode's own teal-tinted `0x171b1b`, never VS Code's `0x181818`.
         /// One Dark's `0x282c34` and `0x21252b` are asserted *absent* from
         /// the whole painted grid for the same reason: this test is red
         /// whenever the default resolves to that palette instead.
+        ///
+        /// **Verified RED against unfixed `develop`:** with
+        /// `Theme::dark()`'s `tab_bar_bg`/`status_bg` temporarily reverted
+        /// to VS Code Dark Modern's `#181818`, the `VSCODE_DARK_MODERN_CHROME_BG`
+        /// assertion below failed at cell (0, 0) with `left: Rgb(24, 24, 24)
+        /// / right: Rgb(24, 24, 24)`; restoring `#171b1b` makes it pass.
         #[test]
-        fn fresh_engine_paints_vs_code_dark_modern_chrome_via_shell_app() {
+        fn fresh_engine_paints_vimcode_dark_chrome_via_shell_app() {
             use quadraui::tui::testing::Color;
 
             let mut h = harness(plain_engine());
@@ -2379,8 +2384,9 @@ mod tests {
 
             const COLS: u16 = 80;
             const ROWS: u16 = 24;
-            const DARK_MODERN_EDITOR_BG: Color = Color::Rgb(0x1f, 0x1f, 0x1f);
-            const DARK_MODERN_CHROME_BG: Color = Color::Rgb(0x18, 0x18, 0x18);
+            const VIMCODE_DARK_EDITOR_BG: Color = Color::Rgb(0x1f, 0x1f, 0x1f);
+            const VIMCODE_DARK_CHROME_BG: Color = Color::Rgb(0x17, 0x1b, 0x1b);
+            const VSCODE_DARK_MODERN_CHROME_BG: Color = Color::Rgb(0x18, 0x18, 0x18);
             const ONEDARK_EDITOR_BG: Color = Color::Rgb(0x28, 0x2c, 0x34);
             const ONEDARK_CHROME_BG: Color = Color::Rgb(0x21, 0x25, 0x2b);
 
@@ -2391,13 +2397,13 @@ mod tests {
                     let Some(style) = driver.style_at(x, y) else {
                         continue;
                     };
-                    saw_editor_bg |= style.bg == DARK_MODERN_EDITOR_BG;
-                    saw_chrome_bg |= style.bg == DARK_MODERN_CHROME_BG;
+                    saw_editor_bg |= style.bg == VIMCODE_DARK_EDITOR_BG;
+                    saw_chrome_bg |= style.bg == VIMCODE_DARK_CHROME_BG;
                     assert_ne!(
                         style.bg,
                         ONEDARK_EDITOR_BG,
                         "cell ({x}, {y}) paints One Dark's editor background; \
-                         the default colorscheme must be VS Code Dark Modern; \
+                         the default colorscheme must be vimcode's own 'dark'; \
                          screen:\n{}",
                         driver.screen()
                     );
@@ -2405,8 +2411,16 @@ mod tests {
                         style.bg,
                         ONEDARK_CHROME_BG,
                         "cell ({x}, {y}) paints One Dark's chrome background; \
-                         the default colorscheme must be VS Code Dark Modern; \
+                         the default colorscheme must be vimcode's own 'dark'; \
                          screen:\n{}",
+                        driver.screen()
+                    );
+                    assert_ne!(
+                        style.bg,
+                        VSCODE_DARK_MODERN_CHROME_BG,
+                        "cell ({x}, {y}) paints VS Code Dark Modern's own \
+                         chrome background #181818; vimcode's 'dark' theme \
+                         must repaint it with its own #171b1b; screen:\n{}",
                         driver.screen()
                     );
                 }
@@ -2414,14 +2428,14 @@ mod tests {
 
             assert!(
                 saw_editor_bg,
-                "no cell painted Dark Modern's editor.background #1f1f1f; \
+                "no cell painted 'dark's editor.background #1f1f1f; \
                  screen:\n{}",
                 driver.screen()
             );
             assert!(
                 saw_chrome_bg,
-                "no cell painted Dark Modern's unified chrome background \
-                 #181818 (status bar / sidebar / tab strip); screen:\n{}",
+                "no cell painted 'dark's unified chrome background #171b1b \
+                 (status bar / sidebar / tab strip); screen:\n{}",
                 driver.screen()
             );
         }
@@ -3584,7 +3598,7 @@ mod tests {
         }
     }
 
-    // Mode-toggle regression test (#1780)
+    // Mode-toggle regression test
     /// A mode-toggle regression test does not belong inside
     /// `vscode_mode_alt_rung_1744` — that module is scoped to the five
     /// brand-new VS Code-mode chords, not mode-toggle chrome — so it
@@ -4715,6 +4729,157 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+        /// The quick-open preview pane must run the selected file's text
+        /// through the same syntax-highlighting pipeline as the main
+        /// editor, not paint it as one uniform color. `picker_populate_files`
+        /// -> `picker_load_preview` -> `syntax_highlights_for_path` feeds
+        /// `PickerPreview::highlights` from the real tree-sitter grammar for
+        /// `.rs`, and `picker_panel_to_palette` turns each highlighted byte
+        /// range into its own `StyledSpan::with_fg(..., theme.scope_color(..))`
+        /// — so a string-literal token's cell must carry a different `fg`
+        /// than a plain, unstyled cell elsewhere on screen (the picker's own
+        /// file-name entry, built with `StyledText::plain`).
+        ///
+        /// Confirmed red against the unfixed preview rendering, which built
+        /// every preview line with `StyledText::plain` regardless of
+        /// `highlights`: both cells then shared the same fallback
+        /// `theme.surface_fg`, so this `assert_ne!` failed.
+        #[test]
+        fn quick_open_preview_pane_syntax_highlights_source_text_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "vc1926_synhi_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            std::fs::write(
+                dir.join("hello.rs"),
+                b"fn main() {\n    let s = \"ZQX_MARK\";\n}\n",
+            )
+            .unwrap();
+            // The popup's height tracks the result count, and the preview
+            // pane is only as tall as the list beside it — so the fixture
+            // needs enough entries for the marker on the file's second line
+            // to be painted. `hello.rs` sorts first, so it stays selected
+            // and its preview is the one shown.
+            for i in 0..6 {
+                std::fs::write(dir.join(format!("zpad{i}.txt")), b"pad\n").unwrap();
+            }
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.open_picker(crate::core::engine::PickerSource::Files);
+            let h = harness(engine);
+            let driver = &h.driver;
+
+            let marker_bounds = driver.find_bounds("ZQX_MARK").unwrap_or_else(|| {
+                panic!(
+                    "preview pane must show the string literal's text; screen:\n{}",
+                    driver.screen()
+                )
+            });
+            let item_bounds = driver.find_bounds("hello.rs").unwrap_or_else(|| {
+                panic!(
+                    "picker list must show the plain file-name entry; screen:\n{}",
+                    driver.screen()
+                )
+            });
+
+            let marker_style = driver
+                .style_at(marker_bounds.x as u16, marker_bounds.y as u16)
+                .expect("marker cell must be on screen");
+            let item_style = driver
+                .style_at(item_bounds.x as u16, item_bounds.y as u16)
+                .expect("item cell must be on screen");
+
+            assert_ne!(
+                marker_style.fg,
+                item_style.fg,
+                "preview pane's string-literal token must render in a \
+                 different color than the plain, unstyled file-name entry \
+                 — got the same fg ({:?}) for both, meaning the preview \
+                 text is still painted as one uniform color; screen:\n{}",
+                marker_style.fg,
+                driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `picker_panel_to_palette` must not duplicate preview text when a
+        /// line's tree-sitter captures overlap or coincide byte-for-byte —
+        /// which is the common case for a method call (`@property` and
+        /// `@method.call` both matching the same `field_identifier`) or an
+        /// escape sequence inside a string literal (`@escape` nesting inside
+        /// `@string`). A per-line builder that pushes a colored span for
+        /// every highlight entry unconditionally (instead of resolving each
+        /// byte to at most one scope) re-emits the overlapped text, so the
+        /// rendered line grows longer than the source line and later
+        /// characters shift off past where they belong.
+        ///
+        /// Confirmed red against the unfixed sequential-cursor builder: the
+        /// `push_str` call's `_str` suffix and the escape sequence's
+        /// characters were re-emitted into the rendered row, so the painted
+        /// line no longer matched the source line byte-for-byte and
+        /// `push_str` appeared twice.
+        #[test]
+        fn quick_open_preview_pane_does_not_duplicate_overlapping_highlight_text() {
+            let dir = std::env::temp_dir().join(format!(
+                "vc1926_synhi_overlap_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            // The second line packs both overlap shapes into one short row
+            // that fits the narrow preview pane: `push_str` is a method call
+            // through a field expression, so its `field_identifier` is
+            // captured by both `@property` and `@method.call` over identical
+            // byte ranges, and the `\n` escape nests inside the `@string`
+            // capture that spans it.
+            std::fs::write(
+                dir.join("hello.rs"),
+                b"fn f(s: &mut String) {\ns.push_str(\"a\\nEM\");\n}\n",
+            )
+            .unwrap();
+            // Pad the result list so the popup is tall enough to paint the
+            // second preview line. `hello.rs` sorts first and stays selected.
+            for i in 0..6 {
+                std::fs::write(dir.join(format!("zpad{i}.txt")), b"pad\n").unwrap();
+            }
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.open_picker(crate::core::engine::PickerSource::Files);
+            let h = harness(engine);
+            let driver = &h.driver;
+
+            let screen = driver.screen();
+            let call_line = screen
+                .lines()
+                .find(|l| l.contains("push_str"))
+                .unwrap_or_else(|| {
+                    panic!("preview must show the method-call line; screen:\n{screen}")
+                });
+            assert!(
+                call_line.contains("s.push_str(\"a\\nEM\");"),
+                "overlapping @property/@method.call captures on the same \
+                 `push_str` field identifier, and the nested @escape inside \
+                 the @string capture, must not duplicate any of the line's \
+                 text — got:\n{call_line}\nfull screen:\n{screen}"
+            );
+            assert_eq!(
+                call_line.matches("push_str").count(),
+                1,
+                "`push_str` must appear exactly once in its preview row, not \
+                 duplicated by overlapping highlight spans; got:\n{call_line}\n\
+                 full screen:\n{screen}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -5532,9 +5697,8 @@ mod tests {
                 .driver
                 .style_at(rx, ry)
                 .expect("the revealed row must paint a styled cell");
-            let expected_bg = quadraui::tui::ratatui_color(
-                crate::render::Theme::vscode_light().sidebar_sel_bg_inactive,
-            );
+            let expected_bg =
+                quadraui::tui::ratatui_color(crate::render::Theme::light().sidebar_sel_bg_inactive);
             assert_eq!(
                 style.bg,
                 expected_bg,
@@ -5722,7 +5886,7 @@ mod tests {
             // the faint `inactive_selected_bg` an unfocused Explorer paints
             // (see `explorer_unfocused_selected_row_paints_sidebar_sel_bg_
             // inactive_via_shell_app`).
-            let qtheme = crate::render::to_quadraui_theme(&crate::render::Theme::vscode_light());
+            let qtheme = crate::render::to_quadraui_theme(&crate::render::Theme::light());
             assert_eq!(
                 style.bg,
                 quadraui::tui::ratatui_color(qtheme.selected_bg),
@@ -5885,9 +6049,8 @@ mod tests {
                 .driver
                 .style_at(rx, ry)
                 .expect("the revealed row must paint a styled cell");
-            let expected_bg = quadraui::tui::ratatui_color(
-                crate::render::Theme::vscode_light().sidebar_sel_bg_inactive,
-            );
+            let expected_bg =
+                quadraui::tui::ratatui_color(crate::render::Theme::light().sidebar_sel_bg_inactive);
             assert_eq!(
                 style.bg,
                 expected_bg,
@@ -5952,6 +6115,112 @@ mod tests {
                         driver.screen()
                     );
                 },
+            );
+        }
+
+        /// The bottom panel tab strip must offer more than a single bare
+        /// "Terminal" label: at minimum "Terminal" (active) and "Problems"
+        /// must both paint when the terminal is open, so the panel reads as
+        /// a switchable VS Code-style tab bar rather than a plain label.
+        #[test]
+        fn render_content_paints_bottom_panel_problems_tab_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+
+            known_bug_gate(
+                "app_on_tui::render_content_paints_bottom_panel_problems_tab_via_shell_app",
+                || {
+                    assert!(
+                        driver.screen_has("Terminal"),
+                        "bottom panel should still paint the active Terminal tab; \
+                         screen:\n{}",
+                        driver.screen()
+                    );
+                    assert!(
+                        driver.screen_has("Problems"),
+                        "bottom panel tab strip should also offer a Problems tab; \
+                         screen:\n{}",
+                        driver.screen()
+                    );
+                },
+            );
+        }
+
+        /// A click on the "Problems" tab must switch which panel is
+        /// **painted**, through `App::handle_dispatch`'s shared
+        /// `render::route_bottom_panel_click` -> `render::apply_bottom_panel_
+        /// route` -> `Engine::handle_bottom_tab_bar_click` chain (the same
+        /// chain `gtk::testing::bottom_panel_tab_strip_click_switches_the_
+        /// painted_panel` drives on the other backend). With only a
+        /// terminal open (no debug output), `build_bottom_panel_tab_bar`
+        /// paints three slots: Problems, Output, Terminal — clicking
+        /// "Problems" must swap the terminal content for the Problems
+        /// placeholder.
+        ///
+        /// The index-to-kind mapping inside
+        /// `Engine::handle_bottom_tab_bar_click` is the load-bearing half:
+        /// it rebuilds the very sequence `build_bottom_panel_tab_bar` paints,
+        /// so slot 0 resolves to `Problems`. Any drift between those two
+        /// orders leaves the terminal content on screen after the click and
+        /// trips the final assertion.
+        #[test]
+        fn bottom_panel_tab_strip_click_switches_the_painted_panel_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                !driver.screen_has("No problems have been detected"),
+                "precondition: the Terminal tab owns the panel body; screen:\n{}",
+                driver.screen()
+            );
+
+            let (x, y) = driver
+                .find("Problems")
+                .expect("the bottom panel tab strip must paint a Problems tab");
+            driver.click(x, y);
+
+            assert!(
+                driver.screen_has("No problems have been detected"),
+                "clicking the Problems tab must repaint the panel body with the \
+                 Problems placeholder; screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// The same click-to-switch chain, driven onto the *second* always-
+        /// present slot: with only a terminal open the strip paints
+        /// Problems, Output, Terminal, so "Output" is slot 1 and clicking it
+        /// must paint the Output placeholder instead of the terminal body.
+        /// Covers the index arithmetic one step past slot 0 — an off-by-one
+        /// in either half of the lockstep order would land on Problems or
+        /// Terminal here.
+        #[test]
+        fn bottom_panel_tab_strip_click_switches_to_the_output_panel_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                !driver.screen_has("No output channels are available"),
+                "precondition: the Terminal tab owns the panel body; screen:\n{}",
+                driver.screen()
+            );
+
+            let (x, y) = driver
+                .find("Output")
+                .expect("the bottom panel tab strip must paint an Output tab");
+            driver.click(x, y);
+
+            assert!(
+                driver.screen_has("No output channels are available"),
+                "clicking the Output tab must repaint the panel body with the \
+                 Output placeholder; screen:\n{}",
+                driver.screen()
             );
         }
 
@@ -6038,8 +6307,8 @@ mod tests {
             let h = harness_no_sidebar(plain_engine());
             let driver = &h.driver;
 
-            // `App::render_content` reserves TAB_ROW_HEIGHT_PX/
-            // BREADCRUMB_ROW_HEIGHT_PX as cell-grid rows.
+            // `App::render_content` reserves the px profile's
+            // tab/breadcrumb row heights as cell-grid rows.
             assert!(
                 driver.screen_has("Ln 1,"),
                 "a fresh buffer's status bar must show the cursor on line \
@@ -6709,6 +6978,39 @@ mod tests {
             assert!(
                 driver.screen_contains("Check Nerd Fonts"),
                 "the painted dialog must show its own title; \
+                 screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// `:about` must paint the trademark disclaimer and codicon
+        /// attribution lines `execute.rs`'s `"about"` handler adds to the
+        /// dialog body, not just hold them in `engine.dialog.body`.
+        #[test]
+        fn about_dialog_shows_trademark_and_codicon_attribution_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.execute_command("about");
+            assert!(
+                engine.dialog.is_some(),
+                "fixture must actually open the dialog"
+            );
+            let h = crate::tui_main::testing::conformance_harness(engine, 100, 30);
+            let driver = &h.driver;
+
+            assert!(
+                driver.screen_contains("About VimCode"),
+                "the painted dialog must show its own title; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_contains("not affiliated with Microsoft"),
+                "the painted dialog must show the trademark disclaimer; \
+                 screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_contains("codicon"),
+                "the painted dialog must show the codicon attribution; \
                  screen:\n{}",
                 driver.screen()
             );
@@ -7874,6 +8176,92 @@ mod tests {
                  whole file (file-wide geometry, matching VS Code) — \
                  landed on line {top} of {TOTAL_LINES}; \
                  screen:\n{screen}"
+            );
+        }
+
+        /// A plain (no-modifier) **click away from the thumb** — a "jump" to
+        /// a point near the bottom of the strip, not a drag of the highlight
+        /// itself — must not scroll past the painted window's own local
+        /// ceiling, `base + (span - viewport_lines)`: the highest
+        /// `scroll_top` that still shows a line within `[base, base + span)`
+        /// as the viewport's last visible row. The strip only ever paints
+        /// lines `[base, base + span)`, so letting a bottom-edge click push
+        /// `scroll_top` any higher scrolls past content the minimap never
+        /// represented. Reads `base`/`span`/`viewport_lines` back from the
+        /// actually-painted window instead of a hardcoded guess, so the
+        /// expectation always matches whatever window size the minimap
+        /// happens to choose.
+        #[test]
+        fn clicking_the_minimap_strip_near_its_bottom_edge_does_not_overshoot_the_window() {
+            const TOTAL_LINES: usize = 200_000;
+            let mut engine = plain_engine();
+            // Minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
+            let text: String = (0..TOTAL_LINES)
+                .map(|i| format!("line {i} content\n"))
+                .collect();
+            engine.buffer_mut().insert(0, &text);
+
+            let mut h = harness_no_sidebar(engine);
+            let win = h.engine.borrow().active_window_id();
+            h.driver.render();
+
+            let (strip, base, span) = {
+                let layout = h.screen_layout.borrow();
+                let mm = layout
+                    .as_ref()
+                    .expect("render_content must have painted a ScreenLayout")
+                    .minimap
+                    .iter()
+                    .find(|m| m.window_id == win)
+                    .expect("a 200,000-line buffer must publish a minimap strip");
+                let first = mm
+                    .minimap
+                    .lines
+                    .first()
+                    .expect("a painted window has at least one line");
+                let last = mm
+                    .minimap
+                    .lines
+                    .last()
+                    .expect("a painted window has at least one line");
+                let base = first.line_idx;
+                let span = last.line_idx + 1 - base;
+                (crate::render::minimap_strip_rect(mm), base, span)
+            };
+            let viewport_lines = h
+                .engine
+                .borrow()
+                .windows
+                .get(&win)
+                .unwrap()
+                .view
+                .viewport_lines;
+
+            let x = strip.x + strip.width / 2.0;
+            // The highlight band sits at the strip's own top (scroll_top
+            // starts at 0), so a press one row above the strip's bottom
+            // edge lands well outside the band — a jump, not a thumb
+            // drag — and a follow-up move to the same point exercises the
+            // armed scrollbar's own clamping instead of the jump's
+            // one-shot centring.
+            let py = strip.y + strip.height - 1.0;
+            h.driver.mouse_down(x, py);
+            h.driver.mouse_move(x, py);
+            h.driver.mouse_up(x, py);
+            h.driver.render();
+
+            let top = h.engine.borrow().windows.get(&win).unwrap().view.scroll_top;
+            let local_ceiling = base + span.saturating_sub(viewport_lines);
+
+            assert!(
+                top <= local_ceiling,
+                "a plain click near the minimap strip's bottom edge must \
+                 not scroll past the painted window's own local ceiling \
+                 (base {base}, span {span}, viewport_lines {viewport_lines}, \
+                 local ceiling {local_ceiling}) — landed on line {top} of \
+                 {TOTAL_LINES}"
             );
         }
     }

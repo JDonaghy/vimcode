@@ -152,28 +152,30 @@ pub(crate) fn pixel_to_click_target(
     // *every* pane's strip and reports which one it hit — never assumed to be
     // the active window, since a split can have a strip on an inactive pane too.
     if mutate_focus {
-        // File-wide geometry: dragging the minimap thumb from top to bottom
-        // scrolls through the entire file, matching VS Code. Alt is unused.
         if let Some(press) = render_mod::minimap_press(engine, cached_layout, x, y, false) {
             if press.jump {
                 render_mod::apply_minimap_click(engine, cached_layout, x, y);
             } else {
-                // A press directly on the highlight band skips
-                // `apply_minimap_click`'s centring (nothing should scroll
-                // yet — that's the whole point of preserving the grab
-                // offset), but a click on a *background* pane's strip must
-                // still focus that pane, exactly like every other click
-                // does. `apply_minimap_click`'s `jump` branch above already
-                // covers this itself.
                 engine.activate_window(press.window_id);
             }
+            // Thumb grabs use file-wide (coarse) geometry so dragging
+            // from top to bottom scrolls through the entire file (VS
+            // Code parity). Jump clicks re-resolve with window-local
+            // (fine) geometry so the armed drag's scale matches the
+            // minimap's painted window — a mouse_move at the same
+            // position as the jump must not overshoot.
+            let drag_press = if press.jump {
+                render_mod::minimap_press(engine, cached_layout, x, y, true).unwrap_or(press)
+            } else {
+                press
+            };
             drag.begin(quadraui::DragTarget::ScrollbarY {
-                widget: render_mod::minimap_drag_widget(press.window_id),
-                track_start: press.track_start,
-                track_length: press.track_length,
-                thumb_length: press.thumb_length,
-                max_scroll: press.max_scroll,
-                grab_offset: press.grab_offset,
+                widget: render_mod::minimap_drag_widget(drag_press.window_id, drag_press.base),
+                track_start: drag_press.track_start,
+                track_length: drag_press.track_length,
+                thumb_length: drag_press.thumb_length,
+                max_scroll: drag_press.max_scroll,
+                grab_offset: drag_press.grab_offset,
                 inverted: false,
             });
             return ClickTarget::Minimap(press.window_id, 0);

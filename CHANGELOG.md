@@ -15,7 +15,17 @@ no matching section fails the release job before anything is published (see
 
 ## [Unreleased]
 
-## [0.15.2] - 2026-10-14
+## [0.15.3] - 2026-10-14
+### Added
+- The bottom panel's tab strip now always shows PROBLEMS and OUTPUT tabs
+  alongside TERMINAL and DEBUG CONSOLE (when open), instead of a plain
+  "Terminal" label with no tab chrome (#1928).
+- Declarative skin files: load a skin at startup with `--skin <FILE>` to
+  override the chrome colors the GUI backends paint (#1950).
+- File picker preview pane now has syntax highlighting (#1926).
+- Activity-bar icons are now distinct, non-Codicon glyphs (#1956).
+- Release script (`scripts/release.py`) automates the end-to-end release
+  workflow including quadraui dependency updates.
 
 ### Changed
 - The default colorscheme is now `vscode-dark-modern`, matching VS Code's
@@ -26,6 +36,9 @@ no matching section fails the release job before anything is published (see
   `dark+` or `vscode-dark-classic`), so anyone who has already set
   `colorscheme` in their config — including to `vscode-dark` — is unaffected;
   only the unset default moves.
+- Built-in themes rebranded: `dark` / `light` replace
+  `vscode_dark_modern` / `vscode_light` as canonical names (#1951).
+- quadraui bumped from 0.1.4 to 0.1.8.
 
 ### Fixed
 - Status bar, command line, and wildmenu now confined to the main column
@@ -34,11 +47,16 @@ no matching section fails the release job before anything is published (see
 - The scroll gutter between the minimap and pane edge now matches the
   editor scrollbar width (16 px on GUI backends) instead of collapsing to
   one character width (~8 px) on macOS (#1960, refs #723, #1869).
+- Minimap scroll thumb drag no longer feels sluggish/dampened.
 - Minimap thumb drag now uses file-wide geometry — dragging the thumb
   traverses the entire buffer like VS Code, instead of drifting within the
   minimap's painted window.
-- `pre_render` hook synchronises per-frame backend state (font metrics,
-  scrollbar widths) before layout, eliminating a one-frame convergence lag.
+- `apply_scroll_offset` now accepts both minimap id formats.
+- File picker overlay now floats over the editor pane instead of spanning
+  the sidebar and full window height (#1925).
+- Layout convergence: `sync_per_frame_backend_state` moved to the
+  `pre_render` hook so chrome_line_height is set before the shell reads it,
+  fixing a one-frame layout lag that caused explorer hit-band drift (#1917).
 
 ## [0.15.1] - 2026-10-11
 

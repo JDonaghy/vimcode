@@ -221,7 +221,7 @@ fn settings_panel_cycle_colorscheme() {
 
     let cs_idx = find_core_setting(&e, "colorscheme");
     e.settings_selected = cs_idx;
-    assert_eq!(e.settings.colorscheme, "vscode-dark-modern");
+    assert_eq!(e.settings.colorscheme, "dark");
 
     // Enter cycles forward
     e.handle_settings_key("Return", false, None);
@@ -229,7 +229,7 @@ fn settings_panel_cycle_colorscheme() {
 
     // l cycles forward again
     e.handle_settings_key("l", false, None);
-    assert_eq!(e.settings.colorscheme, "vscode-light");
+    assert_eq!(e.settings.colorscheme, "light");
 
     // h cycles backward
     e.handle_settings_key("h", false, None);

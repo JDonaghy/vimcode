@@ -737,16 +737,14 @@ impl quadraui::ShellApp for App {
                 // the same generic helpers the legacy path used.
                 render::FrameOp::UnifiedPicker => {
                     if let Some(ref picker) = screen.picker {
-                        // Scoped to the editor+sidebar band only, never the
-                        // full window: `modal_scrim_rect` derives its bottom
-                        // edge from *this frame's* `el`, so it stops above
-                        // every row already painted by an earlier rung — the
-                        // bottom-chrome rungs `FRAME_Z_ORDER` composes first
-                        // (`FrameOp::StatusBar`, wildmenu row included,
-                        // `FrameOp::CommandLine`, quickfix, terminal) and the
-                        // active window's own status row inside the band.
-                        // Only `popup_viewport` (the popup's own centring
-                        // anchor) stays full-window.
+                        // Floats over the editor pane only, so it never spans
+                        // the sidebar or the activity bar.
+                        let editor_viewport =
+                            quadraui::Rect::new(x as f32, y as f32, w as f32, h as f32);
+                        // Scrim covers the editor+sidebar band to signal
+                        // modal state; `modal_scrim_rect` derives its bottom
+                        // edge from this frame's `el`, stopping above every
+                        // bottom-chrome rung already painted.
                         let scrim_rect = render::modal_scrim_rect(
                             &engine,
                             &el,
@@ -757,9 +755,10 @@ impl quadraui::ShellApp for App {
                         let rect = render::paint_picker_rung(
                             backend,
                             picker,
-                            popup_viewport,
+                            editor_viewport,
                             scrim_rect,
                             &(self.units.picker)(lh as f32),
+                            &theme,
                         );
                         // Hand the *painted* rect to the click/drag handlers.
                         self.picker_popup_rect.set(Some(rect));

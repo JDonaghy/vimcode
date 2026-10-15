@@ -942,12 +942,17 @@ impl App {
                     // picker popup bounds `handle_mouse_drag_msg` computes)
                     // still clamps against the window's true bottom edge,
                     // not `shell_config`'s static bottom-chrome reservation.
+                    let viewport = quadraui::Rect::new(
+                        main.x,
+                        main.y,
+                        main.width,
+                        render::main_content_true_height(ctx.layout),
+                    );
                     self.handle_mouse_drag_msg(
                         &*backend,
                         position.x as f64,
                         position.y as f64,
-                        main.width as f64,
-                        render::main_content_true_height(ctx.layout) as f64,
+                        viewport,
                     );
                 }
             }

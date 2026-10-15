@@ -56,7 +56,8 @@ pub fn build_screen_layout(
 /// bar's own height/position from `line_height`.
 ///
 /// GTK's tab-bar and breadcrumb rows are fixed-pixel chrome
-/// (`tab_row_height_px`/`BREADCRUMB_ROW_HEIGHT_PX`) independent of
+/// (`tab_row_height_px`/`breadcrumb_row_height_px`, both read from the active
+/// skin) independent of
 /// `settings.font_size` — raising the editor font must not inflate the
 /// breadcrumb row along with it. The space reserved above the window
 /// content (`window_rects`, computed by the caller via
@@ -679,6 +680,15 @@ pub fn build_screen_layout_with_breadcrumb_row(
                         .or_else(|| Some(Vec::new()))
                 } else {
                     None
+                },
+                preview_highlights: if has_preview {
+                    engine
+                        .picker_preview
+                        .as_ref()
+                        .map(|p| p.highlights.clone())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
                 },
                 preview_scroll: engine.picker_preview_scroll,
             }

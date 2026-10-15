@@ -472,6 +472,9 @@ pub fn modal_scrim_rect(
 
 /// The [`FrameOp::UnifiedPicker`] rung's whole body on both backends.
 ///
+/// `viewport` is the pane the picker floats over (the editor area, not the
+/// whole window), so the popup stays clear of the sidebar and activity bar.
+///
 /// Returns the popup rect it resolved and painted into, so GTK can cache it
 /// for click/drag hit-testing; TUI recomputes the identical
 /// geometry cheaply at click time instead and ignores the return value.
@@ -495,11 +498,12 @@ pub fn paint_picker_rung(
     viewport: quadraui::Rect,
     scrim_rect: quadraui::Rect,
     sizing: &PickerSizing,
+    theme: &Theme,
 ) -> quadraui::Rect {
     b.draw_solid_fill(scrim_rect, MODAL_SCRIM_COLOR);
     let has_preview = picker.preview.is_some();
-    let geo = PickerGeometry::compute(viewport.width, viewport.height, has_preview, sizing);
-    let palette = picker_panel_to_palette(picker);
+    let geo = PickerGeometry::compute(viewport, picker.items.len(), has_preview, sizing);
+    let palette = picker_panel_to_palette(picker, theme);
     let rect = quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h);
     b.draw_palette(rect, &palette);
     rect
