@@ -1415,6 +1415,117 @@ mod tests {
             );
         }
 
+        /// Ctrl-W h from a keyboard-focused sidebar panel (not the
+        /// activity bar itself) moves focus onto the activity-bar
+        /// toolbar and leaves every subsequent key reaching it: `j`/`k`
+        /// walk the toolbar cursor and Enter activates whatever icon it
+        /// lands on, twice in a row. `build_activity_bar` always paints
+        /// `is_keyboard_focused: false`, so quadraui's own
+        /// `preprocess_event` layer never reroutes a raw `KeyPressed`
+        /// into a `UiEvent::ActivityBar(..)` consumed entirely by
+        /// quadraui's `ShellAdapter`; every key instead reaches
+        /// `route_sidebar_chord_key`/`handle_activity_bar_key` in
+        /// `src/app/input.rs`, which is what actually drives the
+        /// toolbar's focused-cursor movement and activation.
+        #[test]
+        fn ctrl_w_h_from_sidebar_panel_reaches_activity_bar_toolbar() {
+            use crate::core::engine::sidebar::PANEL_EXPLORER;
+
+            let mut engine = plain_engine();
+            engine.focus_sidebar_panel(PANEL_EXPLORER);
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::ctrl_w_h_from_sidebar_panel_reaches_activity_bar_toolbar",
+                || {
+                    let before = driver.screen();
+                    assert!(
+                        !before.contains("SOURCE CONTROL"),
+                        "precondition: Source Control must not already be \
+                         the active panel; screen:\n{before}"
+                    );
+
+                    // Ctrl-W, h: Explorer panel -> activity-bar toolbar,
+                    // parked at Explorer's own toolbar index.
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('w'),
+                        modifiers: quadraui::Modifiers {
+                            ctrl: true,
+                            ..quadraui::Modifiers::default()
+                        },
+                        repeat: false,
+                    });
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('h'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+                    // j, j: Explorer -> Search -> Source Control (`PANEL_GIT`).
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('j'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('j'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+
+                    let after = driver.screen();
+                    assert!(
+                        after.contains("SOURCE CONTROL"),
+                        "j, j, Enter after Ctrl-W h must land on and \
+                         activate Source Control; screen:\n{after}"
+                    );
+
+                    // Enter already left keyboard focus on the Source
+                    // Control panel itself (`sc_has_focus`), not the
+                    // toolbar, so a second Ctrl-W h from here re-enters the
+                    // toolbar directly -- the cursor must still be
+                    // reachable a second time, parked now at Source
+                    // Control's own index, not reset to Explorer's.
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('w'),
+                        modifiers: quadraui::Modifiers {
+                            ctrl: true,
+                            ..quadraui::Modifiers::default()
+                        },
+                        repeat: false,
+                    });
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('h'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+                    // j: Source Control -> Run and Debug (`PANEL_DEBUG`).
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('j'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+
+                    let after2 = driver.screen();
+                    assert!(
+                        after2.contains("RUN AND DEBUG"),
+                        "a second Ctrl-W h / j / Enter round must still \
+                         reach and activate Run and Debug; screen:\n{after2}"
+                    );
+                },
+            );
+        }
+
         /// Mirrors `shell_app.rs`'s test of the same name: clicking
         /// each activity-bar icon in turn must switch the sidebar's own
         /// *content*, not just its chrome — every icon located via
