@@ -165,8 +165,7 @@ pub(crate) fn pixel_to_click_target(
             // minimap's painted window — a mouse_move at the same
             // position as the jump must not overshoot.
             let drag_press = if press.jump {
-                render_mod::minimap_press(engine, cached_layout, x, y, true)
-                    .unwrap_or(press)
+                render_mod::minimap_press(engine, cached_layout, x, y, true).unwrap_or(press)
             } else {
                 press
             };
