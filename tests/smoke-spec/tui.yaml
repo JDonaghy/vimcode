@@ -1887,6 +1887,78 @@ steps:
     key: esc
 
   # ─────────────────────────────────────────────────────────────────────
+  # vimcode#1970 -- Ctrl-W h from a focused sidebar panel (Explorer is the
+  # active panel here, re-selected by click-explorer-icon-again above) must
+  # move keyboard focus onto the activity-bar toolbar and leave it
+  # reachable there: j/k must walk the toolbar cursor and Enter must
+  # activate whatever icon it lands on. Before the fix, the toolbar painted
+  # `is_keyboard_focused: true` the moment it gained focus, so quadraui's
+  # own preprocess_event layer intercepted every following raw key (j, j,
+  # Enter) into a ActivityBarEvent that never reached vimcode's own
+  # chord/activity-bar handling in src/app/input.rs -- the toolbar looked
+  # focused but every key after the first was swallowed, so no amount of
+  # j/k ever changed the selected icon and Enter re-activated whatever was
+  # already active. Driving it over the real PTY (not synthetic engine
+  # events) is required because the bug lived entirely in the
+  # render -> quadraui preprocess_event path, not in route_sidebar_chord_key
+  # itself.
+  - type: key
+    id: ctrl-w-nav-1970-arm-1
+    key: 'ctrl+w'
+  - type: key
+    id: ctrl-w-nav-1970-to-toolbar-1
+    key: 'h'
+  - type: key
+    id: ctrl-w-nav-1970-move-down-1
+    key: 'j'
+  - type: key
+    id: ctrl-w-nav-1970-move-down-2
+    key: 'j'
+  - type: key
+    id: ctrl-w-nav-1970-activate-1
+    key: 'enter'
+  - type: expect_within
+    id: ctrl-w-nav-1970-source-control-selected
+    text: "SOURCE CONTROL"
+    ms: 1500
+  - type: wait_idle
+    id: ctrl-w-nav-1970-settle-1
+    ms: 300
+  # Enter already left keyboard focus on the Source Control panel
+  # itself, not the toolbar, so a single Ctrl-W h from here re-enters
+  # the toolbar directly.
+  - type: key
+    id: ctrl-w-nav-1970-arm-2
+    key: 'ctrl+w'
+  - type: key
+    id: ctrl-w-nav-1970-to-toolbar-2
+    key: 'h'
+  - type: key
+    id: ctrl-w-nav-1970-move-down-3
+    key: 'j'
+  - type: key
+    id: ctrl-w-nav-1970-activate-2
+    key: 'enter'
+  - type: expect_within
+    id: ctrl-w-nav-1970-debug-selected
+    text: "RUN AND DEBUG"
+    ms: 1500
+  - type: wait_idle
+    id: ctrl-w-nav-1970-settle-2
+    ms: 300
+  # Enter already left keyboard focus on the Debug panel itself, so a
+  # single Ctrl-W l sends focus straight to the editor.
+  - type: key
+    id: ctrl-w-nav-1970-arm-4
+    key: 'ctrl+w'
+  - type: key
+    id: ctrl-w-nav-1970-to-editor
+    key: 'l'
+  - type: wait_idle
+    id: ctrl-w-nav-1970-settle-3
+    ms: 300
+
+  # ─────────────────────────────────────────────────────────────────────
   # vimcode#1835 -- Linux "first five minutes" smoke: typing, `:term`, and
   # extension-install probes, exercised with the `type_text`/`expect_file`
   # driver steps `tui-pty` gained for exactly this purpose
