@@ -242,6 +242,16 @@ impl Engine {
             self.app_shell
                 .show_panel(&quadraui::WidgetId::new(panel_id));
             self.clear_sidebar_focus();
+            // Keyboard navigation into a sidebar panel takes priority over
+            // an already-focused terminal: `terminal_has_focus` staying true
+            // alongside the new panel's own flag would let
+            // `route_focus_key`'s terminal gate outrank every sidebar arm,
+            // e.g. routing Enter on the settings color-scheme picker to the
+            // terminal PTY instead of activating the selection. Scoped to
+            // this focus-*grant* branch only, not the hide branch above or
+            // the shared `clear_sidebar_focus`, so collapsing/hiding a panel
+            // while a terminal is genuinely focused leaves that focus alone.
+            self.terminal_has_focus = false;
             self.set_panel_focus(panel_id);
         }
         self.session.explorer_visible = self.app_shell.sidebar_visible();
@@ -254,6 +264,11 @@ impl Engine {
         self.app_shell
             .show_panel(&quadraui::WidgetId::new(panel_id));
         self.clear_sidebar_focus();
+        // See the matching comment in `toggle_sidebar_panel`'s grant branch:
+        // this is a focus-*grant* site, so it takes focus away from a
+        // terminal explicitly rather than via the shared
+        // `clear_sidebar_focus` primitive.
+        self.terminal_has_focus = false;
         self.set_panel_focus(panel_id);
         self.session.explorer_visible = true;
         let _ = self.session.save();

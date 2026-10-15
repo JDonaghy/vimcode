@@ -20714,6 +20714,77 @@ fn test_clear_sidebar_focus() {
     assert!(!engine.activity_bar_focused);
 }
 
+/// `clear_sidebar_focus` only clears the nine sidebar-band flags; it must
+/// leave `terminal_has_focus` untouched. It is called from focus-*release*
+/// paths too (hiding the sidebar, a mouse click on the bottom panel) where a
+/// terminal that is genuinely still focused must not lose that focus.
+/// Terminal focus is instead cleared at the specific focus-*grant* call
+/// sites (`Engine::focus_sidebar_panel`, the show branch of
+/// `Engine::toggle_sidebar_panel`) that actually hand focus to a sidebar
+/// panel.
+#[test]
+fn test_clear_sidebar_focus_leaves_terminal_focus_untouched() {
+    let mut engine = Engine::new();
+    engine.terminal_new_tab(80, 24);
+    engine.terminal_has_focus = true;
+    engine.explorer_has_focus = true;
+
+    engine.clear_sidebar_focus();
+
+    assert!(!engine.explorer_has_focus);
+    assert!(
+        engine.terminal_has_focus,
+        "clear_sidebar_focus must not clear terminal focus"
+    );
+}
+
+/// `Engine::toggle_sidebar()` (the plain visibility toggle reached by the
+/// global `Ctrl-B` accelerator) hides the sidebar via `clear_sidebar_focus`
+/// when collapsing it. A terminal that was focused before the sidebar
+/// collapsed must still be focused afterward.
+#[test]
+fn test_toggle_sidebar_hide_leaves_terminal_focus_untouched() {
+    let mut engine = Engine::new();
+    engine.terminal_new_tab(80, 24);
+    engine.terminal_has_focus = true;
+    engine.focus_sidebar_panel(sidebar::PANEL_EXPLORER);
+    // `focus_sidebar_panel` is itself a focus-grant site, so re-arm the flag
+    // the same way a user would: the terminal regains focus some other way
+    // (e.g. clicking into it) while the sidebar stays open.
+    engine.terminal_has_focus = true;
+    assert!(engine.app_shell.sidebar_visible());
+
+    engine.toggle_sidebar();
+
+    assert!(!engine.app_shell.sidebar_visible());
+    assert!(
+        engine.terminal_has_focus,
+        "collapsing the sidebar must not steal focus from an already-focused terminal"
+    );
+}
+
+/// `Engine::toggle_sidebar_panel`'s hide branch (reached by clicking an
+/// already-active activity-bar icon, via
+/// `render::apply_activity_panel_switch`) must behave the same way: a
+/// focused terminal stays focused when the panel is toggled closed.
+#[test]
+fn test_toggle_sidebar_panel_hide_leaves_terminal_focus_untouched() {
+    let mut engine = Engine::new();
+    engine.terminal_new_tab(80, 24);
+    engine.focus_sidebar_panel(sidebar::PANEL_EXPLORER);
+    engine.terminal_has_focus = true;
+    assert!(engine.app_shell.sidebar_visible());
+
+    // Same panel id, already visible: takes the hide branch.
+    engine.toggle_sidebar_panel(sidebar::PANEL_EXPLORER);
+
+    assert!(!engine.app_shell.sidebar_visible());
+    assert!(
+        engine.terminal_has_focus,
+        "toggling a sidebar panel closed must not steal focus from an already-focused terminal"
+    );
+}
+
 #[test]
 fn test_explorer_focus_blocks_normal_keys() {
     let mut engine = engine_with_text("hello world\n");
