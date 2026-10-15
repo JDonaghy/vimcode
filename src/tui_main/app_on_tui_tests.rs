@@ -3342,6 +3342,71 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// #1979: a terminal pane left focused, then a real
+        /// `Engine::focus_sidebar_panel` call (the method every
+        /// keyboard-driven focus transfer — Ctrl-W chord, activity-bar
+        /// `Activate` — routes through) into Settings must hand the very
+        /// next keypress to the settings form, not the stale terminal.
+        ///
+        /// `Engine::clear_sidebar_focus` is the chokepoint
+        /// `focus_sidebar_panel` calls before setting `settings_has_focus`;
+        /// it must also drop `terminal_has_focus`, or
+        /// `render::route_focus_key`'s terminal gate (checked before every
+        /// sidebar arm) keeps outranking Settings even though the sidebar
+        /// is now the real focus owner.
+        ///
+        /// The needle is Enter on the "Cursor Line" row rather than the
+        /// issue's literal colour-scheme picker: both are `settings_flat_list`
+        /// rows gated by the exact same focus check, but the colour-scheme
+        /// row's value text ("dark" / "vscode-dark") doesn't fit the default
+        /// sidebar width, so quadraui's `Form` TUI renderer drops it
+        /// entirely rather than truncating it — an unrelated, upstream
+        /// rendering-geometry limit this test must not depend on. "Cursor
+        /// Line" is a `Bool` setting with a short label, so its `[ ]`/`[x]`
+        /// toggle glyph always paints; unswallowed, Enter flips
+        /// `settings.cursorline` from its default `true` to `false`.
+        #[test]
+        fn settings_enter_activates_after_focus_transfer_leaves_terminal_stale() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            engine.terminal_has_focus = true;
+
+            // The real production focus-transfer call — not a raw flag
+            // poke — so this exercises `clear_sidebar_focus` itself.
+            engine.focus_sidebar_panel(crate::core::engine::sidebar::PANEL_SETTINGS);
+            // Row 0 of `settings_flat_list` is the "Appearance" category
+            // header; row 9 is "Cursor Line" (`SETTING_DEFS[8]`).
+            engine.settings_selected = 9;
+
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            let cursor_line_row = |screen: &str| -> String {
+                screen
+                    .lines()
+                    .find(|l| l.contains("Cursor Line"))
+                    .unwrap_or_default()
+                    .to_string()
+            };
+
+            let before = cursor_line_row(&driver.screen());
+            assert!(
+                before.contains("[x]"),
+                "precondition: Cursor Line must default to its checked \
+                 glyph before Enter is pressed; row:\n{before}"
+            );
+
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            let after = cursor_line_row(&driver.screen());
+            assert!(
+                after.contains("[ ]"),
+                "Enter on the Cursor Line row must flip its toggle and \
+                 repaint the unchecked glyph — if the terminal still \
+                 swallowed the key, the glyph stays checked; row:\n{after}"
+            );
+        }
+
         /// Mirrors `shell_app.rs`'s test of the same name: Alt+Right
         /// must widen the painted sidebar by one column, pushing the editor
         /// one column right; Alt+Left must narrow it straight back.
