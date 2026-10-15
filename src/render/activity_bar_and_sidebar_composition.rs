@@ -148,9 +148,18 @@ pub fn build_activity_bar(
             theme.cursor.g,
             theme.cursor.b,
         )),
-        // Signals to the quadraui backend that this bar owns the keyboard so
-        // it intercepts KeyPressed as ActivityBarEvent::KeyPressed.
-        is_keyboard_focused: engine.activity_bar_focused,
+        // Always `false`: setting this makes the TUI/GTK backend reroute the
+        // next raw key into `UiEvent::ActivityBar(id, KeyPressed { .. })`,
+        // which `App` (a `quadraui::ShellApp`) never reads — that event type
+        // is fully consumed by `ShellAdapter::handle` against its own
+        // internal `AppShell`, which this bar's painted state (`kbd_sel`
+        // above, driven by `Engine::activity_bar_focused`/
+        // `activity_bar_selected_item_id`) never reads back from. Leaving
+        // this `false` keeps every key arriving as a raw `KeyPressed`, so
+        // `App::handle_key_press`'s `FocusKeyRoute::ActivityBar` rung (in
+        // `app/input.rs`, backed by `Engine::activity_bar_move_up/down/
+        // activate/focus_out`) stays the sole, working navigation path.
+        is_keyboard_focused: false,
     }
 }
 
