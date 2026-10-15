@@ -3342,18 +3342,22 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// #1979: a terminal pane left focused, then a real
+        /// A terminal pane left focused, then a real
         /// `Engine::focus_sidebar_panel` call (the method every
         /// keyboard-driven focus transfer — Ctrl-W chord, activity-bar
         /// `Activate` — routes through) into Settings must hand the very
         /// next keypress to the settings form, not the stale terminal.
         ///
-        /// `Engine::clear_sidebar_focus` is the chokepoint
-        /// `focus_sidebar_panel` calls before setting `settings_has_focus`;
-        /// it must also drop `terminal_has_focus`, or
+        /// `focus_sidebar_panel` clears `terminal_has_focus` itself, right
+        /// after calling the shared `Engine::clear_sidebar_focus` and before
+        /// setting `settings_has_focus`; without it,
         /// `render::route_focus_key`'s terminal gate (checked before every
         /// sidebar arm) keeps outranking Settings even though the sidebar
-        /// is now the real focus owner.
+        /// is now the real focus owner. The clear lives at this specific
+        /// focus-*grant* call site rather than inside `clear_sidebar_focus`
+        /// itself, since that function is also called from several focus-
+        /// *release* paths (hiding the sidebar, a mouse click landing on the
+        /// bottom panel) where a focused terminal must stay focused.
         ///
         /// The needle is Enter on the "Cursor Line" row rather than the
         /// issue's literal colour-scheme picker: both are `settings_flat_list`
@@ -6397,6 +6401,38 @@ mod tests {
                 "clicking the Output tab must repaint the panel body with the \
                  Output placeholder; screen:\n{}",
                 driver.screen()
+            );
+        }
+
+        /// Clicking the bottom panel's tab strip at all — even the already-
+        /// active "Terminal" tab, a no-op for which panel is painted — goes
+        /// through `App::handle_mouse_click_msg`'s unconditional pre-dispatch
+        /// `Engine::clear_sidebar_focus()` call before the click is routed
+        /// to `handle_bottom_tab_bar_click`. `clear_sidebar_focus` must leave
+        /// `terminal_has_focus` alone (it only clears the sidebar-band
+        /// flags), so a terminal that was genuinely focused before the click
+        /// must still be focused after it.
+        #[test]
+        fn bottom_panel_terminal_tab_click_leaves_the_terminal_focused_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let mut h = harness_no_sidebar(engine);
+            // `harness_no_sidebar`'s sidebar-collapse clicks land on the
+            // Explorer activity-bar icon, outside the bottom panel, so they
+            // legitimately clear `terminal_has_focus` themselves. Set focus
+            // only after that setup, right before the click under test.
+            h.engine.borrow_mut().terminal_has_focus = true;
+            let driver = &mut h.driver;
+
+            let (x, y) = driver
+                .find("Terminal")
+                .expect("the bottom panel tab strip must paint a Terminal tab");
+            driver.click(x, y);
+
+            assert!(
+                h.engine.borrow().terminal_has_focus,
+                "clicking the bottom panel's tab strip must not steal focus \
+                 from an already-focused terminal"
             );
         }
 

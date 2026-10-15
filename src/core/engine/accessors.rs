@@ -775,15 +775,6 @@ impl Engine {
         self.settings_has_focus = false;
         self.ext_panel_has_focus = false;
         self.activity_bar_focused = false;
-        // Every grant of sidebar-band focus (activity bar, a built-in panel,
-        // an ext panel) routes through here first, so this is also the
-        // chokepoint for taking focus away from the terminal. Without this,
-        // keyboard navigation into a sidebar panel left `terminal_has_focus`
-        // true alongside the new panel's own flag, and `route_focus_key`'s
-        // terminal gate outranks every sidebar arm — e.g. Enter on the
-        // settings color-scheme picker kept going to the terminal PTY
-        // instead of activating the selection.
-        self.terminal_has_focus = false;
     }
 
     /// Collapse (hide) the sidebar: hide it in `app_shell`, clear every

@@ -5239,6 +5239,40 @@ mod sidebar_panel_clicks {
         );
     }
 
+    /// GTK half of
+    /// `bottom_panel_terminal_tab_click_leaves_the_terminal_focused_via_shell_app`:
+    /// clicking the bottom panel's tab strip at all — even the already-
+    /// active "Terminal" tab, a no-op for which panel is painted — goes
+    /// through `App::handle_mouse_click_msg`'s unconditional pre-dispatch
+    /// `Engine::clear_sidebar_focus()` call before the click is routed to
+    /// `handle_bottom_tab_bar_click`. `clear_sidebar_focus` must leave
+    /// `terminal_has_focus` alone (it only clears the sidebar-band flags),
+    /// so a terminal that was genuinely focused before the click must still
+    /// be focused after it.
+    #[test]
+    fn bottom_panel_terminal_tab_click_leaves_the_terminal_focused() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.terminal_new_tab(80, 10);
+        engine.terminal_has_focus = true;
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        let (x, y) = h
+            .driver
+            .find("Terminal")
+            .expect("the bottom panel tab strip must paint a Terminal tab");
+        h.driver.click(x, y);
+        h.driver.render();
+
+        assert!(
+            h.engine.borrow().terminal_has_focus,
+            "clicking the bottom panel's tab strip must not steal focus \
+             from an already-focused terminal"
+        );
+    }
+
     // ── #758 / #734 slice 3: the shared terminal (PTY) keyboard rung ───────
 
     /// GTK half of `terminal_ctrl_f_opens_the_painted_find_bar_via_shell_app`:
