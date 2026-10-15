@@ -70,8 +70,18 @@ def fail(msg: str) -> None:
     sys.exit(1)
 
 
+AUTO_YES = False
+
+
 def confirm(prompt: str) -> bool:
-    answer = input(f"\n  {YELLOW}?{RESET} {prompt} [y/N] ").strip().lower()
+    if AUTO_YES:
+        print(f"\n  {YELLOW}?{RESET} {prompt} [y/N] y (--yes)")
+        return True
+    try:
+        answer = input(f"\n  {YELLOW}?{RESET} {prompt} [y/N] ").strip().lower()
+    except EOFError:
+        warn("no TTY — use --yes for non-interactive mode")
+        return True
     return answer in ("y", "yes")
 
 
@@ -446,10 +456,48 @@ def vimcode_gate(args: argparse.Namespace) -> None:
 # ── Phase 6: Release ─────────────────────────────────────────────────
 
 
+def reconcile_main_into_develop() -> None:
+    """Merge origin/main into develop so the PR has no conflicts."""
+    git(["fetch", "origin", "main"], VIMCODE_DIR)
+    behind = git(
+        ["rev-list", "--count", "HEAD..origin/main"], VIMCODE_DIR,
+    ).stdout.strip()
+    if behind == "0":
+        info("develop already contains all of main")
+        return
+
+    info(f"main is {behind} commit(s) ahead of develop — merging")
+    merge = git(["merge", "origin/main", "--no-edit"], VIMCODE_DIR, check=False)
+    if merge.returncode != 0:
+        conflicts = git(
+            ["diff", "--name-only", "--diff-filter=U"], VIMCODE_DIR,
+        ).stdout.strip()
+        if conflicts:
+            # For version-only conflicts in Cargo.toml/Cargo.lock, take ours
+            version_files = {"Cargo.toml", "Cargo.lock"}
+            conflict_set = set(conflicts.splitlines())
+            auto_resolvable = conflict_set <= version_files
+            if auto_resolvable or conflict_set - version_files == {"CHANGELOG.md"}:
+                for f in conflict_set:
+                    git(["checkout", "--ours", f], VIMCODE_DIR)
+                    git(["add", f], VIMCODE_DIR)
+                git(["commit", "--no-edit"], VIMCODE_DIR)
+                info("auto-resolved version conflicts (kept develop's versions)")
+            else:
+                fail(
+                    f"merge conflicts in unexpected files: {conflicts}\n"
+                    "  Resolve manually: git merge origin/main"
+                )
+        else:
+            fail(f"merge failed:\n{merge.stderr}")
+
+
 def vimcode_release(args: argparse.Namespace) -> None:
     banner("6/6", f"Release vimcode v{args.vimcode_version}")
 
     vc_ver = args.vimcode_version
+
+    reconcile_main_into_develop()
 
     git(["push", "origin", "develop"], VIMCODE_DIR, check=False)
     info("develop pushed")
@@ -476,26 +524,43 @@ def vimcode_release(args: argparse.Namespace) -> None:
     print(f"\n  About to create the develop → main PR for v{vc_ver}.")
     print(f"  Merging it triggers release.yml which builds + publishes.\n")
 
-    if not confirm("Create the release PR?"):
-        print(f"\n  Create it manually:")
-        print(f'    gh pr create --base main --head develop --title "Release v{vc_ver}"')
-        sys.exit(0)
-
-    pr_result = run(
-        ["gh", "pr", "create",
-         "--base", "main",
-         "--head", "develop",
-         "--title", f"Release v{vc_ver}",
-         "--body", pr_body],
-        VIMCODE_DIR,
-        check=False,
+    # Check for an existing develop→main PR
+    existing = run(
+        ["gh", "pr", "list", "--base", "main", "--head", "develop",
+         "--json", "url,number", "--jq", ".[0]"],
+        VIMCODE_DIR, check=False,
     )
-    if pr_result.returncode == 0:
-        pr_url = pr_result.stdout.strip()
-        info(f"release PR created: {pr_url}")
+    pr_url = None
+    if existing.returncode == 0 and existing.stdout.strip():
+        import json
+        pr_info = json.loads(existing.stdout.strip())
+        pr_url = pr_info["url"]
+        info(f"updating existing PR #{pr_info['number']}: {pr_url}")
+        run(
+            ["gh", "pr", "edit", str(pr_info["number"]),
+             "--title", f"Release v{vc_ver}", "--body", pr_body],
+            VIMCODE_DIR, check=False,
+        )
     else:
-        warn(f"PR creation failed — check GitHub\n{pr_result.stderr}")
-        pr_url = None
+        if not confirm("Create the release PR?"):
+            print(f"\n  Create it manually:")
+            print(f'    gh pr create --base main --head develop --title "Release v{vc_ver}"')
+            sys.exit(0)
+
+        pr_result = run(
+            ["gh", "pr", "create",
+             "--base", "main",
+             "--head", "develop",
+             "--title", f"Release v{vc_ver}",
+             "--body", pr_body],
+            VIMCODE_DIR,
+            check=False,
+        )
+        if pr_result.returncode == 0:
+            pr_url = pr_result.stdout.strip()
+            info(f"release PR created: {pr_url}")
+        else:
+            warn(f"PR creation failed — check GitHub\n{pr_result.stderr}")
 
     print(f"\n  {YELLOW}Final steps:{RESET}")
     print(f"    1. Review the PR, confirm CI is green")
@@ -532,7 +597,15 @@ def main() -> None:
         "--skip-gate", action="store_true",
         help="skip platform-conformance gate (already run)",
     )
+    parser.add_argument(
+        "--yes", "-y", action="store_true",
+        help="answer yes to all prompts (non-interactive mode)",
+    )
     args = parser.parse_args()
+
+    if args.yes:
+        global AUTO_YES
+        AUTO_YES = True
 
     if not args.skip_quadraui and not args.quadraui_version:
         parser.error("--quadraui-version is required (or pass --skip-quadraui)")
