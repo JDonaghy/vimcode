@@ -500,7 +500,15 @@ pub fn paint_picker_rung(
     sizing: &PickerSizing,
     theme: &Theme,
 ) -> quadraui::Rect {
-    b.draw_solid_fill(scrim_rect, MODAL_SCRIM_COLOR);
+    // Pixel backends (GTK/macOS/Win) alpha-blend the scrim, dimming the
+    // editor behind the popup while keeping it visible.  TUI's
+    // `draw_solid_fill` has no alpha channel — it overwrites every cell in
+    // the rect with a blank glyph, destroying the content entirely.  Skip
+    // the scrim on TUI: the popup's own bordered background provides enough
+    // visual separation, matching VS Code's terminal command palette.
+    if b.backend_caps().window_chrome {
+        b.draw_solid_fill(scrim_rect, MODAL_SCRIM_COLOR);
+    }
     let has_preview = picker.preview.is_some();
     let geo = PickerGeometry::compute(viewport, picker.items.len(), has_preview, sizing);
     let palette = picker_panel_to_palette(picker, theme);

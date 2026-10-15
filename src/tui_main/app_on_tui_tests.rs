@@ -4110,15 +4110,13 @@ mod tests {
             );
         }
 
-        /// Opening the unified picker must darken the chrome behind it — a
-        /// corner cell outside the popup's own rect (top-left, where the
-        /// collapsed-sidebar tab bar paints) must switch to the dark scrim
-        /// background once the picker opens, and switch back once it's
-        /// dismissed. Without `paint_picker_rung`'s `draw_solid_fill` call
-        /// this cell's background never changes, so this test is red against
-        /// unfixed `develop`.
+        /// Opening the unified picker on TUI must NOT destroy the content
+        /// behind it — TUI skips the scrim fill (which is destructive on a
+        /// cell grid) and relies on the popup's own bordered background for
+        /// visual separation. A corner cell outside the popup's own rect
+        /// must keep its original background while the picker is open.
         #[test]
-        fn picker_open_paints_a_backdrop_scrim_behind_it_via_shell_app() {
+        fn picker_open_preserves_background_behind_it_on_tui_via_shell_app() {
             let engine = plain_engine();
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
@@ -4133,22 +4131,16 @@ mod tests {
                 quadraui::Modifiers::default(),
             ));
 
-            let scrim = crate::render::MODAL_SCRIM_COLOR;
             let during = driver
                 .style_at(0, 0)
                 .expect("top-left cell must be in bounds")
                 .bg;
             assert_eq!(
                 during,
-                ratatui::style::Color::Rgb(scrim.r, scrim.g, scrim.b),
-                "opening the command palette must dim the top-left corner cell \
-                 behind it to the scrim colour; screen:\n{}",
+                before,
+                "TUI must not overwrite the corner cell's background with a \
+                 scrim fill — the popup's own chrome is enough; screen:\n{}",
                 driver.screen()
-            );
-            assert_ne!(
-                before, during,
-                "the scrim must actually change the corner cell's background, \
-                 not merely repaint the same colour"
             );
 
             driver.press_named(quadraui::NamedKey::Escape);
@@ -4159,8 +4151,8 @@ mod tests {
             assert_eq!(
                 after,
                 before,
-                "dismissing the picker must remove the scrim and restore the \
-                 corner cell's original background; screen:\n{}",
+                "dismissing the picker must leave the corner cell unchanged; \
+                 screen:\n{}",
                 driver.screen()
             );
         }
