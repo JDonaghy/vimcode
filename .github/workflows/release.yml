@@ -168,8 +168,8 @@ jobs:
         ```
 
         **GUI — testing only, not ready for use**
-        - **Native (AppKit, no dependencies):** download `vimcode-macos-native-arm64.tar.gz`, then `tar xzf vimcode-macos-native-arm64.tar.gz && xattr -d com.apple.quarantine vimcode && ./vimcode`. Launch it from a normal Terminal window: launched from a tmux server that predates your login session, macOS won't let it come to the front.
-        - **GTK4:** `brew install vimcode` (GTK4 GUI + TUI), or download `vimcode-macos-arm64.tar.gz`; requires GTK4 via Homebrew (`brew install gtk4`).
+        - **Native (AppKit, recommended):** `brew tap JDonaghy/vimcode && brew install vimcode`, or download `vimcode-macos-native-arm64.tar.gz` and run `tar xzf vimcode-macos-native-arm64.tar.gz && xattr -d com.apple.quarantine vimcode && ./vimcode`. No dependencies. Launch from a normal Terminal window (not a tmux server that predates your login session).
+        - **GTK4:** download `vimcode-macos-arm64.tar.gz`; requires GTK4 via Homebrew (`brew install gtk4`).
 
         ### Windows
 
