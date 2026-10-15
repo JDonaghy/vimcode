@@ -5672,7 +5672,8 @@ impl Engine {
             // `sidebar::FIXED_ACTIVITY_PANEL_IDS` — the same constant the TUI
             // shell's `build_shell_config` iterates directly. Both sources of
             // truth must stay synchronized.
-            app_shell: quadraui::AppShell::new(sidebar::engine_app_shell_panel_definitions(), 30.0),
+            app_shell: quadraui::AppShell::new(sidebar::engine_app_shell_panel_definitions(), 30.0)
+                .with_status_bar_under_main_column(),
             file_watcher: None,
             file_watcher_rx: None,
             file_watcher_pending: HashSet::new(),

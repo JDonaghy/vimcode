@@ -135,9 +135,9 @@ impl App {
                         .or(status.right_segments.first())
                         .map(|s| quadraui::Color::rgb(s.bg.r, s.bg.g, s.bg.b));
                     let backdrop_rect = quadraui::Rect::new(
-                        0.0,
+                        main.x,
                         separated_status_y as f32,
-                        backend.viewport().width,
+                        main.width,
                         el.separated_status_h as f32,
                     );
                     render::paint_status_backdrop(
@@ -1387,12 +1387,6 @@ impl App {
                 };
                 for ev in &events {
                     if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
-                        // The widget-id → scroll-state table is
-                        // `render::apply_scroll_offset`, shared with TUI. The
-                        // copy this replaced knew `picker` and `editor:h_sb:N`
-                        // and nothing else — see the rung's banner in
-                        // `render.rs`, point 2, for why two half-tables is a
-                        // silent trap rather than a live bug.
                         render::apply_scroll_offset(
                             &mut self.engine.borrow_mut(),
                             widget.as_str(),

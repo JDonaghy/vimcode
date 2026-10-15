@@ -598,15 +598,15 @@ impl App {
         cfg.max_sidebar_width = render::ALT_SIDEBAR_WIDTH_MAX as f32;
         // Reserve one line-height each for the always-present
         // command line and the (near-always-present) status line at the
-        // *shell* level, so `AppShellLayout::activity_bar_bounds` — and
-        // `sidebar_header_bounds`/`sidebar_content_bounds` — stop one-plus
-        // rows above the window's bottom edge instead of running the full
-        // window height. Without this, `AppShell::compute_layout` has no
-        // idea vimcode paints its own bottom chrome underneath
-        // `main_content_bounds`, so the activity bar's bottom-pinned
-        // Settings button ends up pinned to the *window's* bottom edge —
-        // the exact same y-range vimcode's own status/command-line rows
-        // occupy — instead of ending above them the way VS Code's does.
+        // *shell* level.  With `AppShell::with_status_bar_under_main_column`
+        // the activity bar and sidebar now run the full window
+        // height and these bands are carved from the main column only,
+        // matching VS Code's layout.  The reservations themselves are
+        // still needed: they tell `AppShell::compute_layout` how much
+        // vertical space to subtract from `main_content_bounds` for the
+        // status bar and command line — the new mode only changes
+        // *where* that subtraction is applied (main-column width, not
+        // full window width).
         //
         // `with_status_bar()`/`with_command_line()` each reserve a static
         // `line_height.round()` row — not vimcode's own dynamic
@@ -637,7 +637,10 @@ impl App {
         // before computing editor/status/command-line geometry, so this
         // reservation affects only the activity bar/sidebar's painted
         // height, never where the editor or its chrome actually paint.
-        cfg = cfg.with_command_line().with_status_bar();
+        cfg = cfg
+            .with_status_bar_under_main_column()
+            .with_command_line()
+            .with_status_bar();
         cfg
     }
 

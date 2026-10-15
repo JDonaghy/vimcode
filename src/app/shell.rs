@@ -17,7 +17,7 @@ impl quadraui::ShellApp for App {
         self.engine.borrow_mut().platform_name = backend.services().platform_name();
         // VS Code's editor scrollbar is 14px wide; a
         // no-op on TUI, whose scrollbar is one cell.
-        backend.set_editor_v_scrollbar_width(Some(14.0));
+        backend.set_editor_v_scrollbar_width(Some(16.0));
         // `shell_config`'s `with_editor_font` seed covers family/size only.
         // The runner's `set_editor_font` call resets `current_line_height` to
         // this backend's natural font metric every time. Re-apply the VS Code
@@ -236,7 +236,10 @@ impl quadraui::ShellApp for App {
             cw,
             false,
             (self.units.breadcrumb_row_h)(lh),
-            backend.scrollbar_reserve() as f64,
+            backend
+                .editor_v_scrollbar_width()
+                .unwrap_or(0.0)
+                .max(backend.scrollbar_reserve()) as f64,
             self.units.minimap,
         );
 
@@ -306,6 +309,16 @@ impl quadraui::ShellApp for App {
         // *order* and the *gates* are shared. Caches whose "absent" branch used
         // to live in an `else` are cleared here, before the walk: `compose_frame`
         // returns only the live rungs, so an absent rung has no arm left to run.
+        //
+        // In `status_bar_under_main_column` mode, quadraui confines the
+        // status/command bars to the main column. Use quadraui's x/width
+        // for horizontal confinement but keep vimcode's own y/height
+        // (the editor's `lh` differs from quadraui's `chrome_line_height`).
+        let chrome_x = layout.status_bar_bounds.map(|r| r.x as f64).unwrap_or(x);
+        let chrome_w = layout
+            .status_bar_bounds
+            .map(|r| r.width as f64)
+            .unwrap_or(w);
         let status_y = y + h - status_bar_h;
         self.engine
             .borrow()
@@ -546,8 +559,12 @@ impl quadraui::ShellApp for App {
                         } else {
                             status_y
                         };
-                        let wm_rect =
-                            quadraui::Rect::new(x as f32, wm_y as f32, w as f32, lh as f32);
+                        let wm_rect = quadraui::Rect::new(
+                            chrome_x as f32,
+                            wm_y as f32,
+                            chrome_w as f32,
+                            lh as f32,
+                        );
                         render::paint_wildmenu_rung(backend, wm, &theme, wm_rect);
                         composed.push(render::FrameOp::Wildmenu);
                     }
@@ -562,11 +579,14 @@ impl quadraui::ShellApp for App {
                 // know what was really drawn.
                 render::FrameOp::StatusBar => {
                     if let Some(ref bar) = screen.global_status_bar {
-                        let sb_rect =
-                            quadraui::Rect::new(x as f32, status_y as f32, w as f32, lh as f32);
+                        let sb_rect = quadraui::Rect::new(
+                            chrome_x as f32,
+                            status_y as f32,
+                            chrome_w as f32,
+                            lh as f32,
+                        );
                         let sb_layout =
                             render::paint_global_status_bar_rung(backend, &engine, bar, sb_rect);
-                        // Same zone recovery as the per-window and separated bars above.
                         *self.global_status_zones.borrow_mut() =
                             render::status_bar_zones_from_layout(&sb_layout);
                         composed.push(render::FrameOp::StatusBar);
@@ -575,9 +595,14 @@ impl quadraui::ShellApp for App {
 
                 // ── Command line ─────────────────────────────────────────────
                 render::FrameOp::CommandLine => {
-                    let cmd_y = status_y + (status_bar_h - lh);
                     let cmd = render::command_line_view(&screen.command);
-                    let cmd_rect = quadraui::Rect::new(x as f32, cmd_y as f32, w as f32, lh as f32);
+                    let cmd_y = status_y + (status_bar_h - lh);
+                    let cmd_rect = quadraui::Rect::new(
+                        chrome_x as f32,
+                        cmd_y as f32,
+                        chrome_w as f32,
+                        lh as f32,
+                    );
                     // Catch a "row clipped by the window edge"
                     // regression the instant it's introduced, on every
                     // backend, rather than only on a live macOS run.

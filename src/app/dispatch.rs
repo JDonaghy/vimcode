@@ -605,7 +605,7 @@ impl App {
         // panel's controller before the editor click path sees them. In ShellApp
         // mode there is no per-panel DrawingArea, so without this the file explorer
         // never receives clicks.
-        if self.try_route_sidebar_mouse_event(&*backend, &event, ctx) {
+        if self.try_route_sidebar_mouse_event(backend, &event, ctx) {
             return if self.draw_needed.get() {
                 self.draw_needed.set(false);
                 quadraui::Reaction::Redraw

@@ -465,8 +465,10 @@ impl App {
                     .first()
                     .or(win_bar.right_segments.first())
                     .map(|s| s.bg);
-                let backdrop_rect =
-                    quadraui::Rect::new(0.0, bar_y as f32, backend.viewport().width, lh as f32);
+                // In `status_bar_under_main_column` mode, the sidebar
+                // runs full height — the backdrop must stay within
+                // the window bounds, not extend under the sidebar.
+                let backdrop_rect = sb_rect;
                 render::paint_status_backdrop(
                     backend,
                     &format!("status-backdrop:{}", rw.window_id.0),

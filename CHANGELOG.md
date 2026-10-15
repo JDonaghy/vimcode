@@ -41,7 +41,16 @@ no matching section fails the release job before anything is published (see
 - quadraui bumped from 0.1.4 to 0.1.8.
 
 ### Fixed
+- Status bar, command line, and wildmenu now confined to the main column
+  when `status_bar_under_main_column` is enabled — the backdrop no longer
+  overspills into the sidebar and activity bar rows (#1959).
+- The scroll gutter between the minimap and pane edge now matches the
+  editor scrollbar width (16 px on GUI backends) instead of collapsing to
+  one character width (~8 px) on macOS (#1960, refs #723, #1869).
 - Minimap scroll thumb drag no longer feels sluggish/dampened.
+- Minimap thumb drag now uses file-wide geometry — dragging the thumb
+  traverses the entire buffer like VS Code, instead of drifting within the
+  minimap's painted window.
 - `apply_scroll_offset` now accepts both minimap id formats.
 - File picker overlay now floats over the editor pane instead of spanning
   the sidebar and full window height (#1925).

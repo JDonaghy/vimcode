@@ -221,7 +221,11 @@ impl App {
     /// here is GTK-only plumbing: which events this panel claims at all
     /// (`dominated`), pulling the metrics/backend/theme it needs, and
     /// draw-invalidation bookkeeping.
-    pub(crate) fn explorer_ui_event(&mut self, ev: quadraui::UiEvent) {
+    pub(crate) fn explorer_ui_event(
+        &mut self,
+        ev: quadraui::UiEvent,
+        backend: &mut dyn quadraui::Backend,
+    ) {
         let dominated = matches!(
             ev,
             quadraui::UiEvent::MouseDown { .. }
@@ -252,15 +256,12 @@ impl App {
         // methods on `dyn Backend`, so they must be set from here rather
         // than inside the shared function.
         let metrics = self.cached_explorer_metrics.get();
-        let backend_rc = self.backend.clone();
-        let mut b = backend_rc.borrow_mut();
-        quadraui::Backend::set_current_line_height(&mut **b, metrics.0 as f32);
-        quadraui::Backend::set_current_char_width(&mut **b, metrics.1 as f32);
+        quadraui::Backend::set_current_line_height(backend, metrics.0 as f32);
+        quadraui::Backend::set_current_char_width(backend, metrics.1 as f32);
         let tree_event = {
             let mut engine = self.engine.borrow_mut();
-            render::route_explorer_tree_event(&mut engine, &ev, rect, metrics, &theme, &mut **b)
+            render::route_explorer_tree_event(&mut engine, &ev, rect, metrics, &theme, backend)
         };
-        drop(b);
 
         // `None` means either the event was fully resolved inside the tree routing
         // or the rect wasn't paintable; either way this panel already did everything it needs to.
@@ -401,7 +402,7 @@ impl App {
     /// into the sidebar still finalizes through the editor's own mouse-up path.
     pub(crate) fn try_route_sidebar_mouse_event(
         &mut self,
-        backend: &dyn quadraui::Backend,
+        backend: &mut dyn quadraui::Backend,
         event: &quadraui::UiEvent,
         ctx: &quadraui::ShellContext<'_>,
     ) -> bool {
@@ -504,7 +505,7 @@ impl App {
                     ..
                 }
             ) {
-                self.dispatch_context_menu_click(backend, pos.x as f64, pos.y as f64);
+                self.dispatch_context_menu_click(&*backend, pos.x as f64, pos.y as f64);
             }
             self.draw_needed.set(true);
             return true;
@@ -524,7 +525,7 @@ impl App {
                 // open the overflow menu or run an action; a drag
                 // follow-through always falls to the tree.
                 if !starts_interaction || !self.route_explorer_toolbar_click(pos) {
-                    self.explorer_ui_event(event.clone());
+                    self.explorer_ui_event(event.clone(), backend);
                 }
                 true
             }
