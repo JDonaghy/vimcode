@@ -151,6 +151,33 @@ internal-only changes are exempt — **say so in the PR**. The adversarial revie
    release notes or status report. Release notes list every still-gated issue under
    **"Reproduced, not yet fixed"**.
 
+### Red-green gate for TUI/GTK bug fixes (MANDATORY)
+
+A bug-fix PR must show, not just assert, that its driver test went red before the
+fix and green after:
+
+1. **Commit the driver test first, on its own commit, before the fix commit.**
+   Run it against that commit (i.e. before your fix lands) and confirm it fails —
+   state the failure in the PR. A test added in the same commit as the fix, or
+   only ever run after the fix, proves nothing (rule 2 above).
+2. **Then commit the fix.** The same test, unchanged, must now pass.
+3. **The reviewer checks the sequence, not just green at PR head:** it looks at
+   the commit that introduced the test and confirms it precedes the commit that
+   changes production code, and that the test's assertion reads rendered output
+   (the table above), not a state flag. A PR that only shows green at HEAD, or
+   whose "red" claim can't be tied to a specific pre-fix commit, is a
+   request-changes.
+4. **For bugs involving real keyboard input or terminal escape-sequence
+   rendering, a driver test alone is not the trust gate.** `TuiDriver` and
+   `quadraui::testing::ConformanceDriver` inject synthetic key/event values
+   directly — they never exercise the real terminal-input-parsing path a
+   genuine keyboard bug can live in. Such a fix also needs a PTY-level scenario
+   in `tests/smoke-spec/tui.yaml` (coord's `tui-pty` driver: real `vcd` binary
+   under a real pty, real byte sequences in, real VT screen asserted on) added
+   or extended to cover the reported key sequence, additive-only per that
+   file's own header. A conformance-harness pass with no corresponding PTY
+   scenario does not clear this gate for keyboard/terminal bugs.
+
 **Sealed acceptance suite:** slices under `tests/acceptance/**` (driven via
 `tests/acceptance.rs`) are authored by the test-author agent. Workers may *run*
 them (`coord acceptance run --issue N`) but must never create, edit or delete them.
@@ -160,8 +187,12 @@ them (`coord acceptance run --issue N`) but must never create, edit or delete th
 The Test stage is black-box validation, not a redo of the Work stage: run the
 routed command / pulled artifact (`coord pull-artifact <work_aid>`) you are given,
 don't rebuild or run the full suite. A bug-fix branch fails Test unless it names
-the black-box test covering the bug and states it was seen red on unfixed
-`develop`; a `KNOWN_BUGS`-gated scenario is reproduced, not fixed. Record the verdict
+the black-box test covering the bug, points at the commit where it was added
+failing (the red-green gate above), and states it was seen red on unfixed
+`develop`; a `KNOWN_BUGS`-gated scenario is reproduced, not fixed. A keyboard- or
+terminal-rendering bug fails Test unless it also names the `tests/smoke-spec/
+tui.yaml` scenario covering it — a `TuiDriver`/`ConformanceDriver`-only pass is
+not sufficient for that bug class. Record the verdict
 with `coord test --passed <work_aid>` or `coord test --fail <work_aid> --reason
 "<expected vs actual, steps, suspected files>"`. Full procedure:
 `docs/AGENT_REFERENCE.md`.
