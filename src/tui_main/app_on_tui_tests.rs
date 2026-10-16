@@ -40,6 +40,11 @@ mod tests {
     //!   (`App::compose_bottom_band_rungs`), `src/render/frame_editor_band.rs`
     //!   (`BottomPanelUnits`) and `src/render/hit_test_geometry.rs`
     //!   (`UnitProfile::terminal_scrollbar_gutter`).
+    //! - `pressing_the_painted_terminal_scrollbar_track_on_tui_scrolls_the_scrollback`
+    //!   pins the other half of the same change: the reserved gutter carries a
+    //!   hit-testable `quadraui::SurfaceScrollbar`, registered by
+    //!   `src/render/frame_editor_band.rs` from the width
+    //!   `App::compose_bottom_band_rungs` passes.
     //!
     //! Everything else in this file only drives already-shipped code.
     //!
@@ -6990,6 +6995,76 @@ mod tests {
                  cols), reserving only the one-cell scrollbar gutter; a \
                  pixel-count gutter wrongly subtracted as whole TUI columns \
                  would land this several columns narrower (71) instead"
+            );
+        }
+
+        /// The one-cell gutter the TUI reserves is a real, hit-testable
+        /// scrollbar, not dead space: a press on the painted track must page
+        /// the terminal's scrollback and repaint the body with older output.
+        ///
+        /// `paint_bottom_panel_rung` only registers a
+        /// `quadraui::SurfaceScrollbar` on the `terminal_scrollback` scroll
+        /// surface when `BottomPanelUnits::terminal_scrollbar` is `Some`, and
+        /// `quadraui::dispatch_click` only hit-tests a track that exists — so
+        /// a cell backend that reserves the gutter width but registers no
+        /// scrollbar swallows the press as a plain body click and leaves the
+        /// live view painted.
+        ///
+        /// The track is located from the surface the paint pass registered
+        /// (never hardcoded coordinates) and the assertion is on painted
+        /// text: the newest line must leave the screen once the track press
+        /// pages back into history.
+        #[test]
+        fn pressing_the_painted_terminal_scrollbar_track_on_tui_scrolls_the_scrollback() {
+            // Distinctive enough that no shell prompt or ambient PTY output
+            // can produce it, and numbered so "newest" is unambiguous.
+            let newest = "ZQXWSCROLL59";
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let mut h = harness_no_sidebar(engine);
+
+            // Synthetic scrollback, fed straight into the pane's parser so
+            // the test doesn't depend on a real shell's output timing.
+            {
+                let mut e = h.engine.borrow_mut();
+                let session = &mut e.terminal_panes[0].session;
+                for i in 0..60 {
+                    session.feed_for_bench(format!("ZQXWSCROLL{i}\r\n").as_bytes());
+                }
+            }
+            h.driver.tick();
+
+            assert!(
+                h.driver.screen_has(newest),
+                "precondition: the live view paints the newest scrollback line; \
+                 screen:\n{}",
+                h.driver.screen()
+            );
+
+            let track = h
+                .engine
+                .borrow()
+                .scroll_surfaces
+                .borrow()
+                .iter()
+                .find(|s| s.id.as_str() == "terminal_scrollback")
+                .and_then(|s| s.scrollbar.as_ref())
+                .map(|sb| sb.track_bounds)
+                .expect(
+                    "the terminal panel must register a hit-testable scrollbar \
+                     over its reserved gutter",
+                );
+            // Top of the track: with the view live the thumb sits at the
+            // bottom of an inverted track, so this is a page-back press.
+            h.driver
+                .click(track.x + 0.5, track.y + f32::min(0.5, track.height / 2.0));
+
+            assert!(
+                !h.driver.screen_has(newest),
+                "pressing the terminal scrollbar track must page the painted \
+                 scrollback back so the newest line leaves the screen; \
+                 screen:\n{}",
+                h.driver.screen()
             );
         }
     }
