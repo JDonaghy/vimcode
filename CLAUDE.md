@@ -141,8 +141,13 @@ internal-only changes are exempt — **say so in the PR**. The adversarial revie
 1. **Assert on rendered output — never on state being populated.** Locate targets
    with `find` / `screen_contains`, or probe pixels for icon glyphs — never hardcode
    coordinates.
-2. **State in the PR that the new test fails against unfixed `develop`.** Remove the
-   fix, re-run, confirm red, restore — a test that cannot fail is not coverage.
+2. **Commit the test red before the fix commit (#1976).** For bug fixes, the driver
+   test that reproduces the bug must be committed *first* as a separate, failing
+   commit on `develop` (actually run it — don't just assert it "would" fail). The
+   fix commit follows; the same test goes green. The reviewer diffs two real commits
+   instead of trusting a PR-body claim. For non-bug-fix behaviour changes, stating
+   in the PR that the test fails against unfixed `develop` (item 2's previous bar)
+   is still sufficient.
 3. **A reproduction is not a fix.** A test-only issue (a red, `KNOWN_BUGS`-gated
    scenario, no code change) may not be closed until its follow-up fix issue
    exists, and that issue's number goes in the `KNOWN_BUGS` comment beside the label
@@ -150,6 +155,12 @@ internal-only changes are exempt — **say so in the PR**. The adversarial revie
 4. **Never describe a `KNOWN_BUGS`-gated issue as fixed** — not in a PR body,
    release notes or status report. Release notes list every still-gated issue under
    **"Reproduced, not yet fixed"**.
+5. **Keyboard/terminal rendering bugs need a PTY smoke scenario (#1976).** A
+   `ConformanceDriver` test injects synthetic key values that bypass the real
+   terminal-input-parsing path — it cannot catch bugs that live there (#1970). For
+   bugs involving keyboard input or terminal rendering, add a
+   `tests/smoke-spec/tui.yaml` PTY scenario (real `vcd` under a real pty, real byte
+   sequences) alongside the driver test.
 
 **Sealed acceptance suite:** slices under `tests/acceptance/**` (driven via
 `tests/acceptance.rs`) are authored by the test-author agent. Workers may *run*
