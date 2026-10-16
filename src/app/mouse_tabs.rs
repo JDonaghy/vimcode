@@ -83,11 +83,16 @@ impl App {
                     composed_bottom.push(render::BottomOp::Quickfix);
                 }
                 render::BottomOp::BottomPanel => {
-                    // `None` on a cell-grid backend defers to quadraui's own
-                    // `terminal_scrollbar_default_width` (one column); only a
-                    // pixel backend gets vimcode's narrower explicit override.
-                    let terminal_scrollbar = Self::terminal_panel_sb_is_pixels(backend)
-                        .then_some(Self::TERMINAL_PANEL_SB_W as u16);
+                    // An explicit width in `self.units`'s own units on every
+                    // backend — real pixels on GTK/macOS/Win, one cell on
+                    // TUI, matching quadraui's own
+                    // `Backend::terminal_scrollbar_default_width` so the
+                    // painted gutter is unchanged. Passing `None` here would
+                    // leave vimcode's own `ScrollSurface` with no `scrollbar`
+                    // to hit-test thumb-drag/track-click against (mouse-wheel
+                    // scroll needs only `surface.bounds`, so it would keep
+                    // working while clicking/dragging silently did nothing).
+                    let terminal_scrollbar = Some(self.units.terminal_scrollbar_gutter as u16);
                     render::paint_bottom_panel_rung(
                         backend,
                         engine,
@@ -99,7 +104,7 @@ impl App {
                             main.width,
                             el.terminal_h as f32,
                         ),
-                        render::BottomPanelUnits::px(lh, cw, terminal_scrollbar),
+                        render::BottomPanelUnits::new(lh, cw, terminal_scrollbar),
                     );
                     composed_bottom.push(render::BottomOp::BottomPanel);
                 }
@@ -1483,10 +1488,7 @@ impl App {
             render::MouseDragRoute::TerminalSplitDivider => {
                 if self.cached_char_width > 0.0 {
                     let min_x = self.cached_char_width * 5.0;
-                    let gutter = Self::terminal_panel_scrollbar_gutter(
-                        &**self.backend.borrow(),
-                        self.cached_char_width,
-                    );
+                    let gutter = self.units.terminal_scrollbar_gutter;
                     let max_x = (width - gutter - self.cached_char_width * 5.0).max(min_x);
                     let clamped_x = x.clamp(min_x, max_x);
                     let left_cols = (clamped_x / self.cached_char_width) as u16;

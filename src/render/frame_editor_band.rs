@@ -688,17 +688,12 @@ pub struct BottomPanelUnits {
 }
 
 impl BottomPanelUnits {
-    /// One terminal cell, deferring to the backend's own default scrollbar
-    /// width.
-    pub const CELL: Self = Self {
-        metrics: FrameMetrics::CELL,
-        terminal_scrollbar: None,
-        clear_terminal_bg: true,
-    };
-
-    /// Real pixels, with an explicit `terminal_scrollbar` override (`None` to
-    /// defer to the backend's own default width instead).
-    pub fn px(line_height: f64, char_width: f64, terminal_scrollbar: Option<u16>) -> Self {
+    /// Build a `BottomPanelUnits` from the caller's own per-cell/per-line
+    /// metrics, with an explicit `terminal_scrollbar` width in those same
+    /// units (`None` to defer to the backend's own default width instead).
+    /// The sole constructor for both backends: GTK passes real pixels, TUI
+    /// passes one cell.
+    pub fn new(line_height: f64, char_width: f64, terminal_scrollbar: Option<u16>) -> Self {
         Self {
             metrics: FrameMetrics::px(line_height, char_width),
             terminal_scrollbar,
@@ -853,13 +848,19 @@ pub fn paint_bottom_panel_rung(
                 // every quadraui rect is `f32`.
                 let thumb_t = g.thumb_top_frac as f32 * content_h;
                 let thumb_h = (g.thumb_height_frac as f32 * content_h).max(4.0);
+                // A wide (pixel-backend) gutter insets the thumb by one pixel
+                // on each side so it reads as a distinct bar inside the
+                // track; a one-cell TUI gutter has no room for that margin,
+                // so the thumb fills the whole track instead of going
+                // negative-width.
+                let thumb_inset = if sb_w > 2.0 { 1.0 } else { 0.0 };
                 Some(quadraui::SurfaceScrollbar {
                     axis: quadraui::ScrollAxis::Vertical,
                     track_bounds: quadraui::Rect::new(sb_x, content_y, sb_w, content_h),
                     thumb_bounds: quadraui::Rect::new(
-                        sb_x + 1.0,
+                        sb_x + thumb_inset,
                         content_y + thumb_t,
-                        sb_w - 2.0,
+                        (sb_w - 2.0 * thumb_inset).max(1.0),
                         thumb_h,
                     ),
                     total_items: g.total_items,

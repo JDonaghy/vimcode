@@ -14,7 +14,7 @@ mod tests {
     //! name where `App`'s own construction/fields differ enough that a
     //! faithful port needed a different shape.
     //!
-    //! # No production code here (exceptions: #1762, #1763, #1764, #1750)
+    //! # No production code here (exceptions: #1762, #1763, #1764, #1750, #1991)
     //!
     //! Every test below drives already-shipped code through the existing
     //! [`crate::tui_main::testing::conformance_harness`] / [`crate::harness`]
@@ -34,6 +34,12 @@ mod tests {
     //!   covers new `src/app.rs` and `src/render.rs` code for Alt-chord handling.
     //! - All tests under `editor_hover_dwell_1750` cover new `src/app.rs` code
     //!   that arms the dwell timer in the `MouseMoved` arm of `App::handle_dispatch`.
+    //! - `opening_a_terminal_on_tui_sizes_the_pty_within_one_column_of_the_painted_width`
+    //!   pins the terminal panel scrollbar gutter fix in `src/app/dialogs.rs`
+    //!   (`App::terminal_panel_cols`), `src/app/mouse_tabs.rs`
+    //!   (`App::compose_bottom_band_rungs`), `src/render/frame_editor_band.rs`
+    //!   (`BottomPanelUnits`) and `src/render/hit_test_geometry.rs`
+    //!   (`UnitProfile::terminal_scrollbar_gutter`).
     //!
     //! Everything else in this file only drives already-shipped code.
     //!
@@ -6946,16 +6952,15 @@ mod tests {
             );
         }
 
-        /// Opening the terminal via the accelerator must size its PTY from
-        /// the full painted editor width, not a flat pixel-sized scrollbar
-        /// gutter wrongly treated as whole columns. On an 80-column, no-
-        /// sidebar TUI window `App::terminal_panel_cols` resolves the
-        /// painted editor width (77 cols) minus `TERMINAL_PANEL_SB_W`
-        /// (`6.0`, a *pixel* count) as six whole columns rather than the one
-        /// cell a cell-grid backend actually has no sub-cell room for,
-        /// landing the PTY at 71 columns instead of 76 — exactly the
-        /// "5-7 columns narrower" this test pins down. Mirrors the GTK
-        /// precedent (`issue_1421_terminal_size_derived_from_layout`'s
+        /// Opening the terminal via the accelerator sizes its PTY from the
+        /// full painted editor width, reserving only the one-cell scrollbar
+        /// gutter (`UnitProfile::terminal_scrollbar_gutter`) a cell-grid
+        /// backend actually has room for, not a pixel-sized gutter
+        /// mistakenly subtracted as whole columns. On an 80-column,
+        /// no-sidebar TUI window `App::terminal_panel_cols` resolves the
+        /// painted editor width (77 cols) minus that one-cell gutter to 76
+        /// columns. Mirrors the GTK precedent
+        /// (`issue_1421_terminal_size_derived_from_layout`'s
         /// `opening_a_terminal_in_a_wide_window_sizes_the_pty_from_the_
         /// painted_layout_on_gtk`), which asserts on the same
         /// `TerminalSession::cols()` signal.
@@ -6982,9 +6987,9 @@ mod tests {
                 Some(76),
                 "an 80-column, no-sidebar TUI window's terminal PTY should be \
                  sized within one column of the painted editor width (76 \
-                 cols); a `TERMINAL_PANEL_SB_W` pixel-count gutter wrongly \
-                 subtracted as whole TUI columns would land this several \
-                 columns narrower (71) instead"
+                 cols), reserving only the one-cell scrollbar gutter; a \
+                 pixel-count gutter wrongly subtracted as whole TUI columns \
+                 would land this several columns narrower (71) instead"
             );
         }
     }
