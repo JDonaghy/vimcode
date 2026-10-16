@@ -11589,6 +11589,79 @@ mod command_center {
         );
     }
 
+    /// With no drawn menu row this frame, the title-bar band's background must
+    /// reach the canvas as a plain solid fill — `Backend::draw_solid_fill`, which
+    /// every backend records as a `chrome:solid-fill` zone — and never as an
+    /// item-less filler `MenuBar` handed to `Backend::draw_menu_bar`. On a
+    /// native-menu backend that call is the platform menu-bar *install* point, so
+    /// an empty bar passed purely for its background wipes the real app menus.
+    ///
+    /// The two paint identical pixels (quadraui's menu-bar primitive fills its
+    /// background with `theme.tab_bar_bg`), so pixels cannot tell them apart —
+    /// the zone inventory can, on every backend, which is what makes this
+    /// cross-backend observable rather than a macOS-only one.
+    #[test]
+    fn hidden_menu_row_fills_the_title_band_with_a_plain_solid_fill() {
+        use quadraui::testing::ConformanceDriver;
+
+        let mut h = harness(engine_with_tab_history(), 1400, 900);
+        h.engine.borrow_mut().menu_bar_visible = false;
+        h.driver.render();
+
+        let layout = h
+            .engine
+            .borrow()
+            .command_center_layout
+            .borrow()
+            .clone()
+            .expect("the Command Center must paint while the menu row is hidden");
+        let back = layout
+            .back_bounds
+            .expect("the back arrow must have a painted bounds");
+        let search = layout
+            .search_bounds
+            .expect("the search box must have a painted bounds");
+
+        // Band geometry comes from what actually painted into the band, never
+        // from literal coordinates: the fill has to start at or left of the back
+        // arrow, run past the search box's trailing edge, and cover the arrow's
+        // full height.
+        let fill_id = quadraui::WidgetId::new("chrome:solid-fill");
+        let band_fill = h.driver.inventory().zones().iter().any(|z| {
+            z.id == fill_id
+                && z.bounds.x <= back.x
+                && z.bounds.x + z.bounds.width >= search.x + search.width
+                && z.bounds.y <= back.y
+                && z.bounds.y + z.bounds.height >= back.y + back.height
+        });
+        assert!(
+            band_fill,
+            "the title-bar band must be filled with draw_solid_fill while the \
+             drawn menu row is hidden (a `chrome:solid-fill` zone spanning the \
+             Command Center's painted bounds); zones were {:?}",
+            h.driver
+                .inventory()
+                .zones()
+                .iter()
+                .map(|z| (z.id.as_str().to_string(), z.bounds))
+                .collect::<Vec<_>>()
+        );
+
+        // Same band, same colour contract as the pixel assertion in
+        // `command_center_stays_live_when_menu_bar_is_hidden`: swapping the
+        // filler `MenuBar` for a plain fill must not change what is on screen.
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let row_y = (back.y + back.height / 2.0) as i32;
+        let (r, g, b) = h.driver.pixel(2, row_y);
+        assert_eq!(
+            (r, g, b),
+            (theme.tab_bar_bg.r, theme.tab_bar_bg.g, theme.tab_bar_bg.b),
+            "the plain fill must paint the same theme.tab_bar_bg band the \
+             filler MenuBar did; sampled {:?} at (2, {row_y})",
+            (r, g, b)
+        );
+    }
+
     /// The smoke-spec's hit-test pixel coordinates were derived from a model
     /// that never accounted for the Command Center (back/forward nav arrows +
     /// search box) now painting between the menu row and caption buttons on a

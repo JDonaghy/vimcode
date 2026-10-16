@@ -2186,13 +2186,14 @@ mod mac_driver_tests {
     /// paint the theme's title-bar colour instead of showing a bare,
     /// unthemed surface.
     ///
-    /// The fix (`App::render_content`'s `FrameOp::CommandCenter` arm) is
-    /// unconditional on `!presence.menu_row` — true for every `MacDriver`
+    /// The painter (`App::render_content`'s `FrameOp::CommandCenter` arm)
+    /// is gated only on `!presence.menu_row` — true for every `MacDriver`
     /// fixture, real window or not, since `MacBackend::backend_caps()`
     /// declares `native_menu: true` unconditionally (`App::setup` reads
     /// that to suppress the drawn menu row, independent of any window) —
-    /// so it reaches `backend.draw_menu_bar(menu_row_rect, &filler)` on
-    /// every `MacDriver` run. What this test **cannot** independently
+    /// so it reaches `backend.draw_solid_fill(menu_row_rect,
+    /// theme.tab_bar_bg)` on every `MacDriver` run. What this test
+    /// **cannot** independently
     /// prove is that this fill is *visible* — `Backend::titlebar_control_
     /// inset()` is provably always `Rect::default()` here (see
     /// `control_inset_is_default_because_mac_driver_never_sets_a_window`'s
@@ -2201,9 +2202,9 @@ mod mac_driver_tests {
     /// bands`'s `menu_end` already sits at the row's leading edge, so the
     /// Command Center's own background fill (`quadraui::macos::
     /// command_center`'s `fill_rect(.., theme.tab_bar_bg)`) already paints
-    /// this pixel the *same* colour this fix's fill paints underneath it
-    /// -- the two are visually indistinguishable in this harness, pre-fix
-    /// or post. A live NSWindow is the only thing that can put a non-zero
+    /// this pixel the *same* colour the shell's own fill paints
+    /// underneath it -- the two are visually indistinguishable in this
+    /// harness. A live NSWindow is the only thing that can put a non-zero
     /// inset there (this issue's SMOKE_TESTS item), the same gap #940
     /// already hit and documented as a quadraui-side limitation, not a
     /// vimcode workaround (CLAUDE.md's Platform-Neutrality Rule: file
