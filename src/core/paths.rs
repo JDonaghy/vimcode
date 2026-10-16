@@ -166,23 +166,29 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(home)
 }
 
-/// Expand a leading `~` or `~/...` in a file-path argument to [`home_dir()`].
+/// Expand a leading `~` or `~<sep>...` in a file-path argument to
+/// [`home_dir()`], where `<sep>` is whichever path separator the platform
+/// accepts ([`std::path::is_separator`] — `/` everywhere, plus `\` on
+/// Windows), so a path typed with the native separator (`~\src\foo.lua`)
+/// expands just like `~/src/foo.lua`.
 ///
 /// This is the shared helper every file-opening ex command (`:e`, `:split`,
 /// `:vsplit`, `:tabe`, `:saveas`, `:r`, ...) runs its raw path argument
 /// through before resolving it relative to the current working directory,
 /// so `~` behaves the same everywhere a path can be typed.
 ///
-/// Only a bare `~` or a `~/`-prefixed path is expanded. `~user` forms and
-/// any path not starting with `~` are returned unchanged — expanding another
-/// user's home directory needs a passwd/directory-services lookup this
-/// function deliberately doesn't do.
+/// Only a bare `~` or a `~`-plus-separator-prefixed path is expanded.
+/// `~user` forms and any path not starting with `~` are returned unchanged
+/// — expanding another user's home directory needs a passwd/directory-
+/// services lookup this function deliberately doesn't do.
 pub fn expand_tilde(path_str: &str) -> PathBuf {
     if path_str == "~" {
         return home_dir();
     }
-    if let Some(rest) = path_str.strip_prefix("~/") {
-        return home_dir().join(rest);
+    if let Some(rest) = path_str.strip_prefix('~') {
+        if let Some(sep) = rest.chars().next().filter(|c| std::path::is_separator(*c)) {
+            return home_dir().join(&rest[sep.len_utf8()..]);
+        }
     }
     PathBuf::from(path_str)
 }
@@ -374,6 +380,20 @@ mod tests {
         assert_eq!(
             expand_tilde("~/src/foo/bar.lua"),
             PathBuf::from("/tmp/fake-home/src/foo/bar.lua")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_expands_native_separator_prefix() {
+        let _guard = set_test_home(Path::new("/tmp/fake-home"));
+        let native = format!(
+            "~{}src{}foo.lua",
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        );
+        assert_eq!(
+            expand_tilde(&native),
+            PathBuf::from("/tmp/fake-home").join("src").join("foo.lua")
         );
     }
 

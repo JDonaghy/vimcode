@@ -32669,6 +32669,89 @@ fn test_edit_bang_bypasses_dirty_guard_1190() {
     );
 }
 
+#[test]
+fn test_edit_expands_tilde_in_path_arg_1847() {
+    let home = std::env::temp_dir().join(format!(
+        "vimcode_test_1847_engine_edit_{}",
+        std::process::id()
+    ));
+    let _guard = crate::core::paths::set_test_home(&home);
+
+    let mut engine = Engine::new();
+    engine.settings.hidden = false;
+    let action = type_command_action(&mut engine, "edit ~/somefile_1847.txt");
+    assert_eq!(
+        action,
+        EngineAction::OpenFile(home.join("somefile_1847.txt")),
+        "`:edit ~/...` expands `~` to the home directory before resolving \
+         the path"
+    );
+}
+
+#[test]
+fn test_read_expands_tilde_in_path_arg_1847() {
+    let home = std::env::temp_dir().join(format!(
+        "vimcode_test_1847_engine_read_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("readme_1847.txt"), "READ1847_TILDE_OK\n").unwrap();
+    let _guard = crate::core::paths::set_test_home(&home);
+
+    let mut engine = Engine::new();
+    let action = type_command_action(&mut engine, "read ~/readme_1847.txt");
+    assert_eq!(action, EngineAction::None);
+    let content: String = engine.buffer().content.to_string();
+    assert!(
+        content.contains("READ1847_TILDE_OK"),
+        "`:read ~/...` must expand `~` and insert the real file's \
+         contents; buffer:\n{content}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_saveas_expands_tilde_in_path_arg_1847() {
+    let home = std::env::temp_dir().join(format!(
+        "vimcode_test_1847_engine_saveas_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    let _guard = crate::core::paths::set_test_home(&home);
+
+    let mut engine = Engine::new();
+    let _ = type_command_action(&mut engine, "saveas ~/saved_1847.txt");
+    let file_path = engine
+        .buffer_manager
+        .get(engine.active_buffer_id())
+        .unwrap()
+        .file_path
+        .clone();
+    assert_eq!(file_path, Some(home.join("saved_1847.txt")));
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_resolve_path_arg_expands_tilde_1847() {
+    let home = std::env::temp_dir().join(format!(
+        "vimcode_test_1847_engine_resolve_{}",
+        std::process::id()
+    ));
+    let _guard = crate::core::paths::set_test_home(&home);
+
+    let engine = Engine::new();
+    assert_eq!(
+        engine.resolve_path_arg("~/somefile_1847.txt"),
+        home.join("somefile_1847.txt")
+    );
+    assert_eq!(
+        engine.resolve_path_arg("relative_1847.txt"),
+        engine.cwd.join("relative_1847.txt")
+    );
+}
+
 // -- Window move (<C-w>H/J/K/L) --
 
 #[test]

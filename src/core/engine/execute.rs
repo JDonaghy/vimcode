@@ -481,13 +481,14 @@ pub(crate) fn spawn_http_request(spec: HttpRequestSpec) -> std::io::Result<HttpP
 }
 
 impl Engine {
-    /// Resolve a raw file-path argument typed after a file-opening ex
-    /// command (`:e`, `:split`, `:vsplit`, `:tabe`, `:saveas`, `:r`, ...)
-    /// into an absolute path: expand a leading `~`/`~/` to the home
-    /// directory first (see [`crate::core::paths::expand_tilde`]), then
-    /// resolve anything still relative against `self.cwd`. The shared
-    /// point every such command runs its argument through, so `~` behaves
-    /// the same everywhere a path can be typed.
+    /// Resolve a raw file-path argument into an absolute path: expand a
+    /// leading `~`/`~/` to the home directory first (see
+    /// [`crate::core::paths::expand_tilde`]), then resolve anything still
+    /// relative against `self.cwd`. The shared point every file-opening
+    /// command runs its argument through, whether that argument came from
+    /// an ex command (`:e`, `:split`, `:vsplit`, `:tabe`, `:saveas`, `:r`,
+    /// ...) or from a path found under the cursor (`gf`, `gF`, `Ctrl-W f`),
+    /// so `~` behaves the same everywhere a path can be typed.
     pub(crate) fn resolve_path_arg(&self, arg: &str) -> PathBuf {
         let expanded = crate::core::paths::expand_tilde(arg);
         if expanded.is_absolute() {

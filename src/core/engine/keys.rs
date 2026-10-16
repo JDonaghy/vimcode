@@ -2428,11 +2428,7 @@ impl Engine {
                 Some('f') => {
                     // gf: open file path under cursor
                     if let Some(path) = self.file_path_under_cursor() {
-                        let abs_path = if path.is_absolute() {
-                            path
-                        } else {
-                            self.cwd.join(&path)
-                        };
+                        let abs_path = self.resolve_path_arg(&path.to_string_lossy());
                         return EngineAction::OpenFile(abs_path);
                     } else {
                         self.message = "No file path under cursor".to_string();
@@ -2441,11 +2437,7 @@ impl Engine {
                 Some('F') => {
                     // gF: open file under cursor + jump to line number
                     if let Some((path, line_num)) = self.file_path_and_line_under_cursor() {
-                        let abs_path = if path.is_absolute() {
-                            path
-                        } else {
-                            self.cwd.join(&path)
-                        };
+                        let abs_path = self.resolve_path_arg(&path.to_string_lossy());
                         match self.open_file_with_mode(
                             &abs_path,
                             crate::core::engine::OpenMode::Permanent,
