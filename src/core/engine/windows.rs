@@ -2073,7 +2073,7 @@ impl Engine {
                 // `run_board_action_by_name` re-resolving it (rather than
                 // this call site caching the argv) keeps the menu-vs-run
                 // lookup as the single source of truth.
-                let card_id = card_id.clone();
+                let card_id = *card_id;
                 self.run_board_action_by_name(&action, card_id);
             }
         }

@@ -655,7 +655,7 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
         fields.push(field);
     }
 
-    let focused_field = fields.get(engine.settings_selected).map(|f| f.id.clone());
+    let focused_field = fields.get(engine.settings_selected).map(|f| f.id);
 
     Form {
         id: WidgetId::new("settings"),
@@ -714,7 +714,7 @@ pub fn handle_settings_form_ui_event(
     let (probe, activate_row) = match event {
         quadraui::UiEvent::DoubleClick { widget, position } => (
             quadraui::UiEvent::MouseDown {
-                widget: widget.clone(),
+                widget: *widget,
                 button: quadraui::MouseButton::Left,
                 position: *position,
                 modifiers: quadraui::Modifiers::default(),
