@@ -32663,7 +32663,9 @@ fn test_edit_bang_bypasses_dirty_guard_1190() {
     let action = type_command_action(&mut engine, "edit! somefile_1190.txt");
     assert_eq!(
         action,
-        EngineAction::OpenFile(std::path::PathBuf::from("somefile_1190.txt"))
+        EngineAction::OpenFile(engine.cwd.join("somefile_1190.txt")),
+        "`:edit!` resolves a relative path argument against the engine cwd, \
+         so the action carries an absolute path"
     );
 }
 
