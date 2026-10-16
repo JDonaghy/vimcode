@@ -989,7 +989,7 @@ impl quadraui::ShellApp for App {
             self.suppress_shell_panel_echo = true;
             return Some(id);
         }
-        let current = engine.app_shell.active_panel_id()?.clone();
+        let current = *engine.app_shell.active_panel_id()?;
         if self.last_shell_panel.as_ref() == Some(&current) {
             return None;
         }

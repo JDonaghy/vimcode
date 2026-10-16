@@ -150,7 +150,7 @@ pub fn plugin_view_to_form(
         })
         .collect();
 
-    let focused_field = fields.get(selected).map(|f| f.id.clone());
+    let focused_field = fields.get(selected).map(|f| f.id);
 
     Form {
         id: WidgetId::new(if view.id.is_empty() {
@@ -249,7 +249,7 @@ pub fn handle_plugin_view_ui_event(
     // press (mirrors `handle_settings_form_ui_event`).
     let probe = match event {
         quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::MouseDown {
-            widget: widget.clone(),
+            widget: *widget,
             button: quadraui::MouseButton::Left,
             position: *position,
             modifiers: quadraui::Modifiers::default(),
@@ -329,7 +329,7 @@ pub fn handle_plugin_view_tab_ui_event(
     }
     let probe = match event {
         quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::MouseDown {
-            widget: widget.clone(),
+            widget: *widget,
             button: quadraui::MouseButton::Left,
             position: *position,
             modifiers: quadraui::Modifiers::default(),
