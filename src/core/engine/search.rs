@@ -1767,14 +1767,43 @@ impl Engine {
         }
     }
 
+    /// Make sure `search_matches` holds the *overlay's* match set before
+    /// navigating, returning false when there is nothing to navigate to.
+    ///
+    /// `search_next`/`search_prev` rebuild an empty match set with
+    /// `run_search`, which scans the whole buffer under vim-regex rules and
+    /// knows nothing about the overlay's options or its find-in-selection
+    /// bound. Rebuilding here with [`Self::run_find_replace_search`] keeps
+    /// navigation inside the selection — and keeps an empty scoped result
+    /// empty, rather than letting the fallback repopulate out-of-selection
+    /// matches.
+    fn ensure_find_replace_matches(&mut self) -> bool {
+        if !self.search_matches.is_empty() {
+            return true;
+        }
+        if self.find_replace_query.is_empty() {
+            return false;
+        }
+        self.run_find_replace_search();
+        if self.search_matches.is_empty() {
+            self.message = format!("Pattern not found: {}", self.find_replace_query);
+            return false;
+        }
+        true
+    }
+
     /// Navigate to the next match in the find/replace overlay.
     pub fn find_replace_next(&mut self) {
-        self.search_next();
+        if self.ensure_find_replace_matches() {
+            self.search_next();
+        }
     }
 
     /// Navigate to the previous match in the find/replace overlay.
     pub fn find_replace_prev(&mut self) {
-        self.search_prev();
+        if self.ensure_find_replace_matches() {
+            self.search_prev();
+        }
     }
 
     /// Replace the current match and advance to the next.
