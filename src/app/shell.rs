@@ -676,16 +676,29 @@ impl quadraui::ShellApp for App {
                 // strip with no vimcode paint call touching it at all. Fill the *entire*
                 // row — inset included — with the theme's title-bar colour first, so the
                 // traffic-light strip is themed, matching VS Code's own macOS title bar.
+                //
+                // On a native-menu backend, `draw_menu_bar` doubles as the install point
+                // for the platform's real menu bar (`NSApp.mainMenu` on macOS) — handing
+                // it an empty filler `MenuBar` to get a background fill would reinstall
+                // the menu bar as empty too, wiping every app menu down to nothing. Use
+                // `draw_solid_fill` for the background instead on those backends, same as
+                // every other plain background band in this file (see `paint_title_bar_band`
+                // above); only backends without a native menu (GTK, TUI) get the
+                // empty-`MenuBar` filler, where `draw_menu_bar` is purely a paint call.
                 render::FrameOp::CommandCenter => {
                     let mut row_filled = false;
                     if !presence.menu_row {
-                        let filler = quadraui::MenuBar {
-                            id: quadraui::WidgetId::new("title_row_background_fill"),
-                            items: Vec::new(),
-                            open_item: None,
-                            focused_item: None,
-                        };
-                        let _ = backend.draw_menu_bar(menu_row_rect, &filler);
+                        if backend.backend_caps().native_menu {
+                            backend.draw_solid_fill(menu_row_rect, theme.tab_bar_bg);
+                        } else {
+                            let filler = quadraui::MenuBar {
+                                id: quadraui::WidgetId::new("title_row_background_fill"),
+                                items: Vec::new(),
+                                open_item: None,
+                                focused_item: None,
+                            };
+                            let _ = backend.draw_menu_bar(menu_row_rect, &filler);
+                        }
                         row_filled = true;
                     }
                     let mut cc_painted = false;
