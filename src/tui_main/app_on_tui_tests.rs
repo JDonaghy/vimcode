@@ -6828,8 +6828,11 @@ mod tests {
             let mut engine = plain_engine();
             engine.buffer_mut().insert(0, "ZQXW_TERM_FOCUS_LINE\n");
             engine.terminal_new_tab(80, 10);
-            engine.terminal_has_focus = true;
             let mut h = harness_no_sidebar(engine);
+            // Set terminal focus *after* `harness_no_sidebar`: its
+            // `collapse_sidebar` clicks activate the Explorer panel (a
+            // focus-grant site), which clears `terminal_has_focus`.
+            h.engine.borrow_mut().terminal_has_focus = true;
             let driver = &mut h.driver;
 
             // 'dd' would delete the line under Normal-mode dispatch; with
@@ -6919,8 +6922,11 @@ mod tests {
         fn terminal_ctrl_f_opens_the_painted_find_bar() {
             let mut engine = plain_engine();
             engine.terminal_new_tab(80, 10);
-            engine.terminal_has_focus = true;
             let mut h = harness_no_sidebar(engine);
+            // Set terminal focus *after* `harness_no_sidebar`: its
+            // `collapse_sidebar` clicks activate the Explorer panel (a
+            // focus-grant site), which clears `terminal_has_focus`.
+            h.engine.borrow_mut().terminal_has_focus = true;
             let driver = &mut h.driver;
 
             known_bug_gate(
