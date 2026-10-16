@@ -1487,8 +1487,7 @@ impl App {
                         &**self.backend.borrow(),
                         self.cached_char_width,
                     );
-                    let max_x =
-                        (width - gutter - self.cached_char_width * 5.0).max(min_x);
+                    let max_x = (width - gutter - self.cached_char_width * 5.0).max(min_x);
                     let clamped_x = x.clamp(min_x, max_x);
                     let left_cols = (clamped_x / self.cached_char_width) as u16;
                     self.engine
