@@ -804,12 +804,24 @@ fn guided_mode_results_file_name_matches_the_documented_pattern() {
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
 
     let file = PathBuf::from(guided_summary_field(&stdout, "file"));
-    let sha_out = Command::new("git")
+    // Mirror the script's own fallback: a checkout git cannot read (an export,
+    // a foreign-owned clone) still has to produce a well-formed name, and the
+    // expectation must not silently become `regress-tui--<date>.md`.
+    let sha = match Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .current_dir(repo_root())
         .output()
-        .expect("run git rev-parse");
-    let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+    {
+        Ok(out) if out.status.success() => {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if sha.is_empty() {
+                "nogit".to_string()
+            } else {
+                sha
+            }
+        }
+        _ => "nogit".to_string(),
+    };
 
     let name = file
         .file_name()
@@ -835,6 +847,89 @@ fn guided_mode_results_file_name_matches_the_documented_pattern() {
             _ => c.is_ascii_digit(),
         }),
         "date part must be YYYY-MM-DD: got `{date_part}` in `{name}`"
+    );
+}
+
+/// The fixture checklists above prove the walk; this one proves the parser
+/// against the real committed `tests/regress/checklist.toml`, which is the
+/// file an operator actually runs and the only place items are defined.
+#[test]
+fn guided_mode_walks_the_committed_checklist() {
+    let scratch = Scratch::new("guided_committed_checklist");
+    let out_dir = scratch.dir.join("out");
+
+    let (stdout, stderr, code) = run_script_with_stdin(
+        &["--backend", "tui", "--guided"],
+        &[
+            ("REGRESS_GUIDED_CMD_TUI", guided_noop_driver()),
+            ("REGRESS_GUIDED_OUT_DIR", out_dir.to_str().unwrap()),
+        ],
+        &"y\n".repeat(64),
+    );
+
+    assert_eq!(
+        code, 0,
+        "the committed checklist must walk to completion\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let total: usize = guided_summary_field(&stdout, "total")
+        .parse()
+        .unwrap_or_else(|e| panic!("non-numeric total ({e}):\n{stdout}"));
+    assert!(
+        total >= 2,
+        "the committed checklist must yield items for tui, got {total}:\n{stdout}"
+    );
+    assert_eq!(guided_summary_field(&stdout, "verdict"), "pass", "{stdout}");
+
+    let file = PathBuf::from(guided_summary_field(&stdout, "file"));
+    let contents = std::fs::read_to_string(&file).expect("results file must exist");
+    let ids = results_file_item_ids(&contents);
+    assert_eq!(
+        ids.len(),
+        total,
+        "every walked item must be recorded:\n{contents}"
+    );
+    assert!(
+        ids.contains(&"buffer-glyph-rendering"),
+        "the committed checklist's first item must be parsed:\n{contents}"
+    );
+    assert!(
+        !ids.contains(&"traffic-light-theme"),
+        "a macos-only item must not be walked on tui:\n{contents}"
+    );
+    // A `reference` field is optional, so its presence proves the parser kept
+    // a string field that follows an array field in the same table.
+    assert!(
+        stdout.contains("Reference: "),
+        "an item's `reference` must reach the operator prompt:\n{stdout}"
+    );
+}
+
+/// The script must run on a bare POSIX userland: `--guided` is used on release
+/// day on whatever machine the operator has, so reading the checklist may not
+/// pull in an interpreter (python, perl, ...) that host might not ship.
+#[test]
+fn the_script_needs_no_interpreter_beyond_the_posix_userland() {
+    let src = std::fs::read_to_string(script_path()).expect("read scripts/regress");
+    let banned = ["python3", "python", "perl", "ruby", "node", "jq"];
+    let mut offenders = Vec::new();
+    for (lineno, line) in src.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with('#') {
+            continue;
+        }
+        for needle in banned {
+            if code.contains(needle) {
+                offenders.push(format!(
+                    "scripts/regress:{}: `{needle}` is not guaranteed on an operator's host\n    {code}",
+                    lineno + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "non-POSIX interpreters found; use awk/sed/bash builtins instead:\n{}",
+        offenders.join("\n")
     );
 }
 
