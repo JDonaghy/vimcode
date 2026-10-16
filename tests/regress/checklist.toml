@@ -1,0 +1,67 @@
+# Guided visual checklist for `scripts/regress --guided`.
+#
+# This file is the single source of truth for guided-mode items: adding,
+# removing or editing an item means editing this file only, never
+# scripts/regress itself.
+#
+# Each [[item]] table:
+#   id        unique, snake_case, stable across releases (used in the
+#             results file).
+#   prompt    one line telling the operator what to look at. Keep it
+#             specific enough to judge without the `reference` field.
+#   reference optional: what to compare against (another editor, a doc,
+#             a previous release screenshot).
+#   backends  optional list restricting the item to specific backends
+#             (tui, gtk, macos, win). Omit (or leave empty) to apply to
+#             every backend.
+#   setup     ordered list of setup steps, each driving the real app
+#             through an existing ex-command or keybinding -- never a
+#             test-only hook. Recognised step forms:
+#               "open:<fixture>"  -> opens tests/regress/fixtures/<fixture>
+#                                    via the real `:e` ex-command.
+#               "ex:<command>"    -> sends ":<command>" + Enter, i.e. any
+#                                    existing ex-command.
+#               "keys:<literal>"  -> sends the literal keys/chord as-is
+#                                    (reserved for items that need a raw
+#                                    keybinding rather than an ex-command;
+#                                    none of the items below need it yet).
+
+[[item]]
+id = "buffer-glyph-rendering"
+prompt = "Open the glyph sample. ASCII, accented Latin, box-drawing, wide CJK characters and the emoji line should all render as distinct, non-overlapping glyphs with no tofu boxes or stray blank cells."
+reference = "compare with VS Code at the same zoom level"
+setup = ["open:glyph_sample.rs"]
+
+[[item]]
+id = "editor-scrollbar"
+prompt = "With the long file open, the scrollbar should be a visible, reasonably-wide thumb reflecting roughly the top of the file, not a hairline or an invisible overlay."
+reference = "compare with VS Code's default scrollbar width"
+setup = ["open:long_file.rs"]
+
+[[item]]
+id = "minimap-width"
+prompt = "With the minimap enabled, it should occupy a sensible fraction of the window width (roughly a VS Code-sized minimap), not overflow or collapse to near-zero width."
+reference = "compare with VS Code's default minimap width"
+setup = ["open:long_file.rs", "ex:set minimap"]
+
+[[item]]
+id = "text-vertical-centring"
+prompt = "Each line of text should sit vertically centred within its line's row height, not hugging the top or bottom of the row."
+setup = ["open:glyph_sample.rs"]
+
+[[item]]
+id = "status-bar-activity-bar-gear"
+prompt = "The status bar at the bottom should not visually overlap or cover the activity bar, and the settings gear icon in the activity bar should be clickable (clicking it opens the settings/command surface)."
+setup = ["open:glyph_sample.rs"]
+
+[[item]]
+id = "traffic-light-theme"
+prompt = "The window's traffic-light (close/minimize/zoom) button strip should be themed consistently with the current colorscheme, not left as the raw unthemed system default."
+reference = "compare light vs dark colorscheme"
+backends = ["macos"]
+setup = ["ex:colorscheme dark"]
+
+[[item]]
+id = "codicons-tabs-explorer-activity-bar"
+prompt = "Codicons (file-type icons, modified-dot, close glyph) should render as crisp icon glyphs -- not tofu boxes or missing boxes -- in the tab bar, the explorer file tree, and the activity bar."
+setup = ["open:long_file.rs", "ex:sidebar"]

@@ -11,14 +11,25 @@
 #   scripts/regress --backend gtk --area tab-bar           # run only tab-bar scenarios on GTK
 #   scripts/regress --backend macos --list                 # list macOS-capable scenarios
 #   scripts/regress --backend tui --list --json            # list as JSON
-#   scripts/regress --backend gtk --guided                 # (placeholder) visual checklist
+#   scripts/regress --backend tui --guided                 # guided visual checklist
 #   scripts/regress --backend win --json                   # run win scenarios, JSON output
 #
+# --guided walks the backend-neutral checklist in tests/regress/checklist.toml,
+# driving the real app through existing ex-commands/keybindings into the state
+# each item needs, then asks for a y (pass) / n (fail) / s (skip) judgement.
+# On tui it launches the real `vcd` binary in a tmux session and drives it with
+# `tmux send-keys`; on gtk/macos/win there is no backend-neutral way to inject
+# real GUI input (adding one would mean new per-backend code, see
+# CLAUDE.md's Platform-Neutrality Rule), so those backends print each setup
+# step as an instruction for the operator to perform by hand. A
+# `regress-<backend>-<sha>-<date>.md` results file, ready to paste into a
+# release PR, is written at the end either way.
+#
 # Exit codes (same discipline as platform-conformance.sh):
-#   0  all selected scenarios passed
+#   0  all selected scenarios passed (guided: no failed items)
 #   1  at least one scenario failed (or zero tests ran -- the #645 guard)
 #   2  the selected backend is not available on this host
-#   3  internal error (bad arguments, missing cargo, etc.)
+#   3  internal error (bad arguments, missing cargo, missing checklist, etc.)
 #
 # Testing hooks (used by tests/regress_script.rs; not part of the documented
 # interface, no compatibility promise beyond that suite):
@@ -29,6 +40,14 @@
 #       availability probe (1 = available, 0 = not available).
 #   REGRESS_HARNESS_FILE=<path>              replaces src/harness.rs as the
 #       source of the `backend_conformance!` label set.
+#   REGRESS_CHECKLIST_FILE=<path>            replaces tests/regress/checklist.toml
+#       as the --guided item source.
+#   REGRESS_GUIDED_CMD_<BACKEND>="<shell command>"  replaces the launch/send/kill
+#       driver for --guided on that backend. Invoked once per verb as
+#       `regress-guided-stub <verb> <arg>` (verb is launch/send/kill; arg is
+#       the setup step for send, empty otherwise).
+#   REGRESS_GUIDED_OUT_DIR=<dir>              replaces the repo root as the
+#       directory the --guided results file is written into.
 # <BACKEND> is the upper-cased backend name (TUI, GTK, MACOS, WIN).
 #
 set -euo pipefail
@@ -59,7 +78,8 @@ Options:
   --backend <name>   Required. One of: tui, gtk, macos, win.
   --area <area>      Filter to a feature area (e.g. tab-bar, scroll, editor).
   --list             List available scenarios for this backend without running.
-  --guided           (Placeholder) Visual checklist mode.
+  --guided           Walk the visual checklist (tests/regress/checklist.toml)
+                     against the real app instead of running cargo tests.
   --json             Output results as JSON.
   -h, --help         Show this help.
 
@@ -115,14 +135,6 @@ case "$BACKEND" in
         exit $EXIT_ERROR
         ;;
 esac
-
-# -- Guided mode (placeholder) ----------------------------------------------
-
-if $GUIDED; then
-    echo "Phase 0.5 visual checklist: not yet implemented."
-    echo "Run without --guided to execute tests, or --list to see available scenarios."
-    exit 0
-fi
 
 # -- Backend availability probe ---------------------------------------------
 # Mirrors platform-conformance.sh's probe logic.
@@ -263,6 +275,349 @@ fi
 if ! probe_backend "$BACKEND"; then
     echo "Backend '$BACKEND' is not available on this host." >&2
     exit $EXIT_SKIP
+fi
+
+# -- Guided mode --------------------------------------------------------------
+#
+# Walks the backend-neutral checklist (tests/regress/checklist.toml by
+# default), driving the real app through the same ex-commands/keybindings a
+# user would use, then asks a human -- or a piped answer stream, for test
+# determinism -- to judge each item as pass/fail/skip. See the module header
+# for the REGRESS_CHECKLIST_FILE / REGRESS_GUIDED_CMD_<BACKEND> /
+# REGRESS_GUIDED_OUT_DIR testing hooks.
+
+if $GUIDED; then
+    CHECKLIST_FILE="${REGRESS_CHECKLIST_FILE:-$REPO_DIR/tests/regress/checklist.toml}"
+
+    if [[ ! -f "$CHECKLIST_FILE" ]]; then
+        echo "error: checklist file not found: $CHECKLIST_FILE" >&2
+        exit $EXIT_ERROR
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "error: --guided requires python3 to read the checklist" >&2
+        exit $EXIT_ERROR
+    fi
+
+    # Emits one record line per [[item]]: id, prompt, reference, backends
+    # (comma-joined; empty = all backends), setup (comma-joined steps) --
+    # fields separated by ASCII unit separator (\x1f), deliberately not a
+    # tab. Bash's `read` treats tab (like space and newline) as "IFS
+    # whitespace" no matter what IFS is set to: runs of it collapse into one
+    # delimiter and leading/trailing runs are stripped, which silently drops
+    # empty fields (e.g. a missing `reference`) instead of preserving them.
+    # \x1f is not IFS whitespace, so empty fields round-trip correctly.
+    #
+    # This is a deliberately small TOML subset -- [[item]] tables holding
+    # only string and array-of-string fields -- parsed by hand rather than
+    # via Python's tomllib, which needs 3.11+ and is not guaranteed on every
+    # host this script runs on.
+    checklist_items_tsv() {
+        python3 - "$CHECKLIST_FILE" <<'PYEOF'
+import re
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    text = f.read()
+
+STRING = re.compile(r'"((?:\\.|[^"\\])*)"')
+FIELD_SEP = "\x1f"
+
+
+def unescape(s):
+    return s.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def parse_value(raw):
+    raw = raw.strip()
+    if raw.startswith("["):
+        return [unescape(m) for m in STRING.findall(raw)]
+    m = STRING.match(raw)
+    return unescape(m.group(1)) if m else ""
+
+
+def record_safe(s):
+    return s.replace(FIELD_SEP, " ").replace("\n", " ")
+
+
+for block in text.split("[[item]]")[1:]:
+    fields = {}
+    for line in block.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"([A-Za-z_]+)\s*=\s*(.+)", line)
+        if not m:
+            continue
+        key, raw = m.groups()
+        fields[key] = parse_value(raw)
+
+    item_id = fields.get("id", "")
+    if not item_id:
+        continue
+    backends = fields.get("backends", [])
+    setup = fields.get("setup", [])
+    if isinstance(backends, str):
+        backends = [backends]
+    if isinstance(setup, str):
+        setup = [setup]
+    print(
+        FIELD_SEP.join(
+            [
+                record_safe(item_id),
+                record_safe(fields.get("prompt", "")),
+                record_safe(fields.get("reference", "")),
+                ",".join(backends),
+                ",".join(setup),
+            ]
+        )
+    )
+PYEOF
+    }
+
+    # True (0) when an item with the given comma-joined `backends` list
+    # applies to `backend` -- an empty list means "every backend".
+    item_applies_to_backend() {
+        local backends_csv="$1" backend="$2"
+        [[ -z "$backends_csv" ]] && return 0
+        local -a backends
+        IFS=',' read -ra backends <<< "$backends_csv"
+        local b
+        for b in "${backends[@]}"; do
+            [[ "$b" == "$backend" ]] && return 0
+        done
+        return 1
+    }
+
+    GUIDED_TMUX_SESSION="vimcode-regress-guided-$$"
+    VCD_BIN="$REPO_DIR/target/debug/vcd"
+
+    # Sends one checklist "setup" step to the running tmux session, through
+    # the same ex-command/keybinding surface a user would type -- never a
+    # test-only injection path.
+    tui_send_step() {
+        local step="$1"
+        case "$step" in
+            open:*)
+                tmux send-keys -t "$GUIDED_TMUX_SESSION" Escape
+                tmux send-keys -t "$GUIDED_TMUX_SESSION" ":e $REPO_DIR/tests/regress/fixtures/${step#open:}" Enter
+                ;;
+            ex:*)
+                tmux send-keys -t "$GUIDED_TMUX_SESSION" Escape
+                tmux send-keys -t "$GUIDED_TMUX_SESSION" ":${step#ex:}" Enter
+                ;;
+            keys:*)
+                tmux send-keys -t "$GUIDED_TMUX_SESSION" "${step#keys:}"
+                ;;
+            *)
+                echo "warning: unknown setup step '$step', ignoring" >&2
+                ;;
+        esac
+        sleep 0.2
+    }
+
+    tui_guided_driver() {
+        local verb="$1" arg="${2:-}"
+        case "$verb" in
+            launch)
+                if [[ ! -x "$VCD_BIN" ]]; then
+                    echo "Building vcd (debug, no-default-features)..." >&2
+                    (cd "$REPO_DIR" && cargo build --no-default-features --bin vcd) >&2
+                fi
+                tmux new-session -d -s "$GUIDED_TMUX_SESSION" -x 120 -y 40 "$VCD_BIN"
+                sleep 0.3
+                ;;
+            send)
+                tui_send_step "$arg"
+                ;;
+            kill)
+                tmux kill-session -t "$GUIDED_TMUX_SESSION" >/dev/null 2>&1 || true
+                ;;
+        esac
+    }
+
+    # gtk/macos/win: there is no backend-neutral way to inject real GUI
+    # input (synthesizing it would mean new per-backend code in src/gtk,
+    # src/macos or src/win, which the platform-neutrality rule forbids), so
+    # these backends launch the real app for the operator and print each
+    # setup step as a manual instruction instead of performing it.
+    manual_guided_driver() {
+        local backend="$1" verb="$2" arg="${3:-}"
+        case "$verb" in
+            launch)
+                echo "Guided $backend mode: start the real app yourself and follow the prompts below." >&2
+                ;;
+            send)
+                echo "  -> manually: $arg" >&2
+                ;;
+            kill)
+                : ;;
+        esac
+    }
+
+    # launch/send/kill the real app for one checklist step. Delegates
+    # entirely to REGRESS_GUIDED_CMD_<BACKEND> when set, mirroring
+    # REGRESS_CMD_<BACKEND>, so tests never need real tmux or a real app.
+    guided_driver() {
+        local backend="$1" verb="$2" arg="${3:-}"
+        local override_var="REGRESS_GUIDED_CMD_$(backend_upper "$backend")"
+        local override="${!override_var:-}"
+        if [[ -n "$override" ]]; then
+            bash -c "$override" regress-guided-stub "$verb" "$arg"
+            return $?
+        fi
+        case "$backend" in
+            tui) tui_guided_driver "$verb" "$arg" ;;
+            *) manual_guided_driver "$backend" "$verb" "$arg" ;;
+        esac
+    }
+
+    items_tsv="$(checklist_items_tsv)"
+
+    declare -a G_IDS=() G_PROMPTS=() G_REFS=() G_SETUPS=()
+    while IFS=$'\x1f' read -r i_id i_prompt i_ref i_backends i_setup; do
+        [[ -z "$i_id" ]] && continue
+        if item_applies_to_backend "$i_backends" "$BACKEND"; then
+            G_IDS+=("$i_id")
+            G_PROMPTS+=("$i_prompt")
+            G_REFS+=("$i_ref")
+            G_SETUPS+=("$i_setup")
+        fi
+    done <<< "$items_tsv"
+
+    GUIDED_N="${#G_IDS[@]}"
+    if [[ "$GUIDED_N" -eq 0 ]]; then
+        echo "error: no checklist items apply to backend '$BACKEND'" >&2
+        exit $EXIT_FAIL
+    fi
+
+    echo "=== regress --guided: backend=$BACKEND ($GUIDED_N item(s)) ==="
+    echo "Checklist: $CHECKLIST_FILE"
+    echo ""
+
+    guided_driver "$BACKEND" launch
+
+    GUIDED_CLEANED_UP=false
+    guided_cleanup() {
+        if ! $GUIDED_CLEANED_UP; then
+            GUIDED_CLEANED_UP=true
+            guided_driver "$BACKEND" kill
+        fi
+    }
+    trap guided_cleanup EXIT
+
+    declare -a R_STATUS=() R_NOTES=()
+    GUIDED_PASS=0
+    GUIDED_FAIL=0
+    GUIDED_SKIP=0
+
+    for ((g_idx = 0; g_idx < GUIDED_N; g_idx++)); do
+        item_id="${G_IDS[$g_idx]}"
+        item_prompt="${G_PROMPTS[$g_idx]}"
+        item_ref="${G_REFS[$g_idx]}"
+        item_setup="${G_SETUPS[$g_idx]}"
+
+        if [[ -n "$item_setup" ]]; then
+            declare -a g_steps=()
+            IFS=',' read -ra g_steps <<< "$item_setup"
+            for g_step in "${g_steps[@]}"; do
+                guided_driver "$BACKEND" send "$g_step"
+            done
+        fi
+
+        echo ""
+        echo "[$((g_idx + 1))/$GUIDED_N] $item_id"
+        echo "  $item_prompt"
+        if [[ -n "$item_ref" ]]; then
+            echo "  Reference: $item_ref"
+        fi
+        printf "  Pass (y) / Fail (n) / Skip (s)? "
+
+        g_status="skip"
+        g_note=""
+        while true; do
+            g_answer=""
+            if ! IFS= read -r g_answer; then
+                g_answer="s"
+            fi
+            g_char="$(printf '%s' "$g_answer" | cut -c1 | tr '[:upper:]' '[:lower:]')"
+            case "$g_char" in
+                y)
+                    g_status="pass"
+                    break
+                    ;;
+                s)
+                    g_status="skip"
+                    break
+                    ;;
+                n)
+                    g_status="fail"
+                    g_note="$(printf '%s' "${g_answer:1}" | sed -E 's/^[[:space:]]+//')"
+                    break
+                    ;;
+                *)
+                    printf "  please answer y, n, or s: "
+                    ;;
+            esac
+        done
+
+        R_STATUS+=("$g_status")
+        R_NOTES+=("$g_note")
+        case "$g_status" in
+            pass) GUIDED_PASS=$((GUIDED_PASS + 1)) ;;
+            fail) GUIDED_FAIL=$((GUIDED_FAIL + 1)) ;;
+            skip) GUIDED_SKIP=$((GUIDED_SKIP + 1)) ;;
+        esac
+    done
+
+    guided_cleanup
+    trap - EXIT
+
+    GUIDED_SHA="$(cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "nogit")"
+    GUIDED_DATE="$(date +%Y-%m-%d)"
+    GUIDED_OUT_DIR="${REGRESS_GUIDED_OUT_DIR:-$REPO_DIR}"
+    mkdir -p "$GUIDED_OUT_DIR"
+    GUIDED_OUT_FILE="$GUIDED_OUT_DIR/regress-$BACKEND-$GUIDED_SHA-$GUIDED_DATE.md"
+
+    {
+        echo "# Guided regression checklist"
+        echo ""
+        echo "- Backend: $BACKEND"
+        echo "- Commit: $GUIDED_SHA"
+        echo "- Date: $GUIDED_DATE"
+        echo ""
+        for ((g_idx = 0; g_idx < GUIDED_N; g_idx++)); do
+            g_mark="[ ]"
+            [[ "${R_STATUS[$g_idx]}" == "pass" ]] && g_mark="[x]"
+            case "${R_STATUS[$g_idx]}" in
+                pass) g_label="PASS" ;;
+                fail) g_label="FAIL" ;;
+                skip) g_label="SKIP" ;;
+            esac
+            if [[ "${R_STATUS[$g_idx]}" == "fail" && -n "${R_NOTES[$g_idx]}" ]]; then
+                g_label="$g_label: ${R_NOTES[$g_idx]}"
+            fi
+            echo "- $g_mark ${G_IDS[$g_idx]} -- $g_label"
+            echo "      ${G_PROMPTS[$g_idx]}"
+        done
+    } > "$GUIDED_OUT_FILE"
+
+    echo ""
+    echo "=== regress --guided summary ==="
+    echo "Backend:  $BACKEND"
+    echo "Total:    $GUIDED_N"
+    echo "Pass:     $GUIDED_PASS"
+    echo "Fail:     $GUIDED_FAIL"
+    echo "Skip:     $GUIDED_SKIP"
+    echo "Results:  $GUIDED_OUT_FILE"
+
+    GUIDED_VERDICT="pass"
+    [[ "$GUIDED_FAIL" -gt 0 ]] && GUIDED_VERDICT="fail"
+    echo "GUIDED_SUMMARY backend=$BACKEND total=$GUIDED_N pass=$GUIDED_PASS fail=$GUIDED_FAIL skip=$GUIDED_SKIP verdict=$GUIDED_VERDICT file=$GUIDED_OUT_FILE"
+
+    if [[ "$GUIDED_FAIL" -gt 0 ]]; then
+        exit $EXIT_FAIL
+    fi
+    exit $EXIT_PASS
 fi
 
 # -- Build the cargo test command -------------------------------------------
