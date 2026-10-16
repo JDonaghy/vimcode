@@ -35624,3 +35624,88 @@ fn test_find_in_selection_reselect_without_closing() {
          the new selection, not the stale one"
     );
 }
+
+/// With find-in-selection active and no match inside the selection,
+/// navigating (the `↓`/`↑` buttons, `Enter`, `Down`/`Up`) must stay scoped:
+/// it may not repopulate `search_matches` with whole-buffer hits that then
+/// paint as highlights and as a buffer-wide match count.
+#[test]
+fn test_find_in_selection_nav_stays_within_selection() {
+    let mut engine = Engine::new();
+    engine.settings.ctrl_f_action = Some("find".to_string());
+    engine
+        .buffer_mut()
+        .insert(0, "alpha beta\nfoo bar foo\ngamma foo\n");
+    engine.update_syntax();
+    let wid = engine.active_window_id();
+
+    // Select line 0 ("alpha beta") — it contains no "foo".
+    engine.mouse_click(wid, 0, 0);
+    engine.mouse_drag(wid, 0, 10);
+    assert_eq!(engine.mode, Mode::Visual);
+
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleInSelection);
+    while !engine.find_replace_query.is_empty() {
+        press_special(&mut engine, "BackSpace");
+    }
+    for ch in "foo".chars() {
+        press_char(&mut engine, ch);
+    }
+    assert!(
+        engine.search_matches.is_empty(),
+        "sanity: no 'foo' inside the selected line"
+    );
+
+    engine.handle_find_replace_click(FindReplaceClickTarget::NextMatch);
+    assert!(
+        engine.search_matches.is_empty(),
+        "the next-match button must not repopulate out-of-selection matches, \
+         got {:?}",
+        engine.search_matches
+    );
+
+    engine.handle_find_replace_click(FindReplaceClickTarget::PrevMatch);
+    assert!(
+        engine.search_matches.is_empty(),
+        "the prev-match button must not repopulate out-of-selection matches, \
+         got {:?}",
+        engine.search_matches
+    );
+}
+
+/// Navigation must still cycle through the matches that *are* inside the
+/// selection — scoping the fallback must not disable the buttons.
+#[test]
+fn test_find_in_selection_nav_cycles_matches_inside_selection() {
+    let mut engine = Engine::new();
+    engine.settings.ctrl_f_action = Some("find".to_string());
+    engine.buffer_mut().insert(0, "foo bar foo\ngamma foo\n");
+    engine.update_syntax();
+    let wid = engine.active_window_id();
+
+    // Select line 0 ("foo bar foo") — two of the three "foo"s.
+    engine.mouse_click(wid, 0, 0);
+    engine.mouse_drag(wid, 0, 11);
+    press_ctrl(&mut engine, 'f');
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleInSelection);
+    while !engine.find_replace_query.is_empty() {
+        press_special(&mut engine, "BackSpace");
+    }
+    for ch in "foo".chars() {
+        press_char(&mut engine, ch);
+    }
+    assert_eq!(engine.search_matches.len(), 2);
+
+    engine.handle_find_replace_click(FindReplaceClickTarget::NextMatch);
+    assert_eq!(
+        engine.search_matches.len(),
+        2,
+        "navigating inside the selection must keep the scoped match set"
+    );
+    assert!(
+        engine.search_index.is_some(),
+        "navigation must select a match"
+    );
+}
