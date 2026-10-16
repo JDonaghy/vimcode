@@ -666,19 +666,21 @@ pub fn paint_status_backdrop(
     let _ = b.draw_status_bar_interactive(rect, &backdrop, &quadraui::InteractionState::new());
 }
 
-/// The unit system one backend composes [`paint_bottom_panel_rung`] in.
+/// The unit system `render_content` composes [`paint_bottom_panel_rung`] in,
+/// in the active backend's own units.
 ///
-/// Everything here is a genuine rasteriser difference: Cairo repaints the whole
-/// surface every frame so GTK needs no background pass, while ratatui coalesces
-/// cells and must blank the terminal body itself; and a scrollbar gutter is six
-/// *pixels* on GTK and nothing at all in a cell grid.
+/// `clear_terminal_bg` is a genuine rasteriser difference: Cairo repaints the
+/// whole surface every frame so GTK needs no background pass, while ratatui
+/// coalesces cells and must blank the terminal body itself. A scrollbar
+/// gutter, by contrast, is never intrinsic to one rasteriser — `None` always
+/// means "let the backend's own default apply", not "no backend has one".
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BottomPanelUnits {
     /// One line / one column, in the caller's units.
     pub metrics: FrameMetrics,
     /// Width of the gutter `build_terminal_draw_data` reserves for the
-    /// scrollbar, in the caller's units, or `None` for a cell grid that has no
-    /// room for one.
+    /// scrollbar, in the caller's units, or `None` to defer to the backend's
+    /// own default scrollbar width.
     pub terminal_scrollbar: Option<u16>,
     /// Blank the terminal body before painting into it. `false` on GTK (Cairo
     /// already cleared the surface), `true` on TUI.
@@ -686,18 +688,20 @@ pub struct BottomPanelUnits {
 }
 
 impl BottomPanelUnits {
-    /// One terminal cell — what the TUI shell's `render_content` composes in.
+    /// One terminal cell, deferring to the backend's own default scrollbar
+    /// width.
     pub const CELL: Self = Self {
         metrics: FrameMetrics::CELL,
         terminal_scrollbar: None,
         clear_terminal_bg: true,
     };
 
-    /// Real pixels — what `gtk::App::render_content` composes in.
-    pub fn px(line_height: f64, char_width: f64) -> Self {
+    /// Real pixels, with an explicit `terminal_scrollbar` override (`None` to
+    /// defer to the backend's own default width instead).
+    pub fn px(line_height: f64, char_width: f64, terminal_scrollbar: Option<u16>) -> Self {
         Self {
             metrics: FrameMetrics::px(line_height, char_width),
-            terminal_scrollbar: Some(6),
+            terminal_scrollbar,
             clear_terminal_bg: false,
         }
     }

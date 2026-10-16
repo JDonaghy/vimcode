@@ -340,10 +340,39 @@ impl App {
     }
 
     /// Terminal panel pixel width reserved for the panel's own vertical
-    /// scrollbar — the same strip `render_content` paints one into and
-    /// `MouseDragRoute::TerminalSplitDivider` already clamps the divider
-    /// drag against (`handle_mouse_drag_msg`).
+    /// scrollbar on a *pixel* backend — the same strip `render_content`
+    /// paints one into and `MouseDragRoute::TerminalSplitDivider` already
+    /// clamps the divider drag against (`handle_mouse_drag_msg`). A
+    /// cell-grid backend (TUI) has no sub-cell room for this and reserves
+    /// exactly one column instead — see `terminal_panel_scrollbar_gutter`.
     pub(crate) const TERMINAL_PANEL_SB_W: f64 = 6.0;
+
+    /// Whether `backend` paints in real pixels, where the terminal panel
+    /// wants the narrower-than-default `TERMINAL_PANEL_SB_W` scrollbar
+    /// gutter, rather than terminal cells, where quadraui's own
+    /// `Backend::terminal_scrollbar_default_width` already reserves exactly
+    /// one column (`TuiBackend` overrides it to `1.0`; pixel backends
+    /// default to `8.0`).
+    pub(crate) fn terminal_panel_sb_is_pixels(backend: &dyn quadraui::Backend) -> bool {
+        backend.terminal_scrollbar_default_width() > 1.0
+    }
+
+    /// Scrollbar gutter to subtract from a terminal-panel width before
+    /// converting it to columns or clamping a drag against it, in
+    /// `backend`'s own units: `TERMINAL_PANEL_SB_W` real pixels on a pixel
+    /// backend, or exactly one cell (`cell_width`) on a cell-grid backend —
+    /// a flat pixel count would otherwise eat several whole columns instead
+    /// of a sliver of one.
+    pub(crate) fn terminal_panel_scrollbar_gutter(
+        backend: &dyn quadraui::Backend,
+        cell_width: f64,
+    ) -> f64 {
+        if Self::terminal_panel_sb_is_pixels(backend) {
+            Self::TERMINAL_PANEL_SB_W
+        } else {
+            cell_width.max(1.0)
+        }
+    }
 
     /// Convert a *live* terminal-panel pixel width to a column count using
     /// the last-painted char advance (`cached_char_width`). This performs
@@ -354,7 +383,8 @@ impl App {
     /// floor is enough to avoid a divide-by-zero.
     pub(crate) fn terminal_panel_cols(&self, width: f64) -> u16 {
         let cw = self.cached_char_width.max(1.0);
-        ((width - Self::TERMINAL_PANEL_SB_W).max(0.0) / cw) as u16
+        let gutter = Self::terminal_panel_scrollbar_gutter(&**self.backend.borrow(), cw);
+        ((width - gutter).max(0.0) / cw) as u16
     }
 
     /// Terminal-maximize target row count for the next
