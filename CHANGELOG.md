@@ -14,6 +14,12 @@ no matching section fails the release job before anything is published (see
 `scripts/release_notes.py`).
 
 ## [Unreleased]
+### Fixed
+- Ex commands and cursor-based file-opening commands (`:e`, `:split`,
+  `:vsplit`, `:tabe`/`:tabnew`, `:cd`, `:r`, `:saveas`, `gf`, `gF`,
+  `Ctrl-W f`) now expand a leading `~` to the home directory before
+  resolving the path, instead of treating it as a literal relative
+  directory name (#1847).
 
 ## [0.15.3] - 2026-10-14
 ### Added

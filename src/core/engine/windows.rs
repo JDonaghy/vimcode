@@ -4101,11 +4101,7 @@ impl Engine {
             // Composite
             'f' => {
                 if let Some(path) = self.file_path_under_cursor() {
-                    let abs_path = if path.is_absolute() {
-                        path
-                    } else {
-                        self.cwd.join(&path)
-                    };
+                    let abs_path = self.resolve_path_arg(&path.to_string_lossy());
                     self.split_window(SplitDirection::Horizontal, None);
                     return EngineAction::OpenFile(abs_path);
                 } else {

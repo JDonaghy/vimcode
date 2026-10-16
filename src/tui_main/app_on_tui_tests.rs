@@ -17462,22 +17462,38 @@ mod tests {
     mod tilde_expansion_1847 {
         use super::*;
 
+        /// RAII guard returned by [`fresh_test_home_with_file`]: restores the
+        /// previous `$HOME` override (via the inner `TestHomeGuard`) *and*
+        /// deletes the temp directory it created, so the test doesn't leave
+        /// a populated fake-home tree behind on disk.
+        struct FreshHomeGuard {
+            _home_guard: crate::core::paths::TestHomeGuard,
+            dir: std::path::PathBuf,
+        }
+
+        impl Drop for FreshHomeGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
         /// Point `$HOME` at a fresh, unique temp dir holding one real file
         /// with distinctive content, for the duration of the returned guard.
-        fn fresh_test_home_with_file(
-            tag: &str,
-            file_name: &str,
-            content: &str,
-        ) -> crate::core::paths::TestHomeGuard {
+        fn fresh_test_home_with_file(tag: &str, file_name: &str, content: &str) -> FreshHomeGuard {
+            static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let home = std::env::temp_dir().join(format!(
-                "vimcode_test_1847_home_{tag}_{}_{:?}",
-                std::process::id(),
-                std::thread::current().id()
+                "vimcode_test_1847_home_{tag}_{}_{n}",
+                std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&home);
             std::fs::create_dir_all(&home).unwrap();
             std::fs::write(home.join(file_name), content).unwrap();
-            crate::core::paths::set_test_home(&home)
+            let home_guard = crate::core::paths::set_test_home(&home);
+            FreshHomeGuard {
+                _home_guard: home_guard,
+                dir: home,
+            }
         }
 
         /// `:vsplit ~/<file>` must expand `~` to the test `$HOME` and open
