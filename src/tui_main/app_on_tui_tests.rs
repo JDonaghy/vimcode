@@ -6945,6 +6945,48 @@ mod tests {
                 },
             );
         }
+
+        /// Opening the terminal via the accelerator must size its PTY from
+        /// the full painted editor width, not a flat pixel-sized scrollbar
+        /// gutter wrongly treated as whole columns. On an 80-column, no-
+        /// sidebar TUI window `App::terminal_panel_cols` resolves the
+        /// painted editor width (77 cols) minus `TERMINAL_PANEL_SB_W`
+        /// (`6.0`, a *pixel* count) as six whole columns rather than the one
+        /// cell a cell-grid backend actually has no sub-cell room for,
+        /// landing the PTY at 71 columns instead of 76 — exactly the
+        /// "5-7 columns narrower" this test pins down. Mirrors the GTK
+        /// precedent (`issue_1421_terminal_size_derived_from_layout`'s
+        /// `opening_a_terminal_in_a_wide_window_sizes_the_pty_from_the_
+        /// painted_layout_on_gtk`), which asserts on the same
+        /// `TerminalSession::cols()` signal.
+        #[test]
+        fn opening_a_terminal_on_tui_sizes_the_pty_within_one_column_of_the_painted_width() {
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_OPEN_TERMINAL),
+                quadraui::Modifiers::default(),
+            ));
+            // Drains the `DeferredAction::ToggleTerminal` the accelerator
+            // arm queued, which is what actually calls `terminal_new_tab`.
+            driver.tick();
+
+            let cols = h
+                .engine
+                .borrow()
+                .terminal_panes
+                .first()
+                .map(|slot| slot.session.cols());
+            assert_eq!(
+                cols,
+                Some(76),
+                "an 80-column, no-sidebar TUI window's terminal PTY should be \
+                 sized within one column of the painted editor width (76 \
+                 cols); a `TERMINAL_PANEL_SB_W` pixel-count gutter wrongly \
+                 subtracted as whole TUI columns would land this several \
+                 columns narrower (71) instead"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
