@@ -766,28 +766,36 @@ done < <(grep -E 'test [^ ]+ \.\.\. (ok|FAILED|ignored)' "$OUTFILE" || true)
 # For tui/gtk, add a skip row for every registered scenario that produced
 # no row at all (most commonly: filtered out by --area).
 #
-# The lookup below is a plain associative array built with a non-piped
-# `for` loop, not a `printf ... | grep -q` pipeline. Under `set -o
-# pipefail` (part of `set -euo pipefail` above), a `grep -q` that matches
-# and exits early can SIGPIPE the still-writing `printf`, and pipefail then
-# reports that SIGPIPE as the pipeline's exit status even though the grep
-# match itself succeeded -- turning a real match into a spurious "not
-# matched" skip row for a scenario that actually ran and passed. That
-# failure mode is data-dependent (it only shows up when a match lands
-# early enough in a large TABLE_ROWS to let the writer get SIGPIPE'd), so
-# it does not reproduce on every run with every label.
+# The lookup below is a newline-delimited string tested with bash's own
+# pattern match, for two independent reasons:
+#
+#   * Not a `printf ... | grep -q` pipeline. Under `set -o pipefail` (part
+#     of `set -euo pipefail` above), a `grep -q` that matches and exits
+#     early can SIGPIPE the still-writing `printf`, and pipefail then
+#     reports that SIGPIPE as the pipeline's exit status even though the
+#     grep match itself succeeded -- turning a real match into a spurious
+#     "not matched" skip row for a scenario that actually ran and passed.
+#     That failure mode is data-dependent (it only shows up when a match
+#     lands early enough in a large TABLE_ROWS to let the writer get
+#     SIGPIPE'd), so it does not reproduce on every run with every label.
+#   * Not an associative array (`declare -A`). That needs bash 4, and
+#     macOS ships bash 3.2 as /bin/bash, where `declare -A` aborts the
+#     whole script under `set -e`.
+#
+# Every entry is stored surrounded by newlines so a `*\n<label>\n*` match
+# is always whole-label and never a substring of a longer label.
 if [[ "$BACKEND" == "tui" || "$BACKEND" == "gtk" ]]; then
-    declare -A SEEN_LABELS=()
+    SEEN_LABELS=$'\n'
     for row in "${TABLE_ROWS[@]:-}"; do
         [[ -z "$row" ]] && continue
         row_label="${row%%\\t*}"
-        SEEN_LABELS["$row_label"]=1
+        SEEN_LABELS+="${row_label}"$'\n'
     done
 
     ALL_LABELS=$(all_labels)
     while IFS= read -r label; do
         [[ -z "$label" ]] && continue
-        if [[ -z "${SEEN_LABELS[$label]:-}" ]]; then
+        if [[ "$SEEN_LABELS" != *$'\n'"$label"$'\n'* ]]; then
             reason="not matched by filter '$cargo_test_filter'"
             TABLE_ROWS+=("${label}\t${BACKEND}\tskip (${reason})")
         fi

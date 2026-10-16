@@ -838,6 +838,53 @@ fn guided_mode_results_file_name_matches_the_documented_pattern() {
     );
 }
 
+/// macOS ships bash 3.2 as `/bin/bash`, so the script must stay inside that
+/// dialect: a bash-4-only construct aborts the whole run under `set -e` on a
+/// stock mac, while staying invisible on a bash-5 Linux CI box. The tests
+/// above only catch it on the older host, so this one fails everywhere.
+#[test]
+fn the_script_uses_no_bash_4_only_features() {
+    let src = std::fs::read_to_string(script_path()).expect("read scripts/regress");
+    // (construct, what to use instead)
+    let banned: &[(&str, &str)] = &[
+        (
+            "declare -A",
+            "a newline-delimited string tested with `[[ == *..* ]]`",
+        ),
+        (
+            "local -A",
+            "a newline-delimited string tested with `[[ == *..* ]]`",
+        ),
+        ("mapfile", "a `while IFS= read -r` loop"),
+        ("readarray", "a `while IFS= read -r` loop"),
+        ("coproc", "a plain subshell"),
+        ("wait -n", "`wait` on the collected pids"),
+        ("&>>", "`>>file 2>&1`"),
+        (",,}", "`tr '[:upper:]' '[:lower:]'`"),
+        ("^^}", "`tr '[:lower:]' '[:upper:]'`"),
+    ];
+    let mut offenders = Vec::new();
+    for (lineno, line) in src.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with('#') {
+            continue;
+        }
+        for (needle, alternative) in banned {
+            if code.contains(needle) {
+                offenders.push(format!(
+                    "scripts/regress:{}: `{needle}` needs bash 4 -- use {alternative}\n    {code}",
+                    lineno + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "bash-4-only constructs found (macOS /bin/bash is 3.2):\n{}",
+        offenders.join("\n")
+    );
+}
+
 /// The script is committed executable, so `scripts/regress --backend tui`
 /// works as documented without a `bash` prefix.
 #[test]
