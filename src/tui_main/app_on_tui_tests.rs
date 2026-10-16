@@ -17453,4 +17453,59 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Ex commands expand a leading `~` in a file-path argument before
+    // resolving it, so `:vsplit ~/foo.txt` opens the real file under the
+    // home directory rather than an empty buffer for a literal path under a
+    // directory named `~`.
+    mod tilde_expansion_1847 {
+        use super::*;
+
+        /// Point `$HOME` at a fresh, unique temp dir holding one real file
+        /// with distinctive content, for the duration of the returned guard.
+        fn fresh_test_home_with_file(
+            tag: &str,
+            file_name: &str,
+            content: &str,
+        ) -> crate::core::paths::TestHomeGuard {
+            let home = std::env::temp_dir().join(format!(
+                "vimcode_test_1847_home_{tag}_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join(file_name), content).unwrap();
+            crate::core::paths::set_test_home(&home)
+        }
+
+        /// `:vsplit ~/<file>` must expand `~` to the test `$HOME` and open
+        /// that file's real contents in the new split, not an empty buffer
+        /// for a literal path under a directory named `~`.
+        #[test]
+        fn vsplit_tilde_path_opens_real_file_contents() {
+            let _home_guard =
+                fresh_test_home_with_file("vsplit", "issue1847.txt", "ISSUE1847_TILDE_OK");
+
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "vsplit ~/issue1847.txt".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ISSUE1847_TILDE_OK"),
+                "`:vsplit ~/issue1847.txt` must expand `~` to the home \
+                 directory and open the real file's contents, not an empty \
+                 buffer for a literal path under a directory named `~`; \
+                 screen:\n{screen}"
+            );
+        }
+    }
 }
