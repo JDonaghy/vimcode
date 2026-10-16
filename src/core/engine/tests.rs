@@ -35512,3 +35512,115 @@ fn test_1160_ctrl_x_ctrl_f_wins_over_ctrl_f_find_replace_binding() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+/// Mouse-driven selection, opening find/replace with Ctrl+F, toggling
+/// "find in selection" (the ≡ button), typing a query, closing, reselecting,
+/// and reopening must all agree on the selection bound — not just the single
+/// `open_find_replace()`/`toggle_find_replace_in_selection()` calls a
+/// white-box test would make directly.
+#[test]
+fn test_find_in_selection_full_mouse_driven_cycle() {
+    let mut engine = Engine::new();
+    engine.settings.ctrl_f_action = Some("find".to_string());
+    engine.buffer_mut().insert(0, "foo foo foo\nfoo foo\n");
+    engine.update_syntax();
+    let wid = engine.active_window_id();
+
+    // Select "foo foo" on line 0 (cols 0..6, the first two words) by mouse drag.
+    engine.mouse_click(wid, 0, 0);
+    engine.mouse_drag(wid, 0, 6);
+    assert_eq!(engine.mode, Mode::Visual);
+
+    // Ctrl+F opens find/replace and must preserve the selection.
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
+    assert!(engine.visual_anchor.is_some(), "selection lost on open");
+
+    engine.find_replace_query = "foo".to_string();
+    engine.run_find_replace_search();
+    let total_matches = engine.search_matches.len();
+    assert_eq!(total_matches, 5, "sanity: 'foo' appears 5 times total");
+
+    // Click the ≡ toggle — matches must narrow to the selection.
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleInSelection);
+    assert_eq!(
+        engine.search_matches.len(),
+        2,
+        "toggling find-in-selection must narrow matches to the 2 'foo's inside the selection"
+    );
+
+    // Close, reselect a *different* span, and reopen — the overlay must not
+    // leak the previous selection's range or the toggle's stale state.
+    press_special(&mut engine, "Escape");
+    assert!(!engine.find_replace_open);
+
+    // Select "foo foo" on line 1 this time (cols 0..6).
+    engine.mouse_click(wid, 1, 0);
+    engine.mouse_drag(wid, 1, 6);
+    assert_eq!(engine.mode, Mode::Visual);
+
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
+    assert!(engine.visual_anchor.is_some(), "selection lost on reopen");
+
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleInSelection);
+    // Typing re-runs the search on every keystroke — simulate backspacing the
+    // prefilled query and retyping "foo" one character at a time.
+    while !engine.find_replace_query.is_empty() {
+        press_special(&mut engine, "BackSpace");
+    }
+    for ch in "foo".chars() {
+        press_char(&mut engine, ch);
+    }
+    assert_eq!(
+        engine.search_matches.len(),
+        2,
+        "after close/reselect/reopen, matches must stay scoped to the new selection"
+    );
+}
+
+/// Reselecting a new single-line span and reopening find/replace *without*
+/// closing it first must not leak a stale selection range or toggle state
+/// from the previous selection into the new one.
+#[test]
+fn test_find_in_selection_reselect_without_closing() {
+    let mut engine = Engine::new();
+    engine.settings.ctrl_f_action = Some("find".to_string());
+    engine.buffer_mut().insert(0, "foo foo foo\nfoo foo\n");
+    engine.update_syntax();
+    let wid = engine.active_window_id();
+
+    // Select "foo foo" on line 0 (cols 0..6) via double-click + drag-equivalent.
+    engine.mouse_click(wid, 0, 0);
+    engine.mouse_drag(wid, 0, 6);
+    assert_eq!(engine.mode, Mode::Visual);
+
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
+    engine.find_replace_query = "foo".to_string();
+    engine.run_find_replace_search();
+
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleInSelection);
+    assert_eq!(
+        engine.search_matches.len(),
+        2,
+        "narrowed to first selection"
+    );
+
+    // Without pressing Escape or otherwise closing the overlay, make a new
+    // single-line selection elsewhere and reopen find/replace on it.
+    engine.mouse_click(wid, 1, 0);
+    engine.mouse_drag(wid, 1, 6);
+    assert_eq!(engine.mode, Mode::Visual);
+
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
+    engine.find_replace_query = "foo".to_string();
+    engine.run_find_replace_search();
+
+    assert_eq!(
+        engine.search_matches.len(),
+        2,
+        "reopening on a new selection without closing must scope matches to \
+         the new selection, not the stale one"
+    );
+}
