@@ -677,28 +677,20 @@ impl quadraui::ShellApp for App {
                 // row — inset included — with the theme's title-bar colour first, so the
                 // traffic-light strip is themed, matching VS Code's own macOS title bar.
                 //
-                // On a native-menu backend, `draw_menu_bar` doubles as the install point
-                // for the platform's real menu bar (`NSApp.mainMenu` on macOS) — handing
-                // it an empty filler `MenuBar` to get a background fill would reinstall
-                // the menu bar as empty too, wiping every app menu down to nothing. Use
-                // `draw_solid_fill` for the background instead on those backends, same as
-                // every other plain background band in this file (see `paint_title_bar_band`
-                // above); only backends without a native menu (GTK, TUI) get the
-                // empty-`MenuBar` filler, where `draw_menu_bar` is purely a paint call.
+                // The fill is a plain `draw_solid_fill`, same as every other background
+                // band in this file (see `paint_title_bar_band` above), never an empty
+                // filler `MenuBar` handed to `draw_menu_bar`: on a native-menu backend
+                // `draw_menu_bar` doubles as the install point for the platform's real
+                // menu bar (`NSApp.mainMenu` on macOS), so an empty bar passed purely to
+                // get a background would reinstall the menu bar as empty too, wiping every
+                // app menu down to nothing. The two paint the same pixels anyway —
+                // quadraui's menu-bar primitive fills its background with
+                // `theme.tab_bar_bg`, and an item-less bar paints nothing else — so one
+                // unconditional fill covers every backend with no capability branch.
                 render::FrameOp::CommandCenter => {
                     let mut row_filled = false;
                     if !presence.menu_row {
-                        if backend.backend_caps().native_menu {
-                            backend.draw_solid_fill(menu_row_rect, theme.tab_bar_bg);
-                        } else {
-                            let filler = quadraui::MenuBar {
-                                id: quadraui::WidgetId::new("title_row_background_fill"),
-                                items: Vec::new(),
-                                open_item: None,
-                                focused_item: None,
-                            };
-                            let _ = backend.draw_menu_bar(menu_row_rect, &filler);
-                        }
+                        backend.draw_solid_fill(menu_row_rect, theme.tab_bar_bg);
                         row_filled = true;
                     }
                     let mut cc_painted = false;
