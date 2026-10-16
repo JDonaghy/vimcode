@@ -23153,3 +23153,87 @@ mod issue_1513_at_dir_and_at_symbol_mentions {
         }
     }
 }
+
+/// Find-in-selection (the `≡` toggle) must bound the whole overlay —
+/// the painted match count and the `↑`/`↓` navigation buttons included.
+#[cfg(test)]
+mod find_in_selection {
+    use super::*;
+
+    /// `≡` is U+2261, `↓` is U+2193 — the glyphs
+    /// `quadraui::primitives::find_replace` paints for
+    /// `FindReplaceClickTarget::ToggleInSelection` and `NextMatch`.
+    const TOGGLE_IN_SELECTION: &str = "\u{2261}";
+    const NEXT_MATCH: &str = "\u{2193}";
+
+    /// Line 0 holds no `foo`; the other two lines hold three between them.
+    /// Selecting line 0 and enabling find-in-selection must therefore leave
+    /// the overlay with zero matches.
+    fn engine_with_selection_outside_the_matches() -> Engine {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "alpha beta\nfoo bar foo\ngamma foo\n");
+        engine.update_syntax();
+        let wid = engine.active_window_id();
+        engine.mouse_click(wid, 0, 0);
+        engine.mouse_drag(wid, 0, 10);
+        engine.open_find_replace();
+        engine.find_replace_query = "foo".to_string();
+        engine.find_replace_cursor = engine.find_replace_query.chars().count();
+        engine.run_find_replace_search();
+        engine
+    }
+
+    fn click_painted<A: quadraui::AppLogic>(h: &mut Harness<A>, glyph: &str, what: &str) {
+        let bounds = h.driver.find_bounds(glyph).unwrap_or_else(|| {
+            panic!(
+                "the panel must paint its {what} button; painted: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+        h.driver.click(
+            bounds.x + bounds.width / 2.0,
+            bounds.y + bounds.height / 2.0,
+        );
+        h.driver.render();
+    }
+
+    /// Clicking `≡` with a selection active must narrow the *painted* match
+    /// count to the selection, and clicking `↓` afterwards must keep it
+    /// there.
+    ///
+    /// **RED-verified against unfixed `develop`.** The `↓` click fell through
+    /// to the unscoped whole-buffer search, so the panel repainted
+    /// `1 of 3` — three matches, none of them inside the selection.
+    #[test]
+    fn in_selection_toggle_and_next_match_keep_the_painted_count_scoped() {
+        let mut h = harness(engine_with_selection_outside_the_matches(), 1400, 900);
+        assert!(
+            h.driver.screen_contains("1 of 3"),
+            "fixture must paint the unscoped count first; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        click_painted(&mut h, TOGGLE_IN_SELECTION, "find-in-selection");
+        assert!(
+            h.driver.screen_contains("No results"),
+            "clicking the painted ≡ toggle must narrow the match count to the \
+             selection, which holds no 'foo'; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        click_painted(&mut h, NEXT_MATCH, "next-match");
+        assert!(
+            h.driver.screen_contains("No results"),
+            "the ↓ button must honour the find-in-selection bound instead of \
+             falling back to a whole-buffer search; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("1 of 3"),
+            "navigation must not repaint out-of-selection matches; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+}
