@@ -24424,6 +24424,39 @@ fn test_close_all_tabs_method() {
     assert_eq!(e.active_group().tabs.len(), 1);
 }
 
+#[test]
+fn test_tab_context_menu_close_right_keeps_tabs_before_target() {
+    // 4 tabs total: [0, 1, 2, 3]. Right-click tab 1 and choose
+    // "Close to the Right": only tabs 2 and 3 (after the target) should
+    // close. Tab 0, which sits *before* the target, must survive -- unlike
+    // "Close Others", which closes tabs on both sides.
+    let mut e = Engine::new();
+    e.new_tab(None);
+    e.new_tab(None);
+    e.new_tab(None);
+    let gid = e.active_group;
+    assert_eq!(e.active_group().tabs.len(), 4);
+    let tab_ids: Vec<_> = e.active_group().tabs.iter().map(|t| t.id).collect();
+
+    e.open_tab_context_menu(gid, 1, 0, 0);
+    let cm = e.context_menu.as_mut().unwrap();
+    let idx = cm
+        .items
+        .iter()
+        .position(|i| i.action == "close_right")
+        .unwrap();
+    cm.selected = idx;
+    e.context_menu_confirm();
+
+    let remaining: Vec<_> = e.active_group().tabs.iter().map(|t| t.id).collect();
+    assert_eq!(
+        remaining,
+        vec![tab_ids[0], tab_ids[1]],
+        "Close to the Right must keep tab 0 (before target) and tab 1 (target), \
+         closing only tabs 2 and 3 (after target)"
+    );
+}
+
 // ── Explorer inline rename improvements ──────────────────────────────────────
 
 #[test]

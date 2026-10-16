@@ -16713,6 +16713,85 @@ mod modal_rung {
              ({many_h}) than the line-endings picker (two results, {few_h})"
         );
     }
+
+    /// Right-clicking a tab and choosing "Close to the Right" must close only
+    /// the tabs *after* the target -- never the ones before it, which is what
+    /// "Close Others" does. Driven through the real tab-bar right-click path
+    /// (`App::dispatch`'s `MouseButton::Right` arm -> `resolve_tab_right_click`
+    /// -> `handle_tab_right_click` -> `Engine::open_tab_context_menu`) and a
+    /// real left click on the painted "Close to the Right" row, not a direct
+    /// `context_menu_confirm()` call.
+    #[test]
+    fn tab_right_click_close_to_the_right_keeps_tabs_before_target() {
+        let mut engine = Engine::new();
+        engine.new_tab(Some(std::path::Path::new("a.txt")));
+        engine.new_tab(Some(std::path::Path::new("b.txt")));
+        engine.new_tab(Some(std::path::Path::new("c.txt")));
+        engine.new_tab(Some(std::path::Path::new("d.txt")));
+
+        let group = engine.active_group;
+        assert_eq!(
+            engine.editor_groups[&group].tabs.len(),
+            5,
+            "the default startup tab plus the four opened files"
+        );
+
+        let mut h = harness(engine, 1400, 900);
+        let bar = quadraui::WidgetId::new(crate::render::EDITOR_TAB_BAR_WIDGET_ID);
+
+        // Tab index 2 is "b.txt" (0: default startup tab, 1: a.txt, 2: b.txt,
+        // 3: c.txt, 4: d.txt).
+        let (bx, by) = h
+            .driver
+            .tab_center(&bar, 2)
+            .expect("tab index 2 (b.txt) must have painted a tab-bar entry");
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(bx, by),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("Close to the Right"),
+            "right-clicking a tab must open a context menu with a \
+             'Close to the Right' entry; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let (tx, ty) = h
+            .driver
+            .find("Close to the Right")
+            .expect("the 'Close to the Right' row must be painted");
+        h.driver.click(tx, ty);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("a.txt "),
+            "tab 'a.txt', which sits before the target tab, must survive \
+             'Close to the Right'; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("b.txt "),
+            "the target tab 'b.txt' itself must survive 'Close to the \
+             Right'; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("c.txt "),
+            "tab 'c.txt', which sits after the target tab, must be closed \
+             by 'Close to the Right'; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("d.txt "),
+            "tab 'd.txt', which sits after the target tab, must be closed \
+             by 'Close to the Right'; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
 }
 
 /// Adopting `quadraui::FolderPickerController` on GTK, replacing the
