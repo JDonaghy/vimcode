@@ -166,6 +166,27 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(home)
 }
 
+/// Expand a leading `~` or `~/...` in a file-path argument to [`home_dir()`].
+///
+/// This is the shared helper every file-opening ex command (`:e`, `:split`,
+/// `:vsplit`, `:tabe`, `:saveas`, `:r`, ...) runs its raw path argument
+/// through before resolving it relative to the current working directory,
+/// so `~` behaves the same everywhere a path can be typed.
+///
+/// Only a bare `~` or a `~/`-prefixed path is expanded. `~user` forms and
+/// any path not starting with `~` are returned unchanged — expanding another
+/// user's home directory needs a passwd/directory-services lookup this
+/// function deliberately doesn't do.
+pub fn expand_tilde(path_str: &str) -> PathBuf {
+    if path_str == "~" {
+        return home_dir();
+    }
+    if let Some(rest) = path_str.strip_prefix("~/") {
+        return home_dir().join(rest);
+    }
+    PathBuf::from(path_str)
+}
+
 /// Return the platform-appropriate VimCode *data* directory — where
 /// vimcode-managed tool acquisitions are unpacked, as opposed to
 /// [`vimcode_config_dir()`]'s user-editable settings/manifests.
@@ -339,6 +360,42 @@ mod tests {
     fn home_dir_is_not_empty() {
         let dir = home_dir();
         assert!(!dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn expand_tilde_expands_bare_tilde() {
+        let _guard = set_test_home(Path::new("/tmp/fake-home"));
+        assert_eq!(expand_tilde("~"), PathBuf::from("/tmp/fake-home"));
+    }
+
+    #[test]
+    fn expand_tilde_expands_tilde_slash_prefix() {
+        let _guard = set_test_home(Path::new("/tmp/fake-home"));
+        assert_eq!(
+            expand_tilde("~/src/foo/bar.lua"),
+            PathBuf::from("/tmp/fake-home/src/foo/bar.lua")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_leaves_tilde_user_unchanged() {
+        let _guard = set_test_home(Path::new("/tmp/fake-home"));
+        assert_eq!(
+            expand_tilde("~other/file.txt"),
+            PathBuf::from("~other/file.txt")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_leaves_other_paths_unchanged() {
+        assert_eq!(
+            expand_tilde("/absolute/path.txt"),
+            PathBuf::from("/absolute/path.txt")
+        );
+        assert_eq!(
+            expand_tilde("relative/path.txt"),
+            PathBuf::from("relative/path.txt")
+        );
     }
 
     /// Proves the backstop fires in a `--lib` test build: deliberately skips
