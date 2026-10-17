@@ -1459,7 +1459,7 @@ pub fn route_board_click(engine: &mut Engine, pos: quadraui::Point, is_double_cl
         .unwrap_or(quadraui::BoardHit::Empty);
     match hit {
         quadraui::BoardHit::Card(id) => {
-            engine.apply_board_action(quadraui::BoardAction::SelectCard(id.clone()));
+            engine.apply_board_action(quadraui::BoardAction::SelectCard(id));
             if is_double_click {
                 engine.apply_board_action(quadraui::BoardAction::OpenIssue(id));
             }

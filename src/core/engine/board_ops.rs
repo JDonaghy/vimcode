@@ -262,7 +262,7 @@ impl Engine {
             }
             return;
         }
-        if self.run_board_action_by_name("OpenIssue", id.clone()) {
+        if self.run_board_action_by_name("OpenIssue", id) {
             return;
         }
         let title = self.board_model.as_ref().and_then(|model| {
@@ -496,7 +496,7 @@ impl Engine {
     /// the card's current stage.
     fn board_key_action(&self, key: &str) -> Option<(String, quadraui::WidgetId)> {
         let provider = self.board_provider()?;
-        let card_id = self.board_model.as_ref()?.selected_card_id.clone()?;
+        let card_id = self.board_model.as_ref()?.selected_card_id?;
         let stage_id = self.board_card_stage_id(&card_id)?;
         provider
             .action_for_key(key, &stage_id)
@@ -538,11 +538,7 @@ impl Engine {
             return false;
         }
         if key == "R" {
-            if let Some(id) = self
-                .board_model
-                .as_ref()
-                .and_then(|m| m.selected_card_id.clone())
-            {
+            if let Some(id) = self.board_model.as_ref().and_then(|m| m.selected_card_id) {
                 self.apply_board_action(quadraui::BoardAction::OpenReview(id));
             }
             return true;

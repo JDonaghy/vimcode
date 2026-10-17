@@ -442,7 +442,7 @@ impl App {
         backend
             .modal_stack_handle()
             .borrow_mut()
-            .push(picker_id.clone(), geo.bounds);
+            .push(picker_id, geo.bounds);
 
         match route {
             render::PickerRoute::Row(idx) => {
