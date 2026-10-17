@@ -14,7 +14,17 @@ no matching section fails the release job before anything is published (see
 `scripts/release_notes.py`).
 
 ## [Unreleased]
+### Added
+- Settings panel renders as a centered modal overlay (~80% viewport)
+  instead of inside the sidebar. Printable characters filter settings
+  immediately (no "/" activation needed), with a "Find: " prefix in the
+  search bar. Escape closes; the activity-bar icon toggles.
+
 ### Fixed
+- Second `yy`/`yw` followed by `p` now correctly pastes the second
+  yanked content instead of the first. `sync_register_to_clipboard` only
+  tracks the unnamed register, and `load_clipboard_for_paste` no longer
+  contaminates the `+`/`*` registers.
 - Ex commands and cursor-based file-opening commands (`:e`, `:split`,
   `:vsplit`, `:tabe`/`:tabnew`, `:cd`, `:r`, `:saveas`, `gf`, `gF`,
   `Ctrl-W f`) now expand a leading `~` to the home directory before
