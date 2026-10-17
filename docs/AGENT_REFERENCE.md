@@ -92,6 +92,24 @@ still-broken bug report a *green* CI run. The v0.11.0 suite (#983, #984, #986,
 #987, #988, #990) shipped 15 gated labels in v0.12.0, all six issues closed, zero
 fix issues filed, and the bugs went out to a user who believed they were fixed.
 
+Red-green gate (#1976): rule 2 says "prove it fails on unfixed `develop`" but
+didn't say *when* to prove it, and two incidents showed that gap matters. #1975
+(TUI picker scrim): the first fix attempt changed the scrim from black fill to
+dark-gray fill — every existing test passed, because they asserted a color value,
+not whether the underlying content survived the scrim; the bug (content still
+destroyed) was still there and only a human visual check caught it. #1970 (Ctrl-W
+navigation): the PR passed four `ConformanceDriver` conformance scenarios across
+gtk/tui/tui_prod and adversarial review, merged, and the feature didn't work on a
+real keyboard — `ConformanceDriver` injects synthetic key values that never cross
+the real terminal-input-parsing path, so it cannot see a bug that lives there.
+The fix for both: commit the driver test failing *before* the fix commit (not
+just "assert it would fail" after the fact — actually run it red, on that
+specific commit), so the reviewer can diff two real commits instead of trusting a
+PR-body claim; and for keyboard/terminal bugs specifically, require a
+`tests/smoke-spec/tui.yaml` PTY scenario (real `vcd` under a real pty, real byte
+sequences) alongside the driver test, since that is the only tier that exercises
+real terminal input.
+
 ### Test lanes: which command covers which backend (#645)
 
 | Command | Compiles | Covers |

@@ -367,7 +367,7 @@ impl ChangeReviewEntry {
             new_text,
         };
         let mut rebuilt = ChangeReviewEntry::new(change, id_suffix);
-        rebuilt.view.id = self.view.id.clone();
+        rebuilt.view.id = self.view.id;
         let mut new_decisions = vec![ChangeDecision::Pending; rebuilt.view.hunks.len()];
         for (i, h) in rebuilt.view.hunks.iter().enumerate() {
             if let Some((_, d)) = carried.iter().find(|(ls, _)| *ls == h.left_start) {

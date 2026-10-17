@@ -481,6 +481,23 @@ pub(crate) fn spawn_http_request(spec: HttpRequestSpec) -> std::io::Result<HttpP
 }
 
 impl Engine {
+    /// Resolve a raw file-path argument into an absolute path: expand a
+    /// leading `~`/`~/` to the home directory first (see
+    /// [`crate::core::paths::expand_tilde`]), then resolve anything still
+    /// relative against `self.cwd`. The shared point every file-opening
+    /// command runs its argument through, whether that argument came from
+    /// an ex command (`:e`, `:split`, `:vsplit`, `:tabe`, `:saveas`, `:r`,
+    /// ...) or from a path found under the cursor (`gf`, `gF`, `Ctrl-W f`),
+    /// so `~` behaves the same everywhere a path can be typed.
+    pub(crate) fn resolve_path_arg(&self, arg: &str) -> PathBuf {
+        let expanded = crate::core::paths::expand_tilde(arg);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.cwd.join(expanded)
+        }
+    }
+
     pub fn execute_command(&mut self, cmd: &str) -> EngineAction {
         // Save for @: repeat (before normalization, using trimmed original).
         // `prev_ex_command` is the value *before* this overwrite — the ":"
@@ -596,12 +613,7 @@ impl Engine {
             return EngineAction::SaveWorkspaceAsDialog;
         }
         if let Some(path_str) = cmd.strip_prefix("cd ").map(|s| s.trim()) {
-            let path = Path::new(path_str);
-            let target = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                self.cwd.join(path)
-            };
+            let target = self.resolve_path_arg(path_str);
             self.open_folder(&target);
             return EngineAction::None;
         }
@@ -1818,7 +1830,7 @@ impl Engine {
                 self.message = "No file name".to_string();
                 return EngineAction::Error;
             }
-            return EngineAction::OpenFile(PathBuf::from(filename));
+            return EngineAction::OpenFile(self.resolve_path_arg(filename));
         }
 
         // Handle :e[dit] <filename> — 'hidden' guard: unlike
@@ -1835,7 +1847,7 @@ impl Engine {
                 self.message = msg;
                 return EngineAction::Error;
             }
-            return EngineAction::OpenFile(PathBuf::from(filename));
+            return EngineAction::OpenFile(self.resolve_path_arg(filename));
         }
 
         // Handle :b[uffer][!] <buffer> — same 'hidden' guard as `:edit`,
@@ -1921,8 +1933,9 @@ impl Engine {
             let file = cmd
                 .strip_prefix("split")
                 .map(|s| s.trim())
-                .filter(|s| !s.is_empty());
-            self.split_window(SplitDirection::Horizontal, file.map(Path::new));
+                .filter(|s| !s.is_empty())
+                .map(|f| self.resolve_path_arg(f));
+            self.split_window(SplitDirection::Horizontal, file.as_deref());
             return EngineAction::None;
         }
 
@@ -1931,8 +1944,9 @@ impl Engine {
             let file = cmd
                 .strip_prefix("vsplit")
                 .map(|s| s.trim())
-                .filter(|s| !s.is_empty());
-            self.split_window(SplitDirection::Vertical, file.map(Path::new));
+                .filter(|s| !s.is_empty())
+                .map(|f| self.resolve_path_arg(f));
+            self.split_window(SplitDirection::Vertical, file.as_deref());
             return EngineAction::None;
         }
 
@@ -1988,8 +2002,9 @@ impl Engine {
                 .strip_prefix("tabnew")
                 .or_else(|| cmd.strip_prefix("tabe"))
                 .map(|s| s.trim())
-                .filter(|s| !s.is_empty());
-            self.new_tab(file.map(Path::new));
+                .filter(|s| !s.is_empty())
+                .map(|f| self.resolve_path_arg(f));
+            self.new_tab(file.as_deref());
             return EngineAction::None;
         }
 
@@ -2644,11 +2659,7 @@ impl Engine {
                 }
                 return EngineAction::None;
             }
-            let path = if Path::new(arg).is_absolute() {
-                PathBuf::from(arg)
-            } else {
-                self.cwd.join(arg)
-            };
+            let path = self.resolve_path_arg(arg);
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     let inserted_lines = self.insert_read_content(&content);
@@ -2731,11 +2742,7 @@ impl Engine {
                 self.message = "Usage: :saveas {file}".to_string();
                 return EngineAction::Error;
             }
-            let path = if Path::new(path_str).is_absolute() {
-                PathBuf::from(path_str)
-            } else {
-                self.cwd.join(path_str)
-            };
+            let path = self.resolve_path_arg(path_str);
             self.buffer_manager
                 .get_mut(self.active_buffer_id())
                 .unwrap()

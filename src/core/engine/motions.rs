@@ -4630,10 +4630,13 @@ impl Engine {
     /// `"marker"` and nothing defined yet at the cursor, falls back
     /// to the real computed-fold hierarchy (`compute_configured_folds`) —
     /// Vim computes those methods' hierarchy automatically, without a `zf`.
-    /// In `"manual"` mode with nothing defined, matches Vim: nothing happens
-    /// (`E490`), verified against `nvim --headless` — vimcode used
-    /// to invent a fold from indentation here even in the default manual
-    /// method, which real Vim never does.
+    /// In `"manual"` mode with nothing defined at the cursor, falls back to
+    /// the same indentation heuristic the gutter fold markers and the
+    /// VS-Code-style progressive fold commands already use
+    /// (`detect_fold_range`/`find_enclosing_fold_range`), so `zc` on a block
+    /// header (or anywhere inside its body) agrees with what the gutter
+    /// shows. Only when neither the cursor's line nor any enclosing line
+    /// looks like a foldable block does `zc` give up with `E490`.
     pub(crate) fn cmd_fold_close(&mut self) {
         let line = self.view().cursor.line;
         if let Some(range) = self.view().enclosing_fold_def(line) {
@@ -4646,6 +4649,12 @@ impl Engine {
                 self.close_fold_and_clamp(start, end);
                 return;
             }
+        } else if let Some((start, end)) = self
+            .detect_fold_range(line)
+            .or_else(|| self.find_enclosing_fold_range(line))
+        {
+            self.close_fold_and_clamp(start, end);
+            return;
         }
         self.message = "E490: No fold found".to_string();
     }
@@ -4886,6 +4895,18 @@ impl Engine {
         None
     }
 
+    /// Every indentation-detected fold range in the buffer (`detect_fold_range`
+    /// run at each line), used by `zM` to close foldable blocks under the
+    /// default `"manual"` `'foldmethod'` that were never `zf`-defined. Ranges
+    /// naturally nest, since each candidate header line is evaluated
+    /// independently.
+    fn auto_detect_fold_ranges(&self) -> Vec<(usize, usize)> {
+        let total = self.buffer().len_lines();
+        (0..total)
+            .filter_map(|line| self.detect_fold_range(line))
+            .collect()
+    }
+
     /// Progressive fold (VSCode Ctrl+Shift+[): fold the enclosing block around
     /// the cursor.  If the cursor is already on a fold header, fold the parent
     /// block instead.  This makes repeated presses fold progressively larger
@@ -4953,9 +4974,11 @@ impl Engine {
 
     /// zM — close every fold in the buffer. With `'foldmethod'` `"indent"`/
     /// `"marker"` this first computes the whole fold hierarchy and closes it
-    /// down to `'foldlevel'` 0. Otherwise (`"manual"`) it only closes folds
-    /// that already exist via `zf`; matching Vim, `zM` never invents a manual
-    /// fold.
+    /// down to `'foldlevel'` 0. Otherwise (`"manual"`) it closes every
+    /// `zf`-defined fold plus every indentation-detected block
+    /// (`auto_detect_fold_ranges`) that doesn't already overlap a defined
+    /// fold — the same heuristic `zc` and the gutter fold markers use — so
+    /// `zM` closes foldable blocks even when none were ever `zf`-defined.
     pub(crate) fn cmd_fold_close_all(&mut self) {
         if self.folds_are_computed() {
             self.apply_foldlevel(0);
@@ -4966,9 +4989,19 @@ impl Engine {
                 .iter()
                 .map(|f| (f.start, f.end))
                 .collect();
-            // Innermost (narrowest) first, so `close_fold`'s "drop folds
-            // fully contained in the new one" rule folds a closed child into
-            // its closed parent instead of leaving two overlapping entries.
+            for (start, end) in self.auto_detect_fold_ranges() {
+                let covered = self
+                    .view()
+                    .fold_defs
+                    .iter()
+                    .any(|f| f.start <= start && start <= f.end);
+                if !covered && !defs.contains(&(start, end)) {
+                    defs.push((start, end));
+                }
+            }
+            // Innermost (narrowest) first, so a closed child header is
+            // visited before its closed parent — real Vim's `zM` leaves both
+            // closed, nested, rather than the parent swallowing the child.
             defs.sort_by_key(|(start, end)| end - start);
             for (start, end) in defs {
                 self.view_mut().close_fold(start, end);

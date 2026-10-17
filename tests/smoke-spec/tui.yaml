@@ -1887,6 +1887,78 @@ steps:
     key: esc
 
   # ─────────────────────────────────────────────────────────────────────
+  # vimcode#1970 -- Ctrl-W h from a focused sidebar panel (Explorer is the
+  # active panel here, re-selected by click-explorer-icon-again above) must
+  # move keyboard focus onto the activity-bar toolbar and leave it
+  # reachable there: j/k must walk the toolbar cursor and Enter must
+  # activate whatever icon it lands on. Before the fix, the toolbar painted
+  # `is_keyboard_focused: true` the moment it gained focus, so quadraui's
+  # own preprocess_event layer intercepted every following raw key (j, j,
+  # Enter) into a ActivityBarEvent that never reached vimcode's own
+  # chord/activity-bar handling in src/app/input.rs -- the toolbar looked
+  # focused but every key after the first was swallowed, so no amount of
+  # j/k ever changed the selected icon and Enter re-activated whatever was
+  # already active. Driving it over the real PTY (not synthetic engine
+  # events) is required because the bug lived entirely in the
+  # render -> quadraui preprocess_event path, not in route_sidebar_chord_key
+  # itself.
+  - type: key
+    id: ctrl-w-nav-1970-arm-1
+    key: 'ctrl+w'
+  - type: key
+    id: ctrl-w-nav-1970-to-toolbar-1
+    key: 'h'
+  - type: key
+    id: ctrl-w-nav-1970-move-down-1
+    key: 'j'
+  - type: key
+    id: ctrl-w-nav-1970-move-down-2
+    key: 'j'
+  - type: key
+    id: ctrl-w-nav-1970-activate-1
+    key: 'enter'
+  - type: expect_within
+    id: ctrl-w-nav-1970-source-control-selected
+    text: "SOURCE CONTROL"
+    ms: 1500
+  - type: wait_idle
+    id: ctrl-w-nav-1970-settle-1
+    ms: 300
+  # Enter already left keyboard focus on the Source Control panel
+  # itself, not the toolbar, so a single Ctrl-W h from here re-enters
+  # the toolbar directly.
+  - type: key
+    id: ctrl-w-nav-1970-arm-2
+    key: 'ctrl+w'
+  - type: key
+    id: ctrl-w-nav-1970-to-toolbar-2
+    key: 'h'
+  - type: key
+    id: ctrl-w-nav-1970-move-down-3
+    key: 'j'
+  - type: key
+    id: ctrl-w-nav-1970-activate-2
+    key: 'enter'
+  - type: expect_within
+    id: ctrl-w-nav-1970-debug-selected
+    text: "RUN AND DEBUG"
+    ms: 1500
+  - type: wait_idle
+    id: ctrl-w-nav-1970-settle-2
+    ms: 300
+  # Enter already left keyboard focus on the Debug panel itself, so a
+  # single Ctrl-W l sends focus straight to the editor.
+  - type: key
+    id: ctrl-w-nav-1970-arm-4
+    key: 'ctrl+w'
+  - type: key
+    id: ctrl-w-nav-1970-to-editor
+    key: 'l'
+  - type: wait_idle
+    id: ctrl-w-nav-1970-settle-3
+    ms: 300
+
+  # ─────────────────────────────────────────────────────────────────────
   # vimcode#1835 -- Linux "first five minutes" smoke: typing, `:term`, and
   # extension-install probes, exercised with the `type_text`/`expect_file`
   # driver steps `tui-pty` gained for exactly this purpose
@@ -2146,4 +2218,128 @@ steps:
     id: 'cleanup-probe-settle-1835'
     ms: 300
     timeout_ms: 4000
+
+  # ─────────────────────────────────────────────────────────────────────
+  # vimcode#1971 -- `zc`/`zo` on a Rust block must agree with the gutter
+  # fold markers, exercised over a real pty with real keystrokes (per
+  # #1970's precedent that a ConformanceDriver-only test is not sufficient
+  # evidence for this class of bug: the gutter-vs-`z`-command disconnect
+  # this issue reports only shows up when real key EVENTS are routed
+  # through the normal keyboard-routing ladder, not when a test calls the
+  # engine's fold methods directly). Additive (#3509): a new section
+  # appended after the #1835 section above, independent of it.
+  #
+  # The #1835 section above ends with the terminal panel OPEN and
+  # FOCUSED (`cleanup-probe-settle-1835`). `<C-t>` (the default
+  # `toggle_terminal` binding, `src/core/settings.rs`'s
+  # `pk_open_terminal`) closes a focused terminal panel and returns full
+  # keyboard focus to the editor -- confirmed against a live `vcd` pty
+  # session before writing this step, since every ordinary keystroke
+  # (including a bare Escape) is otherwise swallowed by
+  # `Engine::handle_terminal_key` while a terminal pane has focus, and
+  # `route_focus_key`/`route_terminal_key`
+  # (`src/render/keyboard_routing.rs`) never let a key escape that focus
+  # on their own -- only the separate panel-accelerator dispatch rung
+  # (`src/render/keyboard_routing_closing.rs`) bound to this chord does.
+  - type: key
+    id: 'fold-probe-close-terminal-1971'
+    key: 'ctrl+t'
+  - type: wait_idle
+    id: 'fold-probe-close-terminal-settle-1971'
+    ms: 300
+    timeout_ms: 4000
+
+  # Clear the buffer (same four-key `:%d<CR>` pattern the #1835 probes
+  # above use) and type a minimal Rust `fn` block: a header line plus one
+  # indented body statement plus a closing brace. `cmd_fold_close`'s
+  # indentation fallback (`detect_fold_range`/`find_enclosing_fold_range`,
+  # `src/core/engine/motions.rs`) folds every line whose indent is
+  # strictly greater than the header's, so the body line's exact
+  # indentation (autoindent may carry it deeper than the four columns
+  # typed here) does not change which lines the fold covers -- only
+  # whether the closing `}` itself ends up inside or just after the fold,
+  # neither of which this probe's assertions depend on.
+  - type: key
+    id: 'fold-probe-clear-colon-1971'
+    key: ':'
+  - type: key
+    id: 'fold-probe-clear-pct-1971'
+    key: '%'
+  - type: key
+    id: 'fold-probe-clear-d-1971'
+    key: 'd'
+  - type: key
+    id: 'fold-probe-clear-enter-1971'
+    key: 'enter'
+  - type: wait_idle
+    id: 'fold-probe-clear-settle-1971'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'fold-probe-insert-1971'
+    key: 'i'
+  - type: type_text
+    id: 'fold-probe-type-text-1971'
+    text: "fn fold_target_1971() {\n    let unique_fold_body_1971 = 42;\n}"
+  - type: key
+    id: 'fold-probe-esc-1971'
+    key: 'esc'
+  - type: wait_idle
+    id: 'fold-probe-typed-settle-1971'
+    ms: 300
+    timeout_ms: 4000
+  - type: expect_within
+    id: 'fold-probe-body-visible-before-close-1971'
+    text: 'unique_fold_body_1971'
+    ms: 5000
+
+  # Move to the block header (`gg`), then `zc` -- a closed fold renders
+  # the header line with a leading `+`
+  # (`src/render`'s fold-marker gutter/line rendering) and hides every
+  # line it covers, which is the only observable, assertable proof that
+  # `zc` actually closed a fold rather than silently failing with
+  # `E490: No fold found` (success sets no status message to assert on;
+  # confirmed against a live `vcd` pty session before writing this step).
+  - type: key
+    id: 'fold-probe-goto-top-1-1971'
+    key: 'g'
+  - type: key
+    id: 'fold-probe-goto-top-2-1971'
+    key: 'g'
+  - type: wait_idle
+    id: 'fold-probe-goto-top-settle-1971'
+    ms: 200
+    timeout_ms: 4000
+  - type: key
+    id: 'fold-probe-zc-z-1971'
+    key: 'z'
+  - type: key
+    id: 'fold-probe-zc-c-1971'
+    key: 'c'
+  - type: wait_idle
+    id: 'fold-probe-zc-settle-1971'
+    ms: 300
+    timeout_ms: 4000
+  - type: expect_within
+    id: 'fold-probe-header-folded-1971'
+    text: '+fn fold_target_1971() {'
+    ms: 5000
+
+  # `zo` on the still-closed fold's header reopens it -- the body text
+  # becomes visible again, proving `zo` and `zc` agree on the same fold
+  # boundaries the gutter already showed.
+  - type: key
+    id: 'fold-probe-zo-z-1971'
+    key: 'z'
+  - type: key
+    id: 'fold-probe-zo-o-1971'
+    key: 'o'
+  - type: wait_idle
+    id: 'fold-probe-zo-settle-1971'
+    ms: 300
+    timeout_ms: 4000
+  - type: expect_within
+    id: 'fold-probe-body-visible-after-open-1971'
+    text: 'unique_fold_body_1971'
+    ms: 5000
 

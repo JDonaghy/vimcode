@@ -14,7 +14,7 @@ mod tests {
     //! name where `App`'s own construction/fields differ enough that a
     //! faithful port needed a different shape.
     //!
-    //! # No production code here (exceptions: #1762, #1763, #1764, #1750)
+    //! # No production code here (exceptions: #1762, #1763, #1764, #1750, #1991)
     //!
     //! Every test below drives already-shipped code through the existing
     //! [`crate::tui_main::testing::conformance_harness`] / [`crate::harness`]
@@ -34,6 +34,17 @@ mod tests {
     //!   covers new `src/app.rs` and `src/render.rs` code for Alt-chord handling.
     //! - All tests under `editor_hover_dwell_1750` cover new `src/app.rs` code
     //!   that arms the dwell timer in the `MouseMoved` arm of `App::handle_dispatch`.
+    //! - `opening_a_terminal_on_tui_sizes_the_pty_within_one_column_of_the_painted_width`
+    //!   pins the terminal panel scrollbar gutter fix in `src/app/dialogs.rs`
+    //!   (`App::terminal_panel_cols`), `src/app/mouse_tabs.rs`
+    //!   (`App::compose_bottom_band_rungs`), `src/render/frame_editor_band.rs`
+    //!   (`BottomPanelUnits`) and `src/render/hit_test_geometry.rs`
+    //!   (`UnitProfile::terminal_scrollbar_gutter`).
+    //! - `pressing_the_painted_terminal_scrollbar_track_on_tui_scrolls_the_scrollback`
+    //!   pins the other half of the same change: the reserved gutter carries a
+    //!   hit-testable `quadraui::SurfaceScrollbar`, registered by
+    //!   `src/render/frame_editor_band.rs` from the width
+    //!   `App::compose_bottom_band_rungs` passes.
     //!
     //! Everything else in this file only drives already-shipped code.
     //!
@@ -294,7 +305,7 @@ mod tests {
         ///    *other* `new_tab(Some(..))` in this file sidesteps the issue
         ///    by using a `.txt` fixture, so `language_id_from_path` returns
         ///    `None` and `lsp_did_open` bails before the manager. These
-        ///    #1750 tests need a real `.rs` path for the diagnostics key.)
+        ///    tests need a real `.rs` path for the diagnostics key.)
         /// 2. **After the first `driver.tick()`** — that tick runs
         ///    `Engine::check_settings_reload`, which replaces the whole
         ///    `settings` struct wholesale (`self.settings = new_settings`),
@@ -1415,6 +1426,180 @@ mod tests {
             );
         }
 
+        /// Ctrl-W h from a keyboard-focused sidebar panel (not the
+        /// activity bar itself) moves focus onto the activity-bar
+        /// toolbar and leaves every subsequent key reaching it: `j`/`k`
+        /// walk the toolbar cursor and Enter activates whatever icon it
+        /// lands on, twice in a row. `build_activity_bar` always paints
+        /// `is_keyboard_focused: false`, so quadraui's own
+        /// `preprocess_event` layer never reroutes a raw `KeyPressed`
+        /// into a `UiEvent::ActivityBar(..)` consumed entirely by
+        /// quadraui's `ShellAdapter`; every key instead reaches
+        /// `route_sidebar_chord_key`/`handle_activity_bar_key` in
+        /// `src/app/input.rs`, which is what actually drives the
+        /// toolbar's focused-cursor movement and activation.
+        #[test]
+        fn ctrl_w_h_from_sidebar_panel_reaches_activity_bar_toolbar() {
+            use crate::core::engine::sidebar::PANEL_EXPLORER;
+
+            let mut engine = plain_engine();
+            engine.focus_sidebar_panel(PANEL_EXPLORER);
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::ctrl_w_h_from_sidebar_panel_reaches_activity_bar_toolbar",
+                || {
+                    let before = driver.screen();
+                    assert!(
+                        !before.contains("SOURCE CONTROL"),
+                        "precondition: Source Control must not already be \
+                         the active panel; screen:\n{before}"
+                    );
+
+                    // Ctrl-W, h: Explorer panel -> activity-bar toolbar,
+                    // parked at Explorer's own toolbar index.
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('w'),
+                        modifiers: quadraui::Modifiers {
+                            ctrl: true,
+                            ..quadraui::Modifiers::default()
+                        },
+                        repeat: false,
+                    });
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('h'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+                    // j, j: Explorer -> Search -> Source Control (`PANEL_GIT`).
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('j'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('j'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+
+                    let after = driver.screen();
+                    assert!(
+                        after.contains("SOURCE CONTROL"),
+                        "j, j, Enter after Ctrl-W h must land on and \
+                         activate Source Control; screen:\n{after}"
+                    );
+
+                    // Enter already left keyboard focus on the Source
+                    // Control panel itself (`sc_has_focus`), not the
+                    // toolbar, so a second Ctrl-W h from here re-enters the
+                    // toolbar directly -- the cursor must still be
+                    // reachable a second time, parked now at Source
+                    // Control's own index, not reset to Explorer's.
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('w'),
+                        modifiers: quadraui::Modifiers {
+                            ctrl: true,
+                            ..quadraui::Modifiers::default()
+                        },
+                        repeat: false,
+                    });
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('h'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+                    // j: Source Control -> Run and Debug (`PANEL_DEBUG`).
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('j'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+
+                    let after2 = driver.screen();
+                    assert!(
+                        after2.contains("RUN AND DEBUG"),
+                        "a second Ctrl-W h / j / Enter round must still \
+                         reach and activate Run and Debug; screen:\n{after2}"
+                    );
+                },
+            );
+        }
+
+        /// Ctrl-W l (or Right) from the activity-bar toolbar, when a sidebar
+        /// panel is already visible, must move focus to that panel — the
+        /// mirror of `ctrl_w_h_from_sidebar_panel_reaches_activity_bar_toolbar`.
+        #[test]
+        fn ctrl_w_right_from_toolbar_focuses_panel() {
+            use crate::core::engine::sidebar::PANEL_EXPLORER;
+
+            let mut engine = plain_engine();
+            engine.focus_sidebar_panel(PANEL_EXPLORER);
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                h.engine.borrow().explorer_has_focus,
+                "precondition: Explorer must have focus"
+            );
+
+            // Ctrl-W, h: Explorer panel -> activity-bar toolbar.
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('w'),
+                modifiers: quadraui::Modifiers {
+                    ctrl: true,
+                    ..quadraui::Modifiers::default()
+                },
+                repeat: false,
+            });
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('h'),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+
+            assert!(
+                h.engine.borrow().activity_bar_focused,
+                "after Ctrl-W h, toolbar must have focus"
+            );
+
+            // Ctrl-W, Right: toolbar -> Explorer panel.
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('w'),
+                modifiers: quadraui::Modifiers {
+                    ctrl: true,
+                    ..quadraui::Modifiers::default()
+                },
+                repeat: false,
+            });
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+
+            let engine = h.engine.borrow();
+            assert!(
+                !engine.activity_bar_focused,
+                "toolbar must lose focus after Ctrl-W Right"
+            );
+            assert!(
+                engine.explorer_has_focus,
+                "Explorer must gain focus after Ctrl-W Right from toolbar"
+            );
+        }
+
         /// Mirrors `shell_app.rs`'s test of the same name: clicking
         /// each activity-bar icon in turn must switch the sidebar's own
         /// *content*, not just its chrome — every icon located via
@@ -1528,6 +1713,178 @@ mod tests {
             );
 
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The active panel's icon must paint a left-edge accent line
+        /// from vimcode's own theme (`theme.activity_active_accent`), not
+        /// quadraui's unset `None` default (`ActivityBar::active_accent`'s
+        /// own doc: "`None` paints zero accent-line pixels"). `App::handle`
+        /// (`src/app/shell.rs`) sets the runner's own `AppShell` accent on
+        /// every real dispatch, so clicking the Explorer icon below both
+        /// activates Explorer and is itself the real dispatch that leaves
+        /// the accent painted.
+        #[test]
+        fn activity_bar_paints_active_accent_from_theme_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            let bounds = driver
+                .inventory()
+                .zones()
+                .iter()
+                .find(|z| z.id.as_str() == crate::core::engine::sidebar::PANEL_EXPLORER)
+                .map(|z| z.bounds)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Explorer icon must register a chrome zone; screen:\n{}",
+                        driver.screen()
+                    )
+                });
+            driver.click(
+                bounds.x + bounds.width / 2.0,
+                bounds.y + bounds.height / 2.0,
+            );
+
+            // The accent column is the activity bar's own left edge —
+            // quadraui's `compose/app_shell.rs` registers each item's zone
+            // starting at that same `x` (`layout.activity_bar_bounds.x`), so
+            // `bounds.x`/`bounds.y` already address it directly.
+            let accent_x = bounds.x as u16;
+            let accent_y = bounds.y as u16;
+            let (glyph, style) = driver
+                .styled_row(accent_y)
+                .into_iter()
+                .nth(accent_x as usize)
+                .expect("the active panel's accent column must paint a styled cell");
+
+            let theme = crate::render::Theme::light();
+            let expected_fg = quadraui::tui::ratatui_color(theme.activity_active_accent);
+
+            // Independent of the colour assertion below: quadraui's TUI
+            // rasteriser (`quadraui::tui::activity_bar::draw_activity_bar_with_style`)
+            // only ever writes the `'▎'` glyph into this column when
+            // `ActivityBar::active_accent` is `Some`; its unset `None`
+            // default leaves the column's background-fill space character.
+            assert_eq!(
+                glyph,
+                '▎',
+                "the active panel's accent column must paint quadraui's \
+                 accent glyph, not the plain background fill left by its \
+                 unset `active_accent: None` default; screen:\n{}",
+                driver.screen()
+            );
+            assert_eq!(
+                style.fg,
+                expected_fg,
+                "the active panel's accent column must paint with \
+                 theme.activity_active_accent, not quadraui's unset `None` \
+                 default; screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// Clicking exercises the mouse path only; the issue's actual trigger is
+        /// keyboard navigation (`Ctrl-W Left` to give the activity bar keyboard
+        /// focus, then `j`/`l` to move the cursor and activate the item under
+        /// it) — `src/app/shell.rs`'s `App::handle` reaches this through
+        /// `on_shell_event_ctx`, the same early-return path quadraui's
+        /// `ShellAdapter::handle` takes for a mouse click. This drives that
+        /// sequence directly (activity-bar keyboard focus is itself the `Ctrl-W
+        /// Left` destination — see `Engine::activity_bar_focus_in_at`) and
+        /// asserts the accent follows the newly activated panel rather than
+        /// staying on the one it left.
+        #[test]
+        fn activity_bar_keyboard_activation_moves_active_accent_via_shell_app() {
+            use crate::core::engine::sidebar::{PANEL_EXPLORER, PANEL_SEARCH};
+
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            let explorer_idx = engine
+                .activity_bar_idx_for_item_id(PANEL_EXPLORER)
+                .expect("Explorer must have a keyboard (toolbar) index");
+            engine.activity_bar_focus_in_at(explorer_idx);
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                !driver.screen_has("SEARCH"),
+                "precondition: the Search panel must not already be open; screen:\n{}",
+                driver.screen()
+            );
+
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('j'),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('l'),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+
+            assert!(
+                driver.screen_has("SEARCH"),
+                "`j` then `l` must move the keyboard cursor to Search and \
+                 activate it; screen:\n{}",
+                driver.screen()
+            );
+
+            let zone_bounds = |id: &str| {
+                driver
+                    .inventory()
+                    .zones()
+                    .iter()
+                    .find(|z| z.id.as_str() == id)
+                    .map(|z| z.bounds)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{id} icon must register a chrome zone; screen:\n{}",
+                            driver.screen()
+                        )
+                    })
+            };
+            let explorer_bounds = zone_bounds(PANEL_EXPLORER);
+            let search_bounds = zone_bounds(PANEL_SEARCH);
+
+            let theme = crate::render::Theme::light();
+            let expected_fg = quadraui::tui::ratatui_color(theme.activity_active_accent);
+
+            let (explorer_glyph, _) = driver
+                .styled_row(explorer_bounds.y as u16)
+                .into_iter()
+                .nth(explorer_bounds.x as usize)
+                .expect("Explorer's accent column must paint a styled cell");
+            assert_ne!(
+                explorer_glyph,
+                '▎',
+                "Explorer is no longer the active panel after keyboard-\
+                 activating Search, so its accent column must not paint the \
+                 accent glyph; screen:\n{}",
+                driver.screen()
+            );
+
+            let (search_glyph, search_style) = driver
+                .styled_row(search_bounds.y as u16)
+                .into_iter()
+                .nth(search_bounds.x as usize)
+                .expect("Search's accent column must paint a styled cell");
+            assert_eq!(
+                search_glyph,
+                '▎',
+                "the keyboard-activated Search panel's accent column must paint \
+                 quadraui's accent glyph; screen:\n{}",
+                driver.screen()
+            );
+            assert_eq!(
+                search_style.fg,
+                expected_fg,
+                "the keyboard-activated Search panel's accent column must paint \
+                 with theme.activity_active_accent; screen:\n{}",
+                driver.screen()
+            );
         }
 
         /// `tests/smoke-spec/tui.yaml`'s header comment claimed the real-terminal
@@ -3229,6 +3586,75 @@ mod tests {
             );
 
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A terminal pane left focused, then a real
+        /// `Engine::focus_sidebar_panel` call (the method every
+        /// keyboard-driven focus transfer — Ctrl-W chord, activity-bar
+        /// `Activate` — routes through) into Settings must hand the very
+        /// next keypress to the settings form, not the stale terminal.
+        ///
+        /// `focus_sidebar_panel` clears `terminal_has_focus` itself, right
+        /// after calling the shared `Engine::clear_sidebar_focus` and before
+        /// setting `settings_has_focus`; without it,
+        /// `render::route_focus_key`'s terminal gate (checked before every
+        /// sidebar arm) keeps outranking Settings even though the sidebar
+        /// is now the real focus owner. The clear lives at this specific
+        /// focus-*grant* call site rather than inside `clear_sidebar_focus`
+        /// itself, since that function is also called from several focus-
+        /// *release* paths (hiding the sidebar, a mouse click landing on the
+        /// bottom panel) where a focused terminal must stay focused.
+        ///
+        /// The needle is Enter on the "Cursor Line" row rather than the
+        /// issue's literal colour-scheme picker: both are `settings_flat_list`
+        /// rows gated by the exact same focus check, but the colour-scheme
+        /// row's value text ("dark" / "vscode-dark") doesn't fit the default
+        /// sidebar width, so quadraui's `Form` TUI renderer drops it
+        /// entirely rather than truncating it — an unrelated, upstream
+        /// rendering-geometry limit this test must not depend on. "Cursor
+        /// Line" is a `Bool` setting with a short label, so its `[ ]`/`[x]`
+        /// toggle glyph always paints; unswallowed, Enter flips
+        /// `settings.cursorline` from its default `true` to `false`.
+        #[test]
+        fn settings_enter_activates_after_focus_transfer_leaves_terminal_stale() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            engine.terminal_has_focus = true;
+
+            // The real production focus-transfer call — not a raw flag
+            // poke — so this exercises `clear_sidebar_focus` itself.
+            engine.focus_sidebar_panel(crate::core::engine::sidebar::PANEL_SETTINGS);
+            // Row 0 of `settings_flat_list` is the "Appearance" category
+            // header; row 9 is "Cursor Line" (`SETTING_DEFS[8]`).
+            engine.settings_selected = 9;
+
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            let cursor_line_row = |screen: &str| -> String {
+                screen
+                    .lines()
+                    .find(|l| l.contains("Cursor Line"))
+                    .unwrap_or_default()
+                    .to_string()
+            };
+
+            let before = cursor_line_row(&driver.screen());
+            assert!(
+                before.contains("[x]"),
+                "precondition: Cursor Line must default to its checked \
+                 glyph before Enter is pressed; row:\n{before}"
+            );
+
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            let after = cursor_line_row(&driver.screen());
+            assert!(
+                after.contains("[ ]"),
+                "Enter on the Cursor Line row must flip its toggle and \
+                 repaint the unchecked glyph — if the terminal still \
+                 swallowed the key, the glyph stays checked; row:\n{after}"
+            );
         }
 
         /// Mirrors `shell_app.rs`'s test of the same name: Alt+Right
@@ -6224,6 +6650,38 @@ mod tests {
             );
         }
 
+        /// Clicking the bottom panel's tab strip at all — even the already-
+        /// active "Terminal" tab, a no-op for which panel is painted — goes
+        /// through `App::handle_mouse_click_msg`'s unconditional pre-dispatch
+        /// `Engine::clear_sidebar_focus()` call before the click is routed
+        /// to `handle_bottom_tab_bar_click`. `clear_sidebar_focus` must leave
+        /// `terminal_has_focus` alone (it only clears the sidebar-band
+        /// flags), so a terminal that was genuinely focused before the click
+        /// must still be focused after it.
+        #[test]
+        fn bottom_panel_terminal_tab_click_leaves_the_terminal_focused_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let mut h = harness_no_sidebar(engine);
+            // `harness_no_sidebar`'s sidebar-collapse clicks land on the
+            // Explorer activity-bar icon, outside the bottom panel, so they
+            // legitimately clear `terminal_has_focus` themselves. Set focus
+            // only after that setup, right before the click under test.
+            h.engine.borrow_mut().terminal_has_focus = true;
+            let driver = &mut h.driver;
+
+            let (x, y) = driver
+                .find("Terminal")
+                .expect("the bottom panel tab strip must paint a Terminal tab");
+            driver.click(x, y);
+
+            assert!(
+                h.engine.borrow().terminal_has_focus,
+                "clicking the bottom panel's tab strip must not steal focus \
+                 from an already-focused terminal"
+            );
+        }
+
         /// An **open but empty** quickfix list must reserve no rows — paint-
         /// only twin of `shell_app.rs`'s
         /// `empty_quickfix_does_not_displace_the_terminal_band_via_shell_app`:
@@ -6616,8 +7074,11 @@ mod tests {
             let mut engine = plain_engine();
             engine.buffer_mut().insert(0, "ZQXW_TERM_FOCUS_LINE\n");
             engine.terminal_new_tab(80, 10);
-            engine.terminal_has_focus = true;
             let mut h = harness_no_sidebar(engine);
+            // Set terminal focus *after* `harness_no_sidebar`: its
+            // `collapse_sidebar` clicks activate the Explorer panel (a
+            // focus-grant site), which clears `terminal_has_focus`.
+            h.engine.borrow_mut().terminal_has_focus = true;
             let driver = &mut h.driver;
 
             // 'dd' would delete the line under Normal-mode dispatch; with
@@ -6707,8 +7168,11 @@ mod tests {
         fn terminal_ctrl_f_opens_the_painted_find_bar() {
             let mut engine = plain_engine();
             engine.terminal_new_tab(80, 10);
-            engine.terminal_has_focus = true;
             let mut h = harness_no_sidebar(engine);
+            // Set terminal focus *after* `harness_no_sidebar`: its
+            // `collapse_sidebar` clicks activate the Explorer panel (a
+            // focus-grant site), which clears `terminal_has_focus`.
+            h.engine.borrow_mut().terminal_has_focus = true;
             let driver = &mut h.driver;
 
             known_bug_gate(
@@ -6725,6 +7189,118 @@ mod tests {
                         driver.screen()
                     );
                 },
+            );
+        }
+
+        /// Opening the terminal via the accelerator sizes its PTY from the
+        /// full painted editor width, reserving only the one-cell scrollbar
+        /// gutter (`UnitProfile::terminal_scrollbar_gutter`) a cell-grid
+        /// backend actually has room for, not a pixel-sized gutter
+        /// mistakenly subtracted as whole columns. On an 80-column,
+        /// no-sidebar TUI window `App::terminal_panel_cols` resolves the
+        /// painted editor width (77 cols) minus that one-cell gutter to 76
+        /// columns. Mirrors the GTK precedent
+        /// (`issue_1421_terminal_size_derived_from_layout`'s
+        /// `opening_a_terminal_in_a_wide_window_sizes_the_pty_from_the_
+        /// painted_layout_on_gtk`), which asserts on the same
+        /// `TerminalSession::cols()` signal.
+        #[test]
+        fn opening_a_terminal_on_tui_sizes_the_pty_within_one_column_of_the_painted_width() {
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_OPEN_TERMINAL),
+                quadraui::Modifiers::default(),
+            ));
+            // Drains the `DeferredAction::ToggleTerminal` the accelerator
+            // arm queued, which is what actually calls `terminal_new_tab`.
+            driver.tick();
+
+            let cols = h
+                .engine
+                .borrow()
+                .terminal_panes
+                .first()
+                .map(|slot| slot.session.cols());
+            assert_eq!(
+                cols,
+                Some(75),
+                "an 80-column, no-sidebar TUI window's terminal PTY should be \
+                 sized within one column of the painted editor width (75 \
+                 cols), reserving the one-cell scrollbar gutter and the \
+                 activity-bar accent column; a pixel-count gutter wrongly \
+                 subtracted as whole TUI columns would land this several \
+                 columns narrower (71) instead"
+            );
+        }
+
+        /// The one-cell gutter the TUI reserves is a real, hit-testable
+        /// scrollbar, not dead space: a press on the painted track must page
+        /// the terminal's scrollback and repaint the body with older output.
+        ///
+        /// `paint_bottom_panel_rung` only registers a
+        /// `quadraui::SurfaceScrollbar` on the `terminal_scrollback` scroll
+        /// surface when `BottomPanelUnits::terminal_scrollbar` is `Some`, and
+        /// `quadraui::dispatch_click` only hit-tests a track that exists — so
+        /// a cell backend that reserves the gutter width but registers no
+        /// scrollbar swallows the press as a plain body click and leaves the
+        /// live view painted.
+        ///
+        /// The track is located from the surface the paint pass registered
+        /// (never hardcoded coordinates) and the assertion is on painted
+        /// text: the newest line must leave the screen once the track press
+        /// pages back into history.
+        #[test]
+        fn pressing_the_painted_terminal_scrollbar_track_on_tui_scrolls_the_scrollback() {
+            // Distinctive enough that no shell prompt or ambient PTY output
+            // can produce it, and numbered so "newest" is unambiguous.
+            let newest = "ZQXWSCROLL59";
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let mut h = harness_no_sidebar(engine);
+
+            // Synthetic scrollback, fed straight into the pane's parser so
+            // the test doesn't depend on a real shell's output timing.
+            {
+                let mut e = h.engine.borrow_mut();
+                let session = &mut e.terminal_panes[0].session;
+                for i in 0..60 {
+                    session.feed_for_bench(format!("ZQXWSCROLL{i}\r\n").as_bytes());
+                }
+            }
+            h.driver.tick();
+
+            assert!(
+                h.driver.screen_has(newest),
+                "precondition: the live view paints the newest scrollback line; \
+                 screen:\n{}",
+                h.driver.screen()
+            );
+
+            let track = h
+                .engine
+                .borrow()
+                .scroll_surfaces
+                .borrow()
+                .iter()
+                .find(|s| s.id.as_str() == "terminal_scrollback")
+                .and_then(|s| s.scrollbar.as_ref())
+                .map(|sb| sb.track_bounds)
+                .expect(
+                    "the terminal panel must register a hit-testable scrollbar \
+                     over its reserved gutter",
+                );
+            // Top of the track: with the view live the thumb sits at the
+            // bottom of an inverted track, so this is a page-back press.
+            h.driver
+                .click(track.x + 0.5, track.y + f32::min(0.5, track.height / 2.0));
+
+            assert!(
+                !h.driver.screen_has(newest),
+                "pressing the terminal scrollbar track must page the painted \
+                 scrollback back so the newest line leaves the screen; \
+                 screen:\n{}",
+                h.driver.screen()
             );
         }
     }
@@ -17234,5 +17810,216 @@ mod tests {
                 "#1739: the extension must still be marked installed"
             );
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Ex commands expand a leading `~` in a file-path argument before
+    // resolving it, so `:vsplit ~/foo.txt` opens the real file under the
+    // home directory rather than an empty buffer for a literal path under a
+    // directory named `~`.
+    mod tilde_expansion_1847 {
+        use super::*;
+
+        /// RAII guard returned by [`fresh_test_home_with_file`]: restores the
+        /// previous `$HOME` override (via the inner `TestHomeGuard`) *and*
+        /// deletes the temp directory it created, so the test doesn't leave
+        /// a populated fake-home tree behind on disk.
+        struct FreshHomeGuard {
+            _home_guard: crate::core::paths::TestHomeGuard,
+            dir: std::path::PathBuf,
+        }
+
+        impl Drop for FreshHomeGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        /// Point `$HOME` at a fresh, unique temp dir holding one real file
+        /// with distinctive content, for the duration of the returned guard.
+        fn fresh_test_home_with_file(tag: &str, file_name: &str, content: &str) -> FreshHomeGuard {
+            static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let home = std::env::temp_dir().join(format!(
+                "vimcode_test_1847_home_{tag}_{}_{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join(file_name), content).unwrap();
+            let home_guard = crate::core::paths::set_test_home(&home);
+            FreshHomeGuard {
+                _home_guard: home_guard,
+                dir: home,
+            }
+        }
+
+        /// `:vsplit ~/<file>` must expand `~` to the test `$HOME` and open
+        /// that file's real contents in the new split, not an empty buffer
+        /// for a literal path under a directory named `~`.
+        #[test]
+        fn vsplit_tilde_path_opens_real_file_contents() {
+            let _home_guard =
+                fresh_test_home_with_file("vsplit", "issue1847.txt", "ISSUE1847_TILDE_OK");
+
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "vsplit ~/issue1847.txt".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ISSUE1847_TILDE_OK"),
+                "`:vsplit ~/issue1847.txt` must expand `~` to the home \
+                 directory and open the real file's contents, not an empty \
+                 buffer for a literal path under a directory named `~`; \
+                 screen:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_colorscheme_cycles_on_return() {
+        use crate::core::engine::sidebar::PANEL_SETTINGS;
+
+        let mut engine = plain_engine();
+        engine.toggle_sidebar_panel(PANEL_SETTINGS);
+        let mut h = harness(engine);
+        let driver = &mut h.driver;
+
+        known_bug_gate("app_on_tui::settings_colorscheme_cycles_on_return", || {
+            let before = driver.screen();
+            assert!(
+                before.contains("dark"),
+                "precondition: default colorscheme is dark"
+            );
+
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+
+            let after = driver.screen();
+            assert!(
+                after.contains("vscode-dark"),
+                "colorscheme must cycle from dark to vscode-dark after Return; screen:\n{after}"
+            );
+        });
+    }
+
+    #[test]
+    fn settings_colorscheme_cycles_after_click_open() {
+        use crate::core::engine::sidebar::PANEL_SETTINGS;
+
+        let engine = plain_engine();
+        let mut h = harness(engine);
+
+        known_bug_gate(
+            "app_on_tui::settings_colorscheme_cycles_after_click_open",
+            || {
+                // Open settings by clicking the settings icon — the real user flow
+                let bounds = h
+                    .driver
+                    .inventory()
+                    .zones()
+                    .iter()
+                    .find(|z| z.id.as_str() == PANEL_SETTINGS)
+                    .map(|z| z.bounds)
+                    .expect("settings icon must register a chrome zone");
+                h.driver.click(
+                    bounds.x + bounds.width / 2.0,
+                    bounds.y + bounds.height / 2.0,
+                );
+
+                let screen = h.driver.screen();
+                eprintln!("=== After clicking settings icon ===");
+                eprintln!("{}", &screen[..screen.len().min(1200)]);
+
+                {
+                    let engine = h.engine.borrow();
+                    eprintln!("settings_has_focus: {}", engine.settings_has_focus);
+                    eprintln!("settings_modal_open: {}", engine.settings_modal_open);
+                    eprintln!("settings_selected: {}", engine.settings_selected);
+                    eprintln!("activity_bar_focused: {}", engine.activity_bar_focused);
+                    let flat = engine.settings_flat_list();
+                    for (i, row) in flat.iter().enumerate().take(5) {
+                        eprintln!("  flat[{i}] = {row:?}");
+                    }
+                }
+
+                // Press Enter to cycle colorscheme
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+                    modifiers: quadraui::Modifiers::default(),
+                    repeat: false,
+                });
+
+                let after = h.driver.screen();
+                eprintln!("=== After pressing Enter ===");
+                eprintln!("{}", &after[..after.len().min(1200)]);
+
+                {
+                    let engine = h.engine.borrow();
+                    eprintln!("colorscheme now: {}", engine.settings.colorscheme);
+                    eprintln!("settings_selected: {}", engine.settings_selected);
+                    eprintln!("settings_has_focus: {}", engine.settings_has_focus);
+                    eprintln!("activity_bar_focused: {}", engine.activity_bar_focused);
+                }
+
+                assert_eq!(
+                    h.engine.borrow().settings.colorscheme,
+                    "vscode-dark",
+                    "colorscheme must cycle from dark to vscode-dark after Enter"
+                );
+            },
+        );
+    }
+
+    /// When the saved colorscheme is not in `available_colorschemes()` (e.g.
+    /// a deprecated alias like "vscode-dark-modern"), Enter must still cycle
+    /// to the first available option instead of silently doing nothing.
+    #[test]
+    fn settings_colorscheme_cycles_even_when_current_value_unlisted() {
+        use crate::core::engine::sidebar::PANEL_SETTINGS;
+
+        let engine = plain_engine();
+        let mut h = harness(engine);
+
+        known_bug_gate(
+            "app_on_tui::settings_colorscheme_cycles_even_when_current_value_unlisted",
+            || {
+                h.engine.borrow_mut().settings.colorscheme = "vscode-dark-modern".to_string();
+
+                let bounds = h
+                    .driver
+                    .inventory()
+                    .zones()
+                    .iter()
+                    .find(|z| z.id.as_str() == PANEL_SETTINGS)
+                    .map(|z| z.bounds)
+                    .expect("settings icon zone");
+                h.driver.click(
+                    bounds.x + bounds.width / 2.0,
+                    bounds.y + bounds.height / 2.0,
+                );
+
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+                    modifiers: quadraui::Modifiers::default(),
+                    repeat: false,
+                });
+                assert_ne!(
+                    h.engine.borrow().settings.colorscheme,
+                    "vscode-dark-modern",
+                    "colorscheme must cycle away from an unlisted value"
+                );
+            },
+        );
     }
 }

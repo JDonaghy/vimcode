@@ -1,6 +1,6 @@
 [package]
 name = "vimcode"
-version = "0.15.3"
+version = "0.15.4"
 edition = "2021"
 description = "Vim-like code editor with GTK4 and tree-sitter"
 license = "MIT"
@@ -228,8 +228,8 @@ test-build-guard = []
 # checkout" section) — a `paths` override works the same way it did against
 # the git dependency, redirecting the build to the local checkout by package
 # name, as long as the local checkout's own `Cargo.toml` version satisfies
-# `^0.1`.
-quadraui = { version = "0.1.8", features = ["tui", "terminal"] }
+# `^0.2`.
+quadraui = { version = "0.2.1", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole

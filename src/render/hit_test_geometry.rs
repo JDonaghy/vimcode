@@ -1099,6 +1099,16 @@ pub struct UnitProfile {
     /// `quadraui::tui::rich_text_popup`'s 2-cell-x/1-cell-y on TUI. Both the
     /// press and drag handlers need the same value for consistent hit-testing.
     pub hover_popup_pad: (f32, f32),
+    /// Terminal panel scrollbar gutter width, in this profile's own units:
+    /// `6.0` real pixels (GTK/macOS/Win, sized for the painted scrollbar
+    /// strip) or `1.0` cell (TUI, matching quadraui's own
+    /// `Backend::terminal_scrollbar_default_width` cell-grid default).
+    /// Subtracted from the terminal panel's width before converting to
+    /// columns ([`crate::app::App::terminal_panel_cols`]), passed as the
+    /// explicit [`crate::render::BottomPanelUnits::terminal_scrollbar`]
+    /// override so vimcode's own `ScrollSurface` hit region covers it, and
+    /// clamps the `TerminalSplitDivider` drag.
+    pub terminal_scrollbar_gutter: f64,
 }
 
 impl UnitProfile {
@@ -1127,6 +1137,7 @@ impl UnitProfile {
             is_gui_backend: true,
             explorer_row_h: |lh| (lh * 1.4).round(),
             hover_popup_pad: (4.0, 4.0),
+            terminal_scrollbar_gutter: 6.0,
         }
     }
 
@@ -1165,6 +1176,7 @@ impl UnitProfile {
             is_gui_backend: false,
             explorer_row_h: |lh| lh,
             hover_popup_pad: (2.0, 1.0),
+            terminal_scrollbar_gutter: 1.0,
         }
     }
 }

@@ -168,8 +168,8 @@ jobs:
         ```
 
         **GUI — testing only, not ready for use**
-        - **Native (AppKit, no dependencies):** download `vimcode-macos-native-arm64.tar.gz`, then `tar xzf vimcode-macos-native-arm64.tar.gz && xattr -d com.apple.quarantine vimcode && ./vimcode`. Launch it from a normal Terminal window: launched from a tmux server that predates your login session, macOS won't let it come to the front.
-        - **GTK4:** `brew install vimcode` (GTK4 GUI + TUI), or download `vimcode-macos-arm64.tar.gz`; requires GTK4 via Homebrew (`brew install gtk4`).
+        - **Native (AppKit, recommended):** `brew tap JDonaghy/vimcode && brew install vimcode` (then `ln -sf $(brew --prefix)/opt/vimcode/VimCode.app /Applications/VimCode.app` for Spotlight/Dock), or download `vimcode-macos-native-arm64.tar.gz`, extract and drag `VimCode.app` to `/Applications`. Ad-hoc signed — if macOS blocks it: `xattr -dr com.apple.quarantine VimCode.app`. No dependencies.
+        - **GTK4:** download `vimcode-macos-arm64.tar.gz`; requires GTK4 via Homebrew (`brew install gtk4`).
 
         ### Windows
 
@@ -257,13 +257,68 @@ jobs:
         codesign --sign - --force target/release/vimcode
         codesign --sign - --force target/release/vcd
         strip target-native/release/vimcode
-        codesign --sign - --force target-native/release/vimcode
+
+    - name: Build native macOS .app bundle
+      env:
+        VERSION: ${{ needs.build-and-release.outputs.version }}
+      run: |
+        APP="VimCode.app"
+        mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+        cp target-native/release/vimcode "$APP/Contents/MacOS/VimCode"
+
+        # Convert PNG icon to .icns
+        ICONSET=$(mktemp -d)/VimCode.iconset
+        mkdir -p "$ICONSET"
+        for size in 16 32 128 256 512; do
+          sips -z $size $size data/icons/io.github.jdonaghy.VimCode.png \
+            --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+          double=$((size * 2))
+          if [ $double -le 1024 ]; then
+            sips -z $double $double data/icons/io.github.jdonaghy.VimCode.png \
+              --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+          fi
+        done
+        iconutil -c icns -o "$APP/Contents/Resources/VimCode.icns" "$ICONSET"
+
+        cat > "$APP/Contents/Info.plist" <<PLIST
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+          "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>CFBundleName</key>
+          <string>VimCode</string>
+          <key>CFBundleDisplayName</key>
+          <string>VimCode</string>
+          <key>CFBundleIdentifier</key>
+          <string>io.github.jdonaghy.VimCode</string>
+          <key>CFBundleVersion</key>
+          <string>${VERSION}</string>
+          <key>CFBundleShortVersionString</key>
+          <string>${VERSION}</string>
+          <key>CFBundleExecutable</key>
+          <string>VimCode</string>
+          <key>CFBundleIconFile</key>
+          <string>VimCode</string>
+          <key>CFBundlePackageType</key>
+          <string>APPL</string>
+          <key>CFBundleInfoDictionaryVersion</key>
+          <string>6.0</string>
+          <key>NSHighResolutionCapable</key>
+          <true/>
+          <key>LSMinimumSystemVersion</key>
+          <string>13.0</string>
+        </dict>
+        </plist>
+        PLIST
+
+        codesign --sign - --force --deep "$APP"
 
     - name: Package as tarballs
       run: |
         tar czf vimcode-macos-arm64.tar.gz -C target/release vimcode
         tar czf vcd-macos-arm64.tar.gz -C target/release vcd
-        tar czf vimcode-macos-native-arm64.tar.gz -C target-native/release vimcode
+        tar czf vimcode-macos-native-arm64.tar.gz VimCode.app
 
     - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v2

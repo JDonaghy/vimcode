@@ -254,6 +254,77 @@ fn test_big_p_paste_above() {
     assert_eq!(lines[1], "world"); // pasted above line 1
 }
 
+#[test]
+fn test_second_yy_overwrites_register() {
+    let mut e = engine_with("first\nsecond\nthird\n");
+    type_chars(&mut e, "yy");
+    type_chars(&mut e, "j");
+    type_chars(&mut e, "yy");
+    type_chars(&mut e, "j");
+    type_chars(&mut e, "p");
+    let lines = get_lines(&e);
+    assert_eq!(
+        lines[3], "second",
+        "second yy must overwrite the unnamed register; got lines: {:?}",
+        lines
+    );
+}
+
+#[test]
+fn test_yw_twice_pastes_second_yank() {
+    let mut e = engine_with("alpha beta\ngamma delta\n");
+    type_chars(&mut e, "yw");
+    type_chars(&mut e, "j");
+    type_chars(&mut e, "yw");
+    type_chars(&mut e, "p");
+    let line = &get_lines(&e)[1];
+    assert!(
+        line.starts_with("ggamma"),
+        "second yw must overwrite the unnamed register; got: {:?}",
+        line
+    );
+}
+
+/// With a system clipboard wired, the second `yy` must still overwrite
+/// the unnamed register and paste correctly. Before the fix,
+/// `load_clipboard_for_paste` contaminated the `+` register, which
+/// blocked `sync_register_to_clipboard` from syncing subsequent yanks.
+#[test]
+fn test_second_yy_with_clipboard_pastes_second_yank() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut e = engine_with("first\nsecond\nthird\n");
+    let clip: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let clip_w = clip.clone();
+    let clip_r = clip.clone();
+    e.clipboard_write = Some(Box::new(move |text: &str| {
+        *clip_w.borrow_mut() = Some(text.to_string());
+        Ok(())
+    }));
+    e.clipboard_read = Some(Box::new(move || {
+        clip_r.borrow().clone().ok_or_else(|| "empty".to_string())
+    }));
+
+    let mut last_clip: Option<String> = None;
+    type_chars(&mut e, "yy");
+    vimcode_core::render::sync_register_to_clipboard(&mut e, &mut last_clip);
+
+    type_chars(&mut e, "j");
+    type_chars(&mut e, "yy");
+    vimcode_core::render::sync_register_to_clipboard(&mut e, &mut last_clip);
+
+    type_chars(&mut e, "j");
+    vimcode_core::render::preload_paste_clipboard(&mut e, "p", Some('p'), false);
+    type_chars(&mut e, "p");
+
+    let lines = get_lines(&e);
+    assert_eq!(
+        lines[3], "second",
+        "with clipboard wired, second yy must still paste correctly; got: {:?}",
+        lines
+    );
+}
+
 // ── Text objects ──────────────────────────────────────────────────────────────
 
 #[test]

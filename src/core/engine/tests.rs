@@ -8137,6 +8137,99 @@ fn test_prev_visible_line_skips_outermost_nested_closed_fold() {
     );
 }
 
+// ── zc/za/zo/zM auto-detect a block from indentation without `zf` ──────────
+//
+// The gutter's hover fold marker (`fold_indicator_char`) already shows `-`
+// on a Rust block header purely from indentation, with no `zf` involved.
+// These cover the z-commands agreeing with that marker under the default
+// `'foldmethod'` `"manual"`, instead of reporting `E490`.
+
+#[test]
+fn test_zc_closes_rust_block_without_zf() {
+    let mut engine = make_indented_engine();
+    engine.view_mut().cursor.line = 0; // "fn foo() {"
+    engine.feed_keys("zc");
+    assert!(
+        engine.view().fold_at(0).is_some(),
+        "zc should auto-detect and close the fn block from indentation alone"
+    );
+    let fold = engine.view().fold_at(0).unwrap();
+    assert_eq!(fold.end, 3, "fold should span the whole indented body");
+    assert!(!engine.message.contains("E490"));
+}
+
+#[test]
+fn test_zo_reopens_auto_detected_fold() {
+    let mut engine = make_indented_engine();
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("zc");
+    assert!(engine.view().fold_at(0).is_some());
+    engine.feed_keys("zo");
+    assert!(
+        engine.view().fold_at(0).is_none(),
+        "zo should reopen the fold zc auto-detected"
+    );
+}
+
+#[test]
+fn test_za_closes_rust_block_without_zf() {
+    let mut engine = make_indented_engine();
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("za");
+    assert!(
+        engine.view().fold_at(0).is_some(),
+        "za should auto-detect and close the fn block from indentation alone"
+    );
+}
+
+#[test]
+fn test_zc_from_inside_body_without_zf() {
+    let mut engine = make_indented_engine();
+    engine.view_mut().cursor.line = 2; // "    let y = 2;" — inside the body
+    engine.feed_keys("zc");
+    assert!(
+        engine.view().fold_at(0).is_some(),
+        "zc inside an undefined block's body should find and close its enclosing header"
+    );
+    assert_eq!(
+        engine.view().cursor.line,
+        0,
+        "cursor should be pulled up to the fold header"
+    );
+}
+
+#[test]
+fn test_zm_closes_rust_blocks_without_zf() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(
+        0,
+        "fn main() {\n    let x = 1;\n}\nfn foo() {\n    bar();\n}\n",
+    );
+    engine.feed_keys("zM");
+    assert!(
+        engine.view().fold_at(0).is_some(),
+        "zM should auto-detect and close the first fn block"
+    );
+    assert!(
+        engine.view().fold_at(3).is_some(),
+        "zM should auto-detect and close the second fn block"
+    );
+}
+
+#[test]
+fn test_zc_still_reports_e490_on_flat_text() {
+    // No indentation change anywhere — `detect_fold_range` finds nothing,
+    // so `zc` still has no fold to close.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+    engine.feed_keys("zc");
+    assert!(
+        engine.message.contains("E490"),
+        "flat text has no foldable block, unexpected message: {}",
+        engine.message
+    );
+}
+
 // ── Auto-indent tests ─────────────────────────────────────────────────────
 
 #[test]
@@ -20621,6 +20714,77 @@ fn test_clear_sidebar_focus() {
     assert!(!engine.activity_bar_focused);
 }
 
+/// `clear_sidebar_focus` only clears the nine sidebar-band flags; it must
+/// leave `terminal_has_focus` untouched. It is called from focus-*release*
+/// paths too (hiding the sidebar, a mouse click on the bottom panel) where a
+/// terminal that is genuinely still focused must not lose that focus.
+/// Terminal focus is instead cleared at the specific focus-*grant* call
+/// sites (`Engine::focus_sidebar_panel`, the show branch of
+/// `Engine::toggle_sidebar_panel`) that actually hand focus to a sidebar
+/// panel.
+#[test]
+fn test_clear_sidebar_focus_leaves_terminal_focus_untouched() {
+    let mut engine = Engine::new();
+    engine.terminal_new_tab(80, 24);
+    engine.terminal_has_focus = true;
+    engine.explorer_has_focus = true;
+
+    engine.clear_sidebar_focus();
+
+    assert!(!engine.explorer_has_focus);
+    assert!(
+        engine.terminal_has_focus,
+        "clear_sidebar_focus must not clear terminal focus"
+    );
+}
+
+/// `Engine::toggle_sidebar()` (the plain visibility toggle reached by the
+/// global `Ctrl-B` accelerator) hides the sidebar via `clear_sidebar_focus`
+/// when collapsing it. A terminal that was focused before the sidebar
+/// collapsed must still be focused afterward.
+#[test]
+fn test_toggle_sidebar_hide_leaves_terminal_focus_untouched() {
+    let mut engine = Engine::new();
+    engine.terminal_new_tab(80, 24);
+    engine.terminal_has_focus = true;
+    engine.focus_sidebar_panel(sidebar::PANEL_EXPLORER);
+    // `focus_sidebar_panel` is itself a focus-grant site, so re-arm the flag
+    // the same way a user would: the terminal regains focus some other way
+    // (e.g. clicking into it) while the sidebar stays open.
+    engine.terminal_has_focus = true;
+    assert!(engine.app_shell.sidebar_visible());
+
+    engine.toggle_sidebar();
+
+    assert!(!engine.app_shell.sidebar_visible());
+    assert!(
+        engine.terminal_has_focus,
+        "collapsing the sidebar must not steal focus from an already-focused terminal"
+    );
+}
+
+/// `Engine::toggle_sidebar_panel`'s hide branch (reached by clicking an
+/// already-active activity-bar icon, via
+/// `render::apply_activity_panel_switch`) must behave the same way: a
+/// focused terminal stays focused when the panel is toggled closed.
+#[test]
+fn test_toggle_sidebar_panel_hide_leaves_terminal_focus_untouched() {
+    let mut engine = Engine::new();
+    engine.terminal_new_tab(80, 24);
+    engine.focus_sidebar_panel(sidebar::PANEL_EXPLORER);
+    engine.terminal_has_focus = true;
+    assert!(engine.app_shell.sidebar_visible());
+
+    // Same panel id, already visible: takes the hide branch.
+    engine.toggle_sidebar_panel(sidebar::PANEL_EXPLORER);
+
+    assert!(!engine.app_shell.sidebar_visible());
+    assert!(
+        engine.terminal_has_focus,
+        "toggling a sidebar panel closed must not steal focus from an already-focused terminal"
+    );
+}
+
 #[test]
 fn test_explorer_focus_blocks_normal_keys() {
     let mut engine = engine_with_text("hello world\n");
@@ -24258,6 +24422,39 @@ fn test_close_all_tabs_method() {
     e.close_all_tabs();
     // close_tab always leaves at least 1 scratch buffer.
     assert_eq!(e.active_group().tabs.len(), 1);
+}
+
+#[test]
+fn test_tab_context_menu_close_right_keeps_tabs_before_target() {
+    // 4 tabs total: [0, 1, 2, 3]. Right-click tab 1 and choose
+    // "Close to the Right": only tabs 2 and 3 (after the target) should
+    // close. Tab 0, which sits *before* the target, must survive -- unlike
+    // "Close Others", which closes tabs on both sides.
+    let mut e = Engine::new();
+    e.new_tab(None);
+    e.new_tab(None);
+    e.new_tab(None);
+    let gid = e.active_group;
+    assert_eq!(e.active_group().tabs.len(), 4);
+    let tab_ids: Vec<_> = e.active_group().tabs.iter().map(|t| t.id).collect();
+
+    e.open_tab_context_menu(gid, 1, 0, 0);
+    let cm = e.context_menu.as_mut().unwrap();
+    let idx = cm
+        .items
+        .iter()
+        .position(|i| i.action == "close_right")
+        .unwrap();
+    cm.selected = idx;
+    e.context_menu_confirm();
+
+    let remaining: Vec<_> = e.active_group().tabs.iter().map(|t| t.id).collect();
+    assert_eq!(
+        remaining,
+        vec![tab_ids[0], tab_ids[1]],
+        "Close to the Right must keep tab 0 (before target) and tab 1 (target), \
+         closing only tabs 2 and 3 (after target)"
+    );
 }
 
 // ── Explorer inline rename improvements ──────────────────────────────────────
@@ -32499,7 +32696,92 @@ fn test_edit_bang_bypasses_dirty_guard_1190() {
     let action = type_command_action(&mut engine, "edit! somefile_1190.txt");
     assert_eq!(
         action,
-        EngineAction::OpenFile(std::path::PathBuf::from("somefile_1190.txt"))
+        EngineAction::OpenFile(engine.cwd.join("somefile_1190.txt")),
+        "`:edit!` resolves a relative path argument against the engine cwd, \
+         so the action carries an absolute path"
+    );
+}
+
+#[test]
+fn test_edit_expands_tilde_in_path_arg_1847() {
+    let home = std::env::temp_dir().join(format!(
+        "vimcode_test_1847_engine_edit_{}",
+        std::process::id()
+    ));
+    let _guard = crate::core::paths::set_test_home(&home);
+
+    let mut engine = Engine::new();
+    engine.settings.hidden = false;
+    let action = type_command_action(&mut engine, "edit ~/somefile_1847.txt");
+    assert_eq!(
+        action,
+        EngineAction::OpenFile(home.join("somefile_1847.txt")),
+        "`:edit ~/...` expands `~` to the home directory before resolving \
+         the path"
+    );
+}
+
+#[test]
+fn test_read_expands_tilde_in_path_arg_1847() {
+    let home = std::env::temp_dir().join(format!(
+        "vimcode_test_1847_engine_read_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("readme_1847.txt"), "READ1847_TILDE_OK\n").unwrap();
+    let _guard = crate::core::paths::set_test_home(&home);
+
+    let mut engine = Engine::new();
+    let action = type_command_action(&mut engine, "read ~/readme_1847.txt");
+    assert_eq!(action, EngineAction::None);
+    let content: String = engine.buffer().content.to_string();
+    assert!(
+        content.contains("READ1847_TILDE_OK"),
+        "`:read ~/...` must expand `~` and insert the real file's \
+         contents; buffer:\n{content}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_saveas_expands_tilde_in_path_arg_1847() {
+    let home = std::env::temp_dir().join(format!(
+        "vimcode_test_1847_engine_saveas_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    let _guard = crate::core::paths::set_test_home(&home);
+
+    let mut engine = Engine::new();
+    let _ = type_command_action(&mut engine, "saveas ~/saved_1847.txt");
+    let file_path = engine
+        .buffer_manager
+        .get(engine.active_buffer_id())
+        .unwrap()
+        .file_path
+        .clone();
+    assert_eq!(file_path, Some(home.join("saved_1847.txt")));
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_resolve_path_arg_expands_tilde_1847() {
+    let home = std::env::temp_dir().join(format!(
+        "vimcode_test_1847_engine_resolve_{}",
+        std::process::id()
+    ));
+    let _guard = crate::core::paths::set_test_home(&home);
+
+    let engine = Engine::new();
+    assert_eq!(
+        engine.resolve_path_arg("~/somefile_1847.txt"),
+        home.join("somefile_1847.txt")
+    );
+    assert_eq!(
+        engine.resolve_path_arg("relative_1847.txt"),
+        engine.cwd.join("relative_1847.txt")
     );
 }
 
@@ -35347,4 +35629,201 @@ fn test_1160_ctrl_x_ctrl_f_wins_over_ctrl_f_find_replace_binding() {
         "find/replace must not have opened"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+/// Mouse-driven selection, opening find/replace with Ctrl+F, toggling
+/// "find in selection" (the ≡ button), typing a query, closing, reselecting,
+/// and reopening must all agree on the selection bound — not just the single
+/// `open_find_replace()`/`toggle_find_replace_in_selection()` calls a
+/// white-box test would make directly.
+#[test]
+fn test_find_in_selection_full_mouse_driven_cycle() {
+    let mut engine = Engine::new();
+    engine.settings.ctrl_f_action = Some("find".to_string());
+    engine.buffer_mut().insert(0, "foo foo foo\nfoo foo\n");
+    engine.update_syntax();
+    let wid = engine.active_window_id();
+
+    // Select "foo foo" on line 0 (cols 0..6, the first two words) by mouse drag.
+    engine.mouse_click(wid, 0, 0);
+    engine.mouse_drag(wid, 0, 6);
+    assert_eq!(engine.mode, Mode::Visual);
+
+    // Ctrl+F opens find/replace and must preserve the selection.
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
+    assert!(engine.visual_anchor.is_some(), "selection lost on open");
+
+    engine.find_replace_query = "foo".to_string();
+    engine.run_find_replace_search();
+    let total_matches = engine.search_matches.len();
+    assert_eq!(total_matches, 5, "sanity: 'foo' appears 5 times total");
+
+    // Click the ≡ toggle — matches must narrow to the selection.
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleInSelection);
+    assert_eq!(
+        engine.search_matches.len(),
+        2,
+        "toggling find-in-selection must narrow matches to the 2 'foo's inside the selection"
+    );
+
+    // Close, reselect a *different* span, and reopen — the overlay must not
+    // leak the previous selection's range or the toggle's stale state.
+    press_special(&mut engine, "Escape");
+    assert!(!engine.find_replace_open);
+
+    // Select "foo foo" on line 1 this time (cols 0..6).
+    engine.mouse_click(wid, 1, 0);
+    engine.mouse_drag(wid, 1, 6);
+    assert_eq!(engine.mode, Mode::Visual);
+
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
+    assert!(engine.visual_anchor.is_some(), "selection lost on reopen");
+
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleInSelection);
+    // Typing re-runs the search on every keystroke — simulate backspacing the
+    // prefilled query and retyping "foo" one character at a time.
+    while !engine.find_replace_query.is_empty() {
+        press_special(&mut engine, "BackSpace");
+    }
+    for ch in "foo".chars() {
+        press_char(&mut engine, ch);
+    }
+    assert_eq!(
+        engine.search_matches.len(),
+        2,
+        "after close/reselect/reopen, matches must stay scoped to the new selection"
+    );
+}
+
+/// Reselecting a new single-line span and reopening find/replace *without*
+/// closing it first must not leak a stale selection range or toggle state
+/// from the previous selection into the new one.
+#[test]
+fn test_find_in_selection_reselect_without_closing() {
+    let mut engine = Engine::new();
+    engine.settings.ctrl_f_action = Some("find".to_string());
+    engine.buffer_mut().insert(0, "foo foo foo\nfoo foo\n");
+    engine.update_syntax();
+    let wid = engine.active_window_id();
+
+    // Select "foo foo" on line 0 (cols 0..6) via double-click + drag-equivalent.
+    engine.mouse_click(wid, 0, 0);
+    engine.mouse_drag(wid, 0, 6);
+    assert_eq!(engine.mode, Mode::Visual);
+
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
+    engine.find_replace_query = "foo".to_string();
+    engine.run_find_replace_search();
+
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleInSelection);
+    assert_eq!(
+        engine.search_matches.len(),
+        2,
+        "narrowed to first selection"
+    );
+
+    // Without pressing Escape or otherwise closing the overlay, make a new
+    // single-line selection elsewhere and reopen find/replace on it.
+    engine.mouse_click(wid, 1, 0);
+    engine.mouse_drag(wid, 1, 6);
+    assert_eq!(engine.mode, Mode::Visual);
+
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
+    engine.find_replace_query = "foo".to_string();
+    engine.run_find_replace_search();
+
+    assert_eq!(
+        engine.search_matches.len(),
+        2,
+        "reopening on a new selection without closing must scope matches to \
+         the new selection, not the stale one"
+    );
+}
+
+/// With find-in-selection active and no match inside the selection,
+/// navigating (the `↓`/`↑` buttons, `Enter`, `Down`/`Up`) must stay scoped:
+/// it may not repopulate `search_matches` with whole-buffer hits that then
+/// paint as highlights and as a buffer-wide match count.
+#[test]
+fn test_find_in_selection_nav_stays_within_selection() {
+    let mut engine = Engine::new();
+    engine.settings.ctrl_f_action = Some("find".to_string());
+    engine
+        .buffer_mut()
+        .insert(0, "alpha beta\nfoo bar foo\ngamma foo\n");
+    engine.update_syntax();
+    let wid = engine.active_window_id();
+
+    // Select line 0 ("alpha beta") — it contains no "foo".
+    engine.mouse_click(wid, 0, 0);
+    engine.mouse_drag(wid, 0, 10);
+    assert_eq!(engine.mode, Mode::Visual);
+
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleInSelection);
+    while !engine.find_replace_query.is_empty() {
+        press_special(&mut engine, "BackSpace");
+    }
+    for ch in "foo".chars() {
+        press_char(&mut engine, ch);
+    }
+    assert!(
+        engine.search_matches.is_empty(),
+        "sanity: no 'foo' inside the selected line"
+    );
+
+    engine.handle_find_replace_click(FindReplaceClickTarget::NextMatch);
+    assert!(
+        engine.search_matches.is_empty(),
+        "the next-match button must not repopulate out-of-selection matches, \
+         got {:?}",
+        engine.search_matches
+    );
+
+    engine.handle_find_replace_click(FindReplaceClickTarget::PrevMatch);
+    assert!(
+        engine.search_matches.is_empty(),
+        "the prev-match button must not repopulate out-of-selection matches, \
+         got {:?}",
+        engine.search_matches
+    );
+}
+
+/// Navigation must still cycle through the matches that *are* inside the
+/// selection — scoping the fallback must not disable the buttons.
+#[test]
+fn test_find_in_selection_nav_cycles_matches_inside_selection() {
+    let mut engine = Engine::new();
+    engine.settings.ctrl_f_action = Some("find".to_string());
+    engine.buffer_mut().insert(0, "foo bar foo\ngamma foo\n");
+    engine.update_syntax();
+    let wid = engine.active_window_id();
+
+    // Select line 0 ("foo bar foo") — two of the three "foo"s.
+    engine.mouse_click(wid, 0, 0);
+    engine.mouse_drag(wid, 0, 11);
+    press_ctrl(&mut engine, 'f');
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleInSelection);
+    while !engine.find_replace_query.is_empty() {
+        press_special(&mut engine, "BackSpace");
+    }
+    for ch in "foo".chars() {
+        press_char(&mut engine, ch);
+    }
+    assert_eq!(engine.search_matches.len(), 2);
+
+    engine.handle_find_replace_click(FindReplaceClickTarget::NextMatch);
+    assert_eq!(
+        engine.search_matches.len(),
+        2,
+        "navigating inside the selection must keep the scoped match set"
+    );
+    assert!(
+        engine.search_index.is_some(),
+        "navigation must select a match"
+    );
 }

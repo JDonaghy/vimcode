@@ -37,6 +37,31 @@
 //!
 //! This exercises the entire real path for the input decoding through
 //! `App` dispatch with nothing stubbed out.
+//!
+//! # Ruling out a quadraui version bump before suspecting this test
+//!
+//! `quadraui`'s only `src/`-level change between published versions 0.1.7
+//! and 0.1.8 is an additive `ShellApp::pre_render` hook (default no-op) and
+//! its single call site in `shell_adapter.rs`'s `render()`, run before
+//! `viewport`/`area` are computed — confirmed by diffing the two published
+//! crate sources directly. Vimcode's own consumer of that hook
+//! (`App::pre_render` / `App::sync_per_frame_backend_state`) only ever
+//! reaches `Backend::set_current_line_height` when
+//! `resolve_editor_line_height_px` returns `Some`, which per that
+//! function's own doc is true on native macOS only — every other backend,
+//! TUI included, gets `None` and leaves `chrome_line_height()`'s default
+//! (`Self::line_height()`, a fixed per-cell constant on TUI) untouched.
+//! Neither [`ICON_COLUMN`] (derived purely from
+//! `quadraui::shell::ShellConfig::activity_bar_width`) nor
+//! `quadraui::tui::activity_bar::draw_activity_bar_with_style` (byte-
+//! identical between 0.1.7 and 0.1.8) reads chrome line height at all, so
+//! there is no code path through which that version bump can move this
+//! test's expected icon column or its row-discovery polling. If this test
+//! regresses again right after a quadraui bump, suspect real-ConPTY startup
+//! timing (e.g. binary size growth nudging a cold start closer to
+//! [`SETTLE_TIMEOUT`]) or CI/hardware flakiness first, not activity-bar
+//! rendering math — and re-diff the two quadraui versions' `src/` trees
+//! directly before assuming otherwise.
 #![cfg(windows)]
 
 use std::io::{Read, Write};

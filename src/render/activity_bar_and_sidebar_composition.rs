@@ -4,8 +4,11 @@ use super::*;
 
 /// Build a `quadraui::ActivityBar` primitive from engine state.
 ///
-/// Both backends call this once per frame, then delegate to
-/// `quadraui::{tui,gtk}::draw_activity_bar`.
+/// Not on either backend's render path: the activity bar itself is painted
+/// by `quadraui::compose::AppShell::render()` from `App`'s `ShellApp`
+/// wiring, not from this struct. This builder exists for tests that want to
+/// assert on activity-bar item selection/order/icon state without driving a
+/// full `AppShell` frame (see `menu_bar_structure.rs`).
 ///
 /// * `include_hamburger` — `true` for TUI (no native menu bar so the
 ///   hamburger item at keyboard-index 0 provides keyboard access to the
@@ -148,9 +151,18 @@ pub fn build_activity_bar(
             theme.cursor.g,
             theme.cursor.b,
         )),
-        // Signals to the quadraui backend that this bar owns the keyboard so
-        // it intercepts KeyPressed as ActivityBarEvent::KeyPressed.
-        is_keyboard_focused: engine.activity_bar_focused,
+        // Always `false`: setting this makes the TUI/GTK backend reroute the
+        // next raw key into `UiEvent::ActivityBar(id, KeyPressed { .. })`,
+        // which `App` (a `quadraui::ShellApp`) never reads — that event type
+        // is fully consumed by `ShellAdapter::handle` against its own
+        // internal `AppShell`, which this bar's painted state (`kbd_sel`
+        // above, driven by `Engine::activity_bar_focused`/
+        // `activity_bar_selected_item_id`) never reads back from. Leaving
+        // this `false` keeps every key arriving as a raw `KeyPressed`, so
+        // `App::handle_key_press`'s `FocusKeyRoute::ActivityBar` rung (in
+        // `app/input.rs`, backed by `Engine::activity_bar_move_up/down/
+        // activate/focus_out`) stays the sole, working navigation path.
+        is_keyboard_focused: false,
     }
 }
 
@@ -356,6 +368,32 @@ pub fn search_only_chrome(
         fg,
         bg: theme.completion_bg,
     }
+}
+
+pub fn find_chrome(query: &str, placeholder: &str, theme: &Theme) -> SidebarPanelChrome {
+    let show_placeholder = query.is_empty() && !placeholder.is_empty();
+    let fg = if show_placeholder {
+        theme.line_number_fg
+    } else {
+        theme.foreground
+    };
+    let text = if show_placeholder {
+        format!(" Find: {placeholder}")
+    } else {
+        format!(" Find: {query}")
+    };
+    let bg = theme.completion_bg.lighten(0.08);
+    SidebarPanelChrome::StatusBars(vec![quadraui::StatusBar {
+        id: quadraui::WidgetId::new("settings-find"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text,
+            fg,
+            bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: Vec::new(),
+    }])
 }
 
 /// Owned per-frame body for the plugin extension panel (`ext:<name>`) —
@@ -646,7 +684,7 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
         fields.push(field);
     }
 
-    let focused_field = fields.get(engine.settings_selected).map(|f| f.id.clone());
+    let focused_field = fields.get(engine.settings_selected).map(|f| f.id);
 
     Form {
         id: WidgetId::new("settings"),
@@ -705,7 +743,7 @@ pub fn handle_settings_form_ui_event(
     let (probe, activate_row) = match event {
         quadraui::UiEvent::DoubleClick { widget, position } => (
             quadraui::UiEvent::MouseDown {
-                widget: widget.clone(),
+                widget: *widget,
                 button: quadraui::MouseButton::Left,
                 position: *position,
                 modifiers: quadraui::Modifiers::default(),

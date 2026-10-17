@@ -693,7 +693,7 @@ pub fn menu_defs_to_menu_bar(defs: &[quadraui::MenuDef]) -> quadraui::MenuBar {
         items: defs
             .iter()
             .map(|def| quadraui::MenuBarItem {
-                id: def.id.clone(),
+                id: def.id,
                 label: def.label.clone(),
                 disabled: def.disabled,
                 submenu: Some(def.items.clone()),

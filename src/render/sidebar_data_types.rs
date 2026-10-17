@@ -69,7 +69,7 @@ use super::*;
 /// fn compiled into both bin targets, so the compiler keeps them in step
 /// instead of comment discipline.
 ///
-/// Nine of the fifteen rungs are live and six are not, which keeps this
+/// Nine of the sixteen rungs are live and seven are not, which keeps this
 /// discriminating — it must never degenerate into "whatever
 /// [`FRAME_Z_ORDER`] contains".
 #[cfg(test)]
@@ -90,6 +90,7 @@ pub(crate) fn frame_sequence_fixture() -> Vec<FrameOp> {
         tab_switcher: false,
         context_menu: true,
         change_review: false,
+        settings_modal: false,
         dialog: true,
         toast_stack: false,
     })
