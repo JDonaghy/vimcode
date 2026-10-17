@@ -2167,6 +2167,13 @@ impl Engine {
     /// Row types for the settings flat list.
     /// Build the flat list of rows for the Settings sidebar.
     /// Includes both core settings and extension-declared settings.
+    fn first_setting_index(&self) -> usize {
+        self.settings_flat_list()
+            .iter()
+            .position(|r| matches!(r, SettingsRow::CoreSetting(_) | SettingsRow::ExtSetting(..)))
+            .unwrap_or(0)
+    }
+
     pub fn settings_flat_list(&self) -> Vec<SettingsRow> {
         use crate::core::settings::{setting_categories, SETTING_DEFS};
         let cats = setting_categories();
@@ -2341,22 +2348,47 @@ impl Engine {
     pub fn handle_settings_key(&mut self, key: &str, ctrl: bool, unicode: Option<char>) {
         use crate::core::settings::{SettingType, SETTING_DEFS};
 
+        // Modal: printable chars and BackSpace route to the filter directly.
+        // Navigation/activation keys fall through to normal handling.
+        if self.settings_modal_open
+            && self.settings_editing.is_none()
+            && self.ext_settings_editing.is_none()
+        {
+            if key == "BackSpace" {
+                self.settings_query.pop();
+                self.settings_selected = self.first_setting_index();
+                self.settings_scroll_top = 0;
+                return;
+            }
+            if !matches!(key, "Escape" | "Down" | "Up" | "Return" | "Space" | "Tab" | "Right" | "Left") {
+                if let Some(ch) = unicode {
+                    if !ch.is_control() {
+                        self.settings_query.push(ch);
+                        self.settings_selected = self.first_setting_index();
+                        self.settings_scroll_top = 0;
+                    }
+                }
+                return;
+            }
+            // Navigation/activation keys fall through to normal handling below
+        }
+
         // Search input active — route printable chars to query
-        if self.settings_input_active {
+        if self.settings_input_active && !self.settings_modal_open {
             match key {
                 "Escape" | "Return" => {
                     self.settings_input_active = false;
                 }
                 "BackSpace" => {
                     self.settings_query.pop();
-                    self.settings_selected = 0;
+                    self.settings_selected = self.first_setting_index();
                     self.settings_scroll_top = 0;
                 }
                 _ => {
                     if let Some(ch) = unicode {
                         if !ch.is_control() {
                             self.settings_query.push(ch);
-                            self.settings_selected = 0;
+                            self.settings_selected = self.first_setting_index();
                             self.settings_scroll_top = 0;
                         }
                     }
@@ -2471,7 +2503,11 @@ impl Engine {
                 false
             };
             if !is_enum {
+                if self.settings_modal_open {
+                    return;
+                }
                 self.settings_has_focus = false;
+                self.settings_modal_open = false;
                 self.activity_bar_focus_in_at(sidebar::TOOLBAR_IDX_SETTINGS);
                 return;
             }
@@ -2481,6 +2517,11 @@ impl Engine {
         match key {
             "q" | "Escape" => {
                 self.settings_has_focus = false;
+                self.settings_modal_open = false;
+                // Switch the visual sidebar back to explorer without
+                // giving it keyboard focus — focus returns to the editor.
+                self.app_shell
+                    .show_panel(&quadraui::WidgetId::new(sidebar::PANEL_EXPLORER));
             }
             "/" => {
                 self.settings_input_active = true;
@@ -2523,23 +2564,23 @@ impl Engine {
                             SettingType::Enum(options) => {
                                 let forward = matches!(key, "Return" | "Space" | "l" | "Right");
                                 let backward = matches!(key, "h" | "Left");
-                                if forward || backward {
+                                if (forward || backward) && !options.is_empty() {
                                     let cur = self.settings.get_value_str(def.key);
-                                    if let Some(pos) =
-                                        options.iter().position(|&o| o == cur.as_str())
+                                    let pos = options
+                                        .iter()
+                                        .position(|&o| o == cur.as_str())
+                                        .unwrap_or(0);
+                                    let next = if forward {
+                                        (pos + 1) % options.len()
+                                    } else {
+                                        (pos + options.len() - 1) % options.len()
+                                    };
+                                    if self
+                                        .settings
+                                        .set_value_str(def.key, options[next])
+                                        .is_ok()
                                     {
-                                        let next = if forward {
-                                            (pos + 1) % options.len()
-                                        } else {
-                                            (pos + options.len() - 1) % options.len()
-                                        };
-                                        if self
-                                            .settings
-                                            .set_value_str(def.key, options[next])
-                                            .is_ok()
-                                        {
-                                            let _ = self.settings.save();
-                                        }
+                                        let _ = self.settings.save();
                                     }
                                 }
                             }
@@ -2548,8 +2589,12 @@ impl Engine {
                                 let backward = matches!(key, "h" | "Left");
                                 if forward || backward {
                                     let options = options_fn();
-                                    let cur = self.settings.get_value_str(def.key);
-                                    if let Some(pos) = options.iter().position(|o| o == &cur) {
+                                    if !options.is_empty() {
+                                        let cur = self.settings.get_value_str(def.key);
+                                        let pos = options
+                                            .iter()
+                                            .position(|o| o == &cur)
+                                            .unwrap_or(0);
                                         let next = if forward {
                                             (pos + 1) % options.len()
                                         } else {
@@ -2644,9 +2689,9 @@ impl Engine {
     pub fn settings_paste(&mut self, text: &str) {
         // Strip newlines — settings values are single-line.
         let clean: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-        if self.settings_input_active {
+        if self.settings_input_active || (self.settings_modal_open && self.settings_editing.is_none() && self.ext_settings_editing.is_none()) {
             self.settings_query.push_str(&clean);
-            self.settings_selected = 0;
+            self.settings_selected = self.first_setting_index();
             self.settings_scroll_top = 0;
         } else if self.settings_editing.is_some() {
             self.settings_edit_buf.push_str(&clean);

@@ -603,18 +603,16 @@ pub fn post_key_epilogue(
 /// priority is fixed; it isn't a workaround for the priority bug, so there's
 /// nothing to collapse into a single trigger.
 pub fn sync_register_to_clipboard(engine: &mut Engine, last: &mut Option<String>) {
+    // Track only the unnamed register — explicit `"+yy` / `"*yy` already
+    // sync to the system clipboard inline in `set_register_typed`, and
+    // checking `+` here caused a stale-latch bug: `load_clipboard_for_paste`
+    // wrote the clipboard text into `+`, which then blocked subsequent `yy`
+    // updates to `"` from being detected as changes.
     let new_content = engine
         .registers
-        .get(&'+')
+        .get(&'"')
         .filter(|(s, _)| !s.is_empty())
-        .map(|(s, _)| s.clone())
-        .or_else(|| {
-            engine
-                .registers
-                .get(&'"')
-                .filter(|(s, _)| !s.is_empty())
-                .map(|(s, _)| s.clone())
-        });
+        .map(|(s, _)| s.clone());
 
     if new_content != *last {
         if let (Some(ref content), Some(ref cb)) = (&new_content, &engine.clipboard_write) {

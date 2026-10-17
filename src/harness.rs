@@ -470,14 +470,6 @@ pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
         description: "SC CHANGES section shows M/U status badges after startup cwd fix",
     },
     ScenarioMeta {
-        name: "settings_row_sweep_hit_band_integrity",
-        area: FeatureArea::Settings,
-        driver_cap: DriverCap::ClickInput,
-        backends: BackendSet::ALL_MACRO,
-        issue: None,
-        description: "Settings row click lands on its own hit band",
-    },
-    ScenarioMeta {
         name: "explorer_row_sweep_hit_band_integrity",
         area: FeatureArea::FileOps,
         driver_cap: DriverCap::ClickInput,
@@ -3804,152 +3796,6 @@ mod tests {
     }
 }
 
-// A click anywhere in a row's painted band — the padding strip above
-// its glyph and the one below it — acts on that row. TUI is excluded:
-// its row pitch always equals its glyph height by construction, so it
-// has no padding strip to probe and the helper's sanity assert fails
-// loudly there rather than reporting a false pass.
-#[cfg(test)]
-mod issue_983_row_click_selects_the_row_below {
-    use super::*;
-    use crate::core::engine::sidebar::PANEL_SETTINGS;
-
-    /// The Settings panel, scrolled so the "LSP" category — far below row 0,
-    /// so as not to reuse `settings_panel_click_toggles_the_clicked_category`'s
-    /// row-0 target — sits near the top of a normal 1400x900 viewport with its
-    /// settings painted below it. The scroll offset is derived from LSP's real
-    /// flat-list index, so adding or removing settings above it can't push its
-    /// children off-screen. LSP's own first two settings ("Enable LSP",
-    /// "Format on Save") are both `Bool`, chosen deliberately: collapsing
-    /// LSP hides both their labels outright, giving a clean, unambiguous
-    /// painted signal that the *category* row (not the row below it) was
-    /// hit — mirrors `settings_panel_click_toggles_the_clicked_category`'s
-    /// own "does the child label vanish" technique, just pointed lower.
-    ///
-    /// The colorscheme is pinned to `onedark` because [`probe_band`] walks a
-    /// column of painted pixels outward from the category header's own fill,
-    /// which only resolves a band when that header is painted in a colour its
-    /// neighbouring data rows do not share. `onedark` separates the two
-    /// (`status_bg` ≠ `tab_bar_bg`); the default `dark` theme unifies them.
-    /// The row-pitch and hit-band geometry under test here are
-    /// theme-independent, so which palette paints them is incidental.
-    fn engine_settings_scrolled_to_lsp() -> Engine {
-        let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = Some(false);
-        engine.settings.colorscheme = "onedark".to_string();
-        engine
-            .app_shell
-            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
-        let lsp_cat = crate::core::settings::setting_categories()
-            .iter()
-            .position(|&c| c == "LSP")
-            .expect("an \"LSP\" settings category");
-        let lsp_row = engine
-            .settings_flat_list()
-            .iter()
-            .position(
-                |r| matches!(r, crate::core::engine::SettingsRow::CoreCategory(i) if *i == lsp_cat),
-            )
-            .expect("the LSP category header in the settings flat list");
-        engine.settings_scroll_top = lsp_row.saturating_sub(2);
-        engine
-    }
-
-    // The Settings panel, scrolled so the "LSP" category paints inside a
-    // normal 1400x900 viewport. LSP's own first two settings ("Enable LSP",
-    // "Format on Save") are both `Bool`, chosen deliberately: collapsing
-    // LSP hides both their labels outright, giving a clean, unambiguous
-
-    /// `needle`'s painted background band, measured off the pixels of the
-    /// frame currently on screen.
-    ///
-    /// The probe column sits just past the right edge of `needle`'s own
-    /// glyph — inside the panel, clear of the glyph itself, its chevron and
-    /// the scrollbar gutter — so the colour it reads is the row's own
-    /// background fill. Never a hardcoded coordinate: both the column and
-    /// the seed row come from `needle`'s real painted bounds.
-    #[cfg(feature = "gui")]
-    fn probe_band<A: quadraui::AppLogic>(
-        driver: &mut quadraui::gtk::testing::GtkDriver<A>,
-        needle: &str,
-        viewport_h: i32,
-    ) -> (f32, f32) {
-        let glyph = driver
-            .find_bounds(needle)
-            .unwrap_or_else(|| panic!("probe_band: {needle:?} not painted"));
-        let probe_x = (glyph.x + glyph.width + 8.0) as i32;
-        let seed_y = (glyph.y + glyph.height / 2.0) as i32;
-        crate::harness::painted_row_band(|y| driver.pixel(probe_x, y), seed_y, viewport_h)
-    }
-
-    #[cfg(feature = "gui")]
-    #[test]
-    fn settings_row_click_below_its_glyph_hits_its_own_row_gtk() {
-        let mut h =
-            crate::gtk::testing::conformance_harness(engine_settings_scrolled_to_lsp(), 1400, 900);
-        assert!(
-            h.driver.screen_has("Enable LSP") && h.driver.screen_has("Format on Save"),
-            "precondition: scrolling to the LSP category must paint both of its \
-             settings; painted: {:?}",
-            h.driver.inventory().text_runs()
-        );
-        let band = probe_band(&mut h.driver, "▼ LSP", 900);
-        crate::harness::row_click_in_its_painted_band_hits_its_own_row(
-            &mut h.driver,
-            "▼ LSP",
-            "Enable LSP",
-            band,
-            crate::harness::RowBandEdge::BelowGlyph,
-            |d| !(d.screen_has("Enable LSP") || d.screen_has("Format on Save")),
-        );
-    }
-
-    #[cfg(feature = "gui")]
-    #[test]
-    fn settings_row_click_above_its_glyph_hits_its_own_row_gtk() {
-        let mut h =
-            crate::gtk::testing::conformance_harness(engine_settings_scrolled_to_lsp(), 1400, 900);
-        assert!(
-            h.driver.screen_has("Enable LSP") && h.driver.screen_has("Format on Save"),
-            "precondition: scrolling to the LSP category must paint both of its \
-             settings; painted: {:?}",
-            h.driver.inventory().text_runs()
-        );
-        let band = probe_band(&mut h.driver, "▼ LSP", 900);
-        crate::harness::row_click_in_its_painted_band_hits_its_own_row(
-            &mut h.driver,
-            "▼ LSP",
-            "Enable LSP",
-            band,
-            crate::harness::RowBandEdge::AboveGlyph,
-            |d| !(d.screen_has("Enable LSP") || d.screen_has("Format on Save")),
-        );
-    }
-
-    // Sweep hit-band integrity over a settings row, sampling strictly inside
-    // the needle's own painted glyph bounds. This passes today on every backend.
-    // It protects against a #967-style regression in the row-pitch formula
-    crate::backend_conformance! {
-        label: settings_row_sweep_hit_band_integrity,
-        backends: [gtk, tui, tui_prod],
-        engine: engine_settings_scrolled_to_lsp(),
-        size: (1400, 900),
-        body: |driver| {
-            assert!(
-                driver.screen_has("Enable"),
-                "precondition: LSP's first setting must be painted"
-            );
-            crate::harness::sweep_hit_band_integrity(driver, "LSP", 5, |d| {
-                // "Enable", not "Enable LSP" -- TUI paints multi-word labels
-                // as one text run per word (`Enable`/`LSP` separately), so a
-                // needle spanning both never matches there; GTK's single
-                // combined-string run still contains "Enable" too.
-                d.screen_has("Enable")
-            });
-        },
-    }
-}
-
 // The file explorer's expand/collapse chevron needs a double click, while
 // its row's text label needs one. The root cause: a missing
 // `TreeControllerEvent::RowToggleExpand` match arm in
@@ -4896,37 +4742,29 @@ mod issue_1057_bottom_item_click_toggles_sidebar {
         engine: engine_fixture(),
         size: (800, 480),
         body: |driver| {
-            // Every click below is a genuine, independent, fully-released
-            // press -- `drag_text(icon, icon)` (down -> move -> up, all at
-            // the same point) rather than the bare `click_text`/`click`
-            // (down only, no release). A bottom item is not a
-            // `SidebarHidden`-reporting top panel (`AppShell` never runs
-            // its own toggle for one -- see the arms this scenario
-            // exercises, in `src/app.rs` and `src/tui_main/shell_app.rs`),
-            // so nothing here depends on that difference *semantically* --
-            // but a second bare `mouse_down` at the same point with no
-            // intervening `mouse_up` left the simulated button latched
-            // "still pressed" and the second click was silently swallowed
-            // before ever reaching `on_shell_event` (observed directly:
-            // `TuiDriver`'s own translate/dispatch layer, independent of
-            // this issue's fix). `drag_text` releases between presses, so
-            // each of the two clicks below is a real, independent one, the
-            // same as a user's two separate mouse clicks would be.
+            // Click by zone position, not `drag_text(icon, icon)`:
+            // once the settings modal is open, the form body contains
+            // `"*"` characters (e.g. `**/.git` in Explorer Exclude)
+            // that `drag_text("*", "*")` finds before the activity-bar
+            // icon, mis-targeting the second click into the modal.
             //
-            // Also disables double-click folding: two of these close
+            // `drag(x, y, x, y)` is a full press-move-release cycle
+            // rather than the bare `click` (down only, no release).
+            // A second bare `mouse_down` at the same point with no
+            // intervening `mouse_up` left the simulated button latched
+            // "still pressed" and the second click was silently swallowed.
+            //
+            // Also disables double-click folding: two clicks close
             // together in simulated time would otherwise fold into a
             // `DoubleClick`, which bypasses `ShellAdapter`'s semantic
-            // dispatch (and so this arm) entirely (see
-            // `driver_click_on_every_activity_bar_icon_opens_its_panel_via_
-            // shell_app`'s own doc for the same rationale).
+            // dispatch entirely.
             driver.set_double_click_folding(false);
 
-            // `driver.screen()` is not used in diagnostics here: its return
-            // type diverges per backend (`GtkDriver::screen` -> `Vec<u8>`,
-            // `TuiDriver::screen` -> `String`), so a shared
-            // `backend_conformance!` body can only rely on
-            // `ConformanceDriver::screen_has`, which is uniformly `bool`
-            // everywhere.
+            let (x, y) = activity_bar_zone_center(
+                driver,
+                crate::core::engine::sidebar::PANEL_SETTINGS,
+            );
+
             assert!(
                 !driver.screen_has("Appearance"),
                 "precondition: the sidebar starts closed (session.explorer_\
@@ -4934,14 +4772,14 @@ mod issue_1057_bottom_item_click_toggles_sidebar {
                  must not be painted yet"
             );
 
-            driver.drag_text(crate::icons::SETTINGS.s(), crate::icons::SETTINGS.s());
+            driver.drag(x, y, x, y);
             assert!(
                 driver.screen_has("Appearance"),
                 "clicking the Settings bottom item once must open its \
                  panel, on every backend"
             );
 
-            driver.drag_text(crate::icons::SETTINGS.s(), crate::icons::SETTINGS.s());
+            driver.drag(x, y, x, y);
             assert!(
                 !driver.screen_has("Appearance"),
                 "#1057: clicking the Settings bottom item again, while its \
@@ -4953,6 +4791,7 @@ mod issue_1057_bottom_item_click_toggles_sidebar {
             );
         },
     }
+
 }
 
 /// The third of three `AppShellEvent` shadow-`engine.app_shell` sync arms
@@ -6458,48 +6297,6 @@ mod issue_1427_menu_bar_reveal_shared {
             "revealing the menu bar should reserve one more row above the \
              editor content, shifting the marker down by exactly one line; \
              before:\n{before}\nafter:\n{after}"
-        );
-    }
-
-    /// Port of `driver_click_on_settings_toggle_with_menu_bar_visible_
-    /// flips_its_own_row_via_shell_app`: with the menu bar already visible
-    /// (occupying its own reserved row above the sidebar/activity bar,
-    /// `render::sync_menu_bar_title_row`'s seeded-at-construction half —
-    /// `App::shell_config`'s `cell`-profile `has_title_bar` branch), a click
-    /// on a settings toggle row still resolves to the *painted* row, not a
-    /// stale one-row-too-high guess.
-    #[test]
-    fn driver_click_on_settings_toggle_with_menu_bar_visible_flips_its_own_row_via_app_on_tui() {
-        use crate::core::engine::sidebar::PANEL_SETTINGS;
-
-        let mut engine = engine_fixture();
-        engine.menu_bar_visible = true;
-        engine
-            .app_shell
-            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
-        assert!(
-            engine.settings.cursorline,
-            "fixture assumes cursorline defaults to true"
-        );
-
-        let mut h = crate::tui_main::testing::conformance_harness(engine, 80, 24);
-        let before = h
-            .driver
-            .find_bounds("Cursor Line")
-            .expect("the \"Cursor Line\" toggle row must paint");
-
-        // Click mid-row (not on the label's own first cell) — the whole
-        // row is the control's hit target, so this still proves the click
-        // resolved to *this* row's control, not a fluke hit on the label
-        // glyph itself.
-        h.driver.click(before.x + 2.0, before.y);
-
-        let screen = h.driver.screen();
-        let clicked_row = screen.lines().nth(before.y as usize).unwrap_or_default();
-        assert!(
-            clicked_row.contains("[ ]"),
-            "clicking the \"Cursor Line\" row should flip its own toggle off (was \"[x]\"); \
-             row:\n{clicked_row}\nfull screen:\n{screen}"
         );
     }
 

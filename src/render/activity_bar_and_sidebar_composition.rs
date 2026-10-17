@@ -367,6 +367,36 @@ pub fn search_only_chrome(
     }
 }
 
+pub fn find_chrome(
+    query: &str,
+    placeholder: &str,
+    theme: &Theme,
+) -> SidebarPanelChrome {
+    let show_placeholder = query.is_empty() && !placeholder.is_empty();
+    let fg = if show_placeholder {
+        theme.line_number_fg
+    } else {
+        theme.foreground
+    };
+    let text = if show_placeholder {
+        format!(" Find: {placeholder}")
+    } else {
+        format!(" Find: {query}")
+    };
+    let bg = theme.completion_bg.lighten(0.08);
+    SidebarPanelChrome::StatusBars(vec![quadraui::StatusBar {
+        id: quadraui::WidgetId::new("settings-find"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text,
+            fg,
+            bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: Vec::new(),
+    }])
+}
+
 /// Owned per-frame body for the plugin extension panel (`ext:<name>`) —
 /// unlike the stateful controllers `SidebarPanelBody::render_with` exists
 /// for (the module note above), [`ext_panel_to_tree_view`]'s output is

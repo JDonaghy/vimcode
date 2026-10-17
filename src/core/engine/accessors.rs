@@ -773,8 +773,10 @@ impl Engine {
         // against an unrelated later message in a future panel session.
         self.ai_leader_toggle_pending.clear();
         self.settings_has_focus = false;
+        self.settings_modal_open = false;
         self.ext_panel_has_focus = false;
         self.activity_bar_focused = false;
+        self.app_shell.set_activity_keyboard_focused(false);
     }
 
     /// Collapse (hide) the sidebar: hide it in `app_shell`, clear every
