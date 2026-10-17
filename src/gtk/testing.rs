@@ -15508,6 +15508,7 @@ mod chrome_band_order {
         engine.app_shell.show_panel(&quadraui::WidgetId::new(
             crate::core::engine::sidebar::PANEL_SETTINGS,
         ));
+        engine.settings_modal_open = true;
         engine.wildmenu_items = vec!["ZQXWwildA".to_string(), "ZQXWwildB".to_string()];
         engine.wildmenu_selected = Some(0);
 
@@ -15530,13 +15531,12 @@ mod chrome_band_order {
             h.driver.screen_contains("ZQXWwildA"),
             "Wildmenu was composed but no wildmenu entry painted"
         );
-        // Not `screen_contains("SETTINGS")`: GTK's `PANEL_SETTINGS` renders
-        // straight into the AppShell-provided content rect with no separate
-        // header. "Appearance" is the first `setting_categories()` entry,
-        // so its presence proves the settings form reached the Cairo surface.
+        // Settings renders as a centred modal overlay (SettingsModal rung),
+        // not inside the sidebar body. "Appearance" is the first
+        // `setting_categories()` entry, proving the modal reached the surface.
         assert!(
             h.driver.screen_contains("Appearance"),
-            "SidebarPanel was composed but the settings form never painted; painted: {:?}",
+            "SettingsModal was composed but the settings form never painted; painted: {:?}",
             h.driver.painted_texts()
         );
     }
