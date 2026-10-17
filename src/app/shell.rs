@@ -862,13 +862,8 @@ impl quadraui::ShellApp for App {
                 // exactly like the sidebar `PANEL_SETTINGS` arm in paint.rs but
                 // with a wider, self-contained rect.
                 render::FrameOp::SettingsModal => {
-                    let scrim_rect = render::modal_scrim_rect(
-                        &engine,
-                        &el,
-                        popup_viewport.width,
-                        y as f32,
-                        lh,
-                    );
+                    let scrim_rect =
+                        render::modal_scrim_rect(&engine, &el, popup_viewport.width, y as f32, lh);
                     // On GUI backends the RGBA scrim blends into a dim tint;
                     // on TUI `draw_solid_fill` drops the alpha channel and
                     // fills the band with opaque black, hiding everything
@@ -883,9 +878,9 @@ impl quadraui::ShellApp for App {
                     let modal_w = (popup_viewport.width * 0.8).round();
                     let modal_h = (popup_viewport.height * 0.7).round();
                     let modal_x = ((popup_viewport.width - modal_w) / 2.0).round();
-                    let modal_y = popup_viewport.y + ((popup_viewport.height - modal_h) / 2.0).round();
-                    let modal_rect =
-                        quadraui::Rect::new(modal_x, modal_y, modal_w, modal_h);
+                    let modal_y =
+                        popup_viewport.y + ((popup_viewport.height - modal_h) / 2.0).round();
+                    let modal_rect = quadraui::Rect::new(modal_x, modal_y, modal_w, modal_h);
 
                     backend.set_editor_font(&editor_family, editor_size_pt);
                     let panel = render::SidebarPanelBody {

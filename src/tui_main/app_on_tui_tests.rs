@@ -17892,25 +17892,25 @@ mod tests {
         let mut h = harness(engine);
         let driver = &mut h.driver;
 
-        known_bug_gate(
-            "app_on_tui::settings_colorscheme_cycles_on_return",
-            || {
-                let before = driver.screen();
-                assert!(before.contains("dark"), "precondition: default colorscheme is dark");
+        known_bug_gate("app_on_tui::settings_colorscheme_cycles_on_return", || {
+            let before = driver.screen();
+            assert!(
+                before.contains("dark"),
+                "precondition: default colorscheme is dark"
+            );
 
-                driver.dispatch(quadraui::UiEvent::KeyPressed {
-                    key: quadraui::Key::Named(quadraui::NamedKey::Enter),
-                    modifiers: quadraui::Modifiers::default(),
-                    repeat: false,
-                });
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
 
-                let after = driver.screen();
-                assert!(
-                    after.contains("vscode-dark"),
-                    "colorscheme must cycle from dark to vscode-dark after Return; screen:\n{after}"
-                );
-            },
-        );
+            let after = driver.screen();
+            assert!(
+                after.contains("vscode-dark"),
+                "colorscheme must cycle from dark to vscode-dark after Return; screen:\n{after}"
+            );
+        });
     }
 
     #[test]
@@ -17924,7 +17924,8 @@ mod tests {
             "app_on_tui::settings_colorscheme_cycles_after_click_open",
             || {
                 // Open settings by clicking the settings icon — the real user flow
-                let bounds = h.driver
+                let bounds = h
+                    .driver
                     .inventory()
                     .zones()
                     .iter()
@@ -17972,7 +17973,8 @@ mod tests {
                 }
 
                 assert_eq!(
-                    h.engine.borrow().settings.colorscheme, "vscode-dark",
+                    h.engine.borrow().settings.colorscheme,
+                    "vscode-dark",
                     "colorscheme must cycle from dark to vscode-dark after Enter"
                 );
             },
@@ -17994,7 +17996,8 @@ mod tests {
             || {
                 h.engine.borrow_mut().settings.colorscheme = "vscode-dark-modern".to_string();
 
-                let bounds = h.driver
+                let bounds = h
+                    .driver
                     .inventory()
                     .zones()
                     .iter()
@@ -18012,7 +18015,8 @@ mod tests {
                     repeat: false,
                 });
                 assert_ne!(
-                    h.engine.borrow().settings.colorscheme, "vscode-dark-modern",
+                    h.engine.borrow().settings.colorscheme,
+                    "vscode-dark-modern",
                     "colorscheme must cycle away from an unlisted value"
                 );
             },

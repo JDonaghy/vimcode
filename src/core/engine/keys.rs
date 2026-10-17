@@ -10815,7 +10815,10 @@ impl Engine {
         // `route_paste`'s `text` argument on all backends uniformly. Without
         // this branch, a Settings-panel paste would fall through to the
         // mode-based match below (whatever `self.mode` is behind the panel).
-        if self.settings_input_active || self.settings_editing.is_some() || (self.settings_has_focus && self.settings_modal_open) {
+        if self.settings_input_active
+            || self.settings_editing.is_some()
+            || (self.settings_has_focus && self.settings_modal_open)
+        {
             self.settings_paste(text);
             return;
         }

@@ -276,10 +276,7 @@ impl App {
                     let event = quadraui::UiEvent::Scroll {
                         widget: None,
                         position: quadraui::Point::new(fx, fy),
-                        delta: quadraui::ScrollDelta::new(
-                            delta_x as f32,
-                            -(delta_y as f32),
-                        ),
+                        delta: quadraui::ScrollDelta::new(delta_x as f32, -(delta_y as f32)),
                     };
                     render::handle_settings_form_ui_event(
                         &mut self.engine.borrow_mut(),

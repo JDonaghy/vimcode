@@ -370,11 +370,7 @@ pub fn search_only_chrome(
     }
 }
 
-pub fn find_chrome(
-    query: &str,
-    placeholder: &str,
-    theme: &Theme,
-) -> SidebarPanelChrome {
+pub fn find_chrome(query: &str, placeholder: &str, theme: &Theme) -> SidebarPanelChrome {
     let show_placeholder = query.is_empty() && !placeholder.is_empty();
     let fg = if show_placeholder {
         theme.line_number_fg

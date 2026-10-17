@@ -4791,7 +4791,6 @@ mod issue_1057_bottom_item_click_toggles_sidebar {
             );
         },
     }
-
 }
 
 /// The third of three `AppShellEvent` shadow-`engine.app_shell` sync arms

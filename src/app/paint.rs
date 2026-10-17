@@ -595,7 +595,10 @@ impl App {
                 };
                 panel.render_with(backend, q_sb, |backend, body_rect| {
                     engine.search_sidebar_body_rect.set(body_rect);
-                    engine.search_sidebar_system.borrow().render(backend, body_rect);
+                    engine
+                        .search_sidebar_system
+                        .borrow()
+                        .render(backend, body_rect);
                 });
             }
             PANEL_DEBUG => {

@@ -2360,7 +2360,10 @@ impl Engine {
                 self.settings_scroll_top = 0;
                 return;
             }
-            if !matches!(key, "Escape" | "Down" | "Up" | "Return" | "Space" | "Tab" | "Right" | "Left") {
+            if !matches!(
+                key,
+                "Escape" | "Down" | "Up" | "Return" | "Space" | "Tab" | "Right" | "Left"
+            ) {
                 if let Some(ch) = unicode {
                     if !ch.is_control() {
                         self.settings_query.push(ch);
@@ -2575,11 +2578,7 @@ impl Engine {
                                     } else {
                                         (pos + options.len() - 1) % options.len()
                                     };
-                                    if self
-                                        .settings
-                                        .set_value_str(def.key, options[next])
-                                        .is_ok()
-                                    {
+                                    if self.settings.set_value_str(def.key, options[next]).is_ok() {
                                         let _ = self.settings.save();
                                     }
                                 }
@@ -2591,10 +2590,8 @@ impl Engine {
                                     let options = options_fn();
                                     if !options.is_empty() {
                                         let cur = self.settings.get_value_str(def.key);
-                                        let pos = options
-                                            .iter()
-                                            .position(|o| o == &cur)
-                                            .unwrap_or(0);
+                                        let pos =
+                                            options.iter().position(|o| o == &cur).unwrap_or(0);
                                         let next = if forward {
                                             (pos + 1) % options.len()
                                         } else {
@@ -2689,7 +2686,11 @@ impl Engine {
     pub fn settings_paste(&mut self, text: &str) {
         // Strip newlines — settings values are single-line.
         let clean: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-        if self.settings_input_active || (self.settings_modal_open && self.settings_editing.is_none() && self.ext_settings_editing.is_none()) {
+        if self.settings_input_active
+            || (self.settings_modal_open
+                && self.settings_editing.is_none()
+                && self.ext_settings_editing.is_none())
+        {
             self.settings_query.push_str(&clean);
             self.settings_selected = self.first_setting_index();
             self.settings_scroll_top = 0;
