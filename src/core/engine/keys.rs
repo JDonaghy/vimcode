@@ -10815,7 +10815,7 @@ impl Engine {
         // `route_paste`'s `text` argument on all backends uniformly. Without
         // this branch, a Settings-panel paste would fall through to the
         // mode-based match below (whatever `self.mode` is behind the panel).
-        if self.settings_input_active || self.settings_editing.is_some() {
+        if self.settings_input_active || self.settings_editing.is_some() || (self.settings_has_focus && self.settings_modal_open) {
             self.settings_paste(text);
             return;
         }
@@ -10874,10 +10874,7 @@ impl Engine {
         };
 
         self.registers
-            .insert('"', (text.clone(), RegType::from_linewise(existing_lw)));
-        self.registers
-            .insert('+', (text.clone(), RegType::Charwise));
-        self.registers.insert('*', (text, RegType::Charwise));
+            .insert('"', (text, RegType::from_linewise(existing_lw)));
     }
 
     /// Returns `true` if the upcoming key is a paste that needs system clipboard

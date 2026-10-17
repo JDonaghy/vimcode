@@ -652,6 +652,10 @@ impl App {
         width: f64,
         alt: bool,
     ) {
+        if self.engine.borrow().activity_bar_focused {
+            self.engine.borrow_mut().activity_bar_focus_out();
+        }
+
         // ── Folder picker mouse handling ────────────────────────────────
         // Checked before every other rung: like a modal dialog, the picker
         // swallows every click while open rather than competing for z-order
@@ -670,6 +674,36 @@ impl App {
         // `mouse::handle_mouse` checks the identical shared helper.
         if self.engine.borrow().change_review.is_some() {
             self.route_and_apply_change_review_click(x, y);
+            return;
+        }
+
+        // ── Settings modal overlay ───────────────────────────────────────
+        // When the settings panel is shown as a centred modal, clicks
+        // inside the painted form rect route to the FormController; clicks
+        // outside dismiss the modal.  Checked before the general modal
+        // ladder because the scrim covers the editor band.
+        if self.engine.borrow().settings_modal_open {
+            let form_rect = self.engine.borrow().settings_form_rect.get();
+            let fx = x as f32;
+            let fy = y as f32;
+            let inside = fx >= form_rect.x
+                && fx < form_rect.x + form_rect.width
+                && fy >= form_rect.y
+                && fy < form_rect.y + form_rect.height;
+            if inside {
+                let event = quadraui::UiEvent::DoubleClick {
+                    widget: None,
+                    position: quadraui::Point::new(fx, fy),
+                };
+                render::handle_settings_form_ui_event(
+                    &mut self.engine.borrow_mut(),
+                    &event,
+                    form_rect,
+                );
+            } else {
+                self.engine.borrow_mut().collapse_sidebar();
+            }
+            self.draw_needed.set(true);
             return;
         }
 

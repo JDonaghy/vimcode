@@ -130,6 +130,11 @@ pub enum FrameOp {
     /// change, so it sits above every other overlay except a modal dialog and the
     /// toast stack.
     ChangeReview,
+    /// The settings panel as a centered modal overlay — wider than the
+    /// sidebar, covering ~80% of the viewport with a scrim behind it.
+    /// Painted when `Engine::settings_modal_open` is true instead of the
+    /// `PANEL_SETTINGS` arm of [`Self::SidebarPanel`].
+    SettingsModal,
     /// `Backend::draw_dialog` — modal, so above every rung but the toasts,
     /// matching [`route_modal_overlay_click`]'s own arbitration.
     Dialog,
@@ -156,6 +161,7 @@ impl FrameOp {
                 | FrameOp::TabSwitcher
                 | FrameOp::ContextMenu
                 | FrameOp::ChangeReview
+                | FrameOp::SettingsModal
                 | FrameOp::Dialog
                 | FrameOp::ToastStack
         )
@@ -170,10 +176,10 @@ impl FrameOp {
 /// Adding a surface means adding a variant here: a compile error in both
 /// backends' `match` until both handle it.
 ///
-/// The five chrome rungs come first, the eight overlay rungs
+/// The five chrome rungs come first, the eleven overlay rungs
 /// ([`FrameOp::is_overlay`]) are the tail: every chrome rung is composed before
 /// the first overlay rung, on both backends.
-pub const FRAME_Z_ORDER: [FrameOp; 15] = [
+pub const FRAME_Z_ORDER: [FrameOp; 16] = [
     // ── chrome ───────────────────────────────────────────────────────────
     FrameOp::MenuRow,
     FrameOp::SidebarPanel,
@@ -189,6 +195,7 @@ pub const FRAME_Z_ORDER: [FrameOp; 15] = [
     FrameOp::TabSwitcher,
     FrameOp::ContextMenu,
     FrameOp::ChangeReview,
+    FrameOp::SettingsModal,
     FrameOp::Dialog,
     FrameOp::ToastStack,
 ];
@@ -222,6 +229,7 @@ pub struct FramePresence {
     pub tab_switcher: bool,
     pub context_menu: bool,
     pub change_review: bool,
+    pub settings_modal: bool,
     pub dialog: bool,
     pub toast_stack: bool,
 }
@@ -280,6 +288,7 @@ impl FramePresence {
                 .as_ref()
                 .is_some_and(|p| !p.items.is_empty()),
             change_review: screen.change_review.is_some(),
+            settings_modal: false,
             dialog: screen.dialog.is_some(),
             toast_stack: false,
         }
@@ -301,6 +310,7 @@ impl FramePresence {
             FrameOp::TabSwitcher => self.tab_switcher,
             FrameOp::ContextMenu => self.context_menu,
             FrameOp::ChangeReview => self.change_review,
+            FrameOp::SettingsModal => self.settings_modal,
             FrameOp::Dialog => self.dialog,
             FrameOp::ToastStack => self.toast_stack,
         }

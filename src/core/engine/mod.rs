@@ -4487,6 +4487,9 @@ pub struct Engine {
     /// from the real painted origin when the menu bar (or any other chrome above
     /// the sidebar) shifts it.
     pub settings_form_rect: std::cell::Cell<quadraui::Rect>,
+    /// When true, the settings panel renders as a centered modal overlay
+    /// instead of inside the sidebar.
+    pub settings_modal_open: bool,
     /// Search/filter query typed in the settings panel.
     pub settings_query: String,
     /// Whether the search input is active (user typing a filter).
@@ -5541,12 +5544,13 @@ impl Engine {
             board_action_rx: None,
             document_client: std::sync::Arc::new(crate::core::tool_client::SubprocessToolClient),
             settings_has_focus: false,
-            settings_selected: 0,
+            settings_selected: 1,
             settings_scroll_top: 0,
             settings_form_controller: std::cell::RefCell::new(quadraui::FormController::new(
                 "settings".to_string(),
             )),
             settings_form_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            settings_modal_open: false,
             settings_query: String::new(),
             settings_input_active: false,
             settings_editing: None,

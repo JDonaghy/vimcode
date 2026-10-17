@@ -1123,6 +1123,7 @@ pub(crate) mod tests {
                 FrameOp::TabSwitcher,
                 FrameOp::ContextMenu,
                 FrameOp::ChangeReview,
+                FrameOp::SettingsModal,
                 FrameOp::Dialog,
                 FrameOp::ToastStack,
             ],
@@ -1276,6 +1277,7 @@ pub(crate) mod tests {
             tab_switcher: true,
             context_menu: true,
             change_review: true,
+            settings_modal: true,
             dialog: true,
             toast_stack: true,
         };

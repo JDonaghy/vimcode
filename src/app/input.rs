@@ -145,6 +145,16 @@ impl App {
         x: f64,
         y: f64,
     ) {
+        // ── Settings modal overlay ───────────────────────────────────────
+        // The single-click handler (mouse_tabs.rs) already sends a
+        // `DoubleClick` event to `handle_settings_form_ui_event`, which
+        // activates the focused row.  Consume the real double-click here
+        // so it does not fall through to the editor's word-select.
+        if self.engine.borrow().settings_modal_open {
+            self.draw_needed.set(true);
+            return;
+        }
+
         // Check the editor hover popup first, before the editor's word-select.
         // This shared rung runs the same path as single-click.
         if self.route_and_apply_editor_hover_popup(backend, x, y) {
@@ -249,6 +259,39 @@ impl App {
         delta_x: f64,
         delta_y: f64,
     ) {
+        // ── Settings modal overlay scroll ────────────────────────────────
+        // When the settings modal is open, route wheel events to its
+        // FormController so the settings list scrolls instead of the
+        // editor underneath.
+        if self.engine.borrow().settings_modal_open && delta_y.abs() > 0.01 {
+            if let Some((px, py)) = self.last_editor_pointer.get() {
+                let form_rect = self.engine.borrow().settings_form_rect.get();
+                let fx = px as f32;
+                let fy = py as f32;
+                let inside = fx >= form_rect.x
+                    && fx < form_rect.x + form_rect.width
+                    && fy >= form_rect.y
+                    && fy < form_rect.y + form_rect.height;
+                if inside {
+                    let event = quadraui::UiEvent::Scroll {
+                        widget: None,
+                        position: quadraui::Point::new(fx, fy),
+                        delta: quadraui::ScrollDelta::new(
+                            delta_x as f32,
+                            -(delta_y as f32),
+                        ),
+                    };
+                    render::handle_settings_form_ui_event(
+                        &mut self.engine.borrow_mut(),
+                        &event,
+                        form_rect,
+                    );
+                }
+            }
+            self.draw_needed.set(true);
+            return;
+        }
+
         let mut engine = self.engine.borrow_mut();
         // Picker open: scroll the picker results. Multiply by 5.0 and round up
         // the absolute value to guarantee every non-zero event advances at least

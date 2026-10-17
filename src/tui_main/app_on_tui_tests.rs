@@ -1537,6 +1537,69 @@ mod tests {
             );
         }
 
+        /// Ctrl-W l (or Right) from the activity-bar toolbar, when a sidebar
+        /// panel is already visible, must move focus to that panel — the
+        /// mirror of `ctrl_w_h_from_sidebar_panel_reaches_activity_bar_toolbar`.
+        #[test]
+        fn ctrl_w_right_from_toolbar_focuses_panel() {
+            use crate::core::engine::sidebar::PANEL_EXPLORER;
+
+            let mut engine = plain_engine();
+            engine.focus_sidebar_panel(PANEL_EXPLORER);
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                h.engine.borrow().explorer_has_focus,
+                "precondition: Explorer must have focus"
+            );
+
+            // Ctrl-W, h: Explorer panel -> activity-bar toolbar.
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('w'),
+                modifiers: quadraui::Modifiers {
+                    ctrl: true,
+                    ..quadraui::Modifiers::default()
+                },
+                repeat: false,
+            });
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('h'),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+
+            assert!(
+                h.engine.borrow().activity_bar_focused,
+                "after Ctrl-W h, toolbar must have focus"
+            );
+
+            // Ctrl-W, Right: toolbar -> Explorer panel.
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('w'),
+                modifiers: quadraui::Modifiers {
+                    ctrl: true,
+                    ..quadraui::Modifiers::default()
+                },
+                repeat: false,
+            });
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+
+            let engine = h.engine.borrow();
+            assert!(
+                !engine.activity_bar_focused,
+                "toolbar must lose focus after Ctrl-W Right"
+            );
+            assert!(
+                engine.explorer_has_focus,
+                "Explorer must gain focus after Ctrl-W Right from toolbar"
+            );
+        }
+
         /// Mirrors `shell_app.rs`'s test of the same name: clicking
         /// each activity-bar icon in turn must switch the sidebar's own
         /// *content*, not just its chrome — every icon located via
@@ -17817,5 +17880,141 @@ mod tests {
                  screen:\n{screen}"
             );
         }
+    }
+
+    #[test]
+    fn settings_colorscheme_cycles_on_return() {
+        use crate::core::engine::sidebar::PANEL_SETTINGS;
+
+        let mut engine = plain_engine();
+        engine.toggle_sidebar_panel(PANEL_SETTINGS);
+        let mut h = harness(engine);
+        let driver = &mut h.driver;
+
+        known_bug_gate(
+            "app_on_tui::settings_colorscheme_cycles_on_return",
+            || {
+                let before = driver.screen();
+                assert!(before.contains("dark"), "precondition: default colorscheme is dark");
+
+                driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+                    modifiers: quadraui::Modifiers::default(),
+                    repeat: false,
+                });
+
+                let after = driver.screen();
+                assert!(
+                    after.contains("vscode-dark"),
+                    "colorscheme must cycle from dark to vscode-dark after Return; screen:\n{after}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn settings_colorscheme_cycles_after_click_open() {
+        use crate::core::engine::sidebar::PANEL_SETTINGS;
+
+        let engine = plain_engine();
+        let mut h = harness(engine);
+
+        known_bug_gate(
+            "app_on_tui::settings_colorscheme_cycles_after_click_open",
+            || {
+                // Open settings by clicking the settings icon — the real user flow
+                let bounds = h.driver
+                    .inventory()
+                    .zones()
+                    .iter()
+                    .find(|z| z.id.as_str() == PANEL_SETTINGS)
+                    .map(|z| z.bounds)
+                    .expect("settings icon must register a chrome zone");
+                h.driver.click(
+                    bounds.x + bounds.width / 2.0,
+                    bounds.y + bounds.height / 2.0,
+                );
+
+                let screen = h.driver.screen();
+                eprintln!("=== After clicking settings icon ===");
+                eprintln!("{}", &screen[..screen.len().min(1200)]);
+
+                {
+                    let engine = h.engine.borrow();
+                    eprintln!("settings_has_focus: {}", engine.settings_has_focus);
+                    eprintln!("settings_modal_open: {}", engine.settings_modal_open);
+                    eprintln!("settings_selected: {}", engine.settings_selected);
+                    eprintln!("activity_bar_focused: {}", engine.activity_bar_focused);
+                    let flat = engine.settings_flat_list();
+                    for (i, row) in flat.iter().enumerate().take(5) {
+                        eprintln!("  flat[{i}] = {row:?}");
+                    }
+                }
+
+                // Press Enter to cycle colorscheme
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+                    modifiers: quadraui::Modifiers::default(),
+                    repeat: false,
+                });
+
+                let after = h.driver.screen();
+                eprintln!("=== After pressing Enter ===");
+                eprintln!("{}", &after[..after.len().min(1200)]);
+
+                {
+                    let engine = h.engine.borrow();
+                    eprintln!("colorscheme now: {}", engine.settings.colorscheme);
+                    eprintln!("settings_selected: {}", engine.settings_selected);
+                    eprintln!("settings_has_focus: {}", engine.settings_has_focus);
+                    eprintln!("activity_bar_focused: {}", engine.activity_bar_focused);
+                }
+
+                assert_eq!(
+                    h.engine.borrow().settings.colorscheme, "vscode-dark",
+                    "colorscheme must cycle from dark to vscode-dark after Enter"
+                );
+            },
+        );
+    }
+
+    /// When the saved colorscheme is not in `available_colorschemes()` (e.g.
+    /// a deprecated alias like "vscode-dark-modern"), Enter must still cycle
+    /// to the first available option instead of silently doing nothing.
+    #[test]
+    fn settings_colorscheme_cycles_even_when_current_value_unlisted() {
+        use crate::core::engine::sidebar::PANEL_SETTINGS;
+
+        let engine = plain_engine();
+        let mut h = harness(engine);
+
+        known_bug_gate(
+            "app_on_tui::settings_colorscheme_cycles_even_when_current_value_unlisted",
+            || {
+                h.engine.borrow_mut().settings.colorscheme = "vscode-dark-modern".to_string();
+
+                let bounds = h.driver
+                    .inventory()
+                    .zones()
+                    .iter()
+                    .find(|z| z.id.as_str() == PANEL_SETTINGS)
+                    .map(|z| z.bounds)
+                    .expect("settings icon zone");
+                h.driver.click(
+                    bounds.x + bounds.width / 2.0,
+                    bounds.y + bounds.height / 2.0,
+                );
+
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+                    modifiers: quadraui::Modifiers::default(),
+                    repeat: false,
+                });
+                assert_ne!(
+                    h.engine.borrow().settings.colorscheme, "vscode-dark-modern",
+                    "colorscheme must cycle away from an unlisted value"
+                );
+            },
+        );
     }
 }

@@ -403,6 +403,7 @@ impl quadraui::ShellApp for App {
         // stays cleared above and nothing is recorded — the sequence describes
         // what reached the canvas.
         presence.dialog = screen.dialog.is_some() && !self.native_dialog_shown.get();
+        presence.settings_modal = engine.settings_modal_open;
 
         // Measure the title-bar band whenever the Command Center rung
         // is live, independent of whether `FrameOp::MenuRow` itself composes.
@@ -852,6 +853,64 @@ impl quadraui::ShellApp for App {
                         );
                         composed.push(render::FrameOp::ChangeReview);
                     }
+                }
+
+                // ── Settings modal overlay ──────────────────────────────────────
+                // When the settings panel is open, paint it as a centred modal
+                // covering ~80 % of the viewport instead of inside the narrow
+                // sidebar.  Scrim → centred SidebarPanelBody + FormController,
+                // exactly like the sidebar `PANEL_SETTINGS` arm in paint.rs but
+                // with a wider, self-contained rect.
+                render::FrameOp::SettingsModal => {
+                    let scrim_rect = render::modal_scrim_rect(
+                        &engine,
+                        &el,
+                        popup_viewport.width,
+                        y as f32,
+                        lh,
+                    );
+                    // On GUI backends the RGBA scrim blends into a dim tint;
+                    // on TUI `draw_solid_fill` drops the alpha channel and
+                    // fills the band with opaque black, hiding everything
+                    // behind the modal. Skip the scrim on TUI — the modal's
+                    // own `background: Some(theme.tab_bar_bg)` is enough to
+                    // separate it from the editor band.
+                    if backend.backend_caps().window_chrome {
+                        backend.draw_solid_fill(scrim_rect, render::MODAL_SCRIM_COLOR);
+                    }
+
+                    // 80 % of the popup viewport, centred.
+                    let modal_w = (popup_viewport.width * 0.8).round();
+                    let modal_h = (popup_viewport.height * 0.7).round();
+                    let modal_x = ((popup_viewport.width - modal_w) / 2.0).round();
+                    let modal_y = popup_viewport.y + ((popup_viewport.height - modal_h) / 2.0).round();
+                    let modal_rect =
+                        quadraui::Rect::new(modal_x, modal_y, modal_w, modal_h);
+
+                    backend.set_editor_font(&editor_family, editor_size_pt);
+                    let panel = render::SidebarPanelBody {
+                        background: Some(theme.tab_bar_bg),
+                        chrome: render::find_chrome(
+                            &engine.settings_query,
+                            "type to filter",
+                            &theme,
+                        ),
+                        scrollbar_gutter: None,
+                    };
+                    panel.render_with(backend, modal_rect, |backend, body_rect| {
+                        engine.settings_form_rect.set(body_rect);
+                        render::populate_settings_form_controller(&engine);
+                        engine
+                            .settings_form_controller
+                            .borrow_mut()
+                            .render_and_cache(backend, body_rect);
+                    });
+                    if let Some(px) =
+                        resolve_editor_line_height_px(&engine.settings, backend, editor_size_pt)
+                    {
+                        quadraui::Backend::set_current_line_height(backend, px);
+                    }
+                    composed.push(render::FrameOp::SettingsModal);
                 }
 
                 // ── Modal dialog ────────────────────────────────────────────────
