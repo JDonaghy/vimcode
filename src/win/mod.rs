@@ -1421,12 +1421,18 @@ mod win_driver_tests {
 
     // ── #1689: activity bar paints no active-view accent line on Win-GUI ──
     //
-    // `render::build_activity_bar` *does* set `active_accent`, but every real
-    // `App` renders through `quadraui::AppShell::build_activity_bar` instead,
-    // which this repo never overrides. `AppShell::build_activity_bar` hardcodes
-    // `active_accent: None` unconditionally, with no theme in scope to source
-    // a colour from. Nothing in this vimcode repo can fix this — `AppShell`
-    // and its `build_activity_bar` live entirely inside quadraui.
+    // `App::handle` (`src/app/shell.rs`) calls
+    // `ctx.shell_mut().set_active_accent(Some(theme.activity_active_accent))`
+    // on every real dispatch, so the runner's `AppShell` carries the
+    // theme's accent colour once a real `UiEvent` has gone through
+    // `handle`. `ShellContext` is reachable only from `ShellApp::handle`/
+    // `on_shell_event_ctx` (quadraui 0.2.1), not from `setup`/`pre_render`,
+    // so the accent is still unset on the very first painted frame — this
+    // test renders once to learn the activity bar's geometry, clicks the
+    // already-active Explorer row (a real `WinDriver` click, idempotent on
+    // engine state but routed through the same dispatch path as #1689's
+    // report) to exercise the accent-paint call, then re-renders before
+    // sampling pixels.
     #[cfg_attr(target_os = "windows", test)]
     fn activity_bar_paints_active_accent_strip_on_the_open_panel_1689() {
         let mut engine = plain_engine();
@@ -1466,14 +1472,21 @@ mod win_driver_tests {
         // Search: top_items[1] -> bar-local y in [row_h, 2*row_h).
         let search_mid_y = (ab_top + row_h + row_h / 2.0) as u32;
 
+        // Re-click the already-open Explorer row: a no-op for engine state,
+        // but a real dispatch through `WinDriver` -> `App::handle` /
+        // `on_shell_event_ctx`, which is what actually paints the accent
+        // (see this test's doc comment above).
+        h.driver.click(row_h / 2.0, explorer_mid_y as f32);
+        h.driver.render();
+
         let active_px = h.driver.pixel(1, explorer_mid_y);
         assert_eq!(
             (active_px.r, active_px.g, active_px.b),
             (accent.r, accent.g, accent.b),
             "the open Explorer panel's row must paint a {:?} accent strip \
-             at the activity bar's left edge (x=1, y={explorer_mid_y}) — \
-             got {:?} instead (quadraui's `AppShell::build_activity_bar` \
-             hardcodes `active_accent: None`, see this test's own doc)",
+             at the activity bar's left edge (x=1, y={explorer_mid_y}) \
+             after a real dispatch has run `App::handle` — got {:?} \
+             instead (see this test's own doc)",
             accent,
             (active_px.r, active_px.g, active_px.b),
         );

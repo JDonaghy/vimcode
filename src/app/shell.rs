@@ -944,6 +944,7 @@ impl quadraui::ShellApp for App {
         if self.engine.borrow().menu_bar_toggleable {
             self.sync_runner_sidebar_visibility(ctx);
         }
+        self.paint_active_accent(ctx);
         if self.exit_requested.get() {
             return quadraui::Reaction::Exit;
         }
@@ -1052,5 +1053,38 @@ impl quadraui::ShellApp for App {
         if self.engine.borrow().menu_bar_toggleable {
             render::sync_menu_bar_title_row(ctx, &self.engine.borrow());
         }
+        // Same reasoning as `Self::handle`'s own call: a mouse click that
+        // switches panels is consumed entirely inside `ShellAdapter::handle`
+        // and never reaches `Self::handle`, so this is the only choke point
+        // that repaints the accent onto the newly-activated panel.
+        self.paint_active_accent(ctx);
+    }
+}
+
+impl App {
+    /// Paint the active panel's left-edge accent strip from vimcode's own
+    /// theme instead of quadraui's unset `None` default (which paints no
+    /// accent at all). Unconditional across every profile — the accent
+    /// line is a chrome detail, not something gated on the toggleable-
+    /// menu-bar (TUI) profile `ShellApp::handle`'s other syncs are scoped to.
+    ///
+    /// Called from both [`quadraui::ShellApp::handle`] and
+    /// [`quadraui::ShellApp::on_shell_event_ctx`]: `ShellAdapter::handle`
+    /// (quadraui) consumes a mouse click that switches the active panel
+    /// entirely inside `AppShell::handle` and returns early through
+    /// `notify_shell_event` — which calls `on_shell_event_ctx`, never
+    /// `handle` — so a mouse-driven panel switch would otherwise never
+    /// repaint the accent onto its new panel until some unrelated later
+    /// event reached `handle`.
+    ///
+    /// `ctx` is only reachable from those two methods (`quadraui::ShellApp`'s
+    /// own doc), so the very first frame — before any real `UiEvent` has
+    /// dispatched — paints with no accent; the same "until a real click/
+    /// event lands" gap `sync_runner_sidebar_visibility`'s own call sites
+    /// already live with.
+    fn paint_active_accent(&self, ctx: &quadraui::ShellContext<'_>) {
+        let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
+        ctx.shell_mut()
+            .set_active_accent(Some(theme.activity_active_accent));
     }
 }
