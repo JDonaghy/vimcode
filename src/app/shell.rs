@@ -1083,8 +1083,17 @@ impl App {
     /// event lands" gap `sync_runner_sidebar_visibility`'s own call sites
     /// already live with.
     fn paint_active_accent(&self, ctx: &quadraui::ShellContext<'_>) {
-        let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
-        ctx.shell_mut()
-            .set_active_accent(Some(theme.activity_active_accent));
+        let colorscheme = self.engine.borrow().settings.colorscheme.clone();
+        let mut cache = self.cached_active_accent.borrow_mut();
+        let accent = match cache.as_ref() {
+            Some((name, color)) if *name == colorscheme => *color,
+            _ => {
+                let color = Theme::from_name(&colorscheme).activity_active_accent;
+                *cache = Some((colorscheme, color));
+                color
+            }
+        };
+        drop(cache);
+        ctx.shell_mut().set_active_accent(Some(accent));
     }
 }
