@@ -7224,12 +7224,13 @@ mod tests {
                 .map(|slot| slot.session.cols());
             assert_eq!(
                 cols,
-                Some(76),
+                Some(75),
                 "an 80-column, no-sidebar TUI window's terminal PTY should be \
-                 sized within one column of the painted editor width (76 \
-                 cols), reserving only the one-cell scrollbar gutter; a \
-                 pixel-count gutter wrongly subtracted as whole TUI columns \
-                 would land this several columns narrower (71) instead"
+                 sized within one column of the painted editor width (75 \
+                 cols), reserving the one-cell scrollbar gutter and the \
+                 activity-bar accent column; a pixel-count gutter wrongly \
+                 subtracted as whole TUI columns would land this several \
+                 columns narrower (71) instead"
             );
         }
 

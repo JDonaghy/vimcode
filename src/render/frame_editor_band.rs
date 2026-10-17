@@ -1217,6 +1217,7 @@ pub(crate) mod tests {
                     | FrameOp::CommandCenter
                     | FrameOp::FolderPicker
                     | FrameOp::ChangeReview
+                    | FrameOp::SettingsModal
             );
             assert_eq!(
                 arbitrated, !routed_elsewhere,

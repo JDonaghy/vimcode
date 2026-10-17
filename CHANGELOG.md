@@ -14,6 +14,8 @@ no matching section fails the release job before anything is published (see
 `scripts/release_notes.py`).
 
 ## [Unreleased]
+
+## [0.15.4] - 2026-10-17
 ### Added
 - Settings panel renders as a centered modal overlay (~80% viewport)
   instead of inside the sidebar. Printable characters filter settings
