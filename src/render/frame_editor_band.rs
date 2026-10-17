@@ -666,19 +666,21 @@ pub fn paint_status_backdrop(
     let _ = b.draw_status_bar_interactive(rect, &backdrop, &quadraui::InteractionState::new());
 }
 
-/// The unit system one backend composes [`paint_bottom_panel_rung`] in.
+/// The unit system `render_content` composes [`paint_bottom_panel_rung`] in,
+/// in the active backend's own units.
 ///
-/// Everything here is a genuine rasteriser difference: Cairo repaints the whole
-/// surface every frame so GTK needs no background pass, while ratatui coalesces
-/// cells and must blank the terminal body itself; and a scrollbar gutter is six
-/// *pixels* on GTK and nothing at all in a cell grid.
+/// `clear_terminal_bg` is a genuine rasteriser difference: Cairo repaints the
+/// whole surface every frame so GTK needs no background pass, while ratatui
+/// coalesces cells and must blank the terminal body itself. A scrollbar
+/// gutter, by contrast, is never intrinsic to one rasteriser — `None` always
+/// means "let the backend's own default apply", not "no backend has one".
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BottomPanelUnits {
     /// One line / one column, in the caller's units.
     pub metrics: FrameMetrics,
     /// Width of the gutter `build_terminal_draw_data` reserves for the
-    /// scrollbar, in the caller's units, or `None` for a cell grid that has no
-    /// room for one.
+    /// scrollbar, in the caller's units, or `None` to defer to the backend's
+    /// own default scrollbar width.
     pub terminal_scrollbar: Option<u16>,
     /// Blank the terminal body before painting into it. `false` on GTK (Cairo
     /// already cleared the surface), `true` on TUI.
@@ -686,18 +688,15 @@ pub struct BottomPanelUnits {
 }
 
 impl BottomPanelUnits {
-    /// One terminal cell — what the TUI shell's `render_content` composes in.
-    pub const CELL: Self = Self {
-        metrics: FrameMetrics::CELL,
-        terminal_scrollbar: None,
-        clear_terminal_bg: true,
-    };
-
-    /// Real pixels — what `gtk::App::render_content` composes in.
-    pub fn px(line_height: f64, char_width: f64) -> Self {
+    /// Build a `BottomPanelUnits` from the caller's own per-cell/per-line
+    /// metrics, with an explicit `terminal_scrollbar` width in those same
+    /// units (`None` to defer to the backend's own default width instead).
+    /// The sole constructor for both backends: GTK passes real pixels, TUI
+    /// passes one cell.
+    pub fn new(line_height: f64, char_width: f64, terminal_scrollbar: Option<u16>) -> Self {
         Self {
             metrics: FrameMetrics::px(line_height, char_width),
-            terminal_scrollbar: Some(6),
+            terminal_scrollbar,
             clear_terminal_bg: false,
         }
     }
@@ -849,13 +848,19 @@ pub fn paint_bottom_panel_rung(
                 // every quadraui rect is `f32`.
                 let thumb_t = g.thumb_top_frac as f32 * content_h;
                 let thumb_h = (g.thumb_height_frac as f32 * content_h).max(4.0);
+                // A wide (pixel-backend) gutter insets the thumb by one pixel
+                // on each side so it reads as a distinct bar inside the
+                // track; a one-cell TUI gutter has no room for that margin,
+                // so the thumb fills the whole track instead of going
+                // negative-width.
+                let thumb_inset = if sb_w > 2.0 { 1.0 } else { 0.0 };
                 Some(quadraui::SurfaceScrollbar {
                     axis: quadraui::ScrollAxis::Vertical,
                     track_bounds: quadraui::Rect::new(sb_x, content_y, sb_w, content_h),
                     thumb_bounds: quadraui::Rect::new(
-                        sb_x + 1.0,
+                        sb_x + thumb_inset,
                         content_y + thumb_t,
-                        sb_w - 2.0,
+                        (sb_w - 2.0 * thumb_inset).max(1.0),
                         thumb_h,
                     ),
                     total_items: g.total_items,
