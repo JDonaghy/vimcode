@@ -305,7 +305,7 @@ mod tests {
         ///    *other* `new_tab(Some(..))` in this file sidesteps the issue
         ///    by using a `.txt` fixture, so `language_id_from_path` returns
         ///    `None` and `lsp_did_open` bails before the manager. These
-        ///    #1750 tests need a real `.rs` path for the diagnostics key.)
+        ///    tests need a real `.rs` path for the diagnostics key.)
         /// 2. **After the first `driver.tick()`** — that tick runs
         ///    `Engine::check_settings_reload`, which replaces the whole
         ///    `settings` struct wholesale (`self.settings = new_settings`),
@@ -1650,6 +1650,76 @@ mod tests {
             );
 
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The active panel's icon must paint a left-edge accent line
+        /// from vimcode's own theme (`theme.activity_active_accent`), not
+        /// quadraui's unset `None` default (`ActivityBar::active_accent`'s
+        /// own doc: "`None` paints zero accent-line pixels"). `App::handle`
+        /// (`src/app/shell.rs`) sets the runner's own `AppShell` accent on
+        /// every real dispatch, so clicking the Explorer icon below both
+        /// activates Explorer and is itself the real dispatch that leaves
+        /// the accent painted.
+        #[test]
+        fn activity_bar_paints_active_accent_from_theme_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            let bounds = driver
+                .inventory()
+                .zones()
+                .iter()
+                .find(|z| z.id.as_str() == crate::core::engine::sidebar::PANEL_EXPLORER)
+                .map(|z| z.bounds)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Explorer icon must register a chrome zone; screen:\n{}",
+                        driver.screen()
+                    )
+                });
+            driver.click(
+                bounds.x + bounds.width / 2.0,
+                bounds.y + bounds.height / 2.0,
+            );
+
+            // The accent column is the activity bar's own left edge —
+            // quadraui's `compose/app_shell.rs` registers each item's zone
+            // starting at that same `x` (`layout.activity_bar_bounds.x`), so
+            // `bounds.x`/`bounds.y` already address it directly.
+            let accent_x = bounds.x as u16;
+            let accent_y = bounds.y as u16;
+            let (glyph, style) = driver
+                .styled_row(accent_y)
+                .into_iter()
+                .nth(accent_x as usize)
+                .expect("the active panel's accent column must paint a styled cell");
+
+            let theme = crate::render::Theme::light();
+            let expected_fg = quadraui::tui::ratatui_color(theme.activity_active_accent);
+
+            // Independent of the colour assertion below: quadraui's TUI
+            // rasteriser (`quadraui::tui::activity_bar::draw_activity_bar_with_style`)
+            // only ever writes the `'▎'` glyph into this column when
+            // `ActivityBar::active_accent` is `Some`; its unset `None`
+            // default leaves the column's background-fill space character.
+            assert_eq!(
+                glyph,
+                '▎',
+                "the active panel's accent column must paint quadraui's \
+                 accent glyph, not the plain background fill left by its \
+                 unset `active_accent: None` default; screen:\n{}",
+                driver.screen()
+            );
+            assert_eq!(
+                style.fg,
+                expected_fg,
+                "the active panel's accent column must paint with \
+                 theme.activity_active_accent, not quadraui's unset `None` \
+                 default; screen:\n{}",
+                driver.screen()
+            );
         }
 
         /// `tests/smoke-spec/tui.yaml`'s header comment claimed the real-terminal
