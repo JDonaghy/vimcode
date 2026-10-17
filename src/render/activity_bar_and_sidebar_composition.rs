@@ -4,8 +4,11 @@ use super::*;
 
 /// Build a `quadraui::ActivityBar` primitive from engine state.
 ///
-/// Both backends call this once per frame, then delegate to
-/// `quadraui::{tui,gtk}::draw_activity_bar`.
+/// Not on either backend's render path: the activity bar itself is painted
+/// by `quadraui::compose::AppShell::render()` from `App`'s `ShellApp`
+/// wiring, not from this struct. This builder exists for tests that want to
+/// assert on activity-bar item selection/order/icon state without driving a
+/// full `AppShell` frame (see `menu_bar_structure.rs`).
 ///
 /// * `include_hamburger` — `true` for TUI (no native menu bar so the
 ///   hamburger item at keyboard-index 0 provides keyboard access to the

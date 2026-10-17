@@ -305,7 +305,7 @@ mod tests {
         ///    *other* `new_tab(Some(..))` in this file sidesteps the issue
         ///    by using a `.txt` fixture, so `language_id_from_path` returns
         ///    `None` and `lsp_did_open` bails before the manager. These
-        ///    #1750 tests need a real `.rs` path for the diagnostics key.)
+        ///    tests need a real `.rs` path for the diagnostics key.)
         /// 2. **After the first `driver.tick()`** — that tick runs
         ///    `Engine::check_settings_reload`, which replaces the whole
         ///    `settings` struct wholesale (`self.settings = new_settings`),
@@ -1713,6 +1713,178 @@ mod tests {
             );
 
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The active panel's icon must paint a left-edge accent line
+        /// from vimcode's own theme (`theme.activity_active_accent`), not
+        /// quadraui's unset `None` default (`ActivityBar::active_accent`'s
+        /// own doc: "`None` paints zero accent-line pixels"). `App::handle`
+        /// (`src/app/shell.rs`) sets the runner's own `AppShell` accent on
+        /// every real dispatch, so clicking the Explorer icon below both
+        /// activates Explorer and is itself the real dispatch that leaves
+        /// the accent painted.
+        #[test]
+        fn activity_bar_paints_active_accent_from_theme_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            let bounds = driver
+                .inventory()
+                .zones()
+                .iter()
+                .find(|z| z.id.as_str() == crate::core::engine::sidebar::PANEL_EXPLORER)
+                .map(|z| z.bounds)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Explorer icon must register a chrome zone; screen:\n{}",
+                        driver.screen()
+                    )
+                });
+            driver.click(
+                bounds.x + bounds.width / 2.0,
+                bounds.y + bounds.height / 2.0,
+            );
+
+            // The accent column is the activity bar's own left edge —
+            // quadraui's `compose/app_shell.rs` registers each item's zone
+            // starting at that same `x` (`layout.activity_bar_bounds.x`), so
+            // `bounds.x`/`bounds.y` already address it directly.
+            let accent_x = bounds.x as u16;
+            let accent_y = bounds.y as u16;
+            let (glyph, style) = driver
+                .styled_row(accent_y)
+                .into_iter()
+                .nth(accent_x as usize)
+                .expect("the active panel's accent column must paint a styled cell");
+
+            let theme = crate::render::Theme::light();
+            let expected_fg = quadraui::tui::ratatui_color(theme.activity_active_accent);
+
+            // Independent of the colour assertion below: quadraui's TUI
+            // rasteriser (`quadraui::tui::activity_bar::draw_activity_bar_with_style`)
+            // only ever writes the `'▎'` glyph into this column when
+            // `ActivityBar::active_accent` is `Some`; its unset `None`
+            // default leaves the column's background-fill space character.
+            assert_eq!(
+                glyph,
+                '▎',
+                "the active panel's accent column must paint quadraui's \
+                 accent glyph, not the plain background fill left by its \
+                 unset `active_accent: None` default; screen:\n{}",
+                driver.screen()
+            );
+            assert_eq!(
+                style.fg,
+                expected_fg,
+                "the active panel's accent column must paint with \
+                 theme.activity_active_accent, not quadraui's unset `None` \
+                 default; screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// Clicking exercises the mouse path only; the issue's actual trigger is
+        /// keyboard navigation (`Ctrl-W Left` to give the activity bar keyboard
+        /// focus, then `j`/`l` to move the cursor and activate the item under
+        /// it) — `src/app/shell.rs`'s `App::handle` reaches this through
+        /// `on_shell_event_ctx`, the same early-return path quadraui's
+        /// `ShellAdapter::handle` takes for a mouse click. This drives that
+        /// sequence directly (activity-bar keyboard focus is itself the `Ctrl-W
+        /// Left` destination — see `Engine::activity_bar_focus_in_at`) and
+        /// asserts the accent follows the newly activated panel rather than
+        /// staying on the one it left.
+        #[test]
+        fn activity_bar_keyboard_activation_moves_active_accent_via_shell_app() {
+            use crate::core::engine::sidebar::{PANEL_EXPLORER, PANEL_SEARCH};
+
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            let explorer_idx = engine
+                .activity_bar_idx_for_item_id(PANEL_EXPLORER)
+                .expect("Explorer must have a keyboard (toolbar) index");
+            engine.activity_bar_focus_in_at(explorer_idx);
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                !driver.screen_has("SEARCH"),
+                "precondition: the Search panel must not already be open; screen:\n{}",
+                driver.screen()
+            );
+
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('j'),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('l'),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+
+            assert!(
+                driver.screen_has("SEARCH"),
+                "`j` then `l` must move the keyboard cursor to Search and \
+                 activate it; screen:\n{}",
+                driver.screen()
+            );
+
+            let zone_bounds = |id: &str| {
+                driver
+                    .inventory()
+                    .zones()
+                    .iter()
+                    .find(|z| z.id.as_str() == id)
+                    .map(|z| z.bounds)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{id} icon must register a chrome zone; screen:\n{}",
+                            driver.screen()
+                        )
+                    })
+            };
+            let explorer_bounds = zone_bounds(PANEL_EXPLORER);
+            let search_bounds = zone_bounds(PANEL_SEARCH);
+
+            let theme = crate::render::Theme::light();
+            let expected_fg = quadraui::tui::ratatui_color(theme.activity_active_accent);
+
+            let (explorer_glyph, _) = driver
+                .styled_row(explorer_bounds.y as u16)
+                .into_iter()
+                .nth(explorer_bounds.x as usize)
+                .expect("Explorer's accent column must paint a styled cell");
+            assert_ne!(
+                explorer_glyph,
+                '▎',
+                "Explorer is no longer the active panel after keyboard-\
+                 activating Search, so its accent column must not paint the \
+                 accent glyph; screen:\n{}",
+                driver.screen()
+            );
+
+            let (search_glyph, search_style) = driver
+                .styled_row(search_bounds.y as u16)
+                .into_iter()
+                .nth(search_bounds.x as usize)
+                .expect("Search's accent column must paint a styled cell");
+            assert_eq!(
+                search_glyph,
+                '▎',
+                "the keyboard-activated Search panel's accent column must paint \
+                 quadraui's accent glyph; screen:\n{}",
+                driver.screen()
+            );
+            assert_eq!(
+                search_style.fg,
+                expected_fg,
+                "the keyboard-activated Search panel's accent column must paint \
+                 with theme.activity_active_accent; screen:\n{}",
+                driver.screen()
+            );
         }
 
         /// `tests/smoke-spec/tui.yaml`'s header comment claimed the real-terminal

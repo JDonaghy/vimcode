@@ -706,6 +706,7 @@ impl App {
             pending_file_dialog: Cell::new(None),
             cached_line_height: 24.0,
             cached_char_width: 9.0,
+            cached_active_accent: RefCell::new(None),
             last_editor_pointer: Rc::new(Cell::new(None)),
             cached_ui_line_height: 20.0,
             dialog_layout: Rc::new(RefCell::new(None)),
