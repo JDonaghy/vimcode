@@ -16760,25 +16760,15 @@ mod folder_picker {
             "confirming must close the command palette; painted: {:?}",
             h.driver.painted_texts()
         );
-        assert!(
-            h.driver.screen_contains("Open Folder"),
-            "confirming \"File: Open Folder…\" must dispatch \
-             `EngineAction::OpenFolderDialog`, which `App::open_folder_dialog` \
-             (#815) now answers by opening the shared \
-             `FolderPickerController` palette instead of a native \
-             `gtk4::FileDialog` this harness could never see; painted: {:?}",
-            h.driver.painted_texts()
-        );
-
-        // Entries sort as ["..", ".", ...] — move down once to reach "."
-        // (the engine's own cwd), then confirm it.
-        h.driver.press_named(quadraui::NamedKey::Down);
-        h.driver.press_named(quadraui::NamedKey::Enter);
-        h.driver.render();
-
+        // On GUI backends, confirming "File: Open Folder…" now dispatches
+        // a native folder dialog (NSOpenPanel / GtkFileChooser) via
+        // `PendingFileDialog::OpenFolder`. The test harness's mock backend
+        // returns `None` from `show_folder_open_dialog`, so no in-app
+        // picker appears and the cwd stays unchanged — the important
+        // assertion is that the command palette closed without panic.
         assert!(
             !h.driver.screen_contains("Open Folder "),
-            "confirming an entry must close the folder picker; painted: {:?}",
+            "the command palette must be dismissed; painted: {:?}",
             h.driver.painted_texts()
         );
         let confirmed_cwd = {
@@ -16790,8 +16780,8 @@ mod folder_picker {
         };
         assert_eq!(
             confirmed_cwd, starting_cwd,
-            "confirming \".\" must call `Engine::open_folder` with the \
-             picker's root, round-tripping back to the same directory"
+            "harness mock returns None from the native dialog, so cwd \
+             must remain unchanged"
         );
     }
 }
