@@ -92,8 +92,8 @@ The Flatpak bundles GTK4 and all dependencies — works on any Linux distro with
 
 ```bash
 brew tap JDonaghy/vimcode
-brew install vimcode    # GTK4 GUI + TUI (installs both `vimcode` and `vcd`)
-brew install vcd        # TUI only (no GTK4 dependency)
+brew install vimcode    # Native macOS GUI (AppKit)
+brew install vcd        # TUI only (no GUI dependencies)
 ```
 
 ### Windows

@@ -511,6 +511,10 @@ impl App {
             return true;
         }
 
+        if is_press && self.engine.borrow().activity_bar_focused {
+            self.engine.borrow_mut().activity_bar_focus_out();
+        }
+
         // Which panel owns the sidebar body? `render::sidebar_owner` states that
         // precedence once so the click router, hover router and painter never disagree.
         let owner = render::sidebar_owner(&self.engine.borrow());

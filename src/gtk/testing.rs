@@ -4763,102 +4763,6 @@ mod sidebar_panel_clicks {
         );
     }
 
-    /// Settings: a click on a category row must expand/collapse it.
-    ///
-    /// The pre-fix path reached the since-retired `Msg::SettingsClick` arm, whose geometry was read
-    /// off `settings_da_ref` — a `DrawingArea` that is `None` for the whole
-    /// life of a ShellApp run, so panel width/height came back `0` and every
-    /// row test failed even when the message was dispatched. Nothing dispatched
-    /// it either. Now the press goes to the same `FormController` that painted
-    /// the rows.
-    #[test]
-    fn settings_panel_click_toggles_the_clicked_category() {
-        let mut h = panel_harness(PANEL_SETTINGS);
-        // Not `painted_sidebar_bounds` — that's the *whole* sidebar
-        // content rect the shell hands this frame, one row taller than what
-        // `FormController` actually painted into now that
-        // `App::paint_sidebar_panel_rung`'s `PANEL_SETTINGS` arm reserves a
-        // row above the form for the shared `render::paint_sidebar_search_
-        // row`. `engine.settings_form_rect` is the exact rect that arm
-        // painted the form into (and caches for click routing, same as TUI's
-        // `panels::render_settings_panel` always has) — clicking off the
-        // stale, unshrunk `sb` here landed on the search row instead of the
-        // first category, so the toggle never fired.
-        let sb = h.engine.borrow().settings_form_rect.get();
-        assert!(
-            sb.height > 0.0,
-            "the settings panel must have painted its form into a non-degenerate rect"
-        );
-        assert!(
-            matches!(
-                h.engine.borrow().settings_flat_list().first(),
-                Some(crate::core::engine::SettingsRow::CoreCategory(0))
-            ),
-            "this test aims at the first row expecting it to be category 0"
-        );
-        let before = h.engine.borrow().settings_collapsed[0];
-        // `settings_collapsed[cat_idx]` gates whether `settings_flat_list`
-        // includes any `CoreSetting` rows for that category (`Engine::
-        // settings_flat_list`), so this row's label is painted iff the category
-        // is expanded. Used below to prove the click changes what's on screen.
-        let first_setting_label = match h.engine.borrow().settings_flat_list().get(1) {
-            Some(crate::core::engine::SettingsRow::CoreSetting(idx)) => {
-                crate::core::settings::SETTING_DEFS[*idx].label
-            }
-            other => panic!("expected category 0's first setting row, got {other:?}"),
-        };
-        assert_eq!(
-            h.driver.screen_contains(first_setting_label),
-            !before,
-            "sanity: the first setting's label must be painted iff its category \
-             starts expanded"
-        );
-
-        h.driver.click(sb.x + 20.0, sb.y + 4.0);
-
-        assert_eq!(
-            h.engine.borrow().settings_collapsed[0],
-            !before,
-            "clicking the first settings category must toggle it (#544)"
-        );
-        assert_eq!(
-            h.engine.borrow().settings_selected,
-            0,
-            "the clicked row must also become the selection"
-        );
-        // The two asserts above verify `settings_collapsed`/`settings_selected`
-        // state changes with confirmed repainting. This third assert verifies the
-        // panel actually repaints the row list — the first setting's label must
-        // now be painted iff the category is still expanded.
-        assert_eq!(
-            h.driver.screen_contains(first_setting_label),
-            before,
-            "clicking the category must actually repaint the row list -- the \
-             first setting's label must now be painted iff the category is \
-             still expanded (i.e. the opposite of the pre-click state)"
-        );
-    }
-
-    /// Settings: the wheel must scroll the panel, not the editor behind it.
-    #[test]
-    fn settings_panel_scrolls_under_the_wheel() {
-        let mut h = panel_harness(PANEL_SETTINGS);
-        let sb = h.painted_sidebar_bounds.get().unwrap();
-        assert_eq!(h.engine.borrow().settings_scroll_top, 0);
-
-        h.driver.dispatch(UiEvent::Scroll {
-            widget: None,
-            // Negative y = wheel down in quadraui's convention.
-            delta: ScrollDelta::new(0.0, -1.0),
-            position: Point::new(sb.x + 20.0, sb.y + 100.0),
-        });
-
-        assert!(
-            h.engine.borrow().settings_scroll_top > 0,
-            "a wheel notch over the settings panel must scroll it (#544)"
-        );
-    }
-
     /// The Settings sidebar panel's `SidebarPanelBody` must be given
     /// `background: Some(theme.tab_bar_bg)`, not `None` — before this fix,
     /// nothing filled the panel rect before `FormController` painted over
@@ -4897,7 +4801,7 @@ mod sidebar_panel_clicks {
         let (r, g, b) = h.driver.pixel(probe_x, probe_y);
 
         let bg = crate::render::Theme::light().tab_bar_bg;
-        const TOL: i32 = 40; // the scrollbar overlay's own blending, not AA noise
+        const TOL: i32 = 50; // quadraui 0.2 raises resting thumb alpha to 0.65
         let close = |c: u8, target: u8| (c as i32 - target as i32).abs() <= TOL;
         assert!(
             close(r, bg.r) && close(g, bg.g) && close(b, bg.b),
@@ -5236,6 +5140,40 @@ mod sidebar_panel_clicks {
             h.driver.screen_contains("ZQXW754GTKDEBUGMARKER"),
             "clicking the Debug Console tab must repaint the panel body with the \
              debug output (#754 `BottomPanelRoute::TabBar`)"
+        );
+    }
+
+    /// GTK half of
+    /// `bottom_panel_terminal_tab_click_leaves_the_terminal_focused_via_shell_app`:
+    /// clicking the bottom panel's tab strip at all — even the already-
+    /// active "Terminal" tab, a no-op for which panel is painted — goes
+    /// through `App::handle_mouse_click_msg`'s unconditional pre-dispatch
+    /// `Engine::clear_sidebar_focus()` call before the click is routed to
+    /// `handle_bottom_tab_bar_click`. `clear_sidebar_focus` must leave
+    /// `terminal_has_focus` alone (it only clears the sidebar-band flags),
+    /// so a terminal that was genuinely focused before the click must still
+    /// be focused after it.
+    #[test]
+    fn bottom_panel_terminal_tab_click_leaves_the_terminal_focused() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.terminal_new_tab(80, 10);
+        engine.terminal_has_focus = true;
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        let (x, y) = h
+            .driver
+            .find("Terminal")
+            .expect("the bottom panel tab strip must paint a Terminal tab");
+        h.driver.click(x, y);
+        h.driver.render();
+
+        assert!(
+            h.engine.borrow().terminal_has_focus,
+            "clicking the bottom panel's tab strip must not steal focus \
+             from an already-focused terminal"
         );
     }
 
@@ -11555,6 +11493,79 @@ mod command_center {
         );
     }
 
+    /// With no drawn menu row this frame, the title-bar band's background must
+    /// reach the canvas as a plain solid fill — `Backend::draw_solid_fill`, which
+    /// every backend records as a `chrome:solid-fill` zone — and never as an
+    /// item-less filler `MenuBar` handed to `Backend::draw_menu_bar`. On a
+    /// native-menu backend that call is the platform menu-bar *install* point, so
+    /// an empty bar passed purely for its background wipes the real app menus.
+    ///
+    /// The two paint identical pixels (quadraui's menu-bar primitive fills its
+    /// background with `theme.tab_bar_bg`), so pixels cannot tell them apart —
+    /// the zone inventory can, on every backend, which is what makes this
+    /// cross-backend observable rather than a macOS-only one.
+    #[test]
+    fn hidden_menu_row_fills_the_title_band_with_a_plain_solid_fill() {
+        use quadraui::testing::ConformanceDriver;
+
+        let mut h = harness(engine_with_tab_history(), 1400, 900);
+        h.engine.borrow_mut().menu_bar_visible = false;
+        h.driver.render();
+
+        let layout = h
+            .engine
+            .borrow()
+            .command_center_layout
+            .borrow()
+            .clone()
+            .expect("the Command Center must paint while the menu row is hidden");
+        let back = layout
+            .back_bounds
+            .expect("the back arrow must have a painted bounds");
+        let search = layout
+            .search_bounds
+            .expect("the search box must have a painted bounds");
+
+        // Band geometry comes from what actually painted into the band, never
+        // from literal coordinates: the fill has to start at or left of the back
+        // arrow, run past the search box's trailing edge, and cover the arrow's
+        // full height.
+        let fill_id = quadraui::WidgetId::new("chrome:solid-fill");
+        let band_fill = h.driver.inventory().zones().iter().any(|z| {
+            z.id == fill_id
+                && z.bounds.x <= back.x
+                && z.bounds.x + z.bounds.width >= search.x + search.width
+                && z.bounds.y <= back.y
+                && z.bounds.y + z.bounds.height >= back.y + back.height
+        });
+        assert!(
+            band_fill,
+            "the title-bar band must be filled with draw_solid_fill while the \
+             drawn menu row is hidden (a `chrome:solid-fill` zone spanning the \
+             Command Center's painted bounds); zones were {:?}",
+            h.driver
+                .inventory()
+                .zones()
+                .iter()
+                .map(|z| (z.id.as_str().to_string(), z.bounds))
+                .collect::<Vec<_>>()
+        );
+
+        // Same band, same colour contract as the pixel assertion in
+        // `command_center_stays_live_when_menu_bar_is_hidden`: swapping the
+        // filler `MenuBar` for a plain fill must not change what is on screen.
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let row_y = (back.y + back.height / 2.0) as i32;
+        let (r, g, b) = h.driver.pixel(2, row_y);
+        assert_eq!(
+            (r, g, b),
+            (theme.tab_bar_bg.r, theme.tab_bar_bg.g, theme.tab_bar_bg.b),
+            "the plain fill must paint the same theme.tab_bar_bg band the \
+             filler MenuBar did; sampled {:?} at (2, {row_y})",
+            (r, g, b)
+        );
+    }
+
     /// The smoke-spec's hit-test pixel coordinates were derived from a model
     /// that never accounted for the Command Center (back/forward nav arrows +
     /// search box) now painting between the menu row and caption buttons on a
@@ -15497,6 +15508,7 @@ mod chrome_band_order {
         engine.app_shell.show_panel(&quadraui::WidgetId::new(
             crate::core::engine::sidebar::PANEL_SETTINGS,
         ));
+        engine.settings_modal_open = true;
         engine.wildmenu_items = vec!["ZQXWwildA".to_string(), "ZQXWwildB".to_string()];
         engine.wildmenu_selected = Some(0);
 
@@ -15519,13 +15531,12 @@ mod chrome_band_order {
             h.driver.screen_contains("ZQXWwildA"),
             "Wildmenu was composed but no wildmenu entry painted"
         );
-        // Not `screen_contains("SETTINGS")`: GTK's `PANEL_SETTINGS` renders
-        // straight into the AppShell-provided content rect with no separate
-        // header. "Appearance" is the first `setting_categories()` entry,
-        // so its presence proves the settings form reached the Cairo surface.
+        // Settings renders as a centred modal overlay (SettingsModal rung),
+        // not inside the sidebar body. "Appearance" is the first
+        // `setting_categories()` entry, proving the modal reached the surface.
         assert!(
             h.driver.screen_contains("Appearance"),
-            "SidebarPanel was composed but the settings form never painted; painted: {:?}",
+            "SettingsModal was composed but the settings form never painted; painted: {:?}",
             h.driver.painted_texts()
         );
     }
@@ -16604,6 +16615,85 @@ mod modal_rung {
             many_h > few_h,
             "the command palette (many results) must paint a taller popup \
              ({many_h}) than the line-endings picker (two results, {few_h})"
+        );
+    }
+
+    /// Right-clicking a tab and choosing "Close to the Right" must close only
+    /// the tabs *after* the target -- never the ones before it, which is what
+    /// "Close Others" does. Driven through the real tab-bar right-click path
+    /// (`App::dispatch`'s `MouseButton::Right` arm -> `resolve_tab_right_click`
+    /// -> `handle_tab_right_click` -> `Engine::open_tab_context_menu`) and a
+    /// real left click on the painted "Close to the Right" row, not a direct
+    /// `context_menu_confirm()` call.
+    #[test]
+    fn tab_right_click_close_to_the_right_keeps_tabs_before_target() {
+        let mut engine = Engine::new();
+        engine.new_tab(Some(std::path::Path::new("a.txt")));
+        engine.new_tab(Some(std::path::Path::new("b.txt")));
+        engine.new_tab(Some(std::path::Path::new("c.txt")));
+        engine.new_tab(Some(std::path::Path::new("d.txt")));
+
+        let group = engine.active_group;
+        assert_eq!(
+            engine.editor_groups[&group].tabs.len(),
+            5,
+            "the default startup tab plus the four opened files"
+        );
+
+        let mut h = harness(engine, 1400, 900);
+        let bar = quadraui::WidgetId::new(crate::render::EDITOR_TAB_BAR_WIDGET_ID);
+
+        // Tab index 2 is "b.txt" (0: default startup tab, 1: a.txt, 2: b.txt,
+        // 3: c.txt, 4: d.txt).
+        let (bx, by) = h
+            .driver
+            .tab_center(&bar, 2)
+            .expect("tab index 2 (b.txt) must have painted a tab-bar entry");
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(bx, by),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("Close to the Right"),
+            "right-clicking a tab must open a context menu with a \
+             'Close to the Right' entry; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let (tx, ty) = h
+            .driver
+            .find("Close to the Right")
+            .expect("the 'Close to the Right' row must be painted");
+        h.driver.click(tx, ty);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("a.txt "),
+            "tab 'a.txt', which sits before the target tab, must survive \
+             'Close to the Right'; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("b.txt "),
+            "the target tab 'b.txt' itself must survive 'Close to the \
+             Right'; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("c.txt "),
+            "tab 'c.txt', which sits after the target tab, must be closed \
+             by 'Close to the Right'; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("d.txt "),
+            "tab 'd.txt', which sits after the target tab, must be closed \
+             by 'Close to the Right'; painted: {:?}",
+            h.driver.painted_texts()
         );
     }
 }
@@ -23044,5 +23134,89 @@ mod issue_1513_at_dir_and_at_symbol_mentions {
                 h.driver.painted_texts()
             );
         }
+    }
+}
+
+/// Find-in-selection (the `≡` toggle) must bound the whole overlay —
+/// the painted match count and the `↑`/`↓` navigation buttons included.
+#[cfg(test)]
+mod find_in_selection {
+    use super::*;
+
+    /// `≡` is U+2261, `↓` is U+2193 — the glyphs
+    /// `quadraui::primitives::find_replace` paints for
+    /// `FindReplaceClickTarget::ToggleInSelection` and `NextMatch`.
+    const TOGGLE_IN_SELECTION: &str = "\u{2261}";
+    const NEXT_MATCH: &str = "\u{2193}";
+
+    /// Line 0 holds no `foo`; the other two lines hold three between them.
+    /// Selecting line 0 and enabling find-in-selection must therefore leave
+    /// the overlay with zero matches.
+    fn engine_with_selection_outside_the_matches() -> Engine {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "alpha beta\nfoo bar foo\ngamma foo\n");
+        engine.update_syntax();
+        let wid = engine.active_window_id();
+        engine.mouse_click(wid, 0, 0);
+        engine.mouse_drag(wid, 0, 10);
+        engine.open_find_replace();
+        engine.find_replace_query = "foo".to_string();
+        engine.find_replace_cursor = engine.find_replace_query.chars().count();
+        engine.run_find_replace_search();
+        engine
+    }
+
+    fn click_painted<A: quadraui::AppLogic>(h: &mut Harness<A>, glyph: &str, what: &str) {
+        let bounds = h.driver.find_bounds(glyph).unwrap_or_else(|| {
+            panic!(
+                "the panel must paint its {what} button; painted: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+        h.driver.click(
+            bounds.x + bounds.width / 2.0,
+            bounds.y + bounds.height / 2.0,
+        );
+        h.driver.render();
+    }
+
+    /// Clicking `≡` with a selection active must narrow the *painted* match
+    /// count to the selection, and clicking `↓` afterwards must keep it
+    /// there.
+    ///
+    /// **RED-verified against unfixed `develop`.** The `↓` click fell through
+    /// to the unscoped whole-buffer search, so the panel repainted
+    /// `1 of 3` — three matches, none of them inside the selection.
+    #[test]
+    fn in_selection_toggle_and_next_match_keep_the_painted_count_scoped() {
+        let mut h = harness(engine_with_selection_outside_the_matches(), 1400, 900);
+        assert!(
+            h.driver.screen_contains("1 of 3"),
+            "fixture must paint the unscoped count first; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        click_painted(&mut h, TOGGLE_IN_SELECTION, "find-in-selection");
+        assert!(
+            h.driver.screen_contains("No results"),
+            "clicking the painted ≡ toggle must narrow the match count to the \
+             selection, which holds no 'foo'; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        click_painted(&mut h, NEXT_MATCH, "next-match");
+        assert!(
+            h.driver.screen_contains("No results"),
+            "the ↓ button must honour the find-in-selection bound instead of \
+             falling back to a whole-buffer search; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("1 of 3"),
+            "navigation must not repaint out-of-selection matches; painted: {:?}",
+            h.driver.painted_texts()
+        );
     }
 }

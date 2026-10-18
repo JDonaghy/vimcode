@@ -158,6 +158,15 @@ pub(crate) struct App {
     pub(crate) pending_file_dialog: Cell<Option<PendingFileDialog>>,
     pub(crate) cached_line_height: f64,
     pub(crate) cached_char_width: f64,
+    /// `Theme::from_name(colorscheme).activity_active_accent`, keyed by the
+    /// colorscheme name it was computed from. `paint_active_accent`
+    /// (`src/app/shell.rs`) runs on every dispatched event, which would
+    /// otherwise double `pre_render`/`render_content`'s own per-frame
+    /// `Theme::from_name` call — for a custom theme loaded from
+    /// `~/.config/vimcode/themes/`, that call is a filesystem read plus a
+    /// JSON parse, not just a struct literal. Recomputed only when the
+    /// colorscheme name changes.
+    pub(crate) cached_active_accent: RefCell<Option<(String, quadraui::Color)>>,
     /// Absolute surface pixel position of the wheel event currently being handled
     /// (the same frame `render_content` paints in). Read by `handle_mouse_scroll_msg`
     /// to route the wheel to the registered scroll surface or editor pane under the

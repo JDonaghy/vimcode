@@ -211,7 +211,7 @@ fn debug_sidebar_status_bars(
                 fg: icon_fg,
                 bg,
                 bold: false,
-                action_id: action_id.clone(),
+                action_id,
             },
             quadraui::StatusBarSegment {
                 text: label.to_string(),

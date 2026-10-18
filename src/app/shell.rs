@@ -403,6 +403,7 @@ impl quadraui::ShellApp for App {
         // stays cleared above and nothing is recorded — the sequence describes
         // what reached the canvas.
         presence.dialog = screen.dialog.is_some() && !self.native_dialog_shown.get();
+        presence.settings_modal = engine.settings_modal_open;
 
         // Measure the title-bar band whenever the Command Center rung
         // is live, independent of whether `FrameOp::MenuRow` itself composes.
@@ -676,16 +677,21 @@ impl quadraui::ShellApp for App {
                 // strip with no vimcode paint call touching it at all. Fill the *entire*
                 // row — inset included — with the theme's title-bar colour first, so the
                 // traffic-light strip is themed, matching VS Code's own macOS title bar.
+                //
+                // The fill is a plain `draw_solid_fill`, same as every other background
+                // band in this file (see `paint_title_bar_band` above), never an empty
+                // filler `MenuBar` handed to `draw_menu_bar`: on a native-menu backend
+                // `draw_menu_bar` doubles as the install point for the platform's real
+                // menu bar (`NSApp.mainMenu` on macOS), so an empty bar passed purely to
+                // get a background would reinstall the menu bar as empty too, wiping every
+                // app menu down to nothing. The two paint the same pixels anyway —
+                // quadraui's menu-bar primitive fills its background with
+                // `theme.tab_bar_bg`, and an item-less bar paints nothing else — so one
+                // unconditional fill covers every backend with no capability branch.
                 render::FrameOp::CommandCenter => {
                     let mut row_filled = false;
                     if !presence.menu_row {
-                        let filler = quadraui::MenuBar {
-                            id: quadraui::WidgetId::new("title_row_background_fill"),
-                            items: Vec::new(),
-                            open_item: None,
-                            focused_item: None,
-                        };
-                        let _ = backend.draw_menu_bar(menu_row_rect, &filler);
+                        backend.draw_solid_fill(menu_row_rect, theme.tab_bar_bg);
                         row_filled = true;
                     }
                     let mut cc_painted = false;
@@ -849,6 +855,59 @@ impl quadraui::ShellApp for App {
                     }
                 }
 
+                // ── Settings modal overlay ──────────────────────────────────────
+                // When the settings panel is open, paint it as a centred modal
+                // covering ~80 % of the viewport instead of inside the narrow
+                // sidebar.  Scrim → centred SidebarPanelBody + FormController,
+                // exactly like the sidebar `PANEL_SETTINGS` arm in paint.rs but
+                // with a wider, self-contained rect.
+                render::FrameOp::SettingsModal => {
+                    let scrim_rect =
+                        render::modal_scrim_rect(&engine, &el, popup_viewport.width, y as f32, lh);
+                    // On GUI backends the RGBA scrim blends into a dim tint;
+                    // on TUI `draw_solid_fill` drops the alpha channel and
+                    // fills the band with opaque black, hiding everything
+                    // behind the modal. Skip the scrim on TUI — the modal's
+                    // own `background: Some(theme.tab_bar_bg)` is enough to
+                    // separate it from the editor band.
+                    if backend.backend_caps().window_chrome {
+                        backend.draw_solid_fill(scrim_rect, render::MODAL_SCRIM_COLOR);
+                    }
+
+                    // 80 % of the popup viewport, centred.
+                    let modal_w = (popup_viewport.width * 0.8).round();
+                    let modal_h = (popup_viewport.height * 0.7).round();
+                    let modal_x = ((popup_viewport.width - modal_w) / 2.0).round();
+                    let modal_y =
+                        popup_viewport.y + ((popup_viewport.height - modal_h) / 2.0).round();
+                    let modal_rect = quadraui::Rect::new(modal_x, modal_y, modal_w, modal_h);
+
+                    backend.set_editor_font(&editor_family, editor_size_pt);
+                    let panel = render::SidebarPanelBody {
+                        background: Some(theme.tab_bar_bg),
+                        chrome: render::find_chrome(
+                            &engine.settings_query,
+                            "type to filter",
+                            &theme,
+                        ),
+                        scrollbar_gutter: None,
+                    };
+                    panel.render_with(backend, modal_rect, |backend, body_rect| {
+                        engine.settings_form_rect.set(body_rect);
+                        render::populate_settings_form_controller(&engine);
+                        engine
+                            .settings_form_controller
+                            .borrow_mut()
+                            .render_and_cache(backend, body_rect);
+                    });
+                    if let Some(px) =
+                        resolve_editor_line_height_px(&engine.settings, backend, editor_size_pt)
+                    {
+                        quadraui::Backend::set_current_line_height(backend, px);
+                    }
+                    composed.push(render::FrameOp::SettingsModal);
+                }
+
                 // ── Modal dialog ────────────────────────────────────────────────
                 // Same story as the context menu: invisible AND undismissable by mouse
                 // under ShellApp — `dialog.is_some()` stayed true forever. Modal rungs
@@ -939,6 +998,7 @@ impl quadraui::ShellApp for App {
         if self.engine.borrow().menu_bar_toggleable {
             self.sync_runner_sidebar_visibility(ctx);
         }
+        self.paint_active_accent(ctx);
         if self.exit_requested.get() {
             return quadraui::Reaction::Exit;
         }
@@ -984,7 +1044,7 @@ impl quadraui::ShellApp for App {
             self.suppress_shell_panel_echo = true;
             return Some(id);
         }
-        let current = engine.app_shell.active_panel_id()?.clone();
+        let current = *engine.app_shell.active_panel_id()?;
         if self.last_shell_panel.as_ref() == Some(&current) {
             return None;
         }
@@ -1047,5 +1107,47 @@ impl quadraui::ShellApp for App {
         if self.engine.borrow().menu_bar_toggleable {
             render::sync_menu_bar_title_row(ctx, &self.engine.borrow());
         }
+        // Same reasoning as `Self::handle`'s own call: a mouse click that
+        // switches panels is consumed entirely inside `ShellAdapter::handle`
+        // and never reaches `Self::handle`, so this is the only choke point
+        // that repaints the accent onto the newly-activated panel.
+        self.paint_active_accent(ctx);
+    }
+}
+
+impl App {
+    /// Paint the active panel's left-edge accent strip from vimcode's own
+    /// theme instead of quadraui's unset `None` default (which paints no
+    /// accent at all). Unconditional across every profile — the accent
+    /// line is a chrome detail, not something gated on the toggleable-
+    /// menu-bar (TUI) profile `ShellApp::handle`'s other syncs are scoped to.
+    ///
+    /// Called from both [`quadraui::ShellApp::handle`] and
+    /// [`quadraui::ShellApp::on_shell_event_ctx`]: `ShellAdapter::handle`
+    /// (quadraui) consumes a mouse click that switches the active panel
+    /// entirely inside `AppShell::handle` and returns early through
+    /// `notify_shell_event` — which calls `on_shell_event_ctx`, never
+    /// `handle` — so a mouse-driven panel switch would otherwise never
+    /// repaint the accent onto its new panel until some unrelated later
+    /// event reached `handle`.
+    ///
+    /// `ctx` is only reachable from those two methods (`quadraui::ShellApp`'s
+    /// own doc), so the very first frame — before any real `UiEvent` has
+    /// dispatched — paints with no accent; the same "until a real click/
+    /// event lands" gap `sync_runner_sidebar_visibility`'s own call sites
+    /// already live with.
+    fn paint_active_accent(&self, ctx: &quadraui::ShellContext<'_>) {
+        let colorscheme = self.engine.borrow().settings.colorscheme.clone();
+        let mut cache = self.cached_active_accent.borrow_mut();
+        let accent = match cache.as_ref() {
+            Some((name, color)) if *name == colorscheme => *color,
+            _ => {
+                let color = Theme::from_name(&colorscheme).activity_active_accent;
+                *cache = Some((colorscheme, color));
+                color
+            }
+        };
+        drop(cache);
+        ctx.shell_mut().set_active_accent(Some(accent));
     }
 }

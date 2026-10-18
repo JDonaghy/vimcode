@@ -30,8 +30,9 @@
 //! Unix-only: the script is bash, and the tests shell out to it.
 #![cfg(unix)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -41,24 +42,33 @@ fn script_path() -> PathBuf {
     repo_root().join("scripts/regress")
 }
 
+/// Every `REGRESS_*` testing hook the script reads. Cleared before every run
+/// so one test's override can never leak into another via the ambient
+/// environment.
+const REGRESS_ENV_VARS: &[&str] = &[
+    "REGRESS_CMD_TUI",
+    "REGRESS_CMD_GTK",
+    "REGRESS_CMD_MACOS",
+    "REGRESS_CMD_WIN",
+    "REGRESS_OVERRIDE_TUI",
+    "REGRESS_OVERRIDE_GTK",
+    "REGRESS_OVERRIDE_MACOS",
+    "REGRESS_OVERRIDE_WIN",
+    "REGRESS_HARNESS_FILE",
+    "REGRESS_CHECKLIST_FILE",
+    "REGRESS_GUIDED_CMD_TUI",
+    "REGRESS_GUIDED_CMD_GTK",
+    "REGRESS_GUIDED_CMD_MACOS",
+    "REGRESS_GUIDED_CMD_WIN",
+    "REGRESS_GUIDED_OUT_DIR",
+];
+
 /// Run the script with the given args and env overrides; returns
 /// (stdout, stderr, exit code).
 fn run_script(args: &[&str], envs: &[(&str, &str)]) -> (String, String, i32) {
     let mut cmd = Command::new("bash");
     cmd.arg(script_path()).args(args);
-    // Start from a clean slate for every REGRESS_* var so one test's override
-    // can never leak into another via the ambient environment.
-    for var in [
-        "REGRESS_CMD_TUI",
-        "REGRESS_CMD_GTK",
-        "REGRESS_CMD_MACOS",
-        "REGRESS_CMD_WIN",
-        "REGRESS_OVERRIDE_TUI",
-        "REGRESS_OVERRIDE_GTK",
-        "REGRESS_OVERRIDE_MACOS",
-        "REGRESS_OVERRIDE_WIN",
-        "REGRESS_HARNESS_FILE",
-    ] {
+    for var in REGRESS_ENV_VARS {
         cmd.env_remove(var);
     }
     for (k, v) in envs {
@@ -67,6 +77,45 @@ fn run_script(args: &[&str], envs: &[(&str, &str)]) -> (String, String, i32) {
     let out = cmd
         .output()
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", script_path().display()));
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// Like [`run_script`], but writes `stdin_data` to the child's stdin and
+/// closes it before collecting output -- needed for `--guided`, which reads
+/// y/n/s answers from its own stdin.
+fn run_script_with_stdin(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin_data: &str,
+) -> (String, String, i32) {
+    let mut cmd = Command::new("bash");
+    cmd.arg(script_path())
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for var in REGRESS_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", script_path().display()));
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(stdin_data.as_bytes())
+        .expect("write stdin");
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("failed to wait on {}: {e}", script_path().display()));
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -109,6 +158,30 @@ impl Scratch {
                  label: beta_scenario,\n    \
                  backends: [gtk, tui, tui_prod],\n\
              }\n",
+        )
+    }
+
+    /// A three-item checklist fixture for `--guided`: two items applicable
+    /// to every backend, one restricted to `gtk` so backend filtering has
+    /// something to exclude.
+    fn checklist_fixture(&self) -> PathBuf {
+        self.write(
+            "checklist_fixture.toml",
+            r#"
+[[item]]
+id = "item_a"
+prompt = "Item A prompt."
+setup = ["open:fixture.txt"]
+
+[[item]]
+id = "item_b"
+prompt = "Item B prompt."
+
+[[item]]
+id = "item_c"
+prompt = "Item C prompt, gtk only."
+backends = ["gtk"]
+"#,
         )
     }
 }
@@ -539,6 +612,372 @@ fn list_and_the_table_name_the_same_scenarios() {
             "{scenario} is listed by --list, so it must appear in the table:\n{run_stdout}"
         );
     }
+}
+
+// ── --guided walks the checklist and writes a results file ──────────────────
+
+/// Parse the single greppable `GUIDED_SUMMARY ...` line into key=value pairs.
+fn guided_summary_fields(stdout: &str) -> Vec<(String, String)> {
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("GUIDED_SUMMARY "))
+        .unwrap_or_else(|| panic!("no GUIDED_SUMMARY line in output:\n{stdout}"));
+    line.split_whitespace()
+        .skip(1)
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+fn guided_summary_field(stdout: &str, key: &str) -> String {
+    guided_summary_fields(stdout)
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
+        .unwrap_or_else(|| panic!("no `{key}=` in GUIDED_SUMMARY line:\n{stdout}"))
+}
+
+/// A no-op guided driver override: ignores launch/send/kill and always
+/// succeeds, so `--guided` tests never touch tmux or a real app binary.
+fn guided_noop_driver() -> &'static str {
+    "exit 0"
+}
+
+/// Every item id present in the results-file markdown, in file order.
+fn results_file_item_ids(contents: &str) -> Vec<&str> {
+    contents
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim_start();
+            if !l.starts_with("- [") {
+                return None;
+            }
+            // "- [x] item_id -- PASS" / "- [ ] item_id -- FAIL: note"
+            let after_mark = l.split_once(']')?.1.trim_start();
+            after_mark.split(" -- ").next()
+        })
+        .collect()
+}
+
+/// A piped `y\n` for every applicable item lets `--guided` run to completion
+/// non-interactively, which is exactly what CI/an operator scripting
+/// `yes y | scripts/regress --backend tui --guided` relies on.
+#[test]
+fn guided_mode_with_piped_yes_produces_a_complete_results_file() {
+    let scratch = Scratch::new("guided_complete");
+    let checklist = scratch.checklist_fixture();
+    let out_dir = scratch.dir.join("out");
+
+    let (stdout, stderr, code) = run_script_with_stdin(
+        &["--backend", "tui", "--guided"],
+        &[
+            ("REGRESS_CHECKLIST_FILE", checklist.to_str().unwrap()),
+            ("REGRESS_GUIDED_CMD_TUI", guided_noop_driver()),
+            ("REGRESS_GUIDED_OUT_DIR", out_dir.to_str().unwrap()),
+        ],
+        "y\ny\n",
+    );
+
+    assert_eq!(
+        code, 0,
+        "all-pass guided run must exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(guided_summary_field(&stdout, "total"), "2", "{stdout}");
+    assert_eq!(guided_summary_field(&stdout, "pass"), "2", "{stdout}");
+    assert_eq!(guided_summary_field(&stdout, "fail"), "0", "{stdout}");
+    assert_eq!(guided_summary_field(&stdout, "verdict"), "pass", "{stdout}");
+
+    let file = PathBuf::from(guided_summary_field(&stdout, "file"));
+    let contents = std::fs::read_to_string(&file)
+        .unwrap_or_else(|e| panic!("results file {} must exist ({e})", file.display()));
+    let ids = results_file_item_ids(&contents);
+    assert_eq!(
+        ids,
+        vec!["item_a", "item_b"],
+        "every backend-applicable item must appear, in order:\n{contents}"
+    );
+    assert!(
+        contents.contains("- [x] item_a -- PASS") && contents.contains("- [x] item_b -- PASS"),
+        "a `y` answer must mark the item PASS with a checked box:\n{contents}"
+    );
+}
+
+/// A `backends = ["gtk"]` item is excluded from a `tui` run, and included
+/// (with `backends` empty-list items) when the matching backend runs --
+/// the checklist file alone decides what applies, never the script.
+#[test]
+fn guided_mode_filters_items_by_backend_tag() {
+    let scratch = Scratch::new("guided_backend_filter");
+    let checklist = scratch.checklist_fixture();
+    let out_dir = scratch.dir.join("out");
+
+    // tui: the gtk-only item must not appear at all.
+    let (stdout, stderr, code) = run_script_with_stdin(
+        &["--backend", "tui", "--guided"],
+        &[
+            ("REGRESS_CHECKLIST_FILE", checklist.to_str().unwrap()),
+            ("REGRESS_GUIDED_CMD_TUI", guided_noop_driver()),
+            ("REGRESS_GUIDED_OUT_DIR", out_dir.to_str().unwrap()),
+        ],
+        "y\ny\n",
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(guided_summary_field(&stdout, "total"), "2", "{stdout}");
+    assert!(
+        !stdout.contains("item_c"),
+        "the gtk-only item must be excluded from a tui run:\n{stdout}"
+    );
+
+    // gtk (probe overridden so this is deterministic on any host): all three
+    // items apply.
+    let (stdout, stderr, code) = run_script_with_stdin(
+        &["--backend", "gtk", "--guided"],
+        &[
+            ("REGRESS_CHECKLIST_FILE", checklist.to_str().unwrap()),
+            ("REGRESS_OVERRIDE_GTK", "1"),
+            ("REGRESS_GUIDED_CMD_GTK", guided_noop_driver()),
+            ("REGRESS_GUIDED_OUT_DIR", out_dir.to_str().unwrap()),
+        ],
+        "y\ny\ny\n",
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(guided_summary_field(&stdout, "total"), "3", "{stdout}");
+    let file = PathBuf::from(guided_summary_field(&stdout, "file"));
+    let contents = std::fs::read_to_string(&file).expect("results file must exist");
+    assert!(
+        results_file_item_ids(&contents).contains(&"item_c"),
+        "a gtk run must include the gtk-tagged item:\n{contents}"
+    );
+}
+
+/// An `n` answer may carry a trailing note (e.g. `n blurry edges`), and that
+/// note must survive into the results file so a release PR gets the actual
+/// complaint, not just a bare FAIL.
+#[test]
+fn guided_mode_records_the_note_on_a_failed_item() {
+    let scratch = Scratch::new("guided_fail_note");
+    let checklist = scratch.checklist_fixture();
+    let out_dir = scratch.dir.join("out");
+
+    let (stdout, stderr, code) = run_script_with_stdin(
+        &["--backend", "tui", "--guided"],
+        &[
+            ("REGRESS_CHECKLIST_FILE", checklist.to_str().unwrap()),
+            ("REGRESS_GUIDED_CMD_TUI", guided_noop_driver()),
+            ("REGRESS_GUIDED_OUT_DIR", out_dir.to_str().unwrap()),
+        ],
+        "n too blurry\ny\n",
+    );
+
+    assert_eq!(
+        code, 1,
+        "a guided run with a failed item must exit 1\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(guided_summary_field(&stdout, "fail"), "1", "{stdout}");
+    assert_eq!(guided_summary_field(&stdout, "verdict"), "fail", "{stdout}");
+
+    let file = PathBuf::from(guided_summary_field(&stdout, "file"));
+    let contents = std::fs::read_to_string(&file).expect("results file must exist");
+    assert!(
+        contents.contains("- [ ] item_a -- FAIL: too blurry"),
+        "the note must be kept next to the FAILed item:\n{contents}"
+    );
+}
+
+/// The results file name is documented as `regress-<backend>-<sha>-<date>.md`
+/// -- a release PR's checklist must be found by that exact pattern.
+#[test]
+fn guided_mode_results_file_name_matches_the_documented_pattern() {
+    let scratch = Scratch::new("guided_file_name");
+    let checklist = scratch.checklist_fixture();
+    let out_dir = scratch.dir.join("out");
+
+    let (stdout, stderr, code) = run_script_with_stdin(
+        &["--backend", "tui", "--guided"],
+        &[
+            ("REGRESS_CHECKLIST_FILE", checklist.to_str().unwrap()),
+            ("REGRESS_GUIDED_CMD_TUI", guided_noop_driver()),
+            ("REGRESS_GUIDED_OUT_DIR", out_dir.to_str().unwrap()),
+        ],
+        "y\ny\n",
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let file = PathBuf::from(guided_summary_field(&stdout, "file"));
+    // Mirror the script's own fallback: a checkout git cannot read (an export,
+    // a foreign-owned clone) still has to produce a well-formed name, and the
+    // expectation must not silently become `regress-tui--<date>.md`.
+    let sha = match Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(repo_root())
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if sha.is_empty() {
+                "nogit".to_string()
+            } else {
+                sha
+            }
+        }
+        _ => "nogit".to_string(),
+    };
+
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_else(|| panic!("results path has no file name: {}", file.display()));
+    let expected_prefix = format!("regress-tui-{sha}-");
+    assert!(
+        name.starts_with(&expected_prefix) && name.ends_with(".md"),
+        "expected a name like `regress-tui-{sha}-YYYY-MM-DD.md`, got `{name}`"
+    );
+    let date_part = name
+        .strip_prefix(&expected_prefix)
+        .and_then(|s| s.strip_suffix(".md"))
+        .unwrap();
+    assert_eq!(
+        date_part.len(),
+        10,
+        "date part must be YYYY-MM-DD: got `{date_part}` in `{name}`"
+    );
+    assert!(
+        date_part.chars().enumerate().all(|(i, c)| match i {
+            4 | 7 => c == '-',
+            _ => c.is_ascii_digit(),
+        }),
+        "date part must be YYYY-MM-DD: got `{date_part}` in `{name}`"
+    );
+}
+
+/// The fixture checklists above prove the walk; this one proves the parser
+/// against the real committed `tests/regress/checklist.toml`, which is the
+/// file an operator actually runs and the only place items are defined.
+#[test]
+fn guided_mode_walks_the_committed_checklist() {
+    let scratch = Scratch::new("guided_committed_checklist");
+    let out_dir = scratch.dir.join("out");
+
+    let (stdout, stderr, code) = run_script_with_stdin(
+        &["--backend", "tui", "--guided"],
+        &[
+            ("REGRESS_GUIDED_CMD_TUI", guided_noop_driver()),
+            ("REGRESS_GUIDED_OUT_DIR", out_dir.to_str().unwrap()),
+        ],
+        &"y\n".repeat(64),
+    );
+
+    assert_eq!(
+        code, 0,
+        "the committed checklist must walk to completion\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let total: usize = guided_summary_field(&stdout, "total")
+        .parse()
+        .unwrap_or_else(|e| panic!("non-numeric total ({e}):\n{stdout}"));
+    assert!(
+        total >= 2,
+        "the committed checklist must yield items for tui, got {total}:\n{stdout}"
+    );
+    assert_eq!(guided_summary_field(&stdout, "verdict"), "pass", "{stdout}");
+
+    let file = PathBuf::from(guided_summary_field(&stdout, "file"));
+    let contents = std::fs::read_to_string(&file).expect("results file must exist");
+    let ids = results_file_item_ids(&contents);
+    assert_eq!(
+        ids.len(),
+        total,
+        "every walked item must be recorded:\n{contents}"
+    );
+    assert!(
+        ids.contains(&"buffer-glyph-rendering"),
+        "the committed checklist's first item must be parsed:\n{contents}"
+    );
+    assert!(
+        !ids.contains(&"traffic-light-theme"),
+        "a macos-only item must not be walked on tui:\n{contents}"
+    );
+    // A `reference` field is optional, so its presence proves the parser kept
+    // a string field that follows an array field in the same table.
+    assert!(
+        stdout.contains("Reference: "),
+        "an item's `reference` must reach the operator prompt:\n{stdout}"
+    );
+}
+
+/// The script must run on a bare POSIX userland: `--guided` is used on release
+/// day on whatever machine the operator has, so reading the checklist may not
+/// pull in an interpreter (python, perl, ...) that host might not ship.
+#[test]
+fn the_script_needs_no_interpreter_beyond_the_posix_userland() {
+    let src = std::fs::read_to_string(script_path()).expect("read scripts/regress");
+    let banned = ["python3", "python", "perl", "ruby", "node", "jq"];
+    let mut offenders = Vec::new();
+    for (lineno, line) in src.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with('#') {
+            continue;
+        }
+        for needle in banned {
+            if code.contains(needle) {
+                offenders.push(format!(
+                    "scripts/regress:{}: `{needle}` is not guaranteed on an operator's host\n    {code}",
+                    lineno + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "non-POSIX interpreters found; use awk/sed/bash builtins instead:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// macOS ships bash 3.2 as `/bin/bash`, so the script must stay inside that
+/// dialect: a bash-4-only construct aborts the whole run under `set -e` on a
+/// stock mac, while staying invisible on a bash-5 Linux CI box. The tests
+/// above only catch it on the older host, so this one fails everywhere.
+#[test]
+fn the_script_uses_no_bash_4_only_features() {
+    let src = std::fs::read_to_string(script_path()).expect("read scripts/regress");
+    // (construct, what to use instead)
+    let banned: &[(&str, &str)] = &[
+        (
+            "declare -A",
+            "a newline-delimited string tested with `[[ == *..* ]]`",
+        ),
+        (
+            "local -A",
+            "a newline-delimited string tested with `[[ == *..* ]]`",
+        ),
+        ("mapfile", "a `while IFS= read -r` loop"),
+        ("readarray", "a `while IFS= read -r` loop"),
+        ("coproc", "a plain subshell"),
+        ("wait -n", "`wait` on the collected pids"),
+        ("&>>", "`>>file 2>&1`"),
+        (",,}", "`tr '[:upper:]' '[:lower:]'`"),
+        ("^^}", "`tr '[:lower:]' '[:upper:]'`"),
+    ];
+    let mut offenders = Vec::new();
+    for (lineno, line) in src.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with('#') {
+            continue;
+        }
+        for (needle, alternative) in banned {
+            if code.contains(needle) {
+                offenders.push(format!(
+                    "scripts/regress:{}: `{needle}` needs bash 4 -- use {alternative}\n    {code}",
+                    lineno + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "bash-4-only constructs found (macOS /bin/bash is 3.2):\n{}",
+        offenders.join("\n")
+    );
 }
 
 /// The script is committed executable, so `scripts/regress --backend tui`

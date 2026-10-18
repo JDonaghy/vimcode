@@ -2073,7 +2073,7 @@ impl Engine {
                 // `run_board_action_by_name` re-resolving it (rather than
                 // this call site caching the argv) keeps the menu-vs-run
                 // lookup as the single source of truth.
-                let card_id = card_id.clone();
+                let card_id = *card_id;
                 self.run_board_action_by_name(&action, card_id);
             }
         }
@@ -4101,11 +4101,7 @@ impl Engine {
             // Composite
             'f' => {
                 if let Some(path) = self.file_path_under_cursor() {
-                    let abs_path = if path.is_absolute() {
-                        path
-                    } else {
-                        self.cwd.join(&path)
-                    };
+                    let abs_path = self.resolve_path_arg(&path.to_string_lossy());
                     self.split_window(SplitDirection::Horizontal, None);
                     return EngineAction::OpenFile(abs_path);
                 } else {

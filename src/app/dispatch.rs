@@ -1212,14 +1212,14 @@ impl App {
                 // `render::route_hamburger_panel_changed`; see its own doc. A no-op check on
                 // GTK/macOS/Win, which never register this panel id in the first place.
                 if render::route_hamburger_panel_changed(&mut self.engine.borrow_mut(), panel_id) {
-                    self.last_shell_panel = Some(panel_id.clone());
+                    self.last_shell_panel = Some(*panel_id);
                     return;
                 }
                 // Record what the runner's own `AppShell` now
                 // believes is active, whether this notification came from
                 // a real click or from `take_requested_panel`'s own echo
                 // below — see `Self::last_shell_panel`'s doc.
-                self.last_shell_panel = Some(panel_id.clone());
+                self.last_shell_panel = Some(*panel_id);
                 if std::mem::take(&mut self.suppress_shell_panel_echo) {
                     // Echo of our own `take_requested_panel` reconciliation:
                     // the engine already holds this state (an app-initiated

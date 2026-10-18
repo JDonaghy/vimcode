@@ -530,8 +530,23 @@ impl App {
         // (VS Code parity), so sizing its width from the editor font
         // makes it oblong — `UnitProfile::px()` pins a fixed-pixel width.
         // `UnitProfile::cell()` leaves this `None`, so the default
-        // (3-line-height multiple) stays in charge.
+        // (4-line-height multiple) stays in charge.
         cfg.activity_bar_width_px = self.units.activity_bar_width_px;
+        {
+            let engine = self.engine.borrow();
+            let theme = render::Theme::from_name(&engine.settings.colorscheme);
+            cfg = cfg
+                .with_active_accent(quadraui::Color::rgb(
+                    theme.activity_active_accent.r,
+                    theme.activity_active_accent.g,
+                    theme.activity_active_accent.b,
+                ))
+                .with_selection_bg(quadraui::Color::rgb(
+                    theme.cursor.r,
+                    theme.cursor.g,
+                    theme.cursor.b,
+                ));
+        }
         // Seed the *initial* editor font from `settings.font_family`/
         // `font_size` before the runner's first frame, not just via
         // `sync_per_frame_backend_state`'s per-frame `set_editor_font` call.
@@ -691,6 +706,7 @@ impl App {
             pending_file_dialog: Cell::new(None),
             cached_line_height: 24.0,
             cached_char_width: 9.0,
+            cached_active_accent: RefCell::new(None),
             last_editor_pointer: Rc::new(Cell::new(None)),
             cached_ui_line_height: 20.0,
             dialog_layout: Rc::new(RefCell::new(None)),

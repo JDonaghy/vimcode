@@ -551,7 +551,7 @@ impl App {
                 // `explorer_tree_rect`/`explorer_viewport_rows` need no
                 // change to account for it.
                 let panel = render::SidebarPanelBody {
-                    background: None,
+                    background: Some(theme.tab_bar_bg),
                     chrome: render::SidebarPanelChrome::StatusBars(vec![
                         render::explorer_toolbar_status_bar(theme),
                     ]),
@@ -584,8 +584,22 @@ impl App {
                     .borrow_mut()
                     .set_backend_info(search_lh, (self.units.sidebar_system_metrics)(search_lh));
                 render::populate_search_sidebar_system(engine, &engine.cwd, theme);
-                engine.search_sidebar_body_rect.set(q_sb);
-                engine.search_sidebar_system.borrow().render(backend, q_sb);
+                // Wrap in `SidebarPanelBody` so the sidebar background is
+                // filled with `tab_bar_bg` before the search system renders.
+                // Without this, unfilled cells default to the terminal
+                // background on TUI (black), unlike every other panel.
+                let panel = render::SidebarPanelBody {
+                    background: Some(theme.tab_bar_bg),
+                    chrome: render::SidebarPanelChrome::None,
+                    scrollbar_gutter: None,
+                };
+                panel.render_with(backend, q_sb, |backend, body_rect| {
+                    engine.search_sidebar_body_rect.set(body_rect);
+                    engine
+                        .search_sidebar_system
+                        .borrow()
+                        .render(backend, body_rect);
+                });
             }
             PANEL_DEBUG => {
                 // Composed through `SidebarPanelBody::render_with`
@@ -595,7 +609,7 @@ impl App {
                 // `engine.dap_sidebar_action_hits`, eliminating a second independently-derived
                 // copy of geometry that could disagree with what was painted.
                 let panel = render::SidebarPanelBody {
-                    background: None,
+                    background: Some(theme.tab_bar_bg),
                     chrome: render::debug_sidebar_chrome(&screen.debug_sidebar, theme),
                     scrollbar_gutter: None,
                 };
@@ -790,55 +804,10 @@ impl App {
                 }
             }
             PANEL_SETTINGS => {
-                // Settings is a shell bottom item that owns the
-                // sidebar header (quadraui#1055, #1356's pin bump) — the
-                // shell paints " SETTINGS " above `q_sb`, so this arm
-                // paints only the filter row, instead of the pre-#1343
-                // `SidebarPanelChrome::None` (no chrome at all — #1256's
-                // `settings_filter_row_is_painted::gtk` gap).
-                //
-                // Composed through `SidebarPanelBody::render_with`
-                // with `SidebarPanelChrome::Search` instead
-                // of the bespoke `render::paint_sidebar_search_row` (deleted
-                // by this issue) — see `render::search_only_chrome`'s doc.
-                // TUI's `panels::render_settings_panel` builds the identical
-                // chrome through the same helper.
-                //
-                // `background` is `Some(theme.tab_bar_bg)`, not
-                // `None` — the same sidebar background the `PANEL_EXPLORER`
-                // arm's doc comment above says TUI passes for this composer.
-                // With `None`, nothing fills the strip under the settings
-                // scrollbar's gutter, so the backend's own clear colour
-                // (dark on macOS regardless of the active colourscheme)
-                // showed through there instead of the themed sidebar bg.
-                // GTK-only: `src/gtk/testing.rs`'s
-                // `settings_panel_scrollbar_gutter_paints_theme_tab_bar_bg`
-                // covers it with a pixel probe (that module's own doc
-                // records why an equivalent TUI probe can't reproduce this
-                // one — `FormController` already paints an opaque per-row
-                // background there regardless of this field).
-                let panel = render::SidebarPanelBody {
-                    background: Some(theme.tab_bar_bg),
-                    chrome: render::search_only_chrome(
-                        &engine.settings_query,
-                        "",
-                        engine.settings_input_active,
-                        theme,
-                    ),
-                    scrollbar_gutter: None,
-                };
-                panel.render_with(backend, q_sb, |backend, body_rect| {
-                    // Cache the exact rect this frame painted the form into —
-                    // `try_route_sidebar_mouse_event`'s `Settings` arm reads this back
-                    // instead of the raw, unshrunk `q_sb`, so clicks resolve against
-                    // `FormController`'s row geometry at the correct painted position.
-                    engine.settings_form_rect.set(body_rect);
-                    render::populate_settings_form_controller(engine);
-                    engine
-                        .settings_form_controller
-                        .borrow_mut()
-                        .render_and_cache(backend, body_rect);
-                });
+                // Settings only ever shows as a centred modal overlay
+                // (the SettingsModal rung). The sidebar slot is always
+                // blank — just background fill.
+                backend.draw_solid_fill(q_sb, theme.tab_bar_bg);
             }
             id if id
                 .strip_prefix("ext:")

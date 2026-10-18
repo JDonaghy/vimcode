@@ -242,6 +242,16 @@ impl Engine {
             self.app_shell
                 .show_panel(&quadraui::WidgetId::new(panel_id));
             self.clear_sidebar_focus();
+            // Keyboard navigation into a sidebar panel takes priority over
+            // an already-focused terminal: `terminal_has_focus` staying true
+            // alongside the new panel's own flag would let
+            // `route_focus_key`'s terminal gate outrank every sidebar arm,
+            // e.g. routing Enter on the settings color-scheme picker to the
+            // terminal PTY instead of activating the selection. Scoped to
+            // this focus-*grant* branch only, not the hide branch above or
+            // the shared `clear_sidebar_focus`, so collapsing/hiding a panel
+            // while a terminal is genuinely focused leaves that focus alone.
+            self.terminal_has_focus = false;
             self.set_panel_focus(panel_id);
         }
         self.session.explorer_visible = self.app_shell.sidebar_visible();
@@ -254,6 +264,11 @@ impl Engine {
         self.app_shell
             .show_panel(&quadraui::WidgetId::new(panel_id));
         self.clear_sidebar_focus();
+        // See the matching comment in `toggle_sidebar_panel`'s grant branch:
+        // this is a focus-*grant* site, so it takes focus away from a
+        // terminal explicitly rather than via the shared
+        // `clear_sidebar_focus` primitive.
+        self.terminal_has_focus = false;
         self.set_panel_focus(panel_id);
         self.session.explorer_visible = true;
         let _ = self.session.save();
@@ -299,7 +314,10 @@ impl Engine {
                     self.board_refresh();
                 }
             }
-            PANEL_SETTINGS => self.settings_has_focus = true,
+            PANEL_SETTINGS => {
+                self.settings_has_focus = true;
+                self.settings_modal_open = true;
+            }
             _ => {}
         }
     }
@@ -391,6 +409,8 @@ impl Engine {
     pub fn activity_bar_focus_in_at(&mut self, idx: u16) {
         self.activity_bar_focused = true;
         self.activity_bar_selected = idx;
+        self.app_shell.set_activity_keyboard_focused(true);
+        self.sync_activity_cursor_to_app_shell();
     }
 
     /// Return the toolbar index that corresponds to the currently active panel.
@@ -414,6 +434,32 @@ impl Engine {
     /// Remove activity bar keyboard focus (return focus to the editor).
     pub fn activity_bar_focus_out(&mut self) {
         self.activity_bar_focused = false;
+        self.app_shell.set_activity_keyboard_focused(false);
+    }
+
+    /// Sync the engine's toolbar index to the real `AppShell` cursor so the
+    /// TUI path (which reads `AppShell::build_activity_bar`) highlights the
+    /// correct row.
+    fn sync_activity_cursor_to_app_shell(&mut self) {
+        let Some(id) = self.activity_bar_selected_item_id() else {
+            return;
+        };
+        let np = self.app_shell.panels().len();
+        let cursor = self
+            .app_shell
+            .panels()
+            .iter()
+            .position(|p| p.id.as_str() == id)
+            .or_else(|| {
+                self.app_shell
+                    .bottom_items()
+                    .iter()
+                    .position(|p| p.id.as_str() == id)
+                    .map(|i| np + i)
+            });
+        if let Some(c) = cursor {
+            self.app_shell.activity_set_cursor(c);
+        }
     }
 
     /// The activity bar's items **in painted order**, as a throwaway
@@ -565,6 +611,7 @@ impl Engine {
         };
         if let Some(idx) = self.activity_bar_idx_for_item_id(&next_id) {
             self.activity_bar_selected = idx;
+            self.sync_activity_cursor_to_app_shell();
         }
     }
 
@@ -576,6 +623,7 @@ impl Engine {
     /// (e.g. setting `sidebar.has_focus`, closing TUI menu).
     pub fn activity_bar_activate(&mut self) -> ActivityBarActivation {
         self.activity_bar_focused = false;
+        self.app_shell.set_activity_keyboard_focused(false);
         // Dispatch on the item *id* rather than re-deriving `sel - 8`
         // here. `activity_bar_item_id` owns the one index↔id table, so an
         // out-of-range selection (stale extension index) yields `None` → NoOp,

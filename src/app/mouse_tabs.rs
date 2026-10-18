@@ -83,6 +83,16 @@ impl App {
                     composed_bottom.push(render::BottomOp::Quickfix);
                 }
                 render::BottomOp::BottomPanel => {
+                    // An explicit width in `self.units`'s own units on every
+                    // backend — real pixels on GTK/macOS/Win, one cell on
+                    // TUI, matching quadraui's own
+                    // `Backend::terminal_scrollbar_default_width` so the
+                    // painted gutter is unchanged. Passing `None` here would
+                    // leave vimcode's own `ScrollSurface` with no `scrollbar`
+                    // to hit-test thumb-drag/track-click against (mouse-wheel
+                    // scroll needs only `surface.bounds`, so it would keep
+                    // working while clicking/dragging silently did nothing).
+                    let terminal_scrollbar = Some(self.units.terminal_scrollbar_gutter as u16);
                     render::paint_bottom_panel_rung(
                         backend,
                         engine,
@@ -94,7 +104,7 @@ impl App {
                             main.width,
                             el.terminal_h as f32,
                         ),
-                        render::BottomPanelUnits::px(lh, cw),
+                        render::BottomPanelUnits::new(lh, cw, terminal_scrollbar),
                     );
                     composed_bottom.push(render::BottomOp::BottomPanel);
                 }
@@ -432,7 +442,7 @@ impl App {
         backend
             .modal_stack_handle()
             .borrow_mut()
-            .push(picker_id.clone(), geo.bounds);
+            .push(picker_id, geo.bounds);
 
         match route {
             render::PickerRoute::Row(idx) => {
@@ -642,6 +652,10 @@ impl App {
         width: f64,
         alt: bool,
     ) {
+        if self.engine.borrow().activity_bar_focused {
+            self.engine.borrow_mut().activity_bar_focus_out();
+        }
+
         // ── Folder picker mouse handling ────────────────────────────────
         // Checked before every other rung: like a modal dialog, the picker
         // swallows every click while open rather than competing for z-order
@@ -660,6 +674,36 @@ impl App {
         // `mouse::handle_mouse` checks the identical shared helper.
         if self.engine.borrow().change_review.is_some() {
             self.route_and_apply_change_review_click(x, y);
+            return;
+        }
+
+        // ── Settings modal overlay ───────────────────────────────────────
+        // When the settings panel is shown as a centred modal, clicks
+        // inside the painted form rect route to the FormController; clicks
+        // outside dismiss the modal.  Checked before the general modal
+        // ladder because the scrim covers the editor band.
+        if self.engine.borrow().settings_modal_open {
+            let form_rect = self.engine.borrow().settings_form_rect.get();
+            let fx = x as f32;
+            let fy = y as f32;
+            let inside = fx >= form_rect.x
+                && fx < form_rect.x + form_rect.width
+                && fy >= form_rect.y
+                && fy < form_rect.y + form_rect.height;
+            if inside {
+                let event = quadraui::UiEvent::DoubleClick {
+                    widget: None,
+                    position: quadraui::Point::new(fx, fy),
+                };
+                render::handle_settings_form_ui_event(
+                    &mut self.engine.borrow_mut(),
+                    &event,
+                    form_rect,
+                );
+            } else {
+                self.engine.borrow_mut().collapse_sidebar();
+            }
+            self.draw_needed.set(true);
             return;
         }
 
@@ -1478,8 +1522,8 @@ impl App {
             render::MouseDragRoute::TerminalSplitDivider => {
                 if self.cached_char_width > 0.0 {
                     let min_x = self.cached_char_width * 5.0;
-                    let max_x = (width - Self::TERMINAL_PANEL_SB_W - self.cached_char_width * 5.0)
-                        .max(min_x);
+                    let gutter = self.units.terminal_scrollbar_gutter;
+                    let max_x = (width - gutter - self.cached_char_width * 5.0).max(min_x);
                     let clamped_x = x.clamp(min_x, max_x);
                     let left_cols = (clamped_x / self.cached_char_width) as u16;
                     self.engine

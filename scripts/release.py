@@ -242,106 +242,35 @@ def preflight(args: argparse.Namespace) -> None:
     info("preflight passed")
 
 
-# ── Phase 2: quadraui prepare ────────────────────────────────────────
+# ── Phases 2-3: quadraui release (delegated to release_full.py) ──────
 
 
-def quadraui_prepare(args: argparse.Namespace) -> None:
-    banner("2/6", f"Prepare quadraui {args.quadraui_version}")
+def quadraui_release(args: argparse.Namespace) -> None:
+    banner("2-3/6", f"Release quadraui {args.quadraui_version}")
 
-    branch = f"release-{args.quadraui_version}"
-    current = git_branch(QUADRAUI_DIR)
-
-    if current == branch:
-        info(f"already on {branch} — skipping prepare")
-        return
-
-    if current != "develop":
-        warn(f"quadraui is on {current}, switching to develop")
-        git(["checkout", "develop"], QUADRAUI_DIR)
-        git(["pull", "--ff-only"], QUADRAUI_DIR)
-
-    print(f"  Running: quadraui/scripts/release.py prepare {args.quadraui_version}")
-    result = run_show(
-        [sys.executable, "scripts/release.py", "prepare", args.quadraui_version],
-        QUADRAUI_DIR,
-    )
-    if result.returncode != 0:
-        fail("quadraui prepare failed")
-
-    info(f"quadraui release branch {branch} ready")
-
-
-# ── Phase 3: quadraui publish ────────────────────────────────────────
-
-
-def quadraui_publish(args: argparse.Namespace) -> None:
-    banner("3/6", "Publish quadraui to crates.io")
+    release_script = QUADRAUI_DIR / "scripts" / "release_full.py"
+    if not release_script.exists():
+        fail(f"quadraui release script not found: {release_script}")
 
     qu_ver = args.quadraui_version
     tag = f"v{qu_ver}"
 
     if tag_exists_on_remote(tag, QUADRAUI_DIR):
-        info(f"quadraui {tag} already published — skipping")
+        info(f"quadraui {tag} already tagged on remote")
         if wait_for_crate("quadraui", qu_ver, timeout=10):
             info(f"quadraui {qu_ver} confirmed on crates.io")
-        return
+            return
+        info("tag exists but crate not yet on crates.io — waiting...")
 
-    branch = f"release-{qu_ver}"
-    if git_branch(QUADRAUI_DIR) != branch:
-        git(["checkout", branch], QUADRAUI_DIR)
+    cmd = [sys.executable, str(release_script), qu_ver]
+    if AUTO_YES:
+        cmd.append("--yes")
 
-    print(f"\n  The release branch {branch} needs to be pushed and merged.")
-    print("  This involves three PRs (quadraui's workflow):\n")
-    print(f"    1. Push {branch}, open PR to develop, merge it")
-    print(f"    2. Promote develop → main (merge commit, not squash)")
-    print(f"    3. Push to main triggers CI → cargo publish + tag {tag}\n")
+    result = run_show(cmd, QUADRAUI_DIR)
+    if result.returncode != 0:
+        fail(f"quadraui release failed (exit {result.returncode})")
 
-    if not confirm(f"Push {branch} and create the bump PR?"):
-        fail("aborted — push the branch manually and re-run")
-
-    git(["push", "-u", "origin", branch], QUADRAUI_DIR)
-    info(f"pushed {branch}")
-
-    pr_result = run(
-        ["gh", "pr", "create",
-         "--repo", "JDonaghy/quadraui",
-         "--base", "develop",
-         "--head", branch,
-         "--title", f"Release v{qu_ver} (version bump + CHANGELOG)",
-         "--body", f"Bumps quadraui to {qu_ver} and retitles CHANGELOG.md."],
-        QUADRAUI_DIR,
-        check=False,
-    )
-    if pr_result.returncode == 0:
-        pr_url = pr_result.stdout.strip()
-        info(f"bump PR created: {pr_url}")
-    else:
-        warn("PR creation failed (may already exist) — check GitHub")
-        pr_url = None
-
-    print(f"\n  {YELLOW}Manual steps required:{RESET}")
-    print(f"    1. Merge the bump PR to develop")
-    print(f"    2. Then run the promotion (develop → main merge commit)")
-    print(f"    3. Wait for CI to publish the crate\n")
-
-    if pr_url:
-        print(f"  Bump PR: {pr_url}")
-
-    print(f"\n  Promotion command (after bump PR is merged):")
-    print(f"    cd {QUADRAUI_DIR}")
-    print(f"    git checkout develop && git pull")
-    print(f"    python3 scripts/release.py promote")
-    print(f"    # then run the printed gh commands\n")
-
-    if not confirm(f"Wait here for quadraui {qu_ver} to appear on crates.io? (may take several minutes)"):
-        print(f"\n  Re-run this script after quadraui {qu_ver} is published.")
-        sys.exit(0)
-
-    print(f"\n  Polling crates.io for quadraui {qu_ver}...")
-    if wait_for_crate("quadraui", qu_ver, timeout=900):
-        info(f"quadraui {qu_ver} is live on crates.io")
-    else:
-        fail(f"timed out waiting for quadraui {qu_ver} on crates.io — check the release workflow")
+    info(f"quadraui {qu_ver} released")
 
 
 # ── Phase 4: vimcode update ──────────────────────────────────────────
@@ -612,8 +541,7 @@ def main() -> None:
 
     preflight(args)
     if not args.skip_quadraui:
-        quadraui_prepare(args)
-        quadraui_publish(args)
+        quadraui_release(args)
     vimcode_update(args)
     vimcode_gate(args)
     vimcode_release(args)
