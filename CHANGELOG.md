@@ -15,6 +15,7 @@ no matching section fails the release job before anything is published (see
 
 ## [Unreleased]
 
+## [0.15.5] - 2026-10-17
 ## [0.15.4] - 2026-10-17
 ### Added
 - Settings panel renders as a centered modal overlay (~80% viewport)
