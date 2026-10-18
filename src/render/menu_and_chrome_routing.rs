@@ -100,13 +100,7 @@ pub(crate) fn apply_engine_action(
             false
         }
         EngineAction::OpenFolderDialog => {
-            let controller = quadraui::FolderPickerController::new(
-                engine.cwd.clone(),
-                vec![".vimcode-workspace".to_string()],
-                engine.settings.show_hidden_files,
-            );
-            *app.folder_picker.borrow_mut() = Some(controller);
-            app.draw_needed.set(true);
+            app.open_folder_dialog_native();
             false
         }
         // Inlines the `refresh_file_tree` / `refresh_explorer` /

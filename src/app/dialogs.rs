@@ -25,6 +25,26 @@ impl App {
                     self.refresh_file_tree();
                 }
             }
+            PendingFileDialog::OpenFolder => {
+                if backend.backend_caps().native_dialogs {
+                    let path = {
+                        let engine = self.engine.borrow();
+                        backend
+                            .services()
+                            .show_folder_open_dialog(quadraui::FileDialogOptions {
+                                title: Some("Open Folder".to_string()),
+                                initial_dir: Some(engine.cwd.clone()),
+                                ..Default::default()
+                            })
+                    };
+                    if let Some(path) = path {
+                        self.engine.borrow_mut().open_folder(&path);
+                        self.refresh_file_tree();
+                    }
+                } else {
+                    self.open_folder_dialog();
+                }
+            }
             PendingFileDialog::SaveWorkspaceAs => {
                 let mut engine = self.engine.borrow_mut();
                 render::run_save_workspace_as_dialog(&mut engine, backend);
@@ -161,14 +181,18 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// Show the shared folder/workspace picker modal.
-    ///
-    /// Opens the `Palette`-based picker identical to what TUI does via
-    /// `quadraui::FolderPickerController` (see `FrameOp::FolderPicker` and
-    /// `handle_key_press`'s folder-picker rung). This stays on
-    /// `FolderPickerController` deliberately, because it's the shape that
-    /// behaves identically on every backend, whereas native file-dialog
-    /// primitives are backend-specific and TUI cannot implement the same way.
+    /// Request a native folder dialog. On backends with `native_dialogs`
+    /// this opens the OS file picker (NSOpenPanel / GtkFileChooser /
+    /// IFileOpenDialog); on TUI it falls back to the in-app
+    /// `FolderPickerController`. Deferred to `tick()` where `backend` is
+    /// available — see `PendingFileDialog`.
+    pub(crate) fn open_folder_dialog_native(&mut self) {
+        self.pending_file_dialog
+            .set(Some(PendingFileDialog::OpenFolder));
+        self.draw_needed.set(true);
+    }
+
+    /// Show the in-app folder/workspace picker modal (fallback for TUI).
     pub(crate) fn open_folder_dialog(&mut self) {
         let engine = self.engine.borrow();
         let controller = quadraui::FolderPickerController::new(
