@@ -50,7 +50,7 @@ impl App {
                 self.open_file_dialog();
             }
             "open_folder_dialog" => {
-                self.open_folder_dialog();
+                self.open_folder_dialog_native();
             }
             "open_workspace_dialog" => {
                 self.engine.borrow_mut().open_workspace_from_file();

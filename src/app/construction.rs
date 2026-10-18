@@ -87,6 +87,7 @@ pub(crate) fn setup_gtk_clipboard(
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PendingFileDialog {
     OpenFile,
+    OpenFolder,
     SaveWorkspaceAs,
 }
 
