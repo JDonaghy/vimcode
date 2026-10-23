@@ -316,8 +316,11 @@ impl App {
     /// divider lines *within* each group.
     ///
     /// `window_editors` collects each window's owned `quadraui::Editor` for
-    /// the caller's `FrameHitMap`, so the map hit-tests the SAME
-    /// objects that were painted rather than a second copy that could drift.
+    /// the caller's `FrameHitMap`. `Surface::Editor` owns its `Editor` by
+    /// value, so the one pushed onto the frame is a clone taken immediately
+    /// before `window_editors` takes the original — same content, so the
+    /// map hit-tests against data identical to what was painted rather than
+    /// a second, independently-built copy that could drift.
     ///
     /// TUI's twin is `render_impl::render_all_windows`, which also paints its
     /// within-group separators (`render_separators`) from the same rung.
@@ -423,7 +426,7 @@ impl App {
             let mut frame = QSL::new();
             frame.push(Surface::Editor {
                 rect,
-                editor: &editor,
+                editor: editor.clone(),
             });
             frame.draw(backend);
             window_editors.push(editor);
@@ -1386,7 +1389,7 @@ impl App {
         for editor in &window_editors {
             hit_frame.push(Surface::Editor {
                 rect: editor.rect,
-                editor,
+                editor: editor.clone(),
             });
         }
         let mut tab_bar_zones: HashMap<usize, (core::window::GroupId, quadraui::Rect)> =
@@ -1394,7 +1397,7 @@ impl App {
         for (surface_idx, (group_id, rect, bar)) in (window_editors.len()..).zip(hit_bars) {
             hit_frame.push(Surface::TabBar {
                 rect,
-                bar,
+                bar: bar.clone(),
                 hovered_close: None,
             });
             tab_bar_zones.insert(surface_idx, (group_id, rect));

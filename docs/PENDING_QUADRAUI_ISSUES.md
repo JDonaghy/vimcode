@@ -2652,6 +2652,16 @@ Whether the bug is actually *reached* in any given run turns out to be a race, n
 
 **Note on the two `#[ignore]`d vimcode tests this entry now covers:** `tests/crossterm_dead_pty_busy_loop.rs` un-ignores only once Ask item 1 (a real `crossterm` fix) lands and vimcode's pin picks it up — it bypasses any quadraui-level guard by construction, so no quadraui-side fix (quadraui#1295, #1301, or any future workaround) can turn it green. `tests/pty_dead_master_exit.rs` un-ignored as of #1775 (quadraui#1301) — it drove a real `vcd` through quadraui's own `TuiBackend`, so it was able to observe the quadraui-side fix once one actually closed the race rather than narrowing it. Do not assume `crossterm_dead_pty_busy_loop.rs` is also ready; it is not, and has a different, upstream-only un-ignore condition.
 
+**#2005 update:** vimcode#2005 bumped the pin past `0.2.2` to the published `0.4.0`
+release. No change to this entry's status: `Cargo.lock` still resolves `crossterm
+0.29.0` transitively (`0.4.0`'s own changes — `Backend::draw_date_picker`,
+`SelectionMode::Multi`, chrome-glyph override hooks — don't touch `TuiBackend`'s
+event-wait path), and `tests/crossterm_dead_pty_busy_loop.rs` re-confirmed RED
+against this pin (re-run with `--ignored`, ~100%+ of one core over the sample
+window). `tests/pty_dead_master_exit.rs` re-confirmed passing against this pin.
+Ask item 1 (an upstream `crossterm` fix) remains the only thing that changes
+either test's status.
+
 **Blocks:** `JDonaghy/vimcode#1735` — **closed by #1775's pin bump** (quadraui#1301 fixes the reported symptom: an orphaned `vcd` busy-spinning on a dead pty, via `TuiBackend::wait_events`, the path every real vcd session goes through). This entry itself stays open: the upstream `crossterm` 0.29.0 defect this entry root-causes is still unpatched, and `tests/crossterm_dead_pty_busy_loop.rs` (which drives raw `crossterm::event::poll`, bypassing `TuiBackend` by construction) still reproduces it and stays `#[ignore]`d — there is no per-backend vimcode-side fix available for that half, and per this repo's Platform-Neutrality Rule a vimcode-side workaround (e.g. vimcode polling its own fds independently of quadraui's event loop) is exactly the kind of per-backend code that rule exists to prevent. Ask item 1 (an upstream `crossterm` fix) remains the thing this entry is actually waiting on now.
 
 
