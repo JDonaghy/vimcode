@@ -256,10 +256,7 @@ mod emoji_click_column_tests {
             b.set_current_char_width(char_width);
             b.enter_frame_scope(&cr, &layout, |b| {
                 let mut frame = QScreenLayout::new();
-                frame.push(Surface::Editor {
-                    rect,
-                    editor: &editor,
-                });
+                frame.push(Surface::Editor { rect, editor });
                 frame.draw(b);
             });
         }
@@ -597,7 +594,7 @@ mod frame_hit_map_tests {
         for editor in &window_editors {
             hit_frame.push(Surface::Editor {
                 rect: editor.rect,
-                editor,
+                editor: editor.clone(),
             });
         }
 
@@ -609,7 +606,7 @@ mod frame_hit_map_tests {
         ) {
             hit_frame.push(Surface::TabBar {
                 rect: target.rect,
-                bar: target.bar,
+                bar: target.bar.clone(),
                 hovered_close: None,
             });
             tab_bar_zones.insert(next_surface_idx, (target.group_id, target.rect));
