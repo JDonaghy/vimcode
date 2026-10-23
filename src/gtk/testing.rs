@@ -16361,16 +16361,16 @@ mod modal_rung {
              drawing-area-width hit test dropped"
         );
 
-        // `×` is painted three times on this frame (tab close, window close,
-        // and the panel's own) so it cannot disambiguate the panel; `Aa` is
-        // unique to it. Clicking the case-sensitivity toggle flips it, and
-        // `quadraui::gtk::find_replace` fills an *active* toggle with the
-        // accent colour and inverts its label — a rendered change, not a
-        // state read.
+        // The case-sensitivity toggle paints a unique codicon glyph
+        // (`\u{eab1}`), so unlike `×` — painted three times this frame (tab
+        // close, window close, and the panel's own) — it pins the panel
+        // unambiguously. Clicking the toggle flips it, and quadraui fills an
+        // *active* toggle with the accent colour and inverts its glyph — a
+        // rendered change, not a state read.
         let toggle = h
             .driver
-            .find_bounds("Aa")
-            .expect("the panel must paint its Aa case-sensitivity toggle");
+            .find_bounds("\u{eab1}")
+            .expect("the panel must paint its case-sensitivity toggle glyph");
         // Sample the whole toggle cell rather than one pixel: the fill, the
         // border stroke and the glyph all change together, and which of the
         // three a single probe lands on depends on the font.
@@ -16396,9 +16396,9 @@ mod modal_rung {
         assert_ne!(
             sample(&mut h),
             before,
-            "clicking the painted Aa toggle must repaint it as active; its \
-             pixels are unchanged, so the click hit-tested somewhere the panel \
-             is not"
+            "clicking the painted case-sensitivity toggle must repaint it as \
+             active; its pixels are unchanged, so the click hit-tested \
+             somewhere the panel is not"
         );
     }
 
