@@ -6729,11 +6729,14 @@ mod issue_1266_scroll_router_convergence {
     /// proof that the convergence covers it too, not just the `scroll_surfaces`
     /// registered arms.
     ///
-    /// Also unlike the other two scenarios, quadraui's own `SidebarSystem::handle_inner`
-    /// scrolls by a **fixed one row per event, regardless of the delta's magnitude**.
-    /// So magnitude for *this* surface is tested by dispatching a wheel event more than
-    /// once, not by one bigger-delta event — a single `scroll_at` call moves exactly
-    /// one row.
+    /// quadraui's own `SidebarSystem::handle_inner` scrolls its tree sections by
+    /// `wheel_row_delta(delta.y, 1.0)` — the gesture's magnitude in rows, so one
+    /// wheel notch moves as many rows as the backend's `conformance_line_height`:
+    /// one row per notch on the TUI (a cell is one row high), `line_height` rows
+    /// per notch on GTK (a notch's `ScrollDelta::y` is scaled by the pixel line
+    /// height). Magnitude for this surface therefore shows up both ways — a bigger
+    /// delta and repeated notches both move further — and this scenario drives it
+    /// with repeated notches so the shared body reads the same on every backend.
     ///
     /// Load-bearing for #554's convention: `try_route_sidebar_mouse_event` is called
     /// *before* the `UiEvent::Scroll` match arm that negates `delta.y` back to GTK-raw
@@ -6744,17 +6747,24 @@ mod issue_1266_scroll_router_convergence {
     mod issue_1266_sidebar_scroll_router_convergence {
         use quadraui::testing::ConformanceDriver;
 
-        /// 80 synthetic unstaged files so the panel body overflows one
-        /// screen — single-token paths (`gitf0000` .. `gitf0079`, no `/`
-        /// or extra punctuation) for the same reason `engine_fixture`'s
-        /// `L%04d` lines are single tokens in the sibling scenario above.
+        /// 240 synthetic unstaged files so the panel body overflows one
+        /// screen by a wide margin — single-token paths (`gitf0000` ..
+        /// `gitf0239`, no `/` or extra punctuation) for the same reason
+        /// `engine_fixture`'s `L%04d` lines are single tokens in the sibling
+        /// scenario above. The count is deliberately far larger than the
+        /// rows any one notch of this scenario scrolls: a GTK wheel notch
+        /// moves `line_height` rows (see `run_scenario`), so five notches
+        /// advance well over a hundred rows, and the list must stay long
+        /// enough that none of those steps hit the bottom clamp — a clamped
+        /// offset paints the anchor row off-screen and breaks the
+        /// screen-point anchoring the scenario measures scroll with.
         fn engine_fixture() -> crate::core::Engine {
             let mut engine = crate::core::Engine::new_for_test();
             engine.settings.use_nerd_fonts = Some(false);
             engine.app_shell.show_panel(&quadraui::WidgetId::new(
                 crate::core::engine::sidebar::PANEL_GIT,
             ));
-            engine.sc_file_statuses = (0..80)
+            engine.sc_file_statuses = (0..240)
                 .map(|i| crate::core::git::FileStatus {
                     path: format!("gitf{i:04}"),
                     unstaged: Some(crate::core::git::StatusKind::Modified),
@@ -6805,7 +6815,7 @@ mod issue_1266_scroll_router_convergence {
                 .map(|(idx, text, _)| (idx, text))
                 .expect(
                     "at least one gitf%04d row must be painted somewhere — \
-                     the fixture seeded 80 of them",
+                     the fixture seeded 240 of them",
                 )
         }
 
@@ -6853,10 +6863,12 @@ mod issue_1266_scroll_router_convergence {
             );
 
             // Magnitude: four more notches (five total) must advance it
-            // further still — SidebarSystem's own `UiEvent::Scroll` arm
-            // moves exactly one row per *event* (ignoring delta magnitude,
-            // see this module's doc), so magnitude here means "more events
-            // moved it further", not "one bigger event moved it further".
+            // further still. Each notch moves `line_height` rows on GTK and
+            // one row on the TUI (see this module's doc), and the 240-file
+            // fixture is long enough that five notches stay clear of the
+            // bottom clamp on both — so a later anchor row here means the
+            // repeated wheel events each kept moving the content, not that
+            // one saturated it.
             let mut needle = needle1;
             for _ in 0..4 {
                 driver.scroll_at(&needle, -1);
