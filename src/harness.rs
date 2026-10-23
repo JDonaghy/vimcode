@@ -6730,13 +6730,20 @@ mod issue_1266_scroll_router_convergence {
     /// registered arms.
     ///
     /// quadraui's own `SidebarSystem::handle_inner` scrolls its tree sections by
-    /// `wheel_row_delta(delta.y, 1.0)` — the gesture's magnitude in rows, so one
-    /// wheel notch moves as many rows as the backend's `conformance_line_height`:
-    /// one row per notch on the TUI (a cell is one row high), `line_height` rows
-    /// per notch on GTK (a notch's `ScrollDelta::y` is scaled by the pixel line
-    /// height). Magnitude for this surface therefore shows up both ways — a bigger
-    /// delta and repeated notches both move further — and this scenario drives it
-    /// with repeated notches so the shared body reads the same on every backend.
+    /// `wheel_row_delta(delta.y, 1.0)` — the gesture's magnitude in rows, so the
+    /// rows moved scale with `ScrollDelta::y`. Magnitude for this surface therefore
+    /// shows up both ways — a bigger delta and repeated notches both move further —
+    /// and this scenario drives it with repeated notches so the shared body reads
+    /// the same on every backend.
+    ///
+    /// How big one `scroll_at(_, 1)` step is here is a property of the *test
+    /// driver*, not of production GTK: `ConformanceDriver::scroll_at` synthesises
+    /// `ScrollDelta::new(0.0, lines * self.conformance_line_height())`, which is
+    /// 1.0 on the TUI (a cell is one row high) but the pixel line height on GTK, so
+    /// one driver step moves one row on the TUI and `line_height` rows on GTK. In
+    /// the real app a discrete GTK notch arrives as `delta.y == ±1.0` —
+    /// `gdk_scroll_to_uievent` forwards GDK's `dy` with only a sign and precision
+    /// cast — i.e. one sidebar row per notch, not seventeen.
     ///
     /// Load-bearing for #554's convention: `try_route_sidebar_mouse_event` is called
     /// *before* the `UiEvent::Scroll` match arm that negates `delta.y` back to GTK-raw
@@ -6752,9 +6759,10 @@ mod issue_1266_scroll_router_convergence {
         /// `gitf0239`, no `/` or extra punctuation) for the same reason
         /// `engine_fixture`'s `L%04d` lines are single tokens in the sibling
         /// scenario above. The count is deliberately far larger than the
-        /// rows any one notch of this scenario scrolls: a GTK wheel notch
-        /// moves `line_height` rows (see `run_scenario`), so five notches
-        /// advance well over a hundred rows, and the list must stay long
+        /// rows any one step of this scenario scrolls: one `scroll_at` step
+        /// moves `line_height` rows under `GtkDriver` (see this module's
+        /// doc), so five steps advance well over a hundred rows, and the
+        /// list must stay long
         /// enough that none of those steps hit the bottom clamp — a clamped
         /// offset paints the anchor row off-screen and breaks the
         /// screen-point anchoring the scenario measures scroll with.
@@ -6863,9 +6871,9 @@ mod issue_1266_scroll_router_convergence {
             );
 
             // Magnitude: four more notches (five total) must advance it
-            // further still. Each notch moves `line_height` rows on GTK and
-            // one row on the TUI (see this module's doc), and the 240-file
-            // fixture is long enough that five notches stay clear of the
+            // further still. Each driver step moves `line_height` rows under
+            // `GtkDriver` and one row on the TUI (see this module's doc), and
+            // the 240-file fixture is long enough that five steps stay clear of the
             // bottom clamp on both — so a later anchor row here means the
             // repeated wheel events each kept moving the content, not that
             // one saturated it.

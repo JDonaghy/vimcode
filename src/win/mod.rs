@@ -1426,7 +1426,7 @@ mod win_driver_tests {
     // on every real dispatch, so the runner's `AppShell` carries the
     // theme's accent colour once a real `UiEvent` has gone through
     // `handle`. `ShellContext` is reachable only from `ShellApp::handle`/
-    // `on_shell_event_ctx` (quadraui 0.2.1), not from `setup`/`pre_render`,
+    // `on_shell_event_ctx`, not from `setup`/`pre_render`,
     // so the accent is still unset on the very first painted frame — this
     // test renders once to learn the activity bar's geometry, clicks the
     // already-active Explorer row (a real `WinDriver` click, idempotent on

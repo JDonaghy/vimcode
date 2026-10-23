@@ -4801,7 +4801,9 @@ mod sidebar_panel_clicks {
         let (r, g, b) = h.driver.pixel(probe_x, probe_y);
 
         let bg = crate::render::Theme::light().tab_bar_bg;
-        const TOL: i32 = 50; // quadraui 0.2 raises resting thumb alpha to 0.65
+        // The resting scrollbar thumb floors at alpha 0.65, so a probe that
+        // lands on it blends this far from the pure panel background.
+        const TOL: i32 = 50;
         let close = |c: u8, target: u8| (c as i32 - target as i32).abs() <= TOL;
         assert!(
             close(r, bg.r) && close(g, bg.g) && close(b, bg.b),

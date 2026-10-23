@@ -148,20 +148,14 @@
 //! 0.29.0 ... busy-spins" entry — see its "#1775 update" section for what
 //! changed.
 //!
-//! This stays RED at the currently pinned quadraui `0.4.0`. `0.4.0` does
-//! not touch `crossterm`'s own pinned version — `Cargo.lock` still
-//! resolves `crossterm = "0.29.0"` transitively, the exact release this
-//! file's repro targets — and nothing in `0.4.0`'s own changelog claims to
-//! patch it (`0.4.0`'s additions are `Backend::draw_date_picker`,
-//! `SelectionMode::Multi`, and chrome-glyph override hooks, none of which
-//! touch `TuiBackend`'s event-wait path). Re-running with
-//! `cargo test --release --test crossterm_dead_pty_busy_loop -- --ignored`
-//! against this pin still fails (~100%+ of one core over the sample
-//! window), for the same reason the paragraph above gives: this file
-//! bypasses `TuiBackend` (and therefore any quadraui-side guard, present or
-//! future) by construction. Stays `#[ignore]`d; the only thing that
-//! un-ignores it is `crossterm` itself shipping a fix this crate's pin can
-//! pick up.
+//! No quadraui version can turn this file green, whatever its changelog
+//! says: the repro bypasses `TuiBackend`, and therefore any quadraui-side
+//! guard, by construction. It observes only whether the `crossterm` release
+//! `Cargo.lock` resolves has itself been patched, so it stays `#[ignore]`d
+//! until `crossterm` ships a fix this crate's pin picks up. To check that,
+//! run `cargo test --release --test crossterm_dead_pty_busy_loop --
+//! --ignored`: a failure (the process burning ~100% of a core over the
+//! sample window) means the resolved `crossterm` is still unpatched.
 #![cfg(target_os = "linux")]
 
 use std::ffi::CStr;

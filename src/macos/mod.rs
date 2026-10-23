@@ -1703,26 +1703,26 @@ mod mac_driver_tests {
         /// (`tests/vscode_keybinding_parity.rs`'s
         /// `test_vscode_ctrl_f_opens_find`). Paint-based per CLAUDE.md's
         /// rendered-output rule: the find/replace panel's own case-
-        /// sensitivity toggle (`render.rs`'s `FindReplacePanel`, label
-        /// `"Aa"`) is painted once the panel opens and nowhere else on this
-        /// fixture — the only other `"Aa"` literal in `render.rs` belongs to
-        /// the separate sidebar *Search* panel's own toggle, which this
-        /// fixture never opens.
+        /// sensitivity toggle paints the codicon glyph `U+EAB1`
+        /// (quadraui's `primitives::find_replace`, which `MacBackend::
+        /// draw_find_replace` delegates to), and that glyph appears nowhere
+        /// else on this fixture, so it pins the panel unambiguously.
         ///
         /// RED against the pre-#1745 tree (see the submodule-level
         /// RED-verification note above): `ctrl` stays `false`, so the
         /// Insert-mode engine treats the keystroke as a plain character
-        /// insertion instead — the find/replace panel never opens and
-        /// `"Aa"` never paints.
+        /// insertion instead — the find/replace panel never opens and the
+        /// glyph never paints.
         #[test]
         fn cmd_f_opens_find() {
             let engine = vscode_engine("hello\n");
             let (_guards, mut driver) = super::driver(engine);
             driver.render();
             assert!(
-                !driver.screen_contains("Aa"),
-                "precondition: find/replace must start closed, so its \"Aa\" \
-                 toggle must not be painted yet; painted text was {:?}",
+                !driver.screen_contains("\u{eab1}"),
+                "precondition: find/replace must start closed, so its \
+                 case-sensitivity toggle glyph must not be painted yet; \
+                 painted text was {:?}",
                 driver.painted_texts()
             );
 
@@ -1737,10 +1737,11 @@ mod mac_driver_tests {
             driver.render();
 
             assert!(
-                driver.screen_contains("Aa"),
+                driver.screen_contains("\u{eab1}"),
                 "Cmd+F must open find on the macOS GUI, the same as Ctrl+F \
-                 on Linux/Windows — the find/replace panel's \"Aa\" toggle \
-                 must now be painted; painted text was {:?}",
+                 on Linux/Windows — the find/replace panel's \
+                 case-sensitivity toggle glyph must now be painted; painted \
+                 text was {:?}",
                 driver.painted_texts()
             );
         }
