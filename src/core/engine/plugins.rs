@@ -1970,7 +1970,13 @@ impl Engine {
         // Marks snapshot for the active buffer (1-indexed). `<`/`>` (the
         // visual-selection marks) live outside `self.marks` since they apply
         // across buffers rather than per-buffer letter marks, so they're
-        // merged in here from `visual_mark_start`/`visual_mark_end`.
+        // merged in here from `visual_mark_start`/`visual_mark_end` — falling
+        // back to the live selection the same way `ex_mark_line` does, so a
+        // callback invoked while Visual mode is still active (no `'<`/`'>`
+        // recorded yet) sees the same selection `:'<,'>` would resolve, and
+        // clamping the line in case the buffer shrank since the selection
+        // was made.
+        let last_line_idx = self.buffer().len_lines().saturating_sub(1);
         let mut marks_snapshot: HashMap<char, (usize, usize)> = self
             .marks
             .get(&buf_id)
@@ -1980,11 +1986,19 @@ impl Engine {
                     .collect()
             })
             .unwrap_or_default();
-        if let Some((line, col)) = self.visual_mark_start {
-            marks_snapshot.insert('<', (line + 1, col + 1));
+        let visual_lt = self.visual_mark_start.or_else(|| {
+            self.get_visual_selection_range()
+                .map(|(s, _)| (s.line, s.col))
+        });
+        let visual_gt = self.visual_mark_end.or_else(|| {
+            self.get_visual_selection_range()
+                .map(|(_, e)| (e.line, e.col))
+        });
+        if let Some((line, col)) = visual_lt {
+            marks_snapshot.insert('<', (line.min(last_line_idx) + 1, col + 1));
         }
-        if let Some((line, col)) = self.visual_mark_end {
-            marks_snapshot.insert('>', (line + 1, col + 1));
+        if let Some((line, col)) = visual_gt {
+            marks_snapshot.insert('>', (line.min(last_line_idx) + 1, col + 1));
         }
 
         // Filetype from active buffer's language ID

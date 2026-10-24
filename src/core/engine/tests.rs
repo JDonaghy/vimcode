@@ -17510,8 +17510,9 @@ fn test_plugin_disabled_not_registered() {
 
 /// `:'<,'>SqlRun`-style invocation routes the resolved range into the
 /// plugin command via `vimcode.state.range()`, and `vimcode.state.mark()`
-/// sees the same `<`/`>` visual-selection marks the ex-range parser used to
-/// resolve `'<`/`'>` — covering both halves of the visual-selection host API.
+/// sees the same `<`/`>` visual-selection marks the ex-range parser reads
+/// when resolving `'<`/`'>` — covering both halves of the visual-selection
+/// host API.
 #[test]
 fn test_plugin_ranged_command_sees_visual_selection() {
     let dir = write_plugin_lua(
@@ -17538,17 +17539,19 @@ fn test_plugin_ranged_command_sees_visual_selection() {
     }
     engine.buffer_mut().insert(0, "one\ntwo\nthree\nfour\n");
 
-    // Select lines 1..2 (0-indexed) in Visual Line mode, then simulate what
-    // leaving Visual mode via `:` does: record the selection as the `<`/`>`
-    // marks (see the mode-dispatch block in `handle_key` that does this for
-    // real keystrokes).
-    engine.visual_mark_start = Some((1, 0));
-    engine.visual_mark_end = Some((2, 0));
+    // Drive a real Visual Line selection through `handle_key` exactly as a
+    // user would reach `:'<,'>`: `V` to enter Visual Line, `j` to extend the
+    // selection onto line 2, then `:` — which is what actually leaves Visual
+    // mode and records the `'<`/`'>` marks (the `pre_mode`/`pre_anchor` hook
+    // in the mode-dispatch block of `handle_key`).
+    press_char(&mut engine, 'V');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, ':');
 
     let action = engine.execute_command("'<,'>SqlRun hello");
     assert_eq!(action, EngineAction::None);
     assert_eq!(
-        engine.message, "range=2,3 mark<=2,1 mark>=3,1 args=hello",
+        engine.message, "range=1,2 mark<=1,1 mark>=2,1 args=hello",
         "plugin command must see the resolved 1-indexed range and marks \
          for a ':\\'<,\\'>Name' invocation"
     );

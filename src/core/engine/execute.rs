@@ -6349,11 +6349,32 @@ impl Engine {
         // Fall through to a plugin-registered `:[range]Name` command,
         // carrying the resolved range through the call context so e.g.
         // `:'<,'>SqlRun` can act on just the selected lines (exposed to the
-        // callback via `vimcode.state.range()`).
-        if !name.is_empty() {
+        // callback via `vimcode.state.range()`). This re-splits `rest`
+        // rather than reusing `name`/`args`/`bang` from the abbreviation-
+        // aware split above: that split stops at the first digit and
+        // already dropped a trailing `!`, so it disagrees with the plain
+        // `:Name` path's split (the final arm of `execute_command`, which
+        // splits on the first space only) about what a command name is —
+        // a plugin command whose name contains a digit or underscore
+        // (`Zq146OpenTab`) would otherwise mis-resolve. Gating on an
+        // uppercase first letter matches Vim's rule that user-defined
+        // command names must start with one, so this fall-through can
+        // never shadow a lowercase built-in like `:'<,'>s/a/b/` or
+        // `:'<,'>g/pat/d` with a plugin command of the same name; declining
+        // a bang (rather than silently dropping it, as a bare `strip_suffix`
+        // would) keeps a `:'<,'>Name!` invocation consistent with the plain
+        // path, which also has no way to pass a bang through.
+        let (full_name, full_args) = rest
+            .split_once(' ')
+            .map(|(n, a)| (n, a.trim()))
+            .unwrap_or((rest.as_str(), ""));
+        if !full_name.is_empty()
+            && !full_name.ends_with('!')
+            && full_name.starts_with(|c: char| c.is_ascii_uppercase())
+        {
             let resolved_range =
                 range.map(|(a, b)| (a.max(0) as usize, (b.max(0) as usize).min(last_line)));
-            if self.plugin_run_command_ranged(name, args, resolved_range) {
+            if self.plugin_run_command_ranged(full_name, full_args, resolved_range) {
                 return Some(EngineAction::None);
             }
         }
