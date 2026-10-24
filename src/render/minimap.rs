@@ -383,6 +383,37 @@ pub(crate) fn scroll_gutter_width(scrollbar_reserve: f64, char_width: f64) -> f6
     scrollbar_reserve.max(char_width)
 }
 
+/// The `rect` [`crate::app::App::paint_editor_windows_rung`] hands to
+/// `Surface::Editor` for a buffer-text window, narrowed by
+/// `minimap_reserved_w` columns on the right.
+///
+/// `quadraui::Editor::rect`'s own doc comment says it's "used by GTK /
+/// Win-GUI; TUI ignores" — and that asymmetry runs both ways. GTK's and
+/// Win-GUI's `Backend::draw_editor` impls discard the `rect` argument
+/// `Surface::Editor` carries (`let _ = rect;`) and paint against
+/// `editor.rect` instead; TUI's does the opposite, painting against exactly
+/// this argument (`q_rect_to_ratatui(rect)`) and never reading `editor.rect`
+/// at all. Narrowing only the value this function returns therefore reserves
+/// TUI's minimap gutter — so the strip and buffer text occupy disjoint
+/// columns instead of the strip overprinting the rightmost text — with zero
+/// effect on GTK/Win-GUI, which keep painting (and anchoring their
+/// scrollbar) against the full, unmodified `editor.rect` either way, so this
+/// can't reopen #1094's scrollbar-flush-against-text regression there.
+/// Click/hit-test geometry is unaffected too: column resolution goes through
+/// `to_q_editor` + `Editor::layout` directly, a separate call path that never
+/// reads this `rect`.
+pub(crate) fn tui_editor_paint_rect(
+    rect: quadraui::Rect,
+    minimap_reserved_w: f64,
+) -> quadraui::Rect {
+    quadraui::Rect::new(
+        rect.x,
+        rect.y,
+        (rect.width - minimap_reserved_w as f32).max(0.0),
+        rect.height,
+    )
+}
+
 /// Build the quadraui `Minimap` for `window_id` over the strip `rect`.
 /// Returns `None` when the setting is off, when the strip cannot hold a
 /// single row, or when the window/buffer has gone away. All sampling and

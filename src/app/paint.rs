@@ -443,7 +443,12 @@ impl App {
 
             let mut frame = QSL::new();
             frame.push(Surface::Editor {
-                rect,
+                // Narrowed by `rw.minimap_reserved_w` — see
+                // `render::tui_editor_paint_rect`'s doc for why this is safe
+                // for GTK/Win-GUI (they ignore this `rect` and paint against
+                // `editor.rect`, left untouched above) and only takes effect
+                // on TUI, which is the backend that actually consults it.
+                rect: render::tui_editor_paint_rect(rect, rw.minimap_reserved_w),
                 editor: editor.clone(),
             });
             frame.draw(backend);
