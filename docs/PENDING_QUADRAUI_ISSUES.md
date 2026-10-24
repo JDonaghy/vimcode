@@ -2228,6 +2228,97 @@ second quadraui issue for #2015 — point it at this same entry.
 
 ---
 
+## `quadraui::tui::editor::draw_editor` never calls `Editor::layout` for its own scrollbar math, so narrowing its `area` to fix vimcode#2025's text/minimap overlap also drags the *painted* scrollbar off the position vimcode's click/drag geometry still targets (TUI-only rasteriser twin of the entry above)
+
+**Title:** `pub fn draw_editor(buf, area, editor, theme)` in `quadraui::tui::
+editor` recomputes `has_scrollbar`/the scrollbar track bounds directly
+from its own `area: Rect` parameter (`area.x + area.width - 1`, confirmed
+at the pinned 0.5.1 rev) — it never calls `Editor::layout`/
+`layout_with_options`, so the `reserved_trailing_width` ask in the
+neighbouring entry (which targets exactly that generic layout function)
+does not, by itself, cover this TUI-specific rasteriser.
+
+**Body:**
+
+vimcode#2025 ("TUI minimap paints over buffer text instead of a reserved
+gutter") is vimcode#1696's TUI report. The in-repo fix narrows the `rect`
+vimcode hands to `Surface::Editor` by `rw.minimap_reserved_w` before TUI
+paints it (`render::tui_editor_paint_rect`, called only from
+`App::paint_editor_windows_rung`) — safe for GTK/Win-GUI because both
+ignore that `rect` argument and paint against `editor.rect` instead, so
+only TUI's rasteriser sees the narrower value.
+
+That rasteriser, though, is `quadraui::tui::editor::draw_editor` — and
+unlike the generic `primitives::editor::Editor::layout_with_options` the
+neighbouring entry is about, it does not call `Editor::layout` at all for
+its own paint math. It takes the `area: Rect` argument verbatim and
+independently derives everything from it, scrollbar included:
+
+```rust
+// quadraui-0.5.1/src/tui/editor.rs, draw_editor (abbreviated)
+let has_scrollbar = editor.total_lines > viewport_lines && area.width > gutter_w + 1;
+let viewport_cols = (area.width as usize)
+    .saturating_sub(gutter_w as usize + if has_scrollbar { 1 } else { 0 });
+...
+// vertical scrollbar track, later in the same function:
+(area.x + area.width - 1) as f32,
+```
+
+So narrowing `area` by `minimap_reserved_w` to stop text from reaching the
+strip's columns *also* pulls this scrollbar one column left — flush
+against the (now-narrower) text, immediately before the strip, instead of
+at the pane's true right edge.
+
+vimcode's own click/drag geometry does not move with it: both
+`app_support::editor_scrollbar_layout` (reached from every backend's
+mouse-press resolver, `app::mouse_tabs::editor_scrollbar_press`) and
+`render::hit_test_geometry::window_zone_hit_test` derive the scrollbar's
+hit region from the window's **un-narrowed** `rect` — the same
+`Editor::layout_with_options_and_v_scrollbar_w`-backed math the
+neighbouring entry documents as reaching past the strip by design. On TUI
+with the minimap on, that leaves a one-column gap between where the
+scrollbar is actually painted and where a click is resolved as hitting
+it: clicking the glyph starts a text selection (resolves to the editor's
+text zone instead); the blank column at the true edge, one column
+further right, does nothing.
+
+**Why the neighbouring entry's `reserved_trailing_width` ask doesn't
+cover this too:** that capability targets `Editor::layout_with_options`,
+which vimcode's `to_q_editor` + GTK/Win-GUI click resolution already
+calls — fixing it resolves vimcode#1696/#2015's *layout*-driven half.
+`quadraui::tui::editor::draw_editor` is a separate, TUI-only rasteriser
+that never reaches that function; it needs its own, parallel paint-side
+parameter.
+
+**Ask:** give `draw_editor` a way to reserve trailing columns for content
+(the minimap strip) without moving where it anchors the scrollbar — e.g.
+a `right_reserve_w: u16` parameter (default `0`) that narrows
+`viewport_cols`/the text-paint width exactly as today's narrowed `area`
+already does, while computing the scrollbar track bounds from
+`area.x + area.width - 1 - right_reserve_w`'s *complement* (i.e. the
+scrollbar keeps anchoring at `area`'s original right edge, only the text
+budget shrinks) — the paint-side analog of the generic
+`reserved_trailing_width` ask above, scoped to this one rasteriser.
+
+**Why not fixed in vimcode instead:** the only vimcode-side lever
+available is the `area`/`rect` already handed to `draw_editor`; narrowing
+it is what causes the scrollbar to move in the first place, and there is
+no way to narrow it for text while leaving it un-narrowed for the
+scrollbar from vimcode's side of the call — that decoupling has to live
+inside `draw_editor` itself, which is quadraui code.
+
+**Test:** `minimap_does_not_overlap_buffer_text`
+(`src/tui_main/app_on_tui_tests.rs`) — overflows the fixture buffer
+vertically so the pane grows a real vertical scrollbar, then pins the
+scrollbar's current paint column (one column left of the minimap strip,
+immediately against the text) as today's intended *paint* behaviour. It
+does not and cannot assert anything about click/drag resolution landing
+on that same column — that divergence is this entry, not a test gap.
+
+**Blocks:** `JDonaghy/vimcode#2025`.
+
+---
+
 ## `TabBar`'s right-aligned segments have no outer-edge inset, unlike `StatusBar`'s `PIXEL_EDGE_INSET` (#1155) — the tab-strip overflow-action glyph can sit flush against (or past) a borderless window's real right edge (blocks vimcode#1696, half 2)
 
 **Title:** `primitives::tab_bar::TabBar::layout`'s right-aligned-segment
