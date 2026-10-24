@@ -882,6 +882,9 @@ vimcode.panel.register("my_panel", {
     icon = "X",                          -- Single character for activity bar icon
     fallback_icon = "M",                 -- Used when Nerd Fonts are disabled
     sections = {"Section A", "Section B"}, -- Named collapsible sections
+    toolbar = {                          -- Button row under the panel header
+        {id = "connect", label = "Connect", icon = "+"},
+    },
 })
 
 -- Populate a section with items (typically from a panel_focus hook)
@@ -917,6 +920,11 @@ vimcode.panel.set_input("my_panel", "text") -- Set input text
 collapsed), `actions` (`{{label=, key=}}`, drawn as clickable badges), `badges`
 (`{{text=, color=}}`, colour as a name or `"#rrggbb"`), and `is_separator`.
 
+**Toolbar:** the `toolbar` registration option (`{{id=, label=, icon=}, ...}`)
+paints a button row under the panel header, the same kind of toolbar native
+panels like Source Control have. Clicking a button fires `panel_toolbar` with
+`"panel|id"` — it does not go through `panel_select`/`panel_action`.
+
 **Panel navigation keys** (when panel has focus):
 
 | Key | Action |
@@ -943,6 +951,7 @@ collapsed), `actions` (`{{label=, key=}}`, drawn as clickable badges), `badges`
 | `panel_double_click` | `"panel\|section\|id\|\|index"` | Double-click on item |
 | `panel_context_menu` | `"panel\|section\|id\|\|index"` | Right-click on item |
 | `panel_input` | `"panel\|\|\|text\|"` | Input field text changed or confirmed |
+| `panel_toolbar` | `"panel\|button_id"` | Toolbar button clicked |
 
 **Item styles:**
 
@@ -1207,6 +1216,7 @@ decimal string; use `tonumber(arg)`.
 | `panel_double_click` | `"panel\|section\|id\|\|index"` | Double-click on panel item |
 | `panel_context_menu` | `"panel\|section\|id\|\|index"` | Right-click on panel item |
 | `panel_input` | `"panel\|\|\|text\|"` | Panel input field text changed |
+| `panel_toolbar` | `"panel\|button_id"` | Extension panel toolbar button clicked |
 | Custom | shell output | `async_shell()` callback event |
 
 Mode names in `ModeChanged`, `InsertEnter` and `InsertLeave` are `Normal`, `Insert`,

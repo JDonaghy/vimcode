@@ -293,6 +293,81 @@ pub fn explorer_toolbar_hit_at(engine: &Engine, pos: quadraui::Point) -> Option<
     })
 }
 
+/// Build a plugin panel's title + `toolbar` button-row `StatusBar` pair
+/// (`vimcode.panel.register`'s `toolbar` option) for `paint_sidebar_panel_rung`'s
+/// `ext:` arm. Mirrors `debug_sidebar_status_bars`'s two-bar shape: a title
+/// bar (no click targets) plus a button bar whose segments carry
+/// `action_id`s decoded by [`ext_panel_toolbar_hit_at`].
+///
+/// Unlike the Explorer toolbar's fixed 5-icon array, a plugin's `toolbar` is
+/// variable length, so each button's `action_id` encodes its index directly
+/// via `Engine::ext_toolbar_action_id` rather than indexing a static table.
+pub fn ext_panel_toolbar_status_bars(
+    title: &str,
+    buttons: &[crate::core::plugin::PanelToolbarButton],
+    theme: &Theme,
+) -> (quadraui::StatusBar, quadraui::StatusBar) {
+    let bg = theme.status_bg;
+    let fg = theme.status_fg;
+
+    let title_bar = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("ext_panel:title"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: format!("  {title}"),
+            fg,
+            bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: Vec::new(),
+    };
+
+    let toolbar_bar = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("ext_panel:toolbar"),
+        left_segments: buttons
+            .iter()
+            .enumerate()
+            .map(|(idx, button)| {
+                let text = match button.icon {
+                    Some(icon) => format!(" {icon} {} ", button.label),
+                    None => format!(" {} ", button.label),
+                };
+                quadraui::StatusBarSegment {
+                    text,
+                    fg,
+                    bg,
+                    bold: false,
+                    action_id: Some(Engine::ext_toolbar_action_id(idx)),
+                }
+            })
+            .collect(),
+        right_segments: Vec::new(),
+    };
+
+    (title_bar, toolbar_bar)
+}
+
+/// Resolve a press against the active plugin panel's `toolbar` button row,
+/// given `pos` in the same absolute space `SidebarPanelBody::render`
+/// painted the chrome into — mirrors `explorer_toolbar_hit_at`'s contract.
+/// `engine.ext_panel_toolbar_hits` is populated straight from
+/// `SidebarPanelBodyLayout::status_bar_hit_regions` at paint time. Returns
+/// the matched button index, or `None` when `pos` doesn't land on a toolbar
+/// segment (the caller falls through to the panel's own tree-row click
+/// routing in that case).
+pub fn ext_panel_toolbar_hit_at(engine: &Engine, pos: quadraui::Point) -> Option<usize> {
+    let hits = engine.ext_panel_toolbar_hits.borrow();
+    hits.iter().find_map(|(rect, hit)| {
+        if !rect.contains(pos) {
+            return None;
+        }
+        match hit {
+            quadraui::StatusBarHit::Segment(id) => Engine::ext_toolbar_action_index(id),
+            _ => None,
+        }
+    })
+}
+
 /// `action_id` for each inline window-control button drawn by
 /// [`window_controls_status_bar`]. Shared with the GTK click handler so the
 /// two sides can't drift.
@@ -716,6 +791,7 @@ mod tests {
             input_active: false,
             help_open: false,
             help_bindings: vec![],
+            toolbar: vec![],
         };
 
         let theme = Theme::onedark();
@@ -770,6 +846,7 @@ mod tests {
             input_active: false,
             help_open: false,
             help_bindings: vec![],
+            toolbar: vec![],
         };
         let tv = ext_panel_to_tree_view(&panel, &Theme::onedark());
         assert_eq!(tv.selected_path, None);

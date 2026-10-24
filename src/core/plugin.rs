@@ -501,6 +501,23 @@ pub struct PanelRegistration {
     /// If `None` and nerd fonts are off, the first letter of `title` is used.
     pub fallback_icon: Option<char>,
     pub sections: Vec<String>,
+    /// Button row painted below the panel title, above the tree body.
+    /// Empty when the plugin didn't register a `toolbar` option.
+    pub toolbar: Vec<PanelToolbarButton>,
+}
+
+/// A single button in a plugin panel's toolbar (`vimcode.panel.register`'s
+/// `toolbar` option). Clicking it fires the `panel_toolbar` plugin event
+/// with arg `"<panel_name>|<id>"`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PanelToolbarButton {
+    /// Plugin-chosen stable identifier, echoed back in the `panel_toolbar`
+    /// event argument.
+    pub id: String,
+    /// Display label.
+    pub label: String,
+    /// Optional single-character icon shown before the label.
+    pub icon: Option<char>,
 }
 
 impl PanelRegistration {
@@ -4292,12 +4309,29 @@ impl PluginManager {
                 if sections.is_empty() {
                     sections.push("Default".to_string());
                 }
+                let mut toolbar = Vec::new();
+                if let Ok(toolbar_val) = opts.get::<_, LuaTable>("toolbar") {
+                    for (_, btn) in toolbar_val.pairs::<usize, LuaTable>().flatten() {
+                        let id: String = btn.get("id").unwrap_or_default();
+                        if id.is_empty() {
+                            continue;
+                        }
+                        let label: String = btn.get("label").unwrap_or_default();
+                        let icon_str: String = btn.get("icon").unwrap_or_default();
+                        toolbar.push(PanelToolbarButton {
+                            id,
+                            label,
+                            icon: icon_str.chars().next(),
+                        });
+                    }
+                }
                 let reg = PanelRegistration {
                     name: name.clone(),
                     title,
                     icon,
                     fallback_icon,
                     sections,
+                    toolbar,
                 };
                 // During load_one_plugin: write to PluginRegistrations
                 if let Some(mut regs) = lua.app_data_mut::<PluginRegistrations>() {
@@ -4523,6 +4557,9 @@ impl PluginManager {
                     // registration path is shared with `vimcode.panel.register`,
                     // which requires at least one section name.
                     sections: vec!["Default".to_string()],
+                    // Form-backed views have no tree toolbar row; only
+                    // `vimcode.panel.register`'s `toolbar` option populates this.
+                    toolbar: Vec::new(),
                 };
                 if let Some(mut regs) = lua.app_data_mut::<PluginRegistrations>() {
                     regs.views.push(ViewRegistration {

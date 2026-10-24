@@ -22,7 +22,9 @@ use quadraui::testing::{ConformanceDriver, DriverInput};
 
 use crate::harness::DriverRepaint;
 
-use crate::core::plugin::{ExtPanelBadge, ExtPanelItem, PanelRegistration};
+use crate::core::plugin::{
+    ExtPanelBadge, ExtPanelItem, PanelRegistration, PanelToolbarButton, PluginManager,
+};
 use crate::core::Engine;
 
 // ── Deliverable 1: the shared plugin-panel fixture ──────────────────────
@@ -90,6 +92,12 @@ pub const ID_COMMIT_A: &str = "c0ffee101090aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 /// The short-hash prefix a real `:GitShow` "Open Commit" link reveals by.
 pub const REVEAL_QUERY: &str = "c0ffee10";
 
+/// Scenario 8's toolbar button label and id — distinct from every
+/// section/row/badge name above so [`painted_bounds`]'s substring match
+/// cannot collide with anything else this fixture paints.
+pub const TOOLBAR_BUTTON_LABEL: &str = "ZQXW1090Connect";
+pub const TOOLBAR_BUTTON_ID: &str = "zqxw1090-connect";
+
 /// How many filler rows section 0 carries. Chosen so `ROW_COMMIT_A` sits
 /// well below row 0 while the whole panel still fits a 30-row viewport unscrolled.
 pub const FILLER_ROWS: usize = 12;
@@ -131,6 +139,10 @@ pub struct PluginPanelFixture {
     /// `Engine::apply_plugin_ctx`'s `panel_reveal_request` arm passes for a
     /// `panel.reveal` call from Lua.
     pub reveal: Option<(String, String)>,
+    /// `vimcode.panel.register`'s `toolbar` option — a button row painted
+    /// below the panel header, above the tree body. Empty by default, like
+    /// a plugin that never set `toolbar` on registration.
+    pub toolbar: Vec<PanelToolbarButton>,
 }
 
 impl PluginPanelFixture {
@@ -162,6 +174,13 @@ impl PluginPanelFixture {
     /// Drive a `panel.reveal` for `query` in `section` (scenario 6).
     pub fn with_reveal(mut self, section: &str, query: &str) -> Self {
         self.reveal = Some((section.to_string(), query.to_string()));
+        self
+    }
+
+    /// Register a toolbar button row (scenario 8 — `vimcode.panel.register`'s
+    /// `toolbar` option).
+    pub fn with_toolbar(mut self, buttons: Vec<PanelToolbarButton>) -> Self {
+        self.toolbar = buttons;
         self
     }
 }
@@ -203,6 +222,7 @@ pub fn engine_with_plugin_panel(fx: &PluginPanelFixture) -> Engine {
                 SEC_COMMITS.to_string(),
                 SEC_EMPTY.to_string(),
             ],
+            toolbar: fx.toolbar.clone(),
         },
     );
 
@@ -680,6 +700,85 @@ pub fn hover_resolves_to_the_row_under_the_pointer<
             .iter()
             .map(|r| r.text.clone())
             .collect::<Vec<_>>()
+    );
+}
+
+/// Unique scratch dir for [`install_panel_toolbar_hook`]'s throwaway Lua
+/// fixture. A monotonic counter on top of the process id keeps every call
+/// within one test binary from colliding — several backend arms (`tui_prod`,
+/// `tui_shared_app`, `gtk`) call it from the same process.
+fn panel_toolbar_hook_dir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "vc_plugin_panel_toolbar_{}_{n}",
+        std::process::id()
+    ))
+}
+
+/// Load a throwaway Lua plugin whose only job is hooking `panel_toolbar`
+/// and recording the event's argument via `vimcode.message` — scenario 8's
+/// way of observing that a toolbar-button click actually reaches
+/// `Engine::plugin_event`, not merely that the click avoided falling
+/// through to `panel_select`.
+///
+/// `PluginManager::load_plugins_dir` is the only way to register a Lua
+/// hook (there is no in-memory/string-load API), so this writes a real
+/// temp-dir `.lua` file — mirroring `tests/extensions.rs`'s
+/// `engine_with_plugin` fixture, which is private to that
+/// integration-test binary and not reachable from here.
+pub fn install_panel_toolbar_hook(engine: &mut Engine) {
+    let dir = panel_toolbar_hook_dir();
+    std::fs::create_dir_all(&dir).expect("create panel_toolbar hook fixture dir");
+    std::fs::write(
+        dir.join("panel_toolbar_hook.lua"),
+        "vimcode.on(\"panel_toolbar\", function(arg)\n    \
+         vimcode.message(\"toolbar:\" .. arg)\nend)\n",
+    )
+    .expect("write panel_toolbar hook fixture");
+
+    match PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(e) => panic!("failed to create PluginManager for panel_toolbar hook fixture: {e}"),
+    }
+}
+
+/// Scenario 8 — clicking a painted toolbar button
+/// (`vimcode.panel.register`'s `toolbar` option) dispatches `panel_toolbar`
+/// to registered Lua hooks with `"<panel>|<button id>"`, the same event a
+/// native panel's own toolbar fires. Proves the full chain end to end:
+/// paint (`ext_panel_toolbar_status_bars`) → click → hit-test
+/// (`ext_panel_toolbar_hit_at`) → `Engine::handle_ext_panel_toolbar_click`
+/// → `Engine::plugin_event` → the registered Lua hook → `engine.message`
+/// — not just that the click didn't fall through to `panel_select`.
+///
+/// `button_label` is matched against painted text with [`painted_bounds`]
+/// (a `contains` match), so the caller's toolbar button must use a label
+/// distinct from every section/row/badge name this module's fixture paints.
+pub fn toolbar_button_click_dispatches_panel_toolbar_event<D: ConformanceDriver + DriverInput>(
+    driver: &mut D,
+    engine: &Rc<RefCell<Engine>>,
+    button_label: &str,
+    expected_button_id: &str,
+) {
+    install_panel_toolbar_hook(&mut engine.borrow_mut());
+
+    let b = painted_bounds(driver, button_label);
+    driver.click(b.x + b.width / 2.0, b.y + b.height / 2.0);
+
+    let expected = format!("toolbar:{PANEL}|{expected_button_id}");
+    assert_eq!(
+        engine.borrow().message,
+        expected,
+        "clicking the painted {button_label:?} toolbar button (at y={}) \
+         must dispatch panel_toolbar to the registered Lua hook with arg \
+         {PANEL:?}|{expected_button_id:?} — engine.message was {:?} instead",
+        b.y,
+        engine.borrow().message,
     );
 }
 

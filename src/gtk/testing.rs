@@ -3357,6 +3357,7 @@ mod tests {
                         icon: '\u{f113}',
                         fallback_icon: Some(EXT_ICON),
                         sections: Vec::new(),
+                        toolbar: Vec::new(),
                     },
                 );
             }
@@ -5585,6 +5586,7 @@ mod sidebar_panel_clicks {
                 icon: '\u{f113}',
                 fallback_icon: Some('X'),
                 sections: Vec::new(),
+                toolbar: Vec::new(),
             },
         );
         // Visit the Extensions marketplace panel first, as a user would
@@ -9959,6 +9961,7 @@ mod panel_surfaces {
                 icon: '\u{f113}',
                 fallback_icon: Some('X'),
                 sections: vec!["Log".to_string()],
+                toolbar: Vec::new(),
             },
         );
         let items: Vec<crate::core::plugin::ExtPanelItem> = (0..30)
@@ -17864,6 +17867,7 @@ mod editor_mouse_rungs {
                 icon: '\u{f113}',
                 fallback_icon: Some('X'),
                 sections: Vec::new(),
+                toolbar: Vec::new(),
             },
         );
         // The exact pair `activity_bar_activate`'s ext-panel branch sets.

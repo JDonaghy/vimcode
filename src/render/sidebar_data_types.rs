@@ -289,6 +289,11 @@ pub struct ExtPanelData {
     pub input_active: bool,
     pub help_open: bool,
     pub help_bindings: Vec<(String, String)>,
+    /// `vimcode.panel.register`'s `toolbar` option — a button row painted
+    /// below the header (and above the search row, when present). Empty for
+    /// panels that never set `toolbar`, which keeps today's header-only
+    /// chrome unchanged.
+    pub toolbar: Vec<crate::core::plugin::PanelToolbarButton>,
 }
 
 /// A single section within an extension panel.

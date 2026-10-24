@@ -1504,6 +1504,13 @@ pub fn board_status_bar(status: &str, theme: &Theme) -> quadraui::StatusBar {
 }
 
 pub fn route_ext_panel_click(engine: &mut Engine, pos: quadraui::Point, is_double_click: bool) {
+    // A registered `toolbar` (`vimcode.panel.register`'s `toolbar` option)
+    // paints its button row above the tree body; resolve against it first
+    // so a toolbar click can't fall through to tree-row selection.
+    if let Some(idx) = ext_panel_toolbar_hit_at(engine, pos) {
+        engine.handle_ext_panel_toolbar_click(idx);
+        return;
+    }
     let Some(flat_idx) = ext_panel_hit_flat_index(engine, pos) else {
         return;
     };

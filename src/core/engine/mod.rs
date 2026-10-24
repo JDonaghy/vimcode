@@ -4929,6 +4929,13 @@ pub struct Engine {
     /// the panel's body has zero height this frame).
     pub ext_panel_tree_layout:
         std::cell::RefCell<Option<(quadraui::Rect, quadraui::TreeViewLayout)>>,
+    /// Hit regions for the active plugin panel's `toolbar` button row
+    /// (`vimcode.panel.register`'s `toolbar` option) — populated from
+    /// `SidebarPanelBodyLayout::status_bar_hit_regions` when that panel's
+    /// chrome includes a toolbar bar. Mirrors `explorer_toolbar_hits`: paint
+    /// writes the rect/hit regions, `render::ext_panel_toolbar_hit_at` reads
+    /// them. Empty when the active panel registers no `toolbar`.
+    pub ext_panel_toolbar_hits: std::cell::RefCell<Vec<(quadraui::Rect, quadraui::StatusBarHit)>>,
 
     // --- Notifications (background operation progress) ---
     /// Active notifications (spinner/bell indicators in status bar).
@@ -5705,6 +5712,7 @@ impl Engine {
             ext_panel_help_bindings: HashMap::new(),
             ext_panel_content_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             ext_panel_tree_layout: std::cell::RefCell::new(None),
+            ext_panel_toolbar_hits: std::cell::RefCell::new(Vec::new()),
             notifications: Vec::new(),
             next_notification_id: 1,
             toasts: Vec::new(),

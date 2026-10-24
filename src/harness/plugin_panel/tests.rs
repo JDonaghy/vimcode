@@ -213,14 +213,29 @@ fn plugin_panel_reveal_selects_the_revealed_row_on_tui_prod() {
     });
 }
 
-// The `hover_resolves_to_the_row_under_the_pointer` scenario needs a *live*
-// `ConformanceHarness::engine` (it backdates `panel_hover_dwell` and calls
-// `poll_panel_hover` directly, in place of a real wall-clock wait) — the one
-// thing `conformance_harness_prod`'s own doc says its `engine` field cannot
-// give a scenario (the TUI shell owns its `Engine` directly, not behind an
-// `Rc<RefCell<_>>`; see that function's "not live here" doc). So this
-// scenario is not registered on `tui_prod` at all — see the `tui shared app`
-// arm below, which uses `conformance_harness` (a live `Rc<RefCell<Engine>>`) instead.
+#[test]
+fn plugin_panel_toolbar_button_click_dispatches_panel_toolbar_event_on_tui_prod() {
+    let mut h = prod(
+        &PluginPanelFixture::new().with_toolbar(vec![PanelToolbarButton {
+            id: TOOLBAR_BUTTON_ID.to_string(),
+            label: TOOLBAR_BUTTON_LABEL.to_string(),
+            icon: None,
+        }]),
+    );
+    toolbar_button_click_dispatches_panel_toolbar_event(
+        &mut h.driver,
+        &h.engine,
+        TOOLBAR_BUTTON_LABEL,
+        TOOLBAR_BUTTON_ID,
+    );
+}
+
+// The `hover_resolves_to_the_row_under_the_pointer` scenario is registered
+// on the `tui shared app` arm below (via `conformance_harness`), not here on
+// `tui_prod`. `conformance_harness_prod` is a plain alias of
+// `conformance_harness` (both give a live `Rc<RefCell<Engine>>`), so the
+// split is not about engine liveness — scenario 8 above shows `h.engine` on
+// `tui_prod` works the same way.
 //
 // ── gtk / tui (shared `App`) / macos: red until #1089 ───────────────────
 //
@@ -363,6 +378,28 @@ fn plugin_panel_hover_resolves_to_the_row_under_the_pointer_on_gtk() {
     );
 }
 
+#[cfg(feature = "gui")]
+#[test]
+fn plugin_panel_toolbar_button_click_dispatches_panel_toolbar_event_on_gtk() {
+    let mut h = crate::gtk::testing::conformance_harness(
+        engine_with_plugin_panel(&PluginPanelFixture::new().with_toolbar(vec![
+            PanelToolbarButton {
+                id: TOOLBAR_BUTTON_ID.to_string(),
+                label: TOOLBAR_BUTTON_LABEL.to_string(),
+                icon: None,
+            },
+        ])),
+        W as i32,
+        H as i32,
+    );
+    toolbar_button_click_dispatches_panel_toolbar_event(
+        &mut h.driver,
+        &h.engine,
+        TOOLBAR_BUTTON_LABEL,
+        TOOLBAR_BUTTON_ID,
+    );
+}
+
 // The `tui` control arm wraps the same shared `App` GTK does, so it fails
 // for the identical reason — kept so the shared shell's own regression
 // is visible on a lane that needs no GTK dev libs.
@@ -390,16 +427,34 @@ fn plugin_panel_item_row_hit_band_on_tui_shared_app() {
     });
 }
 
+#[test]
+fn plugin_panel_toolbar_button_click_dispatches_panel_toolbar_event_on_tui_shared_app() {
+    let mut h = crate::tui_main::testing::conformance_harness(
+        engine_with_plugin_panel(&PluginPanelFixture::new().with_toolbar(vec![
+            PanelToolbarButton {
+                id: TOOLBAR_BUTTON_ID.to_string(),
+                label: TOOLBAR_BUTTON_LABEL.to_string(),
+                icon: None,
+            },
+        ])),
+        TUI_W,
+        TUI_H,
+    );
+    toolbar_button_click_dispatches_panel_toolbar_event(
+        &mut h.driver,
+        &h.engine,
+        TOOLBAR_BUTTON_LABEL,
+        TOOLBAR_BUTTON_ID,
+    );
+}
+
 /// #1236, the `tui` control-arm twin of `plugin_panel_hover_resolves_to_
 /// the_row_under_the_pointer_on_gtk`. Not `known_bug_gate`d (TUI's tree
 /// rows are uniformly one cell each — `quadraui::tui::tree`'s module doc —
 /// so `content_row`'s uniform-row-height formula never drifted here).
 /// Registered because this arm, unlike `tui_prod`, wraps the same shared
-/// `App` GTK does and its `ConformanceHarness::engine` is a *live*
-/// `Rc<RefCell<Engine>>` (`conformance_harness`, not `conformance_harness_
-/// prod` — see that function's "not live here" doc for why the scenario
-/// cannot run on `tui_prod` at all), so it is a regression guard that the
-/// shared route still resolves correctly on the one backend tested.
+/// `App` GTK does, so it is a regression guard that the shared route still
+/// resolves correctly on the one backend tested.
 #[test]
 fn plugin_panel_hover_resolves_to_the_row_under_the_pointer_on_tui_shared_app() {
     let mut h = crate::tui_main::testing::conformance_harness(
