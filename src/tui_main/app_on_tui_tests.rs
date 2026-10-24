@@ -8267,12 +8267,18 @@ mod tests {
     mod minimap {
         use super::*;
 
-        /// True if any character in `s` falls in the Unicode Braille Patterns
-        /// block (U+2800..=U+28FF) — the glyph range `quadraui`'s minimap
-        /// rasteriser uses on TUI, same check `shell_app.rs`'s own minimap
+        /// True if `c` falls in the Unicode Braille Patterns block
+        /// (U+2800..=U+28FF) — the glyph range `quadraui`'s minimap
+        /// rasteriser uses on TUI.
+        fn has_braille_char(c: char) -> bool {
+            ('\u{2800}'..='\u{28FF}').contains(&c)
+        }
+
+        /// True if any character in `s` is a braille glyph (see
+        /// [`has_braille_char`]) — same check `shell_app.rs`'s own minimap
         /// tests use.
         fn has_braille(s: &str) -> bool {
-            s.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
+            s.chars().any(has_braille_char)
         }
 
         /// With the setting explicitly on, a buffer with enough lines to need
@@ -8727,21 +8733,34 @@ mod tests {
             );
         }
 
-        /// The minimap strip must represent the *entire* visible window of
-        /// the buffer, down-sampled to the full strip height, not just the first
-        /// screenful of lines with the remaining rows left blank.
+        /// The minimap strip must represent the entire file, scaled to fill
+        /// the full strip height, never just the first few blocks of
+        /// content with the remaining rows left blank — regardless of
+        /// whether the file compresses into the strip (long file, many
+        /// real lines per block) or must be stretched to fill it (file
+        /// shorter than the strip's own sampling budget, each real line
+        /// repeated across several blocks).
         ///
-        /// Every line in the fixture carries the same non-whitespace content,
-        /// so once the buffer is long enough that each strip row covers many
-        /// real lines (`k > 1`), a correctly-scaled strip paints braille at
-        /// *every* row from top to bottom. A strip that only samples the
-        /// first screenful's worth of real lines and leaves the rest of its
-        /// rows at their background glyph would paint braille near the top
-        /// and nothing but blanks near the bottom — exactly the symptom this
-        /// test probes for, scrolled to the very top of the file.
+        /// `TOTAL_LINES` (40) is deliberately in the failing regime a
+        /// 2000-line fixture cannot reach: longer than the editor pane's
+        /// own visible rows (so the buffer needs more than one screenful,
+        /// matching the issue's "whole file" framing) but shorter than the
+        /// strip's full sampling budget (`target_lines`, ~80 rows at this
+        /// harness's 80x24 size) — the window-length/target-row ratio that
+        /// collapses `quadraui::primitives::minimap::block_bounds`'s
+        /// "never upscales" branch down to fewer blocks than the strip
+        /// has rows, leaving the lower rows unaccounted for. A 2000-line
+        /// fixture instead drives `k` high enough that `window_len` always
+        /// saturates back up to (or past) `target_lines`, so it can never
+        /// observe this collapse no matter how it scales up.
+        ///
+        /// Every line in the fixture carries the same non-whitespace
+        /// content, so a correctly-scaled strip paints braille at *every*
+        /// row from top to bottom; a strip that stops partway leaves a
+        /// gap of background glyph below wherever it stopped.
         #[test]
         fn minimap_strip_paints_braille_across_the_full_strip_height() {
-            const TOTAL_LINES: usize = 2000;
+            const TOTAL_LINES: usize = 40;
             let mut engine = plain_engine();
             // Minimap is experimental and off by default — this test is
             // specifically about the minimap, so turn it on explicitly.
@@ -8753,22 +8772,40 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             h.driver.render();
 
-            let strip = {
+            let (strip, editor_rows) = {
                 let layout = h.screen_layout.borrow();
                 let win = h.engine.borrow().active_window_id();
-                let mm = layout
+                let layout = layout
                     .as_ref()
-                    .expect("render_content must have painted a ScreenLayout")
+                    .expect("render_content must have painted a ScreenLayout");
+                let mm = layout
                     .minimap
                     .iter()
                     .find(|m| m.window_id == win)
                     .expect("a long, scrolling buffer must publish a minimap strip");
-                crate::render::minimap_strip_rect(mm)
+                let editor_rows = layout
+                    .windows
+                    .iter()
+                    .find(|w| w.window_id == win)
+                    .expect("the active window must publish a RenderedWindow")
+                    .visible_line_capacity;
+                (crate::render::minimap_strip_rect(mm), editor_rows)
             };
             assert!(
                 strip.height >= 2.0,
                 "precondition: the strip must span at least two rows for a \
                  top-vs-bottom comparison to mean anything (strip={strip:?})"
+            );
+            // The strip must track the editor pane's own real height — a
+            // strip that silently settled for painting fewer rows than
+            // the pane it sits beside would never be caught by only
+            // checking its own self-reported height against a constant.
+            assert_eq!(
+                strip.height.round() as usize,
+                editor_rows,
+                "the minimap strip must span the same number of rows as \
+                 the editor pane it sits beside; strip={strip:?} \
+                 editor_rows={editor_rows}"
             );
 
             let has_braille_in_row =
@@ -8779,11 +8816,11 @@ mod tests {
                         .into_iter()
                         .skip(strip.x as usize)
                         .take(strip.width as usize)
-                        .any(|(c, _)| ('\u{2800}'..='\u{28FF}').contains(&c))
+                        .any(|(c, _)| has_braille_char(c))
                 };
 
-            let top_row = strip.y as u16;
-            let bottom_row = (strip.y as u16) + (strip.height as u16) - 1;
+            let top_row = strip.y.round() as u16;
+            let bottom_row = top_row + (strip.height.round() as u16) - 1;
             assert!(
                 has_braille_in_row(&h, top_row),
                 "the strip's top row ({top_row}) must paint braille for a \
@@ -8794,7 +8831,7 @@ mod tests {
                 has_braille_in_row(&h, bottom_row),
                 "the strip's bottom row ({bottom_row}) must also paint \
                  braille — the whole file must be scaled to fill the full \
-                 strip height, not just the first screenful; \
+                 strip height, not just the first few blocks; \
                  strip={strip:?} screen:\n{}",
                 h.driver.screen()
             );
