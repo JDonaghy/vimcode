@@ -7,10 +7,17 @@
 //! panel, and routes the resulting widget events back to the plugin's
 //! `on_event` callback.
 //!
-//! # ABI design: a vimcode-owned vocabulary, not quadraui's serde shape
+//! # ABI design: a curated subset-profile of quadraui's descriptor JSON
 //!
-//! This module defines **a small vimcode-owned vocabulary**, versioned by
-//! [`VIEW_SCHEMA_VERSION`], converted to quadraui primitives in one place.
+//! This module defines **a small, documented vocabulary**, versioned by
+//! [`VIEW_SCHEMA_VERSION`], that is a curated allow-list of
+//! `quadraui::FieldKind`/`FormEvent` variants rather than an independent
+//! representation: every [`ViewFieldKind`] variant's doc comment names the
+//! `quadraui::FieldKind` it is translated to (and back) in exactly one place,
+//! [`crate::render::plugin_view_to_form`]. Exposing a new primitive is an
+//! allow-list entry here plus a matching arm in that one translation
+//! function — never a hand-invented representation.
+//!
 //! Feeding quadraui's own `Serialize`/`Deserialize` impls straight from Lua
 //! is avoided for three concrete reasons, all visible in `quadraui::Form`:
 //!
@@ -41,6 +48,15 @@
 //! than [`VIEW_SCHEMA_VERSION`] is rejected at parse time with a Lua error
 //! rather than being silently half-rendered, which is what makes it safe to add
 //! required semantics to version 2 later.
+//!
+//! Adding a new [`ViewFieldKind`]/[`ViewEventKind`] variant (most recently
+//! `Date` and `Slider`) is additive and does **not** bump
+//! [`VIEW_SCHEMA_VERSION`]: every pre-existing variant's wire tag and fields
+//! are untouched, so a `schema_version = 1` view written before the new
+//! variant existed still parses byte-for-byte the same, and the new variant
+//! only appears in views that opt in by declaring it. A bump to version 2 is
+//! reserved for a change that would make an *existing* `type`/`kind` tag mean
+//! something different, or make a currently-optional field required.
 
 use serde::{Deserialize, Serialize};
 
@@ -281,6 +297,13 @@ fn default_text_area_rows() -> usize {
     3
 }
 
+/// Default step for a `slider` field — matches quadraui's own
+/// `FieldKind::Slider` default so an author who omits `step` gets the same
+/// behaviour on both sides of the translation.
+fn default_slider_step() -> f32 {
+    1.0
+}
+
 /// The input variant carried by a [`ViewField`].
 ///
 /// The serde tag is the Lua-facing `type = "..."` key, so the Rust enum and the
@@ -289,22 +312,30 @@ fn default_text_area_rows() -> usize {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ViewFieldKind {
     /// A non-interactive section header. `label` carries the text.
+    ///
+    /// No `quadraui::FieldKind` — `plugin_view_to_form` paints this as a
+    /// label-only `FormField` with no input, the one row shape quadraui's
+    /// own descriptor has no need to name separately.
     Label,
-    /// Single-line text input.
+    /// Single-line text input. Translated to `quadraui::FieldKind::TextInput`
+    /// (its `multiline: false`, `cursor`/`selection_anchor` interaction state
+    /// stays Engine-owned — see the module doc's firewall reasons).
     Text {
         #[serde(default)]
         value: String,
         #[serde(default)]
         placeholder: String,
     },
-    /// Single-line text input rendered masked. Value is plaintext.
+    /// Single-line text input rendered masked. Translated to
+    /// `quadraui::FieldKind::PasswordInput`. Value is plaintext on this
+    /// side of the firewall.
     Password {
         #[serde(default)]
         value: String,
         #[serde(default)]
         placeholder: String,
     },
-    /// Multi-line text input.
+    /// Multi-line text input. Translated to `quadraui::FieldKind::TextArea`.
     TextArea {
         #[serde(default)]
         value: String,
@@ -313,43 +344,49 @@ pub enum ViewFieldKind {
         #[serde(default = "default_text_area_rows")]
         rows: usize,
     },
-    /// Boolean checkbox.
+    /// Boolean checkbox. Translated to `quadraui::FieldKind::Toggle`.
     Toggle {
         #[serde(default)]
         value: bool,
     },
-    /// A single clickable button; `label` is the caption.
+    /// A single clickable button; `label` is the caption. Translated to
+    /// `quadraui::FieldKind::Button`.
     Button,
-    /// Read-only value row.
+    /// Read-only value row. Translated to `quadraui::FieldKind::ReadOnly`.
     ReadOnly {
         #[serde(default)]
         value: String,
     },
-    /// Single choice from a collapsed dropdown.
+    /// Single choice from a collapsed dropdown. Translated to
+    /// `quadraui::FieldKind::Dropdown`.
     Dropdown {
         #[serde(default)]
         options: Vec<String>,
         #[serde(default)]
         selected: usize,
     },
-    /// Single choice with every option visible.
+    /// Single choice with every option visible. Translated to
+    /// `quadraui::FieldKind::SegmentedControl`.
     Segmented {
         #[serde(default)]
         options: Vec<String>,
         #[serde(default)]
         selected: usize,
     },
-    /// A horizontal row of buttons, each with its own id.
+    /// A horizontal row of buttons, each with its own id. Translated to
+    /// `quadraui::FieldKind::ButtonRow`.
     Buttons {
         #[serde(default)]
         buttons: Vec<ViewButton>,
     },
-    /// A horizontal row of named toggles, each with its own id.
+    /// A horizontal row of named toggles, each with its own id. Translated
+    /// to `quadraui::FieldKind::ToggleGroup`.
     Toggles {
         #[serde(default)]
         toggles: Vec<ViewToggle>,
     },
-    /// A calendar date picker. `value` is an ISO8601 `YYYY-MM-DD` string, or
+    /// A calendar date picker. Translated to `quadraui::FieldKind::DatePicker`.
+    /// `value` is an ISO8601 `YYYY-MM-DD` string, or
     /// empty for unset. An empty or malformed `value` starts the picker on
     /// `1970-01-01` with no day selected — declare a real starting date to
     /// avoid landing the user decades away from today.
@@ -365,6 +402,26 @@ pub enum ViewFieldKind {
     Date {
         #[serde(default)]
         value: String,
+    },
+    /// A numeric slider within `[min, max]`, stepping by `step` per
+    /// adjustment. Translated to `quadraui::FieldKind::Slider` — the
+    /// vocabulary's demonstration that adding a primitive is an allow-list
+    /// entry (this variant plus one arm in
+    /// [`crate::render::plugin_view_to_form`]), not a new representation:
+    /// the field names below are exactly quadraui's own.
+    ///
+    /// `quadraui::FormController` has no native keyboard path for sliders
+    /// (unlike [`ViewFieldKind::Date`]'s scrub-and-confirm); `Enter`/`Space`
+    /// on a focused slider steps `value` by `step`, clamped to
+    /// `[min, max]`, and reaches the plugin immediately as a
+    /// [`ViewEventKind::SliderChanged`] — there is no separate "confirm"
+    /// step.
+    Slider {
+        value: f32,
+        min: f32,
+        max: f32,
+        #[serde(default = "default_slider_step")]
+        step: f32,
     },
 }
 
@@ -384,6 +441,7 @@ impl ViewFieldKind {
             ViewFieldKind::Buttons { .. } => "buttons",
             ViewFieldKind::Toggles { .. } => "toggles",
             ViewFieldKind::Date { .. } => "date",
+            ViewFieldKind::Slider { .. } => "slider",
         }
     }
 }
@@ -435,6 +493,12 @@ pub enum ViewEventKind {
     DateChanged {
         value: String,
     },
+    /// A `slider` field's value changed (Enter/Space step, or a drag/click
+    /// through `quadraui::FormController`). `value` is already clamped to
+    /// the field's declared `[min, max]`.
+    SliderChanged {
+        value: f32,
+    },
     FocusChanged,
     // ── ViewBody events ──────────────────────────────────────────────────
     /// A `List`/`Table` row moved into selection (index into
@@ -482,6 +546,7 @@ impl ViewEventKind {
             ViewEventKind::TextChanged { .. } => "TextChanged",
             ViewEventKind::TextCommitted { .. } => "TextCommitted",
             ViewEventKind::DateChanged { .. } => "DateChanged",
+            ViewEventKind::SliderChanged { .. } => "SliderChanged",
             ViewEventKind::FocusChanged => "FocusChanged",
             ViewEventKind::ItemSelected { .. } => "ItemSelected",
             ViewEventKind::ItemActivated { .. } => "ItemActivated",
@@ -637,6 +702,54 @@ mod tests {
         assert_eq!(kind.type_name(), "date");
         assert_eq!(
             kind,
+            ViewFieldKind::Date {
+                value: "2024-03-15".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn slider_field_kind_tag_is_the_lua_type_string() {
+        let json = r#"{"type":"slider","value":5.0,"min":0.0,"max":10.0,"step":0.5}"#;
+        let kind: ViewFieldKind = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(kind.type_name(), "slider");
+        assert_eq!(
+            kind,
+            ViewFieldKind::Slider {
+                value: 5.0,
+                min: 0.0,
+                max: 10.0,
+                step: 0.5,
+            }
+        );
+    }
+
+    #[test]
+    fn slider_field_kind_step_defaults_like_quadraui() {
+        let json = r#"{"type":"slider","value":5.0,"min":0.0,"max":10.0}"#;
+        let kind: ViewFieldKind = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            kind,
+            ViewFieldKind::Slider {
+                value: 5.0,
+                min: 0.0,
+                max: 10.0,
+                step: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn adding_slider_is_additive_old_schema_version_1_json_still_parses() {
+        // A `date` field declared before `Slider` existed, under the same
+        // `schema_version = 1` this build still understands.
+        let json = r#"{"id":"v","schema_version":1,"fields":[
+            {"id":"dob","kind":{"type":"date","value":"2024-03-15"}}
+        ]}"#;
+        let view: PluginView = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(view.schema_version, 1);
+        assert_eq!(
+            view.fields[0].kind,
             ViewFieldKind::Date {
                 value: "2024-03-15".into(),
             }
@@ -830,6 +943,10 @@ mod tests {
             }
             .kind_name(),
             "DateChanged"
+        );
+        assert_eq!(
+            ViewEventKind::SliderChanged { value: 3.5 }.kind_name(),
+            "SliderChanged"
         );
     }
 }

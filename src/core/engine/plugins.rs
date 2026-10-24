@@ -819,6 +819,22 @@ impl Engine {
                         // the `FormController` to confirm the scrubbed day.
                         return true;
                     }
+                    ViewFieldKind::Slider {
+                        value,
+                        min,
+                        max,
+                        step,
+                    } => {
+                        // `quadraui::FormController` has no native keyboard path
+                        // for a slider (unlike `Date`'s scrub-and-confirm), so
+                        // Enter/Space steps and reaches the plugin directly —
+                        // there is no separate confirm step.
+                        let next = (*value + *step).min(*max).max(*min);
+                        (
+                            field.id.clone(),
+                            ViewEventKind::SliderChanged { value: next },
+                        )
+                    }
                 };
                 self.dispatch_plugin_view_event(PluginViewEvent {
                     view: name.to_string(),

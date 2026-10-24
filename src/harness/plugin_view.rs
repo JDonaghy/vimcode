@@ -27,11 +27,15 @@ pub const VIEW: &str = "zqxw146view";
 /// Its activity-bar / sidebar-header title.
 pub const VIEW_TITLE: &str = "Zq146";
 
-// Needles are deliberately short and distinctive. The shared `App` sidebar is
-// only ~30 columns wide on TUI at the viewport sizes below, and a `Form` row
-// splits that between a label column and a value column — a needle that doesn't
-// fit is a needle `screen_has` cannot see (the same column-budget trap
-// `crate::harness::plugin_panel`'s module doc records for the tree panel).
+// Needles are deliberately short and distinctive. The TUI sidebar defaults to
+// 20 columns (`render::hit_test_geometry::UnitProfile::cell().sidebar_width_lh`),
+// and a `Form` row splits that between a label column and a value column — a
+// needle that doesn't fit is a needle `screen_has` cannot see (the same
+// column-budget trap `crate::harness::plugin_panel`'s module doc records for
+// the tree panel). A row whose track genuinely cannot fit in 20 columns (the
+// slider's) is measured through the editor-tab fixture instead
+// (`engine_with_plugin_view_tab`/`tui_tab`/`gtk_tab`), which has the whole
+// editor column's width to work with.
 
 /// A `label`-kind row: non-interactive, spans the whole row width.
 pub const ROW_HEADER: &str = "HdZQ146";
@@ -76,6 +80,25 @@ pub const ROW_DATE_DOWN: &str = "2024-01-08";
 /// [`ROW_DATE_INITIAL`] by one month (`DatePicker::navigate`'s
 /// `"PageDown"` arm is `focused.add_months(1)`).
 pub const ROW_DATE_PAGE_FORWARD: &str = "2024-02-01";
+/// A `slider`-kind row's label. Short on purpose, same column-budget trap
+/// [`ROW_DATE_LABEL`] already names: `tui::form::draw_field_slider` only
+/// paints the `[====--------] value` track once
+/// `start_col > label_end + 1`, and the track alone (12 cells + brackets +
+/// the two-decimal value) needs roughly 28+ columns of row width to clear
+/// that guard at all — more than the sidebar's 20-column TUI default has to
+/// give even with the shortest practical label. Scenarios that need this row
+/// painted use the editor-tab fixture (`tui_tab`/`gtk_tab`) instead of the
+/// sidebar one, since the editor column has the width to spare.
+pub const ROW_SLIDER_LABEL: &str = "SlZ";
+/// That row's plugin-declared initial value, as `quadraui`'s
+/// `draw_field_slider` paints it (`format!("{{value:.2}}")`).
+pub const ROW_SLIDER_INITIAL: &str = "6.00";
+/// The value painted after one `Enter`/`Space` steps the slider by its
+/// declared `step` (3.0), clamped to `[min, max]` — there is no separate
+/// scrub-then-confirm step like [`ROW_DATE_SCRUBBED`]'s, since
+/// `quadraui::FormController` has no native keyboard path for a slider and
+/// vimcode reaches the plugin directly.
+pub const ROW_SLIDER_STEPPED: &str = "9.00";
 
 /// Registered view names for each `ViewBody` kind's fixture.
 pub const LIST_VIEW: &str = "zqxw1631list";
@@ -249,6 +272,7 @@ fn plugin_source() -> String {
         r#"
 local count = 0
 local date_value = "{ROW_DATE_INITIAL}"
+local slider_value = 6.0
 
 vimcode.ui.register_view("{VIEW}", {{
   title = "{VIEW_TITLE}",
@@ -270,6 +294,8 @@ vimcode.ui.register_view("{VIEW}", {{
            value = "" }},
         {{ type = "date",   id = "dob",  label = "{ROW_DATE_LABEL}",
            value = date_value }},
+        {{ type = "slider", id = "vol",  label = "{ROW_SLIDER_LABEL}",
+           value = slider_value, min = 0.0, max = 10.0, step = 3.0 }},
       }},
     }}
   end,
@@ -280,12 +306,15 @@ vimcode.ui.register_view("{VIEW}", {{
       count = count + 1
     elseif event.widget_id == "etx"
         and (event.kind == "TextChanged" or event.kind == "TextCommitted") then
-      -- #1627: every keystroke into the focused text field reaches here as
-      -- a TextChanged event, and Enter reaches here once more as
+      -- Every keystroke into the focused text field reaches here as a
+      -- TextChanged event, and Enter reaches here once more as
       -- TextCommitted with the same (by-then-final) value.
       count = count + 1
     elseif event.widget_id == "dob" and event.kind == "DateChanged" then
       date_value = event.value
+      count = count + 1
+    elseif event.widget_id == "vol" and event.kind == "SliderChanged" then
+      slider_value = event.value
       count = count + 1
     end
   end,
@@ -516,6 +545,8 @@ pub fn declared_tree_is_painted(driver: &impl ConformanceDriver) {
             ROW_BUTTON,
             ROW_DATE_LABEL,
             ROW_DATE_INITIAL,
+            ROW_SLIDER_LABEL,
+            ROW_SLIDER_INITIAL,
             COUNT_0,
         ],
         "the plugin-declared widget tree",
@@ -718,6 +749,50 @@ pub fn scrubbing_and_confirming_a_date_field_reaches_the_plugin_handler(
         driver.screen_has(COUNT_1),
         "Enter on the focused date field must reach the plugin's on_event \
          handler as DateChanged and repaint ({COUNT_1:?}); painted runs \
+         were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 4c — a focused `slider` field's `Enter`/`Space` steps its value by
+/// one `step` (clamped to `[min, max]`) and reaches the plugin's `on_event`
+/// handler as a `SliderChanged` — unlike the date field above,
+/// `quadraui::FormController` has no native keyboard path for a slider, so
+/// vimcode computes the next value directly and there is no separate
+/// scrub-then-confirm step.
+///
+/// `Tab` x5 walks from the initially-focused `url` field past `tls`, `send`,
+/// `etx` and `dob` onto `vol`, the last declared field.
+pub fn stepping_a_slider_field_reaches_the_plugin_handler(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(ROW_SLIDER_INITIAL),
+        "precondition: the slider row must start at {ROW_SLIDER_INITIAL:?}; \
+         painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_0),
+        "precondition: the counter row must start at {COUNT_0:?}; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has(ROW_SLIDER_STEPPED),
+        "Enter on the focused slider field must step its value by one \
+         `step` and repaint it ({ROW_SLIDER_STEPPED:?}); painted runs were \
+         {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_1),
+        "Enter on the focused slider field must reach the plugin's on_event \
+         handler as SliderChanged and repaint ({COUNT_1:?}); painted runs \
          were {:?}",
         painted(driver)
     );
@@ -1107,7 +1182,10 @@ mod tests {
 
     #[test]
     fn plugin_view_declared_tree_is_painted_on_tui() {
-        let (h, _dir) = tui();
+        // The sidebar's 20-column TUI default is too narrow for the slider
+        // row's track (`ROW_SLIDER_LABEL`'s doc comment) — the editor-tab
+        // fixture has room for every row this checks.
+        let (h, _dir) = tui_tab();
         declared_tree_is_painted(&h.driver);
     }
 
@@ -1133,6 +1211,14 @@ mod tests {
     fn plugin_view_scrubbing_and_confirming_a_date_field_reaches_the_handler_on_tui() {
         let (mut h, _dir) = tui();
         scrubbing_and_confirming_a_date_field_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_stepping_a_slider_field_reaches_the_handler_on_tui() {
+        // Same reason as `plugin_view_declared_tree_is_painted_on_tui`: the
+        // slider row only paints in the wider editor-tab fixture.
+        let (mut h, _dir) = tui_tab();
+        stepping_a_slider_field_reaches_the_plugin_handler(&mut h.driver);
     }
 
     #[test]
@@ -1265,7 +1351,7 @@ mod tests {
     #[cfg(feature = "gui")]
     #[test]
     fn plugin_view_declared_tree_is_painted_on_gtk() {
-        let (h, _dir) = gtk();
+        let (h, _dir) = gtk_tab();
         declared_tree_is_painted(&h.driver);
     }
 
@@ -1295,6 +1381,13 @@ mod tests {
     fn plugin_view_scrubbing_and_confirming_a_date_field_reaches_the_handler_on_gtk() {
         let (mut h, _dir) = gtk();
         scrubbing_and_confirming_a_date_field_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_stepping_a_slider_field_reaches_the_handler_on_gtk() {
+        let (mut h, _dir) = gtk_tab();
+        stepping_a_slider_field_reaches_the_plugin_handler(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]

@@ -176,6 +176,17 @@ pub fn plugin_view_to_form(
                     // from the embedded `DatePicker`'s own flag.
                     FieldKind::DatePicker(picker)
                 }
+                ViewFieldKind::Slider {
+                    value,
+                    min,
+                    max,
+                    step,
+                } => FieldKind::Slider {
+                    value: *value,
+                    min: *min,
+                    max: *max,
+                    step: *step,
+                },
             };
             FormField {
                 id: wid(&f.id),
@@ -550,6 +561,9 @@ pub(crate) fn plugin_view_event_from_form_event(
                 value: value.format(quadraui::DateFormat::Iso8601),
             },
         ),
+        quadraui::FormEvent::SliderChanged { id, value } => {
+            (id, ViewEventKind::SliderChanged { value: *value })
+        }
         quadraui::FormEvent::FocusChanged { id } => (id, ViewEventKind::FocusChanged),
         _ => return None,
     };
@@ -615,5 +629,60 @@ mod date_parse_tests {
     #[test]
     fn rejects_trailing_junk_after_the_day() {
         assert_eq!(parse_iso_date("2024-01-15-99"), None);
+    }
+}
+
+#[cfg(test)]
+mod slider_translation_tests {
+    use super::*;
+    use crate::core::plugin_ui::{PluginView, ViewField, ViewFieldKind};
+
+    #[test]
+    fn slider_field_translates_to_the_quadraui_slider_field_kind() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![ViewField {
+                id: "vol".into(),
+                label: "Volume".into(),
+                hint: String::new(),
+                disabled: false,
+                error: None,
+                warning: None,
+                kind: ViewFieldKind::Slider {
+                    value: 3.0,
+                    min: 0.0,
+                    max: 10.0,
+                    step: 0.5,
+                },
+            }],
+            body: None,
+        };
+        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
+        assert_eq!(
+            form.fields[0].kind,
+            quadraui::FieldKind::Slider {
+                value: 3.0,
+                min: 0.0,
+                max: 10.0,
+                step: 0.5,
+            }
+        );
+    }
+
+    #[test]
+    fn form_slider_changed_event_translates_back_to_the_plugin_event() {
+        let id = quadraui::WidgetId::new(crate::core::plugin_ui::namespaced_widget_id(
+            "myview", "vol",
+        ));
+        let action = quadraui::FormEvent::SliderChanged { id, value: 7.5 };
+        let (view, field, kind) =
+            plugin_view_event_from_form_event(&action).expect("must map back");
+        assert_eq!(view, "myview");
+        assert_eq!(field, "vol");
+        assert_eq!(
+            kind,
+            crate::core::plugin_ui::ViewEventKind::SliderChanged { value: 7.5 }
+        );
     }
 }
