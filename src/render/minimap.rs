@@ -400,7 +400,7 @@ pub(crate) fn scroll_gutter_width(scrollbar_reserve: f64, char_width: f64) -> f6
 /// effect on GTK/Win-GUI, which keep painting (and anchoring their
 /// scrollbar) against the full, unmodified `editor.rect` either way.
 ///
-/// TUI's own vertical/horizontal scrollbars are **not** unaffected, though:
+/// TUI's own vertical/horizontal scrollbars **are** affected, though:
 /// `quadraui::tui::editor::draw_editor` computes their bounds directly from
 /// this narrowed `area` (its own `area.x + area.width - 1`, no call to
 /// `Editor::layout` at all), so they move one column left, flush against
@@ -423,10 +423,18 @@ pub(crate) fn tui_editor_paint_rect(
     rect: quadraui::Rect,
     minimap_reserved_w: f64,
 ) -> quadraui::Rect {
+    // A negative reserve would *widen* the paint rect past the pane, so
+    // text would spill into the neighbouring window instead of stopping
+    // short of the strip. Every producer (`render::window_builder`) only
+    // ever adds non-negative widths; catch a future one that doesn't.
+    debug_assert!(
+        minimap_reserved_w >= 0.0,
+        "minimap_reserved_w must be non-negative, got {minimap_reserved_w}"
+    );
     quadraui::Rect::new(
         rect.x,
         rect.y,
-        (rect.width - minimap_reserved_w as f32).max(0.0),
+        (rect.width - minimap_reserved_w.max(0.0) as f32).max(0.0),
         rect.height,
     )
 }
