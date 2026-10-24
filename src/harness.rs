@@ -10861,11 +10861,24 @@ mod terminal_panel_click_focuses_it_for_keystroke_routing_mod {
             // Enter, so nothing executes).
             driver.type_char(':');
             driver.type_char('Q');
-            assert!(
-                driver.screen_has(":Q"),
-                "precondition: with the terminal unfocused, typing ':Q' must echo \
-                 literally in the host's command line"
-            );
+            // Remember *which painted row* is the host's command line, captured
+            // from the run that echoes the typed text rather than hardcoded. The
+            // terminal pane runs a real shell, which echoes whatever it receives
+            // into its own body, so "is ':Q' anywhere on screen" cannot tell the
+            // two destinations apart -- the assertion below has to name the row.
+            let (command_line_y, command_line_height) = driver
+                .inventory()
+                .text_runs()
+                .iter()
+                .find(|r| r.text.contains(":Q"))
+                .map(|r| (r.bounds.y, r.bounds.height))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "precondition: with the terminal unfocused, typing ':Q' must \
+                         echo literally in the host's command line; painted: {:?}",
+                        driver.inventory().text_runs()
+                    )
+                });
             driver.press_named(quadraui::NamedKey::Escape);
 
             // Locate the terminal's own tab label, then click a few rows below it --
@@ -10889,11 +10902,23 @@ mod terminal_panel_click_focuses_it_for_keystroke_routing_mod {
             // by the terminal instead of reaching the host's command line.
             driver.type_char(':');
             driver.type_char('Q');
+            let on_command_line: Vec<_> = driver
+                .inventory()
+                .text_runs()
+                .iter()
+                .filter(|r| {
+                    r.text.contains(":Q")
+                        && (r.bounds.y - command_line_y).abs()
+                            < command_line_height.max(1.0) / 2.0
+                })
+                .map(|r| (r.text.clone(), r.bounds))
+                .collect();
             assert!(
-                !driver.screen_has(":Q"),
+                on_command_line.is_empty(),
                 "clicking inside the terminal pane's body must focus it -- typing \
                  ':Q' afterward must be routed to the terminal, not echoed in the \
-                 host's command line"
+                 host's command line (row y={command_line_y}); painted there: {:?}",
+                on_command_line
             );
         },
     }
