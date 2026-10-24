@@ -14,6 +14,11 @@ no matching section fails the release job before anything is published (see
 `scripts/release_notes.py`).
 
 ## [Unreleased]
+### Added
+- Plugin-declared views gain a `date` field kind, rendered as a
+  `quadraui::DatePicker`. `Left`/`Right`/`Up`/`Down`/`PageUp`/`PageDown`
+  scrub the focused day live; `Enter` confirms it as a `DateChanged`
+  event to the plugin's `on_event` handler.
 
 ## [0.15.5] - 2026-10-17
 ### Changed

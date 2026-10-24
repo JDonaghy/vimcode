@@ -14,18 +14,19 @@ fn parse_iso_date(s: &str) -> Option<quadraui::CalendarDate> {
         Some(rest) => (-1, rest),
         None => (1, s),
     };
+    // `splitn(3, '-')` yields at most three items, so there is no fourth
+    // `parts.next()` to reject — a trailing `-<junk>` ends up inside the
+    // `day` slice instead (e.g. `"15-99"`) and is rejected by `day`'s own
+    // `parse::<u8>()` call above.
     let mut parts = rest.splitn(3, '-');
     let year: i32 = parts.next()?.parse().ok()?;
     let month: u8 = parts.next()?.parse().ok()?;
     let day: u8 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
     if !(1..=12).contains(&month) {
         return None;
     }
     let year = sign * year;
-    if day < 1 || day > quadraui::CalendarDate::days_in_month(year, month) {
+    if !(1..=quadraui::CalendarDate::days_in_month(year, month)).contains(&day) {
         return None;
     }
     Some(quadraui::CalendarDate::new(year, month, day))
@@ -167,6 +168,12 @@ pub fn plugin_view_to_form(
                     let mut picker =
                         quadraui::DatePicker::new(wid(&f.id), parsed.unwrap_or_default());
                     picker.selected = parsed;
+                    // `picker.has_focus` is left at its `false` default:
+                    // `quadraui::primitives::form`'s inline `DatePicker`
+                    // row paint derives its focus affordance from
+                    // `Form::has_focus` + `Form::focused_field` (set
+                    // below), the same as every other field kind, not
+                    // from the embedded `DatePicker`'s own flag.
                     FieldKind::DatePicker(picker)
                 }
             };
@@ -548,4 +555,65 @@ pub(crate) fn plugin_view_event_from_form_event(
     };
     let (view, field) = split_widget_id(id.as_str())?;
     Some((view.to_string(), field.to_string(), kind))
+}
+
+#[cfg(test)]
+mod date_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_well_formed_iso8601_date() {
+        let d = parse_iso_date("2024-01-02").expect("well-formed date must parse");
+        assert_eq!(d, quadraui::CalendarDate::new(2024, 1, 2));
+    }
+
+    #[test]
+    fn parses_a_negative_year() {
+        let d = parse_iso_date("-0044-03-15").expect("BC year must parse");
+        assert_eq!(d, quadraui::CalendarDate::new(-44, 3, 15));
+    }
+
+    #[test]
+    fn rejects_an_empty_string() {
+        assert_eq!(parse_iso_date(""), None);
+    }
+
+    #[test]
+    fn rejects_malformed_input() {
+        assert_eq!(parse_iso_date("not-a-date"), None);
+        assert_eq!(parse_iso_date("2024/01/02"), None);
+        assert_eq!(parse_iso_date("2024-01"), None);
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_month() {
+        assert_eq!(parse_iso_date("2024-00-01"), None);
+        assert_eq!(parse_iso_date("2024-13-01"), None);
+    }
+
+    #[test]
+    fn rejects_february_30th() {
+        assert_eq!(parse_iso_date("2024-02-30"), None);
+    }
+
+    #[test]
+    fn accepts_february_29th_in_a_leap_year() {
+        let d = parse_iso_date("2024-02-29").expect("2024 is a leap year");
+        assert_eq!(d, quadraui::CalendarDate::new(2024, 2, 29));
+    }
+
+    #[test]
+    fn rejects_february_29th_in_a_non_leap_year() {
+        assert_eq!(parse_iso_date("2023-02-29"), None);
+    }
+
+    #[test]
+    fn rejects_a_zero_day() {
+        assert_eq!(parse_iso_date("2024-01-00"), None);
+    }
+
+    #[test]
+    fn rejects_trailing_junk_after_the_day() {
+        assert_eq!(parse_iso_date("2024-01-15-99"), None);
+    }
 }

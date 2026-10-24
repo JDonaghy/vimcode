@@ -350,7 +350,18 @@ pub enum ViewFieldKind {
         toggles: Vec<ViewToggle>,
     },
     /// A calendar date picker. `value` is an ISO8601 `YYYY-MM-DD` string, or
-    /// empty for unset.
+    /// empty for unset. An empty or malformed `value` starts the picker on
+    /// `1970-01-01` with no day selected — declare a real starting date to
+    /// avoid landing the user decades away from today.
+    ///
+    /// While this field has focus, `Left`/`Right`/`Up`/`Down`/`PageUp`/
+    /// `PageDown` scrub a day/month that paints immediately but is held by
+    /// `quadraui::FormController`'s own cache, not by the plugin, until
+    /// `Enter` confirms it as a [`ViewEventKind::DateChanged`] event. That
+    /// cache survives this field being re-declared with a different
+    /// `value` while it stays focused — a plugin whose `on_event` ignores
+    /// `DateChanged` sees its own declared value repainted only once focus
+    /// leaves and returns to this field, which reseeds the cache.
     Date {
         #[serde(default)]
         value: String,

@@ -62,11 +62,20 @@ pub const ROW_DATE_LABEL: &str = "DtZ";
 /// That row's plugin-declared initial value (ISO8601 `YYYY-MM-DD`).
 pub const ROW_DATE_INITIAL: &str = "2024-01-01";
 /// The value painted after one `Right` keypress scrubs the focused day
-/// forward without yet confirming it (`FormController::handle_date_
-/// picker_key`'s `FocusMoved` arm — a `Consumed` navigation event that never
-/// reaches the plugin). Confirms the live scrub repaints the field even
-/// though [`COUNT_0`] must not have bumped yet.
+/// forward without yet confirming it
+/// (`FormController::handle_date_picker_key`'s `FocusMoved` arm — a
+/// `Consumed` navigation event that never reaches the plugin). Confirms the
+/// live scrub repaints the field even though [`COUNT_0`] must not have
+/// bumped yet.
 pub const ROW_DATE_SCRUBBED: &str = "2024-01-02";
+/// The value painted after `Down` shifts the focused day back from
+/// [`ROW_DATE_INITIAL`] by one week (`DatePicker::navigate`'s `"Down"` arm
+/// is `focused.add_days(7)`).
+pub const ROW_DATE_DOWN: &str = "2024-01-08";
+/// The value painted after `PageDown` shifts the focused day forward from
+/// [`ROW_DATE_INITIAL`] by one month (`DatePicker::navigate`'s
+/// `"PageDown"` arm is `focused.add_months(1)`).
+pub const ROW_DATE_PAGE_FORWARD: &str = "2024-02-01";
 
 /// Registered view names for each `ViewBody` kind's fixture.
 pub const LIST_VIEW: &str = "zqxw1631list";
@@ -609,14 +618,20 @@ pub fn typing_edits_the_focused_text_field(driver: &mut impl ConformanceDriver) 
 
 /// Scenario 4b — a focused `date` field scrubs its live day with
 /// `Left`/`Right`/`Up`/`Down`/`PageUp`/`PageDown`, repainting on every
-/// keystroke, but only hands the plugin a [`crate::core::plugin_ui::
-/// ViewEventKind::DateChanged`] once `Enter` confirms the scrubbed day —
-/// `quadraui`'s `FormController::handle_date_picker_key` returns a plain
-/// `Consumed` (not a `FormAction`) for the scrub keys themselves, per its
-/// own "Date picker fields" doc.
+/// keystroke, but only hands the plugin a
+/// [`crate::core::plugin_ui::ViewEventKind::DateChanged`] once `Enter`
+/// confirms the scrubbed day — `quadraui`'s
+/// `FormController::handle_date_picker_key` returns a plain `Consumed`
+/// (not a `FormAction`) for the scrub keys themselves, per its own "Date
+/// picker fields" doc.
 ///
 /// `Tab` x4 walks from the initially-focused `url` field past `tls`, `send`
-/// and `etx` onto `dob`, the last declared field.
+/// and `etx` onto `dob`, the last declared field. Each navigation key is
+/// pressed and then undone with its opposite (`Right`/`Left`,
+/// `Down`/`Up`, `PageDown`/`PageUp`) to land back on
+/// [`ROW_DATE_INITIAL`] before the final `Right` + `Enter`, so every arm
+/// of `DatePicker::navigate` is exercised while the assertions stay
+/// anchored to a small, known set of needles.
 pub fn scrubbing_and_confirming_a_date_field_reaches_the_plugin_handler(
     driver: &mut impl ConformanceDriver,
 ) {
@@ -641,6 +656,55 @@ pub fn scrubbing_and_confirming_a_date_field_reaches_the_plugin_handler(
         driver.screen_has(COUNT_0),
         "scrubbing alone (no Enter) must not yet reach the plugin's \
          on_event handler; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Left);
+    assert!(
+        driver.screen_has(ROW_DATE_INITIAL),
+        "Left must undo the prior Right, scrubbing the focused day back to \
+         {ROW_DATE_INITIAL:?}; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Down);
+    assert!(
+        driver.screen_has(ROW_DATE_DOWN),
+        "Down on the focused date field must scrub the live day forward by \
+         a week ({ROW_DATE_DOWN:?}); painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Up);
+    assert!(
+        driver.screen_has(ROW_DATE_INITIAL),
+        "Up must undo the prior Down, scrubbing the focused day back to \
+         {ROW_DATE_INITIAL:?}; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::PageDown);
+    assert!(
+        driver.screen_has(ROW_DATE_PAGE_FORWARD),
+        "PageDown on the focused date field must scrub the live day \
+         forward by a month ({ROW_DATE_PAGE_FORWARD:?}); painted runs were \
+         {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::PageUp);
+    assert!(
+        driver.screen_has(ROW_DATE_INITIAL),
+        "PageUp must undo the prior PageDown, scrubbing the focused day \
+         back to {ROW_DATE_INITIAL:?}; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_0),
+        "none of the Left/Down/Up/PageDown/PageUp scrubs above must reach \
+         the plugin's on_event handler; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Right);
+    assert!(
+        driver.screen_has(ROW_DATE_SCRUBBED),
+        "Right on the focused date field must scrub the live day forward \
+         and repaint it ({ROW_DATE_SCRUBBED:?}); painted runs were {:?}",
         painted(driver)
     );
     driver.press_named(quadraui::NamedKey::Enter);
