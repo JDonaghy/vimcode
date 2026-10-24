@@ -494,6 +494,27 @@ fn active_table_sort(
         .filter(|&(col, _)| col < column_count)
 }
 
+/// A table's stored column-width overrides, or an empty slice when they are
+/// stale.
+///
+/// Overrides are absolute widths held positionally, so they only describe the
+/// column set they were dragged against: a plugin whose `render` returns a
+/// different number of columns would otherwise have the old widths applied to
+/// whichever columns happen to share those indices. Mirrors
+/// [`active_table_sort`]'s own staleness filter.
+fn active_table_col_overrides<'a>(
+    engine: &'a Engine,
+    name: &str,
+    column_count: usize,
+) -> &'a [Option<f32>] {
+    engine
+        .plugin_view_table_col_overrides
+        .get(name)
+        .map(Vec::as_slice)
+        .filter(|o| o.len() == column_count)
+        .unwrap_or(&[])
+}
+
 /// Display order for a table's rows: display position → index into the
 /// plugin's declared `rows`. Identity when `sort` is `None`.
 ///
@@ -643,11 +664,7 @@ pub(crate) fn paint_plugin_view_table(
         .plugin_view_text_edit
         .as_ref()
         .filter(|e| e.view == name);
-    let empty_overrides: Vec<Option<f32>> = Vec::new();
-    let column_overrides = engine
-        .plugin_view_table_col_overrides
-        .get(name)
-        .unwrap_or(&empty_overrides);
+    let column_overrides = active_table_col_overrides(engine, name, columns.len());
     let sort = active_table_sort(engine, name, columns.len());
     let row_order = plugin_view_table_row_order(rows, sort);
     let table = plugin_view_to_table(
@@ -699,7 +716,7 @@ pub(crate) fn route_plugin_view_table_click(
     // an `editable` column is worth recording; a click on a read-only
     // column leaves the last editable selection alone rather than clearing
     // it to a column `Enter` could never open anyway.
-    let (idx, col, divider, header) = {
+    let (idx, col, divider, header, baseline) = {
         let borrowed = cache.borrow();
         let Some((rect, layout)) = borrowed.as_ref() else {
             return false;
@@ -727,17 +744,26 @@ pub(crate) fn route_plugin_view_table_click(
             .iter()
             .position(|c| local_x >= c.x && local_x < c.x + c.width)
             .filter(|&c| columns.get(c).is_some_and(|c| c.editable));
-        (idx, col, divider, header)
+        // Snapshotted only for a divider press, which is the only hit that
+        // needs the pre-gesture geometry to survive the frames the drag
+        // spans (`PluginTableColumnDrag::layout`).
+        let baseline = divider.map(|_| (*rect, layout.clone()));
+        (idx, col, divider, header, baseline)
     };
     // Arm the resize drag and return before computing the sort cycle below:
     // `divider` and `header` come from mutually exclusive `DataTableHit`
     // arms, so a divider hit never needs the row reorder a header click
     // would, and there's no reason to pay for it.
     if let Some(col) = divider {
+        let (rect, layout) = baseline.expect("a divider hit always snapshots its baseline");
+        let column_count = columns.len();
         engine.plugin_view_table_resize_drag = Some(PluginTableColumnDrag {
             view: name.to_string(),
             host,
             col,
+            rect,
+            layout,
+            overrides: active_table_col_overrides(engine, name, column_count).to_vec(),
         });
         return true;
     }
@@ -806,6 +832,10 @@ pub(crate) fn route_plugin_view_table_click(
     true
 }
 
+/// Narrowest a plugin-view table column may be dragged to, in character
+/// widths (converted to the backend's own unit by [`min_table_column_width`]).
+const MIN_TABLE_COLUMN_WIDTH_CHARS: f32 = 3.0;
+
 /// Floor a dragged (or the rightmost, slack-absorbing) plugin-view table
 /// column is clamped to. A pixel literal here would violate the
 /// platform-neutrality rule (TUI columns are cell-wide, GTK columns are
@@ -815,10 +845,6 @@ pub(crate) fn route_plugin_view_table_click(
 fn min_table_column_width(backend: &dyn quadraui::Backend) -> f32 {
     backend.char_width() * MIN_TABLE_COLUMN_WIDTH_CHARS
 }
-
-/// Narrowest a plugin-view table column may be dragged to, in character
-/// widths (converted to the backend's own unit by [`min_table_column_width`]).
-const MIN_TABLE_COLUMN_WIDTH_CHARS: f32 = 3.0;
 
 /// Continue a header-divider drag armed by `route_plugin_view_table_click`'s
 /// `HeaderDivider` branch, recomputing `Engine::plugin_view_table_col_overrides`
@@ -832,6 +858,10 @@ const MIN_TABLE_COLUMN_WIDTH_CHARS: f32 = 3.0;
 /// event for; they are checked against the armed drag's own `view`/`host`
 /// (see [`crate::core::engine::PluginTableColumnDrag`]) so a drag armed by one
 /// view or host is never continued — or later cleared — by an unrelated one.
+///
+/// Every move resolves against the drag's own pre-gesture baseline rather
+/// than the live layout cache, which `paint_plugin_view_table` rewrites each
+/// frame — see [`crate::core::engine::PluginTableColumnDrag::layout`].
 pub(crate) fn continue_plugin_view_table_resize_drag(
     engine: &mut Engine,
     name: &str,
@@ -846,30 +876,16 @@ pub(crate) fn continue_plugin_view_table_resize_drag(
         return false;
     }
     let view = drag.view.clone();
-    let col = drag.col;
-    let existing = engine
-        .plugin_view_table_col_overrides
-        .get(&view)
-        .cloned()
-        .unwrap_or_default();
-    let cache = match host {
-        PluginViewHost::Sidebar => &engine.plugin_view_table_layout,
-        PluginViewHost::Tab => &engine.plugin_view_tab_table_layout,
-    };
     let min_width = min_table_column_width(backend);
-    let next = {
-        let borrowed = cache.borrow();
-        let Some((rect, layout)) = borrowed.as_ref() else {
-            return false;
-        };
-        // Clamp to the viewport so a column can never be dragged so wide that
-        // its own divider ends up past `viewport_width` — quadraui's
-        // `hit_test` early-returns `Empty` there, which would otherwise make
-        // the divider permanently unreachable (and the override permanent)
-        // for the rest of the session.
-        let target_x = (pos.x - rect.x).min(layout.viewport_width - 1.0);
-        layout.drag_divider(&existing, col, target_x, min_width)
-    };
+    // Clamp to the viewport so a column can never be dragged so wide that
+    // its own divider ends up past `viewport_width` — quadraui's `hit_test`
+    // early-returns `Empty` there, which would otherwise make the divider
+    // permanently unreachable (and the override permanent) for the rest of
+    // the session.
+    let target_x = (pos.x - drag.rect.x).min(drag.layout.viewport_width - 1.0);
+    let next = drag
+        .layout
+        .drag_divider(&drag.overrides, drag.col, target_x, min_width);
     engine.plugin_view_table_col_overrides.insert(view, next);
     true
 }

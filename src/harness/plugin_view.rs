@@ -249,6 +249,12 @@ vimcode.ui.register_view("{TEXT_VIEW}", {{
 vimcode.command("Zq1631ListOpenTab", function()
   vimcode.ui.open_view("{LIST_VIEW}", {{ location = "tab" }})
 end)
+
+-- The same for the `table`-kind view, so the header-divider resize gesture can
+-- be driven in an editor tab as well as the sidebar.
+vimcode.command("Zq1631TableOpenTab", function()
+  vimcode.ui.open_view("{TABLE_VIEW}", {{ location = "tab" }})
+end)
 "#
     )
 }
@@ -1116,7 +1122,8 @@ fn next_header_run_x(driver: &impl ConformanceDriver, left_run: quadraui::event:
 /// unlike a leftward drag, which the min-width floor could clamp back up.
 ///
 /// The drag's start point is still read from the cached layout
-/// (`engine.plugin_view_table_layout`) — same as
+/// (`engine.plugin_view_table_layout`, or `plugin_view_tab_table_layout` for
+/// `host == PluginViewHost::Tab`) — same as
 /// [`table_header_click_sorts_the_painted_rows`]'s header click — because
 /// that only ever drives the input, never judges the outcome:
 /// the pass/fail assertion below reads nothing but `inventory().text_runs()`,
@@ -1125,11 +1132,39 @@ fn next_header_run_x(driver: &impl ConformanceDriver, left_run: quadraui::event:
 /// has a fixed total width, so widening column 0 shrinks every column after
 /// it, and a large drag can squeeze column 1 down to nothing legible on a
 /// narrow TUI viewport before the assertion ever gets to look at it.
+///
+/// Drives the sidebar-hosted copy of the table;
+/// [`table_header_divider_drag_in_a_tab_resizes_the_column`] is the editor-tab
+/// twin. The two hosts reach the engine through entirely separate routing — the
+/// sidebar's via `App::try_route_sidebar_mouse_event`, an editor tab's via
+/// `App::try_route_tab_plugin_table_drag` — so both need driving.
 pub fn table_header_divider_drag_resizes_the_column<D>(
     h: &mut crate::harness::ConformanceHarness<D>,
 ) where
     D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
 {
+    table_divider_drag_resizes_the_column(h, crate::core::engine::PluginViewHost::Sidebar);
+}
+
+/// Editor-tab twin of [`table_header_divider_drag_resizes_the_column`]: same
+/// gesture and same assertion, against a table opened with `location = "tab"`,
+/// whose `MouseMoved`/`MouseUp` follow-through is routed by
+/// `App::try_route_tab_plugin_table_drag` instead of the sidebar's capture path.
+pub fn table_header_divider_drag_in_a_tab_resizes_the_column<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    table_divider_drag_resizes_the_column(h, crate::core::engine::PluginViewHost::Tab);
+}
+
+fn table_divider_drag_resizes_the_column<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+    host: crate::core::engine::PluginViewHost,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    use crate::core::engine::PluginViewHost;
     assert_paints(
         &h.driver,
         &[TABLE_COL_KEY, TABLE_COL_VALUE],
@@ -1137,10 +1172,13 @@ pub fn table_header_divider_drag_resizes_the_column<D>(
     );
     let (divider_x, y) = {
         let engine = h.engine.borrow();
-        let cached = engine.plugin_view_table_layout.borrow();
+        let cached = match host {
+            PluginViewHost::Sidebar => engine.plugin_view_table_layout.borrow(),
+            PluginViewHost::Tab => engine.plugin_view_tab_table_layout.borrow(),
+        };
         let (rect, layout) = cached
             .as_ref()
-            .expect("table_header_divider_drag_resizes_the_column: no frame painted yet");
+            .expect("table_divider_drag_resizes_the_column: no frame painted yet");
         let col0 = &layout.columns[0];
         (
             rect.x + col0.x + col0.width,
@@ -1168,8 +1206,9 @@ pub fn table_header_divider_drag_resizes_the_column<D>(
 ///
 /// The click lands on the middle of the header cell, read back from the
 /// cached layout like [`table_header_divider_drag_resizes_the_column`] does,
-/// so it stays well clear of the header *divider* (a resize) regardless of
-/// how wide the backend painted the column.
+/// which keeps it clear of the header *divider* (a resize) for any column
+/// wider than twice quadraui's `DIVIDER_GRAB_PX` — comfortably true of the
+/// fixture's columns on both backends.
 pub fn table_header_click_sorts_the_painted_rows<D>(h: &mut crate::harness::ConformanceHarness<D>)
 where
     D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
@@ -1372,6 +1411,12 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_table_tab_header_divider_drag_resizes_the_column_on_tui() {
+        let (mut h, _dir) = tui_named_tab(TABLE_VIEW, "Zq1631TableOpenTab");
+        table_header_divider_drag_in_a_tab_resizes_the_column(&mut h);
+    }
+
+    #[test]
     fn plugin_view_table_header_click_sorts_the_painted_rows_on_tui() {
         let (mut h, _dir) = tui_named(TABLE_VIEW);
         table_header_click_sorts_the_painted_rows(&mut h);
@@ -1555,6 +1600,13 @@ mod tests {
     fn plugin_view_table_header_divider_drag_resizes_the_column_on_gtk() {
         let (mut h, _dir) = gtk_named(TABLE_VIEW);
         table_header_divider_drag_resizes_the_column(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_tab_header_divider_drag_resizes_the_column_on_gtk() {
+        let (mut h, _dir) = gtk_named_tab(TABLE_VIEW, "Zq1631TableOpenTab");
+        table_header_divider_drag_in_a_tab_resizes_the_column(&mut h);
     }
 
     #[cfg(feature = "gui")]

@@ -2820,6 +2820,22 @@ pub(crate) struct PluginTableColumnDrag {
     /// The column to the left of the dragged divider, as returned by
     /// `quadraui::DataTableHit::HeaderDivider`.
     pub col: usize,
+    /// The view's painted rect the drag is armed against, which puts the
+    /// pointer into the table's own coordinate space on every later move.
+    pub rect: quadraui::Rect,
+    /// The resolved table layout the gesture starts from.
+    ///
+    /// `quadraui::DataTableLayout::drag_divider` is a pure function of the
+    /// pointer position *relative to the layout it is called on*, and that is
+    /// what makes a drag reversible: the dragged column's width plus the
+    /// slack-absorbing last column's are the pre-gesture pair on every move,
+    /// so dragging back to the starting pointer position restores the
+    /// starting widths exactly.
+    pub layout: quadraui::DataTableLayout,
+    /// The snapshot of `Engine::plugin_view_table_col_overrides` for `view`
+    /// the gesture starts from — the `overrides` argument `drag_divider`
+    /// expects alongside `layout`.
+    pub overrides: Vec<Option<f32>>,
 }
 
 pub struct Engine {
