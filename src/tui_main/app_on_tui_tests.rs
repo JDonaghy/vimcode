@@ -9199,7 +9199,8 @@ mod tests {
                 .style_at(x, row1_y)
                 .expect("the strip's second row must be a painted cell");
             assert_eq!(
-                style.fg, comment_fg,
+                style.fg,
+                comment_fg,
                 "minimap display row 1 (buffer lines 4-7, entirely inside \
                  a multi-line block comment that starts on line 0) must \
                  paint the theme's comment colour, not fall back to the \
