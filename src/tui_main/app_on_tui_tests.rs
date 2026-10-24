@@ -9139,6 +9139,74 @@ mod tests {
                  {TOTAL_LINES}"
             );
         }
+
+        /// A single tree-sitter capture spanning many buffer lines (a
+        /// multi-line block comment) must colour *every* minimap row it
+        /// overlaps, not just the row containing its start byte. The
+        /// buffer is small enough that the whole file fits the viewport
+        /// (no scroll, no block-compression), so display row `R` maps
+        /// 1:1 to buffer lines `[4*R, 4*R+4)` — row 1 (lines 4-7) sits
+        /// entirely inside the comment without containing its opening
+        /// `/*`, exactly the span the buggy per-line lookup dropped.
+        #[test]
+        fn minimap_colours_every_row_of_a_multiline_comment_via_shell_app() {
+            use crate::core::syntax::{Syntax, SyntaxLanguage};
+
+            let mut body_lines: Vec<String> = vec!["/*".to_string()];
+            for i in 0..10 {
+                body_lines.push(format!("comment body line {i}"));
+            }
+            body_lines.push("*/".to_string());
+            for i in 0..4 {
+                body_lines.push(format!("code_line_{i}();"));
+            }
+            let text: String = body_lines.iter().map(|l| format!("{l}\n")).collect();
+
+            let mut engine = plain_engine();
+            let comment_fg = {
+                let theme = crate::render::Theme::from_name(&engine.settings.colorscheme);
+                let t = theme.comment;
+                quadraui::tui::testing::Color::Rgb(t.r, t.g, t.b)
+            };
+            // Minimap is experimental and off by default — this test is
+            // specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
+            engine.buffer_mut().insert(0, &text);
+            engine.active_buffer_state_mut().syntax =
+                Some(Syntax::new_for_language(SyntaxLanguage::Rust));
+            engine.active_buffer_state_mut().update_syntax();
+
+            let mut h = harness_no_sidebar(engine);
+            h.driver.render();
+
+            let strip = {
+                let layout = h.screen_layout.borrow();
+                let win = h.engine.borrow().active_window_id();
+                let mm = layout
+                    .as_ref()
+                    .expect("render_content must have painted a ScreenLayout")
+                    .minimap
+                    .iter()
+                    .find(|m| m.window_id == win)
+                    .expect("a buffer with the minimap setting on must publish a strip");
+                crate::render::minimap_strip_rect(mm)
+            };
+
+            let x = strip.x.round() as u16;
+            let row1_y = strip.y.round() as u16 + 1;
+            let style = h
+                .driver
+                .style_at(x, row1_y)
+                .expect("the strip's second row must be a painted cell");
+            assert_eq!(
+                style.fg, comment_fg,
+                "minimap display row 1 (buffer lines 4-7, entirely inside \
+                 a multi-line block comment that starts on line 0) must \
+                 paint the theme's comment colour, not fall back to the \
+                 default — strip={strip:?} screen:\n{}",
+                h.driver.screen()
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
