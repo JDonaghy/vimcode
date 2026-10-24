@@ -385,7 +385,8 @@ pub(crate) fn scroll_gutter_width(scrollbar_reserve: f64, char_width: f64) -> f6
 
 /// The `rect` [`crate::app::App::paint_editor_windows_rung`] hands to
 /// `Surface::Editor` for a buffer-text window, narrowed by
-/// `minimap_reserved_w` columns on the right.
+/// `minimap_reserved_w` (in the caller's own unit — character cells on
+/// TUI, pixels on GTK/Win-GUI) on the right.
 ///
 /// `quadraui::Editor::rect`'s own doc comment says it's "used by GTK /
 /// Win-GUI; TUI ignores" — and that asymmetry runs both ways. GTK's and
@@ -397,11 +398,27 @@ pub(crate) fn scroll_gutter_width(scrollbar_reserve: f64, char_width: f64) -> f6
 /// TUI's minimap gutter — so the strip and buffer text occupy disjoint
 /// columns instead of the strip overprinting the rightmost text — with zero
 /// effect on GTK/Win-GUI, which keep painting (and anchoring their
-/// scrollbar) against the full, unmodified `editor.rect` either way, so this
-/// can't reopen #1094's scrollbar-flush-against-text regression there.
-/// Click/hit-test geometry is unaffected too: column resolution goes through
-/// `to_q_editor` + `Editor::layout` directly, a separate call path that never
-/// reads this `rect`.
+/// scrollbar) against the full, unmodified `editor.rect` either way.
+///
+/// TUI's own vertical/horizontal scrollbars are **not** unaffected, though:
+/// `quadraui::tui::editor::draw_editor` computes their bounds directly from
+/// this narrowed `area` (its own `area.x + area.width - 1`, no call to
+/// `Editor::layout` at all), so they move one column left, flush against
+/// the text, immediately before the strip — the TUI rasteriser has no
+/// paint-side "reserve" parameter to decouple "how much width text gets"
+/// from "where the scrollbar anchors". Click/drag geometry
+/// (`app_support::editor_scrollbar_layout`,
+/// `render::hit_test_geometry::window_zone_hit_test`) still targets the
+/// un-narrowed pane edge one column further right, where nothing is
+/// painted. This divergence is a quadraui gap, documented in
+/// `docs/PENDING_QUADRAUI_ISSUES.md`, not fixed by this function.
+///
+/// Named for the one backend it takes visual effect on, but lives in
+/// shared `src/render/` rather than `src/tui_main/` because what it
+/// computes — "the paint rect minus the minimap's reserved width" — is
+/// itself backend-agnostic data; only the single call site in
+/// `App::paint_editor_windows_rung` decides which backends' paint actually
+/// reads it, the same split [`scroll_gutter_width`] above already uses.
 pub(crate) fn tui_editor_paint_rect(
     rect: quadraui::Rect,
     minimap_reserved_w: f64,

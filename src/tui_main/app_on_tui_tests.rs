@@ -8410,7 +8410,25 @@ mod tests {
         /// hands `Surface::Editor` the window's full, un-narrowed `rect`
         /// renders this marker line out to the pane's full width, so it
         /// collides with the strip's left edge; that's the overlap this
-        /// test catches (#2025).
+        /// test catches.
+        ///
+        /// Also overflows the buffer vertically (not just one long line),
+        /// so the pane grows a vertical scrollbar and the test can pin
+        /// *where* it paints: `quadraui::tui::draw_editor` draws it at the
+        /// last column of whatever (narrowed) `area` it is given, so
+        /// narrowing that `area` for the minimap also pulls the scrollbar
+        /// one column left, flush against the text, immediately before the
+        /// strip rather than at the pane's true right edge. That relocation
+        /// is pinned here as current, intended behavior for *painting*.
+        /// Click/drag geometry (`app_support::editor_scrollbar_layout`,
+        /// `render::hit_test_geometry::window_zone_hit_test`) still targets
+        /// the un-narrowed true edge, one column further right than where
+        /// this test finds the scrollbar glyphs — a real but separate
+        /// defect tracked as a quadraui gap in
+        /// `docs/PENDING_QUADRAUI_ISSUES.md` (TUI `draw_editor` has no
+        /// paint-side "reserve" parameter to decouple "how much width text
+        /// gets" from "where the scrollbar anchors", the rasteriser sibling
+        /// of the already-tracked `Editor::layout` gap).
         #[test]
         fn minimap_does_not_overlap_buffer_text() {
             let mut engine = plain_engine();
@@ -8419,24 +8437,44 @@ mod tests {
             engine.settings.minimap = true;
             // One long, unwrapped line of a marker character that would
             // reach the pane's full 80-column width if the editor's paint
-            // rect were not narrowed for the minimap strip.
-            let text = format!("{}\n", "Z".repeat(200));
+            // rect were not narrowed for the minimap strip, followed by
+            // enough short lines to overflow the pane vertically and grow
+            // a vertical scrollbar (harness terminal is 80x24; the editor
+            // band is well under 100 rows).
+            let mut text = format!("{}\n", "Z".repeat(200));
+            for _ in 0..100 {
+                text.push_str("line\n");
+            }
             engine.buffer_mut().insert(0, &text);
             let mut h = harness_no_sidebar(engine);
             h.driver.render();
 
             let win = h.engine.borrow().active_window_id();
-            let strip = {
+            let (window_has_v_scrollbar, strip) = {
                 let layout = h.screen_layout.borrow();
-                let mm = layout
+                let layout = layout
                     .as_ref()
-                    .expect("render_content must have painted a ScreenLayout")
+                    .expect("render_content must have painted a ScreenLayout");
+                let rw = layout
+                    .windows
+                    .iter()
+                    .find(|rw| rw.window_id == win)
+                    .expect("the active window must publish a RenderedWindow");
+                let mm = layout
                     .minimap
                     .iter()
                     .find(|m| m.window_id == win)
                     .expect("a minimap-enabled window must publish a strip");
-                crate::render::minimap_strip_rect(mm)
+                (
+                    rw.total_lines > rw.visible_line_capacity,
+                    crate::render::minimap_strip_rect(mm),
+                )
             };
+            assert!(
+                window_has_v_scrollbar,
+                "fixture must overflow the pane vertically so the vertical \
+                 scrollbar's relocation is actually exercised by this test"
+            );
             // The TUI backend converts every `quadraui::Rect` (editor and
             // minimap strip alike) to terminal cells by rounding to the
             // nearest column, not truncating — match that here so this
@@ -8445,19 +8483,40 @@ mod tests {
             let strip_left = strip.x.round() as usize;
 
             let screen = h.driver.screen();
-            for (row_idx, row) in screen.lines().enumerate() {
+            let violation = screen.lines().enumerate().find_map(|(row_idx, row)| {
                 let row_chars: Vec<char> = row.chars().collect();
-                for (col, &ch) in row_chars.iter().enumerate().skip(strip_left) {
-                    assert_ne!(
-                        ch, 'Z',
-                        "row {row_idx} col {col}: buffer text marker 'Z' \
-                         painted at or past the minimap strip's left edge \
-                         (x={strip_left}); the editor text rect must be \
-                         narrowed by the minimap's reserved width so text \
-                         and the strip occupy disjoint columns; screen:\n{screen}"
-                    );
-                }
-            }
+                row_chars[strip_left.min(row_chars.len())..]
+                    .iter()
+                    .position(|&ch| ch == 'Z')
+                    .map(|rel_col| (row_idx, strip_left + rel_col))
+            });
+            assert!(
+                violation.is_none(),
+                "{}: buffer text marker 'Z' painted at or past the minimap \
+                 strip's left edge (x={strip_left}); the editor text rect \
+                 must be narrowed by the minimap's reserved width so text \
+                 and the strip occupy disjoint columns; screen:\n{screen}",
+                violation
+                    .map(|(row_idx, col)| format!("row {row_idx} col {col}"))
+                    .unwrap_or_default(),
+            );
+
+            // Pin where the narrowed paint rect puts the vertical
+            // scrollbar: one column left of the strip, not at the pane's
+            // true (un-narrowed) right edge. '█'/'░' are the thumb/track
+            // glyphs `quadraui::tui::draw_scrollbar` paints.
+            let scrollbar_col = strip_left - 1;
+            let scrollbar_col_has_glyph = screen.lines().any(|row| {
+                row.chars()
+                    .nth(scrollbar_col)
+                    .is_some_and(|ch| ch == '█' || ch == '░')
+            });
+            assert!(
+                scrollbar_col_has_glyph,
+                "expected the vertical scrollbar to paint at column \
+                 {scrollbar_col} (one column left of the minimap strip at \
+                 x={strip_left}); screen:\n{screen}"
+            );
         }
 
         /// The lowest `line N` number among the frame's painted text —
