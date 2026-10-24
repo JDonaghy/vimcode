@@ -1503,6 +1503,22 @@ pub fn board_status_bar(status: &str, theme: &Theme) -> quadraui::StatusBar {
     }
 }
 
+/// Resolve a right-click at `pos` to the flat row index it landed on, if
+/// any — mirroring [`board_right_click_card`]'s "paint caches, click reads"
+/// split for the ext-panel tree. A toolbar-row click (resolved the same way
+/// [`route_ext_panel_click`] gives the toolbar precedence) or a click past
+/// the end of the flat list isn't a context-menu trigger.
+pub fn ext_panel_right_click_index(engine: &Engine, pos: quadraui::Point) -> Option<usize> {
+    if ext_panel_toolbar_hit_at(engine, pos).is_some() {
+        return None;
+    }
+    let flat_idx = ext_panel_hit_flat_index(engine, pos)?;
+    if flat_idx >= engine.ext_panel_flat_len() {
+        return None;
+    }
+    Some(flat_idx)
+}
+
 pub fn route_ext_panel_click(engine: &mut Engine, pos: quadraui::Point, is_double_click: bool) {
     // A registered `toolbar` (`vimcode.panel.register`'s `toolbar` option)
     // paints its button row above the tree body; resolve against it first

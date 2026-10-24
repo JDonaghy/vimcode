@@ -565,36 +565,71 @@ impl Engine {
         }
     }
 
-    /// Open a context menu for an extension panel item.
-    /// Fires `panel_context_menu` with the selected item info.
+    /// Open a native context menu for the right-clicked extension panel row.
+    ///
+    /// Fires `panel_context_menu` with the row info, mirroring
+    /// `Engine::open_board_context_menu`'s split: the engine resolves *which*
+    /// row was clicked, the plugin declares *what* the menu offers. A plugin
+    /// handling that event calls `vimcode.panel.set_context_menu(panel,
+    /// items)` synchronously, which lands in `ext_panel_context_menu_pending`
+    /// (via `apply_plugin_ctx`) before `plugin_event` returns here. `x`/`y`
+    /// are cell coordinates, the same convention `open_board_context_menu`
+    /// uses.
+    ///
+    /// A no-op — no menu opened — when there's no active panel, the selected
+    /// row doesn't resolve to a section, or the handler never called
+    /// `set_context_menu` (or called it with an empty list): the panel stays
+    /// perfectly usable without a native menu in that case.
     pub fn open_ext_panel_context_menu(&mut self, x: u16, y: u16) {
         let panel_name = match &self.ext_panel_active {
             Some(n) => n.clone(),
             None => return,
         };
-        if let Some((si, item_idx)) = self.ext_panel_flat_to_section(self.ext_panel_selected) {
-            let reg = self.ext_panels.get(&panel_name).cloned();
-            if let Some(reg) = reg {
-                if let Some(section) = reg.sections.get(si) {
-                    let key = (panel_name.clone(), section.clone());
-                    let id = if item_idx != usize::MAX {
-                        self.ext_panel_items
-                            .get(&key)
-                            .and_then(|items| items.get(item_idx))
-                            .map(|item| item.id.clone())
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    let arg = format!(
-                        "{}|{}|{}||{}",
-                        panel_name, section, id, self.ext_panel_selected
-                    );
-                    self.plugin_event("panel_context_menu", &arg);
-                }
-            }
+        let Some((si, item_idx)) = self.ext_panel_flat_to_section(self.ext_panel_selected) else {
+            return;
+        };
+        let Some(reg) = self.ext_panels.get(&panel_name).cloned() else {
+            return;
+        };
+        let Some(section) = reg.sections.get(si).cloned() else {
+            return;
+        };
+        let key = (panel_name.clone(), section.clone());
+        let id = if item_idx != usize::MAX {
+            self.ext_panel_items
+                .get(&key)
+                .and_then(|items| items.get(item_idx))
+                .map(|item| item.id.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let index = self.ext_panel_selected;
+        // Cleared unconditionally first so a stale menu from an earlier
+        // right-click (one whose handler called `set_context_menu`) can
+        // never leak into this one if this turn's handler doesn't call it.
+        self.ext_panel_context_menu_pending = None;
+        let arg = format!("{}|{}|{}||{}", panel_name, section, id, index);
+        self.plugin_event("panel_context_menu", &arg);
+        let Some((pending_panel, items)) = self.ext_panel_context_menu_pending.take() else {
+            return;
+        };
+        if pending_panel != panel_name || items.is_empty() {
+            return;
         }
-        let _ = (x, y); // Position reserved for future native menu rendering.
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::ExtPanel {
+                panel_name,
+                section,
+                item_id: id,
+                index,
+            },
+            items,
+            selected: 0,
+            screen_x: x,
+            screen_y: y,
+            trigger_height: 0.0,
+        });
     }
 
     /// Handle a click on the active ext panel's toolbar button `idx`
