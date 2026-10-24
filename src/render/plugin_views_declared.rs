@@ -510,9 +510,11 @@ pub(crate) fn route_plugin_view_body_event(
             // arms consult `Engine::plugin_view_table_resize_drag` directly
             // rather than re-hit-testing `position` against `rect`.
             quadraui::UiEvent::MouseMoved { position, .. } => {
-                continue_plugin_view_table_resize_drag(engine, *position)
+                continue_plugin_view_table_resize_drag(engine, name, host, *position, backend)
             }
-            quadraui::UiEvent::MouseUp { .. } => end_plugin_view_table_resize_drag(engine),
+            quadraui::UiEvent::MouseUp { .. } => {
+                end_plugin_view_table_resize_drag(engine, name, host)
+            }
             _ => false,
         }),
         Some("text_view") => Some(match event {

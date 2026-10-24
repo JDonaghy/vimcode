@@ -2805,9 +2805,15 @@ struct PluginTimerEntry {
 /// An in-progress header-divider drag on a `ViewBody::Table`-kind plugin
 /// view. Armed by `route_plugin_view_table_click` on a `HeaderDivider` hit,
 /// consulted by `continue_plugin_view_table_resize_drag` on every later
-/// `MouseMoved`, and cleared on `MouseUp` — see
-/// `Engine::plugin_view_table_resize_drag`'s doc for why this carries `host`
-/// even though the resulting width override itself is host-independent.
+/// `MouseMoved`, and cleared on `MouseUp`.
+///
+/// Carries `host` even though the resulting width override itself is
+/// host-independent (`plugin_view_table_col_overrides` is keyed by view
+/// name only): the sidebar and a Tab can host the same view at once, and
+/// `host` is how `continue_plugin_view_table_resize_drag` and the Tab-side
+/// router (`try_route_tab_plugin_table_drag` in `src/app/mouse_tabs.rs`)
+/// each confirm a `MouseMoved`/`MouseUp` belongs to *their* host's drag
+/// before acting on it, rather than both reacting to the same armed drag.
 pub(crate) struct PluginTableColumnDrag {
     pub view: String,
     pub host: PluginViewHost,
@@ -4844,7 +4850,7 @@ pub struct Engine {
     /// table the plugin declared, shared by whichever host displays it.
     pub plugin_view_table_sort: HashMap<String, (usize, quadraui::SortDirection)>,
     /// The in-progress header-divider drag on a `ViewBody::Table`-kind view,
-    /// if any. See `PluginTableColumnDrag`.
+    /// if any — see `PluginTableColumnDrag`'s doc for its fields' meaning.
     pub(crate) plugin_view_table_resize_drag: Option<PluginTableColumnDrag>,
     /// The selected *column* within a `ViewBody::Table`-kind view's selected
     /// row, in the sidebar. Separate from `ext_panel_selected` (which is the

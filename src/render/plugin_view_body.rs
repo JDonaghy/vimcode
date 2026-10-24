@@ -522,7 +522,14 @@ fn plugin_view_table_row_order(
         let (ka, kb) = (key(a), key(b));
         let ord = match (ka.trim().parse::<f64>(), kb.trim().parse::<f64>()) {
             (Ok(na), Ok(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
-            _ => ka.to_lowercase().cmp(&kb.to_lowercase()),
+            // Compare lowercased chars pairwise instead of `to_lowercase()`ing
+            // both whole strings: this runs once per comparator call during a
+            // sort, so an allocation per call here would add up on a large
+            // table.
+            _ => ka
+                .chars()
+                .flat_map(char::to_lowercase)
+                .cmp(kb.chars().flat_map(char::to_lowercase)),
         };
         match dir {
             quadraui::SortDirection::Ascending => ord,
@@ -722,6 +729,18 @@ pub(crate) fn route_plugin_view_table_click(
             .filter(|&c| columns.get(c).is_some_and(|c| c.editable));
         (idx, col, divider, header)
     };
+    // Arm the resize drag and return before computing the sort cycle below:
+    // `divider` and `header` come from mutually exclusive `DataTableHit`
+    // arms, so a divider hit never needs the row reorder a header click
+    // would, and there's no reason to pay for it.
+    if let Some(col) = divider {
+        engine.plugin_view_table_resize_drag = Some(PluginTableColumnDrag {
+            view: name.to_string(),
+            host,
+            col,
+        });
+        return true;
+    }
     let current_sort = active_table_sort(engine, name, columns.len());
     let row_order = plugin_view_table_row_order(rows, current_sort);
     // A header click cycles the sort for that column. Resolved while `rows` is
@@ -747,14 +766,6 @@ pub(crate) fn route_plugin_view_table_click(
         let next_sel = next_order.iter().position(|&d| d == declared).unwrap_or(0);
         (next, next_sel)
     });
-    if let Some(col) = divider {
-        engine.plugin_view_table_resize_drag = Some(PluginTableColumnDrag {
-            view: name.to_string(),
-            host,
-            col,
-        });
-        return true;
-    }
     if let Some((next, next_sel)) = header_cycle {
         match next {
             Some(spec) => {
@@ -796,9 +807,18 @@ pub(crate) fn route_plugin_view_table_click(
 }
 
 /// Floor a dragged (or the rightmost, slack-absorbing) plugin-view table
-/// column is clamped to — mirrors the floor every other quadraui
-/// `DataTableLayout::drag_divider` caller in-tree uses.
-const MIN_TABLE_COLUMN_WIDTH: f32 = 20.0;
+/// column is clamped to. A pixel literal here would violate the
+/// platform-neutrality rule (TUI columns are cell-wide, GTK columns are
+/// pixel-wide), so the floor is derived from the backend's own character
+/// metric (`quadraui::Backend::char_width`) at the call site instead of a
+/// single shared constant.
+fn min_table_column_width(backend: &dyn quadraui::Backend) -> f32 {
+    backend.char_width() * MIN_TABLE_COLUMN_WIDTH_CHARS
+}
+
+/// Narrowest a plugin-view table column may be dragged to, in character
+/// widths (converted to the backend's own unit by [`min_table_column_width`]).
+const MIN_TABLE_COLUMN_WIDTH_CHARS: f32 = 3.0;
 
 /// Continue a header-divider drag armed by `route_plugin_view_table_click`'s
 /// `HeaderDivider` branch, recomputing `Engine::plugin_view_table_col_overrides`
@@ -807,15 +827,25 @@ const MIN_TABLE_COLUMN_WIDTH: f32 = 20.0;
 /// caller's dispatch falls through to its usual "unconsumed" handling) rather
 /// than when the drag didn't move anything — a stationary pointer still
 /// "consumes" the event so it doesn't fall through to e.g. text selection.
+///
+/// `name`/`host` identify the view/host the *caller* is currently routing an
+/// event for; they are checked against the armed drag's own `view`/`host`
+/// (see [`crate::core::engine::PluginTableColumnDrag`]) so a drag armed by one
+/// view or host is never continued — or later cleared — by an unrelated one.
 pub(crate) fn continue_plugin_view_table_resize_drag(
     engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
     pos: quadraui::Point,
+    backend: &dyn quadraui::Backend,
 ) -> bool {
     let Some(drag) = engine.plugin_view_table_resize_drag.as_ref() else {
         return false;
     };
+    if drag.view != name || drag.host != host {
+        return false;
+    }
     let view = drag.view.clone();
-    let host = drag.host;
     let col = drag.col;
     let existing = engine
         .plugin_view_table_col_overrides
@@ -826,20 +856,39 @@ pub(crate) fn continue_plugin_view_table_resize_drag(
         PluginViewHost::Sidebar => &engine.plugin_view_table_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_table_layout,
     };
+    let min_width = min_table_column_width(backend);
     let next = {
         let borrowed = cache.borrow();
         let Some((rect, layout)) = borrowed.as_ref() else {
             return false;
         };
-        layout.drag_divider(&existing, col, pos.x - rect.x, MIN_TABLE_COLUMN_WIDTH)
+        // Clamp to the viewport so a column can never be dragged so wide that
+        // its own divider ends up past `viewport_width` — quadraui's
+        // `hit_test` early-returns `Empty` there, which would otherwise make
+        // the divider permanently unreachable (and the override permanent)
+        // for the rest of the session.
+        let target_x = (pos.x - rect.x).min(layout.viewport_width - 1.0);
+        layout.drag_divider(&existing, col, target_x, min_width)
     };
     engine.plugin_view_table_col_overrides.insert(view, next);
     true
 }
 
 /// End a header-divider drag on `MouseUp`. Returns `false` when there was no
-/// drag in progress.
-pub(crate) fn end_plugin_view_table_resize_drag(engine: &mut Engine) -> bool {
+/// drag in progress for `name`/`host` — see [`continue_plugin_view_table_resize_drag`]
+/// for why the check matters.
+pub(crate) fn end_plugin_view_table_resize_drag(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+) -> bool {
+    let matches = matches!(
+        engine.plugin_view_table_resize_drag.as_ref(),
+        Some(drag) if drag.view == name && drag.host == host
+    );
+    if !matches {
+        return false;
+    }
     engine.plugin_view_table_resize_drag.take().is_some()
 }
 

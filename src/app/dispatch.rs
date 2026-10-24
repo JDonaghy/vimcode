@@ -614,6 +614,19 @@ impl App {
             };
         }
 
+        // Same early-intercept shape as the sidebar check above, for an
+        // editor-tab-hosted plugin table's header-divider drag — see
+        // `try_route_tab_plugin_table_drag`'s doc comment for why it needs no
+        // `MouseDown`-armed capture flag of its own.
+        if self.try_route_tab_plugin_table_drag(backend, &event) {
+            return if self.draw_needed.get() {
+                self.draw_needed.set(false);
+                quadraui::Reaction::Redraw
+            } else {
+                quadraui::Reaction::Continue
+            };
+        }
+
         match event {
             UiEvent::KeyPressed {
                 key,

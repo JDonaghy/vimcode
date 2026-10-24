@@ -266,6 +266,24 @@ impl App {
         })
     }
 
+    /// Resolve `name`'s editor-tab-hosted window rect from the currently
+    /// painted `screen.windows`, by identity rather than position.
+    ///
+    /// A header-divider drag continuation/cancellation (`MouseMoved`/
+    /// `MouseUp`) is not geometry-bound — the pointer can stray outside the
+    /// view's rect mid-drag without the drag ending — so it needs the
+    /// window's own rect (stable for the frame) rather than
+    /// [`Self::plugin_view_tab_hit`]'s position-based lookup, which would
+    /// return `None` the moment the pointer left the rect.
+    pub(crate) fn plugin_view_tab_window_rect(&self, name: &str) -> Option<quadraui::Rect> {
+        self.cached_screen_layout.borrow().as_ref().and_then(|l| {
+            l.windows
+                .iter()
+                .find(|w| w.plugin_view.as_deref() == Some(name))
+                .map(|w| w.rect.into())
+        })
+    }
+
     /// Both divider lists for the frame just painted, plus whether `(x, y)`
     /// lands on a group's tab bar — everything
     /// [`render::route_divider_grab`] needs from this backend.
