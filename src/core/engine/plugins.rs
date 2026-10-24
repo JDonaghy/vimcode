@@ -677,8 +677,8 @@ impl Engine {
                 "Right" => Some(quadraui::NamedKey::Right),
                 "Up" => Some(quadraui::NamedKey::Up),
                 "Down" => Some(quadraui::NamedKey::Down),
-                "PageUp" => Some(quadraui::NamedKey::PageUp),
-                "PageDown" => Some(quadraui::NamedKey::PageDown),
+                "PageUp" | "Page_Up" => Some(quadraui::NamedKey::PageUp),
+                "PageDown" | "Page_Down" => Some(quadraui::NamedKey::PageDown),
                 "Enter" | "Return" => Some(quadraui::NamedKey::Enter),
                 _ => None,
             };
