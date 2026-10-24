@@ -8725,6 +8725,79 @@ mod tests {
             );
         }
 
+        /// The minimap strip must represent the *entire* visible window of
+        /// the buffer, down-sampled to the full strip height, not just the first
+        /// screenful of lines with the remaining rows left blank.
+        ///
+        /// Every line in the fixture carries the same non-whitespace content,
+        /// so once the buffer is long enough that each strip row covers many
+        /// real lines (`k > 1`), a correctly-scaled strip paints braille at
+        /// *every* row from top to bottom. A strip that only samples the
+        /// first screenful's worth of real lines and leaves the rest of its
+        /// rows at their background glyph would paint braille near the top
+        /// and nothing but blanks near the bottom — exactly the symptom this
+        /// test probes for, scrolled to the very top of the file.
+        #[test]
+        fn minimap_strip_paints_braille_across_the_full_strip_height() {
+            const TOTAL_LINES: usize = 2000;
+            let mut engine = plain_engine();
+            // Minimap is experimental and off by default — this test is
+            // specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
+            let text: String = (0..TOTAL_LINES)
+                .map(|i| format!("line {i} content\n"))
+                .collect();
+            engine.buffer_mut().insert(0, &text);
+            let mut h = harness_no_sidebar(engine);
+            h.driver.render();
+
+            let strip = {
+                let layout = h.screen_layout.borrow();
+                let win = h.engine.borrow().active_window_id();
+                let mm = layout
+                    .as_ref()
+                    .expect("render_content must have painted a ScreenLayout")
+                    .minimap
+                    .iter()
+                    .find(|m| m.window_id == win)
+                    .expect("a long, scrolling buffer must publish a minimap strip");
+                crate::render::minimap_strip_rect(mm)
+            };
+            assert!(
+                strip.height >= 2.0,
+                "precondition: the strip must span at least two rows for a \
+                 top-vs-bottom comparison to mean anything (strip={strip:?})"
+            );
+
+            let has_braille_in_row =
+                |h: &crate::harness::ConformanceHarness<quadraui::tui::testing::TuiDriver<_>>,
+                 y: u16| {
+                    h.driver
+                        .styled_row(y)
+                        .into_iter()
+                        .skip(strip.x as usize)
+                        .take(strip.width as usize)
+                        .any(|(c, _)| ('\u{2800}'..='\u{28FF}').contains(&c))
+                };
+
+            let top_row = strip.y as u16;
+            let bottom_row = (strip.y as u16) + (strip.height as u16) - 1;
+            assert!(
+                has_braille_in_row(&h, top_row),
+                "the strip's top row ({top_row}) must paint braille for a \
+                 {TOTAL_LINES}-line buffer; strip={strip:?} screen:\n{}",
+                h.driver.screen()
+            );
+            assert!(
+                has_braille_in_row(&h, bottom_row),
+                "the strip's bottom row ({bottom_row}) must also paint \
+                 braille — the whole file must be scaled to fill the full \
+                 strip height, not just the first screenful; \
+                 strip={strip:?} screen:\n{}",
+                h.driver.screen()
+            );
+        }
+
         /// Light-theme sibling of `minimap_viewport_highlight_band_paints_a_distinct_background`:
         /// confirms the perceptible-delta threshold holds under both dark and light
         /// themes.
