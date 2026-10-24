@@ -427,6 +427,8 @@ fn lua_table_to_view_body(
                     columns.push(ViewTableColumn {
                         title,
                         editable: row.get("editable").unwrap_or(false),
+                        width: row.get::<_, f32>("width").ok(),
+                        min_width: row.get::<_, f32>("min_width").ok(),
                     });
                 }
             }
@@ -2627,6 +2629,7 @@ impl PluginManager {
                 tbl.set("value", value.as_str())?;
             }
             ViewEventKind::SliderChanged { value } => tbl.set("value", *value as f64)?,
+            ViewEventKind::HeaderClicked { col } => tbl.set("col", *col as i64)?,
             ViewEventKind::ButtonClicked | ViewEventKind::FocusChanged => {}
         }
         Ok(tbl)

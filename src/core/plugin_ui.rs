@@ -267,6 +267,18 @@ pub struct ViewTableColumn {
     /// Editable cells are keyed by `"r{row}c{col}"` address.
     #[serde(default)]
     pub editable: bool,
+    /// Fixed column width, in the host surface's own unit (character cells
+    /// on the TUI backend, pixels on GTK/macOS/Windows). Takes priority over
+    /// `min_width` when both are set. `None` leaves the column proportional
+    /// (`quadraui::ColumnWidth::Flex`), the same as a column that declares
+    /// neither field.
+    #[serde(default)]
+    pub width: Option<f32>,
+    /// Lower bound a content-sized column may shrink to, in the same unit as
+    /// `width`. Ignored when `width` is set. `None` with `width` also unset
+    /// leaves the column proportional.
+    #[serde(default)]
+    pub min_width: Option<f32>,
 }
 
 /// One row in a [`ViewBody::Table`].
@@ -552,6 +564,14 @@ pub enum ViewEventKind {
         col: usize,
         value: String,
     },
+    /// A `Table` column header was clicked. The engine's own display-order
+    /// overlay (ascending/descending/unsorted) already cycled by the time
+    /// this reaches the plugin, so a handler that wants to sort its own
+    /// `rows` and `render` again is layering a second, plugin-owned sort on
+    /// top rather than replacing the built-in one.
+    HeaderClicked {
+        col: usize,
+    },
 }
 
 impl ViewEventKind {
@@ -574,6 +594,7 @@ impl ViewEventKind {
             ViewEventKind::Expanded { .. } => "Expanded",
             ViewEventKind::Collapsed { .. } => "Collapsed",
             ViewEventKind::CellEdited { .. } => "CellEdited",
+            ViewEventKind::HeaderClicked { .. } => "HeaderClicked",
         }
     }
 }
@@ -896,10 +917,14 @@ mod tests {
                 ViewTableColumn {
                     title: "Key".into(),
                     editable: true,
+                    width: None,
+                    min_width: None,
                 },
                 ViewTableColumn {
                     title: "Value".into(),
                     editable: true,
+                    width: Some(12.0),
+                    min_width: None,
                 },
             ],
             rows: vec![ViewTableRow {

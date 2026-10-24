@@ -157,6 +157,28 @@ pub const TABLE_EDITED: &str = "EDITED1631";
 /// needle gets ellipsis-truncated and never matches exactly).
 pub const TABLE_EDITED_COL1: &str = "EDC1631";
 
+/// Registered view name for a dedicated table fixture whose only job is
+/// reporting `HeaderClicked` — kept separate from [`TABLE_VIEW`] so the
+/// sort-cycle and resize scenarios above never observe the extra plugin
+/// state this adds.
+pub const HEADER_EVENT_VIEW: &str = "zqxw1631hevent";
+pub const HEADER_EVENT_COL0: &str = "HeC01631";
+pub const HEADER_EVENT_COL1: &str = "HeC11631";
+/// Marker row's painted text before any header click reaches the plugin.
+pub const HEADER_EVENT_NONE: &str = "HeN1631";
+/// Painted once `on_event` has seen `HeaderClicked{{col: 0}}`.
+pub const HEADER_EVENT_COL0_SEEN: &str = "He01631";
+/// Painted once `on_event` has seen `HeaderClicked{{col: 1}}`.
+pub const HEADER_EVENT_COL1_SEEN: &str = "He11631";
+
+/// Registered view name for a dedicated table fixture with a declared
+/// column `width` — same two-column shape as [`TABLE_VIEW`] but column 0
+/// names an explicit `width`, so its painted layout can be compared against
+/// [`TABLE_VIEW`]'s undeclared (purely `Flex`) default.
+pub const WIDTH_VIEW: &str = "zqxw1631width";
+pub const WIDTH_COL0: &str = "W01631";
+pub const WIDTH_COL1: &str = "W11631";
+
 /// `TextView` fixture needles — first and last of 50 generated lines, far
 /// enough apart that only one is visible at a time on a narrow viewport.
 pub const TEXT_FIRST_LINE: &str = "Ln0X1631";
@@ -250,6 +272,52 @@ vimcode.ui.register_view("{TEXT_VIEW}", {{
       lines[#lines + 1] = "Ln" .. i .. "X1631"
     end
     return {{ kind = "text_view", text = table.concat(lines, "\n"), filetype = "json" }}
+  end,
+}})
+
+local header_event_col = -1
+vimcode.ui.register_view("{HEADER_EVENT_VIEW}", {{
+  title = "Zq1631E", icon = "E", fallback_icon = "E",
+  render = function()
+    local marker
+    if header_event_col == 0 then
+      marker = "{HEADER_EVENT_COL0_SEEN}"
+    elseif header_event_col == 1 then
+      marker = "{HEADER_EVENT_COL1_SEEN}"
+    else
+      marker = "{HEADER_EVENT_NONE}"
+    end
+    return {{
+      kind = "table",
+      columns = {{
+        {{ title = "{HEADER_EVENT_COL0}" }},
+        {{ title = "{HEADER_EVENT_COL1}" }},
+      }},
+      rows = {{
+        {{ id = "m0", cells = {{ marker, "{HEADER_EVENT_COL1}v" }} }},
+      }},
+    }}
+  end,
+  on_event = function(ctx, event)
+    if event.kind == "HeaderClicked" then
+      header_event_col = event.col
+    end
+  end,
+}})
+
+vimcode.ui.register_view("{WIDTH_VIEW}", {{
+  title = "Zq1631W", icon = "W", fallback_icon = "W",
+  render = function()
+    return {{
+      kind = "table",
+      columns = {{
+        {{ title = "{WIDTH_COL0}", width = 8 }},
+        {{ title = "{WIDTH_COL1}" }},
+      }},
+      rows = {{
+        {{ id = "w0", cells = {{ "{WIDTH_COL0}v", "{WIDTH_COL1}v" }} }},
+      }},
+    }}
   end,
 }})
 
@@ -429,7 +497,14 @@ fn load_fixture_plugin(engine: &mut Engine, dir: &std::path::Path) {
         engine.is_plugin_view(VIEW),
         "fixture must register {VIEW:?} as a view-backed panel"
     );
-    for view in [LIST_VIEW, TREE_VIEW, TABLE_VIEW, TEXT_VIEW] {
+    for view in [
+        LIST_VIEW,
+        TREE_VIEW,
+        TABLE_VIEW,
+        TEXT_VIEW,
+        HEADER_EVENT_VIEW,
+        WIDTH_VIEW,
+    ] {
         assert!(
             engine.is_plugin_view(view),
             "fixture must register {view:?} as a view-backed panel"
@@ -1350,6 +1425,97 @@ where
     );
 }
 
+/// Scenario 10e — a click on a table's column header reaches the plugin's
+/// `on_event` as `HeaderClicked{{col}}`, carrying the clicked column's
+/// index, independently of the engine's own internal sort-cycle overlay
+/// [`table_header_click_sorts_the_painted_rows`] exercises. The dedicated
+/// [`HEADER_EVENT_VIEW`] fixture's marker row is the round-trip signal: state
+/// only `on_event` mutates, only `render` reads — the same shape every other
+/// reachability scenario in this module uses.
+pub fn table_header_click_reaches_the_plugin_handler<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    assert_paints(
+        &h.driver,
+        &[HEADER_EVENT_NONE],
+        "the fixture's initial paint, before any header click",
+    );
+
+    let header_mid_x = |h: &crate::harness::ConformanceHarness<D>, col: usize| -> (f32, f32) {
+        let engine = h.engine.borrow();
+        let cached = engine.plugin_view_table_layout.borrow();
+        let (rect, layout) = cached
+            .as_ref()
+            .expect("table_header_click_reaches_the_plugin_handler: no frame painted yet");
+        let column = &layout.columns[col];
+        (
+            rect.x + column.x + column.width / 2.0,
+            rect.y + layout.header_height / 2.0,
+        )
+    };
+
+    let (col0_x, col0_y) = header_mid_x(h, 0);
+    h.driver.click(col0_x, col0_y);
+    assert!(
+        h.driver.screen_has(HEADER_EVENT_COL0_SEEN),
+        "a click on column 0's header must dispatch HeaderClicked{{col: 0}} to \
+         the plugin and repaint the marker row as {HEADER_EVENT_COL0_SEEN:?}; \
+         painted runs were {:?}",
+        painted(&h.driver)
+    );
+
+    let (col1_x, col1_y) = header_mid_x(h, 1);
+    h.driver.click(col1_x, col1_y);
+    assert!(
+        h.driver.screen_has(HEADER_EVENT_COL1_SEEN),
+        "a click on column 1's header must dispatch HeaderClicked{{col: 1}} to \
+         the plugin and repaint the marker row as {HEADER_EVENT_COL1_SEEN:?}; \
+         painted runs were {:?}",
+        painted(&h.driver)
+    );
+}
+
+/// Scenario 10f — a column's declared `width` is honored as a `Fixed`
+/// quadraui column width rather than the even `Flex` split every column got
+/// before this field existed. [`WIDTH_VIEW`]'s column 0 declares a `width`
+/// far below what an even `Flex` split of the same sidebar body would give
+/// it, so column 1's painted header must land further left than it does in
+/// [`TABLE_VIEW`]'s undeclared, purely proportional fixture — same viewport,
+/// same column count, differing only in whether column 0 names a `width`.
+pub fn table_declared_width_narrows_the_column<D>(
+    narrow: &mut crate::harness::ConformanceHarness<D>,
+    baseline: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    assert_paints(
+        &narrow.driver,
+        &[WIDTH_COL0, WIDTH_COL1],
+        "the declared-width fixture's initial paint",
+    );
+    assert_paints(
+        &baseline.driver,
+        &[TABLE_COL_KEY, TABLE_COL_VALUE],
+        "the undeclared-width fixture's initial paint",
+    );
+
+    let col0_run_narrow = painted_run(&narrow.driver, WIDTH_COL0);
+    let col1_x_narrow = next_header_run_x(&narrow.driver, col0_run_narrow);
+
+    let col0_run_baseline = painted_run(&baseline.driver, TABLE_COL_KEY);
+    let col1_x_baseline = next_header_run_x(&baseline.driver, col0_run_baseline);
+
+    assert!(
+        col1_x_narrow < col1_x_baseline,
+        "declaring column 0's width far below its proportional Flex share \
+         must narrow it, so column 1's header paints further left than the \
+         undeclared-width fixture's: narrow {col1_x_narrow}, baseline \
+         {col1_x_baseline}"
+    );
+}
+
 /// Scenario 11 — a `kind = "text_view"` with more lines than fit the
 /// viewport starts scrolled to the top and scrolls to the bottom on `End`.
 pub fn text_view_scrolls_to_the_bottom_on_end(driver: &mut impl ConformanceDriver) {
@@ -1506,6 +1672,19 @@ mod tests {
     fn plugin_view_table_header_click_sorts_the_painted_rows_on_tui() {
         let (mut h, _dir) = tui_named(TABLE_VIEW);
         table_header_click_sorts_the_painted_rows(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_table_header_click_reaches_the_plugin_handler_on_tui() {
+        let (mut h, _dir) = tui_named(HEADER_EVENT_VIEW);
+        table_header_click_reaches_the_plugin_handler(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_table_declared_width_narrows_the_column_on_tui() {
+        let (mut narrow, _narrow_dir) = tui_named(WIDTH_VIEW);
+        let (mut baseline, _baseline_dir) = tui_named(TABLE_VIEW);
+        table_declared_width_narrows_the_column(&mut narrow, &mut baseline);
     }
 
     #[test]
@@ -1712,6 +1891,21 @@ mod tests {
     fn plugin_view_table_header_click_sorts_the_painted_rows_on_gtk() {
         let (mut h, _dir) = gtk_named(TABLE_VIEW);
         table_header_click_sorts_the_painted_rows(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_header_click_reaches_the_plugin_handler_on_gtk() {
+        let (mut h, _dir) = gtk_named(HEADER_EVENT_VIEW);
+        table_header_click_reaches_the_plugin_handler(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_declared_width_narrows_the_column_on_gtk() {
+        let (mut narrow, _narrow_dir) = gtk_named(WIDTH_VIEW);
+        let (mut baseline, _baseline_dir) = gtk_named(TABLE_VIEW);
+        table_declared_width_narrows_the_column(&mut narrow, &mut baseline);
     }
 
     #[cfg(feature = "gui")]

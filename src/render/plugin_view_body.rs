@@ -576,6 +576,18 @@ fn next_table_sort(
     }
 }
 
+/// A declared `width` fixes the column; a declared `min_width` with no
+/// `width` sizes the column to its content, floored at `min_width`; neither
+/// leaves the column proportional, matching every column declared before
+/// these fields existed.
+fn plugin_table_column_width(column: &ViewTableColumn) -> quadraui::ColumnWidth {
+    match (column.width, column.min_width) {
+        (Some(w), _) => quadraui::ColumnWidth::Fixed(w),
+        (None, Some(min)) => quadraui::ColumnWidth::Content { min, max: f32::MAX },
+        (None, None) => quadraui::ColumnWidth::Flex(1.0),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plugin_view_to_table(
     view: &str,
@@ -590,12 +602,12 @@ fn plugin_view_to_table(
     row_order: &[usize],
 ) -> quadraui::DataTable {
     use crate::core::plugin_ui::namespaced_widget_id;
-    use quadraui::{Column, ColumnWidth, DataRow, DataTable, Decoration, StyledText, WidgetId};
+    use quadraui::{Column, DataRow, DataTable, Decoration, StyledText, WidgetId};
     let q_columns: Vec<Column> = columns
         .iter()
         .map(|c| Column {
             title: c.title.clone(),
-            width: ColumnWidth::Flex(1.0),
+            width: plugin_table_column_width(c),
             align: quadraui::ColumnAlign::Left,
         })
         .collect();
@@ -803,6 +815,13 @@ pub(crate) fn route_plugin_view_table_click(
         }
         engine.set_plugin_view_selected(host, next_sel);
         engine.plugin_view_ensure_visible(host);
+        if let Some(col) = header {
+            engine.dispatch_plugin_view_event(PluginViewEvent {
+                view: name.to_string(),
+                widget_id: String::new(),
+                kind: ViewEventKind::HeaderClicked { col },
+            });
+        }
         return true;
     }
     let Some(idx) = idx else { return false };
