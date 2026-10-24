@@ -2077,7 +2077,7 @@ quadraui, not in this repo.
 
 ---
 
-## `Editor`/`EditorPaintOptions` has no way to reserve trailing content width independently of where the v/h scrollbar anchors — the minimap strip can overlap unwrapped buffer text (blocks vimcode#1696, half 1)
+## `Editor`/`EditorPaintOptions` has no way to reserve trailing content width independently of where the v/h scrollbar anchors — the minimap strip can overlap unwrapped buffer text (blocks vimcode#1696, half 1; also blocks vimcode#2015, the TUI twin)
 
 **Title:** `Editor::layout_with_options`'s `text_w`/`visible_cols` and its
 `v_scrollbar_bounds`/`h_scrollbar_bounds` are both derived from the one
@@ -2217,6 +2217,14 @@ vimcode-side test that cannot itself observe the eventual fix).
 the neighbouring entry below for the tab-bar-toolbar half). Leave that
 issue open behind both entries per `GOALS.md`'s milestone-discipline rule
 — there is no per-backend vimcode-side fix available for either half.
+
+Also blocks `JDonaghy/vimcode#2015`, reported independently against the
+TUI backend ("minimap paints over the buffer text instead of a reserved
+gutter") — same root cause, same shared `to_q_editor`/`Editor::layout`
+call path (TUI and Win-GUI both reach it via the one `crate::app::App`
+paint rung), so the same `reserved_trailing_width` capability resolves
+both reports in one vimcode-side change once it lands. Do not file a
+second quadraui issue for #2015 — point it at this same entry.
 
 ---
 
