@@ -577,6 +577,15 @@ impl Engine {
     /// [`Self::handle_plugin_view_text_key`] instead — typed characters must
     /// insert into the field rather than double as `j`/`k` navigation once a
     /// field can actually take text.
+    ///
+    /// When the focused row is a `Date` field, `Left`/`Right`/`Up`/`Down`/
+    /// `PageUp`/`PageDown`/`Enter` are forwarded to the shared
+    /// `quadraui::FormController` as a `KeyPressed` event — the same
+    /// controller a mouse click on the field already routes through (see
+    /// `render::handle_plugin_view_ui_event`) — because `quadraui::DatePicker`
+    /// only exposes keyboard scrub-and-confirm navigation; there is no
+    /// click-driven day selection to fall back to. `j`/`k`/`g`/`G` keep their
+    /// ordinary field-to-field meaning so vim navigation is never shadowed.
     pub(crate) fn handle_plugin_view_key(
         &mut self,
         name: &str,
@@ -627,6 +636,10 @@ impl Engine {
                         | ViewFieldKind::TextArea { .. }
                 )
         });
+        let is_date_field = view
+            .fields
+            .get(selected)
+            .is_some_and(|f| !f.disabled && matches!(f.kind, ViewFieldKind::Date { .. }));
 
         // Field-to-field navigation always wins, text field or not.
         match key {
@@ -656,6 +669,39 @@ impl Engine {
                 return true;
             }
             _ => {}
+        }
+
+        if is_date_field {
+            let named = match key {
+                "Left" => Some(quadraui::NamedKey::Left),
+                "Right" => Some(quadraui::NamedKey::Right),
+                "Up" => Some(quadraui::NamedKey::Up),
+                "Down" => Some(quadraui::NamedKey::Down),
+                "PageUp" => Some(quadraui::NamedKey::PageUp),
+                "PageDown" => Some(quadraui::NamedKey::PageDown),
+                "Enter" | "Return" => Some(quadraui::NamedKey::Enter),
+                _ => None,
+            };
+            if let Some(named) = named {
+                let event = quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(named),
+                    modifiers: quadraui::Modifiers {
+                        ctrl,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                };
+                return match host {
+                    PluginViewHost::Sidebar => {
+                        let rect = self.plugin_view_form_rect.get();
+                        crate::render::handle_plugin_view_ui_event(self, &event, rect)
+                    }
+                    PluginViewHost::Tab => {
+                        let rect = self.plugin_view_tab_form_rect.get();
+                        crate::render::handle_plugin_view_tab_ui_event(self, name, &event, rect)
+                    }
+                };
+            }
         }
 
         if is_text_field {
@@ -766,6 +812,13 @@ impl Engine {
                         return true;
                     }
                     ViewFieldKind::Label | ViewFieldKind::ReadOnly { .. } => return true,
+                    ViewFieldKind::Date { .. } => {
+                        // Reached only for `Space`, which is not one of the
+                        // `DatePicker`'s own navigation keys: Enter is already
+                        // intercepted above (see `is_date_field`) and forwarded to
+                        // the `FormController` to confirm the scrubbed day.
+                        return true;
+                    }
                 };
                 self.dispatch_plugin_view_event(PluginViewEvent {
                     view: name.to_string(),

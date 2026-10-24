@@ -349,6 +349,12 @@ pub enum ViewFieldKind {
         #[serde(default)]
         toggles: Vec<ViewToggle>,
     },
+    /// A calendar date picker. `value` is an ISO8601 `YYYY-MM-DD` string, or
+    /// empty for unset.
+    Date {
+        #[serde(default)]
+        value: String,
+    },
 }
 
 impl ViewFieldKind {
@@ -366,6 +372,7 @@ impl ViewFieldKind {
             ViewFieldKind::Segmented { .. } => "segmented",
             ViewFieldKind::Buttons { .. } => "buttons",
             ViewFieldKind::Toggles { .. } => "toggles",
+            ViewFieldKind::Date { .. } => "date",
         }
     }
 }
@@ -410,6 +417,11 @@ pub enum ViewEventKind {
         value: String,
     },
     TextCommitted {
+        value: String,
+    },
+    /// A `date` field's selection was confirmed (Enter). `value` is an
+    /// ISO8601 `YYYY-MM-DD` string.
+    DateChanged {
         value: String,
     },
     FocusChanged,
@@ -458,6 +470,7 @@ impl ViewEventKind {
             ViewEventKind::SegmentedChanged { .. } => "SegmentedChanged",
             ViewEventKind::TextChanged { .. } => "TextChanged",
             ViewEventKind::TextCommitted { .. } => "TextCommitted",
+            ViewEventKind::DateChanged { .. } => "DateChanged",
             ViewEventKind::FocusChanged => "FocusChanged",
             ViewEventKind::ItemSelected { .. } => "ItemSelected",
             ViewEventKind::ItemActivated { .. } => "ItemActivated",
@@ -602,6 +615,19 @@ mod tests {
             ViewFieldKind::Dropdown {
                 options: vec!["GET".into(), "POST".into()],
                 selected: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn date_field_kind_tag_is_the_lua_type_string() {
+        let json = r#"{"type":"date","value":"2024-03-15"}"#;
+        let kind: ViewFieldKind = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(kind.type_name(), "date");
+        assert_eq!(
+            kind,
+            ViewFieldKind::Date {
+                value: "2024-03-15".into(),
             }
         );
     }
@@ -786,6 +812,13 @@ mod tests {
         assert_eq!(
             ViewEventKind::TextCommitted { value: "x".into() }.kind_name(),
             "TextCommitted"
+        );
+        assert_eq!(
+            ViewEventKind::DateChanged {
+                value: "2024-03-15".into(),
+            }
+            .kind_name(),
+            "DateChanged"
         );
     }
 }

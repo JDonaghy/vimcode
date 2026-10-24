@@ -324,6 +324,9 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
                     }
                     ViewFieldKind::Toggles { toggles }
                 }
+                "date" => ViewFieldKind::Date {
+                    value: value_str("value"),
+                },
                 other => {
                     return Err(LuaError::RuntimeError(format!(
                         "view field {} (id {field_id:?}): unknown type {other:?}",
@@ -2537,9 +2540,9 @@ impl PluginManager {
                 // 0-based, matching the `selected` the plugin authored.
                 tbl.set("value", *selected as i64)?
             }
-            ViewEventKind::TextChanged { value } | ViewEventKind::TextCommitted { value } => {
-                tbl.set("value", value.as_str())?
-            }
+            ViewEventKind::TextChanged { value }
+            | ViewEventKind::TextCommitted { value }
+            | ViewEventKind::DateChanged { value } => tbl.set("value", value.as_str())?,
             ViewEventKind::ItemSelected { index } | ViewEventKind::ItemActivated { index } => {
                 tbl.set("index", *index as i64)?
             }
