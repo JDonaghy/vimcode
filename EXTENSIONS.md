@@ -967,8 +967,10 @@ panels like Source Control have. Clicking a button fires `panel_toolbar` with
 `vimcode.panel.*` above paints a **tree of rows**. `vimcode.ui.register_view`
 paints a **form of widgets** (text fields, dropdowns, toggles, buttons) or a single
 **list, tree, table or text view**, from a declarative tree your `render` callback
-returns, and routes widget events back to your `on_event` callback. A view lives in the
-sidebar, and `vimcode.ui.open_view` also opens it as an editor tab.
+returns, and routes widget events back to your `on_event` callback. By default a view
+lives in the sidebar (with an activity-bar icon), and `vimcode.ui.open_view` also opens
+it as an editor tab. Pass `sidebar = false` to register a **tab-only** view instead —
+it has no activity-bar icon, and `open_view` is its only entry point.
 
 ```lua
 local method = 1   -- 0-based index into the options list below
@@ -978,6 +980,8 @@ vimcode.ui.register_view("my_view", {
     title = "My View",             -- sidebar header + activity-bar tooltip
     icon = "",                    -- single character for the activity bar
     fallback_icon = "M",           -- used when Nerd Fonts are disabled
+    -- sidebar = false,            -- tab-only: no activity-bar icon (default true);
+                                    -- `icon`/`fallback_icon` are ignored when false
 
     -- Called when the panel is focused and after every `on_event`.
     -- Return the widget tree to paint. `ctx.view` is the view's name.

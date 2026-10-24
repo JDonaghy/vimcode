@@ -608,15 +608,19 @@ pub fn sidebar_false_view_has_no_activity_bar_zone(driver: &impl ConformanceDriv
     );
 }
 
-/// Scenario — a `sidebar = false` view still opens and paints as a tab.
+/// Scenario — a `sidebar = false` view still opens and paints as a tab, with
+/// its declared `title` — not the raw view name — as the tab's label.
 ///
 /// `sidebar = false` only suppresses the activity-bar icon; `open_view(...,
 /// {location = "tab"})` remains the view's entry point and still renders its
-/// declared tree.
+/// declared tree. The tab title comes from `Engine::plugin_view_title`,
+/// which (for a tab-only view with no `ext_panels` entry) must read
+/// `PluginManager::view_title` instead of falling back to the raw view name
+/// (`VIEW_NO_SIDEBAR`, e.g. `"zqxw146viewtab"`).
 pub fn tab_only_view_paints_its_declared_row(driver: &impl ConformanceDriver) {
     assert_paints(
         driver,
-        &[ROW_NO_SIDEBAR_LABEL],
+        &[ROW_NO_SIDEBAR_LABEL, VIEW_NO_SIDEBAR_TITLE],
         "sidebar = false view opened as a tab",
     );
 }
