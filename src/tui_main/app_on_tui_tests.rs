@@ -5331,7 +5331,7 @@ mod tests {
         /// at the default `breadcrumbs = true` the tab bar's band is two
         /// rows tall and `bounds.y - 1` no longer reliably lands on the
         /// label row.
-        fn active_group_tab_bar_row(
+        pub(super) fn active_group_tab_bar_row(
             h: &crate::harness::ConformanceHarness<
                 quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
             >,
@@ -16459,6 +16459,285 @@ mod tests {
                 screen.contains("ZQ_HTTP_1632_PROOF_BODY"),
                 "the fixture server's response body must be painted into \
                  the view within 10s of the button click; screen:\n{screen}"
+            );
+        }
+
+        /// `vimcode.ui.open_view(name, { location = "vsplit" })` must place
+        /// the view as a sibling window split of the active window, not as
+        /// a new tab: the original buffer's own text and the view's own
+        /// painted label must both be visible on screen at once, and the
+        /// tab bar must still show exactly one tab.
+        #[test]
+        fn open_view_vsplit_places_view_as_sibling_split_not_new_tab_via_shell_app() {
+            let mut engine = engine_with_plugin(
+                "open_view_vsplit_2009",
+                r#"
+                vimcode.ui.register_view("split_demo_2009", {
+                    title = "Split Demo",
+                    render = function()
+                        return {
+                            fields = {
+                                { type = "label", id = "lbl", label = "ZQ_SPLIT_VIEW_LABEL" },
+                            },
+                        }
+                    end,
+                })
+                vimcode.command("ZqOpenSplitView", function(_)
+                    vimcode.ui.open_view("split_demo_2009", { location = "vsplit" })
+                end)
+                "#,
+            );
+            engine.buffer_mut().insert(0, "ZQ_ORIGINAL_FILE_TEXT\n");
+            engine.settings.breadcrumbs = false; // one-row tab bar, simplest geometry
+            let active_group = engine.active_group;
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqOpenSplitView".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            driver.mouse_up(1.0, 1.0); // settle the layout, as Ctrl-W v's own test does
+
+            let screen = driver.screen();
+            // Two tabs would only ever paint *one* tab's content at a
+            // time (the active one); both markers visible together is
+            // only possible if the view shares the window group as a
+            // split, not a swapped-in tab.
+            assert!(
+                screen.contains("ZQ_ORIGINAL_FILE_TEXT") && screen.contains("ZQ_SPLIT_VIEW_LABEL"),
+                "a vsplit-placed view must paint alongside the original \
+                 window's own buffer text, not replace it with a new tab; \
+                 screen:\n{screen}"
+            );
+
+            // Locate the tab bar via its own layout-registered bounds
+            // (`active_group_tab_bar_row`), not by assuming it's the
+            // screen's first row or by content: the view window becomes
+            // the active window, so the tab label itself reflects the
+            // view's title, not the original buffer's "[No Name]". Each
+            // open tab paints its own close button ('×'), so counting them
+            // directly rules out a second tab having opened alongside the
+            // split.
+            let tab_bar_row = super::tab_bar::active_group_tab_bar_row(&h, active_group);
+            assert_eq!(
+                tab_bar_row.matches('×').count(),
+                1,
+                "a vsplit-placed view must share the active window's tab, \
+                 not open a second tab; tab bar row:\n{tab_bar_row}"
+            );
+
+            let content_row = screen
+                .lines()
+                .find(|line| {
+                    line.contains("ZQ_ORIGINAL_FILE_TEXT") && line.contains("ZQ_SPLIT_VIEW_LABEL")
+                })
+                .unwrap_or_else(|| {
+                    panic!("expected a row with both panes' content painted; screen:\n{screen}")
+                });
+            // `splitright` defaults to false, so the new (view) window
+            // lands first/left of the original window — don't assume
+            // which marker comes first in the row.
+            let original_at = content_row.find("ZQ_ORIGINAL_FILE_TEXT").unwrap();
+            let view_at = content_row.find("ZQ_SPLIT_VIEW_LABEL").unwrap();
+            let (first_end, second_start) = if original_at < view_at {
+                (original_at + "ZQ_ORIGINAL_FILE_TEXT".len(), view_at)
+            } else {
+                (view_at + "ZQ_SPLIT_VIEW_LABEL".len(), original_at)
+            };
+            let between = &content_row[first_end..second_start];
+            assert_eq!(
+                between.matches('\u{2502}').count(),
+                1,
+                "a vsplit must reserve exactly one column for the divider \
+                 between the two panes; between-text: {between:?}; \
+                 row:\n{content_row}"
+            );
+        }
+
+        /// `vimcode.ui.open_view(name, { location = "split" })` must place
+        /// the view as a horizontal (stacked) sibling split of the active
+        /// window rather than a vertical (side-by-side) one or a new tab.
+        ///
+        /// Reproduces a pre-existing, feature-independent rendering bug that
+        /// is not specific to plugin views: `screen.window_dividers` is
+        /// painted unconditionally by `draw_dividers_as_splits` at
+        /// `src/app/paint.rs`'s `EditorOp::Windows` rung, with no
+        /// `Horizontal`-direction filter analogous to
+        /// `painted_group_dividers` (`src/render/frame_editor_band.rs`). A
+        /// stacked window divider's `position` sits exactly on the bottom
+        /// window's own first content row (see
+        /// `WindowLayout::layout_snapped`'s `Horizontal` arm in
+        /// `src/core/window.rs`, and `calculate_window_dividers` in
+        /// `src/core/engine/windows.rs`), so that row's painted text is
+        /// overwritten. Fixing this requires editing `src/render/*` and
+        /// `src/app/paint.rs`, which are out of scope for this change.
+        #[ignore = "reproduces a pre-existing window-divider paint-order bug \
+                    in src/render/frame_editor_band.rs + src/app/paint.rs; \
+                    tracked for a follow-up fix outside this change's scope"]
+        #[test]
+        fn open_view_split_stacks_view_below_active_window_via_shell_app() {
+            let mut engine = engine_with_plugin(
+                "open_view_split_2009",
+                r#"
+                vimcode.ui.register_view("stack_demo_2009", {
+                    title = "Stack Demo",
+                    render = function()
+                        return {
+                            fields = {
+                                { type = "label", id = "lbl", label = "ZQ_STACK_VIEW_LABEL" },
+                            },
+                        }
+                    end,
+                })
+                vimcode.command("ZqOpenStackView", function(_)
+                    vimcode.ui.open_view("stack_demo_2009", { location = "split" })
+                end)
+                "#,
+            );
+            engine.buffer_mut().insert(0, "ZQ_ORIGINAL_FILE_TEXT\n");
+            engine.settings.breadcrumbs = false; // one-row tab bar, simplest geometry
+            let active_group = engine.active_group;
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqOpenStackView".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            driver.mouse_up(1.0, 1.0); // settle the layout
+
+            let screen = driver.screen();
+            // Two tabs would only ever paint *one* tab's content at a
+            // time; both markers visible together is only possible if
+            // the view shares the window group as a split.
+            assert!(
+                screen.contains("ZQ_ORIGINAL_FILE_TEXT") && screen.contains("ZQ_STACK_VIEW_LABEL"),
+                "a split-placed view must paint alongside the original \
+                 window's own buffer text, not replace it with a new tab; \
+                 screen:\n{screen}"
+            );
+
+            // Locate the tab bar via its own layout-registered bounds
+            // (`active_group_tab_bar_row`), not by assuming it's the
+            // screen's first row or by content: the view window becomes
+            // the active window, so the tab label itself reflects the
+            // view's title, not the original buffer's "[No Name]". Each
+            // open tab paints its own close button ('×'), so counting them
+            // directly rules out a second tab having opened alongside the
+            // split.
+            let tab_bar_row = super::tab_bar::active_group_tab_bar_row(&h, active_group);
+            assert_eq!(
+                tab_bar_row.matches('×').count(),
+                1,
+                "a split-placed view must share the active window's tab, \
+                 not open a second tab; tab bar row:\n{tab_bar_row}"
+            );
+
+            // A horizontal (stacked) split means the two panes occupy
+            // disjoint rows, unlike a vsplit where both markers share a
+            // row — so no single row may contain both markers.
+            let original_row = screen
+                .lines()
+                .enumerate()
+                .find(|(_, line)| line.contains("ZQ_ORIGINAL_FILE_TEXT"))
+                .unwrap_or_else(|| {
+                    panic!("expected a row painting \"ZQ_ORIGINAL_FILE_TEXT\"; screen:\n{screen}")
+                });
+            let view_row = screen
+                .lines()
+                .enumerate()
+                .find(|(_, line)| line.contains("ZQ_STACK_VIEW_LABEL"))
+                .unwrap_or_else(|| {
+                    panic!("expected a row painting \"ZQ_STACK_VIEW_LABEL\"; screen:\n{screen}")
+                });
+            assert_ne!(
+                original_row.0, view_row.0,
+                "'location = \"split\"' must stack the panes on separate \
+                 rows (horizontal split), not place them side by side on \
+                 the same row; screen:\n{screen}"
+            );
+
+            // The horizontal divider between the two stacked panes paints
+            // a row of '─' strictly between their two content rows; a
+            // vsplit or a missing split would not produce one there.
+            let (top_row, bottom_row) = if original_row.0 < view_row.0 {
+                (original_row.0, view_row.0)
+            } else {
+                (view_row.0, original_row.0)
+            };
+            let lines: Vec<&str> = screen.lines().collect();
+            assert!(
+                lines[(top_row + 1)..bottom_row]
+                    .iter()
+                    .any(|line| line.contains('\u{2500}')),
+                "'location = \"split\"' must paint a horizontal divider \
+                 row between the two stacked panes' content rows ({top_row} \
+                 and {bottom_row}); screen:\n{screen}"
+            );
+        }
+
+        /// `vimcode.ui.open_view(name, { location = "vsplit", side = "right"
+        /// })` must pin the view window on the right, overriding
+        /// `splitbelow`/`splitright`'s own default placement (which would
+        /// otherwise put it on the left — see the sibling vsplit test's
+        /// comment). This is the one assertion that distinguishes `side`
+        /// from the default path.
+        #[test]
+        fn open_view_vsplit_side_right_overrides_default_placement_via_shell_app() {
+            let mut engine = engine_with_plugin(
+                "open_view_vsplit_side_2009",
+                r#"
+                vimcode.ui.register_view("side_demo_2009", {
+                    title = "Side Demo",
+                    render = function()
+                        return {
+                            fields = {
+                                { type = "label", id = "lbl", label = "ZQ_SIDE_VIEW_LABEL" },
+                            },
+                        }
+                    end,
+                })
+                vimcode.command("ZqOpenSideView", function(_)
+                    vimcode.ui.open_view("side_demo_2009", { location = "vsplit", side = "right" })
+                end)
+                "#,
+            );
+            engine.buffer_mut().insert(0, "ZQ_ORIGINAL_FILE_TEXT\n");
+            // `splitright` stays at its default `false`; `side = "right"`
+            // must still land the view window on the right.
+            assert!(!engine.settings.splitright);
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqOpenSideView".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            driver.mouse_up(1.0, 1.0); // settle the layout, as Ctrl-W v's own test does
+
+            let screen = driver.screen();
+            let content_row = screen
+                .lines()
+                .find(|line| {
+                    line.contains("ZQ_ORIGINAL_FILE_TEXT") && line.contains("ZQ_SIDE_VIEW_LABEL")
+                })
+                .unwrap_or_else(|| {
+                    panic!("expected a row with both panes' content painted; screen:\n{screen}")
+                });
+            let original_at = content_row.find("ZQ_ORIGINAL_FILE_TEXT").unwrap();
+            let view_at = content_row.find("ZQ_SIDE_VIEW_LABEL").unwrap();
+            assert!(
+                original_at < view_at,
+                "'side = \"right\"' must place the view window to the \
+                 right of the original window regardless of 'splitright''s \
+                 own default; row:\n{content_row}"
             );
         }
 
