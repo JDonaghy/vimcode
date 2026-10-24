@@ -622,6 +622,12 @@ struct ViewRegistration {
     panel: PanelRegistration,
     render: LuaRegistryKey,
     on_event: Option<LuaRegistryKey>,
+    /// Whether this view also gets an activity-bar panel. `false` for a
+    /// `register_view(name, { sidebar = false, ... })` tab-only view — it is
+    /// still inserted into `PluginManager::views` (so `open_view` can open it
+    /// as a tab), but never into `panels` / `Engine::ext_panels`, so it has no
+    /// activity-bar icon and no sidebar entry point.
+    sidebar: bool,
 }
 
 /// A registered view's stored callbacks, keyed by view name in
@@ -629,6 +635,12 @@ struct ViewRegistration {
 struct StoredView {
     render: LuaRegistryKey,
     on_event: Option<LuaRegistryKey>,
+    /// The view's declared `title`, kept here (not just on the
+    /// `PanelRegistration` in `PluginManager::panels`) so a tab-only
+    /// (`sidebar = false`) view still has a title available to
+    /// `Engine::open_plugin_view_tab` / `open_plugin_view_split`, even
+    /// though such a view has no `PanelRegistration` in `panels`.
+    title: String,
 }
 
 /// Manages all loaded Lua plugins and their registered callbacks.
@@ -1561,15 +1573,22 @@ impl PluginManager {
             // A view-backed panel is registered in `panels` like any other
             // (so the activity bar and `Engine::ext_panels` need no new path)
             // *and* in `views`, whose presence is what makes the sidebar paint a
-            // `quadraui::Form` instead of tree rows.
+            // `quadraui::Form` instead of tree rows — unless `sidebar = false`
+            // made it tab-only, in which case it is registered only in
+            // `views`: `open_view` still works, but there is no activity-bar
+            // panel to click into.
             for view in reg.views {
                 let name = view.panel.name.clone();
-                self.panels.insert(name.clone(), view.panel);
+                let title = view.panel.title.clone();
+                if view.sidebar {
+                    self.panels.insert(name.clone(), view.panel);
+                }
                 self.views.insert(
                     name,
                     StoredView {
                         render: view.render,
                         on_event: view.on_event,
+                        title,
                     },
                 );
             }
@@ -2486,6 +2505,15 @@ impl PluginManager {
     /// `vimcode.panel.register` tree panel).
     pub fn is_view(&self, name: &str) -> bool {
         self.views.contains_key(name)
+    }
+
+    /// `name`'s declared `title`, independent of whether it also has a
+    /// `PanelRegistration` in [`Self::panels`] — a tab-only
+    /// (`sidebar = false`) view has none, so callers that need a display
+    /// title for a plugin-view tab/window (as opposed to an activity-bar
+    /// entry) should use this instead of `panels.get(name)`.
+    pub fn view_title(&self, name: &str) -> Option<&str> {
+        self.views.get(name).map(|v| v.title.as_str())
     }
 
     /// Run a view's `render` callback and parse the widget tree it returns.
@@ -4510,13 +4538,18 @@ impl PluginManager {
         let ui_tbl = lua.create_table()?;
 
         // vimcode.ui.register_view(name, {title=, icon=, fallback_icon=,
-        //                                 render=fn, on_event=fn})
+        //                                 sidebar=bool, render=fn, on_event=fn})
         //
         // Load-time only (like `vimcode.command` / `vimcode.keymap`): the two
         // callbacks are stashed in the Lua registry so they survive the load and
         // can be fired from any later dispatch. `PluginRegistrations` is only
         // installed while a plugin's top-level chunk runs, so a `register_view`
         // from inside a callback is a no-op — documented in EXTENSIONS.md.
+        //
+        // `sidebar` (default `true`) controls whether the view also gets an
+        // activity-bar panel. `sidebar = false` registers a tab-only view: it
+        // is still a valid `vimcode.ui.open_view` target, but has no
+        // activity-bar icon and no sidebar entry point.
         ui_tbl.set(
             "register_view",
             lua.create_function(|lua, (name, opts): (String, LuaTable)| {
@@ -4561,11 +4594,19 @@ impl PluginManager {
                     // `vimcode.panel.register`'s `toolbar` option populates this.
                     toolbar: Vec::new(),
                 };
+                // `opts.get::<_, bool>(...)` on a missing key returns `Ok(false)`
+                // (mlua's `bool::from_lua` maps `Nil` to `false`, Lua's own
+                // truthiness rule, not "key absent") — `unwrap_or(true)` would
+                // never fire. Go through `Option<bool>` instead, whose `Nil` ->
+                // `None` round-trip actually distinguishes "absent" from
+                // "explicitly false".
+                let sidebar: bool = opts.get::<_, Option<bool>>("sidebar")?.unwrap_or(true);
                 if let Some(mut regs) = lua.app_data_mut::<PluginRegistrations>() {
                     regs.views.push(ViewRegistration {
                         panel,
                         render: render_key,
                         on_event: on_event_key,
+                        sidebar,
                     });
                 }
                 Ok(())
@@ -5910,6 +5951,27 @@ mod tests {
         let panel = pm.panels.get("vext").expect("panel registration");
         assert_eq!(panel.title, "V Ext");
         assert_eq!(panel.icon, 'V');
+    }
+
+    #[test]
+    fn sidebar_false_view_has_no_activity_bar_panel_but_still_opens() {
+        let pm = pm_with_view(
+            "no_sidebar",
+            r#"
+            vimcode.ui.register_view("vext", {
+                title = "V Ext",
+                icon = "V",
+                sidebar = false,
+                render = function() return { fields = {} } end,
+            })
+            "#,
+        );
+        // Still a valid `open_view` target...
+        assert!(pm.is_view("vext"));
+        assert_eq!(pm.view_names(), vec!["vext".to_string()]);
+        assert_eq!(pm.view_title("vext"), Some("V Ext"));
+        // ...but `sidebar = false` means no activity-bar panel at all.
+        assert!(pm.panels.get("vext").is_none());
     }
 
     #[test]

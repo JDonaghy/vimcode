@@ -233,6 +233,21 @@ impl Engine {
         self.plugin_views.contains_key(name)
     }
 
+    /// The display title to use for a plugin view's tab/window title.
+    ///
+    /// Reads the view's own declared `title` via
+    /// `PluginManager::view_title` first, so a tab-only (`sidebar = false`)
+    /// view — which has no `PanelRegistration` in `ext_panels` — still gets
+    /// its declared title instead of falling back to the raw view `name`.
+    fn plugin_view_title(&self, name: &str) -> String {
+        self.plugin_manager
+            .as_ref()
+            .and_then(|pm| pm.view_title(name))
+            .map(str::to_string)
+            .or_else(|| self.ext_panels.get(name).map(|p| p.title.clone()))
+            .unwrap_or_else(|| name.to_string())
+    }
+
     /// Re-run `name`'s `render` callback and store the widget tree it returns.
     ///
     /// Returns `true` when the stored tree changed (i.e. a repaint is worth it).
@@ -355,11 +370,7 @@ impl Engine {
         if !self.is_plugin_view(name) {
             return false;
         }
-        let title = self
-            .ext_panels
-            .get(name)
-            .map(|p| p.title.clone())
-            .unwrap_or_else(|| name.to_string());
+        let title = self.plugin_view_title(name);
         self.new_tab(None);
         let buf_id = self.active_buffer_id();
         if let Some(state) = self.buffer_manager.get_mut(buf_id) {
@@ -419,11 +430,7 @@ impl Engine {
         if !self.is_plugin_view(name) {
             return false;
         }
-        let title = self
-            .ext_panels
-            .get(name)
-            .map(|p| p.title.clone())
-            .unwrap_or_else(|| name.to_string());
+        let title = self.plugin_view_title(name);
         let buf_id = self.buffer_manager.create();
         self.split_active_window_for_buffer(buf_id, direction, new_first);
         if let Some(state) = self.buffer_manager.get_mut(buf_id) {

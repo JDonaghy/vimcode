@@ -27,6 +27,17 @@ pub const VIEW: &str = "zqxw146view";
 /// Its activity-bar / sidebar-header title.
 pub const VIEW_TITLE: &str = "Zq146";
 
+/// A second view registered with `sidebar = false`: a tab-only view with no
+/// activity-bar icon. Exists alongside [`VIEW`] so a single fixture load
+/// proves both halves of the `sidebar` option at once — [`VIEW`] still gets
+/// an `ext:` activity-bar zone, this one does not.
+pub const VIEW_NO_SIDEBAR: &str = "zqxw146viewtab";
+/// [`VIEW_NO_SIDEBAR`]'s tab title.
+pub const VIEW_NO_SIDEBAR_TITLE: &str = "Zq146Tab";
+/// The single row [`VIEW_NO_SIDEBAR`] declares — enough to prove it still
+/// paints as a tab even though it never reaches the activity bar.
+pub const ROW_NO_SIDEBAR_LABEL: &str = "NsZQ146";
+
 // Needles are deliberately short and distinctive. The TUI sidebar defaults to
 // 20 columns (`render::hit_test_geometry::UnitProfile::cell().sidebar_width_lh`),
 // and a `Form` row splits that between a label column and a value column — a
@@ -334,6 +345,26 @@ vimcode.ui.register_view("{VIEW}", {{
 vimcode.command("Zq146OpenTab", function()
   vimcode.ui.open_view("{VIEW}", {{ location = "tab" }})
 end)
+
+-- `sidebar = false`: registered as a view, routable through `open_view`, but
+-- never harvested into `ext_panels` — no activity-bar icon.
+vimcode.ui.register_view("{VIEW_NO_SIDEBAR}", {{
+  title = "{VIEW_NO_SIDEBAR_TITLE}",
+  sidebar = false,
+  render = function(ctx)
+    return {{
+      id = "main",
+      schema_version = 1,
+      fields = {{
+        {{ type = "label", id = "hdr", label = "{ROW_NO_SIDEBAR_LABEL}" }},
+      }},
+    }}
+  end,
+}})
+
+vimcode.command("Zq146NoSidebarOpenTab", function()
+  vimcode.ui.open_view("{VIEW_NO_SIDEBAR}", {{ location = "tab" }})
+end)
 "#
     )
 }
@@ -404,6 +435,15 @@ fn load_fixture_plugin(engine: &mut Engine, dir: &std::path::Path) {
             "fixture must register {view:?} as a view-backed panel"
         );
     }
+    assert!(
+        engine.is_plugin_view(VIEW_NO_SIDEBAR),
+        "fixture must register {VIEW_NO_SIDEBAR:?} as a view-backed panel"
+    );
+    assert!(
+        !engine.ext_panels.contains_key(VIEW_NO_SIDEBAR),
+        "{VIEW_NO_SIDEBAR:?} was registered with sidebar = false; it must not \
+         get an activity-bar panel"
+    );
 }
 
 /// Build the fixture engine: a genuine `vimcode.ui.register_view` registration
@@ -537,6 +577,48 @@ fn assert_paints(driver: &impl ConformanceDriver, needles: &[&str], what: &str) 
             painted(driver)
         );
     }
+}
+
+/// Scenario — `sidebar = false` suppresses the activity-bar zone.
+///
+/// Reads the real `quadraui::compose::app_shell::AppShell` render path's zone
+/// registry rather than `Engine` state: [`VIEW`] (`sidebar` defaults to
+/// `true`) must still register an `ext:`-prefixed activity-bar zone;
+/// [`VIEW_NO_SIDEBAR`] (`sidebar = false`) must not — it is only reachable
+/// through `vimcode.ui.open_view(..., {location = "tab"})`.
+pub fn sidebar_false_view_has_no_activity_bar_zone(driver: &impl ConformanceDriver) {
+    let zones = driver.inventory().zones().to_vec();
+    let has_zone = |view: &str| {
+        let id = quadraui::WidgetId::new(crate::core::engine::sidebar::ext_panel_id(view));
+        zones.iter().any(|z| z.id == id)
+    };
+    assert!(
+        has_zone(VIEW),
+        "{VIEW:?} is registered with the sidebar default (true); it must still \
+         get an activity-bar zone; zones were {:?}",
+        zones
+            .iter()
+            .map(|z| z.id.as_str().to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !has_zone(VIEW_NO_SIDEBAR),
+        "{VIEW_NO_SIDEBAR:?} was registered with sidebar = false; it must not \
+         get an activity-bar zone"
+    );
+}
+
+/// Scenario — a `sidebar = false` view still opens and paints as a tab.
+///
+/// `sidebar = false` only suppresses the activity-bar icon; `open_view(...,
+/// {location = "tab"})` remains the view's entry point and still renders its
+/// declared tree.
+pub fn tab_only_view_paints_its_declared_row(driver: &impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[ROW_NO_SIDEBAR_LABEL],
+        "sidebar = false view opened as a tab",
+    );
 }
 
 /// Scenario 1 — the declared tree is what gets painted, in the sidebar.
@@ -1487,6 +1569,18 @@ mod tests {
         closing_the_tab_removes_it(&mut h.driver);
     }
 
+    #[test]
+    fn plugin_view_sidebar_false_view_has_no_activity_bar_zone_on_tui() {
+        let (h, _dir) = tui();
+        sidebar_false_view_has_no_activity_bar_zone(&h.driver);
+    }
+
+    #[test]
+    fn plugin_view_tab_only_view_paints_its_declared_row_on_tui() {
+        let (h, _dir) = tui_named_tab(VIEW_NO_SIDEBAR, "Zq146NoSidebarOpenTab");
+        tab_only_view_paints_its_declared_row(&h.driver);
+    }
+
     #[cfg(feature = "gui")]
     fn gtk() -> (
         crate::harness::ConformanceHarness<
@@ -1688,5 +1782,19 @@ mod tests {
     fn plugin_view_closing_the_tab_removes_it_on_gtk() {
         let (mut h, _dir) = gtk_tab();
         closing_the_tab_removes_it(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_sidebar_false_view_has_no_activity_bar_zone_on_gtk() {
+        let (h, _dir) = gtk();
+        sidebar_false_view_has_no_activity_bar_zone(&h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_tab_only_view_paints_its_declared_row_on_gtk() {
+        let (h, _dir) = gtk_named_tab(VIEW_NO_SIDEBAR, "Zq146NoSidebarOpenTab");
+        tab_only_view_paints_its_declared_row(&h.driver);
     }
 }
