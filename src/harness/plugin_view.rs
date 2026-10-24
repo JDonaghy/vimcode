@@ -1065,14 +1065,66 @@ pub fn table_right_key_reaches_the_second_editable_column(driver: &mut impl Conf
     );
 }
 
+/// Locate `needle`'s painted text run.
+fn painted_run(driver: &impl ConformanceDriver, needle: &str) -> quadraui::event::Rect {
+    driver
+        .inventory()
+        .text_runs()
+        .iter()
+        .find(|r| r.text.contains(needle))
+        .map(|r| r.bounds)
+        .unwrap_or_else(|| {
+            panic!(
+                "painted_run: {needle:?} not painted; painted runs were {:?}",
+                painted(driver)
+            )
+        })
+}
+
+/// Column 1's header x-position, located by *order* rather than by text
+/// content: the run immediately to the right of column 0's header
+/// (`left_run`) on its own painted row. A table with a fixed total width
+/// redistributes space between columns on every drag, so a wide enough
+/// widen of column 0 can truncate column 1's header text down to one or two
+/// characters — ordering survives that truncation; matching on the full
+/// `TABLE_COL_VALUE` string would not.
+fn next_header_run_x(driver: &impl ConformanceDriver, left_run: quadraui::event::Rect) -> f32 {
+    driver
+        .inventory()
+        .text_runs()
+        .iter()
+        .filter(|r| {
+            (r.bounds.y - left_run.y).abs() < 0.5 && r.bounds.x >= left_run.x + left_run.width - 0.5
+        })
+        .map(|r| r.bounds.x)
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or_else(|| {
+            panic!(
+                "next_header_run_x: nothing painted right of {left_run:?}; painted runs were {:?}",
+                painted(driver)
+            )
+        })
+}
+
 /// Scenario 10c — dragging the divider between a table's first two header
-/// columns widens the left column and records a per-view column-width
-/// override, mirroring `crate::harness::drag_group_divider_resizes`'s
+/// columns widens the left column, which shifts column 1's painted header
+/// right on screen, mirroring `crate::harness::drag_group_divider_resizes`'s
 /// pattern for the window-group divider. The drag goes rightward: pulling a
 /// divider right always grows the left column by construction
 /// (`DataTableLayout::drag_divider`'s `target` is unbounded above), so this
 /// holds regardless of how narrow the fixture's starting columns are —
 /// unlike a leftward drag, which the min-width floor could clamp back up.
+///
+/// The drag's start point is still read from the cached layout
+/// (`engine.plugin_view_table_layout`) — same as
+/// [`table_header_click_sorts_the_painted_rows`]'s header click — because
+/// that only ever drives the input, never judges the outcome:
+/// the pass/fail assertion below reads nothing but `inventory().text_runs()`,
+/// the same painted output a user would see. The drag distance is a small,
+/// fixed amount rather than derived from the column's own width: a table
+/// has a fixed total width, so widening column 0 shrinks every column after
+/// it, and a large drag can squeeze column 1 down to nothing legible on a
+/// narrow TUI viewport before the assertion ever gets to look at it.
 pub fn table_header_divider_drag_resizes_the_column<D>(
     h: &mut crate::harness::ConformanceHarness<D>,
 ) where
@@ -1083,7 +1135,7 @@ pub fn table_header_divider_drag_resizes_the_column<D>(
         &[TABLE_COL_KEY, TABLE_COL_VALUE],
         "the table-kind view's initial paint",
     );
-    let (divider_x, y, width_before) = {
+    let (divider_x, y) = {
         let engine = h.engine.borrow();
         let cached = engine.plugin_view_table_layout.borrow();
         let (rect, layout) = cached
@@ -1093,31 +1145,19 @@ pub fn table_header_divider_drag_resizes_the_column<D>(
         (
             rect.x + col0.x + col0.width,
             rect.y + layout.header_height / 2.0,
-            col0.width,
         )
     };
-    h.driver.drag(divider_x, y, divider_x + 40.0, y);
-    let (width_after, has_override) = {
-        let engine = h.engine.borrow();
-        let cached = engine.plugin_view_table_layout.borrow();
-        let (_rect, layout) = cached
-            .as_ref()
-            .expect("table_header_divider_drag_resizes_the_column: no frame after the drag");
-        let has_override = engine
-            .plugin_view_table_col_overrides
-            .get(TABLE_VIEW)
-            .map(|overrides| overrides.iter().any(|w| w.is_some()))
-            .unwrap_or(false);
-        (layout.columns[0].width, has_override)
-    };
+    let col0_run_before = painted_run(&h.driver, TABLE_COL_KEY);
+    let col1_x_before = next_header_run_x(&h.driver, col0_run_before);
+    h.driver.drag(divider_x, y, divider_x + 2.0, y);
+    let col0_run_after = painted_run(&h.driver, TABLE_COL_KEY);
+    let col1_x_after = next_header_run_x(&h.driver, col0_run_after);
     assert!(
-        width_after > width_before,
-        "dragging the header divider right must widen column 0: before \
-         {width_before}, after {width_after}"
-    );
-    assert!(
-        has_override,
-        "the drag must record a column-width override for {TABLE_VIEW:?}"
+        col1_x_after > col1_x_before,
+        "dragging the header divider right must widen column 0, shifting \
+         column 1's painted header right: before {col1_x_before}, after \
+         {col1_x_after}; painted runs were {:?}",
+        painted(&h.driver)
     );
 }
 
@@ -1128,8 +1168,8 @@ pub fn table_header_divider_drag_resizes_the_column<D>(
 ///
 /// The click lands on the middle of the header cell, read back from the
 /// cached layout like [`table_header_divider_drag_resizes_the_column`] does,
-/// so it can never drift onto the header *divider* (a resize) however wide
-/// the backend painted the column.
+/// so it stays well clear of the header *divider* (a resize) regardless of
+/// how wide the backend painted the column.
 pub fn table_header_click_sorts_the_painted_rows<D>(h: &mut crate::harness::ConformanceHarness<D>)
 where
     D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
