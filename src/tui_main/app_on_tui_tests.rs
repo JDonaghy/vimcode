@@ -16462,6 +16462,174 @@ mod tests {
             );
         }
 
+        /// `vimcode.ui.open_view(name, { location = "vsplit" })` must place
+        /// the view as a sibling window split of the active window, not as
+        /// a new tab: the original buffer's own text and the view's own
+        /// painted label must both be visible on screen at once, and the
+        /// tab bar must still show exactly one tab.
+        #[test]
+        fn open_view_vsplit_places_view_as_sibling_split_not_new_tab_via_shell_app() {
+            let mut engine = engine_with_plugin(
+                "open_view_vsplit_2009",
+                r#"
+                vimcode.ui.register_view("split_demo_2009", {
+                    title = "Split Demo",
+                    render = function()
+                        return {
+                            fields = {
+                                { type = "label", id = "lbl", label = "ZQ_SPLIT_VIEW_LABEL" },
+                            },
+                        }
+                    end,
+                })
+                vimcode.command("ZqOpenSplitView", function(_)
+                    vimcode.ui.open_view("split_demo_2009", { location = "vsplit" })
+                end)
+                "#,
+            );
+            engine.buffer_mut().insert(0, "ZQ_ORIGINAL_FILE_TEXT\n");
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqOpenSplitView".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            driver.mouse_up(1.0, 1.0); // settle the layout, as Ctrl-W v's own test does
+
+            let screen = driver.screen();
+            // Two tabs would only ever paint *one* tab's content at a
+            // time (the active one); both markers visible together is
+            // only possible if the view shares the window group as a
+            // split, not a swapped-in tab.
+            assert!(
+                screen.contains("ZQ_ORIGINAL_FILE_TEXT") && screen.contains("ZQ_SPLIT_VIEW_LABEL"),
+                "a vsplit-placed view must paint alongside the original \
+                 window's own buffer text, not replace it with a new tab; \
+                 screen:\n{screen}"
+            );
+
+            // The tab bar is the screen's first row; each open tab paints
+            // its own close button ('×'), so counting them directly rules
+            // out a second tab having opened alongside the split.
+            let tab_bar_row = screen.lines().next().unwrap_or("");
+            assert_eq!(
+                tab_bar_row.matches('×').count(),
+                1,
+                "a vsplit-placed view must share the active window's tab, \
+                 not open a second tab; tab bar row:\n{tab_bar_row}"
+            );
+
+            let content_row = screen
+                .lines()
+                .find(|line| {
+                    line.contains("ZQ_ORIGINAL_FILE_TEXT") && line.contains("ZQ_SPLIT_VIEW_LABEL")
+                })
+                .unwrap_or_else(|| {
+                    panic!("expected a row with both panes' content painted; screen:\n{screen}")
+                });
+            // `splitright` defaults to false, so the new (view) window
+            // lands first/left of the original window — don't assume
+            // which marker comes first in the row.
+            let original_at = content_row.find("ZQ_ORIGINAL_FILE_TEXT").unwrap();
+            let view_at = content_row.find("ZQ_SPLIT_VIEW_LABEL").unwrap();
+            let (first_end, second_start) = if original_at < view_at {
+                (original_at + "ZQ_ORIGINAL_FILE_TEXT".len(), view_at)
+            } else {
+                (view_at + "ZQ_SPLIT_VIEW_LABEL".len(), original_at)
+            };
+            let between = &content_row[first_end..second_start];
+            assert_eq!(
+                between.matches('\u{2502}').count(),
+                1,
+                "a vsplit must reserve exactly one column for the divider \
+                 between the two panes; between-text: {between:?}; \
+                 row:\n{content_row}"
+            );
+        }
+
+        /// `vimcode.ui.open_view(name, { location = "split" })` must place
+        /// the view as a horizontal (stacked) sibling split of the active
+        /// window rather than a vertical (side-by-side) one or a new tab.
+        #[test]
+        fn open_view_split_stacks_view_below_active_window_via_shell_app() {
+            let mut engine = engine_with_plugin(
+                "open_view_split_2009",
+                r#"
+                vimcode.ui.register_view("stack_demo_2009", {
+                    title = "Stack Demo",
+                    render = function()
+                        return {
+                            fields = {
+                                { type = "label", id = "lbl", label = "ZQ_STACK_VIEW_LABEL" },
+                            },
+                        }
+                    end,
+                })
+                vimcode.command("ZqOpenStackView", function(_)
+                    vimcode.ui.open_view("stack_demo_2009", { location = "split" })
+                end)
+                "#,
+            );
+            engine.buffer_mut().insert(0, "ZQ_ORIGINAL_FILE_TEXT\n");
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqOpenStackView".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            driver.mouse_up(1.0, 1.0); // settle the layout
+
+            let screen = driver.screen();
+            // Two tabs would only ever paint *one* tab's content at a
+            // time; both markers visible together is only possible if
+            // the view shares the window group as a split.
+            assert!(
+                screen.contains("ZQ_ORIGINAL_FILE_TEXT") && screen.contains("ZQ_STACK_VIEW_LABEL"),
+                "a split-placed view must paint alongside the original \
+                 window's own buffer text, not replace it with a new tab; \
+                 screen:\n{screen}"
+            );
+
+            // The tab bar is the screen's first row; each open tab paints
+            // its own close button ('×'), so counting them directly rules
+            // out a second tab having opened alongside the split.
+            let tab_bar_row = screen.lines().next().unwrap_or("");
+            assert_eq!(
+                tab_bar_row.matches('×').count(),
+                1,
+                "a split-placed view must share the active window's tab, \
+                 not open a second tab; tab bar row:\n{tab_bar_row}"
+            );
+
+            // A horizontal (stacked) split means the two panes occupy
+            // disjoint rows, unlike a vsplit where both markers share a
+            // row — so no single row may contain both markers.
+            assert!(
+                !screen
+                    .lines()
+                    .any(|line| line.contains("ZQ_ORIGINAL_FILE_TEXT")
+                        && line.contains("ZQ_STACK_VIEW_LABEL")),
+                "'location = \"split\"' must stack the panes on separate \
+                 rows (horizontal split), not place them side by side on \
+                 the same row; screen:\n{screen}"
+            );
+
+            // The horizontal divider between stacked windows paints a
+            // full-width row of '─'; a vsplit or a missing split would
+            // not produce one.
+            assert!(
+                screen.lines().any(|line| line.contains('\u{2500}')),
+                "'location = \"split\"' must paint a horizontal divider \
+                 row between the two stacked panes; screen:\n{screen}"
+            );
+        }
+
         /// Driver-tier test: a `:`-command's Lua callback `async_shell`s `pwd`
         /// with no `cwd` option, and the completion handler writes the result
         /// into a scratch buffer (`vimcode.buffer.*` + `vimcode.window.set_buf`),

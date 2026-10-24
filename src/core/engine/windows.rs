@@ -181,7 +181,6 @@ impl Engine {
         new_first: bool,
     ) {
         let current_buffer_id = self.active_buffer_id();
-        let current_window_id = self.active_window_id();
 
         let new_buffer_id = if let Some(path) = file_path {
             match self.buffer_manager.open_file(path) {
@@ -215,10 +214,35 @@ impl Engine {
             self.push_jump_location();
         }
 
-        let new_window_id = self.new_window_id();
-        let mut new_window = Window::new(new_window_id, new_buffer_id);
+        self.split_active_window_for_buffer(new_buffer_id, direction, new_first);
 
-        if new_buffer_id == current_buffer_id {
+        if file_path.is_some() {
+            self.message = String::new();
+            self.lsp_did_open(new_buffer_id);
+        }
+    }
+
+    /// Split the active window, inserting a fresh [`Window`] for
+    /// `buffer_id` as `direction`'s sibling (`new_first` picks which side)
+    /// of the window being left. Shared by `split_window_with_new_first`
+    /// (file/current-buffer splits, `<C-w>s`/`<C-w>v`/`:split`) and
+    /// `Engine::open_plugin_view_split` (`vimcode.ui.open_view(name,
+    /// {location = "split"/"vsplit"})`) — both need the same "new window,
+    /// `split_at`, give both siblings an accurate initial viewport size"
+    /// dance (see the inline comment below for why the sizing matters);
+    /// only how `buffer_id` itself was produced differs between the two
+    /// callers.
+    pub(crate) fn split_active_window_for_buffer(
+        &mut self,
+        buffer_id: BufferId,
+        direction: SplitDirection,
+        new_first: bool,
+    ) -> WindowId {
+        let current_window_id = self.active_window_id();
+        let new_window_id = self.new_window_id();
+        let mut new_window = Window::new(new_window_id, buffer_id);
+
+        if buffer_id == self.active_buffer_id() {
             new_window.view = self.active_window().view.clone();
         }
 
@@ -271,10 +295,7 @@ impl Engine {
             }
         }
 
-        if file_path.is_some() {
-            self.message = String::new();
-            self.lsp_did_open(new_buffer_id);
-        }
+        new_window_id
     }
 
     /// Close the active window. Returns true if the window was closed.
