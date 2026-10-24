@@ -913,6 +913,16 @@ vimcode.panel.reveal("my_panel", "Section A", "item_id")
 -- Panel input field
 vimcode.panel.get_input("my_panel")         -- Current input text
 vimcode.panel.set_input("my_panel", "text") -- Set input text
+
+-- Native context menu: call from a panel_context_menu handler to show
+-- an anchored menu at the right-click position
+vimcode.on("panel_context_menu", function(arg)
+    local info = vimcode.panel.parse_event(arg)
+    vimcode.panel.set_context_menu(info.panel, {
+        {id = "open", label = "Open"},
+        {id = "delete", label = "Delete", disabled = true},
+    })
+end)
 ```
 
 **Item fields:** `text`, `id`, `hint`, `icon`, `style`, `indent` (number),
@@ -938,6 +948,15 @@ panels like Source Control have. Clicking a button fires `panel_toolbar` with
 | Other keys | Fire `panel_action` event with the key |
 
 **Panel input field:** Press `/` to activate an inline input field at the top of the panel. Typing fires `panel_input` events on every keystroke for live filtering. Press `Escape` to deactivate or `Return` to confirm and deactivate. Plugins can read/write the input text via `vimcode.panel.get_input(name)` and `vimcode.panel.set_input(name, text)`.
+
+**Native context menu:** right-clicking an item fires `panel_context_menu` (see
+the events table below). Calling `vimcode.panel.set_context_menu(panel, items)`
+synchronously from inside that handler opens a native anchored menu at the
+click position; it is a no-op outside that handler. Each item is
+`{id=, label=, disabled=}` (`disabled` defaults to `false` and greys the row
+out). Confirming a menu entry fires `panel_action` in the same
+`"panel|section|id|key|index"` format used elsewhere, with `key` set to the
+chosen item's `id`.
 
 **Panel events:**
 

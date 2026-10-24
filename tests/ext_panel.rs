@@ -586,6 +586,150 @@ fn ext_panel_context_menu_on_header() {
     assert_eq!(e.ext_panel_selected, 4);
 }
 
+// ── vimcode.panel.set_context_menu — native menu from a Lua handler ────────────
+
+/// Load a throwaway Lua plugin into `e`, mirroring `tests/extensions.rs`'s
+/// private `engine_with_plugin` helper (there is no in-memory/string-load
+/// API, so a real temp-dir `.lua` file is the only way to register a hook).
+fn load_plugin(e: &mut vimcode_core::Engine, plugin_name: &str, lua_code: &str) {
+    let dir = std::env::temp_dir().join(format!(
+        "vc_ext_panel_ctx_menu_{plugin_name}_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{plugin_name}.lua")), lua_code).unwrap();
+
+    match vimcode_core::core::plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            e.set_plugin_manager(mgr);
+        }
+        Err(e) => panic!("failed to create PluginManager: {e}"),
+    }
+}
+
+#[test]
+fn ext_panel_context_menu_opens_with_plugin_items() {
+    use vimcode_core::core::engine::ContextMenuTarget;
+
+    let mut e = engine_with("");
+    setup_panel(&mut e);
+    load_plugin(
+        &mut e,
+        "set_context_menu",
+        r#"
+        vimcode.on("panel_context_menu", function(arg)
+            local p = vimcode.panel.parse_event(arg)
+            vimcode.panel.set_context_menu(p.panel, {
+                { id = "foo", label = "Foo" },
+                { id = "bar", label = "Bar", disabled = true },
+            })
+        end)
+        "#,
+    );
+    e.ext_panel_has_focus = true;
+    e.ext_panel_selected = 5; // item b1 (section B, item 0)
+
+    e.open_ext_panel_context_menu(10, 20);
+
+    let menu = e
+        .context_menu
+        .as_ref()
+        .expect("plugin called set_context_menu, so a native menu must open");
+    match &menu.target {
+        ContextMenuTarget::ExtPanel {
+            panel_name,
+            section,
+            item_id,
+            index,
+        } => {
+            assert_eq!(panel_name, "tp");
+            assert_eq!(section, "B");
+            assert_eq!(item_id, "b1");
+            assert_eq!(*index, 5);
+        }
+        other => panic!("expected ContextMenuTarget::ExtPanel, got {other:?}"),
+    }
+    assert_eq!(menu.items.len(), 2);
+    assert_eq!(menu.items[0].label, "Foo");
+    assert_eq!(menu.items[0].action, "foo");
+    assert!(menu.items[0].enabled);
+    assert_eq!(menu.items[1].label, "Bar");
+    assert_eq!(menu.items[1].action, "bar");
+    assert!(
+        !menu.items[1].enabled,
+        "disabled = true must map to enabled = false"
+    );
+}
+
+#[test]
+fn ext_panel_context_menu_noop_when_plugin_does_not_set_items() {
+    let mut e = engine_with("");
+    setup_panel(&mut e);
+    load_plugin(
+        &mut e,
+        "ignore_context_menu",
+        r#"
+        vimcode.on("panel_context_menu", function(arg)
+            vimcode.message("saw:" .. arg)
+        end)
+        "#,
+    );
+    e.ext_panel_has_focus = true;
+    e.ext_panel_selected = 5;
+
+    e.open_ext_panel_context_menu(10, 20);
+
+    assert!(
+        e.message.starts_with("saw:"),
+        "the handler must still run (message={:?})",
+        e.message
+    );
+    assert!(
+        e.context_menu.is_none(),
+        "no native menu should open when the handler never calls set_context_menu"
+    );
+}
+
+#[test]
+fn ext_panel_context_menu_confirm_fires_panel_action() {
+    let mut e = engine_with("");
+    setup_panel(&mut e);
+    load_plugin(
+        &mut e,
+        "confirm_context_menu",
+        r#"
+        vimcode.on("panel_context_menu", function(arg)
+            local p = vimcode.panel.parse_event(arg)
+            vimcode.panel.set_context_menu(p.panel, {
+                { id = "foo", label = "Foo" },
+            })
+        end)
+        vimcode.on("panel_action", function(arg)
+            vimcode.message("action:" .. arg)
+        end)
+        "#,
+    );
+    e.ext_panel_has_focus = true;
+    e.ext_panel_selected = 5; // item b1
+
+    e.open_ext_panel_context_menu(10, 20);
+    assert!(e.context_menu.is_some());
+
+    e.context_menu_confirm();
+
+    assert_eq!(
+        e.message, "action:tp|B|b1|foo|5",
+        "confirming the menu item must dispatch panel_action in the \
+         canonical panel|section|id|key|index format"
+    );
+    assert!(
+        e.context_menu.is_none(),
+        "confirming the menu must close it"
+    );
+}
+
 // ── Panel input field ─────────────────────────────────────────────────────────
 
 #[test]

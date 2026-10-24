@@ -2528,6 +2528,23 @@ impl Engine {
         for (panel_name, text) in ctx.panel_input_values {
             self.ext_panel_input_text.insert(panel_name, text);
         }
+        // Stash the last `set_context_menu` call this turn — read (and
+        // cleared) by `open_ext_panel_context_menu` right after it fires
+        // `panel_context_menu`, so a stale call from an earlier turn never
+        // lingers.
+        if let Some((panel_name, entries)) = ctx.panel_context_menu_items.into_iter().last() {
+            let items = entries
+                .into_iter()
+                .map(|e| ContextMenuItem {
+                    label: e.label,
+                    action: e.id,
+                    shortcut: String::new(),
+                    separator_after: false,
+                    enabled: !e.disabled,
+                })
+                .collect();
+            self.ext_panel_context_menu_pending = Some((panel_name, items));
+        }
         // Register editor hover content from plugin callbacks
         for (line, markdown) in ctx.editor_hover_entries {
             self.editor_hover_content.insert(line, markdown);

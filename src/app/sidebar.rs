@@ -648,8 +648,27 @@ impl App {
                     } => {
                         render::route_ext_panel_click(&mut engine, pos, false);
                     }
-                    // Right-click context menu and mid-drag follow-through aren't wired yet;
-                    // still consumed below so neither leaks through to the editor.
+                    UiEvent::MouseDown {
+                        button: quadraui::MouseButton::Right,
+                        ..
+                    } => {
+                        // Mirrors `route_board_sidebar_event`'s right-click
+                        // arm: resolve the row against the cached layout,
+                        // select it, then let the engine fire
+                        // `panel_context_menu` and build the menu from
+                        // whatever the plugin declares via
+                        // `vimcode.panel.set_context_menu`.
+                        if let Some(flat_idx) = render::ext_panel_right_click_index(&engine, pos) {
+                            engine.ext_panel_selected = flat_idx;
+                            let cw = self.cached_char_width.max(1.0);
+                            let lh = self.cached_line_height.max(1.0);
+                            let cx = (pos.x as f64 / cw) as u16;
+                            let cy = (pos.y as f64 / lh) as u16;
+                            engine.open_ext_panel_context_menu(cx, cy);
+                        }
+                    }
+                    // Mid-drag follow-through isn't wired yet; still
+                    // consumed below so it doesn't leak through to the editor.
                     _ => {}
                 }
                 true

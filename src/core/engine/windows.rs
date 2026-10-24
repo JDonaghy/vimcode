@@ -2079,11 +2079,20 @@ impl Engine {
             }
             ContextMenuTarget::ExtPanel {
                 panel_name,
+                section,
                 item_id,
+                index,
             } => {
-                // Fire panel_context_menu event — Lua plugins handle all actions.
-                let arg = format!("{}||{}|{}|", panel_name, item_id, action);
-                self.plugin_event("panel_context_menu", &arg);
+                // Confirming a menu entry is just another panel action, so it
+                // goes out in the same canonical 5-field format
+                // `panel_select`/`panel_double_click`/etc. use —
+                // `vimcode.panel.parse_event` decodes it identically on the
+                // Lua side, with `key` carrying the chosen menu item's id.
+                let arg = format!(
+                    "{}|{}|{}|{}|{}",
+                    panel_name, section, item_id, action, index
+                );
+                self.plugin_event("panel_action", &arg);
             }
             ContextMenuTarget::Board { card_id } => {
                 // `action` is one of the provider-declared action

@@ -581,6 +581,19 @@ pub struct ExtPanelBadge {
     pub color: String,
 }
 
+/// A single entry declared via `vimcode.panel.set_context_menu(panel, items)`,
+/// one `{id, label, disabled?}` Lua table per row.
+#[derive(Debug, Clone)]
+pub struct PanelContextMenuEntry {
+    /// Plugin-chosen stable identifier, echoed back as the `key` field of
+    /// the `panel_action` event fired on confirm.
+    pub id: String,
+    /// Display label.
+    pub label: String,
+    /// Greyed out and unselectable when true.
+    pub disabled: bool,
+}
+
 impl Default for ExtPanelItem {
     fn default() -> Self {
         Self {
@@ -1005,6 +1018,11 @@ pub struct PluginCallContext {
     pub panel_help_entries: Vec<(String, Vec<(String, String)>)>,
     /// Panel input field text values to set: `(panel_name, text)`.
     pub panel_input_values: Vec<(String, String)>,
+    /// Native context menu entries declared via
+    /// `vimcode.panel.set_context_menu(panel, items)`: `(panel_name, items)`.
+    /// Read by `Engine::open_ext_panel_context_menu` immediately after it
+    /// fires `panel_context_menu` — a no-op outside that call.
+    pub panel_context_menu_items: Vec<(String, Vec<PanelContextMenuEntry>)>,
     /// `vimcode.ui.refresh(name)` requests — view names whose `render` callback
     /// should run again after this call returns.
     pub plugin_view_refresh: Vec<String>,
@@ -4454,6 +4472,32 @@ impl PluginManager {
                     Ok(())
                 },
             )?,
+        )?;
+
+        // vimcode.panel.set_context_menu(panel_name, items) — declare a native
+        // context menu for the row a `panel_context_menu` event was just fired
+        // for. `items` is a table of `{id, label, disabled?}`; call this only
+        // from inside a `panel_context_menu` handler — the engine reads it
+        // right after dispatching that event and discards it otherwise.
+        panel_tbl.set(
+            "set_context_menu",
+            lua.create_function(|lua, (panel_name, items_tbl): (String, LuaTable)| {
+                let mut entries = Vec::new();
+                for (_, row) in items_tbl.pairs::<usize, LuaTable>().flatten() {
+                    let id: String = row.get("id").unwrap_or_default();
+                    let label: String = row.get("label").unwrap_or_default();
+                    let disabled: bool = row.get("disabled").unwrap_or(false);
+                    entries.push(PanelContextMenuEntry {
+                        id,
+                        label,
+                        disabled,
+                    });
+                }
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    ctx.panel_context_menu_items.push((panel_name, entries));
+                }
+                Ok(())
+            })?,
         )?;
 
         // vimcode.panel.set_help(panel_name, bindings) — register help popup bindings

@@ -1645,7 +1645,14 @@ pub enum ContextMenuTarget {
     },
     ExtPanel {
         panel_name: String,
+        /// The section the right-clicked item belongs to — empty when the
+        /// menu was opened on a section header row.
+        section: String,
         item_id: String,
+        /// The right-clicked row's flat index, echoed back in the
+        /// `panel_action` event so the plugin can resolve it the same way
+        /// `panel_select`/`panel_double_click` do.
+        index: usize,
     },
     /// A Board-panel card — right-clicked, or opened via a future
     /// keyboard binding. `context_menu_confirm`'s items are the provider's
@@ -4892,6 +4899,12 @@ pub struct Engine {
     /// Signals backends to switch the sidebar to this extension panel on the next frame.
     /// Set by `panel.reveal()` — backends check + clear each frame.
     pub ext_panel_focus_pending: Option<String>,
+    /// Items a plugin declared via `vimcode.panel.set_context_menu` while
+    /// handling the `panel_context_menu` event this call turn — `(panel_name,
+    /// items)`. `Engine::open_ext_panel_context_menu` reads this right after
+    /// firing that event and clears it either way, so a stale menu from an
+    /// earlier right-click can never leak into a later one.
+    pub ext_panel_context_menu_pending: Option<(String, Vec<ContextMenuItem>)>,
     /// Extension panel help popup state
     pub ext_panel_help_open: bool,
     /// Extension panel help bindings: panel_name -> [(key, description)]
@@ -5708,6 +5721,7 @@ impl Engine {
             ext_panel_input_text: HashMap::new(),
             ext_panel_input_active: false,
             ext_panel_focus_pending: None,
+            ext_panel_context_menu_pending: None,
             ext_panel_help_open: false,
             ext_panel_help_bindings: HashMap::new(),
             ext_panel_content_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
