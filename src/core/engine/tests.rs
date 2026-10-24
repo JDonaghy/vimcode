@@ -17508,6 +17508,52 @@ fn test_plugin_disabled_not_registered() {
     assert!(engine.message.contains("Not an editor command"));
 }
 
+/// `:'<,'>SqlRun`-style invocation routes the resolved range into the
+/// plugin command via `vimcode.state.range()`, and `vimcode.state.mark()`
+/// sees the same `<`/`>` visual-selection marks the ex-range parser used to
+/// resolve `'<`/`'>` — covering both halves of the visual-selection host API.
+#[test]
+fn test_plugin_ranged_command_sees_visual_selection() {
+    let dir = write_plugin_lua(
+        "test_ranged_cmd",
+        r#"
+        vimcode.command("SqlRun", function(args)
+            local r = vimcode.state.range()
+            local lt = vimcode.state.mark("<")
+            local gt = vimcode.state.mark(">")
+            vimcode.message(string.format(
+                "range=%d,%d mark<=%d,%d mark>=%d,%d args=%s",
+                r.first, r.last, lt.line, lt.col, gt.line, gt.col, args
+            ))
+        end)
+        "#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\nfour\n");
+
+    // Select lines 1..2 (0-indexed) in Visual Line mode, then simulate what
+    // leaving Visual mode via `:` does: record the selection as the `<`/`>`
+    // marks (see the mode-dispatch block in `handle_key` that does this for
+    // real keystrokes).
+    engine.visual_mark_start = Some((1, 0));
+    engine.visual_mark_end = Some((2, 0));
+
+    let action = engine.execute_command("'<,'>SqlRun hello");
+    assert_eq!(action, EngineAction::None);
+    assert_eq!(
+        engine.message, "range=2,3 mark<=2,1 mark>=3,1 args=hello",
+        "plugin command must see the resolved 1-indexed range and marks \
+         for a ':\\'<,\\'>Name' invocation"
+    );
+}
+
 // ─── Source Control (Session 99) ─────────────────────────────────────────
 
 /// An existing, empty, **non-git** directory for [`make_sc_engine_with_files`]

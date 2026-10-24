@@ -10436,10 +10436,24 @@ impl Engine {
     /// dispatch must answer synchronously, and Lua cannot be re-entered while
     /// the engine is loaned to it.
     pub fn plugin_run_command(&mut self, name: &str, args: &str) -> bool {
+        self.plugin_run_command_ranged(name, args, None)
+    }
+
+    /// Like [`Engine::plugin_run_command`], but for a command invoked with an
+    /// explicit ex address range (e.g. `:'<,'>Name`, `:1,5Name`). `range` is
+    /// `(first_line, last_line)`, 0-indexed inclusive; the callback sees it
+    /// 1-indexed via `vimcode.state.range()`.
+    pub fn plugin_run_command_ranged(
+        &mut self,
+        name: &str,
+        args: &str,
+        range: Option<(usize, usize)>,
+    ) -> bool {
         if !self.can_dispatch_to_plugins() {
             return false;
         }
-        let ctx = self.make_plugin_ctx(false);
+        let mut ctx = self.make_plugin_ctx(false);
+        ctx.cmd_range = range.map(|(first, last)| (first + 1, last + 1));
         let Some((found, ctx)) = self.with_plugin_dispatch(|pm| pm.call_command(name, args, ctx))
         else {
             return false;

@@ -1914,8 +1914,11 @@ impl Engine {
             .map(|(k, (text, ty))| (*k, (text.clone(), ty.is_linewise())))
             .collect();
 
-        // Marks snapshot for the active buffer (1-indexed)
-        let marks_snapshot = self
+        // Marks snapshot for the active buffer (1-indexed). `<`/`>` (the
+        // visual-selection marks) live outside `self.marks` since they apply
+        // across buffers rather than per-buffer letter marks, so they're
+        // merged in here from `visual_mark_start`/`visual_mark_end`.
+        let mut marks_snapshot: HashMap<char, (usize, usize)> = self
             .marks
             .get(&buf_id)
             .map(|m| {
@@ -1924,6 +1927,12 @@ impl Engine {
                     .collect()
             })
             .unwrap_or_default();
+        if let Some((line, col)) = self.visual_mark_start {
+            marks_snapshot.insert('<', (line + 1, col + 1));
+        }
+        if let Some((line, col)) = self.visual_mark_end {
+            marks_snapshot.insert('>', (line + 1, col + 1));
+        }
 
         // Filetype from active buffer's language ID
         let filetype = self
