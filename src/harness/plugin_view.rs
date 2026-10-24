@@ -533,7 +533,10 @@ fn assert_paints(driver: &impl ConformanceDriver, needles: &[&str], what: &str) 
     }
 }
 
-/// Scenario 1 — the declared tree is what gets painted.
+/// Scenario 1 — the declared tree is what gets painted, in the sidebar.
+///
+/// Covers every row kind except `slider`, which is asserted separately by
+/// [`declared_slider_row_is_painted`] — see that function's doc for why.
 pub fn declared_tree_is_painted(driver: &impl ConformanceDriver) {
     assert_paints(
         driver,
@@ -545,11 +548,26 @@ pub fn declared_tree_is_painted(driver: &impl ConformanceDriver) {
             ROW_BUTTON,
             ROW_DATE_LABEL,
             ROW_DATE_INITIAL,
-            ROW_SLIDER_LABEL,
-            ROW_SLIDER_INITIAL,
             COUNT_0,
         ],
         "the plugin-declared widget tree",
+    );
+}
+
+/// Scenario 1b — the declared `slider` row is painted.
+///
+/// Kept separate from [`declared_tree_is_painted`] because the two backends
+/// need different fixtures to exercise it: on TUI, `quadraui::tui::form`'s
+/// column-budget guard means the slider's track only clears in the wider
+/// editor-tab fixture (`tui_tab`; see [`ROW_SLIDER_LABEL`]'s doc). GTK has no
+/// such guard — its sidebar fixture (`gtk`) paints the row fine — but the
+/// scenario stays split rather than folded back into the sidebar's shared
+/// assertion list, so both backends' callers run the identical scenario body.
+pub fn declared_slider_row_is_painted(driver: &impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[ROW_SLIDER_LABEL, ROW_SLIDER_INITIAL],
+        "the plugin-declared slider row",
     );
 }
 
@@ -657,7 +675,7 @@ pub fn typing_edits_the_focused_text_field(driver: &mut impl ConformanceDriver) 
 /// picker fields" doc.
 ///
 /// `Tab` x4 walks from the initially-focused `url` field past `tls`, `send`
-/// and `etx` onto `dob`, the last declared field. Each navigation key is
+/// and `etx` onto `dob`. Each navigation key is
 /// pressed and then undone with its opposite (`Right`/`Left`,
 /// `Down`/`Up`, `PageDown`/`PageUp`) to land back on
 /// [`ROW_DATE_INITIAL`] before the final `Right` + `Enter`, so every arm
@@ -763,6 +781,13 @@ pub fn scrubbing_and_confirming_a_date_field_reaches_the_plugin_handler(
 ///
 /// `Tab` x5 walks from the initially-focused `url` field past `tls`, `send`,
 /// `etx` and `dob` onto `vol`, the last declared field.
+///
+/// RED-verified: replacing `engine::plugins`'s `ViewFieldKind::Slider` match
+/// arm with a no-op `return true` (matching the `Label`/`ReadOnly` arms,
+/// which also decline to act on Enter/Space) makes the first assertion
+/// below fail — the screen still shows the stale `"6.00"` instead of
+/// `"9.00"` — while the rest of the suite, including every other
+/// `plugin_view` scenario, stays green.
 pub fn stepping_a_slider_field_reaches_the_plugin_handler(driver: &mut impl ConformanceDriver) {
     assert!(
         driver.screen_has(ROW_SLIDER_INITIAL),
@@ -794,6 +819,12 @@ pub fn stepping_a_slider_field_reaches_the_plugin_handler(driver: &mut impl Conf
         "Enter on the focused slider field must reach the plugin's on_event \
          handler as SliderChanged and repaint ({COUNT_1:?}); painted runs \
          were {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(ROW_SLIDER_INITIAL),
+        "the stale slider value {ROW_SLIDER_INITIAL:?} must not still be \
+         painted after the view re-rendered; painted runs were {:?}",
         painted(driver)
     );
 }
@@ -1182,11 +1213,17 @@ mod tests {
 
     #[test]
     fn plugin_view_declared_tree_is_painted_on_tui() {
+        let (h, _dir) = tui();
+        declared_tree_is_painted(&h.driver);
+    }
+
+    #[test]
+    fn plugin_view_declared_slider_row_is_painted_on_tui() {
         // The sidebar's 20-column TUI default is too narrow for the slider
         // row's track (`ROW_SLIDER_LABEL`'s doc comment) — the editor-tab
-        // fixture has room for every row this checks.
+        // fixture has room for it.
         let (h, _dir) = tui_tab();
-        declared_tree_is_painted(&h.driver);
+        declared_slider_row_is_painted(&h.driver);
     }
 
     #[test]
@@ -1215,8 +1252,8 @@ mod tests {
 
     #[test]
     fn plugin_view_stepping_a_slider_field_reaches_the_handler_on_tui() {
-        // Same reason as `plugin_view_declared_tree_is_painted_on_tui`: the
-        // slider row only paints in the wider editor-tab fixture.
+        // Same reason as `plugin_view_declared_slider_row_is_painted_on_tui`:
+        // the slider row only paints in the wider editor-tab fixture.
         let (mut h, _dir) = tui_tab();
         stepping_a_slider_field_reaches_the_plugin_handler(&mut h.driver);
     }
@@ -1351,8 +1388,19 @@ mod tests {
     #[cfg(feature = "gui")]
     #[test]
     fn plugin_view_declared_tree_is_painted_on_gtk() {
-        let (h, _dir) = gtk_tab();
+        let (h, _dir) = gtk();
         declared_tree_is_painted(&h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_declared_slider_row_is_painted_on_gtk() {
+        // Unlike TUI, GTK's `form.rs` has no column-budget guard gating the
+        // slider track (it lays out pixel widths, not fixed character
+        // columns), and the sidebar fixture (`gtk`) has been confirmed to
+        // paint this row — so this uses `gtk` rather than `gtk_tab`.
+        let (h, _dir) = gtk();
+        declared_slider_row_is_painted(&h.driver);
     }
 
     #[cfg(feature = "gui")]

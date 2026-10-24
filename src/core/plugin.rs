@@ -328,12 +328,23 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
                     value: value_str("value"),
                 },
                 "slider" => {
-                    let value_f32 =
-                        |key: &str| -> f32 { row.get::<_, f64>(key).unwrap_or(0.0) as f32 };
+                    // `value`/`min`/`max` are required on the `ViewFieldKind::Slider`
+                    // wire shape (only `step` carries a serde default) — reject a
+                    // missing one here the same way an unknown `type` is rejected
+                    // below, rather than silently snapping it to some default that
+                    // then disagrees with the field's own declared range.
+                    let require_f32 = |key: &str| -> LuaResult<f32> {
+                        row.get::<_, f64>(key).map(|v| v as f32).map_err(|_| {
+                            LuaError::RuntimeError(format!(
+                                "view field {} (id {field_id:?}): slider requires a numeric `{key}`",
+                                idx + 1
+                            ))
+                        })
+                    };
                     ViewFieldKind::Slider {
-                        value: value_f32("value"),
-                        min: value_f32("min"),
-                        max: row.get::<_, f64>("max").unwrap_or(1.0) as f32,
+                        value: require_f32("value")?,
+                        min: require_f32("min")?,
+                        max: require_f32("max")?,
                         step: row.get::<_, f64>("step").unwrap_or(1.0) as f32,
                     }
                 }
@@ -5869,6 +5880,60 @@ mod tests {
         assert!(
             err.contains("buton"),
             "the error must name the offending type: {err}"
+        );
+    }
+
+    #[test]
+    fn a_slider_field_parses_value_min_max_step_through_lua() {
+        use crate::core::plugin_ui::ViewFieldKind;
+        let pm = pm_with_view(
+            "slider_ok",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        fields = {
+                            { type = "slider", id = "vol", value = 6.0, min = 0.0, max = 10.0, step = 3.0 },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(
+            view.fields[0].kind,
+            ViewFieldKind::Slider {
+                value: 6.0,
+                min: 0.0,
+                max: 10.0,
+                step: 3.0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_slider_field_missing_max_is_an_error_not_a_silent_default() {
+        let pm = pm_with_view(
+            "slider_missing_max",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        fields = {
+                            { type = "slider", id = "vol", value = 6.0, min = 0.0 },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("a missing `max` must not silently snap the field's range");
+        assert!(
+            err.contains("max"),
+            "the error must name the missing field: {err}"
         );
     }
 

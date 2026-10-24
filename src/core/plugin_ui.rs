@@ -13,10 +13,16 @@
 //! [`VIEW_SCHEMA_VERSION`], that is a curated allow-list of
 //! `quadraui::FieldKind`/`FormEvent` variants rather than an independent
 //! representation: every [`ViewFieldKind`] variant's doc comment names the
-//! `quadraui::FieldKind` it is translated to (and back) in exactly one place,
-//! [`crate::render::plugin_view_to_form`]. Exposing a new primitive is an
-//! allow-list entry here plus a matching arm in that one translation
-//! function — never a hand-invented representation.
+//! `quadraui::FieldKind` it is translated to (and back), and the translation
+//! itself lives in exactly one place, [`crate::render::plugin_view_to_form`].
+//! Exposing a new primitive that has a direct one-field-to-one-field quadraui
+//! counterpart is usually just an allow-list entry here plus a matching arm
+//! in that one translation function — never a hand-invented representation
+//! — but is not guaranteed to be *only* that: a primitive quadraui's own
+//! `FormController` has no native interaction path for (as `Slider` turned
+//! out to be, see its doc below) also needs vimcode's own keyboard-handling
+//! arm in `core::engine::plugins`, plus the matching Lua parse/encode arms in
+//! `plugin.rs`. The ceiling is still small and enumerable, not open-ended.
 //!
 //! Feeding quadraui's own `Serialize`/`Deserialize` impls straight from Lua
 //! is avoided for three concrete reasons, all visible in `quadraui::Form`:
@@ -148,18 +154,27 @@ impl PluginView {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ViewBody {
     /// Selectable rows with an optional title and per-row detail text.
+    /// Painted through `quadraui::ListView`/`ListItem` directly (see
+    /// `crate::render::plugin_view_body`) — there is no composed quadraui
+    /// controller for selection/scroll, so that part is hand-rolled in that
+    /// backend-neutral module rather than through `FormController`.
     List {
         #[serde(default)]
         title: Option<String>,
         #[serde(default)]
         items: Vec<ViewListItem>,
     },
-    /// Expandable nodes.
+    /// Expandable nodes. Flattened to `quadraui::TreeRow`s and painted
+    /// through `quadraui::TreeView`, with keyboard/expand-collapse handling
+    /// going through quadraui's own `TreeController`.
     Tree {
         #[serde(default)]
         nodes: Vec<ViewTreeNode>,
     },
-    /// Columns + rows, optionally with editable cells.
+    /// Columns + rows, optionally with editable cells. Painted through
+    /// `quadraui::DataTable` (`Column`/`DataRow`); like `List`, selection
+    /// and scroll are hand-rolled since `DataTable` has no composed
+    /// controller of its own.
     Table {
         #[serde(default)]
         columns: Vec<ViewTableColumn>,
@@ -167,7 +182,8 @@ pub enum ViewBody {
         rows: Vec<ViewTableRow>,
     },
     /// Multi-line read-only text with scrolling. An optional `filetype`
-    /// hint enables syntax highlighting (e.g. `"json"`).
+    /// hint enables syntax highlighting (e.g. `"json"`). Painted through
+    /// `quadraui::TextDisplay`.
     TextView {
         #[serde(default)]
         text: String,
@@ -313,13 +329,15 @@ fn default_slider_step() -> f32 {
 pub enum ViewFieldKind {
     /// A non-interactive section header. `label` carries the text.
     ///
-    /// No `quadraui::FieldKind` — `plugin_view_to_form` paints this as a
-    /// label-only `FormField` with no input, the one row shape quadraui's
-    /// own descriptor has no need to name separately.
+    /// Translated to `quadraui::FieldKind::Label` directly — both sides are
+    /// already just "a header row, no interaction, no `FormEvent`".
     Label,
     /// Single-line text input. Translated to `quadraui::FieldKind::TextInput`
-    /// (its `multiline: false`, `cursor`/`selection_anchor` interaction state
-    /// stays Engine-owned — see the module doc's firewall reasons).
+    /// (its `cursor`/`selection_anchor` interaction state stays Engine-owned
+    /// — see the module doc's firewall reasons). Multi-line input is the
+    /// separate [`ViewFieldKind::TextArea`] variant, translated to
+    /// `quadraui::FieldKind::TextArea` instead — `TextInput` itself has no
+    /// multi-line flag on either side of the translation.
     Text {
         #[serde(default)]
         value: String,
@@ -404,18 +422,18 @@ pub enum ViewFieldKind {
         value: String,
     },
     /// A numeric slider within `[min, max]`, stepping by `step` per
-    /// adjustment. Translated to `quadraui::FieldKind::Slider` — the
-    /// vocabulary's demonstration that adding a primitive is an allow-list
-    /// entry (this variant plus one arm in
-    /// [`crate::render::plugin_view_to_form`]), not a new representation:
-    /// the field names below are exactly quadraui's own.
+    /// adjustment. Translated to `quadraui::FieldKind::Slider`; the field
+    /// names below are exactly quadraui's own.
     ///
-    /// `quadraui::FormController` has no native keyboard path for sliders
-    /// (unlike [`ViewFieldKind::Date`]'s scrub-and-confirm); `Enter`/`Space`
-    /// on a focused slider steps `value` by `step`, clamped to
-    /// `[min, max]`, and reaches the plugin immediately as a
-    /// [`ViewEventKind::SliderChanged`] — there is no separate "confirm"
-    /// step.
+    /// `quadraui::FormController` has no native keyboard *or* mouse/drag
+    /// path for sliders at all (unlike [`ViewFieldKind::Date`]'s own
+    /// scrub-and-confirm keyboard path) — this variant is translated by
+    /// `plugin_view_to_form`, but stepping it is vimcode's own hand-written
+    /// handling in `core::engine::plugins`, not something the controller
+    /// does for free. `Enter`/`Space` on a focused slider steps `value` by
+    /// `step`, clamped to `[min, max]`, and reaches the plugin immediately
+    /// as a [`ViewEventKind::SliderChanged`] — there is no separate
+    /// "confirm" step, and no mouse/drag path exists yet on either side.
     Slider {
         value: f32,
         min: f32,
@@ -493,9 +511,10 @@ pub enum ViewEventKind {
     DateChanged {
         value: String,
     },
-    /// A `slider` field's value changed (Enter/Space step, or a drag/click
-    /// through `quadraui::FormController`). `value` is already clamped to
-    /// the field's declared `[min, max]`.
+    /// A `slider` field's value changed — currently only an Enter/Space
+    /// step; `quadraui::FormController` has no drag/click path for sliders
+    /// to route through (see [`ViewFieldKind::Slider`]'s doc). `value` is
+    /// already clamped to the field's declared `[min, max]`.
     SliderChanged {
         value: f32,
     },
@@ -741,6 +760,14 @@ mod tests {
 
     #[test]
     fn adding_slider_is_additive_old_schema_version_1_json_still_parses() {
+        // Exercises the serde shape directly; production code never
+        // deserializes `PluginView` from JSON — the real author-facing path
+        // is `lua_table_to_view` (see `plugin.rs`'s own
+        // `an_unknown_field_type_is_an_error_not_a_silent_drop` and sibling
+        // tests for additive-schema coverage through that path). This test
+        // still earns its keep as the narrowest possible check that the
+        // wire shape of a pre-existing variant is untouched by the new one.
+        //
         // A `date` field declared before `Slider` existed, under the same
         // `schema_version = 1` this build still understands.
         let json = r#"{"id":"v","schema_version":1,"fields":[
