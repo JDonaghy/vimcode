@@ -2680,9 +2680,9 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "quadraui"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a1087d7961b8936241354491e689291b8e8281a59613c3d72bfdd3aea1b8b00"
+checksum = "27a999c9608c6cfb1cd6cc00b577f00b4cb47b0c6720d33666c9a70702887005"
 dependencies = [
  "arboard",
  "core-foundation 0.9.4",
