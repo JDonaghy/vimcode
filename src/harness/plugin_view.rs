@@ -1121,6 +1121,70 @@ pub fn table_header_divider_drag_resizes_the_column<D>(
     );
 }
 
+/// Scenario 10d — clicking a table's column header cycles the sort for that
+/// column, and the *painted* row order follows: unsorted → ascending (the
+/// fixture's declared order already is ascending by key) → descending (the
+/// two rows swap places on screen) → unsorted again.
+///
+/// The click lands on the middle of the header cell, read back from the
+/// cached layout like [`table_header_divider_drag_resizes_the_column`] does,
+/// so it can never drift onto the header *divider* (a resize) however wide
+/// the backend painted the column.
+pub fn table_header_click_sorts_the_painted_rows<D>(h: &mut crate::harness::ConformanceHarness<D>)
+where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    assert_paints(
+        &h.driver,
+        &[TABLE_COL_KEY, TABLE_ROW0_KEY, TABLE_ROW1_KEY],
+        "the table-kind view's initial paint",
+    );
+    assert!(
+        h.driver.inventory().above(TABLE_ROW0_KEY, TABLE_ROW1_KEY),
+        "precondition: the table starts in the plugin's declared row order, \
+         {TABLE_ROW0_KEY:?} above {TABLE_ROW1_KEY:?}; painted runs were {:?}",
+        painted(&h.driver)
+    );
+    let (header_x, header_y) = {
+        let engine = h.engine.borrow();
+        let cached = engine.plugin_view_table_layout.borrow();
+        let (rect, layout) = cached
+            .as_ref()
+            .expect("table_header_click_sorts_the_painted_rows: no frame painted yet");
+        let col0 = &layout.columns[0];
+        (
+            rect.x + col0.x + col0.width / 2.0,
+            rect.y + layout.header_height / 2.0,
+        )
+    };
+
+    h.driver.click(header_x, header_y);
+    assert!(
+        h.driver.inventory().above(TABLE_ROW0_KEY, TABLE_ROW1_KEY),
+        "one header click sorts column 0 ascending, which for this fixture is \
+         the order it already painted in ({TABLE_ROW0_KEY:?} above \
+         {TABLE_ROW1_KEY:?}); painted runs were {:?}",
+        painted(&h.driver)
+    );
+
+    h.driver.click(header_x, header_y);
+    assert!(
+        h.driver.inventory().above(TABLE_ROW1_KEY, TABLE_ROW0_KEY),
+        "a second header click sorts column 0 descending, so {TABLE_ROW1_KEY:?} \
+         must now paint above {TABLE_ROW0_KEY:?}; painted runs were {:?}",
+        painted(&h.driver)
+    );
+
+    h.driver.click(header_x, header_y);
+    assert!(
+        h.driver.inventory().above(TABLE_ROW0_KEY, TABLE_ROW1_KEY),
+        "a third header click clears the sort, restoring the plugin's declared \
+         row order ({TABLE_ROW0_KEY:?} above {TABLE_ROW1_KEY:?}); painted runs \
+         were {:?}",
+        painted(&h.driver)
+    );
+}
+
 /// Scenario 11 — a `kind = "text_view"` with more lines than fit the
 /// viewport starts scrolled to the top and scrolls to the bottom on `End`.
 pub fn text_view_scrolls_to_the_bottom_on_end(driver: &mut impl ConformanceDriver) {
@@ -1265,6 +1329,12 @@ mod tests {
     fn plugin_view_table_header_divider_drag_resizes_the_column_on_tui() {
         let (mut h, _dir) = tui_named(TABLE_VIEW);
         table_header_divider_drag_resizes_the_column(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_table_header_click_sorts_the_painted_rows_on_tui() {
+        let (mut h, _dir) = tui_named(TABLE_VIEW);
+        table_header_click_sorts_the_painted_rows(&mut h);
     }
 
     #[test]
@@ -1445,6 +1515,13 @@ mod tests {
     fn plugin_view_table_header_divider_drag_resizes_the_column_on_gtk() {
         let (mut h, _dir) = gtk_named(TABLE_VIEW);
         table_header_divider_drag_resizes_the_column(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_header_click_sorts_the_painted_rows_on_gtk() {
+        let (mut h, _dir) = gtk_named(TABLE_VIEW);
+        table_header_click_sorts_the_painted_rows(&mut h);
     }
 
     #[cfg(feature = "gui")]
