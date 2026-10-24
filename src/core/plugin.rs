@@ -327,6 +327,16 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
                 "date" => ViewFieldKind::Date {
                     value: value_str("value"),
                 },
+                "slider" => {
+                    let value_f32 =
+                        |key: &str| -> f32 { row.get::<_, f64>(key).unwrap_or(0.0) as f32 };
+                    ViewFieldKind::Slider {
+                        value: value_f32("value"),
+                        min: value_f32("min"),
+                        max: row.get::<_, f64>("max").unwrap_or(1.0) as f32,
+                        step: row.get::<_, f64>("step").unwrap_or(1.0) as f32,
+                    }
+                }
                 other => {
                     return Err(LuaError::RuntimeError(format!(
                         "view field {} (id {field_id:?}): unknown type {other:?}",
@@ -2559,6 +2569,7 @@ impl PluginManager {
                 tbl.set("col", *col as i64)?;
                 tbl.set("value", value.as_str())?;
             }
+            ViewEventKind::SliderChanged { value } => tbl.set("value", *value as f64)?,
             ViewEventKind::ButtonClicked | ViewEventKind::FocusChanged => {}
         }
         Ok(tbl)
