@@ -8402,6 +8402,60 @@ mod tests {
             );
         }
 
+        /// The editor's text rect must be narrowed by the minimap's
+        /// reserved width, not merely painted under a strip drawn on top of
+        /// it: a long, unwrapped line's marker characters must never reach
+        /// the strip's own columns, for *every* row — not just the rows the
+        /// strip happens to paint over this frame. A buggy build that still
+        /// hands `Surface::Editor` the window's full, un-narrowed `rect`
+        /// renders this marker line out to the pane's full width, so it
+        /// collides with the strip's left edge; that's the overlap this
+        /// test catches (#2025).
+        #[test]
+        fn minimap_does_not_overlap_buffer_text() {
+            let mut engine = plain_engine();
+            // Minimap is experimental and off by default — this test
+            // is specifically about the minimap, so turn it on explicitly.
+            engine.settings.minimap = true;
+            // One long, unwrapped line of a marker character that would
+            // reach the pane's full 80-column width if the editor's paint
+            // rect were not narrowed for the minimap strip.
+            let text = format!("{}\n", "Z".repeat(200));
+            engine.buffer_mut().insert(0, &text);
+            let mut h = harness_no_sidebar(engine);
+            h.driver.render();
+
+            let win = h.engine.borrow().active_window_id();
+            let strip = {
+                let layout = h.screen_layout.borrow();
+                let mm = layout
+                    .as_ref()
+                    .expect("render_content must have painted a ScreenLayout")
+                    .minimap
+                    .iter()
+                    .find(|m| m.window_id == win)
+                    .expect("a minimap-enabled window must publish a strip");
+                crate::render::minimap_strip_rect(mm)
+            };
+            let strip_left = strip.x as usize;
+
+            let screen = h.driver.screen();
+            for (row_idx, row) in screen.lines().enumerate() {
+                let row_chars: Vec<char> = row.chars().collect();
+                for (col, &ch) in row_chars.iter().enumerate().skip(strip_left) {
+                    assert_ne!(
+                        ch,
+                        'Z',
+                        "row {row_idx} col {col}: buffer text marker 'Z' \
+                         painted at or past the minimap strip's left edge \
+                         (x={strip_left}); the editor text rect must be \
+                         narrowed by the minimap's reserved width so text \
+                         and the strip occupy disjoint columns; screen:\n{screen}"
+                    );
+                }
+            }
+        }
+
         /// The lowest `line N` number among the frame's painted text —
         /// the TUI twin of `gtk::testing`'s identically-named helper on its
         /// own pair of acceptance tests below.
