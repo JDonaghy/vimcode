@@ -4831,6 +4831,18 @@ pub struct Engine {
     /// whichever host currently displays it, not of which host holds
     /// keyboard focus right now (the thing the twin pairs exist to track).
     pub plugin_view_table_col_overrides: HashMap<String, Vec<Option<f32>>>,
+    /// The active sort for `ViewBody::Table`-kind views, keyed by view name:
+    /// `(column, direction)`, absent when the table is painted in the
+    /// plugin's declared row order. Cycled by a header click
+    /// (unsorted → ascending → descending → unsorted).
+    ///
+    /// vimcode owns the row order because `quadraui::DataTable::sort` is
+    /// indicator-only — quadraui paints the arrow glyph on the sorted header
+    /// and never reorders `rows`. Keyed by view name and not split into a
+    /// sidebar/tab twin pair for the same reason
+    /// `plugin_view_table_col_overrides` isn't: a sort is a property of the
+    /// table the plugin declared, shared by whichever host displays it.
+    pub plugin_view_table_sort: HashMap<String, (usize, quadraui::SortDirection)>,
     /// The in-progress header-divider drag on a `ViewBody::Table`-kind view,
     /// if any. See `PluginTableColumnDrag`.
     pub(crate) plugin_view_table_resize_drag: Option<PluginTableColumnDrag>,
@@ -5658,6 +5670,7 @@ impl Engine {
             plugin_view_table_layout: std::cell::RefCell::new(None),
             plugin_view_tab_table_layout: std::cell::RefCell::new(None),
             plugin_view_table_col_overrides: HashMap::new(),
+            plugin_view_table_sort: HashMap::new(),
             plugin_view_table_resize_drag: None,
             ext_panel_table_col: 0,
             plugin_view_tab_table_col: 0,

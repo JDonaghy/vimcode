@@ -144,17 +144,28 @@ pub(crate) fn route_plugin_view_list_click(
 /// key`'s field-stack navigation (`"Down"`/`"j"`/... — not `quadraui::Key`),
 /// since this is called from that same function. Returns `false` when
 /// `len == 0` (nothing to navigate) or the key isn't a navigation key.
+///
+/// `row_order` maps a display position to the index the plugin declared the
+/// row at, for a body whose painted order can differ from its declared one (a
+/// sorted `Table`); `None` means the two coincide. The *selection* stays in
+/// display space — so `j`/`k` always walk the rows the user can see — and only
+/// the index carried by the dispatched event is translated back, since that is
+/// what the plugin indexes its own data with.
 fn navigate_flat_selection(
     engine: &mut Engine,
     name: &str,
     host: PluginViewHost,
     len: usize,
     key: &str,
+    row_order: Option<&[usize]>,
 ) -> bool {
     use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
     if len == 0 {
         return false;
     }
+    let declared = |display: usize| -> usize {
+        row_order.map_or(display, |o| o.get(display).copied().unwrap_or(display))
+    };
     let sel = engine.plugin_view_selected(host).min(len - 1);
     let new_sel = match key {
         "Down" | "j" => Some((sel + 1).min(len - 1)),
@@ -172,7 +183,9 @@ fn navigate_flat_selection(
         engine.dispatch_plugin_view_event(PluginViewEvent {
             view: name.to_string(),
             widget_id: String::new(),
-            kind: ViewEventKind::ItemSelected { index: new_sel },
+            kind: ViewEventKind::ItemSelected {
+                index: declared(new_sel),
+            },
         });
         return true;
     }
@@ -180,7 +193,9 @@ fn navigate_flat_selection(
         engine.dispatch_plugin_view_event(PluginViewEvent {
             view: name.to_string(),
             widget_id: String::new(),
-            kind: ViewEventKind::ItemActivated { index: sel },
+            kind: ViewEventKind::ItemActivated {
+                index: declared(sel),
+            },
         });
         return true;
     }
@@ -199,7 +214,7 @@ pub(crate) fn handle_plugin_view_list_key(
         return false;
     };
     let len = items.len();
-    navigate_flat_selection(engine, name, host, len, key)
+    navigate_flat_selection(engine, name, host, len, key, None)
 }
 
 /// Scroll-wheel handling for a `ViewBody::List`-kind view: adjusts the
@@ -463,6 +478,76 @@ pub(crate) fn handle_plugin_view_tree_key(
 
 // ── Table ────────────────────────────────────────────────────────────────
 
+/// The sort a `ViewBody::Table`-kind view is currently painted in, or `None`
+/// for the plugin's declared row order. A stored column that a later
+/// `ui.refresh` dropped is treated as "unsorted" rather than clamped onto a
+/// neighbouring column the user never clicked.
+fn active_table_sort(
+    engine: &Engine,
+    name: &str,
+    column_count: usize,
+) -> Option<(usize, quadraui::SortDirection)> {
+    engine
+        .plugin_view_table_sort
+        .get(name)
+        .copied()
+        .filter(|&(col, _)| col < column_count)
+}
+
+/// Display order for a table's rows: display position → index into the
+/// plugin's declared `rows`. Identity when `sort` is `None`.
+///
+/// vimcode orders the rows itself because `quadraui::DataTable::sort` is
+/// indicator-only — quadraui appends the direction glyph to the sorted
+/// column's header and leaves `rows` exactly as handed to it.
+///
+/// Two cells that both parse as numbers compare numerically (so `"9"` sorts
+/// before `"12"`, not after it); anything else compares case-insensitively.
+/// The sort is stable, so rows with equal keys keep their declared order.
+fn plugin_view_table_row_order(
+    rows: &[ViewTableRow],
+    sort: Option<(usize, quadraui::SortDirection)>,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    let Some((col, dir)) = sort else {
+        return order;
+    };
+    let key = |idx: usize| -> &str {
+        rows.get(idx)
+            .and_then(|r| r.cells.get(col))
+            .map(String::as_str)
+            .unwrap_or("")
+    };
+    order.sort_by(|&a, &b| {
+        let (ka, kb) = (key(a), key(b));
+        let ord = match (ka.trim().parse::<f64>(), kb.trim().parse::<f64>()) {
+            (Ok(na), Ok(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+            _ => ka.to_lowercase().cmp(&kb.to_lowercase()),
+        };
+        match dir {
+            quadraui::SortDirection::Ascending => ord,
+            quadraui::SortDirection::Descending => ord.reverse(),
+        }
+    });
+    order
+}
+
+/// The sort a header click on `col` moves to, cycling
+/// unsorted → ascending → descending → unsorted. Clicking a *different*
+/// column starts that column's own cycle at ascending.
+fn next_table_sort(
+    current: Option<(usize, quadraui::SortDirection)>,
+    col: usize,
+) -> Option<(usize, quadraui::SortDirection)> {
+    match current {
+        Some((c, quadraui::SortDirection::Ascending)) if c == col => {
+            Some((col, quadraui::SortDirection::Descending))
+        }
+        Some((c, quadraui::SortDirection::Descending)) if c == col => None,
+        _ => Some((col, quadraui::SortDirection::Ascending)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plugin_view_to_table(
     view: &str,
@@ -473,6 +558,8 @@ fn plugin_view_to_table(
     has_focus: bool,
     cell_edit: Option<&crate::core::plugin_ui::PluginViewTextEditState>,
     column_overrides: &[Option<f32>],
+    sort: Option<(usize, quadraui::SortDirection)>,
+    row_order: &[usize],
 ) -> quadraui::DataTable {
     use crate::core::plugin_ui::namespaced_widget_id;
     use quadraui::{Column, ColumnWidth, DataRow, DataTable, Decoration, StyledText, WidgetId};
@@ -484,9 +571,12 @@ fn plugin_view_to_table(
             align: quadraui::ColumnAlign::Left,
         })
         .collect();
-    let q_rows: Vec<DataRow> = rows
+    // Painted in display order; `row_idx` stays the *declared* index, so a
+    // live cell edit keyed by `table_cell_field_id` still lands on its own
+    // row under a sort.
+    let q_rows: Vec<DataRow> = row_order
         .iter()
-        .enumerate()
+        .filter_map(|&row_idx| rows.get(row_idx).map(|row| (row_idx, row)))
         .map(|(row_idx, row)| DataRow {
             cells: row
                 .cells
@@ -516,7 +606,7 @@ fn plugin_view_to_table(
         rows: q_rows,
         selected_idx: (!rows.is_empty()).then(|| selected.min(rows.len().saturating_sub(1))),
         scroll_offset: scroll_top,
-        sort: None,
+        sort,
         has_focus,
         show_scrollbar: true,
         min_total_width: None,
@@ -551,6 +641,8 @@ pub(crate) fn paint_plugin_view_table(
         .plugin_view_table_col_overrides
         .get(name)
         .unwrap_or(&empty_overrides);
+    let sort = active_table_sort(engine, name, columns.len());
+    let row_order = plugin_view_table_row_order(rows, sort);
     let table = plugin_view_to_table(
         name,
         columns,
@@ -560,6 +652,8 @@ pub(crate) fn paint_plugin_view_table(
         has_focus,
         cell_edit,
         column_overrides,
+        sort,
+        &row_order,
     );
     let layout = backend.draw_data_table(rect, &table, None);
     let cache = match host {
@@ -598,7 +692,7 @@ pub(crate) fn route_plugin_view_table_click(
     // an `editable` column is worth recording; a click on a read-only
     // column leaves the last editable selection alone rather than clearing
     // it to a column `Enter` could never open anyway.
-    let (idx, col, divider) = {
+    let (idx, col, divider, header) = {
         let borrowed = cache.borrow();
         let Some((rect, layout)) = borrowed.as_ref() else {
             return false;
@@ -606,6 +700,10 @@ pub(crate) fn route_plugin_view_table_click(
         let hit = layout.hit_test(pos.x - rect.x, pos.y - rect.y, scroll_offset, total_rows);
         let idx = match hit {
             quadraui::DataTableHit::Row { idx } => Some(idx),
+            _ => None,
+        };
+        let header = match hit {
+            quadraui::DataTableHit::Header { col } => Some(col),
             _ => None,
         };
         // A `HeaderDivider` hit takes priority over `Header`/row hits in the
@@ -622,8 +720,33 @@ pub(crate) fn route_plugin_view_table_click(
             .iter()
             .position(|c| local_x >= c.x && local_x < c.x + c.width)
             .filter(|&c| columns.get(c).is_some_and(|c| c.editable));
-        (idx, col, divider)
+        (idx, col, divider, header)
     };
+    let current_sort = active_table_sort(engine, name, columns.len());
+    let row_order = plugin_view_table_row_order(rows, current_sort);
+    // A header click cycles the sort for that column. Resolved while `rows` is
+    // still borrowed so the selection can follow its row across the reorder:
+    // selection is a display position, and the row the user had selected is at
+    // a different one once the order changes.
+    //
+    // Every press on a header cycles, including the one a backend reports as
+    // `DoubleClick` rather than `MouseDown` (the double-click detector
+    // *replaces* the second rapid press). Two quick clicks on a header
+    // therefore reach descending, exactly like two slow ones.
+    let header_cycle = header.map(|col| {
+        let next = next_table_sort(current_sort, col);
+        let declared = row_order
+            .get(
+                engine
+                    .plugin_view_selected(host)
+                    .min(total_rows.saturating_sub(1)),
+            )
+            .copied()
+            .unwrap_or(0);
+        let next_order = plugin_view_table_row_order(rows, next);
+        let next_sel = next_order.iter().position(|&d| d == declared).unwrap_or(0);
+        (next, next_sel)
+    });
     if let Some(col) = divider {
         engine.plugin_view_table_resize_drag = Some(PluginTableColumnDrag {
             view: name.to_string(),
@@ -632,21 +755,41 @@ pub(crate) fn route_plugin_view_table_click(
         });
         return true;
     }
+    if let Some((next, next_sel)) = header_cycle {
+        match next {
+            Some(spec) => {
+                engine.plugin_view_table_sort.insert(name.to_string(), spec);
+            }
+            None => {
+                engine.plugin_view_table_sort.remove(name);
+            }
+        }
+        engine.set_plugin_view_selected(host, next_sel);
+        engine.plugin_view_ensure_visible(host);
+        return true;
+    }
     let Some(idx) = idx else { return false };
     engine.set_plugin_view_selected(host, idx);
     if let Some(col) = col {
         engine.set_plugin_view_table_col(host, col);
     }
+    // The selection is a display position; the plugin indexes its own rows by
+    // the order it declared them in, so that is what the event carries.
+    let declared_idx = row_order.get(idx).copied().unwrap_or(idx);
     engine.dispatch_plugin_view_event(PluginViewEvent {
         view: name.to_string(),
         widget_id: String::new(),
-        kind: ViewEventKind::ItemSelected { index: idx },
+        kind: ViewEventKind::ItemSelected {
+            index: declared_idx,
+        },
     });
     if is_double_click {
         engine.dispatch_plugin_view_event(PluginViewEvent {
             view: name.to_string(),
             widget_id: String::new(),
-            kind: ViewEventKind::ItemActivated { index: idx },
+            kind: ViewEventKind::ItemActivated {
+                index: declared_idx,
+            },
         });
     }
     true
@@ -754,8 +897,14 @@ pub(crate) fn handle_plugin_view_table_key(
             editable_cols.first().copied()
         }
     };
+    // Display position → declared row index, so a sorted table edits and
+    // reports the row the user can actually see.
+    let row_order =
+        plugin_view_table_row_order(rows, active_table_sort(engine, name, columns.len()));
+    let declared_row =
+        |display: usize| -> usize { row_order.get(display).copied().unwrap_or(display) };
     let cell_value = |sel: usize, col: usize| -> String {
-        rows.get(sel)
+        rows.get(declared_row(sel))
             .and_then(|r| r.cells.get(col))
             .cloned()
             .unwrap_or_default()
@@ -848,7 +997,7 @@ pub(crate) fn handle_plugin_view_table_key(
         let value = cell_value.unwrap_or_default();
         engine.plugin_view_text_edit = Some(PluginViewTextEditState {
             view: name.to_string(),
-            field_id: table_cell_field_id(sel, col),
+            field_id: table_cell_field_id(declared_row(sel), col),
             cursor: value.len(),
             selection_anchor: None,
             value,
@@ -870,7 +1019,7 @@ pub(crate) fn handle_plugin_view_table_key(
         engine.set_plugin_view_table_col(host, editable_cols[next]);
         true
     } else {
-        navigate_flat_selection(engine, name, host, rows_len, key)
+        navigate_flat_selection(engine, name, host, rows_len, key, Some(&row_order))
     }
 }
 
