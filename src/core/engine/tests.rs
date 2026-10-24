@@ -34237,6 +34237,7 @@ fn ext_activity_panels_are_sorted_by_name_with_ext_prefixed_ids() {
                 icon,
                 fallback_icon: Some(icon),
                 sections: vec![],
+                toolbar: Vec::new(),
             },
         );
     }
@@ -34268,6 +34269,7 @@ fn test_ext_panel_h_focuses_activity_bar() {
             icon: 'B',
             fallback_icon: None,
             sections: vec![],
+            toolbar: Vec::new(),
         },
     );
     engine.ext_panels.insert(
@@ -34278,6 +34280,7 @@ fn test_ext_panel_h_focuses_activity_bar() {
             icon: 'A',
             fallback_icon: None,
             sections: vec![],
+            toolbar: Vec::new(),
         },
     );
     // Simulate "beta" ext panel being focused (sorted index 1 → toolbar idx 10).
@@ -34314,6 +34317,7 @@ fn test_ext_panel_left_focuses_activity_bar() {
             icon: 'M',
             fallback_icon: None,
             sections: vec![],
+            toolbar: Vec::new(),
         },
     );
     engine.ext_panel_has_focus = true;
@@ -34340,6 +34344,7 @@ fn engine_with_ext_panel_items(items: Vec<crate::core::plugin::ExtPanelItem>) ->
             icon: 'T',
             fallback_icon: Some('T'),
             sections: vec!["Log".to_string()],
+            toolbar: Vec::new(),
         },
     );
     engine

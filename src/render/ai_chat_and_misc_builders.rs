@@ -126,6 +126,7 @@ pub(crate) fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
             .get(panel_name)
             .cloned()
             .unwrap_or_default(),
+        toolbar: reg.toolbar.clone(),
     })
 }
 

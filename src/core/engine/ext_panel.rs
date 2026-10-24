@@ -597,6 +597,40 @@ impl Engine {
         let _ = (x, y); // Position reserved for future native menu rendering.
     }
 
+    /// Handle a click on the active ext panel's toolbar button `idx`
+    /// (`vimcode.panel.register`'s `toolbar` option).
+    /// Fires `panel_toolbar` with arg `"<panel_name>|<button_id>"`.
+    pub fn handle_ext_panel_toolbar_click(&mut self, idx: usize) {
+        let panel_name = match &self.ext_panel_active {
+            Some(n) => n.clone(),
+            None => return,
+        };
+        let Some(reg) = self.ext_panels.get(&panel_name) else {
+            return;
+        };
+        let Some(button) = reg.toolbar.get(idx) else {
+            return;
+        };
+        let arg = format!("{}|{}", panel_name, button.id);
+        self.plugin_event("panel_toolbar", &arg);
+    }
+
+    /// Stable `quadraui::WidgetId` for ext-panel toolbar button `idx`.
+    ///
+    /// Unlike the Explorer toolbar's fixed 5-button array
+    /// (`EXPLORER_TOOLBAR_ACTION_IDS`), a plugin panel's `toolbar` is
+    /// variable-length and plugin-chosen, so the id encodes the index
+    /// directly (`"ext_toolbar:<idx>"`) rather than looking one up in a
+    /// static table.
+    pub fn ext_toolbar_action_id(idx: usize) -> quadraui::WidgetId {
+        quadraui::WidgetId::new(format!("ext_toolbar:{idx}"))
+    }
+
+    /// Inverse of [`Self::ext_toolbar_action_id`].
+    pub fn ext_toolbar_action_index(id: &quadraui::WidgetId) -> Option<usize> {
+        id.as_str().strip_prefix("ext_toolbar:")?.parse().ok()
+    }
+
     /// Handle keyboard input for the extension panel input field.
     /// Returns `true` if the key was consumed.
     pub fn handle_ext_panel_input_key(

@@ -948,23 +948,47 @@ impl App {
 
                     let input_visible = panel.input_active || !panel.input_text.is_empty();
                     let header_title = format!(" {}", panel.title);
+                    // A registered `toolbar` (`vimcode.panel.register`'s
+                    // `toolbar` option) replaces the plain `Header` chrome
+                    // with a two-bar `StatusBars` chrome (title + button
+                    // row), the same shape `debug_sidebar_chrome` uses for
+                    // the Debug sidebar's title/action bars. `quadraui::
+                    // SidebarPanelChrome`'s variants are mutually exclusive,
+                    // so a toolbar can't be layered onto `HeaderAndSearch`
+                    // too — when the search row is active, fall back to
+                    // today's `HeaderAndSearch` chrome unchanged (no
+                    // regression: there was no toolbar at all before this).
+                    let show_toolbar = !panel.toolbar.is_empty() && !input_visible;
+                    let chrome = if input_visible {
+                        render::SidebarPanelChrome::HeaderAndSearch {
+                            header: header_title,
+                            query: panel.input_text.clone(),
+                            placeholder: String::new(),
+                            active: panel.input_active,
+                        }
+                    } else if show_toolbar {
+                        let (title_bar, toolbar_bar) = render::ext_panel_toolbar_status_bars(
+                            &header_title,
+                            &panel.toolbar,
+                            theme,
+                        );
+                        render::SidebarPanelChrome::StatusBars(vec![title_bar, toolbar_bar])
+                    } else {
+                        render::SidebarPanelChrome::Header(header_title)
+                    };
                     let sidebar_panel = render::SidebarPanelBody {
                         background: None,
-                        chrome: if input_visible {
-                            render::SidebarPanelChrome::HeaderAndSearch {
-                                header: header_title,
-                                query: panel.input_text.clone(),
-                                placeholder: String::new(),
-                                active: panel.input_active,
-                            }
-                        } else {
-                            render::SidebarPanelChrome::Header(header_title)
-                        },
+                        chrome,
                         scrollbar_gutter: None,
                     };
                     let body =
                         render::ExtPanelTreeBody(render::ext_panel_to_tree_view(panel, theme));
                     let layout = sidebar_panel.render(backend, q_sb, &body);
+                    engine.ext_panel_toolbar_hits.replace(if show_toolbar {
+                        layout.status_bar_hit_regions.clone()
+                    } else {
+                        Vec::new()
+                    });
 
                     if layout.body_rect.height > 0.0 {
                         // Cache the exact `Backend::tree_layout` this

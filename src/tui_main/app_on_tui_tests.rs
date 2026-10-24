@@ -3035,6 +3035,7 @@ mod tests {
                     icon: '\u{f113}',
                     fallback_icon: Some('X'),
                     sections: vec!["Log".to_string()],
+                    toolbar: Vec::new(),
                 },
             );
             engine.ext_panel_help_bindings.insert(
@@ -3474,6 +3475,7 @@ mod tests {
                     icon: '\u{f113}',
                     fallback_icon: Some('Ж'),
                     sections: Vec::new(),
+                    toolbar: Vec::new(),
                 },
             );
             // Park the activity bar's keyboard cursor on the (only) plugin
