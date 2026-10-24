@@ -393,6 +393,62 @@ impl Engine {
         true
     }
 
+    /// Open `name` (a `vimcode.ui.register_view` view) as a new window
+    /// split alongside the active window, the way `vimcode.ui.open_view(
+    /// name, {location = "split"/"vsplit"})` is wired. `direction`/
+    /// `new_first` map onto quadraui's split-tree the same way
+    /// `Engine::split_window_with_new_first` does for an ordinary file
+    /// split — via the same `Engine::split_active_window_for_buffer`
+    /// helper, just handed a fresh scratch buffer instead of a file's.
+    ///
+    /// Shares every buffer-level and focus-level detail with
+    /// `Engine::open_plugin_view_tab` (`BufferState::plugin_view`,
+    /// `scratch_name`, `read_only`, deferred refresh,
+    /// `PluginViewHost::Tab`): rendering and key/event routing both key off
+    /// `BufferState::plugin_view` on the *active window's* buffer
+    /// (`Engine::active_plugin_view_tab`), which doesn't care whether that
+    /// window is a tab's sole window or a split sibling — only how the
+    /// window was placed into the layout differs between the two entry
+    /// points.
+    pub fn open_plugin_view_split(
+        &mut self,
+        name: &str,
+        direction: SplitDirection,
+        new_first: bool,
+    ) -> bool {
+        if !self.is_plugin_view(name) {
+            return false;
+        }
+        let title = self
+            .ext_panels
+            .get(name)
+            .map(|p| p.title.clone())
+            .unwrap_or_else(|| name.to_string());
+        let buf_id = self.buffer_manager.create();
+        self.split_active_window_for_buffer(buf_id, direction, new_first);
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.read_only = true;
+            state.dirty = false;
+            state.scratch_name = Some(title);
+            state.plugin_view = Some(name.to_string());
+        }
+        // See `open_plugin_view_tab`'s doc for why the refresh must be
+        // deferred when called from inside an already-running plugin
+        // callback.
+        if self.plugin_dispatch_depth == 0 {
+            self.refresh_plugin_view(name);
+        } else {
+            self.plugin_view_tab_pending_refresh.push(name.to_string());
+        }
+        let first = self
+            .plugin_views
+            .get(name)
+            .and_then(|v| v.first_focusable())
+            .unwrap_or(0);
+        self.plugin_view_focus_field(name, PluginViewHost::Tab, first);
+        true
+    }
+
     /// Read the selection index for `host`.
     pub(crate) fn plugin_view_selected(&self, host: PluginViewHost) -> usize {
         match host {
