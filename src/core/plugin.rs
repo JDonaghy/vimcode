@@ -4594,12 +4594,9 @@ impl PluginManager {
                     // `vimcode.panel.register`'s `toolbar` option populates this.
                     toolbar: Vec::new(),
                 };
-                // `opts.get::<_, bool>(...)` on a missing key returns `Ok(false)`
-                // (mlua's `bool::from_lua` maps `Nil` to `false`, Lua's own
-                // truthiness rule, not "key absent") — `unwrap_or(true)` would
-                // never fire. Go through `Option<bool>` instead, whose `Nil` ->
-                // `None` round-trip actually distinguishes "absent" from
-                // "explicitly false".
+                // `Option<bool>` maps an absent/`Nil` key to `None`, which
+                // defaults to `true`; only an explicit `sidebar = false`
+                // yields `Some(false)`.
                 let sidebar: bool = opts.get::<_, Option<bool>>("sidebar")?.unwrap_or(true);
                 if let Some(mut regs) = lua.app_data_mut::<PluginRegistrations>() {
                     regs.views.push(ViewRegistration {

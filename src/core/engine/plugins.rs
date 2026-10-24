@@ -235,10 +235,13 @@ impl Engine {
 
     /// The display title to use for a plugin view's tab/window title.
     ///
-    /// Reads the view's own declared `title` via
-    /// `PluginManager::view_title` first, so a tab-only (`sidebar = false`)
-    /// view — which has no `PanelRegistration` in `ext_panels` — still gets
-    /// its declared title instead of falling back to the raw view `name`.
+    /// Reads the view's own declared `title` via `PluginManager::view_title`,
+    /// which every registered view has (tab-only `sidebar = false` views
+    /// included, even though they have no `PanelRegistration` in
+    /// `ext_panels`). The `ext_panels` lookup and the `name` fallback below
+    /// are unreachable for a view that is actually registered — they exist
+    /// only so a caller that somehow asks for an unregistered name gets a
+    /// sane title instead of a panic.
     fn plugin_view_title(&self, name: &str) -> String {
         self.plugin_manager
             .as_ref()
