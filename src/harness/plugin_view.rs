@@ -249,6 +249,12 @@ vimcode.ui.register_view("{TEXT_VIEW}", {{
 vimcode.command("Zq1631ListOpenTab", function()
   vimcode.ui.open_view("{LIST_VIEW}", {{ location = "tab" }})
 end)
+
+-- The same for the `table`-kind view, so the header-divider resize gesture can
+-- be driven in an editor tab as well as the sidebar.
+vimcode.command("Zq1631TableOpenTab", function()
+  vimcode.ui.open_view("{TABLE_VIEW}", {{ location = "tab" }})
+end)
 "#
     )
 }
@@ -1065,6 +1071,199 @@ pub fn table_right_key_reaches_the_second_editable_column(driver: &mut impl Conf
     );
 }
 
+/// Locate `needle`'s painted text run.
+fn painted_run(driver: &impl ConformanceDriver, needle: &str) -> quadraui::event::Rect {
+    driver
+        .inventory()
+        .text_runs()
+        .iter()
+        .find(|r| r.text.contains(needle))
+        .map(|r| r.bounds)
+        .unwrap_or_else(|| {
+            panic!(
+                "painted_run: {needle:?} not painted; painted runs were {:?}",
+                painted(driver)
+            )
+        })
+}
+
+/// Column 1's header x-position, located by *order* rather than by text
+/// content: the run immediately to the right of column 0's header
+/// (`left_run`) on its own painted row. A table with a fixed total width
+/// redistributes space between columns on every drag, so a wide enough
+/// widen of column 0 can truncate column 1's header text down to one or two
+/// characters — ordering survives that truncation; matching on the full
+/// `TABLE_COL_VALUE` string would not.
+fn next_header_run_x(driver: &impl ConformanceDriver, left_run: quadraui::event::Rect) -> f32 {
+    driver
+        .inventory()
+        .text_runs()
+        .iter()
+        .filter(|r| {
+            (r.bounds.y - left_run.y).abs() < 0.5 && r.bounds.x >= left_run.x + left_run.width - 0.5
+        })
+        .map(|r| r.bounds.x)
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or_else(|| {
+            panic!(
+                "next_header_run_x: nothing painted right of {left_run:?}; painted runs were {:?}",
+                painted(driver)
+            )
+        })
+}
+
+/// Scenario 10c — dragging the divider between a table's first two header
+/// columns widens the left column, which shifts column 1's painted header
+/// right on screen, mirroring `crate::harness::drag_group_divider_resizes`'s
+/// pattern for the window-group divider. The drag goes rightward: pulling a
+/// divider right always grows the left column by construction
+/// (`DataTableLayout::drag_divider`'s `target` is unbounded above), so this
+/// holds regardless of how narrow the fixture's starting columns are —
+/// unlike a leftward drag, which the min-width floor could clamp back up.
+///
+/// The drag's start point is still read from the cached layout
+/// (`engine.plugin_view_table_layout`, or `plugin_view_tab_table_layout` for
+/// `host == PluginViewHost::Tab`) — same as
+/// [`table_header_click_sorts_the_painted_rows`]'s header click — because
+/// that only ever drives the input, never judges the outcome:
+/// the pass/fail assertion below reads nothing but `inventory().text_runs()`,
+/// the same painted output a user would see. The drag distance is a small,
+/// fixed amount rather than derived from the column's own width: a table
+/// has a fixed total width, so widening column 0 shrinks every column after
+/// it, and a large drag can squeeze column 1 down to nothing legible on a
+/// narrow TUI viewport before the assertion ever gets to look at it.
+///
+/// Drives the sidebar-hosted copy of the table;
+/// [`table_header_divider_drag_in_a_tab_resizes_the_column`] is the editor-tab
+/// twin. The two hosts reach the engine through entirely separate routing — the
+/// sidebar's via `App::try_route_sidebar_mouse_event`, an editor tab's via
+/// `App::try_route_tab_plugin_table_drag` — so both need driving.
+pub fn table_header_divider_drag_resizes_the_column<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    table_divider_drag_resizes_the_column(h, crate::core::engine::PluginViewHost::Sidebar);
+}
+
+/// Editor-tab twin of [`table_header_divider_drag_resizes_the_column`]: same
+/// gesture and same assertion, against a table opened with `location = "tab"`,
+/// whose `MouseMoved`/`MouseUp` follow-through is routed by
+/// `App::try_route_tab_plugin_table_drag` instead of the sidebar's capture path.
+pub fn table_header_divider_drag_in_a_tab_resizes_the_column<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    table_divider_drag_resizes_the_column(h, crate::core::engine::PluginViewHost::Tab);
+}
+
+fn table_divider_drag_resizes_the_column<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+    host: crate::core::engine::PluginViewHost,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    use crate::core::engine::PluginViewHost;
+    assert_paints(
+        &h.driver,
+        &[TABLE_COL_KEY, TABLE_COL_VALUE],
+        "the table-kind view's initial paint",
+    );
+    let (divider_x, y) = {
+        let engine = h.engine.borrow();
+        let cached = match host {
+            PluginViewHost::Sidebar => engine.plugin_view_table_layout.borrow(),
+            PluginViewHost::Tab => engine.plugin_view_tab_table_layout.borrow(),
+        };
+        let (rect, layout) = cached
+            .as_ref()
+            .expect("table_divider_drag_resizes_the_column: no frame painted yet");
+        let col0 = &layout.columns[0];
+        (
+            rect.x + col0.x + col0.width,
+            rect.y + layout.header_height / 2.0,
+        )
+    };
+    let col0_run_before = painted_run(&h.driver, TABLE_COL_KEY);
+    let col1_x_before = next_header_run_x(&h.driver, col0_run_before);
+    h.driver.drag(divider_x, y, divider_x + 2.0, y);
+    let col0_run_after = painted_run(&h.driver, TABLE_COL_KEY);
+    let col1_x_after = next_header_run_x(&h.driver, col0_run_after);
+    assert!(
+        col1_x_after > col1_x_before,
+        "dragging the header divider right must widen column 0, shifting \
+         column 1's painted header right: before {col1_x_before}, after \
+         {col1_x_after}; painted runs were {:?}",
+        painted(&h.driver)
+    );
+}
+
+/// Scenario 10d — clicking a table's column header cycles the sort for that
+/// column, and the *painted* row order follows: unsorted → ascending (the
+/// fixture's declared order already is ascending by key) → descending (the
+/// two rows swap places on screen) → unsorted again.
+///
+/// The click lands on the middle of the header cell, read back from the
+/// cached layout like [`table_header_divider_drag_resizes_the_column`] does,
+/// which keeps it clear of the header *divider* (a resize) for any column
+/// wider than twice quadraui's `DIVIDER_GRAB_PX` — comfortably true of the
+/// fixture's columns on both backends.
+pub fn table_header_click_sorts_the_painted_rows<D>(h: &mut crate::harness::ConformanceHarness<D>)
+where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    assert_paints(
+        &h.driver,
+        &[TABLE_COL_KEY, TABLE_ROW0_KEY, TABLE_ROW1_KEY],
+        "the table-kind view's initial paint",
+    );
+    assert!(
+        h.driver.inventory().above(TABLE_ROW0_KEY, TABLE_ROW1_KEY),
+        "precondition: the table starts in the plugin's declared row order, \
+         {TABLE_ROW0_KEY:?} above {TABLE_ROW1_KEY:?}; painted runs were {:?}",
+        painted(&h.driver)
+    );
+    let (header_x, header_y) = {
+        let engine = h.engine.borrow();
+        let cached = engine.plugin_view_table_layout.borrow();
+        let (rect, layout) = cached
+            .as_ref()
+            .expect("table_header_click_sorts_the_painted_rows: no frame painted yet");
+        let col0 = &layout.columns[0];
+        (
+            rect.x + col0.x + col0.width / 2.0,
+            rect.y + layout.header_height / 2.0,
+        )
+    };
+
+    h.driver.click(header_x, header_y);
+    assert!(
+        h.driver.inventory().above(TABLE_ROW0_KEY, TABLE_ROW1_KEY),
+        "one header click sorts column 0 ascending, which for this fixture is \
+         the order it already painted in ({TABLE_ROW0_KEY:?} above \
+         {TABLE_ROW1_KEY:?}); painted runs were {:?}",
+        painted(&h.driver)
+    );
+
+    h.driver.click(header_x, header_y);
+    assert!(
+        h.driver.inventory().above(TABLE_ROW1_KEY, TABLE_ROW0_KEY),
+        "a second header click sorts column 0 descending, so {TABLE_ROW1_KEY:?} \
+         must now paint above {TABLE_ROW0_KEY:?}; painted runs were {:?}",
+        painted(&h.driver)
+    );
+
+    h.driver.click(header_x, header_y);
+    assert!(
+        h.driver.inventory().above(TABLE_ROW0_KEY, TABLE_ROW1_KEY),
+        "a third header click clears the sort, restoring the plugin's declared \
+         row order ({TABLE_ROW0_KEY:?} above {TABLE_ROW1_KEY:?}); painted runs \
+         were {:?}",
+        painted(&h.driver)
+    );
+}
+
 /// Scenario 11 — a `kind = "text_view"` with more lines than fit the
 /// viewport starts scrolled to the top and scrolls to the bottom on `End`.
 pub fn text_view_scrolls_to_the_bottom_on_end(driver: &mut impl ConformanceDriver) {
@@ -1203,6 +1402,24 @@ mod tests {
     fn plugin_view_table_right_key_reaches_the_second_editable_column_on_tui() {
         let (mut h, _dir) = tui_named(TABLE_VIEW);
         table_right_key_reaches_the_second_editable_column(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_table_header_divider_drag_resizes_the_column_on_tui() {
+        let (mut h, _dir) = tui_named(TABLE_VIEW);
+        table_header_divider_drag_resizes_the_column(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_table_tab_header_divider_drag_resizes_the_column_on_tui() {
+        let (mut h, _dir) = tui_named_tab(TABLE_VIEW, "Zq1631TableOpenTab");
+        table_header_divider_drag_in_a_tab_resizes_the_column(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_table_header_click_sorts_the_painted_rows_on_tui() {
+        let (mut h, _dir) = tui_named(TABLE_VIEW);
+        table_header_click_sorts_the_painted_rows(&mut h);
     }
 
     #[test]
@@ -1376,6 +1593,27 @@ mod tests {
     fn plugin_view_table_right_key_reaches_the_second_editable_column_on_gtk() {
         let (mut h, _dir) = gtk_named(TABLE_VIEW);
         table_right_key_reaches_the_second_editable_column(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_header_divider_drag_resizes_the_column_on_gtk() {
+        let (mut h, _dir) = gtk_named(TABLE_VIEW);
+        table_header_divider_drag_resizes_the_column(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_tab_header_divider_drag_resizes_the_column_on_gtk() {
+        let (mut h, _dir) = gtk_named_tab(TABLE_VIEW, "Zq1631TableOpenTab");
+        table_header_divider_drag_in_a_tab_resizes_the_column(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_header_click_sorts_the_painted_rows_on_gtk() {
+        let (mut h, _dir) = gtk_named(TABLE_VIEW);
+        table_header_click_sorts_the_painted_rows(&mut h);
     }
 
     #[cfg(feature = "gui")]

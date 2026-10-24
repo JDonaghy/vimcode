@@ -2802,6 +2802,42 @@ struct PluginTimerEntry {
     seq: u64,
 }
 
+/// An in-progress header-divider drag on a `ViewBody::Table`-kind plugin
+/// view. Armed by `route_plugin_view_table_click` on a `HeaderDivider` hit,
+/// consulted by `continue_plugin_view_table_resize_drag` on every later
+/// `MouseMoved`, and cleared on `MouseUp`.
+///
+/// Carries `host` even though the resulting width override itself is
+/// host-independent (`plugin_view_table_col_overrides` is keyed by view
+/// name only): the sidebar and a Tab can host the same view at once, and
+/// `host` is how `continue_plugin_view_table_resize_drag` and the Tab-side
+/// router (`try_route_tab_plugin_table_drag` in `src/app/mouse_tabs.rs`)
+/// each confirm a `MouseMoved`/`MouseUp` belongs to *their* host's drag
+/// before acting on it, rather than both reacting to the same armed drag.
+pub(crate) struct PluginTableColumnDrag {
+    pub view: String,
+    pub host: PluginViewHost,
+    /// The column to the left of the dragged divider, as returned by
+    /// `quadraui::DataTableHit::HeaderDivider`.
+    pub col: usize,
+    /// The view's painted rect the drag is armed against, which puts the
+    /// pointer into the table's own coordinate space on every later move.
+    pub rect: quadraui::Rect,
+    /// The resolved table layout the gesture starts from.
+    ///
+    /// `quadraui::DataTableLayout::drag_divider` is a pure function of the
+    /// pointer position *relative to the layout it is called on*, and that is
+    /// what makes a drag reversible: the dragged column's width plus the
+    /// slack-absorbing last column's are the pre-gesture pair on every move,
+    /// so dragging back to the starting pointer position restores the
+    /// starting widths exactly.
+    pub layout: quadraui::DataTableLayout,
+    /// The snapshot of `Engine::plugin_view_table_col_overrides` for `view`
+    /// the gesture starts from — the `overrides` argument `drag_divider`
+    /// expects alongside `layout`.
+    pub overrides: Vec<Option<f32>>,
+}
+
 pub struct Engine {
     // --- Multi-buffer/window state ---
     pub buffer_manager: BufferManager,
@@ -4807,6 +4843,31 @@ pub struct Engine {
     #[allow(clippy::type_complexity)]
     pub plugin_view_tab_table_layout:
         std::cell::RefCell<Option<(quadraui::Rect, quadraui::DataTableLayout)>>,
+    /// Column-width overrides for `ViewBody::Table`-kind views, keyed by
+    /// view name and indexed by column — mirrors
+    /// `quadraui::DataTable::column_overrides` exactly, recomputed by
+    /// `quadraui::DataTableLayout::drag_divider` as the user drags a header
+    /// divider. Deliberately **not** split into a sidebar/tab twin pair like
+    /// every other piece of plugin-view-table state above: a column's width
+    /// is a property of the table's layout, which a plugin shares across
+    /// whichever host currently displays it, not of which host holds
+    /// keyboard focus right now (the thing the twin pairs exist to track).
+    pub plugin_view_table_col_overrides: HashMap<String, Vec<Option<f32>>>,
+    /// The active sort for `ViewBody::Table`-kind views, keyed by view name:
+    /// `(column, direction)`, absent when the table is painted in the
+    /// plugin's declared row order. Cycled by a header click
+    /// (unsorted → ascending → descending → unsorted).
+    ///
+    /// vimcode owns the row order because `quadraui::DataTable::sort` is
+    /// indicator-only — quadraui paints the arrow glyph on the sorted header
+    /// and never reorders `rows`. Keyed by view name and not split into a
+    /// sidebar/tab twin pair for the same reason
+    /// `plugin_view_table_col_overrides` isn't: a sort is a property of the
+    /// table the plugin declared, shared by whichever host displays it.
+    pub plugin_view_table_sort: HashMap<String, (usize, quadraui::SortDirection)>,
+    /// The in-progress header-divider drag on a `ViewBody::Table`-kind view,
+    /// if any — see `PluginTableColumnDrag`'s doc for its fields' meaning.
+    pub(crate) plugin_view_table_resize_drag: Option<PluginTableColumnDrag>,
     /// The selected *column* within a `ViewBody::Table`-kind view's selected
     /// row, in the sidebar. Separate from `ext_panel_selected` (which is the
     /// row) because a table author may mark more than one column `editable`
@@ -5630,6 +5691,9 @@ impl Engine {
             plugin_view_tab_list_layout: std::cell::RefCell::new(None),
             plugin_view_table_layout: std::cell::RefCell::new(None),
             plugin_view_tab_table_layout: std::cell::RefCell::new(None),
+            plugin_view_table_col_overrides: HashMap::new(),
+            plugin_view_table_sort: HashMap::new(),
+            plugin_view_table_resize_drag: None,
             ext_panel_table_col: 0,
             plugin_view_tab_table_col: 0,
             ext_panel_sections_expanded: HashMap::new(),

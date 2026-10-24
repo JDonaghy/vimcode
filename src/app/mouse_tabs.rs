@@ -1313,6 +1313,81 @@ impl App {
         quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h)
     }
 
+    /// Continue or end an editor-tab-hosted plugin table's header-divider
+    /// drag, called before the generic dispatch match (mirrors
+    /// `try_route_sidebar_mouse_event`'s early-intercept position in
+    /// `dispatch.rs`) so `MouseMoved`/`MouseUp` reach the drag even once the
+    /// pointer has strayed outside the view's window rect.
+    ///
+    /// Unlike the sidebar's `sidebar_pointer_captured` flag (which gates many
+    /// different interactions, not just table resize), a Tab-hosted drag
+    /// needs no separate capture flag: `Engine::plugin_view_table_resize_drag`
+    /// being armed for `PluginViewHost::Tab` *is* the capture state, and
+    /// `continue_plugin_view_table_resize_drag`/`end_plugin_view_table_resize_drag`
+    /// already check the drag's own `host`/`view` before acting on it.
+    ///
+    /// The rect from `plugin_view_tab_window_rect` is the view's *window* rect,
+    /// not the inner body rect the table paints into, and that is deliberate:
+    /// it serves only as "the view is still on screen" evidence. The follow-
+    /// through arms of `render::route_plugin_view_body_event`'s `table` branch
+    /// ignore the rect they are handed and put the pointer into table space
+    /// with the drag's own snapshotted
+    /// [`crate::core::engine::PluginTableColumnDrag::rect`] instead, so the
+    /// coordinate space is the one the gesture was armed in either way.
+    ///
+    /// Returns `false` (so the caller falls through to its usual handling)
+    /// when there is no active Tab-hosted drag, or the event isn't a
+    /// `MouseUp`/a left-button-held `MouseMoved`. A move with no button down
+    /// is plain hover and must stay available to the rest of the dispatch
+    /// (mirroring the sidebar's `ButtonMask { left: true, .. }` gate).
+    pub(crate) fn try_route_tab_plugin_table_drag(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        event: &quadraui::UiEvent,
+    ) -> bool {
+        use quadraui::UiEvent;
+        let follow_through = matches!(
+            event,
+            UiEvent::MouseUp { .. }
+                | UiEvent::MouseMoved {
+                    buttons: quadraui::ButtonMask { left: true, .. },
+                    ..
+                }
+        );
+        if !follow_through {
+            return false;
+        }
+        let mut engine = self.engine.borrow_mut();
+        let Some(drag) = engine.plugin_view_table_resize_drag.as_ref() else {
+            return false;
+        };
+        if drag.host != PluginViewHost::Tab {
+            return false;
+        }
+        let name = drag.view.clone();
+        let Some(rect) = self.plugin_view_tab_window_rect(&name) else {
+            // The view's tab is gone (closed, or replaced by another buffer)
+            // mid-gesture, so there is nothing left to resize and no later
+            // `MouseUp` would be routed to this view to clear the drag.
+            engine.plugin_view_table_resize_drag = None;
+            return false;
+        };
+        let consumed = render::route_plugin_view_body_event(
+            &mut engine,
+            &name,
+            PluginViewHost::Tab,
+            event,
+            rect,
+            backend,
+        )
+        .unwrap_or(false);
+        drop(engine);
+        if consumed {
+            self.draw_needed.set(true);
+        }
+        consumed
+    }
+
     // ── Drag-follow-through rung ──────────────────────────────────────
     //
     // Which gesture owns a move-with-the-button-held is
