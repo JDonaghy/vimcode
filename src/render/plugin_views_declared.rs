@@ -3,6 +3,34 @@ use crate::core::engine::PluginViewHost;
 
 // ─── Plugin-declared UI views ───────────────────────────────────────────────
 
+/// Parse a plugin-declared `date` field's ISO8601 `YYYY-MM-DD` string (an
+/// optional leading `-` negates the year) into a `quadraui::CalendarDate`.
+///
+/// Returns `None` for an empty or malformed string — callers fall back to
+/// an unset/default date rather than rejecting the whole view.
+fn parse_iso_date(s: &str) -> Option<quadraui::CalendarDate> {
+    let s = s.trim();
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(rest) => (-1, rest),
+        None => (1, s),
+    };
+    let mut parts = rest.splitn(3, '-');
+    let year: i32 = parts.next()?.parse().ok()?;
+    let month: u8 = parts.next()?.parse().ok()?;
+    let day: u8 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let year = sign * year;
+    if day < 1 || day > quadraui::CalendarDate::days_in_month(year, month) {
+        return None;
+    }
+    Some(quadraui::CalendarDate::new(year, month, day))
+}
+
 /// Adapt a plugin-declared [`crate::core::plugin_ui::PluginView`] into a
 /// `quadraui::Form`.
 ///
@@ -134,6 +162,13 @@ pub fn plugin_view_to_form(
                         })
                         .collect(),
                 },
+                ViewFieldKind::Date { value } => {
+                    let parsed = parse_iso_date(value);
+                    let mut picker =
+                        quadraui::DatePicker::new(wid(&f.id), parsed.unwrap_or_default());
+                    picker.selected = parsed;
+                    FieldKind::DatePicker(picker)
+                }
             };
             FormField {
                 id: wid(&f.id),
@@ -500,6 +535,12 @@ pub(crate) fn plugin_view_event_from_form_event(
             id,
             ViewEventKind::TextCommitted {
                 value: value.clone(),
+            },
+        ),
+        quadraui::FormEvent::DateChanged { id, value } => (
+            id,
+            ViewEventKind::DateChanged {
+                value: value.format(quadraui::DateFormat::Iso8601),
             },
         ),
         quadraui::FormEvent::FocusChanged { id } => (id, ViewEventKind::FocusChanged),

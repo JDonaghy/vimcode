@@ -51,6 +51,22 @@ pub const ROW_TOGGLE: &str = "TgZQ146";
 /// comment already names, just triggered by *editing* rather than by an
 /// already-too-long declared value. Starting empty leaves ample room.
 pub const ROW_EMPTY_TEXT_LABEL: &str = "EtZQ146";
+/// A `date`-kind row's label. Short on purpose: quadraui's inline `Form` row
+/// paint for `FieldKind::DatePicker` only draws the formatted value when
+/// `ix > label_right + 8.0` (`primitives/form.rs`), and the value here is a
+/// full ISO8601 date (10 chars, longer than this fixture's other row values)
+/// — the same column-budget trap [`ROW_EMPTY_TEXT_LABEL`] and [`LIST_DETAIL`]
+/// already name, just needing a shorter *label* rather than a shorter value
+/// to leave the column room the value needs.
+pub const ROW_DATE_LABEL: &str = "DtZ";
+/// That row's plugin-declared initial value (ISO8601 `YYYY-MM-DD`).
+pub const ROW_DATE_INITIAL: &str = "2024-01-01";
+/// The value painted after one `Right` keypress scrubs the focused day
+/// forward without yet confirming it (`FormController::handle_date_
+/// picker_key`'s `FocusMoved` arm — a `Consumed` navigation event that never
+/// reaches the plugin). Confirms the live scrub repaints the field even
+/// though [`COUNT_0`] must not have bumped yet.
+pub const ROW_DATE_SCRUBBED: &str = "2024-01-02";
 
 /// Registered view names for each `ViewBody` kind's fixture.
 pub const LIST_VIEW: &str = "zqxw1631list";
@@ -223,6 +239,7 @@ fn plugin_source() -> String {
     format!(
         r#"
 local count = 0
+local date_value = "{ROW_DATE_INITIAL}"
 
 vimcode.ui.register_view("{VIEW}", {{
   title = "{VIEW_TITLE}",
@@ -242,6 +259,8 @@ vimcode.ui.register_view("{VIEW}", {{
         {{ type = "button", id = "send", label = "{ROW_BUTTON}" }},
         {{ type = "text",   id = "etx",  label = "{ROW_EMPTY_TEXT_LABEL}",
            value = "" }},
+        {{ type = "date",   id = "dob",  label = "{ROW_DATE_LABEL}",
+           value = date_value }},
       }},
     }}
   end,
@@ -255,6 +274,9 @@ vimcode.ui.register_view("{VIEW}", {{
       -- #1627: every keystroke into the focused text field reaches here as
       -- a TextChanged event, and Enter reaches here once more as
       -- TextCommitted with the same (by-then-final) value.
+      count = count + 1
+    elseif event.widget_id == "dob" and event.kind == "DateChanged" then
+      date_value = event.value
       count = count + 1
     end
   end,
@@ -483,6 +505,8 @@ pub fn declared_tree_is_painted(driver: &impl ConformanceDriver) {
             ROW_TEXT_VALUE,
             ROW_TOGGLE,
             ROW_BUTTON,
+            ROW_DATE_LABEL,
+            ROW_DATE_INITIAL,
             COUNT_0,
         ],
         "the plugin-declared widget tree",
@@ -579,6 +603,58 @@ pub fn typing_edits_the_focused_text_field(driver: &mut impl ConformanceDriver) 
         driver.screen_has("n3ZQ146"),
         "Enter must commit the field (TextCommitted), bumping the counter a \
          third time; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 4b — a focused `date` field scrubs its live day with
+/// `Left`/`Right`/`Up`/`Down`/`PageUp`/`PageDown`, repainting on every
+/// keystroke, but only hands the plugin a [`crate::core::plugin_ui::
+/// ViewEventKind::DateChanged`] once `Enter` confirms the scrubbed day —
+/// `quadraui`'s `FormController::handle_date_picker_key` returns a plain
+/// `Consumed` (not a `FormAction`) for the scrub keys themselves, per its
+/// own "Date picker fields" doc.
+///
+/// `Tab` x4 walks from the initially-focused `url` field past `tls`, `send`
+/// and `etx` onto `dob`, the last declared field.
+pub fn scrubbing_and_confirming_a_date_field_reaches_the_plugin_handler(
+    driver: &mut impl ConformanceDriver,
+) {
+    assert!(
+        driver.screen_has(ROW_DATE_INITIAL),
+        "precondition: the date row must start at {ROW_DATE_INITIAL:?}; \
+         painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Right);
+    assert!(
+        driver.screen_has(ROW_DATE_SCRUBBED),
+        "Right on the focused date field must scrub the live day forward \
+         and repaint it ({ROW_DATE_SCRUBBED:?}); painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_0),
+        "scrubbing alone (no Enter) must not yet reach the plugin's \
+         on_event handler; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has(ROW_DATE_SCRUBBED),
+        "Enter must confirm the scrubbed day and keep it painted; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_1),
+        "Enter on the focused date field must reach the plugin's on_event \
+         handler as DateChanged and repaint ({COUNT_1:?}); painted runs \
+         were {:?}",
         painted(driver)
     );
 }
@@ -990,6 +1066,12 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_scrubbing_and_confirming_a_date_field_reaches_the_handler_on_tui() {
+        let (mut h, _dir) = tui();
+        scrubbing_and_confirming_a_date_field_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_tab_paints_and_click_reaches_the_handler_on_tui() {
         let (mut h, _dir) = tui_tab();
         tab_paints_and_click_reaches_the_plugin_handler(&mut h.driver);
@@ -1142,6 +1224,13 @@ mod tests {
     fn plugin_view_typing_edits_the_focused_text_field_on_gtk() {
         let (mut h, _dir) = gtk();
         typing_edits_the_focused_text_field(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_scrubbing_and_confirming_a_date_field_reaches_the_handler_on_gtk() {
+        let (mut h, _dir) = gtk();
+        scrubbing_and_confirming_a_date_field_reaches_the_plugin_handler(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]
