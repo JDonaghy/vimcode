@@ -4557,10 +4557,11 @@ impl PluginManager {
         // `"split"`, `"left"`/`"right"` for `"vsplit"`) pins which sibling
         // the new window lands on, overriding `splitbelow`/`splitright`;
         // omitting it falls back to those settings, the way `<C-w>s`/
-        // `<C-w>v` already do. A call with an unsupported `location`/`side`
-        // (or a `name` that isn't a registered view) is a Lua error rather
-        // than a silent no-op, matching `register_view`'s "fail loudly at
-        // the Lua/Rust boundary" convention.
+        // `<C-w>v` already do. A call with an unsupported `location`/`side`,
+        // a `side` from the wrong axis (e.g. `"left"` with `location =
+        // "split"`), or a `name` that isn't a registered view is a Lua
+        // error rather than a silent no-op, matching `register_view`'s
+        // "fail loudly at the Lua/Rust boundary" convention.
         //
         // Immediate ("live engine") API, like `vimcode.buffer.*`: opening a
         // tab or split is a structural engine mutation
@@ -4589,11 +4590,27 @@ impl PluginManager {
                         } else {
                             SplitDirection::Horizontal
                         };
-                        let new_first = match side.as_deref() {
-                            None => None,
-                            Some("above") | Some("left") => Some(true),
-                            Some("below") | Some("right") => Some(false),
-                            Some(other) => {
+                        let new_first = match (direction, side.as_deref()) {
+                            (_, None) => None,
+                            (SplitDirection::Horizontal, Some("above")) => Some(true),
+                            (SplitDirection::Horizontal, Some("below")) => Some(false),
+                            (SplitDirection::Vertical, Some("left")) => Some(true),
+                            (SplitDirection::Vertical, Some("right")) => Some(false),
+                            (SplitDirection::Horizontal, Some(other @ ("left" | "right"))) => {
+                                return Err(LuaError::RuntimeError(format!(
+                                    "vimcode.ui.open_view({name:?}): side {other:?} is for \
+                                     \"vsplit\", not \"split\" (expected \"above\" or \
+                                     \"below\")"
+                                )));
+                            }
+                            (SplitDirection::Vertical, Some(other @ ("above" | "below"))) => {
+                                return Err(LuaError::RuntimeError(format!(
+                                    "vimcode.ui.open_view({name:?}): side {other:?} is for \
+                                     \"split\", not \"vsplit\" (expected \"left\" or \
+                                     \"right\")"
+                                )));
+                            }
+                            (_, Some(other)) => {
                                 return Err(LuaError::RuntimeError(format!(
                                     "vimcode.ui.open_view({name:?}): unsupported side \
                                      {other:?} (expected \"above\", \"below\", \"left\" \
