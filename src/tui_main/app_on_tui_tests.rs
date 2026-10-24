@@ -8437,15 +8437,19 @@ mod tests {
                     .expect("a minimap-enabled window must publish a strip");
                 crate::render::minimap_strip_rect(mm)
             };
-            let strip_left = strip.x as usize;
+            // The TUI backend converts every `quadraui::Rect` (editor and
+            // minimap strip alike) to terminal cells by rounding to the
+            // nearest column, not truncating — match that here so this
+            // assertion's boundary lines up with the boundary the backend
+            // itself actually paints against.
+            let strip_left = strip.x.round() as usize;
 
             let screen = h.driver.screen();
             for (row_idx, row) in screen.lines().enumerate() {
                 let row_chars: Vec<char> = row.chars().collect();
                 for (col, &ch) in row_chars.iter().enumerate().skip(strip_left) {
                     assert_ne!(
-                        ch,
-                        'Z',
+                        ch, 'Z',
                         "row {row_idx} col {col}: buffer text marker 'Z' \
                          painted at or past the minimap strip's left edge \
                          (x={strip_left}); the editor text rect must be \
