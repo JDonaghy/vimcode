@@ -1065,6 +1065,62 @@ pub fn table_right_key_reaches_the_second_editable_column(driver: &mut impl Conf
     );
 }
 
+/// Scenario 10c — dragging the divider between a table's first two header
+/// columns widens the left column and records a per-view column-width
+/// override, mirroring `crate::harness::drag_group_divider_resizes`'s
+/// pattern for the window-group divider. The drag goes rightward: pulling a
+/// divider right always grows the left column by construction
+/// (`DataTableLayout::drag_divider`'s `target` is unbounded above), so this
+/// holds regardless of how narrow the fixture's starting columns are —
+/// unlike a leftward drag, which the min-width floor could clamp back up.
+pub fn table_header_divider_drag_resizes_the_column<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    assert_paints(
+        &h.driver,
+        &[TABLE_COL_KEY, TABLE_COL_VALUE],
+        "the table-kind view's initial paint",
+    );
+    let (divider_x, y, width_before) = {
+        let engine = h.engine.borrow();
+        let cached = engine.plugin_view_table_layout.borrow();
+        let (rect, layout) = cached
+            .as_ref()
+            .expect("table_header_divider_drag_resizes_the_column: no frame painted yet");
+        let col0 = &layout.columns[0];
+        (
+            rect.x + col0.x + col0.width,
+            rect.y + layout.header_height / 2.0,
+            col0.width,
+        )
+    };
+    h.driver.drag(divider_x, y, divider_x + 40.0, y);
+    let (width_after, has_override) = {
+        let engine = h.engine.borrow();
+        let cached = engine.plugin_view_table_layout.borrow();
+        let (_rect, layout) = cached
+            .as_ref()
+            .expect("table_header_divider_drag_resizes_the_column: no frame after the drag");
+        let has_override = engine
+            .plugin_view_table_col_overrides
+            .get(TABLE_VIEW)
+            .map(|overrides| overrides.iter().any(|w| w.is_some()))
+            .unwrap_or(false);
+        (layout.columns[0].width, has_override)
+    };
+    assert!(
+        width_after > width_before,
+        "dragging the header divider right must widen column 0: before \
+         {width_before}, after {width_after}"
+    );
+    assert!(
+        has_override,
+        "the drag must record a column-width override for {TABLE_VIEW:?}"
+    );
+}
+
 /// Scenario 11 — a `kind = "text_view"` with more lines than fit the
 /// viewport starts scrolled to the top and scrolls to the bottom on `End`.
 pub fn text_view_scrolls_to_the_bottom_on_end(driver: &mut impl ConformanceDriver) {
@@ -1203,6 +1259,12 @@ mod tests {
     fn plugin_view_table_right_key_reaches_the_second_editable_column_on_tui() {
         let (mut h, _dir) = tui_named(TABLE_VIEW);
         table_right_key_reaches_the_second_editable_column(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_table_header_divider_drag_resizes_the_column_on_tui() {
+        let (mut h, _dir) = tui_named(TABLE_VIEW);
+        table_header_divider_drag_resizes_the_column(&mut h);
     }
 
     #[test]
@@ -1376,6 +1438,13 @@ mod tests {
     fn plugin_view_table_right_key_reaches_the_second_editable_column_on_gtk() {
         let (mut h, _dir) = gtk_named(TABLE_VIEW);
         table_right_key_reaches_the_second_editable_column(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_header_divider_drag_resizes_the_column_on_gtk() {
+        let (mut h, _dir) = gtk_named(TABLE_VIEW);
+        table_header_divider_drag_resizes_the_column(&mut h);
     }
 
     #[cfg(feature = "gui")]

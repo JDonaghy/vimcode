@@ -17,7 +17,7 @@ use super::*;
 // so there is never a collision, and it keeps `Engine`'s field count from
 // growing by one pair per widget kind.
 
-use crate::core::engine::PluginViewHost;
+use crate::core::engine::{PluginTableColumnDrag, PluginViewHost};
 use crate::core::plugin_ui::{
     table_cell_field_id, ViewBody, ViewListItem, ViewTableColumn, ViewTableRow, ViewTreeNode,
 };
@@ -463,6 +463,7 @@ pub(crate) fn handle_plugin_view_tree_key(
 
 // ── Table ────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn plugin_view_to_table(
     view: &str,
     columns: &[ViewTableColumn],
@@ -471,6 +472,7 @@ fn plugin_view_to_table(
     scroll_top: usize,
     has_focus: bool,
     cell_edit: Option<&crate::core::plugin_ui::PluginViewTextEditState>,
+    column_overrides: &[Option<f32>],
 ) -> quadraui::DataTable {
     use crate::core::plugin_ui::namespaced_widget_id;
     use quadraui::{Column, ColumnWidth, DataRow, DataTable, Decoration, StyledText, WidgetId};
@@ -519,7 +521,7 @@ fn plugin_view_to_table(
         show_scrollbar: true,
         min_total_width: None,
         h_scroll: 0.0,
-        column_overrides: Vec::new(),
+        column_overrides: column_overrides.to_vec(),
         footer: None,
     }
 }
@@ -544,8 +546,20 @@ pub(crate) fn paint_plugin_view_table(
         .plugin_view_text_edit
         .as_ref()
         .filter(|e| e.view == name);
+    let empty_overrides: Vec<Option<f32>> = Vec::new();
+    let column_overrides = engine
+        .plugin_view_table_col_overrides
+        .get(name)
+        .unwrap_or(&empty_overrides);
     let table = plugin_view_to_table(
-        name, columns, rows, selected, scroll_top, has_focus, cell_edit,
+        name,
+        columns,
+        rows,
+        selected,
+        scroll_top,
+        has_focus,
+        cell_edit,
+        column_overrides,
     );
     let layout = backend.draw_data_table(rect, &table, None);
     let cache = match host {
@@ -584,13 +598,22 @@ pub(crate) fn route_plugin_view_table_click(
     // an `editable` column is worth recording; a click on a read-only
     // column leaves the last editable selection alone rather than clearing
     // it to a column `Enter` could never open anyway.
-    let (idx, col) = {
+    let (idx, col, divider) = {
         let borrowed = cache.borrow();
         let Some((rect, layout)) = borrowed.as_ref() else {
             return false;
         };
-        let idx = match layout.hit_test(pos.x - rect.x, pos.y - rect.y, scroll_offset, total_rows) {
+        let hit = layout.hit_test(pos.x - rect.x, pos.y - rect.y, scroll_offset, total_rows);
+        let idx = match hit {
             quadraui::DataTableHit::Row { idx } => Some(idx),
+            _ => None,
+        };
+        // A `HeaderDivider` hit takes priority over `Header`/row hits in the
+        // same zone (quadraui's own `hit_test` already checks dividers
+        // first) — a non-double-click divider hit arms a resize drag instead
+        // of touching selection.
+        let divider = match hit {
+            quadraui::DataTableHit::HeaderDivider { col } if !is_double_click => Some(col),
             _ => None,
         };
         let local_x = pos.x - rect.x;
@@ -599,8 +622,16 @@ pub(crate) fn route_plugin_view_table_click(
             .iter()
             .position(|c| local_x >= c.x && local_x < c.x + c.width)
             .filter(|&c| columns.get(c).is_some_and(|c| c.editable));
-        (idx, col)
+        (idx, col, divider)
     };
+    if let Some(col) = divider {
+        engine.plugin_view_table_resize_drag = Some(PluginTableColumnDrag {
+            view: name.to_string(),
+            host,
+            col,
+        });
+        return true;
+    }
     let Some(idx) = idx else { return false };
     engine.set_plugin_view_selected(host, idx);
     if let Some(col) = col {
@@ -619,6 +650,54 @@ pub(crate) fn route_plugin_view_table_click(
         });
     }
     true
+}
+
+/// Floor a dragged (or the rightmost, slack-absorbing) plugin-view table
+/// column is clamped to — mirrors the floor every other quadraui
+/// `DataTableLayout::drag_divider` caller in-tree uses.
+const MIN_TABLE_COLUMN_WIDTH: f32 = 20.0;
+
+/// Continue a header-divider drag armed by `route_plugin_view_table_click`'s
+/// `HeaderDivider` branch, recomputing `Engine::plugin_view_table_col_overrides`
+/// from the pointer's current position via `quadraui::DataTableLayout::
+/// drag_divider`. Returns `false` when there is no drag in progress (so the
+/// caller's dispatch falls through to its usual "unconsumed" handling) rather
+/// than when the drag didn't move anything — a stationary pointer still
+/// "consumes" the event so it doesn't fall through to e.g. text selection.
+pub(crate) fn continue_plugin_view_table_resize_drag(
+    engine: &mut Engine,
+    pos: quadraui::Point,
+) -> bool {
+    let Some(drag) = engine.plugin_view_table_resize_drag.as_ref() else {
+        return false;
+    };
+    let view = drag.view.clone();
+    let host = drag.host;
+    let col = drag.col;
+    let existing = engine
+        .plugin_view_table_col_overrides
+        .get(&view)
+        .cloned()
+        .unwrap_or_default();
+    let cache = match host {
+        PluginViewHost::Sidebar => &engine.plugin_view_table_layout,
+        PluginViewHost::Tab => &engine.plugin_view_tab_table_layout,
+    };
+    let next = {
+        let borrowed = cache.borrow();
+        let Some((rect, layout)) = borrowed.as_ref() else {
+            return false;
+        };
+        layout.drag_divider(&existing, col, pos.x - rect.x, MIN_TABLE_COLUMN_WIDTH)
+    };
+    engine.plugin_view_table_col_overrides.insert(view, next);
+    true
+}
+
+/// End a header-divider drag on `MouseUp`. Returns `false` when there was no
+/// drag in progress.
+pub(crate) fn end_plugin_view_table_resize_drag(engine: &mut Engine) -> bool {
+    engine.plugin_view_table_resize_drag.take().is_some()
 }
 
 /// Keyboard handling for a `ViewBody::Table`-kind view. Uses the

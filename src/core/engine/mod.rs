@@ -2802,6 +2802,20 @@ struct PluginTimerEntry {
     seq: u64,
 }
 
+/// An in-progress header-divider drag on a `ViewBody::Table`-kind plugin
+/// view. Armed by `route_plugin_view_table_click` on a `HeaderDivider` hit,
+/// consulted by `continue_plugin_view_table_resize_drag` on every later
+/// `MouseMoved`, and cleared on `MouseUp` — see
+/// `Engine::plugin_view_table_resize_drag`'s doc for why this carries `host`
+/// even though the resulting width override itself is host-independent.
+pub(crate) struct PluginTableColumnDrag {
+    pub view: String,
+    pub host: PluginViewHost,
+    /// The column to the left of the dragged divider, as returned by
+    /// `quadraui::DataTableHit::HeaderDivider`.
+    pub col: usize,
+}
+
 pub struct Engine {
     // --- Multi-buffer/window state ---
     pub buffer_manager: BufferManager,
@@ -4807,6 +4821,19 @@ pub struct Engine {
     #[allow(clippy::type_complexity)]
     pub plugin_view_tab_table_layout:
         std::cell::RefCell<Option<(quadraui::Rect, quadraui::DataTableLayout)>>,
+    /// Column-width overrides for `ViewBody::Table`-kind views, keyed by
+    /// view name and indexed by column — mirrors
+    /// `quadraui::DataTable::column_overrides` exactly, recomputed by
+    /// `quadraui::DataTableLayout::drag_divider` as the user drags a header
+    /// divider. Deliberately **not** split into a sidebar/tab twin pair like
+    /// every other piece of plugin-view-table state above: a column's width
+    /// is a property of the table's layout, which a plugin shares across
+    /// whichever host currently displays it, not of which host holds
+    /// keyboard focus right now (the thing the twin pairs exist to track).
+    pub plugin_view_table_col_overrides: HashMap<String, Vec<Option<f32>>>,
+    /// The in-progress header-divider drag on a `ViewBody::Table`-kind view,
+    /// if any. See `PluginTableColumnDrag`.
+    pub(crate) plugin_view_table_resize_drag: Option<PluginTableColumnDrag>,
     /// The selected *column* within a `ViewBody::Table`-kind view's selected
     /// row, in the sidebar. Separate from `ext_panel_selected` (which is the
     /// row) because a table author may mark more than one column `editable`
@@ -5630,6 +5657,8 @@ impl Engine {
             plugin_view_tab_list_layout: std::cell::RefCell::new(None),
             plugin_view_table_layout: std::cell::RefCell::new(None),
             plugin_view_tab_table_layout: std::cell::RefCell::new(None),
+            plugin_view_table_col_overrides: HashMap::new(),
+            plugin_view_table_resize_drag: None,
             ext_panel_table_col: 0,
             plugin_view_tab_table_col: 0,
             ext_panel_sections_expanded: HashMap::new(),
