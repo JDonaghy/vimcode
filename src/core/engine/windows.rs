@@ -13,8 +13,8 @@ use crate::core::settings::ExplorerAction;
 /// cost the *split* pays once, not each window individually — so a single
 /// window's own `raw_axis_extent` still round-trips through `viewport_cols`
 /// unchanged; only the *pair's* total is one column short of the bounds
-/// width. Used by `split_window_with_new_first` and `resize_window_split` to
-/// convert between the two spaces when recovering or redistributing a
+/// width. Used by `split_active_window_for_buffer` and `resize_window_split`
+/// to convert between the two spaces when recovering or redistributing a
 /// split's axis size.
 fn raw_axis_extent(view: &View, direction: SplitDirection) -> f64 {
     match direction {
@@ -237,7 +237,7 @@ impl Engine {
         buffer_id: BufferId,
         direction: SplitDirection,
         new_first: bool,
-    ) -> WindowId {
+    ) {
         let current_window_id = self.active_window_id();
         let new_window_id = self.new_window_id();
         let mut new_window = Window::new(new_window_id, buffer_id);
@@ -294,8 +294,6 @@ impl Engine {
                 set_raw_axis_extent(&mut w.view, direction, new_raw);
             }
         }
-
-        new_window_id
     }
 
     /// Close the active window. Returns true if the window was closed.
