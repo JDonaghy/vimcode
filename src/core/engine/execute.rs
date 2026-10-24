@@ -6346,6 +6346,18 @@ impl Engine {
             });
         }
 
+        // Fall through to a plugin-registered `:[range]Name` command,
+        // carrying the resolved range through the call context so e.g.
+        // `:'<,'>SqlRun` can act on just the selected lines (exposed to the
+        // callback via `vimcode.state.range()`).
+        if !name.is_empty() {
+            let resolved_range =
+                range.map(|(a, b)| (a.max(0) as usize, (b.max(0) as usize).min(last_line)));
+            if self.plugin_run_command_ranged(name, args, resolved_range) {
+                return Some(EngineAction::None);
+            }
+        }
+
         None
     }
 

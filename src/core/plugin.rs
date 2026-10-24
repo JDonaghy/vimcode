@@ -912,6 +912,10 @@ pub struct PluginCallContext {
     pub settings_snapshot: HashMap<String, String>,
     /// Snapshot of panel input field texts: panel_name → current text.
     pub panel_input_snapshot: HashMap<String, String>,
+    /// `(first_line, last_line)` (1-indexed, inclusive) when this command was
+    /// invoked with an explicit address range (e.g. `:'<,'>Name`, `:1,5Name`,
+    /// `:%Name`). `None` when the command was called with no range.
+    pub cmd_range: Option<(usize, usize)>,
     // ── Outputs written by callbacks ────────────────────────────────────────
     pub message: Option<String>,
     /// `(0-based line index, new text)` — applied by the engine after the call.
@@ -3635,6 +3639,28 @@ impl PluginManager {
                         let t = lua.create_table()?;
                         t.set("line", *line)?;
                         t.set("col", *col)?;
+                        Ok(LuaValue::Table(t))
+                    }
+                    None => Ok(LuaValue::Nil),
+                }
+            })?,
+        )?;
+
+        // vimcode.state.range() → {first, last} (1-indexed, inclusive) when
+        // the command was invoked with an explicit address range (e.g.
+        // `:'<,'>Name`), or nil for a plain `:Name` call.
+        state.set(
+            "range",
+            lua.create_function(|lua, ()| {
+                let ctx = match lua.app_data_ref::<PluginCallContext>() {
+                    Some(c) => c,
+                    None => return Ok(LuaValue::Nil),
+                };
+                match ctx.cmd_range {
+                    Some((first, last)) => {
+                        let t = lua.create_table()?;
+                        t.set("first", first)?;
+                        t.set("last", last)?;
                         Ok(LuaValue::Table(t))
                     }
                     None => Ok(LuaValue::Nil),
