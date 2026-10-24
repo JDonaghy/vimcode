@@ -605,14 +605,21 @@ pub fn build_minimap_data(
     // mapping in the same bounded pass over sampled lines instead of a
     // second pass over the *entire* `buffer_state.highlights` vec, which
     // would be O(buffer). `buffer_state.highlights` is sorted by start
-    // byte, so for each sampled line this binary-searches to the handful
-    // of spans that start on it. `bounds` is *window*-relative, remapped
-    // to real buffer line numbers below.
+    // byte; a single capture (e.g. a multi-line block comment) can span
+    // many lines, so a highlight that *started* before this line can still
+    // overlap it via its end byte. `highlight_lo` is a frontier that only
+    // ever advances: `bounds[r]`/`block_sample_indices` yield real buffer
+    // lines in monotonically non-decreasing order across the whole loop,
+    // so once a highlight has fully ended at or before the current line's
+    // start it can never overlap any later line either, and is safe to
+    // drop for good. `bounds` is *window*-relative, remapped to real
+    // buffer line numbers below.
     let bounds = quadraui::primitives::minimap::block_bounds(window_len, target_lines);
     if bounds.len() < 2 {
         return None;
     }
     let mut raw_spans: Vec<quadraui::MinimapSpan> = Vec::new();
+    let mut highlight_lo = 0usize;
     for r in 0..bounds.len() - 1 {
         let indices: Vec<usize> = quadraui::primitives::minimap::block_sample_indices(
             bounds[r],
@@ -629,11 +636,13 @@ pub fn build_minimap_data(
             } else {
                 rope.len_bytes()
             };
-            let lo = buffer_state
-                .highlights
-                .partition_point(|h| h.0 < line_start);
+            while highlight_lo < buffer_state.highlights.len()
+                && buffer_state.highlights[highlight_lo].1 <= line_start
+            {
+                highlight_lo += 1;
+            }
             let hi = buffer_state.highlights.partition_point(|h| h.0 < line_end);
-            if lo >= hi {
+            if highlight_lo >= hi {
                 continue;
             }
             let slice = rope.line(i);
@@ -653,8 +662,13 @@ pub fn build_minimap_data(
                 let b = b.min(content_byte_len);
                 slice.byte_to_char(b).min(MINIMAP_COL_SCAN_LIMIT)
             };
-            for (start, end, scope) in &buffer_state.highlights[lo..hi] {
-                if end <= start {
+            for (start, end, scope) in &buffer_state.highlights[highlight_lo..hi] {
+                // `highlight_lo` only drops entries that are expired *and
+                // at the front* of the slice; an entry further inside
+                // `[highlight_lo..hi]` that already ended before this
+                // line (hidden behind a still-active earlier entry) is
+                // filtered here instead.
+                if end <= start || *end <= line_start {
                     continue;
                 }
                 let start_col = to_col(start.saturating_sub(line_start));
