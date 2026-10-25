@@ -1199,24 +1199,34 @@ local history = vimcode.storage.get("history") or {}
 
 ```lua
 local handle = vimcode.fs.walk(root, {
-    on_batch = function(paths) ... end,  -- called with a list of relative paths
-    on_done = function() ... end,
-    ignore_hidden = true,   -- default true; skips dotfiles/dirs
-    respect_gitignore = true,  -- default true
-})
+    hidden = false,      -- default false; set true to include dotfiles/dirs
+    max_depth = nil,     -- directory levels below root; nil/omitted = unlimited
+    include = { "*.lua" },  -- gitignore-glob patterns, relative to root
+    exclude = { "vendor/**" },
+}, function(paths) ... end,  -- on_batch: called with a list of root-relative paths
+   function() ... end)       -- on_done: called once, after the last batch
 handle:cancel()   -- Stop delivery; no further on_batch/on_done calls
 
 local handle = vimcode.fs.grep(root, pattern, {
-    on_batch = function(matches) ... end,  -- {path, line, text} per match
-    on_done = function() ... end,
-    ignore_hidden = true,
-    respect_gitignore = true,
-})
+    case_sensitive = false,
+    use_regex = false,   -- default false: pattern is matched literally
+    include = { "*.lua" },
+    exclude = { "vendor/**" },
+    max_results = 500,
+}, function(matches) ... end,  -- on_batch: {path, line, col, text} per match
+                                -- (1-indexed line, 1-indexed byte column)
+   function() ... end)         -- on_done
 ```
 
-- `walk` and `grep` stream matches from a background thread in batches, falling
-  back to a pure-Rust walker/matcher when `fd`/`rg` are not on `PATH`. `root` is
-  resolved as a directory, not through `~`/workspace-relative expansion.
+- `on_batch`/`on_done` are positional function arguments, not opts-table
+  fields — `opts` may be `nil`/`{}` but the two callbacks always follow it.
+- `walk`/`grep` always run the in-process, gitignore-aware walker
+  (`ignore::WalkBuilder`) on a background thread and stream results in
+  batches; neither shells out to `fd`/`rg`, so an extension never depends on
+  them being installed. Gitignore rules are always respected — there is no
+  option to turn that off. `root` resolves the same way `:w`/`:e` resolve
+  their argument: empty means the workspace root, and anything relative is
+  resolved against it (`~` is not expanded here).
 - `cancel()` stops delivery promptly: no batch or done callback fires afterward.
 
 ```lua
@@ -1228,8 +1238,12 @@ local text, err = vimcode.fs.read(path)
   `{ append = true }` to append instead. It never throws: on success it
   returns `true` with a `nil` error, on failure `nil` with the OS error
   message (e.g. a missing parent directory, which `write` does not create).
+  `content` is written as the raw bytes of the Lua string, so binary or
+  non-UTF-8 content round-trips correctly.
 - `read` returns the file's whole contents as a string, or `nil` plus an
-  error message if the file cannot be read.
+  error message if the file cannot be read, including when the file's
+  contents are not valid UTF-8 (reading arbitrary binary data back is not
+  supported in this version).
 - Both resolve `path` the same way `:w`/`:e` resolve their argument: a
   leading `~` expands to the home directory, and anything still relative is
   resolved against the workspace root.

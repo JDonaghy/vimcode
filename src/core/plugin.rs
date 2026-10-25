@@ -5080,14 +5080,19 @@ impl PluginManager {
         // workspace root, exactly like `:w`/`:e` (see
         // `Engine::resolve_path_arg`); missing parent directories are not
         // created. `opts.append` (default false) appends instead of
-        // truncating.
+        // truncating. `content` is taken as a `LuaString` rather than a
+        // Rust `String` — a Lua string is a byte string, so a `String`
+        // parameter (which requires valid UTF-8) would make writing
+        // arbitrary binary/latin-1 content throw an mlua conversion error,
+        // contradicting the "never throws" contract above.
         fs_tbl.set(
             "write",
             lua.create_function(
-                |_, (path, content, opts): (String, String, Option<LuaTable>)| {
+                |_, (path, content, opts): (String, LuaString, Option<LuaTable>)| {
                     let append = opts
                         .and_then(|o| o.get::<_, bool>("append").ok())
                         .unwrap_or(false);
+                    let content = content.as_bytes().to_vec();
                     let result = live_engine("vimcode.fs.write", move |e| {
                         e.plugin_api_fs_write(&path, &content, append)
                     })?;
