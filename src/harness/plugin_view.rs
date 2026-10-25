@@ -1204,6 +1204,23 @@ pub fn table_paints_and_enter_commits_a_cell_edit(driver: &mut impl ConformanceD
     );
 }
 
+/// Scenario 10a — a `kind = "table"` view's column headers paint even when
+/// its host panel is much shorter and narrower than the harness's usual
+/// generous viewport, e.g. a squeezed sidebar panel with room for only a
+/// couple of rows below the header.
+pub fn table_header_paints_at_a_short_narrow_panel(driver: &mut impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[
+            TABLE_COL_KEY,
+            TABLE_COL_VALUE,
+            TABLE_ROW0_KEY,
+            TABLE_ROW0_VALUE,
+        ],
+        "the table-kind view's header and first row at a short, narrow panel",
+    );
+}
+
 /// Scenario 10b — a table author who marks *more than one* column `editable`
 /// (e.g. a "Key"/"Value" pair) can reach the second editable column too, not
 /// just the first: `Right` moves the column selection before `Enter` starts
@@ -1553,11 +1570,22 @@ mod tests {
     /// Cell viewport for the TUI arm.
     const TUI_W: u16 = 120;
     const TUI_H: u16 = 30;
+    /// A much shorter, narrower cell viewport than `TUI_W`x`TUI_H` — shaped
+    /// like a squeezed sidebar panel rather than a full-screen window.
+    const TUI_SHORT_W: u16 = 40;
+    const TUI_SHORT_H: u16 = 8;
     /// Pixel viewport for the GTK arm.
     #[cfg(feature = "gui")]
     const W: i32 = 1400;
     #[cfg(feature = "gui")]
     const H: i32 = 900;
+    /// A much shorter, narrower pixel viewport than `W`x`H`, scaled by the
+    /// same proportions as `TUI_SHORT_W`/`TUI_SHORT_H` relative to
+    /// `TUI_W`/`TUI_H`.
+    #[cfg(feature = "gui")]
+    const W_SHORT: i32 = 480;
+    #[cfg(feature = "gui")]
+    const H_SHORT: i32 = 240;
 
     fn tui() -> (
         crate::harness::ConformanceHarness<
@@ -1594,6 +1622,22 @@ mod tests {
     ) {
         let (engine, dir) = engine_with_named_plugin_view(view);
         let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    /// Sidebar fixture for a named `ViewBody`-kind view at a short, narrow
+    /// viewport (TUI arm) — see `TUI_SHORT_W`/`TUI_SHORT_H`.
+    fn tui_named_short(
+        view: &str,
+    ) -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_named_plugin_view(view);
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_SHORT_W, TUI_SHORT_H);
         h.driver.render();
         (h, dir)
     }
@@ -1648,6 +1692,12 @@ mod tests {
     fn plugin_view_table_paints_and_enter_commits_a_cell_edit_on_tui() {
         let (mut h, _dir) = tui_named(TABLE_VIEW);
         table_paints_and_enter_commits_a_cell_edit(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_table_header_paints_at_a_short_narrow_panel_on_tui() {
+        let (mut h, _dir) = tui_named_short(TABLE_VIEW);
+        table_header_paints_at_a_short_narrow_panel(&mut h.driver);
     }
 
     #[test]
@@ -1806,6 +1856,23 @@ mod tests {
         (h, dir)
     }
 
+    /// Sidebar fixture for a named `ViewBody`-kind view at a short, narrow
+    /// viewport (GTK arm) — see `W_SHORT`/`H_SHORT`.
+    #[cfg(feature = "gui")]
+    fn gtk_named_short(
+        view: &str,
+    ) -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_named_plugin_view(view);
+        let mut h = crate::gtk::testing::conformance_harness(engine, W_SHORT, H_SHORT);
+        h.driver.render();
+        (h, dir)
+    }
+
     /// Editor-tab fixture for a named body-kind view (GTK arm).
     #[cfg(feature = "gui")]
     fn gtk_named_tab(
@@ -1863,6 +1930,13 @@ mod tests {
     fn plugin_view_table_paints_and_enter_commits_a_cell_edit_on_gtk() {
         let (mut h, _dir) = gtk_named(TABLE_VIEW);
         table_paints_and_enter_commits_a_cell_edit(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_header_paints_at_a_short_narrow_panel_on_gtk() {
+        let (mut h, _dir) = gtk_named_short(TABLE_VIEW);
+        table_header_paints_at_a_short_narrow_panel(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]
