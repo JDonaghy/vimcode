@@ -221,6 +221,45 @@ impl Engine {
         Ok(id as i64)
     }
 
+    /// `vimcode.fs.write(path, content, append)`: write `content` to `path`
+    /// synchronously, replacing any existing file (or appending to it when
+    /// `append` is true). `path` is resolved the same way `:w`'s argument is
+    /// — [`Engine::resolve_path_arg`] expands a leading `~` then resolves
+    /// anything still relative against `self.cwd`. Returns the OS error's
+    /// message on failure (including a missing parent directory — this
+    /// never creates one) rather than panicking or propagating a Lua error,
+    /// so the binding can hand the extension an `(nil, err)` pair it can
+    /// recover from instead of an uncatchable throw.
+    pub(crate) fn plugin_api_fs_write(
+        &self,
+        path: &str,
+        content: &str,
+        append: bool,
+    ) -> Result<(), String> {
+        use std::io::Write;
+        let path = self.resolve_path_arg(path);
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.write(true).create(true);
+        if append {
+            open_opts.append(true);
+        } else {
+            open_opts.truncate(true);
+        }
+        let mut file = open_opts.open(&path).map_err(|e| e.to_string())?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| e.to_string())
+    }
+
+    /// `vimcode.fs.read(path)`: read `path`'s whole contents as a string,
+    /// resolved the same way [`Engine::plugin_api_fs_write`] resolves its
+    /// `path` argument. Returns the OS error's message on failure (missing
+    /// file, permission denied, non-UTF-8 content, ...) rather than
+    /// propagating a Lua error.
+    pub(crate) fn plugin_api_fs_read(&self, path: &str) -> Result<String, String> {
+        let path = self.resolve_path_arg(path);
+        std::fs::read_to_string(&path).map_err(|e| e.to_string())
+    }
+
     /// `vimcode.fs.walk(...):cancel()` / `vimcode.fs.grep(...):cancel()` —
     /// stop the background walk promptly (it's checked between every
     /// entry/batch) and drop the handle immediately. No `on_batch`/`on_done`
