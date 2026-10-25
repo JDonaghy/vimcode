@@ -125,13 +125,19 @@ pub(crate) fn route_plugin_view_list_click(
     engine.dispatch_plugin_view_event(PluginViewEvent {
         view: name.to_string(),
         widget_id: String::new(),
-        kind: ViewEventKind::ItemSelected { index: idx },
+        kind: ViewEventKind::ItemSelected {
+            index: idx,
+            col: None,
+        },
     });
     if is_double_click {
         engine.dispatch_plugin_view_event(PluginViewEvent {
             view: name.to_string(),
             widget_id: String::new(),
-            kind: ViewEventKind::ItemActivated { index: idx },
+            kind: ViewEventKind::ItemActivated {
+                index: idx,
+                col: None,
+            },
         });
     }
     true
@@ -185,6 +191,7 @@ fn navigate_flat_selection(
             widget_id: String::new(),
             kind: ViewEventKind::ItemSelected {
                 index: declared(new_sel),
+                col: None,
             },
         });
         return true;
@@ -195,6 +202,7 @@ fn navigate_flat_selection(
             widget_id: String::new(),
             kind: ViewEventKind::ItemActivated {
                 index: declared(sel),
+                col: None,
             },
         });
         return true;
@@ -724,11 +732,14 @@ pub(crate) fn route_plugin_view_table_click(
     // result) only ever reports `Row { idx }` — no column component — so a
     // click's column is resolved separately here from the same per-column
     // `x`/`width` (`ResolvedColumn`) the layout already carries for
-    // painting, rather than a hand-rolled backend-specific hit-test. Only
-    // an `editable` column is worth recording; a click on a read-only
-    // column leaves the last editable selection alone rather than clearing
-    // it to a column `Enter` could never open anyway.
-    let (idx, col, divider, header, baseline) = {
+    // painting, rather than a hand-rolled backend-specific hit-test.
+    // `clicked_col` is unfiltered — it reports whatever column the pointer
+    // landed in, read-only or not, for the dispatched event. `editable_col`
+    // narrows that to only an `editable` column, since that is the one
+    // thing worth arming a cell edit on: a click on a read-only column
+    // leaves the last editable selection alone rather than clearing it to a
+    // column `Enter` could never open anyway.
+    let (idx, clicked_col, editable_col, divider, header, baseline) = {
         let borrowed = cache.borrow();
         let Some((rect, layout)) = borrowed.as_ref() else {
             return false;
@@ -751,16 +762,16 @@ pub(crate) fn route_plugin_view_table_click(
             _ => None,
         };
         let local_x = pos.x - rect.x;
-        let col = layout
+        let clicked_col = layout
             .columns
             .iter()
-            .position(|c| local_x >= c.x && local_x < c.x + c.width)
-            .filter(|&c| columns.get(c).is_some_and(|c| c.editable));
+            .position(|c| local_x >= c.x && local_x < c.x + c.width);
+        let editable_col = clicked_col.filter(|&c| columns.get(c).is_some_and(|c| c.editable));
         // Snapshotted only for a divider press, which is the only hit that
         // needs the pre-gesture geometry to survive the frames the drag
         // spans (`PluginTableColumnDrag::layout`).
         let baseline = divider.map(|_| (*rect, layout.clone()));
-        (idx, col, divider, header, baseline)
+        (idx, clicked_col, editable_col, divider, header, baseline)
     };
     // Arm the resize drag and return before computing the sort cycle below:
     // `divider` and `header` come from mutually exclusive `DataTableHit`
@@ -826,7 +837,7 @@ pub(crate) fn route_plugin_view_table_click(
     }
     let Some(idx) = idx else { return false };
     engine.set_plugin_view_selected(host, idx);
-    if let Some(col) = col {
+    if let Some(col) = editable_col {
         engine.set_plugin_view_table_col(host, col);
     }
     // The selection is a display position; the plugin indexes its own rows by
@@ -837,6 +848,7 @@ pub(crate) fn route_plugin_view_table_click(
         widget_id: String::new(),
         kind: ViewEventKind::ItemSelected {
             index: declared_idx,
+            col: clicked_col,
         },
     });
     if is_double_click {
@@ -845,6 +857,7 @@ pub(crate) fn route_plugin_view_table_click(
             widget_id: String::new(),
             kind: ViewEventKind::ItemActivated {
                 index: declared_idx,
+                col: clicked_col,
             },
         });
     }

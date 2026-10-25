@@ -2636,8 +2636,15 @@ impl PluginManager {
             ViewEventKind::TextChanged { value }
             | ViewEventKind::TextCommitted { value }
             | ViewEventKind::DateChanged { value } => tbl.set("value", value.as_str())?,
-            ViewEventKind::ItemSelected { index } | ViewEventKind::ItemActivated { index } => {
-                tbl.set("index", *index as i64)?
+            ViewEventKind::ItemSelected { index, col }
+            | ViewEventKind::ItemActivated { index, col } => {
+                tbl.set("index", *index as i64)?;
+                // `nil` (never a numeric `-1` or similar) when the view has no
+                // column concept (`List`) or the dispatch is keyboard-driven —
+                // see `ViewEventKind::ItemSelected`'s doc.
+                if let Some(col) = col {
+                    tbl.set("col", *col as i64)?;
+                }
             }
             ViewEventKind::NodeSelected { id }
             | ViewEventKind::NodeActivated { id }
@@ -6349,7 +6356,7 @@ mod tests {
             vimcode.ui.register_view("vext", {
                 render = function() return { kind = "list", items = {} } end,
                 on_event = function(ctx, event)
-                    last = event.kind .. "/" .. tostring(event.index)
+                    last = event.kind .. "/" .. tostring(event.index) .. "/" .. tostring(event.col)
                 end,
             })
             vimcode.command("Last", function() vimcode.message(last) end)
@@ -6359,14 +6366,19 @@ mod tests {
             &PluginViewEvent {
                 view: "vext".to_string(),
                 widget_id: String::new(),
-                kind: ViewEventKind::ItemActivated { index: 2 },
+                kind: ViewEventKind::ItemActivated {
+                    index: 2,
+                    col: None,
+                },
             },
             PluginCallContext::default(),
         );
         assert!(ctx.message.is_none());
         let (found, ctx) = pm.call_command("Last", "", PluginCallContext::default());
         assert!(found);
-        assert_eq!(ctx.message.as_deref(), Some("ItemActivated/2"));
+        // A `List`-kind event has no column concept, so `event.col` is Lua
+        // `nil`, not a stand-in numeric value.
+        assert_eq!(ctx.message.as_deref(), Some("ItemActivated/2/nil"));
     }
 
     #[test]

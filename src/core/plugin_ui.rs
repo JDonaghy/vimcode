@@ -533,13 +533,21 @@ pub enum ViewEventKind {
     FocusChanged,
     // ── ViewBody events ──────────────────────────────────────────────────
     /// A `List`/`Table` row moved into selection (index into
-    /// `items`/`rows`).
+    /// `items`/`rows`). `col` is the 0-based column a mouse click landed in
+    /// — `Some` for every `Table` click, including a read-only column,
+    /// since it reports what was clicked rather than what became editable;
+    /// `None` for a `List` view (no columns) and for keyboard navigation
+    /// (`j`/`k`/Home/End), which has no per-click column to report. Lua sees
+    /// this as `nil` when `None`.
     ItemSelected {
         index: usize,
+        col: Option<usize>,
     },
-    /// A `List`/`Table` row was activated (Enter or double-click).
+    /// A `List`/`Table` row was activated (Enter or double-click). `col`
+    /// follows the same convention as [`Self::ItemSelected`]'s.
     ItemActivated {
         index: usize,
+        col: Option<usize>,
     },
     /// A `Tree` node moved into selection, named by its declared id (a flat
     /// index would be unstable across expand/collapse).

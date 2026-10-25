@@ -1084,11 +1084,19 @@ cursor movement (`Left`/`Right`/`Home`/`End`), selection and clipboard (`Ctrl-A`
 |--------|------|--------------------|
 | `"list"` | `title`, `items = {{id=, text=, detail=}}` (`id` required) | `ItemSelected`, `ItemActivated` (`index`, 0-based) |
 | `"tree"` | `nodes = {{id=, label=, expanded=, children={...}}}` (`id` required) | `NodeSelected`, `NodeActivated`, `Expanded`, `Collapsed` (`node_id`) |
-| `"table"` | `columns = {{title=, editable=}}` (`title` required), `rows = {{id=, cells={...}}}` (`cells` required) | `ItemSelected`, `ItemActivated` (`index`), `CellEdited` (`row`, `col`, both 0-based, and `value`) |
+| `"table"` | `columns = {{title=, editable=}}` (`title` required), `rows = {{id=, cells={...}}}` (`cells` required) | `ItemSelected`, `ItemActivated` (`index`, `col`), `CellEdited` (`row`, `col`, both 0-based, and `value`) |
 | `"text_view"` | `text`, `filetype` | none (scrollable, read-only text) |
 
 "Activated" means `Enter` or a double-click. A view is either a field stack or one
 body, never both.
+
+**`col` on `ItemSelected`/`ItemActivated`.** For a `"table"` view, `event.col` is
+the 0-based column the mouse click landed in — whichever column was clicked, not
+just an `editable` one, since it reports what was clicked rather than what became
+editable. Keyboard-driven selection (`j`/`k`, `Home`/`End`) has no column to
+report, so `event.col` is `nil` then too. `"list"` views have no column concept at
+all, so `event.col` is always `nil` there — not a bug, just that list rows have no
+columns to report.
 
 ```lua
 vimcode.ui.register_view("my_list", {
