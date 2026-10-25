@@ -586,7 +586,9 @@ pub struct ExtPanelBadge {
 #[derive(Debug, Clone)]
 pub struct PanelContextMenuEntry {
     /// Plugin-chosen stable identifier, echoed back as the `key` field of
-    /// the `panel_action` event fired on confirm.
+    /// the `panel_action` event fired on confirm. `|` characters are
+    /// stripped by the Lua binding before this struct is built, since the
+    /// event arg is `|`-delimited.
     pub id: String,
     /// Display label.
     pub label: String,
@@ -4485,6 +4487,12 @@ impl PluginManager {
                 let mut entries = Vec::new();
                 for (_, row) in items_tbl.pairs::<usize, LuaTable>().flatten() {
                     let id: String = row.get("id").unwrap_or_default();
+                    // `id` is echoed verbatim into the `|`-delimited
+                    // `panel_action` event arg (`panel|section|item_id|id|index`),
+                    // so a literal `|` here would shift every field after
+                    // it — replace rather than reject so a plugin author's
+                    // typo doesn't silently drop the whole menu entry.
+                    let id = id.replace('|', "_");
                     let label: String = row.get("label").unwrap_or_default();
                     let disabled: bool = row.get("disabled").unwrap_or(false);
                     entries.push(PanelContextMenuEntry {

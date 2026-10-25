@@ -257,6 +257,17 @@ impl Engine {
 
     /// Handle keyboard input for an extension panel.
     /// Returns `true` if the key was consumed.
+    ///
+    /// The `panel_action` event's `key` field is a shared slot with two
+    /// sources: here it's a raw key name (e.g. `"d"`) or a matched
+    /// toolbar/binding action label, while `context_menu_confirm` (for an
+    /// `ExtPanel` target) instead puts the confirmed menu item's `id` there.
+    /// A plugin can tell them apart because it controls both vocabularies —
+    /// menu item ids it passed to `vimcode.panel.set_context_menu` and key
+    /// names/action labels it declared in its own bindings/toolbar — so
+    /// authors should pick menu item ids that can't collide with a key name
+    /// or action label they also bind (e.g. a multi-word id like
+    /// `"copy_link"` rather than a bare `"d"`).
     pub fn handle_ext_panel_key(&mut self, key: &str, ctrl: bool, unicode: Option<char>) -> bool {
         let panel_name = match &self.ext_panel_active {
             Some(n) => n.clone(),
@@ -617,6 +628,11 @@ impl Engine {
         if pending_panel != panel_name || items.is_empty() {
             return;
         }
+        // Seed at the first enabled item so an immediate Enter can't confirm
+        // a disabled entry — `handle_context_menu_key`'s j/k navigation
+        // already skips disabled items, so the initial selection should
+        // honor the same rule.
+        let selected = items.iter().position(|item| item.enabled).unwrap_or(0);
         self.context_menu = Some(ContextMenuState {
             target: ContextMenuTarget::ExtPanel {
                 panel_name,
@@ -625,7 +641,7 @@ impl Engine {
                 index,
             },
             items,
-            selected: 0,
+            selected,
             screen_x: x,
             screen_y: y,
             trigger_height: 0.0,

@@ -10023,6 +10023,127 @@ mod panel_surfaces {
         );
     }
 
+    /// Loads a real Lua plugin from a per-test, per-process temp dir so
+    /// `vimcode.panel.set_context_menu` runs through the actual plugin
+    /// runtime rather than a hand-built `ContextMenuItem` list — mirrors
+    /// `app_on_tui_tests::engine_with_plugin`'s fixture hygiene (clean
+    /// before *and* after, assert the fixture actually loaded) rather than
+    /// leaking a `/tmp` dir per run.
+    fn load_plugin_for_test(engine: &mut Engine, unique: &str, lua: &str) {
+        let dir = std::env::temp_dir().join(format!(
+            "vc_gtk_ext_panel_ctx_menu_{unique}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{unique}.lua")), lua).unwrap();
+
+        let mut mgr = crate::core::plugin::PluginManager::new()
+            .unwrap_or_else(|e| panic!("failed to create PluginManager: {e}"));
+        mgr.load_plugins_dir(&dir, &[]);
+        assert!(
+            mgr.plugins[0].error.is_none(),
+            "fixture plugin must load cleanly: {:?}",
+            mgr.plugins[0].error
+        );
+        engine.set_plugin_manager(mgr);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Right-clicking a plugin-panel row opens a native context menu built
+    /// from whatever the plugin declares via `vimcode.panel.set_context_menu`
+    /// — driven through the real right-click event path
+    /// (`App::route_ext_panel_sidebar_event`'s `MouseButton::Right` arm,
+    /// `render::ext_panel_right_click_index`), exactly like
+    /// `board_right_click_opens_context_menu_with_provider_actions` above.
+    /// Asserted on the *painted* menu, not engine state.
+    #[test]
+    fn ext_panel_right_click_opens_context_menu_with_plugin_items_on_gtk() {
+        let mut engine = small_engine();
+        engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some('X'),
+                sections: vec!["Log".to_string()],
+                toolbar: Vec::new(),
+            },
+        );
+        let items: Vec<crate::core::plugin::ExtPanelItem> = (0..3)
+            .map(|i| crate::core::plugin::ExtPanelItem {
+                text: format!("ctxmenu1448item{i}"),
+                id: format!("item{i}"),
+                ..Default::default()
+            })
+            .collect();
+        engine
+            .ext_panel_items
+            .insert(("git-insights".to_string(), "Log".to_string()), items);
+        engine.ext_panel_active = Some("git-insights".to_string());
+        if !engine.app_shell.sidebar_visible() {
+            engine.app_shell.toggle_sidebar();
+        }
+        load_plugin_for_test(
+            &mut engine,
+            "ctxmenu1448",
+            r#"
+            vimcode.on("panel_context_menu", function(arg)
+                local p = vimcode.panel.parse_event(arg)
+                vimcode.panel.set_context_menu(p.panel, {
+                    { id = "foo", label = "CtxMenu1448Foo" },
+                })
+            end)
+            "#,
+        );
+
+        let mut h = harness(engine, 1400, 900);
+
+        // Target the first real item row (flat index 1 — index 0 is the
+        // "Log" section header), resolving its painted position from the
+        // cached tree layout rather than a hand-rolled row formula, the
+        // same "paint caches, click reads" split `ext_panel_hit_flat_index`
+        // documents.
+        let target_flat_idx = 1usize;
+        let (body_rect, layout) = h
+            .engine
+            .borrow()
+            .ext_panel_tree_layout
+            .borrow()
+            .clone()
+            .expect("the plugin panel must have painted a tree layout");
+        let (row_rect, _) = layout
+            .hit_regions
+            .iter()
+            .find(|(_, hit)| matches!(hit, quadraui::TreeViewHit::Row(i) if *i == target_flat_idx))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a hit region for flat row {target_flat_idx}; got {:?}",
+                    layout.hit_regions
+                )
+            });
+        let cx = body_rect.x + row_rect.x + row_rect.width / 2.0;
+        let cy = body_rect.y + row_rect.y + row_rect.height / 2.0;
+
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(cx, cy),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("CtxMenu1448Foo"),
+            "right-clicking a plugin-panel row should open a context menu \
+             listing the item the plugin declared via \
+             vimcode.panel.set_context_menu; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     /// Clicking a link inside the panel-hover popup (source-control / extension-
     /// panel item dwell tooltip) was a complete no-op on GTK — this backend
     /// painted and cached `panel_hover_link_rects` but never read them back on
