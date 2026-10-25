@@ -170,6 +170,14 @@ pub const HEADER_EVENT_NONE: &str = "HeN1631";
 pub const HEADER_EVENT_COL0_SEEN: &str = "He01631";
 /// Painted once `on_event` has seen `HeaderClicked{{col: 1}}`.
 pub const HEADER_EVENT_COL1_SEEN: &str = "He11631";
+/// Second marker row's painted text before any body-row click reaches the
+/// plugin as `ItemSelected`.
+pub const HEADER_EVENT_CELL_NONE: &str = "HeCN1631";
+/// Painted once `on_event` has seen `ItemSelected{{col: Some(1)}}` from a
+/// click on row `m1`'s column 1 — both of this fixture's columns are
+/// read-only (neither declares `editable = true`), so this is the
+/// read-only-column case the event's `col` field reports for.
+pub const HEADER_EVENT_CELL_COL1_SEEN: &str = "HeMC1631";
 
 /// Registered view name for a dedicated table fixture with a declared
 /// column `width` — same two-column shape as [`TABLE_VIEW`] but column 0
@@ -276,6 +284,7 @@ vimcode.ui.register_view("{TEXT_VIEW}", {{
 }})
 
 local header_event_col = -1
+local cell_event_col = -1
 vimcode.ui.register_view("{HEADER_EVENT_VIEW}", {{
   title = "Zq1631E", icon = "E", fallback_icon = "E",
   render = function()
@@ -287,6 +296,12 @@ vimcode.ui.register_view("{HEADER_EVENT_VIEW}", {{
     else
       marker = "{HEADER_EVENT_NONE}"
     end
+    local cell_marker
+    if cell_event_col == 1 then
+      cell_marker = "{HEADER_EVENT_CELL_COL1_SEEN}"
+    else
+      cell_marker = "{HEADER_EVENT_CELL_NONE}"
+    end
     return {{
       kind = "table",
       columns = {{
@@ -295,12 +310,15 @@ vimcode.ui.register_view("{HEADER_EVENT_VIEW}", {{
       }},
       rows = {{
         {{ id = "m0", cells = {{ marker, "{HEADER_EVENT_COL1}v" }} }},
+        {{ id = "m1", cells = {{ cell_marker, "{HEADER_EVENT_COL1}v2" }} }},
       }},
     }}
   end,
   on_event = function(ctx, event)
     if event.kind == "HeaderClicked" then
       header_event_col = event.col
+    elseif event.kind == "ItemSelected" then
+      cell_event_col = event.col
     end
   end,
 }})
@@ -1494,6 +1512,48 @@ pub fn table_header_click_reaches_the_plugin_handler<D>(
     );
 }
 
+/// Scenario 10e2 — a click on a table **body** row's column dispatches
+/// `ItemSelected{{col}}` carrying the clicked column, resolved against *all*
+/// columns rather than only `editable` ones. [`HEADER_EVENT_VIEW`] declares
+/// neither column `editable`, so row `m1`'s column 1 is a read-only cell:
+/// clicking it must still report `col: Some(1)` on the dispatched event, even
+/// though the same click leaves cell-edit arming untouched (there is no
+/// editable column to arm here at all).
+pub fn table_body_click_reports_the_clicked_column_even_when_read_only<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    assert_paints(
+        &h.driver,
+        &[HEADER_EVENT_CELL_NONE],
+        "the fixture's initial paint, before any body-row click",
+    );
+
+    let (x, y) = {
+        let engine = h.engine.borrow();
+        let cached = engine.plugin_view_table_layout.borrow();
+        let (rect, layout) = cached.as_ref().expect(
+            "table_body_click_reports_the_clicked_column_even_when_read_only: \
+             no frame painted yet",
+        );
+        let column = &layout.columns[1];
+        (
+            rect.x + column.x + column.width / 2.0,
+            rect.y + layout.header_height + layout.row_height + layout.row_height / 2.0,
+        )
+    };
+    h.driver.click(x, y);
+    assert!(
+        h.driver.screen_has(HEADER_EVENT_CELL_COL1_SEEN),
+        "a click on row m1's read-only column 1 must dispatch \
+         ItemSelected{{col: Some(1)}} to the plugin and repaint the cell marker \
+         row as {HEADER_EVENT_CELL_COL1_SEEN:?}, even though neither column \
+         declares editable = true; painted runs were {:?}",
+        painted(&h.driver)
+    );
+}
+
 /// Scenario 10f — a column's declared `width` is honored as a `Fixed`
 /// quadraui column width rather than the even `Flex` split every column got
 /// before this field existed. [`WIDTH_VIEW`]'s column 0 declares a `width`
@@ -1728,6 +1788,12 @@ mod tests {
     fn plugin_view_table_header_click_reaches_the_plugin_handler_on_tui() {
         let (mut h, _dir) = tui_named(HEADER_EVENT_VIEW);
         table_header_click_reaches_the_plugin_handler(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_table_body_click_reports_the_clicked_column_even_when_read_only_on_tui() {
+        let (mut h, _dir) = tui_named(HEADER_EVENT_VIEW);
+        table_body_click_reports_the_clicked_column_even_when_read_only(&mut h);
     }
 
     #[test]
@@ -1972,6 +2038,13 @@ mod tests {
     fn plugin_view_table_header_click_reaches_the_plugin_handler_on_gtk() {
         let (mut h, _dir) = gtk_named(HEADER_EVENT_VIEW);
         table_header_click_reaches_the_plugin_handler(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_body_click_reports_the_clicked_column_even_when_read_only_on_gtk() {
+        let (mut h, _dir) = gtk_named(HEADER_EVENT_VIEW);
+        table_body_click_reports_the_clicked_column_even_when_read_only(&mut h);
     }
 
     #[cfg(feature = "gui")]
