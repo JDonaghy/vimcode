@@ -1195,6 +1195,45 @@ local history = vimcode.storage.get("history") or {}
 `contrib/extensions/rest-client/` is a complete extension built on `vimcode.ui`,
 `vimcode.http`, `vimcode.json` and `vimcode.storage`.
 
+### Filesystem (`vimcode.fs.*`)
+
+```lua
+local handle = vimcode.fs.walk(root, {
+    on_batch = function(paths) ... end,  -- called with a list of relative paths
+    on_done = function() ... end,
+    ignore_hidden = true,   -- default true; skips dotfiles/dirs
+    respect_gitignore = true,  -- default true
+})
+handle:cancel()   -- Stop delivery; no further on_batch/on_done calls
+
+local handle = vimcode.fs.grep(root, pattern, {
+    on_batch = function(matches) ... end,  -- {path, line, text} per match
+    on_done = function() ... end,
+    ignore_hidden = true,
+    respect_gitignore = true,
+})
+```
+
+- `walk` and `grep` stream matches from a background thread in batches, falling
+  back to a pure-Rust walker/matcher when `fd`/`rg` are not on `PATH`. `root` is
+  resolved as a directory, not through `~`/workspace-relative expansion.
+- `cancel()` stops delivery promptly: no batch or done callback fires afterward.
+
+```lua
+local ok, err = vimcode.fs.write(path, content, { append = false })
+local text, err = vimcode.fs.read(path)
+```
+
+- `write` replaces the file's entire contents by default; pass
+  `{ append = true }` to append instead. It never throws: on success it
+  returns `true` with a `nil` error, on failure `nil` with the OS error
+  message (e.g. a missing parent directory, which `write` does not create).
+- `read` returns the file's whole contents as a string, or `nil` plus an
+  error message if the file cannot be read.
+- Both resolve `path` the same way `:w`/`:e` resolve their argument: a
+  leading `~` expands to the home directory, and anything still relative is
+  resolved against the workspace root.
+
 ### Comment Style Override
 
 Override comment syntax for a language (useful for custom/niche languages):

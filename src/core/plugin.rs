@@ -5067,6 +5067,49 @@ impl PluginManager {
             )?,
         )?;
 
+        // `vimcode.fs.write(path, content, opts)` / `vimcode.fs.read(path)`:
+        // synchronous whole-file write/read, the only way a sandboxed
+        // extension (no `io`/`os` in the mlua sandbox) can produce or
+        // consume a file on disk. Unlike `walk`/`grep` these return directly
+        // rather than taking callbacks — a single read/write is cheap enough
+        // not to need a background thread. Error-return style, not
+        // exceptions: `(true)` on success or `(nil, err_string)` on
+        // failure, mirroring how `vimcode.loop.spawn`'s exit is reported
+        // rather than raising an uncatchable Lua error. `path` expands a
+        // leading `~` and resolves anything still relative against the
+        // workspace root, exactly like `:w`/`:e` (see
+        // `Engine::resolve_path_arg`); missing parent directories are not
+        // created. `opts.append` (default false) appends instead of
+        // truncating.
+        fs_tbl.set(
+            "write",
+            lua.create_function(
+                |_, (path, content, opts): (String, String, Option<LuaTable>)| {
+                    let append = opts
+                        .and_then(|o| o.get::<_, bool>("append").ok())
+                        .unwrap_or(false);
+                    let result = live_engine("vimcode.fs.write", move |e| {
+                        e.plugin_api_fs_write(&path, &content, append)
+                    })?;
+                    Ok::<(Option<bool>, Option<String>), LuaError>(match result {
+                        Ok(()) => (Some(true), None),
+                        Err(e) => (None, Some(e)),
+                    })
+                },
+            )?,
+        )?;
+
+        fs_tbl.set(
+            "read",
+            lua.create_function(|_, path: String| {
+                let result = live_engine("vimcode.fs.read", move |e| e.plugin_api_fs_read(&path))?;
+                Ok::<(Option<String>, Option<String>), LuaError>(match result {
+                    Ok(text) => (Some(text), None),
+                    Err(e) => (None, Some(e)),
+                })
+            })?,
+        )?;
+
         vimcode.set("fs", fs_tbl)?;
 
         // ── vimcode.editor subtable ────────────────────────────────────────

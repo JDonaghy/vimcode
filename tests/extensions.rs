@@ -9116,3 +9116,151 @@ fn fs_walk_cancel_stops_delivery_promptly_1806() {
         e.message
     );
 }
+
+// ── vimcode.fs.write / vimcode.fs.read ──────────────────────────────────────
+//
+// Synchronous whole-file write/read: the only way a sandboxed extension can
+// produce or consume a file on disk, since there is no `io`/`os` in the mlua
+// sandbox. Error-return style (`(true)` / `(nil, err)`), never a thrown Lua
+// error, mirroring `vimcode.loop.spawn`'s exit reporting.
+
+/// `vimcode.fs.write(path, content)` creates the file with exactly the given
+/// content and returns `true`; a second call with different content
+/// truncates and replaces rather than appending.
+///
+/// RED-verified against unfixed `develop`: no `vimcode.fs.write` function
+/// exists, so `pcall` fails and `_G.result` is never set.
+#[test]
+fn fs_write_creates_then_truncates_on_second_call_2040() {
+    let project = std::env::temp_dir().join(format!(
+        "vimcode_fs_write_2040_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let target = project.join("out.csv");
+
+    let mut e = engine_with_plugin(
+        "",
+        "fs_write_basic_2040",
+        r#"
+        vimcode.command("Write", function(path)
+            local ok, err = vimcode.fs.write(path, "a,b\n1,2\n")
+            vimcode.message(tostring(ok) .. "|" .. tostring(err))
+        end)
+        "#,
+    );
+    e.cwd = project.clone();
+
+    exec(&mut e, &format!("Write {}", target.display()));
+    assert_eq!(
+        e.message, "true|nil",
+        "first write must report (true, nil), got {:?}",
+        e.message
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "a,b\n1,2\n",
+        "the file must contain exactly the written content"
+    );
+
+    exec(&mut e, &format!("Write {}", target.display()));
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "a,b\n1,2\n",
+        "a second write with the same content must still leave exactly that content \
+         (replaced, not appended) — this would show stale doubled content if the \
+         call silently appended"
+    );
+}
+
+/// `vimcode.fs.write` to a path inside a nonexistent parent directory
+/// returns `(nil, <non-empty error>)` rather than throwing a Lua error the
+/// extension cannot catch.
+#[test]
+fn fs_write_to_unwritable_path_returns_nil_and_error_2040() {
+    let project = std::env::temp_dir().join(format!(
+        "vimcode_fs_write_bad_2040_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    // Parent directory `missing/` is never created — `fs.write` must not
+    // create it, so the write fails.
+    let target = project.join("missing").join("out.csv");
+
+    let mut e = engine_with_plugin(
+        "",
+        "fs_write_bad_path_2040",
+        r#"
+        vimcode.command("Write", function(path)
+            local ok, err = vimcode.fs.write(path, "x")
+            vimcode.message(tostring(ok) .. "|" .. tostring(err ~= nil and #err > 0))
+        end)
+        "#,
+    );
+    e.cwd = project;
+
+    exec(&mut e, &format!("Write {}", target.display()));
+    assert_eq!(
+        e.message, "nil|true",
+        "a write under a missing parent directory must return (nil, <non-empty error>), \
+         got {:?}",
+        e.message
+    );
+    assert!(
+        !target.exists(),
+        "fs.write must not create the missing parent directory"
+    );
+}
+
+/// `vimcode.fs.read` round-trips what `vimcode.fs.write` wrote, and reading
+/// a nonexistent path returns `(nil, <non-empty error>)`.
+#[test]
+fn fs_read_round_trips_write_and_errors_on_missing_file_2040() {
+    let project = std::env::temp_dir().join(format!(
+        "vimcode_fs_read_2040_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let target = project.join("roundtrip.txt");
+
+    let mut e = engine_with_plugin(
+        "",
+        "fs_read_roundtrip_2040",
+        r#"
+        vimcode.command("Write", function(path)
+            vimcode.fs.write(path, "hello\nworld\n")
+        end)
+        vimcode.command("Read", function(path)
+            local text, err = vimcode.fs.read(path)
+            vimcode.message(tostring(text) .. "|" .. tostring(err))
+        end)
+        vimcode.command("ReadMissing", function(path)
+            local text, err = vimcode.fs.read(path)
+            vimcode.message(tostring(text) .. "|" .. tostring(err ~= nil and #err > 0))
+        end)
+        "#,
+    );
+    e.cwd = project.clone();
+
+    exec(&mut e, &format!("Write {}", target.display()));
+    exec(&mut e, &format!("Read {}", target.display()));
+    assert_eq!(
+        e.message, "hello\nworld\n|nil",
+        "fs.read must return exactly what fs.write wrote, with a nil error, got {:?}",
+        e.message
+    );
+
+    let missing = project.join("does-not-exist.txt");
+    exec(&mut e, &format!("ReadMissing {}", missing.display()));
+    assert_eq!(
+        e.message, "nil|true",
+        "reading a nonexistent file must return (nil, <non-empty error>), got {:?}",
+        e.message
+    );
+}
