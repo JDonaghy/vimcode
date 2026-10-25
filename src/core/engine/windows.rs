@@ -2087,7 +2087,12 @@ impl Engine {
                 // goes out in the same canonical 5-field format
                 // `panel_select`/`panel_double_click`/etc. use —
                 // `vimcode.panel.parse_event` decodes it identically on the
-                // Lua side, with `key` carrying the chosen menu item's id.
+                // Lua side, with `key` carrying the chosen menu item's id
+                // (the same `id` the plugin passed to
+                // `vimcode.panel.set_context_menu`) rather than a pressed
+                // key name — see `Engine::handle_ext_panel_key`'s
+                // `panel_action` doc comment for the shared-slot convention
+                // plugin authors should follow to tell the two sources apart.
                 let arg = format!(
                     "{}|{}|{}|{}|{}",
                     panel_name, section, item_id, action, index

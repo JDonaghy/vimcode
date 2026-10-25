@@ -964,7 +964,7 @@ chosen item's `id`.
 |-------|----------|------|
 | `panel_focus` | panel name | Panel gains focus in sidebar |
 | `panel_select` | `"panel\|section\|id\|\|index"` | Enter pressed on item |
-| `panel_action` | `"panel\|section\|id\|key\|index"` | Other key pressed on item |
+| `panel_action` | `"panel\|section\|id\|key\|index"` | Other key pressed on item, or a context menu item confirmed (`key` is then the confirmed item's `id`, not a key name) |
 | `panel_expand` | `"panel\|section\|id\|\|index"` | Tree node expanded via Tab |
 | `panel_collapse` | `"panel\|section\|id\|\|index"` | Tree node collapsed via Tab |
 | `panel_double_click` | `"panel\|section\|id\|\|index"` | Double-click on item |
@@ -1229,7 +1229,7 @@ decimal string; use `tonumber(arg)`.
 | `git_branch_changed` | new branch name (or `""`) | External git branch change detected (rate-limited to once per 2s) |
 | `panel_focus` | panel name | Extension panel gains focus |
 | `panel_select` | `"panel\|section\|id\|\|index"` | Enter pressed on extension panel item |
-| `panel_action` | `"panel\|section\|id\|key\|index"` | Other key pressed on extension panel item |
+| `panel_action` | `"panel\|section\|id\|key\|index"` | Other key pressed on extension panel item, or a `panel_context_menu`-declared item confirmed (`key` is then that item's `id`) |
 | `panel_expand` | `"panel\|section\|id\|\|index"` | Tree node expanded via Tab |
 | `panel_collapse` | `"panel\|section\|id\|\|index"` | Tree node collapsed via Tab |
 | `panel_double_click` | `"panel\|section\|id\|\|index"` | Double-click on panel item |

@@ -591,7 +591,7 @@ fn ext_panel_context_menu_on_header() {
 /// Load a throwaway Lua plugin into `e`, mirroring `tests/extensions.rs`'s
 /// private `engine_with_plugin` helper (there is no in-memory/string-load
 /// API, so a real temp-dir `.lua` file is the only way to register a hook).
-fn load_plugin(e: &mut vimcode_core::Engine, plugin_name: &str, lua_code: &str) {
+fn load_plugin(engine: &mut vimcode_core::Engine, plugin_name: &str, lua_code: &str) {
     let dir = std::env::temp_dir().join(format!(
         "vc_ext_panel_ctx_menu_{plugin_name}_{}",
         std::process::id()
@@ -600,13 +600,17 @@ fn load_plugin(e: &mut vimcode_core::Engine, plugin_name: &str, lua_code: &str) 
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(format!("{plugin_name}.lua")), lua_code).unwrap();
 
-    match vimcode_core::core::plugin::PluginManager::new() {
-        Ok(mut mgr) => {
-            mgr.load_plugins_dir(&dir, &[]);
-            e.set_plugin_manager(mgr);
-        }
-        Err(e) => panic!("failed to create PluginManager: {e}"),
-    }
+    let mut mgr = vimcode_core::core::plugin::PluginManager::new()
+        .unwrap_or_else(|err| panic!("failed to create PluginManager: {err}"));
+    mgr.load_plugins_dir(&dir, &[]);
+    assert!(
+        mgr.plugins[0].error.is_none(),
+        "fixture plugin must load cleanly: {:?}",
+        mgr.plugins[0].error
+    );
+    engine.set_plugin_manager(mgr);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -1645,9 +1645,11 @@ pub enum ContextMenuTarget {
     },
     ExtPanel {
         panel_name: String,
-        /// The section the right-clicked item belongs to — empty when the
-        /// menu was opened on a section header row.
+        /// The section the right-clicked row belongs to; always resolved,
+        /// including for a section header row.
         section: String,
+        /// The right-clicked item's id — empty when the menu was opened on
+        /// a section header row rather than an item row.
         item_id: String,
         /// The right-clicked row's flat index, echoed back in the
         /// `panel_action` event so the plugin can resolve it the same way
