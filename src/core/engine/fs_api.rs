@@ -229,15 +229,19 @@ impl Engine {
     /// message on failure (including a missing parent directory — this
     /// never creates one) rather than panicking or propagating a Lua error,
     /// so the binding can hand the extension an `(nil, err)` pair it can
-    /// recover from instead of an uncatchable throw.
+    /// recover from instead of an uncatchable throw. `content` is taken as
+    /// raw bytes, not a UTF-8 `str` — a Lua string is a byte string, and
+    /// rejecting non-UTF-8 content here would reintroduce exactly the kind
+    /// of uncatchable conversion error this binding exists to avoid (e.g.
+    /// exporting a latin-1 dump or anything produced by a binary codec).
     pub(crate) fn plugin_api_fs_write(
         &self,
         path: &str,
-        content: &str,
+        content: &[u8],
         append: bool,
     ) -> Result<(), String> {
         use std::io::Write;
-        let path = self.resolve_path_arg(path);
+        let resolved = self.resolve_path_arg(path);
         let mut open_opts = std::fs::OpenOptions::new();
         open_opts.write(true).create(true);
         if append {
@@ -245,19 +249,23 @@ impl Engine {
         } else {
             open_opts.truncate(true);
         }
-        let mut file = open_opts.open(&path).map_err(|e| e.to_string())?;
-        file.write_all(content.as_bytes())
-            .map_err(|e| e.to_string())
+        let mut file = open_opts
+            .open(&resolved)
+            .map_err(|e| format!("{}: {e}", resolved.display()))?;
+        file.write_all(content)
+            .map_err(|e| format!("{}: {e}", resolved.display()))
     }
 
     /// `vimcode.fs.read(path)`: read `path`'s whole contents as a string,
     /// resolved the same way [`Engine::plugin_api_fs_write`] resolves its
     /// `path` argument. Returns the OS error's message on failure (missing
     /// file, permission denied, non-UTF-8 content, ...) rather than
-    /// propagating a Lua error.
+    /// propagating a Lua error. Unlike `write`, this returns a UTF-8 `String`
+    /// (a non-UTF-8 file is reported as an error rather than read) — see the
+    /// `fs.read` note in `EXTENSIONS.md`.
     pub(crate) fn plugin_api_fs_read(&self, path: &str) -> Result<String, String> {
-        let path = self.resolve_path_arg(path);
-        std::fs::read_to_string(&path).map_err(|e| e.to_string())
+        let resolved = self.resolve_path_arg(path);
+        std::fs::read_to_string(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))
     }
 
     /// `vimcode.fs.walk(...):cancel()` / `vimcode.fs.grep(...):cancel()` —

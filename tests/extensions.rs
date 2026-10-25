@@ -9124,21 +9124,29 @@ fn fs_walk_cancel_stops_delivery_promptly_1806() {
 // sandbox. Error-return style (`(true)` / `(nil, err)`), never a thrown Lua
 // error, mirroring `vimcode.loop.spawn`'s exit reporting.
 
-/// `vimcode.fs.write(path, content)` creates the file with exactly the given
-/// content and returns `true`; a second call with different content
-/// truncates and replaces rather than appending.
-///
-/// RED-verified against unfixed `develop`: no `vimcode.fs.write` function
-/// exists, so `pcall` fails and `_G.result` is never set.
-#[test]
-fn fs_write_creates_then_truncates_on_second_call_2040() {
-    let project = std::env::temp_dir().join(format!(
-        "vimcode_fs_write_2040_{}_{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
+/// Build an empty project dir for a `vimcode.fs.write`/`vimcode.fs.read` test
+/// to point `e.cwd` at. Unlike `engine_with_plugin_and_fs_project` (used by
+/// the `walk`/`grep` tests above), these tests write their own target files,
+/// so there is no fixture content to seed. Shares `plugin_fixture_dir`'s
+/// `vc_plugin_api_` prefix so `cleanup_stale_fixture_dirs` sweeps leftovers
+/// from past runs instead of letting them accumulate under `/tmp` forever.
+fn fs_write_project_dir(name: &str) -> std::path::PathBuf {
+    let project = plugin_fixture_dir(&format!("{name}_project"));
     let _ = std::fs::remove_dir_all(&project);
     std::fs::create_dir_all(&project).unwrap();
+    project
+}
+
+/// `vimcode.fs.write(path, content)` creates the file with exactly the given
+/// content and returns `true`; a second call with *different, shorter*
+/// content truncates and replaces rather than appending or leaving a stale
+/// tail. (A same-length-or-longer second payload would pass even if `write`
+/// opened the file without `truncate(true)`, since the old tail would just
+/// be overwritten in place — the second write here is deliberately shorter
+/// than the first so a missing truncate leaves a visible leftover byte.)
+#[test]
+fn fs_write_creates_then_truncates_on_second_call_2040() {
+    let project = fs_write_project_dir("fs_write_basic_2040");
     let target = project.join("out.csv");
 
     let mut e = engine_with_plugin(
@@ -9147,6 +9155,10 @@ fn fs_write_creates_then_truncates_on_second_call_2040() {
         r#"
         vimcode.command("Write", function(path)
             local ok, err = vimcode.fs.write(path, "a,b\n1,2\n")
+            vimcode.message(tostring(ok) .. "|" .. tostring(err))
+        end)
+        vimcode.command("WriteShort", function(path)
+            local ok, err = vimcode.fs.write(path, "x\n")
             vimcode.message(tostring(ok) .. "|" .. tostring(err))
         end)
         "#,
@@ -9165,13 +9177,12 @@ fn fs_write_creates_then_truncates_on_second_call_2040() {
         "the file must contain exactly the written content"
     );
 
-    exec(&mut e, &format!("Write {}", target.display()));
+    exec(&mut e, &format!("WriteShort {}", target.display()));
     assert_eq!(
         std::fs::read_to_string(&target).unwrap(),
-        "a,b\n1,2\n",
-        "a second write with the same content must still leave exactly that content \
-         (replaced, not appended) — this would show stale doubled content if the \
-         call silently appended"
+        "x\n",
+        "a second, shorter write must leave exactly the new content with no stale tail \
+         from the first (truncated, not appended or overwritten-in-place)"
     );
 }
 
@@ -9180,13 +9191,7 @@ fn fs_write_creates_then_truncates_on_second_call_2040() {
 /// extension cannot catch.
 #[test]
 fn fs_write_to_unwritable_path_returns_nil_and_error_2040() {
-    let project = std::env::temp_dir().join(format!(
-        "vimcode_fs_write_bad_2040_{}_{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&project);
-    std::fs::create_dir_all(&project).unwrap();
+    let project = fs_write_project_dir("fs_write_bad_path_2040");
     // Parent directory `missing/` is never created — `fs.write` must not
     // create it, so the write fails.
     let target = project.join("missing").join("out.csv");
@@ -9216,17 +9221,48 @@ fn fs_write_to_unwritable_path_returns_nil_and_error_2040() {
     );
 }
 
+/// `vimcode.fs.write(path, content, { append = true })` appends to existing
+/// content instead of truncating it.
+#[test]
+fn fs_write_append_true_concatenates_instead_of_truncating_2040() {
+    let project = fs_write_project_dir("fs_write_append_2040");
+    let target = project.join("log.txt");
+
+    let mut e = engine_with_plugin(
+        "",
+        "fs_write_append_2040",
+        r#"
+        vimcode.command("Write", function(path)
+            local ok, err = vimcode.fs.write(path, "first\n")
+            vimcode.message(tostring(ok) .. "|" .. tostring(err))
+        end)
+        vimcode.command("Append", function(path)
+            local ok, err = vimcode.fs.write(path, "second\n", { append = true })
+            vimcode.message(tostring(ok) .. "|" .. tostring(err))
+        end)
+        "#,
+    );
+    e.cwd = project.clone();
+
+    exec(&mut e, &format!("Write {}", target.display()));
+    exec(&mut e, &format!("Append {}", target.display()));
+    assert_eq!(
+        e.message, "true|nil",
+        "append must report (true, nil), got {:?}",
+        e.message
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "first\nsecond\n",
+        "append must concatenate onto the existing content rather than truncating it"
+    );
+}
+
 /// `vimcode.fs.read` round-trips what `vimcode.fs.write` wrote, and reading
 /// a nonexistent path returns `(nil, <non-empty error>)`.
 #[test]
 fn fs_read_round_trips_write_and_errors_on_missing_file_2040() {
-    let project = std::env::temp_dir().join(format!(
-        "vimcode_fs_read_2040_{}_{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&project);
-    std::fs::create_dir_all(&project).unwrap();
+    let project = fs_write_project_dir("fs_read_roundtrip_2040");
     let target = project.join("roundtrip.txt");
 
     let mut e = engine_with_plugin(
