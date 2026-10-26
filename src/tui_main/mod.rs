@@ -162,9 +162,11 @@ pub mod testing {
             backend,
             crate::render::UnitProfile::cell(),
         );
+        let picker_popup_rect = Rc::clone(&app.picker_popup_rect);
         crate::harness::install_folder_picker(&app, dir);
         let driver = driver_with_shell(app, config, width, height);
         ConformanceHarness::new(driver, engine, paint, cwd)
+            .with_picker_popup_rect(picker_popup_rect)
     }
 
     /// Alias of [`conformance_harness`] — both build the identical `App`.

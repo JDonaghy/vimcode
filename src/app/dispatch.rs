@@ -950,11 +950,18 @@ impl App {
                 if buttons.left {
                     let main = ctx.layout.main_content_bounds;
                     // The recovered (un-shrunk) height — see
-                    // `render::main_content_true_height`'s doc — so a drag
-                    // that clamps against the content height (e.g. the
-                    // picker popup bounds `handle_mouse_drag_msg` computes)
-                    // still clamps against the window's true bottom edge,
-                    // not `shell_config`'s static bottom-chrome reservation.
+                    // `render::main_content_true_height`'s doc — so the
+                    // terminal-split and explorer-resize arms below (which
+                    // clamp against this height directly) still clamp
+                    // against the window's true bottom edge, not
+                    // `shell_config`'s static bottom-chrome reservation.
+                    //
+                    // `handle_mouse_drag_msg`'s picker-scrollbar arm reuses
+                    // this same `viewport` for `PickerGeometry::compute`,
+                    // whose paint-time counterpart (`shell.rs`) passes the
+                    // already-shrunk editor area instead; a drag while the
+                    // picker's row budget is near that boundary can clamp
+                    // against a taller-than-painted viewport.
                     let viewport = quadraui::Rect::new(
                         main.x,
                         main.y,

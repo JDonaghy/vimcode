@@ -5053,6 +5053,53 @@ mod tests {
             );
         }
 
+        /// Mirrors `shell_app.rs`'s test of the same name: a click
+        /// outside the painted picker popup must dismiss it.
+        ///
+        /// Derives the click point from the live
+        /// [`crate::harness::ConformanceHarness::picker_popup`] rect rather
+        /// than a hand-guessed coordinate, so it keeps working regardless of
+        /// how `PickerGeometry::compute`'s sizing ratios change: one row
+        /// below the popup's own painted bottom edge is outside the popup on
+        /// every sizing, and (since the popup never paints flush against row
+        /// 0) is still clear of the tab strip, which claims `MouseDown`
+        /// before modal-overlay routing runs.
+        #[test]
+        fn click_outside_picker_popup_dismisses_it_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "fn main() {}\n");
+            engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+            let title = engine.picker_title.clone();
+            let mut h = harness_no_sidebar(engine);
+
+            known_bug_gate(
+                "app_on_tui::click_outside_picker_popup_dismisses_it_via_shell_app",
+                || {
+                    assert!(
+                        h.driver.screen_contains(&title),
+                        "precondition: the picker's title must paint; \
+                         screen:\n{}",
+                        h.driver.screen()
+                    );
+
+                    let (_, py, _, ph) = h
+                        .picker_popup()
+                        .expect("fixture must actually paint the picker popup");
+                    let click_y = py + ph + 1.0;
+
+                    h.driver.click(6.0, click_y);
+                    h.driver.render();
+                    let screen = h.driver.screen();
+                    assert!(
+                        !screen.contains(&title),
+                        "a click outside the painted popup must dismiss the \
+                         picker (route_modal_overlay_click's \
+                         PickerRoute::Dismiss arm); screen:\n{screen}"
+                    );
+                },
+            );
+        }
+
         /// The picker popup sizes to ~90% of the combined editor area
         /// spanning every tab group, in both width and height. Opens a
         /// picker with enough entries to saturate the row budget, so the
@@ -5060,12 +5107,21 @@ mod tests {
         /// `item_count`, then checks the live rect
         /// [`crate::harness::ConformanceHarness::picker_popup`] reports
         /// against the harness's own raw terminal size.
+        ///
+        /// **Verified RED against unfixed `develop`:** before this change,
+        /// `TUI_PICKER_SIZING.max_visible_ratio` was `0.6` with a 20-row cap
+        /// and `PickerGeometry::compute`'s `width_ratio` was `0.55` clamped
+        /// at 110 columns — against this test's 220x60 terminal that works
+        /// out to a height ratio of `20/60 ≈ 0.33` and a width ratio of
+        /// `110/220 = 0.5`, both outside the `[0.75, 0.95]` band asserted
+        /// below.
         #[test]
         fn picker_popup_sizes_to_90_percent_of_the_editor_area_via_shell_app() {
             let mut engine = plain_engine();
             engine.buffer_mut().insert(0, "fn main() {}\n");
             engine.open_picker(crate::core::engine::PickerSource::Keybindings);
             let title = engine.picker_title.clone();
+            let item_count = engine.picker_items.len();
             // Both safely under the sizing's width-clamp ceiling (~244
             // cols) and row-budget cap (~71 rows), so the 90% formulas
             // govern outright rather than either guard rail.
@@ -5077,6 +5133,17 @@ mod tests {
             known_bug_gate(
                 "app_on_tui::picker_popup_sizes_to_90_percent_of_the_editor_area_via_shell_app",
                 || {
+                    // At `HEIGHT` 60, `TUI_PICKER_SIZING`'s row budget
+                    // (`max_visible_ratio * viewport height`, minus the
+                    // header) is well under 50 rows, so this must hold for
+                    // `max_visible_ratio` — not `item_count` — to actually
+                    // govern `popup_h` below.
+                    assert!(
+                        item_count > 50,
+                        "fixture must have enough keybindings ({item_count}) \
+                         to saturate max_visible_ratio rather than being \
+                         governed by item_count"
+                    );
                     assert!(
                         h.driver.screen_contains(&title),
                         "precondition: the picker's title must paint; \

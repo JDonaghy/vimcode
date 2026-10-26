@@ -134,7 +134,7 @@ pub mod plugin_view;
 #[cfg(test)]
 pub mod rest_client;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -1592,7 +1592,7 @@ pub struct ConformanceHarness<D> {
     /// Lets a scenario assert a click point is outside the *live* painted
     /// popup instead of a hand-guessed coordinate, the same way
     /// `crate::gtk::testing::Harness::picker_popup` does for GTK.
-    picker_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
+    picker_popup_rect: Rc<Cell<Option<quadraui::Rect>>>,
     /// Held for the harness's whole lifetime — see
     /// `crate::test_paint::PaintGuard`'s own doc for why a headless paint
     /// harness must never run concurrently with another one on a second
@@ -1627,7 +1627,7 @@ impl<D> ConformanceHarness<D> {
             driver,
             engine,
             screen_layout: Rc::new(RefCell::new(None)),
-            picker_popup_rect: Rc::new(std::cell::Cell::new(None)),
+            picker_popup_rect: Rc::new(Cell::new(None)),
             _paint: paint,
             _cwd: cwd,
         }
@@ -1649,7 +1649,7 @@ impl<D> ConformanceHarness<D> {
             driver,
             engine,
             screen_layout,
-            picker_popup_rect: Rc::new(std::cell::Cell::new(None)),
+            picker_popup_rect: Rc::new(Cell::new(None)),
             _paint: paint,
             _cwd: cwd,
         }
@@ -1663,7 +1663,7 @@ impl<D> ConformanceHarness<D> {
     /// stay untouched.
     pub(crate) fn with_picker_popup_rect(
         mut self,
-        picker_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
+        picker_popup_rect: Rc<Cell<Option<quadraui::Rect>>>,
     ) -> Self {
         self.picker_popup_rect = picker_popup_rect;
         self
