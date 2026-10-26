@@ -1117,9 +1117,8 @@ mod tests {
         .is_none());
     }
 
-    /// Issue #2045: the popup must track ~90% of `viewport` — the combined
-    /// editor area spanning every tab group — in both width and height,
-    /// not a narrower fixed fraction.
+    /// The popup tracks ~90% of `viewport` — the combined editor area
+    /// spanning every tab group — in both width and height.
     #[test]
     fn picker_geometry_targets_90_percent_of_viewport_in_both_dimensions() {
         let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);

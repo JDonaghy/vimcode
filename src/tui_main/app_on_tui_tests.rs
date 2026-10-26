@@ -4983,13 +4983,13 @@ mod tests {
             );
         }
 
-        /// Issue #2045: the popup must size to ~90% of the combined editor
-        /// area spanning every tab group, in both width and height, not a
-        /// narrower fixed fraction. Opens a picker with enough entries to
-        /// saturate the row budget, so the painted height is governed by
-        /// `max_visible_ratio` rather than `item_count`, then checks the
-        /// live rect [`crate::harness::ConformanceHarness::picker_popup`]
-        /// reports against the harness's own raw terminal size.
+        /// The picker popup sizes to ~90% of the combined editor area
+        /// spanning every tab group, in both width and height. Opens a
+        /// picker with enough entries to saturate the row budget, so the
+        /// painted height is governed by `max_visible_ratio` rather than
+        /// `item_count`, then checks the live rect
+        /// [`crate::harness::ConformanceHarness::picker_popup`] reports
+        /// against the harness's own raw terminal size.
         #[test]
         fn picker_popup_sizes_to_90_percent_of_the_editor_area_via_shell_app() {
             let mut engine = plain_engine();
@@ -5017,12 +5017,11 @@ mod tests {
                         .picker_popup()
                         .expect("fixture must actually paint the picker popup");
 
-                    // The old fixed ratios (0.55 width, 0.6 height-share
-                    // capped at 20 rows) would land far below this band at
-                    // this terminal size; a tolerant [0.75, 0.95] band
-                    // confirms the fix while leaving room for the editor
-                    // area's own chrome insets (tab strip, status/command
-                    // lines) relative to the raw terminal dimensions.
+                    // A tolerant [0.75, 0.95] band confirms the popup
+                    // tracks ~90% of the terminal while leaving room for
+                    // the editor area's own chrome insets (tab strip,
+                    // status/command lines) relative to the raw terminal
+                    // dimensions.
                     let width_ratio = pw / WIDTH as f32;
                     let height_ratio = ph / HEIGHT as f32;
                     assert!(
