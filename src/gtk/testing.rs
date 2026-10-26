@@ -14417,12 +14417,11 @@ mod clipboard_paste {
     /// The command palette's backdrop scrim must dim the editor band behind
     /// it without touching the status bar, on GTK's real Cairo alpha-blend
     /// compositing. `render::paint_picker_rung` is shared between both
-    /// backends, but `Backend::draw_solid_fill`'s actual pixel effect
-    /// differs enough between them (a true alpha blend here vs. a
-    /// destructive blank-glyph fill on TUI, which
+    /// backends, and `Backend::draw_solid_fill` alpha-blends on both — see
     /// `picker_open_leaves_status_bar_text_visible_via_shell_app` in
-    /// `src/tui_main/app_on_tui_tests.rs` covers) that this backend needs
-    /// its own black-box coverage of the same `scrim_rect` contract.
+    /// `src/tui_main/app_on_tui_tests.rs` for the TUI half — but this
+    /// backend needs its own black-box coverage of the same `scrim_rect`
+    /// contract against GTK's own Cairo compositing.
     #[test]
     fn opening_command_palette_dims_editor_without_touching_status_bar_via_gtk_driver() {
         let engine = Engine::new_for_test();
