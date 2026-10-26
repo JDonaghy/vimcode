@@ -524,7 +524,7 @@ pub fn picker_panel_to_palette(picker: &PickerPanel, theme: &Theme) -> quadraui:
         id: WidgetId::new("picker"),
         title: picker.title.clone(),
         query: picker.query.clone(),
-        query_cursor: picker.query.len(),
+        query_cursor: picker.query_cursor,
         items,
         selected_idx: picker.selected_idx,
         scroll_offset: picker.scroll_top,

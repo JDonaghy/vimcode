@@ -3518,6 +3518,12 @@ pub struct Engine {
     pub picker_source: PickerSource,
     /// Current query typed in the picker input.
     pub picker_query: String,
+    /// Byte offset of the insertion cursor within `picker_query`. Kept at
+    /// `picker_query.len()` (cursor pinned to the end) whenever the whole
+    /// string is replaced wholesale (history recall, prefix routing,
+    /// programmatic prefill); `handle_picker_key`'s Left/Right/Home/End/
+    /// BackSpace/insert arms are the only paths that move it independently.
+    pub picker_query_cursor: usize,
     /// Full source items (pre-loaded sources only; empty for live sources like Grep).
     pub picker_all_items: Vec<PickerItem>,
     /// Filtered/scored items currently displayed (capped).
@@ -5384,6 +5390,7 @@ impl Engine {
             picker_open: false,
             picker_source: PickerSource::Files,
             picker_query: String::new(),
+            picker_query_cursor: 0,
             picker_all_items: Vec::new(),
             picker_items: Vec::new(),
             picker_selected: 0,

@@ -70,6 +70,16 @@ fn highlights_by_line(
 }
 
 impl Engine {
+    /// Replace the picker's query text wholesale, pinning the insertion
+    /// cursor to the end. Every path that sets the whole string at once
+    /// (history recall, breadcrumb/prefix routing, programmatic prefill)
+    /// goes through this — only `handle_picker_key`'s Left/Right/Home/End/
+    /// BackSpace/insert arms move the cursor independently of the text.
+    pub(crate) fn picker_set_query(&mut self, query: impl Into<String>) {
+        self.picker_query = query.into();
+        self.picker_query_cursor = self.picker_query.len();
+    }
+
     /// Open the unified picker with a given source.
     pub fn open_picker(&mut self, source: PickerSource) {
         // Opening a picker is a "user is now focused on this modal"
@@ -78,6 +88,7 @@ impl Engine {
         self.dismiss_editor_hover();
 
         self.picker_query.clear();
+        self.picker_query_cursor = 0;
         self.picker_selected = 0;
         self.picker_scroll_top = 0;
         self.picker_all_items.clear();
@@ -183,7 +194,7 @@ impl Engine {
         if is_symbol {
             // Open document symbol picker
             self.open_picker(PickerSource::CommandCenter);
-            self.picker_query = "@".to_string();
+            self.picker_set_query("@");
             self.picker_filter();
             self.picker_load_preview();
         } else if let Some(path) = path_prefix {
@@ -195,11 +206,11 @@ impl Engine {
                 .unwrap_or(parent)
                 .to_string_lossy()
                 .to_string();
-            self.picker_query = if rel.is_empty() {
+            self.picker_set_query(if rel.is_empty() {
                 String::new()
             } else {
                 format!("{}/", rel)
-            };
+            });
             self.picker_filter();
             self.picker_load_preview();
         }
@@ -244,6 +255,7 @@ impl Engine {
     pub fn close_picker(&mut self) {
         self.picker_open = false;
         self.picker_query.clear();
+        self.picker_query_cursor = 0;
         self.picker_all_items.clear();
         self.picker_items.clear();
         self.picker_selected = 0;
@@ -403,7 +415,7 @@ impl Engine {
         self.open_picker(PickerSource::CommandCenter);
         self.breadcrumb_scoped_parent = Some(seg.parent_scope.clone());
         self.breadcrumb_scoped_parent_line = parent_line;
-        self.picker_query = "@".to_string();
+        self.picker_set_query("@");
         self.picker_filter();
         self.picker_load_preview();
     }
@@ -2317,11 +2329,11 @@ impl Engine {
                         self.picker_items =
                             self.picker_all_items.iter().take(100).cloned().collect();
                     } else {
-                        self.picker_query = if prefix.contains(char::is_alphabetic) {
+                        self.picker_set_query(if prefix.contains(char::is_alphabetic) {
                             format!("{} ", prefix)
                         } else {
                             prefix.to_string()
-                        };
+                        });
                         self.picker_selected = 0;
                         self.picker_scroll_top = 0;
                         self.picker_filter();
@@ -2447,6 +2459,10 @@ impl Engine {
                         }
                     }
                 }
+                self.picker_query_cursor = quadraui::text_util::next_char_boundary(
+                    &self.picker_query,
+                    self.picker_query_cursor,
+                );
                 EngineAction::None
             }
             "Left" => {
@@ -2460,6 +2476,18 @@ impl Engine {
                         }
                     }
                 }
+                self.picker_query_cursor = quadraui::text_util::prev_char_boundary(
+                    &self.picker_query,
+                    self.picker_query_cursor,
+                );
+                EngineAction::None
+            }
+            "Home" => {
+                self.picker_query_cursor = 0;
+                EngineAction::None
+            }
+            "End" => {
+                self.picker_query_cursor = self.picker_query.len();
                 EngineAction::None
             }
             "Down" | "Tab" => {
@@ -2473,10 +2501,11 @@ impl Engine {
                     let idx = self.picker_history_index.unwrap();
                     if idx + 1 < hist.len() {
                         self.picker_history_index = Some(idx + 1);
-                        self.picker_query = hist[idx + 1].clone();
+                        self.picker_set_query(hist[idx + 1].clone());
                     } else {
                         // Past newest entry — restore the original typed query.
-                        self.picker_query = std::mem::take(&mut self.picker_history_typing_buffer);
+                        let typed = std::mem::take(&mut self.picker_history_typing_buffer);
+                        self.picker_set_query(typed);
                         self.picker_history_index = None;
                     }
                     self.picker_selected = 0;
@@ -2509,7 +2538,7 @@ impl Engine {
                             Some(idx) => idx.saturating_sub(1),
                         };
                         self.picker_history_index = Some(new_idx);
-                        self.picker_query = hist[new_idx].clone();
+                        self.picker_set_query(hist[new_idx].clone());
                         self.picker_selected = 0;
                         self.picker_scroll_top = 0;
                         self.picker_filter();
@@ -2536,15 +2565,19 @@ impl Engine {
                 EngineAction::None
             }
             "v" if ctrl => {
-                // Paste clipboard into picker query
+                // Paste clipboard into picker query at the cursor position
                 if let Some(text) = self.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
                     // Take first line only, strip control chars
                     let line = text.lines().next().unwrap_or("");
+                    let insert_at = self.picker_query_cursor;
+                    let mut cursor = insert_at;
                     for c in line.chars() {
                         if !c.is_control() {
-                            self.picker_query.push(c);
+                            self.picker_query.insert(cursor, c);
+                            cursor += c.len_utf8();
                         }
                     }
+                    self.picker_query_cursor = cursor;
                     self.picker_exit_history();
                     self.picker_selected = 0;
                     self.picker_scroll_top = 0;
@@ -2555,7 +2588,15 @@ impl Engine {
             }
             "BackSpace" => {
                 self.picker_exit_history();
-                self.picker_query.pop();
+                if self.picker_query_cursor > 0 {
+                    let start = quadraui::text_util::prev_char_boundary(
+                        &self.picker_query,
+                        self.picker_query_cursor,
+                    );
+                    self.picker_query
+                        .replace_range(start..self.picker_query_cursor, "");
+                    self.picker_query_cursor = start;
+                }
                 self.picker_selected = 0;
                 self.picker_scroll_top = 0;
                 self.picker_filter();
@@ -2567,7 +2608,8 @@ impl Engine {
                     if let Some(c) = unicode {
                         if !c.is_control() {
                             self.picker_exit_history();
-                            self.picker_query.push(c);
+                            self.picker_query.insert(self.picker_query_cursor, c);
+                            self.picker_query_cursor += c.len_utf8();
                             self.picker_selected = 0;
                             self.picker_scroll_top = 0;
                             self.picker_filter();
