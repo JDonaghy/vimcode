@@ -499,9 +499,10 @@ pub fn modal_scrim_rect(
 /// first, and on TUI `Backend::draw_solid_fill` overwrites every cell in its
 /// rect with a blank glyph rather than blending an alpha channel, so handing
 /// it a chrome rung's rect would erase that rung's text instead of dimming
-/// it. `viewport` (the popup's own anchor rect) is unaffected by that and
-/// stays full-window, since `PickerGeometry::compute` centres the popup
-/// against the whole window regardless of how much of it the scrim covers.
+/// it. `viewport` (the popup's own anchor rect) is unaffected by that: the
+/// caller passes it the combined editor area (every tab group, net of
+/// bottom chrome), and `PickerGeometry::compute` centres the popup against
+/// that rect regardless of how much of it the scrim covers.
 pub fn paint_picker_rung(
     b: &mut dyn quadraui::Backend,
     picker: &PickerPanel,
