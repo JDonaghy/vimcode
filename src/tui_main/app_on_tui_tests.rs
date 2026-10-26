@@ -4499,11 +4499,11 @@ mod tests {
 
         /// Opening the unified picker must darken the chrome behind it — a
         /// corner cell outside the popup's own rect (top-left, where the
-        /// collapsed-sidebar tab bar paints) must switch to the dark scrim
-        /// background once the picker opens, and switch back once it's
-        /// dismissed. Without `paint_picker_rung`'s `draw_solid_fill` call
-        /// this cell's background never changes, so this test is red against
-        /// unfixed `develop`.
+        /// collapsed-sidebar tab bar paints) must switch to its background
+        /// alpha-blended with the scrim color once the picker opens, and
+        /// switch back once it's dismissed. Without `paint_picker_rung`'s
+        /// `draw_solid_fill` call this cell's background never changes, so
+        /// this test is red against unfixed `develop`.
         #[test]
         fn picker_open_paints_a_backdrop_scrim_behind_it_via_shell_app() {
             let engine = plain_engine();
@@ -4521,15 +4521,21 @@ mod tests {
             ));
 
             let scrim = crate::render::MODAL_SCRIM_COLOR;
+            let before_rgb = match before {
+                ratatui::style::Color::Rgb(r, g, b) => quadraui::Color::rgb(r, g, b),
+                other => panic!("top-left cell must have a literal rgb background, got {other:?}"),
+            };
+            let expected_during =
+                quadraui::tui::ratatui_color(before_rgb.blend(scrim, scrim.a as f64 / 255.0));
             let during = driver
                 .style_at(0, 0)
                 .expect("top-left cell must be in bounds")
                 .bg;
             assert_eq!(
                 during,
-                ratatui::style::Color::Rgb(scrim.r, scrim.g, scrim.b),
+                expected_during,
                 "opening the command palette must dim the top-left corner cell \
-                 behind it to the scrim colour; screen:\n{}",
+                 behind it by alpha-blending it with the scrim colour; screen:\n{}",
                 driver.screen()
             );
             assert_ne!(
@@ -4552,15 +4558,120 @@ mod tests {
             );
         }
 
+        /// The fuzzy finder (`Ctrl+P`, `ACC_FUZZY_FINDER`) must darken the
+        /// editor content behind its popup, not blank it: a line of buffer
+        /// text sitting in the scrim band but outside the popup's own rect
+        /// keeps its glyph and gets a darker (alpha-blended) background
+        /// once the finder opens, while the popup's own "Find Files" title
+        /// stays legible on top of that same scrim.
+        #[test]
+        fn fuzzy_finder_leaves_dimmed_editor_text_visible_behind_the_popup_via_shell_app() {
+            let mut engine = plain_engine();
+            // A line wide enough to reach the screen's right edge: the
+            // fuzzy finder's popup covers ~90% of the editor area, so a
+            // short line would land entirely underneath it and never
+            // probe the dimmed backdrop outside the popup's own rect.
+            engine
+                .buffer_mut()
+                .insert(0, &format!("{}\n", "Z".repeat(200)));
+            let mut h = harness_no_sidebar(engine);
+
+            // `harness_no_sidebar` builds an 80x24 driver (see `harness`
+            // below); probe near the right edge, well outside the popup's
+            // ~90%-wide rect.
+            let probe_y: u16 = 2;
+            let probe_x: u16 = 78;
+            let before = h
+                .driver
+                .style_at(probe_x, probe_y)
+                .expect("probe cell must be in bounds")
+                .bg;
+            let before_glyph = h.driver.styled_row(probe_y)[probe_x as usize].0;
+            assert_eq!(
+                before_glyph,
+                'Z',
+                "precondition: the probe cell must land on the inserted \
+                 buffer text before the finder opens; screen:\n{}",
+                h.driver.screen()
+            );
+
+            h.driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_FUZZY_FINDER),
+                quadraui::Modifiers::default(),
+            ));
+
+            assert!(
+                h.driver.screen_contains("Find Files"),
+                "the fuzzy finder must actually open and paint its title; \
+                 screen:\n{}",
+                h.driver.screen()
+            );
+            let (px, py, pw, ph) = h
+                .picker_popup()
+                .expect("the fuzzy finder must register its popup rect");
+            assert!(
+                !((probe_x as f32) >= px
+                    && (probe_x as f32) < px + pw
+                    && (probe_y as f32) >= py
+                    && (probe_y as f32) < py + ph),
+                "probe cell ({probe_x}, {probe_y}) must sit outside the \
+                 popup's own rect ({px}, {py}, {pw}, {ph}) so it samples \
+                 the dimmed backdrop rather than the popup's own fill; \
+                 screen:\n{}",
+                h.driver.screen()
+            );
+
+            let scrim = crate::render::MODAL_SCRIM_COLOR;
+            let before_rgb = match before {
+                ratatui::style::Color::Rgb(r, g, b) => quadraui::Color::rgb(r, g, b),
+                other => panic!("probe cell must have a literal rgb background, got {other:?}"),
+            };
+            let expected_during =
+                quadraui::tui::ratatui_color(before_rgb.blend(scrim, scrim.a as f64 / 255.0));
+            let (after_glyph, after_style) = h.driver.styled_row(probe_y)[probe_x as usize];
+
+            assert_eq!(
+                after_glyph,
+                before_glyph,
+                "the fuzzy finder's backdrop scrim must dim the editor text \
+                 behind it, not blank it to a space; screen:\n{}",
+                h.driver.screen()
+            );
+            assert_eq!(
+                after_style.bg,
+                expected_during,
+                "the fuzzy finder's backdrop scrim must alpha-blend the \
+                 probe cell's background with the scrim colour, not leave \
+                 it untouched or replace it with the raw unblended scrim \
+                 colour; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let title_bounds = h
+                .driver
+                .find_bounds("Find Files")
+                .expect("title must be findable once the finder is open");
+            let title_style = h
+                .driver
+                .style_at(title_bounds.x as u16, title_bounds.y as u16)
+                .expect("title cell must be in bounds");
+            assert_ne!(
+                title_style.bg,
+                expected_during,
+                "the popup itself must stay fully opaque: its own title \
+                 must not be painted with the same dimmed background as \
+                 the backdrop behind it; screen:\n{}",
+                h.driver.screen()
+            );
+        }
+
         /// The scrim behind the unified picker must stop above the
-        /// status-bar/command-line band, not blank it: `FRAME_Z_ORDER`
+        /// status-bar/command-line band, not dim it: `FRAME_Z_ORDER`
         /// composes `StatusBar`/`CommandLine` before `UnifiedPicker`, so a
-        /// scrim fill that reaches into their rows would overwrite their
-        /// text with blank scrim-coloured cells on TUI (`draw_solid_fill`
-        /// fills every cell in its rect with a blank glyph, it does not
-        /// alpha-blend). Opening the command palette must leave the
-        /// "NORMAL" mode indicator on the status bar readable both before
-        /// and while the picker is open.
+        /// scrim rect that reaches into their rows would darken their text
+        /// along with the editor behind the popup. Opening the command
+        /// palette must leave the "NORMAL" mode indicator on the status bar
+        /// at full brightness both before and while the picker is open.
         #[test]
         fn picker_open_leaves_status_bar_text_visible_via_shell_app() {
             let engine = plain_engine();

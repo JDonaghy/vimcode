@@ -455,9 +455,10 @@ pub const MODAL_SCRIM_COLOR: quadraui::Color = quadraui::Color::rgba(0, 0, 0, 10
 ///
 /// All of that precision is load-bearing: `FRAME_Z_ORDER` composes the chrome
 /// rungs *before* [`FrameOp::UnifiedPicker`] and the editor band earlier still,
-/// and on TUI the scrim fill is destructive (see [`paint_picker_rung`]), so a
-/// rect reaching one row too far erases text that already painted this frame.
-/// Neither the shell's *static* two-row reservation
+/// and a rect reaching one row too far would dim a chrome rung that already
+/// painted this frame (see [`paint_picker_rung`]), even though the scrim fill
+/// itself alpha-blends rather than blanks what it covers. Neither the shell's *static*
+/// two-row reservation
 /// (`main_content_bounds.height`) nor the status bar's own top edge is a safe
 /// substitute: the first is one row short whenever the wildmenu is open, and
 /// the second sits below the quickfix/terminal/per-window-status rows.
@@ -496,10 +497,10 @@ pub fn modal_scrim_rect(
 /// it must cover only the editor/sidebar band, never a chrome rung
 /// ([`FrameOp::StatusBar`], [`FrameOp::CommandLine`], [`FrameOp::MenuRow`])
 /// that already painted earlier this frame — `FRAME_Z_ORDER` composes those
-/// first, and on TUI `Backend::draw_solid_fill` overwrites every cell in its
-/// rect with a blank glyph rather than blending an alpha channel, so handing
-/// it a chrome rung's rect would erase that rung's text instead of dimming
-/// it. `viewport` (the popup's own anchor rect) is unaffected by that: the
+/// first, and dimming a chrome rung's text along with the editor would be a
+/// visible mismatch, since those rungs stay
+/// readable at full brightness even while the picker is open. `viewport`
+/// (the popup's own anchor rect) is unaffected by that: the
 /// caller passes it the combined editor area (every tab group, net of
 /// bottom chrome), and `PickerGeometry::compute` centres the popup against
 /// that rect regardless of how much of it the scrim covers.
@@ -1609,8 +1610,9 @@ mod tests {
     }
 
     /// `modal_scrim_rect` spans the full window width but stops above every
-    /// row an earlier rung already painted text into, so the destructive TUI
-    /// fill cannot erase chrome. With per-window status lines on (the default)
+    /// row an earlier rung already painted text into, so the scrim dims only
+    /// the editor/sidebar band and leaves chrome at full brightness. With
+    /// per-window status lines on (the default)
     /// the lowest such row is the active window's own status line, *inside*
     /// the band at `editor_bottom - line_height`.
     #[test]
