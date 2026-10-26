@@ -744,9 +744,14 @@ impl quadraui::ShellApp for App {
                 render::FrameOp::UnifiedPicker => {
                     if let Some(ref picker) = screen.picker {
                         // Floats over the editor pane only, so it never spans
-                        // the sidebar or the activity bar.
+                        // the sidebar or the activity bar. Height is
+                        // `editor_area_h`, not the window-reaching `h` — the
+                        // same bottom-chrome-aware bound `scrim_rect` below
+                        // uses via `el.editor_bottom` — so a popup sized to
+                        // ~90% of this viewport never grows into the status
+                        // bar/command line/wildmenu rows that paint after it.
                         let editor_viewport =
-                            quadraui::Rect::new(x as f32, y as f32, w as f32, h as f32);
+                            quadraui::Rect::new(x as f32, y as f32, w as f32, editor_area_h as f32);
                         // Scrim covers the editor+sidebar band to signal
                         // modal state; `modal_scrim_rect` derives its bottom
                         // edge from this frame's `el`, stopping above every

@@ -136,8 +136,10 @@ pub mod testing {
             crate::render::UnitProfile::cell(),
         );
         let screen_layout = Rc::clone(&app.cached_screen_layout);
+        let picker_popup_rect = Rc::clone(&app.picker_popup_rect);
         let driver = driver_with_shell(app, config, width, height);
         ConformanceHarness::new_with_screen_layout(driver, engine, screen_layout, paint, cwd)
+            .with_picker_popup_rect(picker_popup_rect)
     }
 
     #[cfg(test)]

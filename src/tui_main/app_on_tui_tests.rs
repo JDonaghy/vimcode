@@ -5053,35 +5053,57 @@ mod tests {
             );
         }
 
-        /// Mirrors `shell_app.rs`'s test of the same name: a click
-        /// outside the painted picker popup must dismiss it.
+        /// Issue #2045: the popup must size to ~90% of the combined editor
+        /// area spanning every tab group, in both width and height, not a
+        /// narrower fixed fraction. Opens a picker with enough entries to
+        /// saturate the row budget, so the painted height is governed by
+        /// `max_visible_ratio` rather than `item_count`, then checks the
+        /// live rect [`crate::harness::ConformanceHarness::picker_popup`]
+        /// reports against the harness's own raw terminal size.
         #[test]
-        fn click_outside_picker_popup_dismisses_it_via_shell_app() {
+        fn picker_popup_sizes_to_90_percent_of_the_editor_area_via_shell_app() {
             let mut engine = plain_engine();
             engine.buffer_mut().insert(0, "fn main() {}\n");
-            engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+            engine.open_picker(crate::core::engine::PickerSource::Keybindings);
             let title = engine.picker_title.clone();
-            let mut h = harness_no_sidebar(engine);
-            let driver = &mut h.driver;
+            // Both safely under the sizing's width-clamp ceiling (~244
+            // cols) and row-budget cap (~71 rows), so the 90% formulas
+            // govern outright rather than either guard rail.
+            const WIDTH: u16 = 220;
+            const HEIGHT: u16 = 60;
+            let mut h = crate::tui_main::testing::conformance_harness(engine, WIDTH, HEIGHT);
+            collapse_sidebar(&mut h.driver);
 
             known_bug_gate(
-                "app_on_tui::click_outside_picker_popup_dismisses_it_via_shell_app",
+                "app_on_tui::picker_popup_sizes_to_90_percent_of_the_editor_area_via_shell_app",
                 || {
                     assert!(
-                        driver.screen_contains(&title),
+                        h.driver.screen_contains(&title),
                         "precondition: the picker's title must paint; \
                          screen:\n{}",
-                        driver.screen()
+                        h.driver.screen()
                     );
+                    let (_, _, pw, ph) = h
+                        .picker_popup()
+                        .expect("fixture must actually paint the picker popup");
 
-                    driver.click(6.0, 10.0);
-                    driver.render();
-                    let screen = driver.screen();
+                    // The old fixed ratios (0.55 width, 0.6 height-share
+                    // capped at 20 rows) would land far below this band at
+                    // this terminal size; a tolerant [0.75, 0.95] band
+                    // confirms the fix while leaving room for the editor
+                    // area's own chrome insets (tab strip, status/command
+                    // lines) relative to the raw terminal dimensions.
+                    let width_ratio = pw / WIDTH as f32;
+                    let height_ratio = ph / HEIGHT as f32;
                     assert!(
-                        !screen.contains(&title),
-                        "a click outside the painted popup must dismiss the \
-                         picker (route_modal_overlay_click's \
-                         PickerRoute::Dismiss arm); screen:\n{screen}"
+                        (0.75..=0.95).contains(&width_ratio),
+                        "popup width {pw} should be ~90% of the {WIDTH}-col \
+                         terminal (ratio {width_ratio})"
+                    );
+                    assert!(
+                        (0.75..=0.95).contains(&height_ratio),
+                        "popup height {ph} should be ~90% of the \
+                         {HEIGHT}-row terminal (ratio {height_ratio})"
                     );
                 },
             );
