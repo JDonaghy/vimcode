@@ -4397,6 +4397,76 @@ mod tests {
             );
         }
 
+        /// Left/Right/Home/End must move the insertion cursor within the
+        /// picker's query box, not just leave it pinned to the end, so a
+        /// mid-string typo can be fixed without backspacing from the end.
+        #[test]
+        fn picker_arrow_keys_reposition_the_query_cursor_via_shell_app() {
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::picker_arrow_keys_reposition_the_query_cursor_via_shell_app",
+                || {
+                    driver.dispatch(quadraui::UiEvent::Accelerator(
+                        quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+                        quadraui::Modifiers::default(),
+                    ));
+
+                    // Type a typo ("abd") missing the 'c'.
+                    for c in "abd".chars() {
+                        driver.type_char(c);
+                    }
+                    let screen = driver.screen();
+                    assert!(
+                        screen.contains("abd"),
+                        "typed query must be painted before any cursor \
+                         movement; screen:\n{screen}"
+                    );
+
+                    // Left once moves the cursor from after 'd' to between
+                    // 'b' and 'd'. Typing 'c' there must insert it mid-string
+                    // ("abcd"), not append it at the end ("abdc").
+                    driver.press_named(quadraui::NamedKey::Left);
+                    driver.type_char('c');
+                    let screen = driver.screen();
+                    assert!(
+                        screen.contains("abcd"),
+                        "Left must move the insertion cursor so a \
+                         mid-string character lands between 'b' and 'd'; \
+                         screen:\n{screen}"
+                    );
+                    assert!(
+                        !screen.contains("abdc"),
+                        "the 'c' must land where Left moved the cursor to, \
+                         not get appended at the end; screen:\n{screen}"
+                    );
+
+                    // Home moves the cursor to the start; a character typed
+                    // there is prepended.
+                    driver.press_named(quadraui::NamedKey::Home);
+                    driver.type_char('X');
+                    let screen = driver.screen();
+                    assert!(
+                        screen.contains("Xabcd"),
+                        "Home must move the cursor to the start of the \
+                         query; screen:\n{screen}"
+                    );
+
+                    // End moves the cursor back to the end; a character
+                    // typed there is appended.
+                    driver.press_named(quadraui::NamedKey::End);
+                    driver.type_char('Y');
+                    let screen = driver.screen();
+                    assert!(
+                        screen.contains("XabcdY"),
+                        "End must move the cursor back to the end of the \
+                         query; screen:\n{screen}"
+                    );
+                },
+            );
+        }
+
         /// Mirrors `shell_app.rs`'s test of the same name: opening the
         /// unified picker must paint its header, and dismissing it must leave
         /// no trace on the grid.
