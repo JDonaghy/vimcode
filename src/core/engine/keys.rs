@@ -5424,7 +5424,7 @@ impl Engine {
             "so" => {
                 // Document outline / symbol navigation
                 self.open_picker(PickerSource::CommandCenter);
-                self.picker_query = "@".to_string();
+                self.picker_set_query("@");
                 self.picker_filter();
                 self.picker_load_preview();
             }
@@ -5435,7 +5435,7 @@ impl Engine {
                 // Grep word under cursor
                 if let Some(word) = self.word_under_cursor() {
                     self.open_picker(PickerSource::Grep);
-                    self.picker_query = word;
+                    self.picker_set_query(word);
                     self.picker_filter();
                     self.picker_load_preview();
                 } else {
@@ -10759,11 +10759,14 @@ impl Engine {
         }
 
         if self.picker_open {
+            let mut cursor = self.picker_query_cursor;
             for c in first_line.chars() {
                 if !c.is_control() {
-                    self.picker_query.push(c);
+                    self.picker_query.insert(cursor, c);
+                    cursor += c.len_utf8();
                 }
             }
+            self.picker_query_cursor = cursor;
             self.picker_selected = 0;
             self.picker_scroll_top = 0;
             self.picker_filter();

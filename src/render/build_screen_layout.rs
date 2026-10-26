@@ -653,6 +653,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
             PickerPanel {
                 title: engine.picker_title.clone(),
                 query: engine.picker_query.clone(),
+                query_cursor: engine.picker_query_cursor,
                 items: engine
                     .picker_items
                     .iter()

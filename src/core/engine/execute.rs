@@ -2524,7 +2524,7 @@ impl Engine {
         }
         if cmd == "document_outline" {
             self.open_picker(PickerSource::CommandCenter);
-            self.picker_query = "@".to_string();
+            self.picker_set_query("@");
             self.picker_filter();
             self.picker_load_preview();
             return EngineAction::None;
@@ -2535,7 +2535,7 @@ impl Engine {
                 self.message = "No word under cursor".to_string();
             } else {
                 self.open_picker(PickerSource::Grep);
-                self.picker_query = word;
+                self.picker_set_query(word);
                 self.picker_filter();
                 self.picker_load_preview();
             }
@@ -6027,7 +6027,7 @@ impl Engine {
         match action {
             StatusAction::GoToLine => {
                 self.open_picker(PickerSource::CommandCenter);
-                self.picker_query = ":".to_string();
+                self.picker_set_query(":");
                 self.picker_filter();
                 self.picker_load_preview();
             }

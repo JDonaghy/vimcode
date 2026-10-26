@@ -26,6 +26,8 @@ pub struct PickerPanel {
     pub title: String,
     /// Current query typed by the user.
     pub query: String,
+    /// Byte offset of the insertion cursor within `query`.
+    pub query_cursor: usize,
     /// Filtered items to display.
     pub items: Vec<PickerPanelItem>,
     /// Index of the currently highlighted item.
