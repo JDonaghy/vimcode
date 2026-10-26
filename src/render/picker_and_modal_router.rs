@@ -51,7 +51,11 @@ pub struct PickerPanel {
 
 #[derive(Debug, Clone, Copy)]
 pub struct PickerSizing {
-    /// `(min, max)` clamp applied to the computed popup width.
+    /// `(min, max)` clamp applied to the computed popup width. The max is a
+    /// sanity ceiling, not the intended governor of the popup's size: with
+    /// `viewport` spanning every tab group, `compute`'s own `width_ratio`
+    /// (≈90 % of `viewport`) is what the popup is meant to track, and the
+    /// `.min(viewport.width)` guard in `compute` already keeps it on-screen.
     pub width_clamp: (f32, f32),
     /// Share of the popup width given to the results list when a preview
     /// pane is shown.
@@ -64,9 +68,15 @@ pub struct PickerSizing {
     /// popup floats near the top of the pane it is given instead of
     /// covering it end to end.
     pub top_margin: f32,
-    /// Fraction of the viewport height available for result rows.
+    /// Fraction of the viewport height available for result rows. Together
+    /// with `max_visible_cap` this is the real governor of popup height —
+    /// with a result list long enough to fill it, the popup reaches this
+    /// share of `viewport`'s height.
     pub max_visible_ratio: f32,
-    /// Hard cap on visible rows regardless of viewport size.
+    /// Hard cap on visible rows regardless of viewport size. Set high
+    /// enough that `max_visible_ratio` binds first on any viewport a user
+    /// would actually hit — this only guards against pathologically tall
+    /// viewports or result lists.
     pub max_visible_cap: usize,
     /// Smallest popup height the backend will actually paint into. Below
     /// this, the backend's own `draw_palette` silently no-ops (it still
@@ -76,30 +86,28 @@ pub struct PickerSizing {
 }
 
 pub const TUI_PICKER_SIZING: PickerSizing = PickerSizing {
-    width_clamp: (55.0, 110.0),
+    width_clamp: (55.0, 220.0),
     left_pane_ratio: 0.35,
     header_h: 4.0,
     line_h: 1.0,
     top_margin: 2.0,
-    max_visible_ratio: 0.6,
-    max_visible_cap: 20,
+    max_visible_ratio: 0.9,
+    max_visible_cap: 60,
     min_popup_h: 4.0,
 };
 
 pub fn gtk_picker_sizing(line_height: f32) -> PickerSizing {
     PickerSizing {
-        width_clamp: (500.0, 900.0),
+        width_clamp: (500.0, 2400.0),
         left_pane_ratio: 0.40,
         header_h: 2.0 * line_height + 6.0,
         line_h: line_height,
         top_margin: line_height,
-        // The viewport is the editor pane (not the full window), so 0.6
-        // was too tight — it left only ~15 rows on macOS and fewer on
-        // Linux headless.  0.85 of the editor pane ≈ 55-60 % of the
-        // full window, matching the old full-window 60 % behaviour;
-        // max_visible_cap (20) is the binding limit in practice.
-        max_visible_ratio: 0.85,
-        max_visible_cap: 20,
+        // `viewport` is the editor pane (every tab group combined, not the
+        // full window), so 0.9 of it tracks `compute`'s ~90 % width target;
+        // `max_visible_cap` (60) only binds on implausibly tall panes.
+        max_visible_ratio: 0.9,
+        max_visible_cap: 60,
         min_popup_h: line_height * 4.0,
     }
 }
@@ -116,18 +124,22 @@ pub struct PickerGeometry {
 
 impl PickerGeometry {
     /// Resolve the popup rect inside `viewport` (the pane the picker floats
-    /// over, e.g. the editor area — never the whole window). Anchored
-    /// horizontally centred and near the top of `viewport`, with its height
-    /// driven by `item_count` rather than a fixed share of the viewport, so
-    /// a short result list gets a short popup instead of stretching to fill
-    /// the pane.
+    /// over — the combined editor area spanning every tab group, never a
+    /// single group or the whole window). Anchored horizontally centred and
+    /// near the top of `viewport`, targeting ~90 % of `viewport` in both
+    /// width and height. Height still tracks `item_count` rather than
+    /// unconditionally filling that 90 %, so a short result list gets a
+    /// short popup instead of stretching to fill the pane.
     pub fn compute(
         viewport: quadraui::Rect,
         item_count: usize,
         has_preview: bool,
         sizing: &PickerSizing,
     ) -> Self {
-        let width_ratio = if has_preview { 0.8 } else { 0.55 };
+        // ~90 % of `viewport`'s width regardless of preview state — the
+        // preview pane shares that width via `left_pane_ratio` below rather
+        // than widening the popup further.
+        let width_ratio = 0.9;
         let popup_w = (viewport.width * width_ratio)
             .clamp(sizing.width_clamp.0, sizing.width_clamp.1)
             .min(viewport.width);
@@ -1103,6 +1115,29 @@ mod tests {
             &TUI_TAB_SWITCHER_SIZING,
         )
         .is_none());
+    }
+
+    /// Issue #2045: the popup must track ~90% of `viewport` — the combined
+    /// editor area spanning every tab group — in both width and height,
+    /// not a narrower fixed fraction.
+    #[test]
+    fn picker_geometry_targets_90_percent_of_viewport_in_both_dimensions() {
+        let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
+        // A result list long enough to saturate the row budget, so height
+        // is governed by `max_visible_ratio` rather than `item_count`.
+        let geo = PickerGeometry::compute(viewport, 1000, false, &TUI_PICKER_SIZING);
+        assert_eq!(geo.popup_w, 180.0, "width must be exactly 90% of 200.0");
+        assert_eq!(geo.popup_h, 45.0, "height must be exactly 90% of 50.0");
+        // Centred horizontally, anchored at `top_margin` from the top.
+        assert_eq!(geo.popup_x, (200.0 - 180.0) / 2.0);
+        assert_eq!(geo.popup_y, TUI_PICKER_SIZING.top_margin);
+
+        // Below `width_clamp.1` (220), the 90% ratio wins outright; above
+        // it, the clamp still caps the width rather than letting it grow
+        // unbounded on an implausibly wide terminal.
+        let wide = quadraui::Rect::new(0.0, 0.0, 400.0, 50.0);
+        let geo_wide = PickerGeometry::compute(wide, 1000, false, &TUI_PICKER_SIZING);
+        assert_eq!(geo_wide.popup_w, TUI_PICKER_SIZING.width_clamp.1);
     }
 
     #[test]

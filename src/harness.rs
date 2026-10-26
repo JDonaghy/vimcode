@@ -1585,6 +1585,14 @@ pub struct ConformanceHarness<D> {
     /// window's `RenderedWindow` fields (`total_lines`, `scroll_top`, …)
     /// the same arithmetic `quadraui::Editor::layout`/`fit_thumb` uses.
     pub screen_layout: Rc<RefCell<Option<crate::render::ScreenLayout>>>,
+    /// The `App`'s own `picker_popup_rect` cache — the popup rect the last
+    /// frame actually painted, or `None` if no picker painted that frame.
+    /// `None` until a caller attaches it via [`Self::with_picker_popup_rect`]
+    /// (mirrors [`Self::screen_layout`]'s "empty unless wired up" default).
+    /// Lets a scenario assert a click point is outside the *live* painted
+    /// popup instead of a hand-guessed coordinate, the same way
+    /// `crate::gtk::testing::Harness::picker_popup` does for GTK.
+    picker_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
     /// Held for the harness's whole lifetime — see
     /// `crate::test_paint::PaintGuard`'s own doc for why a headless paint
     /// harness must never run concurrently with another one on a second
@@ -1619,6 +1627,7 @@ impl<D> ConformanceHarness<D> {
             driver,
             engine,
             screen_layout: Rc::new(RefCell::new(None)),
+            picker_popup_rect: Rc::new(std::cell::Cell::new(None)),
             _paint: paint,
             _cwd: cwd,
         }
@@ -1640,9 +1649,33 @@ impl<D> ConformanceHarness<D> {
             driver,
             engine,
             screen_layout,
+            picker_popup_rect: Rc::new(std::cell::Cell::new(None)),
             _paint: paint,
             _cwd: cwd,
         }
+    }
+
+    /// Attach a live `picker_popup_rect` handle, `Rc::clone`d from the
+    /// `App`'s own field *before* that `App` moved into `driver_with_shell`
+    /// (same timing requirement as [`Self::new_with_screen_layout`]'s
+    /// `screen_layout` argument). A builder method rather than a third
+    /// constructor so existing `new`/`new_with_screen_layout` call sites
+    /// stay untouched.
+    pub(crate) fn with_picker_popup_rect(
+        mut self,
+        picker_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
+    ) -> Self {
+        self.picker_popup_rect = picker_popup_rect;
+        self
+    }
+
+    /// The picker/command-palette popup rect `(x, y, w, h)` the last frame
+    /// actually painted, or `None` if that frame painted no picker (or no
+    /// caller ever wired up [`Self::with_picker_popup_rect`]).
+    pub(crate) fn picker_popup(&self) -> Option<(f32, f32, f32, f32)> {
+        self.picker_popup_rect
+            .get()
+            .map(|r| (r.x, r.y, r.width, r.height))
     }
 }
 
