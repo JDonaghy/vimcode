@@ -17476,7 +17476,7 @@ fn test_lua_ui_toast_pushes_engine_toast() {
             vimcode.message("toast:" .. id)
         end)"#,
     );
-    let mut engine = Engine::new();
+    let mut engine = Engine::new_for_test();
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
@@ -17505,7 +17505,7 @@ fn test_lua_ui_toast_defaults_severity_to_info() {
             vimcode.ui.toast({ title = "Heads up" })
         end)"#,
     );
-    let mut engine = Engine::new();
+    let mut engine = Engine::new_for_test();
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
@@ -17530,7 +17530,7 @@ fn test_lua_ui_toast_rejects_unknown_severity() {
             if not ok then vimcode.message("rejected") end
         end)"#,
     );
-    let mut engine = Engine::new();
+    let mut engine = Engine::new_for_test();
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
