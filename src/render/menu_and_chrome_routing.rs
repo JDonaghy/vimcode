@@ -664,7 +664,62 @@ pub fn run_pending_platform_action(
                 engine.message = format!("Could not reveal in file manager: {e:?}");
             }
         }
+        PendingPlatformAction::OpenPath(path) => {
+            if let Err(e) = backend.services().open_path(&path) {
+                engine.message = format!("Could not open path: {e:?}");
+            }
+        }
+        PendingPlatformAction::Notify {
+            title,
+            body,
+            urgent,
+        } => {
+            let mut notification = quadraui::Notification::new(title, body);
+            notification.urgent = urgent;
+            backend.services().send_notification(notification);
+        }
+        PendingPlatformAction::PluginDialog(req) => {
+            run_pending_plugin_dialog(engine, req, backend);
+        }
     }
+}
+
+/// Resolve a `vimcode.platform.show_*_dialog` request: show the matching
+/// native dialog when the running backend's capability for it is present,
+/// otherwise deliver `None` straight away (the TUI fallback — no backend
+/// implements the in-canvas `Dialog` primitive for this yet, so plugins
+/// must treat a `nil` path as "no native picker available" and fall back to
+/// their own prompt).
+fn run_pending_plugin_dialog(
+    engine: &mut Engine,
+    req: crate::core::engine::PluginDialogRequest,
+    backend: &mut dyn quadraui::Backend,
+) {
+    use crate::core::engine::PluginDialogKind;
+
+    let caps = engine.backend_caps;
+    let has_cap = match req.kind {
+        PluginDialogKind::Open | PluginDialogKind::Save => caps.file_dialogs,
+        PluginDialogKind::Folder => caps.folder_dialogs,
+    };
+
+    let path = if has_cap {
+        let opts = quadraui::FileDialogOptions {
+            title: req.title,
+            initial_dir: req.initial_dir,
+            initial_filename: req.initial_filename,
+            filters: req.filters,
+        };
+        match req.kind {
+            PluginDialogKind::Open => backend.services().show_file_open_dialog(opts),
+            PluginDialogKind::Save => backend.services().show_file_save_dialog(opts),
+            PluginDialogKind::Folder => backend.services().show_folder_open_dialog(opts),
+        }
+    } else {
+        None
+    };
+
+    engine.deliver_plugin_dialog_result(req.callback_id, path);
 }
 
 /// Editor mode → hardware caret shape: block for Normal/Visual, bar for

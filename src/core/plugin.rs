@@ -65,7 +65,8 @@ use std::path::{Path, PathBuf};
 
 use super::buffer::{DecorOpts, HlGroupDef, VirtTextChunk, VirtTextPos};
 use super::engine::{
-    expand_leader_tokens, parse_key_sequence, Engine, UserKeymap, UserKeymapAction,
+    expand_leader_tokens, parse_key_sequence, Engine, PluginDialogKind, UserKeymap,
+    UserKeymapAction,
 };
 use super::window::SplitDirection;
 
@@ -712,6 +713,12 @@ pub struct PluginManager {
     /// by the same id — this map only holds the Lua side (the callback
     /// itself), mirroring `write_handlers`/`lua_keymap_callbacks`.
     timer_callbacks: RefCell<HashMap<u64, LuaRegistryKey>>,
+    /// `id -> callback` for every in-flight `vimcode.platform.show_*_dialog`
+    /// request. The pending native call lives on
+    /// `Engine::pending_platform_actions` as a `PendingPlatformAction::PluginDialog`,
+    /// keyed by the same id — this map only holds the Lua side, mirroring
+    /// `timer_callbacks`.
+    platform_dialog_callbacks: RefCell<HashMap<u64, LuaRegistryKey>>,
     /// `id -> callbacks` for every live `vimcode.loop.spawn` handle.
     /// The process/pipes/receiver live on `Engine::plugin_spawns`, keyed by
     /// the same id.
@@ -1514,6 +1521,7 @@ impl PluginManager {
             lua_keymap_next_id: Cell::new(0),
             write_handlers: RefCell::new(HashMap::new()),
             timer_callbacks: RefCell::new(HashMap::new()),
+            platform_dialog_callbacks: RefCell::new(HashMap::new()),
             spawn_callbacks: RefCell::new(HashMap::new()),
             next_handle_id: Cell::new(0),
             pickers: RefCell::new(HashMap::new()),
@@ -1928,6 +1936,51 @@ impl PluginManager {
             .and_then(|k| self.lua.registry_value::<LuaFunction>(k).ok());
         if let Some(f) = f {
             let _ = f.call::<(), ()>(());
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
+    }
+
+    /// Register a `vimcode.platform.show_*_dialog` callback and return its
+    /// id. Called from the immediate `vimcode.platform.show_open_dialog`/
+    /// `show_save_dialog`/`show_folder_dialog` bindings while a live engine
+    /// is loaned, so the returned id can be attached to the
+    /// `PendingPlatformAction::PluginDialog` pushed in the same call.
+    pub(crate) fn register_platform_dialog_callback(&self, callback: LuaRegistryKey) -> u64 {
+        let id = self.next_handle_id();
+        self.platform_dialog_callbacks
+            .borrow_mut()
+            .insert(id, callback);
+        id
+    }
+
+    /// Drop a dialog request's stored callback once its result has been
+    /// delivered (or the owning plugin is unloaded first).
+    pub(crate) fn remove_platform_dialog_callback(&self, id: u64) {
+        self.platform_dialog_callbacks.borrow_mut().remove(&id);
+    }
+
+    /// Fire dialog request `id`'s callback with the chosen path (`nil` if
+    /// the user cancelled or the backend has no dialog support).
+    pub(crate) fn call_platform_dialog_result(
+        &self,
+        id: u64,
+        path: Option<String>,
+        ctx: PluginCallContext,
+    ) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let f = self
+            .platform_dialog_callbacks
+            .borrow()
+            .get(&id)
+            .and_then(|k| self.lua.registry_value::<LuaFunction>(k).ok());
+        if let Some(f) = f {
+            let arg = match path.and_then(|p| self.lua.create_string(&p).ok()) {
+                Some(s) => LuaValue::String(s),
+                None => LuaValue::Nil,
+            };
+            let _ = f.call::<LuaValue, ()>(arg);
         }
         self.lua
             .remove_app_data::<PluginCallContext>()
@@ -5391,6 +5444,9 @@ impl PluginManager {
         Self::setup_undo_api(lua, vimcode)?;
         Self::setup_diagnostics_api(lua, vimcode)?;
 
+        // ── vimcode.platform (quadraui PlatformServices exposure) ─────────
+        Self::setup_platform_api(lua, vimcode)?;
+
         Ok(())
     }
 
@@ -5689,6 +5745,171 @@ impl PluginManager {
         )?;
 
         vimcode.set("diagnostics", diagnostics)?;
+        Ok(())
+    }
+
+    /// Install `vimcode.platform.*`: the quadraui `PlatformServices` surface
+    /// (clipboard, file/folder dialogs, URL/path opening, desktop
+    /// notifications, and capability queries) exposed to extensions so a
+    /// plugin can ask the host to do these things without knowing which
+    /// backend is running. Dialogs and notifications are queued as
+    /// [`crate::core::engine::PendingPlatformAction`]s and resolved on the
+    /// next tick by `run_pending_platform_action` (`render/menu_and_chrome_routing.rs`);
+    /// everything else here is immediate.
+    fn setup_platform_api(lua: &Lua, vimcode: &LuaTable) -> LuaResult<()> {
+        let platform = lua.create_table()?;
+
+        // vimcode.platform.has(capability: string) → bool. `capability` is
+        // one of `quadraui::BackendCaps::vocabulary()`'s names (e.g.
+        // `"file_dialogs"`, `"notifications"`, `"native_menu"`) plus the
+        // vimcode-only `"clipboard"`, which `BackendCaps` doesn't track
+        // itself since it's wired per-backend onto `Engine` rather than
+        // being a static per-backend fact.
+        platform.set(
+            "has",
+            lua.create_function(|_, capability: String| {
+                live_engine("vimcode.platform.has", move |e| {
+                    if capability == "clipboard" {
+                        e.clipboard_read.is_some() && e.clipboard_write.is_some()
+                    } else {
+                        e.backend_caps.has(&capability)
+                    }
+                })
+            })?,
+        )?;
+
+        // vimcode.platform.clipboard_read() → string or nil. `nil` when no
+        // clipboard is wired (headless backend) or the read failed.
+        platform.set(
+            "clipboard_read",
+            lua.create_function(|_, ()| {
+                live_engine("vimcode.platform.clipboard_read", |e| {
+                    e.clipboard_read.as_ref().and_then(|cb| cb().ok())
+                })
+            })?,
+        )?;
+
+        // vimcode.platform.clipboard_write(text) → true/false. `false` when
+        // no clipboard is wired or the write failed.
+        platform.set(
+            "clipboard_write",
+            lua.create_function(|_, text: String| {
+                live_engine("vimcode.platform.clipboard_write", move |e| {
+                    e.clipboard_write
+                        .as_ref()
+                        .map(|cb| cb(&text).is_ok())
+                        .unwrap_or(false)
+                })
+            })?,
+        )?;
+
+        // vimcode.platform.reveal_in_file_manager(path) — opens the host
+        // file manager with `path` selected. A no-op on backends without
+        // `native_dialogs`/a desktop shell (queued regardless; the runner
+        // drops it silently rather than erroring plugin code for an absent
+        // capability).
+        platform.set(
+            "reveal_in_file_manager",
+            lua.create_function(|_, path: String| {
+                live_engine("vimcode.platform.reveal_in_file_manager", move |e| {
+                    e.reveal_in_file_manager(&PathBuf::from(path));
+                })
+            })?,
+        )?;
+
+        // vimcode.platform.open_path(path) — opens `path` with the host's
+        // default application for its type.
+        platform.set(
+            "open_path",
+            lua.create_function(|_, path: String| {
+                live_engine("vimcode.platform.open_path", move |e| {
+                    e.open_path(&PathBuf::from(path));
+                })
+            })?,
+        )?;
+
+        // vimcode.platform.open_url(url) — opens `url` in the host's default
+        // browser. Silently dropped for a scheme `is_safe_url` rejects
+        // (anything but `http://`, `https://`, or `command:`).
+        platform.set(
+            "open_url",
+            lua.create_function(|_, url: String| {
+                live_engine("vimcode.platform.open_url", move |e| {
+                    e.open_url(&url);
+                })
+            })?,
+        )?;
+
+        // vimcode.platform.send_notification(title, body, urgent?) — posts a
+        // desktop notification. Silently dropped on backends without
+        // `notifications` (checked by `run_pending_plugin_dialog`'s sibling
+        // handler in `run_pending_platform_action`).
+        platform.set(
+            "send_notification",
+            lua.create_function(|_, (title, body, urgent): (String, String, Option<bool>)| {
+                live_engine("vimcode.platform.send_notification", move |e| {
+                    e.send_notification(title, body, urgent.unwrap_or(false));
+                })
+            })?,
+        )?;
+
+        // vimcode.platform.show_open_dialog/show_save_dialog/show_folder_dialog(
+        //   opts, callback)
+        // `opts` is `{title=, initial_dir=, initial_filename=,
+        // filters={ {name=, patterns={"txt","md"}}, ... } }`, all optional.
+        // `callback(path)` fires once the dialog resolves, with `path` as a
+        // string or `nil` if the user cancelled, the backend lacks the
+        // matching dialog capability (`file_dialogs`/`folder_dialogs`), or
+        // the TUI fallback has nothing better to offer yet — see
+        // `run_pending_plugin_dialog`'s doc comment.
+        for (name, kind) in [
+            ("show_open_dialog", PluginDialogKind::Open),
+            ("show_save_dialog", PluginDialogKind::Save),
+            ("show_folder_dialog", PluginDialogKind::Folder),
+        ] {
+            platform.set(
+                name,
+                lua.create_function(move |lua, (opts, cb): (Option<LuaTable>, LuaFunction)| {
+                    let mut title = None;
+                    let mut initial_dir = None;
+                    let mut initial_filename = None;
+                    let mut filters: Vec<(String, Vec<String>)> = Vec::new();
+                    if let Some(ref o) = opts {
+                        if let Ok(t) = o.get::<_, String>("title") {
+                            title = Some(t);
+                        }
+                        if let Ok(d) = o.get::<_, String>("initial_dir") {
+                            if !d.is_empty() {
+                                initial_dir = Some(PathBuf::from(d));
+                            }
+                        }
+                        if let Ok(f) = o.get::<_, String>("initial_filename") {
+                            initial_filename = Some(f);
+                        }
+                        if let Ok(list) = o.get::<_, LuaTable>("filters") {
+                            for row in list.sequence_values::<LuaTable>().flatten() {
+                                let fname: String = row.get("name").unwrap_or_default();
+                                let patterns: Vec<String> = row.get("patterns").unwrap_or_default();
+                                filters.push((fname, patterns));
+                            }
+                        }
+                    }
+                    let key = lua.create_registry_value(cb)?;
+                    live_engine("vimcode.platform.show_dialog", move |e| {
+                        e.plugin_api_show_dialog(
+                            kind,
+                            title,
+                            initial_dir,
+                            initial_filename,
+                            filters,
+                            key,
+                        )
+                    })
+                })?,
+            )?;
+        }
+
+        vimcode.set("platform", platform)?;
         Ok(())
     }
 }

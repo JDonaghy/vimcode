@@ -1858,6 +1858,48 @@ pub enum PendingPlatformAction {
     /// Reveal a path in the platform's file manager, selected
     /// (`PlatformServices::reveal_in_file_manager`).
     Reveal(PathBuf),
+    /// Open a path with the platform's default handler for it
+    /// (`PlatformServices::open_path`), e.g. an editor associated with a
+    /// file extension or a folder's default file manager.
+    OpenPath(PathBuf),
+    /// Send a desktop notification (`PlatformServices::send_notification`).
+    /// Carries primitive fields rather than a `quadraui::Notification`
+    /// (which has no `PartialEq`/`Eq` impl) so this enum keeps deriving
+    /// both.
+    Notify {
+        title: String,
+        body: String,
+        urgent: bool,
+    },
+    /// A file/save/folder picker dialog requested through the plugin API,
+    /// resolved by `callback_id` once the user picks or cancels.
+    PluginDialog(PluginDialogRequest),
+}
+
+/// Which `quadraui::PlatformServices` dialog method a [`PluginDialogRequest`]
+/// maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginDialogKind {
+    Open,
+    Save,
+    Folder,
+}
+
+/// A file/save/folder dialog requested via `vimcode.platform.show_*_dialog`.
+///
+/// Mirrors `quadraui::FileDialogOptions` field-for-field, but as a local,
+/// `Eq`-able struct — `FileDialogOptions` itself has no `PartialEq`/`Eq`
+/// impl, so it can't live inside `PendingPlatformAction` directly. Converted
+/// to the real `quadraui::FileDialogOptions` only where the dialog is
+/// actually shown (`render::run_pending_platform_action`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginDialogRequest {
+    pub kind: PluginDialogKind,
+    pub title: Option<String>,
+    pub initial_dir: Option<PathBuf>,
+    pub initial_filename: Option<String>,
+    pub filters: Vec<(String, Vec<String>)>,
+    pub callback_id: u64,
 }
 
 /// Convert a hex ASCII byte to its numeric value (0–15), or `None`.
@@ -5046,6 +5088,16 @@ pub struct Engine {
     /// ctx.open_urls { self.open_url(&url); }` loop.
     pub pending_platform_actions: Vec<PendingPlatformAction>,
 
+    /// The runner's `quadraui::BackendCaps`, cached once at startup —
+    /// mirrors `App::keyboard_enhanced`'s pattern (`src/app/shell.rs`'s
+    /// `ShellApp::setup`) but keeps the whole struct rather than a single
+    /// bool, since `vimcode.platform.has(...)` needs to answer for several
+    /// capabilities and `Engine` (unlike `App`) is reachable from Lua
+    /// bindings via `with_live_engine`. Defaulted to `BackendCaps::empty()`
+    /// until `setup` runs, so a check made before then degrades to "no
+    /// capability", never a stale guess.
+    pub backend_caps: quadraui::BackendCaps,
+
     /// Inline rename state for the explorer sidebar.  When `Some`, the
     /// sidebar row matching `path` should render an editable text input
     /// instead of the plain filename.
@@ -5761,6 +5813,7 @@ impl Engine {
             pending_delete: None,
             explorer_needs_refresh: false,
             pending_platform_actions: Vec::new(),
+            backend_caps: quadraui::BackendCaps::empty(),
             explorer_rename: None,
             explorer_new_entry: None,
             // The panel list — order, ids, titles, tooltips — is built from

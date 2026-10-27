@@ -11,6 +11,10 @@ impl quadraui::ShellApp for App {
         // TUI-only shell — `backend.backend_caps()` reads the same `TuiBackend`
         // state either way.
         self.keyboard_enhanced = backend.backend_caps().kitty_keyboard;
+        // Cache the full capability set so `vimcode.platform.has(...)` and
+        // the plugin-dialog dispatch in `render::run_pending_platform_action`
+        // can answer without a `Backend` handle of their own.
+        self.engine.borrow_mut().backend_caps = backend.backend_caps();
         // Lets `Engine` render command-palette/picker shortcut hints in the
         // running backend's convention (`⌘S` on macOS, `Ctrl+S` elsewhere) —
         // see `format_shortcut_for_platform`.

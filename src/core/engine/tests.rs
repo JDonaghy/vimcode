@@ -19841,6 +19841,35 @@ fn test_gx_queues_open_url_platform_action_for_word_under_cursor() {
 }
 
 #[test]
+fn test_engine_open_path_queues_platform_action() {
+    let mut e = engine_with_text("hello\n");
+    let path = std::path::PathBuf::from("/tmp/vimcode-2057-open-path.txt");
+    e.open_path(&path);
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::OpenPath(path)]
+    );
+}
+
+#[test]
+fn test_engine_send_notification_queues_platform_action() {
+    let mut e = engine_with_text("hello\n");
+    e.send_notification(
+        "Build done".to_string(),
+        "All tests passed".to_string(),
+        false,
+    );
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::Notify {
+            title: "Build done".to_string(),
+            body: "All tests passed".to_string(),
+            urgent: false,
+        }]
+    );
+}
+
+#[test]
 fn test_hover_links_filtered_by_safe_url() {
     let mut e = engine_with_text("hello\n");
     // Markdown with a safe link and a dangerous link
@@ -28121,6 +28150,233 @@ fn test_lua_set_lines_insert_at_beginning() {
     engine.execute_command("InsLines");
     // set_lines(0, 0, {"new first"}) inserts before line 0
     assert_eq!(engine.buffer().to_string(), "new first\naaa\nbbb\n");
+}
+
+// =========================================================================
+// Lua API: vimcode.platform (PlatformServices exposure)
+// =========================================================================
+
+#[test]
+fn test_lua_platform_has_reflects_backend_caps() {
+    let dir = write_plugin_lua(
+        "test_platform_has",
+        r#"vimcode.command("CheckHas", function()
+            local has_notifications = vimcode.platform.has("notifications")
+            local has_clipboard = vimcode.platform.has("clipboard")
+            vimcode.message("notif:" .. tostring(has_notifications) .. " clip:" .. tostring(has_clipboard))
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    // Default caps are `BackendCaps::empty()` and no clipboard callbacks are wired.
+    engine.execute_command("CheckHas");
+    assert_eq!(engine.message, "notif:false clip:false");
+
+    engine.backend_caps.notifications = true;
+    engine.execute_command("CheckHas");
+    assert_eq!(engine.message, "notif:true clip:false");
+}
+
+#[test]
+fn test_lua_platform_open_url_queues_platform_action() {
+    let dir = write_plugin_lua(
+        "test_platform_open_url",
+        r#"vimcode.command("OpenIt", function()
+            vimcode.platform.open_url("https://example.com/2057")
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("OpenIt");
+    assert_eq!(
+        engine.pending_platform_actions,
+        vec![PendingPlatformAction::OpenUrl(
+            "https://example.com/2057".to_string()
+        )]
+    );
+}
+
+#[test]
+fn test_lua_platform_reveal_and_open_path_queue_platform_actions() {
+    let dir = write_plugin_lua(
+        "test_platform_reveal_open_path",
+        r#"vimcode.command("RevealIt", function()
+            vimcode.platform.reveal_in_file_manager("/tmp/vimcode-2057-a.txt")
+        end)
+        vimcode.command("OpenPathIt", function()
+            vimcode.platform.open_path("/tmp/vimcode-2057-b.txt")
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("RevealIt");
+    engine.execute_command("OpenPathIt");
+    assert_eq!(
+        engine.pending_platform_actions,
+        vec![
+            PendingPlatformAction::Reveal(std::path::PathBuf::from("/tmp/vimcode-2057-a.txt")),
+            PendingPlatformAction::OpenPath(std::path::PathBuf::from("/tmp/vimcode-2057-b.txt")),
+        ]
+    );
+}
+
+#[test]
+fn test_lua_platform_send_notification_queues_platform_action() {
+    let dir = write_plugin_lua(
+        "test_platform_notify",
+        r#"vimcode.command("NotifyIt", function()
+            vimcode.platform.send_notification("Hi", "there", true)
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("NotifyIt");
+    assert_eq!(
+        engine.pending_platform_actions,
+        vec![PendingPlatformAction::Notify {
+            title: "Hi".to_string(),
+            body: "there".to_string(),
+            urgent: true,
+        }]
+    );
+}
+
+#[test]
+fn test_lua_platform_show_open_dialog_queues_request_and_delivers_result() {
+    let dir = write_plugin_lua(
+        "test_platform_show_open_dialog",
+        r#"vimcode.command("PickFile", function()
+            vimcode.platform.show_open_dialog(
+                { title = "Pick one", filters = { { name = "Text", patterns = { "txt" } } } },
+                function(path)
+                    vimcode.message("picked:" .. tostring(path))
+                end
+            )
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("PickFile");
+    assert_eq!(engine.pending_platform_actions.len(), 1);
+    let PendingPlatformAction::PluginDialog(req) = engine.pending_platform_actions[0].clone()
+    else {
+        panic!(
+            "expected a PluginDialog action, got {:?}",
+            engine.pending_platform_actions[0]
+        );
+    };
+    assert_eq!(req.kind, PluginDialogKind::Open);
+    assert_eq!(req.title.as_deref(), Some("Pick one"));
+    assert_eq!(
+        req.filters,
+        vec![("Text".to_string(), vec!["txt".to_string()])]
+    );
+
+    // Resolving the request (as `run_pending_plugin_dialog` would after the
+    // backend's dialog returns) fires the Lua callback with the chosen path.
+    engine.deliver_plugin_dialog_result(
+        req.callback_id,
+        Some(std::path::PathBuf::from("/tmp/picked.txt")),
+    );
+    assert_eq!(engine.message, "picked:/tmp/picked.txt");
+}
+
+#[test]
+fn test_lua_platform_show_dialog_callback_receives_nil_when_cancelled() {
+    let dir = write_plugin_lua(
+        "test_platform_show_dialog_nil",
+        r#"vimcode.command("PickFolder", function()
+            vimcode.platform.show_folder_dialog(nil, function(path)
+                vimcode.message("picked:" .. tostring(path))
+            end)
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("PickFolder");
+    let PendingPlatformAction::PluginDialog(req) = engine.pending_platform_actions[0].clone()
+    else {
+        panic!(
+            "expected a PluginDialog action, got {:?}",
+            engine.pending_platform_actions[0]
+        );
+    };
+    assert_eq!(req.kind, PluginDialogKind::Folder);
+    engine.deliver_plugin_dialog_result(req.callback_id, None);
+    assert_eq!(engine.message, "picked:nil");
+}
+
+/// `run_pending_plugin_dialog`'s TUI/no-capability fallback: a backend
+/// without `file_dialogs` never calls `services()` — the callback simply
+/// resolves with `nil` instead of panicking or shelling out.
+#[test]
+fn test_run_pending_plugin_dialog_falls_back_to_nil_without_capability() {
+    let dir = write_plugin_lua(
+        "test_platform_dialog_fallback",
+        r#"vimcode.command("PickFile", function()
+            vimcode.platform.show_open_dialog(nil, function(path)
+                vimcode.message("picked:" .. tostring(path))
+            end)
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    // `engine.backend_caps` defaults to `BackendCaps::empty()`, so
+    // `file_dialogs` is false — this backend should never be asked to
+    // show a real dialog.
+    assert!(!engine.backend_caps.file_dialogs);
+    engine.execute_command("PickFile");
+    let action = engine.pending_platform_actions.remove(0);
+    let mut backend = quadraui::testing::RecordingBackend::new();
+    crate::render::run_pending_platform_action(&mut engine, action, &mut backend);
+    assert!(
+        backend.calls.is_empty(),
+        "backend.services() must never be touched without file_dialogs capability; calls were {:?}",
+        backend.calls
+    );
+    assert_eq!(engine.message, "picked:nil");
 }
 
 // ── Phase 4: Neovim test suite mining ────────────────────────────────────

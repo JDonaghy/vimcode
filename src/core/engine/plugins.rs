@@ -2771,6 +2771,55 @@ impl Engine {
         fired
     }
 
+    /// Deliver a `vimcode.platform.show_*_dialog` result to its callback and
+    /// drop the now-spent registration. Called from
+    /// `run_pending_plugin_dialog` once the native (or TUI-fallback) dialog
+    /// call has returned, with `path` already `None` if the user cancelled
+    /// or the backend lacks the dialog capability.
+    pub(crate) fn deliver_plugin_dialog_result(&mut self, id: u64, path: Option<PathBuf>) {
+        let path = path.map(|p| p.to_string_lossy().into_owned());
+        let ctx = self.make_plugin_ctx(true);
+        let Some(ctx) =
+            self.with_plugin_dispatch(|pm| pm.call_platform_dialog_result(id, path, ctx))
+        else {
+            return;
+        };
+        self.apply_plugin_ctx(ctx);
+        if let Some(pm) = self.plugin_manager.clone() {
+            pm.remove_platform_dialog_callback(id);
+        }
+    }
+
+    /// `vimcode.platform.show_open_dialog`/`show_save_dialog`/
+    /// `show_folder_dialog`: register `callback` and queue a
+    /// [`PendingPlatformAction::PluginDialog`] for the runner to resolve on
+    /// the next tick. A no-op (the callback is dropped unfired) if there is
+    /// no live plugin manager — mirrors `plugin_api_spawn`'s `?` early-out.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plugin_api_show_dialog(
+        &mut self,
+        kind: PluginDialogKind,
+        title: Option<String>,
+        initial_dir: Option<PathBuf>,
+        initial_filename: Option<String>,
+        filters: Vec<(String, Vec<String>)>,
+        callback: mlua::RegistryKey,
+    ) {
+        let Some(pm) = self.plugin_manager.clone() else {
+            return;
+        };
+        let callback_id = pm.register_platform_dialog_callback(callback);
+        self.pending_platform_actions
+            .push(PendingPlatformAction::PluginDialog(PluginDialogRequest {
+                kind,
+                title,
+                initial_dir,
+                initial_filename,
+                filters,
+                callback_id,
+            }));
+    }
+
     // ─── `vimcode.loop.spawn` ───────────────────────────────────────────────
 
     /// `vimcode.loop.spawn(cmd, args, opts)`: launch a child process and wire
