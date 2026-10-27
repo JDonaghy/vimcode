@@ -245,6 +245,189 @@ jobs:
         test -z "${DISPLAY:-}" && test -z "${WAYLAND_DISPLAY:-}"
         cargo test
 
+  # #2067: every job above drives the app only through a synthetic-key
+  # `TuiDriver`/`GtkDriver` (in-process `Msg` injection) or compiles it
+  # without ever launching it. None of them proves real terminal input bytes
+  # or a real display round-trip the engine's own input-parsing/paint path --
+  # a feature can pass every job above and still break on a real keyboard
+  # (#1970). This job closes that gap for the TUI backend: it builds the real
+  # `vcd` binary and drives it under an actual pty
+  # (`coord app-drive run-spec tui-pty`, `coord/tui_pty_driver.py`), sending
+  # real bytes down a real fd rather than injecting a `Key` enum value.
+  #
+  # `tests/smoke-spec/ci-tui.yaml` is a small, deterministic, CI-only spec --
+  # see its own header for why it is a separate file from the sealed,
+  # additive-only `tui.yaml` that fleet hardware runs.
+  smoke-tui-pty:
+    name: Smoke (TUI, real pty)
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        # Distinct key from the `test` job's: this builds a release-profile
+        # binary to drive, not a debug test harness.
+        key: ${{ runner.os }}-cargo-build-target-smoke-tui-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build vcd (release, no GTK)
+      run: cargo build --release --no-default-features --bin vcd
+
+    # Floor, not an exact pin: `app-drive run-spec` first shipped the one-shot
+    # CLI entry point this job calls directly, above the lower floor
+    # `test-smoke-specs` installs for the earlier `parse_*_spec`-only surface.
+    # The `tui-pty` extra pulls in `pyte`, the terminal-screen emulator the
+    # driver needs to decode pty output for `expect_within`/text assertions.
+    # Without it, `expect_within` steps fail fast with a clear "missing
+    # 'pyte'" error at `launch` -- but every `key`/`type_text` step that
+    # doesn't itself read the screen would otherwise report a spurious
+    # "pass" with no real check behind it.
+    - name: Install code-coordinator
+      run: pip install --quiet 'code-coordinator[tui-pty]>=0.5.673'
+
+    - name: Run tests/smoke-spec/ci-tui.yaml under a real pty
+      run: |
+        set -euo pipefail
+        WORKDIR="$(mktemp -d)"
+        printf 'line one\nline two\nline three\n' > "$WORKDIR/sample.txt"
+        # Isolated $HOME: a real settings file with lsp/nerd-fonts off keeps
+        # the run deterministic and independent of whatever happens to be in
+        # the runner's default profile.
+        export HOME="$WORKDIR/home"
+        mkdir -p "$HOME/.config/vimcode"
+        printf '{"lsp_enabled": false, "use_nerd_fonts": false}' \
+          > "$HOME/.config/vimcode/settings.json"
+        BIN="$GITHUB_WORKSPACE/target/release/vcd"
+        coord app-drive run-spec tui-pty tests/smoke-spec/ci-tui.yaml \
+          --launch "$BIN $WORKDIR/sample.txt" \
+          --cwd "$WORKDIR"
+
+  # #2067: the Xvfb/xdotool counterpart to `smoke-tui-pty` above, for the GTK
+  # backend -- every GTK-touching job elsewhere either compiles headlessly
+  # (`test-gui`, in-memory Cairo surfaces, no `gtk::init`) or never launches
+  # the real binary at all. This job builds the real `vimcode` binary and
+  # drives it against a real X11 display under Xvfb
+  # (`coord app-drive run-spec gtk-native`, `coord/gtk_native_driver.py`),
+  # using `xdotool`/`xwd` for real key/click injection and real pixel
+  # capture, closing the #1970 synthetic-input gap for the GTK backend.
+  #
+  # `fluxbox` matters here, not just cosmetically: `expect_frontmost` in
+  # `tests/smoke-spec/ci-gtk.yaml` asks `xdotool getactivewindow`, which
+  # reads the `_NET_ACTIVE_WINDOW` root-window property -- a property only a
+  # running window manager maintains. A bare Xvfb server with no WM leaves
+  # it unset, so `is_frontmost` would read "not confirmed frontmost" forever
+  # and that step would fail every run regardless of whether the real window
+  # actually opened correctly.
+  smoke-gtk-xvfb:
+    name: Smoke (GTK, Xvfb)
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install GTK4 dev libraries and X11 tooling
+      run: |
+        sudo apt-get update
+        # libgtk-4-dev/librsvg2-common: same as `test-gui` -- see its own
+        # comment for why librsvg2-common needs listing explicitly.
+        # xvfb: the virtual X server this job drives the real binary against.
+        # fluxbox: minimal window manager -- see the job header comment on
+        # why `expect_frontmost` needs one actually running.
+        # xdotool: real key/click injection and `_NET_ACTIVE_WINDOW` probing.
+        # x11-apps: ships `xwd`, the real pixel-capture tool
+        # `coord.gtk_native_driver.decode_xwd` consumes.
+        # x11-utils: ships `xdpyinfo`, used below only to poll for Xvfb
+        # readiness before launching fluxbox/the app against it.
+        sudo apt-get install -y --no-install-recommends \
+          libgtk-4-dev librsvg2-common xvfb fluxbox xdotool x11-apps x11-utils
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        # Distinct key from every other job's: this builds a release-profile
+        # GUI binary to drive, not a debug test harness.
+        key: ${{ runner.os }}-cargo-build-target-smoke-gtk-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build vimcode (release, GUI feature on)
+      run: cargo build --release --bin vimcode
+
+    - name: Install code-coordinator
+      run: pip install --quiet 'code-coordinator>=0.5.673'
+
+    - name: Run tests/smoke-spec/ci-gtk.yaml under Xvfb + fluxbox
+      run: |
+        set -euo pipefail
+        WORKDIR="$(mktemp -d)"
+        printf 'line one\nline two\nline three\n' > "$WORKDIR/sample.txt"
+        export HOME="$WORKDIR/home"
+        mkdir -p "$HOME/.config/vimcode"
+        printf '{"lsp_enabled": false, "use_nerd_fonts": false}' \
+          > "$HOME/.config/vimcode/settings.json"
+
+        export DISPLAY=:99
+        Xvfb "$DISPLAY" -screen 0 1280x1024x24 &
+        XVFB_PID=$!
+        # Give Xvfb a moment to accept connections before the WM (and later
+        # the app) tries to use the display.
+        for _ in $(seq 1 20); do
+          xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
+          sleep 0.5
+        done
+
+        fluxbox &
+        FLUXBOX_PID=$!
+        sleep 2
+
+        BIN="$GITHUB_WORKSPACE/target/release/vimcode"
+        set +e
+        coord app-drive run-spec gtk-native tests/smoke-spec/ci-gtk.yaml \
+          --launch "$BIN $WORKDIR/sample.txt" \
+          --cwd "$WORKDIR"
+        STATUS=$?
+        set -e
+
+        kill "$FLUXBOX_PID" 2>/dev/null || true
+        kill "$XVFB_PID" 2>/dev/null || true
+        exit $STATUS
+
   # #1042: the two jobs above are both Linux, so `src/macos/mod.rs` — gated
   # `#[cfg(all(feature = "macos", target_os = "macos"))]` in src/lib.rs, and
   # likewise in quadraui itself — is never compiled by either of them and its
