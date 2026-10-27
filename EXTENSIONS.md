@@ -1248,6 +1248,53 @@ local text, err = vimcode.fs.read(path)
   leading `~` expands to the home directory, and anything still relative is
   resolved against the workspace root.
 
+### Platform Services (`vimcode.platform.*`)
+
+Thin wrapper over quadraui's `PlatformServices`/`BackendCaps`, so an extension can
+check what the current backend supports before using it:
+
+```lua
+if vimcode.platform.has("notifications") then
+    vimcode.platform.send_notification("Build done", "All tests passed", false)
+end
+
+vimcode.platform.open_url("https://example.com")
+vimcode.platform.reveal_in_file_manager("/path/to/file.txt")
+vimcode.platform.open_path("/path/to/file.txt")  -- opens with the OS default handler
+
+local text = vimcode.platform.clipboard_read()
+vimcode.platform.clipboard_write("copied text")
+
+vimcode.platform.show_open_dialog({
+    title = "Pick a file",
+    initial_dir = "/tmp",
+    initial_filename = "export.json",
+    filters = { { name = "JSON", patterns = { "json" } } },
+}, function(path)
+    -- path is a string, or nil if the user cancelled
+end)
+vimcode.platform.show_save_dialog(nil, function(path) ... end)
+vimcode.platform.show_folder_dialog(nil, function(path) ... end)
+```
+
+- `has(capability)` checks a `BackendCaps` flag by name — `"file_dialogs"`,
+  `"folder_dialogs"`, `"notifications"`, `"native_dialogs"`, `"native_menu"`,
+  etc. (any field of quadraui's `BackendCaps`) — plus the vimcode-only
+  `"clipboard"`, which isn't a `BackendCaps` field since it's wired per-backend
+  onto the engine rather than being a static per-backend fact. Unknown names
+  return `false`.
+- `open_url`, `reveal_in_file_manager`, `open_path` and `send_notification` are
+  fire-and-forget: they queue a platform action and return immediately, with no
+  way to observe success/failure from Lua. There is no matching `has()`
+  capability to gate them on — a backend without a desktop shell drops the
+  action silently instead of erroring the calling plugin.
+- `show_open_dialog`/`show_save_dialog`/`show_folder_dialog` take an optional
+  `opts` table (or `nil`) and a callback invoked exactly once with the chosen
+  path, or `nil` if the dialog was cancelled or the backend lacks the
+  capability. On a backend without `file_dialogs`/`folder_dialogs` (e.g. the
+  TUI), the callback fires with `nil` immediately rather than opening anything.
+- `clipboard_read`/`clipboard_write` are synchronous and return immediately.
+
 ### Comment Style Override
 
 Override comment syntax for a language (useful for custom/niche languages):

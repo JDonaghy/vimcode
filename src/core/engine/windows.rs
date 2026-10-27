@@ -1240,6 +1240,30 @@ impl Engine {
             .push(PendingPlatformAction::Reveal(path.to_path_buf()));
     }
 
+    /// Open a path with the platform's default handler for it (the
+    /// associated application for a file, the default file manager for a
+    /// directory). Queues a [`PendingPlatformAction::OpenPath`] — see
+    /// `reveal_in_file_manager`'s doc for why this can't shell out directly.
+    pub fn open_path(&mut self, path: &Path) {
+        self.pending_platform_actions
+            .push(PendingPlatformAction::OpenPath(path.to_path_buf()));
+    }
+
+    /// Send a desktop notification via `PlatformServices::send_notification`.
+    /// Queues a [`PendingPlatformAction::Notify`] — see
+    /// `reveal_in_file_manager`'s doc for why this can't shell out directly.
+    /// `urgent` maps to `quadraui::Notification::urgent`, a hint backends may
+    /// use to request the notification stay visible or interrupt do-not-
+    /// disturb.
+    pub fn send_notification(&mut self, title: String, body: String, urgent: bool) {
+        self.pending_platform_actions
+            .push(PendingPlatformAction::Notify {
+                title,
+                body,
+                urgent,
+            });
+    }
+
     /// Return the path relative to cwd.
     pub fn copy_relative_path(&self, path: &Path) -> String {
         let clean_path = crate::core::paths::strip_unc_prefix(path);
