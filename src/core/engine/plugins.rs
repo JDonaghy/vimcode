@@ -77,21 +77,23 @@ fn spawn_cwd(cwd: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
 }
 
 /// Which surface currently owns a `vimcode.ui.register_view` view's keyboard
-/// focus / selection index — the sidebar body or an editor-area tab
-/// (`Engine::open_plugin_view_tab`, #1627).
+/// focus / selection index — the sidebar body, an editor-area tab
+/// (`Engine::open_plugin_view_tab`), or the bottom-panel dock
+/// (`Engine::open_plugin_view_dock`).
 ///
-/// The two never hold keyboard focus at once (`Engine::handle_key`'s
+/// No two ever hold keyboard focus at once (`Engine::handle_key`'s
 /// `ext_panel_has_focus` check always wins over a plugin-view tab's own key
-/// routing — see `keys.rs`), but both may be *painted* in the same frame,
-/// hosting different views, so each keeps its own selection/scroll index and
-/// `FormController` rather than sharing `ext_panel_selected`/
-/// `ext_panel_scroll_top`/`plugin_view_form_controller` — see
-/// `Engine::plugin_view_tab_selected`'s doc for why sharing would be wrong,
-/// not just redundant.
+/// routing — see `keys.rs`; the dock does not take keyboard focus at all,
+/// mirroring the bottom panel's other non-Terminal content), but any
+/// combination may be *painted* in the same frame, hosting different views,
+/// so each keeps its own selection/scroll index and `FormController` rather
+/// than sharing one — see `Engine::plugin_view_tab_selected`'s doc for why
+/// sharing would be wrong, not just redundant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PluginViewHost {
     Sidebar,
     Tab,
+    Dock,
 }
 
 impl Engine {
@@ -459,11 +461,60 @@ impl Engine {
         true
     }
 
+    /// Open or re-focus `name` (a `vimcode.ui.register_view` view) as the
+    /// bottom panel's docked content, the way `vimcode.ui.open_view(name,
+    /// {location = "dock"})` is wired.
+    ///
+    /// Unlike `Engine::open_plugin_view_tab`/`open_plugin_view_split`, this
+    /// never creates a new buffer/window/tab — it just re-points
+    /// `Engine::bottom_panel_kind` at `BottomPanelKind::Plugin(name)` and
+    /// opens the bottom panel, so calling this again for the same name is a
+    /// no-op beyond the refresh: "reuse by name" falls out of there being
+    /// only one dock slot, rather than needing any dedupe logic of its own.
+    ///
+    /// Only `Form`- and `TextView`-kind views paint anything useful in the
+    /// dock today (`render::paint_bottom_panel_rung`'s `Plugin` arm) —
+    /// `List`/`Tree`/`Table` kinds are accepted here (so a plugin can still
+    /// dock one) but currently paint as an empty panel, matching
+    /// `BottomPanelKind::Problems`/`Output`'s own "accepted, not yet wired"
+    /// precedent.
+    pub fn open_plugin_view_dock(&mut self, name: &str) -> bool {
+        if !self.is_plugin_view(name) {
+            return false;
+        }
+        self.bottom_panel_kind = BottomPanelKind::Plugin(name.to_string());
+        self.bottom_panel_open = true;
+        // See `open_plugin_view_tab`'s doc for why the refresh must be
+        // deferred when called from inside an already-running plugin
+        // callback.
+        if self.plugin_dispatch_depth == 0 {
+            self.refresh_plugin_view(name);
+        } else {
+            self.plugin_view_tab_pending_refresh.push(name.to_string());
+        }
+        true
+    }
+
+    /// Handle a scroll event on the bottom panel's docked plugin view
+    /// (`"plugin_dock"`'s scroll surface). No-op when the bottom panel
+    /// isn't currently showing a `BottomPanelKind::Plugin`, or that view
+    /// isn't `TextView`-kind (`List`/`Tree`/`Table`/`Form` dock bodies don't
+    /// scroll via this path yet).
+    pub fn handle_plugin_view_dock_scroll(&mut self, delta_y: f32) {
+        let BottomPanelKind::Plugin(name) = &self.bottom_panel_kind else {
+            return;
+        };
+        let name = name.clone();
+        let step = (delta_y.abs() * 3.0).ceil() as i32 * delta_y.signum() as i32;
+        crate::render::scroll_plugin_view_text(self, &name, PluginViewHost::Dock, step);
+    }
+
     /// Read the selection index for `host`.
     pub(crate) fn plugin_view_selected(&self, host: PluginViewHost) -> usize {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_selected,
             PluginViewHost::Tab => self.plugin_view_tab_selected,
+            PluginViewHost::Dock => self.plugin_view_dock_selected,
         }
     }
 
@@ -472,6 +523,7 @@ impl Engine {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_selected = idx,
             PluginViewHost::Tab => self.plugin_view_tab_selected = idx,
+            PluginViewHost::Dock => self.plugin_view_dock_selected = idx,
         }
     }
 
@@ -482,6 +534,7 @@ impl Engine {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_scroll_top,
             PluginViewHost::Tab => self.plugin_view_tab_scroll_top,
+            PluginViewHost::Dock => self.plugin_view_dock_scroll_top,
         }
     }
 
@@ -490,6 +543,7 @@ impl Engine {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_scroll_top = offset,
             PluginViewHost::Tab => self.plugin_view_tab_scroll_top = offset,
+            PluginViewHost::Dock => self.plugin_view_dock_scroll_top = offset,
         }
     }
 
@@ -502,6 +556,7 @@ impl Engine {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_table_col,
             PluginViewHost::Tab => self.plugin_view_tab_table_col,
+            PluginViewHost::Dock => self.plugin_view_dock_table_col,
         }
     }
 
@@ -510,6 +565,7 @@ impl Engine {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_table_col = col,
             PluginViewHost::Tab => self.plugin_view_tab_table_col = col,
+            PluginViewHost::Dock => self.plugin_view_dock_table_col = col,
         }
     }
 
@@ -533,6 +589,15 @@ impl Engine {
                     self.plugin_view_tab_scroll_top = sel;
                 } else if sel >= self.plugin_view_tab_scroll_top + ROWS {
                     self.plugin_view_tab_scroll_top = sel.saturating_sub(ROWS - 1);
+                }
+            }
+            PluginViewHost::Dock => {
+                const ROWS: usize = 20;
+                let sel = self.plugin_view_dock_selected;
+                if sel < self.plugin_view_dock_scroll_top {
+                    self.plugin_view_dock_scroll_top = sel;
+                } else if sel >= self.plugin_view_dock_scroll_top + ROWS {
+                    self.plugin_view_dock_scroll_top = sel.saturating_sub(ROWS - 1);
                 }
             }
         }
@@ -768,6 +833,10 @@ impl Engine {
                         let rect = self.plugin_view_tab_form_rect.get();
                         crate::render::handle_plugin_view_tab_ui_event(self, name, &event, rect)
                     }
+                    // The dock never holds keyboard focus, so a
+                    // Date-field key never actually reaches this arm in
+                    // practice; it exists only to keep the match exhaustive.
+                    PluginViewHost::Dock => false,
                 };
             }
         }
@@ -809,6 +878,7 @@ impl Engine {
                 match host {
                     PluginViewHost::Sidebar => self.ext_panel_scroll_top = 0,
                     PluginViewHost::Tab => self.plugin_view_tab_scroll_top = 0,
+                    PluginViewHost::Dock => self.plugin_view_dock_scroll_top = 0,
                 }
                 true
             }

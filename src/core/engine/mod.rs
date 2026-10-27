@@ -1511,7 +1511,10 @@ pub enum DebugSidebarSection {
 /// Which panel is shown in the bottom area. The tab strip always offers
 /// `Problems` and `Output` as placeholders (no diagnostics/channel content
 /// is wired up yet); `DebugOutput` and `Terminal` only appear once there is
-/// something to show (a running debug session / an open terminal).
+/// something to show (a running debug session / an open terminal); `Plugin`
+/// appears once a `vimcode.ui.register_view` view has been docked via
+/// `Engine::open_plugin_view_dock` (`vimcode.ui.open_view(name, {location =
+/// "dock"})`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BottomPanelKind {
     /// Placeholder — no diagnostics content is wired up yet.
@@ -1519,6 +1522,13 @@ pub enum BottomPanelKind {
     /// Placeholder — no output-channel content is wired up yet.
     Output,
     DebugOutput,
+    /// A `vimcode.ui.register_view` view docked into the bottom panel,
+    /// named by the view's registration name. Reused by name — docking the
+    /// same view twice re-focuses this one rather than creating another
+    /// (`Engine::open_plugin_view_dock`), the dock's twin of
+    /// `Engine::active_plugin_view_tab`'s "no duplicate tabs" behavior for
+    /// editor-area tabs.
+    Plugin(String),
     #[default]
     Terminal,
 }
@@ -4943,6 +4953,29 @@ pub struct Engine {
     /// Tab twin of `ext_panel_table_col`, kept separate for the same reason
     /// `plugin_view_tab_selected` is kept separate from `ext_panel_selected`.
     pub plugin_view_tab_table_col: usize,
+    /// Flat selection index for a `vimcode.ui.register_view` view docked into
+    /// the bottom panel (`Engine::open_plugin_view_dock`) — the dock twin of
+    /// `plugin_view_tab_selected`, kept separate for the same reason: the
+    /// sidebar, an editor tab and the dock can each be showing a different
+    /// view at once.
+    pub plugin_view_dock_selected: usize,
+    /// Scroll offset for a dock-hosted plugin view — the dock twin of
+    /// `plugin_view_tab_scroll_top`.
+    pub plugin_view_dock_scroll_top: usize,
+    /// The `quadraui::FormController` a dock-hosted plugin view is painted
+    /// through — the dock twin of `plugin_view_tab_form_controller`, kept
+    /// separate so a simultaneously-visible tab/sidebar view and the dock
+    /// view don't overwrite each other's cached click-routing geometry.
+    pub plugin_view_dock_form_controller: std::cell::RefCell<quadraui::FormController>,
+    /// The exact rect the last frame painted the dock-hosted plugin view's
+    /// form into (dock twin of `plugin_view_tab_form_rect`).
+    pub plugin_view_dock_form_rect: std::cell::Cell<quadraui::Rect>,
+    /// Dock twin of `plugin_view_tab_table_col`. The dock does not yet paint
+    /// `Table`-kind views (only `Form` and `TextView` are wired), so this
+    /// is only reachable in practice via the generic per-host accessor
+    /// below — it exists purely to keep that accessor exhaustive over every
+    /// `PluginViewHost`.
+    pub plugin_view_dock_table_col: usize,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
     /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
@@ -5783,6 +5816,15 @@ impl Engine {
             plugin_view_table_resize_drag: None,
             ext_panel_table_col: 0,
             plugin_view_tab_table_col: 0,
+            plugin_view_dock_selected: 0,
+            plugin_view_dock_scroll_top: 0,
+            plugin_view_dock_form_controller: std::cell::RefCell::new(
+                quadraui::FormController::new("plugin-view-dock".to_string()),
+            ),
+            plugin_view_dock_form_rect: std::cell::Cell::new(quadraui::Rect::new(
+                0.0, 0.0, 0.0, 0.0,
+            )),
+            plugin_view_dock_table_col: 0,
             ext_panel_sections_expanded: HashMap::new(),
             ext_panel_tree_expanded: HashMap::new(),
             ext_panel_input_text: HashMap::new(),

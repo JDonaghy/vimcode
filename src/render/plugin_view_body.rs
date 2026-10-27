@@ -89,6 +89,8 @@ pub(crate) fn paint_plugin_view_list(
     let cache = match host {
         PluginViewHost::Sidebar => &engine.plugin_view_list_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_list_layout,
+        // List-kind Dock support isn't implemented.
+        PluginViewHost::Dock => return false,
     };
     cache.replace(Some((rect, layout)));
     true
@@ -109,6 +111,8 @@ pub(crate) fn route_plugin_view_list_click(
     let cache = match host {
         PluginViewHost::Sidebar => &engine.plugin_view_list_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_list_layout,
+        // List-kind Dock support isn't implemented.
+        PluginViewHost::Dock => return false,
     };
     let idx = {
         let borrowed = cache.borrow();
@@ -295,6 +299,8 @@ pub(crate) fn populate_plugin_view_tree_controller(
     let controller = match host {
         PluginViewHost::Sidebar => &engine.plugin_view_tree_controller,
         PluginViewHost::Tab => &engine.plugin_view_tab_tree_controller,
+        // Tree-kind Dock support isn't implemented.
+        PluginViewHost::Dock => return false,
     };
     let mut tc = controller.borrow_mut();
     tc.set_has_focus(has_focus);
@@ -325,6 +331,10 @@ pub(crate) fn route_plugin_view_tree_event(
     let controller = match host {
         PluginViewHost::Sidebar => engine.plugin_view_tree_controller.clone(),
         PluginViewHost::Tab => engine.plugin_view_tab_tree_controller.clone(),
+        // Tree-kind Dock support isn't implemented; the
+        // `populate_plugin_view_tree_controller` call above already bailed
+        // out for `Dock`, so this arm is unreachable in practice.
+        PluginViewHost::Dock => return false,
     };
     let tree_event = controller.borrow_mut().handle(event, backend, rect);
 
@@ -411,6 +421,10 @@ pub(crate) fn handle_plugin_view_tree_key(
     let controller = match host {
         PluginViewHost::Sidebar => engine.plugin_view_tree_controller.clone(),
         PluginViewHost::Tab => engine.plugin_view_tab_tree_controller.clone(),
+        // Tree-kind Dock support isn't implemented; the
+        // `populate_plugin_view_tree_controller` call above already bailed
+        // out for `Dock`, so this arm is unreachable in practice.
+        PluginViewHost::Dock => return false,
     };
     let (rows, selected_path) = {
         let tc = controller.borrow();
@@ -703,6 +717,8 @@ pub(crate) fn paint_plugin_view_table(
     let cache = match host {
         PluginViewHost::Sidebar => &engine.plugin_view_table_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_table_layout,
+        // Table-kind Dock support isn't implemented.
+        PluginViewHost::Dock => return false,
     };
     cache.replace(Some((rect, layout)));
     true
@@ -722,6 +738,8 @@ pub(crate) fn route_plugin_view_table_click(
     let cache = match host {
         PluginViewHost::Sidebar => &engine.plugin_view_table_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_table_layout,
+        // Table-kind Dock support isn't implemented.
+        PluginViewHost::Dock => return false,
     };
     let Some(ViewBody::Table { columns, rows }) = plugin_view_body(engine, name) else {
         return false;

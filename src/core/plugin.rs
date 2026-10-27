@@ -4772,28 +4772,30 @@ impl PluginManager {
         )?;
 
         // vimcode.ui.open_view(name, opts) — open a registered view either
-        // as an editor-area tab (`{location = "tab"}`, the default) or as a
-        // new window split alongside the active window (`{location =
-        // "split"}` for a horizontal/top-bottom split, `{location =
-        // "vsplit"}` for a vertical/left-right split — vim's own `:split`/
-        // `:vsplit` naming). An optional `side` (`"above"`/`"below"` for
-        // `"split"`, `"left"`/`"right"` for `"vsplit"`) pins which sibling
-        // the new window lands on, overriding `splitbelow`/`splitright`;
-        // omitting it falls back to those settings, the way `<C-w>s`/
-        // `<C-w>v` already do. A call with an unsupported `location`/`side`,
-        // a `side` from the wrong axis (e.g. `"left"` with `location =
-        // "split"`), or a `name` that isn't a registered view is a Lua
-        // error rather than a silent no-op, matching `register_view`'s
-        // "fail loudly at the Lua/Rust boundary" convention.
+        // as an editor-area tab (`{location = "tab"}`, the default), a new
+        // window split alongside the active window (`{location = "split"}`
+        // for a horizontal/top-bottom split, `{location = "vsplit"}` for a
+        // vertical/left-right split — vim's own `:split`/`:vsplit` naming),
+        // or the single reusable bottom-panel slot (`{location = "dock"}`).
+        // An optional `side` (`"above"`/`"below"` for `"split"`, `"left"`/
+        // `"right"` for `"vsplit"`) pins which sibling the new window lands
+        // on, overriding `splitbelow`/`splitright`; omitting it falls back
+        // to those settings, the way `<C-w>s`/`<C-w>v` already do. `"dock"`
+        // ignores `side` (there is only ever one dock slot, re-pointed to
+        // `name` and re-shown if it isn't already — the "reuse by name"
+        // behaviour: the same `name` opened twice never creates a second
+        // surface). A call with an unsupported `location`/`side`, a `side`
+        // from the wrong axis (e.g. `"left"` with `location = "split"`), or
+        // a `name` that isn't a registered view is a Lua error rather than
+        // a silent no-op, matching `register_view`'s "fail loudly at the
+        // Lua/Rust boundary" convention.
         //
         // Immediate ("live engine") API, like `vimcode.buffer.*`: opening a
-        // tab or split is a structural engine mutation
-        // (`Engine::open_plugin_view_tab`/`open_plugin_view_split` — a real
-        // `Tab`/`Window`/scratch `BufferId`, via the pre-existing
-        // `Engine::new_tab`/`split_active_window_for_buffer`), not queued
-        // output data, so it needs `live_engine` the way
-        // `vimcode.buffer.create` does rather than a `PluginCallContext`
-        // field `apply_plugin_ctx` applies later.
+        // tab, split or dock is a structural engine mutation
+        // (`Engine::open_plugin_view_tab`/`open_plugin_view_split`/
+        // `open_plugin_view_dock`), not queued output data, so it needs
+        // `live_engine` the way `vimcode.buffer.create` does rather than a
+        // `PluginCallContext` field `apply_plugin_ctx` applies later.
         ui_tbl.set(
             "open_view",
             lua.create_function(|_, (name, opts): (String, Option<LuaTable>)| {
@@ -4806,6 +4808,9 @@ impl PluginManager {
                 let opened = match location.as_str() {
                     "tab" => live_engine("vimcode.ui.open_view", move |e| {
                         e.open_plugin_view_tab(&name)
+                    })?,
+                    "dock" => live_engine("vimcode.ui.open_view", move |e| {
+                        e.open_plugin_view_dock(&name)
                     })?,
                     "split" | "vsplit" => {
                         let direction = if location == "vsplit" {
@@ -4852,7 +4857,7 @@ impl PluginManager {
                     other => {
                         return Err(LuaError::RuntimeError(format!(
                             "vimcode.ui.open_view({name:?}): unsupported location {other:?} \
-                             (expected \"tab\", \"split\" or \"vsplit\")"
+                             (expected \"tab\", \"dock\", \"split\" or \"vsplit\")"
                         )));
                     }
                 };

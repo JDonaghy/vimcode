@@ -342,6 +342,36 @@ pub fn populate_plugin_view_tab_form_controller(
     true
 }
 
+/// Populate `Engine::plugin_view_dock_form_controller` from the named plugin
+/// view — the bottom-dock twin of [`populate_plugin_view_tab_form_controller`],
+/// reading `plugin_view_dock_*` interaction state instead of `_tab_*`. The
+/// caller is `paint_bottom_panel_rung`, which resolves the view name from
+/// `BottomPanelKind::Plugin`.
+///
+/// Returns `false` when `name` isn't a registered view.
+pub fn populate_plugin_view_dock_form_controller(
+    engine: &Engine,
+    name: &str,
+    has_focus: bool,
+) -> bool {
+    let Some(view) = engine.plugin_views.get(name) else {
+        return false;
+    };
+    let form = plugin_view_to_form(
+        name,
+        view,
+        engine.plugin_view_dock_selected,
+        engine.plugin_view_dock_scroll_top,
+        has_focus,
+        engine.plugin_view_text_edit.as_ref(),
+    );
+    let mut fc = engine.plugin_view_dock_form_controller.borrow_mut();
+    fc.set_form(form);
+    fc.set_scroll_offset(engine.plugin_view_dock_scroll_top);
+    fc.set_has_focus(has_focus);
+    true
+}
+
 /// Route a pointer event over a plugin view through the shared
 /// `quadraui::FormController` and dispatch whatever widget event it resolves to
 /// the plugin's `on_event` callback.
