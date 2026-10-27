@@ -484,6 +484,7 @@ impl Engine {
         }
         self.bottom_panel_kind = BottomPanelKind::Plugin(name.to_string());
         self.bottom_panel_open = true;
+        self.terminal_has_focus = false;
         // See `open_plugin_view_tab`'s doc for why the refresh must be
         // deferred when called from inside an already-running plugin
         // callback.

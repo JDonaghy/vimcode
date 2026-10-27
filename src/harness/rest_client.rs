@@ -273,6 +273,22 @@ fn activate_send<D: ConformanceDriver>(driver: &mut D) {
     driver.press_named(NamedKey::Enter);
 }
 
+/// Click the Request view's "Response" nav button (`open_response`).
+///
+/// Unlike [`activate_add_header`]/[`activate_send`], this is relative to
+/// `send` rather than `url`: it is only ever called right after
+/// [`activate_send`], and clicking a button does not itself move focus, so
+/// the view is still focused on `send` when this runs. `send, save,
+/// open_headers, open_params, open_response` is the focusable list from
+/// there (`status`, read-only, is skipped by `first_focusable`/Tab
+/// traversal) — four `Tab`s reaches `open_response`.
+fn activate_open_response<D: ConformanceDriver>(driver: &mut D) {
+    for _ in 0..4 {
+        driver.press_named(NamedKey::Tab);
+    }
+    driver.press_named(NamedKey::Enter);
+}
+
 // ── Shared scenario bodies ──────────────────────────────────────────────
 
 /// Fill the URL, send, and assert the painted status line and the
@@ -320,6 +336,54 @@ pub fn fill_url_send_and_paint_response<D: ConformanceDriver + DrivesIdle>(
         "the Response view must paint the response's headers list \
          (MVP scope: \"headers list\"), not just status/body; painted \
          runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Send a request, then click the Request view's "Response" nav button
+/// (`open_response`) and confirm it docks `rest_client_response` into the
+/// bottom panel — reusing the editor area, not opening a new tab — and
+/// paints the response body/headers there.
+pub fn open_response_docks_after_send<D: ConformanceDriver + DrivesIdle>(
+    driver: &mut D,
+    engine: &Rc<RefCell<Engine>>,
+    get_url: &str,
+    response_needle: &str,
+) {
+    open_tab(driver, engine, "RestClient");
+    driver.type_text(get_url);
+    activate_send(driver);
+    wait_for(driver, engine, STATUS_SEPARATOR, HTTP_TIMEOUT);
+    assert!(
+        driver.screen_has("200"),
+        "the status line must show the fixture server's 200 response \
+         within {HTTP_TIMEOUT:?}; painted runs were {:?}",
+        painted(driver)
+    );
+    activate_open_response(driver);
+    {
+        let e = engine.borrow();
+        assert_eq!(
+            e.bottom_panel_kind,
+            crate::core::engine::BottomPanelKind::Plugin("rest_client_response".to_string()),
+            "clicking the Response nav button must dock rest_client_response \
+             in the bottom panel rather than opening a new editor-area tab"
+        );
+        assert!(
+            e.bottom_panel_open,
+            "docking the Response view must also open the bottom panel"
+        );
+    }
+    assert!(
+        driver.screen_has(response_needle),
+        "the docked Response view must paint the pretty-printed JSON body; \
+         painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has("Content-Type"),
+        "the docked Response view must paint the response's headers list \
+         too, not just the body; painted runs were {:?}",
         painted(driver)
     );
 }
@@ -688,6 +752,16 @@ mod tests {
         other_views_render_without_error(&mut h.driver, &engine);
     }
 
+    #[test]
+    fn rest_client_open_response_docks_after_send_on_tui() {
+        let (_data_home, _dir) = data_home_guard("open_response_dock_tui");
+        let (base_url, _captured) = spawn_capturing_server(r#"{"status":"zqxw147dock"}"#);
+        let get_url = format!("{base_url}/get147dock");
+        let mut h = tui_harness(engine_with_extension());
+        let engine = Rc::clone(&h.engine);
+        open_response_docks_after_send(&mut h.driver, &engine, &get_url, "zqxw147dock");
+    }
+
     // ── GTK harness ──────────────────────────────────────────────────────
 
     #[cfg(feature = "gui")]
@@ -772,5 +846,16 @@ mod tests {
         let mut h = gtk_harness(engine_with_extension());
         let engine = Rc::clone(&h.engine);
         other_views_render_without_error(&mut h.driver, &engine);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn rest_client_open_response_docks_after_send_on_gtk() {
+        let (_data_home, _dir) = data_home_guard("open_response_dock_gtk");
+        let (base_url, _captured) = spawn_capturing_server(r#"{"status":"zqxw147dock"}"#);
+        let get_url = format!("{base_url}/get147dock");
+        let mut h = gtk_harness(engine_with_extension());
+        let engine = Rc::clone(&h.engine);
+        open_response_docks_after_send(&mut h.driver, &engine, &get_url, "zqxw147dock");
     }
 }

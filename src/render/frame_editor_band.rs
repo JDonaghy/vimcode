@@ -393,7 +393,7 @@ pub(crate) fn paint_editor_band_rungs<'screen>(
 //     The rung lived nested under the sidebar rung, so caches were not reset
 //     when the sidebar collapsed. A source-control / extension item tooltip
 //     left open while collapsing would keep its last painted rect forever:
-// `handle_mouse_press` would arbitrate clicks against a popup no longer on
+//     `handle_mouse_press` would arbitrate clicks against a popup no longer on
 //     screen. Input and paint disagreeing about what is painted.
 //   * **TUI's debug toolbar had the mirror-image bug.** Its rung had no else
 //     case, so the toolbar's rect kept its last value when the toolbar hid,
@@ -962,11 +962,18 @@ pub fn paint_bottom_panel_rung(
             // holds keyboard focus, so `has_focus` is always `false`; body
             // kinds dispatch the same way `App::paint_editor_windows_rung`
             // dispatches a tab-hosted view, with `PluginViewHost::Dock` in
-            // place of `PluginViewHost::Tab`. List/Tree/Table-kind bodies
-            // aren't implemented for the dock host (`plugin_view_body.rs`'s
-            // `Dock => return false` arms), so only `text_view` and the
-            // `Form` default actually paint here; the other two calls are
-            // kept for parity with the tab dispatch and simply no-op.
+            // place of `PluginViewHost::Tab`. Only `text_view` and the `Form`
+            // default are implemented for the dock host today: List/Tree/
+            // Table-kind bodies paint nothing here rather than falling into
+            // the `Form` default (which would render the view's likely-empty
+            // field list instead). `paint_plugin_view_list`/
+            // `paint_plugin_view_table` are not called for the dock host —
+            // both functions paint via `Backend::draw_list`/
+            // `draw_data_table` before reaching their own
+            // `PluginViewHost::Dock => return false` cache-selection arm, so
+            // calling them here would paint content with no corresponding
+            // cached hit-test layout, leaving a click over it to fall through
+            // to the terminal pane underneath.
             let body =
                 quadraui::Rect::new(rect.x, rect.y + lh, rect.width, (rect.height - lh).max(0.0));
             engine.plugin_view_dock_form_rect.set(body);
@@ -976,17 +983,19 @@ pub fn paint_bottom_panel_rung(
                 .and_then(|v| v.body.as_ref())
                 .map(|v| v.kind_name());
             match kind {
-                Some("list") => {
-                    paint_plugin_view_list(engine, name, PluginViewHost::Dock, false, body, b);
-                }
+                // List-kind bodies have no dock-hosted layout cache yet
+                // (`plugin_view_body.rs`'s `paint_plugin_view_list`'s
+                // `Dock => return false` arm) — see the comment above.
+                Some("list") => {}
                 // Tree-kind bodies have no dock-hosted `TreeController`
                 // (deferred, like List/Table above); painting nothing here
                 // rather than falling into the `Form` default avoids
                 // rendering the view's (likely empty) field list instead.
                 Some("tree") => {}
-                Some("table") => {
-                    paint_plugin_view_table(engine, name, PluginViewHost::Dock, false, body, b);
-                }
+                // Table-kind bodies have no dock-hosted layout cache yet
+                // (`plugin_view_body.rs`'s `paint_plugin_view_table`'s
+                // `Dock => return false` arm) — see the comment above.
+                Some("table") => {}
                 Some("text_view") => {
                     paint_plugin_view_text(engine, name, PluginViewHost::Dock, false, body, b);
                     engine
