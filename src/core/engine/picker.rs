@@ -476,7 +476,7 @@ impl Engine {
     fn picker_populate_commands(&mut self) {
         let use_vscode = self.is_vscode_mode();
         let platform_name = self.platform_name;
-        self.picker_all_items = PALETTE_COMMANDS
+        let mut items: Vec<PickerItem> = PALETTE_COMMANDS
             .iter()
             .map(|cmd| {
                 let sc = if use_vscode && !cmd.vscode_shortcut.is_empty() {
@@ -499,6 +499,26 @@ impl Engine {
                 }
             })
             .collect();
+        // Extension-registered commands (`vimcode.command(name, fn)`) are
+        // listed alongside the built-ins so a plugin's actions are reachable
+        // from the palette without any extra registration step on its part.
+        if let Some(pm) = self.plugin_manager.as_ref() {
+            for name in pm.command_names() {
+                items.push(PickerItem {
+                    display: name.clone(),
+                    filter_text: name.clone(),
+                    detail: Some("Extension command".to_string()),
+                    action: PickerAction::ExecuteCommand(name),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                });
+            }
+        }
+        self.picker_all_items = items;
     }
 
     /// Populate picker_all_items with git branches.

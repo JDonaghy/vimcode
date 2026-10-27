@@ -336,7 +336,9 @@ Buffers and windows are plain integer **handles**, and `0` always means "current
 Call these at the top level of your script (during load time):
 
 ```lua
--- Register a custom command (callable via :MyCommand args)
+-- Register a custom command (callable via :MyCommand args). Registered
+-- commands also appear in the command palette automatically, filtered by
+-- name alongside the built-ins -- no extra registration step needed.
 vimcode.command("MyCommand", function(args)
     -- args is a string containing everything after the command name
     vimcode.message("Got: " .. args)

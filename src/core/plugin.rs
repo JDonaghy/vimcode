@@ -1714,6 +1714,14 @@ impl PluginManager {
         (true, ctx)
     }
 
+    /// Names of every `vimcode.command()`-registered command, sorted for a
+    /// stable command-palette listing.
+    pub fn command_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.commands.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Return true if at least one hook is registered for `event`.
     /// Use this to skip expensive context construction when no hooks exist.
     pub fn has_event_hooks(&self, event: &str) -> bool {
