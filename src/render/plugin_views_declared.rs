@@ -71,10 +71,11 @@ pub fn plugin_view_to_form(
     let wid = |field: &str| WidgetId::new(namespaced_widget_id(view_name, field));
     let live = |field_id: &str| text_edit.filter(|e| e.view == view_name && e.field_id == field_id);
 
-    let fields: Vec<FormField> = view
-        .fields
+    let visible = view.visible_field_indices();
+    let fields: Vec<FormField> = visible
         .iter()
-        .map(|f| {
+        .map(|&i| {
+            let f = &view.fields[i];
             let kind = match &f.kind {
                 ViewFieldKind::Label => FieldKind::Label,
                 ViewFieldKind::Text { value, placeholder } => {
@@ -187,10 +188,36 @@ pub fn plugin_view_to_form(
                     max: *max,
                     step: *step,
                 },
+                // A collapsible header is a `Button` so activating it (click,
+                // Enter/Space) raises `FormEvent::ButtonClicked` through
+                // quadraui's existing machinery; `handle_plugin_view_ui_event`
+                // and `handle_plugin_view_tab_ui_event` remap that decoded
+                // event into `ViewEventKind::SectionToggled` below. A
+                // non-collapsible header is inert, so it paints as a `Label`.
+                ViewFieldKind::Section { collapsible, .. } => {
+                    if *collapsible {
+                        FieldKind::Button
+                    } else {
+                        FieldKind::Label
+                    }
+                }
+            };
+            // A collapsible section's label is prefixed with a disclosure
+            // glyph reflecting its current state; every other field kind
+            // (including non-collapsible sections) paints its label as-is.
+            let label = match &f.kind {
+                ViewFieldKind::Section {
+                    collapsible: true,
+                    collapsed,
+                } => {
+                    let glyph = if *collapsed { "▸" } else { "▾" };
+                    StyledText::plain(format!("{glyph} {}", f.label))
+                }
+                _ => StyledText::plain(&f.label),
             };
             FormField {
                 id: wid(&f.id),
-                label: StyledText::plain(&f.label),
+                label,
                 kind,
                 hint: StyledText::plain(&f.hint),
                 disabled: f.disabled,
@@ -203,7 +230,15 @@ pub fn plugin_view_to_form(
         })
         .collect();
 
-    let focused_field = fields.get(selected).map(|f| f.id);
+    // `selected` indexes `view.fields` (the logical/declaration order), not
+    // `fields` (the painted/visible-only list) — a collapsed section's
+    // members are absent from `fields` entirely. Find `selected`'s position
+    // within `visible` first; `None` when `selected` itself is hidden.
+    let focused_field = visible
+        .iter()
+        .position(|&i| i == selected)
+        .and_then(|pos| fields.get(pos))
+        .map(|f| f.id);
 
     Form {
         id: WidgetId::new(if view.id.is_empty() {
@@ -329,9 +364,10 @@ pub fn handle_plugin_view_ui_event(
     };
     sync_scroll(engine);
 
-    let Some((view_name, field_id, kind)) = plugin_view_event_from_form_event(&action) else {
+    let Some((view_name, field_id, mut kind)) = plugin_view_event_from_form_event(&action) else {
         return true;
     };
+    kind = remap_section_toggle(engine, &view_name, &field_id, kind);
     // Selection follows the click, so j/k continues from where the user
     // clicked, and a click on a `Text`/`Password`/`TextArea` field primes it
     // for typing exactly as keyboard navigation does.
@@ -412,9 +448,10 @@ pub fn handle_plugin_view_tab_ui_event(
     };
     sync_scroll(engine);
 
-    let Some((view_name, field_id, kind)) = plugin_view_event_from_form_event(&action) else {
+    let Some((view_name, field_id, mut kind)) = plugin_view_event_from_form_event(&action) else {
         return true;
     };
+    kind = remap_section_toggle(engine, &view_name, &field_id, kind);
     if let Some(view) = engine.plugin_views.get(&view_name) {
         if let Some(idx) = view.field_index(&field_id) {
             engine.plugin_view_focus_field(
@@ -524,6 +561,38 @@ pub(crate) fn route_plugin_view_body_event(
             _ => false,
         }),
         _ => None,
+    }
+}
+
+/// A collapsible `Section` header is translated to a `FieldKind::Button` (see
+/// [`plugin_view_to_form`]), so activating it decodes as an ordinary
+/// `ViewEventKind::ButtonClicked` through [`plugin_view_event_from_form_event`].
+/// Re-resolve `field_id` against the live view and, when it names a `Section`,
+/// remap the event into `ViewEventKind::SectionToggled` carrying the proposed
+/// next state — the toggle plugin authors actually want to hear about.
+/// Every other decoded `kind` (including `ButtonClicked` for a real button)
+/// passes through unchanged.
+fn remap_section_toggle(
+    engine: &Engine,
+    view_name: &str,
+    field_id: &str,
+    kind: crate::core::plugin_ui::ViewEventKind,
+) -> crate::core::plugin_ui::ViewEventKind {
+    use crate::core::plugin_ui::{ViewEventKind, ViewFieldKind};
+    if !matches!(kind, ViewEventKind::ButtonClicked) {
+        return kind;
+    }
+    let Some(view) = engine.plugin_views.get(view_name) else {
+        return kind;
+    };
+    let Some(idx) = view.field_index(field_id) else {
+        return kind;
+    };
+    match &view.fields[idx].kind {
+        ViewFieldKind::Section { collapsed, .. } => ViewEventKind::SectionToggled {
+            collapsed: !collapsed,
+        },
+        _ => kind,
     }
 }
 
@@ -695,5 +764,211 @@ mod slider_translation_tests {
             kind,
             crate::core::plugin_ui::ViewEventKind::SliderChanged { value: 7.5 }
         );
+    }
+}
+
+#[cfg(test)]
+mod section_translation_tests {
+    use super::*;
+    use crate::core::plugin_ui::{PluginView, ViewField, ViewFieldKind};
+
+    fn section_field(id: &str, label: &str, collapsible: bool, collapsed: bool) -> ViewField {
+        ViewField {
+            id: id.into(),
+            label: label.into(),
+            hint: String::new(),
+            disabled: false,
+            error: None,
+            warning: None,
+            kind: ViewFieldKind::Section {
+                collapsible,
+                collapsed,
+            },
+        }
+    }
+
+    fn plain_text(text: &quadraui::StyledText) -> String {
+        text.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    fn button_field(id: &str) -> ViewField {
+        ViewField {
+            id: id.into(),
+            label: String::new(),
+            hint: String::new(),
+            disabled: false,
+            error: None,
+            warning: None,
+            kind: ViewFieldKind::Button,
+        }
+    }
+
+    #[test]
+    fn collapsible_section_translates_to_a_button_with_a_collapsed_glyph() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![section_field("adv", "Advanced", true, true)],
+            body: None,
+        };
+        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
+        assert_eq!(form.fields[0].kind, quadraui::FieldKind::Button);
+        assert_eq!(plain_text(&form.fields[0].label), "▸ Advanced");
+    }
+
+    #[test]
+    fn expanded_collapsible_section_paints_the_expanded_glyph() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![section_field("adv", "Advanced", true, false)],
+            body: None,
+        };
+        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
+        assert_eq!(plain_text(&form.fields[0].label), "▾ Advanced");
+    }
+
+    #[test]
+    fn non_collapsible_section_translates_to_an_inert_label_with_no_glyph() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![section_field("grp", "Group", false, false)],
+            body: None,
+        };
+        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
+        assert_eq!(form.fields[0].kind, quadraui::FieldKind::Label);
+        assert_eq!(plain_text(&form.fields[0].label), "Group");
+    }
+
+    #[test]
+    fn collapsed_section_members_are_absent_from_the_painted_form() {
+        // `hidden` is a member of the collapsed `adv` section; the next
+        // `Section` header (`more`) closes that membership run, so `after`
+        // (a member of `more`, which is expanded) stays visible.
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![
+                section_field("adv", "Advanced", true, true),
+                button_field("hidden"),
+                section_field("more", "More", true, false),
+                button_field("after"),
+            ],
+            body: None,
+        };
+        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
+        assert_eq!(form.fields.len(), 3);
+        assert_eq!(
+            form.fields[2].id,
+            quadraui::WidgetId::new(crate::core::plugin_ui::namespaced_widget_id(
+                "myview", "after"
+            ))
+        );
+    }
+
+    #[test]
+    fn focused_field_is_none_when_selected_points_at_a_hidden_member() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![
+                section_field("adv", "Advanced", true, true),
+                button_field("hidden"),
+            ],
+            body: None,
+        };
+        // `selected == 1` names the hidden member — the painted form has no
+        // field to focus.
+        let form = plugin_view_to_form("myview", &view, 1, 0, true, None);
+        assert_eq!(form.focused_field, None);
+    }
+
+    #[test]
+    fn focused_field_follows_selected_through_a_collapsed_section() {
+        // `after` sits beyond the `more` header, outside `adv`'s (collapsed)
+        // membership run, so `selected` pointing at it must resolve to a
+        // focused field even though `adv`'s own member (`hidden`) is hidden.
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![
+                section_field("adv", "Advanced", true, true),
+                button_field("hidden"),
+                section_field("more", "More", true, false),
+                button_field("after"),
+            ],
+            body: None,
+        };
+        let form = plugin_view_to_form("myview", &view, 3, 0, true, None);
+        assert_eq!(
+            form.focused_field,
+            Some(quadraui::WidgetId::new(
+                crate::core::plugin_ui::namespaced_widget_id("myview", "after")
+            ))
+        );
+    }
+
+    #[test]
+    fn button_clicked_on_a_collapsed_section_header_remaps_to_section_toggled_expand() {
+        use crate::core::plugin_ui::ViewEventKind;
+        let mut engine = Engine::new();
+        engine.plugin_views.insert(
+            "myview".to_string(),
+            PluginView {
+                id: "myview".into(),
+                schema_version: 1,
+                fields: vec![section_field("adv", "Advanced", true, true)],
+                body: None,
+            },
+        );
+        let kind = remap_section_toggle(&engine, "myview", "adv", ViewEventKind::ButtonClicked);
+        assert_eq!(kind, ViewEventKind::SectionToggled { collapsed: false });
+    }
+
+    #[test]
+    fn button_clicked_on_an_expanded_section_header_remaps_to_section_toggled_collapse() {
+        use crate::core::plugin_ui::ViewEventKind;
+        let mut engine = Engine::new();
+        engine.plugin_views.insert(
+            "myview".to_string(),
+            PluginView {
+                id: "myview".into(),
+                schema_version: 1,
+                fields: vec![section_field("adv", "Advanced", true, false)],
+                body: None,
+            },
+        );
+        let kind = remap_section_toggle(&engine, "myview", "adv", ViewEventKind::ButtonClicked);
+        assert_eq!(kind, ViewEventKind::SectionToggled { collapsed: true });
+    }
+
+    #[test]
+    fn button_clicked_on_a_real_button_passes_through_unchanged() {
+        use crate::core::plugin_ui::ViewEventKind;
+        let mut engine = Engine::new();
+        engine.plugin_views.insert(
+            "myview".to_string(),
+            PluginView {
+                id: "myview".into(),
+                schema_version: 1,
+                fields: vec![button_field("ok")],
+                body: None,
+            },
+        );
+        let kind = remap_section_toggle(&engine, "myview", "ok", ViewEventKind::ButtonClicked);
+        assert_eq!(kind, ViewEventKind::ButtonClicked);
+    }
+
+    #[test]
+    fn clicking_a_collapsible_section_header_decodes_as_button_clicked_before_remap() {
+        use crate::core::plugin_ui::ViewEventKind;
+        let id = quadraui::WidgetId::new(crate::core::plugin_ui::namespaced_widget_id(
+            "myview", "adv",
+        ));
+        let action = quadraui::FormEvent::ButtonClicked { id };
+        let (_view, _field, kind) =
+            plugin_view_event_from_form_event(&action).expect("must decode");
+        assert_eq!(kind, ViewEventKind::ButtonClicked);
     }
 }

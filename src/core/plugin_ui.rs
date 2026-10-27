@@ -56,7 +56,7 @@
 //! required semantics to version 2 later.
 //!
 //! Adding a new [`ViewFieldKind`]/[`ViewEventKind`] variant (most recently
-//! `Date` and `Slider`) is additive and does **not** bump
+//! `Date`, `Slider`, and `Section`) is additive and does **not** bump
 //! [`VIEW_SCHEMA_VERSION`]: every pre-existing variant's wire tag and fields
 //! are untouched, so a `schema_version = 1` view written before the new
 //! variant existed still parses byte-for-byte the same, and the new variant
@@ -131,16 +131,58 @@ impl Default for PluginView {
 
 impl PluginView {
     /// Index of the field carrying `field_id`, or `None`.
+    ///
+    /// Unaffected by [`Self::visible_field_indices`]: a hidden field (a
+    /// collapsed section's member) still has a stable index here, since
+    /// click/selection-sync code resolves ids after decoding an event, not
+    /// before — a plugin can still name a field it declared even while it's
+    /// collapsed out of view.
     pub fn field_index(&self, field_id: &str) -> Option<usize> {
         self.fields.iter().position(|f| f.id == field_id)
     }
 
+    /// Indices into `self.fields` that are currently painted/focusable —
+    /// every field except one nested under a currently-collapsed
+    /// [`ViewFieldKind::Section`].
+    ///
+    /// A `Section` header is a flat marker, not a container: every field
+    /// declared after one, up to the next `Section` header or the end of the
+    /// list, is implicitly its member by declaration order. The header row
+    /// itself is always visible, even while collapsed (its disclosure
+    /// glyph/label is how a user re-expands it).
+    ///
+    /// The single source of truth for "is this field shown right now" —
+    /// `render::plugin_view_to_form`'s field-building loop and
+    /// `focused_field` lookup, `core::engine::plugins::handle_plugin_view_key`'s
+    /// `focusable` set, and [`Self::first_focusable`] all compute visibility
+    /// through this one method so they can never disagree about it.
+    pub fn visible_field_indices(&self) -> Vec<usize> {
+        let mut visible = Vec::with_capacity(self.fields.len());
+        let mut hiding = false;
+        for (i, f) in self.fields.iter().enumerate() {
+            if let ViewFieldKind::Section {
+                collapsible,
+                collapsed,
+            } = &f.kind
+            {
+                visible.push(i);
+                hiding = *collapsible && *collapsed;
+                continue;
+            }
+            if !hiding {
+                visible.push(i);
+            }
+        }
+        visible
+    }
+
     /// The first field index that can take keyboard focus (skips `Label` and
-    /// `ReadOnly` rows, which emit no events), or `None` when the view is inert.
+    /// `ReadOnly` rows, which emit no events, and any field currently hidden
+    /// inside a collapsed section), or `None` when the view is inert.
     pub fn first_focusable(&self) -> Option<usize> {
-        self.fields
-            .iter()
-            .position(|f| f.is_interactive() && !f.disabled)
+        self.visible_field_indices()
+            .into_iter()
+            .find(|&i| self.fields[i].is_interactive() && !self.fields[i].disabled)
     }
 }
 
@@ -312,11 +354,17 @@ pub struct ViewField {
 
 impl ViewField {
     /// Whether this row can emit a [`PluginViewEvent`] at all.
+    ///
+    /// A collapsible [`ViewFieldKind::Section`] header counts as interactive
+    /// — it's the thing a user tabs to and presses Enter/Space on to
+    /// toggle it — while a non-collapsible one is a plain header, as inert
+    /// as `Label`.
     pub fn is_interactive(&self) -> bool {
-        !matches!(
-            self.kind,
-            ViewFieldKind::Label | ViewFieldKind::ReadOnly { .. }
-        )
+        match &self.kind {
+            ViewFieldKind::Label | ViewFieldKind::ReadOnly { .. } => false,
+            ViewFieldKind::Section { collapsible, .. } => *collapsible,
+            _ => true,
+        }
     }
 }
 
@@ -330,6 +378,13 @@ fn default_text_area_rows() -> usize {
 /// behaviour on both sides of the translation.
 fn default_slider_step() -> f32 {
     1.0
+}
+
+/// Default `collapsible` for a `section` field — a header an author declares
+/// with no `collapsible` key gets the more useful behaviour (a disclosure
+/// triangle the user can act on) rather than silently being a dead label.
+fn default_section_collapsible() -> bool {
+    true
 }
 
 /// The input variant carried by a [`ViewField`].
@@ -453,6 +508,32 @@ pub enum ViewFieldKind {
         #[serde(default = "default_slider_step")]
         step: f32,
     },
+    /// A group header for every field declared after it, up to the next
+    /// `Section` or the end of the list. `label` carries the group's title.
+    ///
+    /// This is a flat marker, not a container — `PluginView::fields` stays a
+    /// single flat `Vec`; see [`PluginView::visible_field_indices`] for how
+    /// membership and visibility are derived from declaration order. A
+    /// labelled group with a horizontal control row is a non-collapsible
+    /// `Section` immediately followed by a [`Self::Buttons`]/[`Self::Toggles`]/
+    /// [`Self::Segmented`] field.
+    ///
+    /// `collapsible: false` translates to `quadraui::FieldKind::Label` — a
+    /// plain header, exactly like [`Self::Label`]. `collapsible: true`
+    /// translates to `quadraui::FieldKind::Button` instead, so focusing it
+    /// and pressing Enter/Space (or clicking it) raises quadraui's own
+    /// `FormEvent::ButtonClicked`, which `render::plugin_view_to_form`'s
+    /// callers special-case back into a [`ViewEventKind::SectionToggled`]
+    /// carrying the *proposed* next `collapsed` value — the plugin, not
+    /// vimcode, decides whether to re-render with members hidden, same
+    /// convention as every other field kind here. The painted label is
+    /// prefixed with a disclosure glyph (▸ collapsed, ▾ expanded).
+    Section {
+        #[serde(default = "default_section_collapsible")]
+        collapsible: bool,
+        #[serde(default)]
+        collapsed: bool,
+    },
 }
 
 impl ViewFieldKind {
@@ -472,6 +553,7 @@ impl ViewFieldKind {
             ViewFieldKind::Toggles { .. } => "toggles",
             ViewFieldKind::Date { .. } => "date",
             ViewFieldKind::Slider { .. } => "slider",
+            ViewFieldKind::Section { .. } => "section",
         }
     }
 }
@@ -529,6 +611,15 @@ pub enum ViewEventKind {
     /// already clamped to the field's declared `[min, max]`.
     SliderChanged {
         value: f32,
+    },
+    /// A collapsible `section` header was activated (Enter/Space/click).
+    /// `collapsed` is the *proposed* next state (`!collapsed` of the
+    /// field as currently declared) — same convention as every other
+    /// field kind here: vimcode never mutates the plugin's declared state
+    /// itself, it reports what the user asked for and re-renders with
+    /// whatever the plugin's `on_event` declares back.
+    SectionToggled {
+        collapsed: bool,
     },
     FocusChanged,
     // ── ViewBody events ──────────────────────────────────────────────────
@@ -594,6 +685,7 @@ impl ViewEventKind {
             ViewEventKind::TextCommitted { .. } => "TextCommitted",
             ViewEventKind::DateChanged { .. } => "DateChanged",
             ViewEventKind::SliderChanged { .. } => "SliderChanged",
+            ViewEventKind::SectionToggled { .. } => "SectionToggled",
             ViewEventKind::FocusChanged => "FocusChanged",
             ViewEventKind::ItemSelected { .. } => "ItemSelected",
             ViewEventKind::ItemActivated { .. } => "ItemActivated",
@@ -840,6 +932,172 @@ mod tests {
         };
         assert_eq!(view.first_focusable(), Some(2));
         assert_eq!(view.field_index("go"), Some(2));
+    }
+
+    // ── Section ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn section_field_kind_tag_is_the_lua_type_string() {
+        let json = r#"{"type":"section","collapsible":true,"collapsed":false}"#;
+        let kind: ViewFieldKind = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(kind.type_name(), "section");
+        assert_eq!(
+            kind,
+            ViewFieldKind::Section {
+                collapsible: true,
+                collapsed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn section_field_kind_collapsible_defaults_to_true() {
+        let json = r#"{"type":"section"}"#;
+        let kind: ViewFieldKind = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            kind,
+            ViewFieldKind::Section {
+                collapsible: true,
+                collapsed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn section_toggled_event_kind_name_is_section_toggled() {
+        assert_eq!(
+            ViewEventKind::SectionToggled { collapsed: true }.kind_name(),
+            "SectionToggled"
+        );
+    }
+
+    #[test]
+    fn adding_section_is_additive_old_schema_version_1_json_still_parses() {
+        // Narrowest possible check (mirrors
+        // `adding_slider_is_additive_old_schema_version_1_json_still_parses`)
+        // that a pre-existing variant's wire shape is untouched by the new
+        // `section` tag.
+        let json = r#"{"id":"v","schema_version":1,"fields":[
+            {"id":"dob","kind":{"type":"date","value":"2024-03-15"}}
+        ]}"#;
+        let view: PluginView = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(view.schema_version, 1);
+        assert_eq!(
+            view.fields[0].kind,
+            ViewFieldKind::Date {
+                value: "2024-03-15".into(),
+            }
+        );
+    }
+
+    fn inert_field(id: &str, kind: ViewFieldKind) -> ViewField {
+        ViewField {
+            id: id.into(),
+            label: String::new(),
+            hint: String::new(),
+            disabled: false,
+            error: None,
+            warning: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn collapsed_section_hides_its_members_but_not_its_header() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: VIEW_SCHEMA_VERSION,
+            body: None,
+            fields: vec![
+                inert_field(
+                    "hdr",
+                    ViewFieldKind::Section {
+                        collapsible: true,
+                        collapsed: true,
+                    },
+                ),
+                inert_field("member", ViewFieldKind::Button),
+                inert_field("after", ViewFieldKind::Button),
+            ],
+        };
+        // The header (index 0) stays visible; with no terminating `Section`
+        // header, the collapse swallows every field after it through the
+        // end of the list (indices 1 and 2 both hide).
+        assert_eq!(view.visible_field_indices(), vec![0]);
+        assert_eq!(view.first_focusable(), Some(0));
+    }
+
+    #[test]
+    fn expanded_section_shows_its_members() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: VIEW_SCHEMA_VERSION,
+            body: None,
+            fields: vec![
+                inert_field(
+                    "hdr",
+                    ViewFieldKind::Section {
+                        collapsible: true,
+                        collapsed: false,
+                    },
+                ),
+                inert_field("member", ViewFieldKind::Button),
+            ],
+        };
+        assert_eq!(view.visible_field_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn non_collapsible_section_never_hides_members_and_is_inert() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: VIEW_SCHEMA_VERSION,
+            body: None,
+            fields: vec![
+                inert_field(
+                    "hdr",
+                    ViewFieldKind::Section {
+                        collapsible: false,
+                        collapsed: true,
+                    },
+                ),
+                inert_field("member", ViewFieldKind::Button),
+            ],
+        };
+        assert_eq!(view.visible_field_indices(), vec![0, 1]);
+        // The non-collapsible header itself is skipped by `first_focusable`,
+        // exactly like `Label` — it's a plain group title, not a control.
+        assert_eq!(view.first_focusable(), Some(1));
+    }
+
+    #[test]
+    fn two_sibling_sections_do_not_leak_into_each_other() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: VIEW_SCHEMA_VERSION,
+            body: None,
+            fields: vec![
+                inert_field(
+                    "a-hdr",
+                    ViewFieldKind::Section {
+                        collapsible: true,
+                        collapsed: true,
+                    },
+                ),
+                inert_field("a-member", ViewFieldKind::Button),
+                inert_field(
+                    "b-hdr",
+                    ViewFieldKind::Section {
+                        collapsible: true,
+                        collapsed: false,
+                    },
+                ),
+                inert_field("b-member", ViewFieldKind::Button),
+            ],
+        };
+        // `a-member` (index 1) hides under `a`'s collapse; `b-hdr`/`b-member`
+        // (indices 2, 3) are unaffected by `a`'s state.
+        assert_eq!(view.visible_field_indices(), vec![0, 2, 3]);
     }
 
     // ── ViewBody ────────────────────────────────────────────────────────

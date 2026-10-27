@@ -349,6 +349,15 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
                         step: row.get::<_, f64>("step").unwrap_or(1.0) as f32,
                     }
                 }
+                "section" => ViewFieldKind::Section {
+                    // `row.get::<_, bool>` converts a missing key's `Nil` to
+                    // `false` (Lua's own falsy convention) rather than
+                    // erroring, so `.unwrap_or(default)` never fires — go
+                    // through `Option<bool>` to tell "absent" apart from an
+                    // explicit `false`.
+                    collapsible: row.get::<_, Option<bool>>("collapsible")?.unwrap_or(true),
+                    collapsed: row.get::<_, Option<bool>>("collapsed")?.unwrap_or(false),
+                },
                 other => {
                     return Err(LuaError::RuntimeError(format!(
                         "view field {} (id {field_id:?}): unknown type {other:?}",
@@ -2657,6 +2666,7 @@ impl PluginManager {
             }
             ViewEventKind::SliderChanged { value } => tbl.set("value", *value as f64)?,
             ViewEventKind::HeaderClicked { col } => tbl.set("col", *col as i64)?,
+            ViewEventKind::SectionToggled { collapsed } => tbl.set("collapsed", *collapsed)?,
             ViewEventKind::ButtonClicked | ViewEventKind::FocusChanged => {}
         }
         Ok(tbl)
@@ -6198,6 +6208,89 @@ mod tests {
             err.contains("max"),
             "the error must name the missing field: {err}"
         );
+    }
+
+    #[test]
+    fn a_section_field_parses_collapsible_and_collapsed_through_lua() {
+        use crate::core::plugin_ui::ViewFieldKind;
+        let pm = pm_with_view(
+            "section_ok",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        fields = {
+                            { type = "section", id = "adv", label = "Advanced",
+                              collapsible = true, collapsed = true },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(
+            view.fields[0].kind,
+            ViewFieldKind::Section {
+                collapsible: true,
+                collapsed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_section_field_defaults_to_collapsible_and_expanded() {
+        use crate::core::plugin_ui::ViewFieldKind;
+        let pm = pm_with_view(
+            "section_defaults",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { fields = { { type = "section", id = "g", label = "Group" } } }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(
+            view.fields[0].kind,
+            ViewFieldKind::Section {
+                collapsible: true,
+                collapsed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn section_toggled_event_carries_collapsed_to_lua() {
+        use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+        let pm = pm_with_view(
+            "section_event",
+            r#"
+            local last = "none"
+            vimcode.ui.register_view("vext", {
+                render = function() return { fields = {} } end,
+                on_event = function(ctx, event)
+                    last = event.kind .. "/" .. tostring(event.collapsed)
+                end,
+            })
+            vimcode.command("Last", function() vimcode.message(last) end)
+            "#,
+        );
+        let ctx = pm.call_view_event(
+            &PluginViewEvent {
+                view: "vext".to_string(),
+                widget_id: "adv".to_string(),
+                kind: ViewEventKind::SectionToggled { collapsed: true },
+            },
+            PluginCallContext::default(),
+        );
+        assert!(ctx.message.is_none());
+        let (found, ctx) = pm.call_command("Last", "", PluginCallContext::default());
+        assert!(found);
+        assert_eq!(ctx.message.as_deref(), Some("SectionToggled/true"));
     }
 
     // ── `kind = "list"/"tree"/"table"/"text_view"` view bodies ────

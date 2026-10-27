@@ -111,6 +111,31 @@ pub const ROW_SLIDER_INITIAL: &str = "6.00";
 /// vimcode reaches the plugin directly.
 pub const ROW_SLIDER_STEPPED: &str = "9.00";
 
+/// Registered view name for the `section`-kind fixture: a labelled,
+/// non-collapsible group (a `Section` header immediately followed by a
+/// `buttons` row) plus a collapsible section with one member field.
+pub const SECTION_VIEW: &str = "zqxw146section";
+/// [`SECTION_VIEW`]'s activity-bar / sidebar-header title.
+pub const SECTION_VIEW_TITLE: &str = "Zq146Sec";
+/// The labelled group's non-collapsible `Section` header.
+pub const ROW_GROUP_HEADER: &str = "GrZQ146";
+/// The first button in the group header's horizontal control row.
+pub const ROW_GROUP_BUTTON1: &str = "G1ZQ146";
+/// The second button in the group header's horizontal control row.
+pub const ROW_GROUP_BUTTON2: &str = "G2ZQ146";
+/// The collapsible section's header label (sans disclosure glyph).
+pub const ROW_COLLAPSIBLE_HEADER: &str = "CoZQ146";
+/// [`ROW_COLLAPSIBLE_HEADER`] as painted while expanded — `render::
+/// plugin_view_to_form` prefixes a collapsible section's label with a
+/// disclosure glyph reflecting its current `collapsed` state.
+pub const ROW_COLLAPSIBLE_HEADER_EXPANDED: &str = "▾ CoZQ146";
+/// [`ROW_COLLAPSIBLE_HEADER`] as painted while collapsed.
+pub const ROW_COLLAPSIBLE_HEADER_COLLAPSED: &str = "▸ CoZQ146";
+/// The collapsible section's single member field — hidden whenever the
+/// section is collapsed, per [`crate::core::plugin_ui::PluginView::
+/// visible_field_indices`].
+pub const ROW_COLLAPSIBLE_MEMBER: &str = "CmZQ146";
+
 /// Registered view names for each `ViewBody` kind's fixture.
 pub const LIST_VIEW: &str = "zqxw1631list";
 pub const TREE_VIEW: &str = "zqxw1631tree";
@@ -451,6 +476,40 @@ vimcode.ui.register_view("{VIEW_NO_SIDEBAR}", {{
 vimcode.command("Zq146NoSidebarOpenTab", function()
   vimcode.ui.open_view("{VIEW_NO_SIDEBAR}", {{ location = "tab" }})
 end)
+
+-- A labelled, non-collapsible group (a `Section` header immediately
+-- followed by a horizontal `buttons` row) plus a collapsible section with
+-- one member field — `SectionToggled` is the only event this view's
+-- `on_event` needs: the plugin stores the proposed `collapsed` value and
+-- `render` echoes it back on the next frame.
+local section_collapsed = false
+vimcode.ui.register_view("{SECTION_VIEW}", {{
+  title = "{SECTION_VIEW_TITLE}",
+  icon = "S",
+  fallback_icon = "S",
+  render = function()
+    return {{
+      id = "main",
+      schema_version = 1,
+      fields = {{
+        {{ type = "section", id = "grp", label = "{ROW_GROUP_HEADER}",
+           collapsible = false }},
+        {{ type = "buttons", id = "grpbtns", buttons = {{
+           {{ id = "g1", label = "{ROW_GROUP_BUTTON1}" }},
+           {{ id = "g2", label = "{ROW_GROUP_BUTTON2}" }},
+        }} }},
+        {{ type = "section", id = "col", label = "{ROW_COLLAPSIBLE_HEADER}",
+           collapsible = true, collapsed = section_collapsed }},
+        {{ type = "button", id = "mem", label = "{ROW_COLLAPSIBLE_MEMBER}" }},
+      }},
+    }}
+  end,
+  on_event = function(ctx, event)
+    if event.widget_id == "col" and event.kind == "SectionToggled" then
+      section_collapsed = event.collapsed
+    end
+  end,
+}})
 "#
     )
 }
@@ -531,6 +590,10 @@ fn load_fixture_plugin(engine: &mut Engine, dir: &std::path::Path) {
     assert!(
         engine.is_plugin_view(VIEW_NO_SIDEBAR),
         "fixture must register {VIEW_NO_SIDEBAR:?} as a view-backed panel"
+    );
+    assert!(
+        engine.is_plugin_view(SECTION_VIEW),
+        "fixture must register {SECTION_VIEW:?} as a view-backed panel"
     );
     assert!(
         !engine.ext_panels.contains_key(VIEW_NO_SIDEBAR),
@@ -777,6 +840,55 @@ pub fn clicking_a_button_reaches_the_plugin_handler(driver: &mut impl Conformanc
         !driver.screen_has(COUNT_0),
         "the stale counter row {COUNT_0:?} must not still be painted after the \
          view re-rendered; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario — a non-collapsible `Section` header immediately followed by a
+/// horizontal `buttons` row paints as a labelled group with its control row
+/// (#2054's DoD: "a form can render a labelled group with a horizontal
+/// control row").
+pub fn labelled_group_with_a_control_row_is_painted(driver: &impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[ROW_GROUP_HEADER, ROW_GROUP_BUTTON1, ROW_GROUP_BUTTON2],
+        "a labelled group with a horizontal control row",
+    );
+}
+
+/// Scenario — clicking a collapsible `Section` header reaches the plugin's
+/// `on_event` handler as a [`crate::core::plugin_ui::ViewEventKind::
+/// SectionToggled`], and the `collapsed` value it echoes back on the next
+/// `render()` call hides the section's member field and flips the header's
+/// disclosure glyph (#2054's DoD: "a collapsible section").
+pub fn clicking_a_collapsible_section_header_toggles_its_member(
+    driver: &mut impl ConformanceDriver,
+) {
+    assert!(
+        driver.screen_has(ROW_COLLAPSIBLE_HEADER_EXPANDED),
+        "precondition: the collapsible section must start expanded, painting \
+         its disclosure glyph as {ROW_COLLAPSIBLE_HEADER_EXPANDED:?}; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(ROW_COLLAPSIBLE_MEMBER),
+        "precondition: an expanded section's member row ({ROW_COLLAPSIBLE_MEMBER:?}) \
+         must be painted; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.click_text(ROW_COLLAPSIBLE_HEADER);
+    assert!(
+        driver.screen_has(ROW_COLLAPSIBLE_HEADER_COLLAPSED),
+        "clicking the collapsible header must reach the plugin's on_event \
+         handler and the next painted frame must flip its disclosure glyph \
+         to {ROW_COLLAPSIBLE_HEADER_COLLAPSED:?}; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(ROW_COLLAPSIBLE_MEMBER),
+        "a collapsed section must hide its member row ({ROW_COLLAPSIBLE_MEMBER:?}); \
+         painted runs were {:?}",
         painted(driver)
     );
 }
@@ -1886,6 +1998,18 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_labelled_group_with_a_control_row_is_painted_on_tui() {
+        let (h, _dir) = tui_named(SECTION_VIEW);
+        labelled_group_with_a_control_row_is_painted(&h.driver);
+    }
+
+    #[test]
+    fn plugin_view_clicking_a_collapsible_section_header_toggles_its_member_on_tui() {
+        let (mut h, _dir) = tui_named(SECTION_VIEW);
+        clicking_a_collapsible_section_header_toggles_its_member(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_keyboard_activation_reaches_the_handler_on_tui() {
         let (mut h, _dir) = tui();
         keyboard_activation_reaches_the_plugin_handler(&mut h.driver);
@@ -2146,6 +2270,20 @@ mod tests {
     fn plugin_view_button_click_reaches_the_handler_on_gtk() {
         let (mut h, _dir) = gtk();
         clicking_a_button_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_labelled_group_with_a_control_row_is_painted_on_gtk() {
+        let (h, _dir) = gtk_named(SECTION_VIEW);
+        labelled_group_with_a_control_row_is_painted(&h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_clicking_a_collapsible_section_header_toggles_its_member_on_gtk() {
+        let (mut h, _dir) = gtk_named(SECTION_VIEW);
+        clicking_a_collapsible_section_header_toggles_its_member(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]
