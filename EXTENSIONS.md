@@ -318,7 +318,8 @@ Lua scripts have access to the `vimcode` global object. Scripts run in Lua 5.4.
 applied after it returns. The newer namespaces (`vimcode.buffer.*`, `vimcode.window.*`,
 `vimcode.keymap.set`/`list`, `vimcode.loop.*`, `vimcode.schedule`/`defer`,
 `vimcode.picker.*`, `vimcode.decor.*`, `vimcode.syntax.*`, `vimcode.undo.*`,
-`vimcode.diagnostics.*`, `vimcode.ui.open_view`, `vimcode.http.*`, `vimcode.fire_event`)
+`vimcode.diagnostics.*`, `vimcode.ui.open_view`, `vimcode.ui.toast`, `vimcode.http.*`,
+`vimcode.fire_event`)
 are **immediate**: they act on the live editor at call time.
 
 Immediate calls only work while vimcode is running one of your callbacks (a command,
@@ -1133,6 +1134,29 @@ the focused field, and `g`/`G` jump to the first/last field. In the sidebar,
 **`schema_version`** declares which vocabulary your tree uses. Omit it for the
 current version (1). A view declaring a version newer than the running vimcode
 understands is refused with a status-line error instead of being half-rendered.
+
+### Toasts (`vimcode.ui.toast`)
+
+A transient popup in the bottom-right corner — the surface for
+"finished", "failed", "heads up" notices that do not deserve a dialog.
+
+```lua
+local id = vimcode.ui.toast({
+    title = "Build finished",            -- required in practice; defaults to ""
+    body = "0 errors, 2 warnings",       -- optional second line
+    severity = "success",                -- "info" (default) | "success" | "warning" | "error"
+})
+```
+
+Immediate, not queued: the toast is on screen as soon as the call
+returns, so it works from a command, an event handler, a timer or an
+async shell callback alike. `severity` picks the accent colour and
+icon; any other string raises a Lua error, so a typo is loud rather
+than silently downgraded to `info`.
+
+Toasts auto-dismiss after five seconds. The returned integer is the
+engine's handle for that toast; there is no Lua dismiss or update call
+for it yet.
 
 ### HTTP, JSON and Storage (`vimcode.http`, `vimcode.json`, `vimcode.storage`)
 
