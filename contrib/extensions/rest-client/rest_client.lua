@@ -161,6 +161,14 @@ local function open_tab(name)
     vimcode.ui.open_view(name, { location = "tab" })
 end
 
+-- Reuses the bottom-panel dock slot (`BottomPanelKind::Plugin`) instead of
+-- opening a new editor-area tab — `rest_client_response` is the one view
+-- this extension docks, since a request's response is exactly the kind of
+-- disposable, below-the-editor result a dock (not a tab) suits.
+local function open_dock(name)
+    vimcode.ui.open_view(name, { location = "dock" })
+end
+
 -- ── Send ─────────────────────────────────────────────────────────────────
 
 local function do_send()
@@ -226,7 +234,7 @@ local function handle_request_event(_ctx, event)
     elseif event.widget_id == "open_params" and event.kind == "ButtonClicked" then
         open_tab("rest_client_params")
     elseif event.widget_id == "open_response" and event.kind == "ButtonClicked" then
-        open_tab("rest_client_response")
+        open_dock("rest_client_response")
     elseif event.widget_id == "open_history" and event.kind == "ButtonClicked" then
         open_tab("rest_client_history")
     elseif event.widget_id == "open_collections" and event.kind == "ButtonClicked" then
