@@ -64,8 +64,8 @@ pub fn plugin_view_to_form(
 ) -> quadraui::Form {
     use crate::core::plugin_ui::{namespaced_widget_id, ViewFieldKind};
     use quadraui::{
-        ButtonRowItem, FieldKind, Form, FormField, StyledText, ToggleGroupItem, ValidationState,
-        WidgetId,
+        ButtonRowItem, Color, FieldKind, Form, FormField, StyledText, ToggleGroupItem, Toolbar,
+        ToolbarButton, ValidationState, WidgetId,
     };
 
     let wid = |field: &str| WidgetId::new(namespaced_widget_id(view_name, field));
@@ -201,6 +201,30 @@ pub fn plugin_view_to_form(
                         FieldKind::Label
                     }
                 }
+                // Malformed hex falls back to black rather than failing the
+                // whole form's render — the plugin author sees the wrong
+                // swatch rather than a crash, and can fix the declared
+                // value. There is no interaction path for this field yet
+                // (see `ViewFieldKind::Color`'s doc), so this is display-only.
+                ViewFieldKind::Color { value } => FieldKind::ColorPicker {
+                    value: Color::from_hex(value).unwrap_or(Color::rgb(0, 0, 0)),
+                },
+                ViewFieldKind::Toolbar { buttons } => FieldKind::Toolbar(
+                    Toolbar::new(wid(&f.id)).with_buttons(
+                        buttons
+                            .iter()
+                            .map(|b| ToolbarButton::Action {
+                                id: wid(&b.id),
+                                label: b.label.clone(),
+                                icon: b.icon.clone(),
+                                key_hint: b.key_hint.clone(),
+                                enabled: !b.disabled,
+                                is_active: false,
+                                tooltip: String::new(),
+                            })
+                            .collect(),
+                    ),
+                ),
             };
             // A collapsible section's label is prefixed with a disclosure
             // glyph reflecting its current state; every other field kind
@@ -645,6 +669,21 @@ pub(crate) fn plugin_view_event_from_form_event(
             (id, ViewEventKind::SliderChanged { value: *value })
         }
         quadraui::FormEvent::FocusChanged { id } => (id, ViewEventKind::FocusChanged),
+        // The clicked button's own id is the dispatched event's widget id —
+        // not the toolbar field's — matching the keyboard-activation path in
+        // `Engine::handle_plugin_view_key`.
+        quadraui::FormEvent::ToolbarButtonClicked {
+            field_id,
+            button_id,
+        } => {
+            let (view, _) = split_widget_id(field_id.as_str())?;
+            let (_, button) = split_widget_id(button_id.as_str())?;
+            return Some((
+                view.to_string(),
+                button.to_string(),
+                ViewEventKind::ToolbarButtonClicked,
+            ));
+        }
         _ => return None,
     };
     let (view, field) = split_widget_id(id.as_str())?;

@@ -903,6 +903,19 @@ impl Engine {
                             ViewEventKind::SliderChanged { value: next },
                         )
                     }
+                    ViewFieldKind::Color { .. } => {
+                        // No native click or keyboard path exists anywhere
+                        // for `ColorPicker` (see `ViewFieldKind::Color`'s
+                        // doc) — display-only until a popup/hex editor is
+                        // designed.
+                        return true;
+                    }
+                    ViewFieldKind::Toolbar { buttons } => {
+                        match buttons.iter().find(|b| !b.disabled) {
+                            Some(b) => (b.id.clone(), ViewEventKind::ToolbarButtonClicked),
+                            None => return true,
+                        }
+                    }
                     ViewFieldKind::Section {
                         collapsible,
                         collapsed,
