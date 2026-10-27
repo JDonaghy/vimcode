@@ -4870,6 +4870,46 @@ impl PluginManager {
             })?,
         )?;
 
+        // vimcode.ui.toast{title=, body=, severity=} → integer toast id.
+        //
+        // Pushes a transient notification onto the same bottom-right toast
+        // stack GTK dialogs and the core engine already use (`push_toast`,
+        // painted via `render::build_toast_stack` / `Backend::draw_toast_overlay`
+        // on both backends). `severity` is one of "info" (default), "success",
+        // "warning" or "error", matching `quadraui::ToastSeverity`.
+        //
+        // Immediate ("live engine") API like `vimcode.ui.open_view`: the toast
+        // is live as soon as the call returns, not queued `PluginCallContext`
+        // output — fire-and-forget notifications have no later apply phase to
+        // land in. The returned id has no dismiss/update API yet; it is
+        // forward-compatible groundwork for one.
+        ui_tbl.set(
+            "toast",
+            lua.create_function(|_, opts: LuaTable| {
+                let title: String = opts.get("title").unwrap_or_default();
+                let body: String = opts.get("body").unwrap_or_default();
+                let severity_str: String = opts
+                    .get::<_, Option<String>>("severity")?
+                    .unwrap_or_else(|| "info".to_string());
+                let severity = match severity_str.as_str() {
+                    "info" => quadraui::ToastSeverity::Info,
+                    "success" => quadraui::ToastSeverity::Success,
+                    "warning" => quadraui::ToastSeverity::Warning,
+                    "error" => quadraui::ToastSeverity::Error,
+                    other => {
+                        return Err(LuaError::RuntimeError(format!(
+                            "vimcode.ui.toast: unsupported severity {other:?} (expected \
+                             \"info\", \"success\", \"warning\" or \"error\")"
+                        )));
+                    }
+                };
+                let id = live_engine("vimcode.ui.toast", move |e| {
+                    e.push_toast(&title, &body, severity)
+                })?;
+                Ok(id)
+            })?,
+        )?;
+
         vimcode.set("ui", ui_tbl)?;
 
         // ── vimcode.completion ───────────────────────────────────────────────
