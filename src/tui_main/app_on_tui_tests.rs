@@ -16882,6 +16882,118 @@ mod tests {
             );
         }
 
+        /// Acceptance scenario: `vimcode.ui.toast{}` paints a real toast in
+        /// the bottom-right stack.
+        ///
+        /// Asserted on painted text, not `engine.toasts`: the title and body
+        /// the plugin passed have to reach `render::build_toast_stack` ->
+        /// `Backend::draw_toast_overlay` for them to show up in
+        /// `driver.screen()`. The returned id is routed back through
+        /// `vimcode.message` so the screen also proves the Lua call handed
+        /// the plugin a usable handle rather than nil.
+        #[test]
+        fn lua_ui_toast_paints_title_and_body_via_shell_app() {
+            let engine = engine_with_plugin(
+                "ui_toast_paint",
+                r#"
+                vimcode.command("ZqToast", function(_)
+                    local id = vimcode.ui.toast({
+                        title = "ZQ_TOAST_TITLE",
+                        body = "ZQ_TOAST_BODY",
+                        severity = "success",
+                    })
+                    vimcode.message("ZQ_TOAST_ID=" .. tostring(id))
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let before = driver.screen();
+            assert!(
+                !before.contains("ZQ_TOAST_TITLE"),
+                "precondition: no toast is painted before the command runs; \
+                 screen:\n{before}"
+            );
+
+            driver.type_char(':');
+            for c in "ZqToast".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQ_TOAST_TITLE"),
+                "the plugin's toast title must paint in the toast stack; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("ZQ_TOAST_BODY"),
+                "the plugin's toast body must paint under its title; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("ZQ_TOAST_ID=0") || screen.contains("ZQ_TOAST_ID=1"),
+                "vimcode.ui.toast must return a numeric toast id to Lua, not \
+                 nil; screen:\n{screen}"
+            );
+        }
+
+        /// A severity string outside the supported set must raise a Lua error
+        /// instead of silently painting an `Info` toast: the `pcall` below
+        /// catches it, so `ZQ_TOAST_REJECTED` paints and the rejected
+        /// toast's title never does.
+        ///
+        /// The plugin pushes one *valid* toast first, and the screen has to
+        /// show it. That keeps the negative assertions honest: an
+        /// environment where `vimcode.ui.toast` is missing entirely would
+        /// also satisfy "the bad title does not paint", so the good title is
+        /// what proves the binding is wired and only the bad severity was
+        /// refused.
+        #[test]
+        fn lua_ui_toast_rejects_unknown_severity_via_shell_app() {
+            let engine = engine_with_plugin(
+                "ui_toast_bad_severity",
+                r#"
+                vimcode.command("ZqToastBad", function(_)
+                    vimcode.ui.toast({ title = "ZQ_GOOD_TITLE" })
+                    local ok = pcall(function()
+                        vimcode.ui.toast({ title = "ZQ_BAD_TITLE", severity = "critical" })
+                    end)
+                    if not ok then vimcode.message("ZQ_TOAST_REJECTED") end
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqToastBad".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQ_GOOD_TITLE"),
+                "the valid toast must still paint, proving the binding ran; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("ZQ_TOAST_REJECTED"),
+                "an unsupported severity must surface as a Lua error the \
+                 plugin can catch; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("ZQ_BAD_TITLE"),
+                "a rejected vimcode.ui.toast call must paint no toast at all; \
+                 screen:\n{screen}"
+            );
+        }
+
         // ─────────────────────────────────────────────────────────────────
         // Native Extension API — Phase 2: a Lua `ys{motion}`
         // operator, built entirely from `vimcode.*` (keymap.set +
