@@ -808,6 +808,61 @@ pub fn keyboard_activation_reaches_the_plugin_handler(driver: &mut impl Conforma
     );
 }
 
+/// Scenario 3b — `Shift+Tab` (`NamedKey::BackTab`) walks the focus
+/// *backward* to the previous interactive field.
+///
+/// Three `Tab`s from the initial focus (already on `url`(0)) reach
+/// [`ROW_EMPTY_TEXT_LABEL`]'s empty `text` field (`url`(0) -> `tls`(1) ->
+/// `send`(2) -> `etx`(3)) — the same count `typing_edits_the_focused_text_
+/// field` uses to land there. One `BackTab` must then move focus back onto
+/// the `send` button (idx 2), not leave it parked on the text field. Typing
+/// right after `BackTab` is the discriminator: the shared counter bumps
+/// identically whether `send` or `etx` ends up handling `Enter` later, so it
+/// cannot tell correct backward navigation apart from `BackTab` being
+/// silently ignored — but only a *text* field inserts typed characters into
+/// its painted value, so if focus is still (wrongly) on `etx`, typing paints
+/// the typed text; if `BackTab` moved focus to the `send` button as it
+/// should, the characters are dropped and the empty field's painted value
+/// never changes. The discriminator characters (`x`, `z`) are plain letters
+/// with no sidebar-chrome binding of their own, so dropping them while
+/// `send` has focus has no side effect beyond being ignored.
+pub fn shift_tab_navigates_backward_to_the_previous_field(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(COUNT_0),
+        "precondition: the counter row must start at {COUNT_0:?}; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::BackTab);
+    driver.type_char('x');
+    driver.type_char('z');
+    assert!(
+        !driver.screen_has("xz"),
+        "BackTab after three Tabs must move focus off the empty text field \
+         and back onto the `send` button, so typing 'xz' must not land in \
+         the text field's painted value; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_0),
+        "typing into a focused button must not reach the plugin as a \
+         TextChanged event, so the counter must still read {COUNT_0:?}; \
+         painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has(COUNT_1),
+        "Enter must now activate the `send` button BackTab moved focus back \
+         onto, reaching the plugin's on_event handler ({COUNT_1:?}); \
+         painted runs were {:?}",
+        painted(driver)
+    );
+}
+
 /// Scenario 4 — typing into a focused `Text` field inserts characters and
 /// paints a caret; the plugin sees `TextChanged` per keystroke and
 /// `TextCommitted` on Enter with the typed value.
@@ -1837,6 +1892,12 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_shift_tab_navigates_backward_on_tui() {
+        let (mut h, _dir) = tui();
+        shift_tab_navigates_backward_to_the_previous_field(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_typing_edits_the_focused_text_field_on_tui() {
         let (mut h, _dir) = tui();
         typing_edits_the_focused_text_field(&mut h.driver);
@@ -2092,6 +2153,13 @@ mod tests {
     fn plugin_view_keyboard_activation_reaches_the_handler_on_gtk() {
         let (mut h, _dir) = gtk();
         keyboard_activation_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_shift_tab_navigates_backward_on_gtk() {
+        let (mut h, _dir) = gtk();
+        shift_tab_navigates_backward_to_the_previous_field(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]

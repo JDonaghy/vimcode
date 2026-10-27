@@ -634,12 +634,12 @@ impl Engine {
     /// chrome to fall through to (`keys.rs`'s caller just drops the key).
     ///
     /// Navigation skips rows that cannot emit events (`label`, `read_only`,
-    /// `disabled`), so `j`/`k`/`Tab`/`BackTab` never park the selection
-    /// somewhere `Enter` does nothing.
+    /// `disabled`), so `j`/`k`/`Tab`/`BackTab`/`ISO_Left_Tab` never park the
+    /// selection somewhere `Enter` does nothing.
     ///
     /// When the focused row is a `Text`/`Password`/`TextArea` field, every key
-    /// except `Tab`/`BackTab` (field-to-field navigation always wins, so a
-    /// view is never a keyboard trap) is handed to
+    /// except `Tab`/`BackTab`/`ISO_Left_Tab` (field-to-field navigation always
+    /// wins, so a view is never a keyboard trap) is handed to
     /// [`Self::handle_plugin_view_text_key`] instead — typed characters must
     /// insert into the field rather than double as `j`/`k` navigation once a
     /// field can actually take text.
@@ -721,7 +721,11 @@ impl Engine {
                 self.plugin_view_ensure_visible(host);
                 return true;
             }
-            "BackTab" => {
+            // `"ISO_Left_Tab"` is what `render::engine_key_from_ui` actually
+            // emits for Shift+Tab on both backends (`NamedKey::BackTab` ->
+            // `"ISO_Left_Tab"`); `"BackTab"` is kept so a caller that passes
+            // the raw named-key spelling still works.
+            "BackTab" | "ISO_Left_Tab" => {
                 let prev = focusable
                     .iter()
                     .rev()
