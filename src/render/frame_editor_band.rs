@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::engine::PluginViewHost;
 
 // ─── Frame composition: the editor band ────────────────
 //
@@ -392,7 +393,7 @@ pub(crate) fn paint_editor_band_rungs<'screen>(
 //     The rung lived nested under the sidebar rung, so caches were not reset
 //     when the sidebar collapsed. A source-control / extension item tooltip
 //     left open while collapsing would keep its last painted rect forever:
-//     `handle_mouse_press` would arbitrate clicks against a popup no longer on
+// `handle_mouse_press` would arbitrate clicks against a popup no longer on
 //     screen. Input and paint disagreeing about what is painted.
 //   * **TUI's debug toolbar had the mirror-image bug.** Its rung had no else
 //     case, so the toolbar's rect kept its last value when the toolbar hid,
@@ -950,6 +951,62 @@ pub fn paint_bottom_panel_rung(
                     bounds: body,
                     scrollbar,
                 });
+        }
+        BottomPanelKind::Plugin(ref name) => {
+            if content_h <= 0.0 {
+                return;
+            }
+            // A `vimcode.ui.open_view(name, { location = "dock" })` result:
+            // same one-line-below-the-tab-strip body as `Problems`/`Output`/
+            // `DebugOutput` (no toolbar row of its own). The dock never
+            // holds keyboard focus, so `has_focus` is always `false`; body
+            // kinds dispatch the same way `App::paint_editor_windows_rung`
+            // dispatches a tab-hosted view, with `PluginViewHost::Dock` in
+            // place of `PluginViewHost::Tab`. List/Tree/Table-kind bodies
+            // aren't implemented for the dock host (`plugin_view_body.rs`'s
+            // `Dock => return false` arms), so only `text_view` and the
+            // `Form` default actually paint here; the other two calls are
+            // kept for parity with the tab dispatch and simply no-op.
+            let body =
+                quadraui::Rect::new(rect.x, rect.y + lh, rect.width, (rect.height - lh).max(0.0));
+            engine.plugin_view_dock_form_rect.set(body);
+            let kind = engine
+                .plugin_views
+                .get(name.as_str())
+                .and_then(|v| v.body.as_ref())
+                .map(|v| v.kind_name());
+            match kind {
+                Some("list") => {
+                    paint_plugin_view_list(engine, name, PluginViewHost::Dock, false, body, b);
+                }
+                // Tree-kind bodies have no dock-hosted `TreeController`
+                // (deferred, like List/Table above); painting nothing here
+                // rather than falling into the `Form` default avoids
+                // rendering the view's (likely empty) field list instead.
+                Some("tree") => {}
+                Some("table") => {
+                    paint_plugin_view_table(engine, name, PluginViewHost::Dock, false, body, b);
+                }
+                Some("text_view") => {
+                    paint_plugin_view_text(engine, name, PluginViewHost::Dock, false, body, b);
+                    engine
+                        .scroll_surfaces
+                        .borrow_mut()
+                        .push(quadraui::ScrollSurface {
+                            id: quadraui::WidgetId::new("plugin_dock"),
+                            bounds: body,
+                            scrollbar: None,
+                        });
+                }
+                _ => {
+                    if populate_plugin_view_dock_form_controller(engine, name, false) {
+                        engine
+                            .plugin_view_dock_form_controller
+                            .borrow_mut()
+                            .render_and_cache(b, body);
+                    }
+                }
+            }
         }
     }
 }

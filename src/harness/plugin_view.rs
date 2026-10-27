@@ -388,6 +388,13 @@ end)
 vimcode.command("Zq1631TableOpenTab", function()
   vimcode.ui.open_view("{TABLE_VIEW}", {{ location = "tab" }})
 end)
+
+-- A real `:Command` around `vimcode.ui.open_view` with `location = "dock"`,
+-- so the bottom-panel-hosted fixture exercises the actual Lua binding
+-- rather than reaching straight for `Engine::open_plugin_view_dock`.
+vimcode.command("Zq2059TextOpenDock", function()
+  vimcode.ui.open_view("{TEXT_VIEW}", {{ location = "dock" }})
+end)
 "#
     )
 }
@@ -723,6 +730,37 @@ pub fn engine_with_named_plugin_view_tab(view: &str, command: &str) -> (Engine, 
         engine.active_group().tabs.len(),
         before_tabs + 1,
         "{command:?} must open {view:?} as a new tab"
+    );
+    (engine, dir)
+}
+
+/// Dock twin of [`engine_with_plugin_view_tab`] — opens [`TEXT_VIEW`] into
+/// the bottom-panel dock via the fixture's real `Zq2059TextOpenDock`
+/// `:Command`, which calls `vimcode.ui.open_view(TEXT_VIEW, {location =
+/// "dock"})`. Driving the real Lua command keeps the Lua binding itself in
+/// the measured path, exactly like the tab fixture above.
+pub fn engine_with_plugin_view_dock() -> (Engine, PathBuf) {
+    let dir = plugin_dir();
+    let mut engine = Engine::new_for_test();
+    load_fixture_plugin(&mut engine, &dir);
+
+    engine.app_shell.show_panel(&quadraui::WidgetId::new(
+        crate::core::engine::sidebar::PANEL_SETTINGS,
+    ));
+
+    assert!(
+        engine.plugin_run_command("Zq2059TextOpenDock", ""),
+        "fixture plugin must register the Zq2059TextOpenDock command"
+    );
+    assert!(
+        engine.bottom_panel_open,
+        "vimcode.ui.open_view(..., {{location = \"dock\"}}) must open the bottom panel"
+    );
+    assert_eq!(
+        engine.bottom_panel_kind,
+        crate::core::engine::BottomPanelKind::Plugin(TEXT_VIEW.to_string()),
+        "vimcode.ui.open_view(..., {{location = \"dock\"}}) must point the bottom \
+         panel at the docked view"
     );
     (engine, dir)
 }
@@ -1604,6 +1642,11 @@ fn table_divider_drag_resizes_the_column<D>(
         let cached = match host {
             PluginViewHost::Sidebar => engine.plugin_view_table_layout.borrow(),
             PluginViewHost::Tab => engine.plugin_view_tab_table_layout.borrow(),
+            PluginViewHost::Dock => unreachable!(
+                "table_divider_drag_resizes_the_column is never called with \
+                 PluginViewHost::Dock — the bottom-panel dock does not render \
+                 table-kind views yet"
+            ),
         };
         let (rect, layout) = cached
             .as_ref()
@@ -1856,6 +1899,130 @@ pub fn text_view_scrolls_to_the_bottom_on_end(driver: &mut impl ConformanceDrive
     );
 }
 
+/// Scenario 12 — `location = "dock"` paints the view into the bottom-panel
+/// dock, and re-invoking the open command for the same name re-focuses that
+/// one dock slot (stays open, stays pointed at the same view) rather than
+/// closing it or swapping in a different panel kind. Takes the whole
+/// harness, not just its driver, so it can drive a second `:Command`
+/// invocation through the live fixture engine between paints.
+pub fn dock_paints_and_reuses_by_name<
+    D: ConformanceDriver + crate::harness::rest_client::DrivesIdle,
+>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) {
+    assert!(
+        h.driver.screen_has(TEXT_FIRST_LINE),
+        "a view docked via location = \"dock\" must paint in the bottom panel; \
+         painted runs were {:?}",
+        painted(&h.driver)
+    );
+    assert_eq!(
+        h.engine.borrow().bottom_panel_kind,
+        crate::core::engine::BottomPanelKind::Plugin(TEXT_VIEW.to_string()),
+        "the bottom panel must point at the docked view"
+    );
+
+    assert!(
+        h.engine
+            .borrow_mut()
+            .plugin_run_command("Zq2059TextOpenDock", ""),
+        "fixture plugin must register the Zq2059TextOpenDock command"
+    );
+    assert!(
+        h.engine.borrow().bottom_panel_open,
+        "re-opening the same docked view by name must leave the bottom \
+         panel open, not toggle it closed"
+    );
+    assert_eq!(
+        h.engine.borrow().bottom_panel_kind,
+        crate::core::engine::BottomPanelKind::Plugin(TEXT_VIEW.to_string()),
+        "re-opening the same docked view by name must reuse the single \
+         dock slot, not replace it with a different panel kind"
+    );
+    h.driver.repaint();
+    assert!(
+        h.driver.screen_has(TEXT_FIRST_LINE),
+        "the docked view must still paint after being re-opened by name; \
+         painted runs were {:?}",
+        painted(&h.driver)
+    );
+}
+
+/// Nearest painted `LnNX1631` text-view line to `anchor_y` — keeps
+/// `scroll_at`'s needle valid across repeated wheel scrolls, since the exact
+/// line at a given screen row changes as the view scrolls (mirrors
+/// `crate::harness`'s own `nearest_row` helper for the sidebar's wheel-scroll
+/// scenario).
+fn nearest_text_line<D: ConformanceDriver>(driver: &D, anchor_y: f32) -> (u32, String) {
+    driver
+        .inventory()
+        .text_runs()
+        .iter()
+        .filter_map(|run| {
+            let trimmed = run.text.trim();
+            trimmed
+                .strip_prefix("Ln")
+                .and_then(|rest| rest.strip_suffix("X1631"))
+                .and_then(|digits| digits.parse::<u32>().ok())
+                .map(|idx| (idx, trimmed.to_string(), (run.bounds.y - anchor_y).abs()))
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(idx, text, _)| (idx, text))
+        .expect(
+            "at least one LnNX1631 line must be painted somewhere — the \
+             fixture seeded 50 of them",
+        )
+}
+
+/// Scenario 13 — a mouse-wheel scroll over the dock's body reaches the
+/// docked `text_view`, via the `"plugin_dock"` scroll surface
+/// (`frame_editor_band.rs`) and `Engine::handle_plugin_view_dock_scroll`.
+pub fn dock_scrolls_on_mouse_wheel(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(TEXT_FIRST_LINE),
+        "precondition: the dock starts scrolled to the top; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(TEXT_LAST_LINE),
+        "precondition: with 50 lines in a short dock, the last line must not \
+         be visible before scrolling; painted runs were {:?}",
+        painted(driver)
+    );
+
+    let anchor_y = driver
+        .inventory()
+        .text_runs()
+        .iter()
+        .find(|run| run.text.trim() == TEXT_FIRST_LINE)
+        .map(|run| run.bounds.y)
+        .expect("precondition: the first text-view line must be painted somewhere");
+
+    let mut needle = TEXT_FIRST_LINE.to_string();
+    let mut idx = 0u32;
+    for _ in 0..30 {
+        driver.scroll_at(&needle, -1);
+        let (new_idx, new_needle) = nearest_text_line(driver, anchor_y);
+        idx = new_idx;
+        needle = new_needle;
+        if driver.screen_has(TEXT_LAST_LINE) {
+            break;
+        }
+    }
+    assert!(
+        idx > 0,
+        "scrolling the mouse wheel over the docked text view must move it \
+         off its first line"
+    );
+    assert!(
+        driver.screen_has(TEXT_LAST_LINE),
+        "scrolling the mouse wheel over the docked text view must reach its \
+         last line; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1949,6 +2116,31 @@ mod tests {
         let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
         h.driver.render();
         (h, dir)
+    }
+
+    /// Bottom-panel dock fixture for [`TEXT_VIEW`] (TUI arm).
+    fn tui_dock() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_dock();
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[test]
+    fn plugin_view_dock_paints_and_reuses_by_name_on_tui() {
+        let (mut h, _dir) = tui_dock();
+        dock_paints_and_reuses_by_name(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_dock_scrolls_on_mouse_wheel_on_tui() {
+        let (mut h, _dir) = tui_dock();
+        dock_scrolls_on_mouse_wheel(&mut h.driver);
     }
 
     #[test]
@@ -2226,6 +2418,34 @@ mod tests {
         let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
         h.driver.render();
         (h, dir)
+    }
+
+    /// Bottom-panel dock fixture for [`TEXT_VIEW`] (GTK arm).
+    #[cfg(feature = "gui")]
+    fn gtk_dock() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_dock();
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_dock_paints_and_reuses_by_name_on_gtk() {
+        let (mut h, _dir) = gtk_dock();
+        dock_paints_and_reuses_by_name(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_dock_scrolls_on_mouse_wheel_on_gtk() {
+        let (mut h, _dir) = gtk_dock();
+        dock_scrolls_on_mouse_wheel(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]

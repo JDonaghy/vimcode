@@ -386,6 +386,12 @@ impl App {
                             self.draw_needed.set(true);
                             return;
                         }
+                        "plugin_dock" => {
+                            engine.handle_plugin_view_dock_scroll(delta.y);
+                            drop(engine);
+                            self.draw_needed.set(true);
+                            return;
+                        }
                         _ => {}
                     }
                 }
