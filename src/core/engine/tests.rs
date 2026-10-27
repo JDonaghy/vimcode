@@ -17464,6 +17464,89 @@ fn test_plugin_loads_and_command_runs() {
 }
 
 #[test]
+fn test_lua_ui_toast_pushes_engine_toast() {
+    let dir = write_plugin_lua(
+        "test_ui_toast",
+        r#"vimcode.command("Notify", function()
+            local id = vimcode.ui.toast({
+                title = "Build finished",
+                body = "0 errors, 2 warnings",
+                severity = "success",
+            })
+            vimcode.message("toast:" .. id)
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Notify");
+    assert_eq!(
+        engine.toasts.len(),
+        1,
+        "toast was not pushed onto the engine's stack"
+    );
+    let toast = &engine.toasts[0];
+    assert_eq!(toast.title, "Build finished");
+    assert_eq!(toast.body, "0 errors, 2 warnings");
+    assert_eq!(toast.severity, quadraui::ToastSeverity::Success);
+    assert_eq!(engine.message, format!("toast:{}", toast.id));
+}
+
+#[test]
+fn test_lua_ui_toast_defaults_severity_to_info() {
+    let dir = write_plugin_lua(
+        "test_ui_toast_default_severity",
+        r#"vimcode.command("Notify", function()
+            vimcode.ui.toast({ title = "Heads up" })
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Notify");
+    assert_eq!(engine.toasts.len(), 1);
+    assert_eq!(engine.toasts[0].severity, quadraui::ToastSeverity::Info);
+    assert_eq!(engine.toasts[0].body, "");
+}
+
+#[test]
+fn test_lua_ui_toast_rejects_unknown_severity() {
+    let dir = write_plugin_lua(
+        "test_ui_toast_bad_severity",
+        r#"vimcode.command("Notify", function()
+            local ok, err = pcall(function()
+                vimcode.ui.toast({ title = "x", severity = "critical" })
+            end)
+            if not ok then vimcode.message("rejected") end
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Notify");
+    assert!(
+        engine.toasts.is_empty(),
+        "an unsupported severity must not push a toast at all"
+    );
+    assert_eq!(engine.message, "rejected");
+}
+
+#[test]
 fn test_plugin_on_save_fires() {
     let dir = write_plugin_lua(
         "test_save",
