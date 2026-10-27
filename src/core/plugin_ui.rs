@@ -56,7 +56,8 @@
 //! required semantics to version 2 later.
 //!
 //! Adding a new [`ViewFieldKind`]/[`ViewEventKind`] variant (most recently
-//! `Date`, `Slider`, and `Section`) is additive and does **not** bump
+//! `Date`, `Slider`, `Section`, `Color`, and `Toolbar`) is additive and does
+//! **not** bump
 //! [`VIEW_SCHEMA_VERSION`]: every pre-existing variant's wire tag and fields
 //! are untouched, so a `schema_version = 1` view written before the new
 //! variant existed still parses byte-for-byte the same, and the new variant
@@ -508,6 +509,35 @@ pub enum ViewFieldKind {
         #[serde(default = "default_slider_step")]
         step: f32,
     },
+    /// A color swatch. `value` is a `"#rrggbb"` hex string (an empty or
+    /// malformed string paints black). Translated to
+    /// `quadraui::FieldKind::ColorPicker`.
+    ///
+    /// `quadraui::FormController` emits no `FormEvent::ColorChanged` from any
+    /// click or key path — the popup/hex-input editor the kind's own doc
+    /// describes is explicitly left to the app. This variant is therefore
+    /// display-only for now: Enter/Space on a focused `color` field is a
+    /// no-op, same as [`Self::Label`]/[`Self::ReadOnly`], and there is no
+    /// matching `ViewEventKind` yet. A plugin that wants to change the color
+    /// re-declares `value` itself (e.g. from a `Buttons` row of presets).
+    Color {
+        #[serde(default)]
+        value: String,
+    },
+    /// A horizontal strip of toolbar buttons (icons, key hints, separators).
+    /// Translated to `quadraui::FieldKind::Toolbar`.
+    ///
+    /// `quadraui::FormController` hit-tests clicks against each button's id
+    /// natively, but — like [`Self::Buttons`]/[`Self::Toggles`] — has no
+    /// keyboard path: `Enter`/`Space` on a focused `toolbar` field is
+    /// vimcode's own handling in `core::engine::plugins`, activating the
+    /// first non-disabled [`ViewToolbarButton`] (`ToolbarButton::Separator`/
+    /// `ToolbarButton::Label` entries have no id and are never activated) and
+    /// reporting it as a [`ViewEventKind::ToolbarButtonClicked`].
+    Toolbar {
+        #[serde(default)]
+        buttons: Vec<ViewToolbarButton>,
+    },
     /// A group header for every field declared after it, up to the next
     /// `Section` or the end of the list. `label` carries the group's title.
     ///
@@ -553,6 +583,8 @@ impl ViewFieldKind {
             ViewFieldKind::Toggles { .. } => "toggles",
             ViewFieldKind::Date { .. } => "date",
             ViewFieldKind::Slider { .. } => "slider",
+            ViewFieldKind::Color { .. } => "color",
+            ViewFieldKind::Toolbar { .. } => "toolbar",
             ViewFieldKind::Section { .. } => "section",
         }
     }
@@ -576,6 +608,23 @@ pub struct ViewToggle {
     pub label: String,
     #[serde(default)]
     pub value: bool,
+}
+
+/// One button inside a [`ViewFieldKind::Toolbar`] row. Mirrors
+/// `quadraui::ToolbarButton::Action`'s fields; a toolbar's `Separator`/
+/// `Label` entries carry no id and so have no representation here — a
+/// plugin that wants one declares two separate `Toolbar` fields instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewToolbarButton {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub key_hint: Option<String>,
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -621,6 +670,11 @@ pub enum ViewEventKind {
     SectionToggled {
         collapsed: bool,
     },
+    /// A `toolbar` field's button was activated (Enter/Space/click). Carries
+    /// no payload of its own — same convention as [`Self::ButtonClicked`]:
+    /// the activated [`ViewToolbarButton::id`] is reported as the dispatched
+    /// [`PluginViewEvent::widget_id`], not duplicated here.
+    ToolbarButtonClicked,
     FocusChanged,
     // ── ViewBody events ──────────────────────────────────────────────────
     /// A `List`/`Table` row moved into selection (index into
@@ -686,6 +740,7 @@ impl ViewEventKind {
             ViewEventKind::DateChanged { .. } => "DateChanged",
             ViewEventKind::SliderChanged { .. } => "SliderChanged",
             ViewEventKind::SectionToggled { .. } => "SectionToggled",
+            ViewEventKind::ToolbarButtonClicked => "ToolbarButtonClicked",
             ViewEventKind::FocusChanged => "FocusChanged",
             ViewEventKind::ItemSelected { .. } => "ItemSelected",
             ViewEventKind::ItemActivated { .. } => "ItemActivated",
@@ -875,6 +930,50 @@ mod tests {
                 min: 0.0,
                 max: 10.0,
                 step: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn color_field_kind_tag_is_the_lua_type_string() {
+        let json = r##"{"type":"color","value":"#ff00aa"}"##;
+        let kind: ViewFieldKind = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(kind.type_name(), "color");
+        assert_eq!(
+            kind,
+            ViewFieldKind::Color {
+                value: "#ff00aa".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn toolbar_field_kind_tag_is_the_lua_type_string() {
+        let json = r#"{"type":"toolbar","buttons":[
+            {"id":"save","label":"Save"},
+            {"id":"undo","label":"Undo","disabled":true}
+        ]}"#;
+        let kind: ViewFieldKind = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(kind.type_name(), "toolbar");
+        assert_eq!(
+            kind,
+            ViewFieldKind::Toolbar {
+                buttons: vec![
+                    ViewToolbarButton {
+                        id: "save".into(),
+                        label: "Save".into(),
+                        icon: None,
+                        key_hint: None,
+                        disabled: false,
+                    },
+                    ViewToolbarButton {
+                        id: "undo".into(),
+                        label: "Undo".into(),
+                        icon: None,
+                        key_hint: None,
+                        disabled: true,
+                    },
+                ],
             }
         );
     }
@@ -1265,6 +1364,10 @@ mod tests {
         assert_eq!(
             ViewEventKind::SliderChanged { value: 3.5 }.kind_name(),
             "SliderChanged"
+        );
+        assert_eq!(
+            ViewEventKind::ToolbarButtonClicked.kind_name(),
+            "ToolbarButtonClicked"
         );
     }
 }

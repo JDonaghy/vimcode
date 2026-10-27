@@ -110,6 +110,17 @@ pub const ROW_SLIDER_INITIAL: &str = "6.00";
 /// `quadraui::FormController` has no native keyboard path for a slider and
 /// vimcode reaches the plugin directly.
 pub const ROW_SLIDER_STEPPED: &str = "9.00";
+/// A `color`-kind row's label. `tui::form::draw_field_color_picker` paints a
+/// swatch glyph plus the hex value once `start_col > label_end + 1`; unlike
+/// the slider's track, the color row's total painted width (swatch + `#` +
+/// 6 hex digits) comfortably clears that guard even at the sidebar's
+/// 20-column default, so this row needs no editor-tab fixture split.
+pub const ROW_COLOR_LABEL: &str = "ClZQ146";
+/// A `toolbar`-kind row's label.
+pub const ROW_TOOLBAR_LABEL: &str = "TbZQ146";
+/// The caption of the `toolbar` row's single action button — the click
+/// target for [`clicking_a_toolbar_button_reaches_the_plugin_handler`].
+pub const ROW_TOOLBAR_BUTTON: &str = "GoZQ146";
 
 /// Registered view name for the `section`-kind fixture: a labelled,
 /// non-collapsible group (a `Section` header immediately followed by a
@@ -424,6 +435,10 @@ vimcode.ui.register_view("{VIEW}", {{
            value = date_value }},
         {{ type = "slider", id = "vol",  label = "{ROW_SLIDER_LABEL}",
            value = slider_value, min = 0.0, max = 10.0, step = 3.0 }},
+        {{ type = "color",  id = "swt",  label = "{ROW_COLOR_LABEL}",
+           value = '#ab12cd' }},
+        {{ type = "toolbar", id = "tbr", label = "{ROW_TOOLBAR_LABEL}",
+           buttons = {{ {{ id = "go", label = "{ROW_TOOLBAR_BUTTON}" }} }} }},
       }},
     }}
   end,
@@ -443,6 +458,8 @@ vimcode.ui.register_view("{VIEW}", {{
       count = count + 1
     elseif event.widget_id == "vol" and event.kind == "SliderChanged" then
       slider_value = event.value
+      count = count + 1
+    elseif event.widget_id == "go" and event.kind == "ToolbarButtonClicked" then
       count = count + 1
     end
   end,
@@ -816,6 +833,57 @@ pub fn declared_slider_row_is_painted(driver: &impl ConformanceDriver) {
         driver,
         &[ROW_SLIDER_LABEL, ROW_SLIDER_INITIAL],
         "the plugin-declared slider row",
+    );
+}
+
+/// Scenario 1c — the declared `color` row is painted. Unlike the slider's,
+/// its guard clears at the sidebar's default width (see [`ROW_COLOR_LABEL`]'s
+/// doc), so this needs no editor-tab split.
+pub fn declared_color_row_is_painted(driver: &impl ConformanceDriver) {
+    assert_paints(driver, &[ROW_COLOR_LABEL], "the plugin-declared color row");
+}
+
+/// Scenario 1d — the declared `toolbar` row, including its action button's
+/// caption, is painted.
+pub fn declared_toolbar_row_is_painted(driver: &impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[ROW_TOOLBAR_LABEL, ROW_TOOLBAR_BUTTON],
+        "the plugin-declared toolbar row",
+    );
+}
+
+/// Scenario 2b — clicking a declared toolbar's action button runs the
+/// plugin's `on_event` as a [`crate::core::plugin_ui::ViewEventKind::
+/// ToolbarButtonClicked`], reported with the *button's* id (not the
+/// toolbar field's), and the effect shows up in the next painted frame.
+///
+/// Currently red on every backend: both `#[test]`s calling this are
+/// `#[ignore]`d. `quadraui::FormController::handle_cached` (the only entry
+/// point vimcode calls for plugin-view clicks) always measures fields with
+/// its generic, backend-free `form_field_measure` fallback, and that
+/// fallback has no `FieldKind::Toolbar` arm (unlike `ButtonRow`,
+/// `ToggleGroup`, `SegmentedControl`, `TextArea`, which all do) — so it
+/// never produces a per-button hit region for a toolbar row, and a click
+/// anywhere on the row resolves to the row's own id, not the button's. The
+/// vimcode-side translation of `FormEvent::ToolbarButtonClicked` into
+/// [`crate::core::plugin_ui::ViewEventKind::ToolbarButtonClicked`] is
+/// already wired (see `plugin_view_event_from_form_event`); it is simply
+/// unreachable until the quadraui fallback gains the missing arm.
+pub fn clicking_a_toolbar_button_reaches_the_plugin_handler(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(COUNT_0),
+        "precondition: the counter row must start at {COUNT_0:?}; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    driver.click_text(ROW_TOOLBAR_BUTTON);
+    assert!(
+        driver.screen_has(COUNT_1),
+        "clicking {ROW_TOOLBAR_BUTTON:?} must reach the plugin's on_event \
+         handler and the next painted frame must show its effect \
+         ({COUNT_1:?}); painted runs were {:?}",
+        painted(driver)
     );
 }
 
@@ -1996,6 +2064,27 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_declared_color_row_is_painted_on_tui() {
+        let (h, _dir) = tui();
+        declared_color_row_is_painted(&h.driver);
+    }
+
+    #[test]
+    fn plugin_view_declared_toolbar_row_is_painted_on_tui() {
+        let (h, _dir) = tui();
+        declared_toolbar_row_is_painted(&h.driver);
+    }
+
+    // Red on every backend — see `clicking_a_toolbar_button_reaches_the_plugin_handler`'s
+    // doc comment. Blocked on a quadraui fix, not a vimcode backend bug.
+    #[test]
+    #[ignore = "blocked on quadraui: form_field_measure has no FieldKind::Toolbar arm"]
+    fn plugin_view_toolbar_button_click_reaches_the_handler_on_tui() {
+        let (mut h, _dir) = tui();
+        clicking_a_toolbar_button_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_labelled_group_with_a_control_row_is_painted_on_tui() {
         let (h, _dir) = tui_named(SECTION_VIEW);
         labelled_group_with_a_control_row_is_painted(&h.driver);
@@ -2268,6 +2357,30 @@ mod tests {
     fn plugin_view_button_click_reaches_the_handler_on_gtk() {
         let (mut h, _dir) = gtk();
         clicking_a_button_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_declared_color_row_is_painted_on_gtk() {
+        let (h, _dir) = gtk();
+        declared_color_row_is_painted(&h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_declared_toolbar_row_is_painted_on_gtk() {
+        let (h, _dir) = gtk();
+        declared_toolbar_row_is_painted(&h.driver);
+    }
+
+    // Red on every backend — see `clicking_a_toolbar_button_reaches_the_plugin_handler`'s
+    // doc comment. Blocked on a quadraui fix, not a vimcode backend bug.
+    #[cfg(feature = "gui")]
+    #[test]
+    #[ignore = "blocked on quadraui: form_field_measure has no FieldKind::Toolbar arm"]
+    fn plugin_view_toolbar_button_click_reaches_the_handler_on_gtk() {
+        let (mut h, _dir) = gtk();
+        clicking_a_toolbar_button_reaches_the_plugin_handler(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]

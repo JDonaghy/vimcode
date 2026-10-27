@@ -349,6 +349,27 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
                         step: row.get::<_, f64>("step").unwrap_or(1.0) as f32,
                     }
                 }
+                "color" => ViewFieldKind::Color {
+                    value: value_str("value"),
+                },
+                "toolbar" => {
+                    let mut buttons = Vec::new();
+                    if let Ok(t) = row.get::<_, LuaTable>("buttons") {
+                        for b in t.sequence_values::<LuaTable>().flatten() {
+                            buttons.push(crate::core::plugin_ui::ViewToolbarButton {
+                                id: b.get("id").unwrap_or_default(),
+                                label: b.get("label").unwrap_or_default(),
+                                icon: b.get::<_, String>("icon").ok().filter(|s| !s.is_empty()),
+                                key_hint: b
+                                    .get::<_, String>("key_hint")
+                                    .ok()
+                                    .filter(|s| !s.is_empty()),
+                                disabled: b.get("disabled").unwrap_or(false),
+                            });
+                        }
+                    }
+                    ViewFieldKind::Toolbar { buttons }
+                }
                 "section" => ViewFieldKind::Section {
                     // `row.get::<_, bool>` converts a missing key's `Nil` to
                     // `false` (Lua's own falsy convention) rather than
@@ -2667,7 +2688,9 @@ impl PluginManager {
             ViewEventKind::SliderChanged { value } => tbl.set("value", *value as f64)?,
             ViewEventKind::HeaderClicked { col } => tbl.set("col", *col as i64)?,
             ViewEventKind::SectionToggled { collapsed } => tbl.set("collapsed", *collapsed)?,
-            ViewEventKind::ButtonClicked | ViewEventKind::FocusChanged => {}
+            ViewEventKind::ButtonClicked
+            | ViewEventKind::ToolbarButtonClicked
+            | ViewEventKind::FocusChanged => {}
         }
         Ok(tbl)
     }
