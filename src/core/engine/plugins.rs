@@ -686,11 +686,9 @@ impl Engine {
         }
 
         let focusable: Vec<usize> = view
-            .fields
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.is_interactive() && !f.disabled)
-            .map(|(i, _)| i)
+            .visible_field_indices()
+            .into_iter()
+            .filter(|&i| view.fields[i].is_interactive() && !view.fields[i].disabled)
             .collect();
         let selected = self.plugin_view_selected(host);
         let is_text_field = view.fields.get(selected).is_some_and(|f| {
@@ -905,6 +903,20 @@ impl Engine {
                             ViewEventKind::SliderChanged { value: next },
                         )
                     }
+                    ViewFieldKind::Section {
+                        collapsible,
+                        collapsed,
+                    } => {
+                        if !*collapsible {
+                            return true;
+                        }
+                        (
+                            field.id.clone(),
+                            ViewEventKind::SectionToggled {
+                                collapsed: !*collapsed,
+                            },
+                        )
+                    }
                 };
                 self.dispatch_plugin_view_event(PluginViewEvent {
                     view: name.to_string(),
@@ -1088,11 +1100,9 @@ impl Engine {
                     .plugin_views
                     .get(name)
                     .map(|v| {
-                        v.fields
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, f)| f.is_interactive() && !f.disabled)
-                            .map(|(i, _)| i)
+                        v.visible_field_indices()
+                            .into_iter()
+                            .filter(|&i| v.fields[i].is_interactive() && !v.fields[i].disabled)
                             .collect()
                     })
                     .unwrap_or_default();
