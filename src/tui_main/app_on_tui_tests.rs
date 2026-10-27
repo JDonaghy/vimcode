@@ -16726,11 +16726,10 @@ mod tests {
             }
         }
 
-        /// Acceptance scenario (review finding on #2057): `vimcode.platform.
-        /// show_open_dialog` must drive TUI's real in-canvas
-        /// `FilePickerController` and deliver the picked path to the Lua
-        /// callback — not merely queue a request that a unit test inspects
-        /// without ever calling `services()`.
+        /// Acceptance scenario: `vimcode.platform.show_open_dialog` drives
+        /// TUI's real in-canvas `FilePickerController` through
+        /// `backend.services()` and delivers the picked path to the Lua
+        /// callback.
         ///
         /// Exercises the full tick-drain chain: `:ZqPick<Enter>` only
         /// *queues* a `PendingPlatformAction::PluginDialog` on
@@ -16756,7 +16755,7 @@ mod tests {
             let tmp_lua = tmp.display().to_string();
 
             let engine = engine_with_plugin(
-                "open_dialog_2057",
+                "platform_open_dialog_acceptance",
                 &format!(
                     r#"
                     vimcode.command("ZqPick", function(_)
