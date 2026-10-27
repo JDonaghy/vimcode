@@ -201,13 +201,19 @@ pub fn plugin_view_to_form(
                         FieldKind::Label
                     }
                 }
-                // Malformed hex falls back to black rather than failing the
-                // whole form's render — the plugin author sees the wrong
-                // swatch rather than a crash, and can fix the declared
-                // value. There is no interaction path for this field yet
+                // A valid hex string paints a swatch. A malformed or empty
+                // one falls back to a read-only row echoing the raw string
+                // rather than failing the whole form's render — the plugin
+                // author sees the bad value they typed instead of a crash,
+                // and can fix it. Form building runs without a theme in
+                // scope, so there is no colour to borrow for a swatch
+                // fallback. There is no interaction path for this field yet
                 // (see `ViewFieldKind::Color`'s doc), so this is display-only.
-                ViewFieldKind::Color { value } => FieldKind::ColorPicker {
-                    value: Color::from_hex(value).unwrap_or(Color::rgb(0, 0, 0)),
+                ViewFieldKind::Color { value } => match Color::from_hex(value) {
+                    Some(color) => FieldKind::ColorPicker { value: color },
+                    None => FieldKind::ReadOnly {
+                        value: StyledText::plain(value),
+                    },
                 },
                 ViewFieldKind::Toolbar { buttons } => FieldKind::Toolbar(
                     Toolbar::new(wid(&f.id)).with_buttons(
@@ -1009,5 +1015,72 @@ mod section_translation_tests {
         let (_view, _field, kind) =
             plugin_view_event_from_form_event(&action).expect("must decode");
         assert_eq!(kind, ViewEventKind::ButtonClicked);
+    }
+}
+
+#[cfg(test)]
+mod color_translation_tests {
+    use super::*;
+    use crate::core::plugin_ui::{PluginView, ViewField, ViewFieldKind};
+
+    fn color_field(value: &str) -> ViewField {
+        ViewField {
+            id: "swatch".into(),
+            label: "Accent".into(),
+            hint: String::new(),
+            disabled: false,
+            error: None,
+            warning: None,
+            kind: ViewFieldKind::Color {
+                value: value.into(),
+            },
+        }
+    }
+
+    fn plain_text(text: &quadraui::StyledText) -> String {
+        text.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    fn form_for(value: &str) -> quadraui::Form {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![color_field(value)],
+            body: None,
+        };
+        plugin_view_to_form("myview", &view, 0, 0, false, None)
+    }
+
+    #[test]
+    fn valid_hex_translates_to_a_color_picker_swatch() {
+        let form = form_for("#ff8800");
+        assert_eq!(
+            form.fields[0].kind,
+            quadraui::FieldKind::ColorPicker {
+                value: Color::from_hex("#ff8800").expect("valid hex"),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_hex_falls_back_to_a_read_only_row_echoing_the_raw_string() {
+        let form = form_for("not-a-color");
+        match &form.fields[0].kind {
+            quadraui::FieldKind::ReadOnly { value } => {
+                assert_eq!(plain_text(value), "not-a-color");
+            }
+            other => panic!("expected ReadOnly fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_value_falls_back_to_an_empty_read_only_row() {
+        let form = form_for("");
+        match &form.fields[0].kind {
+            quadraui::FieldKind::ReadOnly { value } => {
+                assert_eq!(plain_text(value), "");
+            }
+            other => panic!("expected ReadOnly fallback, got {other:?}"),
+        }
     }
 }

@@ -509,9 +509,10 @@ pub enum ViewFieldKind {
         #[serde(default = "default_slider_step")]
         step: f32,
     },
-    /// A color swatch. `value` is a `"#rrggbb"` hex string (an empty or
-    /// malformed string paints black). Translated to
-    /// `quadraui::FieldKind::ColorPicker`.
+    /// A color swatch. `value` is a `"#rrggbb"` hex string. A valid value is
+    /// translated to `quadraui::FieldKind::ColorPicker`; an empty or malformed
+    /// value falls back to a read-only row echoing the raw string, so the
+    /// plugin author sees what they typed instead of a wrong swatch.
     ///
     /// `quadraui::FormController` emits no `FormEvent::ColorChanged` from any
     /// click or key path — the popup/hex-input editor the kind's own doc
