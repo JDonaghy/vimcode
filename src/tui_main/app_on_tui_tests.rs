@@ -16815,6 +16815,50 @@ mod tests {
             let _ = std::fs::remove_dir_all(&tmp);
         }
 
+        /// Acceptance scenario (#2063): a `vimcode.command(name, fn)`
+        /// registration is discoverable from the command palette without any
+        /// extra registration step, and confirming it there actually runs
+        /// the Lua callback — not just lists the name.
+        #[test]
+        fn plugin_registered_command_appears_in_and_runs_from_the_palette_via_shell_app() {
+            let engine = engine_with_plugin(
+                "palette_command_2063",
+                r#"
+                vimcode.command("ZqPaletteCmd2063", function(_)
+                    vimcode.message("ZQ_PALETTE_RAN")
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+                quadraui::Modifiers::default(),
+            ));
+            for c in "ZqPaletteCmd2063".chars() {
+                driver.type_char(c);
+            }
+
+            let open_screen = driver.screen();
+            assert!(
+                open_screen.contains("ZqPaletteCmd2063"),
+                "an extension-registered command must be listed in the \
+                 command palette by name, filtered down like any built-in \
+                 entry; screen:\n{open_screen}"
+            );
+
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQ_PALETTE_RAN"),
+                "confirming the extension command's palette entry must \
+                 actually invoke its registered Lua callback; screen:\n{screen}"
+            );
+        }
+
         /// Acceptance scenario: a `vimcode.completion.register` source's item
         /// appears in the real completion popup — by its `label`, not its
         /// `insert_text`, since those differ here — the moment its trigger
