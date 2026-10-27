@@ -16705,6 +16705,117 @@ mod tests {
             );
         }
 
+        /// `UiEvent::KeyPressed` for a plain character, no modifiers — used
+        /// below to script the in-canvas file picker via
+        /// [`quadraui::tui::testing::TuiDriver::queue_dialog_events`].
+        fn dialog_key_char(c: char) -> quadraui::UiEvent {
+            quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char(c),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            }
+        }
+
+        /// `UiEvent::KeyPressed` for a named key (e.g. `Enter`), no
+        /// modifiers — the other half of [`dialog_key_char`].
+        fn dialog_key_named(k: quadraui::NamedKey) -> quadraui::UiEvent {
+            quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Named(k),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            }
+        }
+
+        /// Acceptance scenario (review finding on #2057): `vimcode.platform.
+        /// show_open_dialog` must drive TUI's real in-canvas
+        /// `FilePickerController` and deliver the picked path to the Lua
+        /// callback — not merely queue a request that a unit test inspects
+        /// without ever calling `services()`.
+        ///
+        /// Exercises the full tick-drain chain: `:ZqPick<Enter>` only
+        /// *queues* a `PendingPlatformAction::PluginDialog` on
+        /// `engine.pending_platform_actions` — the Lua call returns before
+        /// any dialog is shown. `TuiDriver::tick()` is what actually drains
+        /// it, via `render::run_shared_tick_chores` ->
+        /// `run_pending_platform_action` -> `run_pending_plugin_dialog` ->
+        /// `backend.services().show_file_open_dialog()`. So the scripted
+        /// picker keystrokes must be queued via
+        /// `TuiDriver::queue_dialog_events` *before that `tick()`* —
+        /// queuing them before the `Enter` that submits the `:`-command
+        /// would also work (nothing drains the queue in between), but the
+        /// tick is the actual trigger, not the keypress.
+        #[test]
+        fn platform_show_open_dialog_drives_real_picker_and_delivers_path_via_shell_app() {
+            let tmp = std::env::temp_dir().join(format!(
+                "vc_app_on_tui_live_api_open_dialog_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::fs::write(tmp.join("target.txt"), b"").unwrap();
+            let tmp_lua = tmp.display().to_string();
+
+            let engine = engine_with_plugin(
+                "open_dialog_2057",
+                &format!(
+                    r#"
+                    vimcode.command("ZqPick", function(_)
+                        vimcode.platform.show_open_dialog({{ initial_dir = "{tmp_lua}" }}, function(path)
+                            local b = vimcode.buffer.create({{ scratch = true, name = "ZQPICKED" }})
+                            local name = "NIL"
+                            if path then
+                                name = path:match("([^/]+)$") or path
+                            end
+                            vimcode.buffer.set_lines(b, 0, -1, {{ "ZQ_PICKED=" .. name }})
+                            vimcode.window.set_buf(0, b)
+                        end)
+                    end)
+                    "#
+                ),
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let before = driver.screen();
+            assert!(
+                !before.contains("ZQ_PICKED"),
+                "precondition: nothing is painted before the command runs; \
+                 screen:\n{before}"
+            );
+
+            driver.type_char(':');
+            for c in "ZqPick".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            // Script the picker: type a fuzzy prefix matching only
+            // "target.txt" in the otherwise-empty temp dir, then confirm.
+            driver.queue_dialog_events(vec![
+                dialog_key_char('t'),
+                dialog_key_char('a'),
+                dialog_key_char('r'),
+                dialog_key_char('g'),
+                dialog_key_named(quadraui::NamedKey::Enter),
+            ]);
+            driver.tick();
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQ_PICKED=target.txt"),
+                "the real in-canvas file picker must resolve the scripted \
+                 keystrokes to the fuzzy-matched file and deliver its path \
+                 to the Lua callback; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("[ZQPICKED]"),
+                "the scratch buffer the callback wrote to must be the one \
+                 on display; screen:\n{screen}"
+            );
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
         /// Acceptance scenario: a `vimcode.completion.register` source's item
         /// appears in the real completion popup — by its `label`, not its
         /// `insert_text`, since those differ here — the moment its trigger

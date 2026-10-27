@@ -1892,6 +1892,12 @@ pub enum PluginDialogKind {
 /// impl, so it can't live inside `PendingPlatformAction` directly. Converted
 /// to the real `quadraui::FileDialogOptions` only where the dialog is
 /// actually shown (`render::run_pending_platform_action`).
+/// Carries only `callback_id`, with no liveness handle like
+/// [`PluginTimerEntry`]'s `Weak<PluginManager>`. That is safe only because a
+/// replaced `PluginManager` starts with an empty `platform_dialog_callbacks`
+/// map and an id counter reset to 0: resolving a stale `callback_id` against
+/// the new manager misses the lookup instead of firing a stranger's
+/// callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginDialogRequest {
     pub kind: PluginDialogKind,

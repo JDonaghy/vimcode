@@ -685,11 +685,20 @@ pub fn run_pending_platform_action(
 }
 
 /// Resolve a `vimcode.platform.show_*_dialog` request: show the matching
-/// native dialog when the running backend's capability for it is present,
-/// otherwise deliver `None` straight away (the TUI fallback — no backend
-/// implements the in-canvas `Dialog` primitive for this yet, so plugins
-/// must treat a `nil` path as "no native picker available" and fall back to
-/// their own prompt).
+/// dialog via `backend`'s `PlatformServices`.
+///
+/// `Open`/`Save` call `show_file_open_dialog`/`show_file_save_dialog`
+/// unconditionally, with no capability gate — exactly like the menu's own
+/// [`run_open_file_dialog`]/[`run_save_workspace_as_dialog`] above. On TUI
+/// these are real in-canvas `FilePickerController` draw/read loops (not a
+/// `None`-returning stub); gating them on `BackendCaps::file_dialogs` (which
+/// TUI leaves `false`) would silently disable a working picker. `Folder`
+/// gates on `folder_dialogs` because TUI's `show_folder_open_dialog`
+/// genuinely returns `None` unconditionally there — same shape as
+/// `App::run_pending_file_dialog`'s `OpenFolder` arm (`src/app/dialogs.rs`),
+/// which falls back to the in-canvas `FolderPickerController` instead; that
+/// in-canvas fallback for the plugin API's `Folder` kind doesn't exist yet,
+/// so an unsupported folder dialog still resolves to `nil` for now.
 fn run_pending_plugin_dialog(
     engine: &mut Engine,
     req: crate::core::engine::PluginDialogRequest,
@@ -697,26 +706,19 @@ fn run_pending_plugin_dialog(
 ) {
     use crate::core::engine::PluginDialogKind;
 
-    let caps = engine.backend_caps;
-    let has_cap = match req.kind {
-        PluginDialogKind::Open | PluginDialogKind::Save => caps.file_dialogs,
-        PluginDialogKind::Folder => caps.folder_dialogs,
+    let opts = quadraui::FileDialogOptions {
+        title: req.title,
+        initial_dir: req.initial_dir,
+        initial_filename: req.initial_filename,
+        filters: req.filters,
     };
-
-    let path = if has_cap {
-        let opts = quadraui::FileDialogOptions {
-            title: req.title,
-            initial_dir: req.initial_dir,
-            initial_filename: req.initial_filename,
-            filters: req.filters,
-        };
-        match req.kind {
-            PluginDialogKind::Open => backend.services().show_file_open_dialog(opts),
-            PluginDialogKind::Save => backend.services().show_file_save_dialog(opts),
-            PluginDialogKind::Folder => backend.services().show_folder_open_dialog(opts),
+    let path = match req.kind {
+        PluginDialogKind::Open => backend.services().show_file_open_dialog(opts),
+        PluginDialogKind::Save => backend.services().show_file_save_dialog(opts),
+        PluginDialogKind::Folder if engine.backend_caps.folder_dialogs => {
+            backend.services().show_folder_open_dialog(opts)
         }
-    } else {
-        None
+        PluginDialogKind::Folder => None,
     };
 
     engine.deliver_plugin_dialog_result(req.callback_id, path);

@@ -5764,7 +5764,12 @@ impl PluginManager {
         // `"file_dialogs"`, `"notifications"`, `"native_menu"`) plus the
         // vimcode-only `"clipboard"`, which `BackendCaps` doesn't track
         // itself since it's wired per-backend onto `Engine` rather than
-        // being a static per-backend fact.
+        // being a static per-backend fact. `vocabulary()` is every bool
+        // *capability* field, not every `BackendCaps` field: `color_depth`/
+        // `kitty_keyboard`/`sgr_pixel_mouse` are runtime-detected terminal
+        // properties rather than "does this backend implement X" flags, and
+        // are deliberately excluded (see quadraui's `BackendCaps::ALL_NAMES`
+        // doc comment).
         platform.set(
             "has",
             lua.create_function(|_, capability: String| {
@@ -5841,9 +5846,11 @@ impl PluginManager {
         )?;
 
         // vimcode.platform.send_notification(title, body, urgent?) — posts a
-        // desktop notification. Silently dropped on backends without
-        // `notifications` (checked by `run_pending_plugin_dialog`'s sibling
-        // handler in `run_pending_platform_action`).
+        // desktop notification via `Engine::send_notification`, which queues
+        // a `PendingPlatformAction::Notify` drained unconditionally by
+        // `run_pending_platform_action` — no capability gate here; a backend
+        // with no real notification surface just has nowhere for the OS
+        // layer to show it.
         platform.set(
             "send_notification",
             lua.create_function(|_, (title, body, urgent): (String, String, Option<bool>)| {
@@ -5858,9 +5865,10 @@ impl PluginManager {
         // `opts` is `{title=, initial_dir=, initial_filename=,
         // filters={ {name=, patterns={"txt","md"}}, ... } }`, all optional.
         // `callback(path)` fires once the dialog resolves, with `path` as a
-        // string or `nil` if the user cancelled, the backend lacks the
-        // matching dialog capability (`file_dialogs`/`folder_dialogs`), or
-        // the TUI fallback has nothing better to offer yet — see
+        // string or `nil` if the user cancelled. `show_open_dialog`/
+        // `show_save_dialog` always call the backend's real dialog (on TUI,
+        // the in-canvas `FilePickerController`); `show_folder_dialog` falls
+        // back to `nil` on a backend without `folder_dialogs` — see
         // `run_pending_plugin_dialog`'s doc comment.
         for (name, kind) in [
             ("show_open_dialog", PluginDialogKind::Open),
@@ -5876,7 +5884,9 @@ impl PluginManager {
                     let mut filters: Vec<(String, Vec<String>)> = Vec::new();
                     if let Some(ref o) = opts {
                         if let Ok(t) = o.get::<_, String>("title") {
-                            title = Some(t);
+                            if !t.is_empty() {
+                                title = Some(t);
+                            }
                         }
                         if let Ok(d) = o.get::<_, String>("initial_dir") {
                             if !d.is_empty() {
@@ -5884,7 +5894,9 @@ impl PluginManager {
                             }
                         }
                         if let Ok(f) = o.get::<_, String>("initial_filename") {
-                            initial_filename = Some(f);
+                            if !f.is_empty() {
+                                initial_filename = Some(f);
+                            }
                         }
                         if let Ok(list) = o.get::<_, LuaTable>("filters") {
                             for row in list.sequence_values::<LuaTable>().flatten() {
