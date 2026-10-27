@@ -845,9 +845,7 @@ pub fn clicking_a_button_reaches_the_plugin_handler(driver: &mut impl Conformanc
 }
 
 /// Scenario — a non-collapsible `Section` header immediately followed by a
-/// horizontal `buttons` row paints as a labelled group with its control row
-/// (#2054's DoD: "a form can render a labelled group with a horizontal
-/// control row").
+/// horizontal `buttons` row paints as a labelled group with its control row.
 pub fn labelled_group_with_a_control_row_is_painted(driver: &impl ConformanceDriver) {
     assert_paints(
         driver,
@@ -860,7 +858,7 @@ pub fn labelled_group_with_a_control_row_is_painted(driver: &impl ConformanceDri
 /// `on_event` handler as a [`crate::core::plugin_ui::ViewEventKind::
 /// SectionToggled`], and the `collapsed` value it echoes back on the next
 /// `render()` call hides the section's member field and flips the header's
-/// disclosure glyph (#2054's DoD: "a collapsible section").
+/// disclosure glyph.
 pub fn clicking_a_collapsible_section_header_toggles_its_member(
     driver: &mut impl ConformanceDriver,
 ) {
