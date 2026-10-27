@@ -4558,6 +4558,63 @@ mod tests {
             );
         }
 
+        /// Opening the Settings modal (`FrameOp::SettingsModal`) must darken
+        /// the chrome behind it exactly like every other picker/modal rung:
+        /// a corner cell outside the modal's own centred rect (top-left,
+        /// where the collapsed-sidebar tab bar paints) must switch to its
+        /// background alpha-blended with the scrim colour once the modal
+        /// opens, on every backend including TUI.
+        #[test]
+        fn settings_modal_paints_a_backdrop_scrim_behind_it_via_shell_app() {
+            let engine = plain_engine();
+            let mut h = harness_no_sidebar(engine);
+
+            let before = h
+                .driver
+                .style_at(0, 0)
+                .expect("top-left cell must be in bounds")
+                .bg;
+
+            {
+                let mut engine = h.engine.borrow_mut();
+                engine.focus_sidebar_panel(crate::core::engine::sidebar::PANEL_SETTINGS);
+            }
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("Appearance"),
+                "the settings modal must actually open and paint its form; \
+                 screen:\n{}",
+                h.driver.screen()
+            );
+
+            let scrim = crate::render::MODAL_SCRIM_COLOR;
+            let before_rgb = match before {
+                ratatui::style::Color::Rgb(r, g, b) => quadraui::Color::rgb(r, g, b),
+                other => panic!("top-left cell must have a literal rgb background, got {other:?}"),
+            };
+            let expected_during =
+                quadraui::tui::ratatui_color(before_rgb.blend(scrim, scrim.a as f64 / 255.0));
+            let during = h
+                .driver
+                .style_at(0, 0)
+                .expect("top-left cell must be in bounds")
+                .bg;
+            assert_eq!(
+                during,
+                expected_during,
+                "opening the settings modal must dim the top-left corner \
+                 cell behind it by alpha-blending it with the scrim \
+                 colour; screen:\n{}",
+                h.driver.screen()
+            );
+            assert_ne!(
+                before, during,
+                "the scrim must actually change the corner cell's \
+                 background, not merely repaint the same colour"
+            );
+        }
+
         /// The fuzzy finder (`Ctrl+P`, `ACC_FUZZY_FINDER`) must darken the
         /// editor content behind its popup, not blank it: a line of buffer
         /// text sitting in the scrim band but outside the popup's own rect

@@ -869,15 +869,11 @@ impl quadraui::ShellApp for App {
                 render::FrameOp::SettingsModal => {
                     let scrim_rect =
                         render::modal_scrim_rect(&engine, &el, popup_viewport.width, y as f32, lh);
-                    // On GUI backends the RGBA scrim blends into a dim tint;
-                    // on TUI `draw_solid_fill` drops the alpha channel and
-                    // fills the band with opaque black, hiding everything
-                    // behind the modal. Skip the scrim on TUI — the modal's
-                    // own `background: Some(theme.tab_bar_bg)` is enough to
-                    // separate it from the editor band.
-                    if backend.backend_caps().window_chrome {
-                        backend.draw_solid_fill(scrim_rect, render::MODAL_SCRIM_COLOR);
-                    }
+                    // `draw_solid_fill` alpha-blends `MODAL_SCRIM_COLOR` into the
+                    // existing background on every backend (TUI included), so the
+                    // dimmed editor/sidebar content stays visible behind the modal
+                    // — the same unconditional scrim every other picker rung paints.
+                    backend.draw_solid_fill(scrim_rect, render::MODAL_SCRIM_COLOR);
 
                     // 80 % of the popup viewport, centred.
                     let modal_w = (popup_viewport.width * 0.8).round();
