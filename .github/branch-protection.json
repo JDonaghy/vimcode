@@ -30,6 +30,12 @@
     "is a standalone Python script no cargo job runs, so a regression in it (or",
     "a PR that lets a module's fix-history-comment count climb) would otherwise",
     "go uncaught.",
+    "#2067 added the two real-input smoke lanes: every job above drives the app",
+    "only through synthetic-key TuiDriver/GtkDriver injection or never launches",
+    "it at all, so a real-keyboard or real-display regression could pass every",
+    "other job and still break on real hardware. smoke-tui-pty drives the real",
+    "vcd binary under an actual pty; smoke-gtk-xvfb drives the real vimcode",
+    "binary against a real X11 display under Xvfb.",
     "",
     "Apply with:  scripts/apply-branch-protection.sh",
     "Audit with:  scripts/apply-branch-protection.sh --check"
@@ -42,7 +48,9 @@
     "Build (Windows TUI, vcd.exe)",
     "Build (Windows GUI, vimcode.exe)",
     "Validate Tier-2 smoke specs",
-    "Comment-history lint"
+    "Comment-history lint",
+    "Smoke (TUI, real pty)",
+    "Smoke (GTK, Xvfb)"
   ],
 
   "branches": {

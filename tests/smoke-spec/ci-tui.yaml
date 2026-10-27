@@ -1,0 +1,76 @@
+# vimcode#2067: a CI-only, real-pty smoke spec for the TUI backend.
+#
+# `tui.yaml` in this directory is the sealed, additive-only Tier-2 spec (see
+# its own header) that fleet hardware runs during a real acceptance pass. It
+# is not used here: a CI job that mutated it would be bound by the
+# additive-only policy forever, and its scope (many steps accumulated across
+# many bug reports) is larger than a fast, required CI lane needs. This file
+# is a separate, deliberately small, deterministic journey that a Linux CI
+# runner drives under a real pty (`coord app-drive run-spec tui-pty`, not a
+# synthetic-key `TuiDriver` test) -- closing the synthetic-input trust gap
+# for the one thing a driver-only test cannot prove: that real terminal
+# input bytes reach the real input-parsing path.
+#
+# Not sealed/additive-only: unlike the Tier-2 fleet specs, this file may be
+# edited freely as the CI job around it evolves.
+name: vimcode-ci-tui-pty
+cols: 100
+rows: 30
+
+steps:
+  - type: launch
+    id: launch
+
+  # Extension-registry refresh (Engine::ext_refresh) runs unconditionally on
+  # startup and is a real network fetch, so its timing is not deterministic.
+  # expect_within polls for the first real paint rather than assuming a fixed
+  # settle time.
+  - type: expect_within
+    id: first-frame-painted
+    text: "NORMAL"
+    ms: 20000
+
+  - type: expect_within
+    id: file-content-visible
+    text: "line one"
+    ms: 5000
+
+  - type: key
+    id: enter-insert-mode
+    key: 'i'
+
+  - type: expect_within
+    id: insert-mode-shown
+    text: "INSERT"
+    ms: 5000
+
+  - type: type_text
+    id: type-marker
+    text: "MARKER "
+
+  - type: expect_within
+    id: typed-text-visible
+    text: "MARKER line one"
+    ms: 5000
+
+  - type: key
+    id: back-to-normal
+    key: 'esc'
+
+  - type: expect_within
+    id: normal-mode-restored
+    text: "NORMAL"
+    ms: 5000
+
+  - type: key
+    id: colon
+    key: ':'
+  - type: key
+    id: q
+    key: 'q'
+  - type: key
+    id: bang
+    key: '!'
+  - type: key
+    id: quit-enter
+    key: 'enter'
