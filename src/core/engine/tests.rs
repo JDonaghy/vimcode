@@ -19843,7 +19843,7 @@ fn test_gx_queues_open_url_platform_action_for_word_under_cursor() {
 #[test]
 fn test_engine_open_path_queues_platform_action() {
     let mut e = engine_with_text("hello\n");
-    let path = std::path::PathBuf::from("/tmp/vimcode-2057-open-path.txt");
+    let path = std::path::PathBuf::from("/tmp/vimcode-test-open-path.txt");
     e.open_path(&path);
     assert_eq!(
         e.pending_platform_actions,
@@ -28188,7 +28188,7 @@ fn test_lua_platform_open_url_queues_platform_action() {
     let dir = write_plugin_lua(
         "test_platform_open_url",
         r#"vimcode.command("OpenIt", function()
-            vimcode.platform.open_url("https://example.com/2057")
+            vimcode.platform.open_url("https://example.com/queued")
         end)"#,
     );
     let mut engine = Engine::new();
@@ -28203,7 +28203,7 @@ fn test_lua_platform_open_url_queues_platform_action() {
     assert_eq!(
         engine.pending_platform_actions,
         vec![PendingPlatformAction::OpenUrl(
-            "https://example.com/2057".to_string()
+            "https://example.com/queued".to_string()
         )]
     );
 }
@@ -28213,10 +28213,10 @@ fn test_lua_platform_reveal_and_open_path_queue_platform_actions() {
     let dir = write_plugin_lua(
         "test_platform_reveal_open_path",
         r#"vimcode.command("RevealIt", function()
-            vimcode.platform.reveal_in_file_manager("/tmp/vimcode-2057-a.txt")
+            vimcode.platform.reveal_in_file_manager("/tmp/vimcode-test-reveal-a.txt")
         end)
         vimcode.command("OpenPathIt", function()
-            vimcode.platform.open_path("/tmp/vimcode-2057-b.txt")
+            vimcode.platform.open_path("/tmp/vimcode-test-open-path-b.txt")
         end)"#,
     );
     let mut engine = Engine::new();
@@ -28232,8 +28232,12 @@ fn test_lua_platform_reveal_and_open_path_queue_platform_actions() {
     assert_eq!(
         engine.pending_platform_actions,
         vec![
-            PendingPlatformAction::Reveal(std::path::PathBuf::from("/tmp/vimcode-2057-a.txt")),
-            PendingPlatformAction::OpenPath(std::path::PathBuf::from("/tmp/vimcode-2057-b.txt")),
+            PendingPlatformAction::Reveal(std::path::PathBuf::from(
+                "/tmp/vimcode-test-reveal-a.txt"
+            )),
+            PendingPlatformAction::OpenPath(std::path::PathBuf::from(
+                "/tmp/vimcode-test-open-path-b.txt"
+            )),
         ]
     );
 }
@@ -28342,15 +28346,17 @@ fn test_lua_platform_show_dialog_callback_receives_nil_when_cancelled() {
     assert_eq!(engine.message, "picked:nil");
 }
 
-/// `run_pending_plugin_dialog`'s TUI/no-capability fallback: a backend
-/// without `file_dialogs` never calls `services()` — the callback simply
-/// resolves with `nil` instead of panicking or shelling out.
+/// `run_pending_plugin_dialog`'s `Folder`/no-capability fallback: a backend
+/// without `folder_dialogs` never calls `services()` — the callback simply
+/// resolves with `nil` instead of panicking or shelling out. `Open`/`Save`
+/// call `services()` unconditionally (TUI's in-canvas picker works without
+/// the capability flag), so only `Folder` has a gate to test here.
 #[test]
 fn test_run_pending_plugin_dialog_falls_back_to_nil_without_capability() {
     let dir = write_plugin_lua(
         "test_platform_dialog_fallback",
-        r#"vimcode.command("PickFile", function()
-            vimcode.platform.show_open_dialog(nil, function(path)
+        r#"vimcode.command("PickFolder", function()
+            vimcode.platform.show_folder_dialog(nil, function(path)
                 vimcode.message("picked:" .. tostring(path))
             end)
         end)"#,
@@ -28364,16 +28370,16 @@ fn test_run_pending_plugin_dialog_falls_back_to_nil_without_capability() {
         Err(_) => return,
     }
     // `engine.backend_caps` defaults to `BackendCaps::empty()`, so
-    // `file_dialogs` is false — this backend should never be asked to
+    // `folder_dialogs` is false — this backend should never be asked to
     // show a real dialog.
-    assert!(!engine.backend_caps.file_dialogs);
-    engine.execute_command("PickFile");
+    assert!(!engine.backend_caps.folder_dialogs);
+    engine.execute_command("PickFolder");
     let action = engine.pending_platform_actions.remove(0);
     let mut backend = quadraui::testing::RecordingBackend::new();
     crate::render::run_pending_platform_action(&mut engine, action, &mut backend);
     assert!(
         backend.calls.is_empty(),
-        "backend.services() must never be touched without file_dialogs capability; calls were {:?}",
+        "backend.services() must never be touched without folder_dialogs capability; calls were {:?}",
         backend.calls
     );
     assert_eq!(engine.message, "picked:nil");

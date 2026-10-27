@@ -1254,9 +1254,7 @@ Thin wrapper over quadraui's `PlatformServices`/`BackendCaps`, so an extension c
 check what the current backend supports before using it:
 
 ```lua
-if vimcode.platform.has("notifications") then
-    vimcode.platform.send_notification("Build done", "All tests passed", false)
-end
+vimcode.platform.send_notification("Build done", "All tests passed", false)
 
 vimcode.platform.open_url("https://example.com")
 vimcode.platform.reveal_in_file_manager("/path/to/file.txt")
@@ -1279,20 +1277,25 @@ vimcode.platform.show_folder_dialog(nil, function(path) ... end)
 
 - `has(capability)` checks a `BackendCaps` flag by name — `"file_dialogs"`,
   `"folder_dialogs"`, `"notifications"`, `"native_dialogs"`, `"native_menu"`,
-  etc. (any field of quadraui's `BackendCaps`) — plus the vimcode-only
-  `"clipboard"`, which isn't a `BackendCaps` field since it's wired per-backend
-  onto the engine rather than being a static per-backend fact. Unknown names
-  return `false`.
+  etc. — plus the vimcode-only `"clipboard"`, which isn't a `BackendCaps`
+  field since it's wired per-backend onto the engine rather than being a
+  static per-backend fact. `"clipboard"` aside, the names are exactly
+  `quadraui::BackendCaps::vocabulary()`: every *bool capability* field, but
+  not `color_depth`/`kitty_keyboard`/`sgr_pixel_mouse`, which are
+  runtime-detected terminal properties rather than "does this backend
+  implement optional surface X" flags, and so aren't queryable through
+  `has()`. Unknown names return `false`.
 - `open_url`, `reveal_in_file_manager`, `open_path` and `send_notification` are
   fire-and-forget: they queue a platform action and return immediately, with no
   way to observe success/failure from Lua. There is no matching `has()`
   capability to gate them on — a backend without a desktop shell drops the
   action silently instead of erroring the calling plugin.
-- `show_open_dialog`/`show_save_dialog`/`show_folder_dialog` take an optional
-  `opts` table (or `nil`) and a callback invoked exactly once with the chosen
-  path, or `nil` if the dialog was cancelled or the backend lacks the
-  capability. On a backend without `file_dialogs`/`folder_dialogs` (e.g. the
-  TUI), the callback fires with `nil` immediately rather than opening anything.
+- `show_open_dialog`/`show_save_dialog` always call the backend's real file
+  dialog (on TUI, the in-canvas file picker) — there is no `has()` capability
+  to check first. `show_folder_dialog` falls back to a `nil` callback on a
+  backend without `folder_dialogs` (e.g. TUI, which has no in-canvas folder
+  picker for the plugin API yet). All three also resolve to `nil` if the user
+  cancels.
 - `clipboard_read`/`clipboard_write` are synchronous and return immediately.
 
 ### Comment Style Override
