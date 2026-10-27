@@ -206,6 +206,20 @@ fn live_engine<R>(what: &str, f: impl FnOnce(&mut Engine) -> R) -> LuaResult<R> 
     })
 }
 
+/// Parse `opts.severity` ("info" | "success" | "warning" | "error") into a
+/// `quadraui::ToastSeverity`, defaulting to `Info` when the key is absent
+/// or unrecognised — `vimcode.ui.toast`/`progress_start`/`spinner_start`
+/// all accept this shape.
+fn lua_toast_severity(opts: &LuaTable) -> LuaResult<quadraui::ToastSeverity> {
+    let severity: Option<String> = opts.get("severity")?;
+    Ok(match severity.as_deref() {
+        Some("success") => quadraui::ToastSeverity::Success,
+        Some("warning") => quadraui::ToastSeverity::Warning,
+        Some("error") => quadraui::ToastSeverity::Error,
+        _ => quadraui::ToastSeverity::Info,
+    })
+}
+
 // ─── Lua → plugin_ui vocabulary ──────────────────────────────────────────────
 
 /// Parse the table a view's `render()` returned into a
@@ -4867,6 +4881,135 @@ impl PluginManager {
                     ));
                 }
                 Ok(())
+            })?,
+        )?;
+
+        // vimcode.ui.toast{title=, body=, severity=, sticky=} -> id
+        //
+        // Pushes a toast through quadraui's `ToastStackController`/`Toast`
+        // primitive — the same stack `:Notifications` and extension-install
+        // offers render through, so a plugin toast looks identical on every
+        // backend (TUI renders the stack as text; GTK paints it). `severity`
+        // is one of "info" (default), "success", "warning", "error".
+        // `sticky = true` keeps the toast until `toast_dismiss` removes it
+        // instead of fading after `TOAST_LIFETIME`.
+        ui_tbl.set(
+            "toast",
+            lua.create_function(|_, opts: LuaTable| {
+                let title: String = opts.get("title").unwrap_or_default();
+                let body: String = opts.get("body").unwrap_or_default();
+                let severity = lua_toast_severity(&opts)?;
+                let sticky: bool = opts.get::<_, Option<bool>>("sticky")?.unwrap_or(false);
+                live_engine("vimcode.ui.toast", move |e| {
+                    if sticky {
+                        e.push_sticky_actions_toast(&title, &body, severity, Vec::new())
+                    } else {
+                        e.push_toast(&title, &body, severity)
+                    }
+                })
+            })?,
+        )?;
+
+        // vimcode.ui.toast_update(id, {title=, body=}) -> bool
+        // Updates a live toast's title and/or body in place; either key is
+        // optional. Returns `false` if `id` no longer refers to a live
+        // toast (already dismissed or faded out).
+        ui_tbl.set(
+            "toast_update",
+            lua.create_function(|_, (id, opts): (u64, LuaTable)| {
+                let title: Option<String> = opts.get("title")?;
+                let body: Option<String> = opts.get("body")?;
+                live_engine("vimcode.ui.toast_update", move |e| {
+                    e.update_toast(id, title.as_deref(), body.as_deref())
+                })
+            })?,
+        )?;
+
+        // vimcode.ui.toast_dismiss(id) -> bool
+        ui_tbl.set(
+            "toast_dismiss",
+            lua.create_function(|_, id: u64| {
+                live_engine("vimcode.ui.toast_dismiss", move |e| e.dismiss_toast(id))
+            })?,
+        )?;
+
+        // vimcode.ui.progress_start{title=, message=, percentage=} -> id
+        //
+        // Long-running progress rendered as a sticky toast whose body is a
+        // text bar backed by quadraui's real `ProgressBar::layout()` fill
+        // math (`rest-client`/`sql-tool`-style async status). `percentage`
+        // is `0..=100`; omit it for an indeterminate bar (message only).
+        // Use `progress_update`/`progress_finish` to advance or release it.
+        ui_tbl.set(
+            "progress_start",
+            lua.create_function(|_, opts: LuaTable| {
+                let title: String = opts.get("title").unwrap_or_default();
+                let message: String = opts.get("message").unwrap_or_default();
+                let percentage: Option<f32> = opts.get("percentage")?;
+                live_engine("vimcode.ui.progress_start", move |e| {
+                    e.start_progress(&title, &message, percentage)
+                })
+            })?,
+        )?;
+
+        // vimcode.ui.progress_update(id, {message=, percentage=}) -> bool
+        ui_tbl.set(
+            "progress_update",
+            lua.create_function(|_, (id, opts): (u64, LuaTable)| {
+                let message: String = opts.get("message").unwrap_or_default();
+                let percentage: Option<f32> = opts.get("percentage")?;
+                live_engine("vimcode.ui.progress_update", move |e| {
+                    e.update_progress(id, &message, percentage)
+                })
+            })?,
+        )?;
+
+        // vimcode.ui.progress_finish(id, message) -> bool
+        // Replaces the progress toast's body with a final `message`, clears
+        // its sticky flag, and lets it fade out on the normal toast
+        // lifetime rather than lingering or vanishing immediately.
+        ui_tbl.set(
+            "progress_finish",
+            lua.create_function(|_, (id, message): (u64, String)| {
+                live_engine("vimcode.ui.progress_finish", move |e| {
+                    e.finish_progress(id, &message)
+                })
+            })?,
+        )?;
+
+        // vimcode.ui.spinner_start{title=, label=} -> id
+        //
+        // Indeterminate spinner rendered as a sticky toast whose glyph comes
+        // from the same braille frame table quadraui's own `Spinner`
+        // rasterisers use, so it degrades to an identical text rotation on
+        // every backend. Advance frames with `spinner_update`, release with
+        // `spinner_stop`.
+        ui_tbl.set(
+            "spinner_start",
+            lua.create_function(|_, opts: LuaTable| {
+                let title: String = opts.get("title").unwrap_or_default();
+                let label: String = opts.get("label").unwrap_or_default();
+                live_engine("vimcode.ui.spinner_start", move |e| {
+                    e.start_spinner(&title, &label)
+                })
+            })?,
+        )?;
+
+        // vimcode.ui.spinner_update(id, label, frame_idx) -> bool
+        ui_tbl.set(
+            "spinner_update",
+            lua.create_function(|_, (id, label, frame_idx): (u64, String, usize)| {
+                live_engine("vimcode.ui.spinner_update", move |e| {
+                    e.update_spinner(id, &label, frame_idx)
+                })
+            })?,
+        )?;
+
+        // vimcode.ui.spinner_stop(id) -> bool
+        ui_tbl.set(
+            "spinner_stop",
+            lua.create_function(|_, id: u64| {
+                live_engine("vimcode.ui.spinner_stop", move |e| e.stop_spinner(id))
             })?,
         )?;
 

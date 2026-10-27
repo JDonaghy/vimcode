@@ -6428,6 +6428,118 @@ impl Engine {
         }
     }
 
+    /// Update an existing toast's title and/or body in place, leaving its
+    /// severity, actions and sticky flag untouched. Used by
+    /// `vimcode.ui.toast_update` and by the progress/spinner helpers below.
+    /// Returns `false` if `id` no longer refers to a live toast.
+    pub fn update_toast(&mut self, id: u64, title: Option<&str>, body: Option<&str>) -> bool {
+        let Some(toast) = self.toasts.iter_mut().find(|t| t.id == id) else {
+            return false;
+        };
+        if let Some(title) = title {
+            toast.title = title.to_string();
+        }
+        if let Some(body) = body {
+            toast.body = body.to_string();
+        }
+        true
+    }
+
+    /// Dismiss a toast by id regardless of its sticky flag. Returns `false`
+    /// if `id` no longer refers to a live toast.
+    pub fn dismiss_toast(&mut self, id: u64) -> bool {
+        let before = self.toasts.len();
+        self.toasts.retain(|t| t.id != id);
+        self.toasts.len() != before
+    }
+
+    /// Render a text-mode progress bar through quadraui's real `ProgressBar`
+    /// primitive: builds a throwaway `ProgressBar` with `value` set to
+    /// `fraction` and reads back its clamped fill width from `.layout()`,
+    /// so the glyph count always matches quadraui's own fill-fraction math
+    /// rather than a second, independently maintained clamp.
+    fn render_progress_bar_text(fraction: f32, cells: usize) -> String {
+        let bar = quadraui::ProgressBar {
+            id: quadraui::WidgetId::new("vimcode-ui-progress"),
+            label: String::new(),
+            value: Some(fraction),
+            frame_idx: 0,
+            cancellable: false,
+            accent: None,
+        };
+        let layout = bar.layout(0.0, 0.0, quadraui::ProgressBarMeasure::new(cells as f32, 1.0));
+        let filled = layout
+            .fill_bounds
+            .map(|r| r.width.round() as usize)
+            .unwrap_or(0)
+            .min(cells);
+        let pct = (fraction.clamp(0.0, 1.0) * 100.0).round() as i32;
+        format!(
+            "[{}{}] {pct}%",
+            "█".repeat(filled),
+            "░".repeat(cells.saturating_sub(filled))
+        )
+    }
+
+    fn progress_body(message: &str, percentage: Option<f32>) -> String {
+        match percentage {
+            Some(pct) => format!("{message}\n{}", Self::render_progress_bar_text(pct / 100.0, 20)),
+            None => message.to_string(),
+        }
+    }
+
+    /// Start a long-running progress toast (`vimcode.ui.progress_start`).
+    /// `percentage` is `0..=100`; `None` renders the message with no bar for
+    /// indeterminate progress. The toast is sticky until `finish_progress`
+    /// releases it, same degrade-to-text behaviour on every backend since
+    /// both TUI and GTK render toast bodies as plain text.
+    pub fn start_progress(&mut self, title: &str, message: &str, percentage: Option<f32>) -> u64 {
+        let body = Self::progress_body(message, percentage);
+        self.push_sticky_actions_toast(title, &body, quadraui::ToastSeverity::Info, Vec::new())
+    }
+
+    /// Update a progress toast's message and/or percentage in place.
+    /// Returns `false` if `id` no longer refers to a live toast.
+    pub fn update_progress(&mut self, id: u64, message: &str, percentage: Option<f32>) -> bool {
+        let body = Self::progress_body(message, percentage);
+        self.update_toast(id, None, Some(&body))
+    }
+
+    /// Finish a progress toast: replaces its body with `message`, clears the
+    /// sticky flag and resets its creation time so it fades out on the
+    /// normal `TOAST_LIFETIME` schedule instead of lingering or vanishing
+    /// immediately. Returns `false` if `id` no longer refers to a live toast.
+    pub fn finish_progress(&mut self, id: u64, message: &str) -> bool {
+        let Some(toast) = self.toasts.iter_mut().find(|t| t.id == id) else {
+            return false;
+        };
+        toast.body = message.to_string();
+        toast.sticky = false;
+        toast.created_at = std::time::Instant::now();
+        true
+    }
+
+    /// Start an indeterminate spinner toast (`vimcode.ui.spinner_start`).
+    /// The glyph comes from the same braille frame table quadraui's own
+    /// backends use to rasterise `Spinner` (`crate::render::spinner_glyph`),
+    /// so a text-mode spinner degrades to the identical visual rotation.
+    pub fn start_spinner(&mut self, title: &str, label: &str) -> u64 {
+        let body = format!("{} {label}", crate::render::spinner_glyph(0));
+        self.push_sticky_actions_toast(title, &body, quadraui::ToastSeverity::Info, Vec::new())
+    }
+
+    /// Advance a spinner toast to `frame_idx` with an updated label. Returns
+    /// `false` if `id` no longer refers to a live toast.
+    pub fn update_spinner(&mut self, id: u64, label: &str, frame_idx: usize) -> bool {
+        let body = format!("{} {label}", crate::render::spinner_glyph(frame_idx));
+        self.update_toast(id, None, Some(&body))
+    }
+
+    /// Stop a spinner toast by dismissing it immediately.
+    pub fn stop_spinner(&mut self, id: u64) -> bool {
+        self.dismiss_toast(id)
+    }
+
     /// Give the toast stack keyboard focus (`:Notifications` /
     /// `panel_keys.focus_notifications`) — the keyboard-only equivalent of
     /// clicking a toast's button, through quadraui's `ToastStackController`.

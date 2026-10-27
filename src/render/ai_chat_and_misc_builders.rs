@@ -807,16 +807,17 @@ pub fn route_ai_plan_band_click(engine: &mut Engine, pos: quadraui::Point) -> bo
 /// Braille spinner frame table — the same 10-glyph rotation
 /// quadraui's own GTK/TUI/macOS `Spinner` rasterisers use internally
 /// (`gtk::spinner`/`macos::spinner`'s private `FRAMES` const), duplicated
-/// here because neither is a public quadraui export: this one is embedded
-/// directly into the status-strip *text* (`⠹ execute: cargo test · 12s`),
-/// not painted through the `Spinner` primitive itself (that's the
-/// separate icon `ChatController::set_spinner_frame`, just above, already
-/// drives). A cosmetic text constant shared verbatim by both backends —
-/// not per-backend rendering logic — so duplicating it here doesn't need
-/// a quadraui issue first.
+/// here because neither is a public quadraui export: embedded directly into
+/// text (the AI-panel status strip's `⠹ execute: cargo test · 12s`, and
+/// `vimcode.ui.spinner_start`/`spinner_update`'s toast body), not painted
+/// through the `Spinner` primitive itself (that's the separate icon
+/// `ChatController::set_spinner_frame`, just below, already drives). A
+/// cosmetic text constant shared verbatim by both backends — not
+/// per-backend rendering logic — so duplicating it here doesn't need a
+/// quadraui issue first.
 const SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-fn spinner_glyph(frame_idx: usize) -> char {
+pub(crate) fn spinner_glyph(frame_idx: usize) -> char {
     SPINNER_GLYPHS[frame_idx % SPINNER_GLYPHS.len()]
 }
 

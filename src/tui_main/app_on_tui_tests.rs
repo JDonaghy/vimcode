@@ -13475,6 +13475,219 @@ mod tests {
         }
     }
 
+    /// Driver-tier black-box coverage for `vimcode.ui.toast`/
+    /// `progress_start`/`spinner_start` and their `_update`/`_finish`/
+    /// `_stop` counterparts (`Engine::start_progress` et al. in
+    /// `core::engine::mod`) — these degrade to plain toast text on every
+    /// backend, so there is no backend-specific paint path to cover beyond
+    /// the existing toast stack this module's sibling (`issue_1577_ext_
+    /// install_offer_toast`) already exercises.
+    mod issue_2061_ui_toast_progress_spinner {
+        use super::*;
+
+        /// A plain, sidebar-free fixture with no toast queued yet, so each
+        /// test below can push exactly the toast it wants to assert on.
+        fn harness_no_toast() -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            harness(plain_engine())
+        }
+
+        /// `vimcode.ui.toast` (via `Engine::push_toast`) must paint the
+        /// given title and body text. Title and body are each a single
+        /// word, deliberately, so this asserts on exact painted text
+        /// without tripping over the box's own word-wrap (quadraui's
+        /// `wrap_text_lines`, already covered by its own `wrap_tests`) —
+        /// not a claim that toast text never wraps.
+        #[test]
+        fn toast_paints_title_and_body_via_shell_app() {
+            let mut h = harness_no_toast();
+            h.engine
+                .borrow_mut()
+                .push_toast("Started", "Running", quadraui::ToastSeverity::Info);
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("Started"),
+                "toast title must paint; painted: {:?}",
+                h.driver.screen()
+            );
+            assert!(
+                h.driver.screen_contains("Running"),
+                "toast body must paint; painted: {:?}",
+                h.driver.screen()
+            );
+        }
+
+        /// A progress toast (`vimcode.ui.progress_start`) must paint its
+        /// title, message and a text-mode fill bar whose filled glyph
+        /// reflects the given percentage — proving `start_progress`
+        /// actually renders through quadraui's `ProgressBar::layout`
+        /// clamp-and-fill math rather than just echoing the percentage as a
+        /// number. Title/message are single words for the same reason as
+        /// [`toast_paints_title_and_body_via_shell_app`].
+        #[test]
+        fn progress_start_paints_message_and_fill_bar_via_shell_app() {
+            let mut h = harness_no_toast();
+            let id = h
+                .engine
+                .borrow_mut()
+                .start_progress("Indexing", "Scanning", Some(50.0));
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("Indexing"),
+                "progress toast title must paint; painted: {:?}",
+                h.driver.screen()
+            );
+            assert!(
+                h.driver.screen_contains("Scanning"),
+                "progress toast message must paint; painted: {:?}",
+                h.driver.screen()
+            );
+            assert!(
+                h.driver.screen_contains("50%"),
+                "progress toast must paint its percentage; painted: {:?}",
+                h.driver.screen()
+            );
+            assert!(
+                h.driver.screen_contains("█"),
+                "a 50% progress bar must paint at least one filled glyph; \
+                 painted: {:?}",
+                h.driver.screen()
+            );
+
+            // progress_update must replace the message and advance the bar.
+            h.engine
+                .borrow_mut()
+                .update_progress(id, "Finishing", Some(90.0));
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("Finishing") && h.driver.screen_contains("90%"),
+                "progress_update must repaint the new message and \
+                 percentage; painted: {:?}",
+                h.driver.screen()
+            );
+            assert!(
+                !h.driver.screen_contains("Scanning"),
+                "progress_update must replace the old message, not \
+                 append to it; painted: {:?}",
+                h.driver.screen()
+            );
+
+            // progress_finish must replace the body with the final message
+            // and stop pinning the toast open (sticky cleared).
+            h.engine.borrow_mut().finish_progress(id, "Indexed");
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("Indexed"),
+                "progress_finish must paint the final message; painted: {:?}",
+                h.driver.screen()
+            );
+            assert!(
+                !h.engine
+                    .borrow()
+                    .toasts
+                    .iter()
+                    .find(|t| t.id == id)
+                    .unwrap()
+                    .sticky,
+                "progress_finish must clear the sticky flag so the toast \
+                 fades out on the normal schedule"
+            );
+        }
+
+        /// A spinner toast (`vimcode.ui.spinner_start`) must paint its
+        /// title, label and a rotating braille glyph from the same table
+        /// quadraui's own `Spinner` primitive rotates through — proving the
+        /// text-mode degrade uses the real frame table, not a hardcoded
+        /// placeholder character. Title/label are single words for the same
+        /// reason as [`toast_paints_title_and_body_via_shell_app`].
+        #[test]
+        fn spinner_start_paints_label_and_rotating_glyph_via_shell_app() {
+            let mut h = harness_no_toast();
+            let id = h.engine.borrow_mut().start_spinner("Querying", "Waiting");
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("Querying"),
+                "spinner toast title must paint; painted: {:?}",
+                h.driver.screen()
+            );
+            assert!(
+                h.driver.screen_contains("Waiting"),
+                "spinner toast label must paint; painted: {:?}",
+                h.driver.screen()
+            );
+            let frame0 = crate::render::spinner_glyph(0).to_string();
+            assert!(
+                h.driver.screen_contains(&frame0),
+                "spinner must paint its frame-0 glyph; painted: {:?}",
+                h.driver.screen()
+            );
+
+            // spinner_update must advance to a different frame's glyph and
+            // repaint the label.
+            h.engine.borrow_mut().update_spinner(id, "Retrying", 3);
+            h.driver.render();
+            let frame3 = crate::render::spinner_glyph(3).to_string();
+            assert!(
+                h.driver.screen_contains("Retrying") && h.driver.screen_contains(&frame3),
+                "spinner_update must repaint the new label and frame-3 \
+                 glyph; painted: {:?}",
+                h.driver.screen()
+            );
+
+            // spinner_stop must dismiss the toast entirely.
+            h.engine.borrow_mut().stop_spinner(id);
+            h.driver.render();
+            assert!(
+                !h.driver.screen_contains("Retrying"),
+                "spinner_stop must dismiss the toast; painted: {:?}",
+                h.driver.screen()
+            );
+        }
+
+        /// `toast_update`/`toast_dismiss` (the plain, non-progress/spinner
+        /// bindings) must repaint new text in place and then remove the
+        /// toast on dismiss. Bodies are single words for the same reason as
+        /// [`toast_paints_title_and_body_via_shell_app`].
+        #[test]
+        fn toast_update_and_dismiss_via_shell_app() {
+            let mut h = harness_no_toast();
+            let id = h.engine.borrow_mut().push_sticky_actions_toast(
+                "Upload",
+                "Pending",
+                quadraui::ToastSeverity::Info,
+                Vec::new(),
+            );
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("Pending"),
+                "toast body must paint before update; painted: {:?}",
+                h.driver.screen()
+            );
+
+            h.engine
+                .borrow_mut()
+                .update_toast(id, None, Some("Uploading"));
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("Uploading") && !h.driver.screen_contains("Pending"),
+                "toast_update must replace the body; painted: {:?}",
+                h.driver.screen()
+            );
+
+            h.engine.borrow_mut().dismiss_toast(id);
+            h.driver.render();
+            assert!(
+                !h.driver.screen_contains("Uploading"),
+                "toast_dismiss must remove the toast; painted: {:?}",
+                h.driver.screen()
+            );
+        }
+    }
+
     /// Driver-tier black-box coverage for the "package-manager
     /// acquire kind whose runtime is missing" fallback — CLAUDE.md's
     /// black-box coverage rule requires a test that drives the running app
