@@ -2761,6 +2761,27 @@ window). `tests/pty_dead_master_exit.rs` re-confirmed passing against this pin.
 Ask item 1 (an upstream `crossterm` fix) remains the only thing that changes
 either test's status.
 
+**macOS measurement:** `tests/pty_dead_master_exit.rs::vcd_should_exit_promptly_once_its_pty_master_closes`
+is RED on macOS (Apple Silicon) against the current pin, measured on real
+hardware: ~3 failures in 17 standalone runs and 2/2 under machine load, with
+the busy-spin signature this entry describes (`stime`-dominated CPU, e.g.
+`utime 0:00.18, stime 0:00.59, 58.2% CPU`; `peak_cpu_during_wait` of 1.33s and
+2.44s against the test's 1.0s bar). So quadraui#1301's `wait_for_stdin_ready`
+`poll(2)` guard closes the race on Linux but only narrows it on Darwin:
+`poll(2)` there does not surface `POLLHUP` on a pty slave whose master side
+closed, so the `Duration::ZERO` call the guard then hands `crossterm` can
+still be the one that enters the `Ok(0)` spin. The scenario is therefore
+`#[cfg_attr(target_os = "macos", ignore = …)]` — reproduced, not fixed — and
+the Linux lane keeps running it unconditionally. Gating it costs no CI
+coverage: `ci.yml`'s `test-macos` job runs `cargo test --lib
+--no-default-features --features macos` and never builds `tests/`. Per the
+Platform-Neutrality Rule there is no vimcode-side fix to make; what is needed
+is hangup detection in quadraui's own TUI backend that holds on Darwin (a
+`kqueue` `EVFILT_READ`/`EV_EOF` wakeup, or a dedicated reader thread), not a
+vimcode workaround. Re-check with `cargo test --test pty_dead_master_exit --
+--ignored` on a macOS host after any quadraui pin bump; drop the gate when it
+passes.
+
 **Blocks:** `JDonaghy/vimcode#1735` — **closed by #1775's pin bump** (quadraui#1301 fixes the reported symptom: an orphaned `vcd` busy-spinning on a dead pty, via `TuiBackend::wait_events`, the path every real vcd session goes through). This entry itself stays open: the upstream `crossterm` 0.29.0 defect this entry root-causes is still unpatched, and `tests/crossterm_dead_pty_busy_loop.rs` (which drives raw `crossterm::event::poll`, bypassing `TuiBackend` by construction) still reproduces it and stays `#[ignore]`d — there is no per-backend vimcode-side fix available for that half, and per this repo's Platform-Neutrality Rule a vimcode-side workaround (e.g. vimcode polling its own fds independently of quadraui's event loop) is exactly the kind of per-backend code that rule exists to prevent. Ask item 1 (an upstream `crossterm` fix) remains the thing this entry is actually waiting on now.
 
 
