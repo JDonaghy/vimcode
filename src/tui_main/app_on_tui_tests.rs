@@ -17827,18 +17827,19 @@ mod tests {
         /// single screen row the toast body actually lands on: the row
         /// directly below the toast's title row (quadraui's
         /// `tui/toast.rs::paint_toast` paints the title on `by + 1` and
-        /// the (unwrapped, given the long title below) body on the row
-        /// right after it). The title itself is picked deliberately long
-        /// enough (28 chars) to widen the toast box past the point where
-        /// a 20-cell bar plus its percentage would wrap across lines.
+        /// the body on the row right after it). The title is long enough
+        /// (28 chars) that `"{pct}% {bar}"` fits on a single body line
+        /// without wrapping; `progress_toast_with_short_title_wraps_bar_\
+        /// onto_its_own_line_via_shell_app` below pins the narrow-toast
+        /// case where the percentage and bar land on separate lines.
         #[test]
         fn progress_toast_paints_bar_percentage_and_updates_in_place_via_shell_app() {
             let engine = engine_with_plugin(
-                "win_progress_2061",
+                "zq_progress_toast",
                 r#"
                 vimcode.command("ZqProgressStart", function(_)
                     _G.zq_progress_id = vimcode.ui.progress({
-                        title = "ZQ_PROGRESS_TOAST_TITLE_2061",
+                        title = "ZQ_PROGRESS_TOAST_TITLE_2094",
                         fraction = 0.5,
                     })
                 end)
@@ -17872,7 +17873,7 @@ mod tests {
                 let lines: Vec<&str> = screen.lines().collect();
                 let title_idx = lines
                     .iter()
-                    .position(|l| l.contains("ZQ_PROGRESS_TOAST_TITLE_2061"))
+                    .position(|l| l.contains("ZQ_PROGRESS_TOAST_TITLE_2094"))
                     .unwrap_or_else(|| {
                         panic!("progress toast title must paint somewhere on screen:\n{screen}")
                     });
@@ -17890,15 +17891,15 @@ mod tests {
             let row = progress_body_row(&screen);
             assert_eq!(
                 row.matches('█').count(),
-                10,
-                "fraction 0.5 over a 20-cell bar must paint exactly 10 \
+                5,
+                "fraction 0.5 over a 10-cell bar must paint exactly 5 \
                  filled cells on the toast's own body row; \
                  row:\n{row}\nscreen:\n{screen}"
             );
             assert_eq!(
                 row.matches('░').count(),
-                10,
-                "fraction 0.5 over a 20-cell bar must paint exactly 10 \
+                5,
+                "fraction 0.5 over a 10-cell bar must paint exactly 5 \
                  empty cells on the toast's own body row; \
                  row:\n{row}\nscreen:\n{screen}"
             );
@@ -17914,7 +17915,7 @@ mod tests {
             let row = progress_body_row(&screen);
             assert_eq!(
                 row.matches('█').count(),
-                20,
+                10,
                 "progress_update to fraction 1.0 must repaint the same \
                  toast's body fully filled, in place (not spawn a second \
                  toast); row:\n{row}\nscreen:\n{screen}"
@@ -17930,9 +17931,84 @@ mod tests {
 
             let screen = driver.screen();
             assert!(
-                !screen.contains("ZQ_PROGRESS_TOAST_TITLE_2061"),
+                !screen.contains("ZQ_PROGRESS_TOAST_TITLE_2094"),
                 "progress_finish must dismiss the toast entirely; \
                  screen:\n{screen}"
+            );
+        }
+
+        /// A 5-char title ("ZQP94") sizes the toast to quadraui's 12-cell
+        /// width floor, leaving only 10 body columns — narrower than
+        /// `"{pct}% {bar}"` (14 chars) but exactly as wide as the bar
+        /// alone. This pins the behaviour the bar width was chosen for:
+        /// the percentage and bar word-wrap onto two separate body
+        /// lines, and the bar itself paints in full (no `…`
+        /// hard-truncation), so every fraction still renders distinct
+        /// bar glyphs even at the narrowest possible toast.
+        #[test]
+        fn progress_toast_with_short_title_wraps_bar_onto_its_own_line_via_shell_app() {
+            let engine = engine_with_plugin(
+                "zq_progress_toast_narrow",
+                r#"
+                vimcode.command("ZqProgressStart", function(_)
+                    vimcode.ui.progress({ title = "ZQP94", fraction = 0.5 })
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqProgressStart".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let screen = driver.screen();
+            let lines: Vec<&str> = screen.lines().collect();
+            let title_idx = lines
+                .iter()
+                .position(|l| l.contains("ZQP94"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "progress toast title \"ZQP94\" must paint somewhere on screen:\n{screen}"
+                    )
+                });
+            let pct_row = lines.get(title_idx + 1).unwrap_or_else(|| {
+                panic!("a percentage row must exist directly below the title row:\n{screen}")
+            });
+            let bar_row = lines.get(title_idx + 2).unwrap_or_else(|| {
+                panic!("a bar row must exist two rows below the title row:\n{screen}")
+            });
+            assert!(
+                pct_row.contains("50%"),
+                "a narrow toast must still wrap the percentage onto its \
+                 own body line; pct_row:\n{pct_row}\nscreen:\n{screen}"
+            );
+            assert!(
+                !pct_row.contains('█') && !pct_row.contains('░'),
+                "the percentage line must not also carry the bar; \
+                 pct_row:\n{pct_row}\nscreen:\n{screen}"
+            );
+            assert_eq!(
+                bar_row.matches('█').count(),
+                5,
+                "the bar must paint in full (5 filled of 10 cells for \
+                 fraction 0.5) on its own wrapped line, not get \
+                 hard-truncated; bar_row:\n{bar_row}\nscreen:\n{screen}"
+            );
+            assert_eq!(
+                bar_row.matches('░').count(),
+                5,
+                "the bar must paint in full (5 empty of 10 cells for \
+                 fraction 0.5) with no truncation ellipsis; \
+                 bar_row:\n{bar_row}\nscreen:\n{screen}"
+            );
+            assert!(
+                !bar_row.contains('…'),
+                "the bar must never be hard-truncated, even at the \
+                 narrowest toast width; bar_row:\n{bar_row}\nscreen:\n{screen}"
             );
         }
     }

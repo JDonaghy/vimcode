@@ -1243,12 +1243,14 @@ plugin owns its lifetime explicitly.
 ```lua
 local id = vimcode.ui.progress({
     title = "Fetching",        -- required in practice; defaults to ""
-    label = "GET /users",      -- optional detail text
-    fraction = 0.5,            -- 0..1 for a determinate bar; omit/nil for a spinner
+    label = "GET /users",      -- optional detail text (`body` also works, as an alias)
+    fraction = 0.5,            -- 0..1 for a determinate bar; omit/nil for "Working…"
 })
 
 -- Redraw the same toast in place. fraction/label are each optional;
--- omitting fraction keeps it indeterminate. Returns false if `id` is gone.
+-- omitting fraction keeps it indeterminate; omitting label leaves
+-- whatever label was last set (pass "" explicitly to clear it).
+-- Returns false if `id` is gone.
 local ok = vimcode.ui.progress_update(id, 0.9, "almost done")
 
 -- Remove the toast once the operation finishes (or is cancelled).
@@ -1256,11 +1258,27 @@ local ok = vimcode.ui.progress_update(id, 0.9, "almost done")
 local ok = vimcode.ui.progress_finish(id)
 ```
 
-A determinate `fraction` renders as a block-character bar plus
-percentage (`"██████████░░░░░░░░░░ 50% — GET /users"`); an
-indeterminate progress toast renders as `"Working… <label>"`. Both
-render as plain toast body text, so they paint identically on every
-backend via the existing toast pipeline — no new overlay primitive.
+A determinate `fraction` renders percentage-first, then a 10-cell
+block-character bar, then the label (`"50% █████░░░░░ — GET
+/users"`); an indeterminate progress toast renders as `"Working…
+<label>"`. Both render as plain toast body text, so they paint
+identically on every backend via the existing toast pipeline — no new
+overlay primitive. A narrow toast (short title) may word-wrap the
+percentage and bar onto separate lines, but the bar itself always
+paints in full — it never truncates.
+
+The indeterminate ("Working…") state is a static label, not an
+animated spinner: nothing redraws it on its own. A plugin driving
+genuinely indeterminate work should call `progress_update` periodically
+(or switch to a determinate `fraction` once one is known) if it wants
+visible motion.
+
+Progress toasts are sticky and `vimcode.ui.progress` doesn't cap how
+many a plugin can have open at once, so a plugin that errors out
+between `progress` and `progress_finish` leaks a toast that never
+expires. Wrap the `progress_finish`/`dismiss` call in a `pcall`-guarded
+cleanup path (e.g. an HTTP callback's error branch) rather than relying
+on the happy path alone.
 
 ### HTTP, JSON and Storage (`vimcode.http`, `vimcode.json`, `vimcode.storage`)
 

@@ -17631,6 +17631,59 @@ fn test_lua_ui_progress_update_changes_body() {
 }
 
 #[test]
+fn test_lua_ui_progress_update_without_label_preserves_previous_label() {
+    let dir = write_plugin_lua(
+        "test_ui_progress_update_no_label",
+        r#"vimcode.command("Start", function()
+            local id = vimcode.ui.progress({ title = "Fetching", label = "GET /users", fraction = 0.1 })
+            vimcode.ui.progress_update(id, 0.9)
+        end)"#,
+    );
+    let mut engine = Engine::new_for_test();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Start");
+    assert_eq!(engine.toasts.len(), 1);
+    assert!(
+        engine.toasts[0].body.contains("90%") && engine.toasts[0].body.contains("GET /users"),
+        "progress_update with no label argument must keep the label \
+         set by the original progress() call: {:?}",
+        engine.toasts[0].body
+    );
+}
+
+#[test]
+fn test_lua_ui_progress_accepts_body_as_label_alias() {
+    let dir = write_plugin_lua(
+        "test_ui_progress_body_alias",
+        r#"vimcode.command("Start", function()
+            vimcode.ui.progress({ title = "Fetching", body = "GET /users", fraction = 0.5 })
+        end)"#,
+    );
+    let mut engine = Engine::new_for_test();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Start");
+    assert_eq!(engine.toasts.len(), 1);
+    assert!(
+        engine.toasts[0].body.contains("GET /users"),
+        "progress({{ body = ... }}) must accept `body` as an alias for \
+         `label`: {:?}",
+        engine.toasts[0].body
+    );
+}
+
+#[test]
 fn test_lua_ui_progress_finish_removes_toast() {
     let dir = write_plugin_lua(
         "test_ui_progress_finish",

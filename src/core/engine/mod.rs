@@ -1107,6 +1107,11 @@ pub struct EngineToast {
     /// a decision: disappearing after 5s would silently revert to
     /// "never asked", with no record the user ever saw it.
     pub sticky: bool,
+    /// The label last passed to `push_progress_toast`/`update_progress_toast`
+    /// (empty for a plain, non-progress toast). Kept separately from `body`
+    /// so `update_progress_toast(id, fraction, None)` can redraw the bar
+    /// without wiping a label it was never told to change.
+    pub progress_label: String,
 }
 
 /// One action button on an [`EngineToast`] (`quadraui::ToastButton`).
@@ -6377,6 +6382,7 @@ impl Engine {
             created_at: std::time::Instant::now(),
             actions,
             sticky,
+            progress_label: String::new(),
         });
         id
     }
@@ -6392,23 +6398,44 @@ impl Engine {
         self.toasts.len() != before
     }
 
+    /// Width of the `format_progress_body` block-character bar, in cells.
+    ///
+    /// quadraui's TUI toast box is sized from the *title* alone
+    /// (`tui_toast_width`), then the body is word-wrapped/hard-truncated
+    /// into whatever's left — as little as 10 columns at the 12-cell width
+    /// floor (a 1-char title). The bar is one whitespace-free "word", so
+    /// if it's wider than the narrowest body width, `wrap_text_lines`
+    /// hard-truncates it with a trailing `…` and *every* fraction above
+    /// the truncation point paints the same glyphs. Sizing the bar to fit
+    /// the floor means it always renders in full, on its own wrapped line,
+    /// regardless of title length.
+    const PROGRESS_BAR_WIDTH: usize = 10;
+
     /// Render a progress/spinner state as plain toast body text: a
-    /// block-character bar + percentage when `fraction` is known, or an
+    /// percentage + block-character bar when `fraction` is known, or an
     /// indeterminate "Working…" message otherwise. Both backends already
     /// paint a toast body as plain text, so a progress toast needs no
     /// new overlay primitive or paint path — it degrades identically on
     /// TUI and GTK.
+    ///
+    /// The percentage is placed *before* the bar: on a narrow TUI toast
+    /// the two wrap onto separate lines (the bar is `PROGRESS_BAR_WIDTH`
+    /// cells, sized to fit even the narrowest box — see its doc), and
+    /// leading with the percentage means the first body line always
+    /// differs between fractions even if a future change widens the bar
+    /// again and reintroduces truncation.
     fn format_progress_body(fraction: Option<f32>, label: &str) -> String {
         match fraction {
             Some(f) => {
                 let f = f.clamp(0.0, 1.0);
                 let pct = (f * 100.0).round() as u32;
-                let filled = ((f * 20.0).round() as usize).min(20);
-                let bar: String = "█".repeat(filled) + &"░".repeat(20 - filled);
+                let filled = (f * Self::PROGRESS_BAR_WIDTH as f32).round() as usize;
+                let bar: String =
+                    "█".repeat(filled) + &"░".repeat(Self::PROGRESS_BAR_WIDTH - filled);
                 if label.is_empty() {
-                    format!("{bar} {pct}%")
+                    format!("{pct}% {bar}")
                 } else {
-                    format!("{bar} {pct}% — {label}")
+                    format!("{pct}% {bar} — {label}")
                 }
             }
             None => {
@@ -6428,23 +6455,40 @@ impl Engine {
     /// `update_progress_toast`/`dismiss_toast`.
     pub fn push_progress_toast(&mut self, title: &str, fraction: Option<f32>, label: &str) -> u64 {
         let body = Self::format_progress_body(fraction, label);
-        self.push_toast_inner(
+        let id = self.push_toast_inner(
             title,
             &body,
             quadraui::ToastSeverity::Info,
             Vec::new(),
             true,
-        )
+        );
+        if let Some(toast) = self.toasts.iter_mut().find(|t| t.id == id) {
+            toast.progress_label = label.to_string();
+        }
+        id
     }
 
     /// Update an in-flight progress/spinner toast's body in place.
     /// Returns false if `id` does not match any live toast (e.g. the
-    /// user dismissed it).
-    pub fn update_progress_toast(&mut self, id: u64, fraction: Option<f32>, label: &str) -> bool {
+    /// user dismissed it). `label = None` keeps the label last set by
+    /// `push_progress_toast`/a previous call — only `Some("")` clears it —
+    /// so redrawing just the bar (`progress_update(id, fraction)` with no
+    /// label argument) can't silently wipe a label it was never told to
+    /// change.
+    pub fn update_progress_toast(
+        &mut self,
+        id: u64,
+        fraction: Option<f32>,
+        label: Option<&str>,
+    ) -> bool {
         let Some(toast) = self.toasts.iter_mut().find(|t| t.id == id) else {
             return false;
         };
-        toast.body = Self::format_progress_body(fraction, label);
+        if let Some(label) = label {
+            toast.progress_label = label.to_string();
+        }
+        let label = toast.progress_label.clone();
+        toast.body = Self::format_progress_body(fraction, &label);
         true
     }
 
@@ -6488,9 +6532,8 @@ impl Engine {
     /// job, run through `run_toast_action` instead).
     fn dismiss_toast_by_widget(&mut self, widget_id: &quadraui::WidgetId) {
         let key = widget_id.as_str();
-        let target_id: Option<u64> = key.strip_prefix("toast-").and_then(|s| s.parse().ok());
-        if let Some(id) = target_id {
-            self.toasts.retain(|t| t.id != id);
+        if let Some(id) = key.strip_prefix("toast-").and_then(|s| s.parse().ok()) {
+            self.dismiss_toast(id);
         }
     }
 
