@@ -14482,6 +14482,60 @@ mod clipboard_paste {
              unchanged while only the status bar is protected"
         );
     }
+
+    /// The fuzzy-finder / unified-picker popup must paint a *translucent*
+    /// backdrop, not a solid opaque panel: a non-selected result row's
+    /// background pixel must composite the picker's `surface_bg` at
+    /// `PICKER_BACKDROP_OPACITY` over the scrim-dimmed editor behind it, so it
+    /// ends up darker than the opaque `surface_bg` the backdrop would carry at
+    /// full opacity. Against unfixed `develop` (no `set_style` call, so
+    /// `backdrop_opacity` stays 1.0) `draw_palette` fills the row background
+    /// with the exact opaque `surface_bg`, so this test is red there.
+    #[test]
+    fn picker_backdrop_is_translucent_not_opaque_via_gtk_driver() {
+        let mut engine = Engine::new_for_test();
+        // `onedark` keeps the editor `background` (#1a1a1a) distinct from the
+        // picker `surface_bg`/`fuzzy_bg` (#21252b); the default `dark` theme
+        // makes them equal, which would leave nothing for translucency to
+        // reveal and make this assertion vacuous.
+        engine.settings.colorscheme = "onedark".to_string();
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        h.driver.dispatch(UiEvent::Accelerator(
+            quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+            quadraui::Modifiers::default(),
+        ));
+        h.driver.render();
+
+        let qtheme = crate::render::to_quadraui_theme(&crate::render::Theme::from_name("onedark"));
+        let opaque = (
+            qtheme.surface_bg.r,
+            qtheme.surface_bg.g,
+            qtheme.surface_bg.b,
+        );
+
+        // Row 1 is never the initially-selected row (that is row 0), so its
+        // background is the bare palette backdrop with no opaque selected fill.
+        let (probe_x, probe_y) = h
+            .picker_row_probe(1)
+            .expect("the command palette must paint result rows to probe");
+        let backdrop = h.driver.pixel(probe_x, probe_y);
+
+        assert_ne!(
+            backdrop, opaque,
+            "the picker backdrop must be translucent: a non-selected row's \
+             background pixel {backdrop:?} must differ from the opaque \
+             surface_bg {opaque:?} because it composites over the dimmed \
+             editor behind it"
+        );
+        assert!(
+            backdrop.0 < opaque.0 && backdrop.1 < opaque.1 && backdrop.2 < opaque.2,
+            "a translucent backdrop over the darker scrim-dimmed editor must \
+             read darker than the opaque surface_bg on every channel; \
+             backdrop={backdrop:?} opaque_surface_bg={opaque:?}"
+        );
+    }
 }
 
 #[cfg(test)]

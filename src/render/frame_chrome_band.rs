@@ -439,6 +439,19 @@ pub fn paint_command_center_rung(
 /// readable.
 pub const MODAL_SCRIM_COLOR: quadraui::Color = quadraui::Color::rgba(0, 0, 0, 102);
 
+/// Backdrop opacity for the fuzzy finder / unified picker popup
+/// ([`paint_picker_rung`]): below `1.0` so the popup's body is translucent and
+/// the scrim-dimmed editor/explorer behind it stays visible, rather than a
+/// solid panel that occludes everything underneath. The value trades off
+/// against legibility — the result rows and query text paint over this
+/// backdrop and must stay readable, and only the selected row carries its own
+/// opaque fill — so it leans mostly-opaque while still letting content bleed
+/// through. `quadraui::Style::backdrop_opacity` applies this to `Palette`'s
+/// backdrop alone; every other overlay keeps its opaque `surface_bg`, and GTK
+/// blends real alpha while TUI pre-blends the backdrop against the editor
+/// background on the CPU.
+pub const PICKER_BACKDROP_OPACITY: f32 = 0.8;
+
 /// The rect [`paint_picker_rung`]'s scrim fill should cover: the full window
 /// width, from `content_top` down to the lowest row this frame paints *editor*
 /// content into — the editor and sidebar band, and nothing below or above it.
@@ -515,6 +528,10 @@ pub fn paint_picker_rung(
     let geo = PickerGeometry::compute(viewport, picker.items.len(), has_preview, sizing);
     let palette = picker_panel_to_palette(picker, theme);
     let rect = quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h);
+    // Translucent backdrop for this popup only: save the backend's style, draw
+    // the palette with a reduced `backdrop_opacity`, then restore so later
+    // overlays in the same frame (e.g. the git branch picker) keep their
+    // opaque default.
     b.draw_palette(rect, &palette);
     rect
 }

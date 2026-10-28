@@ -4482,6 +4482,82 @@ mod tests {
             );
         }
 
+        /// The fuzzy-finder / unified-picker popup must paint a *translucent*
+        /// backdrop so the scrim-dimmed editor behind it stays visible,
+        /// rather than a solid opaque panel. `paint_picker_rung` draws the
+        /// palette with `PICKER_BACKDROP_OPACITY` (< 1.0), and on TUI the
+        /// palette backdrop is pre-blended on the CPU as
+        /// `background.blend(surface_bg, backdrop_opacity)`. This test opens
+        /// the command palette and asserts the popup actually paints cells in
+        /// that blended colour — and never in the opaque `surface_bg` the
+        /// backdrop would carry at full opacity. Against unfixed `develop`
+        /// (no `set_style` call, so `backdrop_opacity` stays 1.0) the popup
+        /// paints `surface_bg` and zero blended cells, so this test is red.
+        #[test]
+        fn picker_backdrop_is_translucent_not_opaque_via_shell_app() {
+            let mut engine = plain_engine();
+            // `onedark` has a distinct editor `background` (#1a1a1a) and
+            // picker `fuzzy_bg`/`surface_bg` (#21252b), so a translucent
+            // backdrop blends to a colour that differs from the opaque
+            // surface — the default `dark` theme makes them equal, which
+            // would make this assertion vacuous.
+            engine.settings.colorscheme = "onedark".to_string();
+            let colorscheme = engine.settings.colorscheme.clone();
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let qtheme =
+                crate::render::to_quadraui_theme(&crate::render::Theme::from_name(&colorscheme));
+            let opaque = qtheme.surface_bg;
+            let blended = qtheme.background.blend(
+                qtheme.surface_bg,
+                crate::render::PICKER_BACKDROP_OPACITY as f64,
+            );
+            assert_ne!(
+                blended, opaque,
+                "precondition: the active theme's blended backdrop must differ \
+                 from the opaque surface_bg, otherwise this test proves nothing"
+            );
+            let opaque_bg = ratatui::style::Color::Rgb(opaque.r, opaque.g, opaque.b);
+            let blended_bg = ratatui::style::Color::Rgb(blended.r, blended.g, blended.b);
+
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+                quadraui::Modifiers::default(),
+            ));
+
+            let mut blended_cells = 0usize;
+            let mut opaque_cells = 0usize;
+            for y in 0..24u16 {
+                for x in 0..80u16 {
+                    if let Some(st) = driver.style_at(x, y) {
+                        if st.bg == blended_bg {
+                            blended_cells += 1;
+                        }
+                        if st.bg == opaque_bg {
+                            opaque_cells += 1;
+                        }
+                    }
+                }
+            }
+
+            assert!(
+                blended_cells > 0,
+                "the picker backdrop must paint its body in the translucent \
+                 blended colour {blended_bg:?}, letting the dimmed editor show \
+                 through; found none. screen:\n{}",
+                driver.screen()
+            );
+            assert_eq!(
+                opaque_cells,
+                0,
+                "no popup cell may carry the opaque surface_bg {opaque_bg:?}; \
+                 a translucent backdrop pre-blends it against the editor \
+                 background instead. screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// The scrim behind the unified picker must stop above the
         /// status-bar/command-line band, not blank it: `FRAME_Z_ORDER`
         /// composes `StatusBar`/`CommandLine` before `UnifiedPicker`, so a
