@@ -4916,6 +4916,18 @@ pub struct Engine {
     #[allow(clippy::type_complexity)]
     pub plugin_view_tab_table_layout:
         std::cell::RefCell<Option<(quadraui::Rect, quadraui::DataTableLayout)>>,
+    /// The `ChartLayout` returned by `Backend::draw_chart` for the last frame
+    /// that painted a `ViewBody::Chart`-kind plugin view in the sidebar,
+    /// alongside the rect it was resolved against. `Chart` has no scroll or
+    /// persistent selection state of its own (unlike `List`/`Table`), so this
+    /// is the only piece of plugin-view-chart state `Engine` needs to carry.
+    #[allow(clippy::type_complexity)]
+    pub plugin_view_chart_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::ChartLayout)>>,
+    /// Tab twin of `plugin_view_chart_layout`.
+    #[allow(clippy::type_complexity)]
+    pub plugin_view_tab_chart_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::ChartLayout)>>,
     /// Column-width overrides for `ViewBody::Table`-kind views, keyed by
     /// view name and indexed by column — mirrors
     /// `quadraui::DataTable::column_overrides` exactly, recomputed by
@@ -5809,6 +5821,8 @@ impl Engine {
             )),
             plugin_view_list_layout: std::cell::RefCell::new(None),
             plugin_view_tab_list_layout: std::cell::RefCell::new(None),
+            plugin_view_chart_layout: std::cell::RefCell::new(None),
+            plugin_view_tab_chart_layout: std::cell::RefCell::new(None),
             plugin_view_table_layout: std::cell::RefCell::new(None),
             plugin_view_tab_table_layout: std::cell::RefCell::new(None),
             plugin_view_table_col_overrides: HashMap::new(),

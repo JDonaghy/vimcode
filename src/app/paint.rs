@@ -423,6 +423,15 @@ impl App {
                             backend,
                         );
                     }
+                    Some("chart") => {
+                        render::paint_plugin_view_chart(
+                            &engine,
+                            view_name,
+                            PluginViewHost::Tab,
+                            rect,
+                            backend,
+                        );
+                    }
                     _ => {
                         if render::populate_plugin_view_tab_form_controller(
                             &engine,
@@ -919,6 +928,15 @@ impl App {
                                 &name,
                                 PluginViewHost::Sidebar,
                                 has_focus,
+                                body_rect,
+                                backend,
+                            );
+                        }
+                        Some("chart") => {
+                            render::paint_plugin_view_chart(
+                                engine,
+                                &name,
+                                PluginViewHost::Sidebar,
                                 body_rect,
                                 backend,
                             );
