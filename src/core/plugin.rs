@@ -5021,6 +5021,10 @@ impl PluginManager {
         )?;
 
         // vimcode.ui.progress{title=, label=, fraction=} → integer toast id.
+        // `body` is accepted as an alias for `label` (used only when
+        // `label` is absent), since both names show up in the wild for
+        // this field; `label` is the one documented in EXTENSIONS.md and
+        // matches `progress_update`'s third argument.
         //
         // A progress/spinner indicator for async work whose status outlives
         // a single `vimcode.message` line — an HTTP request (`rest-client`),
@@ -5028,8 +5032,8 @@ impl PluginManager {
         // determinate bar, or omitted/nil for an indeterminate "Working…"
         // toast. `label` is optional detail text (e.g. a URL or query).
         //
-        // Rendered as plain toast body text (a block-character bar +
-        // percentage, or "Working…"), so it reuses the toast pipeline every
+        // Rendered as plain toast body text (a percentage + block-character
+        // bar, or "Working…"), so it reuses the toast pipeline every
         // backend already paints — no new overlay primitive or per-backend
         // paint path, and it degrades identically on TUI and GTK. Sticky:
         // stays visible past the normal toast lifetime until
@@ -5038,7 +5042,10 @@ impl PluginManager {
             "progress",
             lua.create_function(|_, opts: LuaTable| {
                 let title: String = opts.get("title").unwrap_or_default();
-                let label: String = opts.get("label").unwrap_or_default();
+                let label: String = opts
+                    .get::<_, Option<String>>("label")?
+                    .or(opts.get::<_, Option<String>>("body")?)
+                    .unwrap_or_default();
                 let fraction: Option<f32> = opts.get::<_, Option<f32>>("fraction")?;
                 live_engine("vimcode.ui.progress", move |e| {
                     e.push_progress_toast(&title, fraction, &label)
@@ -5048,15 +5055,16 @@ impl PluginManager {
 
         // vimcode.ui.progress_update(id, fraction?, label?) → bool. Redraws
         // the bar/label of a toast started by `vimcode.ui.progress`.
-        // `fraction` omitted/nil keeps it indeterminate. `false` if `id`
-        // was already dismissed/finished.
+        // `fraction` omitted/nil keeps it indeterminate; `label` omitted/nil
+        // keeps whatever label was last set (only an explicit `""` clears
+        // it) — so bumping just the fraction doesn't wipe the label.
+        // `false` if `id` was already dismissed/finished.
         ui_tbl.set(
             "progress_update",
             lua.create_function(
                 |_, (id, fraction, label): (u64, Option<f32>, Option<String>)| {
-                    let label = label.unwrap_or_default();
                     live_engine("vimcode.ui.progress_update", move |e| {
-                        e.update_progress_toast(id, fraction, &label)
+                        e.update_progress_toast(id, fraction, label.as_deref())
                     })
                 },
             )?,

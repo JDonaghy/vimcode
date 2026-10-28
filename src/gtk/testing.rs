@@ -10317,6 +10317,35 @@ mod chrome_surfaces {
         assert_region_changed(&without, &with, "an open toast");
     }
 
+    /// A progress toast's body is plain text painted through the same
+    /// `paint_toast_stack_rung` path as every other toast, so GTK renders
+    /// the percentage and bar glyphs exactly like TUI does. This pins that
+    /// on the real GTK paint path — not just the engine's `EngineToast.body`
+    /// string — since a backend-specific text layout bug wouldn't show up
+    /// in an engine-only assertion.
+    #[test]
+    fn progress_toast_paints_percentage_and_bar_via_gtk_driver() {
+        let mut engine = small_engine();
+        engine.push_progress_toast("Uploading", Some(0.5), "report.pdf");
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("Uploading"),
+            "the progress toast's title must paint: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("50%"),
+            "the progress toast's percentage must paint: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("report.pdf"),
+            "the progress toast's label must paint: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     /// Two tabs so `open_tab_switcher` has more than one MRU entry to show
     /// (it no-ops — leaves `tab_switcher_open` false — with only one).
     fn engine_with_two_tabs() -> Engine {
