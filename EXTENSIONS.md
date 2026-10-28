@@ -1067,9 +1067,44 @@ like any other tab: close it with `:tabclose`, split it or move it between group
 | `"segmented"` | `options`, `selected` | `SegmentedChanged` (`event.value` = 0-based index) |
 | `"buttons"` | `buttons = {{id=,label=,disabled=}}` | `ButtonClicked` per button id |
 | `"toggles"` | `toggles = {{id=,label=,value=}}` | `ToggleChanged` per toggle id |
+| `"section"` | `collapsible` (default `true`), `collapsed` | `SectionToggled` (`event.collapsed` = proposed next state), when `collapsible` |
 
 Every field also accepts `label`, `hint`, `disabled`, `error` and `warning`
 (`error` / `warning` render an indicator plus the message instead of the hint).
+
+**Groups, rows and collapsible sections.** `fields` stays a single flat list —
+there is no separate container type — but a `"section"` field groups every field
+declared after it, up to the next `"section"` or the end of the list:
+
+```lua
+fields = {
+    -- A labelled group with a horizontal row of controls: a non-collapsible
+    -- section header followed by a "buttons" (or "toggles"/"segmented") row.
+    { type = "section", id = "net_hdr", label = "Network", collapsible = false },
+    { type = "buttons", id = "net_actions", buttons = {
+        { id = "ping", label = "Ping" },
+        { id = "trace", label = "Traceroute" },
+    } },
+
+    -- A collapsible section: its header toggles every field below it, up to
+    -- the next "section", hidden from both rendering and Tab navigation
+    -- while collapsed = true.
+    { type = "section", id = "adv_hdr", label = "Advanced", collapsed = true },
+    { type = "toggle", id = "verbose", label = "Verbose logging", value = false },
+},
+
+on_event = function(ctx, event)
+    if event.kind == "SectionToggled" and event.widget_id == "adv_hdr" then
+        -- event.collapsed is the proposed next state; re-render with it to
+        -- actually collapse/expand — vimcode never mutates your declared tree.
+        advanced_collapsed = event.collapsed
+    end
+end,
+```
+
+A collapsible header's painted label is prefixed with a disclosure glyph
+(`▾` expanded, `▸` collapsed). A non-collapsible header (`collapsible = false`)
+is a plain label with no glyph and never emits `SectionToggled`.
 
 **Text entry.** A focused `text`, `password` or `text_area` field takes typing,
 cursor movement (`Left`/`Right`/`Home`/`End`), selection and clipboard (`Ctrl-A`,
