@@ -233,6 +233,23 @@ pub enum ViewBody {
         #[serde(default)]
         filetype: Option<String>,
     },
+    /// One or more numeric series, rendered as a sparkline, line, bar, or
+    /// grouped-bar chart. Painted through `quadraui::Chart`/`ChartLayout`
+    /// via `Backend::draw_chart`, which paints and returns a hit-testable
+    /// layout in a single call — there is no separate scroll/selection
+    /// state to hand-roll, unlike `List`/`Table`.
+    Chart {
+        #[serde(default)]
+        chart_kind: ViewChartKind,
+        #[serde(default)]
+        series: Vec<ViewChartSeries>,
+        #[serde(default)]
+        x_label: Option<String>,
+        #[serde(default)]
+        y_label: Option<String>,
+        #[serde(default)]
+        show_legend: bool,
+    },
 }
 
 impl ViewBody {
@@ -243,8 +260,57 @@ impl ViewBody {
             ViewBody::Tree { .. } => "tree",
             ViewBody::Table { .. } => "table",
             ViewBody::TextView { .. } => "text_view",
+            ViewBody::Chart { .. } => "chart",
         }
     }
+}
+
+/// Which `quadraui::ChartKind` a [`ViewBody::Chart`] renders as.
+///
+/// Mirrors `quadraui::ChartKind` one-for-one rather than re-exporting it
+/// directly, so the Lua-facing `chart_kind = "..."` string stays a plain
+/// snake_case tag independent of quadraui's own `Serialize` shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewChartKind {
+    /// No axes, labels, or legend — a compact trend indicator.
+    Sparkline,
+    /// One connected line per series.
+    #[default]
+    Line,
+    /// Bars; multiple series stack bottom-up (a no-op for a single series).
+    Bar,
+    /// Bars; multiple series sit side by side within each category.
+    BarGrouped,
+}
+
+impl ViewChartKind {
+    /// Translate to the quadraui primitive this paints through.
+    pub fn to_quadraui(self) -> quadraui::ChartKind {
+        match self {
+            ViewChartKind::Sparkline => quadraui::ChartKind::Sparkline,
+            ViewChartKind::Line => quadraui::ChartKind::Line,
+            ViewChartKind::Bar => quadraui::ChartKind::Bar,
+            ViewChartKind::BarGrouped => quadraui::ChartKind::BarGrouped,
+        }
+    }
+}
+
+/// One data series in a [`ViewBody::Chart`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewChartSeries {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub data: Vec<f64>,
+    /// `"#rrggbb"` hex string. `None`, or a string that fails to parse,
+    /// falls back to the backend's own per-series palette color — the same
+    /// degrade-don't-error convention `ViewFieldKind::Color`'s malformed-hex
+    /// handling uses.
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub fill: bool,
 }
 
 /// One row in a [`ViewBody::List`].
@@ -726,6 +792,15 @@ pub enum ViewEventKind {
     HeaderClicked {
         col: usize,
     },
+    /// A `Chart` data point was clicked.
+    DataPointClicked {
+        series_idx: usize,
+        data_idx: usize,
+    },
+    /// A `Chart` legend entry was clicked.
+    LegendClicked {
+        series_idx: usize,
+    },
 }
 
 impl ViewEventKind {
@@ -751,6 +826,8 @@ impl ViewEventKind {
             ViewEventKind::Collapsed { .. } => "Collapsed",
             ViewEventKind::CellEdited { .. } => "CellEdited",
             ViewEventKind::HeaderClicked { .. } => "HeaderClicked",
+            ViewEventKind::DataPointClicked { .. } => "DataPointClicked",
+            ViewEventKind::LegendClicked { .. } => "LegendClicked",
         }
     }
 }
@@ -1224,6 +1301,47 @@ mod tests {
     }
 
     #[test]
+    fn view_body_chart_round_trips_and_tags_as_chart() {
+        let json = r##"{"kind":"chart","chart_kind":"bar","series":[
+            {"label":"cpu","data":[1.0,2.0,3.0],"color":"#ff0000","fill":false},
+            {"label":"mem","data":[4.0,5.0,6.0]}
+        ],"x_label":"time","y_label":"percent","show_legend":true}"##;
+        let body: ViewBody = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(body.kind_name(), "chart");
+        match &body {
+            ViewBody::Chart {
+                chart_kind,
+                series,
+                x_label,
+                y_label,
+                show_legend,
+            } => {
+                assert_eq!(*chart_kind, ViewChartKind::Bar);
+                assert_eq!(series.len(), 2);
+                assert_eq!(series[0].label, "cpu");
+                assert_eq!(series[0].color.as_deref(), Some("#ff0000"));
+                assert_eq!(series[1].color, None);
+                assert_eq!(x_label.as_deref(), Some("time"));
+                assert_eq!(y_label.as_deref(), Some("percent"));
+                assert!(*show_legend);
+            }
+            other => panic!("expected Chart, got {other:?}"),
+        }
+        let back: ViewBody = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        assert_eq!(body, back);
+    }
+
+    #[test]
+    fn view_chart_kind_defaults_to_line() {
+        let json = r#"{"kind":"chart","series":[{"label":"s","data":[1.0]}]}"#;
+        let body: ViewBody = serde_json::from_str(json).expect("deserialize");
+        match body {
+            ViewBody::Chart { chart_kind, .. } => assert_eq!(chart_kind, ViewChartKind::Line),
+            other => panic!("expected Chart, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn view_body_unknown_kind_is_a_parse_error() {
         let json = r#"{"kind":"grid","rows":[]}"#;
         let err = serde_json::from_str::<ViewBody>(json).unwrap_err();
@@ -1369,6 +1487,18 @@ mod tests {
         assert_eq!(
             ViewEventKind::ToolbarButtonClicked.kind_name(),
             "ToolbarButtonClicked"
+        );
+        assert_eq!(
+            ViewEventKind::DataPointClicked {
+                series_idx: 0,
+                data_idx: 1,
+            }
+            .kind_name(),
+            "DataPointClicked"
+        );
+        assert_eq!(
+            ViewEventKind::LegendClicked { series_idx: 0 }.kind_name(),
+            "LegendClicked"
         );
     }
 }

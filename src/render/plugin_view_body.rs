@@ -1250,3 +1250,130 @@ pub(crate) fn handle_plugin_view_text_key(
         _ => false,
     }
 }
+
+// ── Chart ────────────────────────────────────────────────────────────────
+//
+// `Chart` has no scroll or selection state of its own — a data point can be
+// clicked but there is nothing to navigate — so unlike List/Table it needs
+// no `Engine` selection/scroll plumbing, only the layout cache. It also
+// paints and lays out in a *single* `Backend::draw_chart` call rather than
+// List's `draw_list` + `list_layout` pair, and that call's returned
+// `ChartLayout` is in the ABSOLUTE coordinate frame (shifted by `rect.x`/
+// `rect.y` already — see `Backend::chart_layout`'s doc comment), the
+// opposite of `ListViewLayout`'s LOCAL frame. So the click router below
+// must *not* subtract `rect.x`/`rect.y` before calling `hit_test`.
+
+fn plugin_view_to_chart(
+    view: &str,
+    chart_kind: crate::core::plugin_ui::ViewChartKind,
+    series: &[crate::core::plugin_ui::ViewChartSeries],
+    x_label: &Option<String>,
+    y_label: &Option<String>,
+    show_legend: bool,
+) -> quadraui::Chart {
+    use crate::core::plugin_ui::namespaced_widget_id;
+    use quadraui::{Chart, Series, WidgetId};
+    Chart {
+        // Namespaced like every other plugin-owned id — see
+        // `plugin_view_to_list`'s matching comment.
+        id: WidgetId::new(namespaced_widget_id(view, "chart")),
+        kind: chart_kind.to_quadraui(),
+        series: series
+            .iter()
+            .map(|s| Series {
+                label: s.label.clone(),
+                data: s.data.clone(),
+                // A malformed or absent hex string falls back to the
+                // backend's default palette colour rather than failing the
+                // whole chart's render.
+                color: s.color.as_deref().and_then(super::primitives::try_from_hex),
+                fill: s.fill,
+            })
+            .collect(),
+        x_label: x_label.clone(),
+        y_label: y_label.clone(),
+        y_range: None,
+        x_range: None,
+        show_legend,
+        y_ticks: None,
+        x_ticks: None,
+        show_grid: false,
+    }
+}
+
+/// Paint a `ViewBody::Chart`-kind view into `rect` and cache the resolved
+/// `ChartLayout` for [`route_plugin_view_chart_click`]. Returns `false`
+/// when `name` isn't a `Chart`-kind view, or `host` is `Dock` (Chart-kind
+/// Dock support isn't implemented, matching List/Tree/Table).
+pub(crate) fn paint_plugin_view_chart(
+    engine: &Engine,
+    name: &str,
+    host: PluginViewHost,
+    rect: quadraui::Rect,
+    backend: &mut dyn quadraui::Backend,
+) -> bool {
+    let Some(ViewBody::Chart {
+        chart_kind,
+        series,
+        x_label,
+        y_label,
+        show_legend,
+    }) = plugin_view_body(engine, name)
+    else {
+        return false;
+    };
+    let chart = plugin_view_to_chart(name, *chart_kind, series, x_label, y_label, *show_legend);
+    let layout = backend.draw_chart(rect, &chart, None, None);
+    let cache = match host {
+        PluginViewHost::Sidebar => &engine.plugin_view_chart_layout,
+        PluginViewHost::Tab => &engine.plugin_view_tab_chart_layout,
+        // Chart-kind Dock support isn't implemented.
+        PluginViewHost::Dock => return false,
+    };
+    cache.replace(Some((rect, layout)));
+    true
+}
+
+/// Resolve a click at `pos` (same units the last frame painted the chart
+/// into) against the cached layout and dispatch `DataPointClicked` or
+/// `LegendClicked` to the plugin. Returns `false` when there is no cached
+/// layout, or the click missed every data point and legend entry.
+///
+/// `pos` is passed through to `hit_test` unshifted — `ChartLayout` is in
+/// the ABSOLUTE frame already (unlike `ListViewLayout`'s LOCAL frame in
+/// [`route_plugin_view_list_click`], which subtracts `rect.x`/`rect.y`).
+pub(crate) fn route_plugin_view_chart_click(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    pos: quadraui::Point,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+    let cache = match host {
+        PluginViewHost::Sidebar => &engine.plugin_view_chart_layout,
+        PluginViewHost::Tab => &engine.plugin_view_tab_chart_layout,
+        // Chart-kind Dock support isn't implemented.
+        PluginViewHost::Dock => return false,
+    };
+    let hit = {
+        let borrowed = cache.borrow();
+        let Some((_, layout)) = borrowed.as_ref() else {
+            return false;
+        };
+        layout.hit_test(pos.x, pos.y)
+    };
+    let kind = match hit {
+        quadraui::ChartHit::DataPoint(_, series_idx, data_idx) => ViewEventKind::DataPointClicked {
+            series_idx,
+            data_idx,
+        },
+        quadraui::ChartHit::Legend(_, series_idx) => ViewEventKind::LegendClicked { series_idx },
+        quadraui::ChartHit::Body(_) | quadraui::ChartHit::Empty => return false,
+    };
+    engine.dispatch_plugin_view_event(PluginViewEvent {
+        view: name.to_string(),
+        widget_id: String::new(),
+        kind,
+    });
+    true
+}

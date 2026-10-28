@@ -230,7 +230,7 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
     }
     let id: String = tbl.get("id").unwrap_or_default();
 
-    // A `kind = "list"/"tree"/"table"/"text_view"` table is a single
+    // A `kind = "list"/"tree"/"table"/"text_view"/"chart"` table is a single
     // `ViewBody` widget, not a field stack — parse it and return early,
     // exactly the "one sibling translation per kind" the issue asks for,
     // kept out of the `fields` loop below rather than interleaved with it.
@@ -414,7 +414,9 @@ fn lua_table_to_view_body(
     kind: &str,
     tbl: &LuaTable,
 ) -> LuaResult<crate::core::plugin_ui::ViewBody> {
-    use crate::core::plugin_ui::{ViewBody, ViewListItem, ViewTableColumn, ViewTableRow};
+    use crate::core::plugin_ui::{
+        ViewBody, ViewChartKind, ViewChartSeries, ViewListItem, ViewTableColumn, ViewTableRow,
+    };
 
     match kind {
         "list" => {
@@ -492,8 +494,59 @@ fn lua_table_to_view_body(
                 .ok()
                 .filter(|s| !s.is_empty()),
         }),
+        "chart" => {
+            let chart_kind = match tbl.get::<_, String>("chart_kind").ok().as_deref() {
+                Some("sparkline") => ViewChartKind::Sparkline,
+                Some("line") | None => ViewChartKind::Line,
+                Some("bar") => ViewChartKind::Bar,
+                Some("bar_grouped") => ViewChartKind::BarGrouped,
+                Some(other) => {
+                    return Err(LuaError::RuntimeError(format!(
+                        "chart: unknown chart_kind {other:?} (expected \"sparkline\", \"line\", \"bar\", or \"bar_grouped\")"
+                    )));
+                }
+            };
+            let mut series = Vec::new();
+            if let Ok(series_tbl) = tbl.get::<_, LuaTable>("series") {
+                for (idx, row) in series_tbl.sequence_values::<LuaTable>().enumerate() {
+                    let row = row?;
+                    let data: Vec<f64> = row
+                        .get::<_, LuaTable>("data")
+                        .map_err(|_| {
+                            LuaError::RuntimeError(format!(
+                                "chart series {}: missing \"data\" table",
+                                idx + 1
+                            ))
+                        })?
+                        .sequence_values::<f64>()
+                        .collect::<LuaResult<_>>()?;
+                    series.push(ViewChartSeries {
+                        label: row.get("label").unwrap_or_default(),
+                        data,
+                        color: row
+                            .get::<_, String>("color")
+                            .ok()
+                            .filter(|s| !s.is_empty()),
+                        fill: row.get("fill").unwrap_or(false),
+                    });
+                }
+            }
+            Ok(ViewBody::Chart {
+                chart_kind,
+                series,
+                x_label: tbl
+                    .get::<_, String>("x_label")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                y_label: tbl
+                    .get::<_, String>("y_label")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                show_legend: tbl.get("show_legend").unwrap_or(false),
+            })
+        }
         other => Err(LuaError::RuntimeError(format!(
-            "view: unknown kind {other:?} (expected \"list\", \"tree\", \"table\", or \"text_view\")"
+            "view: unknown kind {other:?} (expected \"list\", \"tree\", \"table\", \"text_view\", or \"chart\")"
         ))),
     }
 }
@@ -2749,6 +2802,16 @@ impl PluginManager {
             ViewEventKind::SliderChanged { value } => tbl.set("value", *value as f64)?,
             ViewEventKind::HeaderClicked { col } => tbl.set("col", *col as i64)?,
             ViewEventKind::SectionToggled { collapsed } => tbl.set("collapsed", *collapsed)?,
+            ViewEventKind::DataPointClicked {
+                series_idx,
+                data_idx,
+            } => {
+                tbl.set("series_idx", *series_idx as i64)?;
+                tbl.set("data_idx", *data_idx as i64)?;
+            }
+            ViewEventKind::LegendClicked { series_idx } => {
+                tbl.set("series_idx", *series_idx as i64)?
+            }
             ViewEventKind::ButtonClicked
             | ViewEventKind::ToolbarButtonClicked
             | ViewEventKind::FocusChanged => {}
@@ -6642,7 +6705,7 @@ mod tests {
         assert_eq!(ctx.message.as_deref(), Some("SectionToggled/true"));
     }
 
-    // ── `kind = "list"/"tree"/"table"/"text_view"` view bodies ────
+    // ── `kind = "list"/"tree"/"table"/"text_view"/"chart"` view bodies ────
 
     #[test]
     fn a_list_body_parses_its_items() {
@@ -6819,6 +6882,64 @@ mod tests {
                 filetype: Some("json".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn a_chart_body_parses_kind_series_and_labels() {
+        use crate::core::plugin_ui::{ViewBody, ViewChartKind, ViewChartSeries};
+        let pm = pm_with_view(
+            "chart",
+            r##"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "chart",
+                        chart_kind = "bar",
+                        series = {
+                            { label = "cpu", data = { 1, 2, 3 }, color = "#ff0000", fill = true },
+                        },
+                        x_label = "time",
+                        y_label = "pct",
+                        show_legend = true,
+                    }
+                end,
+            })
+            "##,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(
+            view.body,
+            Some(ViewBody::Chart {
+                chart_kind: ViewChartKind::Bar,
+                series: vec![ViewChartSeries {
+                    label: "cpu".to_string(),
+                    data: vec![1.0, 2.0, 3.0],
+                    color: Some("#ff0000".to_string()),
+                    fill: true,
+                }],
+                x_label: Some("time".to_string()),
+                y_label: Some("pct".to_string()),
+                show_legend: true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_chart_series_missing_data_is_an_error() {
+        let pm = pm_with_view(
+            "chart-baddata",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { kind = "chart", series = { { label = "cpu" } } }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("a chart series without \"data\" must not be dropped");
+        assert!(err.contains("data"), "error was: {err}");
     }
 
     #[test]

@@ -532,13 +532,14 @@ pub fn handle_plugin_view_tab_ui_event(
     true
 }
 
-/// Route a `UiEvent` over a body-kind (`List`/`Tree`/`Table`/`TextView`)
-/// plugin view at `host`, through the matching primitive's click/scroll
-/// resolution instead of `FormController`. `rect` is the rect the
-/// view was last painted into for this host — only the `Tree` arm needs it
-/// live (a `TreeController` needs a real rect + backend to `handle` against);
-/// `List`/`Table` resolve through their own cached layouts
-/// (`route_plugin_view_list_click`/`route_plugin_view_table_click`) instead.
+/// Route a `UiEvent` over a body-kind (`List`/`Tree`/`Table`/`TextView`/
+/// `Chart`) plugin view at `host`, through the matching primitive's
+/// click/scroll resolution instead of `FormController`. `rect` is the rect
+/// the view was last painted into for this host — only the `Tree` arm needs
+/// it live (a `TreeController` needs a real rect + backend to `handle`
+/// against); `List`/`Table`/`Chart` resolve through their own cached layouts
+/// (`route_plugin_view_list_click`/`route_plugin_view_table_click`/
+/// `route_plugin_view_chart_click`) instead.
 ///
 /// Shared by both hosts: the sidebar's `ExtPanel` click router and
 /// [`handle_plugin_view_tab_ui_event`]'s caller both dispatch here first —
@@ -618,6 +619,14 @@ pub(crate) fn route_plugin_view_body_event(
             quadraui::UiEvent::Scroll { delta, .. } => {
                 scroll_plugin_view_text(engine, name, host, scroll_step(delta))
             }
+            _ => false,
+        }),
+        Some("chart") => Some(match event {
+            quadraui::UiEvent::MouseDown {
+                position,
+                button: quadraui::MouseButton::Left,
+                ..
+            } => route_plugin_view_chart_click(engine, name, host, *position),
             _ => false,
         }),
         _ => None,

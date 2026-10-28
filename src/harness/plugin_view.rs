@@ -152,6 +152,7 @@ pub const LIST_VIEW: &str = "zqxw1631list";
 pub const TREE_VIEW: &str = "zqxw1631tree";
 pub const TABLE_VIEW: &str = "zqxw1631table";
 pub const TEXT_VIEW: &str = "zqxw1631text";
+pub const CHART_VIEW: &str = "zqxw2065chart";
 
 /// `List` fixture needles. `LIST_ROW0`/`LIST_ROW1` carry a `SEL`/`idl` tag
 /// reflecting `Engine::ext_panel_selected` as of the last `on_event` —
@@ -227,6 +228,20 @@ pub const WIDTH_COL1: &str = "W11631";
 /// enough apart that only one is visible at a time on a narrow viewport.
 pub const TEXT_FIRST_LINE: &str = "Ln0X1631";
 pub const TEXT_LAST_LINE: &str = "Ln49X1631";
+
+/// `Chart` fixture needles. Both series' labels are painted into the legend
+/// row (`quadraui`'s `paint_legend`/`primitives::chart::paint_legend` draw
+/// one swatch-plus-label text run per series), so each doubles as both a
+/// paint-assertion needle and a `click_text` target for triggering
+/// `LegendClicked`. `CHART_Y_LABEL_IDLE`/`_SEEN` is the `y_label` field,
+/// which doubles as this fixture's round-trip marker — same local-state
+/// convention as `list_sel`/`tree_open`/`last_edit` above.
+pub const CHART_SERIES0_LABEL: &str = "A631";
+pub const CHART_SERIES1_LABEL: &str = "B631";
+pub const CHART_X_LABEL: &str = "Cx1631";
+pub const CHART_Y_LABEL_IDLE: &str = "Cy1631";
+/// Painted once `on_event` has seen `LegendClicked{{series_idx: 0}}`.
+pub const CHART_Y_LABEL_SEEN: &str = "CyS1631";
 
 /// Lua source registering one view per `ViewBody` kind, appended
 /// into the same fixture plugin the field-stack view above uses — one real
@@ -316,6 +331,29 @@ vimcode.ui.register_view("{TEXT_VIEW}", {{
       lines[#lines + 1] = "Ln" .. i .. "X1631"
     end
     return {{ kind = "text_view", text = table.concat(lines, "\n"), filetype = "json" }}
+  end,
+}})
+
+local chart_legend_seen = false
+vimcode.ui.register_view("{CHART_VIEW}", {{
+  title = "Zq2065C", icon = "C", fallback_icon = "C",
+  render = function()
+    return {{
+      kind = "chart",
+      chart_kind = "bar",
+      series = {{
+        {{ label = "{CHART_SERIES0_LABEL}", data = {{ 1, 2, 3 }} }},
+        {{ label = "{CHART_SERIES1_LABEL}", data = {{ 3, 2, 1 }} }},
+      }},
+      x_label = "{CHART_X_LABEL}",
+      y_label = chart_legend_seen and "{CHART_Y_LABEL_SEEN}" or "{CHART_Y_LABEL_IDLE}",
+      show_legend = true,
+    }}
+  end,
+  on_event = function(ctx, event)
+    if event.kind == "LegendClicked" and event.series_idx == 0 then
+      chart_legend_seen = true
+    end
   end,
 }})
 
@@ -1385,6 +1423,30 @@ pub fn list_paints_and_click_selects_the_right_index(driver: &mut impl Conforman
     );
 }
 
+/// A `kind = "chart"` view paints its axis label and both series' legend
+/// entries, and a click on a legend entry reaches the plugin's `on_event`
+/// as `LegendClicked{series_idx}` (proved by the `y_label` marker flipping
+/// from idle to seen).
+pub fn chart_paints_and_legend_click_reaches_the_plugin(driver: &mut impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[
+            CHART_X_LABEL,
+            CHART_Y_LABEL_IDLE,
+            CHART_SERIES0_LABEL,
+            CHART_SERIES1_LABEL,
+        ],
+        "the chart-kind view's initial paint (legend and axis label)",
+    );
+    driver.click_text(CHART_SERIES0_LABEL);
+    assert!(
+        driver.screen_has(CHART_Y_LABEL_SEEN),
+        "clicking series 0's legend entry must dispatch LegendClicked{{series_idx: 0}}; \
+         painted runs were {:?}",
+        painted(driver)
+    );
+}
+
 /// Scenario 8 — keyboard `Down` on a list moves selection to the right
 /// index, exactly like a click does.
 pub fn list_key_navigation_selects_the_right_index(driver: &mut impl ConformanceDriver) {
@@ -2150,6 +2212,12 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_chart_paints_and_legend_click_reaches_the_plugin_on_tui() {
+        let (mut h, _dir) = tui_named(CHART_VIEW);
+        chart_paints_and_legend_click_reaches_the_plugin(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_list_key_navigation_selects_the_right_index_on_tui() {
         let (mut h, _dir) = tui_named(LIST_VIEW);
         list_key_navigation_selects_the_right_index(&mut h.driver);
@@ -2453,6 +2521,13 @@ mod tests {
     fn plugin_view_list_paints_and_click_selects_the_right_index_on_gtk() {
         let (mut h, _dir) = gtk_named(LIST_VIEW);
         list_paints_and_click_selects_the_right_index(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_chart_paints_and_legend_click_reaches_the_plugin_on_gtk() {
+        let (mut h, _dir) = gtk_named(CHART_VIEW);
+        chart_paints_and_legend_click_reaches_the_plugin(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]
