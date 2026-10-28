@@ -1277,7 +1277,7 @@ fn plugin_view_to_chart(
         // Namespaced like every other plugin-owned id — see
         // `plugin_view_to_list`'s matching comment.
         id: WidgetId::new(namespaced_widget_id(view, "chart")),
-        kind: chart_kind.to_quadraui(),
+        kind: chart_kind.into_quadraui(),
         series: series
             .iter()
             .map(|s| Series {
@@ -1330,7 +1330,7 @@ pub(crate) fn paint_plugin_view_chart(
         // Chart-kind Dock support isn't implemented.
         PluginViewHost::Dock => return false,
     };
-    cache.replace(Some((rect, layout)));
+    cache.replace(Some(layout));
     true
 }
 
@@ -1339,14 +1339,27 @@ pub(crate) fn paint_plugin_view_chart(
 /// `LegendClicked` to the plugin. Returns `false` when there is no cached
 /// layout, or the click missed every data point and legend entry.
 ///
-/// `pos` is passed through to `hit_test` unshifted — `ChartLayout` is in
-/// the ABSOLUTE frame already (unlike `ListViewLayout`'s LOCAL frame in
-/// [`route_plugin_view_list_click`], which subtracts `rect.x`/`rect.y`).
+/// `pos` is passed through to `hit_test`/`nearest_point` unshifted —
+/// `ChartLayout` is in the ABSOLUTE frame already (unlike `ListViewLayout`'s
+/// LOCAL frame in [`route_plugin_view_list_click`], which subtracts
+/// `rect.x`/`rect.y`).
+///
+/// A hit of `ChartHit::Body` means the click landed inside the plot area but
+/// not directly on a hit region quadraui registers for a data point — true
+/// for every chart kind, since `Chart::layout` only ever pushes one `Body`
+/// region covering the whole plot plus one `Legend` region per series (no
+/// `DataPoint` hit region is ever constructed). Resolving the actual nearest
+/// point is this function's job: it falls through to `ChartLayout::
+/// nearest_point` with the same `line_height() * 2.0` snap radius the
+/// quadraui `chart_app` example uses for `MouseMoved` hover, so a click
+/// anywhere near a plotted bar or line point still dispatches
+/// `DataPointClicked` for it.
 pub(crate) fn route_plugin_view_chart_click(
     engine: &mut Engine,
     name: &str,
     host: PluginViewHost,
     pos: quadraui::Point,
+    backend: &dyn quadraui::Backend,
 ) -> bool {
     use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
     let cache = match host {
@@ -1355,20 +1368,33 @@ pub(crate) fn route_plugin_view_chart_click(
         // Chart-kind Dock support isn't implemented.
         PluginViewHost::Dock => return false,
     };
-    let hit = {
+    let kind = {
         let borrowed = cache.borrow();
-        let Some((_, layout)) = borrowed.as_ref() else {
+        let Some(layout) = borrowed.as_ref() else {
             return false;
         };
-        layout.hit_test(pos.x, pos.y)
-    };
-    let kind = match hit {
-        quadraui::ChartHit::DataPoint(_, series_idx, data_idx) => ViewEventKind::DataPointClicked {
-            series_idx,
-            data_idx,
-        },
-        quadraui::ChartHit::Legend(_, series_idx) => ViewEventKind::LegendClicked { series_idx },
-        quadraui::ChartHit::Body(_) | quadraui::ChartHit::Empty => return false,
+        match layout.hit_test(pos.x, pos.y) {
+            quadraui::ChartHit::DataPoint(_, series_idx, data_idx) => {
+                ViewEventKind::DataPointClicked {
+                    series_idx,
+                    data_idx,
+                }
+            }
+            quadraui::ChartHit::Legend(_, series_idx) => {
+                ViewEventKind::LegendClicked { series_idx }
+            }
+            quadraui::ChartHit::Body(_) => {
+                let snap = backend.line_height() * 2.0;
+                let Some((series_idx, data_idx)) = layout.nearest_point(pos.x, pos.y, snap) else {
+                    return false;
+                };
+                ViewEventKind::DataPointClicked {
+                    series_idx,
+                    data_idx,
+                }
+            }
+            quadraui::ChartHit::Empty => return false,
+        }
     };
     engine.dispatch_plugin_view_event(PluginViewEvent {
         view: name.to_string(),

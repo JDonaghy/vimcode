@@ -1124,9 +1124,20 @@ cursor movement (`Left`/`Right`/`Home`/`End`), selection and clipboard (`Ctrl-A`
 | `"tree"` | `nodes = {{id=, label=, expanded=, children={...}}}` (`id` required) | `NodeSelected`, `NodeActivated`, `Expanded`, `Collapsed` (`node_id`) |
 | `"table"` | `columns = {{title=, editable=}}` (`title` required), `rows = {{id=, cells={...}}}` (`cells` required) | `ItemSelected`, `ItemActivated` (`index`, `col`), `CellEdited` (`row`, `col`, both 0-based, and `value`) |
 | `"text_view"` | `text`, `filetype` | none (scrollable, read-only text) |
+| `"chart"` | `chart_kind` (`"sparkline"`, `"line"`, `"bar"`, `"bar_grouped"`; default `"line"`), `series = {{label=, data=, color=, fill=}}`, `x_label`, `y_label`, `show_legend` | `DataPointClicked` (`series_idx`, `data_idx`), `LegendClicked` (`series_idx`, 0-based) |
 
 "Activated" means `Enter` or a double-click. A view is either a field stack or one
 body, never both.
+
+**`"chart"` bodies.** One or more numeric `series`, each `{label=, data={...}}`
+(a list of numbers), rendered through quadraui's `Chart` primitive. `color` is an
+optional `"#rrggbb"` hex string per series — omit it, or give it a string that
+fails to parse, to fall back to the backend's own per-series palette. `fill`
+shades the area under a `"line"` series. `"sparkline"` ignores `x_label`/`y_label`/
+`show_legend` (no axes or legend). Clicking a legend entry dispatches
+`LegendClicked`; clicking anywhere in the plotted body — a bar, a point on a
+line, or the nearest point to the click when it lands between them — dispatches
+`DataPointClicked` with the series and data index.
 
 **`col` on `ItemSelected`/`ItemActivated`.** For a `"table"` view, `event.col` is
 the 0-based column the mouse click landed in — whichever column was clicked, not
