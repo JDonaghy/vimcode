@@ -1127,6 +1127,15 @@ pub enum BottomPanelRoute {
         name: String,
         position: quadraui::Point,
     },
+    /// A press inside a `BottomPanelKind::Plugin` dock whose body has no
+    /// click behaviour of its own (`List`/`Tree`/`Table`, deferred for the
+    /// dock host, or `TextView`, whose only interaction is the mouse-wheel
+    /// scroll `Engine::handle_plugin_view_dock_scroll` already wires).
+    /// `apply_bottom_panel_route` consumes this as a no-op (beyond dropping
+    /// terminal focus) so the caller stops here instead of falling through
+    /// to the generic buffer-click path with coordinates that land outside
+    /// any editor window.
+    PluginInert,
 }
 
 /// Resolve a press at `(x, y)` against the bottom panel as last painted.
@@ -1148,33 +1157,48 @@ pub fn route_bottom_panel_click(
     }
     let zone = engine.resolve_bottom_panel_zone(y)?;
     let geom = (*engine.bottom_panel_geometry.borrow())?;
+
+    if let crate::core::engine::BottomPanelKind::Plugin(name) = &engine.bottom_panel_kind {
+        // `BottomPanelGeometry`'s `toolbar_y`/`content_y` split
+        // (`frame_editor_band.rs`'s `paint_bottom_panel_rung`) is the
+        // *terminal's* geometry: one toolbar row, then content two lines
+        // below the tab strip. A `Plugin` dock has no toolbar row of its
+        // own — `paint_bottom_panel_rung`'s `Plugin` arm starts the docked
+        // body one line below the tab strip, like `Problems`/`Output`/
+        // `DebugOutput` — so the dock's own first painted row falls in the
+        // `Toolbar` zone, not `Content`. Resolving `Plugin` ahead of the
+        // terminal-shaped zones (rather than only inside `Content`) keeps
+        // every row of the dock, including row 0, off the terminal
+        // Toolbar/Split/Pane fallbacks. `TabBar` is still shared with every
+        // other panel kind, so it keeps going to `BottomPanelRoute::TabBar`.
+        if matches!(zone, BottomPanelZone::TabBar) {
+            return Some(BottomPanelRoute::TabBar);
+        }
+        // Only a `Form`-bodied view has click behaviour here (`List`/
+        // `Tree`/`Table` are deferred for the dock host, and `TextView`'s
+        // only interaction is the mouse-wheel scroll already wired via
+        // `Engine::handle_plugin_view_dock_scroll`), so a `Form`-bodied view
+        // routes to its own arm and anything else routes to `PluginInert`
+        // instead of falling through to `Split`/`Pane`, which would
+        // misinterpret the click as a terminal-pane press.
+        let is_form = engine
+            .plugin_views
+            .get(name.as_str())
+            .is_some_and(|v| v.is_form());
+        return Some(if is_form {
+            BottomPanelRoute::Plugin {
+                name: name.clone(),
+                position: quadraui::Point::new(x as f32, y as f32),
+            }
+        } else {
+            BottomPanelRoute::PluginInert
+        });
+    }
+
     Some(match zone {
         BottomPanelZone::TabBar => BottomPanelRoute::TabBar,
         BottomPanelZone::Toolbar => BottomPanelRoute::Toolbar,
         BottomPanelZone::Content { row_offset } => {
-            if let crate::core::engine::BottomPanelKind::Plugin(name) = &engine.bottom_panel_kind {
-                // A docked plugin view's content zone is not terminal
-                // content — only a `Form`-bodied view has click behaviour
-                // here (`List`/`Tree`/`Table` are deferred for the dock host,
-                // and `TextView`'s only interaction is the mouse-wheel scroll
-                // already wired via `Engine::handle_plugin_view_dock_scroll`),
-                // so a `Form`-bodied view routes to its own arm and anything
-                // else is swallowed rather than falling through to
-                // `Split`/`Pane`, which would misinterpret the click as a
-                // terminal-pane press.
-                let is_form = engine
-                    .plugin_views
-                    .get(name.as_str())
-                    .is_some_and(|v| v.body.is_none());
-                return if is_form {
-                    Some(BottomPanelRoute::Plugin {
-                        name: name.clone(),
-                        position: quadraui::Point::new(x as f32, y as f32),
-                    })
-                } else {
-                    None
-                };
-            }
             let split = *engine.terminal_split_layout.borrow();
             if let Some(sl) = split {
                 // The split layout hit-tests in the *absolute* space it was
@@ -1280,6 +1304,11 @@ pub fn apply_bottom_panel_route(
             );
         }
         BottomPanelRoute::Plugin { name, position } => {
+            // The dock never holds keyboard focus (see `paint_bottom_panel_rung`'s
+            // `Plugin` arm), so a click into it must drop any terminal focus a
+            // prior click left set — otherwise keystrokes after this click
+            // would keep going to the terminal instead of the clicked field.
+            engine.terminal_has_focus = false;
             let rect = engine.plugin_view_dock_form_rect.get();
             let event = quadraui::UiEvent::MouseDown {
                 widget: None,
@@ -1288,6 +1317,13 @@ pub fn apply_bottom_panel_route(
                 modifiers: quadraui::Modifiers::default(),
             };
             handle_plugin_view_dock_ui_event(engine, &name, &event, rect);
+        }
+        BottomPanelRoute::PluginInert => {
+            // Same focus bookkeeping as the `Plugin` arm above, but there is
+            // no view event to dispatch — the click still has to stop here
+            // rather than fall through to the caller's generic buffer-click
+            // path, which has no window registered at these coordinates.
+            engine.terminal_has_focus = false;
         }
     }
     effect

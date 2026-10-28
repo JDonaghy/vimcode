@@ -465,6 +465,23 @@ pub const COUNT_0: &str = "n0ZQ146";
 /// See [`COUNT_0`].
 pub const COUNT_1: &str = "n1ZQ146";
 
+/// The registered view's name for the dock's row-0 click-routing regression
+/// fixture: a view whose *first* declared field is the clickable one.
+///
+/// [`VIEW`]'s own button ([`ROW_BUTTON`]) sits at field index 4, well inside
+/// `BottomPanelZone::Content` — it cannot catch a routing bug confined to
+/// `BottomPanelZone::Toolbar`, the zone a docked `Form`'s very first painted
+/// row falls into (`render::route_bottom_panel_click`'s doc explains why).
+/// [`ROW0_VIEW`] exists only to put a clickable field at index 0, so a dock
+/// click there exercises that zone.
+pub const ROW0_VIEW: &str = "zqxw2060row0";
+/// [`ROW0_VIEW`]'s sole button — field index 0.
+pub const ROW0_BUTTON: &str = "SdZQ2060";
+/// [`ROW0_VIEW`]'s counter label before the button is clicked.
+pub const ROW0_COUNT_0: &str = "n0ZQ2060";
+/// See [`ROW0_COUNT_0`].
+pub const ROW0_COUNT_1: &str = "n1ZQ2060";
+
 /// The Lua plugin the fixture loads.
 ///
 /// `count` is plugin-side state that only `on_event` mutates and only `render`
@@ -545,6 +562,36 @@ end)
 -- body does not.
 vimcode.command("Zq2060FormOpenDock", function()
   vimcode.ui.open_view("{VIEW}", {{ location = "dock" }})
+end)
+
+-- A second, minimal `Form`-kind view whose *first* declared field (index 0)
+-- is the clickable button, unlike {VIEW} above, whose button sits at field
+-- index 4. A docked `Form`'s row 0 falls in `BottomPanelZone::Toolbar`, not
+-- `Content` (`render::route_bottom_panel_click`'s doc explains why), so a
+-- regression confined to that zone needs the clickable field to be row 0
+-- to be caught at all.
+local row0_count = 0
+vimcode.ui.register_view("{ROW0_VIEW}", {{
+  title = "{ROW0_VIEW}",
+  render = function()
+    return {{
+      id = "main",
+      schema_version = 1,
+      fields = {{
+        {{ type = "button", id = "go0", label = "{ROW0_BUTTON}" }},
+        {{ type = "label", id = "cnt0", label = "n" .. tostring(row0_count) .. "ZQ2060" }},
+      }},
+    }}
+  end,
+  on_event = function(ctx, event)
+    if event.widget_id == "go0" and event.kind == "ButtonClicked" then
+      row0_count = row0_count + 1
+    end
+  end,
+}})
+
+vimcode.command("Zq2060Row0OpenDock", function()
+  vimcode.ui.open_view("{ROW0_VIEW}", {{ location = "dock" }})
 end)
 
 -- `sidebar = false`: registered as a view, routable through `open_view`, but
@@ -863,6 +910,43 @@ pub fn engine_with_plugin_view_form_dock() -> (Engine, PathBuf) {
     (engine, dir)
 }
 
+/// Row-0 twin of [`engine_with_plugin_view_form_dock`] — opens [`ROW0_VIEW`],
+/// whose first (and only clickable) field sits at index 0, into the
+/// bottom-panel dock via the fixture's `Zq2060Row0OpenDock` `:Command`.
+///
+/// [`VIEW`]'s own click-routing coverage ([`engine_with_plugin_view_form_dock`]
+/// paired with [`clicking_a_button_reaches_the_plugin_handler`]) only reaches
+/// [`ROW_BUTTON`] at field index 4, inside `BottomPanelZone::Content` — it
+/// cannot catch a routing bug confined to `BottomPanelZone::Toolbar`, the zone
+/// a docked `Form`'s very first painted row falls into
+/// (`render::route_bottom_panel_click`'s doc explains why). This fixture
+/// exists to put the clickable field at row 0 so that zone gets exercised.
+pub fn engine_with_plugin_view_row0_dock() -> (Engine, PathBuf) {
+    let dir = plugin_dir();
+    let mut engine = Engine::new_for_test();
+    load_fixture_plugin(&mut engine, &dir);
+
+    engine.app_shell.show_panel(&quadraui::WidgetId::new(
+        crate::core::engine::sidebar::PANEL_SETTINGS,
+    ));
+
+    assert!(
+        engine.plugin_run_command("Zq2060Row0OpenDock", ""),
+        "fixture plugin must register the Zq2060Row0OpenDock command"
+    );
+    assert!(
+        engine.bottom_panel_open,
+        "vimcode.ui.open_view(..., {{location = \"dock\"}}) must open the bottom panel"
+    );
+    assert_eq!(
+        engine.bottom_panel_kind,
+        crate::core::engine::BottomPanelKind::Plugin(ROW0_VIEW.to_string()),
+        "vimcode.ui.open_view(..., {{location = \"dock\"}}) must point the bottom \
+         panel at the docked view"
+    );
+    (engine, dir)
+}
+
 // ── Shared scenario bodies ──────────────────────────────────────────────
 
 /// Every painted text run, for failure messages — a missing needle is nearly
@@ -1044,6 +1128,37 @@ pub fn clicking_a_button_reaches_the_plugin_handler(driver: &mut impl Conformanc
         !driver.screen_has(COUNT_0),
         "the stale counter row {COUNT_0:?} must not still be painted after the \
          view re-rendered; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Row-0 twin of [`clicking_a_button_reaches_the_plugin_handler`] — clicks
+/// [`ROW0_BUTTON`], the first (field index 0) row of a docked `Form`, the
+/// row that falls in `BottomPanelZone::Toolbar` rather than `Content`
+/// (`render::route_bottom_panel_click`'s doc explains why). Pairs with
+/// [`engine_with_plugin_view_row0_dock`] to cover the routing path
+/// [`clicking_a_button_reaches_the_plugin_handler`] cannot reach.
+pub fn clicking_the_dock_row0_button_reaches_the_plugin_handler(
+    driver: &mut impl ConformanceDriver,
+) {
+    assert!(
+        driver.screen_has(ROW0_COUNT_0),
+        "precondition: the counter row must start at {ROW0_COUNT_0:?}; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+    driver.click_text(ROW0_BUTTON);
+    assert!(
+        driver.screen_has(ROW0_COUNT_1),
+        "clicking {ROW0_BUTTON:?} at dock row 0 must reach the plugin's \
+         on_event handler and the next painted frame must show its effect \
+         ({ROW0_COUNT_1:?}); painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(ROW0_COUNT_0),
+        "the stale counter row {ROW0_COUNT_0:?} must not still be painted \
+         after the view re-rendered; painted runs were {:?}",
         painted(driver)
     );
 }
@@ -2354,6 +2469,26 @@ mod tests {
         clicking_a_button_reaches_the_plugin_handler(&mut h.driver);
     }
 
+    /// Bottom-panel dock fixture for [`ROW0_VIEW`] (clickable field at index 0,
+    /// TUI arm).
+    fn tui_row0_dock() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_row0_dock();
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[test]
+    fn plugin_view_dock_row0_button_click_reaches_the_plugin_handler_on_tui() {
+        let (mut h, _dir) = tui_row0_dock();
+        clicking_the_dock_row0_button_reaches_the_plugin_handler(&mut h.driver);
+    }
+
     #[test]
     fn plugin_view_list_paints_and_click_selects_the_right_index_on_tui() {
         let (mut h, _dir) = tui_named(LIST_VIEW);
@@ -2696,6 +2831,28 @@ mod tests {
     fn plugin_view_form_dock_button_click_reaches_the_plugin_handler_on_gtk() {
         let (mut h, _dir) = gtk_form_dock();
         clicking_a_button_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    /// Bottom-panel dock fixture for [`ROW0_VIEW`] (clickable field at index 0,
+    /// GTK arm).
+    #[cfg(feature = "gui")]
+    fn gtk_row0_dock() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_row0_dock();
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_dock_row0_button_click_reaches_the_plugin_handler_on_gtk() {
+        let (mut h, _dir) = gtk_row0_dock();
+        clicking_the_dock_row0_button_reaches_the_plugin_handler(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]

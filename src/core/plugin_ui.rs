@@ -185,6 +185,18 @@ impl PluginView {
             .into_iter()
             .find(|&i| self.fields[i].is_interactive() && !self.fields[i].disabled)
     }
+
+    /// Whether this view's painted body is the field-stack default (`body:
+    /// None`), as opposed to one of the single-widget [`ViewBody`] kinds.
+    ///
+    /// The one predicate both `render::paint_bottom_panel_rung`'s dock
+    /// painter and `render::route_bottom_panel_click`'s click router
+    /// dispatch on, so a future fifth `ViewBody` variant can't make the
+    /// painter and the router silently disagree about which views have
+    /// `Form`-style click behaviour.
+    pub fn is_form(&self) -> bool {
+        self.body.is_none()
+    }
 }
 
 // ─── List / Tree / Table / TextView bodies ──────────────────────────────────
