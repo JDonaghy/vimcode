@@ -2759,8 +2759,8 @@ pub fn table_shift_click_clamps_a_stale_anchor_to_the_row_count<D>(
     );
 
     // Stands in for the row-count shrink a plugin's own `ui.refresh` would
-    // cause between two gesture clicks: an anchor position the view's rows
-    // no longer reach. Writing it directly keeps the scenario to the one
+    // cause between two gesture clicks: an anchor position past the view's
+    // live rows. Writing it directly keeps the scenario to the one
     // behaviour it measures, since the refresh itself is covered elsewhere.
     h.engine
         .borrow_mut()
