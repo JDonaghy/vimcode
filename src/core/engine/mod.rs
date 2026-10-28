@@ -4971,6 +4971,9 @@ pub struct Engine {
     /// `lo..=hi` can safely span once a header sort has reordered the rows.
     /// The resulting display-position range is mapped through the active
     /// row order back to declared indices before it's stored or dispatched.
+    /// A stored position can outlive the rows it indexed — a plugin may
+    /// `ui.refresh` a shorter row set between two gesture clicks — so
+    /// readers clamp it to the current row count.
     pub plugin_view_table_selection_anchor: HashMap<String, usize>,
     /// The in-progress header-divider drag on a `ViewBody::Table`-kind view,
     /// if any — see `PluginTableColumnDrag`'s doc for its fields' meaning.

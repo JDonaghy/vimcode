@@ -10,8 +10,10 @@
 //! > widget runs the plugin's `on_event` handler whose effect shows up in the
 //! > next painted frame.**
 //!
-//! Every assertion below reads `ConformanceDriver::screen_has` /
-//! `inventory().text_runs()`. The fixture loads genuine Lua from a temp dir, so
+//! Each scenario's acceptance assertion reads `ConformanceDriver::screen_has`
+//! / `inventory().text_runs()`; the multi-select gesture scenarios add a read
+//! of the engine's selection set as a *secondary* check beside the painted
+//! checkbox glyphs, never in place of one. The fixture loads genuine Lua from a temp dir, so
 //! the `render` callback, the Lua-table → [`crate::core::plugin_ui::PluginView`]
 //! parse, the stored-callback dispatch and the paint are all in the measured
 //! path.
@@ -252,6 +254,17 @@ pub const RANGE_ROW0: &str = "Rb2064";
 pub const RANGE_ROW1: &str = "Ra2064";
 /// Declared row 2 — sorts to display position 2, lexically last.
 pub const RANGE_ROW2: &str = "Rz2064";
+/// The range view's footer text before it has handled any
+/// `SelectionChanged`: the plugin rewrites it to [`RANGE_BOUNDS_OK`] or
+/// [`RANGE_BOUNDS_BAD`] from its `on_event`, which makes the bounds of the
+/// indices the editor dispatched readable straight off the painted frame.
+pub const RANGE_BOUNDS_NONE: &str = "Rn2064";
+/// The range view's footer once every index of a dispatched
+/// `SelectionChanged` indexed a row the plugin actually declared.
+pub const RANGE_BOUNDS_OK: &str = "Rk2064";
+/// The range view's footer once a dispatched `SelectionChanged` carried an
+/// index past the end of the plugin's own row list.
+pub const RANGE_BOUNDS_BAD: &str = "Rx2064";
 
 /// Registered view name for a dedicated table fixture with one default
 /// (left-aligned) column and one `align = "right"` column, for asserting
@@ -491,6 +504,8 @@ vimcode.ui.register_view("{MULTI_SELECT_VIEW}", {{
   end,
 }})
 
+local range_row_count = 3
+local range_bounds_marker = "{RANGE_BOUNDS_NONE}"
 vimcode.ui.register_view("{RANGE_SELECT_VIEW}", {{
   title = "Zq2064R", icon = "R", fallback_icon = "R",
   render = function()
@@ -503,7 +518,18 @@ vimcode.ui.register_view("{RANGE_SELECT_VIEW}", {{
         {{ id = "r1", cells = {{ "{RANGE_ROW1}" }} }},
         {{ id = "r2", cells = {{ "{RANGE_ROW2}" }} }},
       }},
+      footer = {{ range_bounds_marker }},
     }}
+  end,
+  on_event = function(ctx, event)
+    if event.kind == "SelectionChanged" then
+      local out_of_range = false
+      for _, idx in ipairs(event.indices) do
+        if idx < 0 or idx >= range_row_count then out_of_range = true end
+      end
+      range_bounds_marker =
+        out_of_range and "{RANGE_BOUNDS_BAD}" or "{RANGE_BOUNDS_OK}"
+    end
   end,
 }})
 
@@ -1807,20 +1833,18 @@ fn painted_run(driver: &impl ConformanceDriver, needle: &str) -> quadraui::event
 
 /// Locate `needle`'s *final* painted text run within the current frame.
 ///
-/// quadraui's GTK `DataTable` body-cell loop paints each cell twice within a
-/// single frame: a provisional pass with a placeholder width, followed by the
-/// authoritative pass with the real measured width and alignment (TUI paints
-/// each cell once, so there the first and last match are the same run). Only
-/// callers that care about a cell's *settled* position (such as the
-/// right-align assertion below) need to skip past GTK's provisional pass;
-/// `painted_run`'s first-match semantics stay the shared default since other
-/// callers rely on them.
+/// Under GTK a cell's text can appear in more than one run for the same
+/// needle — the inventory accumulates a measuring/placeholder paint ahead of
+/// the settled one — while TUI's cell-grid scan yields exactly one run per
+/// cell, so there the first and last match are the same run. Only callers
+/// that care about a cell's *settled* x-origin (such as the right-align
+/// assertion below) need the last match; `painted_run`'s first-match
+/// semantics stay the shared default since other callers rely on them.
 fn painted_run_last(driver: &impl ConformanceDriver, needle: &str) -> quadraui::event::Rect {
     let inventory = driver.inventory();
     let runs = inventory.text_runs();
     runs.iter()
-        .filter(|r| r.text.contains(needle))
-        .last()
+        .rfind(|r| r.text.contains(needle))
         .map(|r| r.bounds)
         .unwrap_or_else(|| {
             panic!(
@@ -1828,6 +1852,112 @@ fn painted_run_last(driver: &impl ConformanceDriver, needle: &str) -> quadraui::
                 painted(driver)
             )
         })
+}
+
+/// The checked multi-select checkbox glyph a `multi_select` table prefixes
+/// a selected row's column-0 cell with.
+const CHECKED: char = '\u{2611}';
+/// The unchecked multi-select checkbox glyph, prefixed onto every
+/// unselected row of a `multi_select` table.
+const UNCHECKED: char = '\u{2610}';
+
+/// Whether `glyph` is painted as the checkbox prefix of the row whose
+/// column-0 cell contains `label`.
+///
+/// Whether the glyph and the row's label share one painted text run depends
+/// on the backend: GTK paints `"☐ Mr01631"` as a single run (the run
+/// containing the label already contains the glyph), while
+/// `TuiDriver::inventory` splits runs on whitespace (its cell-grid scan has
+/// no notion of "same cell group" beyond a run of non-space columns — see
+/// `quadraui::tui::testing::TuiDriver::inventory`), so the glyph lands in
+/// its own run just to the left of the label's, sometimes merged with a
+/// neighboring non-space character such as the column border `│`. So "is
+/// this row checked" has to look in both places: the label's own run, and
+/// any other run on the same painted line to the left of it.
+fn glyph_left_of<D>(h: &crate::harness::ConformanceHarness<D>, glyph: char, label: &str) -> bool
+where
+    D: ConformanceDriver,
+{
+    let inventory = h.driver.inventory();
+    let runs = inventory.text_runs();
+    let Some(label_run) = runs.iter().find(|r| r.text.contains(label)) else {
+        return false;
+    };
+    if label_run.text.contains(glyph) {
+        return true;
+    }
+    let label_bounds = label_run.bounds;
+    runs.iter().any(|r| {
+        r.text.contains(glyph) && r.bounds.y == label_bounds.y && r.bounds.x < label_bounds.x
+    })
+}
+
+/// Assert, on painted output alone, that the row whose column-0 cell
+/// contains `label` is checked (`checked = true`) or unchecked.
+///
+/// Both directions are asserted — the wanted glyph present *and* the other
+/// one absent — so a paint that lost the prefix entirely, or that painted
+/// both states, fails rather than passing on a half-match. `context`
+/// describes the gesture that is supposed to have produced this state.
+fn assert_row_checkbox<D>(
+    h: &crate::harness::ConformanceHarness<D>,
+    label: &str,
+    checked: bool,
+    context: &str,
+) where
+    D: ConformanceDriver,
+{
+    let (want, unwanted) = if checked {
+        (CHECKED, UNCHECKED)
+    } else {
+        (UNCHECKED, CHECKED)
+    };
+    assert!(
+        glyph_left_of(h, want, label),
+        "{context}: row {label:?} must paint its checkbox as {want:?}; \
+         painted runs were {:?}",
+        painted(&h.driver)
+    );
+    assert!(
+        !glyph_left_of(h, unwanted, label),
+        "{context}: row {label:?} must not paint the opposite checkbox \
+         glyph {unwanted:?}; painted runs were {:?}",
+        painted(&h.driver)
+    );
+}
+
+/// How far to shift a modified click's x-coordinate from the previous
+/// click's, in the driver's own coordinate unit.
+///
+/// quadraui's `DoubleClickDetector` folds a second `MouseDown` into a
+/// modifier-less `DoubleClick` when it lands within 400 ms *and* within 1.5
+/// units of the previous one on both axes (`quadraui::dispatch`). Two
+/// gesture clicks on adjacent rows are one row-height apart, which TUI's
+/// character-cell grid measures as a single unit — inside that radius — so
+/// consecutive clicks in the gesture scenarios alternate this nudge on x to
+/// stay outside it. Far enough to clear the 1.5-unit radius, small enough
+/// to stay inside the clicked column on both backends, and not timing
+/// dependent the way a sleep past the 400 ms window would be.
+const CLICK_NUDGE: f32 = 2.0;
+
+/// Dispatch a `MouseDown` carrying `modifiers` at `(x, y)`.
+///
+/// `ConformanceDriver::click` carries no modifiers, so the ctrl/shift
+/// gestures have to be dispatched as raw `UiEvent`s; this is the same
+/// `route_plugin_view_body_event` path a real modified click reaches.
+fn dispatch_modified_click<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+    (x, y): (f32, f32),
+    modifiers: quadraui::Modifiers,
+) where
+    D: ConformanceDriver + quadraui::testing::DriverInput,
+{
+    h.driver.dispatch(quadraui::UiEvent::MouseDown {
+        widget: None,
+        button: quadraui::MouseButton::Left,
+        position: quadraui::Point::new(x, y),
+        modifiers,
+    });
 }
 
 /// Column 1's header x-position, located by *order* rather than by text
@@ -2159,39 +2289,8 @@ pub fn table_multi_select_click_checks_the_row_and_paints_the_footer<D>(
         &[MULTI_ROW0, MULTI_ROW1, MULTI_FOOTER],
         "the multi-select table's initial paint",
     );
-    // Whether the glyph and the row's label share one painted text run
-    // depends on the backend: GTK paints `"☐ Mr01631"` as a single run (the
-    // run containing the label already contains the glyph), while
-    // `TuiDriver::inventory` splits runs on whitespace (its cell-grid scan
-    // has no notion of "same cell group" beyond a run of non-space columns
-    // — see `quadraui::tui::testing::TuiDriver::inventory`), so the glyph
-    // lands in its own run just to the left of the label's, sometimes
-    // merged with a neighboring non-space character such as the column
-    // border `│`. So "is row 0 unchecked" has to check both: the label's
-    // own run, and any other run on the same line to the left of it.
-    let glyph_left_of = |h: &crate::harness::ConformanceHarness<D>,
-                         glyph: char,
-                         label: &str|
-     -> bool {
-        let inventory = h.driver.inventory();
-        let runs = inventory.text_runs();
-        let Some(label_run) = runs.iter().find(|r| r.text.contains(label)) else {
-            return false;
-        };
-        if label_run.text.contains(glyph) {
-            return true;
-        }
-        let label_bounds = label_run.bounds;
-        runs.iter().any(|r| {
-            r.text.contains(glyph) && r.bounds.y == label_bounds.y && r.bounds.x < label_bounds.x
-        })
-    };
-    assert!(
-        glyph_left_of(h, '\u{2610}', MULTI_ROW0),
-        "row 0 must paint unchecked (\u{2610}) before any click; painted \
-         runs were {:?}",
-        painted(&h.driver)
-    );
+    assert_row_checkbox(h, MULTI_ROW0, false, "before any click");
+    assert_row_checkbox(h, MULTI_ROW1, false, "before any click");
 
     let (x, y) = {
         let engine = h.engine.borrow();
@@ -2207,10 +2306,12 @@ pub fn table_multi_select_click_checks_the_row_and_paints_the_footer<D>(
     };
     h.driver.click(x, y);
 
-    assert!(
-        glyph_left_of(h, '\u{2611}', MULTI_ROW0),
-        "clicking row 0 must check it (\u{2611}); painted runs were {:?}",
-        painted(&h.driver)
+    assert_row_checkbox(h, MULTI_ROW0, true, "a plain click on row 0");
+    assert_row_checkbox(
+        h,
+        MULTI_ROW1,
+        false,
+        "a plain click on row 0 (row 1 was never clicked)",
     );
     assert!(
         h.driver.screen_has(MULTI_SELECTION_ROW0),
@@ -2244,19 +2345,22 @@ pub fn table_ctrl_click_toggles_a_row_without_clearing_the_others<D>(
         "the range-select table's initial paint",
     );
 
-    let row_xy = |h: &crate::harness::ConformanceHarness<D>, row: usize| -> (f32, f32) {
-        let engine = h.engine.borrow();
-        let cached = engine.plugin_view_table_layout.borrow();
-        let (rect, layout) = cached.as_ref().expect(
-            "table_ctrl_click_toggles_a_row_without_clearing_the_others: \
+    // `nudge` shifts x off the previous click's so the pair can't fold into
+    // a `DoubleClick` — see [`CLICK_NUDGE`].
+    let row_xy =
+        |h: &crate::harness::ConformanceHarness<D>, row: usize, nudge: f32| -> (f32, f32) {
+            let engine = h.engine.borrow();
+            let cached = engine.plugin_view_table_layout.borrow();
+            let (rect, layout) = cached.as_ref().expect(
+                "table_ctrl_click_toggles_a_row_without_clearing_the_others: \
              no frame painted yet",
-        );
-        let column = &layout.columns[0];
-        (
-            rect.x + column.x + column.width / 2.0,
-            rect.y + layout.header_height + layout.row_height * (row as f32 + 0.5),
-        )
-    };
+            );
+            let column = &layout.columns[0];
+            (
+                rect.x + column.x + column.width / 2.0 + nudge,
+                rect.y + layout.header_height + layout.row_height * (row as f32 + 0.5),
+            )
+        };
     let selected = |h: &crate::harness::ConformanceHarness<D>| -> Vec<usize> {
         let engine = h.engine.borrow();
         let mut v = engine
@@ -2268,29 +2372,40 @@ pub fn table_ctrl_click_toggles_a_row_without_clearing_the_others<D>(
         v
     };
 
-    let (x0, y0) = row_xy(h, 0);
+    for (row, label) in [(0, RANGE_ROW0), (1, RANGE_ROW1), (2, RANGE_ROW2)] {
+        assert_row_checkbox(h, label, false, &format!("row {row} before any click"));
+    }
+
+    let (x0, y0) = row_xy(h, 0, 0.0);
     h.driver.click(x0, y0);
+    assert_row_checkbox(h, RANGE_ROW0, true, "a plain click on declared row 0");
+    assert_row_checkbox(
+        h,
+        RANGE_ROW1,
+        false,
+        "a plain click on declared row 0 (row 1 unclicked)",
+    );
     assert_eq!(
         selected(h),
         vec![0],
         "a plain click on declared row 0 must select only it"
     );
 
-    let (x1, y1) = row_xy(h, 1);
-    // Row 1 sits only one row's height from row 0 — inside every backend's
-    // `DoubleClickDetector` fold radius. Without a real gap past its time
-    // window, this dispatch would be rewritten into a modifier-less
-    // `DoubleClick` and the ctrl-toggle under test would never run.
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    h.driver.dispatch(quadraui::UiEvent::MouseDown {
-        widget: None,
-        button: quadraui::MouseButton::Left,
-        position: quadraui::Point::new(x1, y1),
-        modifiers: quadraui::Modifiers {
+    dispatch_modified_click(
+        h,
+        row_xy(h, 1, CLICK_NUDGE),
+        quadraui::Modifiers {
             ctrl: true,
             ..Default::default()
         },
-    });
+    );
+    assert_row_checkbox(
+        h,
+        RANGE_ROW0,
+        true,
+        "a ctrl-click on declared row 1 must leave row 0 checked",
+    );
+    assert_row_checkbox(h, RANGE_ROW1, true, "a ctrl-click on declared row 1");
     assert_eq!(
         selected(h),
         vec![0, 1],
@@ -2298,26 +2413,37 @@ pub fn table_ctrl_click_toggles_a_row_without_clearing_the_others<D>(
          keeping row 0 selected"
     );
 
-    // Same fold risk as above: row 0 is one row's height from row 1.
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    h.driver.dispatch(quadraui::UiEvent::MouseDown {
-        widget: None,
-        button: quadraui::MouseButton::Left,
-        position: quadraui::Point::new(x0, y0),
-        modifiers: quadraui::Modifiers {
+    dispatch_modified_click(
+        h,
+        row_xy(h, 0, 0.0),
+        quadraui::Modifiers {
             ctrl: true,
             ..Default::default()
         },
-    });
+    );
+    assert_row_checkbox(
+        h,
+        RANGE_ROW0,
+        false,
+        "a second ctrl-click on declared row 0 must uncheck it",
+    );
+    assert_row_checkbox(
+        h,
+        RANGE_ROW1,
+        true,
+        "a second ctrl-click on declared row 0 must leave row 1 checked",
+    );
+    assert_row_checkbox(
+        h,
+        RANGE_ROW2,
+        false,
+        "row 2 was never clicked and must stay unchecked",
+    );
     assert_eq!(
         selected(h),
         vec![1],
         "a second ctrl-click on declared row 0 must toggle it back out, \
          leaving row 1 still selected"
-    );
-    assert!(
-        !selected(h).contains(&2),
-        "row 2 was never clicked and must never enter the selection"
     );
 }
 
@@ -2368,19 +2494,22 @@ pub fn table_shift_click_ranges_over_display_order_under_sort<D>(
         painted(&h.driver)
     );
 
-    let display_xy = |h: &crate::harness::ConformanceHarness<D>, display: usize| -> (f32, f32) {
-        let engine = h.engine.borrow();
-        let cached = engine.plugin_view_table_layout.borrow();
-        let (rect, layout) = cached.as_ref().expect(
-            "table_shift_click_ranges_over_display_order_under_sort: \
+    // `nudge` shifts x off the previous click's so the pair can't fold into
+    // a `DoubleClick` — see [`CLICK_NUDGE`].
+    let display_xy =
+        |h: &crate::harness::ConformanceHarness<D>, display: usize, nudge: f32| -> (f32, f32) {
+            let engine = h.engine.borrow();
+            let cached = engine.plugin_view_table_layout.borrow();
+            let (rect, layout) = cached.as_ref().expect(
+                "table_shift_click_ranges_over_display_order_under_sort: \
              no frame painted yet",
-        );
-        let column = &layout.columns[0];
-        (
-            rect.x + column.x + column.width / 2.0,
-            rect.y + layout.header_height + layout.row_height * (display as f32 + 0.5),
-        )
-    };
+            );
+            let column = &layout.columns[0];
+            (
+                rect.x + column.x + column.width / 2.0 + nudge,
+                rect.y + layout.header_height + layout.row_height * (display as f32 + 0.5),
+            )
+        };
     let selected = |h: &crate::harness::ConformanceHarness<D>| -> Vec<usize> {
         let engine = h.engine.borrow();
         let mut v = engine
@@ -2392,33 +2521,58 @@ pub fn table_shift_click_ranges_over_display_order_under_sort<D>(
         v
     };
 
+    for (display, label) in [(0, RANGE_ROW1), (1, RANGE_ROW0), (2, RANGE_ROW2)] {
+        assert_row_checkbox(
+            h,
+            label,
+            false,
+            &format!("display position {display} before any row click"),
+        );
+    }
+
     // Display position 1 is declared row 0 (`RANGE_ROW0`'s "Rb" sorts second).
-    let (x1, y1) = display_xy(h, 1);
+    let (x1, y1) = display_xy(h, 1, 0.0);
     h.driver.click(x1, y1);
-    assert_eq!(
-        selected(h),
-        vec![0],
-        "a plain click at display position 1 (declared row 0) must select \
-         only declared row 0"
+    assert_row_checkbox(
+        h,
+        RANGE_ROW0,
+        true,
+        "a plain click at display position 1 (declared row 0)",
     );
 
     // Display position 2 is declared row 2 (`RANGE_ROW2`'s "Rz" sorts last).
-    let (x2, y2) = display_xy(h, 2);
-    // Display position 2 sits only one row's height from display position
-    // 1 — inside every backend's `DoubleClickDetector` fold radius. Without
-    // a real gap past its time window, this dispatch would be rewritten
-    // into a modifier-less `DoubleClick` and the shift-range gesture under
-    // test would never run.
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    h.driver.dispatch(quadraui::UiEvent::MouseDown {
-        widget: None,
-        button: quadraui::MouseButton::Left,
-        position: quadraui::Point::new(x2, y2),
-        modifiers: quadraui::Modifiers {
+    dispatch_modified_click(
+        h,
+        display_xy(h, 2, CLICK_NUDGE),
+        quadraui::Modifiers {
             shift: true,
             ..Default::default()
         },
-    });
+    );
+    // The range spans display positions [1, 2] — declared rows 0 and 2 —
+    // so declared row 1 must stay unchecked even though it sits *between*
+    // them in declared order: it paints at display position 0, outside the
+    // span. Reading the glyphs rather than the selection set is what pins
+    // that the display->declared mapping survives all the way to the frame.
+    assert_row_checkbox(
+        h,
+        RANGE_ROW0,
+        true,
+        "a shift-click at display position 2 (range start stays checked)",
+    );
+    assert_row_checkbox(
+        h,
+        RANGE_ROW2,
+        true,
+        "a shift-click at display position 2 (range end)",
+    );
+    assert_row_checkbox(
+        h,
+        RANGE_ROW1,
+        false,
+        "a shift-click over display positions [1, 2] must not reach \
+         declared row 1, which paints at display position 0",
+    );
     assert_eq!(
         selected(h),
         vec![0, 2],
@@ -2428,7 +2582,83 @@ pub fn table_shift_click_ranges_over_display_order_under_sort<D>(
     );
 }
 
-/// Scenario 10j — a column declaring `align = "right"` paints its cell's
+/// Scenario 10j — a selection anchor left pointing past the end of a
+/// shorter row set cannot leak an out-of-range index into the plugin's
+/// `SelectionChanged`. A plugin may `ui.refresh` fewer rows between the
+/// click that anchors a selection and the `Shift`-click that ranges from it,
+/// so the stored anchor is clamped to the current row count: the range it
+/// spans ends at the last row that exists, and the plugin — which reports
+/// out-of-range indices in [`RANGE_SELECT_VIEW`]'s painted footer — sees
+/// only indices into rows it declared.
+pub fn table_shift_click_clamps_a_stale_anchor_to_the_row_count<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    assert_paints(
+        &h.driver,
+        &[RANGE_ROW0, RANGE_ROW1, RANGE_ROW2, RANGE_BOUNDS_NONE],
+        "the range-select table's initial paint",
+    );
+
+    // Stands in for the row-count shrink a plugin's own `ui.refresh` would
+    // cause between two gesture clicks: an anchor position the view's rows
+    // no longer reach. Writing it directly keeps the scenario to the one
+    // behaviour it measures, since the refresh itself is covered elsewhere.
+    h.engine
+        .borrow_mut()
+        .plugin_view_table_selection_anchor
+        .insert(RANGE_SELECT_VIEW.to_string(), 99);
+
+    let (x, y) = {
+        let engine = h.engine.borrow();
+        let cached = engine.plugin_view_table_layout.borrow();
+        let (rect, layout) = cached.as_ref().expect(
+            "table_shift_click_clamps_a_stale_anchor_to_the_row_count: \
+             no frame painted yet",
+        );
+        let column = &layout.columns[0];
+        (
+            rect.x + column.x + column.width / 2.0,
+            rect.y + layout.header_height + layout.row_height * 1.5,
+        )
+    };
+    dispatch_modified_click(
+        h,
+        (x, y),
+        quadraui::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        h.driver.screen_has(RANGE_BOUNDS_OK),
+        "the clamped anchor must dispatch only indices into rows the plugin \
+         declared, which it reports by painting {RANGE_BOUNDS_OK:?} in its \
+         footer; painted runs were {:?}",
+        painted(&h.driver)
+    );
+    assert!(
+        !h.driver.screen_has(RANGE_BOUNDS_BAD),
+        "no dispatched index may point past the plugin's last row; painted \
+         runs were {:?}",
+        painted(&h.driver)
+    );
+    // No header click here, so display and declared order coincide: the
+    // range runs from the clamped anchor (the last row) back to row 1.
+    assert_row_checkbox(h, RANGE_ROW1, true, "a shift-click with a stale anchor");
+    assert_row_checkbox(h, RANGE_ROW2, true, "a shift-click with a stale anchor");
+    assert_row_checkbox(
+        h,
+        RANGE_ROW0,
+        false,
+        "a shift-click with a stale anchor must not reach row 0, which sits \
+         outside the clamped range",
+    );
+}
+
+/// Scenario 10k — a column declaring `align = "right"` paints its cell's
 /// text run further from its own column's left edge than a column with no
 /// `align` override does, using [`ALIGN_VIEW`]'s two single-row columns
 /// (left-default, right-declared) so the comparison is within one frame
@@ -2866,6 +3096,12 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_table_shift_click_clamps_a_stale_anchor_to_the_row_count_on_tui() {
+        let (mut h, _dir) = tui_named(RANGE_SELECT_VIEW);
+        table_shift_click_clamps_a_stale_anchor_to_the_row_count(&mut h);
+    }
+
+    #[test]
     fn plugin_view_table_align_right_column_indents_its_cell_text_on_tui() {
         let (mut h, _dir) = tui_named(ALIGN_VIEW);
         table_align_right_column_indents_its_cell_text(&mut h);
@@ -3230,6 +3466,13 @@ mod tests {
     fn plugin_view_table_shift_click_ranges_over_display_order_under_sort_on_gtk() {
         let (mut h, _dir) = gtk_named(RANGE_SELECT_VIEW);
         table_shift_click_ranges_over_display_order_under_sort(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_shift_click_clamps_a_stale_anchor_to_the_row_count_on_gtk() {
+        let (mut h, _dir) = gtk_named(RANGE_SELECT_VIEW);
+        table_shift_click_clamps_a_stale_anchor_to_the_row_count(&mut h);
     }
 
     #[cfg(feature = "gui")]

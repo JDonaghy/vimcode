@@ -932,11 +932,22 @@ pub(crate) fn route_plugin_view_table_click(
         // `anchor` is a *display* position (like `idx`, not `declared_idx`):
         // `Range` below has to measure contiguous rows the way the user sees
         // them on screen, which only matches declared order when no sort is
-        // active.
-        let anchor = *engine
+        // active. Anchoring on a position rather than on the anchored row's
+        // identity means a header click between the two halves of a
+        // shift-range re-points the anchor at whichever row now occupies that
+        // position.
+        //
+        // Clamped to the current row count for the same reason `current`
+        // below is filtered to it: the plugin can `ui.refresh` a shorter row
+        // set between the anchoring click and the shift-click, and a stale
+        // display position past the end would otherwise pass straight through
+        // `row_order.get(..).unwrap_or(d)` as a declared index the plugin's
+        // own rows have no entry for.
+        let anchor = (*engine
             .plugin_view_table_selection_anchor
             .get(name)
-            .unwrap_or(&idx);
+            .unwrap_or(&idx))
+        .min(total_rows.saturating_sub(1));
         let next = match gesture {
             quadraui::SelectionGesture::Range => {
                 // Range math runs entirely in display space (`anchor..=idx`,
