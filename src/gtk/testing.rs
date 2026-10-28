@@ -14494,8 +14494,8 @@ mod clipboard_paste {
     #[test]
     fn picker_backdrop_is_translucent_not_opaque_via_gtk_driver() {
         let mut engine = Engine::new_for_test();
-        // `onedark` keeps the editor `background` (#1a1a1a) distinct from the
-        // picker `surface_bg`/`fuzzy_bg` (#21252b); the default `dark` theme
+        // `onedark` keeps the editor `background` (0x1a1a1a) distinct from the
+        // picker `surface_bg`/`fuzzy_bg` (0x21252b); the default `dark` theme
         // makes them equal, which would leave nothing for translucency to
         // reveal and make this assertion vacuous.
         engine.settings.colorscheme = "onedark".to_string();

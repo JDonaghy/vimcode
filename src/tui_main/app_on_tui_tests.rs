@@ -4496,8 +4496,8 @@ mod tests {
         #[test]
         fn picker_backdrop_is_translucent_not_opaque_via_shell_app() {
             let mut engine = plain_engine();
-            // `onedark` has a distinct editor `background` (#1a1a1a) and
-            // picker `fuzzy_bg`/`surface_bg` (#21252b), so a translucent
+            // `onedark` has a distinct editor `background` (0x1a1a1a) and
+            // picker `fuzzy_bg`/`surface_bg` (0x21252b), so a translucent
             // backdrop blends to a colour that differs from the opaque
             // surface — the default `dark` theme makes them equal, which
             // would make this assertion vacuous.
