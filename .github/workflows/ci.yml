@@ -304,7 +304,17 @@ jobs:
     # doesn't itself read the screen would otherwise report a spurious
     # "pass" with no real check behind it.
     - name: Install code-coordinator
-      run: pip install --quiet 'code-coordinator[tui-pty]>=0.5.673'
+      # Into a venv, not `pip install --user`: the run step below overrides
+      # $HOME to isolate vcd's config, which also moves Python's user-site
+      # (~/.local) out from under a --user-installed `coord` -- the launcher
+      # then dies with `ModuleNotFoundError: No module named 'coord'` (#2091).
+      # A venv's site-packages live under its own prefix, independent of $HOME.
+      # `coord --version` fails this step loudly if the install didn't land,
+      # instead of surfacing as a late import error inside the run step.
+      run: |
+        python3 -m venv "$RUNNER_TEMP/coord-venv"
+        "$RUNNER_TEMP/coord-venv/bin/pip" install --quiet 'code-coordinator[tui-pty]>=0.5.673'
+        "$RUNNER_TEMP/coord-venv/bin/coord" --version
 
     - name: Run tests/smoke-spec/ci-tui.yaml under a real pty
       run: |
@@ -319,7 +329,7 @@ jobs:
         printf '{"lsp_enabled": false, "use_nerd_fonts": false}' \
           > "$HOME/.config/vimcode/settings.json"
         BIN="$GITHUB_WORKSPACE/target/release/vcd"
-        coord app-drive run-spec tui-pty tests/smoke-spec/ci-tui.yaml \
+        "$RUNNER_TEMP/coord-venv/bin/coord" app-drive run-spec tui-pty tests/smoke-spec/ci-tui.yaml \
           --launch "$BIN $WORKDIR/sample.txt" \
           --cwd "$WORKDIR"
 
@@ -392,7 +402,13 @@ jobs:
       run: cargo build --release --bin vimcode
 
     - name: Install code-coordinator
-      run: pip install --quiet 'code-coordinator>=0.5.673'
+      # Venv install, not --user: see smoke-tui-pty's note -- the $HOME override
+      # in the run step below would otherwise hide a --user-installed `coord`
+      # (#2091). `coord --version` fails loudly on a broken install.
+      run: |
+        python3 -m venv "$RUNNER_TEMP/coord-venv"
+        "$RUNNER_TEMP/coord-venv/bin/pip" install --quiet 'code-coordinator>=0.5.673'
+        "$RUNNER_TEMP/coord-venv/bin/coord" --version
 
     - name: Run tests/smoke-spec/ci-gtk.yaml under Xvfb + fluxbox
       run: |
@@ -420,7 +436,7 @@ jobs:
 
         BIN="$GITHUB_WORKSPACE/target/release/vimcode"
         set +e
-        coord app-drive run-spec gtk-native tests/smoke-spec/ci-gtk.yaml \
+        "$RUNNER_TEMP/coord-venv/bin/coord" app-drive run-spec gtk-native tests/smoke-spec/ci-gtk.yaml \
           --launch "$BIN $WORKDIR/sample.txt" \
           --cwd "$WORKDIR"
         STATUS=$?
