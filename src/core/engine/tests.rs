@@ -17547,6 +17547,143 @@ fn test_lua_ui_toast_rejects_unknown_severity() {
 }
 
 #[test]
+fn test_lua_ui_progress_pushes_sticky_toast_with_bar() {
+    let dir = write_plugin_lua(
+        "test_ui_progress",
+        r#"vimcode.command("Start", function()
+            local id = vimcode.ui.progress({
+                title = "Fetching",
+                label = "GET /users",
+                fraction = 0.5,
+            })
+            vimcode.message("progress:" .. id)
+        end)"#,
+    );
+    let mut engine = Engine::new_for_test();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Start");
+    assert_eq!(engine.toasts.len(), 1, "progress toast was not pushed");
+    let toast = &engine.toasts[0];
+    assert_eq!(toast.title, "Fetching");
+    assert!(
+        toast.body.contains("50%") && toast.body.contains("GET /users"),
+        "progress body missing bar/percentage/label: {:?}",
+        toast.body
+    );
+    assert!(toast.sticky, "progress toast must not auto-expire");
+    assert_eq!(engine.message, format!("progress:{}", toast.id));
+}
+
+#[test]
+fn test_lua_ui_progress_without_fraction_is_indeterminate() {
+    let dir = write_plugin_lua(
+        "test_ui_progress_indeterminate",
+        r#"vimcode.command("Start", function()
+            vimcode.ui.progress({ title = "Working", label = "indexing" })
+        end)"#,
+    );
+    let mut engine = Engine::new_for_test();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Start");
+    assert_eq!(engine.toasts.len(), 1);
+    assert!(engine.toasts[0].body.contains("Working…"));
+    assert!(engine.toasts[0].body.contains("indexing"));
+}
+
+#[test]
+fn test_lua_ui_progress_update_changes_body() {
+    let dir = write_plugin_lua(
+        "test_ui_progress_update",
+        r#"vimcode.command("Start", function()
+            local id = vimcode.ui.progress({ title = "Fetching", fraction = 0.1 })
+            local ok = vimcode.ui.progress_update(id, 0.9, "almost done")
+            vimcode.message("updated:" .. tostring(ok))
+        end)"#,
+    );
+    let mut engine = Engine::new_for_test();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Start");
+    assert_eq!(engine.toasts.len(), 1);
+    assert!(
+        engine.toasts[0].body.contains("90%") && engine.toasts[0].body.contains("almost done"),
+        "progress body was not updated: {:?}",
+        engine.toasts[0].body
+    );
+    assert_eq!(engine.message, "updated:true");
+}
+
+#[test]
+fn test_lua_ui_progress_finish_removes_toast() {
+    let dir = write_plugin_lua(
+        "test_ui_progress_finish",
+        r#"vimcode.command("Start", function()
+            local id = vimcode.ui.progress({ title = "Fetching", fraction = 0.5 })
+            local ok = vimcode.ui.progress_finish(id)
+            vimcode.message("finished:" .. tostring(ok))
+        end)"#,
+    );
+    let mut engine = Engine::new_for_test();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Start");
+    assert!(
+        engine.toasts.is_empty(),
+        "progress_finish must remove the toast"
+    );
+    assert_eq!(engine.message, "finished:true");
+}
+
+#[test]
+fn test_lua_ui_dismiss_removes_toast_and_reports_already_gone() {
+    let dir = write_plugin_lua(
+        "test_ui_dismiss",
+        r#"vimcode.command("Start", function()
+            local id = vimcode.ui.toast({ title = "Heads up" })
+            local first = vimcode.ui.dismiss(id)
+            local second = vimcode.ui.dismiss(id)
+            vimcode.message("first:" .. tostring(first) .. ",second:" .. tostring(second))
+        end)"#,
+    );
+    let mut engine = Engine::new_for_test();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Start");
+    assert!(
+        engine.toasts.is_empty(),
+        "dismiss must remove the toast pushed by vimcode.ui.toast"
+    );
+    assert_eq!(engine.message, "first:true,second:false");
+}
+
+#[test]
 fn test_plugin_on_save_fires() {
     let dir = write_plugin_lua(
         "test_save",

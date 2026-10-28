@@ -6392,6 +6392,70 @@ impl Engine {
         self.toasts.len() != before
     }
 
+    /// Render a progress/spinner state as plain toast body text: a
+    /// block-character bar + percentage when `fraction` is known, or an
+    /// indeterminate "Working…" message otherwise. Both backends already
+    /// paint a toast body as plain text, so a progress toast needs no
+    /// new overlay primitive or paint path — it degrades identically on
+    /// TUI and GTK.
+    fn format_progress_body(fraction: Option<f32>, label: &str) -> String {
+        match fraction {
+            Some(f) => {
+                let f = f.clamp(0.0, 1.0);
+                let pct = (f * 100.0).round() as u32;
+                let filled = ((f * 20.0).round() as usize).min(20);
+                let bar: String = "█".repeat(filled) + &"░".repeat(20 - filled);
+                if label.is_empty() {
+                    format!("{bar} {pct}%")
+                } else {
+                    format!("{bar} {pct}% — {label}")
+                }
+            }
+            None => {
+                if label.is_empty() {
+                    "Working…".to_string()
+                } else {
+                    format!("Working… {label}")
+                }
+            }
+        }
+    }
+
+    /// Push a sticky progress/spinner toast and return its id. `fraction`
+    /// is `0.0..=1.0` for a determinate progress bar, `None` for an
+    /// indeterminate spinner. The toast is sticky (never auto-expires via
+    /// `prune_toasts`) since a plugin drives its lifetime explicitly via
+    /// `update_progress_toast`/`dismiss_toast`.
+    pub fn push_progress_toast(&mut self, title: &str, fraction: Option<f32>, label: &str) -> u64 {
+        let body = Self::format_progress_body(fraction, label);
+        self.push_toast_inner(
+            title,
+            &body,
+            quadraui::ToastSeverity::Info,
+            Vec::new(),
+            true,
+        )
+    }
+
+    /// Update an in-flight progress/spinner toast's body in place.
+    /// Returns false if `id` does not match any live toast (e.g. the
+    /// user dismissed it).
+    pub fn update_progress_toast(&mut self, id: u64, fraction: Option<f32>, label: &str) -> bool {
+        let Some(toast) = self.toasts.iter_mut().find(|t| t.id == id) else {
+            return false;
+        };
+        toast.body = Self::format_progress_body(fraction, label);
+        true
+    }
+
+    /// Remove a toast by its plugin-visible id, regardless of `sticky`.
+    /// Returns false if `id` does not match any live toast.
+    pub fn dismiss_toast(&mut self, id: u64) -> bool {
+        let before = self.toasts.len();
+        self.toasts.retain(|t| t.id != id);
+        self.toasts.len() != before
+    }
+
     /// Dispatch a `ToastHit` from the cached `toast_layout` to the engine.
     /// Both backends call this with the result of
     /// `layout.hit_test(x, y)` and check the bool: true = consumed (don't
