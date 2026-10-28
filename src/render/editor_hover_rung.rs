@@ -1103,7 +1103,7 @@ pub struct BottomPanelMetrics {
 /// Resolved from geometry alone — no engine mutation — so a caller can look
 /// before it leaps (GTK's right-click path needs "is this the terminal?"
 /// without actually driving the terminal).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BottomPanelRoute {
     /// The shared "TERMINAL / DEBUG CONSOLE" tab strip.
     TabBar,
@@ -1115,6 +1115,18 @@ pub enum BottomPanelRoute {
     /// A plain (unsplit) terminal pane press, already translated into
     /// pane-local cells.
     Pane { col: u16, row_offset: u16 },
+    /// A press over a `BottomPanelKind::Plugin` dock's `Form` body — a
+    /// `vimcode.ui.open_view(name, { location = "dock" })` view whose body is
+    /// the field-stack default (not one of the deferred `List`/`Tree`/`Table`
+    /// primitives, nor `TextView`, which has no click behaviour of its own
+    /// beyond the mouse-wheel scroll `Engine::handle_plugin_view_dock_scroll`
+    /// already wires). `position` is the absolute point the backend
+    /// hit-tested, forwarded verbatim into the `quadraui::UiEvent::MouseDown`
+    /// `apply_bottom_panel_route` builds for `handle_plugin_view_dock_ui_event`.
+    Plugin {
+        name: String,
+        position: quadraui::Point,
+    },
 }
 
 /// Resolve a press at `(x, y)` against the bottom panel as last painted.
@@ -1140,6 +1152,29 @@ pub fn route_bottom_panel_click(
         BottomPanelZone::TabBar => BottomPanelRoute::TabBar,
         BottomPanelZone::Toolbar => BottomPanelRoute::Toolbar,
         BottomPanelZone::Content { row_offset } => {
+            if let crate::core::engine::BottomPanelKind::Plugin(name) = &engine.bottom_panel_kind {
+                // A docked plugin view's content zone is not terminal
+                // content — only a `Form`-bodied view has click behaviour
+                // here (`List`/`Tree`/`Table` are deferred for the dock host,
+                // and `TextView`'s only interaction is the mouse-wheel scroll
+                // already wired via `Engine::handle_plugin_view_dock_scroll`),
+                // so a `Form`-bodied view routes to its own arm and anything
+                // else is swallowed rather than falling through to
+                // `Split`/`Pane`, which would misinterpret the click as a
+                // terminal-pane press.
+                let is_form = engine
+                    .plugin_views
+                    .get(name.as_str())
+                    .is_some_and(|v| v.body.is_none());
+                return if is_form {
+                    Some(BottomPanelRoute::Plugin {
+                        name: name.clone(),
+                        position: quadraui::Point::new(x as f32, y as f32),
+                    })
+                } else {
+                    None
+                };
+            }
             let split = *engine.terminal_split_layout.borrow();
             if let Some(sl) = split {
                 // The split layout hit-tests in the *absolute* space it was
@@ -1243,6 +1278,16 @@ pub fn apply_bottom_panel_route(
                 quadraui::MouseButton::Left,
                 quadraui::Modifiers::default(),
             );
+        }
+        BottomPanelRoute::Plugin { name, position } => {
+            let rect = engine.plugin_view_dock_form_rect.get();
+            let event = quadraui::UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position,
+                modifiers: quadraui::Modifiers::default(),
+            };
+            handle_plugin_view_dock_ui_event(engine, &name, &event, rect);
         }
     }
     effect
