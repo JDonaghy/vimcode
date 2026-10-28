@@ -286,7 +286,7 @@ pub enum ViewChartKind {
 
 impl ViewChartKind {
     /// Translate to the quadraui primitive this paints through.
-    pub fn to_quadraui(self) -> quadraui::ChartKind {
+    pub fn into_quadraui(self) -> quadraui::ChartKind {
         match self {
             ViewChartKind::Sparkline => quadraui::ChartKind::Sparkline,
             ViewChartKind::Line => quadraui::ChartKind::Line,

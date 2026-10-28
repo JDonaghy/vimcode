@@ -996,6 +996,10 @@ pub fn paint_bottom_panel_rung(
                 // (`plugin_view_body.rs`'s `paint_plugin_view_table`'s
                 // `Dock => return false` arm) — see the comment above.
                 Some("table") => {}
+                // Chart-kind bodies have no dock-hosted layout cache yet
+                // (`plugin_view_body.rs`'s `paint_plugin_view_chart`'s
+                // `Dock => return false` arm) — see the comment above.
+                Some("chart") => {}
                 Some("text_view") => {
                     paint_plugin_view_text(engine, name, PluginViewHost::Dock, false, body, b);
                     engine

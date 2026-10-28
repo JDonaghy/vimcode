@@ -626,7 +626,7 @@ pub(crate) fn route_plugin_view_body_event(
                 position,
                 button: quadraui::MouseButton::Left,
                 ..
-            } => route_plugin_view_chart_click(engine, name, host, *position),
+            } => route_plugin_view_chart_click(engine, name, host, *position, backend),
             _ => false,
         }),
         _ => None,

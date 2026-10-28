@@ -236,12 +236,21 @@ pub const TEXT_LAST_LINE: &str = "Ln49X1631";
 /// `LegendClicked`. `CHART_Y_LABEL_IDLE`/`_SEEN` is the `y_label` field,
 /// which doubles as this fixture's round-trip marker — same local-state
 /// convention as `list_sel`/`tree_open`/`last_edit` above.
+///
+/// These two drop the other fixtures' `1631` suffix convention: the legend
+/// row only has room for a short swatch-plus-label run on the narrow TUI
+/// sidebar viewport, and a 4-digit suffix pushed the second series' label
+/// past the column budget and into truncation.
 pub const CHART_SERIES0_LABEL: &str = "A631";
 pub const CHART_SERIES1_LABEL: &str = "B631";
 pub const CHART_X_LABEL: &str = "Cx1631";
 pub const CHART_Y_LABEL_IDLE: &str = "Cy1631";
-/// Painted once `on_event` has seen `LegendClicked{{series_idx: 0}}`.
+/// Painted once `on_event` has seen `LegendClicked{series_idx: 0}`.
 pub const CHART_Y_LABEL_SEEN: &str = "CyS1631";
+/// Painted once `on_event` has seen `DataPointClicked{series_idx: 0,
+/// data_idx: 1}` — the point a bar/line-body click resolves to via
+/// `ChartLayout::nearest_point`.
+pub const CHART_POINT_SEEN: &str = "CpS1631";
 
 /// Lua source registering one view per `ViewBody` kind, appended
 /// into the same fixture plugin the field-stack view above uses — one real
@@ -335,6 +344,7 @@ vimcode.ui.register_view("{TEXT_VIEW}", {{
 }})
 
 local chart_legend_seen = false
+local chart_point_seen = false
 vimcode.ui.register_view("{CHART_VIEW}", {{
   title = "Zq2065C", icon = "C", fallback_icon = "C",
   render = function()
@@ -345,7 +355,7 @@ vimcode.ui.register_view("{CHART_VIEW}", {{
         {{ label = "{CHART_SERIES0_LABEL}", data = {{ 1, 2, 3 }} }},
         {{ label = "{CHART_SERIES1_LABEL}", data = {{ 3, 2, 1 }} }},
       }},
-      x_label = "{CHART_X_LABEL}",
+      x_label = chart_point_seen and "{CHART_POINT_SEEN}" or "{CHART_X_LABEL}",
       y_label = chart_legend_seen and "{CHART_Y_LABEL_SEEN}" or "{CHART_Y_LABEL_IDLE}",
       show_legend = true,
     }}
@@ -353,6 +363,8 @@ vimcode.ui.register_view("{CHART_VIEW}", {{
   on_event = function(ctx, event)
     if event.kind == "LegendClicked" and event.series_idx == 0 then
       chart_legend_seen = true
+    elseif event.kind == "DataPointClicked" and event.series_idx == 0 and event.data_idx == 1 then
+      chart_point_seen = true
     end
   end,
 }})
@@ -425,6 +437,12 @@ end)
 -- be driven in an editor tab as well as the sidebar.
 vimcode.command("Zq1631TableOpenTab", function()
   vimcode.ui.open_view("{TABLE_VIEW}", {{ location = "tab" }})
+end)
+
+-- The same for the `chart`-kind view, so the data-point click gesture can be
+-- driven in an editor tab as well as the sidebar.
+vimcode.command("Zq2065ChartOpenTab", function()
+  vimcode.ui.open_view("{CHART_VIEW}", {{ location = "tab" }})
 end)
 
 -- A real `:Command` around `vimcode.ui.open_view` with `location = "dock"`,
@@ -1447,6 +1465,76 @@ pub fn chart_paints_and_legend_click_reaches_the_plugin(driver: &mut impl Confor
     );
 }
 
+/// Scenario — a click on a chart's plotted body (not text, so it can't use
+/// `click_text`) resolves through `ChartLayout::nearest_point` and reaches
+/// the plugin's `on_event` as `DataPointClicked{series_idx, data_idx}`,
+/// proved by the `x_label` marker flipping from idle to seen. Exercises the
+/// `ChartHit::Body` fallback path `route_plugin_view_chart_click` takes when
+/// quadraui's own `hit_test` never returns `ChartHit::DataPoint` directly.
+///
+/// Drives the sidebar-hosted copy of the chart;
+/// [`chart_tab_data_point_click_reaches_the_plugin`] is the editor-tab twin.
+pub fn chart_sidebar_data_point_click_reaches_the_plugin<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    chart_data_point_click_reaches_the_plugin(h, crate::core::engine::PluginViewHost::Sidebar);
+}
+
+/// Editor-tab twin of [`chart_sidebar_data_point_click_reaches_the_plugin`].
+pub fn chart_tab_data_point_click_reaches_the_plugin<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    chart_data_point_click_reaches_the_plugin(h, crate::core::engine::PluginViewHost::Tab);
+}
+
+fn chart_data_point_click_reaches_the_plugin<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+    host: crate::core::engine::PluginViewHost,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    use crate::core::engine::PluginViewHost;
+    assert_paints(
+        &h.driver,
+        &[CHART_X_LABEL],
+        "the chart-kind view's initial paint, before any data-point click",
+    );
+    let (x, y) = {
+        let engine = h.engine.borrow();
+        let cached = match host {
+            PluginViewHost::Sidebar => engine.plugin_view_chart_layout.borrow(),
+            PluginViewHost::Tab => engine.plugin_view_tab_chart_layout.borrow(),
+            PluginViewHost::Dock => unreachable!(
+                "chart_data_point_click_reaches_the_plugin is never called with \
+                 PluginViewHost::Dock -- the bottom-panel dock does not render \
+                 chart-kind views yet"
+            ),
+        };
+        let layout = cached
+            .as_ref()
+            .expect("chart_data_point_click_reaches_the_plugin: no frame painted yet");
+        let &(_, _, x, y) = layout
+            .data_point_positions
+            .iter()
+            .find(|&&(series_idx, data_idx, _, _)| series_idx == 0 && data_idx == 1)
+            .expect("series 0's data point 1 must be in the painted layout");
+        (x, y)
+    };
+    h.driver.click(x, y);
+    assert!(
+        h.driver.screen_has(CHART_POINT_SEEN),
+        "a click on series 0's data point 1 must dispatch \
+         DataPointClicked{{series_idx: 0, data_idx: 1}} to the plugin and \
+         repaint the x_label marker as {CHART_POINT_SEEN:?}; painted runs \
+         were {:?}",
+        painted(&h.driver)
+    );
+}
+
 /// Scenario 8 — keyboard `Down` on a list moves selection to the right
 /// index, exactly like a click does.
 pub fn list_key_navigation_selects_the_right_index(driver: &mut impl ConformanceDriver) {
@@ -2218,6 +2306,18 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_chart_data_point_click_reaches_the_plugin_on_tui() {
+        let (mut h, _dir) = tui_named(CHART_VIEW);
+        chart_sidebar_data_point_click_reaches_the_plugin(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_chart_tab_data_point_click_reaches_the_plugin_on_tui() {
+        let (mut h, _dir) = tui_named_tab(CHART_VIEW, "Zq2065ChartOpenTab");
+        chart_tab_data_point_click_reaches_the_plugin(&mut h);
+    }
+
+    #[test]
     fn plugin_view_list_key_navigation_selects_the_right_index_on_tui() {
         let (mut h, _dir) = tui_named(LIST_VIEW);
         list_key_navigation_selects_the_right_index(&mut h.driver);
@@ -2528,6 +2628,20 @@ mod tests {
     fn plugin_view_chart_paints_and_legend_click_reaches_the_plugin_on_gtk() {
         let (mut h, _dir) = gtk_named(CHART_VIEW);
         chart_paints_and_legend_click_reaches_the_plugin(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_chart_data_point_click_reaches_the_plugin_on_gtk() {
+        let (mut h, _dir) = gtk_named(CHART_VIEW);
+        chart_sidebar_data_point_click_reaches_the_plugin(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_chart_tab_data_point_click_reaches_the_plugin_on_gtk() {
+        let (mut h, _dir) = gtk_named_tab(CHART_VIEW, "Zq2065ChartOpenTab");
+        chart_tab_data_point_click_reaches_the_plugin(&mut h);
     }
 
     #[cfg(feature = "gui")]
