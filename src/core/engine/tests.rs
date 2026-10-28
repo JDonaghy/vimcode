@@ -28651,9 +28651,15 @@ fn test_run_pending_plugin_dialog_falls_back_to_nil_without_capability() {
     let action = engine.pending_platform_actions.remove(0);
     let mut backend = quadraui::testing::RecordingBackend::new();
     crate::render::run_pending_platform_action(&mut engine, action, &mut backend);
+    // The real guard against the gate being dropped is structural, not this
+    // assertion: `RecordingBackend::services()` is `unimplemented!()`, so if
+    // the `Folder => None` arm were replaced with an unconditional
+    // `backend.services().show_folder_open_dialog(...)`, this call would
+    // panic here. `calls` only records paint calls, so an empty `calls`
+    // confirms the fallback paints nothing — not that `services()` is untouched.
     assert!(
         backend.calls.is_empty(),
-        "backend.services() must never be touched without folder_dialogs capability; calls were {:?}",
+        "the nil fallback must not paint any dialog; calls were {:?}",
         backend.calls
     );
     assert_eq!(engine.message, "picked:nil");

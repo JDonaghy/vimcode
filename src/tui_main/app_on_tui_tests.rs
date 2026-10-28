@@ -16815,6 +16815,60 @@ mod tests {
             let _ = std::fs::remove_dir_all(&tmp);
         }
 
+        /// Acceptance scenario: on a backend without a folder picker,
+        /// `vimcode.platform.show_folder_dialog` resolves its callback with
+        /// `nil` — the sane TUI fallback — rather than hanging, panicking, or
+        /// painting a dialog.
+        ///
+        /// TUI has no in-canvas folder picker for the plugin API (its native
+        /// folder-dialog capability is off), so `run_pending_plugin_dialog`
+        /// takes the `Folder => None` arm and delivers `nil`. The callback
+        /// still runs: it writes a scratch buffer reporting `ZQ_FOLDER=NIL`,
+        /// which must paint after the drain tick.
+        #[test]
+        fn platform_show_folder_dialog_falls_back_to_nil_via_shell_app() {
+            let engine = engine_with_plugin(
+                "platform_folder_dialog_fallback",
+                r#"
+                vimcode.command("ZqFolder", function(_)
+                    vimcode.platform.show_folder_dialog(nil, function(path)
+                        local b = vimcode.buffer.create({ scratch = true, name = "ZQFOLDER" })
+                        local name = "NIL"
+                        if path then
+                            name = path:match("([^/]+)$") or path
+                        end
+                        vimcode.buffer.set_lines(b, 0, -1, { "ZQ_FOLDER=" .. name })
+                        vimcode.window.set_buf(0, b)
+                    end)
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqFolder".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            // The drain tick is what runs the pending dialog action and
+            // resolves the callback; no dialog events are scripted because no
+            // picker is shown.
+            driver.tick();
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQ_FOLDER=NIL"),
+                "the folder dialog must resolve its callback with nil on a \
+                 backend with no folder picker; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("[ZQFOLDER]"),
+                "the scratch buffer the callback wrote to must be the one on \
+                 display, proving the callback actually ran; screen:\n{screen}"
+            );
+        }
+
         /// Acceptance scenario (#2063): a `vimcode.command(name, fn)`
         /// registration is discoverable from the command palette without any
         /// extra registration step, and confirming it there actually runs
