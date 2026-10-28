@@ -17814,6 +17814,127 @@ mod tests {
                 tmp.display()
             );
         }
+
+        /// `vimcode.ui.progress` must paint a progress bar + percentage
+        /// onto the toast overlay; `vimcode.ui.progress_update` must
+        /// repaint the same toast's body in place (not spawn a second
+        /// toast); `vimcode.ui.progress_finish` must remove it.
+        ///
+        /// The bar glyphs (`█`/`░`) also appear as the TUI's own
+        /// scrollbar glyphs, so a bare whole-screen `screen_contains`
+        /// for them would pass even if the bar painted nowhere near the
+        /// toast. Every bar/percentage assertion here is scoped to the
+        /// single screen row the toast body actually lands on: the row
+        /// directly below the toast's title row (quadraui's
+        /// `tui/toast.rs::paint_toast` paints the title on `by + 1` and
+        /// the (unwrapped, given the long title below) body on the row
+        /// right after it). The title itself is picked deliberately long
+        /// enough (28 chars) to widen the toast box past the point where
+        /// a 20-cell bar plus its percentage would wrap across lines.
+        #[test]
+        fn progress_toast_paints_bar_percentage_and_updates_in_place_via_shell_app() {
+            let engine = engine_with_plugin(
+                "win_progress_2061",
+                r#"
+                vimcode.command("ZqProgressStart", function(_)
+                    _G.zq_progress_id = vimcode.ui.progress({
+                        title = "ZQ_PROGRESS_TOAST_TITLE_2061",
+                        fraction = 0.5,
+                    })
+                end)
+                vimcode.command("ZqProgressBump", function(_)
+                    vimcode.ui.progress_update(_G.zq_progress_id, 1.0, nil)
+                end)
+                vimcode.command("ZqProgressDone", function(_)
+                    vimcode.ui.progress_finish(_G.zq_progress_id)
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            fn run_command(
+                driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+                cmd: &str,
+            ) {
+                driver.type_char(':');
+                for c in cmd.chars() {
+                    driver.type_char(c);
+                }
+                driver.press_named(quadraui::NamedKey::Enter);
+                driver.render();
+            }
+
+            /// Locates the toast's title row by its known text, then
+            /// returns the row directly below it — the one row the
+            /// progress body (bar + percentage) actually paints on.
+            fn progress_body_row(screen: &str) -> String {
+                let lines: Vec<&str> = screen.lines().collect();
+                let title_idx = lines
+                    .iter()
+                    .position(|l| l.contains("ZQ_PROGRESS_TOAST_TITLE_2061"))
+                    .unwrap_or_else(|| {
+                        panic!("progress toast title must paint somewhere on screen:\n{screen}")
+                    });
+                lines
+                    .get(title_idx + 1)
+                    .unwrap_or_else(|| {
+                        panic!("a body row must exist directly below the title row:\n{screen}")
+                    })
+                    .to_string()
+            }
+
+            run_command(driver, "ZqProgressStart");
+
+            let screen = driver.screen();
+            let row = progress_body_row(&screen);
+            assert_eq!(
+                row.matches('█').count(),
+                10,
+                "fraction 0.5 over a 20-cell bar must paint exactly 10 \
+                 filled cells on the toast's own body row; \
+                 row:\n{row}\nscreen:\n{screen}"
+            );
+            assert_eq!(
+                row.matches('░').count(),
+                10,
+                "fraction 0.5 over a 20-cell bar must paint exactly 10 \
+                 empty cells on the toast's own body row; \
+                 row:\n{row}\nscreen:\n{screen}"
+            );
+            assert!(
+                row.contains("50%"),
+                "the progress toast's body row must paint its \
+                 percentage; row:\n{row}\nscreen:\n{screen}"
+            );
+
+            run_command(driver, "ZqProgressBump");
+
+            let screen = driver.screen();
+            let row = progress_body_row(&screen);
+            assert_eq!(
+                row.matches('█').count(),
+                20,
+                "progress_update to fraction 1.0 must repaint the same \
+                 toast's body fully filled, in place (not spawn a second \
+                 toast); row:\n{row}\nscreen:\n{screen}"
+            );
+            assert!(
+                !row.contains('░') && row.contains("100%"),
+                "progress_update to fraction 1.0 must leave no empty \
+                 cells and must paint the updated percentage; \
+                 row:\n{row}\nscreen:\n{screen}"
+            );
+
+            run_command(driver, "ZqProgressDone");
+
+            let screen = driver.screen();
+            assert!(
+                !screen.contains("ZQ_PROGRESS_TOAST_TITLE_2061"),
+                "progress_finish must dismiss the toast entirely; \
+                 screen:\n{screen}"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

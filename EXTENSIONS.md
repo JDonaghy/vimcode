@@ -1225,8 +1225,42 @@ icon; any other string raises a Lua error, so a typo is loud rather
 than silently downgraded to `info`.
 
 Toasts auto-dismiss after five seconds. The returned integer is the
-engine's handle for that toast; there is no Lua dismiss or update call
-for it yet.
+engine's handle for that toast; pass it to `vimcode.ui.dismiss(id)` to
+remove it early — returns `false` if `id` is already gone (expired or
+already dismissed).
+
+```lua
+local ok = vimcode.ui.dismiss(id)
+```
+
+### Progress toasts (`vimcode.ui.progress`)
+
+A sticky, updatable twin of `vimcode.ui.toast` for async work whose
+status outlives a single notification — an HTTP request, a SQL query,
+an indexing pass. Unlike a plain toast it never auto-expires; the
+plugin owns its lifetime explicitly.
+
+```lua
+local id = vimcode.ui.progress({
+    title = "Fetching",        -- required in practice; defaults to ""
+    label = "GET /users",      -- optional detail text
+    fraction = 0.5,            -- 0..1 for a determinate bar; omit/nil for a spinner
+})
+
+-- Redraw the same toast in place. fraction/label are each optional;
+-- omitting fraction keeps it indeterminate. Returns false if `id` is gone.
+local ok = vimcode.ui.progress_update(id, 0.9, "almost done")
+
+-- Remove the toast once the operation finishes (or is cancelled).
+-- Returns false if `id` is already gone.
+local ok = vimcode.ui.progress_finish(id)
+```
+
+A determinate `fraction` renders as a block-character bar plus
+percentage (`"██████████░░░░░░░░░░ 50% — GET /users"`); an
+indeterminate progress toast renders as `"Working… <label>"`. Both
+render as plain toast body text, so they paint identically on every
+backend via the existing toast pipeline — no new overlay primitive.
 
 ### HTTP, JSON and Storage (`vimcode.http`, `vimcode.json`, `vimcode.storage`)
 
