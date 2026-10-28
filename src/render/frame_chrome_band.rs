@@ -532,7 +532,10 @@ pub fn paint_picker_rung(
     // the palette with a reduced `backdrop_opacity`, then restore so later
     // overlays in the same frame (e.g. the git branch picker) keep their
     // opaque default.
+    let prev_style = b.style();
+    b.set_style(prev_style.with_backdrop_opacity(PICKER_BACKDROP_OPACITY));
     b.draw_palette(rect, &palette);
+    b.set_style(prev_style);
     rect
 }
 
