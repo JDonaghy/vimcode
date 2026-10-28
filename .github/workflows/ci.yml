@@ -306,6 +306,18 @@ jobs:
     - name: Install code-coordinator
       run: pip install --quiet 'code-coordinator[tui-pty]>=0.5.673'
 
+    # #2091: the `coord` console-script's shebang pins the interpreter `pip`
+    # happened to run as at install time. On this runner that interpreter
+    # does not see the `pip install --user` site, so the *script* can exist
+    # on PATH while still failing to import the package it's a launcher for
+    # -- `--quiet` above hides that split entirely. Run the sanity check and
+    # the real invocation both through `python3 -m coord.cli`, the same
+    # interpreter `pip` just installed into, so a broken install fails loudly
+    # right here instead of surfacing as a confusing `ModuleNotFoundError` at
+    # the run step.
+    - name: Verify coord is importable
+      run: python3 -m coord.cli --version
+
     - name: Run tests/smoke-spec/ci-tui.yaml under a real pty
       run: |
         set -euo pipefail
@@ -319,7 +331,7 @@ jobs:
         printf '{"lsp_enabled": false, "use_nerd_fonts": false}' \
           > "$HOME/.config/vimcode/settings.json"
         BIN="$GITHUB_WORKSPACE/target/release/vcd"
-        coord app-drive run-spec tui-pty tests/smoke-spec/ci-tui.yaml \
+        python3 -m coord.cli app-drive run-spec tui-pty tests/smoke-spec/ci-tui.yaml \
           --launch "$BIN $WORKDIR/sample.txt" \
           --cwd "$WORKDIR"
 
@@ -394,6 +406,13 @@ jobs:
     - name: Install code-coordinator
       run: pip install --quiet 'code-coordinator>=0.5.673'
 
+    # #2091: see the matching step in `smoke-tui-pty` -- same shebang vs.
+    # user-site split, same fix: run `coord` through `python3 -m coord.cli`,
+    # the interpreter `pip` just installed into, and fail the install step
+    # loudly rather than the run step.
+    - name: Verify coord is importable
+      run: python3 -m coord.cli --version
+
     - name: Run tests/smoke-spec/ci-gtk.yaml under Xvfb + fluxbox
       run: |
         set -euo pipefail
@@ -420,7 +439,7 @@ jobs:
 
         BIN="$GITHUB_WORKSPACE/target/release/vimcode"
         set +e
-        coord app-drive run-spec gtk-native tests/smoke-spec/ci-gtk.yaml \
+        python3 -m coord.cli app-drive run-spec gtk-native tests/smoke-spec/ci-gtk.yaml \
           --launch "$BIN $WORKDIR/sample.txt" \
           --cwd "$WORKDIR"
         STATUS=$?
