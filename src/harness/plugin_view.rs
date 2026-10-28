@@ -224,6 +224,21 @@ pub const WIDTH_VIEW: &str = "zqxw1631width";
 pub const WIDTH_COL0: &str = "W01631";
 pub const WIDTH_COL1: &str = "W11631";
 
+/// Registered view name for a dedicated table fixture exercising
+/// `multi_select` and `footer` — kept separate from [`TABLE_VIEW`] so the
+/// checkbox-prefix and pinned-footer row never change the column count or
+/// row height the sort/resize/short-panel scenarios above were sized around.
+pub const MULTI_SELECT_VIEW: &str = "zqxw1631multi";
+pub const MULTI_COL: &str = "Mc1631";
+pub const MULTI_ROW0: &str = "Mr01631";
+pub const MULTI_ROW1: &str = "Mr11631";
+pub const MULTI_FOOTER: &str = "MsFt1631";
+/// Painted once `on_event` has seen `SelectionChanged{{indices: [0]}}` from
+/// a click on row `m0`.
+pub const MULTI_SELECTION_ROW0: &str = "MsR01631";
+/// Painted before any `SelectionChanged` has reached the plugin.
+pub const MULTI_SELECTION_NONE: &str = "MsN1631";
+
 /// `TextView` fixture needles — first and last of 50 generated lines, far
 /// enough apart that only one is visible at a time on a narrow viewport.
 pub const TEXT_FIRST_LINE: &str = "Ln0X1631";
@@ -422,6 +437,33 @@ vimcode.ui.register_view("{WIDTH_VIEW}", {{
         {{ id = "w0", cells = {{ "{WIDTH_COL0}v", "{WIDTH_COL1}v" }} }},
       }},
     }}
+  end,
+}})
+
+local ms_selected_marker = "{MULTI_SELECTION_NONE}"
+vimcode.ui.register_view("{MULTI_SELECT_VIEW}", {{
+  title = "Zq1631M", icon = "M", fallback_icon = "M",
+  render = function()
+    return {{
+      kind = "table",
+      multi_select = true,
+      columns = {{ {{ title = "{MULTI_COL}" }} }},
+      rows = {{
+        {{ id = "m0", cells = {{ "{MULTI_ROW0}" }} }},
+        {{ id = "m1", cells = {{ "{MULTI_ROW1}" }} }},
+        {{ id = "m2", cells = {{ ms_selected_marker }} }},
+      }},
+      footer = {{ "{MULTI_FOOTER}" }},
+    }}
+  end,
+  on_event = function(ctx, event)
+    if event.kind == "SelectionChanged" then
+      local has0 = false
+      for _, idx in ipairs(event.indices) do
+        if idx == 0 then has0 = true end
+      end
+      ms_selected_marker = has0 and "{MULTI_SELECTION_ROW0}" or "{MULTI_SELECTION_NONE}"
+    end
   end,
 }})
 
@@ -2019,6 +2061,87 @@ pub fn table_declared_width_narrows_the_column<D>(
     );
 }
 
+/// Scenario 10g — a `multi_select = true` table paints every row with an
+/// unchecked checkbox glyph and a pinned `footer` row, checks the clicked
+/// row's glyph, and dispatches `SelectionChanged` to the plugin alongside
+/// the single-row cursor's own `ItemSelected`.
+pub fn table_multi_select_click_checks_the_row_and_paints_the_footer<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    assert_paints(
+        &h.driver,
+        &[MULTI_ROW0, MULTI_ROW1, MULTI_FOOTER],
+        "the multi-select table's initial paint",
+    );
+    // Whether the glyph and the row's label share one painted text run
+    // depends on the backend: GTK paints `"☐ Mr01631"` as a single run (the
+    // run containing the label already contains the glyph), while
+    // `TuiDriver::inventory` splits runs on whitespace (its cell-grid scan
+    // has no notion of "same cell group" beyond a run of non-space columns
+    // — see `quadraui::tui::testing::TuiDriver::inventory`), so the glyph
+    // lands in its own run just to the left of the label's, sometimes
+    // merged with a neighboring non-space character such as the column
+    // border `│`. So "is row 0 unchecked" has to check both: the label's
+    // own run, and any other run on the same line to the left of it.
+    let glyph_left_of = |h: &crate::harness::ConformanceHarness<D>,
+                         glyph: char,
+                         label: &str|
+     -> bool {
+        let inventory = h.driver.inventory();
+        let runs = inventory.text_runs();
+        let Some(label_run) = runs.iter().find(|r| r.text.contains(label)) else {
+            return false;
+        };
+        if label_run.text.contains(glyph) {
+            return true;
+        }
+        let label_bounds = label_run.bounds;
+        runs.iter().any(|r| {
+            r.text.contains(glyph) && r.bounds.y == label_bounds.y && r.bounds.x < label_bounds.x
+        })
+    };
+    assert!(
+        glyph_left_of(h, '\u{2610}', MULTI_ROW0),
+        "row 0 must paint unchecked (\u{2610}) before any click; painted \
+         runs were {:?}",
+        painted(&h.driver)
+    );
+
+    let (x, y) = {
+        let engine = h.engine.borrow();
+        let cached = engine.plugin_view_table_layout.borrow();
+        let (rect, layout) = cached
+            .as_ref()
+            .expect("the multi-select table must have painted and cached a layout");
+        let column = &layout.columns[0];
+        (
+            rect.x + column.x + column.width / 2.0,
+            rect.y + layout.header_height + layout.row_height / 2.0,
+        )
+    };
+    h.driver.click(x, y);
+
+    assert!(
+        glyph_left_of(h, '\u{2611}', MULTI_ROW0),
+        "clicking row 0 must check it (\u{2611}); painted runs were {:?}",
+        painted(&h.driver)
+    );
+    assert!(
+        h.driver.screen_has(MULTI_SELECTION_ROW0),
+        "the click must dispatch SelectionChanged{{indices: [0]}} to the \
+         plugin; painted runs were {:?}",
+        painted(&h.driver)
+    );
+    assert!(
+        h.driver.screen_has(MULTI_FOOTER),
+        "the pinned footer row must still paint after a body-row click; \
+         painted runs were {:?}",
+        painted(&h.driver)
+    );
+}
+
 /// Scenario 11 — a `kind = "text_view"` with more lines than fit the
 /// viewport starts scrolled to the top and scrolls to the bottom on `End`.
 pub fn text_view_scrolls_to_the_bottom_on_end(driver: &mut impl ConformanceDriver) {
@@ -2397,6 +2520,12 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_table_multi_select_click_checks_the_row_and_paints_the_footer_on_tui() {
+        let (mut h, _dir) = tui_named(MULTI_SELECT_VIEW);
+        table_multi_select_click_checks_the_row_and_paints_the_footer(&mut h);
+    }
+
+    #[test]
     fn plugin_view_text_view_scrolls_to_the_bottom_on_end_on_tui() {
         let (mut h, _dir) = tui_named(TEXT_VIEW);
         text_view_scrolls_to_the_bottom_on_end(&mut h.driver);
@@ -2734,6 +2863,13 @@ mod tests {
         let (mut narrow, _narrow_dir) = gtk_named(WIDTH_VIEW);
         let (mut baseline, _baseline_dir) = gtk_named(TABLE_VIEW);
         table_declared_width_narrows_the_column(&mut narrow, &mut baseline);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_multi_select_click_checks_the_row_and_paints_the_footer_on_gtk() {
+        let (mut h, _dir) = gtk_named(MULTI_SELECT_VIEW);
+        table_multi_select_click_checks_the_row_and_paints_the_footer(&mut h);
     }
 
     #[cfg(feature = "gui")]

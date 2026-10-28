@@ -223,6 +223,20 @@ pub enum ViewBody {
         columns: Vec<ViewTableColumn>,
         #[serde(default)]
         rows: Vec<ViewTableRow>,
+        /// When true, rows support multi-selection (toggle/range-extend via
+        /// click modifiers) in addition to the always-available single-row
+        /// cursor/`ItemSelected`/`ItemActivated` path. Rendered as a
+        /// `\u{2610}`/`\u{2611}` glyph prefix on the first cell of each row
+        /// (the same checkbox convention `plan::plan_to_checklist_text`
+        /// uses), since `quadraui::DataTable` has no native multi-row
+        /// highlight to key off of.
+        #[serde(default)]
+        multi_select: bool,
+        /// Pinned footer row, excluded from scrolling/selection, rendered
+        /// via `quadraui::DataTable`'s own `footer: Option<DataRow>` field.
+        /// One string per column; `None` renders no footer.
+        #[serde(default)]
+        footer: Option<Vec<String>>,
     },
     /// Multi-line read-only text with scrolling. An optional `filetype`
     /// hint enables syntax highlighting (e.g. `"json"`). Painted through
@@ -388,6 +402,23 @@ pub struct ViewTableColumn {
     /// leaves the column proportional.
     #[serde(default)]
     pub min_width: Option<f32>,
+    /// Horizontal text alignment, translated to `quadraui::ColumnAlign` by
+    /// `crate::render::plugin_view_body`. This module stays free of
+    /// quadraui types (see [`ViewTreeNode::resolve`]), so the enum lives
+    /// here rather than re-exporting quadraui's.
+    #[serde(default)]
+    pub align: TableColumnAlign,
+}
+
+/// Horizontal text alignment for a [`ViewTableColumn`]. Mirrors
+/// `quadraui::ColumnAlign` without depending on quadraui from this module.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableColumnAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
 }
 
 /// One row in a [`ViewBody::Table`].
@@ -801,6 +832,16 @@ pub enum ViewEventKind {
     LegendClicked {
         series_idx: usize,
     },
+    /// A `Table` view declaring `multi_select: true` changed its
+    /// multi-selection set (click with Shift/Ctrl/Cmd, or plain click
+    /// resetting it to one row). `indices` are row indices into the
+    /// declared `rows` list (stable across header-sort reorders), sorted
+    /// ascending and deduplicated. Fires alongside — never instead of —
+    /// [`Self::ItemSelected`], which keeps reporting the single-row cursor
+    /// regardless of `multi_select`.
+    SelectionChanged {
+        indices: Vec<usize>,
+    },
 }
 
 impl ViewEventKind {
@@ -828,6 +869,7 @@ impl ViewEventKind {
             ViewEventKind::HeaderClicked { .. } => "HeaderClicked",
             ViewEventKind::DataPointClicked { .. } => "DataPointClicked",
             ViewEventKind::LegendClicked { .. } => "LegendClicked",
+            ViewEventKind::SelectionChanged { .. } => "SelectionChanged",
         }
     }
 }
@@ -1403,18 +1445,22 @@ mod tests {
                     editable: true,
                     width: None,
                     min_width: None,
+                    align: TableColumnAlign::Left,
                 },
                 ViewTableColumn {
                     title: "Value".into(),
                     editable: true,
                     width: Some(12.0),
                     min_width: None,
+                    align: TableColumnAlign::Right,
                 },
             ],
             rows: vec![ViewTableRow {
                 id: "row-1".into(),
                 cells: vec!["Content-Type".into(), "application/json".into()],
             }],
+            multi_select: true,
+            footer: Some(vec!["Total".into(), "1 row".into()]),
         };
         let json = serde_json::to_string(&body).unwrap();
         let back: ViewBody = serde_json::from_str(&json).unwrap();

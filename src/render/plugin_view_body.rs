@@ -610,6 +610,18 @@ fn plugin_table_column_width(column: &ViewTableColumn) -> quadraui::ColumnWidth 
     }
 }
 
+/// Checkbox glyph prefixed onto column 0's cell text for a `multi_select:
+/// true` table — the same convention `plan::plan_to_checklist_text` uses,
+/// chosen because `quadraui::DataTable` has no native multi-row highlight to
+/// key a "selected" decoration off of.
+fn multi_select_prefix(declared_idx: usize, multi_selected: &[usize]) -> &'static str {
+    if multi_selected.contains(&declared_idx) {
+        "\u{2611} " // ☑
+    } else {
+        "\u{2610} " // ☐
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plugin_view_to_table(
     view: &str,
@@ -622,15 +634,22 @@ fn plugin_view_to_table(
     column_overrides: &[Option<f32>],
     sort: Option<(usize, quadraui::SortDirection)>,
     row_order: &[usize],
+    multi_select: bool,
+    multi_selected: &[usize],
+    footer: Option<&[String]>,
 ) -> quadraui::DataTable {
     use crate::core::plugin_ui::namespaced_widget_id;
-    use quadraui::{Column, DataRow, DataTable, Decoration, StyledText, WidgetId};
+    use quadraui::{Column, ColumnAlign, DataRow, DataTable, Decoration, StyledText, WidgetId};
     let q_columns: Vec<Column> = columns
         .iter()
         .map(|c| Column {
             title: c.title.clone(),
             width: plugin_table_column_width(c),
-            align: quadraui::ColumnAlign::Left,
+            align: match c.align {
+                crate::core::plugin_ui::TableColumnAlign::Left => ColumnAlign::Left,
+                crate::core::plugin_ui::TableColumnAlign::Center => ColumnAlign::Center,
+                crate::core::plugin_ui::TableColumnAlign::Right => ColumnAlign::Right,
+            },
         })
         .collect();
     // Painted in display order; `row_idx` stays the *declared* index, so a
@@ -649,16 +668,30 @@ fn plugin_view_to_table(
                     // uncommitted buffer instead of the plugin's declared
                     // value — same "live overrides declared" rule
                     // `plugin_view_to_form`'s `Text` arm uses.
-                    match cell_edit.filter(|e| e.field_id == table_cell_field_id(row_idx, col_idx))
+                    let text = match cell_edit
+                        .filter(|e| e.field_id == table_cell_field_id(row_idx, col_idx))
                     {
-                        Some(e) => StyledText::plain(&e.value),
-                        None => StyledText::plain(cell),
+                        Some(e) => e.value.clone(),
+                        None => cell.clone(),
+                    };
+                    if multi_select && col_idx == 0 {
+                        StyledText::plain(format!(
+                            "{}{}",
+                            multi_select_prefix(row_idx, multi_selected),
+                            text
+                        ))
+                    } else {
+                        StyledText::plain(text)
                     }
                 })
                 .collect(),
             decoration: Decoration::default(),
         })
         .collect();
+    let q_footer = footer.map(|cells| DataRow {
+        cells: cells.iter().map(|c| StyledText::plain(c.clone())).collect(),
+        decoration: Decoration::default(),
+    });
     DataTable {
         // See `plugin_view_to_list`'s matching comment —
         // rebuilt fresh every paint, so it's namespaced like every other
@@ -674,7 +707,7 @@ fn plugin_view_to_table(
         min_total_width: None,
         h_scroll: 0.0,
         column_overrides: column_overrides.to_vec(),
-        footer: None,
+        footer: q_footer,
     }
 }
 
@@ -689,7 +722,13 @@ pub(crate) fn paint_plugin_view_table(
     rect: quadraui::Rect,
     backend: &mut dyn quadraui::Backend,
 ) -> bool {
-    let Some(ViewBody::Table { columns, rows }) = plugin_view_body(engine, name) else {
+    let Some(ViewBody::Table {
+        columns,
+        rows,
+        multi_select,
+        footer,
+    }) = plugin_view_body(engine, name)
+    else {
         return false;
     };
     let selected = engine.plugin_view_selected(host);
@@ -701,6 +740,11 @@ pub(crate) fn paint_plugin_view_table(
     let column_overrides = active_table_col_overrides(engine, name, columns.len());
     let sort = active_table_sort(engine, name, columns.len());
     let row_order = plugin_view_table_row_order(rows, sort);
+    let empty: Vec<usize> = Vec::new();
+    let multi_selected = engine
+        .plugin_view_table_multi_selected
+        .get(name)
+        .unwrap_or(&empty);
     let table = plugin_view_to_table(
         name,
         columns,
@@ -712,6 +756,9 @@ pub(crate) fn paint_plugin_view_table(
         column_overrides,
         sort,
         &row_order,
+        *multi_select,
+        multi_selected,
+        footer.as_deref(),
     );
     let layout = backend.draw_data_table(rect, &table, None);
     let cache = match host {
@@ -733,6 +780,7 @@ pub(crate) fn route_plugin_view_table_click(
     host: PluginViewHost,
     pos: quadraui::Point,
     is_double_click: bool,
+    modifiers: quadraui::Modifiers,
 ) -> bool {
     use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
     let cache = match host {
@@ -741,9 +789,16 @@ pub(crate) fn route_plugin_view_table_click(
         // Table-kind Dock support isn't implemented.
         PluginViewHost::Dock => return false,
     };
-    let Some(ViewBody::Table { columns, rows }) = plugin_view_body(engine, name) else {
+    let Some(ViewBody::Table {
+        columns,
+        rows,
+        multi_select,
+        ..
+    }) = plugin_view_body(engine, name)
+    else {
         return false;
     };
+    let multi_select = *multi_select;
     let total_rows = rows.len();
     let scroll_offset = engine.plugin_view_scroll_top(host);
     // `DataTableHit` (the pinned quadraui rev's hit-test
@@ -861,6 +916,36 @@ pub(crate) fn route_plugin_view_table_click(
     // The selection is a display position; the plugin indexes its own rows by
     // the order it declared them in, so that is what the event carries.
     let declared_idx = row_order.get(idx).copied().unwrap_or(idx);
+    // Additive to (never a replacement for) the single-row cursor updated
+    // just above: a `multi_select: true` table also tracks a selection set
+    // keyed off click modifiers, dispatched as its own `SelectionChanged`
+    // event alongside — not instead of — `ItemSelected` below.
+    if multi_select {
+        let gesture = quadraui::SelectionGesture::from_modifiers(modifiers);
+        let anchor = *engine
+            .plugin_view_table_selection_anchor
+            .get(name)
+            .unwrap_or(&declared_idx);
+        let current = engine
+            .plugin_view_table_multi_selected
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        let next = quadraui::apply_selection_gesture(&current, anchor, declared_idx, gesture);
+        if !matches!(gesture, quadraui::SelectionGesture::Range) {
+            engine
+                .plugin_view_table_selection_anchor
+                .insert(name.to_string(), declared_idx);
+        }
+        engine
+            .plugin_view_table_multi_selected
+            .insert(name.to_string(), next.clone());
+        engine.dispatch_plugin_view_event(PluginViewEvent {
+            view: name.to_string(),
+            widget_id: String::new(),
+            kind: ViewEventKind::SelectionChanged { indices: next },
+        });
+    }
     engine.dispatch_plugin_view_event(PluginViewEvent {
         view: name.to_string(),
         widget_id: String::new(),
@@ -984,7 +1069,7 @@ pub(crate) fn handle_plugin_view_table_key(
 ) -> bool {
     use crate::core::plugin_ui::{PluginViewEvent, PluginViewTextEditState, ViewEventKind};
 
-    let Some(ViewBody::Table { columns, rows }) = plugin_view_body(engine, name) else {
+    let Some(ViewBody::Table { columns, rows, .. }) = plugin_view_body(engine, name) else {
         return false;
     };
     // Snapshot everything the non-editing branches need as owned values so
