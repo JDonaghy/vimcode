@@ -537,6 +537,16 @@ vimcode.command("Zq146OpenTab", function()
   vimcode.ui.open_view("{VIEW}", {{ location = "tab" }})
 end)
 
+-- A real `:Command` around `vimcode.ui.open_view` with `location = "dock"`
+-- for {VIEW} — the `Form`-kind (default `body`) view, mirroring
+-- `Zq2059TextOpenDock` above but exercising the dock's click-routing path
+-- (`render::handle_plugin_view_dock_ui_event`) rather than its scroll-only
+-- path, since a `Form` body accepts button/toggle/text clicks a `TextView`
+-- body does not.
+vimcode.command("Zq2060FormOpenDock", function()
+  vimcode.ui.open_view("{VIEW}", {{ location = "dock" }})
+end)
+
 -- `sidebar = false`: registered as a view, routable through `open_view`, but
 -- never harvested into `ext_panels` — no activity-bar icon.
 vimcode.ui.register_view("{VIEW_NO_SIDEBAR}", {{
@@ -815,6 +825,38 @@ pub fn engine_with_plugin_view_dock() -> (Engine, PathBuf) {
     assert_eq!(
         engine.bottom_panel_kind,
         crate::core::engine::BottomPanelKind::Plugin(TEXT_VIEW.to_string()),
+        "vimcode.ui.open_view(..., {{location = \"dock\"}}) must point the bottom \
+         panel at the docked view"
+    );
+    (engine, dir)
+}
+
+/// `Form`-kind twin of [`engine_with_plugin_view_dock`] — opens [`VIEW`] (the
+/// default-body, field-stack fixture, not [`TEXT_VIEW`]) into the
+/// bottom-panel dock via the fixture's real `Zq2060FormOpenDock` `:Command`.
+/// Exercises the dock's click-routing path
+/// (`render::handle_plugin_view_dock_ui_event`) rather than the scroll-only
+/// path [`engine_with_plugin_view_dock`]'s `TEXT_VIEW` exercises.
+pub fn engine_with_plugin_view_form_dock() -> (Engine, PathBuf) {
+    let dir = plugin_dir();
+    let mut engine = Engine::new_for_test();
+    load_fixture_plugin(&mut engine, &dir);
+
+    engine.app_shell.show_panel(&quadraui::WidgetId::new(
+        crate::core::engine::sidebar::PANEL_SETTINGS,
+    ));
+
+    assert!(
+        engine.plugin_run_command("Zq2060FormOpenDock", ""),
+        "fixture plugin must register the Zq2060FormOpenDock command"
+    );
+    assert!(
+        engine.bottom_panel_open,
+        "vimcode.ui.open_view(..., {{location = \"dock\"}}) must open the bottom panel"
+    );
+    assert_eq!(
+        engine.bottom_panel_kind,
+        crate::core::engine::BottomPanelKind::Plugin(VIEW.to_string()),
         "vimcode.ui.open_view(..., {{location = \"dock\"}}) must point the bottom \
          panel at the docked view"
     );
@@ -2293,6 +2335,25 @@ mod tests {
         dock_scrolls_on_mouse_wheel(&mut h.driver);
     }
 
+    /// Bottom-panel dock fixture for [`VIEW`] (`Form`-kind body, TUI arm).
+    fn tui_form_dock() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_form_dock();
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[test]
+    fn plugin_view_form_dock_button_click_reaches_the_plugin_handler_on_tui() {
+        let (mut h, _dir) = tui_form_dock();
+        clicking_a_button_reaches_the_plugin_handler(&mut h.driver);
+    }
+
     #[test]
     fn plugin_view_list_paints_and_click_selects_the_right_index_on_tui() {
         let (mut h, _dir) = tui_named(LIST_VIEW);
@@ -2614,6 +2675,27 @@ mod tests {
     fn plugin_view_dock_scrolls_on_mouse_wheel_on_gtk() {
         let (mut h, _dir) = gtk_dock();
         dock_scrolls_on_mouse_wheel(&mut h.driver);
+    }
+
+    /// Bottom-panel dock fixture for [`VIEW`] (`Form`-kind body, GTK arm).
+    #[cfg(feature = "gui")]
+    fn gtk_form_dock() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_form_dock();
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_form_dock_button_click_reaches_the_plugin_handler_on_gtk() {
+        let (mut h, _dir) = gtk_form_dock();
+        clicking_a_button_reaches_the_plugin_handler(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]

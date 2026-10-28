@@ -532,6 +532,86 @@ pub fn handle_plugin_view_tab_ui_event(
     true
 }
 
+/// Route a pointer event over a bottom-panel-docked plugin view — the dock
+/// twin of [`handle_plugin_view_tab_ui_event`]. `name` is the view name
+/// (`BottomPanelKind::Plugin`'s payload); `rect` must be the same rect
+/// `paint_bottom_panel_rung`'s `Plugin` arm last painted this view's `Form`
+/// into (cached in `Engine::plugin_view_dock_form_rect`).
+///
+/// Only called for `Form`-bodied views — `route_bottom_panel_click` routes a
+/// click here only once it has confirmed `name`'s body is the field-stack
+/// default, since `List`/`Tree`/`Table` have no dock-hosted layout cache and
+/// `TextView`'s only interaction is the mouse-wheel scroll already wired via
+/// `Engine::handle_plugin_view_dock_scroll`.
+///
+/// Returns `true` when the event was consumed.
+pub fn handle_plugin_view_dock_ui_event(
+    engine: &mut Engine,
+    name: &str,
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+
+    if !populate_plugin_view_dock_form_controller(engine, name, true) {
+        return false;
+    }
+    let probe = match event {
+        quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::MouseDown {
+            widget: *widget,
+            button: quadraui::MouseButton::Left,
+            position: *position,
+            modifiers: quadraui::Modifiers::default(),
+        },
+        other => other.clone(),
+    };
+    let result = engine
+        .plugin_view_dock_form_controller
+        .borrow_mut()
+        .handle_cached(&probe, rect);
+
+    let sync_scroll = |engine: &mut Engine| {
+        let offset = engine
+            .plugin_view_dock_form_controller
+            .borrow()
+            .scroll_offset();
+        engine.plugin_view_dock_scroll_top = offset;
+    };
+
+    let action = match result {
+        quadraui::FormControllerEvent::Ignored => return false,
+        quadraui::FormControllerEvent::ScrollChanged | quadraui::FormControllerEvent::Consumed => {
+            sync_scroll(engine);
+            return true;
+        }
+        quadraui::FormControllerEvent::FormAction(action) => action,
+    };
+    sync_scroll(engine);
+
+    let Some((view_name, field_id, mut kind)) = plugin_view_event_from_form_event(&action) else {
+        return true;
+    };
+    kind = remap_section_toggle(engine, &view_name, &field_id, kind);
+    if let Some(view) = engine.plugin_views.get(&view_name) {
+        if let Some(idx) = view.field_index(&field_id) {
+            engine.plugin_view_focus_field(
+                &view_name,
+                crate::core::engine::PluginViewHost::Dock,
+                idx,
+            );
+        }
+    }
+    if matches!(kind, ViewEventKind::FocusChanged) {
+        return true;
+    }
+    engine.dispatch_plugin_view_event(PluginViewEvent {
+        view: view_name,
+        widget_id: field_id,
+        kind,
+    });
+    true
+}
+
 /// Route a `UiEvent` over a body-kind (`List`/`Tree`/`Table`/`TextView`/
 /// `Chart`) plugin view at `host`, through the matching primitive's
 /// click/scroll resolution instead of `FormController`. `rect` is the rect
