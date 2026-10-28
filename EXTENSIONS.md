@@ -452,6 +452,28 @@ vimcode.window.get_buf(win)           -- Buffer shown in this window
 vimcode.window.set_buf(win, buf)      -- Show `buf` in `win` (fires `BufLeave`, `BufEnter`)
 vimcode.window.get_cursor(win)        -- {line=N, col=M} (also [1]=N, [2]=M), 1-indexed
 vimcode.window.set_cursor(win, pos)   -- pos: {line=N, col=M} or {N, M}, 1-indexed
+
+vimcode.window.focus(win)             -- Focus `win`, switching tabs/groups as needed -> bool
+vimcode.window.split(win, opts)       -- Split `win` -> handle of the new window (0 on failure)
+  -- opts (optional table): direction="split"|"vsplit" (default "split"),
+  --   side="above"/"below" (for "split") or "left"/"right" (for "vsplit");
+  --   omitting side falls back to the splitbelow/splitright settings
+vimcode.window.close(win)             -- Close `win` -> bool; false if it's the last window
+vimcode.window.move_to_group(win, direction) -- Move `win` into a new editor group at
+  -- direction's edge ("left"/"down"/"up"/"right") -> bool
+```
+
+`focus`/`split`/`close`/`move_to_group` are the plugin-facing twins of the
+`<C-w>` family: `split`/`vsplit` mirror `<C-w>s`/`<C-w>v`, and
+`move_to_group` mirrors `<C-w>H`/`<C-w>J`/`<C-w>K`/`<C-w>L`. A plugin that
+wants to lay out its own panes — a file tree in a left group, a log
+viewer below — drives the same window/group machinery these keys do:
+
+```lua
+local tree_win = vimcode.window.current()
+local log_win = vimcode.window.split(tree_win, { direction = "split", side = "below" })
+vimcode.window.move_to_group(tree_win, "left")
+vimcode.window.focus(log_win)
 ```
 
 Conventions, and how they differ from `vimcode.buf.*`:

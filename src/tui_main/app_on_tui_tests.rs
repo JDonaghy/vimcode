@@ -18011,6 +18011,179 @@ mod tests {
                  narrowest toast width; bar_row:\n{bar_row}\nscreen:\n{screen}"
             );
         }
+
+        /// `vimcode.window.split(0, { direction = "vsplit" })` must paint
+        /// the new window as a genuine side-by-side sibling of the original
+        /// one, each showing its own buffer, with exactly one divider
+        /// column between them — the plugin-facing twin of `<C-w>v`.
+        #[test]
+        fn window_split_paints_both_panes_side_by_side_via_shell_app() {
+            let engine = engine_with_plugin(
+                "win_split_2061",
+                r#"
+                vimcode.command("ZqSplitTwo", function(_)
+                    local b1 = vimcode.buffer.create({ scratch = true, name = "ZQSPLIT1" })
+                    vimcode.buffer.set_lines(b1, 0, -1, { "ZQ_PANE_ONE" })
+                    vimcode.window.set_buf(0, b1)
+                    local new_win = vimcode.window.split(0, { direction = "vsplit" })
+                    local b2 = vimcode.buffer.create({ scratch = true, name = "ZQSPLIT2" })
+                    vimcode.buffer.set_lines(b2, 0, -1, { "ZQ_PANE_TWO" })
+                    vimcode.window.set_buf(new_win, b2)
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqSplitTwo".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            driver.mouse_up(1.0, 1.0); // settle the layout, as the ctrl-w v tests do
+
+            let screen = driver.screen();
+            let content_row = screen
+                .lines()
+                .find(|line| line.contains("ZQ_PANE_ONE") && line.contains("ZQ_PANE_TWO"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected a row with both split panes' own buffer \
+                         text painted at once; screen:\n{screen}"
+                    )
+                });
+            let one_at = content_row.find("ZQ_PANE_ONE").unwrap();
+            let two_at = content_row.find("ZQ_PANE_TWO").unwrap();
+            let (first_end, second_start) = if one_at < two_at {
+                (one_at + "ZQ_PANE_ONE".len(), two_at)
+            } else {
+                (two_at + "ZQ_PANE_TWO".len(), one_at)
+            };
+            let between = &content_row[first_end..second_start];
+            assert_eq!(
+                between.matches('\u{2502}').count(),
+                1,
+                "vimcode.window.split with direction = \"vsplit\" must \
+                 reserve exactly one divider column between the two panes; \
+                 between-text: {between:?}; row:\n{content_row}"
+            );
+        }
+
+        /// `vimcode.window.close(win)` must actually remove the painted
+        /// pane: after a vsplit the second pane's buffer disappears from
+        /// the screen entirely, and the divider column goes with it.
+        #[test]
+        fn window_close_removes_the_split_pane_via_shell_app() {
+            let engine = engine_with_plugin(
+                "win_close_2061",
+                r#"
+                vimcode.command("ZqSplitThenClose", function(_)
+                    local b1 = vimcode.buffer.create({ scratch = true, name = "ZQCLOSE1" })
+                    vimcode.buffer.set_lines(b1, 0, -1, { "ZQ_KEEP_PANE" })
+                    vimcode.window.set_buf(0, b1)
+                    local new_win = vimcode.window.split(0, { direction = "vsplit" })
+                    local b2 = vimcode.buffer.create({ scratch = true, name = "ZQCLOSE2" })
+                    vimcode.buffer.set_lines(b2, 0, -1, { "ZQ_DOOMED_PANE" })
+                    vimcode.window.set_buf(new_win, b2)
+                    local ok = vimcode.window.close(new_win)
+                    vimcode.message("closed:" .. tostring(ok))
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqSplitThenClose".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            driver.mouse_up(1.0, 1.0);
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQ_KEEP_PANE"),
+                "the surviving pane's buffer must still be painted; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("ZQ_DOOMED_PANE"),
+                "vimcode.window.close must remove the closed pane's own \
+                 painted buffer text; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains('\u{2502}')
+                    || !screen
+                        .lines()
+                        .any(|l| l.contains("ZQ_KEEP_PANE") && l.matches('\u{2502}').count() >= 2),
+                "closing back down to one window must drop the vsplit \
+                 divider around the remaining pane; screen:\n{screen}"
+            );
+        }
+
+        /// `vimcode.window.focus(win)` must actually move keyboard focus,
+        /// not just flip an engine field nothing else reads: after
+        /// splitting and explicitly re-focusing the original window,
+        /// typed keystrokes must land in that window's own buffer, not the
+        /// newer split's.
+        #[test]
+        fn window_focus_routes_keystrokes_to_the_focused_pane_via_shell_app() {
+            let engine = engine_with_plugin(
+                "win_focus_2061",
+                r#"
+                vimcode.command("ZqSplitThenFocusBack", function(_)
+                    local b1 = vimcode.buffer.create({ scratch = true, name = "ZQFOCUS1" })
+                    vimcode.buffer.set_lines(b1, 0, -1, { "ZQ_ORIGINAL_PANE" })
+                    vimcode.window.set_buf(0, b1)
+                    local new_win = vimcode.window.split(0, { direction = "vsplit" })
+                    local b2 = vimcode.buffer.create({ scratch = true, name = "ZQFOCUS2" })
+                    vimcode.buffer.set_lines(b2, 0, -1, { "ZQ_NEW_PANE" })
+                    vimcode.window.set_buf(new_win, b2)
+                    -- The split left `new_win` focused; explicitly move
+                    -- focus back to the original window (handle 1).
+                    vimcode.window.focus(1)
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqSplitThenFocusBack".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            driver.mouse_up(1.0, 1.0);
+
+            driver.type_char('i'); // Normal -> Insert, in whichever window is now focused
+            for c in "ZQTYPED2061".chars() {
+                driver.type_char(c);
+            }
+            driver.render();
+
+            let screen = driver.screen();
+            // The two panes sit side by side on the same screen *row*, so
+            // checking "does some row contain both markers" can't tell
+            // which pane the typed text actually landed in — only the
+            // exact adjacency (typed text immediately prefixing a pane's
+            // own marker, since the cursor started at column 1) does.
+            assert!(
+                screen.contains("ZQTYPED2061ZQ_ORIGINAL_PANE"),
+                "vimcode.window.focus(1) must route the following \
+                 keystrokes into the original window's own buffer, \
+                 prefixing its text (the one painting ZQ_ORIGINAL_PANE); \
+                 screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("ZQTYPED2061ZQ_NEW_PANE") && screen.contains("ZQ_NEW_PANE"),
+                "vimcode.window.focus(1) must have moved focus away from \
+                 the newer split window, so the typed text must not \
+                 prefix its own unmodified buffer text; screen:\n{screen}"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

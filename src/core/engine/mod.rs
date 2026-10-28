@@ -6424,7 +6424,13 @@ impl Engine {
     /// leading with the percentage means the first body line always
     /// differs between fractions even if a future change widens the bar
     /// again and reintroduces truncation.
+    ///
+    /// A NaN `fraction` (not reachable from Lua's `number` validation, but
+    /// cheap to guard here too) falls back to the indeterminate spinner
+    /// rather than propagating through `f32::clamp`, which would otherwise
+    /// render a bogus "0%" bar.
     fn format_progress_body(fraction: Option<f32>, label: &str) -> String {
+        let fraction = fraction.filter(|f| !f.is_nan());
         match fraction {
             Some(f) => {
                 let f = f.clamp(0.0, 1.0);
