@@ -5523,6 +5523,9 @@ impl PluginManager {
         // ── vimcode.platform (quadraui PlatformServices exposure) ─────────
         Self::setup_platform_api(lua, vimcode)?;
 
+        // ── vimcode.backend (quadraui BackendCaps exposure) ────────────────
+        Self::setup_backend_api(lua, vimcode)?;
+
         Ok(())
     }
 
@@ -5998,6 +6001,43 @@ impl PluginManager {
         }
 
         vimcode.set("platform", platform)?;
+        Ok(())
+    }
+
+    /// Install `vimcode.backend.caps()`: the live `quadraui::BackendCaps`
+    /// table as a whole, one entry per `BackendCaps::vocabulary()` name
+    /// (`"mouse"`, `"native_menu"`, `"file_dialogs"`, `"folder_dialogs"`,
+    /// `"notifications"`, `"window_chrome"`, `"drag"`, `"text_selection"`,
+    /// ...) mapped to its bool. An extension that needs to degrade several
+    /// features at once (e.g. hide a drag-to-reorder affordance *and* a
+    /// context-menu hint) reads the whole table in one call instead of one
+    /// `vimcode.platform.has(name)` round trip per flag; both read the same
+    /// `Engine::backend_caps` cached at startup (`app/shell.rs`), so they
+    /// can never disagree. Excludes `color_depth`/`kitty_keyboard`/
+    /// `sgr_pixel_mouse` — runtime-detected terminal properties, not "does
+    /// this backend implement surface X" facts — the same exclusion
+    /// `vimcode.platform.has` makes.
+    fn setup_backend_api(lua: &Lua, vimcode: &LuaTable) -> LuaResult<()> {
+        let backend = lua.create_table()?;
+
+        backend.set(
+            "caps",
+            lua.create_function(|lua, ()| {
+                let flags = live_engine("vimcode.backend.caps", |e| {
+                    quadraui::BackendCaps::vocabulary()
+                        .into_iter()
+                        .map(|name| (name, e.backend_caps.has(name)))
+                        .collect::<Vec<_>>()
+                })?;
+                let out = lua.create_table()?;
+                for (name, has) in flags {
+                    out.set(name, has)?;
+                }
+                Ok(out)
+            })?,
+        )?;
+
+        vimcode.set("backend", backend)?;
         Ok(())
     }
 }

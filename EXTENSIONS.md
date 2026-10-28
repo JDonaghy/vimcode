@@ -1137,6 +1137,17 @@ the focused field, and `g`/`G` jump to the first/last field. In the sidebar,
 current version (1). A view declaring a version newer than the running vimcode
 understands is refused with a status-line error instead of being half-rendered.
 
+**Adding a field type, body `kind`, or event kind is additive and never bumps
+`schema_version`.** `"date"`, `"slider"`, `"section"`, `"color"` and `"toolbar"`
+all landed this way: every pre-existing tag and field keeps its old wire shape, so
+a `schema_version = 1` tree written before the new kind existed still parses
+byte-for-byte the same, and the new kind only appears in a tree that opts in by
+using it. A version bump is reserved for a change that would make an *existing*
+`type`/`kind` tag mean something different, or make a currently-optional field on
+an existing kind required — never for a new kind added alongside the old ones.
+This means a plugin targeting `schema_version = 1` keeps working unmodified as
+new field/body/event kinds are added; it just doesn't see them until it opts in.
+
 ### Toasts (`vimcode.ui.toast`)
 
 A transient popup in the bottom-right corner — the surface for
@@ -1323,6 +1334,33 @@ vimcode.platform.show_folder_dialog(nil, function(path) ... end)
   picker for the plugin API yet). All three also resolve to `nil` if the user
   cancels.
 - `clipboard_read`/`clipboard_write` are synchronous and return immediately.
+
+### Backend Capabilities (`vimcode.backend.caps()`)
+
+Read the whole `quadraui::BackendCaps` table at once, so an extension can degrade
+several features together instead of making one `vimcode.platform.has(name)` round
+trip per flag:
+
+```lua
+local caps = vimcode.backend.caps()
+
+if not caps.drag then
+    -- hide a drag-to-reorder affordance; offer up/down buttons instead
+end
+if not caps.native_menu then
+    -- skip a native-context-menu hint in a tooltip
+end
+```
+
+`caps` has one boolean entry per `quadraui::BackendCaps::vocabulary()` name —
+`mouse`, `scroll`, `drag`, `text_selection`, `native_menu`, `window_chrome`,
+`pointer_cursor`, `ime`, `file_dialogs`, `folder_dialogs`, `native_dialogs`,
+`notifications`, `app_font_registration`, `window_control`, `tray`,
+`generic_font_families` — the same vocabulary `vimcode.platform.has(capability)`
+checks one name at a time, and both read the same live capability table, so they
+can never disagree. `color_depth`/`kitty_keyboard`/`sgr_pixel_mouse` are left out:
+they are runtime-detected terminal properties, not "does this backend implement
+surface X" facts, and `vimcode.platform.has` excludes them for the same reason.
 
 ### Comment Style Override
 

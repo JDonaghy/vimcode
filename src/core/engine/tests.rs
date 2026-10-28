@@ -28236,7 +28236,8 @@ fn test_lua_set_lines_insert_at_beginning() {
 }
 
 // =========================================================================
-// Lua API: vimcode.platform (PlatformServices exposure)
+// Lua API: vimcode.platform (PlatformServices exposure), vimcode.backend
+// (quadraui BackendCaps exposure)
 // =========================================================================
 
 #[test]
@@ -28466,6 +28467,58 @@ fn test_run_pending_plugin_dialog_falls_back_to_nil_without_capability() {
         backend.calls
     );
     assert_eq!(engine.message, "picked:nil");
+}
+
+#[test]
+fn test_lua_backend_caps_reflects_live_backend_caps() {
+    let dir = write_plugin_lua(
+        "test_backend_caps",
+        r#"vimcode.command("CheckCaps", function()
+            local caps = vimcode.backend.caps()
+            vimcode.message("drag:" .. tostring(caps.drag) .. " native_menu:" .. tostring(caps.native_menu))
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    // Default caps are `BackendCaps::empty()`.
+    engine.execute_command("CheckCaps");
+    assert_eq!(engine.message, "drag:false native_menu:false");
+
+    engine.backend_caps.drag = true;
+    engine.execute_command("CheckCaps");
+    assert_eq!(engine.message, "drag:true native_menu:false");
+}
+
+#[test]
+fn test_lua_backend_caps_agrees_with_platform_has() {
+    // `vimcode.backend.caps()` and `vimcode.platform.has(name)` both read the
+    // same `Engine::backend_caps`, so a flag flipped on one is visible to the
+    // other — they can never disagree.
+    let dir = write_plugin_lua(
+        "test_backend_caps_agree",
+        r#"vimcode.command("CheckAgree", function()
+            local caps = vimcode.backend.caps()
+            local via_has = vimcode.platform.has("notifications")
+            vimcode.message("caps:" .. tostring(caps.notifications) .. " has:" .. tostring(via_has))
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.backend_caps.notifications = true;
+    engine.execute_command("CheckAgree");
+    assert_eq!(engine.message, "caps:true has:true");
 }
 
 // ── Phase 4: Neovim test suite mining ────────────────────────────────────
