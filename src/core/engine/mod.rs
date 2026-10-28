@@ -4962,12 +4962,15 @@ pub struct Engine {
     /// multi-selection is a property of the table the plugin declared, shared
     /// by whichever host displays it.
     pub plugin_view_table_multi_selected: HashMap<String, Vec<usize>>,
-    /// The anchor row (declared index) a `Shift`-extended range selection is
-    /// measured from, keyed by view name alongside
-    /// `plugin_view_table_multi_selected`. Set to the clicked row on every
-    /// non-range gesture (`Replace`/`Toggle`) so the next `Shift`-click
-    /// always ranges from the most recent plain/ctrl click, matching the
-    /// anchor semantics `quadraui::SelectionGesture::Range` assumes.
+    /// The anchor row a `Shift`-extended range selection is measured from,
+    /// keyed by view name alongside `plugin_view_table_multi_selected`. Set
+    /// to the clicked row's *display* position (not its declared index) on
+    /// every non-range gesture (`Replace`/`Toggle`) so the next
+    /// `Shift`-click always ranges contiguously over the rows the user can
+    /// see on screen — the only space `quadraui::SelectionGesture::Range`'s
+    /// `lo..=hi` can safely span once a header sort has reordered the rows.
+    /// The resulting display-position range is mapped through the active
+    /// row order back to declared indices before it's stored or dispatched.
     pub plugin_view_table_selection_anchor: HashMap<String, usize>,
     /// The in-progress header-divider drag on a `ViewBody::Table`-kind view,
     /// if any — see `PluginTableColumnDrag`'s doc for its fields' meaning.

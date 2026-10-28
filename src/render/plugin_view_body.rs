@@ -611,9 +611,10 @@ fn plugin_table_column_width(column: &ViewTableColumn) -> quadraui::ColumnWidth 
 }
 
 /// Checkbox glyph prefixed onto column 0's cell text for a `multi_select:
-/// true` table — the same convention `plan::plan_to_checklist_text` uses,
-/// chosen because `quadraui::DataTable` has no native multi-row highlight to
-/// key a "selected" decoration off of.
+/// true` table — the same `\u{2610}`/`\u{2611}` convention
+/// `ai_chat_and_misc_builders`'s plan-entry glyph uses, chosen because
+/// `quadraui::DataTable` has no native multi-row highlight to key a
+/// "selected" decoration off of.
 fn multi_select_prefix(declared_idx: usize, multi_selected: &[usize]) -> &'static str {
     if multi_selected.contains(&declared_idx) {
         "\u{2611} " // ☑
@@ -740,11 +741,14 @@ pub(crate) fn paint_plugin_view_table(
     let column_overrides = active_table_col_overrides(engine, name, columns.len());
     let sort = active_table_sort(engine, name, columns.len());
     let row_order = plugin_view_table_row_order(rows, sort);
-    let empty: Vec<usize> = Vec::new();
-    let multi_selected = engine
+    // Filtered to the current `rows.len()` so a selection made before a
+    // `ui.refresh` shrank the row count can't paint a `☑` on a declared
+    // index outside the current row count.
+    let multi_selected: Vec<usize> = engine
         .plugin_view_table_multi_selected
         .get(name)
-        .unwrap_or(&empty);
+        .map(|v| v.iter().copied().filter(|&i| i < rows.len()).collect())
+        .unwrap_or_default();
     let table = plugin_view_to_table(
         name,
         columns,
@@ -757,7 +761,7 @@ pub(crate) fn paint_plugin_view_table(
         sort,
         &row_order,
         *multi_select,
-        multi_selected,
+        &multi_selected,
         footer.as_deref(),
     );
     let layout = backend.draw_data_table(rect, &table, None);
@@ -919,23 +923,60 @@ pub(crate) fn route_plugin_view_table_click(
     // Additive to (never a replacement for) the single-row cursor updated
     // just above: a `multi_select: true` table also tracks a selection set
     // keyed off click modifiers, dispatched as its own `SelectionChanged`
-    // event alongside — not instead of — `ItemSelected` below.
-    if multi_select {
+    // event alongside — not instead of — `ItemSelected` below. A double
+    // click only ever activates a row; folding it through `Replace` here
+    // would collapse a deliberately built multi-row selection the instant
+    // before `ItemActivated` fires for it below.
+    if multi_select && !is_double_click {
         let gesture = quadraui::SelectionGesture::from_modifiers(modifiers);
+        // `anchor` is a *display* position (like `idx`, not `declared_idx`):
+        // `Range` below has to measure contiguous rows the way the user sees
+        // them on screen, which only matches declared order when no sort is
+        // active.
         let anchor = *engine
             .plugin_view_table_selection_anchor
             .get(name)
-            .unwrap_or(&declared_idx);
-        let current = engine
-            .plugin_view_table_multi_selected
-            .get(name)
-            .cloned()
-            .unwrap_or_default();
-        let next = quadraui::apply_selection_gesture(&current, anchor, declared_idx, gesture);
+            .unwrap_or(&idx);
+        let next = match gesture {
+            quadraui::SelectionGesture::Range => {
+                // Range math runs entirely in display space (`anchor..=idx`,
+                // or `idx..=anchor`), then each display position is mapped
+                // through `row_order` back to the declared index the plugin
+                // sees — the same display->declared conversion `declared_idx`
+                // above uses for the single-row cursor. `current` plays no
+                // part in `Range`'s own result (quadraui replaces the set
+                // with the contiguous span), so it's never built in display
+                // space.
+                let display_range = quadraui::apply_selection_gesture(&[], anchor, idx, gesture);
+                let mut declared: Vec<usize> = display_range
+                    .iter()
+                    .map(|&d| row_order.get(d).copied().unwrap_or(d))
+                    .collect();
+                declared.sort_unstable();
+                declared.dedup();
+                declared
+            }
+            _ => {
+                // Filtered to `total_rows` for the same reason the paint
+                // path filters it: a stale entry from before a row-count
+                // shrink can't be toggled off onto a row index outside the
+                // current row count.
+                let current: Vec<usize> = engine
+                    .plugin_view_table_multi_selected
+                    .get(name)
+                    .map(|v| v.iter().copied().filter(|&i| i < total_rows).collect())
+                    .unwrap_or_default();
+                // `Toggle`/`Replace` only ever compare/insert `declared_idx`
+                // against `current` (itself declared-space) — `anchor` is
+                // unused by those gestures, so no display/declared
+                // conversion is needed here.
+                quadraui::apply_selection_gesture(&current, anchor, declared_idx, gesture)
+            }
+        };
         if !matches!(gesture, quadraui::SelectionGesture::Range) {
             engine
                 .plugin_view_table_selection_anchor
-                .insert(name.to_string(), declared_idx);
+                .insert(name.to_string(), idx);
         }
         engine
             .plugin_view_table_multi_selected

@@ -239,9 +239,9 @@ pub enum ViewBody {
         /// click modifiers) in addition to the always-available single-row
         /// cursor/`ItemSelected`/`ItemActivated` path. Rendered as a
         /// `\u{2610}`/`\u{2611}` glyph prefix on the first cell of each row
-        /// (the same checkbox convention `plan::plan_to_checklist_text`
-        /// uses), since `quadraui::DataTable` has no native multi-row
-        /// highlight to key off of.
+        /// (the same checkbox convention `ai_chat_and_misc_builders`'s
+        /// plan-entry glyph uses), since `quadraui::DataTable` has no native
+        /// multi-row highlight to key off of.
         #[serde(default)]
         multi_select: bool,
         /// Pinned footer row, excluded from scrolling/selection, rendered
@@ -845,12 +845,15 @@ pub enum ViewEventKind {
         series_idx: usize,
     },
     /// A `Table` view declaring `multi_select: true` changed its
-    /// multi-selection set (click with Shift/Ctrl/Cmd, or plain click
-    /// resetting it to one row). `indices` are row indices into the
+    /// multi-selection set by mouse (click with Shift/Ctrl/Cmd, or plain
+    /// click resetting it to one row — a double click, which only
+    /// activates, never touches it). `indices` are row indices into the
     /// declared `rows` list (stable across header-sort reorders), sorted
     /// ascending and deduplicated. Fires alongside — never instead of —
-    /// [`Self::ItemSelected`], which keeps reporting the single-row cursor
-    /// regardless of `multi_select`.
+    /// [`Self::ItemSelected`] on that click path, which keeps reporting the
+    /// single-row cursor regardless of `multi_select`. Keyboard navigation
+    /// never touches the multi-selection set, so only [`Self::ItemSelected`]
+    /// fires for it.
     SelectionChanged {
         indices: Vec<usize>,
     },
