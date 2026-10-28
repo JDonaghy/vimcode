@@ -4949,6 +4949,26 @@ pub struct Engine {
     /// `plugin_view_table_col_overrides` isn't: a sort is a property of the
     /// table the plugin declared, shared by whichever host displays it.
     pub plugin_view_table_sort: HashMap<String, (usize, quadraui::SortDirection)>,
+    /// The multi-selection set for a `multi_select: true` `ViewBody::Table`-
+    /// kind view, keyed by view name and holding *declared* row indices
+    /// (stable across a header-sort reorder, matching `ItemSelected::index`'s
+    /// own convention) — sorted ascending and deduplicated, the same
+    /// guarantee `quadraui::apply_selection_gesture` already returns.
+    /// Additive to (never a replacement for) the single-row cursor
+    /// `Engine::plugin_view_selected` tracks: both update on every click, so
+    /// a plugin that ignores `multi_select` sees exactly the behaviour it
+    /// always has. Keyed by view name and not split into a sidebar/tab twin
+    /// pair for the same reason `plugin_view_table_col_overrides` isn't — a
+    /// multi-selection is a property of the table the plugin declared, shared
+    /// by whichever host displays it.
+    pub plugin_view_table_multi_selected: HashMap<String, Vec<usize>>,
+    /// The anchor row (declared index) a `Shift`-extended range selection is
+    /// measured from, keyed by view name alongside
+    /// `plugin_view_table_multi_selected`. Set to the clicked row on every
+    /// non-range gesture (`Replace`/`Toggle`) so the next `Shift`-click
+    /// always ranges from the most recent plain/ctrl click, matching the
+    /// anchor semantics `quadraui::SelectionGesture::Range` assumes.
+    pub plugin_view_table_selection_anchor: HashMap<String, usize>,
     /// The in-progress header-divider drag on a `ViewBody::Table`-kind view,
     /// if any — see `PluginTableColumnDrag`'s doc for its fields' meaning.
     pub(crate) plugin_view_table_resize_drag: Option<PluginTableColumnDrag>,
@@ -5826,6 +5846,8 @@ impl Engine {
             plugin_view_tab_table_layout: std::cell::RefCell::new(None),
             plugin_view_table_col_overrides: HashMap::new(),
             plugin_view_table_sort: HashMap::new(),
+            plugin_view_table_multi_selected: HashMap::new(),
+            plugin_view_table_selection_anchor: HashMap::new(),
             plugin_view_table_resize_drag: None,
             ext_panel_table_col: 0,
             plugin_view_tab_table_col: 0,

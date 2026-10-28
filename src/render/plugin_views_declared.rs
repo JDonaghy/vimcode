@@ -674,10 +674,21 @@ pub(crate) fn route_plugin_view_body_event(
             quadraui::UiEvent::MouseDown {
                 position,
                 button: quadraui::MouseButton::Left,
+                modifiers,
                 ..
-            } => route_plugin_view_table_click(engine, name, host, *position, false),
+            } => route_plugin_view_table_click(engine, name, host, *position, false, *modifiers),
             quadraui::UiEvent::DoubleClick { position, .. } => {
-                route_plugin_view_table_click(engine, name, host, *position, true)
+                // `DoubleClick` carries no modifiers of its own — a plain
+                // `Replace` gesture (one row selected, not toggled/extended)
+                // is the only sensible one for an activation click anyway.
+                route_plugin_view_table_click(
+                    engine,
+                    name,
+                    host,
+                    *position,
+                    true,
+                    quadraui::Modifiers::default(),
+                )
             }
             quadraui::UiEvent::Scroll { delta, .. } => {
                 scroll_plugin_view_flat_selection_table(engine, name, host, scroll_step(delta))

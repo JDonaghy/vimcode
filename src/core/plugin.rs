@@ -450,6 +450,8 @@ fn lua_table_to_view_body(
             })
         }
         "table" => {
+            use crate::core::plugin_ui::TableColumnAlign;
+
             let mut columns = Vec::new();
             if let Ok(cols_tbl) = tbl.get::<_, LuaTable>("columns") {
                 for (idx, row) in cols_tbl.sequence_values::<LuaTable>().enumerate() {
@@ -457,11 +459,17 @@ fn lua_table_to_view_body(
                     let title: String = row.get("title").map_err(|_| {
                         LuaError::RuntimeError(format!("table column {}: missing title", idx + 1))
                     })?;
+                    let align = match row.get::<_, String>("align").ok().as_deref() {
+                        Some("center") => TableColumnAlign::Center,
+                        Some("right") => TableColumnAlign::Right,
+                        _ => TableColumnAlign::Left,
+                    };
                     columns.push(ViewTableColumn {
                         title,
                         editable: row.get("editable").unwrap_or(false),
                         width: row.get::<_, f32>("width").ok(),
                         min_width: row.get::<_, f32>("min_width").ok(),
+                        align,
                     });
                 }
             }
@@ -485,7 +493,22 @@ fn lua_table_to_view_body(
                     });
                 }
             }
-            Ok(ViewBody::Table { columns, rows })
+            let multi_select: bool = tbl.get("multi_select").unwrap_or(false);
+            let footer: Option<Vec<String>> = tbl
+                .get::<_, LuaTable>("footer")
+                .ok()
+                .map(|footer_tbl| {
+                    footer_tbl
+                        .sequence_values::<String>()
+                        .collect::<LuaResult<_>>()
+                })
+                .transpose()?;
+            Ok(ViewBody::Table {
+                columns,
+                rows,
+                multi_select,
+                footer,
+            })
         }
         "text_view" => Ok(ViewBody::TextView {
             text: tbl.get("text").unwrap_or_default(),
@@ -2811,6 +2834,13 @@ impl PluginManager {
             }
             ViewEventKind::LegendClicked { series_idx } => {
                 tbl.set("series_idx", *series_idx as i64)?
+            }
+            ViewEventKind::SelectionChanged { indices } => {
+                let lua_indices = self.lua.create_table()?;
+                for (i, idx) in indices.iter().enumerate() {
+                    lua_indices.set(i + 1, *idx as i64)?;
+                }
+                tbl.set("indices", lua_indices)?;
             }
             ViewEventKind::ButtonClicked
             | ViewEventKind::ToolbarButtonClicked
@@ -6834,10 +6864,57 @@ mod tests {
         let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
         let view = view.expect("render must succeed");
         match view.body.expect("table body") {
-            ViewBody::Table { columns, rows } => {
+            ViewBody::Table { columns, rows, .. } => {
                 assert_eq!(columns.len(), 2);
                 assert!(columns[0].editable);
                 assert_eq!(rows[0].cells, vec!["Content-Type", "application/json"]);
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_table_body_parses_align_multi_select_and_footer() {
+        use crate::core::plugin_ui::{TableColumnAlign, ViewBody};
+        let pm = pm_with_view(
+            "table-rich",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "table",
+                        multi_select = true,
+                        columns = {
+                            { title = "Key", align = "left" },
+                            { title = "Count", align = "right" },
+                            { title = "Status", align = "center" },
+                        },
+                        rows = {
+                            { id = "r1", cells = { "a", "1", "ok" } },
+                        },
+                        footer = { "Total", "1", "" },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        match view.body.expect("table body") {
+            ViewBody::Table {
+                columns,
+                multi_select,
+                footer,
+                ..
+            } => {
+                assert!(multi_select);
+                assert_eq!(columns[0].align, TableColumnAlign::Left);
+                assert_eq!(columns[1].align, TableColumnAlign::Right);
+                assert_eq!(columns[2].align, TableColumnAlign::Center);
+                assert_eq!(
+                    footer,
+                    Some(vec!["Total".to_string(), "1".to_string(), "".to_string()])
+                );
             }
             other => panic!("expected Table, got {other:?}"),
         }
