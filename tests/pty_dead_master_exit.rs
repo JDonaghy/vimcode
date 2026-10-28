@@ -43,25 +43,54 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// immediately, and exits essentially right away; a busy-spinning process
 /// never exits. This budget is tight enough that a busy-spin bug is caught
 /// in seconds rather than hanging the suite.
-const EXIT_BUDGET: Duration = Duration::from_secs(5);
+/// Generous on purpose: an idle `vcd` whose pty hangs up exits within one
+/// poll tick (milliseconds), so every second of this budget is headroom for
+/// a loaded machine's scheduler, not slack the bug could hide in. A
+/// busy-spinning build never exits at all, so widening this costs only the
+/// time a genuine failure takes to be reported. The whole suite running in
+/// parallel on a saturated CI box routinely delays a wakeup by seconds.
+const EXIT_BUDGET: Duration = Duration::from_secs(20);
 
-/// Upper bound on how much CPU time (seconds, `utime + stime` as reported
-/// by `ps -o time=`) `vcd` is allowed to consume *during* the dead-pty
-/// wait window. A correct implementation notices the hangup on its next
-/// scheduled wakeup and does ~no work; a busy-spinning process pins close
-/// to 100% of one core for the entire window. `EXIT_BUDGET` is 5s; 1s of
-/// consumed CPU time during that window is already a generous bar — a
-/// reproduction of the bug would consume close to the full 5s.
+/// Upper bound on how much CPU time (seconds, `utime + stime`) `vcd` is
+/// allowed to consume *during* the dead-pty wait window. A correct
+/// implementation notices the hangup on its next scheduled wakeup and does
+/// ~no work; a busy-spinning process pins close to 100% of one core for the
+/// entire window. This — not `EXIT_BUDGET` — is the assertion that
+/// discriminates the bug: it is independent of how contended the machine
+/// is, because a spin burns CPU proportional to the window while an idle
+/// exit burns none regardless of load.
 ///
-/// Note on measurement floor: the BSD `ps` macOS ships reports `time=` with
-/// fractional seconds (`[[dd-]hh:]mm:ss.ff`), but Linux's `procps` `ps`
-/// reports whole seconds only (`[DD-]HH:MM:SS`, no `.ff` field at all) —
-/// `parse_ps_time` handles both, but on Linux this bar is effectively "a
-/// full second of CPU was observed," not "1.0s precisely." That's still
-/// well below what a 100%-of-a-core spin would produce over `EXIT_BUDGET`,
-/// so it doesn't change what this test catches, but don't tighten this
-/// constant below 1.0 expecting sub-second precision on Linux.
+/// Note on measurement floor: `cpu_time_secs` reads `/proc/<pid>/stat` on
+/// Linux (clock-tick resolution, typically 10ms) and falls back to
+/// `ps -o time=` elsewhere. The BSD `ps` macOS ships reports fractional
+/// seconds (`[[dd-]hh:]mm:ss.ff`); Linux's `procps` `ps` reports whole
+/// seconds only, so on a Linux box without `/proc` this bar degrades to "a
+/// full second of CPU was observed."
 const MAX_CPU_SECONDS_WHILE_WAITING: f64 = 1.0;
+
+/// How long `vcd` is given to settle into its idle event wait after
+/// painting its first frame, before this test closes the pty master.
+///
+/// The thing under test is "an *idle* vcd notices its pty hung up", so
+/// "vcd is idle" is a precondition, not an assumption. A freshly painted
+/// first frame does not mean startup is finished: syntax parsing, plugin
+/// discovery and theme loading can still be running, and on a loaded
+/// machine that tail takes seconds. Closing the master mid-startup
+/// measures startup's CPU and startup's latency instead of the hangup
+/// path's, which is a false failure.
+const QUIESCE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Sampling window for the idle check: `vcd` counts as idle once it
+/// consumes less than `IDLE_CPU_DELTA_SECONDS` of CPU across this span.
+const IDLE_SAMPLE_WINDOW: Duration = Duration::from_millis(250);
+
+/// Number of consecutive idle windows required before the master is closed.
+const IDLE_WINDOWS_REQUIRED: u32 = 2;
+
+/// CPU-time growth (seconds) over `IDLE_SAMPLE_WINDOW` that still counts as
+/// idle. One clock tick of noise (10ms on Linux) plus margin; a process
+/// doing real work consumes far more over a 250ms window.
+const IDLE_CPU_DELTA_SECONDS: f64 = 0.03;
 
 /// Non-blocking read polling interval while waiting for `vcd`'s startup
 /// output (the pty's master fd is set `O_NONBLOCK`, so each `read()` that
@@ -192,13 +221,116 @@ fn wait_for_screen_contains(
     }
 }
 
+/// Keeps draining the pty for `span`, so `vcd` never blocks writing into a
+/// full pty buffer while this test is only watching its CPU time.
+fn pump_for(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    parser: &mut vt100::Parser,
+    span: Duration,
+) {
+    let mut buf = [0u8; 4096];
+    let start = Instant::now();
+    while start.elapsed() < span {
+        if !pump_once(reader, writer, parser, &mut buf) {
+            return;
+        }
+        std::thread::sleep(READ_RETRY_INTERVAL);
+    }
+}
+
+/// Waits until `pid` stops consuming CPU — `IDLE_WINDOWS_REQUIRED`
+/// consecutive `IDLE_SAMPLE_WINDOW`s each growing its CPU time by less
+/// than `IDLE_CPU_DELTA_SECONDS` — draining the pty throughout. Returns
+/// the CPU time observed once idle, or `None` if `pid` never settled
+/// within `timeout` (or its CPU time couldn't be sampled at all).
+fn wait_for_cpu_idle(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    parser: &mut vt100::Parser,
+    pid: u32,
+    timeout: Duration,
+) -> Option<f64> {
+    let start = Instant::now();
+    let mut idle_windows = 0;
+    let mut previous = cpu_time_secs(pid)?;
+    while start.elapsed() < timeout {
+        pump_for(reader, writer, parser, IDLE_SAMPLE_WINDOW);
+        let current = cpu_time_secs(pid)?;
+        if (current - previous) < IDLE_CPU_DELTA_SECONDS {
+            idle_windows += 1;
+            if idle_windows >= IDLE_WINDOWS_REQUIRED {
+                return Some(current);
+            }
+        } else {
+            idle_windows = 0;
+        }
+        previous = current;
+    }
+    None
+}
+
+/// Cumulative CPU time (`utime + stime`, in seconds) for `pid`.
+///
+/// Prefers `/proc/<pid>/stat` (clock-tick resolution, typically 10ms) and
+/// falls back to `ps -o time=` where `/proc` isn't available, e.g. macOS.
+/// The precision matters twice over: the idle precondition below needs to
+/// tell "consuming nothing" from "consuming a little", and the CPU
+/// assertion is the test's real discriminator between an idle exit and a
+/// busy spin.
+///
+/// `None` once the process is gone — callers treat that the same as "no
+/// new sample", not an error, since a process that's already exited is
+/// exactly the success case this test is checking for.
+fn cpu_time_secs(pid: u32) -> Option<f64> {
+    if let Some(secs) = proc_stat_cpu_time_secs(pid) {
+        return Some(secs);
+    }
+    ps_cpu_time_secs(pid)
+}
+
+/// Clock ticks per second as reported by `sysconf(_SC_CLK_TCK)`, the unit
+/// `/proc/<pid>/stat`'s `utime`/`stime` fields are counted in.
+fn clock_ticks_per_second() -> f64 {
+    // SAFETY: `sysconf` takes an int name and returns a long; no pointers,
+    // no allocation, no global state touched.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks > 0 {
+        ticks as f64
+    } else {
+        100.0
+    }
+}
+
+/// Cumulative CPU time from `/proc/<pid>/stat`, or `None` where that file
+/// doesn't exist (non-Linux) or the process is gone.
+fn proc_stat_cpu_time_secs(pid: u32) -> Option<f64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let ticks = parse_proc_stat_cpu_ticks(&text)?;
+    Some(ticks / clock_ticks_per_second())
+}
+
+/// Sums `/proc/<pid>/stat`'s `utime` (field 14) and `stime` (field 15),
+/// returning clock ticks.
+///
+/// Field 2 is the executable name in parentheses and may itself contain
+/// spaces and parentheses, so the field split starts after the *last* `)`,
+/// which is how the kernel's own documentation says to parse this file.
+fn parse_proc_stat_cpu_ticks(text: &str) -> Option<f64> {
+    let after_comm = &text[text.rfind(')')? + 1..];
+    // `after_comm` starts at field 3 (`state`), so `utime`/`stime` are the
+    // 12th and 13th whitespace-separated entries of what remains.
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let utime = fields.get(11)?.parse::<f64>().ok()?;
+    let stime = fields.get(12)?.parse::<f64>().ok()?;
+    Some(utime + stime)
+}
+
 /// Cumulative CPU time (`utime + stime`, in seconds) `ps` reports for
 /// `pid`, parsed from `ps -o time=`'s `[[dd-]hh:]mm:ss[.ff]` format (the
 /// same keyword on both the BSD `ps` macOS ships and Linux's `procps`).
 /// `None` once the process is gone (what `ps -p <dead-pid>` reports as a
-/// non-zero exit with empty stdout) — callers treat that the same as "no
-/// new sample", not an error, since a process that's already exited is
-/// exactly the success case this test is checking for.
+/// non-zero exit with empty stdout).
 fn ps_cpu_time_secs(pid: u32) -> Option<f64> {
     let output = Command::new("ps")
         .args(["-o", "time=", "-p", &pid.to_string()])
@@ -232,6 +364,32 @@ fn parse_ps_time(text: &str) -> Option<f64> {
         _ => return None,
     };
     Some(days * 86_400.0 + hours * 3_600.0 + minutes * 60.0 + seconds)
+}
+
+#[test]
+fn proc_stat_cpu_ticks_sums_utime_and_stime() {
+    // Fields: pid, (comm), state, ppid, pgrp, session, tty_nr, tpgid,
+    // flags, minflt, cminflt, majflt, cmajflt, utime, stime, ...
+    let line = "4242 (vcd) S 1 4242 4242 0 -1 4194304 \
+                900 0 0 0 137 42 0 0 20 0 1 0 100 0 0";
+    assert_eq!(parse_proc_stat_cpu_ticks(line), Some(179.0));
+}
+
+#[test]
+fn proc_stat_cpu_ticks_tolerates_spaces_and_parens_in_comm() {
+    let line = "7 (we i)rd name) S 1 7 7 0 -1 0 \
+                0 0 0 0 10 5 0 0 20 0 1 0 0 0 0";
+    assert_eq!(parse_proc_stat_cpu_ticks(line), Some(15.0));
+}
+
+#[test]
+fn own_cpu_time_is_sampleable_and_nonnegative() {
+    let secs =
+        cpu_time_secs(std::process::id()).expect("this very process's own CPU time is sampleable");
+    assert!(
+        secs >= 0.0,
+        "cumulative CPU time should never be negative, got {secs}"
+    );
 }
 
 #[test]
@@ -302,13 +460,38 @@ fn vcd_should_exit_promptly_once_its_pty_master_closes() {
         screen_text(&parser)
     );
 
-    // Baseline CPU time right before the hangup, so the assertion below
-    // measures only what vcd spends *after* its pty dies, not startup/paint
-    // work. `None` (the baseline `ps` call itself failed) is kept distinct
-    // from `Some(0.0)`: a silent zero-fallback would measure vcd's *total*
-    // CPU including startup, which could fail the assertion for unrelated
+    // The thing under test is how an *idle* vcd reacts to its pty hanging
+    // up, so settle into the idle event wait first: a painted first frame
+    // doesn't mean startup finished. The CPU time measured once idle
+    // doubles as the baseline for the assertion below, so that assertion
+    // measures only what vcd spends *after* its pty dies.
+    //
+    // `None` (no sample could be taken at all) is kept distinct from
+    // `Some(0.0)`: a silent zero-fallback would measure vcd's *total* CPU
+    // including startup, which could fail the assertion for unrelated
     // reasons. If the baseline is missing, the CPU assertion is skipped.
-    let cpu_before = ps_cpu_time_secs(pid);
+    let quiesce_start = Instant::now();
+    let cpu_before = wait_for_cpu_idle(
+        &mut *reader,
+        &mut *writer,
+        &mut parser,
+        pid,
+        QUIESCE_TIMEOUT,
+    );
+    match cpu_before {
+        Some(cpu) => eprintln!(
+            "vcd settled into its idle event wait after {:?} \
+             (CPU time consumed by startup: {cpu:.2}s)",
+            quiesce_start.elapsed()
+        ),
+        None => eprintln!(
+            "WARNING: vcd never went idle within {QUIESCE_TIMEOUT:?} of its \
+             first painted frame (or its CPU time could not be sampled — see \
+             cpu_time_secs). Closing the pty master anyway; the CPU-time \
+             assertion is skipped because there is no trustworthy baseline, \
+             so only the exit-time assertion runs."
+        ),
+    }
 
     // The bugbash's own trigger: the driving terminal/process goes away.
     // Every dup'd fd referencing the master (the original handle, the
@@ -326,7 +509,7 @@ fn vcd_should_exit_promptly_once_its_pty_master_closes() {
     // `peak_cpu_during_wait` could stay at its initial 0.0 the whole time
     // and the CPU assertion below would pass vacuously, never having
     // actually measured anything.
-    let mut peak_cpu_during_wait = match (cpu_before, ps_cpu_time_secs(pid)) {
+    let mut peak_cpu_during_wait = match (cpu_before, cpu_time_secs(pid)) {
         (Some(before), Some(now)) => (now - before).max(0.0),
         _ => 0.0,
     };
@@ -338,7 +521,7 @@ fn vcd_should_exit_promptly_once_its_pty_master_closes() {
             exited = true;
             break;
         }
-        if let (Some(before), Some(cpu_now)) = (cpu_before, ps_cpu_time_secs(pid)) {
+        if let (Some(before), Some(cpu_now)) = (cpu_before, cpu_time_secs(pid)) {
             let consumed = (cpu_now - before).max(0.0);
             if consumed > peak_cpu_during_wait {
                 peak_cpu_during_wait = consumed;
@@ -358,14 +541,13 @@ fn vcd_should_exit_promptly_once_its_pty_master_closes() {
     }
     let _ = child.wait();
 
-    if cpu_before.is_none() {
-        eprintln!(
-            "WARNING: the baseline `ps` sample failed (see ps_cpu_time_secs), \
-             so the CPU-time assertion below is being skipped entirely rather \
-             than measuring against a wrong (zero) baseline. Only the exit-\
-             time assertion ran."
-        );
-    }
+    // On stderr so a failing run in a CI/smoke log that captures only
+    // stderr still says what was measured, not just which line panicked.
+    eprintln!(
+        "after closing the pty master: exited={exited} after {wait_elapsed:?} \
+         (budget {EXIT_BUDGET:?}), peak CPU consumed while waiting \
+         {peak_cpu_during_wait:.2}s (bar {MAX_CPU_SECONDS_WHILE_WAITING}s)"
+    );
 
     assert!(
         exited,
@@ -373,7 +555,9 @@ fn vcd_should_exit_promptly_once_its_pty_master_closes() {
          pty master closing — it is still running (and by this point may \
          be busy-spinning on the dead fd; peak CPU time observed while \
          waiting: {peak_cpu_during_wait:.2}s). A fixed build notices the \
-         hangup and exits within roughly one idle-poll tick."
+         hangup and exits within roughly one idle-poll tick. Unless the \
+         warning above says otherwise, vcd was confirmed idle before the \
+         master was closed, so a loaded machine alone doesn't explain this."
     );
     assert!(
         cpu_before.is_none() || peak_cpu_during_wait < MAX_CPU_SECONDS_WHILE_WAITING,
