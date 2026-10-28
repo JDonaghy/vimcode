@@ -1642,6 +1642,79 @@ impl Engine {
         false
     }
 
+    /// Make `win` the focused window, switching `active_group` and the
+    /// owning tab's `active_tab`/`active_window` as needed so the rest of
+    /// the engine (status line, LSP-active-buffer tracking, tab-bar scroll)
+    /// is consistent afterwards — the cross-group twin of
+    /// `activate_group_for_window` plus `goto_tab`'s active-tab bookkeeping,
+    /// driven by `find_window_tab` rather than a linear tab-index. Returns
+    /// false if `win` is invalid.
+    pub(crate) fn plugin_api_win_focus(&mut self, win: i64) -> bool {
+        let Some(id) = self.plugin_api_resolve_win(win) else {
+            return false;
+        };
+        let Some((group_id, tab_idx)) = self.find_window_tab(id) else {
+            return false;
+        };
+        self.active_group = group_id;
+        if let Some(group) = self.editor_groups.get_mut(&group_id) {
+            group.active_tab = tab_idx;
+        }
+        self.active_tab_mut().focus_window(id);
+        self.lsp_ensure_active_buffer();
+        self.ensure_active_tab_visible();
+        true
+    }
+
+    /// Split `win`, giving the new window `direction`'s sibling slot
+    /// (`new_first` picks which side) and leaving the new window focused.
+    /// Returns the new window's handle, or `None` if `win` is invalid.
+    pub(crate) fn plugin_api_win_split(
+        &mut self,
+        win: i64,
+        direction: SplitDirection,
+        new_first: bool,
+    ) -> Option<i64> {
+        if !self.plugin_api_win_focus(win) {
+            return None;
+        }
+        self.split_window_with_new_first(direction, None, new_first);
+        Some(self.active_window_id().0 as i64)
+    }
+
+    /// Close `win`. Returns false if `win` is invalid or it is the last
+    /// window in the editor, matching `Engine::close_window`'s own
+    /// "can't close the last window" refusal.
+    pub(crate) fn plugin_api_win_close(&mut self, win: i64) -> bool {
+        if !self.plugin_api_win_focus(win) {
+            return false;
+        }
+        self.close_window()
+    }
+
+    /// Move `win` into a brand-new editor group placed at `direction`'s
+    /// edge of the group layout (`forward` = after/below/right of the
+    /// existing layout, else before/above/left of it) — the plugin-facing
+    /// twin of the `<C-w>H`/`<C-w>J`/`<C-w>K`/`<C-w>L` drag-to-edge
+    /// gesture, which drives the same `Engine::move_window_to_edge`.
+    /// `move_window_to_edge` reports success only by whether it grew the
+    /// group count, since it has no `bool` return of its own. Returns false
+    /// if `win` is invalid or it was the last window overall (nothing left
+    /// to move).
+    pub(crate) fn plugin_api_win_move_to_group(
+        &mut self,
+        win: i64,
+        direction: SplitDirection,
+        forward: bool,
+    ) -> bool {
+        if !self.plugin_api_win_focus(win) {
+            return false;
+        }
+        let groups_before = self.group_layout.group_ids().len();
+        self.move_window_to_edge(direction, forward);
+        self.group_layout.group_ids().len() > groups_before
+    }
+
     /// Keep every window showing `buf` inside its (possibly shrunken) bounds
     /// after an immediate edit.
     fn clamp_cursors_to_buffer(&mut self, buf: BufferId) {

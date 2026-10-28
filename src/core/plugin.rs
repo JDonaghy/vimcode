@@ -5672,6 +5672,115 @@ impl PluginManager {
             })?,
         )?;
 
+        // vimcode.window.focus(win) → bool. Makes `win` the focused window,
+        // switching tabs/editor groups as needed — the cross-group twin of
+        // `vimcode.window.current()`.
+        window.set(
+            "focus",
+            lua.create_function(|_, win: i64| {
+                live_engine("vimcode.window.focus", move |e| e.plugin_api_win_focus(win))
+            })?,
+        )?;
+
+        // vimcode.window.split(win, opts) → new window handle (0 if `win`
+        // is invalid). opts: { direction = "split"|"vsplit" (default
+        // "split"), side = "above"/"below" for "split", "left"/"right" for
+        // "vsplit" }, mirroring `vimcode.ui.open_view`'s split vocabulary —
+        // "split" is vim's horizontal/top-bottom split, "vsplit" its
+        // vertical/left-right one. Omitting `side` falls back to
+        // `splitbelow`/`splitright`, like `<C-w>s`/`<C-w>v`. A `side` from
+        // the wrong axis is a Lua error rather than a silent no-op.
+        window.set(
+            "split",
+            lua.create_function(|_, (win, opts): (i64, Option<LuaTable>)| {
+                let dir_str: String = opts
+                    .as_ref()
+                    .and_then(|t| t.get::<_, String>("direction").ok())
+                    .unwrap_or_else(|| "split".to_string());
+                let direction = match dir_str.as_str() {
+                    "split" => SplitDirection::Horizontal,
+                    "vsplit" => SplitDirection::Vertical,
+                    other => {
+                        return Err(LuaError::RuntimeError(format!(
+                            "vimcode.window.split: unsupported direction {other:?} \
+                             (expected \"split\" or \"vsplit\")"
+                        )));
+                    }
+                };
+                let side: Option<String> =
+                    opts.as_ref().and_then(|t| t.get::<_, String>("side").ok());
+                let new_first = match (direction, side.as_deref()) {
+                    (_, None) => None,
+                    (SplitDirection::Horizontal, Some("above")) => Some(true),
+                    (SplitDirection::Horizontal, Some("below")) => Some(false),
+                    (SplitDirection::Vertical, Some("left")) => Some(true),
+                    (SplitDirection::Vertical, Some("right")) => Some(false),
+                    (SplitDirection::Horizontal, Some(other @ ("left" | "right"))) => {
+                        return Err(LuaError::RuntimeError(format!(
+                            "vimcode.window.split: side {other:?} is for \"vsplit\", not \
+                             \"split\" (expected \"above\" or \"below\")"
+                        )));
+                    }
+                    (SplitDirection::Vertical, Some(other @ ("above" | "below"))) => {
+                        return Err(LuaError::RuntimeError(format!(
+                            "vimcode.window.split: side {other:?} is for \"split\", not \
+                             \"vsplit\" (expected \"left\" or \"right\")"
+                        )));
+                    }
+                    (_, Some(other)) => {
+                        return Err(LuaError::RuntimeError(format!(
+                            "vimcode.window.split: unsupported side {other:?} (expected \
+                             \"above\", \"below\", \"left\" or \"right\")"
+                        )));
+                    }
+                };
+                live_engine("vimcode.window.split", move |e| {
+                    let new_first = new_first.unwrap_or(match direction {
+                        SplitDirection::Horizontal => !e.settings.splitbelow,
+                        SplitDirection::Vertical => !e.settings.splitright,
+                    });
+                    e.plugin_api_win_split(win, direction, new_first)
+                        .unwrap_or(0)
+                })
+            })?,
+        )?;
+
+        // vimcode.window.close(win) → bool. False if `win` is invalid or is
+        // the last window in the editor.
+        window.set(
+            "close",
+            lua.create_function(|_, win: i64| {
+                live_engine("vimcode.window.close", move |e| e.plugin_api_win_close(win))
+            })?,
+        )?;
+
+        // vimcode.window.move_to_group(win, direction) → bool. Moves `win`
+        // into a brand-new editor group at `direction`'s edge of the
+        // window-group layout — the plugin-facing twin of
+        // `<C-w>H`/`<C-w>J`/`<C-w>K`/`<C-w>L`. `direction` is one of
+        // "left"/"down"/"up"/"right". False if `win` is invalid, `direction`
+        // is unsupported, or `win` was the last window overall.
+        window.set(
+            "move_to_group",
+            lua.create_function(|_, (win, direction): (i64, String)| {
+                let (split_dir, forward) = match direction.as_str() {
+                    "left" => (SplitDirection::Vertical, false),
+                    "right" => (SplitDirection::Vertical, true),
+                    "up" => (SplitDirection::Horizontal, false),
+                    "down" => (SplitDirection::Horizontal, true),
+                    other => {
+                        return Err(LuaError::RuntimeError(format!(
+                            "vimcode.window.move_to_group: unsupported direction {other:?} \
+                             (expected \"left\", \"right\", \"up\" or \"down\")"
+                        )));
+                    }
+                };
+                live_engine("vimcode.window.move_to_group", move |e| {
+                    e.plugin_api_win_move_to_group(win, split_dir, forward)
+                })
+            })?,
+        )?;
+
         vimcode.set("window", window)?;
 
         // ── vimcode.decor (Native API P5) ─────────────────────────────────

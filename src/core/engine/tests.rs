@@ -17737,6 +17737,106 @@ fn test_lua_ui_dismiss_removes_toast_and_reports_already_gone() {
 }
 
 #[test]
+fn test_lua_window_focus_switches_active_window() {
+    let dir = write_plugin_lua(
+        "test_window_focus",
+        r#"vimcode.command("Start", function()
+            vimcode.window.split(0, { direction = "vsplit" })
+            local before = vimcode.window.current()
+            local ok = vimcode.window.focus(1)
+            local after = vimcode.window.current()
+            vimcode.message("before:" .. tostring(before) .. ",ok:" .. tostring(ok)
+                .. ",after:" .. tostring(after))
+        end)"#,
+    );
+    let mut engine = Engine::new_for_test();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Start");
+    assert_eq!(engine.message, "before:2,ok:true,after:1");
+    assert_eq!(engine.active_window_id(), WindowId(1));
+}
+
+#[test]
+fn test_lua_window_split_creates_new_window() {
+    let dir = write_plugin_lua(
+        "test_window_split",
+        r#"vimcode.command("Start", function()
+            local new_win = vimcode.window.split(0, { direction = "vsplit" })
+            vimcode.message("new:" .. tostring(new_win))
+        end)"#,
+    );
+    let mut engine = Engine::new_for_test();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Start");
+    assert_eq!(engine.message, "new:2");
+    assert_eq!(engine.windows.len(), 2);
+    assert_eq!(engine.active_window_id(), WindowId(2));
+}
+
+#[test]
+fn test_lua_window_close_removes_window() {
+    let dir = write_plugin_lua(
+        "test_window_close",
+        r#"vimcode.command("Start", function()
+            vimcode.window.split(0, { direction = "vsplit" })
+            local ok = vimcode.window.close(0)
+            vimcode.message("ok:" .. tostring(ok))
+        end)"#,
+    );
+    let mut engine = Engine::new_for_test();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Start");
+    assert_eq!(engine.message, "ok:true");
+    assert_eq!(engine.windows.len(), 1);
+    assert_eq!(engine.active_window_id(), WindowId(1));
+}
+
+#[test]
+fn test_lua_window_move_to_group_creates_group() {
+    let dir = write_plugin_lua(
+        "test_window_move_to_group",
+        r#"vimcode.command("Start", function()
+            vimcode.window.split(0, { direction = "vsplit" })
+            local ok = vimcode.window.move_to_group(0, "right")
+            vimcode.message("ok:" .. tostring(ok))
+        end)"#,
+    );
+    let mut engine = Engine::new_for_test();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.set_plugin_manager(mgr);
+        }
+        Err(_) => return,
+    }
+    engine.execute_command("Start");
+    assert_eq!(engine.message, "ok:true");
+    assert_eq!(
+        engine.group_layout.group_ids().len(),
+        2,
+        "move_to_group must place the window in a new editor group"
+    );
+}
+
+#[test]
 fn test_plugin_on_save_fires() {
     let dir = write_plugin_lua(
         "test_save",
