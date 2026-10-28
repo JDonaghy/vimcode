@@ -1122,7 +1122,7 @@ cursor movement (`Left`/`Right`/`Home`/`End`), selection and clipboard (`Ctrl-A`
 |--------|------|--------------------|
 | `"list"` | `title`, `items = {{id=, text=, detail=}}` (`id` required) | `ItemSelected`, `ItemActivated` (`index`, 0-based) |
 | `"tree"` | `nodes = {{id=, label=, expanded=, children={...}}}` (`id` required) | `NodeSelected`, `NodeActivated`, `Expanded`, `Collapsed` (`node_id`) |
-| `"table"` | `columns = {{title=, editable=}}` (`title` required), `rows = {{id=, cells={...}}}` (`cells` required) | `ItemSelected`, `ItemActivated` (`index`, `col`), `CellEdited` (`row`, `col`, both 0-based, and `value`) |
+| `"table"` | `columns = {{title=, editable=, align=}}` (`title` required; `align` is `"left"`/`"center"`/`"right"`, default `"left"`), `rows = {{id=, cells={...}}}` (`cells` required), `multi_select`, `footer = {...}` (one string per column, same shape as a row's `cells`) | `ItemSelected`, `ItemActivated` (`index`, `col`), `CellEdited` (`row`, `col`, both 0-based, and `value`), `SelectionChanged` (`indices`, 0-based, only when `multi_select = true`) |
 | `"text_view"` | `text`, `filetype` | none (scrollable, read-only text) |
 | `"chart"` | `chart_kind` (`"sparkline"`, `"line"`, `"bar"`, `"bar_grouped"`; default `"line"`), `series = {{label=, data=, color=, fill=}}`, `x_label`, `y_label`, `show_legend` | `DataPointClicked` (`series_idx`, `data_idx`), `LegendClicked` (`series_idx`, 0-based) |
 
@@ -1146,6 +1146,17 @@ editable. Keyboard-driven selection (`j`/`k`, `Home`/`End`) has no column to
 report, so `event.col` is `nil` then too. `"list"` views have no column concept at
 all, so `event.col` is always `nil` there — not a bug, just that list rows have no
 columns to report.
+
+**Multi-select and footer on `"table"` views.** Declaring `multi_select = true`
+renders a `☐`/`☑` checkbox prefix on column 0 and tracks a selection *set*
+alongside the always-on single-row cursor: a plain click resets it to that one
+row, `Ctrl`/`Cmd`-click toggles a row in or out, and `Shift`-click extends a
+contiguous range from the last plain/`Ctrl` click. Every one of those fires
+`SelectionChanged { indices }` (0-based, into the declared `rows` list, sorted
+ascending) right alongside the unconditional `ItemSelected` — a double-click
+only activates and never changes the set. A declared `footer = { "Total", "1",
+"" }` (one string per column) stays pinned below the scrollable body (excluded
+from scrolling and selection) for a totals/summary row.
 
 ```lua
 vimcode.ui.register_view("my_list", {

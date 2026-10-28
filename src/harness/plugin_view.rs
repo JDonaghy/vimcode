@@ -239,6 +239,30 @@ pub const MULTI_SELECTION_ROW0: &str = "MsR01631";
 /// Painted before any `SelectionChanged` has reached the plugin.
 pub const MULTI_SELECTION_NONE: &str = "MsN1631";
 
+/// Registered view name for a dedicated `multi_select` table fixture with
+/// three rows whose text sorts (ascending, by column 0) into display order
+/// `[1, 0, 2]`, for exercising ctrl-click toggle and shift-click range
+/// selection in both identity order and under a non-trivial sort, without
+/// risking the simpler, already-passing [`MULTI_SELECT_VIEW`] fixture.
+pub const RANGE_SELECT_VIEW: &str = "zqxw2064range";
+pub const RANGE_COL: &str = "Rc2064";
+/// Declared row 0 — sorts to display position 1 (`"Rb" > "Ra"`).
+pub const RANGE_ROW0: &str = "Rb2064";
+/// Declared row 1 — sorts to display position 0, lexically first.
+pub const RANGE_ROW1: &str = "Ra2064";
+/// Declared row 2 — sorts to display position 2, lexically last.
+pub const RANGE_ROW2: &str = "Rz2064";
+
+/// Registered view name for a dedicated table fixture with one default
+/// (left-aligned) column and one `align = "right"` column, for asserting
+/// the painted x-offset of a right-aligned cell's text run is to the right
+/// of its own column's left edge, unlike a left-aligned run's.
+pub const ALIGN_VIEW: &str = "zqxw2064align";
+pub const ALIGN_COL_LEFT: &str = "AlL2064";
+pub const ALIGN_COL_RIGHT: &str = "AlR2064";
+pub const ALIGN_CELL_LEFT: &str = "AlLv2064";
+pub const ALIGN_CELL_RIGHT: &str = "AlRv2064";
+
 /// `TextView` fixture needles — first and last of 50 generated lines, far
 /// enough apart that only one is visible at a time on a narrow viewport.
 pub const TEXT_FIRST_LINE: &str = "Ln0X1631";
@@ -464,6 +488,38 @@ vimcode.ui.register_view("{MULTI_SELECT_VIEW}", {{
       end
       ms_selected_marker = has0 and "{MULTI_SELECTION_ROW0}" or "{MULTI_SELECTION_NONE}"
     end
+  end,
+}})
+
+vimcode.ui.register_view("{RANGE_SELECT_VIEW}", {{
+  title = "Zq2064R", icon = "R", fallback_icon = "R",
+  render = function()
+    return {{
+      kind = "table",
+      multi_select = true,
+      columns = {{ {{ title = "{RANGE_COL}" }} }},
+      rows = {{
+        {{ id = "r0", cells = {{ "{RANGE_ROW0}" }} }},
+        {{ id = "r1", cells = {{ "{RANGE_ROW1}" }} }},
+        {{ id = "r2", cells = {{ "{RANGE_ROW2}" }} }},
+      }},
+    }}
+  end,
+}})
+
+vimcode.ui.register_view("{ALIGN_VIEW}", {{
+  title = "Zq2064A", icon = "A", fallback_icon = "A",
+  render = function()
+    return {{
+      kind = "table",
+      columns = {{
+        {{ title = "{ALIGN_COL_LEFT}" }},
+        {{ title = "{ALIGN_COL_RIGHT}", align = "right" }},
+      }},
+      rows = {{
+        {{ id = "a0", cells = {{ "{ALIGN_CELL_LEFT}", "{ALIGN_CELL_RIGHT}" }} }},
+      }},
+    }}
   end,
 }})
 
@@ -703,6 +759,9 @@ fn load_fixture_plugin(engine: &mut Engine, dir: &std::path::Path) {
         TEXT_VIEW,
         HEADER_EVENT_VIEW,
         WIDTH_VIEW,
+        MULTI_SELECT_VIEW,
+        RANGE_SELECT_VIEW,
+        ALIGN_VIEW,
     ] {
         assert!(
             engine.is_plugin_view(view),
@@ -1746,6 +1805,31 @@ fn painted_run(driver: &impl ConformanceDriver, needle: &str) -> quadraui::event
         })
 }
 
+/// Locate `needle`'s *final* painted text run within the current frame.
+///
+/// quadraui's GTK `DataTable` body-cell loop paints each cell twice within a
+/// single frame: a provisional pass with a placeholder width, followed by the
+/// authoritative pass with the real measured width and alignment (TUI paints
+/// each cell once, so there the first and last match are the same run). Only
+/// callers that care about a cell's *settled* position (such as the
+/// right-align assertion below) need to skip past GTK's provisional pass;
+/// `painted_run`'s first-match semantics stay the shared default since other
+/// callers rely on them.
+fn painted_run_last(driver: &impl ConformanceDriver, needle: &str) -> quadraui::event::Rect {
+    let inventory = driver.inventory();
+    let runs = inventory.text_runs();
+    runs.iter()
+        .filter(|r| r.text.contains(needle))
+        .last()
+        .map(|r| r.bounds)
+        .unwrap_or_else(|| {
+            panic!(
+                "painted_run_last: {needle:?} not painted; painted runs were {:?}",
+                painted(driver)
+            )
+        })
+}
+
 /// Column 1's header x-position, located by *order* rather than by text
 /// content: the run immediately to the right of column 0's header
 /// (`left_run`) on its own painted row. A table with a fixed total width
@@ -2142,6 +2226,250 @@ pub fn table_multi_select_click_checks_the_row_and_paints_the_footer<D>(
     );
 }
 
+/// Scenario 10h — a plain click followed by a ctrl-click on a different row
+/// toggles that second row into the multi-selection *without* dropping the
+/// first, and a further ctrl-click on the first row toggles it back out
+/// again, leaving the second row still selected and the never-clicked third
+/// row untouched throughout. Exercises `quadraui::SelectionGesture::Toggle`
+/// in [`RANGE_SELECT_VIEW`]'s declared (identity) row order — no header
+/// click, so declared and display space coincide here.
+pub fn table_ctrl_click_toggles_a_row_without_clearing_the_others<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    assert_paints(
+        &h.driver,
+        &[RANGE_ROW0, RANGE_ROW1, RANGE_ROW2],
+        "the range-select table's initial paint",
+    );
+
+    let row_xy = |h: &crate::harness::ConformanceHarness<D>, row: usize| -> (f32, f32) {
+        let engine = h.engine.borrow();
+        let cached = engine.plugin_view_table_layout.borrow();
+        let (rect, layout) = cached.as_ref().expect(
+            "table_ctrl_click_toggles_a_row_without_clearing_the_others: \
+             no frame painted yet",
+        );
+        let column = &layout.columns[0];
+        (
+            rect.x + column.x + column.width / 2.0,
+            rect.y + layout.header_height + layout.row_height * (row as f32 + 0.5),
+        )
+    };
+    let selected = |h: &crate::harness::ConformanceHarness<D>| -> Vec<usize> {
+        let engine = h.engine.borrow();
+        let mut v = engine
+            .plugin_view_table_multi_selected
+            .get(RANGE_SELECT_VIEW)
+            .cloned()
+            .unwrap_or_default();
+        v.sort_unstable();
+        v
+    };
+
+    let (x0, y0) = row_xy(h, 0);
+    h.driver.click(x0, y0);
+    assert_eq!(
+        selected(h),
+        vec![0],
+        "a plain click on declared row 0 must select only it"
+    );
+
+    let (x1, y1) = row_xy(h, 1);
+    // Row 1 sits only one row's height from row 0 — inside every backend's
+    // `DoubleClickDetector` fold radius. Without a real gap past its time
+    // window, this dispatch would be rewritten into a modifier-less
+    // `DoubleClick` and the ctrl-toggle under test would never run.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    h.driver.dispatch(quadraui::UiEvent::MouseDown {
+        widget: None,
+        button: quadraui::MouseButton::Left,
+        position: quadraui::Point::new(x1, y1),
+        modifiers: quadraui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+    });
+    assert_eq!(
+        selected(h),
+        vec![0, 1],
+        "a ctrl-click on declared row 1 must add it to the selection, \
+         keeping row 0 selected"
+    );
+
+    // Same fold risk as above: row 0 is one row's height from row 1.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    h.driver.dispatch(quadraui::UiEvent::MouseDown {
+        widget: None,
+        button: quadraui::MouseButton::Left,
+        position: quadraui::Point::new(x0, y0),
+        modifiers: quadraui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+    });
+    assert_eq!(
+        selected(h),
+        vec![1],
+        "a second ctrl-click on declared row 0 must toggle it back out, \
+         leaving row 1 still selected"
+    );
+    assert!(
+        !selected(h).contains(&2),
+        "row 2 was never clicked and must never enter the selection"
+    );
+}
+
+/// Scenario 10i — a `Shift`-extended range selection is measured in
+/// *display* space (the order the rows currently paint in, after a header
+/// sort) and only then translated back to the declared indices
+/// `SelectionChanged` and `plugin_view_table_multi_selected` both use. One
+/// header click on [`RANGE_SELECT_VIEW`] reorders its rows from declared
+/// `[0, 1, 2]` to display `[1, 0, 2]` (ascending by the single column's
+/// text); a plain click at display position 1 (declared row 0) followed by
+/// a shift-click at display position 2 (declared row 2) must select exactly
+/// declared rows `{0, 2}` — *not* declared row 1, even though it sits
+/// between them in the view's declared order, because display position 0
+/// (declared row 1) sits *outside* the `[1, 2]` display range the shift-click
+/// spans.
+pub fn table_shift_click_ranges_over_display_order_under_sort<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    assert_paints(
+        &h.driver,
+        &[RANGE_ROW0, RANGE_ROW1, RANGE_ROW2],
+        "the range-select table's initial paint",
+    );
+
+    let header_xy = |h: &crate::harness::ConformanceHarness<D>| -> (f32, f32) {
+        let engine = h.engine.borrow();
+        let cached = engine.plugin_view_table_layout.borrow();
+        let (rect, layout) = cached.as_ref().expect(
+            "table_shift_click_ranges_over_display_order_under_sort: \
+             no frame painted yet",
+        );
+        let col0 = &layout.columns[0];
+        (
+            rect.x + col0.x + col0.width / 2.0,
+            rect.y + layout.header_height / 2.0,
+        )
+    };
+    let (header_x, header_y) = header_xy(h);
+    h.driver.click(header_x, header_y);
+    assert!(
+        h.driver.inventory().above(RANGE_ROW1, RANGE_ROW0)
+            && h.driver.inventory().above(RANGE_ROW0, RANGE_ROW2),
+        "precondition: one header click must sort ascending into display \
+         order [{RANGE_ROW1:?}, {RANGE_ROW0:?}, {RANGE_ROW2:?}]; painted \
+         runs were {:?}",
+        painted(&h.driver)
+    );
+
+    let display_xy = |h: &crate::harness::ConformanceHarness<D>, display: usize| -> (f32, f32) {
+        let engine = h.engine.borrow();
+        let cached = engine.plugin_view_table_layout.borrow();
+        let (rect, layout) = cached.as_ref().expect(
+            "table_shift_click_ranges_over_display_order_under_sort: \
+             no frame painted yet",
+        );
+        let column = &layout.columns[0];
+        (
+            rect.x + column.x + column.width / 2.0,
+            rect.y + layout.header_height + layout.row_height * (display as f32 + 0.5),
+        )
+    };
+    let selected = |h: &crate::harness::ConformanceHarness<D>| -> Vec<usize> {
+        let engine = h.engine.borrow();
+        let mut v = engine
+            .plugin_view_table_multi_selected
+            .get(RANGE_SELECT_VIEW)
+            .cloned()
+            .unwrap_or_default();
+        v.sort_unstable();
+        v
+    };
+
+    // Display position 1 is declared row 0 (`RANGE_ROW0`'s "Rb" sorts second).
+    let (x1, y1) = display_xy(h, 1);
+    h.driver.click(x1, y1);
+    assert_eq!(
+        selected(h),
+        vec![0],
+        "a plain click at display position 1 (declared row 0) must select \
+         only declared row 0"
+    );
+
+    // Display position 2 is declared row 2 (`RANGE_ROW2`'s "Rz" sorts last).
+    let (x2, y2) = display_xy(h, 2);
+    // Display position 2 sits only one row's height from display position
+    // 1 — inside every backend's `DoubleClickDetector` fold radius. Without
+    // a real gap past its time window, this dispatch would be rewritten
+    // into a modifier-less `DoubleClick` and the shift-range gesture under
+    // test would never run.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    h.driver.dispatch(quadraui::UiEvent::MouseDown {
+        widget: None,
+        button: quadraui::MouseButton::Left,
+        position: quadraui::Point::new(x2, y2),
+        modifiers: quadraui::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+    });
+    assert_eq!(
+        selected(h),
+        vec![0, 2],
+        "a shift-click at display position 2 must range over display \
+         positions [1, 2] (declared rows 0 and 2), excluding declared row 1 \
+         even though it sits between them in declared order"
+    );
+}
+
+/// Scenario 10j — a column declaring `align = "right"` paints its cell's
+/// text run further from its own column's left edge than a column with no
+/// `align` override does, using [`ALIGN_VIEW`]'s two single-row columns
+/// (left-default, right-declared) so the comparison is within one frame
+/// rather than across two fixtures with potentially different column
+/// widths.
+pub fn table_align_right_column_indents_its_cell_text<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    assert_paints(
+        &h.driver,
+        &[ALIGN_CELL_LEFT, ALIGN_CELL_RIGHT],
+        "the align table's initial paint",
+    );
+
+    let engine = h.engine.borrow();
+    let cached = engine.plugin_view_table_layout.borrow();
+    let (rect, layout) = cached
+        .as_ref()
+        .expect("table_align_right_column_indents_its_cell_text: no frame painted yet");
+    let col_left = &layout.columns[0];
+    let col_right = &layout.columns[1];
+    let col_left_x = rect.x + col_left.x;
+    let col_right_x = rect.x + col_right.x;
+    drop(cached);
+    drop(engine);
+
+    let left_run = painted_run_last(&h.driver, ALIGN_CELL_LEFT);
+    let right_run = painted_run_last(&h.driver, ALIGN_CELL_RIGHT);
+    let left_offset = left_run.x - col_left_x;
+    let right_offset = right_run.x - col_right_x;
+
+    assert!(
+        right_offset > left_offset,
+        "a column declaring align = \"right\" must paint its cell's text run \
+         further from its own column's left edge than the default-aligned \
+         column does: left offset {left_offset}, right offset {right_offset}"
+    );
+}
+
 /// Scenario 11 — a `kind = "text_view"` with more lines than fit the
 /// viewport starts scrolled to the top and scrolls to the bottom on `End`.
 pub fn text_view_scrolls_to_the_bottom_on_end(driver: &mut impl ConformanceDriver) {
@@ -2526,6 +2854,24 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_table_ctrl_click_toggles_a_row_without_clearing_the_others_on_tui() {
+        let (mut h, _dir) = tui_named(RANGE_SELECT_VIEW);
+        table_ctrl_click_toggles_a_row_without_clearing_the_others(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_table_shift_click_ranges_over_display_order_under_sort_on_tui() {
+        let (mut h, _dir) = tui_named(RANGE_SELECT_VIEW);
+        table_shift_click_ranges_over_display_order_under_sort(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_table_align_right_column_indents_its_cell_text_on_tui() {
+        let (mut h, _dir) = tui_named(ALIGN_VIEW);
+        table_align_right_column_indents_its_cell_text(&mut h);
+    }
+
+    #[test]
     fn plugin_view_text_view_scrolls_to_the_bottom_on_end_on_tui() {
         let (mut h, _dir) = tui_named(TEXT_VIEW);
         text_view_scrolls_to_the_bottom_on_end(&mut h.driver);
@@ -2870,6 +3216,27 @@ mod tests {
     fn plugin_view_table_multi_select_click_checks_the_row_and_paints_the_footer_on_gtk() {
         let (mut h, _dir) = gtk_named(MULTI_SELECT_VIEW);
         table_multi_select_click_checks_the_row_and_paints_the_footer(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_ctrl_click_toggles_a_row_without_clearing_the_others_on_gtk() {
+        let (mut h, _dir) = gtk_named(RANGE_SELECT_VIEW);
+        table_ctrl_click_toggles_a_row_without_clearing_the_others(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_shift_click_ranges_over_display_order_under_sort_on_gtk() {
+        let (mut h, _dir) = gtk_named(RANGE_SELECT_VIEW);
+        table_shift_click_ranges_over_display_order_under_sort(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_align_right_column_indents_its_cell_text_on_gtk() {
+        let (mut h, _dir) = gtk_named(ALIGN_VIEW);
+        table_align_right_column_indents_its_cell_text(&mut h);
     }
 
     #[cfg(feature = "gui")]
