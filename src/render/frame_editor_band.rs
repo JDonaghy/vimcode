@@ -977,41 +977,16 @@ pub fn paint_bottom_panel_rung(
             let body =
                 quadraui::Rect::new(rect.x, rect.y + lh, rect.width, (rect.height - lh).max(0.0));
             engine.plugin_view_dock_form_rect.set(body);
-            let kind = engine
-                .plugin_views
-                .get(name.as_str())
-                .and_then(|v| v.body.as_ref())
-                .map(|v| v.kind_name());
-            match kind {
-                // List-kind bodies have no dock-hosted layout cache yet
-                // (`plugin_view_body.rs`'s `paint_plugin_view_list`'s
-                // `Dock => return false` arm) — see the comment above.
-                Some("list") => {}
-                // Tree-kind bodies have no dock-hosted `TreeController`
-                // (deferred, like List/Table above); painting nothing here
-                // rather than falling into the `Form` default avoids
-                // rendering the view's (likely empty) field list instead.
-                Some("tree") => {}
-                // Table-kind bodies have no dock-hosted layout cache yet
-                // (`plugin_view_body.rs`'s `paint_plugin_view_table`'s
-                // `Dock => return false` arm) — see the comment above.
-                Some("table") => {}
-                // Chart-kind bodies have no dock-hosted layout cache yet
-                // (`plugin_view_body.rs`'s `paint_plugin_view_chart`'s
-                // `Dock => return false` arm) — see the comment above.
-                Some("chart") => {}
-                Some("text_view") => {
-                    paint_plugin_view_text(engine, name, PluginViewHost::Dock, false, body, b);
-                    engine
-                        .scroll_surfaces
-                        .borrow_mut()
-                        .push(quadraui::ScrollSurface {
-                            id: quadraui::WidgetId::new("plugin_dock"),
-                            bounds: body,
-                            scrollbar: None,
-                        });
-                }
-                _ => {
+            // `PluginView::is_form()` is the one predicate this match and
+            // `render::route_bottom_panel_click`'s click router both key off,
+            // so a future fifth `ViewBody` variant can't make painting and
+            // click-routing silently disagree about which views are
+            // `Form`-shaped. An unrecognized single-widget kind paints
+            // nothing rather than falling into the `Form` default, which
+            // would otherwise render the view's likely-empty field list.
+            let view = engine.plugin_views.get(name.as_str());
+            match view.and_then(|v| v.body.as_ref()) {
+                None => {
                     if populate_plugin_view_dock_form_controller(engine, name, false) {
                         engine
                             .plugin_view_dock_form_controller
@@ -1019,6 +994,35 @@ pub fn paint_bottom_panel_rung(
                             .render_and_cache(b, body);
                     }
                 }
+                Some(view_body) => match view_body.kind_name() {
+                    // List-kind bodies have no dock-hosted layout cache yet
+                    // (`plugin_view_body.rs`'s `paint_plugin_view_list`'s
+                    // `Dock => return false` arm) — see the comment above.
+                    "list" => {}
+                    // Tree-kind bodies have no dock-hosted `TreeController`
+                    // (deferred, like List/Table above).
+                    "tree" => {}
+                    // Table-kind bodies have no dock-hosted layout cache yet
+                    // (`plugin_view_body.rs`'s `paint_plugin_view_table`'s
+                    // `Dock => return false` arm) — see the comment above.
+                    "table" => {}
+                    // Chart-kind bodies have no dock-hosted layout cache yet
+                    // (`plugin_view_body.rs`'s `paint_plugin_view_chart`'s
+                    // `Dock => return false` arm) — see the comment above.
+                    "chart" => {}
+                    "text_view" => {
+                        paint_plugin_view_text(engine, name, PluginViewHost::Dock, false, body, b);
+                        engine
+                            .scroll_surfaces
+                            .borrow_mut()
+                            .push(quadraui::ScrollSurface {
+                                id: quadraui::WidgetId::new("plugin_dock"),
+                                bounds: body,
+                                scrollbar: None,
+                            });
+                    }
+                    _ => {}
+                },
             }
         }
     }
