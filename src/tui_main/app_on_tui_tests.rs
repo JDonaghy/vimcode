@@ -6501,6 +6501,163 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// With two editor *groups* open side by side (`Ctrl+W v`, not a
+        /// vim window split within one group), clicking inside the
+        /// unfocused group's pane **body** — not its tab label — must
+        /// reveal/select that group's active file in the Explorer, the
+        /// same way clicking its tab label already does (see
+        /// `tab_bar_click_reveals_and_highlights_active_file_in_explorer_1903`
+        /// just above).
+        ///
+        /// Both files live directly in the fixture directory (no `sub/`
+        /// nesting) so the Explorer can select them without any ancestor
+        /// expansion — this test is about which group's file gets
+        /// revealed, not the expansion machinery `_1903` already covers.
+        ///
+        /// Group B is created via `open_editor_group` (becomes active with
+        /// a tab cloned from A's), then `new_tab` opens `b.rs` as B's own
+        /// second tab — mirroring `stacked_groups_bottom_tab_row_shows_its_label_1586`'s
+        /// setup. `focus_other_group` then switches focus back to A and
+        /// `explorer_reveal_active_file` is called once directly to seed
+        /// the Explorer's baseline selection on `a.rs`, establishing the
+        /// precondition the click is proven to change — the click itself
+        /// is the only thing that touches B afterward.
+        ///
+        /// Clicks the center of B's pane body, located via its painted
+        /// `RenderedWindow::rect` (the same `windows.iter().find(...)`
+        /// pattern `wheel_scrolls_the_pane_under_the_pointer_not_the_focused_one`
+        /// uses), not a text lookup — the pane body paints buffer content,
+        /// not the file name, so there is nothing to `driver.find`.
+        #[test]
+        fn pane_body_click_in_another_group_reveals_its_active_file_in_explorer_2100() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_2100_pane_body_click_reveal_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let dir = std::fs::canonicalize(&dir).unwrap();
+            let file_a = dir.join("a.rs");
+            let file_b = dir.join("b.rs");
+            std::fs::write(&file_a, "// a\n").unwrap();
+            std::fs::write(&file_b, "// b\n").unwrap();
+
+            let (engine, group_b, window_b) = {
+                let _cwd = crate::test_cwd::CwdGuard::new();
+                std::env::set_current_dir(&dir).expect("chdir into the fixture directory");
+
+                let mut engine = plain_engine();
+                engine.settings.colorscheme = "vscode-light".to_string();
+                engine.settings.breadcrumbs = false; // one-row tab bar, simplest geometry
+                engine.open_file_in_tab(&file_a);
+                // Close `plain_engine`'s pristine `[No Name]` scratch tab,
+                // same as `tab_bar_click_reveals_and_highlights_active_file_in_explorer_1903`.
+                engine.goto_tab(0);
+                engine.close_tab();
+                let group_a = engine.active_group;
+
+                engine.open_editor_group(SplitDirection::Vertical);
+                let group_b = engine.active_group;
+                engine.new_tab(Some(&file_b));
+                let window_b = engine.active_window_id();
+
+                engine.focus_other_group();
+                assert_eq!(
+                    engine.active_group, group_a,
+                    "sanity: with exactly two groups, focus_other_group must \
+                     switch focus back to A"
+                );
+                engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                    crate::core::engine::sidebar::PANEL_EXPLORER,
+                ));
+                engine.session.explorer_visible = true;
+                engine.explorer_has_focus = false;
+                // Seed the Explorer's baseline selection directly — this is
+                // setup, not the behaviour under test (the click is).
+                engine.explorer_reveal_active_file();
+                (engine, group_b, window_b)
+            };
+            let mut h = harness(engine);
+            let expected_bg =
+                quadraui::tui::ratatui_color(crate::render::Theme::light().sidebar_sel_bg_inactive);
+
+            let precondition_row = active_group_tab_bar_row(&h, group_b);
+            assert!(
+                precondition_row.contains("b.rs"),
+                "precondition: group B's own tab bar must already show \
+                 b.rs as its active tab; tab bar row:\n{precondition_row}"
+            );
+            // Unlike `_1903`'s nested/collapsed fixture, both files are
+            // flat siblings, so both rows always paint in the Explorer —
+            // the precondition is which one is *highlighted*, not which
+            // one is merely present.
+            let (ax, ay) = find_below_tab_bar(&h, "a.rs")
+                .expect("a.rs's Explorer row must paint below the tab bar");
+            let (bx, by) = find_below_tab_bar(&h, "b.rs")
+                .expect("b.rs's Explorer row must paint below the tab bar");
+            assert_eq!(
+                h.driver.style_at(ax, ay).expect("styled cell").bg,
+                expected_bg,
+                "precondition: a.rs's row must start out selected in the \
+                 Explorer; screen:\n{}",
+                h.driver.screen()
+            );
+            assert_ne!(
+                h.driver.style_at(bx, by).expect("styled cell").bg,
+                expected_bg,
+                "precondition: b.rs's row must not yet be selected in the \
+                 Explorer, before the click; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let rect = h
+                .screen_layout
+                .borrow()
+                .as_ref()
+                .and_then(|s| s.windows.iter().find(|w| w.window_id == window_b))
+                .map(|w| w.rect)
+                .expect("group B's window must have painted a rect");
+            let x = (rect.x + rect.width / 2.0) as f32;
+            let y = (rect.y + rect.height / 2.0) as f32;
+            h.driver.click(x, y);
+            h.driver.render();
+
+            assert_eq!(
+                h.engine.borrow().active_group,
+                group_b,
+                "clicking inside group B's pane body must focus group B"
+            );
+            assert_eq!(
+                h.engine.borrow().file_path(),
+                Some(&file_b),
+                "clicking inside group B's pane body must make its tab \
+                 (b.rs) the active file"
+            );
+
+            let (rx, ry) = find_below_tab_bar(&h, "b.rs").unwrap_or_else(|| {
+                panic!(
+                    "clicking inside group B's pane body must auto-reveal \
+                     b.rs in the Explorer sidebar, the same way clicking \
+                     its tab label does; screen:\n{}",
+                    h.driver.screen()
+                )
+            });
+            let style = h
+                .driver
+                .style_at(rx, ry)
+                .expect("the revealed row must paint a styled cell");
+            assert_eq!(
+                style.bg,
+                expected_bg,
+                "the revealed row must be selected/highlighted with \
+                 `sidebar_sel_bg_inactive`; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// `explorer_auto_reveal` (default on, mirroring VS Code's
         /// `explorer.autoReveal`) must be possible to turn off — with it
         /// off, the same tab-bar click as
