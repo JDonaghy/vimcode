@@ -2513,10 +2513,16 @@ impl Engine {
                         let line_len = self.buffer().line_len_chars(target_line);
                         let max_col = if line_len > 0 { line_len - 1 } else { 0 };
                         self.view_mut().cursor.col = col.min(max_col);
+                        // Undo group must start after the cursor moves to the
+                        // last-insert position: `cursor_before` is what `u`
+                        // restores to, and that must be the `gi` target, not
+                        // wherever Normal mode left the cursor.
+                        self.start_undo_group();
                         self.mode = Mode::Insert;
                         self.insert_text_buffer.clear();
                     } else {
                         // No previous insert position: just enter Insert mode
+                        self.start_undo_group();
                         self.mode = Mode::Insert;
                         self.insert_text_buffer.clear();
                     }
