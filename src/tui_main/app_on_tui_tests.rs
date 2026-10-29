@@ -1314,6 +1314,43 @@ mod tests {
             );
         }
 
+        /// `gi` (go to last insert position, enter Insert mode) must open an
+        /// undo block like every other way of entering Insert mode: typing
+        /// `g` `i` `t` `<Esc>` `u` from Normal mode must remove the inserted
+        /// "t" and leave the status line clear, not report "Already at
+        /// oldest change".
+        #[test]
+        fn undo_after_gi_removes_the_inserted_text() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQXW_GI_LINE\n");
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char('g');
+            driver.type_char('i');
+            driver.type_char('t');
+            driver.press_named(quadraui::NamedKey::Escape);
+            assert!(
+                driver.screen_has("tZQXW_GI_LINE"),
+                "precondition: 'gi' then 't' must insert a literal 't'; screen:\n{}",
+                driver.screen()
+            );
+
+            driver.type_char('u');
+            assert!(
+                !driver.screen_has("tZQXW_GI_LINE") && driver.screen_has("ZQXW_GI_LINE"),
+                "'u' after a 'gi' insert session must remove the inserted \
+                 text; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                !driver.screen_has("Already at oldest change"),
+                "'u' after a 'gi' insert must not report an empty undo \
+                 history; screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// `i` then `Escape` must return to Normal mode — a typed key after
         /// `Escape` must not insert further text.
         #[test]
