@@ -20,6 +20,12 @@ no matching section fails the release job before anything is published (see
   scrub the focused day live; `Enter` confirms it as a `DateChanged`
   event to the plugin's `on_event` handler.
 
+### Fixed
+- With more than one editor group open, focusing a pane by clicking inside
+  its body (gutter, text area, status row, minimap, or scrollbar — not just
+  its tab label) now reveals/selects that group's active file in the
+  Explorer sidebar, matching the existing tab-click behaviour.
+
 ## [0.15.5] - 2026-10-17
 ### Changed
 - "Open Folder" now opens the OS-native folder dialog (NSOpenPanel on

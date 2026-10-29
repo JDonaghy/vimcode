@@ -10533,20 +10533,15 @@ impl Engine {
         if let Some(list) = self.location_lists.get_mut(&window_id) {
             list.has_focus = false;
         }
-        // Switch to the group that owns this window, then reveal its active
-        // file in the explorer unconditionally — the same way `goto_tab`
-        // does for a tab click. `focus_group_for_window`/`set_cursor_for_
-        // window` alone only flip `active_group`/`active_window`, they
-        // don't reveal the newly active file in the explorer. A
-        // buffer-changed guard here would be a no-op: for a pane-body
-        // click (as opposed to a tab click), the zone resolver
-        // (`pixel_to_click_target`'s `ScreenZone::Window` arm) has already
-        // called `activate_group_for_window` *before* this function runs,
-        // so `active_buffer_id()` already reflects the new pane on both
-        // sides of any before/after comparison taken in here.
+        // Switch to the group that owns this window. The click-target
+        // resolver (`pixel_to_click_target`'s `ScreenZone::Window` arm)
+        // already called `Engine::activate_group_for_window` for this same
+        // window before this function runs; that is also where the
+        // Explorer's auto-reveal fires, guarded on the group actually
+        // changing, so a pane-body click in the already-active group never
+        // disturbs an Explorer selection the user set by hand.
         self.focus_group_for_window(window_id);
         self.set_cursor_for_window(window_id, line, col);
-        self.explorer_reveal_active_file();
     }
 
     /// Handle mouse drag to the given buffer position.
@@ -10664,12 +10659,11 @@ impl Engine {
         self.mouse_drag_origin_window = None;
         self.mouse_drag_word_mode = false;
         self.mouse_drag_word_origin = None;
-        // See `mouse_click` — a double-click can be the first click on a
-        // pane in another group just as easily as a single click, so it
-        // reveals the active file in the explorer the same way.
+        // See `mouse_click` — the click-target resolver already ran
+        // `Engine::activate_group_for_window` (and its guarded Explorer
+        // auto-reveal) for this same window before this function runs.
         self.focus_group_for_window(window_id);
         self.set_cursor_for_window(window_id, line, col);
-        self.explorer_reveal_active_file();
 
         // Find word boundaries at cursor
         let cursor_line = self.view().cursor.line;

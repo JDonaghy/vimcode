@@ -6528,6 +6528,11 @@ mod tests {
         /// pattern `wheel_scrolls_the_pane_under_the_pointer_not_the_focused_one`
         /// uses), not a text lookup — the pane body paints buffer content,
         /// not the file name, so there is nothing to `driver.find`.
+        ///
+        /// Observed red against unfixed `develop`: `Engine::mouse_click`
+        /// only revealed the active file in the Explorer for a tab-bar
+        /// click, not a pane-body click — the final assertion below (b.rs's
+        /// Explorer row painted with `sidebar_sel_bg_inactive`) failed.
         #[test]
         fn pane_body_click_in_another_group_reveals_its_active_file_in_explorer_2100() {
             let dir = std::env::temp_dir().join(format!(
