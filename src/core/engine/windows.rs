@@ -2566,6 +2566,19 @@ impl Engine {
     }
 
     /// Set `active_group` to the group that owns the given window.
+    ///
+    /// When this actually switches the active group (as opposed to a click
+    /// landing back inside the already-active group), reveal the new
+    /// group's active file in the Explorer — the same auto-reveal
+    /// `goto_tab` performs for a tab-bar click. This is the only
+    /// non-test caller of this function other than `src/click.rs`'s
+    /// `ScreenZone::Window` arm, which runs it unconditionally before
+    /// resolving which sub-zone (gutter, text area, status row, minimap,
+    /// scrollbar) was actually clicked — so every one of those pane-body
+    /// click paths gets the reveal here, without needing a reveal call at
+    /// each of their own call sites, and a click that lands back inside
+    /// the already-active group's pane never disturbs an Explorer
+    /// selection/scroll position the user set by hand.
     pub fn activate_group_for_window(&mut self, window_id: WindowId) {
         for (&gid, group) in &self.editor_groups {
             if group
@@ -2573,7 +2586,11 @@ impl Engine {
                 .iter()
                 .any(|t| t.window_ids().contains(&window_id))
             {
+                let changed = self.active_group != gid;
                 self.active_group = gid;
+                if changed {
+                    self.explorer_reveal_active_file();
+                }
                 return;
             }
         }
