@@ -326,7 +326,16 @@ png = "0.18"
 # `default-features = false` is required: without it, this entry would pull
 # in `default = ["gui"]` (GTK4/pangocairo/gio) even for a
 # `--no-default-features` test run, defeating the point of that flag.
-vimcode = { path = ".", default-features = false, features = ["test-build-guard"] }
+#
+# Also activates `test-support`: Cargo unifies this package's features
+# across every place it appears in the build graph, which includes the
+# `vimcode` bin's own `#[cfg(test)]` module in `src/main.rs` — that module
+# links `vimcode_core` as an ordinary (non-`cfg(test)`) dependency, so
+# without this, `tui_main::testing` (gated `any(test, feature =
+# "test-support")`) would be invisible to it. This is how `src/main.rs`'s
+# own driver-backed test reaches the TUI harness without a separate
+# `--features` flag at the command line.
+vimcode = { path = ".", default-features = false, features = ["test-build-guard", "test-support"] }
 insta = "1.39"
 # #1008: msgpack values for the `tests/nvim_conformance.rs` oracle, which
 # drives `nvim --embed` over msgpack-RPC with a UI attached (`nvim_ui_attach`)
