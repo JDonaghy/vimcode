@@ -774,6 +774,10 @@ pub struct PluginManager {
     pub plugins: Vec<LoadedPlugin>,
     /// Registered `:Command` → Lua function.
     commands: HashMap<String, LuaRegistryKey>,
+    /// Palette-facing `title`/`category` for a subset of `commands`, keyed
+    /// by the same name. A command with no entry here still runs via
+    /// `:name` and still shows in the palette, just by its bare name.
+    command_meta: HashMap<String, PluginCommandMeta>,
     /// Registered `(mode, key)` → Lua function.
     keymaps: HashMap<(String, String), LuaRegistryKey>,
     /// Registered `event` → list of Lua functions.
@@ -1158,6 +1162,25 @@ pub struct PluginCallContext {
     pub set_lines_range: Vec<(usize, usize, Vec<String>)>,
 }
 
+/// Optional human-readable metadata for a `vimcode.command()` registration,
+/// used only to render it in the command palette — `title` is shown instead
+/// of the bare `:name`, and `category` prefixes it ("Category: Title").
+/// Neither affects `:name` ex-dispatch or `vimcode.keymap` binding.
+#[derive(Debug, Clone, Default)]
+pub struct PluginCommandMeta {
+    pub title: Option<String>,
+    pub category: Option<String>,
+}
+
+/// One row of [`PluginManager::command_entries`]: a registered command's
+/// name alongside its palette-facing metadata.
+#[derive(Debug, Clone)]
+pub struct PluginCommandEntry {
+    pub name: String,
+    pub title: Option<String>,
+    pub category: Option<String>,
+}
+
 // ─── Internal registration accumulator ───────────────────────────────────────
 
 /// Stored in Lua app_data during a plugin's top-level execution so that
@@ -1166,6 +1189,10 @@ pub struct PluginCallContext {
 #[derive(Default)]
 struct PluginRegistrations {
     commands: HashMap<String, LuaRegistryKey>,
+    /// `title`/`category` passed to the `opts` argument of
+    /// `vimcode.command(name, fn, opts)`, keyed by the same `name` as
+    /// `commands`. Absent for a command registered with no `opts` table.
+    command_meta: HashMap<String, PluginCommandMeta>,
     keymaps: HashMap<(String, String), LuaRegistryKey>,
     hooks: HashMap<String, Vec<LuaRegistryKey>>,
     panels: Vec<PanelRegistration>,
@@ -1608,6 +1635,7 @@ impl PluginManager {
             lua,
             plugins: Vec::new(),
             commands: HashMap::new(),
+            command_meta: HashMap::new(),
             keymaps: HashMap::new(),
             hooks: HashMap::new(),
             panels: HashMap::new(),
@@ -1693,6 +1721,9 @@ impl PluginManager {
         if let Some(reg) = self.lua.remove_app_data::<PluginRegistrations>() {
             for (cmd_name, key) in reg.commands {
                 self.commands.insert(cmd_name, key);
+            }
+            for (cmd_name, meta) in reg.command_meta {
+                self.command_meta.insert(cmd_name, meta);
             }
             for (km, key) in reg.keymaps {
                 self.keymaps.insert(km, key);
@@ -1790,12 +1821,24 @@ impl PluginManager {
         (true, ctx)
     }
 
-    /// Names of every `vimcode.command()`-registered command, sorted for a
-    /// stable command-palette listing.
-    pub fn command_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.commands.keys().cloned().collect();
-        names.sort();
-        names
+    /// Every `vimcode.command()`-registered command, with its optional
+    /// palette title/category, sorted by name for a stable command-palette
+    /// listing.
+    pub fn command_entries(&self) -> Vec<PluginCommandEntry> {
+        let mut entries: Vec<PluginCommandEntry> = self
+            .commands
+            .keys()
+            .map(|name| {
+                let meta = self.command_meta.get(name);
+                PluginCommandEntry {
+                    name: name.clone(),
+                    title: meta.and_then(|m| m.title.clone()),
+                    category: meta.and_then(|m| m.category.clone()),
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries
     }
 
     /// Return true if at least one hook is registered for `event`.
@@ -3028,16 +3071,30 @@ impl PluginManager {
             })?,
         )?;
 
-        // vimcode.command(name, fn)
+        // vimcode.command(name, fn, opts) — opts is optional: { title =
+        // "Run Query", category = "SQLTool" } controls only how the command
+        // renders in the command palette ("SQLTool: Run Query" instead of
+        // the bare `:name`); `:name` dispatch and `vimcode.keymap` binding
+        // are unaffected either way.
         vimcode.set(
             "command",
-            lua.create_function(|lua, (name, f): (String, LuaFunction)| {
-                let key = lua.create_registry_value(f)?;
-                if let Some(mut reg) = lua.app_data_mut::<PluginRegistrations>() {
-                    reg.commands.insert(name, key);
-                }
-                Ok(())
-            })?,
+            lua.create_function(
+                |lua, (name, f, opts): (String, LuaFunction, Option<LuaTable>)| {
+                    let title = opts.as_ref().and_then(|o| o.get::<_, String>("title").ok());
+                    let category = opts
+                        .as_ref()
+                        .and_then(|o| o.get::<_, String>("category").ok());
+                    let key = lua.create_registry_value(f)?;
+                    if let Some(mut reg) = lua.app_data_mut::<PluginRegistrations>() {
+                        if title.is_some() || category.is_some() {
+                            reg.command_meta
+                                .insert(name.clone(), PluginCommandMeta { title, category });
+                        }
+                        reg.commands.insert(name, key);
+                    }
+                    Ok(())
+                },
+            )?,
         )?;
 
         // vimcode.keymap(mode, key, fn) — legacy call form (unchanged):
