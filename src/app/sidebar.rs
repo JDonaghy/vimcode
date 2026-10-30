@@ -599,6 +599,24 @@ impl App {
                 // empty panel padding belongs here rather than leaking to the
                 // editor underneath.
                 match event {
+                    // Right-click on a view's row offers the native context
+                    // menu built from whatever commands the view's plugin
+                    // declared with `vimcode.command(name, fn, { context_menu
+                    // = view_name, ... })` — this arm must come before the
+                    // generic `is_view` one below, which would otherwise
+                    // swallow every event (including this one) by routing it
+                    // to `FormController` first.
+                    UiEvent::MouseDown {
+                        button: quadraui::MouseButton::Right,
+                        ..
+                    } if is_view => {
+                        let name = engine.ext_panel_active.clone().unwrap_or_default();
+                        let cw = self.cached_char_width.max(1.0);
+                        let lh = self.cached_line_height.max(1.0);
+                        let cx = (pos.x as f64 / cw) as u16;
+                        let cy = (pos.y as f64 / lh) as u16;
+                        engine.open_plugin_view_context_menu(&name, cx, cy);
+                    }
                     // A `ViewBody`-kind view routes through its own
                     // matching primitive's click/scroll resolution instead
                     // of `FormController` — `render::route_plugin_view_body_

@@ -1679,6 +1679,15 @@ pub enum ContextMenuTarget {
     Board {
         card_id: quadraui::WidgetId,
     },
+    /// A right-clicked row inside a `vimcode.ui.register_view` view's body.
+    /// Items are every command the view's plugin registered with
+    /// `vimcode.command(name, fn, { context_menu = view_name, ... })` —
+    /// see `Engine::open_plugin_view_context_menu`. Confirming one runs the
+    /// command through `Engine::execute_command`, the same dispatch path
+    /// the command palette and menu bar use.
+    PluginView {
+        view_name: String,
+    },
 }
 
 /// A single item in a context menu popup.

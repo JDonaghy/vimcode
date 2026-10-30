@@ -704,6 +704,48 @@ pub fn menu_defs_to_menu_bar(defs: &[quadraui::MenuDef]) -> quadraui::MenuBar {
     }
 }
 
+/// Fold extension-registered commands declaring `menu = "<name>"` (via
+/// `vimcode.command(name, fn, { menu = "File", ... })`) into `defs`, the
+/// output of [`build_menu_defs`]. Each entry becomes a `ContextMenuItem`
+/// appended to the matching top-level menu (matched by label, case-
+/// sensitive, e.g. `"File"`); a `menu` name with no matching built-in menu
+/// gets its own new top-level `MenuDef` appended at the end, so a plugin can
+/// introduce an entirely new menu-bar menu, not just extend an existing one.
+///
+/// Selecting a plugin menu item dispatches through the same
+/// `quadraui::MenuEvent::Activated(id)` → `Engine::dispatch_menu_action` →
+/// `Engine::execute_command` path every built-in menu item already uses —
+/// `id` is just the registered command name, so no new dispatch code is
+/// needed.
+pub fn append_plugin_menu_entries(
+    defs: &mut Vec<quadraui::MenuDef>,
+    entries: &[crate::core::plugin::PluginCommandEntry],
+) {
+    for entry in entries {
+        let Some(menu_name) = entry.menu.as_ref() else {
+            continue;
+        };
+        let label = entry.title.clone().unwrap_or_else(|| entry.name.clone());
+        let item = quadraui::ContextMenuItem {
+            id: Some(quadraui::WidgetId::new(&entry.name)),
+            label: quadraui::StyledText::plain(label),
+            detail: None,
+            disabled: false,
+            key_equivalent: None,
+            ..Default::default()
+        };
+        match defs.iter_mut().find(|def| &def.label == menu_name) {
+            Some(def) => def.items.push(item),
+            None => defs.push(quadraui::MenuDef {
+                id: quadraui::WidgetId::new(menu_name.as_str()),
+                label: menu_name.clone(),
+                disabled: false,
+                items: vec![item],
+            }),
+        }
+    }
+}
+
 /// Static debug toolbar button definitions.
 /// Icons use the Unicode fallback glyphs (▶ ⏸ ⏹ ↻ etc.) which render
 /// correctly in both TUI (any font) and GTK (no Nerd Font subset needed).

@@ -1162,23 +1162,33 @@ pub struct PluginCallContext {
     pub set_lines_range: Vec<(usize, usize, Vec<String>)>,
 }
 
-/// Optional human-readable metadata for a `vimcode.command()` registration,
-/// used only to render it in the command palette — `title` is shown instead
-/// of the bare `:name`, and `category` prefixes it ("Category: Title").
-/// Neither affects `:name` ex-dispatch or `vimcode.keymap` binding.
+/// Optional human-readable metadata for a `vimcode.command()` registration.
+/// `title`/`category` affect only the command palette — `title` is shown
+/// instead of the bare `:name`, and `category` prefixes it ("Category:
+/// Title"). `menu` names the top-level menu-bar menu (matched by label,
+/// e.g. `"File"`) the command also appears in as a menu item; `context_menu`
+/// names a `vimcode.ui.register_view` view whose right-clicked row offers
+/// the command in its native context menu. None of these affect `:name`
+/// ex-dispatch or `vimcode.keymap` binding — selecting the command from
+/// either menu runs it through the same `execute_command` path `:name` and
+/// the palette use.
 #[derive(Debug, Clone, Default)]
 pub struct PluginCommandMeta {
     pub title: Option<String>,
     pub category: Option<String>,
+    pub menu: Option<String>,
+    pub context_menu: Option<String>,
 }
 
 /// One row of [`PluginManager::command_entries`]: a registered command's
-/// name alongside its palette-facing metadata.
+/// name alongside its palette/menu-bar/context-menu-facing metadata.
 #[derive(Debug, Clone)]
 pub struct PluginCommandEntry {
     pub name: String,
     pub title: Option<String>,
     pub category: Option<String>,
+    pub menu: Option<String>,
+    pub context_menu: Option<String>,
 }
 
 // ─── Internal registration accumulator ───────────────────────────────────────
@@ -1834,6 +1844,8 @@ impl PluginManager {
                     name: name.clone(),
                     title: meta.and_then(|m| m.title.clone()),
                     category: meta.and_then(|m| m.category.clone()),
+                    menu: meta.and_then(|m| m.menu.clone()),
+                    context_menu: meta.and_then(|m| m.context_menu.clone()),
                 }
             })
             .collect();
@@ -3075,7 +3087,12 @@ impl PluginManager {
         // "Run Query", category = "SQLTool" } controls only how the command
         // renders in the command palette ("SQLTool: Run Query" instead of
         // the bare `:name`); `:name` dispatch and `vimcode.keymap` binding
-        // are unaffected either way.
+        // are unaffected either way. `menu = "File"` additionally places the
+        // command as a menu item under the named top-level menu-bar menu;
+        // `context_menu = "my_view"` places it in the native context menu
+        // offered when the user right-clicks a row of the named
+        // `vimcode.ui.register_view` view. Both dispatch through the same
+        // `execute_command` path as `:name` and the palette.
         vimcode.set(
             "command",
             lua.create_function(
@@ -3084,11 +3101,26 @@ impl PluginManager {
                     let category = opts
                         .as_ref()
                         .and_then(|o| o.get::<_, String>("category").ok());
+                    let menu = opts.as_ref().and_then(|o| o.get::<_, String>("menu").ok());
+                    let context_menu = opts
+                        .as_ref()
+                        .and_then(|o| o.get::<_, String>("context_menu").ok());
                     let key = lua.create_registry_value(f)?;
                     if let Some(mut reg) = lua.app_data_mut::<PluginRegistrations>() {
-                        if title.is_some() || category.is_some() {
-                            reg.command_meta
-                                .insert(name.clone(), PluginCommandMeta { title, category });
+                        if title.is_some()
+                            || category.is_some()
+                            || menu.is_some()
+                            || context_menu.is_some()
+                        {
+                            reg.command_meta.insert(
+                                name.clone(),
+                                PluginCommandMeta {
+                                    title,
+                                    category,
+                                    menu,
+                                    context_menu,
+                                },
+                            );
                         }
                         reg.commands.insert(name, key);
                     }

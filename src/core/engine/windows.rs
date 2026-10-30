@@ -2133,6 +2133,13 @@ impl Engine {
                 let card_id = *card_id;
                 self.run_board_action_by_name(&action, card_id);
             }
+            ContextMenuTarget::PluginView { .. } => {
+                // `action` is the registered command name
+                // `open_plugin_view_context_menu` populated the menu from,
+                // so confirming it is just running that command — the same
+                // dispatch path `:name` and the command palette use.
+                self.execute_command(&action);
+            }
         }
 
         Some(action)
