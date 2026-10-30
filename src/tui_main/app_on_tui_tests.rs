@@ -18587,6 +18587,59 @@ mod tests {
             );
         }
 
+        /// A `menu = "<name>"` naming no built-in menu gets its own new
+        /// top-level menu-bar menu: the name paints in the bar alongside
+        /// "File"/"Edit"/…, and clicking it opens a dropdown whose single
+        /// item runs the registered command.
+        #[test]
+        fn plugin_registered_command_contributes_a_new_top_level_menu_via_shell_app() {
+            let mut engine = engine_with_plugin(
+                "menu_bar_new_menu_2103",
+                r#"
+                vimcode.command("ZqNewMenuCmd2103", function(_)
+                    vimcode.message("ZQ_NEW_MENU_RAN")
+                end, { title = "ZQ New Menu Item", menu = "ZqPlugins" })
+                "#,
+            );
+            // The drawn in-window bar row is hidden behind the hamburger by
+            // default; reveal it so the contributed top-level menu has a row
+            // to paint into.
+            engine.menu_bar_visible = true;
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let (mx, my) = driver.find("ZqPlugins").unwrap_or_else(|| {
+                panic!(
+                    "a `menu` naming no built-in menu must paint as a new \
+                     top-level menu-bar menu; screen:\n{}",
+                    driver.screen()
+                )
+            });
+            assert!(
+                !driver.screen_has("ZQ New Menu Item"),
+                "precondition: the new menu's dropdown is not open yet; \
+                 screen:\n{}",
+                driver.screen()
+            );
+            driver.click(mx, my);
+            let (ix, iy) = driver.find("ZQ New Menu Item").unwrap_or_else(|| {
+                panic!(
+                    "clicking the new top-level menu must open a dropdown \
+                     listing the contributed command by its `title`; \
+                     screen:\n{}",
+                    driver.screen()
+                )
+            });
+            driver.click(ix, iy);
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQ_NEW_MENU_RAN"),
+                "selecting the item in the plugin's own menu must run its \
+                 registered Lua callback; screen:\n{screen}"
+            );
+        }
+
         /// A `vimcode.command(name, fn, { context_menu = view_name })`
         /// registration appears in the right-click context menu for a row
         /// in that `vimcode.ui.register_view` view's body, and selecting it
