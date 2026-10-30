@@ -502,13 +502,34 @@ impl Engine {
         // Extension-registered commands (`vimcode.command(name, fn)`) are
         // listed alongside the built-ins so a plugin's actions are reachable
         // from the palette without any extra registration step on its part.
+        // A command registered with `{ title = ..., category = ... }` shows
+        // as "Category: Title" (or bare "Title" with no category); one with
+        // no metadata falls back to the `:Name` ex-command form.
         if let Some(pm) = self.plugin_manager.as_ref() {
-            for name in pm.command_names() {
+            let bound_keys = self.plugin_command_shortcut_hints();
+            for entry in pm.command_entries() {
+                let display = match (&entry.category, &entry.title) {
+                    (Some(cat), Some(title)) if !cat.is_empty() && !title.is_empty() => {
+                        format!("{cat}: {title}")
+                    }
+                    (_, Some(title)) if !title.is_empty() => title.clone(),
+                    _ => format!(":{}", entry.name),
+                };
+                let filter_text = format!(
+                    "{display} {} {} {}",
+                    entry.name,
+                    entry.title.as_deref().unwrap_or(""),
+                    entry.category.as_deref().unwrap_or("")
+                );
+                let detail = bound_keys
+                    .get(&entry.name)
+                    .cloned()
+                    .or_else(|| Some("Extension command".to_string()));
                 items.push(PickerItem {
-                    display: name.clone(),
-                    filter_text: name.clone(),
-                    detail: Some("Extension command".to_string()),
-                    action: PickerAction::ExecuteCommand(name),
+                    display,
+                    filter_text,
+                    detail,
+                    action: PickerAction::ExecuteCommand(entry.name),
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
@@ -519,6 +540,28 @@ impl Engine {
             }
         }
         self.picker_all_items = items;
+    }
+
+    /// Map a plugin command name to the key chord of the first
+    /// `UserKeymapAction::Ex` keymap bound to it (`:Name` or `:Name args`),
+    /// for the command palette's shortcut-hint column. Reflects any keymap
+    /// bound via `vimcode.keymap.set`/config, not just ones a plugin
+    /// registered for itself.
+    fn plugin_command_shortcut_hints(&self) -> HashMap<String, String> {
+        let platform_name = self.platform_name;
+        let mut hints = HashMap::new();
+        for km in &self.user_keymaps {
+            let UserKeymapAction::Ex(cmd) = &km.action else {
+                continue;
+            };
+            let Some(name) = cmd.split_whitespace().next() else {
+                continue;
+            };
+            hints.entry(name.to_string()).or_insert_with(|| {
+                super::format_shortcut_for_platform(&km.keys.join(""), platform_name)
+            });
+        }
+        hints
     }
 
     /// Populate picker_all_items with git branches.

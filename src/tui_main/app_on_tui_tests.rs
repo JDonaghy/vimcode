@@ -17112,6 +17112,101 @@ mod tests {
             );
         }
 
+        /// A `vimcode.command(name, fn, opts)` registration with
+        /// `{ title = ..., category = ... }` renders as
+        /// "Category: Title" in the command palette, is fuzzy-matched by
+        /// typing either the title or the category text (not just the bare
+        /// command name), and still dispatches the registered Lua callback
+        /// on confirm.
+        #[test]
+        fn plugin_command_with_title_and_category_renders_and_fuzzy_matches_via_shell_app() {
+            let engine = engine_with_plugin(
+                "palette_command_2007_meta",
+                r#"
+                vimcode.command("ZqPaletteCmd2007", function(_)
+                    vimcode.message("ZQ_PALETTE_2007_RAN")
+                end, { title = "Run Query", category = "SQLTool" })
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+                quadraui::Modifiers::default(),
+            ));
+            for c in "SQLTool: Run Query".chars() {
+                driver.type_char(c);
+            }
+
+            let open_screen = driver.screen();
+            assert!(
+                open_screen.contains("SQLTool: Run Query"),
+                "a command registered with title/category metadata must be \
+                 listed in the palette as \"Category: Title\", and fuzzy- \
+                 matched by typing that text; screen:\n{open_screen}"
+            );
+            assert!(
+                !open_screen.contains("ZqPaletteCmd2007"),
+                "once a command has a title, its bare ex-name must not be \
+                 shown as the palette label; screen:\n{open_screen}"
+            );
+
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQ_PALETTE_2007_RAN"),
+                "confirming the titled palette entry must still invoke its \
+                 registered Lua callback via the same `:name` dispatch \
+                 path; screen:\n{screen}"
+            );
+        }
+
+        /// A plugin command bound to a key chord via a `settings.keymaps`
+        /// ex-keymap (`"n zqk :Name"`) shows that chord as the command
+        /// palette's shortcut hint, reusing the same detail column
+        /// built-in commands use.
+        #[test]
+        fn plugin_command_bound_to_a_keymap_shows_its_chord_as_the_palette_hint_via_shell_app() {
+            let mut engine = engine_with_plugin(
+                "palette_command_2007_keymap",
+                r#"
+                vimcode.command("ZqPaletteCmd2007Key", function(_)
+                    vimcode.message("ZQ_PALETTE_2007_KEY_RAN")
+                end, { title = "Bound Command" })
+                "#,
+            );
+            engine
+                .settings
+                .keymaps
+                .push("n zqk :ZqPaletteCmd2007Key".to_string());
+            engine.rebuild_user_keymaps();
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+                quadraui::Modifiers::default(),
+            ));
+            for c in "Bound Command".chars() {
+                driver.type_char(c);
+            }
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("Bound Command"),
+                "the titled plugin command must still be listed when \
+                 filtering by its title; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("zqk"),
+                "a plugin command with a bound keymap must show that \
+                 chord as its palette shortcut hint; screen:\n{screen}"
+            );
+        }
+
         /// Acceptance scenario: a `vimcode.completion.register` source's item
         /// appears in the real completion popup — by its `label`, not its
         /// `insert_text`, since those differ here — the moment its trigger
