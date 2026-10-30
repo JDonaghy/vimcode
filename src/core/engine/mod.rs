@@ -5257,7 +5257,7 @@ impl Engine {
     /// state in the first place, including `settings_mtime` (also an ambient
     /// disk read via `Settings::settings_file_path()` + `fs::metadata`, left
     /// as `None` here rather than snuck back in).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_for_test() -> Self {
         Self::new_from_state(
             Settings::default(),
@@ -6113,6 +6113,14 @@ impl Engine {
             } else {
                 self.adopt_cwd_for_startup_file(path);
                 let _ = self.open_file_with_mode(path, OpenMode::Permanent);
+                // A launch argument names one specific file to edit, so the
+                // explorer side panel starts collapsed (matching `nvim
+                // <file>` / `code <file>`) rather than showing whatever the
+                // ambient `explorer_visible_on_startup` setting would
+                // otherwise display. This only flips the shadow `AppShell`'s
+                // transient bit, not `session.explorer_visible`, so a later
+                // bare launch still restores the persisted default.
+                self.app_shell.hide_sidebar();
             }
         } else if restore_session {
             self.restore_session_files();
