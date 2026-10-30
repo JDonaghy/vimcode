@@ -648,6 +648,50 @@ impl Engine {
         });
     }
 
+    /// Open the native context menu for a right-clicked row in a
+    /// `vimcode.ui.register_view` view's body, offering every command the
+    /// view's plugin registered with `vimcode.command(name, fn, {
+    /// context_menu = view_name, ... })`. Unlike `open_ext_panel_context_menu`,
+    /// this doesn't fire a plugin event — the menu contents are declared
+    /// statically on the command itself, so confirming an item just runs
+    /// that command through `Engine::execute_command`, the same dispatch
+    /// path `:name` and the command palette use. `x`/`y` are cell
+    /// coordinates, the same convention `open_board_context_menu` and
+    /// `open_ext_panel_context_menu` use.
+    ///
+    /// A no-op — no menu opened — when there's no plugin manager or no
+    /// command declares `context_menu = view_name`.
+    pub fn open_plugin_view_context_menu(&mut self, view_name: &str, x: u16, y: u16) {
+        let Some(pm) = self.plugin_manager.as_ref() else {
+            return;
+        };
+        let items: Vec<ContextMenuItem> = pm
+            .command_entries()
+            .into_iter()
+            .filter(|entry| entry.context_menu.as_deref() == Some(view_name))
+            .map(|entry| ContextMenuItem {
+                label: entry.title.unwrap_or(entry.name.clone()),
+                action: entry.name,
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::PluginView {
+                view_name: view_name.to_string(),
+            },
+            items,
+            selected: 0,
+            screen_x: x,
+            screen_y: y,
+            trigger_height: 0.0,
+        });
+    }
+
     /// Handle a click on the active ext panel's toolbar button `idx`
     /// (`vimcode.panel.register`'s `toolbar` option).
     /// Fires `panel_toolbar` with arg `"<panel_name>|<button_id>"`.

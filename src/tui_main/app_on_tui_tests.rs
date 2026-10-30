@@ -18532,6 +18532,125 @@ mod tests {
                  prefix its own unmodified buffer text; screen:\n{screen}"
             );
         }
+
+        /// A `vimcode.command(name, fn, { menu = "File" })` registration
+        /// appears as an item in the "File" menu-bar dropdown, and
+        /// selecting it there actually runs the Lua callback — the same
+        /// `MenuEvent::Activated` -> `Engine::execute_command` dispatch
+        /// chain every built-in menu item and the command palette use.
+        #[test]
+        fn plugin_registered_command_appears_in_and_runs_from_the_menu_bar_via_shell_app() {
+            let engine = engine_with_plugin(
+                "menu_bar_command_2103",
+                r#"
+                vimcode.command("ZqMenuBarCmd2103", function(_)
+                    vimcode.message("ZQ_MENU_RAN")
+                end, { title = "Run ZQ Thing", menu = "File" })
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                !driver.screen_has("Run ZQ Thing"),
+                "precondition: the \"File\" dropdown is not open yet, so the \
+                 plugin's menu item must not be visible; screen:\n{}",
+                driver.screen()
+            );
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('f'),
+                modifiers: quadraui::Modifiers {
+                    alt: true,
+                    ..quadraui::Modifiers::default()
+                },
+                repeat: false,
+            });
+            let (ix, iy) = driver.find("Run ZQ Thing").unwrap_or_else(|| {
+                panic!(
+                    "Alt+f must open the \"File\" dropdown with the \
+                     extension-contributed item listed by its `title`; \
+                     screen:\n{}",
+                    driver.screen()
+                )
+            });
+            driver.click(ix, iy);
+
+            let screen = driver.screen();
+            assert!(
+                !screen.contains("Run ZQ Thing"),
+                "selecting the item must close the dropdown; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("ZQ_MENU_RAN"),
+                "selecting the extension-contributed \"File\" menu item \
+                 must run its registered Lua callback; screen:\n{screen}"
+            );
+        }
+
+        /// A `vimcode.command(name, fn, { context_menu = view_name })`
+        /// registration appears in the right-click context menu for a row
+        /// in that `vimcode.ui.register_view` view's body, and selecting it
+        /// there runs the Lua callback through
+        /// `Engine::open_plugin_view_context_menu` /
+        /// `Engine::execute_command` — the same dispatch chain the
+        /// command palette and menu bar (above) use.
+        #[test]
+        fn plugin_registered_command_appears_in_and_runs_from_a_view_row_context_menu_via_shell_app(
+        ) {
+            let view_name = "zq_ctx_view_2103";
+            let mut engine = engine_with_plugin(
+                "ctx_menu_command_2103",
+                r#"
+                vimcode.ui.register_view("zq_ctx_view_2103", {
+                    render = function()
+                        return {
+                            kind = "list",
+                            items = {
+                                { id = "r1", text = "ZQ Row One" },
+                            },
+                        }
+                    end,
+                })
+                vimcode.command("ZqCtxMenuCmd2103", function(_)
+                    vimcode.message("ZQ_CTXMENU_RAN")
+                end, { title = "Do ZQ Thing", context_menu = "zq_ctx_view_2103" })
+                "#,
+            );
+            crate::render::apply_activity_panel_switch(&mut engine, &format!("ext:{view_name}"));
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            let (rx, ry) = driver
+                .find("ZQ Row One")
+                .expect("the registered view's list body must paint its row");
+            assert!(
+                !driver.screen_has("Do ZQ Thing"),
+                "precondition: no context menu is open yet; screen:\n{}",
+                driver.screen()
+            );
+            driver.right_click(rx, ry);
+            let (ix, iy) = driver.find("Do ZQ Thing").unwrap_or_else(|| {
+                panic!(
+                    "right-clicking the view's row must open a context menu \
+                     offering the command registered with \
+                     `context_menu = \"{view_name}\"`, labelled by its \
+                     `title`; screen:\n{}",
+                    driver.screen()
+                )
+            });
+            driver.click(ix, iy);
+
+            let screen = driver.screen();
+            assert!(
+                !screen.contains("Do ZQ Thing"),
+                "selecting the item must close the context menu; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("ZQ_CTXMENU_RAN"),
+                "selecting the extension-contributed context-menu item \
+                 must run its registered Lua callback; screen:\n{screen}"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

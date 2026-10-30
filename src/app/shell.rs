@@ -75,7 +75,15 @@ impl quadraui::ShellApp for App {
         // redundant in-window menu underneath the system one. Same `MenuDef`s
         // either way — `render::menu_defs_to_menu_bar` just reshapes them.
         let is_vscode_mode = self.engine.borrow().is_vscode_mode();
-        let menu_defs = render::build_menu_defs(is_vscode_mode);
+        let mut menu_defs = render::build_menu_defs(is_vscode_mode);
+        // Fold in any `vimcode.command(name, fn, { menu = "..." })`
+        // extension-contributed menu-bar entries before the bar is built —
+        // same `MenuDef`s either backend installs below, so a plugin's menu
+        // item shows up identically on a native (`native_menu`) menu bar and
+        // the drawn in-window one.
+        if let Some(pm) = self.engine.borrow().plugin_manager.as_ref() {
+            render::append_plugin_menu_entries(&mut menu_defs, &pm.command_entries());
+        }
         if backend.backend_caps().native_menu {
             let bar = render::menu_defs_to_menu_bar(&menu_defs);
             // `install_menu_bar`'s macOS implementation (`MacBackend`) asserts it is
