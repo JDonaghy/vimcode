@@ -775,6 +775,85 @@ fn startup_inner_bare_launch_does_not_touch_sidebar_visibility() {
     );
 }
 
+/// A relative file argument that escapes a repo-less launch `cwd`
+/// (`vimcode ../notes/todo.txt` started from a directory with no git repo
+/// above it) must run `adopt_cwd_for_startup_file`'s repoint tail in full:
+/// `cwd` and `workspace_root` both move to the file's own directory, and
+/// `explorer_expanded` is reseeded with exactly that new root, so the
+/// Explorer paints an expanded tree there rather than a single collapsed
+/// root row.
+///
+/// Pinned here, at engine level, because no driver-level launch test can
+/// reach this branch: `cargo test` runs with this crate's root as the
+/// process working directory, that root is itself a git repo root, and the
+/// TUI driver performs no chdir for a file argument — so the tail's "cwd
+/// already has its own repo" guard early-returns regardless of how the
+/// file argument is spelled. Assigning `engine.cwd` directly is the only
+/// way to exercise it.
+///
+/// Scoped to the repoint tail alone: a relative argument's *contents*
+/// cannot be asserted here, because `engine.cwd` is deliberately somewhere
+/// the process's own working directory is not, and the filesystem read
+/// behind `open_file_with_mode` resolves a relative path against the
+/// process cwd. That half is covered by
+/// `file_argument_opens_relative_and_absolute_paths_bare_launch_keeps_default`
+/// in `src/main.rs`, where the two agree as they do in production.
+#[test]
+fn startup_on_a_relative_path_escaping_a_repoless_cwd_adopts_the_files_dir() {
+    let root = test_temp_path("vimcode_relative_escape_adopts_cwd_root");
+    let _ = std::fs::remove_dir_all(&root);
+    let launch_cwd = root.join("launch");
+    let notes = root.join("notes");
+    std::fs::create_dir_all(&launch_cwd).unwrap();
+    std::fs::create_dir_all(&notes).unwrap();
+    // The file has to exist: `adopt_cwd_for_startup_file` canonicalises the
+    // resolved path, and a canonicalise failure would leave the `..`
+    // component in place and make the adopted root a non-canonical spelling
+    // of the same directory.
+    std::fs::write(notes.join("todo.txt"), "todo\n").unwrap();
+
+    // Sanity: the fixture must sit outside any git repo, or the tail's own
+    // "cwd already has its own repo" guard would (correctly) skip it and
+    // every assertion below would be vacuous.
+    assert!(
+        git::find_repo_root(&launch_cwd).is_none(),
+        "fixture must live outside any git repo, but a repo root was found \
+         above {launch_cwd:?}"
+    );
+
+    let mut engine = Engine::new_for_test();
+    engine.cwd = launch_cwd.clone();
+    engine.settings.swap_file = false;
+    engine.startup_without_session_restore(Some(Path::new("../notes/todo.txt")));
+
+    let adopted = notes.canonicalize().unwrap();
+    assert_eq!(
+        engine.cwd, adopted,
+        "a relative argument resolved against a repo-less cwd must repoint \
+         cwd at the file's own directory"
+    );
+    assert_eq!(
+        engine.workspace_root.as_deref(),
+        Some(adopted.as_path()),
+        "workspace_root must follow the adopted cwd, so the quick-open \
+         search root and per-workspace session key move with it"
+    );
+    assert!(
+        engine.explorer_expanded.contains(&adopted),
+        "explorer_expanded must be reseeded with the adopted root, got \
+         {:?}",
+        engine.explorer_expanded
+    );
+    assert_eq!(
+        engine.explorer_expanded.len(),
+        1,
+        "the reseed must clear the pre-adoption expansion set rather than \
+         add to it, got {:?}",
+        engine.explorer_expanded
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// `adopt_cwd_for_startup_file`'s
 /// doc comment makes "a file already under `cwd` must not repoint
 /// anything" a load-bearing guarantee — it's what keeps an ordinary
