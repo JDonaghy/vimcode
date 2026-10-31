@@ -676,10 +676,13 @@ mod file_argument_launch_tests {
             std::thread::current().id()
         );
 
-        // (a) Relative path into another directory, resolved against the
-        // real process CWD (the crate root `cargo test` sets): must open
-        // that file's contents.
-        let rel_scratch_root = PathBuf::from("target").join(format!("{unique}_rel"));
+        // (a) Relative path that escapes the crate root via a leading `..`,
+        // so the path is genuinely outside `cargo test`'s process CWD and
+        // `adopt_cwd_for_startup_file`'s "is this path already under cwd"
+        // early-return is not taken — the real cwd-adoption logic this
+        // issue is about actually runs. (A `target/`-nested relative path
+        // would stay under cwd and never exercise that logic.)
+        let rel_scratch_root = PathBuf::from("..").join(format!("{unique}_rel"));
         let rel_dir = rel_scratch_root.join("notes");
         std::fs::create_dir_all(&rel_dir).expect("create relative scratch dir");
         const REL_MARKER: &str = "VC2105_RELATIVE_MARKER";
@@ -728,6 +731,17 @@ mod file_argument_launch_tests {
             engine.session.explorer_visible = false;
             engine.sync_app_shell_sidebar_visibility();
         });
+        // The runner's own `AppShell` (what actually paints) only learns
+        // the shadow's sidebar visibility once an event has dispatched
+        // through it (`App::handle`'s `sync_runner_sidebar_visibility`
+        // call, gated on `menu_bar_toggleable` which TUI's `setup` always
+        // sets) — a bare `driver.render()` with no prior dispatch paints
+        // `quadraui::AppShell::new`'s construction-time default
+        // regardless of engine state, which would make this assertion
+        // pass unconditionally and catch nothing. `Escape` is a no-op in
+        // Normal mode, so this dispatch doesn't itself change what should
+        // be on screen.
+        driver.press_named(quadraui::NamedKey::Escape);
         driver.render();
         assert!(
             explorer_tree_chevron_painted(&*driver),
@@ -743,10 +757,10 @@ mod file_argument_launch_tests {
     /// the ambient `explorer_visible_on_startup` setting would otherwise
     /// display.
     ///
-    /// `#[ignore]`d: blocked on quadraui. `Engine::startup_inner` already
-    /// flips its own shadow `app_shell`'s sidebar bit via `hide_sidebar()`,
-    /// but that shadow is only ever propagated onto the real, painting
-    /// runner `AppShell` by `sync_runner_sidebar_visibility`
+    /// `#[ignore]`d: blocked on quadraui. `Engine::startup_inner` does not
+    /// touch its own shadow `app_shell`'s sidebar bit on a file-argument
+    /// launch either, because doing so would only ever reach the real,
+    /// painting runner `AppShell` via `sync_runner_sidebar_visibility`
     /// (`src/render/menu_and_chrome_routing.rs`), which itself only runs
     /// from inside `ShellApp::handle`/`on_shell_event_ctx` — both reachable
     /// only once a `UiEvent` has already dispatched through a live
@@ -758,7 +772,9 @@ mod file_argument_launch_tests {
     /// seed a different initial value — confirmed absent in both the
     /// published 0.6.1 this crate depends on and the newer 0.7.0. There is
     /// currently no quadraui-published mechanism for an app to seed the
-    /// real `AppShell`'s initial chrome state before its first paint.
+    /// real `AppShell`'s initial chrome state before its first paint, so
+    /// flipping the shadow alone would only desync it further from the
+    /// runner without changing anything the user sees.
     #[test]
     #[ignore = "blocked on quadraui: AppShell::new has no way to seed \
                 initial sidebar visibility before the first render"]
