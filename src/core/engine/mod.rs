@@ -5266,7 +5266,7 @@ impl Engine {
     /// state in the first place, including `settings_mtime` (also an ambient
     /// disk read via `Settings::settings_file_path()` + `fs::metadata`, left
     /// as `None` here rather than snuck back in).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_for_test() -> Self {
         Self::new_from_state(
             Settings::default(),
@@ -6122,6 +6122,22 @@ impl Engine {
             } else {
                 self.adopt_cwd_for_startup_file(path);
                 let _ = self.open_file_with_mode(path, OpenMode::Permanent);
+                // A launch argument names one specific file to edit, so
+                // ideally the explorer side panel would start collapsed
+                // (matching `nvim <file>` / `code <file>`) rather than
+                // showing whatever the ambient `explorer_visible_on_startup`
+                // setting would otherwise display. There is currently no
+                // quadraui-published mechanism for seeding the real,
+                // painting `AppShell`'s initial sidebar visibility before
+                // its first render (`AppShell::new` hardcodes
+                // `sidebar_visible: true`), and flipping only this engine's
+                // *shadow* `app_shell` here would desync it from the
+                // runner's own copy until the next dispatched `UiEvent` —
+                // including inverting the very first `<C-b>` press
+                // (`Engine::toggle_sidebar` would see the two already
+                // "agreeing" and no-op). So this stays unimplemented until
+                // that quadraui gap closes; see `src/main.rs`'s
+                // `file_argument_on_launch_collapses_explorer` test.
             }
         } else if restore_session {
             self.restore_session_files();

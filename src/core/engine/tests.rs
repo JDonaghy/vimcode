@@ -747,6 +747,34 @@ fn startup_on_a_file_outside_cwd_still_finds_its_repo_for_source_control_1797() 
     let _ = std::fs::remove_dir_all(&launch_cwd);
 }
 
+/// `startup_inner`'s bare-launch branch (`file_path: None`) must leave
+/// the shadow `app_shell`'s sidebar visibility exactly as
+/// `derived_sidebar_visible()` already had it — pinned directly against
+/// `Engine::startup_inner`'s own outcome, with no driver or `setup`-hook
+/// resync in between that could mask a regression of this kind.
+#[test]
+fn startup_inner_bare_launch_does_not_touch_sidebar_visibility() {
+    let mut engine = Engine::new_for_test();
+    engine.settings.swap_file = false;
+    engine.settings.autohide_panels = false;
+    engine.settings.explorer_visible_on_startup = true;
+    engine.session.explorer_visible = false;
+    engine.sync_app_shell_sidebar_visibility();
+    assert!(
+        engine.app_shell.sidebar_visible(),
+        "sanity: the forced settings above must already derive a visible \
+         sidebar"
+    );
+
+    engine.startup_without_session_restore(None);
+
+    assert!(
+        engine.app_shell.sidebar_visible(),
+        "a bare launch with no file argument must not change the shadow \
+         app_shell's sidebar visibility derived from settings/session"
+    );
+}
+
 /// `adopt_cwd_for_startup_file`'s
 /// doc comment makes "a file already under `cwd` must not repoint
 /// anything" a load-bearing guarantee — it's what keeps an ordinary

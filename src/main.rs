@@ -617,6 +617,193 @@ mod arg_parsing_tests {
     }
 }
 
+/// Black-box, backend-neutral coverage for `vimcode <file>`: driven through
+/// `--tui`'s shared `vimcode_core::tui_main::testing` seam, which runs the
+/// exact same `App::new_portable`/`Engine::startup` path every backend
+/// (GTK, macOS, Windows, TUI) does — so this covers all of them without any
+/// per-backend code.
+#[cfg(test)]
+mod file_argument_launch_tests {
+    use std::path::PathBuf;
+
+    use quadraui::testing::ConformanceDriver;
+    use vimcode_core::icons::{TREE_CHEVRON_DOWN, TREE_CHEVRON_RIGHT};
+    use vimcode_core::tui_main::testing::{tui_driver, tui_driver_with};
+
+    /// Whether the Explorer tree's own expand/collapse chevron is painted
+    /// anywhere on screen — a content-area signal driven by `Engine`'s
+    /// shadow `app_shell` (sidebar visibility + active panel), unlike the
+    /// chrome header text `" EXPLORER "` which only paints after a genuine
+    /// click/dispatch lands on the runner's own separate `AppShell` and so
+    /// never appears on a bare first frame either way. Every directory row
+    /// in the tree paints one of these chevrons regardless of expansion
+    /// state, so this is a reliable "is the tree painted at all" oracle
+    /// that doesn't depend on which files happen to be in the tree.
+    ///
+    /// Checks both the Nerd Font and ASCII-fallback forms of each glyph,
+    /// since `use_nerd_fonts` defaults to `true` on non-Windows TUI.
+    fn explorer_tree_chevron_painted<D: ConformanceDriver>(driver: &D) -> bool {
+        driver.inventory().text_runs().iter().any(|r| {
+            r.text == TREE_CHEVRON_DOWN.nerd
+                || r.text == TREE_CHEVRON_DOWN.fallback
+                || r.text == TREE_CHEVRON_RIGHT.nerd
+                || r.text == TREE_CHEVRON_RIGHT.fallback
+        })
+    }
+
+    /// `vimcode <file>` must open `<file>` for editing whether it names a
+    /// relative path into another directory or an absolute path. A bare
+    /// `vimcode` with no file argument is unaffected and must keep today's
+    /// default sidebar visibility.
+    ///
+    /// The "explorer starts collapsed when a file argument is given" half
+    /// of this same requirement is covered separately by
+    /// [`file_argument_on_launch_collapses_explorer`] below, which is
+    /// `#[ignore]`d pending a quadraui capability this crate's published
+    /// version doesn't have yet — see that test's doc.
+    #[test]
+    fn file_argument_opens_relative_and_absolute_paths_bare_launch_keeps_default() {
+        // This bin's own `#[cfg(test)]` module links `vimcode_core` as an
+        // ordinary dependency (no `cfg(test)` on the lib side), so the
+        // `set_test_home()` thread-local sandbox is unreachable here; opt
+        // out of disk writes the same way a `tests/*.rs` integration test
+        // does instead.
+        vimcode_core::core::session::suppress_disk_saves();
+
+        let unique = format!(
+            "vc2105_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+
+        // (a) Relative path that escapes the crate root via a leading `..`,
+        // so the path is genuinely outside `cargo test`'s process CWD and
+        // `adopt_cwd_for_startup_file`'s "is this path already under cwd"
+        // early-return is not taken — the real cwd-adoption logic this
+        // issue is about actually runs. (A `target/`-nested relative path
+        // would stay under cwd and never exercise that logic.)
+        let rel_scratch_root = PathBuf::from("..").join(format!("{unique}_rel"));
+        let rel_dir = rel_scratch_root.join("notes");
+        std::fs::create_dir_all(&rel_dir).expect("create relative scratch dir");
+        const REL_MARKER: &str = "VC2105_RELATIVE_MARKER";
+        std::fs::write(rel_dir.join("todo.txt"), REL_MARKER).expect("write relative scratch file");
+        let rel_path = rel_dir.join("todo.txt");
+
+        {
+            let mut driver = tui_driver(Some(rel_path), 100, 30);
+            driver.render();
+            let screen = driver.screen();
+            assert!(
+                screen.contains(REL_MARKER),
+                "a relative path into another directory must open that \
+                 file's contents; screen:\n{screen}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&rel_scratch_root);
+
+        // (b) Absolute path: same assertion.
+        let abs_dir = std::env::temp_dir().join(format!("{unique}_abs"));
+        std::fs::create_dir_all(&abs_dir).expect("create absolute scratch dir");
+        const ABS_MARKER: &str = "VC2105_ABSOLUTE_MARKER";
+        let abs_path = abs_dir.join("scratch.txt");
+        std::fs::write(&abs_path, ABS_MARKER).expect("write absolute scratch file");
+
+        {
+            let mut driver = tui_driver(Some(abs_path), 100, 30);
+            driver.render();
+            let screen = driver.screen();
+            assert!(
+                screen.contains(ABS_MARKER),
+                "an absolute path must open that file's contents; screen:\n{screen}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&abs_dir);
+
+        // (c) Regression guard: a bare launch with no file argument must
+        // still show the sidebar whenever settings/session say it should.
+        // Forced to a known state via the `setup` hook plus the engine's
+        // own public re-derivation, rather than trusting whatever happens
+        // to be ambient in `~/.config/vimcode` on the machine running this
+        // test.
+        let mut driver = tui_driver_with(None, 100, 30, |engine| {
+            engine.settings.autohide_panels = false;
+            engine.settings.explorer_visible_on_startup = true;
+            engine.session.explorer_visible = false;
+            engine.sync_app_shell_sidebar_visibility();
+        });
+        // The runner's own `AppShell` (what actually paints) only learns
+        // the shadow's sidebar visibility once an event has dispatched
+        // through it (`App::handle`'s `sync_runner_sidebar_visibility`
+        // call, gated on `menu_bar_toggleable` which TUI's `setup` always
+        // sets) — a bare `driver.render()` with no prior dispatch paints
+        // `quadraui::AppShell::new`'s construction-time default
+        // regardless of engine state, which would make this assertion
+        // pass unconditionally and catch nothing. `Escape` is a no-op in
+        // Normal mode, so this dispatch doesn't itself change what should
+        // be on screen.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            explorer_tree_chevron_painted(&*driver),
+            "a bare launch with no file argument must keep today's \
+             default sidebar visibility (regression guard), so the \
+             Explorer tree's chevrons must be painted; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// A file argument on launch must start with the explorer collapsed —
+    /// matching `nvim <file>` / `code <file>` rather than showing whatever
+    /// the ambient `explorer_visible_on_startup` setting would otherwise
+    /// display.
+    ///
+    /// `#[ignore]`d: blocked on quadraui. `Engine::startup_inner` does not
+    /// touch its own shadow `app_shell`'s sidebar bit on a file-argument
+    /// launch either, because doing so would only ever reach the real,
+    /// painting runner `AppShell` via `sync_runner_sidebar_visibility`
+    /// (`src/render/menu_and_chrome_routing.rs`), which itself only runs
+    /// from inside `ShellApp::handle`/`on_shell_event_ctx` — both reachable
+    /// only once a `UiEvent` has already dispatched through a live
+    /// `ShellContext`. The very first frame renders before any event
+    /// dispatches (`quadraui::tui::run::run_with`'s loop calls `app.setup()`
+    /// once, then paints, before ever calling `app.handle()`), and
+    /// `quadraui::compose::app_shell::AppShell::new` hardcodes
+    /// `sidebar_visible: true` with no builder or `ShellConfig` field to
+    /// seed a different initial value — confirmed absent in both the
+    /// published 0.6.1 this crate depends on and the newer 0.7.0. There is
+    /// currently no quadraui-published mechanism for an app to seed the
+    /// real `AppShell`'s initial chrome state before its first paint, so
+    /// flipping the shadow alone would only desync it further from the
+    /// runner without changing anything the user sees.
+    #[test]
+    #[ignore = "blocked on quadraui: AppShell::new has no way to seed \
+                initial sidebar visibility before the first render"]
+    fn file_argument_on_launch_collapses_explorer() {
+        vimcode_core::core::session::suppress_disk_saves();
+
+        let unique = format!(
+            "vc2105_collapse_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let path = dir.join("scratch.txt");
+        std::fs::write(&path, "x").expect("write scratch file");
+
+        let mut driver = tui_driver(Some(path), 100, 30);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !explorer_tree_chevron_painted(&*driver),
+            "a file argument on launch must start with the explorer \
+             collapsed, so the Explorer tree's chevrons must not be \
+             painted; screen:\n{screen}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod gui_backend_tests {
     use super::*;
