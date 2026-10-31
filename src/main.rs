@@ -677,11 +677,23 @@ mod file_argument_launch_tests {
         );
 
         // (a) Relative path that escapes the crate root via a leading `..`,
-        // so the path is genuinely outside `cargo test`'s process CWD and
-        // `adopt_cwd_for_startup_file`'s "is this path already under cwd"
-        // early-return is not taken — the real cwd-adoption logic this
-        // issue is about actually runs. (A `target/`-nested relative path
-        // would stay under cwd and never exercise that logic.)
+        // so the argument genuinely names a file in another directory,
+        // outside `cargo test`'s process CWD. What this asserts is the
+        // launch plumbing end to end: positional argument → `run` →
+        // `Engine::startup` → buffer → painted frame.
+        //
+        // It deliberately claims nothing about
+        // `adopt_cwd_for_startup_file`'s cwd-repoint tail (`workspace_root`
+        // reassignment + `explorer_expanded` reseed), which no driver-level
+        // test here can reach: that tail is gated on the launch `cwd`
+        // having no git repo above it, while `cargo test`'s process CWD is
+        // this crate's root — itself a git repo root — and the driver does
+        // no chdir for a file argument. A test cannot chdir either (holding
+        // a `CwdGuard` deadlocks against `tui_driver_with`'s own). That
+        // branch is pinned directly instead by the engine-level
+        // `startup_on_a_relative_path_escaping_a_repoless_cwd_adopts_the_files_dir`
+        // test in `src/core/engine/tests.rs`, which assigns `engine.cwd` a
+        // repo-less directory before calling `startup_without_session_restore`.
         let rel_scratch_root = PathBuf::from("..").join(format!("{unique}_rel"));
         let rel_dir = rel_scratch_root.join("notes");
         std::fs::create_dir_all(&rel_dir).expect("create relative scratch dir");
