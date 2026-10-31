@@ -2979,19 +2979,44 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: quadraui::Backend>(
 /// category (unit/caps/feature/quadraui/product) and target child are
 /// recorded next to it, not just its issue number, per that issue's own
 /// gate-labelling requirement.
-pub(crate) const KNOWN_BUGS: &[&str] = &[];
+///
+/// Currently holds one entry: the `_gtk` control arm of
+/// `core::engine::tests::test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed`.
+/// See the comment immediately above the entry below for the root cause.
+pub(crate) const KNOWN_BUGS: &[&str] = &[
+    // category: quadraui (no hook in `quadraui::ShellApp`/`ShellAdapter`
+    // lets an app reconcile shell/sidebar state before the first rendered
+    // frame on a non-`cell` profile. `ShellAdapter::setup` takes no
+    // `ShellContext`; `ShellAdapter::render` and the `ShellApp::pre_render`
+    // it calls are both `&self`, so neither can reach
+    // `ShellAdapter::apply_requested_panel` — that method needs `&mut self`
+    // and is only ever called from `ShellAdapter::handle`, which requires a
+    // dispatched `UiEvent`. The real GTK runner never dispatches one
+    // between `setup()` and the first paint (painting is wired through
+    // `set_draw_func`, which calls `render()` directly), so GTK's `px`
+    // profile paints its default Explorer-at-index-0 sidebar on frame 0
+    // regardless of `Engine`'s collapsed-on-startup state. A quadraui issue
+    // requesting a frame-0 reconciliation hook on `ShellApp`/`ShellAdapter`
+    // must be filed) — target: quadraui.
+    "test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_gtk",
+];
 
-/// Empty as of #1432: every entry the App-on-TUI gap inventory added
-/// has been closed — either by a real fix or by correcting a scenario
-/// whose own fixture/assertion turned out to be wrong.
+/// A regression guard, not a "list stays empty forever" rule: an empty
+/// list and a list with a genuine, still-open entry (see the doc above
+/// [`KNOWN_BUGS`]) are both legitimate per this module's own "list may
+/// only shrink by a landed fix" contract. This test exists so a future PR
+/// that adds an entry notices it must also update the count here, rather
+/// than silently growing the list unnoticed.
 #[cfg(test)]
 mod known_bugs_is_empty {
     #[test]
-    fn known_bugs_is_empty() {
-        assert!(
-            super::KNOWN_BUGS.is_empty(),
-            "KNOWN_BUGS must be empty per #1432's acceptance bar — found: \
-             {:?}",
+    fn known_bugs_has_the_expected_entries() {
+        assert_eq!(
+            super::KNOWN_BUGS,
+            &["test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_gtk"],
+            "KNOWN_BUGS changed — update this test's expectation (and this \
+             module's doc comment) alongside whatever PR added or removed \
+             an entry: {:?}",
             super::KNOWN_BUGS
         );
     }

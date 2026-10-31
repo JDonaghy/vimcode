@@ -333,14 +333,13 @@ mod build_portable_engine_no_workspace_tests {
 
     #[test]
     fn a_path_argument_adopts_a_workspace_on_either_backend() {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode_build_portable_engine_path_arg_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // Both `build_portable_engine` calls below open a *directory*, which
+        // `Engine::startup` → `open_folder` turns into
+        // `std::env::set_current_dir` — a process-wide write that must be
+        // excluded from every concurrent harness paint (see `test_cwd`'s
+        // module doc).
+        let _cwd = crate::test_cwd::CwdGuard::new();
+        let dir = crate::harness::scratch_dir("vimcode_build_portable_engine_path_arg");
         std::fs::create_dir_all(&dir).unwrap();
 
         let gui_backend = tui_backend();

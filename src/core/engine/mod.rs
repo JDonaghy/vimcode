@@ -6050,16 +6050,31 @@ impl Engine {
     /// [`Engine::derived_sidebar_visible`]), and zero files open.
     ///
     /// Still performs the two ambient startup reads `startup` does
-    /// (`plugin_init`/`ext_refresh_quiet`) — only the file-vs-session branch
-    /// of [`Engine::startup_inner`] is skipped, by clearing `workspace_root`
-    /// first and passing neither a path nor `restore_session`.
+    /// (`plugin_init`/`ext_refresh_quiet`, i.e. `load_ambient_state = true`
+    /// below) — only the file-vs-session branch of [`Engine::startup_inner`]
+    /// is skipped, by clearing `workspace_root` first and passing neither a
+    /// path nor `restore_session`.
     ///
     /// `vimcode <dir>`/`vimcode <file>` launches never call this — they keep
     /// calling [`Engine::startup`] exactly as before, so passing a path on
     /// the command line is unaffected by this state.
     pub fn startup_into_no_workspace(&mut self) {
+        self.startup_into_no_workspace_inner(true);
+    }
+
+    /// [`Engine::startup_into_no_workspace`] minus the two ambient startup
+    /// reads — the deterministic test entry point must use, for the same
+    /// reason [`Engine::startup_without_session_restore`] skips them (see its
+    /// doc): a real `~/.config/vimcode/plugins/*.lua` or a live network fetch
+    /// would make a driver-tier test depend on the machine it runs on.
+    #[cfg(test)]
+    pub(crate) fn startup_into_no_workspace_for_test(&mut self) {
+        self.startup_into_no_workspace_inner(false);
+    }
+
+    fn startup_into_no_workspace_inner(&mut self, load_ambient_state: bool) {
         self.workspace_root = None;
-        self.startup_inner(None, false, true);
+        self.startup_inner(None, false, load_ambient_state);
         self.sync_app_shell_sidebar_visibility();
     }
 
