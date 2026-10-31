@@ -15,8 +15,13 @@ impl Engine {
     /// Pulled out on its own so there is exactly one place that formula
     /// lives — see [`Self::sync_app_shell_sidebar_visibility`]'s
     /// doc for why a *second*, independent copy of it went stale.
+    ///
+    /// Always `false` in the no-workspace state
+    /// ([`Engine::has_no_workspace`]): there is no workspace tree to show,
+    /// regardless of what `autohide_panels`/`explorer_visible_on_startup`
+    /// otherwise say.
     pub fn derived_sidebar_visible(&self) -> bool {
-        if self.settings.autohide_panels {
+        if self.has_no_workspace() || self.settings.autohide_panels {
             false
         } else {
             self.session.explorer_visible || self.settings.explorer_visible_on_startup

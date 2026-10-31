@@ -935,6 +935,219 @@ fn adopt_cwd_for_startup_file_is_a_no_op_when_cwd_already_has_its_own_repo_1797(
     let _ = std::fs::remove_dir_all(&other_dir);
 }
 
+/// `Engine::startup_into_no_workspace` is the no-arg GUI launch's entry
+/// point: it must clear `workspace_root` (so `has_no_workspace()` reports
+/// true) and must not restore a per-workspace session, even though a
+/// session file really is on disk for the process's own cwd. This mirrors
+/// `test_startup_without_session_restore_ignores_workspace_session`'s
+/// control/subject shape: the first half proves the fixture session is
+/// restorable at all, so a green second half means the restore was
+/// *skipped*, not that the fixture was inert.
+#[test]
+fn test_startup_into_no_workspace_clears_workspace_root_and_skips_session_restore() {
+    use crate::core::session::SessionState;
+    let dir = test_temp_path("vimcode_no_workspace_ws_root");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p1 = dir.join("vimcode_no_workspace_a.txt");
+    let p2 = dir.join("vimcode_no_workspace_b.txt");
+    std::fs::write(&p1, "aaa").unwrap();
+    std::fs::write(&p2, "bbb").unwrap();
+
+    let workspace_dir = dir.join("vimcode_no_workspace_test_ws");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let mut ws_session = SessionState::default();
+    ws_session.open_files = vec![p1.clone(), p2.clone()];
+    ws_session.active_file = Some(p2.clone());
+    let session_path = SessionState::session_path_for_workspace(&workspace_dir);
+    if let Some(parent) = session_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(
+        &session_path,
+        serde_json::to_string_pretty(&ws_session).unwrap(),
+    )
+    .unwrap();
+
+    // Control: the on-disk session really does restore two tabs.
+    let mut restoring = Engine::new_for_test();
+    restoring.cwd = workspace_dir.clone();
+    restoring.settings.swap_file = false;
+    restoring.restore_session_files();
+    assert_eq!(
+        restoring.active_group().tabs.len(),
+        2,
+        "control: the fixture workspace session must be restorable, otherwise \
+         the assertion below proves nothing"
+    );
+
+    // Subject: a no-arg GUI launch must neither adopt cwd as the workspace
+    // nor restore that workspace's session.
+    let mut deterministic = Engine::new_for_test();
+    deterministic.cwd = workspace_dir.clone();
+    deterministic.settings.swap_file = false;
+    assert!(
+        !deterministic.has_no_workspace(),
+        "sanity: Engine::new_for_test must start with a workspace, otherwise \
+         the assertion below proves nothing"
+    );
+    let tabs_before = deterministic.active_group().tabs.len();
+    deterministic.startup_into_no_workspace();
+
+    assert!(
+        deterministic.has_no_workspace(),
+        "startup_into_no_workspace must clear workspace_root"
+    );
+    assert_eq!(
+        deterministic.workspace_root, None,
+        "startup_into_no_workspace must leave workspace_root as None"
+    );
+    assert_eq!(
+        deterministic.active_group().tabs.len(),
+        tabs_before,
+        "startup_into_no_workspace must not reopen the workspace session's files"
+    );
+    assert!(
+        !deterministic
+            .buffer_manager
+            .iter()
+            .any(|(_, s)| s.file_path.as_deref() == Some(p1.as_path())
+                || s.file_path.as_deref() == Some(p2.as_path())),
+        "no buffer should have been created for a session-listed file"
+    );
+
+    let _ = std::fs::remove_file(&p1);
+    let _ = std::fs::remove_file(&p2);
+    let _ = std::fs::remove_file(&session_path);
+    let _ = std::fs::remove_dir(&workspace_dir);
+}
+
+/// The no-workspace state must force the shadow `app_shell`'s sidebar
+/// collapsed even when `explorer_visible_on_startup`/the session would
+/// otherwise derive it visible — pinned directly against `Engine`
+/// state, with no driver in between that could mask a regression.
+#[test]
+fn test_startup_into_no_workspace_forces_sidebar_collapsed() {
+    let mut engine = Engine::new_for_test();
+    engine.settings.swap_file = false;
+    engine.settings.autohide_panels = false;
+    engine.settings.explorer_visible_on_startup = true;
+    engine.session.explorer_visible = true;
+    engine.sync_app_shell_sidebar_visibility();
+    assert!(
+        engine.app_shell.sidebar_visible(),
+        "sanity: the forced settings above must already derive a visible \
+         sidebar, otherwise the assertion below proves nothing"
+    );
+
+    engine.startup_into_no_workspace();
+
+    assert!(
+        !engine.app_shell.sidebar_visible(),
+        "a no-arg GUI launch must force the explorer collapsed regardless \
+         of explorer_visible_on_startup/session.explorer_visible"
+    );
+}
+
+/// `vimcode <dir>` / `vimcode <file>` behaviour is unchanged by the
+/// no-workspace state: a startup call that names a path must still adopt a
+/// workspace (`has_no_workspace()` stays false), whether driven through
+/// the production `Engine::startup` or the deterministic test entry point.
+#[test]
+fn test_startup_with_a_path_argument_does_not_enter_no_workspace_state() {
+    let dir = test_temp_path("vimcode_no_workspace_path_arg_ws");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+
+    let mut by_dir = Engine::new_for_test();
+    by_dir.settings.swap_file = false;
+    by_dir.startup_without_session_restore(Some(&dir));
+    assert!(
+        !by_dir.has_no_workspace(),
+        "opening a directory must adopt it as the workspace, not enter the \
+         no-workspace state"
+    );
+
+    let mut by_file = Engine::new_for_test();
+    by_file.cwd = dir.clone();
+    by_file.settings.swap_file = false;
+    by_file.startup_without_session_restore(Some(&file));
+    assert!(
+        !by_file.has_no_workspace(),
+        "opening a file must leave workspace_root set, not enter the \
+         no-workspace state"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Black-box proof of the no-arg GUI launch's acceptance bar: the rendered
+/// screen — not just the internal flags the tests above pin directly —
+/// must show the explorer collapsed, no restored file tab, and the
+/// editor region still painting the default empty buffer.
+///
+/// Settings/session are forced to otherwise derive a *visible* sidebar and
+/// a *restorable* session with a distinctively-named file, so a passing
+/// assertion below proves `startup_into_no_workspace` actually suppressed
+/// both, rather than the fixture starting out that way.
+#[test]
+fn test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed() {
+    use crate::core::session::SessionState;
+
+    let dir = test_temp_path("vimcode_no_workspace_render_ws");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fixture_file = dir.join("vimcode_no_workspace_render_marker.txt");
+    std::fs::write(&fixture_file, "marker").unwrap();
+
+    let mut session = SessionState::default();
+    session.open_files = vec![fixture_file.clone()];
+    session.active_file = Some(fixture_file.clone());
+    session.explorer_visible = true;
+    let session_path = SessionState::session_path_for_workspace(&dir);
+    if let Some(parent) = session_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(
+        &session_path,
+        serde_json::to_string_pretty(&session).unwrap(),
+    )
+    .unwrap();
+
+    let mut engine = Engine::new_for_test();
+    engine.cwd = dir.clone();
+    engine.settings.swap_file = false;
+    engine.settings.use_nerd_fonts = Some(false);
+    engine.settings.autohide_panels = false;
+    engine.settings.explorer_visible_on_startup = true;
+    engine.startup_into_no_workspace();
+
+    let h = crate::tui_main::testing::conformance_harness(engine, 80, 24);
+
+    assert!(
+        !h.driver.screen_contains("EXPLORER"),
+        "a no-arg GUI launch must render with the explorer collapsed, got:\n{}",
+        h.driver.screen()
+    );
+    assert!(
+        !h.driver
+            .screen_contains("vimcode_no_workspace_render_marker.txt"),
+        "a no-arg GUI launch must not restore the previous session's file \
+         tab, got:\n{}",
+        h.driver.screen()
+    );
+    assert!(
+        h.driver.screen_contains("No Name"),
+        "the editor region must still paint the default empty buffer, \
+         got:\n{}",
+        h.driver.screen()
+    );
+
+    let _ = std::fs::remove_file(&fixture_file);
+    let _ = std::fs::remove_file(&session_path);
+    let _ = std::fs::remove_dir(&dir);
+}
+
 #[test]
 fn test_restore_session_files_opens_separate_tabs() {
     use crate::core::session::SessionState;

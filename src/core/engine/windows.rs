@@ -3609,7 +3609,14 @@ impl Engine {
     /// Restore open files from session state (called at startup when no CLI file is given).
     /// Each file gets its own tab; the previously-active file's tab is focused.
     /// Skips files that no longer exist. Removes the initial empty scratch buffer.
+    ///
+    /// No-op in the no-workspace state ([`Engine::has_no_workspace`]): that
+    /// state must not restore any previous session, regardless of which
+    /// per-workspace session file `self.cwd` happens to key into.
     pub fn restore_session_files(&mut self) {
+        if self.has_no_workspace() {
+            return;
+        }
         // Prefer per-workspace session if one exists for cwd
         let ws_session = SessionState::load_for_workspace(&self.cwd.clone());
 
