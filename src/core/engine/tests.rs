@@ -991,7 +991,7 @@ fn test_startup_into_no_workspace_clears_workspace_root_and_skips_session_restor
          the assertion below proves nothing"
     );
     let tabs_before = deterministic.active_group().tabs.len();
-    deterministic.startup_into_no_workspace();
+    deterministic.startup_into_no_workspace_for_test();
 
     assert!(
         deterministic.has_no_workspace(),
@@ -1019,6 +1019,7 @@ fn test_startup_into_no_workspace_clears_workspace_root_and_skips_session_restor
     let _ = std::fs::remove_file(&p2);
     let _ = std::fs::remove_file(&session_path);
     let _ = std::fs::remove_dir(&workspace_dir);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The no-workspace state must force the shadow `app_shell`'s sidebar
@@ -1039,7 +1040,7 @@ fn test_startup_into_no_workspace_forces_sidebar_collapsed() {
          sidebar, otherwise the assertion below proves nothing"
     );
 
-    engine.startup_into_no_workspace();
+    engine.startup_into_no_workspace_for_test();
 
     assert!(
         !engine.app_shell.sidebar_visible(),
@@ -1054,6 +1055,11 @@ fn test_startup_into_no_workspace_forces_sidebar_collapsed() {
 /// the production `Engine::startup` or the deterministic test entry point.
 #[test]
 fn test_startup_with_a_path_argument_does_not_enter_no_workspace_state() {
+    // `startup_without_session_restore(Some(&dir))` opens a directory, which
+    // calls `Engine::open_folder` → `std::env::set_current_dir` — a process-wide
+    // write that must be excluded from every concurrent harness paint (see
+    // `test_cwd`'s module doc).
+    let _cwd = crate::test_cwd::CwdGuard::new();
     let dir = test_temp_path("vimcode_no_workspace_path_arg_ws");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1082,22 +1088,30 @@ fn test_startup_with_a_path_argument_does_not_enter_no_workspace_state() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Black-box proof of the no-arg GUI launch's acceptance bar: the rendered
-/// screen — not just the internal flags the tests above pin directly —
-/// must show the explorer collapsed, no restored file tab, and the
-/// editor region still painting the default empty buffer.
-///
-/// Settings/session are forced to otherwise derive a *visible* sidebar and
-/// a *restorable* session with a distinctively-named file, so a passing
-/// assertion below proves `startup_into_no_workspace` actually suppressed
-/// both, rather than the fixture starting out that way.
-#[test]
-fn test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed() {
+/// Marker filename the fixture below restores as the previous session's
+/// open file. Short enough to survive an 80-column TUI tab bar without
+/// truncation, so a failing `screen_has` match is unambiguous rather than
+/// a truncated-vs-full-name coincidence.
+const NO_WORKSPACE_RENDER_MARKER: &str = "no_ws_marker.txt";
+
+/// Builds the fixture `test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_tui`/`_gtk`
+/// share: a session/settings combination that would otherwise derive a
+/// *visible* sidebar and a *restorable* file tab, so each arm's assertions
+/// prove `startup_into_no_workspace` actually suppressed both rather than
+/// the fixture starting out that way. Returns the ready-to-start `Engine`
+/// plus the paths the caller must clean up once its harness is done with
+/// them.
+fn no_workspace_render_fixture() -> (
+    Engine,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     use crate::core::session::SessionState;
 
     let dir = test_temp_path("vimcode_no_workspace_render_ws");
     std::fs::create_dir_all(&dir).unwrap();
-    let fixture_file = dir.join("vimcode_no_workspace_render_marker.txt");
+    let fixture_file = dir.join(NO_WORKSPACE_RENDER_MARKER);
     std::fs::write(&fixture_file, "marker").unwrap();
 
     let mut session = SessionState::default();
@@ -1120,32 +1134,92 @@ fn test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed()
     engine.settings.use_nerd_fonts = Some(false);
     engine.settings.autohide_panels = false;
     engine.settings.explorer_visible_on_startup = true;
-    engine.startup_into_no_workspace();
+    engine.startup_into_no_workspace_for_test();
 
+    (engine, dir, fixture_file, session_path)
+}
+
+fn cleanup_no_workspace_render_fixture(
+    dir: &std::path::Path,
+    fixture_file: &std::path::Path,
+    session_path: &std::path::Path,
+) {
+    let _ = std::fs::remove_file(fixture_file);
+    let _ = std::fs::remove_file(session_path);
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// Black-box proof of the no-arg GUI launch's acceptance bar, shared by
+/// the `_tui`/`_gtk` arms below: the rendered screen — not just the
+/// internal flags the tests above pin directly — must show the explorer
+/// collapsed, no restored file tab, and the editor region still painting
+/// the default empty buffer.
+///
+/// Generic over `quadraui::testing::ConformanceDriver` rather than a
+/// concrete driver, so this one scenario body runs against both arms.
+fn assert_no_workspace_render_scenario<D: quadraui::testing::ConformanceDriver>(driver: &D) {
+    assert!(
+        !driver.screen_has("EXPLORER"),
+        "a no-arg GUI launch must render with the explorer collapsed"
+    );
+    assert!(
+        !driver.screen_has(NO_WORKSPACE_RENDER_MARKER),
+        "a no-arg GUI launch must not restore the previous session's file tab"
+    );
+    assert!(
+        driver.screen_has("No Name"),
+        "the editor region must still paint the default empty buffer"
+    );
+}
+
+/// TUI arm. Exercises the real production `startup_into_no_workspace`
+/// path (minus the ambient `plugin_init`/`ext_refresh_quiet` reads, via
+/// `startup_into_no_workspace_for_test`), but on its own this arm's
+/// `!screen_has("EXPLORER")` assertion is vacuously true: `cell`-profile
+/// `AppShell` registers a hamburger panel at index 0 regardless of engine
+/// state, painting "Menu" rather than "EXPLORER" whether or not the
+/// collapse logic under test actually ran. The `_gtk` arm below is meant
+/// to be the control that makes the assertion meaningful on a profile that
+/// *would* paint "EXPLORER" by default; see its own doc for why it is
+/// currently gated instead of a working control.
+#[test]
+fn test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_tui() {
+    let (engine, dir, fixture_file, session_path) = no_workspace_render_fixture();
     let h = crate::tui_main::testing::conformance_harness(engine, 80, 24);
+    assert_no_workspace_render_scenario(&h.driver);
+    cleanup_no_workspace_render_fixture(&dir, &fixture_file, &session_path);
+}
 
-    assert!(
-        !h.driver.screen_contains("EXPLORER"),
-        "a no-arg GUI launch must render with the explorer collapsed, got:\n{}",
-        h.driver.screen()
+/// GTK arm, and the control half of this pair: GTK's `px`-profile
+/// `AppShell` registers no hamburger panel, so it defaults to Explorer at
+/// index 0 and *would* paint "EXPLORER" if the sidebar were left visible —
+/// making the `_tui` arm's `!screen_has("EXPLORER")` assertion a real
+/// control here rather than a given, *if* this arm itself passed.
+///
+/// It currently does not, for a confirmed upstream reason rather than a
+/// vimcode bug: `quadraui::ShellAdapter::setup` takes no `ShellContext`,
+/// and both `ShellAdapter::render` and the `ShellApp::pre_render` it calls
+/// are `&self`, so nothing in the paint path can reach the `&mut self`
+/// `apply_requested_panel` that reconciles sidebar visibility — that only
+/// runs from `ShellAdapter::handle`, which the real GTK runner never
+/// dispatches an event into before the first paint. So GTK's sidebar
+/// defaults to Explorer-visible on frame 0 regardless of
+/// `Engine::startup_into_no_workspace`'s collapsed state, and this arm's
+/// `!screen_has("EXPLORER")` assertion fails. Gated via `known_bug_gate`
+/// (see `crate::harness::KNOWN_BUGS`'s doc) until quadraui grows a frame-0
+/// reconciliation hook; this is not weakened to pass today.
+#[cfg(feature = "gui")]
+#[test]
+fn test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_gtk() {
+    crate::harness::known_bug_gate(
+        "test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_gtk",
+        || {
+            let (engine, dir, fixture_file, session_path) = no_workspace_render_fixture();
+            let h = crate::gtk::testing::conformance_harness(engine, 800, 480);
+            assert_no_workspace_render_scenario(&h.driver);
+            cleanup_no_workspace_render_fixture(&dir, &fixture_file, &session_path);
+        },
     );
-    assert!(
-        !h.driver
-            .screen_contains("vimcode_no_workspace_render_marker.txt"),
-        "a no-arg GUI launch must not restore the previous session's file \
-         tab, got:\n{}",
-        h.driver.screen()
-    );
-    assert!(
-        h.driver.screen_contains("No Name"),
-        "the editor region must still paint the default empty buffer, \
-         got:\n{}",
-        h.driver.screen()
-    );
-
-    let _ = std::fs::remove_file(&fixture_file);
-    let _ = std::fs::remove_file(&session_path);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 #[test]
