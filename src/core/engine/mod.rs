@@ -3428,7 +3428,15 @@ pub struct Engine {
     // --- Workspace ---
     /// Path to the loaded `.vimcode-workspace` file, if any.
     pub workspace_file: Option<PathBuf>,
-    /// Resolved workspace root directory (derived from `workspace_file`), if any.
+    /// Resolved workspace root directory (derived from `workspace_file`), if
+    /// any. `None` means **no workspace is open** — the state
+    /// [`Engine::startup_into_no_workspace`] enters for a no-arg GUI launch
+    /// and [`Engine::has_no_workspace`] queries. [`Engine::new_from_state`]
+    /// otherwise always seeds this from the process cwd, so outside that
+    /// entry point `None` only ever appears where a caller (or test)
+    /// deliberately asks for the no-workspace state, e.g.
+    /// `Engine::open_branch_review`'s own "no workspace open" error already
+    /// treats this sentinel the same way.
     pub workspace_root: Option<PathBuf>,
     /// Snapshot of user settings before any workspace/folder overlay was applied.
     /// Set when entering a workspace, restored when leaving. `None` if no overlay active.
@@ -6019,6 +6027,40 @@ impl Engine {
     /// whatever the developer happens to have installed.
     pub fn startup_without_session_restore(&mut self, file_path: Option<&Path>) {
         self.startup_inner(file_path, false, false);
+    }
+
+    /// `true` once the engine has entered the explicit no-workspace state
+    /// (see [`Engine::startup_into_no_workspace`]): no folder or file was
+    /// opened at startup, the process cwd was not adopted as the workspace,
+    /// and no previous session was restored.
+    ///
+    /// `workspace_root` is the existing sentinel for "no workspace open" —
+    /// [`Engine::open_branch_review`]'s own "no workspace open" error already
+    /// treats a `None` the same way. [`Engine::new_from_state`] always seeds
+    /// `workspace_root` from the process cwd, so outside of
+    /// `startup_into_no_workspace` this is `false` for every real launch.
+    pub fn has_no_workspace(&self) -> bool {
+        self.workspace_root.is_none()
+    }
+
+    /// Entry point for a no-arg GUI launch: unlike [`Engine::startup`], this
+    /// does **not** adopt the process cwd as the workspace and does **not**
+    /// restore the previous session. The editor opens with an empty region,
+    /// the explorer forced collapsed (see
+    /// [`Engine::derived_sidebar_visible`]), and zero files open.
+    ///
+    /// Still performs the two ambient startup reads `startup` does
+    /// (`plugin_init`/`ext_refresh_quiet`) — only the file-vs-session branch
+    /// of [`Engine::startup_inner`] is skipped, by clearing `workspace_root`
+    /// first and passing neither a path nor `restore_session`.
+    ///
+    /// `vimcode <dir>`/`vimcode <file>` launches never call this — they keep
+    /// calling [`Engine::startup`] exactly as before, so passing a path on
+    /// the command line is unaffected by this state.
+    pub fn startup_into_no_workspace(&mut self) {
+        self.workspace_root = None;
+        self.startup_inner(None, false, true);
+        self.sync_app_shell_sidebar_visibility();
     }
 
     /// Before opening a *file* at startup (as opposed to a folder, which

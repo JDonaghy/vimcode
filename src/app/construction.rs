@@ -286,6 +286,88 @@ mod terminal_poll_rearm_tests {
     }
 }
 
+#[cfg(test)]
+mod build_portable_engine_no_workspace_tests {
+    //! Isolated coverage for [`App::build_portable_engine`]'s GUI-vs-TUI
+    //! fork: a no-arg launch on a GUI `UnitProfile` must enter
+    //! `Engine::startup_into_no_workspace`'s state, while a no-arg TUI
+    //! launch (and any launch with a path argument, on either backend)
+    //! keeps today's `Engine::startup` behaviour. `quadraui::tui::
+    //! TuiBackend` stands in as the throwaway `Backend` here purely because
+    //! it's unconditionally compiled (`src/lib.rs`'s `tui_main` module has
+    //! no feature gate) — this test exercises `units.is_gui_backend`, the
+    //! `UnitProfile` flag, not the concrete backend type.
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use quadraui::tui::TuiBackend;
+
+    use super::*;
+
+    fn tui_backend() -> Rc<RefCell<Box<dyn quadraui::Backend>>> {
+        Rc::new(RefCell::new(Box::new(TuiBackend::new())))
+    }
+
+    #[test]
+    fn no_arg_gui_launch_enters_no_workspace_state() {
+        let backend = tui_backend();
+        let (engine, _) = App::build_portable_engine(None, &backend, render::UnitProfile::px());
+        assert!(
+            engine.borrow().has_no_workspace(),
+            "a no-arg launch on a GUI UnitProfile must enter the \
+             no-workspace state rather than adopt the process cwd"
+        );
+    }
+
+    #[test]
+    fn no_arg_tui_launch_keeps_adopting_cwd() {
+        let backend = tui_backend();
+        let (engine, _) = App::build_portable_engine(None, &backend, render::UnitProfile::cell());
+        assert!(
+            !engine.borrow().has_no_workspace(),
+            "a no-arg launch on a TUI UnitProfile must keep today's \
+             behaviour of adopting the process cwd as the workspace"
+        );
+    }
+
+    #[test]
+    fn a_path_argument_adopts_a_workspace_on_either_backend() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_build_portable_engine_path_arg_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let gui_backend = tui_backend();
+        let (gui_engine, _) =
+            App::build_portable_engine(Some(dir.clone()), &gui_backend, render::UnitProfile::px());
+        assert!(
+            !gui_engine.borrow().has_no_workspace(),
+            "a directory argument must adopt a workspace even on a GUI \
+             UnitProfile"
+        );
+
+        let tui_backend_handle = tui_backend();
+        let (tui_engine, _) = App::build_portable_engine(
+            Some(dir.clone()),
+            &tui_backend_handle,
+            render::UnitProfile::cell(),
+        );
+        assert!(
+            !tui_engine.borrow().has_no_workspace(),
+            "a directory argument must adopt a workspace on a TUI \
+             UnitProfile too"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Create a new `App` instance.
 ///
 /// All widget-dependent setup (window handle) is deferred to
@@ -361,7 +443,17 @@ impl App {
             // `is_gui_backend` is `true`, so this stops assuming the answer.
             crate::icons::set_gui_backend(units.is_gui_backend);
             crate::icons::set_nerd_fonts(e.settings.use_nerd_fonts());
-            e.startup(file_path.as_deref());
+            // A no-arg GUI launch gets the explicit no-workspace state
+            // rather than adopting the process cwd and restoring its
+            // session — see `Engine::startup_into_no_workspace`'s doc. The
+            // TUI keeps today's behaviour (`vimcode` with no args opens the
+            // cwd's session), and a path argument on either backend is
+            // unaffected either way.
+            if file_path.is_none() && units.is_gui_backend {
+                e.startup_into_no_workspace();
+            } else {
+                e.startup(file_path.as_deref());
+            }
             e
         };
         setup_gtk_clipboard(&mut engine, backend.clone());
