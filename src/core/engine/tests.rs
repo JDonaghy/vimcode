@@ -17830,6 +17830,26 @@ fn test_welcome_activate_focus_open_folder_button_defers_to_dialog() {
     assert_eq!(engine.cwd, original_cwd);
 }
 
+/// The welcome-panel key intercept in `Engine::handle_key` only claims
+/// `j`/`k`/`Return` while `self.mode == Mode::Normal`. Typing a `:` command
+/// while there's no open workspace switches into `Mode::Command`, so the
+/// rest of the command line (including a trailing `Return`) must reach
+/// `execute_command` instead of being swallowed by the welcome panel's own
+/// `Return` handling.
+#[test]
+fn test_command_mode_return_executes_command_with_no_open_workspace() {
+    let mut engine = Engine::new_for_test();
+    engine.startup_into_no_workspace_for_test();
+    assert!(engine.has_no_workspace());
+    assert_eq!(engine.settings.line_numbers, LineNumberMode::Absolute);
+
+    run_command(&mut engine, "set nonumber");
+
+    assert_eq!(engine.mode, Mode::Normal);
+    assert_eq!(engine.settings.line_numbers, LineNumberMode::None);
+    assert!(engine.has_no_workspace());
+}
+
 /// The process CWD must be back where it started once
 /// `test_open_folder_resets_cwd` has run — the regression guard for the
 /// leak [`CwdGuard`] exists to stop.

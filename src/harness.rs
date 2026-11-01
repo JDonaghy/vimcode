@@ -1427,7 +1427,15 @@ pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
             win: false,
         },
         issue: Some(2112),
-        description: "activating the welcome panel's Open Folder action (Enter on the default focus) opens the in-app folder picker seeded from the engine's cwd",
+        description: "Enter on the welcome panel's Open Folder button opens the in-app folder picker",
+    },
+    ScenarioMeta {
+        name: "welcome_panel_recent_entry_restores_workspace",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2112),
+        description: "activating a recent entry opens that workspace and dismisses the welcome panel",
     },
 ];
 
@@ -11280,6 +11288,67 @@ mod welcome_panel_open_folder_button_opens_in_app_picker_mod {
                 "activating the welcome panel's default focus (Open Folder) \
                  with Enter must open the in-app folder picker seeded from \
                  the engine's cwd; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+}
+
+// Activating a recent-folders entry (click, or the keyboard path via
+// `welcome_focus_down`/`welcome_activate_focus`) must switch the engine to
+// that workspace (`Engine::open_recent_workspace`, which routes through
+// `Engine::open_folder`) and leave the welcome panel painted no more --
+// `Engine::has_no_workspace` goes false once `workspace_root` is set, so the
+// next frame paints the ordinary editor band/explorer instead. Unlike the
+// Open-Folder-button scenario above, this click resolves synchronously
+// (`click.rs`'s `WelcomeRecent` arm calls `open_recent_workspace` directly,
+// no queued dialog), so no `driver.tick()` is needed, and the action runs
+// identically on every backend -- this scenario is cross-backend.
+
+#[cfg(test)]
+mod welcome_panel_recent_entry_restores_workspace_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_welcome_test_recent_entry_2112");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("zq2112mk"))
+            .expect("fixture must be able to create its own scratch directory");
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.startup_into_no_workspace_for_test();
+        engine.session.recent_workspaces = vec![dir];
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: welcome_panel_recent_entry_restores_workspace,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (1000, 700),
+        body: |driver| {
+            assert!(
+                driver.screen_has("Recent Folders")
+                    && !driver.screen_has("zq2112mk"),
+                "precondition: the welcome panel must list the recent \
+                 workspace and not yet show its contents; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+
+            driver.click_text("vimcode_welcome_test_recent_entry_2112");
+
+            assert!(
+                !driver.screen_has("Welcome") && !driver.screen_has("Recent Folders"),
+                "activating a recent-workspace entry must dismiss the \
+                 welcome panel; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+            assert!(
+                driver.screen_has("zq2112mk"),
+                "activating a recent-workspace entry must open that \
+                 workspace, revealing its top-level contents in the \
+                 explorer; painted: {:?}",
                 driver.inventory().text_runs()
             );
         },

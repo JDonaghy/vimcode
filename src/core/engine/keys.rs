@@ -293,7 +293,22 @@ impl Engine {
         // activate `welcome_focus` — the keyboard twin of
         // `welcome_panel_click_target`'s mouse hit-testing. Every other key
         // falls through unclaimed (there's no buffer worth editing yet).
-        if self.has_no_workspace() {
+        //
+        // Gated on `Mode::Normal`, `!ctrl` and no pending operator — mirrors
+        // the plugin-view-tab intercept below. The status/command line stays
+        // visible and usable in the no-workspace state
+        // (`EditorOp::Welcome`'s doc, `frame_editor_band.rs`), so once a
+        // fallthrough `:` or `/` has switched into `Mode::Command` /
+        // `Mode::Search`, every subsequent keystroke (including `j`/`k`/
+        // `Return`) belongs to that command line, not the welcome panel.
+        // Excluding `ctrl` also keeps this from shadowing `Ctrl+J`/`Ctrl+K`
+        // chords (VSCode-mode `Ctrl+K`, user keymaps) that are dispatched
+        // further below.
+        if self.has_no_workspace()
+            && self.mode == Mode::Normal
+            && !ctrl
+            && self.pending_operator.is_none()
+        {
             let logical_key = if key_name.is_empty() {
                 unicode.map(|c| c.to_string()).unwrap_or_default()
             } else {
