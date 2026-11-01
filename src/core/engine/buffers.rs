@@ -4018,9 +4018,27 @@ impl Engine {
     /// workspace picker): switches via [`Engine::open_folder`], then focuses
     /// the explorer on the active file so its row renders with the focused
     /// selection background (inactive_selected_bg is too close to surface_bg
-    /// to read in GTK) and asks the backends to refresh.
+    /// to read in GTK), re-reveals the active file (`open_file_in_tab`
+    /// already did it once during session restore, but the
+    /// `explorer_needs_refresh` below triggers a backend rebuild that can
+    /// desync the cached row index, so the re-reveal is not redundant), and
+    /// asks the backends to refresh.
+    ///
+    /// `open_folder` leaves `self.app_shell`'s sidebar visibility (and
+    /// `self.session.explorer_visible`) exactly as they were before the
+    /// switch — it never calls [`Self::sync_app_shell_sidebar_visibility`]
+    /// itself. Called from the no-workspace state, that stale value is
+    /// `false` (`derived_sidebar_visible` forces it off while
+    /// `has_no_workspace()`), so claiming `explorer_has_focus` without first
+    /// forcing the sidebar on would land keyboard focus on a sidebar that
+    /// isn't actually painted — every key then silently swallows
+    /// (`handle_key`'s `explorer_has_focus` intercept) with no visible focus
+    /// indicator. Setting `session.explorer_visible` and re-deriving before
+    /// claiming focus keeps the two in agreement.
     pub fn open_recent_workspace(&mut self, path: &Path) {
         self.open_folder(path);
+        self.session.explorer_visible = true;
+        self.sync_app_shell_sidebar_visibility();
         self.explorer_has_focus = true;
         self.explorer_reveal_active_file();
         self.explorer_needs_refresh = true;
@@ -4029,16 +4047,20 @@ impl Engine {
     /// Move the welcome panel's keyboard focus to the next widget below
     /// (`OpenFolderButton` -> `RecentItem(0)` -> `RecentItem(1)` -> ...),
     /// clamped at the last recent-workspaces row. No-op with no recents.
+    ///
+    /// Also clamps an *existing* `RecentItem` focus back to
+    /// `OpenFolderButton` when `recent_workspaces` is empty: that combination
+    /// is otherwise a dead state — `paint_welcome_panel` returns before
+    /// building the list, so the button loses its highlight and Enter does
+    /// nothing (`welcome_activate_focus`'s `checked_sub` yields `None`).
     pub fn welcome_focus_down(&mut self) {
+        if self.session.recent_workspaces.is_empty() {
+            self.welcome_focus = WelcomeFocus::OpenFolderButton;
+            return;
+        }
         let last = self.session.recent_workspaces.len().saturating_sub(1);
         self.welcome_focus = match self.welcome_focus {
-            WelcomeFocus::OpenFolderButton => {
-                if self.session.recent_workspaces.is_empty() {
-                    WelcomeFocus::OpenFolderButton
-                } else {
-                    WelcomeFocus::RecentItem(0)
-                }
-            }
+            WelcomeFocus::OpenFolderButton => WelcomeFocus::RecentItem(0),
             WelcomeFocus::RecentItem(i) => {
                 WelcomeFocus::RecentItem(i.min(last).saturating_add(1).min(last))
             }
@@ -4046,8 +4068,13 @@ impl Engine {
     }
 
     /// Move the welcome panel's keyboard focus to the widget above,
-    /// clamped at the "Open Folder" button.
+    /// clamped at the "Open Folder" button. Same empty-list clamp as
+    /// [`Self::welcome_focus_down`].
     pub fn welcome_focus_up(&mut self) {
+        if self.session.recent_workspaces.is_empty() {
+            self.welcome_focus = WelcomeFocus::OpenFolderButton;
+            return;
+        }
         self.welcome_focus = match self.welcome_focus {
             WelcomeFocus::OpenFolderButton => WelcomeFocus::OpenFolderButton,
             WelcomeFocus::RecentItem(0) => WelcomeFocus::OpenFolderButton,

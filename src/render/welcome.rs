@@ -129,11 +129,16 @@ pub(crate) fn paint_welcome_panel(
         crate::core::engine::WelcomeFocus::RecentItem(i) => Some(i),
         crate::core::engine::WelcomeFocus::OpenFolderButton => None,
     };
+    // Clamped against `items.len()` here rather than trusted from
+    // `welcome_focus` alone: `welcome_focus_down`/`_up` keep `RecentItem`
+    // in range today, but the paint path should not depend on an invariant
+    // maintained only by another module reaching the same `recents.len()`.
+    let last_idx = items.len().saturating_sub(1);
     let list = ListView {
         id: WidgetId::new("welcome.recent_list"),
         title: Some(StyledText::plain("Recent Folders")),
         items,
-        selected_idx: recent_focus_idx.unwrap_or(0),
+        selected_idx: recent_focus_idx.unwrap_or(0).min(last_idx),
         scroll_offset: 0,
         has_focus: recent_focus_idx.is_some(),
         bordered: false,
