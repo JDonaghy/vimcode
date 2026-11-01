@@ -14,8 +14,9 @@ use super::*;
 /// layouts `Engine::welcome_button_layout`/`welcome_list_layout` hold so a
 /// later click can be hit-tested against exactly what was last painted.
 ///
-/// With no `recent_workspaces`, only the empty-state heading and the Open
-/// Folder button are painted (no list, and any stale cached list layout is
+/// With no `recent_workspaces`, the "Welcome" heading stays put and the Open
+/// Folder button is painted below it; a second, muted line explains there's
+/// nothing to pick from yet (no list, and any stale cached list layout is
 /// cleared so a leftover rect from a previous frame can't be hit).
 pub(crate) fn paint_welcome_panel(
     engine: &Engine,
@@ -35,14 +36,27 @@ pub(crate) fn paint_welcome_panel(
     }
 
     let recents = &engine.session.recent_workspaces;
+    // Whole multiples of `line_height` throughout, matching the rest of the
+    // editor band's whole-cell units: a half- or 1.5-line offset is
+    // meaningless on a TUI backend, whose rows are integral.
     let unit_h = backend.line_height().max(1.0);
-    let pad = unit_h * 0.5;
+    let pad = unit_h;
 
-    let heading_text = if recents.is_empty() {
-        "Open a folder to get started"
-    } else {
-        "Welcome"
-    };
+    let mut heading_lines = vec![TextDisplayLine {
+        spans: vec![StyledSpan::with_fg("Welcome", theme.default_fg)],
+        decoration: Decoration::default(),
+        timestamp: None,
+    }];
+    if recents.is_empty() {
+        heading_lines.push(TextDisplayLine {
+            spans: vec![StyledSpan::with_fg(
+                "Open a folder to get started",
+                theme.annotation_fg,
+            )],
+            decoration: Decoration::default(),
+            timestamp: None,
+        });
+    }
     let heading_rect = quadraui::Rect::new(
         rect.x + pad,
         rect.y + pad,
@@ -51,11 +65,7 @@ pub(crate) fn paint_welcome_panel(
     );
     let heading = TextDisplay {
         id: WidgetId::new("welcome.heading"),
-        lines: vec![TextDisplayLine {
-            spans: vec![StyledSpan::plain(heading_text)],
-            decoration: Decoration::default(),
-            timestamp: None,
-        }],
+        lines: heading_lines,
         scroll_offset: 0,
         auto_scroll: false,
         max_lines: 0,
@@ -65,12 +75,12 @@ pub(crate) fn paint_welcome_panel(
     };
     backend.draw_text_display(heading_rect, &heading);
 
-    let button_width = (rect.width - pad * 2.0).max(0.0).min(unit_h * 16.0);
+    let button_width = (rect.width - pad * 2.0).clamp(0.0, unit_h * 16.0);
     let button_rect = quadraui::Rect::new(
         rect.x + pad,
         heading_rect.y + heading_rect.height + pad,
         button_width,
-        unit_h * 1.5,
+        unit_h,
     );
     // quadraui's `Button` has no color/style override (`id`, `label`,
     // `variant`, `disabled`, `focused` only, `#[non_exhaustive]`), so this

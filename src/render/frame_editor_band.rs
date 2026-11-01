@@ -90,10 +90,14 @@ pub enum EditorOp {
     /// action and the recent-folders list, filling the single scratch window
     /// `Engine::new_from_state` still seeds even with no workspace open.
     ///
-    /// First in [`EDITOR_Z_ORDER`] and mutually exclusive with every other
-    /// rung in this band — `compose_editor_band` gates all six of them off
-    /// while this one is live, since the scratch window behind the panel has
-    /// no buffer content worth drawing under it.
+    /// Last in [`EDITOR_Z_ORDER`], so it paints *over* that scratch window's
+    /// (empty) [`Self::Windows`] rung rather than suppressing it: the
+    /// per-window status line painted by `Windows` — the default
+    /// configuration's only status bar, since `laststatus=2` leaves
+    /// `ScreenLayout::global_status_bar` `None` — must stay visible under the
+    /// panel, exactly as VS Code's own welcome tab keeps its status bar. The
+    /// paint site (`paint_editor_band_rungs`) insets the panel's rect by one
+    /// line so it never paints over that bottom row.
     Welcome,
 }
 
@@ -115,7 +119,6 @@ pub enum EditorOp {
 /// already paint them from one shared set of adapters. They stay where they
 /// are, immediately after the band.
 pub const EDITOR_Z_ORDER: [EditorOp; 8] = [
-    EditorOp::Welcome,
     EditorOp::Windows,
     EditorOp::Minimap,
     EditorOp::TabBars,
@@ -123,6 +126,7 @@ pub const EDITOR_Z_ORDER: [EditorOp; 8] = [
     EditorOp::GroupDividers,
     EditorOp::TabDragOverlay,
     EditorOp::TabTooltip,
+    EditorOp::Welcome,
 ];
 
 /// Is this group's tab bar painted this frame?
@@ -161,20 +165,22 @@ pub fn compose_editor_band(
         .iter()
         .copied()
         .filter(|op| match op {
-            EditorOp::Welcome => engine.has_no_workspace(),
-            // The remaining six rungs all target real buffer/window content,
-            // which the no-workspace state has none of — `Welcome` is this
-            // band's only live rung while it holds.
-            EditorOp::Windows => !engine.has_no_workspace() && !screen.windows.is_empty(),
+            // Stays live in the no-workspace state too: the scratch window
+            // `Engine::new_from_state` seeds there has no buffer content
+            // worth drawing, but it is still the carrier for the per-window
+            // status line (see `EditorOp::Welcome`'s doc for why that row
+            // must survive this state).
+            EditorOp::Windows => !screen.windows.is_empty(),
             // Empty whenever `minimap_reserved_width` reserved nothing —
             // which is how `:set nominimap` reaches the paint path — so no
             // separate `settings.minimap` test here (that would be a second
             // copy of the gate, free to drift from the reservation).
             EditorOp::Minimap => !engine.has_no_workspace() && !screen.minimap.is_empty(),
-            // Unlike the other five, left ungated on `has_no_workspace`:
-            // `window_builder`'s no-workspace special case still produces a
-            // single "Welcome" tab, which is how this state gets the tab-bar
-            // entry the welcome panel's doc (`EditorOp::Welcome`) promises.
+            // Unlike the other four gated on `has_no_workspace` below,
+            // left ungated here: `window_builder`'s no-workspace special
+            // case still produces a single "Welcome" tab, which is how this
+            // state gets the tab-bar entry the welcome panel's doc
+            // (`EditorOp::Welcome`) promises.
             EditorOp::TabBars => screen
                 .group_tab_bars
                 .iter()
@@ -199,6 +205,7 @@ pub fn compose_editor_band(
             }
             EditorOp::TabDragOverlay => !engine.has_no_workspace() && drag_active,
             EditorOp::TabTooltip => !engine.has_no_workspace() && screen.tab_tooltip.is_some(),
+            EditorOp::Welcome => engine.has_no_workspace(),
         })
         .collect()
 }
@@ -343,12 +350,25 @@ pub(crate) fn paint_editor_band_rungs<'screen>(
             // this reads the single scratch window's rect instead — the one
             // real rect the no-workspace state still lays out — falling back
             // to `band` only if that window is somehow absent.
+            //
+            // Composed last (see `EDITOR_Z_ORDER`), so this paints on top of
+            // the `Windows` rung's already-painted scratch window — including
+            // its per-window status line at the bottom row. Insetting the
+            // height by one line here, when that status line exists, keeps
+            // the panel's own content from painting over it.
             EditorOp::Welcome => {
-                let rect = screen
-                    .windows
-                    .first()
-                    .map(|w| w.rect.into())
-                    .unwrap_or(band);
+                let first_window = screen.windows.first();
+                let rect: quadraui::Rect = first_window.map(|w| w.rect.into()).unwrap_or(band);
+                let rect = if first_window.is_some_and(|w| w.status_line.is_some()) {
+                    quadraui::Rect::new(
+                        rect.x,
+                        rect.y,
+                        rect.width,
+                        (rect.height - units.metrics.line_height).max(0.0),
+                    )
+                } else {
+                    rect
+                };
                 paint_welcome_panel(engine, theme, rect, backend);
             }
             EditorOp::Windows => app.paint_editor_windows_rung(
