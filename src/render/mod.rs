@@ -92,7 +92,7 @@ pub use static_menu_structure::*;
 pub use tab_bar::*;
 pub use theme::*;
 // `welcome` exposes only `pub(crate)` items (same reasoning as
-// `plugin_view_body`/`window_builder` above).
+// `plugin_view_body`/`window_builder` below).
 #[allow(unused_imports)]
 pub use welcome::*;
 pub use window_and_popups::*;

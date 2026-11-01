@@ -1394,6 +1394,22 @@ pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
         issue: Some(2111),
         description: "no-workspace welcome panel with no recent folders shows the empty-state message and Open Folder alone",
     },
+    ScenarioMeta {
+        name: "welcome_panel_tab_bar_welcome_entry_paints_above_panel_heading",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2111),
+        description: "no-workspace tab strip's \"Welcome\" entry paints above the welcome panel's own \"Welcome\" heading, not merged into one hit",
+    },
+    ScenarioMeta {
+        name: "welcome_panel_lists_recent_workspaces_most_recent_first",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2111),
+        description: "the recent-folders list orders entries most-recently-opened first",
+    },
 ];
 
 /// Print the human-readable scenario table to stdout.
@@ -11020,8 +11036,8 @@ mod welcome_panel_shows_open_folder_and_recent_workspaces_mod {
         engine.settings.use_nerd_fonts = Some(false);
         engine.startup_into_no_workspace_for_test();
         engine.session.recent_workspaces = vec![
-            std::path::PathBuf::from("/tmp/vimcode_welcome_test_zorbtastic_project"),
-            std::path::PathBuf::from("/tmp/vimcode_welcome_test_quixium_widgets"),
+            crate::harness::scratch_dir("vimcode_welcome_test_zorbtastic_project"),
+            crate::harness::scratch_dir("vimcode_welcome_test_quixium_widgets"),
         ];
         engine
     }
@@ -11087,6 +11103,100 @@ mod welcome_panel_empty_recents_shows_only_open_folder_mod {
                 !driver.screen_has("Recent Folders"),
                 "with no recent workspaces, the recent-folders list must not \
                  be painted at all; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod welcome_panel_tab_bar_welcome_entry_paints_above_panel_heading_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.startup_into_no_workspace_for_test();
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: welcome_panel_tab_bar_welcome_entry_paints_above_panel_heading,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (1000, 700),
+        body: |driver| {
+            // The no-workspace tab strip (`window_builder::build_tab_bar_for_group_by_id`)
+            // and the welcome panel's own heading (`welcome::paint_welcome_panel`)
+            // both paint a run containing "Welcome" -- the tab strip's "Welcome "
+            // entry above the editor band, the panel's "Welcome" heading inside
+            // it. Distinguishing them by substring alone (`screen_has`/`find`,
+            // which only locates the first match) can't tell them apart, so
+            // this walks every painted run instead and orders them by y.
+            let inventory = driver.inventory();
+            let welcome_runs: Vec<_> = inventory
+                .text_runs()
+                .iter()
+                .filter(|run| run.text.contains("Welcome"))
+                .collect();
+            assert_eq!(
+                welcome_runs.len(),
+                2,
+                "expected exactly two painted runs containing \"Welcome\" (the \
+                 tab-bar entry and the panel heading); painted: {:?}",
+                driver.inventory().text_runs()
+            );
+            let tab_bar_y = welcome_runs[0].bounds.y;
+            let heading_y = welcome_runs[1].bounds.y;
+            assert!(
+                tab_bar_y < heading_y,
+                "the tab strip's \"Welcome\" entry (y={tab_bar_y}) must paint \
+                 above the welcome panel's own \"Welcome\" heading (y={heading_y}); \
+                 painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod welcome_panel_lists_recent_workspaces_most_recent_first_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.startup_into_no_workspace_for_test();
+        // `session.recent_workspaces` stores oldest-first; the welcome panel's
+        // list must render most-recently-opened first (`welcome.rs`'s `.rev()`).
+        engine.session.recent_workspaces = vec![
+            crate::harness::scratch_dir("vimcode_welcome_test_oldest_watfalia"),
+            crate::harness::scratch_dir("vimcode_welcome_test_middle_bruxanto"),
+            crate::harness::scratch_dir("vimcode_welcome_test_newest_plonkerel"),
+        ];
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: welcome_panel_lists_recent_workspaces_most_recent_first,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (1000, 700),
+        body: |driver| {
+            let (_, newest_y) = driver
+                .find("vimcode_welcome_test_newest_plonkerel")
+                .expect("the most-recently-opened workspace must be painted");
+            let (_, middle_y) = driver
+                .find("vimcode_welcome_test_middle_bruxanto")
+                .expect("the middle workspace must be painted");
+            let (_, oldest_y) = driver
+                .find("vimcode_welcome_test_oldest_watfalia")
+                .expect("the oldest workspace must still be painted");
+            assert!(
+                newest_y < middle_y && middle_y < oldest_y,
+                "the recent-folders list must render most-recently-opened \
+                 first: newest_y={newest_y}, middle_y={middle_y}, oldest_y={oldest_y}; \
+                 painted: {:?}",
                 driver.inventory().text_runs()
             );
         },

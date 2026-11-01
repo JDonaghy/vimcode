@@ -3,11 +3,17 @@ use super::*;
 // ─── Private builder helpers ──────────────────────────────────────────────────
 
 pub(crate) fn build_tab_bar_for_group_by_id(engine: &Engine, group_id: GroupId) -> Vec<TabInfo> {
+    let group = match engine.editor_groups.get(&group_id) {
+        Some(g) => g,
+        None => return vec![],
+    };
     // The no-workspace state has no real buffer worth naming in the tab
     // strip — `Engine::new_from_state` still seeds one scratch window, but
     // the welcome panel occupies the editor band in its place (see
     // `EditorOp::Welcome`), so the tab strip reads "Welcome" for the VS Code
-    // feel rather than the scratch buffer's own (empty) name.
+    // feel rather than the scratch buffer's own (empty) name. The lookup
+    // above still runs first, so an unknown `group_id` returns `[]` even in
+    // this state rather than fabricating a tab for a group that doesn't exist.
     if engine.has_no_workspace() {
         return vec![TabInfo {
             name: "Welcome ".to_string(),
@@ -16,10 +22,6 @@ pub(crate) fn build_tab_bar_for_group_by_id(engine: &Engine, group_id: GroupId) 
             preview: false,
         }];
     }
-    let group = match engine.editor_groups.get(&group_id) {
-        Some(g) => g,
-        None => return vec![],
-    };
     group
         .tabs
         .iter()
