@@ -289,6 +289,32 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Welcome panel (no open workspace) intercepts j/k/Enter to move and
+        // activate `welcome_focus` — the keyboard twin of
+        // `welcome_panel_click_target`'s mouse hit-testing. Every other key
+        // falls through unclaimed (there's no buffer worth editing yet).
+        if self.has_no_workspace() {
+            let logical_key = if key_name.is_empty() {
+                unicode.map(|c| c.to_string()).unwrap_or_default()
+            } else {
+                key_name.to_string()
+            };
+            match logical_key.as_str() {
+                "j" | "Down" => {
+                    self.welcome_focus_down();
+                    return EngineAction::None;
+                }
+                "k" | "Up" => {
+                    self.welcome_focus_up();
+                    return EngineAction::None;
+                }
+                "Return" | "KP_Enter" => {
+                    return self.welcome_activate_focus();
+                }
+                _ => {}
+            }
+        }
+
         // Editor hover popup intercepts keys when it has focus.
         if self.editor_hover_has_focus {
             // Use unicode char for printable keys (TUI sends key_name="" for them)

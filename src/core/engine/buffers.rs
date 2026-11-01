@@ -4013,6 +4013,71 @@ impl Engine {
         self.message = format!("Opened folder: {}", canonical.display());
     }
 
+    /// Open `path` as the new workspace from a recent-workspaces entry
+    /// (the welcome panel's recent list, or the `:AiSessions`-style recent
+    /// workspace picker): switches via [`Engine::open_folder`], then focuses
+    /// the explorer on the active file so its row renders with the focused
+    /// selection background (inactive_selected_bg is too close to surface_bg
+    /// to read in GTK) and asks the backends to refresh.
+    pub fn open_recent_workspace(&mut self, path: &Path) {
+        self.open_folder(path);
+        self.explorer_has_focus = true;
+        self.explorer_reveal_active_file();
+        self.explorer_needs_refresh = true;
+    }
+
+    /// Move the welcome panel's keyboard focus to the next widget below
+    /// (`OpenFolderButton` -> `RecentItem(0)` -> `RecentItem(1)` -> ...),
+    /// clamped at the last recent-workspaces row. No-op with no recents.
+    pub fn welcome_focus_down(&mut self) {
+        let last = self.session.recent_workspaces.len().saturating_sub(1);
+        self.welcome_focus = match self.welcome_focus {
+            WelcomeFocus::OpenFolderButton => {
+                if self.session.recent_workspaces.is_empty() {
+                    WelcomeFocus::OpenFolderButton
+                } else {
+                    WelcomeFocus::RecentItem(0)
+                }
+            }
+            WelcomeFocus::RecentItem(i) => {
+                WelcomeFocus::RecentItem(i.min(last).saturating_add(1).min(last))
+            }
+        };
+    }
+
+    /// Move the welcome panel's keyboard focus to the widget above,
+    /// clamped at the "Open Folder" button.
+    pub fn welcome_focus_up(&mut self) {
+        self.welcome_focus = match self.welcome_focus {
+            WelcomeFocus::OpenFolderButton => WelcomeFocus::OpenFolderButton,
+            WelcomeFocus::RecentItem(0) => WelcomeFocus::OpenFolderButton,
+            WelcomeFocus::RecentItem(i) => WelcomeFocus::RecentItem(i - 1),
+        };
+    }
+
+    /// Activate whatever `welcome_focus` currently points at: the Open
+    /// Folder button yields an action the UI layer must dispatch (shows the
+    /// native folder picker); a recent-workspace row is opened directly, no
+    /// picker involved.
+    pub fn welcome_activate_focus(&mut self) -> EngineAction {
+        match self.welcome_focus {
+            WelcomeFocus::OpenFolderButton => EngineAction::OpenFolderDialog,
+            WelcomeFocus::RecentItem(i) => {
+                // Most-recently-opened first, mirroring the `.rev()` the
+                // welcome panel's paint side lists recent workspaces in.
+                let recents = &self.session.recent_workspaces;
+                if let Some(path) = recents
+                    .len()
+                    .checked_sub(1 + i)
+                    .map(|idx| recents[idx].clone())
+                {
+                    self.open_recent_workspace(&path);
+                }
+                EngineAction::None
+            }
+        }
+    }
+
     /// Parse and load a `.vimcode-workspace` JSON file.
     pub fn open_workspace(&mut self, ws_path: &Path) {
         let content = match std::fs::read_to_string(ws_path) {

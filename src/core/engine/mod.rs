@@ -149,6 +149,17 @@ pub enum EngineAction {
     OpenUrl(String),
 }
 
+/// Which widget on the welcome panel (`EditorOp::Welcome`) a keyboard
+/// activation (Enter) acts on. `RecentItem(0)` is the most-recently-opened
+/// workspace, matching the `.rev()` order `paint_welcome_panel` lists them
+/// in — not an index into `session.recent_workspaces` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WelcomeFocus {
+    #[default]
+    OpenFolderButton,
+    RecentItem(usize),
+}
+
 /// One entry in the engine's accelerator registry. Caches the parsed form of
 /// `acc.binding` so [`Engine::match_accelerator`] can do a tight comparison
 /// without re-parsing per keypress.
@@ -4942,6 +4953,11 @@ pub struct Engine {
     /// button.
     #[allow(clippy::type_complexity)]
     pub welcome_button_layout: std::cell::RefCell<Option<(quadraui::Rect, quadraui::ButtonLayout)>>,
+    /// Which welcome-panel widget a keyboard activation (Enter) acts on.
+    /// Navigated with j/k while `has_no_workspace()` is true; painted into
+    /// the `Button`/`ListView` focus flags so the highlight tracks what
+    /// Enter would do.
+    pub welcome_focus: WelcomeFocus,
     /// The `Backend::data_table_layout` cached from the last frame that
     /// painted a `ViewBody::Table`-kind plugin view in the sidebar.
     /// Tab twin is `plugin_view_tab_table_layout`.
@@ -5884,6 +5900,7 @@ impl Engine {
             plugin_view_tab_list_layout: std::cell::RefCell::new(None),
             welcome_list_layout: std::cell::RefCell::new(None),
             welcome_button_layout: std::cell::RefCell::new(None),
+            welcome_focus: WelcomeFocus::default(),
             plugin_view_chart_layout: std::cell::RefCell::new(None),
             plugin_view_tab_chart_layout: std::cell::RefCell::new(None),
             plugin_view_table_layout: std::cell::RefCell::new(None),

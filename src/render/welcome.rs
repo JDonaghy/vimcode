@@ -3,9 +3,16 @@
 //! Folder" button, and a `recent_workspaces` list so a fresh launch reads as
 //! an intentional landing screen rather than an empty window.
 //!
-//! Render + layout-cache only. Routing a click against the cached button/list
-//! layout (`Engine::welcome_button_layout`, `Engine::welcome_list_layout`)
-//! back into `Engine::open_folder`/`open_workspace` is a separate layer's job.
+//! [`paint_welcome_panel`] paints and caches layout; [`welcome_panel_click_target`]
+//! resolves a click against that cache into a [`ClickTarget`] — same
+//! "paint caches, click reads" split `plugin_view_body.rs` uses for its own
+//! lists. Applying the resolved target (opening the dialog, opening a
+//! recent workspace) is `click.rs`'s job, not this file's.
+//!
+//! Keyboard focus (j/k to move, Enter to activate) is tracked by
+//! `Engine::welcome_focus` (`core::engine::WelcomeFocus`) and handled
+//! entirely in `Engine::handle_key` — this file only reads it to paint the
+//! button/list focus highlight.
 
 use super::*;
 
@@ -86,7 +93,8 @@ pub(crate) fn paint_welcome_panel(
     // `variant`, `disabled`, `focused` only, `#[non_exhaustive]`), so this
     // can only be a styled button, not the underlined "link" affordance VS
     // Code uses — the recent-folders rows below get the link color instead.
-    let button = Button::new(WidgetId::new("welcome.open_folder"), "Open Folder");
+    let mut button = Button::new(WidgetId::new("welcome.open_folder"), "Open Folder");
+    button.focused = engine.welcome_focus == crate::core::engine::WelcomeFocus::OpenFolderButton;
     backend.draw_button(button_rect, &button);
     let button_layout = backend.button_layout(button_rect, &button);
     engine
@@ -117,13 +125,17 @@ pub(crate) fn paint_welcome_panel(
             decoration: Decoration::default(),
         })
         .collect();
+    let recent_focus_idx = match engine.welcome_focus {
+        crate::core::engine::WelcomeFocus::RecentItem(i) => Some(i),
+        crate::core::engine::WelcomeFocus::OpenFolderButton => None,
+    };
     let list = ListView {
         id: WidgetId::new("welcome.recent_list"),
         title: Some(StyledText::plain("Recent Folders")),
         items,
-        selected_idx: 0,
+        selected_idx: recent_focus_idx.unwrap_or(0),
         scroll_offset: 0,
-        has_focus: false,
+        has_focus: recent_focus_idx.is_some(),
         bordered: false,
         h_scroll: 0,
         max_content_width: None,
@@ -134,4 +146,46 @@ pub(crate) fn paint_welcome_panel(
     engine
         .welcome_list_layout
         .replace(Some((list_rect, list_layout)));
+}
+
+/// Resolve `pos` (absolute, same units the last frame painted the panel
+/// into) against the welcome panel's cached button/list layouts.
+///
+/// Gates on `Engine::has_no_workspace` rather than cache presence alone:
+/// opening a workspace doesn't clear either cache, only painting a
+/// non-welcome editor band does (and that only happens on the next frame),
+/// so a stale cache from the last welcome frame must not resolve a hit once
+/// the panel is gone.
+pub(crate) fn welcome_panel_click_target(
+    engine: &Engine,
+    pos: quadraui::Point,
+) -> Option<ClickTarget> {
+    if !engine.has_no_workspace() {
+        return None;
+    }
+
+    if let Some((_, button_layout)) = engine.welcome_button_layout.borrow().as_ref() {
+        if button_layout.hit_test(pos) == quadraui::ButtonHit::Body {
+            return Some(ClickTarget::WelcomeOpenFolder);
+        }
+    }
+
+    if let Some((list_rect, list_layout)) = engine.welcome_list_layout.borrow().as_ref() {
+        if let quadraui::ListViewHit::Item(idx) =
+            list_layout.hit_test(pos.x - list_rect.x, pos.y - list_rect.y)
+        {
+            // Most-recently-opened first, mirroring the `.rev()` the paint
+            // side above built the list items from.
+            let recents = &engine.session.recent_workspaces;
+            if let Some(path) = recents
+                .len()
+                .checked_sub(1 + idx)
+                .map(|i| recents[i].clone())
+            {
+                return Some(ClickTarget::WelcomeRecent(path));
+            }
+        }
+    }
+
+    None
 }

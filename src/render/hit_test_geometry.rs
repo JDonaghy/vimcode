@@ -129,6 +129,14 @@ pub enum ClickTarget {
     /// scrolled to the clicked fraction of the file, like `Gutter`'s
     /// "fold already toggled". Carries the buffer line seeked to.
     Minimap(WindowId, usize),
+    /// Click was on the welcome panel's "Open Folder" button. The dialog
+    /// itself is deferred to the caller via `EngineAction::OpenFolderDialog`
+    /// — opening a native file-chooser is a per-backend concern this shared
+    /// resolver has no access to.
+    WelcomeOpenFolder,
+    /// Click was on a recent-workspace entry in the welcome panel's list.
+    /// Opening it is deferred to the caller via `Engine::open_recent_workspace`.
+    WelcomeRecent(std::path::PathBuf),
     /// Click was outside any actionable area.
     None,
 }

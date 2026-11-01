@@ -1410,6 +1410,25 @@ pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
         issue: Some(2111),
         description: "the recent-folders list orders entries most-recently-opened first",
     },
+    ScenarioMeta {
+        name: "welcome_panel_open_folder_button_opens_in_app_picker",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        // TUI only: `native_dialogs` is false there, so activating "Open
+        // Folder" defers to the in-app `FolderPickerController` fallback
+        // this scenario asserts on. On GTK/macOS/Windows the same action
+        // would block on a real OS file-open dialog, which a headless
+        // conformance run cannot drive.
+        backends: BackendSet {
+            gtk: false,
+            tui: true,
+            tui_prod: true,
+            macos: false,
+            win: false,
+        },
+        issue: Some(2112),
+        description: "activating the welcome panel's Open Folder action (Enter on the default focus) opens the in-app folder picker seeded from the engine's cwd",
+    },
 ];
 
 /// Print the human-readable scenario table to stdout.
@@ -11197,6 +11216,70 @@ mod welcome_panel_lists_recent_workspaces_most_recent_first_mod {
                 "the recent-folders list must render most-recently-opened \
                  first: newest_y={newest_y}, middle_y={middle_y}, oldest_y={oldest_y}; \
                  painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+}
+
+// ── #2112: welcome panel action wiring ──────────────────────────────────
+//
+// Activating the welcome panel's default focus (the "Open Folder" button,
+// via Enter) must drive the real `EngineAction::OpenFolderDialog` dispatch
+// chain, not just update `welcome_focus`. On a backend without
+// `native_dialogs` (TUI), that chain ends at `App::open_folder_dialog`,
+// which seeds the in-app `FolderPickerController` from `engine.cwd` --
+// this scenario proves the picker actually opens and lists `cwd`'s real
+// contents. GTK/macOS/Windows would instead block on a real OS dialog,
+// which a headless conformance run cannot drive, so this scenario is
+// TUI-only (see the `ScenarioMeta` entry's own comment).
+
+#[cfg(test)]
+mod welcome_panel_open_folder_button_opens_in_app_picker_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let dir = crate::harness::scratch_dir("vimcode_welcome_test_open_folder_button_2112");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("kkxxqq_distinctive_2112"))
+            .expect("fixture must be able to create its own scratch directory");
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.startup_into_no_workspace_for_test();
+        engine.cwd = dir;
+        engine.welcome_focus = crate::core::engine::WelcomeFocus::OpenFolderButton;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: welcome_panel_open_folder_button_opens_in_app_picker,
+        backends: [tui, tui_prod],
+        engine: engine_fixture(),
+        size: (1000, 700),
+        body: |driver| {
+            assert!(
+                driver.screen_has("Open Folder") && !driver.screen_has("kkxxqq_distinctive_2112"),
+                "precondition: the welcome panel must paint the Open Folder \
+                 action and not yet show the picker's contents; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+
+            driver.press_named(quadraui::NamedKey::Enter);
+            // `App::open_folder_dialog_native` only *queues*
+            // `PendingFileDialog::OpenFolder`; the real TUI run loop
+            // (`TuiRunner::step`/`pump`) drains it via `App::tick` on the
+            // same pass that handled the key, which `TuiDriver::dispatch`
+            // (what `press_named` calls) doesn't do on its own — drive
+            // that tick explicitly so the picker gets seeded and painted
+            // before the assertion below.
+            driver.tick();
+
+            assert!(
+                driver.screen_has("kkxxqq_distinctive_2112"),
+                "activating the welcome panel's default focus (Open Folder) \
+                 with Enter must open the in-app folder picker seeded from \
+                 the engine's cwd; painted: {:?}",
                 driver.inventory().text_runs()
             );
         },

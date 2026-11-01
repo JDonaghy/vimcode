@@ -1111,6 +1111,16 @@ impl App {
                             self.draw_needed.set(true);
                             return;
                         }
+                        Some(core::engine::EngineAction::OpenFolderDialog) => {
+                            // The welcome panel's "Open Folder" button —
+                            // `click::handle_mouse_click` can't drive a
+                            // native file-chooser itself (that lives on
+                            // `App`, not `Engine`), so it hands this back.
+                            drop(engine);
+                            self.open_folder_dialog_native();
+                            self.draw_needed.set(true);
+                            return;
+                        }
                         _ => {}
                     }
                     match click_result {
