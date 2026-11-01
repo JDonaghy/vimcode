@@ -68,13 +68,15 @@ pub const ROW_TOGGLE: &str = "TgZQ146";
 /// comment already names, just triggered by *editing* rather than by an
 /// already-too-long declared value. Starting empty leaves ample room.
 pub const ROW_EMPTY_TEXT_LABEL: &str = "EtZQ146";
-/// A `date`-kind row's label. Short on purpose: quadraui's inline `Form` row
-/// paint for `FieldKind::DatePicker` only draws the formatted value when
-/// `ix > label_right + 8.0` (`primitives/form.rs`), and the value here is a
-/// full ISO8601 date (10 chars, longer than this fixture's other row values)
-/// — the same column-budget trap [`ROW_EMPTY_TEXT_LABEL`] and [`LIST_DETAIL`]
-/// already name, just needing a shorter *label* rather than a shorter value
-/// to leave the column room the value needs.
+/// A `date`-kind row's label. quadraui's `tui::form` right-aligns a
+/// `FieldKind::DatePicker`'s formatted value and only paints it once it clears
+/// the row's shared label column (`start_col > label_end + 1`, `tui/form.rs`).
+/// That column is sized to the form's widest label, and the value here is a
+/// full ISO8601 date (10 chars, longer than this fixture's other row values),
+/// so the 20-column TUI sidebar has no room left for it — the value paints
+/// only in the wider editor-tab fixture (`tui_tab`), the same column-budget
+/// trap [`ROW_SLIDER_LABEL`], [`ROW_EMPTY_TEXT_LABEL`] and [`LIST_DETAIL`]
+/// already name. The label itself still paints in the sidebar.
 pub const ROW_DATE_LABEL: &str = "DtZ";
 /// That row's plugin-declared initial value (ISO8601 `YYYY-MM-DD`).
 pub const ROW_DATE_INITIAL: &str = "2024-01-01";
@@ -1159,10 +1161,26 @@ pub fn declared_tree_is_painted(driver: &impl ConformanceDriver) {
             ROW_TOGGLE,
             ROW_BUTTON,
             ROW_DATE_LABEL,
-            ROW_DATE_INITIAL,
             COUNT_0,
         ],
         "the plugin-declared widget tree",
+    );
+}
+
+/// Scenario 1a′ — the declared `date` row's *value* is painted.
+///
+/// Split out from [`declared_tree_is_painted`] for the same reason as the
+/// slider row: quadraui's `tui::form` reserves a shared label column sized to
+/// the form's widest label, and the full ISO8601 value ([`ROW_DATE_INITIAL`],
+/// 10 chars) only clears that column's right edge in the wider editor-tab
+/// fixture (`tui_tab`; see [`ROW_DATE_LABEL`]'s doc). GTK lays out pixel
+/// widths with room to spare, so its sidebar fixture (`gtk`) paints the value
+/// fine — the scenario stays split so both backends run the identical body.
+pub fn declared_date_row_is_painted(driver: &impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[ROW_DATE_LABEL, ROW_DATE_INITIAL],
+        "the plugin-declared date row",
     );
 }
 
@@ -3325,6 +3343,15 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_declared_date_row_is_painted_on_tui() {
+        // The sidebar's 20-column TUI default is too narrow for the date
+        // row's ISO8601 value past the shared label column
+        // (`ROW_DATE_LABEL`'s doc comment) — the editor-tab fixture has room.
+        let (h, _dir) = tui_tab();
+        declared_date_row_is_painted(&h.driver);
+    }
+
+    #[test]
     fn plugin_view_button_click_reaches_the_handler_on_tui() {
         let (mut h, _dir) = tui();
         clicking_a_button_reaches_the_plugin_handler(&mut h.driver);
@@ -3383,7 +3410,10 @@ mod tests {
 
     #[test]
     fn plugin_view_scrubbing_and_confirming_a_date_field_reaches_the_handler_on_tui() {
-        let (mut h, _dir) = tui();
+        // The date row's value only clears the shared label column in the
+        // wider editor-tab fixture (`ROW_DATE_LABEL`'s doc comment); the
+        // sidebar's 20-column TUI default is too narrow for it.
+        let (mut h, _dir) = tui_tab();
         scrubbing_and_confirming_a_date_field_reaches_the_plugin_handler(&mut h.driver);
     }
 
@@ -3744,6 +3774,16 @@ mod tests {
         // paint this row — so this uses `gtk` rather than `gtk_tab`.
         let (h, _dir) = gtk();
         declared_slider_row_is_painted(&h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_declared_date_row_is_painted_on_gtk() {
+        // GTK lays out pixel widths with room to spare past the shared label
+        // column, so the sidebar fixture (`gtk`) paints the date value fine —
+        // this uses `gtk` rather than `gtk_tab`.
+        let (h, _dir) = gtk();
+        declared_date_row_is_painted(&h.driver);
     }
 
     #[cfg(feature = "gui")]
