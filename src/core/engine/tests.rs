@@ -17788,6 +17788,48 @@ fn test_open_workspace_parses_json() {
     assert!(engine.settings.expand_tab);
 }
 
+/// Activating the welcome panel's "Recent Folders" row (`welcome_focus =
+/// RecentItem(0)`, Enter) opens that workspace directly through
+/// `Engine::open_recent_workspace` — no dialog/picker involved, unlike the
+/// "Open Folder" button.
+#[test]
+fn test_welcome_activate_focus_opens_recent_workspace() {
+    let _cwd = CwdGuard::new();
+    let dir = test_temp_path("vimcode_test_welcome_recent");
+    std::fs::create_dir_all(&dir).unwrap();
+    let expected = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+
+    let mut engine = Engine::new();
+    engine.session.add_recent_workspace(&expected);
+    // `RecentItem(0)` is the most-recently-opened entry (`.rev()`'d by the
+    // paint side), which is exactly the one just added above.
+    engine.welcome_focus = WelcomeFocus::RecentItem(0);
+
+    let action = engine.welcome_activate_focus();
+
+    assert_eq!(action, EngineAction::None);
+    assert_eq!(engine.cwd, expected);
+    assert_eq!(engine.workspace_root, Some(expected));
+    assert!(!engine.has_no_workspace());
+    assert!(engine.explorer_has_focus);
+}
+
+/// The welcome panel's "Open Folder" button yields `EngineAction::
+/// OpenFolderDialog` instead of opening anything itself — the dialog (native
+/// or in-app picker fallback) is the UI layer's job, not the engine's, and
+/// must not touch `cwd` before a path is actually chosen.
+#[test]
+fn test_welcome_activate_focus_open_folder_button_defers_to_dialog() {
+    let mut engine = Engine::new();
+    let original_cwd = engine.cwd.clone();
+    engine.welcome_focus = WelcomeFocus::OpenFolderButton;
+
+    let action = engine.welcome_activate_focus();
+
+    assert_eq!(action, EngineAction::OpenFolderDialog);
+    assert_eq!(engine.cwd, original_cwd);
+}
+
 /// The process CWD must be back where it started once
 /// `test_open_folder_resets_cwd` has run — the regression guard for the
 /// leak [`CwdGuard`] exists to stop.

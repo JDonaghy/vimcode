@@ -143,6 +143,20 @@ pub(crate) fn pixel_to_click_target(
     // before this function — so a status click cannot arrive here, and the
     // shared router decides the order the bars are arbitrated in.
 
+    // ── Welcome panel ───────────────────────────────────────────────────────
+    // No workspace is open, so there's no window/tab-bar geometry below to
+    // resolve against — short-circuit before the zone walk. Resolution is a
+    // pure lookup against what the welcome panel last painted (no side
+    // effect performed here), so unlike every branch below it isn't gated
+    // on `mutate_focus`: `handle_mouse_click` is the only caller that acts
+    // on `WelcomeOpenFolder`/`WelcomeRecent`, every other caller only
+    // matches `BufferPos`/`TabBar` and silently ignores these.
+    if let Some(target) =
+        render_mod::welcome_panel_click_target(engine, quadraui::Point::new(x as f32, y as f32))
+    {
+        return target;
+    }
+
     // ── Minimap press ───────────────────────────────────────────────────────
     // Pure rect plumbing: the shared resolver owns the hit-test and the
     // jump-to-position. Checked before the zone walk because every window's
@@ -533,6 +547,21 @@ pub(crate) fn handle_mouse_click(
                 (render_mod::tab_row_height_px(line_height) / line_height.max(1.0)) as f32;
             engine.open_editor_action_menu(group_id, col, row, trigger_h);
             (None, None)
+        }
+        ClickTarget::WelcomeOpenFolder => {
+            // The native file-chooser lives on `App`, not `Engine` — hand
+            // the action back to the caller the same way `ToggleSidebar`/
+            // `OpenTerminal` already do.
+            (None, Some(EngineAction::OpenFolderDialog))
+        }
+        ClickTarget::WelcomeRecent(path) => {
+            // No dialog/picker: open the already-known path immediately.
+            // `(Some(false), None)` makes the caller treat this like a
+            // normal buffer click (fires `cursor_move` hook, redraws) —
+            // harmless on the now-open workspace and avoids a bespoke
+            // early-return arm here.
+            engine.open_recent_workspace(&path);
+            (Some(false), None)
         }
         _ => (None, None),
     }
