@@ -169,6 +169,10 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 hint: StyledText::default(),
                 disabled: false,
                 validation: None,
+                label_position: None,
+                label_align: None,
+                label_width: None,
+                tab_index: None,
             },
             FormField {
                 id: WidgetId::new("search:replace"),
@@ -186,6 +190,10 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 hint: StyledText::default(),
                 disabled: false,
                 validation: None,
+                label_position: None,
+                label_align: None,
+                label_width: None,
+                tab_index: None,
             },
             FormField {
                 id: WidgetId::new("search:toggles"),
@@ -212,6 +220,10 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 hint: StyledText::default(),
                 disabled: false,
                 validation: None,
+                label_position: None,
+                label_align: None,
+                label_width: None,
+                tab_index: None,
             },
             FormField {
                 id: WidgetId::new("search:buttons"),
@@ -241,6 +253,10 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 hint: StyledText::default(),
                 disabled: false,
                 validation: None,
+                label_position: None,
+                label_align: None,
+                label_width: None,
+                tab_index: None,
             },
             FormField {
                 id: WidgetId::new("search:status"),
@@ -261,11 +277,18 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 hint: StyledText::default(),
                 disabled: false,
                 validation: None,
+                label_position: None,
+                label_align: None,
+                label_width: None,
+                tab_index: None,
             },
         ],
         focused_field: form_focus.as_deref().map(WidgetId::new),
         scroll_offset: 0,
         has_focus: query_focused || replace_focused,
+        label_position: Default::default(),
+        label_align: Default::default(),
+        label_width: None,
     };
 
     // ── Section 1: TreeView (results grouped by file) ───────────────────

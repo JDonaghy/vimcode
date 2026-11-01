@@ -582,6 +582,10 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     hint: StyledText::default(),
                     disabled: false,
                     validation: None,
+                    label_position: None,
+                    label_align: None,
+                    label_width: None,
+                    tab_index: None,
                 }
             }
             SettingsRow::ExtCategory(name) => {
@@ -604,6 +608,10 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     hint: StyledText::default(),
                     disabled: false,
                     validation: None,
+                    label_position: None,
+                    label_align: None,
+                    label_width: None,
+                    tab_index: None,
                 }
             }
             SettingsRow::CoreSetting(idx) => {
@@ -633,6 +641,10 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     hint: StyledText::default(),
                     disabled: false,
                     validation: None,
+                    label_position: None,
+                    label_align: None,
+                    label_width: None,
+                    tab_index: None,
                 }
             }
             SettingsRow::ExtSetting(ext_name, key) => {
@@ -678,6 +690,10 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     hint: StyledText::default(),
                     disabled: false,
                     validation: None,
+                    label_position: None,
+                    label_align: None,
+                    label_width: None,
+                    tab_index: None,
                 }
             }
         };
@@ -692,6 +708,9 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
         focused_field,
         scroll_offset: engine.settings_scroll_top,
         has_focus: engine.settings_has_focus,
+        label_position: Default::default(),
+        label_align: Default::default(),
+        label_width: None,
     }
 }
 

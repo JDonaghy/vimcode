@@ -256,6 +256,10 @@ pub fn plugin_view_to_form(
                     (None, Some(w)) => Some(ValidationState::Warning(w.clone())),
                     (None, None) => None,
                 },
+                label_position: None,
+                label_align: None,
+                label_width: None,
+                tab_index: None,
             }
         })
         .collect();
@@ -280,6 +284,9 @@ pub fn plugin_view_to_form(
         focused_field,
         scroll_offset: scroll_top,
         has_focus,
+        label_position: Default::default(),
+        label_align: Default::default(),
+        label_width: None,
     }
 }
 
