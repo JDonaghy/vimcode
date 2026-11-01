@@ -4928,6 +4928,20 @@ pub struct Engine {
     #[allow(clippy::type_complexity)]
     pub plugin_view_tab_list_layout:
         std::cell::RefCell<Option<(quadraui::Rect, quadraui::ListViewLayout)>>,
+    /// The `Backend::list_layout` cached from the last frame that painted the
+    /// welcome panel's recent-folders list (`EditorOp::Welcome`), alongside
+    /// the rect it was resolved against — same "paint caches, click reads"
+    /// split as `plugin_view_list_layout`. Rows are hit-tested from this
+    /// cache rather than re-derived, so a click lands on exactly what was
+    /// last painted.
+    #[allow(clippy::type_complexity)]
+    pub welcome_list_layout: std::cell::RefCell<Option<(quadraui::Rect, quadraui::ListViewLayout)>>,
+    /// The `Backend::button_layout` cached from the last frame that painted
+    /// the welcome panel's "Open Folder" button, alongside the rect it was
+    /// resolved against — the `welcome_list_layout` twin for the panel's one
+    /// button.
+    #[allow(clippy::type_complexity)]
+    pub welcome_button_layout: std::cell::RefCell<Option<(quadraui::Rect, quadraui::ButtonLayout)>>,
     /// The `Backend::data_table_layout` cached from the last frame that
     /// painted a `ViewBody::Table`-kind plugin view in the sidebar.
     /// Tab twin is `plugin_view_tab_table_layout`.
@@ -5868,6 +5882,8 @@ impl Engine {
             )),
             plugin_view_list_layout: std::cell::RefCell::new(None),
             plugin_view_tab_list_layout: std::cell::RefCell::new(None),
+            welcome_list_layout: std::cell::RefCell::new(None),
+            welcome_button_layout: std::cell::RefCell::new(None),
             plugin_view_chart_layout: std::cell::RefCell::new(None),
             plugin_view_tab_chart_layout: std::cell::RefCell::new(None),
             plugin_view_table_layout: std::cell::RefCell::new(None),

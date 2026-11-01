@@ -60,6 +60,7 @@ mod test_support;
 #[cfg(test)]
 mod tests_behavioral;
 mod theme;
+mod welcome;
 mod window_and_popups;
 mod window_builder;
 
@@ -90,6 +91,10 @@ pub use source_control_sidebar::*;
 pub use static_menu_structure::*;
 pub use tab_bar::*;
 pub use theme::*;
+// `welcome` exposes only `pub(crate)` items (same reasoning as
+// `plugin_view_body`/`window_builder` above).
+#[allow(unused_imports)]
+pub use welcome::*;
 pub use window_and_popups::*;
 // `plugin_view_body` and `window_builder` currently expose only
 // `pub(crate)` items (same as before the split, when they were reachable

@@ -86,6 +86,15 @@ pub enum EditorOp {
     /// The tab-hover tooltip naming the buffer under the pointer
     /// (`ScreenLayout::tab_tooltip`).
     TabTooltip,
+    /// The welcome panel (`Engine::has_no_workspace`): heading, "Open Folder"
+    /// action and the recent-folders list, filling the single scratch window
+    /// `Engine::new_from_state` still seeds even with no workspace open.
+    ///
+    /// First in [`EDITOR_Z_ORDER`] and mutually exclusive with every other
+    /// rung in this band — `compose_editor_band` gates all six of them off
+    /// while this one is live, since the scratch window behind the panel has
+    /// no buffer content worth drawing under it.
+    Welcome,
 }
 
 /// The canonical editor-band order, **lowest z first** (index 0 is composed
@@ -105,7 +114,8 @@ pub enum EditorOp {
 /// the *cursor*, not to the editor column's own structure, and both backends
 /// already paint them from one shared set of adapters. They stay where they
 /// are, immediately after the band.
-pub const EDITOR_Z_ORDER: [EditorOp; 7] = [
+pub const EDITOR_Z_ORDER: [EditorOp; 8] = [
+    EditorOp::Welcome,
     EditorOp::Windows,
     EditorOp::Minimap,
     EditorOp::TabBars,
@@ -151,18 +161,28 @@ pub fn compose_editor_band(
         .iter()
         .copied()
         .filter(|op| match op {
-            EditorOp::Windows => !screen.windows.is_empty(),
+            EditorOp::Welcome => engine.has_no_workspace(),
+            // The remaining six rungs all target real buffer/window content,
+            // which the no-workspace state has none of — `Welcome` is this
+            // band's only live rung while it holds.
+            EditorOp::Windows => !engine.has_no_workspace() && !screen.windows.is_empty(),
             // Empty whenever `minimap_reserved_width` reserved nothing —
             // which is how `:set nominimap` reaches the paint path — so no
             // separate `settings.minimap` test here (that would be a second
             // copy of the gate, free to drift from the reservation).
-            EditorOp::Minimap => !screen.minimap.is_empty(),
+            EditorOp::Minimap => !engine.has_no_workspace() && !screen.minimap.is_empty(),
+            // Unlike the other five, left ungated on `has_no_workspace`:
+            // `window_builder`'s no-workspace special case still produces a
+            // single "Welcome" tab, which is how this state gets the tab-bar
+            // entry the welcome panel's doc (`EditorOp::Welcome`) promises.
             EditorOp::TabBars => screen
                 .group_tab_bars
                 .iter()
                 .any(|gtb| tab_bar_is_drawn(engine, gtb)),
             EditorOp::Breadcrumbs => {
-                !terminal_maximized && screen.breadcrumbs.iter().any(breadcrumb_is_drawn)
+                !engine.has_no_workspace()
+                    && !terminal_maximized
+                    && screen.breadcrumbs.iter().any(breadcrumb_is_drawn)
             }
             // Naturally empty with a single group — `GroupLayout::Leaf
             // ::dividers()` returns `vec![]` — so this needs no
@@ -173,9 +193,12 @@ pub fn compose_editor_band(
             // [`paint_editor_band_rungs`]'s body from being able to disagree about
             // what "live" means for this op, the same invariant [`tab_bar_is_drawn`]
             // states for `TabBars`.
-            EditorOp::GroupDividers => !painted_group_dividers(&screen.group_dividers).is_empty(),
-            EditorOp::TabDragOverlay => drag_active,
-            EditorOp::TabTooltip => screen.tab_tooltip.is_some(),
+            EditorOp::GroupDividers => {
+                !engine.has_no_workspace()
+                    && !painted_group_dividers(&screen.group_dividers).is_empty()
+            }
+            EditorOp::TabDragOverlay => !engine.has_no_workspace() && drag_active,
+            EditorOp::TabTooltip => !engine.has_no_workspace() && screen.tab_tooltip.is_some(),
         })
         .collect()
 }
@@ -223,7 +246,12 @@ pub(crate) fn editor_band_fixture(drag: bool) -> Vec<EditorOp> {
     EDITOR_Z_ORDER
         .iter()
         .copied()
-        .filter(|op| drag || !matches!(op, EditorOp::TabDragOverlay))
+        // `Welcome` is excluded unconditionally: every fixture this feeds
+        // builds a workspace-backed `Engine`, so `compose_editor_band` never
+        // composes that rung for it regardless of `drag`.
+        .filter(|op| {
+            !matches!(op, EditorOp::Welcome) && (drag || !matches!(op, EditorOp::TabDragOverlay))
+        })
         .collect()
 }
 
@@ -311,6 +339,18 @@ pub(crate) fn paint_editor_band_rungs<'screen>(
     let mut composed = Vec::new();
     for op in compose_editor_band(engine, screen, drag_active, engine.terminal_maximized) {
         match op {
+            // `band`'s own height isn't trustworthy (see this fn's doc), so
+            // this reads the single scratch window's rect instead — the one
+            // real rect the no-workspace state still lays out — falling back
+            // to `band` only if that window is somehow absent.
+            EditorOp::Welcome => {
+                let rect = screen
+                    .windows
+                    .first()
+                    .map(|w| w.rect.into())
+                    .unwrap_or(band);
+                paint_welcome_panel(engine, theme, rect, backend);
+            }
             EditorOp::Windows => app.paint_editor_windows_rung(
                 backend,
                 screen,

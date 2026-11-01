@@ -1378,6 +1378,22 @@ pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
         issue: None,
         description: "clicking inside the open terminal's pane body focuses it, so a colon no longer opens the host's own command line",
     },
+    ScenarioMeta {
+        name: "welcome_panel_shows_open_folder_and_recent_workspaces",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2111),
+        description: "no-workspace welcome panel renders the Open Folder action and recent-folder entries",
+    },
+    ScenarioMeta {
+        name: "welcome_panel_empty_recents_shows_only_open_folder",
+        area: FeatureArea::Editor,
+        driver_cap: DriverCap::TextOnly,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2111),
+        description: "no-workspace welcome panel with no recent folders shows the empty-state message and Open Folder alone",
+    },
 ];
 
 /// Print the human-readable scenario table to stdout.
@@ -10977,6 +10993,101 @@ mod terminal_panel_click_focuses_it_for_keystroke_routing_mod {
                  ':Q' afterward must be routed to the terminal, not echoed in the \
                  host's command line (row y={command_line_y}); painted there: {:?}",
                 on_command_line
+            );
+        },
+    }
+}
+
+// ── #2111: welcome panel in the no-workspace editor area ────────────────
+//
+// A no-arg launch lands the engine in the no-workspace state
+// (`Engine::has_no_workspace`); the editor band paints a welcome panel
+// there instead of a blank area: an "Open Folder" button, plus a
+// `recent_workspaces` list when non-empty, or an empty-state message when
+// not.
+
+#[cfg(test)]
+mod welcome_panel_shows_open_folder_and_recent_workspaces_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    /// A no-workspace engine with two distinctive, non-existent recent
+    /// paths seeded directly onto `session.recent_workspaces` --
+    /// `startup_into_no_workspace_for_test`'s own `startup_inner` call
+    /// never reads or overwrites that field, so setting it either before
+    /// or after is equally safe.
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.startup_into_no_workspace_for_test();
+        engine.session.recent_workspaces = vec![
+            std::path::PathBuf::from("/tmp/vimcode_welcome_test_zorbtastic_project"),
+            std::path::PathBuf::from("/tmp/vimcode_welcome_test_quixium_widgets"),
+        ];
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: welcome_panel_shows_open_folder_and_recent_workspaces,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (1000, 700),
+        body: |driver| {
+            assert!(
+                driver.screen_has("Open Folder"),
+                "the welcome panel must paint an \"Open Folder\" action when \
+                 there is no open workspace; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+            assert!(
+                driver.screen_has("vimcode_welcome_test_zorbtastic_project")
+                    && driver.screen_has("vimcode_welcome_test_quixium_widgets"),
+                "the welcome panel must list every seeded recent workspace; \
+                 painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+}
+
+#[cfg(test)]
+mod welcome_panel_empty_recents_shows_only_open_folder_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.startup_into_no_workspace_for_test();
+        assert!(
+            engine.session.recent_workspaces.is_empty(),
+            "precondition: a fresh test engine starts with no recent workspaces"
+        );
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: welcome_panel_empty_recents_shows_only_open_folder,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (1000, 700),
+        body: |driver| {
+            assert!(
+                driver.screen_has("Open Folder"),
+                "with no recent workspaces, the welcome panel must still paint \
+                 the \"Open Folder\" action; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+            assert!(
+                driver.screen_has("get started"),
+                "with no recent workspaces, the welcome panel must paint an \
+                 empty-state message inviting the user to open a folder; \
+                 painted: {:?}",
+                driver.inventory().text_runs()
+            );
+            assert!(
+                !driver.screen_has("Recent Folders"),
+                "with no recent workspaces, the recent-folders list must not \
+                 be painted at all; painted: {:?}",
+                driver.inventory().text_runs()
             );
         },
     }
