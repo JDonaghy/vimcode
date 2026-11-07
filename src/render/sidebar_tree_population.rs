@@ -172,6 +172,8 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 label_position: None,
                 label_align: None,
                 label_width: None,
+                control_width: None,
+                min_control_width: None,
                 tab_index: None,
             },
             FormField {
@@ -193,6 +195,8 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 label_position: None,
                 label_align: None,
                 label_width: None,
+                control_width: None,
+                min_control_width: None,
                 tab_index: None,
             },
             FormField {
@@ -223,6 +227,8 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 label_position: None,
                 label_align: None,
                 label_width: None,
+                control_width: None,
+                min_control_width: None,
                 tab_index: None,
             },
             FormField {
@@ -235,18 +241,21 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                             label: "Find".to_string(),
                             disabled: engine.project_search_query.is_empty(),
                             icon: None,
+                            spec: None,
                         },
                         ButtonRowItem {
                             id: WidgetId::new("search:replace_next"),
                             label: "Repl".to_string(),
                             disabled: results.is_empty(),
                             icon: None,
+                            spec: None,
                         },
                         ButtonRowItem {
                             id: WidgetId::new("search:replace_all"),
                             label: "All".to_string(),
                             disabled: results.is_empty(),
                             icon: None,
+                            spec: None,
                         },
                     ],
                 },
@@ -256,6 +265,8 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 label_position: None,
                 label_align: None,
                 label_width: None,
+                control_width: None,
+                min_control_width: None,
                 tab_index: None,
             },
             FormField {
@@ -280,6 +291,8 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 label_position: None,
                 label_align: None,
                 label_width: None,
+                control_width: None,
+                min_control_width: None,
                 tab_index: None,
             },
         ],
@@ -289,6 +302,8 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
         label_position: Default::default(),
         label_align: Default::default(),
         label_width: None,
+        control_width: Default::default(),
+        min_control_width: None,
     };
 
     // ── Section 1: TreeView (results grouped by file) ───────────────────

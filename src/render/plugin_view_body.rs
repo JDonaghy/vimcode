@@ -603,6 +603,16 @@ fn next_table_sort(
 /// `width` sizes the column to its content, floored at `min_width`; neither
 /// leaves the column proportional, matching every column declared before
 /// these fields existed.
+///
+/// `ViewTableColumn::width`'s own doc commits plugin authors to the same
+/// raw-reinterpretation contract `quadraui::ColumnWidth::Fixed` has (cells on
+/// TUI, pixels on GTK/macOS/Win, no cross-backend conversion) — the
+/// deprecated variant is the only one that keeps that contract; `FixedCells`/
+/// `FixedPx` each convert to the other family's native unit instead, which
+/// would silently rescale every plugin-declared column width. Redesigning the
+/// plugin field itself to pick a cells-vs-pixels variant is a separate,
+/// plugin-API-facing issue, not part of a dependency bump.
+#[allow(deprecated)]
 fn plugin_table_column_width(column: &ViewTableColumn) -> quadraui::ColumnWidth {
     match (column.width, column.min_width) {
         (Some(w), _) => quadraui::ColumnWidth::Fixed(w),

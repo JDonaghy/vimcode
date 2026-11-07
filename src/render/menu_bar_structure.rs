@@ -74,6 +74,7 @@ pub fn debug_toolbar(engine: &Engine) -> quadraui::Toolbar {
             enabled,
             is_active: false,
             tooltip: String::new(),
+            spec: None,
         }
     };
 
