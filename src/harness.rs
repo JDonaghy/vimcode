@@ -11347,6 +11347,9 @@ mod welcome_panel_recent_entry_restores_workspace_mod {
     use quadraui::testing::ConformanceDriver;
 
     fn engine_fixture() -> crate::core::Engine {
+        // The click below opens the folder while the harness holds a
+        // `CwdReadGuard`; keep that from moving the shared process directory.
+        crate::test_cwd::suppress_process_chdir_on_this_thread();
         let dir = crate::harness::scratch_dir("vimcode_welcome_test_recent_entry_2112");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("zq2112mk"))

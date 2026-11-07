@@ -3971,7 +3971,13 @@ impl Engine {
         // Update cwd + workspace root + process working directory
         self.cwd = canonical.clone();
         self.workspace_root = Some(canonical.clone());
-        let _ = std::env::set_current_dir(&canonical);
+        #[cfg(test)]
+        let move_process_cwd = !crate::test_cwd::process_chdir_suppressed();
+        #[cfg(not(test))]
+        let move_process_cwd = true;
+        if move_process_cwd {
+            let _ = std::env::set_current_dir(&canonical);
+        }
 
         // Reset explorer state for the new workspace. The old
         // workspace's `explorer_expanded` paths don't apply here, and the

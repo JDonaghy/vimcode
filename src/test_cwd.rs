@@ -137,6 +137,28 @@ impl CwdGuard {
     }
 }
 
+thread_local! {
+    /// Set by [`suppress_process_chdir_on_this_thread`].
+    static CHDIR_SUPPRESSED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Make `Engine::open_folder` on this thread update the engine's own
+/// `cwd`/`workspace_root` but leave the *process* directory alone.
+///
+/// For a scenario that opens a folder from inside a paint harness's body:
+/// the harness holds a [`CwdReadGuard`], so the test cannot take a
+/// [`CwdGuard`] around the click, and an unguarded `set_current_dir` there
+/// moves every concurrently painting harness — and is never restored.
+/// libtest runs each test on its own thread, so the flag dies with the test.
+pub fn suppress_process_chdir_on_this_thread() {
+    CHDIR_SUPPRESSED.with(|s| s.set(true));
+}
+
+/// Whether [`suppress_process_chdir_on_this_thread`] was called on this thread.
+pub fn process_chdir_suppressed() -> bool {
+    CHDIR_SUPPRESSED.with(Cell::get)
+}
+
 impl Default for CwdGuard {
     fn default() -> Self {
         Self::new()

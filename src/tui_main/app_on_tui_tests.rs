@@ -6117,6 +6117,10 @@ mod tests {
                 engine.buffer_mut().insert(0, "short\n");
                 engine
             }
+            // `Engine::new_for_test` captures the process directory as its
+            // explorer root, so both fixtures must be built under one shared
+            // claim or a concurrent `CwdGuard` writer can split them.
+            let _cwd = crate::test_cwd::CwdReadGuard::acquire();
             let h1 = harness(fixture());
             let h2 = harness(fixture());
 
