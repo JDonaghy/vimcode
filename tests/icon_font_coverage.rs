@@ -62,6 +62,60 @@ fn referenced_nerd_codepoints() -> Vec<u32> {
     codepoints
 }
 
+/// Every fallback (second) argument passed to `Icon::new` in `src/icons.rs`,
+/// with its `\u{...}` escapes decoded, paired with the source line it came
+/// from.
+fn referenced_fallback_strings() -> Vec<(String, String)> {
+    let call_re =
+        Regex::new(r#"Icon::new\(\s*"(?:[^"\\]|\\.)*"\s*,\s*"((?:[^"\\]|\\.)*)"\s*\)"#).unwrap();
+    let escape_re = Regex::new(r"\\u\{([0-9a-fA-F]+)\}").unwrap();
+    call_re
+        .captures_iter(ICONS_RS_SOURCE)
+        .map(|caps| {
+            let decoded = escape_re
+                .replace_all(&caps[1], |e: &regex::Captures| {
+                    char::from_u32(u32::from_str_radix(&e[1], 16).expect("hex codepoint"))
+                        .expect("valid scalar value")
+                        .to_string()
+                })
+                .into_owned();
+            (decoded, caps[0].to_string())
+        })
+        .collect()
+}
+
+/// Every character of every fallback glyph occupies exactly one terminal
+/// cell. A glyph that is double-width under the Unicode tables the TUI lays
+/// out with (`quadraui::text_util::char_cell_width`) but single-width in a
+/// terminal still on older tables (Windows ConPTY treats the Unicode-16-wide
+/// trigrams U+2630..U+2637 as one cell) leaves the terminal's cursor one
+/// column behind the renderer's after the glyph, shifting the rest of the
+/// row and wrapping it into the next. Fallback glyphs are the plain-Unicode
+/// path for terminals without a Nerd Font, so they must not depend on which
+/// Unicode version a terminal implements.
+#[test]
+fn every_icon_fallback_glyph_is_single_cell() {
+    let fallbacks = referenced_fallback_strings();
+    assert!(
+        fallbacks.len() > 50,
+        "expected to parse every Icon::new fallback from src/icons.rs, got {}",
+        fallbacks.len()
+    );
+    let wide: Vec<String> = fallbacks
+        .iter()
+        .flat_map(|(s, src)| {
+            s.chars()
+                .filter(|&c| quadraui::text_util::char_cell_width(c) != 1)
+                .map(move |c| format!("U+{:04X} {c:?} in {src}", c as u32))
+        })
+        .collect();
+    assert!(
+        wide.is_empty(),
+        "icon fallback glyphs must be single-cell; found:\n{}",
+        wide.join("\n")
+    );
+}
+
 // ─── Minimal hand-rolled sfnt/cmap reader ───────────────────────────────────
 //
 // Deliberately not a crate dependency: this is the one check that must stay
