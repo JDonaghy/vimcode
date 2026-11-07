@@ -432,6 +432,18 @@ impl App {
                             backend,
                         );
                     }
+                    Some("message_list") => {
+                        render::paint_plugin_view_message_list(
+                            &engine,
+                            view_name,
+                            PluginViewHost::Tab,
+                            rect,
+                            backend,
+                        );
+                    }
+                    Some("image") => {
+                        render::paint_plugin_view_image(&engine, view_name, rect, backend);
+                    }
                     _ => {
                         if render::populate_plugin_view_tab_form_controller(
                             &engine,
@@ -940,6 +952,18 @@ impl App {
                                 body_rect,
                                 backend,
                             );
+                        }
+                        Some("message_list") => {
+                            render::paint_plugin_view_message_list(
+                                engine,
+                                &name,
+                                PluginViewHost::Sidebar,
+                                body_rect,
+                                backend,
+                            );
+                        }
+                        Some("image") => {
+                            render::paint_plugin_view_image(engine, &name, body_rect, backend);
                         }
                         _ => {
                             if render::populate_plugin_view_form_controller(engine) {

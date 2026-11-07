@@ -620,13 +620,15 @@ pub fn handle_plugin_view_dock_ui_event(
 }
 
 /// Route a `UiEvent` over a body-kind (`List`/`Tree`/`Table`/`TextView`/
-/// `Chart`) plugin view at `host`, through the matching primitive's
-/// click/scroll resolution instead of `FormController`. `rect` is the rect
-/// the view was last painted into for this host — only the `Tree` arm needs
-/// it live (a `TreeController` needs a real rect + backend to `handle`
-/// against); `List`/`Table`/`Chart` resolve through their own cached layouts
+/// `Chart`/`MessageList`/`Image`) plugin view at `host`, through the
+/// matching primitive's click/scroll resolution instead of `FormController`.
+/// `rect` is the rect the view was last painted into for this host — only
+/// the `Tree` arm needs it live (a `TreeController` needs a real rect +
+/// backend to `handle` against); `List`/`Table`/`Chart`/`MessageList`
+/// resolve through their own cached layouts/rects
 /// (`route_plugin_view_list_click`/`route_plugin_view_table_click`/
-/// `route_plugin_view_chart_click`) instead.
+/// `route_plugin_view_chart_click`/`route_plugin_view_message_list_click`)
+/// instead. `Image` is display-only and consumes nothing.
 ///
 /// Shared by both hosts: the sidebar's `ExtPanel` click router and
 /// [`handle_plugin_view_tab_ui_event`]'s caller both dispatch here first —
@@ -727,6 +729,25 @@ pub(crate) fn route_plugin_view_body_event(
             } => route_plugin_view_chart_click(engine, name, host, *position, backend),
             _ => false,
         }),
+        Some("message_list") => Some(match event {
+            quadraui::UiEvent::MouseDown {
+                position,
+                button: quadraui::MouseButton::Left,
+                ..
+            } => {
+                route_plugin_view_message_list_click(engine, name, host, *position, false, backend)
+            }
+            quadraui::UiEvent::DoubleClick { position, .. } => {
+                route_plugin_view_message_list_click(engine, name, host, *position, true, backend)
+            }
+            quadraui::UiEvent::Scroll { delta, .. } => {
+                scroll_plugin_view_message_list(engine, name, host, scroll_step(delta))
+            }
+            _ => false,
+        }),
+        // `Image` is display-only — it has no scroll/selection state and
+        // emits no `ViewEventKind`, so every event falls through unconsumed.
+        Some("image") => Some(false),
         _ => None,
     }
 }

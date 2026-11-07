@@ -230,8 +230,9 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
     }
     let id: String = tbl.get("id").unwrap_or_default();
 
-    // A `kind = "list"/"tree"/"table"/"text_view"/"chart"` table is a single
-    // `ViewBody` widget, not a field stack — parse it and return early,
+    // A `kind = "list"/"tree"/"table"/"text_view"/"chart"/"message_list"/
+    // "image"` table is a single `ViewBody` widget, not a field stack —
+    // parse it and return early,
     // exactly the "one sibling translation per kind" the issue asks for,
     // kept out of the `fields` loop below rather than interleaved with it.
     if let Ok(kind) = tbl.get::<_, String>("kind") {
@@ -546,10 +547,7 @@ fn lua_table_to_view_body(
                     series.push(ViewChartSeries {
                         label: row.get("label").unwrap_or_default(),
                         data,
-                        color: row
-                            .get::<_, String>("color")
-                            .ok()
-                            .filter(|s| !s.is_empty()),
+                        color: row.get::<_, String>("color").ok().filter(|s| !s.is_empty()),
                         fill: row.get("fill").unwrap_or(false),
                     });
                 }
@@ -568,8 +566,69 @@ fn lua_table_to_view_body(
                 show_legend: tbl.get("show_legend").unwrap_or(false),
             })
         }
+        "message_list" => {
+            use crate::core::plugin_ui::ViewMessageRow;
+
+            let mut rows = Vec::new();
+            if let Ok(rows_tbl) = tbl.get::<_, LuaTable>("rows") {
+                for row in rows_tbl.sequence_values::<LuaTable>() {
+                    let row = row?;
+                    rows.push(ViewMessageRow {
+                        text: row.get("text").unwrap_or_default(),
+                        fg: row.get::<_, String>("fg").ok().filter(|s| !s.is_empty()),
+                        indent: row.get::<_, f64>("indent").unwrap_or(0.0) as f32,
+                    });
+                }
+            }
+            Ok(ViewBody::MessageList { rows })
+        }
+        "image" => {
+            use crate::core::plugin_ui::{ViewImageFit, ViewImageSource};
+
+            // `data` (base64 bytes) wins over `path` when both are given — a
+            // self-contained source needs no filesystem round trip. Neither
+            // given is a plugin-author error, not a silent fallback: unlike
+            // every other field here, there is no sensible "declared but
+            // unset" image source.
+            let data: Option<String> = tbl.get::<_, String>("data").ok().filter(|s| !s.is_empty());
+            let path: Option<String> = tbl.get::<_, String>("path").ok().filter(|s| !s.is_empty());
+            let source = match (data, path) {
+                (Some(data), _) => ViewImageSource::Bytes { data },
+                (None, Some(path)) => ViewImageSource::Path { path },
+                (None, None) => {
+                    return Err(LuaError::RuntimeError(
+                        "image view: requires \"path\" or \"data\"".to_string(),
+                    ));
+                }
+            };
+            let intrinsic_size = match (
+                tbl.get::<_, u32>("width").ok(),
+                tbl.get::<_, u32>("height").ok(),
+            ) {
+                (Some(w), Some(h)) => Some((w, h)),
+                _ => None,
+            };
+            let fit = match tbl.get::<_, String>("fit").ok().as_deref() {
+                Some("cover") => ViewImageFit::Cover,
+                Some("fill") => ViewImageFit::Fill,
+                Some("none") => ViewImageFit::None,
+                Some("contain") | None => ViewImageFit::Contain,
+                Some(other) => {
+                    return Err(LuaError::RuntimeError(format!(
+                        "image: unknown fit {other:?} (expected \"contain\", \"cover\", \"fill\", or \"none\")"
+                    )));
+                }
+            };
+            Ok(ViewBody::Image {
+                source,
+                intrinsic_size,
+                fit,
+                fallback_text: tbl.get("fallback_text").unwrap_or_default(),
+            })
+        }
         other => Err(LuaError::RuntimeError(format!(
-            "view: unknown kind {other:?} (expected \"list\", \"tree\", \"table\", \"text_view\", or \"chart\")"
+            "view: unknown kind {other:?} (expected \"list\", \"tree\", \"table\", \"text_view\", \
+             \"chart\", \"message_list\", or \"image\")"
         ))),
     }
 }
@@ -7002,7 +7061,8 @@ mod tests {
         assert_eq!(ctx.message.as_deref(), Some("SectionToggled/true"));
     }
 
-    // ── `kind = "list"/"tree"/"table"/"text_view"/"chart"` view bodies ────
+    // ── `kind = "list"/"tree"/"table"/"text_view"/"chart"/"message_list"/
+    // "image"` view bodies ────
 
     #[test]
     fn a_list_body_parses_its_items() {
@@ -7284,6 +7344,99 @@ mod tests {
         let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
         let err = view.expect_err("a chart series without \"data\" must not be dropped");
         assert!(err.contains("data"), "error was: {err}");
+    }
+
+    #[test]
+    fn a_message_list_body_parses_its_rows() {
+        use crate::core::plugin_ui::{ViewBody, ViewMessageRow};
+        let pm = pm_with_view(
+            "message-list",
+            r##"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "message_list",
+                        rows = {
+                            { text = "You: hi", fg = "#c8c8c8" },
+                            { text = "AI: hello", indent = 8 },
+                        },
+                    }
+                end,
+            })
+            "##,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(
+            view.body,
+            Some(ViewBody::MessageList {
+                rows: vec![
+                    ViewMessageRow {
+                        text: "You: hi".to_string(),
+                        fg: Some("#c8c8c8".to_string()),
+                        indent: 0.0,
+                    },
+                    ViewMessageRow {
+                        text: "AI: hello".to_string(),
+                        fg: None,
+                        indent: 8.0,
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn an_image_body_parses_path_fit_and_fallback() {
+        use crate::core::plugin_ui::{ViewBody, ViewImageFit, ViewImageSource};
+        let pm = pm_with_view(
+            "image",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "image",
+                        path = "logo.png",
+                        width = 64,
+                        height = 64,
+                        fit = "cover",
+                        fallback_text = "[LOGO]",
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(
+            view.body,
+            Some(ViewBody::Image {
+                source: ViewImageSource::Path {
+                    path: "logo.png".to_string()
+                },
+                intrinsic_size: Some((64, 64)),
+                fit: ViewImageFit::Cover,
+                fallback_text: "[LOGO]".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_image_body_with_neither_path_nor_data_is_an_error() {
+        let pm = pm_with_view(
+            "image-nosource",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function() return { kind = "image" } end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("an image with no source must not be dropped");
+        assert!(
+            err.contains("path") || err.contains("data"),
+            "error was: {err}"
+        );
     }
 
     #[test]

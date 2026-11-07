@@ -306,6 +306,28 @@ pub const CHART_Y_LABEL_SEEN: &str = "CyS1631";
 /// `ChartLayout::nearest_point`.
 pub const CHART_POINT_SEEN: &str = "CpS1631";
 
+/// Registered view names for the `message_list`/`image` fixtures.
+pub const MESSAGE_LIST_VIEW: &str = "zqxw2113ml";
+pub const IMAGE_VIEW: &str = "zqxw2113img";
+
+/// `MessageList` fixture needles.
+pub const ML_ROW0: &str = "Mr0ql2113";
+pub const ML_ROW1: &str = "Mr1ql2113";
+/// Painted before any row click has reached the plugin.
+pub const ML_IDLE: &str = "MiDl2113";
+/// Painted once `on_event` has seen `ItemSelected{index: 1}` from a click
+/// on [`ML_ROW1`].
+pub const ML_ROW1_SEEN: &str = "Mr1Sn2113";
+
+/// What a TUI-hosted `image` body paints in place of pixels — TUI cannot
+/// rasterise raster image content at all (see `quadraui::tui::image`'s
+/// module doc), so this is the one needle that fixture's paint proves.
+pub const IMAGE_FALLBACK: &str = "ImgFb2113";
+/// Base64-encoded 2x2 solid-magenta PNG — real, decodable image bytes
+/// (verified against the `png` crate's own decoder), so the GTK backend
+/// decodes and paints real pixels instead of [`IMAGE_FALLBACK`].
+pub const IMAGE_MAGENTA_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR42mP4z/AfiBggFAA31gf5htMR8gAAAABJRU5ErkJggg==";
+
 /// Lua source registering one view per `ViewBody` kind, appended
 /// into the same fixture plugin the field-stack view above uses — one real
 /// `PluginManager` load exercises every kind's parse + paint + event round
@@ -420,6 +442,38 @@ vimcode.ui.register_view("{CHART_VIEW}", {{
     elseif event.kind == "DataPointClicked" and event.series_idx == 0 and event.data_idx == 1 then
       chart_point_seen = true
     end
+  end,
+}})
+
+local ml_clicked = -1
+vimcode.ui.register_view("{MESSAGE_LIST_VIEW}", {{
+  title = "Zq2113M", icon = "M", fallback_icon = "M",
+  render = function()
+    return {{
+      kind = "message_list",
+      rows = {{
+        {{ text = "{ML_ROW0}" }},
+        {{ text = "{ML_ROW1}" }},
+        {{ text = ml_clicked == 1 and "{ML_ROW1_SEEN}" or "{ML_IDLE}" }},
+      }},
+    }}
+  end,
+  on_event = function(ctx, event)
+    if event.kind == "ItemSelected" then ml_clicked = event.index end
+  end,
+}})
+
+vimcode.ui.register_view("{IMAGE_VIEW}", {{
+  title = "Zq2113I", icon = "I", fallback_icon = "I",
+  render = function()
+    return {{
+      kind = "image",
+      data = "{IMAGE_MAGENTA_PNG_BASE64}",
+      width = 2,
+      height = 2,
+      fit = "fill",
+      fallback_text = "{IMAGE_FALLBACK}",
+    }}
   end,
 }})
 
@@ -1837,6 +1891,43 @@ fn chart_data_point_click_reaches_the_plugin<D>(
     );
 }
 
+/// A `kind = "message_list"` view paints its declared rows, and a click on
+/// a row reaches the plugin's `on_event` as `ItemSelected{index}` (proved
+/// by the idle marker row flipping to the "seen" needle once row 1 is
+/// clicked — never for row 0).
+pub fn message_list_paints_and_click_reaches_the_plugin(driver: &mut impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[ML_ROW0, ML_ROW1, ML_IDLE],
+        "the message_list-kind view's initial paint, before any row click",
+    );
+    driver.click_text(ML_ROW1);
+    assert!(
+        driver.screen_has(ML_ROW1_SEEN),
+        "clicking row 1 must dispatch ItemSelected{{index: 1}}; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+}
+
+/// TUI's half of the `kind = "image"` round trip: a declared
+/// `fallback_text` reaches `Backend::draw_image` and paints, because TUI
+/// cannot rasterise image content at all regardless of whether
+/// [`IMAGE_VIEW`]'s declared bytes decode successfully (see
+/// `quadraui::tui::image`'s module doc). GTK's twin — "it decoded the
+/// same declared bytes for real" — is a pixel probe (GTK paints real
+/// pixels instead on a successful decode, so `fallback_text` is *not*
+/// painted there), in `src/harness/plugin_view.rs`'s own
+/// `#[cfg(feature = "gui")] mod tests` block.
+pub fn image_fallback_text_paints(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(IMAGE_FALLBACK),
+        "an image-kind view's declared fallback_text must reach \
+         Backend::draw_image; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
 /// Scenario 8 — keyboard `Down` on a list moves selection to the right
 /// index, exactly like a click does.
 pub fn list_key_navigation_selects_the_right_index(driver: &mut impl ConformanceDriver) {
@@ -3213,6 +3304,18 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_message_list_paints_and_click_reaches_the_plugin_on_tui() {
+        let (mut h, _dir) = tui_named(MESSAGE_LIST_VIEW);
+        message_list_paints_and_click_reaches_the_plugin(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_image_fallback_text_paints_on_tui() {
+        let (mut h, _dir) = tui_named(IMAGE_VIEW);
+        image_fallback_text_paints(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_list_key_navigation_selects_the_right_index_on_tui() {
         let (mut h, _dir) = tui_named(LIST_VIEW);
         list_key_navigation_selects_the_right_index(&mut h.driver);
@@ -3622,6 +3725,41 @@ mod tests {
     fn plugin_view_chart_tab_data_point_click_reaches_the_plugin_on_gtk() {
         let (mut h, _dir) = gtk_named_tab(CHART_VIEW, "Zq2065ChartOpenTab");
         chart_tab_data_point_click_reaches_the_plugin(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_message_list_paints_and_click_reaches_the_plugin_on_gtk() {
+        let (mut h, _dir) = gtk_named(MESSAGE_LIST_VIEW);
+        message_list_paints_and_click_reaches_the_plugin(&mut h.driver);
+    }
+
+    /// GTK's half of the `kind = "image"` round trip: unlike TUI (which
+    /// always paints `fallback_text`, see [`image_fallback_text_paints`]'s
+    /// doc), GTK decodes [`IMAGE_VIEW`]'s declared base64 bytes for real
+    /// and paints actual magenta pixels, not the fallback text, into the
+    /// sidebar body rect `paint_plugin_view_image` was handed.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_image_paints_decoded_pixels_on_gtk() {
+        let (mut h, _dir) = gtk_named(IMAGE_VIEW);
+        assert!(
+            !h.driver.screen_has(IMAGE_FALLBACK),
+            "a successful GTK decode must paint real pixels, not the \
+             fallback_text TUI falls back to"
+        );
+        let rect = h.engine.borrow().plugin_view_form_rect.get();
+        let (cx, cy) = (
+            (rect.x + rect.width / 2.0) as i32,
+            (rect.y + rect.height / 2.0) as i32,
+        );
+        let pixel = h.driver.pixel(cx, cy);
+        let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 10;
+        assert!(
+            near(pixel.0, 255) && near(pixel.1, 0) && near(pixel.2, 255),
+            "the decoded 2x2 magenta PNG, fit=\"fill\", must paint magenta \
+             at the body rect's centre ({cx}, {cy}); got {pixel:?}"
+        );
     }
 
     #[cfg(feature = "gui")]
