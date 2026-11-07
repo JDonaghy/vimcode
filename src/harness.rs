@@ -1573,6 +1573,32 @@ pub fn screen_row_has<D: ConformanceDriver>(driver: &D, needle: &str) -> bool {
     })
 }
 
+/// True if `needle` is painted on one row, either whole or in the
+/// ellipsis-truncated form a surface too narrow for it produces: the longest
+/// prefix that fits, with its final cell replaced by `…`.
+///
+/// quadraui ellipsis-truncates a status-bar segment's text to the cell budget
+/// its layout resolved for that segment, so a phrase a wide GTK sidebar paints
+/// whole arrives in a 20-cell TUI sidebar as `"Search extension…"`. A scenario
+/// that wants to prove the row *is* painted — not how much of it happens to fit
+/// on this backend — asks this instead of pinning a per-backend clip width.
+///
+/// Still an assertion on rendered output: every candidate goes through
+/// [`screen_row_has`], reading the same painted runs the user sees. At least
+/// half of `needle` has to survive, so a bare `"S…"` never satisfies it.
+pub fn screen_row_has_truncatable<D: ConformanceDriver>(driver: &D, needle: &str) -> bool {
+    if screen_row_has(driver, needle) {
+        return true;
+    }
+    let chars: Vec<char> = needle.chars().collect();
+    let shortest = chars.len().div_ceil(2);
+    (shortest..chars.len()).rev().any(|keep| {
+        let mut probe: String = chars[..keep].iter().collect();
+        probe.push('…');
+        screen_row_has(driver, &probe)
+    })
+}
+
 /// Paint one frame *without* dispatching an input event — the harness
 /// stand-in for the runner's "the idle tick reported a redraw, so paint".
 ///
@@ -5708,8 +5734,19 @@ mod issue_1256_sidebar_chrome {
     fn extensions_search_row_is_painted<D: ConformanceDriver>(driver: &mut D) {
         open_extensions(driver);
         assert!(
-            driver.screen_has("Search extensions"),
-            "#1256: the Extensions sidebar must paint its search row"
+            screen_row_has_truncatable(driver, "Search extensions"),
+            "#1256: the Extensions sidebar must paint its search row: {:?}",
+            driver.inventory()
+        );
+        // The truncation tolerance above must not degenerate into "any row
+        // ending in an ellipsis matches": a placeholder no panel paints stays
+        // unfound on the very frame whose search row really does end in `…`
+        // because the TUI sidebar is too narrow for it.
+        assert!(
+            !screen_row_has_truncatable(driver, "Search repositories"),
+            "#1256: the Extensions sidebar's search row must be matched on its \
+             own placeholder, not on any truncated row: {:?}",
+            driver.inventory()
         );
     }
 
