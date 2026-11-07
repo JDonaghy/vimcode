@@ -747,6 +747,10 @@ impl Engine {
                 "text_view" => {
                     crate::render::handle_plugin_view_text_key(self, name, host, key, 10)
                 }
+                "message_list" => {
+                    crate::render::handle_plugin_view_message_list_key(self, name, host, key, 10)
+                }
+                // `Image` is display-only — no keyboard handling of its own.
                 _ => false,
             };
         }

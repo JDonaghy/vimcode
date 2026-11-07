@@ -191,7 +191,7 @@ impl PluginView {
     ///
     /// The one predicate both `render::paint_bottom_panel_rung`'s dock
     /// painter and `render::route_bottom_panel_click`'s click router
-    /// dispatch on, so a future fifth `ViewBody` variant can't make the
+    /// dispatch on, so a new `ViewBody` variant can't make the
     /// painter and the router silently disagree about which views have
     /// `Form`-style click behaviour.
     pub fn is_form(&self) -> bool {
@@ -276,6 +276,39 @@ pub enum ViewBody {
         #[serde(default)]
         show_legend: bool,
     },
+    /// A scrollable chat/transcript body: styled rows, each a flat line of
+    /// text plus a left-indent and foreground colour. Painted through
+    /// `quadraui::MessageList`. Has no selection highlight of its own (the
+    /// primitive carries no `selected_idx`, unlike `List`) — a click just
+    /// reports which row it landed on via `ViewEventKind::ItemSelected`/
+    /// `ItemActivated`; scrolling reuses the same `plugin_view_scroll_top`
+    /// state `TextView` does.
+    MessageList {
+        #[serde(default)]
+        rows: Vec<ViewMessageRow>,
+    },
+    /// A static raster image (SVG/PNG/JPEG), decoded and painted by the
+    /// backend. Painted through `quadraui::Image`. Display-only — it emits
+    /// no `ViewEventKind` and has no scroll/selection state of its own.
+    Image {
+        /// Where the encoded bytes come from. Required: unlike every other
+        /// field on this variant, there is no sensible "declared but
+        /// unset" default for the one thing that makes this an image.
+        source: ViewImageSource,
+        /// The image's natural pixel dimensions, if known — needed for
+        /// `fit` to preserve aspect ratio (see `quadraui::Image::layout`'s
+        /// doc). `None` fills the whole target rect regardless of `fit`.
+        #[serde(default)]
+        intrinsic_size: Option<(u32, u32)>,
+        #[serde(default)]
+        fit: ViewImageFit,
+        /// What TUI paints in place of real pixels (it cannot rasterize
+        /// image content at all), and what every backend paints on a
+        /// decode failure (bad path, corrupt bytes). Empty means "leave
+        /// the rect blank".
+        #[serde(default)]
+        fallback_text: String,
+    },
 }
 
 impl ViewBody {
@@ -287,6 +320,71 @@ impl ViewBody {
             ViewBody::Table { .. } => "table",
             ViewBody::TextView { .. } => "text_view",
             ViewBody::Chart { .. } => "chart",
+            ViewBody::MessageList { .. } => "message_list",
+            ViewBody::Image { .. } => "image",
+        }
+    }
+}
+
+/// One row in a [`ViewBody::MessageList`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewMessageRow {
+    #[serde(default)]
+    pub text: String,
+    /// `"#rrggbb"` hex string. `None`, or a string that fails to parse,
+    /// falls back to the backend's theme foreground colour — the same
+    /// degrade-don't-error convention [`ViewChartSeries::color`] uses.
+    #[serde(default)]
+    pub fg: Option<String>,
+    /// Left-indent offset in the host surface's own unit (cells on TUI,
+    /// pixels on GTK/macOS/Windows).
+    #[serde(default)]
+    pub indent: f32,
+}
+
+/// Where a [`ViewBody::Image`]'s encoded bytes come from. Mirrors
+/// `quadraui::ImageSource` without depending on quadraui from this module
+/// (see [`ViewTreeNode::resolve`]'s matching reasoning) — and, unlike that
+/// primitive's `Vec<u8>`, carries bytes as a base64 string since that is
+/// the only sane way for Lua to hand raw bytes across the plugin ABI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ViewImageSource {
+    /// Filesystem path, decoded lazily by the backend.
+    Path { path: String },
+    /// Base64-encoded raw image bytes (PNG/JPEG/SVG/...); the backend's
+    /// decoder sniffs the format from content. Malformed base64 degrades
+    /// to an empty byte source (decode fails, `fallback_text` renders)
+    /// rather than rejecting the whole view.
+    Bytes { data: String },
+}
+
+/// How a [`ViewBody::Image`]'s intrinsic size maps onto its target rect.
+/// Mirrors `quadraui::ImageFit` without depending on quadraui from this
+/// module, like [`ViewChartKind`] mirrors `quadraui::ChartKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewImageFit {
+    /// Scale to fit entirely within the target rect, preserving aspect
+    /// ratio. May letterbox.
+    #[default]
+    Contain,
+    /// Scale to fill the target rect, preserving aspect ratio. May crop.
+    Cover,
+    /// Stretch to exactly fill the target rect, ignoring aspect ratio.
+    Fill,
+    /// Paint at intrinsic size, anchored at the rect's top-left corner.
+    None,
+}
+
+impl ViewImageFit {
+    /// Translate to the quadraui primitive this paints through.
+    pub fn into_quadraui(self) -> quadraui::ImageFit {
+        match self {
+            ViewImageFit::Contain => quadraui::ImageFit::Contain,
+            ViewImageFit::Cover => quadraui::ImageFit::Cover,
+            ViewImageFit::Fill => quadraui::ImageFit::Fill,
+            ViewImageFit::None => quadraui::ImageFit::None,
         }
     }
 }
@@ -1386,6 +1484,74 @@ mod tests {
         }
         let back: ViewBody = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
         assert_eq!(body, back);
+    }
+
+    #[test]
+    fn view_body_message_list_round_trips_and_tags_as_message_list() {
+        let json = r##"{"kind":"message_list","rows":[
+            {"text":"You: hi","fg":"#c8c8c8","indent":0.0},
+            {"text":"AI: hello","indent":8.0}
+        ]}"##;
+        let body: ViewBody = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(body.kind_name(), "message_list");
+        match &body {
+            ViewBody::MessageList { rows } => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].fg.as_deref(), Some("#c8c8c8"));
+                assert_eq!(rows[1].fg, None);
+                assert_eq!(rows[1].indent, 8.0);
+            }
+            other => panic!("expected MessageList, got {other:?}"),
+        }
+        let back: ViewBody = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        assert_eq!(body, back);
+    }
+
+    #[test]
+    fn view_body_image_round_trips_and_tags_as_image() {
+        let json = r#"{"kind":"image","source":{"kind":"path","path":"logo.png"},
+            "intrinsic_size":[64,64],"fit":"cover","fallback_text":"[LOGO]"}"#;
+        let body: ViewBody = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(body.kind_name(), "image");
+        match &body {
+            ViewBody::Image {
+                source,
+                intrinsic_size,
+                fit,
+                fallback_text,
+            } => {
+                assert_eq!(
+                    source,
+                    &ViewImageSource::Path {
+                        path: "logo.png".to_string()
+                    }
+                );
+                assert_eq!(*intrinsic_size, Some((64, 64)));
+                assert_eq!(*fit, ViewImageFit::Cover);
+                assert_eq!(fallback_text, "[LOGO]");
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+        let back: ViewBody = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        assert_eq!(body, back);
+    }
+
+    #[test]
+    fn view_body_image_bytes_source_round_trips() {
+        let json = r#"{"kind":"image","source":{"kind":"bytes","data":"aGVsbG8="}}"#;
+        let body: ViewBody = serde_json::from_str(json).expect("deserialize");
+        match &body {
+            ViewBody::Image { source, fit, .. } => {
+                assert_eq!(
+                    source,
+                    &ViewImageSource::Bytes {
+                        data: "aGVsbG8=".to_string()
+                    }
+                );
+                assert_eq!(*fit, ViewImageFit::Contain);
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
     }
 
     #[test]

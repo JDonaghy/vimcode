@@ -4979,6 +4979,21 @@ pub struct Engine {
     pub plugin_view_chart_layout: std::cell::RefCell<Option<quadraui::ChartLayout>>,
     /// Tab twin of `plugin_view_chart_layout`.
     pub plugin_view_tab_chart_layout: std::cell::RefCell<Option<quadraui::ChartLayout>>,
+    /// The chrome line height `Backend::draw_message_list` actually
+    /// painted a `ViewBody::MessageList`-kind sidebar view's rows at, for
+    /// `route_plugin_view_message_list_click`'s `MessageList::hit_test`
+    /// call. Unlike `ListView`/`DataTable`/`Chart`, `MessageList` has no
+    /// `Backend::*_layout` entry point of its own returning a hit-testable
+    /// geometry — this vimcode-owned row math is the only one there is, so
+    /// it must use the exact line height the paint call used. A live
+    /// `Backend::measure()` queried later, at click time, is not that
+    /// value: `GtkBackend::current_line_height` is a transient per-paint-
+    /// call field, already overwritten by whatever else the frame paints
+    /// after the sidebar, which would otherwise resolve a click against
+    /// the wrong row.
+    pub plugin_view_message_list_line_height: std::cell::Cell<f32>,
+    /// Tab twin of `plugin_view_message_list_line_height`.
+    pub plugin_view_tab_message_list_line_height: std::cell::Cell<f32>,
     /// Column-width overrides for `ViewBody::Table`-kind views, keyed by
     /// view name and indexed by column — mirrors
     /// `quadraui::DataTable::column_overrides` exactly, recomputed by
@@ -5903,6 +5918,8 @@ impl Engine {
             welcome_focus: WelcomeFocus::default(),
             plugin_view_chart_layout: std::cell::RefCell::new(None),
             plugin_view_tab_chart_layout: std::cell::RefCell::new(None),
+            plugin_view_message_list_line_height: std::cell::Cell::new(0.0),
+            plugin_view_tab_message_list_line_height: std::cell::Cell::new(0.0),
             plugin_view_table_layout: std::cell::RefCell::new(None),
             plugin_view_tab_table_layout: std::cell::RefCell::new(None),
             plugin_view_table_col_overrides: HashMap::new(),

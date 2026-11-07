@@ -1147,6 +1147,8 @@ cursor movement (`Left`/`Right`/`Home`/`End`), selection and clipboard (`Ctrl-A`
 | `"table"` | `columns = {{title=, editable=, align=}}` (`title` required; `align` is `"left"`/`"center"`/`"right"`, default `"left"`), `rows = {{id=, cells={...}}}` (`cells` required), `multi_select`, `footer = {...}` (one string per column, same shape as a row's `cells`) | `ItemSelected`, `ItemActivated` (`index`, `col`), `CellEdited` (`row`, `col`, both 0-based, and `value`), `SelectionChanged` (`indices`, 0-based, only when `multi_select = true`) |
 | `"text_view"` | `text`, `filetype` | none (scrollable, read-only text) |
 | `"chart"` | `chart_kind` (`"sparkline"`, `"line"`, `"bar"`, `"bar_grouped"`; default `"line"`), `series = {{label=, data=, color=, fill=}}`, `x_label`, `y_label`, `show_legend` | `DataPointClicked` (`series_idx`, `data_idx`), `LegendClicked` (`series_idx`, 0-based) |
+| `"message_list"` | `rows = {{text=, fg=, indent=}}` | `ItemSelected`, `ItemActivated` (`index`, 0-based; `col` is always `nil`) |
+| `"image"` | `path` or `data` (one required; `data` wins if both are given), `width`, `height`, `fit` (`"contain"`, `"cover"`, `"fill"`, `"none"`; default `"contain"`), `fallback_text` | none (display-only) |
 
 "Activated" means `Enter` or a double-click. A view is either a field stack or one
 body, never both.
@@ -1161,13 +1163,34 @@ shades the area under a `"line"` series. `"sparkline"` ignores `x_label`/`y_labe
 line, or the nearest point to the click when it lands between them — dispatches
 `DataPointClicked` with the series and data index.
 
+**`"message_list"` bodies.** A scrollable chat/transcript body — rows of plain
+styled text, each `{ text =, fg =, indent = }`. `fg` is an optional `"#rrggbb"`
+hex string (omit it, or give a string that fails to parse, to fall back to the
+theme's default foreground); `indent` is a left-indent offset in the host
+surface's own unit (character cells on TUI, pixels on GTK/macOS/Windows),
+useful for aligning a role label flush-left while its content indents.
+Clicking a row dispatches `ItemSelected`/`ItemActivated` with that row's index
+(`event.col` is always `nil` — a message list has no columns). There is no
+persistent row highlight, unlike `"list"`.
+
+**`"image"` bodies.** A static raster image (SVG/PNG/JPEG), decoded and
+painted by the backend. Give it `path` (a filesystem path, decoded lazily) or
+`data` (a base64-encoded string of the raw encoded bytes) — at least one is
+required, and `data` wins if both are given. `width`/`height` declare the image's
+natural pixel dimensions, needed for `fit` to preserve aspect ratio; omit both
+to fill the whole view regardless of `fit`. `fallback_text` is what paints in
+place of the image on TUI (which cannot rasterize image content at all) and on
+any backend when decoding fails (bad path, corrupt bytes) — an empty string
+leaves the view blank in that case. `"image"` bodies are display-only: they
+never dispatch any `event.kind`.
+
 **`col` on `ItemSelected`/`ItemActivated`.** For a `"table"` view, `event.col` is
 the 0-based column the mouse click landed in — whichever column was clicked, not
 just an `editable` one, since it reports what was clicked rather than what became
 editable. Keyboard-driven selection (`j`/`k`, `Home`/`End`) has no column to
-report, so `event.col` is `nil` then too. `"list"` views have no column concept at
-all, so `event.col` is always `nil` there — not a bug, just that list rows have no
-columns to report.
+report, so `event.col` is `nil` then too. `"list"` and `"message_list"` views
+have no column concept at all, so `event.col` is always `nil` there — not a
+bug, just that their rows have no columns to report.
 
 **Multi-select and footer on `"table"` views.** Declaring `multi_select = true`
 renders a `☐`/`☑` checkbox prefix on column 0 and tracks a selection *set*

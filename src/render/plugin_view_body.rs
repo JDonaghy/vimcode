@@ -19,7 +19,8 @@ use super::*;
 
 use crate::core::engine::{PluginTableColumnDrag, PluginViewHost};
 use crate::core::plugin_ui::{
-    table_cell_field_id, ViewBody, ViewListItem, ViewTableColumn, ViewTableRow, ViewTreeNode,
+    table_cell_field_id, ViewBody, ViewListItem, ViewMessageRow, ViewTableColumn, ViewTableRow,
+    ViewTreeNode,
 };
 
 /// Resolve the active view name for `host`, or `None` when nothing is hosted
@@ -1538,5 +1539,254 @@ pub(crate) fn route_plugin_view_chart_click(
         widget_id: String::new(),
         kind,
     });
+    true
+}
+
+// ── MessageList ──────────────────────────────────────────────────────────
+//
+// `MessageList` carries no `selected_idx`/scroll-layout of its own (unlike
+// `List`'s `ListViewLayout`) — `Backend::draw_message_list` just paints, it
+// doesn't return a hit-testable layout. So, like the quadraui
+// `message_list_demo` example, the click router below rebuilds the same
+// `quadraui::MessageList` value `paint_plugin_view_message_list` just
+// painted and calls `MessageList::hit_test` on it directly, using
+// `plugin_view_form_rect`/`plugin_view_tab_form_rect` — already set
+// unconditionally by every paint call site right before it dispatches on
+// body kind — as "the rect this body last painted into", rather than a new
+// per-kind `Engine` cache field.
+
+/// The rect `host`'s body last painted into, or `None` for `Dock`
+/// (`MessageList`-kind Dock support isn't implemented, matching
+/// List/Tree/Table/Chart).
+fn plugin_view_body_rect(engine: &Engine, host: PluginViewHost) -> Option<quadraui::Rect> {
+    match host {
+        PluginViewHost::Sidebar => Some(engine.plugin_view_form_rect.get()),
+        PluginViewHost::Tab => Some(engine.plugin_view_tab_form_rect.get()),
+        PluginViewHost::Dock => None,
+    }
+}
+
+/// `host`'s cache cell for the chrome line height a `MessageList`-kind
+/// body last painted its rows at, or `None` for `Dock`.
+fn plugin_view_message_list_line_height_cache(
+    engine: &Engine,
+    host: PluginViewHost,
+) -> Option<&std::cell::Cell<f32>> {
+    match host {
+        PluginViewHost::Sidebar => Some(&engine.plugin_view_message_list_line_height),
+        PluginViewHost::Tab => Some(&engine.plugin_view_tab_message_list_line_height),
+        PluginViewHost::Dock => None,
+    }
+}
+
+fn plugin_view_to_message_list(
+    view: &str,
+    rows: &[ViewMessageRow],
+    scroll_top: usize,
+    default_fg: quadraui::Color,
+) -> quadraui::MessageList {
+    use crate::core::plugin_ui::namespaced_widget_id;
+    use quadraui::{MessageList, MessageRow, WidgetId};
+    MessageList {
+        // Namespaced like every other plugin-owned id — see
+        // `plugin_view_to_list`'s matching comment.
+        id: WidgetId::new(namespaced_widget_id(view, "message_list")),
+        rows: rows
+            .iter()
+            .map(|r| {
+                MessageRow::new(
+                    &r.text,
+                    r.fg.as_deref()
+                        .and_then(super::primitives::try_from_hex)
+                        .unwrap_or(default_fg),
+                    r.indent,
+                )
+            })
+            .collect(),
+        scroll_top,
+    }
+}
+
+/// Paint a `ViewBody::MessageList`-kind view into `rect`. Returns `false`
+/// when `name` isn't a `MessageList`-kind view.
+pub(crate) fn paint_plugin_view_message_list(
+    engine: &Engine,
+    name: &str,
+    host: PluginViewHost,
+    rect: quadraui::Rect,
+    backend: &mut dyn quadraui::Backend,
+) -> bool {
+    let Some(ViewBody::MessageList { rows }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    let scroll_top = engine.plugin_view_scroll_top(host);
+    let default_fg = backend.theme().foreground;
+    let list = plugin_view_to_message_list(name, rows, scroll_top, default_fg);
+    backend.draw_message_list(rect, &list);
+    // Record the line height this call actually painted rows at — see
+    // `plugin_view_message_list_line_height`'s doc for why a live
+    // `Backend::measure()` queried later, at click time, cannot be trusted
+    // to still be this value.
+    if let Some(cache) = plugin_view_message_list_line_height_cache(engine, host) {
+        cache.set(backend.line_height());
+    }
+    true
+}
+
+/// Scroll a `ViewBody::MessageList`-kind view by `delta` rows (positive =
+/// down). Returns `false` when `name` isn't a `MessageList`-kind view.
+pub(crate) fn scroll_plugin_view_message_list(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    delta: i32,
+) -> bool {
+    let Some(ViewBody::MessageList { rows }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    let cur = engine.plugin_view_scroll_top(host) as i64;
+    let new_top = (cur + delta as i64).clamp(0, rows.len().saturating_sub(1) as i64) as usize;
+    engine.set_plugin_view_scroll_top(host, new_top);
+    true
+}
+
+/// Keyboard handling for a `ViewBody::MessageList`-kind view: `j`/`Down`/
+/// `k`/`Up` scroll by one row, `PageDown`/`PageUp` by `page` rows, `Home`/
+/// `End` (`g`/`G`) jump to the top/bottom — the same vocabulary
+/// [`handle_plugin_view_text_key`] uses for `TextView`. Returns `false`
+/// when `name` isn't a `MessageList` or the key wasn't a scroll key.
+pub(crate) fn handle_plugin_view_message_list_key(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    key: &str,
+    page: i32,
+) -> bool {
+    if plugin_view_body(engine, name).is_none() {
+        return false;
+    }
+    match key {
+        "Down" | "j" => scroll_plugin_view_message_list(engine, name, host, 1),
+        "Up" | "k" => scroll_plugin_view_message_list(engine, name, host, -1),
+        "PageDown" | "Page_Down" => {
+            scroll_plugin_view_message_list(engine, name, host, page.max(1))
+        }
+        "PageUp" | "Page_Up" => scroll_plugin_view_message_list(engine, name, host, -page.max(1)),
+        "Home" | "g" => scroll_plugin_view_message_list(engine, name, host, i32::MIN),
+        "End" | "G" => scroll_plugin_view_message_list(engine, name, host, i32::MAX),
+        _ => false,
+    }
+}
+
+/// Resolve a click at `pos` (same units the last frame painted the body
+/// into) against the row it landed on and dispatch `ItemSelected` (single
+/// click) or `ItemActivated` (double-click) to the plugin, mirroring
+/// `quadraui`'s own `message_list_demo` example's click-routing shape.
+/// Returns `false` when `host` has no cached paint rect, or the click
+/// missed every row.
+pub(crate) fn route_plugin_view_message_list_click(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    pos: quadraui::Point,
+    is_double_click: bool,
+    backend: &dyn quadraui::Backend,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+    let Some(ViewBody::MessageList { rows }) = plugin_view_body(engine, name) else {
+        return false;
+    };
+    let Some(rect) = plugin_view_body_rect(engine, host) else {
+        return false;
+    };
+    // The line height the last paint actually used, not a live
+    // `Backend::measure()` — see `plugin_view_message_list_line_height`'s
+    // doc comment for why that live value can't be trusted here.
+    let Some(line_height) = plugin_view_message_list_line_height_cache(engine, host)
+        .map(std::cell::Cell::get)
+        .filter(|lh| *lh > 0.0)
+    else {
+        return false;
+    };
+    let scroll_top = engine.plugin_view_scroll_top(host);
+    let list = plugin_view_to_message_list(name, rows, scroll_top, backend.theme().foreground);
+    let measure = quadraui::MessageListMeasure::new(line_height);
+    let index = match list.hit_test(rect, measure, pos.x, pos.y) {
+        quadraui::MessageListHit::Row(idx) => idx,
+        quadraui::MessageListHit::Empty => return false,
+    };
+    let kind = if is_double_click {
+        ViewEventKind::ItemActivated { index, col: None }
+    } else {
+        ViewEventKind::ItemSelected { index, col: None }
+    };
+    engine.dispatch_plugin_view_event(PluginViewEvent {
+        view: name.to_string(),
+        widget_id: String::new(),
+        kind,
+    });
+    true
+}
+
+// ── Image ────────────────────────────────────────────────────────────────
+//
+// Display-only: no scroll/selection state, no layout cache, no
+// `ViewEventKind` of its own — `Backend::draw_image` applies `fit`
+// internally (`Image::layout`), so painting is a single call.
+
+fn plugin_view_to_image(
+    view: &str,
+    source: &crate::core::plugin_ui::ViewImageSource,
+    intrinsic_size: Option<(u32, u32)>,
+    fit: crate::core::plugin_ui::ViewImageFit,
+    fallback_text: &str,
+) -> quadraui::Image {
+    use crate::core::plugin_ui::{namespaced_widget_id, ViewImageSource};
+    use quadraui::{Image, ImageSource, WidgetId};
+    let source = match source {
+        // Malformed base64 degrades to an empty byte source rather than
+        // rejecting the whole view — the backend's decode then fails and
+        // `fallback_text` paints instead, the same degrade-don't-error
+        // convention `plugin_view_to_chart`'s `color` handling uses.
+        ViewImageSource::Bytes { data } => {
+            use base64::Engine as _;
+            ImageSource::Bytes(
+                base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap_or_default(),
+            )
+        }
+        ViewImageSource::Path { path } => ImageSource::Path(path.into()),
+    };
+    Image {
+        // Namespaced like every other plugin-owned id — see
+        // `plugin_view_to_list`'s matching comment.
+        id: WidgetId::new(namespaced_widget_id(view, "image")),
+        source,
+        intrinsic_size,
+        fit: fit.into_quadraui(),
+        fallback_text: fallback_text.to_string(),
+    }
+}
+
+/// Paint a `ViewBody::Image`-kind view into `rect`. Returns `false` when
+/// `name` isn't an `Image`-kind view.
+pub(crate) fn paint_plugin_view_image(
+    engine: &Engine,
+    name: &str,
+    rect: quadraui::Rect,
+    backend: &mut dyn quadraui::Backend,
+) -> bool {
+    let Some(ViewBody::Image {
+        source,
+        intrinsic_size,
+        fit,
+        fallback_text,
+    }) = plugin_view_body(engine, name)
+    else {
+        return false;
+    };
+    let image = plugin_view_to_image(name, source, *intrinsic_size, *fit, fallback_text);
+    backend.draw_image(rect, &image);
     true
 }
