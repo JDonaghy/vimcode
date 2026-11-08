@@ -1084,12 +1084,35 @@ like any other tab: close it with `:tabclose`, split it or move it between group
 | `"password"` | `value`, `placeholder` | `TextChanged`, `TextCommitted` |
 | `"text_area"` | `value`, `placeholder`, `rows` | `TextChanged`, `TextCommitted` |
 | `"toggle"` | `value` | `ToggleChanged` (`event.value` = bool) |
-| `"button"` | — | `ButtonClicked` |
+| `"button"` | `variant`, `icon`, `tooltip` (all optional — see below) | `ButtonClicked` |
 | `"dropdown"` | `options`, `selected` | `DropdownChanged` (`event.value` = 0-based index) |
 | `"segmented"` | `options`, `selected` | `SegmentedChanged` (`event.value` = 0-based index) |
-| `"buttons"` | `buttons = {{id=,label=,disabled=}}` | `ButtonClicked` per button id |
+| `"buttons"` | `buttons = {{id=,label=,disabled=,variant=,icon=,tooltip=}}` | `ButtonClicked` per button id |
 | `"toggles"` | `toggles = {{id=,label=,value=}}` | `ToggleChanged` per toggle id |
 | `"section"` | `collapsible` (default `true`), `collapsed` | `SectionToggled` (`event.collapsed` = proposed next state), when `collapsible` |
+| `"toolbar"` | `buttons = {{id=,label=,icon=,key_hint=,disabled=,variant=,tooltip=}}` | `ToolbarButtonClicked` per button id |
+
+**Button styling (`variant`/`icon`/`tooltip`).** A `"button"` field, each entry
+of a `"buttons"` row, and each entry of a `"toolbar"` row all accept the same
+three optional keys:
+
+- `variant`: `"primary"`, `"secondary"`, `"icon"`, `"danger"` or `"warning"`
+  — any other string is a Lua error naming the bad value. Omit it for
+  today's plain look. The TUI backend only tints `"danger"`
+  (`theme.error_fg`) and `"warning"` (`theme.warning_fg`); every other
+  variant, including `"primary"`, paints the same foreground as no variant
+  at all.
+- `icon`: a codicon name (e.g. `"trash"`, `"save"`, `"gear"`) from
+  quadraui's bundled set — an unrecognised name is a Lua error naming the
+  key. There is no separate fallback text to declare; the name itself is
+  what paints on a backend with no icon font loaded.
+- `tooltip`: hover text.
+
+A `"button"` field with none of the three set keeps rendering through
+quadraui's plain `< label >` chrome exactly as before this vocabulary
+existed. Setting any one of them switches it to the bracketed `[ label ]`
+chrome a styled `"buttons"` row entry already uses, so the intent colour
+has somewhere to paint.
 
 Every field also accepts `label`, `hint`, `disabled`, `error` and `warning`
 (`error` / `warning` render an indicator plus the message instead of the hint).

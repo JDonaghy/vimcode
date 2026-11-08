@@ -643,8 +643,30 @@ pub enum ViewFieldKind {
         value: bool,
     },
     /// A single clickable button; `label` is the caption. Translated to
-    /// `quadraui::FieldKind::Button`.
-    Button,
+    /// `quadraui::FieldKind::Button` when `variant`/`icon`/`tooltip` are all
+    /// unset — byte-for-byte today's rendering. Setting any one of them
+    /// instead translates to a single-item `quadraui::FieldKind::ButtonRow`
+    /// (the only standalone-row kind quadraui 0.9 lets carry a
+    /// `quadraui::ButtonSpec`; plain `FieldKind::Button` has no spec hook
+    /// at all — see `render::plugin_view_to_form`'s doc comment on this
+    /// arm), so the field's own label moves into that single item's
+    /// caption rather than being painted twice.
+    Button {
+        /// Visual emphasis. `None` keeps today's unstyled `< label >`
+        /// look; see this variant's own doc for why any `Some` reroutes
+        /// the translation to `ButtonRow`.
+        #[serde(default)]
+        variant: Option<ViewButtonVariant>,
+        /// A codicon name (e.g. `"trash"`, `"save"`) — see
+        /// `quadraui::Icon::codicon`'s doc for the full bundled set.
+        /// Validated at Lua-parse time in `plugin::lua_table_to_view`; an
+        /// unknown name is a Lua error naming the field.
+        #[serde(default)]
+        icon: Option<String>,
+        /// Hover tooltip text.
+        #[serde(default)]
+        tooltip: Option<String>,
+    },
     /// Read-only value row. Translated to `quadraui::FieldKind::ReadOnly`.
     ReadOnly {
         #[serde(default)]
@@ -775,6 +797,18 @@ pub enum ViewFieldKind {
 }
 
 impl ViewFieldKind {
+    /// A plain, unstyled button — `variant`/`icon`/`tooltip` all unset.
+    /// The shorthand every pre-existing call site (Rust test fixtures and
+    /// `plugin::lua_table_to_view`'s `"button"` arm with no styling keys)
+    /// uses in place of a hand-written struct literal.
+    pub fn plain_button() -> Self {
+        ViewFieldKind::Button {
+            variant: None,
+            icon: None,
+            tooltip: None,
+        }
+    }
+
     /// The `type = "..."` string this variant is authored as.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -783,7 +817,7 @@ impl ViewFieldKind {
             ViewFieldKind::Password { .. } => "password",
             ViewFieldKind::TextArea { .. } => "text_area",
             ViewFieldKind::Toggle { .. } => "toggle",
-            ViewFieldKind::Button => "button",
+            ViewFieldKind::Button { .. } => "button",
             ViewFieldKind::ReadOnly { .. } => "read_only",
             ViewFieldKind::Dropdown { .. } => "dropdown",
             ViewFieldKind::Segmented { .. } => "segmented",
@@ -798,6 +832,44 @@ impl ViewFieldKind {
     }
 }
 
+/// Visual emphasis for a button-shaped field or row item — [`ViewFieldKind::Button`],
+/// a [`ViewButton`] inside a [`ViewFieldKind::Buttons`] row, or a
+/// [`ViewToolbarButton`] inside a [`ViewFieldKind::Toolbar`]. Mirrors
+/// `quadraui::ButtonVariant` without depending on quadraui from this module's
+/// types directly (same reasoning as [`ViewImageFit`]/[`ViewChartKind`]); see
+/// [`Self::into_quadraui`] for the one place that translation happens.
+///
+/// `quadraui`'s own TUI rasterisers (`crate::render::plugin_view_to_form`'s
+/// targets) only tint [`Self::Danger`]/[`Self::Warning`] — every other
+/// variant, including [`Self::Primary`], paints the same plain foreground as
+/// no variant at all. A plugin author who only wants the "no color, just
+/// future-proof myself" look should still prefer leaving `variant` unset;
+/// declaring `"primary"` explicitly is for a plugin that also sets `icon` or
+/// `tooltip` and wants [`ViewFieldKind::Button`]'s single-button row to
+/// resolve through the styled `ButtonRow` translation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewButtonVariant {
+    Primary,
+    Secondary,
+    Icon,
+    Danger,
+    Warning,
+}
+
+impl ViewButtonVariant {
+    /// Translate to the quadraui primitive this paints through.
+    pub fn into_quadraui(self) -> quadraui::ButtonVariant {
+        match self {
+            ViewButtonVariant::Primary => quadraui::ButtonVariant::Primary,
+            ViewButtonVariant::Secondary => quadraui::ButtonVariant::Secondary,
+            ViewButtonVariant::Icon => quadraui::ButtonVariant::Icon,
+            ViewButtonVariant::Danger => quadraui::ButtonVariant::Danger,
+            ViewButtonVariant::Warning => quadraui::ButtonVariant::Warning,
+        }
+    }
+}
+
 /// One button inside a [`ViewFieldKind::Buttons`] row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewButton {
@@ -806,6 +878,16 @@ pub struct ViewButton {
     pub label: String,
     #[serde(default)]
     pub disabled: bool,
+    /// Visual emphasis. `None` keeps today's plain bracket-chrome look —
+    /// see [`ViewButtonVariant`]'s own doc.
+    #[serde(default)]
+    pub variant: Option<ViewButtonVariant>,
+    /// A codicon name — see [`ViewFieldKind::Button`]'s own `icon` doc.
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// Hover tooltip text.
+    #[serde(default)]
+    pub tooltip: Option<String>,
 }
 
 /// One toggle inside a [`ViewFieldKind::Toggles`] row.
@@ -827,12 +909,20 @@ pub struct ViewToolbarButton {
     pub id: String,
     #[serde(default)]
     pub label: String,
+    /// A codicon name, validated the same way as
+    /// [`ViewFieldKind::Button`]'s own `icon` key.
     #[serde(default)]
     pub icon: Option<String>,
     #[serde(default)]
     pub key_hint: Option<String>,
     #[serde(default)]
     pub disabled: bool,
+    /// Visual emphasis — see [`ViewButtonVariant`]'s own doc.
+    #[serde(default)]
+    pub variant: Option<ViewButtonVariant>,
+    /// Hover tooltip text.
+    #[serde(default)]
+    pub tooltip: Option<String>,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -1100,7 +1190,7 @@ mod tests {
                     disabled: false,
                     error: None,
                     warning: None,
-                    kind: ViewFieldKind::Button,
+                    kind: ViewFieldKind::plain_button(),
                 },
             ],
         };
@@ -1198,6 +1288,8 @@ mod tests {
                         icon: None,
                         key_hint: None,
                         disabled: false,
+                        variant: None,
+                        tooltip: None,
                     },
                     ViewToolbarButton {
                         id: "undo".into(),
@@ -1205,6 +1297,8 @@ mod tests {
                         icon: None,
                         key_hint: None,
                         disabled: true,
+                        variant: None,
+                        tooltip: None,
                     },
                 ],
             }
@@ -1259,7 +1353,7 @@ mod tests {
                         value: "1.0".into(),
                     },
                 ),
-                inert("go", ViewFieldKind::Button),
+                inert("go", ViewFieldKind::plain_button()),
             ],
         };
         assert_eq!(view.first_focusable(), Some(2));
@@ -1348,8 +1442,8 @@ mod tests {
                         collapsed: true,
                     },
                 ),
-                inert_field("member", ViewFieldKind::Button),
-                inert_field("after", ViewFieldKind::Button),
+                inert_field("member", ViewFieldKind::plain_button()),
+                inert_field("after", ViewFieldKind::plain_button()),
             ],
         };
         // The header (index 0) stays visible; with no terminating `Section`
@@ -1373,7 +1467,7 @@ mod tests {
                         collapsed: false,
                     },
                 ),
-                inert_field("member", ViewFieldKind::Button),
+                inert_field("member", ViewFieldKind::plain_button()),
             ],
         };
         assert_eq!(view.visible_field_indices(), vec![0, 1]);
@@ -1393,7 +1487,7 @@ mod tests {
                         collapsed: true,
                     },
                 ),
-                inert_field("member", ViewFieldKind::Button),
+                inert_field("member", ViewFieldKind::plain_button()),
             ],
         };
         assert_eq!(view.visible_field_indices(), vec![0, 1]);
@@ -1416,7 +1510,7 @@ mod tests {
                         collapsed: true,
                     },
                 ),
-                inert_field("a-member", ViewFieldKind::Button),
+                inert_field("a-member", ViewFieldKind::plain_button()),
                 inert_field(
                     "b-hdr",
                     ViewFieldKind::Section {
@@ -1424,7 +1518,7 @@ mod tests {
                         collapsed: false,
                     },
                 ),
-                inert_field("b-member", ViewFieldKind::Button),
+                inert_field("b-member", ViewFieldKind::plain_button()),
             ],
         };
         // `a-member` (index 1) hides under `a`'s collapse; `b-hdr`/`b-member`

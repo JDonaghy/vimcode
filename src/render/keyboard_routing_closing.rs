@@ -1621,7 +1621,7 @@ mod slice7_router_tests {
                         placeholder: String::new(),
                     },
                 ),
-                f("send", "Send", ViewFieldKind::Button),
+                f("send", "Send", ViewFieldKind::plain_button()),
             ],
         }
     }

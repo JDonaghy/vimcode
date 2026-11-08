@@ -208,6 +208,55 @@ fn live_engine<R>(what: &str, f: impl FnOnce(&mut Engine) -> R) -> LuaResult<R> 
 
 // ─── Lua → plugin_ui vocabulary ──────────────────────────────────────────────
 
+/// Parse a `variant = "primary"|"secondary"|"icon"|"danger"|"warning"` Lua
+/// key into a [`crate::core::plugin_ui::ViewButtonVariant`]. `None` when the
+/// key is absent. An unrecognised string is a loud Lua error naming the key,
+/// the same convention `vimcode.ui.toast`'s `severity` string uses.
+fn lua_button_variant(
+    row: &LuaTable,
+    key: &str,
+    context: &str,
+) -> LuaResult<Option<crate::core::plugin_ui::ViewButtonVariant>> {
+    use crate::core::plugin_ui::ViewButtonVariant;
+    let Some(raw) = row.get::<_, Option<String>>(key)? else {
+        return Ok(None);
+    };
+    match raw.as_str() {
+        "primary" => Ok(Some(ViewButtonVariant::Primary)),
+        "secondary" => Ok(Some(ViewButtonVariant::Secondary)),
+        "icon" => Ok(Some(ViewButtonVariant::Icon)),
+        "danger" => Ok(Some(ViewButtonVariant::Danger)),
+        "warning" => Ok(Some(ViewButtonVariant::Warning)),
+        other => Err(LuaError::RuntimeError(format!(
+            "{context}: unsupported `{key}` {other:?} (expected \"primary\", \"secondary\", \
+             \"icon\", \"danger\" or \"warning\")"
+        ))),
+    }
+}
+
+/// Parse an `icon = "<codicon-name>"` Lua key, validating it against
+/// quadraui's bundled codicon table via `quadraui::Icon::codicon` (see that
+/// constructor's own doc for the full name list — the same table every
+/// other icon-bearing `vimcode.ui` API would reuse). `None` when the key is
+/// absent or empty; an unrecognised name is a loud Lua error naming the key,
+/// stored as the bare name — `render::plugin_view_to_form` re-resolves it to
+/// a real `quadraui::Icon` at translation time rather than this module
+/// carrying a quadraui type across the plugin ABI boundary.
+fn lua_codicon_name(row: &LuaTable, key: &str, context: &str) -> LuaResult<Option<String>> {
+    let Some(raw) = row
+        .get::<_, Option<String>>(key)?
+        .filter(|s: &String| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    if quadraui::Icon::codicon(&raw, "").is_none() {
+        return Err(LuaError::RuntimeError(format!(
+            "{context}: unknown codicon name {raw:?} for `{key}`"
+        )));
+    }
+    Ok(Some(raw))
+}
+
 /// Parse the table a view's `render()` returned into a
 /// [`crate::core::plugin_ui::PluginView`].
 ///
@@ -289,7 +338,16 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
                 "toggle" => ViewFieldKind::Toggle {
                     value: row.get("value").unwrap_or(false),
                 },
-                "button" => ViewFieldKind::Button,
+                "button" => {
+                    let ctx = format!("view field {} (id {field_id:?})", idx + 1);
+                    ViewFieldKind::Button {
+                        variant: lua_button_variant(&row, "variant", &ctx)?,
+                        icon: lua_codicon_name(&row, "icon", &ctx)?,
+                        tooltip: row
+                            .get::<_, Option<String>>("tooltip")?
+                            .filter(|s| !s.is_empty()),
+                    }
+                }
                 "read_only" => ViewFieldKind::ReadOnly {
                     value: value_str("value"),
                 },
@@ -304,11 +362,21 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
                 "buttons" => {
                     let mut buttons = Vec::new();
                     if let Ok(t) = row.get::<_, LuaTable>("buttons") {
-                        for b in t.sequence_values::<LuaTable>().flatten() {
+                        for (bidx, b) in t.sequence_values::<LuaTable>().flatten().enumerate() {
+                            let ctx = format!(
+                                "view field {} (id {field_id:?}): buttons[{}]",
+                                idx + 1,
+                                bidx + 1
+                            );
                             buttons.push(ViewButton {
                                 id: b.get("id").unwrap_or_default(),
                                 label: b.get("label").unwrap_or_default(),
                                 disabled: b.get("disabled").unwrap_or(false),
+                                variant: lua_button_variant(&b, "variant", &ctx)?,
+                                icon: lua_codicon_name(&b, "icon", &ctx)?,
+                                tooltip: b
+                                    .get::<_, Option<String>>("tooltip")?
+                                    .filter(|s| !s.is_empty()),
                             });
                         }
                     }
@@ -357,16 +425,25 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
                 "toolbar" => {
                     let mut buttons = Vec::new();
                     if let Ok(t) = row.get::<_, LuaTable>("buttons") {
-                        for b in t.sequence_values::<LuaTable>().flatten() {
+                        for (bidx, b) in t.sequence_values::<LuaTable>().flatten().enumerate() {
+                            let ctx = format!(
+                                "view field {} (id {field_id:?}): toolbar buttons[{}]",
+                                idx + 1,
+                                bidx + 1
+                            );
                             buttons.push(crate::core::plugin_ui::ViewToolbarButton {
                                 id: b.get("id").unwrap_or_default(),
                                 label: b.get("label").unwrap_or_default(),
-                                icon: b.get::<_, String>("icon").ok().filter(|s| !s.is_empty()),
+                                icon: lua_codicon_name(&b, "icon", &ctx)?,
                                 key_hint: b
                                     .get::<_, String>("key_hint")
                                     .ok()
                                     .filter(|s| !s.is_empty()),
                                 disabled: b.get("disabled").unwrap_or(false),
+                                variant: lua_button_variant(&b, "variant", &ctx)?,
+                                tooltip: b
+                                    .get::<_, Option<String>>("tooltip")?
+                                    .filter(|s| !s.is_empty()),
                             });
                         }
                     }
@@ -6901,7 +6978,7 @@ mod tests {
                 selected: 1,
             }
         );
-        assert_eq!(view.fields[3].kind, ViewFieldKind::Button);
+        assert_eq!(view.fields[3].kind, ViewFieldKind::plain_button());
     }
 
     #[test]
@@ -6922,6 +6999,126 @@ mod tests {
             err.contains("buton"),
             "the error must name the offending type: {err}"
         );
+    }
+
+    #[test]
+    fn a_button_field_parses_variant_icon_and_tooltip_through_lua() {
+        use crate::core::plugin_ui::{ViewButtonVariant, ViewFieldKind};
+        let pm = pm_with_view(
+            "button_style",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { fields = { {
+                        type = "button", id = "del", label = "Delete",
+                        variant = "danger", icon = "trash", tooltip = "Remove it",
+                    } } }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(
+            view.fields[0].kind,
+            ViewFieldKind::Button {
+                variant: Some(ViewButtonVariant::Danger),
+                icon: Some("trash".to_string()),
+                tooltip: Some("Remove it".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_button_variant_is_an_error_naming_the_key() {
+        let pm = pm_with_view(
+            "bad_variant",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { fields = {
+                        { type = "button", id = "go", label = "Go", variant = "huge" },
+                    } }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("an unrecognised variant must not be silently accepted");
+        assert!(
+            err.contains("variant") && err.contains("huge"),
+            "the error must name the offending key and value: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_codicon_name_is_an_error_naming_the_key() {
+        let pm = pm_with_view(
+            "bad_icon",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { fields = {
+                        { type = "button", id = "go", label = "Go", icon = "not-a-real-icon" },
+                    } }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("an unrecognised codicon name must not be silently accepted");
+        assert!(
+            err.contains("icon") && err.contains("not-a-real-icon"),
+            "the error must name the offending key and value: {err}"
+        );
+    }
+
+    #[test]
+    fn buttons_row_items_and_toolbar_buttons_parse_variant_icon_and_tooltip() {
+        use crate::core::plugin_ui::{ViewButton, ViewButtonVariant, ViewFieldKind};
+        let pm = pm_with_view(
+            "buttons_and_toolbar_style",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { fields = {
+                        { type = "buttons", id = "row", buttons = {
+                            { id = "del", label = "Delete", variant = "danger",
+                              icon = "trash", tooltip = "Remove" },
+                        } },
+                        { type = "toolbar", id = "bar", buttons = {
+                            { id = "save", label = "Save", variant = "primary",
+                              icon = "save", tooltip = "Save file" },
+                        } },
+                    } }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(
+            view.fields[0].kind,
+            ViewFieldKind::Buttons {
+                buttons: vec![ViewButton {
+                    id: "del".to_string(),
+                    label: "Delete".to_string(),
+                    disabled: false,
+                    variant: Some(ViewButtonVariant::Danger),
+                    icon: Some("trash".to_string()),
+                    tooltip: Some("Remove".to_string()),
+                }],
+            }
+        );
+        match &view.fields[1].kind {
+            ViewFieldKind::Toolbar { buttons } => {
+                assert_eq!(buttons[0].id, "save");
+                assert_eq!(buttons[0].variant, Some(ViewButtonVariant::Primary));
+                assert_eq!(buttons[0].icon.as_deref(), Some("save"));
+                assert_eq!(buttons[0].tooltip.as_deref(), Some("Save file"));
+            }
+            other => panic!("expected Toolbar, got {other:?}"),
+        }
     }
 
     #[test]

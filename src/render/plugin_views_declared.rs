@@ -32,6 +32,40 @@ fn parse_iso_date(s: &str) -> Option<quadraui::CalendarDate> {
     Some(quadraui::CalendarDate::new(year, month, day))
 }
 
+/// Resolve a plugin-declared codicon name (already validated at Lua-parse
+/// time by `plugin::lua_codicon_name`) into a real `quadraui::Icon`. The
+/// `unwrap_or_else` fallback never actually triggers for a name that passed
+/// that validation — it exists only so a future change to the two lookups
+/// falling out of sync degrades to a literal glyph instead of panicking.
+fn resolve_view_icon(name: &str) -> quadraui::Icon {
+    quadraui::Icon::codicon(name, name).unwrap_or_else(|| quadraui::Icon::new(name, name))
+}
+
+/// Build the `quadraui::ButtonSpec` override for a button-shaped field/item
+/// that declared at least one of `variant`/`icon`/`tooltip` — `None` when
+/// none of the three are set, so a plugin that never opts in gets `spec:
+/// None` and today's plain rendering, exactly as before this vocabulary
+/// existed.
+fn resolve_button_spec(
+    label: &str,
+    variant: Option<crate::core::plugin_ui::ViewButtonVariant>,
+    icon: Option<&quadraui::Icon>,
+    tooltip: &Option<String>,
+    disabled: bool,
+) -> Option<quadraui::ButtonSpec> {
+    if variant.is_none() && icon.is_none() && tooltip.is_none() {
+        return None;
+    }
+    let mut spec = quadraui::ButtonSpec::new(label.to_string());
+    if let Some(v) = variant {
+        spec.variant = v.into_quadraui();
+    }
+    spec.icon = icon.cloned();
+    spec.tooltip = tooltip.clone();
+    spec.disabled = disabled;
+    Some(spec)
+}
+
 /// Adapt a plugin-declared [`crate::core::plugin_ui::PluginView`] into a
 /// `quadraui::Form`.
 ///
@@ -131,7 +165,43 @@ pub fn plugin_view_to_form(
                     },
                 },
                 ViewFieldKind::Toggle { value } => FieldKind::Toggle { value: *value },
-                ViewFieldKind::Button => FieldKind::Button,
+                // quadraui 0.9's standalone `FieldKind::Button` has no
+                // `ButtonSpec` hook at all (unlike `ButtonRowItem`/
+                // `ToolbarButton::Action` below) — a field that didn't
+                // declare any of `variant`/`icon`/`tooltip` keeps painting
+                // through it unchanged. One that did is translated to a
+                // single-item `FieldKind::ButtonRow` instead, the only
+                // standalone-row kind that does carry a spec; the field's
+                // own label is blanked below so the caption paints once,
+                // inside that one item, not twice.
+                ViewFieldKind::Button {
+                    variant,
+                    icon,
+                    tooltip,
+                } if variant.is_none() && icon.is_none() && tooltip.is_none() => FieldKind::Button,
+                ViewFieldKind::Button {
+                    variant,
+                    icon,
+                    tooltip,
+                } => {
+                    let resolved_icon = icon.as_deref().map(resolve_view_icon);
+                    let spec = resolve_button_spec(
+                        &f.label,
+                        *variant,
+                        resolved_icon.as_ref(),
+                        tooltip,
+                        f.disabled,
+                    );
+                    FieldKind::ButtonRow {
+                        buttons: vec![ButtonRowItem {
+                            id: wid(&f.id),
+                            label: f.label.clone(),
+                            disabled: f.disabled,
+                            icon: resolved_icon,
+                            spec,
+                        }],
+                    }
+                }
                 ViewFieldKind::ReadOnly { value } => FieldKind::ReadOnly {
                     value: StyledText::plain(value.clone()),
                 },
@@ -146,12 +216,22 @@ pub fn plugin_view_to_form(
                 ViewFieldKind::Buttons { buttons } => FieldKind::ButtonRow {
                     buttons: buttons
                         .iter()
-                        .map(|b| ButtonRowItem {
-                            id: wid(&b.id),
-                            label: b.label.clone(),
-                            disabled: b.disabled,
-                            icon: None,
-                            spec: None,
+                        .map(|b| {
+                            let resolved_icon = b.icon.as_deref().map(resolve_view_icon);
+                            let spec = resolve_button_spec(
+                                &b.label,
+                                b.variant,
+                                resolved_icon.as_ref(),
+                                &b.tooltip,
+                                b.disabled,
+                            );
+                            ButtonRowItem {
+                                id: wid(&b.id),
+                                label: b.label.clone(),
+                                disabled: b.disabled,
+                                icon: resolved_icon,
+                                spec,
+                            }
                         })
                         .collect(),
                 },
@@ -220,23 +300,47 @@ pub fn plugin_view_to_form(
                     Toolbar::new(wid(&f.id)).with_buttons(
                         buttons
                             .iter()
-                            .map(|b| ToolbarButton::Action {
-                                id: wid(&b.id),
-                                label: b.label.clone(),
-                                icon: b.icon.clone(),
-                                key_hint: b.key_hint.clone(),
-                                enabled: !b.disabled,
-                                is_active: false,
-                                tooltip: String::new(),
-                                spec: None,
+                            .map(|b| {
+                                let resolved_icon = b.icon.as_deref().map(resolve_view_icon);
+                                let spec = resolve_button_spec(
+                                    &b.label,
+                                    b.variant,
+                                    resolved_icon.as_ref(),
+                                    &b.tooltip,
+                                    b.disabled,
+                                );
+                                ToolbarButton::Action {
+                                    id: wid(&b.id),
+                                    label: b.label.clone(),
+                                    // Legacy glyph field: painted verbatim
+                                    // on every backend (see
+                                    // `ToolbarButton::Action::icon`'s own
+                                    // doc) — this Form-embedded toolbar
+                                    // paint path has no nerd-font-aware
+                                    // glyph swap of its own, so the
+                                    // resolved codicon's ASCII fallback is
+                                    // what actually renders, on every
+                                    // backend, regardless of `spec.icon`.
+                                    icon: resolved_icon.as_ref().map(|i| i.fallback.clone()),
+                                    key_hint: b.key_hint.clone(),
+                                    enabled: !b.disabled,
+                                    is_active: false,
+                                    tooltip: b.tooltip.clone().unwrap_or_default(),
+                                    spec,
+                                }
                             })
                             .collect(),
                     ),
                 ),
             };
             // A collapsible section's label is prefixed with a disclosure
-            // glyph reflecting its current state; every other field kind
-            // (including non-collapsible sections) paints its label as-is.
+            // glyph reflecting its current state. A `Button` field that
+            // declared `variant`/`icon`/`tooltip` has its caption moved
+            // into the single `ButtonRow` item the `kind` match above
+            // built instead (see that arm's doc) — the field's own label
+            // column must stay blank or the caption would paint twice.
+            // Every other field kind (including a plain `Button` and a
+            // non-collapsible section) paints its label as-is.
             let label = match &f.kind {
                 ViewFieldKind::Section {
                     collapsible: true,
@@ -244,6 +348,13 @@ pub fn plugin_view_to_form(
                 } => {
                     let glyph = if *collapsed { "▸" } else { "▾" };
                     StyledText::plain(format!("{glyph} {}", f.label))
+                }
+                ViewFieldKind::Button {
+                    variant,
+                    icon,
+                    tooltip,
+                } if variant.is_some() || icon.is_some() || tooltip.is_some() => {
+                    StyledText::plain("")
                 }
                 _ => StyledText::plain(&f.label),
             };
@@ -1008,7 +1119,7 @@ mod section_translation_tests {
             disabled: false,
             error: None,
             warning: None,
-            kind: ViewFieldKind::Button,
+            kind: ViewFieldKind::plain_button(),
         }
     }
 
@@ -1246,5 +1357,144 @@ mod color_translation_tests {
             }
             other => panic!("expected ReadOnly fallback, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod button_style_translation_tests {
+    use super::*;
+    use crate::core::plugin_ui::{PluginView, ViewButtonVariant, ViewField, ViewFieldKind};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    fn button_field(id: &str, label: &str, kind: ViewFieldKind) -> ViewField {
+        ViewField {
+            id: id.into(),
+            label: label.into(),
+            hint: String::new(),
+            disabled: false,
+            error: None,
+            warning: None,
+            kind,
+        }
+    }
+
+    fn cell_char(buf: &Buffer, x: u16, y: u16) -> char {
+        buf[(x, y)].symbol().chars().next().unwrap_or(' ')
+    }
+
+    fn row_string(buf: &Buffer, y: u16, width: u16) -> String {
+        (0..width).map(|x| cell_char(buf, x, y)).collect()
+    }
+
+    fn cell_fg(buf: &Buffer, x: u16, y: u16) -> ratatui::style::Color {
+        buf[(x, y)]
+            .style()
+            .fg
+            .unwrap_or(ratatui::style::Color::Reset)
+    }
+
+    /// A `button` field that declares a `danger` variant paints its
+    /// bracket chrome and label in `theme.error_fg` on TUI — proving
+    /// `plugin_view_to_form`'s styled-`Button` arm actually reaches
+    /// quadraui's intent-colour paint path (through the single-item
+    /// `ButtonRow` reroute that arm's own doc explains), not just that
+    /// `ButtonSpec.variant` got set somewhere in memory.
+    ///
+    /// A `primary` variant with an icon set alongside it paints the exact
+    /// same plain foreground as no variant at all: quadraui 0.9's TUI
+    /// rasteriser only tints `Danger`/`Warning` (see
+    /// `tui::form::draw_field_button_row`'s own doc comment upstream) —
+    /// this is "TUI degrades intent to the foreground colour on
+    /// `[ Label ]`", the behaviour this issue's acceptance bar names
+    /// explicitly, not a bug in this translation.
+    #[test]
+    fn a_danger_button_field_tints_its_bracket_chrome_on_tui() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![
+                button_field(
+                    "del",
+                    "Delete",
+                    ViewFieldKind::Button {
+                        variant: Some(ViewButtonVariant::Danger),
+                        icon: None,
+                        tooltip: None,
+                    },
+                ),
+                button_field(
+                    "save",
+                    "Save",
+                    ViewFieldKind::Button {
+                        variant: Some(ViewButtonVariant::Primary),
+                        icon: Some("save".into()),
+                        tooltip: None,
+                    },
+                ),
+            ],
+            body: None,
+        };
+        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
+        let theme = quadraui::Theme::default();
+
+        let width = 40u16;
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, 2));
+        quadraui::tui::draw_form(&mut buf, Rect::new(0, 0, width, 2), &form, &theme);
+
+        let danger_row = row_string(&buf, 0, width);
+        let danger_bracket = danger_row
+            .find('[')
+            .expect("danger button must paint bracket chrome");
+        assert!(
+            danger_row.contains("Delete"),
+            "danger button's caption must still paint: {danger_row:?}"
+        );
+        assert_eq!(
+            cell_fg(&buf, danger_bracket as u16, 0),
+            quadraui::tui::ratatui_color(theme.error_fg),
+            "a `danger` button field must tint its bracket in theme.error_fg; row: {danger_row:?}"
+        );
+
+        let primary_row = row_string(&buf, 1, width);
+        let primary_bracket = primary_row
+            .find('[')
+            .expect("primary button must paint bracket chrome");
+        assert!(
+            primary_row.contains("Save"),
+            "primary button's caption must still paint: {primary_row:?}"
+        );
+        assert_ne!(
+            cell_fg(&buf, primary_bracket as u16, 1),
+            quadraui::tui::ratatui_color(theme.error_fg),
+            "a `primary` button field must not pick up the danger tint; row: {primary_row:?}"
+        );
+    }
+
+    /// A plain `button` field (no `variant`/`icon`/`tooltip`) keeps
+    /// painting through quadraui's standalone `FieldKind::Button` —
+    /// today's `< label >` look, byte-for-byte, proving the additive
+    /// vocabulary changes nothing for every plugin that doesn't opt in.
+    #[test]
+    fn a_plain_button_field_keeps_its_unstyled_look() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![button_field("go", "Go", ViewFieldKind::plain_button())],
+            body: None,
+        };
+        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
+        assert_eq!(form.fields[0].kind, quadraui::FieldKind::Button);
+
+        let width = 40u16;
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
+        let theme = quadraui::Theme::default();
+        quadraui::tui::draw_form(&mut buf, Rect::new(0, 0, width, 1), &form, &theme);
+        let row = row_string(&buf, 0, width);
+        assert!(
+            row.contains("< Go >"),
+            "an unstyled button field must still paint quadraui's plain \
+             bracket chrome: {row:?}"
+        );
     }
 }

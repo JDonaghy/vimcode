@@ -908,7 +908,9 @@ impl Engine {
                 // the activation implies and the next `render` reflects whatever
                 // the handler decided to store. Nothing is mutated here.
                 let (widget_id, kind) = match &field.kind {
-                    ViewFieldKind::Button => (field.id.clone(), ViewEventKind::ButtonClicked),
+                    ViewFieldKind::Button { .. } => {
+                        (field.id.clone(), ViewEventKind::ButtonClicked)
+                    }
                     ViewFieldKind::Toggle { value } => (
                         field.id.clone(),
                         ViewEventKind::ToggleChanged { value: !*value },
