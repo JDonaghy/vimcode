@@ -1132,6 +1132,46 @@ layout change.
 Every field also accepts `label`, `hint`, `disabled`, `error` and `warning`
 (`error` / `warning` render an indicator plus the message instead of the hint).
 
+**Layout (`label_position`/`label_align`/`label_width`/`control_width`/
+`min_control_width`).** By default every field's label sits to the left of a
+control that stretches to the row's right edge — tightly packed, full-width
+rows. Five keys let you ask for a different layout, either form-wide (on the
+table `render` returns) or per field (overriding the form-wide default for
+that one row):
+
+```lua
+render = function()
+    return {
+        id = "conn",
+        label_position = "top",          -- "left" | "top" | "inline" | "hidden"
+        label_align = "end",             -- "start" | "center" | "end"
+        label_width = 12,                -- surface-native units (cells on TUI,
+                                          -- pixels on GTK/macOS/Windows)
+        control_width = { fixed = 40 },  -- "fill" | "content" | { fixed = n }
+        min_control_width = 20,
+        fields = {
+            { type = "text", id = "name", label = "Name" },
+            -- A per-field override wins over the form-wide default above.
+            { type = "text", id = "email", label = "Email", label_position = "left" },
+        },
+    }
+end,
+```
+
+| Key | Values | Effect |
+|-----|--------|--------|
+| `label_position` | `"left"` (default), `"top"`, `"inline"`, `"hidden"` | Where the label paints relative to its control: beside it, on its own row above it, sharing a line with no reserved label column, or not at all. |
+| `label_align` | `"start"` (default), `"center"`, `"end"` | Horizontal alignment of a `"left"`-positioned label inside its label column. No effect under any other `label_position`. |
+| `label_width` | a number | Fixed label-column width, surface-native units. Omit to size the column to the widest label, as before these keys existed. Only meaningful under `label_position = "left"`. |
+| `control_width` | `"fill"` (default), `"content"`, `{ fixed = n }` | How wide the control itself (the input/checkbox/dropdown, not the label) paints: stretched to the row's right edge, sized to its own content, or an exact width in surface-native units. |
+| `min_control_width` | a number | A floor under which the control's resolved width never shrinks, regardless of `control_width`'s mode. |
+
+Any other string for `label_position`/`label_align`, or a `control_width`
+table missing `fixed`, is a Lua error naming the offending key and value —
+the same fail-loudly convention `variant`/`icon` above use. Omitting a key
+entirely keeps today's behaviour exactly: full-width, left-labelled,
+tightly-packed rows.
+
 **Groups, rows and collapsible sections.** `fields` stays a single flat list —
 there is no separate container type — but a `"section"` field groups every field
 declared after it, up to the next `"section"` or the end of the list:

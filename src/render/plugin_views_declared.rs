@@ -422,11 +422,11 @@ pub fn plugin_view_to_form_with_combo_edit(
                     (None, Some(w)) => Some(ValidationState::Warning(w.clone())),
                     (None, None) => None,
                 },
-                label_position: None,
-                label_align: None,
-                label_width: None,
-                control_width: None,
-                min_control_width: None,
+                label_position: f.label_position.map(|p| p.into_quadraui()),
+                label_align: f.label_align.map(|a| a.into_quadraui()),
+                label_width: f.label_width,
+                control_width: f.control_width.map(|w| w.into_quadraui()),
+                min_control_width: f.min_control_width,
                 tab_index: None,
             }
         })
@@ -452,11 +452,20 @@ pub fn plugin_view_to_form_with_combo_edit(
         focused_field,
         scroll_offset: scroll_top,
         has_focus,
-        label_position: Default::default(),
-        label_align: Default::default(),
-        label_width: None,
-        control_width: Default::default(),
-        min_control_width: None,
+        label_position: view
+            .label_position
+            .map(|p| p.into_quadraui())
+            .unwrap_or_default(),
+        label_align: view
+            .label_align
+            .map(|a| a.into_quadraui())
+            .unwrap_or_default(),
+        label_width: view.label_width,
+        control_width: view
+            .control_width
+            .map(|w| w.into_quadraui())
+            .unwrap_or_default(),
+        min_control_width: view.min_control_width,
     }
 }
 
@@ -1295,8 +1304,10 @@ mod slider_translation_tests {
                     max: 10.0,
                     step: 0.5,
                 },
+                ..Default::default()
             }],
             body: None,
+            ..Default::default()
         };
         let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
         assert_eq!(
@@ -1344,6 +1355,7 @@ mod section_translation_tests {
                 collapsible,
                 collapsed,
             },
+            ..Default::default()
         }
     }
 
@@ -1360,6 +1372,7 @@ mod section_translation_tests {
             error: None,
             warning: None,
             kind: ViewFieldKind::plain_button(),
+            ..Default::default()
         }
     }
 
@@ -1376,6 +1389,7 @@ mod section_translation_tests {
                 icon: None,
                 tooltip: None,
             },
+            ..Default::default()
         }
     }
 
@@ -1386,6 +1400,7 @@ mod section_translation_tests {
             schema_version: 1,
             fields: vec![section_field("adv", "Advanced", true, true)],
             body: None,
+            ..Default::default()
         };
         let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
         assert_eq!(form.fields[0].kind, quadraui::FieldKind::Button);
@@ -1399,6 +1414,7 @@ mod section_translation_tests {
             schema_version: 1,
             fields: vec![section_field("adv", "Advanced", true, false)],
             body: None,
+            ..Default::default()
         };
         let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
         assert_eq!(plain_text(&form.fields[0].label), "▾ Advanced");
@@ -1411,6 +1427,7 @@ mod section_translation_tests {
             schema_version: 1,
             fields: vec![section_field("grp", "Group", false, false)],
             body: None,
+            ..Default::default()
         };
         let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
         assert_eq!(form.fields[0].kind, quadraui::FieldKind::Label);
@@ -1432,6 +1449,7 @@ mod section_translation_tests {
                 button_field("after"),
             ],
             body: None,
+            ..Default::default()
         };
         let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
         assert_eq!(form.fields.len(), 3);
@@ -1453,6 +1471,7 @@ mod section_translation_tests {
                 button_field("hidden"),
             ],
             body: None,
+            ..Default::default()
         };
         // `selected == 1` names the hidden member — the painted form has no
         // field to focus.
@@ -1475,6 +1494,7 @@ mod section_translation_tests {
                 button_field("after"),
             ],
             body: None,
+            ..Default::default()
         };
         let form = plugin_view_to_form("myview", &view, 3, 0, true, None);
         assert_eq!(
@@ -1496,6 +1516,7 @@ mod section_translation_tests {
                 schema_version: 1,
                 fields: vec![section_field("adv", "Advanced", true, true)],
                 body: None,
+                ..Default::default()
             },
         );
         let kind = remap_section_toggle(&engine, "myview", "adv", ViewEventKind::ButtonClicked);
@@ -1513,6 +1534,7 @@ mod section_translation_tests {
                 schema_version: 1,
                 fields: vec![section_field("adv", "Advanced", true, false)],
                 body: None,
+                ..Default::default()
             },
         );
         let kind = remap_section_toggle(&engine, "myview", "adv", ViewEventKind::ButtonClicked);
@@ -1530,6 +1552,7 @@ mod section_translation_tests {
                 schema_version: 1,
                 fields: vec![button_field("ok")],
                 body: None,
+                ..Default::default()
             },
         );
         let kind = remap_section_toggle(&engine, "myview", "ok", ViewEventKind::ButtonClicked);
@@ -1553,6 +1576,7 @@ mod section_translation_tests {
                 schema_version: 1,
                 fields: vec![styled_button_field("del")],
                 body: None,
+                ..Default::default()
             },
         );
         let kind = remap_styled_button_focus(&engine, "myview", "del", ViewEventKind::FocusChanged);
@@ -1575,6 +1599,7 @@ mod section_translation_tests {
                 schema_version: 1,
                 fields: vec![button_field("go")],
                 body: None,
+                ..Default::default()
             },
         );
         let kind = remap_styled_button_focus(&engine, "myview", "go", ViewEventKind::FocusChanged);
@@ -1594,6 +1619,7 @@ mod section_translation_tests {
                 schema_version: 1,
                 fields: vec![section_field("adv", "Advanced", true, false)],
                 body: None,
+                ..Default::default()
             },
         );
         let kind = remap_styled_button_focus(&engine, "myview", "adv", ViewEventKind::FocusChanged);
@@ -1629,6 +1655,7 @@ mod color_translation_tests {
             kind: ViewFieldKind::Color {
                 value: value.into(),
             },
+            ..Default::default()
         }
     }
 
@@ -1642,6 +1669,7 @@ mod color_translation_tests {
             schema_version: 1,
             fields: vec![color_field(value)],
             body: None,
+            ..Default::default()
         };
         plugin_view_to_form("myview", &view, 0, 0, false, None)
     }
@@ -1696,6 +1724,7 @@ mod button_style_translation_tests {
             error: None,
             warning: None,
             kind,
+            ..Default::default()
         }
     }
 
@@ -1754,6 +1783,7 @@ mod button_style_translation_tests {
                 ),
             ],
             body: None,
+            ..Default::default()
         };
         let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
         let theme = quadraui::Theme::default();
@@ -1811,6 +1841,7 @@ mod button_style_translation_tests {
             schema_version: 1,
             fields: vec![button_field("go", "Go", ViewFieldKind::plain_button())],
             body: None,
+            ..Default::default()
         };
         let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
         assert_eq!(form.fields[0].kind, quadraui::FieldKind::Button);
@@ -1847,6 +1878,7 @@ mod button_style_translation_tests {
                 },
             )],
             body: None,
+            ..Default::default()
         };
         let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
         assert_eq!(form.fields[0].kind, quadraui::FieldKind::Button);
@@ -1860,6 +1892,130 @@ mod button_style_translation_tests {
             row.contains("< Go >"),
             "a tooltip-only button field must still paint quadraui's plain \
              bracket chrome: {row:?}"
+        );
+    }
+}
+
+/// Proves the Lua `label_position`/`control_width` layout knobs
+/// (`plugin::lua_label_position`/`plugin::lua_control_width`,
+/// `ViewField::label_position`/`ViewField::control_width`) actually reach
+/// the painted `quadraui::Form` through [`plugin_view_to_form`], not just
+/// that the parsed [`ViewField`] carries the right enum in memory.
+#[cfg(test)]
+mod layout_knob_translation_tests {
+    use super::*;
+    use crate::core::plugin_ui::{
+        PluginView, ViewControlWidth, ViewField, ViewFieldKind, ViewLabelPosition,
+    };
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    fn cell_char(buf: &Buffer, x: u16, y: u16) -> char {
+        buf[(x, y)].symbol().chars().next().unwrap_or(' ')
+    }
+
+    /// A field whose resolved `label_position` is `Top` paints its label on
+    /// its own row above the input, with a dedicated row reserved for it —
+    /// not beside the input on the same row, today's only pre-existing
+    /// behaviour.
+    #[test]
+    fn label_position_top_paints_the_label_on_its_own_row_above_the_control() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![ViewField {
+                id: "name".into(),
+                label: "Name".into(),
+                kind: ViewFieldKind::Toggle { value: true },
+                label_position: Some(ViewLabelPosition::Top),
+                ..Default::default()
+            }],
+            body: None,
+            ..Default::default()
+        };
+        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
+        assert_eq!(
+            form.fields[0].label_position,
+            Some(quadraui::LabelPosition::Top),
+            "the per-field override must reach the painted `FormField`"
+        );
+
+        let width = 30u16;
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, 2));
+        let theme = quadraui::Theme::default();
+        quadraui::tui::draw_form(&mut buf, Rect::new(0, 0, width, 2), &form, &theme);
+
+        // Row 0 carries the label text, by itself.
+        let row0: String = (1..5).map(|x| cell_char(&buf, x, 0)).collect();
+        assert_eq!(
+            row0, "Name",
+            "the label must paint on its own row: {row0:?}"
+        );
+
+        // Row 1 carries the toggle glyph, with no label beside it.
+        let found_toggle = (1..width).any(|x| cell_char(&buf, x, 1) == 'x');
+        assert!(
+            found_toggle,
+            "the toggle must paint on the row below the label, not beside it"
+        );
+    }
+
+    /// A field whose resolved `control_width` is `Fixed(n)` closes its
+    /// bracketed control exactly `n` cells after it starts, regardless of
+    /// how much row width is available — proving the override reaches the
+    /// painted control geometry rather than the row's default `Fill`
+    /// behaviour (which stretches to the row's right edge).
+    #[test]
+    fn control_width_fixed_stops_the_control_at_n_cells() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![ViewField {
+                id: "name".into(),
+                label: "Name".into(),
+                kind: ViewFieldKind::Text {
+                    value: "a very long value that would otherwise stretch far".into(),
+                    placeholder: String::new(),
+                },
+                control_width: Some(ViewControlWidth::Fixed(10.0)),
+                ..Default::default()
+            }],
+            body: None,
+            ..Default::default()
+        };
+        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
+        assert_eq!(
+            form.fields[0].control_width,
+            Some(quadraui::ControlWidth::Fixed(10.0)),
+            "the per-field override must reach the painted `FormField`"
+        );
+
+        let width = 60u16;
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
+        let theme = quadraui::Theme::default();
+        quadraui::tui::draw_form(&mut buf, Rect::new(0, 0, width, 1), &form, &theme);
+
+        let open_col = (1..width)
+            .find(|&x| cell_char(&buf, x, 0) == '[')
+            .expect("the control's opening bracket must paint");
+        let close_col = (open_col..width)
+            .find(|&x| cell_char(&buf, x, 0) == ']')
+            .expect("the control's closing bracket must paint");
+
+        // `Fixed(10)` closes the bracket 9 cells after it opens
+        // (`control_start + control_width - 1`), nowhere near the row's
+        // right edge at column 59.
+        assert_eq!(
+            close_col - open_col,
+            9,
+            "a `control_width = {{ fixed = 10 }}` field must close its \
+             bracket exactly 9 cells after it opens, not stretch to fill \
+             the row"
+        );
+        assert!(
+            (close_col as usize) < width as usize - 10,
+            "the fixed-width control must stop well short of the row's \
+             right edge: close_col={close_col}, width={width}"
         );
     }
 }
@@ -1885,6 +2041,7 @@ mod combo_box_translation_tests {
                 value: value.into(),
                 placeholder: String::new(),
             },
+            ..Default::default()
         }
     }
 
@@ -1894,6 +2051,7 @@ mod combo_box_translation_tests {
             schema_version: 1,
             fields: vec![combo_field("fruit", &["Apple", "Apricot", "Banana"], value)],
             body: None,
+            ..Default::default()
         }
     }
 

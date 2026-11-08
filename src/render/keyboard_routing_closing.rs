@@ -1601,11 +1601,8 @@ mod slice7_router_tests {
         let f = |id: &str, label: &str, kind: ViewFieldKind| ViewField {
             id: id.to_string(),
             label: label.to_string(),
-            hint: String::new(),
-            disabled: false,
-            error: None,
-            warning: None,
             kind,
+            ..Default::default()
         };
         PluginView {
             id: "main".to_string(),
@@ -1623,6 +1620,7 @@ mod slice7_router_tests {
                 ),
                 f("send", "Send", ViewFieldKind::plain_button()),
             ],
+            ..Default::default()
         }
     }
 
@@ -1706,10 +1704,6 @@ mod slice7_router_tests {
             fields: vec![ViewField {
                 id: "flags".to_string(),
                 label: "Flags".to_string(),
-                hint: String::new(),
-                disabled: false,
-                error: None,
-                warning: None,
                 kind: ViewFieldKind::Toggles {
                     toggles: vec![ViewToggle {
                         id: "case".to_string(),
@@ -1717,7 +1711,9 @@ mod slice7_router_tests {
                         value: false,
                     }],
                 },
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let form = plugin_view_to_form("my-ext", &view, 0, 0, false, None);
         let inner = match &form.fields[0].kind {
