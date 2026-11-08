@@ -97,6 +97,27 @@ pub fn plugin_view_to_form(
     has_focus: bool,
     text_edit: Option<&crate::core::plugin_ui::PluginViewTextEditState>,
 ) -> quadraui::Form {
+    plugin_view_to_form_with_combo_edit(
+        view_name, view, selected, scroll_top, has_focus, text_edit, None,
+    )
+}
+
+/// [`plugin_view_to_form`] plus a `combo_edit` parameter for the
+/// `combo_box` field kind's own live interaction state (`text`/`open`/
+/// `highlighted`) — see [`crate::core::plugin_ui::PluginViewComboBoxEditState`]'s
+/// doc for why it needs one, unlike every other field kind here. A separate
+/// function rather than a seventh parameter on [`plugin_view_to_form`]
+/// itself so every pre-existing call site (test fixtures with no
+/// `combo_box` field in play) keeps compiling unchanged.
+pub fn plugin_view_to_form_with_combo_edit(
+    view_name: &str,
+    view: &crate::core::plugin_ui::PluginView,
+    selected: usize,
+    scroll_top: usize,
+    has_focus: bool,
+    text_edit: Option<&crate::core::plugin_ui::PluginViewTextEditState>,
+    combo_edit: Option<&crate::core::plugin_ui::PluginViewComboBoxEditState>,
+) -> quadraui::Form {
     use crate::core::plugin_ui::{namespaced_widget_id, ViewFieldKind};
     use quadraui::{
         ButtonRowItem, Color, FieldKind, Form, FormField, StyledText, ToggleGroupItem, Toolbar,
@@ -105,6 +126,8 @@ pub fn plugin_view_to_form(
 
     let wid = |field: &str| WidgetId::new(namespaced_widget_id(view_name, field));
     let live = |field_id: &str| text_edit.filter(|e| e.view == view_name && e.field_id == field_id);
+    let live_combo =
+        |field_id: &str| combo_edit.filter(|e| e.view == view_name && e.field_id == field_id);
 
     let visible = view.visible_field_indices();
     let fields: Vec<FormField> = visible
@@ -215,6 +238,32 @@ pub fn plugin_view_to_form(
                     options: options.iter().map(StyledText::plain).collect(),
                     selected_idx: (*selected).min(options.len().saturating_sub(1)),
                 },
+                // `placeholder` has no `quadraui::ComboBox` field to land in
+                // (unlike `TextInput`/`TextArea`'s own `placeholder`) — kept
+                // on the Lua-facing vocabulary for parity with every other
+                // text-backed field kind, but it paints nothing yet; see
+                // `ViewFieldKind::ComboBox`'s own doc. `committed` seeds from
+                // the plugin's declared `value` every render; `text`/`open`/
+                // `highlighted` come from `combo_edit` whenever it names this
+                // field (an edit in progress), falling back to the declared
+                // `value` with the dropdown closed otherwise — the same
+                // "declared value is authoritative unless vimcode is actively
+                // editing it" contract `text_edit`/`live` already follow for
+                // `Text`/`Password`/`TextArea`.
+                ViewFieldKind::ComboBox { options, value, .. } => {
+                    let mut combo = quadraui::ComboBox::new(wid(&f.id), options.clone());
+                    combo.committed = value.clone();
+                    combo.disabled = f.disabled;
+                    match live_combo(&f.id) {
+                        Some(e) => {
+                            combo.text = e.text.clone();
+                            combo.open = e.open;
+                            combo.highlighted = e.highlighted;
+                        }
+                        None => combo.text = value.clone(),
+                    }
+                    FieldKind::ComboBox(combo)
+                }
                 ViewFieldKind::Segmented { options, selected } => FieldKind::SegmentedControl {
                     options: options.clone(),
                     selected_idx: (*selected).min(options.len().saturating_sub(1)),
@@ -423,13 +472,14 @@ pub fn populate_plugin_view_form_controller(engine: &Engine) -> bool {
     let Some(view) = engine.plugin_views.get(&name) else {
         return false;
     };
-    let form = plugin_view_to_form(
+    let form = plugin_view_to_form_with_combo_edit(
         &name,
         view,
         engine.ext_panel_selected,
         engine.ext_panel_scroll_top,
         engine.ext_panel_has_focus,
         engine.plugin_view_text_edit.as_ref(),
+        engine.plugin_view_combo_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_form_controller.borrow_mut();
     fc.set_form(form);
@@ -455,13 +505,14 @@ pub fn populate_plugin_view_tab_form_controller(
     let Some(view) = engine.plugin_views.get(name) else {
         return false;
     };
-    let form = plugin_view_to_form(
+    let form = plugin_view_to_form_with_combo_edit(
         name,
         view,
         engine.plugin_view_tab_selected,
         engine.plugin_view_tab_scroll_top,
         has_focus,
         engine.plugin_view_text_edit.as_ref(),
+        engine.plugin_view_combo_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_tab_form_controller.borrow_mut();
     fc.set_form(form);
@@ -485,13 +536,14 @@ pub fn populate_plugin_view_dock_form_controller(
     let Some(view) = engine.plugin_views.get(name) else {
         return false;
     };
-    let form = plugin_view_to_form(
+    let form = plugin_view_to_form_with_combo_edit(
         name,
         view,
         engine.plugin_view_dock_selected,
         engine.plugin_view_dock_scroll_top,
         has_focus,
         engine.plugin_view_text_edit.as_ref(),
+        engine.plugin_view_combo_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_dock_form_controller.borrow_mut();
     fc.set_form(form);
@@ -551,6 +603,7 @@ pub fn handle_plugin_view_ui_event(
         quadraui::FormControllerEvent::FormAction(action) => action,
     };
     sync_scroll(engine);
+    apply_combo_box_form_action(engine, &action);
 
     let Some((view_name, field_id, mut kind)) = plugin_view_event_from_form_event(&action) else {
         return true;
@@ -637,6 +690,7 @@ pub fn handle_plugin_view_tab_ui_event(
         quadraui::FormControllerEvent::FormAction(action) => action,
     };
     sync_scroll(engine);
+    apply_combo_box_form_action(engine, &action);
 
     let Some((view_name, field_id, mut kind)) = plugin_view_event_from_form_event(&action) else {
         return true;
@@ -719,6 +773,7 @@ pub fn handle_plugin_view_dock_ui_event(
         quadraui::FormControllerEvent::FormAction(action) => action,
     };
     sync_scroll(engine);
+    apply_combo_box_form_action(engine, &action);
 
     let Some((view_name, field_id, mut kind)) = plugin_view_event_from_form_event(&action) else {
         return true;
@@ -950,6 +1005,90 @@ fn remap_styled_button_focus(
     }
 }
 
+/// Apply a `quadraui::FormEvent::ComboBox*` action to
+/// `Engine::plugin_view_combo_edit` — the vimcode-owned shadow state
+/// `plugin_view_to_form_with_combo_edit`'s `ComboBox` arm feeds back into
+/// the embedded `quadraui::ComboBox` every render, since quadraui's own
+/// `FormController` keeps no such cache itself (see
+/// [`crate::core::plugin_ui::PluginViewComboBoxEditState`]'s doc). A no-op
+/// for any other `FormEvent` variant, or for a `ComboBox*` event whose id
+/// isn't in the plugin namespace.
+///
+/// Called by every `handle_plugin_view_*_ui_event` before
+/// [`plugin_view_event_from_form_event`], so the shadow state is updated
+/// even for `ComboBoxHighlightChanged`/`ComboBoxCancelled` — the two
+/// variants that function deliberately does *not* turn into a
+/// `ViewEventKind` the plugin sees.
+///
+/// `ComboBoxCommitted`/`ComboBoxCancelled` both *clear* the state rather
+/// than freeze it at the final value: the next render rebuilds the
+/// `ComboBox` from the plugin's own declared `value` (which `on_event` is
+/// expected to update to match, for `Committed`) with the dropdown closed —
+/// the same "declared value is authoritative once vimcode stops actively
+/// editing it" contract every other field kind here follows.
+fn apply_combo_box_form_action(engine: &mut Engine, action: &quadraui::FormEvent) {
+    use crate::core::plugin_ui::{split_widget_id, PluginViewComboBoxEditState};
+
+    /// The combo-edit slot for `(view, field)`, resetting it first if it
+    /// currently names a different field (stale from a prior edit, or
+    /// never primed).
+    fn ensure<'a>(
+        engine: &'a mut Engine,
+        view: &str,
+        field: &str,
+    ) -> &'a mut PluginViewComboBoxEditState {
+        let stale = !matches!(
+            &engine.plugin_view_combo_edit,
+            Some(s) if s.view == view && s.field_id == field
+        );
+        if stale {
+            engine.plugin_view_combo_edit = Some(PluginViewComboBoxEditState {
+                view: view.to_string(),
+                field_id: field.to_string(),
+                text: String::new(),
+                open: false,
+                highlighted: None,
+            });
+        }
+        engine
+            .plugin_view_combo_edit
+            .as_mut()
+            .expect("just set above")
+    }
+
+    match action {
+        quadraui::FormEvent::ComboBoxTextChanged { id, value } => {
+            let Some((view, field)) = split_widget_id(id.as_str()) else {
+                return;
+            };
+            let state = ensure(engine, view, field);
+            state.text = value.clone();
+            // Typed characters also open the dropdown — mirrors
+            // `quadraui`'s own `form_combo_box` reference example.
+            state.open = true;
+        }
+        quadraui::FormEvent::ComboBoxHighlightChanged { id, index } => {
+            let Some((view, field)) = split_widget_id(id.as_str()) else {
+                return;
+            };
+            ensure(engine, view, field).highlighted = Some(*index);
+        }
+        quadraui::FormEvent::ComboBoxCommitted { id, .. }
+        | quadraui::FormEvent::ComboBoxCancelled { id } => {
+            let Some((view, field)) = split_widget_id(id.as_str()) else {
+                return;
+            };
+            if matches!(
+                &engine.plugin_view_combo_edit,
+                Some(s) if s.view == view && s.field_id == field
+            ) {
+                engine.plugin_view_combo_edit = None;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Decompose a `quadraui::FormEvent` into `(view, plugin-authored field id,
 /// event kind)`, or `None` when the event's widget is not in the plugin
 /// namespace (a Settings field, say) or carries no plugin meaning.
@@ -969,6 +1108,24 @@ pub(crate) fn plugin_view_event_from_form_event(
             id,
             ViewEventKind::DropdownChanged {
                 selected: *selected_idx,
+            },
+        ),
+        // `ComboBoxHighlightChanged`/`ComboBoxCancelled` fall to the `_`
+        // arm below: they're vimcode-owned interaction detail
+        // (`Engine::plugin_view_combo_edit`, applied by
+        // `apply_combo_box_form_action` before this function ever runs),
+        // not something the plugin needs to hear about — same convention
+        // as a `Text`/`Password` field's cursor movement.
+        quadraui::FormEvent::ComboBoxTextChanged { id, value } => (
+            id,
+            ViewEventKind::TextChanged {
+                value: value.clone(),
+            },
+        ),
+        quadraui::FormEvent::ComboBoxCommitted { id, value } => (
+            id,
+            ViewEventKind::ComboBoxChanged {
+                value: value.clone(),
             },
         ),
         quadraui::FormEvent::SegmentedControlChanged { id, selected_idx } => (

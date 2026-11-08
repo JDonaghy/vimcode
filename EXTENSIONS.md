@@ -1086,6 +1086,7 @@ like any other tab: close it with `:tabclose`, split it or move it between group
 | `"toggle"` | `value` | `ToggleChanged` (`event.value` = bool) |
 | `"button"` | `variant`, `icon`, `tooltip` (all optional — see below) | `ButtonClicked` |
 | `"dropdown"` | `options`, `selected` | `DropdownChanged` (`event.value` = 0-based index) |
+| `"combo_box"` | `options`, `value`, `placeholder` | `TextChanged` per filter keystroke, `ComboBoxChanged` on commit (both `event.value` = string) |
 | `"segmented"` | `options`, `selected` | `SegmentedChanged` (`event.value` = 0-based index) |
 | `"buttons"` | `buttons = {{id=,label=,disabled=,variant=,icon=,tooltip=}}` | `ButtonClicked` per button id |
 | `"toggles"` | `toggles = {{id=,label=,value=}}` | `ToggleChanged` per toggle id |
@@ -1173,6 +1174,25 @@ cursor movement (`Left`/`Right`/`Home`/`End`), selection and clipboard (`Ctrl-A`
 - `text` / `password`: `Enter` commits. Leaving the field without `Enter` discards
   the edit, and the next paint shows your declared `value` again.
 - `text_area`: `Enter` inserts a newline. `Ctrl-Enter`, or leaving the field, commits.
+
+**Combo box (`combo_box`).** An editable free-text field backed by a fixed
+`options` list, with a type-ahead filtered dropdown — unlike `dropdown`
+(select-only, cycling through `options` on `Enter`/click), `value` can be any
+string, not necessarily one of `options`. While focused:
+
+- Typing filters `options` (case-insensitive substring match) and opens the
+  dropdown; each keystroke reaches your callback as `TextChanged`
+  (`event.value` = the live filter text).
+- `Up`/`Down` move the highlighted filtered option.
+- `Enter` commits — the highlighted option if one is filtered and
+  highlighted, otherwise the typed text verbatim — reaching your callback as
+  `ComboBoxChanged` (`event.value` = the committed string).
+- `Escape` reverts the live text back to your declared `value` and closes
+  the dropdown, with no event.
+
+vimcode owns the live filter/open/highlight state the same way it owns
+`text`/`password` edit state; your declared `value` is what paints whenever
+the field isn't actively being edited.
 
 **View bodies (#1631).** Instead of `fields`, `render` can return a single body with
 `kind` set:
@@ -1286,8 +1306,8 @@ current version (1). A view declaring a version newer than the running vimcode
 understands is refused with a status-line error instead of being half-rendered.
 
 **Adding a field type, body `kind`, or event kind is additive and never bumps
-`schema_version`.** `"date"`, `"slider"`, `"section"`, `"color"` and `"toolbar"`
-all landed this way: every pre-existing tag and field keeps its old wire shape, so
+`schema_version`.** `"date"`, `"slider"`, `"section"`, `"color"`, `"toolbar"` and
+`"combo_box"` all landed this way: every pre-existing tag and field keeps its old wire shape, so
 a `schema_version = 1` tree written before the new kind existed still parses
 byte-for-byte the same, and the new kind only appears in a tree that opts in by
 using it. A version bump is reserved for a change that would make an *existing*

@@ -4873,6 +4873,18 @@ pub struct Engine {
     /// Primed on focus (`Engine::plugin_view_focus_field`) from the field's
     /// then-current declared value; cleared on blur.
     pub plugin_view_text_edit: Option<crate::core::plugin_ui::PluginViewTextEditState>,
+    /// Local interaction state for whichever plugin-view `combo_box` field
+    /// currently has keyboard focus — the `combo_box` twin of
+    /// `plugin_view_text_edit`, same "one field suffices, only one surface
+    /// holds focus" reasoning. quadraui's `FormController` keeps no shadow
+    /// cache of its own for `FieldKind::ComboBox` (unlike `FieldKind::
+    /// DatePicker`'s scrub position), so vimcode supplies the embedded
+    /// `quadraui::ComboBox`'s `text`/`open`/`highlighted` fresh from here
+    /// every render — see
+    /// [`crate::core::plugin_ui::PluginViewComboBoxEditState`]'s doc. Created
+    /// on demand by the first key that touches a focused `combo_box` field;
+    /// cleared on blur, commit (Enter) or cancel (Escape).
+    pub plugin_view_combo_edit: Option<crate::core::plugin_ui::PluginViewComboBoxEditState>,
     /// Flat selection index for a `vimcode.ui.register_view` view hosted as an
     /// editor-area tab — the tab twin of `ext_panel_selected`. Kept separate
     /// from `ext_panel_selected` (rather than shared) because the sidebar and a
@@ -5896,6 +5908,7 @@ impl Engine {
             plugin_view_form_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             plugin_view_render_depth: 0,
             plugin_view_text_edit: None,
+            plugin_view_combo_edit: None,
             plugin_view_tab_selected: 0,
             plugin_view_tab_scroll_top: 0,
             plugin_view_tab_form_controller: std::cell::RefCell::new(

@@ -20,6 +20,29 @@ fn unpack_completion_request_id(request_id: u64) -> (u64, u64) {
     (request_id >> 32, request_id & 0xFFFF_FFFF)
 }
 
+/// Map an engine key event to the `quadraui::Key` [`quadraui::ComboBox::
+/// handle_key`] recognises, for [`Engine::handle_plugin_view_key`]'s
+/// `combo_box` branch.
+///
+/// `None` for a key the primitive has no path for at all (`Home`/`End`/
+/// `Delete`/`Left`/`Right`/function keys, or a `ctrl`-chord whose `unicode`
+/// is `None`) — unlike the vimcode-owned `Text`/`Password` cursor model,
+/// `quadraui::ComboBox` only ever appends to or backspaces from the *end*
+/// of `text` (see that primitive's own doc), so there is no richer
+/// fallback to hand an unclaimed key off to; it simply falls through to
+/// whatever the caller does for an unrecognised key on any other field.
+fn combo_box_key_from(key: &str, unicode: Option<char>) -> Option<quadraui::Key> {
+    match key {
+        "Up" => Some(quadraui::Key::Named(quadraui::NamedKey::Up)),
+        "Down" => Some(quadraui::Key::Named(quadraui::NamedKey::Down)),
+        "Return" | "Enter" => Some(quadraui::Key::Named(quadraui::NamedKey::Enter)),
+        "Escape" => Some(quadraui::Key::Named(quadraui::NamedKey::Escape)),
+        "BackSpace" => Some(quadraui::Key::Named(quadraui::NamedKey::Backspace)),
+        "Space" | " " => Some(quadraui::Key::Char(' ')),
+        _ => unicode.filter(|c| !c.is_control()).map(quadraui::Key::Char),
+    }
+}
+
 /// Upper bound on nested plugin events queued during one dispatch. A plugin
 /// whose edit fires an event whose handler edits again could otherwise cascade
 /// without end; past this point the queue stops growing and the extra events
@@ -607,16 +630,35 @@ impl Engine {
     /// Move `host`'s keyboard focus to field `idx` of view `name`: blurs
     /// whatever text edit was in progress on the previously-focused field
     /// (committing it first if it was a `TextArea`, discarding otherwise —
-    /// see [`Self::blur_plugin_view_text_edit`]), moves the selection, and
-    /// primes [`Engine::plugin_view_text_edit`] if the newly-focused field is
-    /// a `Text`/`Password`/`TextArea` kind.
+    /// see [`Self::blur_plugin_view_text_edit`]), discards whatever
+    /// `combo_box` edit was in progress *for a field other than `idx`*
+    /// (same "discard, don't commit" contract as `Text`/`Password` — there
+    /// is no equivalent of `TextArea`'s blur-commits-the-buffer carve-out
+    /// here), moves the selection, and primes [`Engine::plugin_view_text_edit`]
+    /// if the newly-focused field is a `Text`/`Password`/`TextArea` kind.
     ///
     /// The single entry point for changing which field a plugin view's
     /// keyboard focus is on — every navigation path (initial panel/tab focus,
     /// `j`/`k`/`Tab`/`BackTab`, a mouse click) routes through this so blur/
-    /// prime can never be skipped on one path and not another.
+    /// prime can never be skipped on one path and not another. That includes
+    /// `render::handle_plugin_view_ui_event`'s own re-assertion of the
+    /// *already*-focused field after every mouse click or forwarded key (so
+    /// selection follows a click) — a `combo_box` key is itself forwarded
+    /// through that same function (see
+    /// `Engine::handle_plugin_view_key`'s combo-box branch), so this must
+    /// not discard the edit state a key's own handling just wrote when
+    /// `idx` still names the field that state belongs to.
     pub(crate) fn plugin_view_focus_field(&mut self, name: &str, host: PluginViewHost, idx: usize) {
         self.blur_plugin_view_text_edit(name, host);
+        let still_focused = self.plugin_view_combo_edit.as_ref().is_some_and(|state| {
+            self.plugin_views
+                .get(name)
+                .and_then(|v| v.fields.get(idx))
+                .is_some_and(|f| state.view == name && state.field_id == f.id)
+        });
+        if !still_focused {
+            self.plugin_view_combo_edit = None;
+        }
         self.set_plugin_view_selected(host, idx);
         self.prime_plugin_view_text_edit(name, idx);
     }
@@ -718,6 +760,13 @@ impl Engine {
     /// only exposes keyboard scrub-and-confirm navigation; there is no
     /// click-driven day selection to fall back to. `j`/`k`/`g`/`G` keep their
     /// ordinary field-to-field meaning so vim navigation is never shadowed.
+    ///
+    /// When the focused row is a `combo_box` field, every key the embedded
+    /// `quadraui::ComboBox` recognises — typed characters, `Backspace`,
+    /// `Up`/`Down`, `Enter`, `Escape` — is forwarded the same way, through
+    /// [`combo_box_key_from`]: `j`/`k`/`g`/`G` are *not* preserved as
+    /// navigation here (unlike `Date`'s), since this field is free text and
+    /// those letters must be insertable.
     pub(crate) fn handle_plugin_view_key(
         &mut self,
         name: &str,
@@ -774,6 +823,10 @@ impl Engine {
             .fields
             .get(selected)
             .is_some_and(|f| !f.disabled && matches!(f.kind, ViewFieldKind::Date { .. }));
+        let is_combo_box_field = view
+            .fields
+            .get(selected)
+            .is_some_and(|f| !f.disabled && matches!(f.kind, ViewFieldKind::ComboBox { .. }));
 
         // Field-to-field navigation always wins, text field or not.
         match key {
@@ -841,6 +894,41 @@ impl Engine {
                     // The dock never holds keyboard focus, so a
                     // Date-field key never actually reaches this arm in
                     // practice; it exists only to keep the match exhaustive.
+                    PluginViewHost::Dock => false,
+                };
+            }
+        }
+
+        // `combo_box`: forward every key the embedded `quadraui::ComboBox`
+        // recognises (typed characters, `Backspace`, `Up`/`Down`, `Enter`,
+        // `Escape`) to the shared `quadraui::FormController`, which drives
+        // its filtering/highlight/commit/cancel logic directly — see
+        // `combo_box_key_from`'s doc for why a key it has no path for at
+        // all (`Home`/`End`/`Delete`/`Left`/`Right`/function keys) instead
+        // falls through to the generic dispatch below, same as an
+        // unclaimed key on any other field kind.
+        if is_combo_box_field {
+            if let Some(quadraui_key) = combo_box_key_from(key, unicode) {
+                let event = quadraui::UiEvent::KeyPressed {
+                    key: quadraui_key,
+                    modifiers: quadraui::Modifiers {
+                        ctrl,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                };
+                return match host {
+                    PluginViewHost::Sidebar => {
+                        let rect = self.plugin_view_form_rect.get();
+                        crate::render::handle_plugin_view_ui_event(self, &event, rect)
+                    }
+                    PluginViewHost::Tab => {
+                        let rect = self.plugin_view_tab_form_rect.get();
+                        crate::render::handle_plugin_view_tab_ui_event(self, name, &event, rect)
+                    }
+                    // The dock never holds keyboard focus (see the `Date`
+                    // arm's identical comment above), so a `combo_box` key
+                    // never actually reaches this arm in practice.
                     PluginViewHost::Dock => false,
                 };
             }
@@ -947,6 +1035,15 @@ impl Engine {
                             field.id.clone(),
                             ViewEventKind::SegmentedChanged { selected: next },
                         )
+                    }
+                    ViewFieldKind::ComboBox { .. } => {
+                        // Unreachable: `is_combo_box_field` routes every key
+                        // for a focused `combo_box` field to the shared
+                        // `quadraui::FormController` above, including
+                        // `Enter`/`Space` (`Space` is just `Key::Char(' ')`
+                        // to the embedded `ComboBox`, appended to the filter
+                        // text like any other character).
+                        return true;
                     }
                     ViewFieldKind::Text { .. }
                     | ViewFieldKind::Password { .. }

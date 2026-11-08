@@ -366,6 +366,11 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
                     options: options("options"),
                     selected,
                 },
+                "combo_box" => ViewFieldKind::ComboBox {
+                    options: options("options"),
+                    value: value_str("value"),
+                    placeholder: value_str("placeholder"),
+                },
                 "segmented" => ViewFieldKind::Segmented {
                     options: options("options"),
                     selected,
@@ -3009,6 +3014,7 @@ impl PluginManager {
             }
             ViewEventKind::TextChanged { value }
             | ViewEventKind::TextCommitted { value }
+            | ViewEventKind::ComboBoxChanged { value }
             | ViewEventKind::DateChanged { value } => tbl.set("value", value.as_str())?,
             ViewEventKind::ItemSelected { index, col }
             | ViewEventKind::ItemActivated { index, col } => {
@@ -6995,6 +7001,41 @@ mod tests {
             }
         );
         assert_eq!(view.fields[3].kind, ViewFieldKind::plain_button());
+    }
+
+    #[test]
+    fn combo_box_field_parses_options_value_and_placeholder() {
+        use crate::core::plugin_ui::ViewFieldKind;
+        let pm = pm_with_view(
+            "combo",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        fields = {
+                            { type = "combo_box", id = "fruit",
+                              options = {"Apple", "Apricot", "Banana"},
+                              value = "Ap", placeholder = "Pick a fruit" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(
+            view.fields[0].kind,
+            ViewFieldKind::ComboBox {
+                options: vec![
+                    "Apple".to_string(),
+                    "Apricot".to_string(),
+                    "Banana".to_string()
+                ],
+                value: "Ap".to_string(),
+                placeholder: "Pick a fruit".to_string(),
+            }
+        );
     }
 
     #[test]

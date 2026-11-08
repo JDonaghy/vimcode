@@ -139,6 +139,26 @@ pub const ROW_TOOLBAR_LABEL: &str = "TbZQ146";
 /// The caption of the `toolbar` row's single action button — the click
 /// target for [`clicking_a_toolbar_button_reaches_the_plugin_handler`].
 pub const ROW_TOOLBAR_BUTTON: &str = "GoZQ146";
+/// A `combo_box`-kind row's label. Declared last in the field stack
+/// (after `tbr`) so this row's addition cannot shift any existing
+/// scenario's `Tab`-count-based navigation.
+pub const ROW_COMBO_LABEL: &str = "CbZ";
+/// The combo box's first declared option — a filtered prefix of
+/// [`ROW_COMBO_FILTER`] narrows `filtered_indices()` down to just this one,
+/// and committing with it highlighted (Enter) hands the plugin this whole
+/// string, not merely the typed prefix.
+pub const ROW_COMBO_OPTION_A: &str = "CmAZQ146";
+/// The combo box's second declared option — exists so filtering actually
+/// narrows a two-item list down to one rather than starting that way.
+pub const ROW_COMBO_OPTION_B: &str = "CmBZQ146";
+/// Typed into the focused, initially-empty combo box: a prefix of
+/// [`ROW_COMBO_OPTION_A`] but not of [`ROW_COMBO_OPTION_B`], so it filters
+/// the dropdown down to exactly one option.
+pub const ROW_COMBO_FILTER: &str = "CmA";
+/// The value painted after `Enter` commits the highlighted (filtered)
+/// option — the full [`ROW_COMBO_OPTION_A`] string, proving the committed
+/// value came from the *option list*, not merely the typed filter text.
+pub const ROW_COMBO_COMMITTED: &str = ROW_COMBO_OPTION_A;
 
 /// Registered view name for the `section`-kind fixture: a labelled,
 /// non-collapsible group (a `Section` header immediately followed by a
@@ -736,6 +756,7 @@ fn plugin_source() -> String {
 local count = 0
 local date_value = "{ROW_DATE_INITIAL}"
 local slider_value = 6.0
+local combo_value = ""
 
 vimcode.ui.register_view("{VIEW}", {{
   title = "{VIEW_TITLE}",
@@ -764,6 +785,9 @@ vimcode.ui.register_view("{VIEW}", {{
            value = '#ab12cd' }},
         {{ type = "toolbar", id = "tbr", label = "{ROW_TOOLBAR_LABEL}",
            buttons = {{ {{ id = "go", label = "{ROW_TOOLBAR_BUTTON}" }} }} }},
+        {{ type = "combo_box", id = "cmb", label = "{ROW_COMBO_LABEL}",
+           options = {{"{ROW_COMBO_OPTION_A}", "{ROW_COMBO_OPTION_B}"}},
+           value = combo_value }},
       }},
     }}
   end,
@@ -785,6 +809,12 @@ vimcode.ui.register_view("{VIEW}", {{
       slider_value = event.value
       count = count + 1
     elseif event.widget_id == "go" and event.kind == "ToolbarButtonClicked" then
+      count = count + 1
+    elseif event.widget_id == "cmb" and event.kind == "ComboBoxChanged" then
+      -- Per-keystroke filter typing reaches here too, as TextChanged —
+      -- deliberately *not* matched above, so only the committed selection
+      -- (Enter) bumps the counter.
+      combo_value = event.value
       count = count + 1
     end
   end,
@@ -1758,6 +1788,73 @@ pub fn stepping_a_slider_field_reaches_the_plugin_handler(driver: &mut impl Conf
         !driver.screen_has(ROW_SLIDER_INITIAL),
         "the stale slider value {ROW_SLIDER_INITIAL:?} must not still be \
          painted after the view re-rendered; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 4d — a focused `combo_box` field: typing filters it (and is
+/// reported per keystroke as `TextChanged`, same shape every other
+/// text-backed field uses), and `Enter` commits the *highlighted* filtered
+/// option — not merely the typed prefix — reaching the plugin's `on_event`
+/// handler as `ComboBoxChanged`.
+///
+/// `Tab` x8 from the initially-focused `url` field walks past `tls`, `send`,
+/// `etx`, `dob`, `vol`, `swt` and `tbr` onto `cmb`, the last declared field
+/// (appended after every pre-existing one so this scenario cannot shift any
+/// other scenario's `Tab`-count navigation).
+///
+/// RED-verified: reverting `render::plugin_view_event_from_form_event`'s
+/// `ComboBoxCommitted` arm to fall through to its `_ => return None` makes
+/// the final two assertions below fail — the screen keeps showing
+/// [`COUNT_0`] and the typed [`ROW_COMBO_FILTER`] instead of
+/// [`ROW_COMBO_COMMITTED`]/[`COUNT_1`] — while every other `plugin_view`
+/// scenario, including the slider one directly above, stays green.
+pub fn combo_box_filter_and_commit_reaches_the_plugin_handler(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(COUNT_0),
+        "precondition: the counter row must start at {COUNT_0:?}; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(ROW_COMBO_OPTION_A) && !driver.screen_has(ROW_COMBO_OPTION_B),
+        "precondition: the combo box starts with an empty value, so neither \
+         declared option should be painted into its row yet; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    for _ in 0..8 {
+        driver.press_named(quadraui::NamedKey::Tab);
+    }
+    driver.type_text(ROW_COMBO_FILTER);
+    assert!(
+        driver.screen_has(ROW_COMBO_FILTER),
+        "typing {ROW_COMBO_FILTER:?} into the focused (empty) combo box must \
+         insert it into the painted row; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_0),
+        "per-keystroke filter typing reaches the plugin as TextChanged, which \
+         this fixture's on_event deliberately ignores for `cmb` — the counter \
+         must still read {COUNT_0:?}; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Down);
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has(ROW_COMBO_COMMITTED),
+        "Down (highlighting the one option {ROW_COMBO_FILTER:?} filters down \
+         to) then Enter must commit that *whole option* — not merely the \
+         typed prefix — and repaint it ({ROW_COMBO_COMMITTED:?}); painted \
+         runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_1),
+        "Enter on the focused combo box must reach the plugin's on_event \
+         handler as ComboBoxChanged and repaint ({COUNT_1:?}); painted runs \
+         were {:?}",
         painted(driver)
     );
 }
@@ -3652,6 +3749,12 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_combo_box_filter_and_commit_reaches_the_handler_on_tui() {
+        let (mut h, _dir) = tui();
+        combo_box_filter_and_commit_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_tab_paints_and_click_reaches_the_handler_on_tui() {
         let (mut h, _dir) = tui_tab();
         tab_paints_and_click_reaches_the_plugin_handler(&mut h.driver);
@@ -4139,6 +4242,13 @@ mod tests {
     fn plugin_view_stepping_a_slider_field_reaches_the_handler_on_gtk() {
         let (mut h, _dir) = gtk_tab();
         stepping_a_slider_field_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_combo_box_filter_and_commit_reaches_the_handler_on_gtk() {
+        let (mut h, _dir) = gtk();
+        combo_box_filter_and_commit_reaches_the_plugin_handler(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]
