@@ -520,13 +520,18 @@ impl Engine {
     }
 
     /// Close every tab, split window and dock slot currently showing `name`
-    /// (a `vimcode.ui.register_view` view), the way `vimcode.ui.close_view(
-    /// name)` is wired.
+    /// (a `vimcode.ui.register_view` view), the way
+    /// `vimcode.ui.close_view(name)` is wired.
     ///
     /// `None` when `name` isn't a registered view at all — the Lua wrapper
     /// turns that into a loud error, matching `vimcode.ui.open_view`'s "fail
     /// loudly at the Lua/Rust boundary" convention. `Some(false)` when `name`
-    /// is registered but not currently open as a tab, split, or dock.
+    /// is registered but not currently open as a tab, split, or dock — with
+    /// one caveat: if `name`'s only remaining window is the editor's one
+    /// remaining window overall, the "refuse to close the last window"
+    /// guard below also reports `Some(false)`, even though the view is
+    /// still open. A caller cannot tell the two apart from the return value
+    /// alone; `vimcode.ui.close_view`'s doc in `EXTENSIONS.md` covers this.
     ///
     /// Each matching editor-area window is closed via `Engine::close_window`
     /// — the same path `<C-w>c`/`:q` use — so its "refuse to close the very
@@ -534,11 +539,24 @@ impl Engine {
     /// applies here too: a plugin cannot use this to quit vimcode. Closing a
     /// window that is the sole window of its tab therefore closes the tab,
     /// matching `Engine::open_plugin_view_tab`'s doc ("closes like any
-    /// tab").
+    /// tab"). That guard's own side effect of setting `self.message` is
+    /// swallowed here — it names an engine-internal action the caller never
+    /// asked for, and the boolean return already carries "didn't close".
+    ///
+    /// Picks windows to close in ascending `WindowId` order (rather than
+    /// `HashMap` iteration order) so which window is closed — and, when the
+    /// guard above stops the loop partway through several matches, which
+    /// one survives — is reproducible rather than incidental to hashing.
+    /// Restores the caller's own active window afterwards, provided that
+    /// window wasn't itself one of the ones just closed — closing a
+    /// background view must not leave the user's own active tab/group
+    /// switched to wherever the last closed window happened to leave focus.
     pub fn close_plugin_view(&mut self, name: &str) -> Option<bool> {
         if !self.is_plugin_view(name) {
             return None;
         }
+        let caller_active = self.active_window_id();
+        let message_before_close = self.message.clone();
         let mut closed = false;
         if let BottomPanelKind::Plugin(dock_name) = &self.bottom_panel_kind {
             if self.bottom_panel_open && dock_name == name {
@@ -552,22 +570,35 @@ impl Engine {
         loop {
             let windows = &self.windows;
             let buffer_manager = &self.buffer_manager;
-            let next = windows.iter().find_map(|(&wid, w)| {
-                buffer_manager
-                    .get(w.buffer_id)
-                    .filter(|s| s.plugin_view.as_deref() == Some(name))
-                    .map(|_| wid)
-            });
-            let Some(window_id) = next else { break };
+            let mut matches: Vec<WindowId> = windows
+                .iter()
+                .filter(|(_, w)| {
+                    buffer_manager
+                        .get(w.buffer_id)
+                        .is_some_and(|s| s.plugin_view.as_deref() == Some(name))
+                })
+                .map(|(&wid, _)| wid)
+                .collect();
+            matches.sort_by_key(|wid| wid.0);
+            let Some(window_id) = matches.into_iter().next() else {
+                break;
+            };
             self.activate_window(window_id);
             if self.close_window() {
                 closed = true;
             } else {
                 // Only fails when this is the editor's one remaining window
                 // overall — further attempts would just loop forever on the
-                // same window.
+                // same window. Undo the guard's "Cannot close last window"
+                // message; it is an editor-internal detail the caller never
+                // asked for, not something `vimcode.ui.close_view` should
+                // surface as a side effect of its return value.
+                self.message = message_before_close;
                 break;
             }
+        }
+        if self.windows.contains_key(&caller_active) && self.active_window_id() != caller_active {
+            self.activate_window(caller_active);
         }
         Some(closed)
     }
