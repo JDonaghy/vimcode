@@ -363,9 +363,7 @@ fn lua_control_width(
 /// The accepted vocabulary is still pinned to the serde tags — every `type`
 /// string below is a [`crate::core::plugin_ui::ViewFieldKind::type_name`].
 fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::PluginView> {
-    use crate::core::plugin_ui::{
-        PluginView, ViewButton, ViewField, ViewFieldKind, ViewToggle, VIEW_SCHEMA_VERSION,
-    };
+    use crate::core::plugin_ui::{PluginView, VIEW_SCHEMA_VERSION};
 
     let schema_version: u32 = tbl.get("schema_version").unwrap_or(VIEW_SCHEMA_VERSION);
     if schema_version > VIEW_SCHEMA_VERSION {
@@ -387,6 +385,28 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
     let min_control_width: Option<f32> = tbl
         .get::<_, Option<f64>>("min_control_width")?
         .map(|w| w as f32);
+
+    // A `kind = "row"/"column"` table is a layout container, not a
+    // `ViewBody` widget — flatten it into the same flat `fields` shape a
+    // plain `fields` list would have produced (see `plugin_ui`'s
+    // "Layout containers" doc) and return early, before the `ViewBody`
+    // branch below gets a look at `kind` at all.
+    if let Ok(kind) = tbl.get::<_, String>("kind") {
+        if kind == "row" || kind == "column" {
+            let fields = lua_table_to_view_container(tbl, &kind, "view")?;
+            return Ok(PluginView {
+                id,
+                schema_version,
+                fields,
+                body: None,
+                label_position,
+                label_align,
+                label_width,
+                control_width,
+                min_control_width,
+            });
+        }
+    }
 
     // A `kind = "list"/"tree"/"table"/"text_view"/"chart"/"message_list"/
     // "image"` table is a single `ViewBody` widget, not a field stack —
@@ -412,205 +432,7 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
     if let Ok(fields_tbl) = tbl.get::<_, LuaTable>("fields") {
         for (idx, row) in fields_tbl.sequence_values::<LuaTable>().enumerate() {
             let row = row?;
-            let type_name: String = row.get("type").unwrap_or_else(|_| "label".to_string());
-            let field_id: String = row.get("id").unwrap_or_default();
-            let label: String = row.get("label").unwrap_or_default();
-            let hint: String = row.get("hint").unwrap_or_default();
-            let disabled: bool = row.get("disabled").unwrap_or(false);
-            // Per-field layout knob overrides — see the form-wide parse
-            // above for what each one means. `None` defers to the
-            // form-wide default (or quadraui's own, if that is also
-            // unset), exactly as before these keys existed.
-            let field_ctx = format!("view field {} (id {field_id:?})", idx + 1);
-            let field_label_position = lua_label_position(&row, "label_position", &field_ctx)?;
-            let field_label_align = lua_label_align(&row, "label_align", &field_ctx)?;
-            let field_label_width: Option<f32> =
-                row.get::<_, Option<f64>>("label_width")?.map(|w| w as f32);
-            let field_control_width = lua_control_width(&row, "control_width", &field_ctx)?;
-            let field_min_control_width: Option<f32> = row
-                .get::<_, Option<f64>>("min_control_width")?
-                .map(|w| w as f32);
-            let error: Option<String> =
-                row.get::<_, String>("error").ok().filter(|s| !s.is_empty());
-            let warning: Option<String> = row
-                .get::<_, String>("warning")
-                .ok()
-                .filter(|s| !s.is_empty());
-            let value_str = |key: &str| -> String { row.get::<_, String>(key).unwrap_or_default() };
-            let options = |key: &str| -> Vec<String> {
-                row.get::<_, LuaTable>(key)
-                    .map(|t| t.sequence_values::<String>().flatten().collect())
-                    .unwrap_or_default()
-            };
-            // `selected` is 0-based, matching the Rust/JSON shape. Lua's
-            // 1-based array convention applies to the `options` table itself,
-            // not to an index the plugin stores as data.
-            let selected: usize = row.get("selected").unwrap_or(0);
-
-            let kind = match type_name.as_str() {
-                "label" => ViewFieldKind::Label,
-                "text" => ViewFieldKind::Text {
-                    value: value_str("value"),
-                    placeholder: value_str("placeholder"),
-                },
-                "password" => ViewFieldKind::Password {
-                    value: value_str("value"),
-                    placeholder: value_str("placeholder"),
-                },
-                "text_area" => ViewFieldKind::TextArea {
-                    value: value_str("value"),
-                    placeholder: value_str("placeholder"),
-                    rows: row.get("rows").unwrap_or(3),
-                },
-                "toggle" => ViewFieldKind::Toggle {
-                    value: row.get("value").unwrap_or(false),
-                },
-                "button" => {
-                    let ctx = format!("view field {} (id {field_id:?})", idx + 1);
-                    ViewFieldKind::Button {
-                        variant: lua_button_variant(&row, "variant", &ctx)?,
-                        icon: lua_codicon_name(&row, "icon", &ctx)?,
-                        tooltip: row
-                            .get::<_, Option<String>>("tooltip")?
-                            .filter(|s| !s.is_empty()),
-                    }
-                }
-                "read_only" => ViewFieldKind::ReadOnly {
-                    value: value_str("value"),
-                },
-                "dropdown" => ViewFieldKind::Dropdown {
-                    options: options("options"),
-                    selected,
-                },
-                "combo_box" => ViewFieldKind::ComboBox {
-                    options: options("options"),
-                    value: value_str("value"),
-                    placeholder: value_str("placeholder"),
-                },
-                "segmented" => ViewFieldKind::Segmented {
-                    options: options("options"),
-                    selected,
-                },
-                "buttons" => {
-                    let mut buttons = Vec::new();
-                    if let Ok(t) = row.get::<_, LuaTable>("buttons") {
-                        for (bidx, b) in t.sequence_values::<LuaTable>().flatten().enumerate() {
-                            let ctx = format!(
-                                "view field {} (id {field_id:?}): buttons[{}]",
-                                idx + 1,
-                                bidx + 1
-                            );
-                            buttons.push(ViewButton {
-                                id: b.get("id").unwrap_or_default(),
-                                label: b.get("label").unwrap_or_default(),
-                                disabled: b.get("disabled").unwrap_or(false),
-                                variant: lua_button_variant(&b, "variant", &ctx)?,
-                                icon: lua_codicon_name(&b, "icon", &ctx)?,
-                                tooltip: b
-                                    .get::<_, Option<String>>("tooltip")?
-                                    .filter(|s| !s.is_empty()),
-                            });
-                        }
-                    }
-                    ViewFieldKind::Buttons { buttons }
-                }
-                "toggles" => {
-                    let mut toggles = Vec::new();
-                    if let Ok(t) = row.get::<_, LuaTable>("toggles") {
-                        for b in t.sequence_values::<LuaTable>().flatten() {
-                            toggles.push(ViewToggle {
-                                id: b.get("id").unwrap_or_default(),
-                                label: b.get("label").unwrap_or_default(),
-                                value: b.get("value").unwrap_or(false),
-                            });
-                        }
-                    }
-                    ViewFieldKind::Toggles { toggles }
-                }
-                "date" => ViewFieldKind::Date {
-                    value: value_str("value"),
-                },
-                "slider" => {
-                    // `value`/`min`/`max` are required on the `ViewFieldKind::Slider`
-                    // wire shape (only `step` carries a serde default) — reject a
-                    // missing one here the same way an unknown `type` is rejected
-                    // below, rather than silently snapping it to some default that
-                    // then disagrees with the field's own declared range.
-                    let require_f32 = |key: &str| -> LuaResult<f32> {
-                        row.get::<_, f64>(key).map(|v| v as f32).map_err(|_| {
-                            LuaError::RuntimeError(format!(
-                                "view field {} (id {field_id:?}): slider requires a numeric `{key}`",
-                                idx + 1
-                            ))
-                        })
-                    };
-                    ViewFieldKind::Slider {
-                        value: require_f32("value")?,
-                        min: require_f32("min")?,
-                        max: require_f32("max")?,
-                        step: row.get::<_, f64>("step").unwrap_or(1.0) as f32,
-                    }
-                }
-                "color" => ViewFieldKind::Color {
-                    value: value_str("value"),
-                },
-                "toolbar" => {
-                    let mut buttons = Vec::new();
-                    if let Ok(t) = row.get::<_, LuaTable>("buttons") {
-                        for (bidx, b) in t.sequence_values::<LuaTable>().flatten().enumerate() {
-                            let ctx = format!(
-                                "view field {} (id {field_id:?}): toolbar buttons[{}]",
-                                idx + 1,
-                                bidx + 1
-                            );
-                            buttons.push(crate::core::plugin_ui::ViewToolbarButton {
-                                id: b.get("id").unwrap_or_default(),
-                                label: b.get("label").unwrap_or_default(),
-                                icon: lua_codicon_name(&b, "icon", &ctx)?,
-                                key_hint: b
-                                    .get::<_, String>("key_hint")
-                                    .ok()
-                                    .filter(|s| !s.is_empty()),
-                                disabled: b.get("disabled").unwrap_or(false),
-                                variant: lua_button_variant(&b, "variant", &ctx)?,
-                                tooltip: b
-                                    .get::<_, Option<String>>("tooltip")?
-                                    .filter(|s| !s.is_empty()),
-                            });
-                        }
-                    }
-                    ViewFieldKind::Toolbar { buttons }
-                }
-                "section" => ViewFieldKind::Section {
-                    // `row.get::<_, bool>` converts a missing key's `Nil` to
-                    // `false` (Lua's own falsy convention) rather than
-                    // erroring, so `.unwrap_or(default)` never fires — go
-                    // through `Option<bool>` to tell "absent" apart from an
-                    // explicit `false`.
-                    collapsible: row.get::<_, Option<bool>>("collapsible")?.unwrap_or(true),
-                    collapsed: row.get::<_, Option<bool>>("collapsed")?.unwrap_or(false),
-                },
-                other => {
-                    return Err(LuaError::RuntimeError(format!(
-                        "view field {} (id {field_id:?}): unknown type {other:?}",
-                        idx + 1
-                    )));
-                }
-            };
-            fields.push(ViewField {
-                id: field_id,
-                label,
-                hint,
-                disabled,
-                error,
-                warning,
-                kind,
-                label_position: field_label_position,
-                label_align: field_label_align,
-                label_width: field_label_width,
-                control_width: field_control_width,
-                min_control_width: field_min_control_width,
-            });
+            fields.push(lua_table_to_view_field(&row, idx)?);
         }
     }
 
@@ -625,6 +447,425 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
         control_width,
         min_control_width,
     })
+}
+
+/// Parse one `fields[i]` row table — the same table shape whether it comes
+/// from a flat `fields` list or from a `{ kind = "row"/"column", children =
+/// {...} }` container's `children[i]` — into a [`ViewField`]. `idx` is the
+/// row's position within whichever list it came from, used only for error
+/// messages ("view field 3 (id ...): ...").
+///
+/// Sibling of [`lua_table_to_view_container`] (container children recurse
+/// through this same function for their leaf rows) and of
+/// [`lua_table_to_view_body`] (a sibling translation for the unrelated
+/// single-widget `ViewBody` shape) — extracted out of [`lua_table_to_view`]'s
+/// own loop so both call sites share one parse, not two that could drift.
+fn lua_table_to_view_field(
+    row: &LuaTable,
+    idx: usize,
+) -> LuaResult<crate::core::plugin_ui::ViewField> {
+    use crate::core::plugin_ui::{ViewButton, ViewField, ViewFieldKind, ViewToggle};
+
+    let type_name: String = row.get("type").unwrap_or_else(|_| "label".to_string());
+    let field_id: String = row.get("id").unwrap_or_default();
+    let label: String = row.get("label").unwrap_or_default();
+    let hint: String = row.get("hint").unwrap_or_default();
+    let disabled: bool = row.get("disabled").unwrap_or(false);
+    // Per-field layout knob overrides — see the form-wide parse
+    // above for what each one means. `None` defers to the
+    // form-wide default (or quadraui's own, if that is also
+    // unset), exactly as before these keys existed.
+    let field_ctx = format!("view field {} (id {field_id:?})", idx + 1);
+    let field_label_position = lua_label_position(row, "label_position", &field_ctx)?;
+    let field_label_align = lua_label_align(row, "label_align", &field_ctx)?;
+    let field_label_width: Option<f32> =
+        row.get::<_, Option<f64>>("label_width")?.map(|w| w as f32);
+    let field_control_width = lua_control_width(row, "control_width", &field_ctx)?;
+    let field_min_control_width: Option<f32> = row
+        .get::<_, Option<f64>>("min_control_width")?
+        .map(|w| w as f32);
+    let error: Option<String> = row.get::<_, String>("error").ok().filter(|s| !s.is_empty());
+    let warning: Option<String> = row
+        .get::<_, String>("warning")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let value_str = |key: &str| -> String { row.get::<_, String>(key).unwrap_or_default() };
+    let options = |key: &str| -> Vec<String> {
+        row.get::<_, LuaTable>(key)
+            .map(|t| t.sequence_values::<String>().flatten().collect())
+            .unwrap_or_default()
+    };
+    // `selected` is 0-based, matching the Rust/JSON shape. Lua's
+    // 1-based array convention applies to the `options` table itself,
+    // not to an index the plugin stores as data.
+    let selected: usize = row.get("selected").unwrap_or(0);
+
+    let kind = match type_name.as_str() {
+        "label" => ViewFieldKind::Label,
+        "text" => ViewFieldKind::Text {
+            value: value_str("value"),
+            placeholder: value_str("placeholder"),
+        },
+        "password" => ViewFieldKind::Password {
+            value: value_str("value"),
+            placeholder: value_str("placeholder"),
+        },
+        "text_area" => ViewFieldKind::TextArea {
+            value: value_str("value"),
+            placeholder: value_str("placeholder"),
+            rows: row.get("rows").unwrap_or(3),
+        },
+        "toggle" => ViewFieldKind::Toggle {
+            value: row.get("value").unwrap_or(false),
+        },
+        "button" => {
+            let ctx = format!("view field {} (id {field_id:?})", idx + 1);
+            ViewFieldKind::Button {
+                variant: lua_button_variant(row, "variant", &ctx)?,
+                icon: lua_codicon_name(row, "icon", &ctx)?,
+                tooltip: row
+                    .get::<_, Option<String>>("tooltip")?
+                    .filter(|s| !s.is_empty()),
+            }
+        }
+        "read_only" => ViewFieldKind::ReadOnly {
+            value: value_str("value"),
+        },
+        "dropdown" => ViewFieldKind::Dropdown {
+            options: options("options"),
+            selected,
+        },
+        "combo_box" => ViewFieldKind::ComboBox {
+            options: options("options"),
+            value: value_str("value"),
+            placeholder: value_str("placeholder"),
+        },
+        "segmented" => ViewFieldKind::Segmented {
+            options: options("options"),
+            selected,
+        },
+        "buttons" => {
+            let mut buttons = Vec::new();
+            if let Ok(t) = row.get::<_, LuaTable>("buttons") {
+                for (bidx, b) in t.sequence_values::<LuaTable>().flatten().enumerate() {
+                    let ctx = format!(
+                        "view field {} (id {field_id:?}): buttons[{}]",
+                        idx + 1,
+                        bidx + 1
+                    );
+                    buttons.push(ViewButton {
+                        id: b.get("id").unwrap_or_default(),
+                        label: b.get("label").unwrap_or_default(),
+                        disabled: b.get("disabled").unwrap_or(false),
+                        variant: lua_button_variant(&b, "variant", &ctx)?,
+                        icon: lua_codicon_name(&b, "icon", &ctx)?,
+                        tooltip: b
+                            .get::<_, Option<String>>("tooltip")?
+                            .filter(|s| !s.is_empty()),
+                    });
+                }
+            }
+            ViewFieldKind::Buttons { buttons }
+        }
+        "toggles" => {
+            let mut toggles = Vec::new();
+            if let Ok(t) = row.get::<_, LuaTable>("toggles") {
+                for b in t.sequence_values::<LuaTable>().flatten() {
+                    toggles.push(ViewToggle {
+                        id: b.get("id").unwrap_or_default(),
+                        label: b.get("label").unwrap_or_default(),
+                        value: b.get("value").unwrap_or(false),
+                    });
+                }
+            }
+            ViewFieldKind::Toggles { toggles }
+        }
+        "date" => ViewFieldKind::Date {
+            value: value_str("value"),
+        },
+        "slider" => {
+            // `value`/`min`/`max` are required on the `ViewFieldKind::Slider`
+            // wire shape (only `step` carries a serde default) — reject a
+            // missing one here the same way an unknown `type` is rejected
+            // below, rather than silently snapping it to some default that
+            // then disagrees with the field's own declared range.
+            let require_f32 = |key: &str| -> LuaResult<f32> {
+                row.get::<_, f64>(key).map(|v| v as f32).map_err(|_| {
+                    LuaError::RuntimeError(format!(
+                        "view field {} (id {field_id:?}): slider requires a numeric `{key}`",
+                        idx + 1
+                    ))
+                })
+            };
+            ViewFieldKind::Slider {
+                value: require_f32("value")?,
+                min: require_f32("min")?,
+                max: require_f32("max")?,
+                step: row.get::<_, f64>("step").unwrap_or(1.0) as f32,
+            }
+        }
+        "color" => ViewFieldKind::Color {
+            value: value_str("value"),
+        },
+        "toolbar" => {
+            let mut buttons = Vec::new();
+            if let Ok(t) = row.get::<_, LuaTable>("buttons") {
+                for (bidx, b) in t.sequence_values::<LuaTable>().flatten().enumerate() {
+                    let ctx = format!(
+                        "view field {} (id {field_id:?}): toolbar buttons[{}]",
+                        idx + 1,
+                        bidx + 1
+                    );
+                    buttons.push(crate::core::plugin_ui::ViewToolbarButton {
+                        id: b.get("id").unwrap_or_default(),
+                        label: b.get("label").unwrap_or_default(),
+                        icon: lua_codicon_name(&b, "icon", &ctx)?,
+                        key_hint: b
+                            .get::<_, String>("key_hint")
+                            .ok()
+                            .filter(|s| !s.is_empty()),
+                        disabled: b.get("disabled").unwrap_or(false),
+                        variant: lua_button_variant(&b, "variant", &ctx)?,
+                        tooltip: b
+                            .get::<_, Option<String>>("tooltip")?
+                            .filter(|s| !s.is_empty()),
+                    });
+                }
+            }
+            ViewFieldKind::Toolbar { buttons }
+        }
+        "section" => ViewFieldKind::Section {
+            // `row.get::<_, bool>` converts a missing key's `Nil` to
+            // `false` (Lua's own falsy convention) rather than
+            // erroring, so `.unwrap_or(default)` never fires — go
+            // through `Option<bool>` to tell "absent" apart from an
+            // explicit `false`.
+            collapsible: row.get::<_, Option<bool>>("collapsible")?.unwrap_or(true),
+            collapsed: row.get::<_, Option<bool>>("collapsed")?.unwrap_or(false),
+        },
+        other => {
+            return Err(LuaError::RuntimeError(format!(
+                "view field {} (id {field_id:?}): unknown type {other:?}",
+                idx + 1
+            )));
+        }
+    };
+    Ok(ViewField {
+        id: field_id,
+        label,
+        hint,
+        disabled,
+        error,
+        warning,
+        kind,
+        label_position: field_label_position,
+        label_align: field_label_align,
+        label_width: field_label_width,
+        control_width: field_control_width,
+        min_control_width: field_min_control_width,
+    })
+}
+
+/// Parse a `padding`/`margin` Lua key: either a bare number (uniform on all
+/// four sides) or a `{top=, right=, bottom=, left=}` table (each side
+/// optional, defaulting to 0). Returns `(top, right, bottom, left)`.
+/// Absent is `(0, 0, 0, 0)` — a container that declares neither key keeps
+/// today's zero-spacing behaviour.
+fn lua_edge_insets(tbl: &LuaTable, key: &str, context: &str) -> LuaResult<(f32, f32, f32, f32)> {
+    let value: LuaValue = match tbl.get(key) {
+        Ok(v) => v,
+        Err(_) => return Ok((0.0, 0.0, 0.0, 0.0)),
+    };
+    match value {
+        LuaValue::Nil => Ok((0.0, 0.0, 0.0, 0.0)),
+        LuaValue::Integer(_) | LuaValue::Number(_) => {
+            let n: f64 = tbl.get(key)?;
+            let n = n as f32;
+            Ok((n, n, n, n))
+        }
+        LuaValue::Table(t) => {
+            let side = |k: &str| -> LuaResult<f32> {
+                Ok(t.get::<_, Option<f64>>(k)?.unwrap_or(0.0) as f32)
+            };
+            Ok((side("top")?, side("right")?, side("bottom")?, side("left")?))
+        }
+        other => Err(LuaError::RuntimeError(format!(
+            "{context}: `{key}` must be a number or a {{top=,right=,bottom=,left=}} table, got {other:?}"
+        ))),
+    }
+}
+
+/// Parse a container's `align = "start"|"center"|"end"|"stretch"` Lua key.
+/// Defaults to `"start"` (today's only packing behaviour — see
+/// `plugin_ui`'s "Layout containers" doc for why every variant besides the
+/// default has no visual effect yet). An unrecognised string is a loud Lua
+/// error naming the key, the same convention [`lua_label_align`] uses —
+/// kept for forward compatibility and so a typo is caught now rather than
+/// silently ignored until the day it does something.
+fn lua_container_align(tbl: &LuaTable, context: &str) -> LuaResult<()> {
+    let Some(raw) = tbl.get::<_, Option<String>>("align")? else {
+        return Ok(());
+    };
+    match raw.as_str() {
+        "start" | "center" | "end" | "stretch" => Ok(()),
+        other => Err(LuaError::RuntimeError(format!(
+            "{context}: unsupported `align` {other:?} (expected \"start\", \"center\", \"end\" \
+             or \"stretch\")"
+        ))),
+    }
+}
+
+/// Parse one `children[i]` entry of a layout container: a nested
+/// `{ kind = "row"/"column", ... }` container (recurses, contributing every
+/// leaf field it flattens to) or a plain leaf field table (contributing
+/// exactly one). Mirrors the disambiguation `lua_table_to_view` itself uses
+/// at the top level: a `kind` key means container, a `type` key (or no key
+/// at all) means leaf field.
+fn lua_table_to_view_child(
+    child: &LuaTable,
+    idx: usize,
+    context: &str,
+) -> LuaResult<Vec<crate::core::plugin_ui::ViewField>> {
+    if let Ok(kind) = child.get::<_, String>("kind") {
+        return match kind.as_str() {
+            "row" | "column" => {
+                lua_table_to_view_container(child, &kind, &format!("{context} > child {}", idx + 1))
+            }
+            other => Err(LuaError::RuntimeError(format!(
+                "{context}: child {} has unknown kind {other:?} (expected \"row\" or \"column\")",
+                idx + 1
+            ))),
+        };
+    }
+    Ok(vec![lua_table_to_view_field(child, idx)?])
+}
+
+/// Parse a `{ kind = "row"/"column", padding=, margin=, gap=, align=,
+/// children= }` layout container into the flat `Vec<ViewField>` it
+/// expands to — see `plugin_ui`'s "Layout containers" doc for the full
+/// design. `kind` has already been read by the caller (both call sites —
+/// [`lua_table_to_view`] at the top level and [`lua_table_to_view_child`]
+/// for a nested one — need it before deciding to call this function at
+/// all), so it is passed in rather than re-read here.
+///
+/// A `column`'s children stack vertically, exactly like a flat `fields`
+/// list, with blank spacer rows realising `padding`'s top/bottom and
+/// `gap` between successive children (quantized by
+/// [`crate::core::plugin_ui::quantize_rows_ceil`]/
+/// [`crate::core::plugin_ui::quantize_rows_floor`] — see that module's
+/// doc for the px-to-row convention and why horizontal padding/margin are
+/// parsed-and-validated but not realised).
+///
+/// A `row`'s children must *all* be `type = "button"` leaf fields —
+/// `quadraui::Form` has exactly one horizontal-packing primitive that
+/// isn't single-purpose chrome (`FieldKind::ButtonRow`), so that is the
+/// only shape a `row` can become today; anything else is a loud Lua error
+/// naming what was found instead, rather than silently stacking the
+/// children vertically (which would defeat the point of asking for a row).
+fn lua_table_to_view_container(
+    tbl: &LuaTable,
+    kind: &str,
+    context: &str,
+) -> LuaResult<Vec<crate::core::plugin_ui::ViewField>> {
+    use crate::core::plugin_ui::{
+        quantize_rows_ceil, quantize_rows_floor, spacer_row, ViewButton, ViewField, ViewFieldKind,
+    };
+
+    let (padding_top, _padding_right, padding_bottom, _padding_left) =
+        lua_edge_insets(tbl, "padding", context)?;
+    let (margin_top, _margin_right, margin_bottom, _margin_left) =
+        lua_edge_insets(tbl, "margin", context)?;
+    let gap: f32 = tbl.get::<_, Option<f64>>("gap")?.unwrap_or(0.0) as f32;
+    lua_container_align(tbl, context)?;
+
+    let children_tbl: Option<LuaTable> = tbl.get("children").ok();
+    let children: Vec<LuaTable> = children_tbl
+        .map(|t| t.sequence_values::<LuaTable>().collect::<LuaResult<_>>())
+        .transpose()?
+        .unwrap_or_default();
+
+    match kind {
+        "column" => {
+            let mut out = Vec::new();
+            for _ in 0..quantize_rows_floor(margin_top) {
+                out.push(spacer_row());
+            }
+            for _ in 0..quantize_rows_ceil(padding_top) {
+                out.push(spacer_row());
+            }
+            for (idx, child) in children.iter().enumerate() {
+                if idx > 0 {
+                    for _ in 0..quantize_rows_ceil(gap) {
+                        out.push(spacer_row());
+                    }
+                }
+                out.extend(lua_table_to_view_child(child, idx, context)?);
+            }
+            for _ in 0..quantize_rows_ceil(padding_bottom) {
+                out.push(spacer_row());
+            }
+            for _ in 0..quantize_rows_floor(margin_bottom) {
+                out.push(spacer_row());
+            }
+            Ok(out)
+        }
+        "row" => {
+            let mut buttons = Vec::new();
+            for (idx, child) in children.iter().enumerate() {
+                if child.get::<_, String>("kind").is_ok() {
+                    return Err(LuaError::RuntimeError(format!(
+                        "{context}: a row's children must be `type = \"button\"` fields — \
+                         child {} is a nested container, which quadraui's Form has no \
+                         horizontal primitive for",
+                        idx + 1
+                    )));
+                }
+                let field = lua_table_to_view_field(child, idx)?;
+                let ViewFieldKind::Button {
+                    variant,
+                    icon,
+                    tooltip,
+                } = field.kind
+                else {
+                    return Err(LuaError::RuntimeError(format!(
+                        "{context}: a row's children must be `type = \"button\"` fields — \
+                         child {} has type {:?}",
+                        idx + 1,
+                        field.kind.type_name()
+                    )));
+                };
+                buttons.push(ViewButton {
+                    id: field.id,
+                    label: field.label,
+                    disabled: field.disabled,
+                    variant,
+                    icon,
+                    tooltip,
+                });
+            }
+            let mut out = Vec::new();
+            for _ in 0..quantize_rows_floor(margin_top) {
+                out.push(spacer_row());
+            }
+            for _ in 0..quantize_rows_ceil(padding_top) {
+                out.push(spacer_row());
+            }
+            out.push(ViewField {
+                kind: ViewFieldKind::Buttons { buttons },
+                ..Default::default()
+            });
+            for _ in 0..quantize_rows_ceil(padding_bottom) {
+                out.push(spacer_row());
+            }
+            for _ in 0..quantize_rows_floor(margin_bottom) {
+                out.push(spacer_row());
+            }
+            Ok(out)
+        }
+        other => Err(LuaError::RuntimeError(format!(
+            "{context}: unknown container kind {other:?} (expected \"row\" or \"column\")"
+        ))),
+    }
 }
 
 /// Parse a `kind = "..."` table into a [`crate::core::plugin_ui::ViewBody`].
@@ -8489,5 +8730,260 @@ mod tests {
             .expect("a view with no render callback must be a load error");
         assert!(err.contains("render"), "error must name `render`: {err}");
         assert!(!pm.is_view("vext"));
+    }
+
+    // ─── Layout containers (`kind = "row"/"column"`) ────────────────────────
+
+    /// A `column` with no `padding`/`margin`/`gap` flattens to exactly the
+    /// same `fields` a flat `fields` list of the same children would have
+    /// produced — the tree is opt-in sugar, not a new wire shape.
+    #[test]
+    fn column_with_no_spacing_flattens_to_the_same_fields_as_a_flat_list() {
+        use crate::core::plugin_ui::ViewFieldKind;
+        let pm = pm_with_view(
+            "column_plain",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "column",
+                        children = {
+                            { type = "text", id = "name", label = "Name", value = "" },
+                            { type = "text", id = "path", label = "Path", value = "" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(view.fields.len(), 2);
+        assert_eq!(view.fields[0].id, "name");
+        assert_eq!(view.fields[1].id, "path");
+        assert_eq!(
+            view.fields[0].kind,
+            ViewFieldKind::Text {
+                value: String::new(),
+                placeholder: String::new(),
+            }
+        );
+    }
+
+    /// A column's `gap` inserts one blank spacer row between each pair of
+    /// declared children — three children, two gaps, five flattened fields.
+    #[test]
+    fn column_gap_inserts_a_spacer_row_between_each_child() {
+        let pm = pm_with_view(
+            "column_gap",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "column", gap = 16,
+                        children = {
+                            { type = "text", id = "a", label = "A", value = "" },
+                            { type = "text", id = "b", label = "B", value = "" },
+                            { type = "text", id = "c", label = "C", value = "" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        let ids: Vec<&str> = view.fields.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "", "b", "", "c"]);
+    }
+
+    /// A column's `padding` inserts blank spacer rows before the first
+    /// child and after the last one.
+    #[test]
+    fn column_padding_adds_spacer_rows_around_the_children() {
+        let pm = pm_with_view(
+            "column_padding",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "column", padding = 16,
+                        children = {
+                            { type = "text", id = "a", label = "A", value = "" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        let ids: Vec<&str> = view.fields.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["", "a", ""]);
+    }
+
+    /// A `row` of `button` children becomes one `ViewFieldKind::Buttons`
+    /// field (the existing button-row primitive), in declaration order —
+    /// the shape the motivating sql-tool Connect/Cancel row needs.
+    #[test]
+    fn row_of_buttons_becomes_one_buttons_field() {
+        use crate::core::plugin_ui::{ViewButton, ViewFieldKind};
+        let pm = pm_with_view(
+            "row_buttons",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "row", align = "end", gap = 8,
+                        children = {
+                            { type = "button", id = "cancel", label = "Cancel" },
+                            { type = "button", id = "connect", label = "Connect",
+                              variant = "primary" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(view.fields.len(), 1);
+        let ViewFieldKind::Buttons { buttons } = &view.fields[0].kind else {
+            panic!(
+                "expected a single Buttons field, got {:?}",
+                view.fields[0].kind
+            );
+        };
+        assert_eq!(
+            buttons,
+            &vec![
+                ViewButton {
+                    id: "cancel".into(),
+                    label: "Cancel".into(),
+                    disabled: false,
+                    variant: None,
+                    icon: None,
+                    tooltip: None,
+                },
+                ViewButton {
+                    id: "connect".into(),
+                    label: "Connect".into(),
+                    disabled: false,
+                    variant: Some(crate::core::plugin_ui::ViewButtonVariant::Primary),
+                    icon: None,
+                    tooltip: None,
+                },
+            ]
+        );
+    }
+
+    /// A `row` nested inside a `column` lands as that one `Buttons` field in
+    /// declaration order among the column's other flattened fields —
+    /// exactly the sql-tool `{ fields..., row(Cancel, Connect) }` shape.
+    #[test]
+    fn a_row_nested_inside_a_column_lands_in_declaration_order() {
+        use crate::core::plugin_ui::ViewFieldKind;
+        let pm = pm_with_view(
+            "nested_row",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "column", gap = 12,
+                        children = {
+                            { type = "text", id = "name", label = "Name", value = "" },
+                            { kind = "row", align = "end", children = {
+                                { type = "button", id = "cancel", label = "Cancel" },
+                                { type = "button", id = "connect", label = "Connect" },
+                            }},
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        let ids: Vec<&str> = view.fields.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["name", "", ""]);
+        assert!(matches!(view.fields[2].kind, ViewFieldKind::Buttons { .. }));
+    }
+
+    /// An unknown top-level container `kind` is a loud Lua error, the same
+    /// fail-loudly convention every other unrecognised `kind`/`type` in
+    /// this module already follows.
+    #[test]
+    fn unknown_container_kind_is_a_lua_error() {
+        let pm = pm_with_view(
+            "bad_kind",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { kind = "diagonal", children = {} }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("an unknown top-level kind must error");
+        assert!(
+            err.contains("diagonal"),
+            "error must name the bad kind: {err}"
+        );
+    }
+
+    /// A bad `align` value on a container is a loud Lua error naming the
+    /// value and the key, not a silent fallback to `"start"`.
+    #[test]
+    fn bad_align_on_a_container_is_a_lua_error() {
+        let pm = pm_with_view(
+            "bad_align",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "row", align = "sideways",
+                        children = {
+                            { type = "button", id = "go", label = "Go" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("an unrecognised align must error");
+        assert!(
+            err.contains("sideways") && err.contains("align"),
+            "error must name the bad align value: {err}"
+        );
+    }
+
+    /// A `row` whose children are not all `type = "button"` fields is a
+    /// loud Lua error, since `quadraui::Form` has no horizontal primitive
+    /// for mixed field kinds — see `lua_table_to_view_container`'s doc.
+    #[test]
+    fn row_with_a_non_button_child_is_a_lua_error() {
+        let pm = pm_with_view(
+            "row_non_button",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "row",
+                        children = {
+                            { type = "text", id = "name", label = "Name", value = "" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("a non-button row child must error");
+        assert!(
+            err.contains("button"),
+            "error must explain that a row needs button children: {err}"
+        );
     }
 }

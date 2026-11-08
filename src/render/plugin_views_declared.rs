@@ -2319,3 +2319,175 @@ mod combo_box_translation_tests {
         assert!(engine.plugin_view_combo_edit.is_none());
     }
 }
+
+/// Painted-output proof that a `kind = "row"/"column"` layout container
+/// reaches `quadraui::tui::draw_form` the way
+/// `core::plugin::lua_table_to_view_container`'s flattening says it should
+/// — these tests build the `PluginView::fields` the flattening produces
+/// directly (that flattening itself, and the Lua `kind`/`align` error
+/// paths, are unit-tested in `core::plugin`'s own test module) and assert
+/// on the painted cells, not on `Form`/`PluginView` state.
+#[cfg(test)]
+mod layout_container_painted_tests {
+    use super::*;
+    use crate::core::plugin_ui::{spacer_row, PluginView, ViewButton, ViewField, ViewFieldKind};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    fn cell_char(buf: &Buffer, x: u16, y: u16) -> char {
+        buf[(x, y)].symbol().chars().next().unwrap_or(' ')
+    }
+
+    fn row_text(buf: &Buffer, y: u16, width: u16) -> String {
+        (0..width).map(|x| cell_char(buf, x, y)).collect()
+    }
+
+    fn dump(buf: &Buffer, width: u16) -> String {
+        (0..buf.area.height)
+            .map(|y| format!("{y:>2}|{}|", row_text(buf, y, width)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn text_field(id: &str, label: &str) -> ViewField {
+        ViewField {
+            id: id.into(),
+            label: label.into(),
+            kind: ViewFieldKind::Text {
+                value: String::new(),
+                placeholder: String::new(),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn view_of(fields: Vec<ViewField>) -> PluginView {
+        PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields,
+            body: None,
+            ..Default::default()
+        }
+    }
+
+    fn paint(view: &PluginView, width: u16, height: u16) -> Buffer {
+        let form = plugin_view_to_form("myview", view, 0, 0, false, None);
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        quadraui::tui::draw_form(&mut buf, area, &form, &quadraui::Theme::default());
+        buf
+    }
+
+    /// A column's `padding` — realised as a blank spacer row before the
+    /// first child and after the last one (see `plugin_ui`'s "Layout
+    /// containers" doc for the px-to-row quantization) — paints as a
+    /// genuinely blank row, with the field's own label one row below it.
+    #[test]
+    fn column_padding_paints_a_blank_row_before_the_first_field() {
+        let view = view_of(vec![spacer_row(), text_field("name", "Name")]);
+        let width = 30u16;
+        let buf = paint(&view, width, 2);
+
+        assert_eq!(
+            row_text(&buf, 0, width).trim(),
+            "",
+            "the padding spacer row must paint blank:\n{}",
+            dump(&buf, width)
+        );
+        assert!(
+            row_text(&buf, 1, width).contains("Name"),
+            "the field's label must paint on the row after the padding:\n{}",
+            dump(&buf, width)
+        );
+    }
+
+    /// A column's `gap` — one blank spacer row between each pair of
+    /// children — separates two fields' labels by exactly one blank
+    /// painted row.
+    #[test]
+    fn column_gap_paints_one_blank_row_between_two_fields() {
+        let view = view_of(vec![
+            text_field("a", "A"),
+            spacer_row(),
+            text_field("b", "B"),
+        ]);
+        let width = 30u16;
+        let buf = paint(&view, width, 3);
+
+        let row_a = (0..3)
+            .find(|&y| row_text(&buf, y, width).contains('A'))
+            .expect("field A must paint");
+        let row_b = (0..3)
+            .find(|&y| row_text(&buf, y, width).contains('B'))
+            .expect("field B must paint");
+        assert_eq!(
+            row_b,
+            row_a + 2,
+            "the gap spacer must separate the two fields by one blank row:\n{}",
+            dump(&buf, width)
+        );
+        assert_eq!(
+            row_text(&buf, row_a + 1, width).trim(),
+            "",
+            "the gap row itself must paint blank:\n{}",
+            dump(&buf, width)
+        );
+    }
+
+    /// A `row` of buttons flattens to one `Buttons` field (see
+    /// `core::plugin::lua_table_to_view_container`'s doc) and paints both
+    /// button labels on that single row — proving it is a horizontal row,
+    /// not two stacked fields. `align = "end"` is accepted at parse time
+    /// (`core::plugin`'s own tests cover that it is not a Lua error) but
+    /// has no effect on *where* the row paints yet: right/center
+    /// justification needs a `quadraui::FieldKind::ButtonRow` alignment
+    /// knob that does not exist in quadraui 0.9 (filed upstream — see this
+    /// issue's own doc), so both buttons still pack left, immediately
+    /// after the (empty) label column, exactly like `"start"` would.
+    #[test]
+    fn a_nested_button_row_paints_both_buttons_on_one_row() {
+        let view = view_of(vec![
+            text_field("name", "Name"),
+            ViewField {
+                kind: ViewFieldKind::Buttons {
+                    buttons: vec![
+                        ViewButton {
+                            id: "cancel".into(),
+                            label: "Cancel".into(),
+                            disabled: false,
+                            variant: None,
+                            icon: None,
+                            tooltip: None,
+                        },
+                        ViewButton {
+                            id: "connect".into(),
+                            label: "Connect".into(),
+                            disabled: false,
+                            variant: None,
+                            icon: None,
+                            tooltip: None,
+                        },
+                    ],
+                },
+                ..Default::default()
+            },
+        ]);
+        let width = 40u16;
+        let buf = paint(&view, width, 2);
+
+        let button_row = row_text(&buf, 1, width);
+        assert!(
+            button_row.contains("Cancel") && button_row.contains("Connect"),
+            "both buttons must paint on the row's single line:\n{}",
+            dump(&buf, width)
+        );
+        let cancel_at = button_row.find("Cancel").unwrap();
+        let connect_at = button_row.find("Connect").unwrap();
+        assert!(
+            cancel_at < connect_at,
+            "buttons must paint in declaration order:\n{}",
+            dump(&buf, width)
+        );
+    }
+}
