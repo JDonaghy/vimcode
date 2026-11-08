@@ -214,7 +214,7 @@ pub fn vimcode_data_dir() -> PathBuf {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             return PathBuf::from(local).join("vimcode");
         }
-        return vimcode_config_dir();
+        vimcode_config_dir()
     }
     #[cfg(target_os = "macos")]
     {

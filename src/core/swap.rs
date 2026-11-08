@@ -280,8 +280,10 @@ pub fn is_pid_alive(pid: u32) -> bool {
 /// crate for three functions; kernel32 is linked into every Windows binary
 /// by default, so no extra linker configuration is required.
 #[cfg(target_os = "windows")]
-#[allow(non_snake_case, non_camel_case_types)]
+#[allow(non_snake_case, non_camel_case_types, clippy::upper_case_acronyms)]
 mod windows_ffi {
+    // Names deliberately mirror the Win32 API (`HANDLE`, `BOOL`, `DWORD`)
+    // rather than following Rust naming conventions.
     pub type HANDLE = *mut std::ffi::c_void;
     pub type BOOL = i32;
     pub type DWORD = u32;
