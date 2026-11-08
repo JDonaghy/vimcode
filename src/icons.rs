@@ -88,7 +88,7 @@ impl Icon {
 
 // ─── Activity Bar ────────────────────────────────────────────────────────────
 
-pub const HAMBURGER: Icon = Icon::new("\u{f035c}", "\u{2630}"); // ☰
+pub const HAMBURGER: Icon = Icon::new("\u{f035c}", "\u{2261}"); // ≡
 
 // ─── Chrome icon identity ────────────────────────────────────────────────
 //

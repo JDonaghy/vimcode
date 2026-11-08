@@ -5686,8 +5686,8 @@ mod tests {
         /// well by the Explorer sidebar row or the breadcrumb segment
         /// painting the same filename.
         ///
-        /// `bounds.x`/`bounds.width` are *display columns* (the activity
-        /// bar's "☰" hamburger glyph is double-width), so this walks the
+        /// `bounds.x`/`bounds.width` are *display columns* (a wide glyph
+        /// such as a CJK file name occupies two), so this walks the
         /// row accumulating [`quadraui::tui::char_cell_width`] rather than
         /// `.chars().skip(n)` — the same char-vs-column distinction
         /// `build_tab_bar_icons`'s own doc traces to width calculations.

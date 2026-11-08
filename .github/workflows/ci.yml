@@ -575,6 +575,9 @@ jobs:
     - name: Build vcd.exe (release, no GTK)
       run: cargo build --release --bin vcd --no-default-features
 
+    - name: Run clippy (no GTK)
+      run: cargo clippy --no-default-features -- -D warnings
+
     - name: Smoke --version
       run: target\release\vcd.exe --version
 

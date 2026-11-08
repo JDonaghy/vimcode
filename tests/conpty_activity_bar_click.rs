@@ -38,30 +38,20 @@
 //! This exercises the entire real path for the input decoding through
 //! `App` dispatch with nothing stubbed out.
 //!
-//! # Ruling out a quadraui version bump before suspecting this test
+//! # When an icon is not found at its column
 //!
-//! `quadraui`'s only `src/`-level change between published versions 0.1.7
-//! and 0.1.8 is an additive `ShellApp::pre_render` hook (default no-op) and
-//! its single call site in `shell_adapter.rs`'s `render()`, run before
-//! `viewport`/`area` are computed — confirmed by diffing the two published
-//! crate sources directly. Vimcode's own consumer of that hook
-//! (`App::pre_render` / `App::sync_per_frame_backend_state`) only ever
-//! reaches `Backend::set_current_line_height` when
-//! `resolve_editor_line_height_px` returns `Some`, which per that
-//! function's own doc is true on native macOS only — every other backend,
-//! TUI included, gets `None` and leaves `chrome_line_height()`'s default
-//! (`Self::line_height()`, a fixed per-cell constant on TUI) untouched.
-//! Neither [`ICON_COLUMN`] (derived purely from
-//! `quadraui::shell::ShellConfig::activity_bar_width`) nor
-//! `quadraui::tui::activity_bar::draw_activity_bar_with_style` (byte-
-//! identical between 0.1.7 and 0.1.8) reads chrome line height at all, so
-//! there is no code path through which that version bump can move this
-//! test's expected icon column or its row-discovery polling. If this test
-//! regresses again right after a quadraui bump, suspect real-ConPTY startup
-//! timing (e.g. binary size growth nudging a cold start closer to
-//! [`SETTLE_TIMEOUT`]) or CI/hardware flakiness first, not activity-bar
-//! rendering math — and re-diff the two quadraui versions' `src/` trees
-//! directly before assuming otherwise.
+//! Compare the screen dump's rows with the in-process twin's. Icons one
+//! column right of [`ICON_COLUMN`], rows carrying the next row's content and
+//! a duplicated status line at the bottom mean ConPTY and the parser reading
+//! its output disagree about some glyph's cell width. ConPTY re-emits its
+//! buffer relying on cursor auto-advance and end-of-row autowrap, measured
+//! with its own (older) Unicode tables, while `vt100` measures with
+//! `unicode-width`'s. A glyph that is one cell to ConPTY but two to `vt100`
+//! (the Unicode-16-wide trigrams U+2630..U+2637, for example) overflows its
+//! row by one column, and every row after it cascades. A terminal emulator on
+//! current Unicode tables shows the same corruption, which is why
+//! `tests/icon_font_coverage.rs` requires every icon fallback glyph to be
+//! single-cell.
 #![cfg(windows)]
 
 use std::io::{Read, Write};
@@ -88,22 +78,17 @@ const PTY_COLS: u16 = 120;
 /// The activity bar's icon column, 0-indexed in cell units.
 ///
 /// Derived, not guessed: `quadraui::shell::ShellConfig::activity_bar_width`
-/// defaults to `3.0` (a line-height multiple), and vimcode's own
-/// `render::UnitProfile::cell()` (what the TUI backend uses — see
-/// `src/render.rs`'s `activity_bar_width_px: None` doc, "`None` on TUI,
-/// which leaves [...] own default [...] in charge") never overrides it, so
-/// the TUI activity bar is always exactly 3 cells wide: an accent column
-/// (`x = 0`, only painted for the active item), a separator column
-/// (`x = area.width - 1 = 2`), and everything else — here, exactly one
-/// column — for the icon glyph itself
-/// (`quadraui::tui::activity_bar::draw_activity_bar_with_style`: `content_start
-/// = area.x + 1`, `content_w = content_end - content_start = 1`, which takes
-/// the single-cell `set_cell` branch, never the wide-glyph `set_cell_wide`
-/// one — the bar is never wide enough for that branch to fire in this
-/// app's own configuration, independent of whether any given icon glyph is
-/// itself wide). The activity bar is also always the screen's leftmost
-/// element (`area.x == 0`), so this column is an absolute screen
-/// coordinate, not just bar-relative.
+/// defaults to `4.0` (a line-height multiple), and vimcode's own
+/// `render::UnitProfile::cell()` (what the TUI backend uses) leaves it in
+/// charge (`activity_bar_width_px: None`), so the TUI activity bar is 4
+/// cells wide: an accent column (`x = 0`, only painted for the active
+/// item), a separator column (`x = area.width - 1 = 3`), and two content
+/// columns between them. `quadraui::tui::activity_bar::draw_activity_bar_with_style`
+/// centres a single-cell glyph in those two columns at
+/// `content_start + (content_w - 1) / 2 = 1 + (2 - 1) / 2 = 1`. Every
+/// fallback glyph this test searches for is single-cell. The activity bar
+/// is always the screen's leftmost element (`area.x == 0`), so this column
+/// is an absolute screen coordinate, not just bar-relative.
 const ICON_COLUMN: u16 = 1;
 
 /// Shared state the reader thread updates: every byte it has ever seen, and
