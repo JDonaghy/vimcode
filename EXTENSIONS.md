@@ -318,7 +318,7 @@ Lua scripts have access to the `vimcode` global object. Scripts run in Lua 5.4.
 applied after it returns. The newer namespaces (`vimcode.buffer.*`, `vimcode.window.*`,
 `vimcode.keymap.set`/`list`, `vimcode.loop.*`, `vimcode.schedule`/`defer`,
 `vimcode.picker.*`, `vimcode.decor.*`, `vimcode.syntax.*`, `vimcode.undo.*`,
-`vimcode.diagnostics.*`, `vimcode.ui.open_view`, `vimcode.ui.toast`, `vimcode.http.*`,
+`vimcode.diagnostics.*`, `vimcode.ui.open_view`, `vimcode.ui.close_view`, `vimcode.ui.toast`, `vimcode.http.*`,
 `vimcode.fire_event`)
 are **immediate**: they act on the live editor at call time.
 
@@ -1063,6 +1063,10 @@ vimcode.ui.refresh("my_view")
 
 -- Open the view as an editor-area tab (from inside a callback):
 vimcode.ui.open_view("my_view", { location = "tab" })
+
+-- ...and close it again — a form's Cancel button, or a successful submit
+-- that should dismiss its own dialog, calls this:
+vimcode.ui.close_view("my_view")
 ```
 
 `register_view` must be called at **load time** (like `vimcode.command` and
@@ -1073,6 +1077,12 @@ later, and may use the whole `vimcode.*` API — including the immediate
 `open_view(name, opts)` is an immediate call. `"tab"` is the only `location` (and the
 default). An unknown view name or any other location raises an error. The tab behaves
 like any other tab: close it with `:tabclose`, split it or move it between groups.
+
+`close_view(name) -> bool` is the immediate-call counterpart: it closes every tab,
+split window and dock slot currently showing `name`, returning `false` if `name`
+wasn't open anywhere. An unknown view name raises an error, matching `open_view`.
+Each closed window goes through the same path `:q`/`<C-w>c` use, so it can never
+close the editor's very last window — a plugin cannot use this to quit vimcode.
 
 **Field types:**
 

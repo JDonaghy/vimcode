@@ -715,6 +715,22 @@ end)
 vimcode.command("Zq2059TextOpenDock", function()
   vimcode.ui.open_view("{TEXT_VIEW}", {{ location = "dock" }})
 end)
+
+-- #2139: a real `:Command` around `vimcode.ui.close_view`, reporting its
+-- boolean return via `vimcode.message` so scenarios can assert on it
+-- without reaching into engine internals — the sql-tool connection
+-- dialog's Cancel button is exactly this call.
+vimcode.command("Zq2139CloseView", function()
+  local closed = vimcode.ui.close_view("{VIEW}")
+  vimcode.message("Zq2139closed:" .. tostring(closed))
+end)
+
+-- Dock twin of `Zq2139CloseView`, closing `{TEXT_VIEW}` as docked by
+-- `Zq2059TextOpenDock`.
+vimcode.command("Zq2139CloseTextView", function()
+  local closed = vimcode.ui.close_view("{TEXT_VIEW}")
+  vimcode.message("Zq2139closed:" .. tostring(closed))
+end)
 "#
     )
 }
@@ -1930,6 +1946,33 @@ pub fn closing_the_tab_removes_it(driver: &mut impl ConformanceDriver) {
     assert!(
         !driver.screen_has(ROW_HEADER),
         ":tabclose must remove the plugin-view tab; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 6b — `vimcode.ui.close_view(name)` removes an editor-tab-hosted
+/// view's tab exactly like `:tabclose` (scenario 6) does — the API a form's
+/// Cancel button (or a successful submit) calls to dismiss its own tab,
+/// without the plugin having to know `:tabclose` exists at all.
+///
+/// `Tab`, `Tab` moves focus off the initially-focused `Text` field onto the
+/// `Button` row first, matching [`closing_the_tab_removes_it`]'s own
+/// reasoning for why the following `:` must not land inside the field.
+pub fn close_view_closes_the_tab(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(ROW_HEADER),
+        "precondition: the view must be painted before vimcode.ui.close_view \
+         removes its tab; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.type_text(":Zq2139CloseView");
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        !driver.screen_has(ROW_HEADER),
+        "vimcode.ui.close_view must remove the plugin-view tab; painted \
+         runs were {:?}",
         painted(driver)
     );
 }
@@ -3253,6 +3296,63 @@ pub fn dock_paints_and_reuses_by_name<
     );
 }
 
+/// Scenario 12b — `vimcode.ui.close_view(name)` closes a docked view,
+/// removing it from the painted bottom panel, and reports `false` the next
+/// time it's called since nothing is open under that name any more.
+/// `bottom_panel_open` is read only as a secondary check beside the painted
+/// assertion, never in place of it — mirroring
+/// [`dock_paints_and_reuses_by_name`]'s own `bottom_panel_kind` checks.
+pub fn close_view_closes_the_dock_then_reports_nothing_open<
+    D: ConformanceDriver + crate::harness::rest_client::DrivesIdle,
+>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) {
+    assert!(
+        h.driver.screen_has(TEXT_FIRST_LINE),
+        "precondition: the docked view must be painted before \
+         vimcode.ui.close_view closes it; painted runs were {:?}",
+        painted(&h.driver)
+    );
+
+    assert!(
+        h.engine
+            .borrow_mut()
+            .plugin_run_command("Zq2139CloseTextView", ""),
+        "fixture plugin must register the Zq2139CloseTextView command"
+    );
+    assert_eq!(
+        h.engine.borrow().message,
+        "Zq2139closed:true",
+        "vimcode.ui.close_view must return true for a view that was open \
+         in the dock"
+    );
+    assert!(
+        !h.engine.borrow().bottom_panel_open,
+        "vimcode.ui.close_view must close the dock, not just point it \
+         elsewhere"
+    );
+    h.driver.repaint();
+    assert!(
+        !h.driver.screen_has(TEXT_FIRST_LINE),
+        "the docked view must no longer paint once vimcode.ui.close_view \
+         has closed it; painted runs were {:?}",
+        painted(&h.driver)
+    );
+
+    assert!(
+        h.engine
+            .borrow_mut()
+            .plugin_run_command("Zq2139CloseTextView", ""),
+        "fixture plugin must register the Zq2139CloseTextView command"
+    );
+    assert_eq!(
+        h.engine.borrow().message,
+        "Zq2139closed:false",
+        "vimcode.ui.close_view must return false once the view is no \
+         longer open anywhere"
+    );
+}
+
 /// Nearest painted `LnNX1631` text-view line to `anchor_y` — keeps
 /// `scroll_at`'s needle valid across repeated wheel scrolls, since the exact
 /// line at a given screen row changes as the view scrolls (mirrors
@@ -3767,6 +3867,18 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_close_view_closes_the_tab_on_tui() {
+        let (mut h, _dir) = tui_tab();
+        close_view_closes_the_tab(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_close_view_closes_the_dock_then_reports_nothing_open_on_tui() {
+        let (mut h, _dir) = tui_dock();
+        close_view_closes_the_dock_then_reports_nothing_open(&mut h);
+    }
+
+    #[test]
     fn plugin_view_sidebar_false_view_has_no_activity_bar_zone_on_tui() {
         let (h, _dir) = tui();
         sidebar_false_view_has_no_activity_bar_zone(&h.driver);
@@ -4263,6 +4375,20 @@ mod tests {
     fn plugin_view_closing_the_tab_removes_it_on_gtk() {
         let (mut h, _dir) = gtk_tab();
         closing_the_tab_removes_it(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_close_view_closes_the_tab_on_gtk() {
+        let (mut h, _dir) = gtk_tab();
+        close_view_closes_the_tab(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_close_view_closes_the_dock_then_reports_nothing_open_on_gtk() {
+        let (mut h, _dir) = gtk_dock();
+        close_view_closes_the_dock_then_reports_nothing_open(&mut h);
     }
 
     #[cfg(feature = "gui")]
