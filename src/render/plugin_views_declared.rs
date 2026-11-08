@@ -32,11 +32,12 @@ fn parse_iso_date(s: &str) -> Option<quadraui::CalendarDate> {
     Some(quadraui::CalendarDate::new(year, month, day))
 }
 
-/// Resolve a plugin-declared codicon name (already validated at Lua-parse
-/// time by `plugin::lua_codicon_name`) into a real `quadraui::Icon`. The
-/// `unwrap_or_else` fallback never actually triggers for a name that passed
-/// that validation — it exists only so a future change to the two lookups
-/// falling out of sync degrades to a literal glyph instead of panicking.
+/// Resolve a plugin-declared `icon` string (already validated at Lua-parse
+/// time by `plugin::lua_codicon_name`) into a real `quadraui::Icon`. A known
+/// codicon name resolves to its glyph; the `unwrap_or_else` fallback paints
+/// the string verbatim — the only route a validated value takes there is the
+/// legacy single-character literal glyph `lua_codicon_name` accepts
+/// unvalidated (e.g. `"⟳"`, `"+"`), so it is reachable, not dead.
 fn resolve_view_icon(name: &str) -> quadraui::Icon {
     quadraui::Icon::codicon(name, name).unwrap_or_else(|| quadraui::Icon::new(name, name))
 }
@@ -168,17 +169,22 @@ pub fn plugin_view_to_form(
                 // quadraui 0.9's standalone `FieldKind::Button` has no
                 // `ButtonSpec` hook at all (unlike `ButtonRowItem`/
                 // `ToolbarButton::Action` below) — a field that didn't
-                // declare any of `variant`/`icon`/`tooltip` keeps painting
-                // through it unchanged. One that did is translated to a
-                // single-item `FieldKind::ButtonRow` instead, the only
-                // standalone-row kind that does carry a spec; the field's
-                // own label is blanked below so the caption paints once,
-                // inside that one item, not twice.
-                ViewFieldKind::Button {
-                    variant,
-                    icon,
-                    tooltip,
-                } if variant.is_none() && icon.is_none() && tooltip.is_none() => FieldKind::Button,
+                // declare `variant`/`icon` keeps painting through it
+                // unchanged. One that did is translated to a single-item
+                // `FieldKind::ButtonRow` instead, the only standalone-row
+                // kind that does carry a spec; the field's own label is
+                // blanked below so the caption paints once, inside that one
+                // item, not twice. `tooltip` alone does *not* trigger the
+                // reroute: no backend paints a form-row tooltip today, so a
+                // plugin that sets only `tooltip` would pay for the layout
+                // change (quadraui's right-anchored `< label >` box becomes a
+                // flush-left `[ label ]`) for zero visual benefit, and its
+                // `tooltip` is simply dropped rather than attached to a spec.
+                ViewFieldKind::Button { variant, icon, .. }
+                    if variant.is_none() && icon.is_none() =>
+                {
+                    FieldKind::Button
+                }
                 ViewFieldKind::Button {
                     variant,
                     icon,
@@ -349,11 +355,9 @@ pub fn plugin_view_to_form(
                     let glyph = if *collapsed { "▸" } else { "▾" };
                     StyledText::plain(format!("{glyph} {}", f.label))
                 }
-                ViewFieldKind::Button {
-                    variant,
-                    icon,
-                    tooltip,
-                } if variant.is_some() || icon.is_some() || tooltip.is_some() => {
+                ViewFieldKind::Button { variant, icon, .. }
+                    if variant.is_some() || icon.is_some() =>
+                {
                     StyledText::plain("")
                 }
                 _ => StyledText::plain(&f.label),
@@ -552,6 +556,8 @@ pub fn handle_plugin_view_ui_event(
         return true;
     };
     kind = remap_section_toggle(engine, &view_name, &field_id, kind);
+    kind = remap_styled_button_focus(engine, &view_name, &field_id, kind);
+
     // Selection follows the click, so j/k continues from where the user
     // clicked, and a click on a `Text`/`Password`/`TextArea` field primes it
     // for typing exactly as keyboard navigation does.
@@ -636,6 +642,8 @@ pub fn handle_plugin_view_tab_ui_event(
         return true;
     };
     kind = remap_section_toggle(engine, &view_name, &field_id, kind);
+    kind = remap_styled_button_focus(engine, &view_name, &field_id, kind);
+
     if let Some(view) = engine.plugin_views.get(&view_name) {
         if let Some(idx) = view.field_index(&field_id) {
             engine.plugin_view_focus_field(
@@ -716,6 +724,8 @@ pub fn handle_plugin_view_dock_ui_event(
         return true;
     };
     kind = remap_section_toggle(engine, &view_name, &field_id, kind);
+    kind = remap_styled_button_focus(engine, &view_name, &field_id, kind);
+
     if let Some(view) = engine.plugin_views.get(&view_name) {
         if let Some(idx) = view.field_index(&field_id) {
             engine.plugin_view_focus_field(
@@ -897,6 +907,45 @@ fn remap_section_toggle(
         ViewFieldKind::Section { collapsed, .. } => ViewEventKind::SectionToggled {
             collapsed: !collapsed,
         },
+        _ => kind,
+    }
+}
+
+/// A styled `Button` field (one that declared `variant` and/or `icon` — see
+/// [`plugin_view_to_form`]'s own doc for why `tooltip` alone does not count)
+/// is rerouted to a single-item `ButtonRow` in [`plugin_view_to_form`], reusing
+/// the *same* widget id as the enclosing `FormField` so the field's own label
+/// column stays blank and the caption paints once, inside that item. quadraui
+/// 0.9's `form_click_event` walks fields in declaration order and returns on
+/// the *first* id match — this field's own `_ => FormEvent::FocusChanged` arm
+/// wins before the `FieldKind::ButtonRow` arm below it is ever reached, so a
+/// click on a styled button decodes as a bare focus move rather than
+/// `ButtonClicked`. Re-resolve `field_id` against the live view and, when it
+/// names a `Button` field that opted into styling, remap `FocusChanged` into
+/// `ButtonClicked` — the event a plugin that asked for the styling vocabulary
+/// actually expects. A plain (unstyled) `Button` field never hits this: it
+/// keeps painting through `FieldKind::Button`, whose own id-match arm already
+/// returns `FormEvent::ButtonClicked` directly.
+fn remap_styled_button_focus(
+    engine: &Engine,
+    view_name: &str,
+    field_id: &str,
+    kind: crate::core::plugin_ui::ViewEventKind,
+) -> crate::core::plugin_ui::ViewEventKind {
+    use crate::core::plugin_ui::{ViewEventKind, ViewFieldKind};
+    if !matches!(kind, ViewEventKind::FocusChanged) {
+        return kind;
+    }
+    let Some(view) = engine.plugin_views.get(view_name) else {
+        return kind;
+    };
+    let Some(idx) = view.field_index(field_id) else {
+        return kind;
+    };
+    match &view.fields[idx].kind {
+        ViewFieldKind::Button { variant, icon, .. } if variant.is_some() || icon.is_some() => {
+            ViewEventKind::ButtonClicked
+        }
         _ => kind,
     }
 }
@@ -1123,6 +1172,22 @@ mod section_translation_tests {
         }
     }
 
+    fn styled_button_field(id: &str) -> ViewField {
+        ViewField {
+            id: id.into(),
+            label: String::new(),
+            hint: String::new(),
+            disabled: false,
+            error: None,
+            warning: None,
+            kind: ViewFieldKind::Button {
+                variant: Some(crate::core::plugin_ui::ViewButtonVariant::Danger),
+                icon: None,
+                tooltip: None,
+            },
+        }
+    }
+
     #[test]
     fn collapsible_section_translates_to_a_button_with_a_collapsed_glyph() {
         let view = PluginView {
@@ -1278,6 +1343,70 @@ mod section_translation_tests {
         );
         let kind = remap_section_toggle(&engine, "myview", "ok", ViewEventKind::ButtonClicked);
         assert_eq!(kind, ViewEventKind::ButtonClicked);
+    }
+
+    /// Reproduces the mouse-dead styled-`button` click regression:
+    /// `form_click_event` resolves a click on the single-item `ButtonRow`
+    /// [`plugin_view_to_form`] built for a styled `Button` field to
+    /// `FormEvent::FocusChanged` (the field's own id, matched before the
+    /// `ButtonRow` arm is ever reached) — `remap_styled_button_focus` must
+    /// turn that back into `ButtonClicked`.
+    #[test]
+    fn focus_changed_on_a_styled_button_field_remaps_to_button_clicked() {
+        use crate::core::plugin_ui::ViewEventKind;
+        let mut engine = Engine::new();
+        engine.plugin_views.insert(
+            "myview".to_string(),
+            PluginView {
+                id: "myview".into(),
+                schema_version: 1,
+                fields: vec![styled_button_field("del")],
+                body: None,
+            },
+        );
+        let kind = remap_styled_button_focus(&engine, "myview", "del", ViewEventKind::FocusChanged);
+        assert_eq!(kind, ViewEventKind::ButtonClicked);
+    }
+
+    /// A plain (unstyled) `button` field never hits the id collision in the
+    /// first place — `form_click_event`'s own `FieldKind::Button` arm
+    /// already returns `ButtonClicked` directly — but confirms the remap is
+    /// a no-op for it regardless, in case it's ever reached with
+    /// `FocusChanged` some other way.
+    #[test]
+    fn focus_changed_on_a_plain_button_field_is_unaffected() {
+        use crate::core::plugin_ui::ViewEventKind;
+        let mut engine = Engine::new();
+        engine.plugin_views.insert(
+            "myview".to_string(),
+            PluginView {
+                id: "myview".into(),
+                schema_version: 1,
+                fields: vec![button_field("go")],
+                body: None,
+            },
+        );
+        let kind = remap_styled_button_focus(&engine, "myview", "go", ViewEventKind::FocusChanged);
+        assert_eq!(kind, ViewEventKind::FocusChanged);
+    }
+
+    /// A plain focus move on a non-button field (the ordinary case —
+    /// clicking a text/dropdown/toggle row) must pass through unchanged.
+    #[test]
+    fn focus_changed_on_a_non_button_field_is_unaffected() {
+        use crate::core::plugin_ui::ViewEventKind;
+        let mut engine = Engine::new();
+        engine.plugin_views.insert(
+            "myview".to_string(),
+            PluginView {
+                id: "myview".into(),
+                schema_version: 1,
+                fields: vec![section_field("adv", "Advanced", true, false)],
+                body: None,
+            },
+        );
+        let kind = remap_styled_button_focus(&engine, "myview", "adv", ViewEventKind::FocusChanged);
+        assert_eq!(kind, ViewEventKind::FocusChanged);
     }
 
     #[test]
@@ -1469,6 +1598,15 @@ mod button_style_translation_tests {
             quadraui::tui::ratatui_color(theme.error_fg),
             "a `primary` button field must not pick up the danger tint; row: {primary_row:?}"
         );
+        // `resolve_view_icon`'s codicon fallback text is the icon's own name
+        // (see that function's own doc) — assert the row actually paints
+        // `"save"`, proving the `icon` key reached quadraui's `ButtonRowItem`
+        // and not merely that the `ButtonSpec` was built with it dropped.
+        assert!(
+            primary_row.contains("save"),
+            "an `icon` on a styled button field must paint its fallback glyph text; \
+             row: {primary_row:?}"
+        );
     }
 
     /// A plain `button` field (no `variant`/`icon`/`tooltip`) keeps
@@ -1494,6 +1632,42 @@ mod button_style_translation_tests {
         assert!(
             row.contains("< Go >"),
             "an unstyled button field must still paint quadraui's plain \
+             bracket chrome: {row:?}"
+        );
+    }
+
+    /// A `button` field that sets only `tooltip` (no `variant`/`icon`) must
+    /// *not* reroute to `ButtonRow`: no backend paints a form-row tooltip
+    /// today, so rerouting would pay for a layout change (quadraui's
+    /// right-anchored `< label >` becomes a flush-left `[ label ]`) for no
+    /// visible benefit, and the tooltip itself is simply dropped.
+    #[test]
+    fn a_tooltip_only_button_field_keeps_its_unstyled_look() {
+        let view = PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![button_field(
+                "go",
+                "Go",
+                ViewFieldKind::Button {
+                    variant: None,
+                    icon: None,
+                    tooltip: Some("Run it".into()),
+                },
+            )],
+            body: None,
+        };
+        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
+        assert_eq!(form.fields[0].kind, quadraui::FieldKind::Button);
+
+        let width = 40u16;
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
+        let theme = quadraui::Theme::default();
+        quadraui::tui::draw_form(&mut buf, Rect::new(0, 0, width, 1), &form, &theme);
+        let row = row_string(&buf, 0, width);
+        assert!(
+            row.contains("< Go >"),
+            "a tooltip-only button field must still paint quadraui's plain \
              bracket chrome: {row:?}"
         );
     }

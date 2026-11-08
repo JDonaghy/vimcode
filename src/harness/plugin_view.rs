@@ -56,7 +56,21 @@ pub const ROW_HEADER: &str = "HdZQ146";
 pub const ROW_TEXT_LABEL: &str = "UrZQ146";
 /// That row's plugin-declared value.
 pub const ROW_TEXT_VALUE: &str = "vaZQ146";
-/// A `button`-kind row's caption — the click target.
+/// A `button`-kind row's caption — the click target. Declared with
+/// `variant = "danger"` (see [`plugin_source`]) so
+/// [`clicking_a_button_reaches_the_plugin_handler`] doubles as the
+/// driver-tier regression coverage for the styled-`button` click-routing
+/// bug: `plugin_view_to_form` reroutes a styled `button` field to a
+/// single-item `ButtonRow` sharing the enclosing `FormField`'s widget id,
+/// and quadraui 0.9's `form_click_event` resolves that id match to
+/// `FormEvent::FocusChanged` before it ever reaches the `ButtonRow` arm —
+/// a click decoded as a bare focus move instead of `ButtonClicked`, so
+/// `on_event` never ran. `render::remap_styled_button_focus` remaps it
+/// back. This constant is deliberately the *only* button this fixture
+/// styles, rather than adding a parallel unstyled one, so one scenario
+/// proves both "the vocabulary parses and paints" and "the click still
+/// reaches the plugin" for the styled path — the shape every real
+/// `variant`/`icon` button in a plugin actually takes.
 pub const ROW_BUTTON: &str = "SdZQ146";
 /// A `toggle`-kind row's label.
 pub const ROW_TOGGLE: &str = "TgZQ146";
@@ -688,7 +702,8 @@ vimcode.ui.register_view("{VIEW}", {{
            value = "{ROW_TEXT_VALUE}" }},
         {{ type = "toggle", id = "tls",  label = "{ROW_TOGGLE}",
            value = count % 2 == 1 }},
-        {{ type = "button", id = "send", label = "{ROW_BUTTON}" }},
+        {{ type = "button", id = "send", label = "{ROW_BUTTON}",
+           variant = "danger" }},
         {{ type = "text",   id = "etx",  label = "{ROW_EMPTY_TEXT_LABEL}",
            value = "" }},
         {{ type = "date",   id = "dob",  label = "{ROW_DATE_LABEL}",
