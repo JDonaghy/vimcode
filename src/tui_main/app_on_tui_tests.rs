@@ -6117,6 +6117,19 @@ mod tests {
                 engine.buffer_mut().insert(0, "short\n");
                 engine
             }
+            // `Engine::new_for_test` captures the process directory as its
+            // explorer root, so both fixtures must be built under one shared
+            // claim or a concurrent `CwdGuard` writer can split them.
+            //
+            // Both guards, in the order every paint harness takes them
+            // (`PaintGuard` first, then `CwdReadGuard` — see
+            // `crate::test_paint`'s module doc): acquiring only the cwd claim
+            // here inverts that order against the harness built below, and a
+            // queued `CwdGuard` writer closes the cycle into a suite-wide
+            // deadlock. Both guards are thread-local reentrant, so the
+            // harnesses below simply join these.
+            let _paint = crate::test_paint::PaintGuard::acquire();
+            let _cwd = crate::test_cwd::CwdReadGuard::acquire();
             let h1 = harness(fixture());
             let h2 = harness(fixture());
 

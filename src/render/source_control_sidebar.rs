@@ -138,6 +138,7 @@ pub fn sc_button_toolbar(sc: &SourceControlData) -> quadraui::Toolbar {
             enabled,
             is_active: false,
             tooltip: String::new(),
+            spec: None,
         }
     };
 
@@ -578,6 +579,7 @@ pub fn sc_help_dialog() -> quadraui::Dialog {
             is_default: true,
             is_cancel: true,
             tint: None,
+            spec: None,
         }],
         severity: None,
         vertical_buttons: false,

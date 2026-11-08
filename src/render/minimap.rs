@@ -1335,6 +1335,7 @@ pub fn dialog_panel_to_quadraui_dialog(panel: &DialogPanel) -> quadraui::Dialog 
                 is_default: *is_selected,
                 is_cancel: *is_cancel,
                 tint: None,
+                spec: None,
             },
         )
         .collect();

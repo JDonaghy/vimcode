@@ -1698,31 +1698,33 @@ mod mac_driver_tests {
             );
         }
 
+        /// The find/replace panel's find-in-selection button glyph, painted
+        /// only while the panel is open.
+        const FIND_PANEL_GLYPH: &str = "\u{2261}";
+
         /// Cmd+F (VS Code's Mac default for `actions.find`) must
         /// open find, exactly like Ctrl+F on Linux/Windows
         /// (`tests/vscode_keybinding_parity.rs`'s
         /// `test_vscode_ctrl_f_opens_find`). Paint-based per CLAUDE.md's
-        /// rendered-output rule: the find/replace panel's own case-
-        /// sensitivity toggle (`render.rs`'s `FindReplacePanel`, label
-        /// `"Aa"`) is painted once the panel opens and nowhere else on this
-        /// fixture — the only other `"Aa"` literal in `render.rs` belongs to
-        /// the separate sidebar *Search* panel's own toggle, which this
-        /// fixture never opens.
+        /// rendered-output rule: the find/replace panel paints its
+        /// find-in-selection button ([`FIND_PANEL_GLYPH`]) once it opens, and
+        /// nothing else on this fixture paints that glyph.
         ///
         /// RED against the pre-#1745 tree (see the submodule-level
         /// RED-verification note above): `ctrl` stays `false`, so the
         /// Insert-mode engine treats the keystroke as a plain character
-        /// insertion instead — the find/replace panel never opens and
-        /// `"Aa"` never paints.
+        /// insertion instead — the find/replace panel never opens and the
+        /// button glyph never paints.
         #[test]
         fn cmd_f_opens_find() {
             let engine = vscode_engine("hello\n");
             let (_guards, mut driver) = super::driver(engine);
             driver.render();
             assert!(
-                !driver.screen_contains("Aa"),
-                "precondition: find/replace must start closed, so its \"Aa\" \
-                 toggle must not be painted yet; painted text was {:?}",
+                !driver.screen_contains(FIND_PANEL_GLYPH),
+                "precondition: find/replace must start closed, so its \
+                 find-in-selection button must not be painted yet; painted \
+                 text was {:?}",
                 driver.painted_texts()
             );
 
@@ -1737,10 +1739,10 @@ mod mac_driver_tests {
             driver.render();
 
             assert!(
-                driver.screen_contains("Aa"),
+                driver.screen_contains(FIND_PANEL_GLYPH),
                 "Cmd+F must open find on the macOS GUI, the same as Ctrl+F \
-                 on Linux/Windows — the find/replace panel's \"Aa\" toggle \
-                 must now be painted; painted text was {:?}",
+                 on Linux/Windows — the find/replace panel's find-in-selection \
+                 button must now be painted; painted text was {:?}",
                 driver.painted_texts()
             );
         }

@@ -987,6 +987,7 @@ pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastOverlay> {
                         id: quadraui::WidgetId::new(format!("toast-action-{}-{i}", t.id)),
                         label: a.kind.button_label().to_string(),
                         primary: a.primary,
+                        spec: None,
                     })
                     .collect(),
                 accent: None,

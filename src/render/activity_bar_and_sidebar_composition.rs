@@ -585,6 +585,8 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     label_position: None,
                     label_align: None,
                     label_width: None,
+                    control_width: None,
+                    min_control_width: None,
                     tab_index: None,
                 }
             }
@@ -611,6 +613,8 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     label_position: None,
                     label_align: None,
                     label_width: None,
+                    control_width: None,
+                    min_control_width: None,
                     tab_index: None,
                 }
             }
@@ -644,6 +648,8 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     label_position: None,
                     label_align: None,
                     label_width: None,
+                    control_width: None,
+                    min_control_width: None,
                     tab_index: None,
                 }
             }
@@ -693,6 +699,8 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     label_position: None,
                     label_align: None,
                     label_width: None,
+                    control_width: None,
+                    min_control_width: None,
                     tab_index: None,
                 }
             }
@@ -711,6 +719,8 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
         label_position: Default::default(),
         label_align: Default::default(),
         label_width: None,
+        control_width: Default::default(),
+        min_control_width: None,
     }
 }
 
