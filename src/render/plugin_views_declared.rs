@@ -1896,16 +1896,16 @@ mod button_style_translation_tests {
     }
 }
 
-/// Proves the Lua `label_position`/`control_width` layout knobs
-/// (`plugin::lua_label_position`/`plugin::lua_control_width`,
-/// `ViewField::label_position`/`ViewField::control_width`) actually reach
-/// the painted `quadraui::Form` through [`plugin_view_to_form`], not just
-/// that the parsed [`ViewField`] carries the right enum in memory.
+/// Proves the Lua layout knobs (`label_position`, `label_align`,
+/// `label_width`, `control_width`, `min_control_width`) declared either
+/// form-wide on a view or per field reach the **painted** output of
+/// [`plugin_view_to_form`], by reading the cells `quadraui::tui::draw_form`
+/// wrote — not by inspecting the `quadraui::Form` fields it built.
 #[cfg(test)]
 mod layout_knob_translation_tests {
     use super::*;
     use crate::core::plugin_ui::{
-        PluginView, ViewControlWidth, ViewField, ViewFieldKind, ViewLabelPosition,
+        PluginView, ViewControlWidth, ViewField, ViewFieldKind, ViewLabelAlign, ViewLabelPosition,
     };
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
@@ -1914,108 +1914,231 @@ mod layout_knob_translation_tests {
         buf[(x, y)].symbol().chars().next().unwrap_or(' ')
     }
 
-    /// A field whose resolved `label_position` is `Top` paints its label on
-    /// its own row above the input, with a dedicated row reserved for it —
-    /// not beside the input on the same row, today's only pre-existing
-    /// behaviour.
-    #[test]
-    fn label_position_top_paints_the_label_on_its_own_row_above_the_control() {
-        let view = PluginView {
+    /// One painted row, as text, so assertions can talk about what the user
+    /// sees instead of about cell coordinates.
+    fn row_text(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| cell_char(buf, x, y)).collect()
+    }
+
+    /// The whole painted buffer, for assertion messages.
+    fn dump(buf: &Buffer) -> String {
+        (0..buf.area.height)
+            .map(|y| format!("{y:>2}|{}|", row_text(buf, y)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The first painted row containing `needle`.
+    fn row_containing(buf: &Buffer, needle: &str) -> Option<u16> {
+        (0..buf.area.height).find(|&y| row_text(buf, y).contains(needle))
+    }
+
+    fn paint(view: &PluginView, width: u16, height: u16) -> Buffer {
+        let form = plugin_view_to_form("myview", view, 0, 0, false, None);
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        quadraui::tui::draw_form(&mut buf, area, &form, &quadraui::Theme::default());
+        buf
+    }
+
+    /// Distance between the opening and closing bracket of row `y`'s
+    /// control — one less than the control's painted width, since
+    /// `draw_form` closes at `control_start + control_width - 1`.
+    fn bracket_span(buf: &Buffer, y: u16) -> u16 {
+        let w = buf.area.width;
+        let open = (0..w)
+            .find(|&x| cell_char(buf, x, y) == '[')
+            .unwrap_or_else(|| panic!("no opening bracket painted:\n{}", dump(buf)));
+        let close = (open..w)
+            .find(|&x| cell_char(buf, x, y) == ']')
+            .unwrap_or_else(|| panic!("no closing bracket painted:\n{}", dump(buf)));
+        close - open
+    }
+
+    fn toggle_field(id: &str, label: &str) -> ViewField {
+        ViewField {
+            id: id.into(),
+            label: label.into(),
+            kind: ViewFieldKind::Toggle { value: true },
+            ..Default::default()
+        }
+    }
+
+    fn text_field(id: &str, label: &str, value: &str) -> ViewField {
+        ViewField {
+            id: id.into(),
+            label: label.into(),
+            kind: ViewFieldKind::Text {
+                value: value.into(),
+                placeholder: String::new(),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn view_of(fields: Vec<ViewField>) -> PluginView {
+        PluginView {
             id: "v".into(),
             schema_version: 1,
-            fields: vec![ViewField {
-                id: "name".into(),
-                label: "Name".into(),
-                kind: ViewFieldKind::Toggle { value: true },
-                label_position: Some(ViewLabelPosition::Top),
-                ..Default::default()
-            }],
+            fields,
             body: None,
             ..Default::default()
-        };
-        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
-        assert_eq!(
-            form.fields[0].label_position,
-            Some(quadraui::LabelPosition::Top),
-            "the per-field override must reach the painted `FormField`"
-        );
+        }
+    }
 
-        let width = 30u16;
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, 2));
-        let theme = quadraui::Theme::default();
-        quadraui::tui::draw_form(&mut buf, Rect::new(0, 0, width, 2), &form, &theme);
-
-        // Row 0 carries the label text, by itself.
-        let row0: String = (1..5).map(|x| cell_char(&buf, x, 0)).collect();
-        assert_eq!(
-            row0, "Name",
-            "the label must paint on its own row: {row0:?}"
-        );
-
-        // Row 1 carries the toggle glyph, with no label beside it.
-        let found_toggle = (1..width).any(|x| cell_char(&buf, x, 1) == 'x');
+    /// A view that declares no layout knob paints a label beside its
+    /// control, on the same row — the baseline every other test here
+    /// contrasts against.
+    #[test]
+    fn a_view_with_no_layout_knobs_paints_its_label_beside_its_control() {
+        let buf = paint(&view_of(vec![toggle_field("name", "Name")]), 30, 4);
+        let row = row_containing(&buf, "Name").expect("the label must paint");
         assert!(
-            found_toggle,
-            "the toggle must paint on the row below the label, not beside it"
+            row_text(&buf, row).contains("[x]"),
+            "the default layout keeps label and control on one row:\n{}",
+            dump(&buf)
         );
     }
 
-    /// A field whose resolved `control_width` is `Fixed(n)` closes its
-    /// bracketed control exactly `n` cells after it starts, regardless of
-    /// how much row width is available — proving the override reaches the
-    /// painted control geometry rather than the row's default `Fill`
-    /// behaviour (which stretches to the row's right edge).
+    /// `label_position = "top"` declared form-wide lifts the label onto a
+    /// row of its own, above a control row that carries no label.
     #[test]
-    fn control_width_fixed_stops_the_control_at_n_cells() {
-        let view = PluginView {
-            id: "v".into(),
-            schema_version: 1,
-            fields: vec![ViewField {
-                id: "name".into(),
-                label: "Name".into(),
-                kind: ViewFieldKind::Text {
-                    value: "a very long value that would otherwise stretch far".into(),
-                    placeholder: String::new(),
-                },
-                control_width: Some(ViewControlWidth::Fixed(10.0)),
-                ..Default::default()
-            }],
-            body: None,
-            ..Default::default()
-        };
-        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
+    fn form_wide_label_position_top_lifts_the_label_off_its_control_row() {
+        let mut view = view_of(vec![toggle_field("name", "Name")]);
+        view.label_position = Some(ViewLabelPosition::Top);
+        let buf = paint(&view, 30, 4);
+
+        let label_row = row_containing(&buf, "Name").expect("the label must paint");
+        let control_row = row_containing(&buf, "[x]").expect("the toggle must paint");
         assert_eq!(
-            form.fields[0].control_width,
-            Some(quadraui::ControlWidth::Fixed(10.0)),
-            "the per-field override must reach the painted `FormField`"
-        );
-
-        let width = 60u16;
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
-        let theme = quadraui::Theme::default();
-        quadraui::tui::draw_form(&mut buf, Rect::new(0, 0, width, 1), &form, &theme);
-
-        let open_col = (1..width)
-            .find(|&x| cell_char(&buf, x, 0) == '[')
-            .expect("the control's opening bracket must paint");
-        let close_col = (open_col..width)
-            .find(|&x| cell_char(&buf, x, 0) == ']')
-            .expect("the control's closing bracket must paint");
-
-        // `Fixed(10)` closes the bracket 9 cells after it opens
-        // (`control_start + control_width - 1`), nowhere near the row's
-        // right edge at column 59.
-        assert_eq!(
-            close_col - open_col,
-            9,
-            "a `control_width = {{ fixed = 10 }}` field must close its \
-             bracket exactly 9 cells after it opens, not stretch to fill \
-             the row"
+            label_row + 1,
+            control_row,
+            "the label must paint on the row directly above the toggle:\n{}",
+            dump(&buf)
         );
         assert!(
-            (close_col as usize) < width as usize - 10,
-            "the fixed-width control must stop well short of the row's \
-             right edge: close_col={close_col}, width={width}"
+            !row_text(&buf, label_row).contains('['),
+            "the label's own row must carry no control:\n{}",
+            dump(&buf)
+        );
+    }
+
+    /// A per-field `label_position` overrides the form-wide default for
+    /// that row alone: the inheriting field's label sits above its control,
+    /// the overriding field's label stays beside its own.
+    #[test]
+    fn a_field_level_label_position_overrides_the_form_wide_default() {
+        let mut view = view_of(vec![
+            toggle_field("name", "Name"),
+            ViewField {
+                label_position: Some(ViewLabelPosition::Left),
+                ..toggle_field("flag", "Flag")
+            },
+        ]);
+        view.label_position = Some(ViewLabelPosition::Top);
+        let buf = paint(&view, 30, 6);
+
+        let name_row = row_containing(&buf, "Name").expect("the first label must paint");
+        assert!(
+            !row_text(&buf, name_row).contains('['),
+            "the inheriting field's label must sit alone above its control:\n{}",
+            dump(&buf)
+        );
+        let flag_row = row_containing(&buf, "Flag").expect("the second label must paint");
+        assert!(
+            row_text(&buf, flag_row).contains("[x]"),
+            "the overriding field's label must stay beside its control:\n{}",
+            dump(&buf)
+        );
+    }
+
+    /// `label_width` reserves a fixed label column and `label_align = "end"`
+    /// pushes the label text to that column's right edge, so the label
+    /// starts well right of column 1.
+    #[test]
+    fn form_wide_label_width_and_end_align_right_align_the_label_column() {
+        let mut view = view_of(vec![toggle_field("name", "Name")]);
+        view.label_width = Some(15.0);
+        view.label_align = Some(ViewLabelAlign::End);
+        let buf = paint(&view, 40, 3);
+
+        let row = row_containing(&buf, "Name").expect("the label must paint");
+        // A 15-cell column starting at column 1 ends at column 16; a
+        // 4-cell label aligned to its end therefore starts at column 12.
+        assert_eq!(
+            row_text(&buf, row).find("Name"),
+            Some(12),
+            "`label_width = 15` + `label_align = \"end\"` must right-align \
+             the label inside its column:\n{}",
+            dump(&buf)
+        );
+    }
+
+    /// A per-field `control_width = { fixed = n }` closes the bracketed
+    /// control `n - 1` cells after it opens, however wide the row is —
+    /// instead of the default `Fill`, which stretches to the right edge.
+    #[test]
+    fn control_width_fixed_stops_the_control_at_n_cells() {
+        let view = view_of(vec![ViewField {
+            control_width: Some(ViewControlWidth::Fixed(10.0)),
+            ..text_field(
+                "name",
+                "Name",
+                "a very long value that would otherwise stretch far",
+            )
+        }]);
+        let width = 60u16;
+        let buf = paint(&view, width, 1);
+
+        assert_eq!(
+            bracket_span(&buf, 0),
+            9,
+            "a `control_width = {{ fixed = 10 }}` field must close its \
+             bracket 9 cells after it opens, not stretch to fill the row:\n{}",
+            dump(&buf)
+        );
+    }
+
+    /// The same knob declared form-wide applies to a field that sets none
+    /// of its own.
+    #[test]
+    fn form_wide_control_width_fixed_applies_to_a_field_with_no_override() {
+        let mut view = view_of(vec![text_field("name", "Name", "a long enough value here")]);
+        view.control_width = Some(ViewControlWidth::Fixed(10.0));
+        let buf = paint(&view, 60, 1);
+
+        assert_eq!(
+            bracket_span(&buf, 0),
+            9,
+            "the form-wide fixed control width must reach the painted row:\n{}",
+            dump(&buf)
+        );
+    }
+
+    /// `control_width = "content"` shrinks the control to its own text, and
+    /// `min_control_width` then floors how far it may shrink.
+    #[test]
+    fn control_width_content_shrinks_to_its_text_and_min_control_width_floors_it() {
+        let mut view = view_of(vec![text_field("name", "Name", "ab")]);
+        view.control_width = Some(ViewControlWidth::Content);
+        let buf = paint(&view, 60, 1);
+        // `"ab"` plus its two brackets is a 4-cell control.
+        assert_eq!(
+            bracket_span(&buf, 0),
+            3,
+            "`control_width = \"content\"` must shrink the control to its \
+             own text:\n{}",
+            dump(&buf)
+        );
+
+        view.min_control_width = Some(20.0);
+        let buf = paint(&view, 60, 1);
+        assert_eq!(
+            bracket_span(&buf, 0),
+            19,
+            "`min_control_width = 20` must floor the content-sized \
+             control:\n{}",
+            dump(&buf)
         );
     }
 }
