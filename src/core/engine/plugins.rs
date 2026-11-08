@@ -4295,9 +4295,10 @@ mod ext_contributions_tests {
     use crate::core::engine::Engine;
 
     /// Write `extensions/<ext_name>/{manifest.toml, README.md,
-    /// <script_name>.lua}` under an isolated `$HOME`, mark the extension
-    /// installed, and return the engine plus the isolated-home guard (the
-    /// caller must keep it alive for the duration of the test).
+    /// <script_name>.lua}` under an isolated `$HOME` and mark the
+    /// extension installed. Returns just the `Engine` — each caller
+    /// creates and holds its own `set_test_home` guard, so there is no
+    /// separate guard to return here.
     fn install_fixture_extension_with_script(
         home: &std::path::Path,
         ext_name: &str,
@@ -4338,6 +4339,7 @@ mod ext_contributions_tests {
         })
         vimcode.ui.register_view("sql_conn", {
             title = "SQL Connection",
+            sidebar = false,
             render = function() return { fields = {} } end,
         })
     "#;
@@ -4411,11 +4413,18 @@ mod ext_contributions_tests {
             .map(|s| s.buffer.content.to_string())
             .unwrap_or_default();
 
+        // `buffer.content` holds the *rendered* markdown (`open_markdown_
+        // preview_in_tab` runs it through `render_markdown` before storing
+        // it), so headings lose their `#`/`##` marker and bullets render as
+        // `•` rather than the generated `-` — assert against that rendered
+        // form, not the raw markdown `ext_contributions_markdown` built.
         for expected in [
             "Provides",
             "SQL: New Connection",
             ",r",
             "Run query",
+            "Panels",
+            "Views",
             "SQL Connection",
             "database connection tool",
         ] {
@@ -4424,6 +4433,85 @@ mod ext_contributions_tests {
                 "expected tab content to contain {expected:?}; got:\n{content}"
             );
         }
+        // The Panels heading's own row must be followed by the panel's
+        // title as a distinct bullet line, strictly before the Views
+        // heading — not merely present anywhere in the content, which
+        // `"SQL: New Connection"`'s `"SQL"` substring would otherwise let
+        // a missing Panels row slip past.
+        let panels_idx = content
+            .find("Panels\n")
+            .expect("Panels heading must be present");
+        let views_idx = content
+            .find("Views\n")
+            .expect("Views heading must be present");
+        assert!(
+            panels_idx < views_idx,
+            "Panels heading must come before Views heading; got:\n{content}"
+        );
+        let panels_section = &content[panels_idx..views_idx];
+        assert!(
+            panels_section.contains("SQL\n") && !panels_section.contains("SQL Connection"),
+            "expected a distinct 'SQL' panel row (and not the tab-only \
+             view's title) between the Panels and Views headings; \
+             got:\n{panels_section}"
+        );
+        let views_section = &content[views_idx..];
+        assert!(
+            views_section.contains("SQL Connection"),
+            "expected the tab-only view's title under the Views heading; \
+             got:\n{views_section}"
+        );
+
+        drop(_home_guard);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An installed extension with no `README.md` on disk (and nowhere to
+    /// fetch one from, `base_url == ""`) must still open a tab listing its
+    /// contributions — the fallback that keeps the Provides listing from
+    /// being reachable only through an extension's README.
+    #[test]
+    fn opening_the_readme_falls_back_to_contributions_when_no_readme_exists() {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_2142_no_readme_fallback_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        // Write the extension's manifest + script directly (skipping
+        // `install_fixture_extension_with_script`'s README.md write) so
+        // there is genuinely no README on disk.
+        let ext_dir = home
+            .join(".config")
+            .join("vimcode")
+            .join("extensions")
+            .join("sql-tool");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("manifest.toml"),
+            "name = \"sql-tool\"\ndisplay_name = \"2142 Fixture\"\n",
+        )
+        .unwrap();
+        std::fs::write(ext_dir.join("sql_tool.lua"), FIXTURE_LUA).unwrap();
+
+        let mut engine = Engine::new();
+        engine.extension_state.mark_installed("sql-tool");
+        engine.plugin_init();
+
+        engine.ext_show_readme_or_fetch_async("sql-tool", "SQL Tool", "", true);
+        let content = engine
+            .buffer_manager
+            .get(engine.active_buffer_id())
+            .map(|s| s.buffer.content.to_string())
+            .unwrap_or_default();
+
+        assert!(
+            content.contains("SQL: New Connection"),
+            "a README-less installed extension must still open a tab \
+             listing its contributions; got:\n{content}"
+        );
 
         drop(_home_guard);
         let _ = std::fs::remove_dir_all(&home);

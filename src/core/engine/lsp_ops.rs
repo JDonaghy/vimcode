@@ -403,7 +403,13 @@ impl Engine {
             return;
         }
         if base_url.is_empty() {
-            if show_missing_message {
+            // No README on disk and nowhere to fetch one from — still show
+            // the extension's own Provides listing (commands/keymaps/
+            // panels/views) if it has any, rather than leaving the user
+            // with nothing at all just because it ships no README.
+            if let Some(provides) = self.ext_contributions_markdown(name) {
+                self.open_markdown_preview_in_tab(&provides, display);
+            } else if show_missing_message {
                 self.message = format!("No README available for '{name}'. Press i to install.");
             }
             return;
@@ -445,10 +451,17 @@ impl Engine {
                 let combined = self.ext_readme_with_contributions(&name, &content);
                 self.open_markdown_preview_in_tab(&combined, &display);
             }
-            None if show_missing_message => {
-                self.message = format!("No README available for '{name}'. Press i to install.");
+            // Same no-README fallback as the synchronous `base_url.is_empty()`
+            // branch above: the network fetch came back empty, but if the
+            // extension is loaded with its own commands/keymaps/panels/
+            // views, show those rather than nothing.
+            None => {
+                if let Some(provides) = self.ext_contributions_markdown(&name) {
+                    self.open_markdown_preview_in_tab(&provides, &display);
+                } else if show_missing_message {
+                    self.message = format!("No README available for '{name}'. Press i to install.");
+                }
             }
-            None => {}
         }
         true
     }
@@ -1068,7 +1081,19 @@ impl Engine {
     /// README is shown unmodified.
     pub(crate) fn ext_contributions_markdown(&self, ext_name: &str) -> Option<String> {
         let pm = self.plugin_manager.as_ref()?;
-        let plugin_names = self.ext_plugin_names.get(ext_name)?;
+        // Case-insensitive: `ext_plugin_names` is keyed by the extension's
+        // *directory* name (`plugin_init`'s own loop, mirroring how it
+        // matches manifests to directories with `eq_ignore_ascii_case`),
+        // while callers here pass the manifest's `name`. An exact-match
+        // `.get()` would silently miss on a case-insensitive filesystem
+        // (macOS, Windows) where the two differ only in case, making the
+        // Provides section appear on Linux and not there — a
+        // platform-dependent behaviour difference this avoids.
+        let plugin_names = self
+            .ext_plugin_names
+            .iter()
+            .find(|(dir_name, _)| dir_name.eq_ignore_ascii_case(ext_name))
+            .map(|(_, names)| names)?;
 
         let mut commands: Vec<crate::core::plugin::PluginCommandEntry> = Vec::new();
         let mut keymaps: Vec<(String, String, Option<String>)> = Vec::new();
@@ -1102,6 +1127,12 @@ impl Engine {
 
         commands.sort_by(|a, b| a.name.cmp(&b.name));
         keymaps.sort();
+        // A reload (`:Plugin reload`, enable/disable, or the install flow's
+        // `poll_ext_scripts`) resets `lua_keymap_next_id` to 0 for the fresh
+        // `PluginManager` but only *appends* to `user_keymaps`, so an id can
+        // briefly collide with a stale entry from the previous generation —
+        // dedup after sort keeps that from printing the same keymap twice.
+        keymaps.dedup();
         panels.sort();
         panels.dedup();
         views.sort();
@@ -1147,12 +1178,14 @@ impl Engine {
         Some(md)
     }
 
-    /// Prefix `readme` with `ext_name`'s "## Provides" section (if any),
+    /// Append `ext_name`'s "## Provides" section (if any) after `readme`,
     /// for the combined content `ext_show_readme_or_fetch_async`/
-    /// `poll_ext_readme` open in the README preview tab.
+    /// `poll_ext_readme` open in the README preview tab. Appended rather
+    /// than prefixed so the README's own `# Title` heading still renders
+    /// first.
     pub(crate) fn ext_readme_with_contributions(&self, ext_name: &str, readme: &str) -> String {
         match self.ext_contributions_markdown(ext_name) {
-            Some(provides) => format!("{provides}\n{readme}"),
+            Some(provides) => format!("{readme}\n\n{provides}"),
             None => readme.to_string(),
         }
     }
