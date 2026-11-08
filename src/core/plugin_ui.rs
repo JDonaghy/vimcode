@@ -95,6 +95,123 @@ fn default_schema_version() -> u32 {
     VIEW_SCHEMA_VERSION
 }
 
+// ─── Layout containers (`kind = "row"` / `"column"`) ────────────────────────
+//
+// A `render()` callback may return a container node — `kind = "row"` or
+// `kind = "column"` with `children` — instead of a flat `fields` list. This
+// is Lua-authoring sugar only: [`crate::core::plugin::lua_table_to_view`]
+// (the one place that owns the translation, mirroring every other
+// Lua-table-to-wire-type rule in this module's doc) flattens the whole tree
+// into the same flat `PluginView::fields` this module has always carried,
+// in depth-first declaration order, before a `PluginView` ever exists — the
+// wire shape, [`VIEW_SCHEMA_VERSION`], `render::plugin_view_to_form`, and
+// every keyboard/mouse/focus path downstream of it are all unaware a tree
+// was ever involved, which is why adding it needed no schema bump and no
+// changes outside `lua_table_to_view`'s own module.
+//
+// `quadraui::Form` (see this module's top doc) has no padding/margin/gap
+// primitive of its own — it is a uniform-row-height vertical field stack,
+// nothing else. A column's vertical `padding`/`margin`/`gap` (declared in
+// px, the same surface-native-units convention `label_width`/
+// `control_width` already use) is therefore realised as extra blank
+// `ViewFieldKind::Label` rows spliced between/around its children: the
+// only vertical spacing unit `Form` offers. [`quantize_rows_ceil`] and
+// [`quantize_rows_floor`] below do that px-to-row-count conversion,
+// against the nominal (not live-measured) cell constants a Lua author's
+// declared pixel value is quantized against — mirroring the
+// `quadraui-binding-core::layout::Spacing` convention this issue's own
+// design doc points at, lifted by hand since vimcode does not depend on
+// that crate (see `Cargo.toml`'s quadraui dependency comment).
+//
+// Horizontal (`left`/`right`) padding/margin and a row's `align` are
+// accepted and validated (an unrecognised `align` is a loud Lua error,
+// same convention as an unknown `kind`) but have **no visual effect yet**:
+// doing either for real needs `quadraui::Form`/`FieldKind::ButtonRow` to
+// learn a horizontal-indent or content-justification primitive, which does
+// not exist in quadraui 0.9. That gap is filed upstream rather than
+// hand-rolled here with per-backend text measurement, which the
+// Platform-Neutrality Rule (`CLAUDE.md`) rules out as a fix location.
+
+/// Nominal pixel height of one `quadraui::Form` row — one text line's
+/// worth of vertical space. Mirrors the `NOMINAL_LINE_HEIGHT = 16` constant
+/// every quadraui backend's own testing fixture hardcodes
+/// (`gtk`/`tui`/`macos`/`win`'s `testing` modules) to turn a cell-grid
+/// row count into a pixel height with no live font metric in play — the
+/// same situation a container's padding/gap is resolved in, at
+/// Lua-parse time, well before any backend measures real text.
+pub const NOMINAL_ROW_PX_HEIGHT: f32 = 16.0;
+
+/// Quantize a declared padding/gap px value into a whole number of blank
+/// spacer rows, rounding **up** — a declared non-zero padding/gap never
+/// silently disappears; even a 1px value reserves one full row.
+pub fn quantize_rows_ceil(px: f32) -> usize {
+    if px <= 0.0 {
+        0
+    } else {
+        (px / NOMINAL_ROW_PX_HEIGHT).ceil() as usize
+    }
+}
+
+/// Quantize a declared margin px value into a whole number of blank spacer
+/// rows, rounding **down** — a margin smaller than one row's worth of
+/// height collapses to 0 rather than reserving a whole row for a few stray
+/// pixels. The asymmetry with [`quantize_rows_ceil`] mirrors the
+/// `quadraui-binding-core::layout::Spacing` quantization rule this
+/// module's container-layout doc above points at: padding/gap round up so
+/// they never vanish, margin rounds down so it can.
+pub fn quantize_rows_floor(px: f32) -> usize {
+    if px < NOMINAL_ROW_PX_HEIGHT {
+        0
+    } else {
+        (px / NOMINAL_ROW_PX_HEIGHT).floor() as usize
+    }
+}
+
+/// One blank spacer row — a `ViewFieldKind::Label` with no id/label/hint,
+/// painting as empty vertical space. The only way to reserve a row of
+/// height with no content, used by the container-flattening in
+/// [`crate::core::plugin::lua_table_to_view`] to realise padding/gap.
+pub fn spacer_row() -> ViewField {
+    ViewField::default()
+}
+
+#[cfg(test)]
+mod layout_container_quantization_tests {
+    use super::*;
+
+    #[test]
+    fn zero_or_negative_px_quantizes_to_no_rows() {
+        assert_eq!(quantize_rows_ceil(0.0), 0);
+        assert_eq!(quantize_rows_ceil(-4.0), 0);
+        assert_eq!(quantize_rows_floor(0.0), 0);
+    }
+
+    #[test]
+    fn padding_and_gap_round_up_so_a_declared_value_never_vanishes() {
+        assert_eq!(quantize_rows_ceil(1.0), 1);
+        assert_eq!(quantize_rows_ceil(16.0), 1);
+        assert_eq!(quantize_rows_ceil(17.0), 2);
+        assert_eq!(quantize_rows_ceil(32.0), 2);
+    }
+
+    #[test]
+    fn margin_rounds_down_so_a_sub_cell_value_drops_to_zero() {
+        assert_eq!(quantize_rows_floor(15.9), 0);
+        assert_eq!(quantize_rows_floor(16.0), 1);
+        assert_eq!(quantize_rows_floor(31.9), 1);
+        assert_eq!(quantize_rows_floor(32.0), 2);
+    }
+
+    #[test]
+    fn spacer_row_is_an_empty_non_interactive_label() {
+        let row = spacer_row();
+        assert_eq!(row.id, "");
+        assert_eq!(row.label, "");
+        assert_eq!(row.kind, ViewFieldKind::Label);
+        assert!(!row.is_interactive());
+    }
+}
+
 /// One plugin-declared view: either a vertical stack of fields or a single
 /// [`ViewBody`] widget.
 ///

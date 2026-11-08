@@ -1222,6 +1222,71 @@ A collapsible header's painted label is prefixed with a disclosure glyph
 (`▾` expanded, `▸` collapsed). A non-collapsible header (`collapsible = false`)
 is a plain label with no glyph and never emits `SectionToggled`.
 
+**Layout containers (`kind = "row"`/`"column"`).** Instead of a flat `fields`
+list, `render` can return a container tree — padded, spaced fields with a
+button row at the bottom, for example:
+
+```lua
+return {
+  id = "conn", schema_version = 1,
+  kind = "column", padding = 16, gap = 12,
+  children = {
+    { type = "text", id = "name", label = "Name", value = "" },
+    { type = "dropdown", id = "engine", label = "Engine", options = { "SQLite" }, selected = 0 },
+    { type = "text", id = "path", label = "Path", value = "" },
+    { kind = "row", align = "end", gap = 8, children = {
+        { type = "button", id = "cancel",  label = "Cancel" },
+        { type = "button", id = "connect", label = "Connect", variant = "primary" },
+    }},
+  },
+}
+```
+
+This is Lua-authoring sugar, not a new wire shape: vimcode flattens the whole
+tree into the same flat `fields` list a hand-written one would be, in
+declaration order, before your view is stored anywhere — Tab/Shift-Tab focus
+order, mouse clicks, and every `on_event` `widget_id` behave exactly as they
+would for the equivalent flat `fields` list. A plain `fields` render (no
+`kind`) is completely unaffected.
+
+| Key | On | Values | Effect |
+|-----|----|--------|--------|
+| `kind` | container | `"row"` \| `"column"` | `"column"` stacks `children` vertically (today's only direction); `"row"` packs `children` horizontally. |
+| `children` | container | a list of field tables and/or nested containers | Depth-first declaration order becomes the flattened `fields` order. |
+| `padding` | container | a number, or `{top=,right=,bottom=,left=}` | Space between the container's own edge and its children. |
+| `margin` | container | a number, or `{top=,right=,bottom=,left=}` | Space between the container and its siblings. |
+| `gap` | container | a number | Space between each pair of a `column`'s children. |
+| `align` | container | `"start"` (default) \| `"center"` \| `"end"` \| `"stretch"` | Cross-axis alignment for a `column`, main-axis for a `row`. |
+
+A `column`'s children are any field row (`{ type = "text", ... }`, a
+`"section"`, a nested `row`/`column`, ...), spaced vertically by its own
+`gap`/`padding`/`margin` — that is how "space above each label, below each
+input" is expressed; `quadraui::Form` itself still has no padding/gap
+primitive. A `row`'s children must all be `type = "button"` fields today —
+`Form` has exactly one horizontal-packing primitive that isn't single-purpose
+chrome (the `"buttons"` row's own `FieldKind::ButtonRow`), so a `row` of
+buttons becomes one `"buttons"` field; anything else in a `row` is a Lua
+error.
+
+`padding`/`margin`/`gap` are declared in surface-native px (the same
+convention `label_width`/`control_width` use) and only their **vertical**
+component (`top`/`bottom` on a `column`) has a visual effect: each is
+quantized into a whole number of blank rows against a nominal 16px row
+height — `padding`/`gap` round up (so a declared non-zero value never
+disappears; even 1px reserves one full row), `margin` rounds down (so a
+value under one row's worth collapses to 0). Horizontal (`left`/`right`)
+padding/margin, and every `align` value besides the `row` default, are
+accepted and validated but have **no visual effect yet**: `quadraui::Form`
+has no horizontal-indent or content-justification primitive to realise them
+with, and doing it with per-backend text measurement instead would break
+vimcode's platform-neutrality rule. That gap is filed upstream
+(`JDonaghy/quadraui`) rather than hand-rolled here.
+
+An unknown `kind`, an `align` outside the four listed values, or a `row`
+containing anything but `type = "button"` children, is a loud Lua error
+naming the offending container/value — the same fail-loudly convention every
+other unrecognised `kind`/`type` in this API already follows.
+
 **Text entry.** A focused `text`, `password` or `text_area` field takes typing,
 cursor movement (`Left`/`Right`/`Home`/`End`), selection and clipboard (`Ctrl-A`,
 `Ctrl-C`, `Ctrl-X`, `Ctrl-V`). vimcode owns the edit state. Your callback sees
