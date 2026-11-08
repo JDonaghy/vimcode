@@ -447,6 +447,11 @@ pub struct ViewListItem {
     /// Optional right-aligned secondary text.
     #[serde(default)]
     pub detail: Option<String>,
+    /// A codicon name — see [`ViewFieldKind::Button`]'s own `icon` doc.
+    /// Validated at Lua-parse time the same way; an unknown name is a Lua
+    /// error naming the item.
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 /// One node in a [`ViewBody::Tree`]. Nesting is real here (unlike the field
@@ -466,6 +471,15 @@ pub struct ViewTreeNode {
     pub expanded: bool,
     #[serde(default)]
     pub children: Vec<ViewTreeNode>,
+    /// A codicon name — see [`ViewFieldKind::Button`]'s own `icon` doc.
+    /// Validated at Lua-parse time the same way; an unknown name is a Lua
+    /// error naming the node.
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// Short right-aligned status text (e.g. a git status letter or item
+    /// count), painted through `quadraui::Badge::plain`.
+    #[serde(default)]
+    pub badge: Option<String>,
 }
 
 impl ViewTreeNode {
@@ -1679,6 +1693,8 @@ mod tests {
                     label: "A".into(),
                     expanded: false,
                     children: vec![],
+                    icon: None,
+                    badge: None,
                 },
                 ViewTreeNode {
                     id: "child-b".into(),
@@ -1689,9 +1705,15 @@ mod tests {
                         label: "GC".into(),
                         expanded: false,
                         children: vec![],
+                        icon: None,
+                        badge: None,
                     }],
+                    icon: None,
+                    badge: None,
                 },
             ],
+            icon: None,
+            badge: None,
         }];
         assert_eq!(
             ViewTreeNode::resolve(&nodes, &[0]).map(|n| n.id.as_str()),

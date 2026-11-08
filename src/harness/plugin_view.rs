@@ -342,6 +342,31 @@ pub const IMAGE_FALLBACK: &str = "ImgFb2113";
 /// decodes and paints real pixels instead of [`IMAGE_FALLBACK`].
 pub const IMAGE_MAGENTA_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR42mP4z/AfiBggFAA31gf5htMR8gAAAABJRU5ErkJggg==";
 
+/// Registered view name for a dedicated `list`-kind fixture whose sole item
+/// declares `icon = "file"` — kept separate from [`LIST_VIEW`] so the extra
+/// icon column never shifts that fixture's own narrow-viewport row-text
+/// assertions.
+pub const ICON_LIST_VIEW: &str = "zqxw2128list";
+pub const ICON_LIST_ITEM: &str = "IcL2128";
+/// The bundled codicon name the item declares. `resolve_view_icon` passes
+/// this same string through as the TUI fallback text (see its own doc), so
+/// it doubles as the paint-assertion needle for "the icon resolved and
+/// painted" with nerd fonts disabled (this fixture's default).
+pub const ICON_LIST_ICON_NAME: &str = "file";
+
+/// Registered view name for a dedicated `tree`-kind fixture whose sole node
+/// declares both `icon = "folder"` and a `badge` — kept separate from
+/// [`TREE_VIEW`] for the same reason as [`ICON_LIST_VIEW`].
+pub const ICON_TREE_VIEW: &str = "zqxw2128tree";
+/// Short enough to survive label ellipsis on a narrow sidebar alongside
+/// both the icon's fallback text and the badge — a tree row has less
+/// width budget than a list row (an indent column and, for a branch, a
+/// chevron), so this fixture's label stays terse on purpose.
+pub const ICON_TREE_NODE: &str = "N28";
+/// See [`ICON_LIST_ICON_NAME`]'s doc — same fallback-text convention.
+pub const ICON_TREE_ICON_NAME: &str = "folder";
+pub const ICON_TREE_BADGE: &str = "B28";
+
 /// Lua source registering one view per `ViewBody` kind, appended
 /// into the same fixture plugin the field-stack view above uses — one real
 /// `PluginManager` load exercises every kind's parse + paint + event round
@@ -614,6 +639,31 @@ vimcode.ui.register_view("{ALIGN_VIEW}", {{
       }},
       rows = {{
         {{ id = "a0", cells = {{ "{ALIGN_CELL_LEFT}", "{ALIGN_CELL_RIGHT}" }} }},
+      }},
+    }}
+  end,
+}})
+
+vimcode.ui.register_view("{ICON_LIST_VIEW}", {{
+  title = "Zq2128L", icon = "L", fallback_icon = "L",
+  render = function()
+    return {{
+      kind = "list",
+      items = {{
+        {{ id = "i0", text = "{ICON_LIST_ITEM}", icon = "{ICON_LIST_ICON_NAME}" }},
+      }},
+    }}
+  end,
+}})
+
+vimcode.ui.register_view("{ICON_TREE_VIEW}", {{
+  title = "Zq2128T", icon = "T", fallback_icon = "T",
+  render = function()
+    return {{
+      kind = "tree",
+      nodes = {{
+        {{ id = "n0", label = "{ICON_TREE_NODE}",
+           icon = "{ICON_TREE_ICON_NAME}", badge = "{ICON_TREE_BADGE}" }},
       }},
     }}
   end,
@@ -2014,6 +2064,52 @@ pub fn tree_paints_collapsed_and_enter_expands_it(driver: &mut impl ConformanceD
     );
 }
 
+/// A `kind = "list"` item's `icon = "file"` reaches `ListItem.icon` and
+/// paints alongside the item's own text — `plugin_view_to_list` resolves
+/// the declared codicon name through `resolve_view_icon` rather than
+/// leaving `icon: None`. With nerd fonts disabled (this fixture's default),
+/// the painted glyph is the codicon's own fallback text, which is the
+/// codicon name itself, so [`ICON_LIST_ICON_NAME`] doubles as the needle.
+pub fn list_item_icon_paints(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(ICON_LIST_ITEM),
+        "precondition: the icon-list fixture's item must paint its own \
+         text; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(ICON_LIST_ICON_NAME),
+        "a list item's icon = \"{ICON_LIST_ICON_NAME}\" must reach \
+         ListItem.icon and paint its fallback text; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// A `kind = "tree"` node's `icon = "folder"` and `badge` both reach
+/// `TreeRow.icon`/`TreeRow.badge` and paint alongside the node's label —
+/// see [`list_item_icon_paints`]'s doc for why the icon's own name doubles
+/// as its paint-assertion needle.
+pub fn tree_node_icon_and_badge_paint(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(ICON_TREE_NODE),
+        "precondition: the icon-tree fixture's node must paint its own \
+         label; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(ICON_TREE_ICON_NAME),
+        "a tree node's icon = \"{ICON_TREE_ICON_NAME}\" must reach \
+         TreeRow.icon and paint its fallback text; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(ICON_TREE_BADGE),
+        "a tree node's badge must reach TreeRow.badge and paint its text; \
+         painted runs were {:?}",
+        painted(driver)
+    );
+}
+
 /// Scenario 10 — a `kind = "table"` view paints its columns and rows; two
 /// `Enter` presses on the default-selected, editable cell start and then
 /// commit an edit, reaching the plugin's `on_event` as `CellEdited{{row: 0,
@@ -3355,6 +3451,18 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_list_item_icon_paints_on_tui() {
+        let (mut h, _dir) = tui_named(ICON_LIST_VIEW);
+        list_item_icon_paints(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_tree_node_icon_and_badge_paint_on_tui() {
+        let (mut h, _dir) = tui_named(ICON_TREE_VIEW);
+        tree_node_icon_and_badge_paint(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_table_paints_and_enter_commits_a_cell_edit_on_tui() {
         let (mut h, _dir) = tui_named(TABLE_VIEW);
         table_paints_and_enter_commits_a_cell_edit(&mut h.driver);
@@ -3803,6 +3911,20 @@ mod tests {
     fn plugin_view_tree_paints_collapsed_and_enter_expands_it_on_gtk() {
         let (mut h, _dir) = gtk_named(TREE_VIEW);
         tree_paints_collapsed_and_enter_expands_it(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_list_item_icon_paints_on_gtk() {
+        let (mut h, _dir) = gtk_named(ICON_LIST_VIEW);
+        list_item_icon_paints(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_tree_node_icon_and_badge_paint_on_gtk() {
+        let (mut h, _dir) = gtk_named(ICON_TREE_VIEW);
+        tree_node_icon_and_badge_paint(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]

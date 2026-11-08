@@ -1179,8 +1179,8 @@ cursor movement (`Left`/`Right`/`Home`/`End`), selection and clipboard (`Ctrl-A`
 
 | `kind` | Keys | Events (`event.*`) |
 |--------|------|--------------------|
-| `"list"` | `title`, `items = {{id=, text=, detail=}}` (`id` required) | `ItemSelected`, `ItemActivated` (`index`, 0-based) |
-| `"tree"` | `nodes = {{id=, label=, expanded=, children={...}}}` (`id` required) | `NodeSelected`, `NodeActivated`, `Expanded`, `Collapsed` (`node_id`) |
+| `"list"` | `title`, `items = {{id=, text=, detail=, icon=}}` (`id` required) | `ItemSelected`, `ItemActivated` (`index`, 0-based) |
+| `"tree"` | `nodes = {{id=, label=, expanded=, children={...}, icon=, badge=}}` (`id` required) | `NodeSelected`, `NodeActivated`, `Expanded`, `Collapsed` (`node_id`) |
 | `"table"` | `columns = {{title=, editable=, align=}}` (`title` required; `align` is `"left"`/`"center"`/`"right"`, default `"left"`), `rows = {{id=, cells={...}}}` (`cells` required), `multi_select`, `footer = {...}` (one string per column, same shape as a row's `cells`) | `ItemSelected`, `ItemActivated` (`index`, `col`), `CellEdited` (`row`, `col`, both 0-based, and `value`), `SelectionChanged` (`indices`, 0-based, only when `multi_select = true`) |
 | `"text_view"` | `text`, `filetype` | none (scrollable, read-only text) |
 | `"chart"` | `chart_kind` (`"sparkline"`, `"line"`, `"bar"`, `"bar_grouped"`; default `"line"`), `series = {{label=, data=, color=, fill=}}`, `x_label`, `y_label`, `show_legend` | `DataPointClicked` (`series_idx`, `data_idx`), `LegendClicked` (`series_idx`, 0-based) |
@@ -1209,6 +1209,15 @@ useful for aligning a role label flush-left while its content indents.
 Clicking a row dispatches `ItemSelected`/`ItemActivated` with that row's index
 (`event.col` is always `nil` — a message list has no columns). There is no
 persistent row highlight, unlike `"list"`.
+
+**`icon` on `"list"` items and `"tree"` nodes, `badge` on `"tree"` nodes.**
+`icon` is a codicon name (e.g. `"file"`, `"folder"`) — the same vocabulary a
+`"button"` field's own `icon` key accepts; an unknown name is a Lua error
+naming the offending item/node, and omitting `icon` keeps today's rendering
+(no icon column). `badge` is short right-aligned status text on a tree node
+(e.g. a git status letter or item count) — omit it for no badge. Both are
+purely decorative: neither changes `ItemSelected`/`NodeSelected`/etc., which
+still report plain indices/ids.
 
 **`"image"` bodies.** A static raster image (SVG/PNG/JPEG), decoded and
 painted by the backend. Give it `path` (a filesystem path, decoded lazily) or
