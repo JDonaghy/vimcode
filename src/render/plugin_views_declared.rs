@@ -1005,6 +1005,27 @@ fn remap_styled_button_focus(
     }
 }
 
+/// The combo box's currently-declared `value`, looked up by `(view,
+/// field)`, or `""` when the view/field is absent or isn't a `combo_box`.
+/// Seeds a freshly-created
+/// [`crate::core::plugin_ui::PluginViewComboBoxEditState`]'s `text` so an
+/// edit that starts with a non-text-typing action (arrow-key navigation,
+/// see [`apply_combo_box_form_action`]'s `ComboBoxHighlightChanged` arm)
+/// doesn't blank the row before the plugin's own declared value ever had a
+/// chance to paint.
+fn declared_combo_box_value(engine: &Engine, view: &str, field: &str) -> String {
+    use crate::core::plugin_ui::ViewFieldKind;
+    engine
+        .plugin_views
+        .get(view)
+        .and_then(|v| v.field_index(field).map(|i| &v.fields[i]))
+        .and_then(|f| match &f.kind {
+            ViewFieldKind::ComboBox { value, .. } => Some(value.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// Apply a `quadraui::FormEvent::ComboBox*` action to
 /// `Engine::plugin_view_combo_edit` — the vimcode-owned shadow state
 /// `plugin_view_to_form_with_combo_edit`'s `ComboBox` arm feeds back into
@@ -1031,7 +1052,11 @@ fn apply_combo_box_form_action(engine: &mut Engine, action: &quadraui::FormEvent
 
     /// The combo-edit slot for `(view, field)`, resetting it first if it
     /// currently names a different field (stale from a prior edit, or
-    /// never primed).
+    /// never primed). A freshly-created slot seeds `text` from the
+    /// field's own declared value (via [`declared_combo_box_value`]),
+    /// never `String::new()` — a bare arrow key as the first keystroke
+    /// must not blank a row that already shows a non-empty declared
+    /// value.
     fn ensure<'a>(
         engine: &'a mut Engine,
         view: &str,
@@ -1042,10 +1067,11 @@ fn apply_combo_box_form_action(engine: &mut Engine, action: &quadraui::FormEvent
             Some(s) if s.view == view && s.field_id == field
         );
         if stale {
+            let text = declared_combo_box_value(engine, view, field);
             engine.plugin_view_combo_edit = Some(PluginViewComboBoxEditState {
                 view: view.to_string(),
                 field_id: field.to_string(),
-                text: String::new(),
+                text,
                 open: false,
                 highlighted: None,
             });
@@ -1071,7 +1097,15 @@ fn apply_combo_box_form_action(engine: &mut Engine, action: &quadraui::FormEvent
             let Some((view, field)) = split_widget_id(id.as_str()) else {
                 return;
             };
-            ensure(engine, view, field).highlighted = Some(*index);
+            let state = ensure(engine, view, field);
+            state.highlighted = Some(*index);
+            // Arrow-key navigation opens the dropdown too (quadraui's own
+            // `ComboBox::handle_key` moves `highlighted` regardless of
+            // `open`, but `ComboBox::commit()` only honours `highlighted`
+            // when `open` is set) — without this, pressing `Down` then
+            // `Enter` as the very first two keystrokes would commit the
+            // typed text ("") instead of the now-highlighted option.
+            state.open = true;
         }
         quadraui::FormEvent::ComboBoxCommitted { id, .. }
         | quadraui::FormEvent::ComboBoxCancelled { id } => {
@@ -1827,5 +1861,180 @@ mod button_style_translation_tests {
             "a tooltip-only button field must still paint quadraui's plain \
              bracket chrome: {row:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod combo_box_translation_tests {
+    use super::*;
+    use crate::core::engine::Engine;
+    use crate::core::plugin_ui::{
+        namespaced_widget_id, PluginView, PluginViewComboBoxEditState, ViewField, ViewFieldKind,
+    };
+
+    fn combo_field(id: &str, options: &[&str], value: &str) -> ViewField {
+        ViewField {
+            id: id.into(),
+            label: "Fruit".into(),
+            hint: String::new(),
+            disabled: false,
+            error: None,
+            warning: None,
+            kind: ViewFieldKind::ComboBox {
+                options: options.iter().map(|s| s.to_string()).collect(),
+                value: value.into(),
+                placeholder: String::new(),
+            },
+        }
+    }
+
+    fn combo_view(value: &str) -> PluginView {
+        PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![combo_field("fruit", &["Apple", "Apricot", "Banana"], value)],
+            body: None,
+        }
+    }
+
+    /// `combo_edit: None` — no edit in progress — seeds both `committed`
+    /// and `text` from the plugin's own declared `value`, with the
+    /// dropdown closed: the same "declared value paints read-only"
+    /// contract every other field kind here follows.
+    #[test]
+    fn no_live_edit_paints_the_declared_value_closed() {
+        let view = combo_view("Banana");
+        let form = plugin_view_to_form_with_combo_edit("myview", &view, 0, 0, false, None, None);
+        let quadraui::FieldKind::ComboBox(combo) = &form.fields[0].kind else {
+            panic!(
+                "expected FieldKind::ComboBox, got {:?}",
+                form.fields[0].kind
+            );
+        };
+        assert_eq!(combo.committed, "Banana");
+        assert_eq!(combo.text, "Banana");
+        assert!(!combo.open);
+        assert_eq!(combo.highlighted, None);
+    }
+
+    /// `combo_edit: Some(state)` naming this field — a live edit in
+    /// progress — overrides `text`/`open`/`highlighted` from the shadow
+    /// state, but `committed` still comes from the plugin's declared
+    /// `value`: a mid-edit combo box must still know what to revert to on
+    /// `Escape`.
+    #[test]
+    fn a_live_edit_overrides_text_open_and_highlighted_but_not_committed() {
+        let view = combo_view("Banana");
+        let edit = PluginViewComboBoxEditState {
+            view: "myview".into(),
+            field_id: "fruit".into(),
+            text: "ap".into(),
+            open: true,
+            highlighted: Some(1),
+        };
+        let form =
+            plugin_view_to_form_with_combo_edit("myview", &view, 0, 0, false, None, Some(&edit));
+        let quadraui::FieldKind::ComboBox(combo) = &form.fields[0].kind else {
+            panic!(
+                "expected FieldKind::ComboBox, got {:?}",
+                form.fields[0].kind
+            );
+        };
+        assert_eq!(combo.committed, "Banana");
+        assert_eq!(combo.text, "ap");
+        assert!(combo.open);
+        assert_eq!(combo.highlighted, Some(1));
+    }
+
+    /// Regression for the bug where pressing `Down` as the very first key
+    /// on a `combo_box` whose declared `value` is non-empty blanked the
+    /// row: `ComboBoxHighlightChanged` lazily creates the shadow state
+    /// before any `ComboBoxTextChanged` has had a chance to prime `text`,
+    /// so a fresh state's `text` must seed from the field's *declared*
+    /// `value`, not `String::new()`.
+    #[test]
+    fn highlight_changed_as_the_first_action_does_not_blank_a_non_empty_declared_value() {
+        let mut engine = Engine::new_for_test();
+        engine
+            .plugin_views
+            .insert("myview".into(), combo_view("Banana"));
+        assert!(engine.plugin_view_combo_edit.is_none());
+
+        let id = quadraui::WidgetId::new(namespaced_widget_id("myview", "fruit"));
+        apply_combo_box_form_action(
+            &mut engine,
+            &quadraui::FormEvent::ComboBoxHighlightChanged { id, index: 0 },
+        );
+
+        let state = engine
+            .plugin_view_combo_edit
+            .as_ref()
+            .expect("highlight must prime the shadow state");
+        assert_eq!(
+            state.text, "Banana",
+            "a fresh shadow state must seed text from the declared value, not blank it"
+        );
+        assert_eq!(state.highlighted, Some(0));
+        assert!(
+            state.open,
+            "arrow-key highlight must open the dropdown so a following Enter commits \
+             the highlighted option rather than the (irrelevant) typed text"
+        );
+    }
+
+    /// `ComboBoxTextChanged` still behaves as before: it primes `text`
+    /// from the typed value (not the declared one — the user is
+    /// overwriting it) and opens the dropdown.
+    #[test]
+    fn text_changed_primes_text_from_the_typed_value_and_opens() {
+        let mut engine = Engine::new_for_test();
+        engine
+            .plugin_views
+            .insert("myview".into(), combo_view("Banana"));
+
+        let id = quadraui::WidgetId::new(namespaced_widget_id("myview", "fruit"));
+        apply_combo_box_form_action(
+            &mut engine,
+            &quadraui::FormEvent::ComboBoxTextChanged {
+                id,
+                value: "ap".into(),
+            },
+        );
+
+        let state = engine
+            .plugin_view_combo_edit
+            .as_ref()
+            .expect("typing must prime the shadow state");
+        assert_eq!(state.text, "ap");
+        assert!(state.open);
+    }
+
+    /// `ComboBoxCommitted`/`ComboBoxCancelled` both clear the shadow state
+    /// so the next render falls back to the plugin's own declared value.
+    #[test]
+    fn committed_and_cancelled_both_clear_the_shadow_state() {
+        let mut engine = Engine::new_for_test();
+        engine
+            .plugin_views
+            .insert("myview".into(), combo_view("Banana"));
+        let id = quadraui::WidgetId::new(namespaced_widget_id("myview", "fruit"));
+
+        apply_combo_box_form_action(
+            &mut engine,
+            &quadraui::FormEvent::ComboBoxTextChanged {
+                id,
+                value: "Cherry".into(),
+            },
+        );
+        assert!(engine.plugin_view_combo_edit.is_some());
+
+        apply_combo_box_form_action(
+            &mut engine,
+            &quadraui::FormEvent::ComboBoxCommitted {
+                id,
+                value: "Cherry".into(),
+            },
+        );
+        assert!(engine.plugin_view_combo_edit.is_none());
     }
 }

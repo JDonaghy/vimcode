@@ -694,16 +694,15 @@ pub enum ViewFieldKind {
         #[serde(default)]
         selected: usize,
     },
-    /// An editable free-text field backed by a fixed candidate list, with a
-    /// type-ahead filtered dropdown. Translated to
-    /// `quadraui::FieldKind::ComboBox`. Unlike [`Self::Dropdown`]'s
-    /// cycle-through selection, this is free text: `value` need not be one
-    /// of `options` verbatim — a plugin that wants strict validation checks
-    /// it itself in `on_event`.
+    /// An editable free-text field backed by a fixed candidate list, with
+    /// type-ahead filtering. Translated to `quadraui::FieldKind::ComboBox`.
+    /// Unlike [`Self::Dropdown`]'s cycle-through selection, this is free
+    /// text: `value` need not be one of `options` verbatim — a plugin that
+    /// wants strict validation checks it itself in `on_event`.
     ///
     /// quadraui's own `FormController` drives the embedded `ComboBox`'s
-    /// keyboard handling (typing filters and opens the dropdown, Up/Down
-    /// move the highlighted option, Enter commits, Escape cancels) — see
+    /// keyboard handling (typing filters, Up/Down move the highlighted
+    /// option, Enter commits, Escape cancels) — see
     /// `render::plugin_view_to_form`'s `ComboBox` arm and
     /// `Engine::handle_plugin_view_key`'s combo-box branch for where
     /// vimcode forwards keys into it and stores the resulting interaction
@@ -711,10 +710,19 @@ pub enum ViewFieldKind {
     /// `FormController` carries no shadow cache for this field kind the way
     /// it does for [`Self::Date`]'s `DatePicker`.
     ///
+    /// **The filtered dropdown itself is not painted.** quadraui 0.9's
+    /// `Form` paints only the compact text row plus a chevron; the open
+    /// overlay is an app-painted popup this crate doesn't paint yet (see
+    /// `EXTENSIONS.md`'s combo-box section). So the live text is visible as
+    /// it's typed, but which options match and which one `Up`/`Down`
+    /// highlights have no visible feedback today. `placeholder` is accepted
+    /// but has no `quadraui::ComboBox` field to land in — reserved, ignored.
+    ///
     /// Per-keystroke filter text reaches the plugin as
     /// [`ViewEventKind::TextChanged`] — the same shape every other
-    /// text-backed field already uses. The confirmed selection (Enter, or a
-    /// dropdown item activated) reaches it as
+    /// text-backed field already uses. The confirmed value (`Enter` only —
+    /// see [`ViewEventKind::ComboBoxChanged`]'s doc for why a dropdown-item
+    /// click doesn't commit yet) reaches it as
     /// [`ViewEventKind::ComboBoxChanged`], a dedicated variant rather than
     /// reusing [`ViewEventKind::DropdownChanged`] (that one carries an
     /// option *index*; a combo box's committed value may be free text with
@@ -988,14 +996,19 @@ pub enum ViewEventKind {
     DropdownChanged {
         selected: usize,
     },
-    /// A `combo_box` field confirmed a value — Enter, or a dropdown item
-    /// activated. Carries the committed free-text value, which need not be
-    /// one of the field's declared `options` verbatim. See
-    /// [`ViewFieldKind::ComboBox`]'s doc for why this isn't
-    /// [`Self::DropdownChanged`] (index, not text) or
+    /// A `combo_box` field confirmed a value via `Enter`. Carries the
+    /// committed free-text value, which need not be one of the field's
+    /// declared `options` verbatim. See [`ViewFieldKind::ComboBox`]'s doc
+    /// for why this isn't [`Self::DropdownChanged`] (index, not text) or
     /// [`Self::TextCommitted`] (also fires on `TextArea` blur). Per-keystroke
     /// filter typing reaches the plugin as [`Self::TextChanged`] instead,
     /// reusing that shape rather than adding a second one.
+    ///
+    /// A dropdown-item *click* does not reach this yet: `quadraui::
+    /// ComboBox::click`/`ComboBoxLayout::hit_test` have no caller anywhere
+    /// in this crate, and `FormController` does not route pointer hits into
+    /// them for `FieldKind::ComboBox`. `Enter` is the only commit path
+    /// until that wiring lands.
     ComboBoxChanged {
         value: String,
     },

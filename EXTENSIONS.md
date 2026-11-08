@@ -1086,7 +1086,7 @@ like any other tab: close it with `:tabclose`, split it or move it between group
 | `"toggle"` | `value` | `ToggleChanged` (`event.value` = bool) |
 | `"button"` | `variant`, `icon`, `tooltip` (all optional — see below) | `ButtonClicked` |
 | `"dropdown"` | `options`, `selected` | `DropdownChanged` (`event.value` = 0-based index) |
-| `"combo_box"` | `options`, `value`, `placeholder` | `TextChanged` per filter keystroke, `ComboBoxChanged` on commit (both `event.value` = string) |
+| `"combo_box"` | `options`, `value`, `placeholder` (reserved, ignored — see below) | `TextChanged` per filter keystroke, `ComboBoxChanged` on commit (both `event.value` = string) |
 | `"segmented"` | `options`, `selected` | `SegmentedChanged` (`event.value` = 0-based index) |
 | `"buttons"` | `buttons = {{id=,label=,disabled=,variant=,icon=,tooltip=}}` | `ButtonClicked` per button id |
 | `"toggles"` | `toggles = {{id=,label=,value=}}` | `ToggleChanged` per toggle id |
@@ -1176,19 +1176,33 @@ cursor movement (`Left`/`Right`/`Home`/`End`), selection and clipboard (`Ctrl-A`
 - `text_area`: `Enter` inserts a newline. `Ctrl-Enter`, or leaving the field, commits.
 
 **Combo box (`combo_box`).** An editable free-text field backed by a fixed
-`options` list, with a type-ahead filtered dropdown — unlike `dropdown`
-(select-only, cycling through `options` on `Enter`/click), `value` can be any
-string, not necessarily one of `options`. While focused:
+`options` list, with type-ahead filtering — unlike `dropdown` (select-only,
+cycling through `options` on `Enter`/click), `value` can be any string, not
+necessarily one of `options`. While focused:
 
-- Typing filters `options` (case-insensitive substring match) and opens the
-  dropdown; each keystroke reaches your callback as `TextChanged`
-  (`event.value` = the live filter text).
-- `Up`/`Down` move the highlighted filtered option.
+- Typing filters `options` (case-insensitive substring match); each keystroke
+  reaches your callback as `TextChanged` (`event.value` = the live filter
+  text).
+- `Up`/`Down` move an internal highlighted-option cursor through the
+  filtered list.
 - `Enter` commits — the highlighted option if one is filtered and
   highlighted, otherwise the typed text verbatim — reaching your callback as
-  `ComboBoxChanged` (`event.value` = the committed string).
-- `Escape` reverts the live text back to your declared `value` and closes
-  the dropdown, with no event.
+  `ComboBoxChanged` (`event.value` = the committed string). A dropdown-item
+  *click* does not commit yet (no pointer wiring exists for this field).
+- `Escape` reverts the live text back to your declared `value`, with no
+  event.
+
+**The filtered popup is not painted yet.** quadraui 0.9's `Form` paints only
+the compact text row (plus a chevron); the open dropdown overlay — the list
+of filtered options, and which one is highlighted — is left to the app to
+paint, which needs a per-field resolved rect quadraui doesn't expose yet
+(tracked upstream as quadraui#2202). Until that lands, the typed text itself
+is visible in the row as you type, but which options it filters to and
+`Up`/`Down`'s highlighted-option cursor have **no visible feedback** — a
+plugin can still use `combo_box` for a free-text field with fixed-list
+validation, but there is no visible dropdown and no visible highlight.
+`placeholder` is accepted but ignored (reserved for when the text-input half
+of the row paints it).
 
 vimcode owns the live filter/open/highlight state the same way it owns
 `text`/`password` edit state; your declared `value` is what paints whenever
