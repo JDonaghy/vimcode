@@ -1083,6 +1083,12 @@ split window and dock slot currently showing `name`, returning `false` if `name`
 wasn't open anywhere. An unknown view name raises an error, matching `open_view`.
 Each closed window goes through the same path `:q`/`<C-w>c` use, so it can never
 close the editor's very last window — a plugin cannot use this to quit vimcode.
+`false` is also what comes back in that one case: if `name`'s only remaining
+window is the editor's only window overall, the close is refused and `false`
+means "refused to close", not "wasn't open" — the return value alone cannot
+tell the two apart. Closing a view that isn't the plugin's own active window
+(e.g. tidying up a background tab) restores focus to wherever it was before
+the call.
 
 **Field types:**
 

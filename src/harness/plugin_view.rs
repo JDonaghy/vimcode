@@ -317,6 +317,25 @@ pub const ALIGN_CELL_RIGHT: &str = "AlRv2064";
 pub const TEXT_FIRST_LINE: &str = "Ln0X1631";
 pub const TEXT_LAST_LINE: &str = "Ln49X1631";
 
+/// Seeded into the original window's buffer before
+/// [`engine_with_plugin_view_split`] splits [`VIEW`] in alongside it — a
+/// scenario that closes the split sibling via `vimcode.ui.close_view` reads
+/// this back to prove the *other* window (and its buffer) survived the
+/// close untouched.
+pub const SPLIT_SIBLING_LINE: &str = "Zq2139Sib";
+
+/// Registered view name for a minimal view whose own `on_event` calls
+/// `vimcode.ui.close_view` on itself — the sql-tool connection dialog's
+/// motivating case: a Cancel button dismissing its own tab from inside the
+/// very dispatch that handled the click, rather than a `:Command` closing
+/// it from outside.
+pub const CANCEL_VIEW: &str = "zqxw2139cancel";
+/// [`CANCEL_VIEW`]'s sole label field — proves the tab painted at all
+/// before the click closes it.
+pub const CANCEL_HEADER: &str = "Zq2139CancelHdr";
+/// [`CANCEL_VIEW`]'s sole button field's caption — the click target.
+pub const CANCEL_BUTTON: &str = "Zq2139CancelBtn";
+
 /// `Chart` fixture needles. Both series' labels are painted into the legend
 /// row (`quadraui`'s `paint_legend`/`primitives::chart::paint_legend` draw
 /// one swatch-plus-label text run per series), so each doubles as both a
@@ -716,10 +735,10 @@ vimcode.command("Zq2059TextOpenDock", function()
   vimcode.ui.open_view("{TEXT_VIEW}", {{ location = "dock" }})
 end)
 
--- #2139: a real `:Command` around `vimcode.ui.close_view`, reporting its
--- boolean return via `vimcode.message` so scenarios can assert on it
--- without reaching into engine internals — the sql-tool connection
--- dialog's Cancel button is exactly this call.
+-- A real `:Command` around `vimcode.ui.close_view`, reporting its boolean
+-- return via `vimcode.message` so scenarios can assert on it without
+-- reaching into engine internals — the sql-tool connection dialog's Cancel
+-- button is exactly this call.
 vimcode.command("Zq2139CloseView", function()
   local closed = vimcode.ui.close_view("{VIEW}")
   vimcode.message("Zq2139closed:" .. tostring(closed))
@@ -730,6 +749,41 @@ end)
 vimcode.command("Zq2139CloseTextView", function()
   local closed = vimcode.ui.close_view("{TEXT_VIEW}")
   vimcode.message("Zq2139closed:" .. tostring(closed))
+end)
+
+-- Split twin of `Zq146OpenTab`: opens `{VIEW}` as a window split alongside
+-- the active window instead of a new tab, so a scenario can drive
+-- `Engine::close_window`'s "remove from the active tab's layout" branch
+-- rather than its "sole window of its tab, close the tab" branch.
+vimcode.command("Zq2139OpenSplit", function()
+  vimcode.ui.open_view("{VIEW}", {{ location = "split" }})
+end)
+
+-- A minimal view whose own `on_event` closes itself — the sql-tool Cancel
+-- button's actual shape: `vimcode.ui.close_view` called from inside the
+-- very dispatch that is handling the click, not from an external
+-- `:Command`.
+vimcode.ui.register_view("{CANCEL_VIEW}", {{
+  title = "{CANCEL_VIEW}",
+  render = function()
+    return {{
+      id = "main",
+      schema_version = 1,
+      fields = {{
+        {{ type = "label", id = "hdr", label = "{CANCEL_HEADER}" }},
+        {{ type = "button", id = "cancel", label = "{CANCEL_BUTTON}" }},
+      }},
+    }}
+  end,
+  on_event = function(ctx, event)
+    if event.widget_id == "cancel" and event.kind == "ButtonClicked" then
+      vimcode.ui.close_view("{CANCEL_VIEW}")
+    end
+  end,
+}})
+
+vimcode.command("Zq2139CancelOpenTab", function()
+  vimcode.ui.open_view("{CANCEL_VIEW}", {{ location = "tab" }})
 end)
 "#
     )
@@ -1112,6 +1166,76 @@ pub fn engine_with_plugin_view_tab() -> (Engine, PathBuf) {
         engine.active_group().tabs.len(),
         before_tabs + 1,
         "vimcode.ui.open_view(..., {{location = \"tab\"}}) must open a new tab"
+    );
+    (engine, dir)
+}
+
+/// [`engine_with_plugin_view_tab`], collapsed down to just the plugin's own
+/// tab/window by closing the original one — so [`VIEW`]'s window becomes
+/// the engine's *sole* remaining window overall. Exercises
+/// `Engine::close_window`'s "refuse to close the last window in the last
+/// tab of the last group" guard from inside `Engine::close_plugin_view`:
+/// the acceptance bullet "closing the last window/tab behaves as `:q` on
+/// that window would, not by quitting the editor".
+pub fn engine_with_plugin_view_tab_as_sole_window() -> (Engine, PathBuf) {
+    let (mut engine, dir) = engine_with_plugin_view_tab();
+    // `Engine::new_tab` appends and activates — the original, pre-fixture
+    // tab is always index 0, [`VIEW`]'s own tab index 1 (the just-opened,
+    // currently active one).
+    assert_eq!(
+        engine.active_group().tabs.len(),
+        2,
+        "engine_with_plugin_view_tab must leave exactly the original tab \
+         plus the new plugin tab open"
+    );
+    let original_window = engine.active_group().tabs[0].active_window;
+    engine.activate_window(original_window);
+    assert!(
+        engine.close_window(),
+        "closing the original (non-plugin) tab must succeed, leaving only \
+         the plugin's own tab/window behind"
+    );
+    assert_eq!(
+        engine.windows.len(),
+        1,
+        "the plugin view's window must be the engine's sole remaining \
+         window after the original tab closes"
+    );
+    (engine, dir)
+}
+
+/// Build a fixture engine with [`VIEW`] split in alongside the active
+/// window — via the fixture's real `Zq2139OpenSplit` `:Command`, which
+/// calls `vimcode.ui.open_view(VIEW, {location = "split"})`. The original
+/// window's buffer is seeded with [`SPLIT_SIBLING_LINE`] first, so a
+/// scenario can assert that window's content survives
+/// `vimcode.ui.close_view` closing only the split sibling — the
+/// `tab.layout.remove`/`repair_active_window` branch of
+/// `Engine::close_window` (`src/core/engine/windows.rs`) that
+/// [`engine_with_plugin_view_tab`]'s own close-the-tab scenario never
+/// reaches, since a plugin tab's window is always the sole window of its
+/// own tab.
+pub fn engine_with_plugin_view_split() -> (Engine, PathBuf) {
+    let dir = plugin_dir();
+    let mut engine = Engine::new_for_test();
+    load_fixture_plugin(&mut engine, &dir);
+
+    engine.app_shell.show_panel(&quadraui::WidgetId::new(
+        crate::core::engine::sidebar::PANEL_SETTINGS,
+    ));
+
+    engine.active_buffer_state_mut().buffer.content = ropey::Rope::from_str(SPLIT_SIBLING_LINE);
+
+    let before_windows = engine.windows.len();
+    assert!(
+        engine.plugin_run_command("Zq2139OpenSplit", ""),
+        "fixture plugin must register the Zq2139OpenSplit command"
+    );
+    assert_eq!(
+        engine.windows.len(),
+        before_windows + 1,
+        "vimcode.ui.open_view(..., {{location = \"split\"}}) must open a new \
+         window split, not reuse the original one"
     );
     (engine, dir)
 }
@@ -1973,6 +2097,95 @@ pub fn close_view_closes_the_tab(driver: &mut impl ConformanceDriver) {
         !driver.screen_has(ROW_HEADER),
         "vimcode.ui.close_view must remove the plugin-view tab; painted \
          runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 6c — `vimcode.ui.close_view(name)` closes a **split** window
+/// (`Engine::close_window`'s `tab.layout.remove`/`repair_active_window`
+/// branch, `src/core/engine/windows.rs` — the half of `close_plugin_view`
+/// [`close_view_closes_the_tab`]'s tab case never reaches, since a plugin
+/// tab's window is always the sole window of its own tab), leaving the
+/// split's *sibling* window — a plain file/scratch buffer, not the plugin
+/// view — painted exactly as it was.
+pub fn close_view_closes_the_split_then_leaves_the_sibling_window_painted(
+    driver: &mut impl ConformanceDriver,
+) {
+    assert!(
+        driver.screen_has(ROW_HEADER),
+        "precondition: the split-in view must be painted before \
+         vimcode.ui.close_view removes it; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(SPLIT_SIBLING_LINE),
+        "precondition: the sibling window's seeded content must be \
+         painted before vimcode.ui.close_view closes the split; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.type_text(":Zq2139CloseView");
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        !driver.screen_has(ROW_HEADER),
+        "vimcode.ui.close_view must remove the split window; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(SPLIT_SIBLING_LINE),
+        "the sibling window must still be painted once vimcode.ui.close_view \
+         has closed only the split sibling, not the whole tab; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+}
+
+/// Acceptance bullet 2 — closing the plugin view's last remaining window
+/// (the engine's sole window overall) behaves exactly as `:q` on that
+/// window would: refused, not a quit of the editor. Built on
+/// [`engine_with_plugin_view_tab_as_sole_window`], which collapses the tab
+/// fixture down to just the plugin's own window first.
+pub fn close_view_refuses_to_close_the_editors_last_window(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(ROW_HEADER),
+        "precondition: the view must be painted before the refused \
+         vimcode.ui.close_view call; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.type_text(":Zq2139CloseView");
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has(ROW_HEADER),
+        "vimcode.ui.close_view must refuse to close the editor's last \
+         remaining window, the same way `:q` on that window would; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// The motivating case itself: a Cancel button whose own `on_event`
+/// (`{CANCEL_VIEW}`'s fixture registration) calls `vimcode.ui.close_view`
+/// on itself, from inside the very plugin-event dispatch handling the
+/// click — not from an external `:Command` the way every other
+/// `close_view` scenario in this module drives it.
+pub fn clicking_its_own_cancel_button_closes_the_view(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(CANCEL_HEADER),
+        "precondition: the cancel view must be painted before its own \
+         button closes it; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.click_text(CANCEL_BUTTON);
+    assert!(
+        !driver.screen_has(CANCEL_HEADER),
+        "clicking the view's own Cancel button must reach vimcode.ui.\
+         close_view from inside on_event and close the tab in the same \
+         dispatch; painted runs were {:?}",
         painted(driver)
     );
 }
@@ -3476,6 +3689,47 @@ mod tests {
         (h, dir)
     }
 
+    /// Editor-tab fixture collapsed to just the plugin's own window (TUI
+    /// arm) — see [`engine_with_plugin_view_tab_as_sole_window`].
+    fn tui_sole_window() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_tab_as_sole_window();
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    /// Split-window fixture for [`VIEW`] (TUI arm) — see
+    /// [`engine_with_plugin_view_split`].
+    fn tui_split() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_split();
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    /// Editor-tab fixture for [`CANCEL_VIEW`] (TUI arm).
+    fn tui_cancel_tab() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_named_plugin_view_tab(CANCEL_VIEW, "Zq2139CancelOpenTab");
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
     /// Sidebar fixture for a named `ViewBody`-kind view (TUI arm).
     fn tui_named(
         view: &str,
@@ -3879,6 +4133,24 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_close_view_closes_the_split_then_leaves_the_sibling_window_painted_on_tui() {
+        let (mut h, _dir) = tui_split();
+        close_view_closes_the_split_then_leaves_the_sibling_window_painted(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_close_view_refuses_to_close_the_editors_last_window_on_tui() {
+        let (mut h, _dir) = tui_sole_window();
+        close_view_refuses_to_close_the_editors_last_window(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_clicking_its_own_cancel_button_closes_the_view_on_tui() {
+        let (mut h, _dir) = tui_cancel_tab();
+        clicking_its_own_cancel_button_closes_the_view(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_sidebar_false_view_has_no_activity_bar_zone_on_tui() {
         let (h, _dir) = tui();
         sidebar_false_view_has_no_activity_bar_zone(&h.driver);
@@ -3911,6 +4183,50 @@ mod tests {
         PathBuf,
     ) {
         let (engine, dir) = engine_with_plugin_view_tab();
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    /// Editor-tab fixture collapsed to just the plugin's own window (GTK
+    /// arm) — see [`engine_with_plugin_view_tab_as_sole_window`].
+    #[cfg(feature = "gui")]
+    fn gtk_sole_window() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_tab_as_sole_window();
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    /// Split-window fixture for [`VIEW`] (GTK arm) — see
+    /// [`engine_with_plugin_view_split`].
+    #[cfg(feature = "gui")]
+    fn gtk_split() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_split();
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    /// Editor-tab fixture for [`CANCEL_VIEW`] (GTK arm).
+    #[cfg(feature = "gui")]
+    fn gtk_cancel_tab() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_named_plugin_view_tab(CANCEL_VIEW, "Zq2139CancelOpenTab");
         let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
         h.driver.render();
         (h, dir)
@@ -4389,6 +4705,27 @@ mod tests {
     fn plugin_view_close_view_closes_the_dock_then_reports_nothing_open_on_gtk() {
         let (mut h, _dir) = gtk_dock();
         close_view_closes_the_dock_then_reports_nothing_open(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_close_view_closes_the_split_then_leaves_the_sibling_window_painted_on_gtk() {
+        let (mut h, _dir) = gtk_split();
+        close_view_closes_the_split_then_leaves_the_sibling_window_painted(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_close_view_refuses_to_close_the_editors_last_window_on_gtk() {
+        let (mut h, _dir) = gtk_sole_window();
+        close_view_refuses_to_close_the_editors_last_window(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_clicking_its_own_cancel_button_closes_the_view_on_gtk() {
+        let (mut h, _dir) = gtk_cancel_tab();
+        clicking_its_own_cancel_button_closes_the_view(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]
